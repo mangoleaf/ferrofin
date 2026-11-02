@@ -52,13 +52,25 @@ watched state. Recovery and snapshot consumption share a transaction.
 
 Recovery runs after scanner and provider refreshes persist item metadata and
 provider IDs. A second recovery pass runs after scan pruning and closing passes,
-before the final library-change notification. It also runs on unchanged scans,
-so a prior interrupted recovery can be retried.
+before the final library-change notification.
 
 The completion pass considers persisted destinations outside the current scan
 scope. This handles both a new path saved before its old path is pruned and a
 destination indexed by an earlier watcher event. Music's closing pass has
 finished before this recovery, so its final metadata is available for keys.
+
+The completion pass always runs after a library scan (`ScanPasses::Library`:
+the scheduled scan, `POST /Library/Refresh`, one library's scan). After a path
+or item scan (`ScanPasses::Touched`: watcher and webhook batches, item and
+folder refreshes) it runs only when history was detached since the last pass,
+read from the retention snapshots' `AUTOINCREMENT` sequence, which every detach
+moves; the first scan after a start always runs it, and a pass that fails is
+retried by the next scan that detached history, and always by the next library
+scan. A touched scan that detached nothing has no new history to place: its own
+saves recovered their history as they were written. What it leaves to the next
+library scan is a destination whose keys changed after its save or outside a
+scan (music's closing pass, a series' re-pointed children, a metadata edit);
+the history waits, retained, for that pass.
 
 The pass processes 500 items per transaction, releases the writer between
 pages, and loads identity fields, providers, and series context in batches.
@@ -77,6 +89,9 @@ eligible for recovery on the next scan or destination refresh.
 | Duplicate paths during adoption | Move the duplicate's history to its known survivor; detach history on descendants that will cascade-delete. |
 | Container ID migration and localized view consolidation | Move history directly to the known survivor and translate its GUID key; preserve existing destination state. |
 | Orphaned person cleanup | Use the same retention-aware persistence deletion. |
+| Scanner prune of rows a disc rip or multi-disc set swallows, and of a removed location's `Folder` row and its items | Pruned through `delete_items`, so history is detached once and recovered when the file resolves at its path again. |
+| Scanner and boot-repair folds (`rekey_items`/`merge_one`: an older per-file row folding into a rip, a duplicate of a re-keyed video, an adopted 10.11 local version) | The loser's history moves onto the kept row (the later-played, then more-played row wins per user and key, as upstream keeps duplicates); nothing is detached or snapshotted, so recovery cannot revive a second copy. |
+| Parts and versions released from a pruned owner (`release_owned_versions`) | The row survives, so its history stays attached; only the pruned owner's history is detached. |
 | Existing person and artist merges | Already transfer user data before deleting duplicate items; their existing conflict handling is retained. |
 | Schema table rebuilds | Already disable foreign-key cascades during migration and validate integrity afterward. Historical migrations are unchanged. |
 

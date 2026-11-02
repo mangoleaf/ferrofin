@@ -38,7 +38,7 @@ use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
-use crate::handlers::session_ctx::{current_session, current_session_id};
+use crate::handlers::session_ctx::current_session_id;
 use crate::state::AppState;
 
 /// Query parameters for `GET /Sessions`.
@@ -140,13 +140,12 @@ async fn display_content(
     if let Some(name) = &command.item_name {
         arguments.insert("ItemName".to_owned(), name.clone());
     }
-    let controlling = current_session(&state, &auth).await?;
+    let controlling_id = controlling_session_id(&state, &auth).await?;
     let general = GeneralCommand {
         name: GeneralCommandType::DisplayContent,
-        controlling_user_id: controlling.user_id,
+        controlling_user_id: auth.user_id(),
         arguments,
     };
-    let controlling_id = session_id_of(&controlling)?;
     state
         .sessions
         .send_general_command(&controlling_id, &session_id, &general)
@@ -200,7 +199,7 @@ async fn play(
         start_index: query.start_index,
         ..PlayRequest::default()
     };
-    let controlling_id = current_session_id(&state, &auth).await?;
+    let controlling_id = controlling_session_id(&state, &auth).await?;
     state
         .sessions
         .send_play_command(&controlling_id, &session_id, &play_request)
@@ -242,7 +241,7 @@ async fn send_playstate_command(
         controlling_user_id: query.controlling_user_id,
         seek_position_ticks: query.seek_position_ticks,
     };
-    let controlling_id = current_session_id(&state, &auth).await?;
+    let controlling_id = controlling_session_id(&state, &auth).await?;
     state
         .sessions
         .send_playstate_command(&controlling_id, &session_id, &request)
@@ -310,9 +309,8 @@ async fn send_full_general_command(
     Path(session_id): Path<String>,
     JsonBody(mut command): JsonBody<GeneralCommand>,
 ) -> Result<StatusCode, ApiError> {
-    let controlling = current_session(&state, &auth).await?;
-    command.controlling_user_id = controlling.user_id;
-    let controlling_id = session_id_of(&controlling)?;
+    let controlling_id = controlling_session_id(&state, &auth).await?;
+    command.controlling_user_id = auth.user_id();
     state
         .sessions
         .send_general_command(&controlling_id, &session_id, &command)
@@ -341,7 +339,7 @@ async fn send_message_command(
     if command.header.as_deref().is_none_or(str::is_empty) {
         command.header = Some("Message from Server".to_owned());
     }
-    let controlling_id = current_session_id(&state, &auth).await?;
+    let controlling_id = controlling_session_id(&state, &auth).await?;
     state
         .sessions
         .send_message_command(&controlling_id, &session_id, &command)
@@ -364,9 +362,27 @@ async fn send_message_command(
 )]
 async fn add_user_to_session(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path((session_id, user_id)): Path<(String, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
+    let controlling_id = controlling_session_id(&state, &auth).await?;
+    state
+        .sessions
+        .assert_can_control(&controlling_id, &session_id)
+        .await?;
+    // Attaching another user affects that user's playback history. Upstream
+    // separately requires administration even when remote control is allowed.
+    if !auth.is_api_key
+        && auth.user_id() != user_id
+        && !auth
+            .user_policy
+            .as_ref()
+            .is_some_and(|p| p.is_administrator)
+    {
+        return Err(ApiError::Forbidden(
+            "cannot attach another user to a session".to_owned(),
+        ));
+    }
     state
         .sessions
         .add_additional_user(&session_id, user_id)
@@ -389,9 +405,14 @@ async fn add_user_to_session(
 )]
 async fn remove_user_from_session(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Path((session_id, user_id)): Path<(String, Uuid)>,
 ) -> Result<StatusCode, ApiError> {
+    let controlling_id = controlling_session_id(&state, &auth).await?;
+    state
+        .sessions
+        .assert_can_control(&controlling_id, &session_id)
+        .await?;
     state
         .sessions
         .remove_additional_user(&session_id, user_id)
@@ -444,6 +465,11 @@ async fn post_capabilities(
         supports_persistent_identifier: query.supports_persistent_identifier.unwrap_or(true),
         ..ClientCapabilities::default()
     };
+    let controlling_id = controlling_session_id(&state, &auth).await?;
+    state
+        .sessions
+        .assert_can_control(&controlling_id, &id)
+        .await?;
     state
         .sessions
         .report_capabilities(&id, &capabilities)
@@ -479,6 +505,11 @@ async fn post_full_capabilities(
         Some(id) if !id.is_empty() => id,
         _ => current_session_id(&state, &auth).await?,
     };
+    let controlling_id = controlling_session_id(&state, &auth).await?;
+    state
+        .sessions
+        .assert_can_control(&controlling_id, &id)
+        .await?;
     state
         .sessions
         .report_capabilities(&id, &capabilities.to_client_capabilities())
@@ -514,6 +545,11 @@ async fn report_viewing(
         Some(id) if !id.is_empty() => id,
         _ => current_session_id(&state, &auth).await?,
     };
+    let controlling_id = controlling_session_id(&state, &auth).await?;
+    state
+        .sessions
+        .assert_can_control(&controlling_id, &session)
+        .await?;
     state
         .sessions
         .report_now_viewing_item(&session, query.item_id.as_deref().unwrap_or_default())
@@ -585,13 +621,12 @@ async fn send_named_command(
     session_id: &str,
     command: GeneralCommandType,
 ) -> Result<StatusCode, ApiError> {
-    let controlling = current_session(state, auth).await?;
+    let controlling_id = controlling_session_id(state, auth).await?;
     let general = GeneralCommand {
         name: command,
-        controlling_user_id: controlling.user_id,
+        controlling_user_id: auth.user_id(),
         arguments: HashMap::new(),
     };
-    let controlling_id = session_id_of(&controlling)?;
     state
         .sessions
         .send_general_command(&controlling_id, session_id, &general)
@@ -599,12 +634,17 @@ async fn send_named_command(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// The id of the caller's own session, or a `404` if it has none.
-fn session_id_of(session: &SessionInfoDto) -> Result<String, ApiError> {
-    session
-        .id
-        .clone()
-        .ok_or_else(|| ApiError::NotFound("Session not found.".to_owned()))
+/// An API key has no controlling user; an empty id is the manager's trusted
+/// internal-operation convention. User requests always resolve their session.
+async fn controlling_session_id(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+) -> Result<String, ApiError> {
+    if auth.is_api_key {
+        Ok(String::new())
+    } else {
+        current_session_id(state, auth).await
+    }
 }
 
 /// The PascalCase serde token for an enum value (used as a command argument).

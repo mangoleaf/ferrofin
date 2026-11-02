@@ -107,6 +107,7 @@
     "TaskExtractMediaSegments": "Сканиране за сегменти",
     "CleanupUserDataTask": "Задача за почистване на потребителски данни",
     "CleanupUserDataTaskDescription": "Почиства всички потребителски данни (статус на гледане, любими и т.н.) от медия, която вече не е налична от поне 90 дни.",
+    "LyricDownloadFailureFromForItem": "Текстът на песента не успя да се изтегли от {0} за {1}",
     "NameExtraBehindTheScenes": "Зад кулисите",
     "NameExtraScene": "Сцена",
     "NameExtraShort": "Откъс",
@@ -119,5 +120,6 @@
     "NameExtraInterview": "Интервю",
     "NameExtraNumbered": "{0} {1}",
     "NameExtraSample": "Пример",
-    "NameExtraThemeSong": "Тема-песен"
+    "NameExtraThemeSong": "Тема-песен",
+    "Original": "Оригинал"
 }

@@ -21,11 +21,8 @@ use ferrofin_wasm::capabilities::{
 mod common;
 use common::{EnabledStub, OneMovieLibrary, RecordingSegments, one_shot_http};
 
-fn client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap()
+fn client() -> ferrofin_wasm::capabilities::GuestHttp {
+    ferrofin_wasm::capabilities::GuestHttp::new(std::time::Duration::from_secs(5)).unwrap()
 }
 
 #[test]
@@ -330,6 +327,16 @@ fn http_fetch_denies_private_destinations_unless_allowlisted() {
         "ff02::1",           // v6 multicast
         "::ffff:10.0.0.1",   // v4-mapped RFC1918
         "::ffff:100.64.0.1", // v4-mapped CGNAT
+        // IPv6 forms that carry a private IPv4 reach it through a NAT64
+        // gateway, a 6to4 relay or IPv4-compatible routing.
+        "64:ff9b::a9fe:a9fe", // NAT64 → cloud metadata
+        "64:ff9b::7f00:1",    // NAT64 → loopback
+        "64:ff9b:1::1",       // local-use NAT64 prefix (not globally reachable)
+        "2002:7f00:1::",      // 6to4 → loopback
+        "2002:c0a8:101::1",   // 6to4 → 192.168.1.1
+        "2002:a00:1::",       // 6to4 → 10.0.0.1
+        "::127.0.0.1",        // IPv4-compatible loopback
+        "::10.0.0.1",         // IPv4-compatible RFC1918
     ] {
         assert!(
             is_private_address(private.parse().unwrap()),
@@ -343,6 +350,11 @@ fn http_fetch_denies_private_destinations_unless_allowlisted() {
         "100.63.255.255", // just below CGNAT
         "100.128.0.0",    // just above CGNAT
         "2606:4700:4700::1111",
+        "64:ff9b::808:808", // NAT64 → 8.8.8.8
+        "2002:808:808::1",  // 6to4 → 8.8.8.8
+        "::8.8.8.8",        // IPv4-compatible public
+        "64:ff9b:2::1",     // just past the local-use NAT64 prefix
+        "64:ff9b:0:0:1::1", // not the NAT64 /96: a non-zero middle
     ] {
         assert!(
             !is_private_address(public.parse().unwrap()),
@@ -370,6 +382,63 @@ fn http_fetch_denies_private_destinations_unless_allowlisted() {
     .unwrap_err();
     assert!(
         err.contains("private/loopback") && err.contains("FERROFIN_WASM_PRIVATE_HTTP_ALLOW"),
+        "got: {err}"
+    );
+}
+
+/// A HOSTNAME that resolves to a private address is refused by the vetted
+/// client's resolver, before any connection: the address vetted is the
+/// address that would be connected (the DNS-rebinding guard). The guest
+/// sees the same message as for a private IP literal, and an unresolvable
+/// name still says so.
+#[test]
+fn a_hostname_resolving_to_a_private_address_is_refused_before_connecting() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let err = http_fetch(
+        &client(),
+        "untrusted-plugin",
+        1024,
+        false,
+        &ferrofin_wasm::capabilities::EgressPolicy::parse(&["localhost".to_owned()]),
+        std::time::Duration::from_secs(5),
+        &HttpRequest {
+            method: "GET".to_owned(),
+            url: format!("http://localhost:{port}/x"),
+            headers: Vec::new(),
+            body: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("destination `localhost` resolves to the private/loopback address")
+            && err.contains("`untrusted-plugin`")
+            && err.contains("FERROFIN_WASM_PRIVATE_HTTP_ALLOW"),
+        "got: {err}"
+    );
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "no connection was opened"
+    );
+
+    let err = http_fetch(
+        &client(),
+        "untrusted-plugin",
+        1024,
+        false,
+        &ferrofin_wasm::capabilities::EgressPolicy::parse(&["*".to_owned()]),
+        std::time::Duration::from_secs(5),
+        &HttpRequest {
+            method: "GET".to_owned(),
+            url: "http://nothing-here.invalid/x".to_owned(),
+            headers: Vec::new(),
+            body: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.starts_with("could not resolve `nothing-here.invalid`"),
         "got: {err}"
     );
 }
@@ -439,25 +508,59 @@ fn download_image_enforces_egress_status_and_returns_bytes() {
 
     // Undeclared destination: refused before any connection.
     let policy = EgressPolicy::parse(&["cdn.example.com".to_owned()]);
-    let err =
-        download_image("p", false, &policy, CAP, TIMEOUT, "http://127.0.0.1:9/x").unwrap_err();
+    let err = download_image(
+        &client(),
+        "p",
+        false,
+        &policy,
+        CAP,
+        TIMEOUT,
+        "http://127.0.0.1:9/x",
+    )
+    .unwrap_err();
     assert!(err.contains("declared egress"), "got: {err}");
 
     // Declared but loopback/private: still refused without the grant.
     let policy = EgressPolicy::parse(&["127.0.0.1".to_owned()]);
-    let err =
-        download_image("p", false, &policy, CAP, TIMEOUT, "http://127.0.0.1:9/x").unwrap_err();
+    let err = download_image(
+        &client(),
+        "p",
+        false,
+        &policy,
+        CAP,
+        TIMEOUT,
+        "http://127.0.0.1:9/x",
+    )
+    .unwrap_err();
     assert!(err.contains("private"), "got: {err}");
 
     // With the private grant: a non-200 answer loses the slot…
     let (url, server) = one_shot_http("404 Not Found", b"nope");
-    let err = download_image("p", true, &EgressPolicy::default(), CAP, TIMEOUT, &url).unwrap_err();
+    let err = download_image(
+        &client(),
+        "p",
+        true,
+        &EgressPolicy::default(),
+        CAP,
+        TIMEOUT,
+        &url,
+    )
+    .unwrap_err();
     assert!(err.contains("404"), "got: {err}");
     server.join().unwrap();
 
     // …and a 200 yields the raw bytes via a GET.
     let (url, server) = one_shot_http("200 OK", b"IMAGEBYTES");
-    let bytes = download_image("p", true, &EgressPolicy::default(), CAP, TIMEOUT, &url).unwrap();
+    let bytes = download_image(
+        &client(),
+        "p",
+        true,
+        &EgressPolicy::default(),
+        CAP,
+        TIMEOUT,
+        &url,
+    )
+    .unwrap();
     assert_eq!(bytes, b"IMAGEBYTES");
     let request = server.join().unwrap();
     assert!(request.starts_with(b"GET "), "artwork fetch must be a GET");
@@ -871,4 +974,211 @@ async fn write_family_caps_ownership_and_plumbing() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)]
+async fn loaded_producer_uses_display_name_library_gate_and_registered_namespace() {
+    use ferrofin_traits::library::VirtualFolderManager;
+    use ferrofin_traits::media_segments::media_segment_provider_id;
+    let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    let item = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01").unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let media = tmp.path().join("media");
+    let library = common::persisted_movie_library(&db, &media, item).await;
+    let folders = Arc::new(ferrofin_core::FerrofinVirtualFolderManager::new(
+        tmp.path().join("views"),
+    ));
+    let mut options = ferrofin_model::configuration::LibraryOptions {
+        path_infos: vec![ferrofin_model::configuration::MediaPathInfo {
+            path: media.to_string_lossy().into_owned(),
+        }],
+        disabled_media_segment_providers: vec!["LOADED DETECTOR".to_owned()],
+        ..Default::default()
+    };
+    folders
+        .add_virtual_folder("Movies", None, &options)
+        .await
+        .unwrap();
+    let manager = Arc::new(
+        ferrofin_core::FerrofinMediaSegmentManager::new(db.clone(), library.clone())
+            .with_virtual_folders(folders.clone()),
+    );
+    let plugin_id = Uuid::new_v4();
+    let namespace = format!("wasm:{plugin_id}");
+    let state = tmp.path().join(format!("{plugin_id}.state.json"));
+    let output = vec![MediaSegment {
+        segment_type: "Intro".to_owned(),
+        start_ticks: 0,
+        end_ticks: 100,
+    }];
+    let call = |cx, state: std::path::PathBuf, namespace: String, output: Vec<MediaSegment>| {
+        tokio::task::spawn_blocking(move || {
+            ferrofin_wasm::capabilities::write_media_segments_from_plugin(
+                &cx,
+                "Loaded Detector",
+                &namespace,
+                Some(&state),
+                &item.to_string(),
+                &output,
+            )
+        })
+    };
+    let skipped = call(
+        collaborators(library.clone(), manager.clone()),
+        state.clone(),
+        namespace.clone(),
+        output.clone(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        skipped,
+        ferrofin_wasm::capabilities::SegmentWriteOutcome::PolicySkipped
+    );
+    assert!(!manager.has_segments(item).await.unwrap());
+    assert!(manager.registered_segment_providers().is_empty());
+    options.disabled_media_segment_providers.clear();
+    folders
+        .update_library_options("Movies", &options)
+        .await
+        .unwrap();
+    call(
+        collaborators(library.clone(), manager.clone()),
+        state.clone(),
+        namespace.clone(),
+        output.clone(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        manager.registered_segment_providers()[0].name,
+        "Loaded Detector"
+    );
+    assert_eq!(
+        manager.registered_segment_providers()[0].id,
+        media_segment_provider_id("Loaded Detector")
+    );
+    assert_eq!(
+        manager.get_segments(item, None, true).await.unwrap().len(),
+        1
+    );
+    assert!(
+        tmp.path()
+            .join(format!("{plugin_id}.segments/{item}.json"))
+            .is_file()
+    );
+    manager
+        .create_segment(
+            &ferrofin_model::media_segments::MediaSegmentDto {
+                item_id: item,
+                type_: MediaSegmentType::Outro,
+                start_ticks: 200,
+                end_ticks: 300,
+                ..Default::default()
+            },
+            "wasm:unloaded",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.get_segments(item, None, true).await.unwrap().len(),
+        1
+    );
+    assert_eq!(manager.run_segment_providers(item, true).await.unwrap(), 1);
+    assert_eq!(
+        manager.get_segments(item, None, true).await.unwrap()[0].end_ticks,
+        100
+    );
+    options.disabled_media_segment_providers = vec!["loaded detector".to_owned()];
+    folders
+        .update_library_options("Movies", &options)
+        .await
+        .unwrap();
+    call(
+        collaborators(library.clone(), manager.clone()),
+        state.clone(),
+        namespace.clone(),
+        Vec::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        manager
+            .get_segments(item, None, true)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        manager.get_segments(item, None, false).await.unwrap()[0].end_ticks,
+        100,
+        "disabled writes preserve previous producer output"
+    );
+    options.disabled_media_segment_providers.clear();
+    folders
+        .update_library_options("Movies", &options)
+        .await
+        .unwrap();
+    let mut cx = collaborators(library, manager.clone());
+    cx.plugins = Arc::new(common::DisabledStub(b"{}".to_vec()));
+    call(cx, state, namespace, Vec::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        manager.get_segments(item, None, true).await.unwrap()[0].end_ticks,
+        100,
+        "global plugin disable still gates a direct host write"
+    );
+}
+
+#[test]
+fn concurrent_guest_and_host_state_writes_preserve_policy_pending_and_independent_keys() {
+    use ferrofin_wasm::capabilities::{get_state, set_state};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plugin.state.json");
+    let pending = serde_json::to_vec(&[Uuid::new_v4()]).unwrap();
+    set_state(
+        Some(&path),
+        "host:segment-policy-pending",
+        Some(pending.clone()),
+    )
+    .unwrap();
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        for writer in 0..4 {
+            let barrier = &barrier;
+            let path = &path;
+            scope.spawn(move || {
+                let key = if writer == 0 {
+                    "host:scan-watermark".to_owned()
+                } else {
+                    format!("guest:{writer}")
+                };
+                for value in 0..30 {
+                    barrier.wait();
+                    set_state(Some(path), &key, Some(value.to_string().into_bytes())).unwrap();
+                }
+            });
+        }
+    });
+    assert_eq!(
+        get_state(Some(&path), "host:segment-policy-pending"),
+        Some(pending)
+    );
+    assert_eq!(
+        get_state(Some(&path), "host:scan-watermark"),
+        Some(b"29".to_vec())
+    );
+    for writer in 1..4 {
+        assert_eq!(
+            get_state(Some(&path), &format!("guest:{writer}")),
+            Some(b"29".to_vec())
+        );
+    }
 }

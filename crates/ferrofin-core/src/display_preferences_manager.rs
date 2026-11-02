@@ -20,9 +20,11 @@
 //!   the Jellyfin default column values and re-read, so the returned entity
 //!   always carries a real surrogate `Id`.
 //! - `UpdateDisplayPreferences`/`UpdateItemDisplayPreferences` attach a modified
-//!   entity in C#. Here they `UPDATE` the row addressed by
-//!   `(UserId, ItemId, Client)` (an `upsert` is unnecessary — the getters
-//!   guarantee the row exists before a client edits it).
+//!   entity in C#. Here they `UPDATE` the row the getter returned: by its
+//!   unique `(UserId, ItemId, Client)` for display preferences, by `Id` for
+//!   item display preferences, whose table has no unique index (an `upsert`
+//!   is unnecessary — the getters guarantee the row exists before a client
+//!   edits it).
 //! - `Guid` identity arguments are [`Uuid`]; they are bound in the canonical
 //!   storage form ([`guid_to_db`], uppercase hyphenated) to match the `TEXT`
 //!   columns, consistent with the rest of the crate.
@@ -136,47 +138,40 @@ impl DisplayPreferencesManager for FerrofinDisplayPreferencesManager {
         item_id: Uuid,
         client: &str,
     ) -> Result<ItemDisplayPreferencesEntity, ServiceError> {
-        // The item's own row if it has one, else the client's DEFAULT row (the
-        // empty-item-id row this method creates below) — one statement, exact
-        // match first.
-        //
-        // Why the fallback exists: C# inserts
-        // `new ItemDisplayPreferences(userId, Guid.Empty, client)`, storing the
-        // row under the *empty* GUID rather than the queried `itemId`. A lookup
-        // for any non-empty `item_id` therefore never finds it, so upstream
-        // inserts another default row on EVERY call — and jellyfin-web hits
-        // `/DisplayPreferences/{id}` (GET and POST) on every page load, so the
-        // table grows without bound and each request pays a write. Ferrofin
-        // keeps the stored shape (empty item id, still excluded from
-        // `ListItemDisplayPreferences`) and returns the same values, but reuses
-        // the default row instead of duplicating it. Deliberate divergence:
-        // upstream's growth is a bug, not a contract.
-        let existing = sqlx::query_as::<_, ItemDisplayPreferencesEntity>(
-            r#"SELECT * FROM "ItemDisplayPreferences"
-               WHERE "UserId" = ?1 AND "Client" = ?3 AND "ItemId" IN (?2, ?4)
-               ORDER BY ("ItemId" = ?2) DESC, "Id"
-               LIMIT 1"#,
-        )
-        .bind(guid_to_db(user_id))
-        .bind(guid_to_db(item_id))
-        .bind(client)
-        .bind(guid_to_db(Uuid::nil()))
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?;
+        // v12.2 looks the row up by the item and, on a miss, stores the
+        // defaults under that item (`new ItemDisplayPreferences(userId,
+        // itemId, client)`, jellyfin/jellyfin#18259). An empty-GUID row an
+        // older build stored is left alone: no item reads it, and
+        // `list_item_display_preferences` leaves it out.
+        let select = r#"SELECT * FROM "ItemDisplayPreferences"
+               WHERE "UserId" = ?1 AND "ItemId" = ?2 AND "Client" = ?3
+               ORDER BY "Id" LIMIT 1"#;
+        let existing = sqlx::query_as::<_, ItemDisplayPreferencesEntity>(select)
+            .bind(guid_to_db(user_id))
+            .bind(guid_to_db(item_id))
+            .bind(client)
+            .fetch_optional(self.db.pool())
+            .await
+            .map_err(db_err)?;
 
         if let Some(row) = existing {
             return Ok(row);
         }
 
+        // The table has no unique index to dedupe on (only
+        // `IX_ItemDisplayPreferences_UserId`), so the insert checks for the
+        // row itself: two concurrent first GETs for the same item, serialised
+        // by the single writer, store one row, and both re-read it.
         sqlx::query(
             r#"INSERT INTO "ItemDisplayPreferences"
                ("Client", "IndexBy", "ItemId", "RememberIndexing",
                 "RememberSorting", "SortBy", "SortOrder", "UserId", "ViewType")
-               VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+               SELECT ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+               WHERE NOT EXISTS (SELECT 1 FROM "ItemDisplayPreferences"
+                                 WHERE "UserId" = ?7 AND "ItemId" = ?2 AND "Client" = ?1)"#,
         )
         .bind(client)
-        .bind(guid_to_db(Uuid::nil()))
+        .bind(guid_to_db(item_id))
         .bind(i64::from(DEFAULT_REMEMBER_INDEXING))
         .bind(i64::from(DEFAULT_REMEMBER_SORTING))
         .bind(DEFAULT_SORT_BY)
@@ -187,17 +182,13 @@ impl DisplayPreferencesManager for FerrofinDisplayPreferencesManager {
         .await
         .map_err(db_err)?;
 
-        sqlx::query_as::<_, ItemDisplayPreferencesEntity>(
-            r#"SELECT * FROM "ItemDisplayPreferences"
-               WHERE "UserId" = ?1 AND "ItemId" = ?2 AND "Client" = ?3
-               ORDER BY "Id" LIMIT 1"#,
-        )
-        .bind(guid_to_db(user_id))
-        .bind(guid_to_db(Uuid::nil()))
-        .bind(client)
-        .fetch_one(self.db.pool())
-        .await
-        .map_err(db_err)
+        sqlx::query_as::<_, ItemDisplayPreferencesEntity>(select)
+            .bind(guid_to_db(user_id))
+            .bind(guid_to_db(item_id))
+            .bind(client)
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_err)
     }
 
     async fn list_item_display_preferences(
@@ -205,8 +196,8 @@ impl DisplayPreferencesManager for FerrofinDisplayPreferencesManager {
         user_id: Uuid,
         client: &str,
     ) -> Result<Vec<ItemDisplayPreferencesEntity>, ServiceError> {
-        // Excludes the empty-item-id rows created by `get_item_display_preferences`
-        // (C# `!prefs.ItemId.Equals(default)`).
+        // Excludes the empty-item-id rows older builds stored (C#
+        // `!prefs.ItemId.Equals(default)`).
         sqlx::query_as::<_, ItemDisplayPreferencesEntity>(
             r#"SELECT * FROM "ItemDisplayPreferences"
                WHERE "UserId" = ?1 AND "Client" = ?2 AND "ItemId" <> ?3"#,
@@ -320,7 +311,7 @@ impl DisplayPreferencesManager for FerrofinDisplayPreferencesManager {
             r#"UPDATE "ItemDisplayPreferences" SET
                  "IndexBy" = ?1, "RememberIndexing" = ?2, "RememberSorting" = ?3,
                  "SortBy" = ?4, "SortOrder" = ?5, "ViewType" = ?6
-               WHERE "UserId" = ?7 AND "ItemId" = ?8 AND "Client" = ?9"#,
+               WHERE "Id" = ?7"#,
         )
         .bind(item_display_preferences.index_by)
         .bind(i64::from(item_display_preferences.remember_indexing))
@@ -328,9 +319,7 @@ impl DisplayPreferencesManager for FerrofinDisplayPreferencesManager {
         .bind(&item_display_preferences.sort_by)
         .bind(item_display_preferences.sort_order)
         .bind(item_display_preferences.view_type)
-        .bind(&item_display_preferences.user_id)
-        .bind(&item_display_preferences.item_id)
-        .bind(&item_display_preferences.client)
+        .bind(item_display_preferences.id)
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
@@ -390,7 +379,9 @@ mod tests {
     /// opens two views at once runs two of these against the same
     /// `(user, item, client)`. Read-then-insert let both see "absent" and both
     /// insert; the loser failed `IX_DisplayPreferences_UserId_ItemId_Client`
-    /// and the page 500'd. Every racer must get the same persisted row.
+    /// and the page 500'd. Every racer must get the same persisted row, and
+    /// the same item display preferences row (that table has no unique index
+    /// to fail, so a lost race would store a second row).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_first_gets_do_not_collide() {
         let db = test_db().await;
@@ -403,7 +394,9 @@ mod tests {
         for _ in 0..8 {
             let mgr = std::sync::Arc::clone(&mgr);
             tasks.push(tokio::spawn(async move {
-                mgr.get_display_preferences(user, item, "web").await
+                let prefs = mgr.get_display_preferences(user, item, "web").await?;
+                let item_prefs = mgr.get_item_display_preferences(user, item, "web").await?;
+                Ok::<_, ServiceError>((prefs.id, item_prefs.id))
             }));
         }
         let mut ids = Vec::new();
@@ -411,8 +404,7 @@ mod tests {
             ids.push(
                 task.await
                     .expect("join")
-                    .expect("a concurrent first get must not fail")
-                    .id,
+                    .expect("a concurrent first get must not fail"),
             );
         }
         assert!(
@@ -474,25 +466,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn item_prefs_created_with_empty_item_id_excluded_from_list() {
+    async fn item_prefs_are_created_under_the_item_and_listed() {
         let db = test_db().await;
         let user = Uuid::new_v4();
         seed_user(&db, user).await;
         let mgr = FerrofinDisplayPreferencesManager::new(db);
+        let item = Uuid::new_v4();
 
-        // Creating item prefs stores an empty item id (Jellyfin quirk).
         let created = mgr
-            .get_item_display_preferences(user, Uuid::new_v4(), "web")
+            .get_item_display_preferences(user, item, "web")
             .await
             .expect("get item prefs");
-        assert_eq!(created.item_id, Uuid::nil().to_string());
+        assert_eq!(created.item_id, guid_to_db(item));
 
-        // The list filters out the empty-item-id placeholder row.
         let listed = mgr
             .list_item_display_preferences(user, "web")
             .await
             .expect("list");
-        assert!(listed.is_empty());
+        assert_eq!(listed, [created]);
     }
 
     #[tokio::test]

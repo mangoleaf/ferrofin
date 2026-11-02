@@ -69,6 +69,21 @@ pub trait TranscodeChild: Send + Sync {
     /// `OnFfMpegProcessExited` equivalent (flips `has_exited`, records the code).
     async fn wait(&self) -> i32;
 
+    /// The latest ffmpeg stderr statistics, before the job's seek offset.
+    /// Children that do not emit statistics return `None`.
+    fn progress(&self) -> Option<super::progress::FfmpegProgress> {
+        None
+    }
+
+    /// Writes an interactive runtime key to the encoder's stdin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process has no writable stdin.
+    async fn write_stdin(&self, _bytes: &[u8]) -> Result<(), String> {
+        Err("transcode child has no interactive stdin".to_owned())
+    }
+
     /// Kills the process (the `Process.Kill`/`Stop` equivalent used by
     /// `KillTranscodingJob`).
     ///

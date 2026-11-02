@@ -208,8 +208,14 @@ fn get_media_info_mp4_metadata_success() {
     assert_eq!(s1.codec.as_deref(), Some("aac"));
     assert_eq!(s1.channels, Some(7));
     assert!(s1.is_default);
+    assert!(!s1.is_original);
     assert_eq!(s1.language.as_deref(), Some("eng"));
     assert_eq!(s1.title.as_deref(), Some("Surround 6.1"));
+    // ProbeResultNormalizer.cs:734 stamps `LocalizedOriginal` on every audio
+    // stream (the passthrough echoes the key); `GetLanguageDisplayName` on the
+    // upstream mock yields null, as `PassthroughLocalization` does.
+    assert_eq!(s1.localized_original.as_deref(), Some("Original"));
+    assert_eq!(s1.localized_language, None);
 
     let s2 = &res.media_source.media_streams[2];
     assert_eq!(s2.stream_type, MediaStreamType::Audio);
@@ -225,6 +231,9 @@ fn get_media_info_mp4_metadata_success() {
     assert_eq!(s3.codec.as_deref(), Some("DVDSUB"));
     assert_eq!(s3.title, None);
     assert!(!s3.is_hearing_impaired);
+    // Subtitles never get `LocalizedOriginal` (ProbeResultNormalizer.cs:774-786).
+    assert_eq!(s3.localized_original, None);
+    assert_eq!(s3.localized_language, None);
 
     let s4 = &res.media_source.media_streams[4];
     assert_eq!(s4.language.as_deref(), Some("eng"));
@@ -519,6 +528,40 @@ fn get_media_stream_mjpeg_with_a_real_codec_tag_is_video() {
     assert_eq!(junk.stream_type, MediaStreamType::EmbeddedImage);
 }
 
+/// `ProbeResultNormalizer` (v12.2 `:967`): the video stream whose first frame
+/// (`-show_frames -only_first_vframe`) carries `HDR Dynamic Metadata
+/// SMPTE2094-40 (HDR10+)` side data is flagged HDR10+; a stream with no such
+/// frame is not.
+#[test]
+fn a_first_frame_with_hdr10_plus_side_data_flags_the_stream() {
+    let json = r#"{"streams":[
+        {"index":0,"codec_name":"hevc","codec_type":"video","width":3840,"height":2160,
+         "pix_fmt":"yuv420p10le","color_transfer":"smpte2084","color_primaries":"bt2020"},
+        {"index":1,"codec_name":"hevc","codec_type":"video","width":1920,"height":1080}
+    ],"format":{},
+    "frames":[{"media_type":"video","stream_index":0,"side_data_list":[
+        {"side_data_type":"Mastering display metadata"},
+        {"side_data_type":"HDR Dynamic Metadata SMPTE2094-40 (HDR10+)"}
+    ]}]}"#;
+    let parsed: InternalMediaInfoResult = serde_json::from_str(json).expect("probe json parses");
+    let res = normalizer().get_media_info(
+        parsed,
+        Some(VideoType::VideoFile),
+        false,
+        "Test Data/Probing/hdr10plus.mkv",
+        MediaProtocol::File,
+    );
+
+    assert_eq!(
+        res.media_source.media_streams[0].hdr10_plus_present_flag,
+        Some(true)
+    );
+    assert_eq!(
+        res.media_source.media_streams[1].hdr10_plus_present_flag,
+        None
+    );
+}
+
 /// A text subtitle has no ffprobe `width`/`height`/`level`/`is_avc`, so on
 /// upstream master — where all four fields are nullable
 /// (`MediaStreamInfo.cs:93/107/170/233`) — the wire carries null, not the
@@ -662,4 +705,39 @@ fn get_media_info_music_success() {
     assert!(res.genres.iter().any(|g| g == "Trance"));
     assert!(res.genres.iter().any(|g| g == "Dance"));
     assert!(res.genres.iter().any(|g| g == "Jazz"));
+}
+
+#[test]
+fn audio_probe_retains_unsplit_tags_with_format_precedence_and_no_wire_extension() {
+    let result: InternalMediaInfoResult = serde_json::from_value(serde_json::json!({
+        "streams":[{"index":0,"codec_type":"audio","codec_name":"flac", "tags":{
+            "ARTIST":"stream / artist", "ALBUMARTISTS":"Additional / Album", "GENRE":"Rock; Metal"
+        }}],
+        "format":{"format_name":"flac","tags":{
+            "ArTiSt":"Format / Artist", "ARTISTS":"Preferred; Artist", "ALBUMARTIST":"Album / Artist"
+        }}
+    })).unwrap();
+    let audio = normalizer().get_media_info(
+        result.clone(),
+        None,
+        true,
+        "/music/Track.flac",
+        MediaProtocol::File,
+    );
+    let raw = audio.raw_audio_tags.as_ref().unwrap();
+    assert_eq!(raw["artist"], "Format / Artist");
+    assert_eq!(raw["artists"], "Preferred; Artist");
+    assert_eq!(raw["albumartist"], "Album / Artist");
+    assert_eq!(raw["albumartists"], "Additional / Album");
+    assert_eq!(raw["genre"], "Rock; Metal");
+    assert!(!raw.contains_key("ARTIST"));
+    assert!(
+        serde_json::to_value(&audio)
+            .unwrap()
+            .get("RawAudioTags")
+            .is_none()
+    );
+    let video =
+        normalizer().get_media_info(result, None, false, "/video/File.mkv", MediaProtocol::File);
+    assert!(video.raw_audio_tags.is_none());
 }

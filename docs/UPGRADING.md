@@ -8,6 +8,595 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — Live TV sources and guides follow Jellyfin more closely
+
+- **A local M3U playlist is opened exactly as configured.** An M3U tuner configured as a
+  `file://` URL (`file:///srv/tv/list.m3u`) is no longer read from the path it names: like
+  Jellyfin, Ferrofin now takes the whole value as a file path, which does not exist. Saving
+  such a tuner is refused with `404`. A stored one can no longer be read: the guide refresh
+  logs a warning and keeps the channels and guide it already has. Configure the plain path
+  (`/srv/tv/list.m3u`) instead. (An XMLTV guide's `file://` path was already refused on
+  save, and is now not read either.)
+- **An XMLTV guide declared `ISO-8859-9` is decoded as that code page.** Bytes `0x80`-`0x9F`
+  read as control characters, as in Jellyfin, not as the `windows-1254` punctuation (`€`,
+  `‚`, …) they were read as before. Turkish letters are unchanged.
+- **Removing a tuner leaves its channels listed until the guide refresh it starts finishes.**
+  As in Jellyfin, the guide and `GET /LiveTv/Channels` keep showing the removed tuner's
+  channels (they cannot be played) until a guide refresh finishes cleanly; one that cannot
+  read a tuner or a guide leaves them for the next. Migration 0046 rebuilds the Live TV channel
+  table to allow this; it keeps every channel and airing.
+- **XMLTV guides must be well-formed XML, as in Jellyfin.** A guide with a bare `&` (say, in
+  an `<icon src="…?a=1&b=2">` URL), an undeclared entity, a mismatched or stray end tag,
+  text after its closing `</tv>`, an XML declaration that is not the very first thing in the
+  file (even a blank line before it), or any other well-formedness error used to load, and
+  now keeps the guide you already have,
+  with a warning in the log, until its source is fixed: escape `&` as `&amp;`. A
+  well-formed document that holds no `<tv>` element (an XHTML error page) now reads as an
+  empty guide and clears that provider's programmes, as in Jellyfin; an HTML page that is
+  not well-formed still keeps the stored guide.
+
+## Unreleased — the config file must be TOML
+
+Usually nothing to do: `{data_dir}/config.toml` reads as before. A `--config` or
+`FERROFIN_CONFIG_FILE` path with another extension (`.json`, `.json5`, `.yaml`, `.yml`,
+`.ini`, `.ron`) used to be read in that format; it now stops the server with "is not of a
+supported file format". Rewrite the file as TOML under a `.toml` name.
+
+## Unreleased — every upgrade copies the database first, and copies are written whole
+
+Usually nothing to do. A boot that applies migrations now holds a copy of the database, as
+large as the database, until its migrations have passed: keep that much disk free when you
+upgrade.
+
+- **A copy before every migration.** A boot that applies any migration first copies the
+  database to `<database>.pre-NNNN`, named after the first migration it runs (or after the
+  first table-rebuilding migration, `0007`, `0032` or `0044`, when one of them is pending),
+  as Jellyfin does before its own migrations. Once the migrations and the foreign-key check
+  have passed, that copy is deleted, except the ones taken before `0007`, `0032` and
+  `0044`, which are kept for good under the same names as before. A boot that fails keeps
+  its copy: it is the database as it was before that upgrade. Delete it by hand once you no
+  longer need it; a later boot that passes leaves it alone. If the copy cannot be written
+  (a full disk), the server logs a warning and migrates without it. The copies before
+  `0007`, `0032` and `0044`, and the adoption copy `jellyfin.db.pre-ferrofin`, still stop
+  the boot when they cannot be written.
+- **No cut-short copies.** Every copy (`jellyfin.db.pre-ferrofin`, `.pre-NNNN`, and the boot
+  repairs' `.pre-rehome`, `.pre-season-ids`, `.pre-playlist-folders` and `.pre-harmonize`)
+  is written to `<name>.partial`, flushed to disk and only then renamed. A full disk or a
+  killed server therefore never leaves a partial file under the real name. The next attempt
+  at that copy deletes a leftover `.partial`; you can also delete one yourself while the
+  server is stopped.
+- **The first copy is kept.** An existing copy is never overwritten: a retried upgrade keeps
+  the one its first attempt took, before anything changed, and the log says so ("kept the
+  database snapshot an earlier boot took"). Ferrofin goes by the file names, so before you
+  move a different database into the data folder, move the old database's `.pre-*` and
+  `.pre-*.partial` files aside, or the new one gets no copies of its own.
+- **Copies while another program uses the database.** If another program is reading or
+  writing the database when Ferrofin copies it before migrating or adopting (Jellyfin still
+  running on it, a database browser in the middle of a query, the previous pod of a rolling
+  update), the write-ahead log cannot be folded into the file first. After waiting up to 30
+  seconds, Ferrofin then takes the copy with SQLite's `VACUUM INTO`, which still holds every
+  committed change, and logs a warning that names the cause. Before, such a copy missed what
+  was still in the write-ahead log, and could be unreadable. Stop the other program before
+  you upgrade anyway, and always before you adopt: the migrations run with it attached, and
+  adopting a database Jellyfin is still using is not safe even with a good copy.
+
+Adoption stays one-way: going back to Jellyfin means restoring `jellyfin.db.pre-ferrofin`.
+The `.pre-NNNN` copies are for recovering from a failed Ferrofin upgrade, not a way back to
+Jellyfin.
+
+## Unreleased — a Jellyfin 10.11 database loses items whose file or library is gone, once
+
+Mount your media before the first boot on an adopted Jellyfin 10.11 database. When Jellyfin
+12 upgrades a 10.11 database, it removes items whose files are gone, and items whose library
+was removed. Ferrofin now does the same, once, on the first boot of a database adopted from
+10.11, including one that Ferrofin 1.2.0 or later adopted:
+- an item whose file or folder is no longer at its path, under a media folder that exists
+  and is not empty;
+- an item outside every media folder, but only when there is at least one media folder and
+  every one exists and is not empty, and never one in a library whose definition folder
+  (`root/default/<library>`) is missing;
+- an item whose top-level library item no longer exists and whose library is not defined.
+
+A root, a library's own folder, a view or a by-name item is never removed this way: it is
+kept, with a warning in the boot log.
+
+Items under a media folder that is missing, empty or fails to list are kept: that looks the
+same as storage that did not mount. So is an item whose path cannot be checked because of a
+read error, where Jellyfin would remove it. Play state recorded for a removed item moves to the placeholder item, as
+in Jellyfin. No media file is touched. The boot log counts what it removed, and lists each
+item at debug level. Before the first removal it snapshots the database to
+`jellyfin.db.pre-missing-items`, unless that file is already there from an interrupted
+earlier boot. That copy is the database Ferrofin had already adopted, so restoring it brings
+the removed items back in Ferrofin; it is not a way back to Jellyfin, which is the
+`jellyfin.db.pre-ferrofin` copy taken at adoption (adoption is one-way). Before this release, these items stayed until a library scan removed them.
+
+## Unreleased — user and policy saves need a complete body
+
+Usually nothing to do: the web client posts back the user it read. A script that calls
+`POST /Users` or `POST /Users/{userId}/Policy` must now send the policy's
+`AuthenticationProviderId` and `PasswordResetProviderId` (or, for `POST /Users`, the whole
+`Policy` or `"Policy": null`) and, for `POST /Users`, the user's `Name`; each is a `400`
+otherwise, as in Jellyfin.
+
+An earlier Ferrofin saved a partial policy body with empty provider ids. A user saved that
+way cannot have their profile or policy saved from the dashboard until both are set again:
+a sign-in restores `AuthenticationProviderId`; set `PasswordResetProviderId` (normally
+`Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider`) with a
+`POST /Users/{userId}/Policy` that carries the user's full policy.
+
+A policy body that leaves other members out now saves Jellyfin's default for each one
+(`new UserPolicy()`: media playback, all libraries, all devices and remote access allowed, no
+login lockout, among others), where an earlier Ferrofin saved `false` or `0`. A script that
+relied on an omitted member being `false` must now send it. A user an earlier Ferrofin saved
+from such a body keeps that stripped policy until it is saved again in full, from the
+dashboard or with the user's complete policy.
+
+## Unreleased — library tiles are drawn as Jellyfin 12.2 draws them
+
+Nothing to do. Some "My Media" tiles change on their next refresh:
+- **A library with artwork at the root of its media folder shows it.** A `folder.jpg`,
+  `poster.jpg` or similar in, say, `/media/movies` replaces the generated collage, as in
+  Jellyfin. Only the media folder's root is read, not its subfolders. An image in the
+  library's own folder (where an upload is saved) still wins.
+  Remove the file from the media folder to get the collage back.
+- **Music tiles come from artists.** A music library's collage samples the artists its
+  tracks credit that have an image, not its albums.
+- **Collages sample items that have a Primary image.** A library whose items have no
+  Primary image keeps the icon tile, where Ferrofin used to draw from any item's artwork.
+- **Each library tile and the root's image are redrawn once.** A library or root row
+  written by an earlier Ferrofin has never recorded a refresh, so its next refresh at the
+  default mode counts as its first and redraws the image past the 7-day gate, as Jellyfin
+  does for an item's first refresh.
+
+## Unreleased — the Screen Grabber, and HDR chapter images
+
+Usually nothing to do. Three changes can show:
+- **Videos with no artwork get a frame as their poster.** The new "Screen Grabber" image
+  fetcher, which Jellyfin has, grabs a frame 10 % into a movie, episode, music video or
+  home video that has no Primary image from any other source. It runs on a video's first
+  scan and on a **Refresh metadata** that searches for missing metadata or replaces it, so
+  a library's first scan runs one more ffmpeg extraction per such video. A new library
+  ticks it, as does a library adopted from Jellyfin whose settings list it. A library that
+  saved image fetchers for a kind on an earlier Ferrofin (every library created from the
+  dashboard did) saved them without it, so it grabs nothing for that kind until you tick
+  **Screen Grabber** for it; a kind the library never saved choices for grabs. To grab
+  frames for videos scanned before, refresh the library once with **Search for missing
+  metadata** (Dashboard → Libraries → the library's menu → Refresh metadata). A video
+  whose first-scan grab fails is refreshed again by the next scan, as in Jellyfin.
+- **New libraries list image fetchers in Jellyfin's order.** The library dialog lists each
+  item type's image fetchers ordered by the server-wide order, then each provider's own
+  order (FanArt now comes before TheMovieDb for series, for example). This is the order a
+  library that never saved one already used, and a new library saves it. A library's
+  saved order is unchanged.
+- **HDR chapter images and thumbnails are tone-mapped.** Frames of HDR10, HLG and Dolby
+  Vision videos are converted to SDR when ffmpeg has `tonemapx` (jellyfin-ffmpeg) or
+  `zscale`; Dolby Vision with no HDR10, HLG or SDR base layer needs `tonemapx`. Images
+  extracted before stay as they were until they are extracted again; a frame-grabbed
+  poster is grabbed again by **Refresh metadata** with **Replace existing images**.
+
+## Unreleased — Live TV sources are checked and read as Jellyfin reads them
+
+Usually nothing to do. Three changes can show on some Live TV sources:
+- **Saving an M3U tuner opens its playlist first.** A local playlist that does not exist is
+  refused with `404`, and a playlist URL that fails with `500`; the dashboard shows the
+  error instead of saving a tuner that never has channels. A tuner whose playlist is down
+  cannot be saved again until it is back, as in Jellyfin. Tuners already saved keep working.
+- **XMLTV guides are decoded by their declaration.** A guide is read in the encoding its
+  `<?xml … encoding="…"?>` declaration or byte-order mark names, else as UTF-8. A byte
+  that is not valid in that encoding, or a declaration naming an encoding that does not
+  exist, makes the guide unreadable: the refresh keeps the guide it has and logs a warning. A local guide in Latin-1 or UTF-16 now loads. A guide
+  downloaded over HTTP that is not valid UTF-8 and declares no other encoding used to load
+  with replacement characters and now does not, as in Jellyfin; fix the guide's
+  declaration, or its source.
+- **XMLTV text follows the guide language.** In a guide with several languages, the
+  programme titles, episode titles, descriptions, categories and channel names are now
+  taken in the listings provider's preferred language (its `PreferredLanguage`), else the
+  server's preferred metadata language, as Jellyfin takes them. A channel with no name or no
+  id in the guide is no longer listed.
+
+## Unreleased — creating a backup needs a JSON body
+
+A script that calls `POST /Backup/Create` with no body must now send `{}` with
+`Content-Type: application/json` to get the default backup, as Jellyfin requires. Without a
+body the request fails: `415` with no content type, `400` with an empty or `null` body.
+`POST /Backup/Restore` with no content type is a `415` too, instead of a `400`.
+
+`GET /Backup` lists the archives in the order the backups folder holds them, as Jellyfin
+does, not newest first; a script that takes the first entry as the latest backup should
+sort by `DateCreated`. Files ending in `.ZIP` or another case are no longer listed.
+
+A backup also fails now where it used to leave something out. A file it cannot read
+(wrong ownership after a manual copy, for example) fails the create with a `500`, and the
+server log names the file: fix the file's permissions and create the backup again. A
+backups folder the server cannot read fails `GET /Backup` the same way, where the dashboard
+used to show no backups. A create during a library scan answers `500` instead of `503`.
+
+## Unreleased — clients are no longer told which accounts have no password
+
+`HasPassword` and `HasConfiguredPassword` now read `true` for every user, as Jellyfin 12
+reports them. Before, an account without a password read `false`, including on the
+login-screen list that `GET /Users/Public` serves to callers who have not signed in.
+
+A client that used the flag to sign a passwordless user in with one click now asks for a
+password instead. Upstream names jellyfin-web's login screen among those clients. Leave the
+password empty: the account still signs in, because sign-in checks the stored password and
+not the flag.
+
+## Unreleased — abandoned playback is stopped, and paused sessions can be
+
+Ferrofin now runs Jellyfin's two playback checks:
+- **Idle playback:** a session that has been playing without reporting progress for more
+  than five minutes is stopped where its client last reported. Its device stops showing as
+  playing, its resume point is saved, and the usual rules may mark the item played. Before,
+  a client that vanished mid-playback over plain HTTP stayed "playing", and the "Clean
+  Transcode Directory" and "Optimize database" tasks skipped every run while it did.
+- **Inactive sessions:** the setting `InactiveSessionThreshold` (minutes, in
+  `config/system.json`, or through `POST /System/Configuration`) now applies. A session
+  paused longer than that is sent a stop command, which reaches clients connected over a
+  WebSocket, as in Jellyfin. It was ignored before, including when carried over from an
+  adopted Jellyfin configuration. At `0`, the default, nothing is stopped.
+
+## Unreleased — the Latest row follows Jellyfin 12 for movies libraries
+
+Nothing to do. A grouped **Latest** request whose first library with a content type is a
+movies library is now answered as Jellyfin 12 answers it: the newest items, one per
+presentation key, as many as the page asks for, then grouped into cards. Before, Ferrofin
+read five times as many items first. As in Jellyfin 12, an item with no presentation key is
+not listed, and items added at the same moment are ordered by id.
+
+The visible case is the home screen's library-wide Latest row on a server whose first
+typed library, in name order, is a movies library. If the newest additions are a few albums'
+tracks or a season's episodes, that row now shows a few cards, as Jellyfin 12 does, where
+it used to fill up with older items. A library's own "Latest Movies" row is unchanged in
+nearly every case.
+
+## Unreleased — the dashboard's HTTPS settings take effect
+
+Ferrofin now serves HTTPS itself, as Jellyfin does. Until now it ignored the HTTPS settings
+on **Dashboard → Networking**. They now apply at startup:
+- With **Enable HTTPS** on and a PKCS#12 certificate that loads, the server also listens on
+  `FERROFIN_HTTPS_PORT` (8920 unless set) and publishes `https://` addresses.
+- With **Require HTTPS** on as well, every plain HTTP request is redirected there with a
+  `307`, `/metrics` included. Only `/health/live` and `/health/ready` are not redirected.
+
+The ports are still `FERROFIN_PORT` and `FERROFIN_HTTPS_PORT`. The port fields on the
+Networking page are not read yet (gl-554). If both name the same port, HTTPS is not served
+and the log says so. If another program holds the HTTPS port, the server does not start, as
+it does not when the HTTP port is taken.
+
+An adopted Jellyfin configuration keeps **Enable HTTPS** and **Require HTTPS**. It does not
+keep the certificate path and password, which pointed into Jellyfin's own filesystem. So
+adopted settings take effect only once you set a certificate path here.
+
+If HTTPS is on, make sure clients can reach the HTTPS port:
+- **Container:** publish it, for example `-p 8920:8920`.
+- **Helm chart:** the chart's service carries only the HTTP port. Terminate TLS at the
+  ingress instead and leave both settings off.
+- **Otherwise:** turn **Require HTTPS** off, or **Enable HTTPS** off. Without a reachable
+  HTTPS port, clients on plain HTTP are redirected to a port they cannot reach.
+
+A reverse proxy that terminates TLS needs neither setting. List it under **Known proxies**;
+its `X-Forwarded-Proto: https` then counts as HTTPS. That header now counts only from known
+proxies, as in Jellyfin, also for the addresses published from each request (**Enable
+published server URI by request**). A proxy that is not listed gets `http://` addresses. A listed
+proxy's `X-Forwarded-Host` is not used yet (gl-813): those addresses still take their host
+from the request's `Host`.
+See [CONFIG.md](CONFIG.md#https).
+
+## Unreleased — the server checks its directories at startup, as Jellyfin does
+
+Ferrofin now runs Jellyfin's startup check on its directories before a scheduled restore and the database open (an adopted Jellyfin database included). Only logging starts before it, and it creates the log directory itself. It creates each of these directories and leaves a small marker file in it, as Jellyfin does:
+
+| Directory | Marker |
+|---|---|
+| configuration (`FERROFIN_CONFIG_DIR`, default `<data>/config`) | `.jellyfin-config` |
+| logs (`<data>/log`) | `.jellyfin-log` |
+| plugins (`<data>/plugins`) | `.jellyfin-plugin` |
+| data (`--data-dir` / `FERROFIN_DATA_DIR`), and `<data>/data` | `.jellyfin-data` |
+| cache (`FERROFIN_CACHE_DIR`, default `<data>/cache`), which also gets `CACHEDIR.TAG` | `.jellyfin-cache` |
+| root folder (`<data>/root`, Jellyfin's `RootFolderPath`) | `.jellyfin-root` |
+
+**Two layouts that used to start now refuse to.**
+- **Two of these paths point at one directory**, for example the configuration or cache directory set to the data directory. The second marker's check finds the first, and Ferrofin exits with:
+
+  ```
+  the server's directories failed their startup check: Expected to find only .jellyfin-cache but found marker for <data>/.jellyfin-data.
+  ```
+
+  Give each its own directory. Then delete the marker the message names if it sits in a directory it does not belong to: the refused start may have left one, such as `.jellyfin-config` in the data directory when the configuration directory pointed there. Jellyfin refuses the same layouts.
+- **One of these directories cannot be created or written**, for example a read-only plugins volume. Ferrofin exits naming it: `creating <path>: …`. Make it writable.
+
+Ferrofin's default layout, the container image and an adopted Jellyfin directory are unaffected: each directory is a different one, and an adopted install already carries the same markers in the same places.
+
+## Unreleased — Schedules Direct guides, and listings providers are checked on save
+
+**Schedules Direct works.** In **Dashboard → Live TV → Add TV guide data provider →
+Schedules Direct**, the account and the lineup save and the guide fills on the next
+refresh. A Schedules Direct provider carried over from a Jellyfin `livetv.xml` now gets
+its guide too.
+
+When Schedules Direct refuses requests, the guide refresh keeps the stored guide instead of
+emptying it. That covers an account error (fixed by saving the provider again), the
+30-minute pause after a failed login, and its daily request limit (lifted at 00:00 UTC).
+
+Saving a listings provider is now checked the way Jellyfin checks it:
+- **A provider without a `Type` is refused (404).** Earlier versions saved it as XMLTV.
+  The dashboard always sends the type, so only scripts calling
+  `POST /LiveTv/ListingProviders` directly need to add `"Type": "xmltv"`.
+- **An XMLTV provider whose path is a local file that does not exist is refused (404).**
+  An `http`/`https` URL is still accepted unchecked.
+
+Providers already saved are not touched.
+
+## Unreleased — extras take their owner's metadata; refresh once to fill existing ones
+
+Trailers, featurettes and other extras now take their movie's or series' genres,
+studios, overview, ratings, year and premiere date, as in Jellyfin. A scan gives them
+the year and premiere date every time. It gives them the rest when it finds an extra
+new, renamed or gone, or when the refresh is a full one. Extras already in your
+libraries get only the dates from an ordinary scan.
+
+To fill the rest for existing extras, refresh each movie or TV library once with
+**Search for missing metadata** (Dashboard → Libraries → the library's menu → Refresh
+metadata), or refresh single items the same way. That is a full refresh, which is all
+the copy needs; **Replace all metadata** also works but re-fetches everything. New
+extras get everything on the scan that finds them.
+
+## Unreleased — missing episodes you now have are removed
+
+A database adopted from Jellyfin can hold **missing episodes**: placeholder rows with no
+file, which Jellyfin's TMDb option or the TheTVDB plugin added. They show to users with
+**Display missing episodes** on. Earlier versions kept every one forever, so when the
+file for one of them arrived, the episode was listed twice.
+
+Each library scan now does what Jellyfin does at the end of every series refresh. It
+removes a series' missing episode when:
+- a file in the same season covers its number;
+- it has no episode number;
+- it carries the TheTVDB, TMDb or other id of exactly one episode you have, under another
+  number. Aired, DVD and absolute orders number the same episode differently.
+
+The first scan after the upgrade does this for every series. Only placeholder rows go;
+no file is touched. A missing episode you still lack stays. A library monitor's event for
+a single file does not refresh its series, as in Jellyfin, so the next library scan
+removes its placeholder.
+
+## Unreleased — the server needs 2 GiB free to start, as Jellyfin does
+
+Ferrofin now checks free space at startup. It refuses to start when `{data_dir}/data`, the
+cache directory (`FERROFIN_CACHE_DIR`, default `{data_dir}/cache`) or `{data_dir}` itself
+has less than 2 GiB free, as Jellyfin does. A scheduled backup restore is checked the same
+way before it is applied. The log names the path and the shortfall: ``The path `…` has
+insufficient free space. Available: …, Required: 2GiB.``
+
+An install that started on a nearly full disk before will stop at boot after this
+upgrade. Free up space on that filesystem, or move the cache to another filesystem with
+`FERROFIN_CACHE_DIR`. A build that cannot read free space (non-Unix, such as Windows) logs
+a warning and starts.
+
+## Unreleased — TheAudioDB descriptions return, in the library's language
+
+TheAudioDB stopped filling its English-suffixed description fields, and earlier versions
+read only those, so music artists and albums got no description from it. Ferrofin now reads
+the description in the item's **preferred metadata language** (its own, else the
+library's, else the server's) when TheAudioDB has one, and the English text otherwise.
+That choice is limited to the languages TheAudioDB translates (German, English, Spanish,
+French, Hebrew, Hungarian, Italian, Japanese, Dutch, Norwegian, Polish, Portuguese,
+Russian, Swedish and Chinese).
+
+Descriptions appear on the next refresh that asks the providers.
+- **Search for missing metadata** fills only items with no description.
+- **Replace all metadata** replaces an existing one, and so does a refresh that is due
+  under the library's automatic refresh interval.
+
+**Music artists with no saved choices ask TheAudioDB again**, as Jellyfin 12.2 does. This
+covers artists known only by name, and artists in a library that never saved **Music
+Artists** downloader choices. The 1.3.0 note below says the server-wide options turn
+TheAudioDB off for these artists. For metadata that no longer holds: a music artist with no
+saved choices may use every metadata downloader, whatever the server-wide
+`MetadataOptions` disable. Image fetchers and albums still follow the server-wide options,
+which ship with TheAudioDB metadata off for albums.
+
+To stop TheAudioDB for a library's artists, open **Dashboard → Libraries** and choose
+**Manage library**. Under **Music Artists**, TheAudioDB shows unticked if the library never
+saved choices (save once to keep that) and ticked if it did (untick it, then save). Artists known only by name have no library, so there
+is no setting that stops TheAudioDB for them.
+
+## Unreleased — rows of deleted users are removed, once
+
+A long-lived Jellyfin database can still hold rows of users deleted long ago (their
+permissions, preferences, play state, devices and display preferences) and ancestry rows
+of items that no longer exist. Jellyfin 12.1 and later start with them; earlier Ferrofin
+versions refused to open such a database ("foreign-key violation(s)"), on adoption and on
+every boot after.
+
+On first boot migration `0044` deletes those rows, as Jellyfin would have when the user or
+item was deleted, and logs how many it removed from each table. It snapshots the file to
+`jellyfin.db.pre-0044` first, unless an earlier table-rebuilding migration (`0007`,
+`0032`) runs in the same boot and takes the snapshot. Adoption also keeps its
+`jellyfin.db.pre-ferrofin` copy, as always. Nobody can reach the deleted
+rows, so nothing visible changes. A database the earlier version refused now opens.
+
+## Unreleased — items whose owner is gone are removed, once
+
+A Jellyfin 12.x database can hold an item whose owning item is gone, typically an extra
+(a trailer, a featurette). Jellyfin 12.2 starts with it and keeps the row (an extra stays
+visible in default queries); earlier Ferrofin versions refused to open such a database
+("foreign-key violation(s)"), on adoption and on every boot after.
+
+On first boot migration `0045` hands such an item to the placeholder item, as `0032` does
+for a 10.11 database, and the start-up repair then deletes it with what hangs under it
+(streams, images, links), logging how many items it removed. Play state recorded for it
+moves to the placeholder item, as in Jellyfin. An owner that exists but is spelled in
+another case keeps its item, and an item whose owner is empty or the all-zero id is kept
+without an owner. A database the earlier version refused now opens. The pre-0044
+snapshot and the adoption copy cover this boot too.
+
+## Unreleased — playlists get their own folder and a new id, once
+
+A playlist created in Ferrofin had no folder. Jellyfin gives each playlist one,
+`<data>/playlists/<name>` (`<name>1` when that is taken), and derives the playlist's id
+from it. A playlist made in Ferrofin is now stored the same way, so Jellyfin finds it in
+its folder after a switch back.
+
+On the first start after upgrading, each playlist an earlier version created moves to
+its folder and its new id. Its entries, owner, shares, played state and favourite move
+with it. The database file is copied to `<database>.pre-playlist-folders` first.
+
+- **A playlist's id changes once.** A client or script that kept the old id has to look
+  the playlist up again. Reloading the playlist list is enough in jellyfin-web and the apps.
+- **Deleting a playlist now deletes its folder too**, as in Jellyfin.
+- **An image uploaded to one of these playlists before the upgrade stays where it was.**
+  A "Replace all metadata" refresh can still replace it with the generated collage. Upload
+  the image again after upgrading to keep it.
+
+## Unreleased — an API key must name the user a playlist is for
+
+An API key carries no user. Earlier versions let `POST /Playlists` with an API key and
+no `userId` create a playlist with no owner, which every account could then rename, edit,
+share or delete. Ferrofin now answers `400 Bad Request`, as Jellyfin does: pass the id of
+the account the playlist is for as `UserId` in the body (or `userId=`). `GET`/`POST
+/Playlists/{id}/Items` take it as `userId=`. The other playlist routes (`GET`/`POST
+/Playlists/{id}`, `Move` and the `Users` routes) act as the account whose token calls
+them, so an API key always gets `400` from them, as in Jellyfin; call them with that
+account's own token. Removing entries (`DELETE /Playlists/{id}/Items`) still works with an
+API key, as in Jellyfin.
+
+Playlists an API key already created stay ownerless, so every account keeps owner rights
+over them, and only an administrator can delete one. To give one an owner, create it again
+for that account, then delete the old one.
+
+## Unreleased — a genre image drawn from music art stays until you delete it
+
+Through 1.3.x, a genre whose movies and series had no poster could take music art
+(album covers, song or music-video images) carrying the same genre name for its
+generated image, which some clients show as the genre's tile. Jellyfin never draws that
+image, and Ferrofin no longer does either, but an image that was already drawn stays.
+A scan only redraws a generated genre image when its file changes on disk. Ferrofin also
+has no record of which items an image was drawn from, so it cannot remove these
+automatically.
+
+To clear one, as an administrator, send `GET /Genres?searchTerm={name}`, take the `Id`
+of the entry whose `Name` matches exactly, and send `DELETE /Items/{id}/Images/Primary`.
+(`GET /Genres/{name}` cannot find a name containing `-`, such as Hip-Hop, because it
+reads the dash as a URL slug.) The next full library scan (**Scan All Libraries** under
+Dashboard → Libraries, or the scheduled scan) draws a new image from the genre's movie
+and series posters if any exist. Otherwise it leaves the genre without one, as Jellyfin
+does. Scanning a single library does not redraw genre images.
+
+## Unreleased — the "Clean up collections and playlists" task is gone
+
+Jellyfin 12 deleted this task, and Ferrofin has now removed it too. It ran about 3
+seconds after every start and removed each collection and playlist member whose file it
+could not see at that moment. If the media storage was not mounted yet (a late NFS/SMB
+mount, a NAS slower to boot than the server, an empty bind mount), it emptied every
+playlist and collection, and they stayed empty after the storage came back. Upgrading
+does not bring back members it already removed; restore a backup taken before the loss
+for that.
+
+Nothing replaces it. Deleting an item already removes it from every playlist and
+collection it was in. A member whose file you deleted stays listed until the next library
+scan removes the item. Jellyfin 12 behaves the same way. Dashboard → Scheduled Tasks no
+longer lists the task, and a trigger you saved for it is ignored.
+
+## Unreleased — Ferrofin reports Jellyfin 12.2.0; Emby-era sign-in is off by default
+
+`/System/Info` now reports `Version` `12.2.0` (1.3.x reported `10.11.8`). As in Jellyfin 12,
+only the `Authorization: MediaBrowser …` header and the `ApiKey` query parameter
+authenticate by default, on HTTP requests and the `/socket` WebSocket alike. The
+Emby-era forms are refused while `EnableLegacyAuthorization` is `false`, the default on
+a fresh install since 1.2.0:
+
+- the `X-Emby-Authorization` header (sign-in returns `400`, "app is required")
+- the bare `X-Emby-Token` and `X-MediaBrowser-Token` headers (`401`; `403` on the socket)
+- the `api_key` query parameter, and the `Emby` scheme name in place of `MediaBrowser`
+
+1.2.0 through 1.3.x refused them too on a fresh install, while reporting 10.11.8, a
+version that accepts them by default. An install first set up on 1.0.x or 1.1.0 wrote
+that release's default, `true`, into `config/system.json` and still accepts them. A
+configuration adopted from Jellyfin keeps the value its `system.xml` had: on for a 10.11
+server (Jellyfin 12 turns it off when it upgrades one; Ferrofin does not). Set it to
+`false` in either case to match Jellyfin 12.
+
+If a client that sends these forms cannot be updated, turn the flag on (Jellyfin
+deprecated them, so only for such a client). jellyfin-web has no switch for it; use one of:
+
+- **Running server:** as an administrator, `GET /System/Configuration`, set
+  `"EnableLegacyAuthorization": true` and `POST` the whole document back to
+  `/System/Configuration`. It takes effect on the next request, without a restart.
+- **Stopped server:** set `"EnableLegacyAuthorization": true` in `config/system.json`.
+
+The `/socket` WebSocket used to read its token itself: it took `api_key`, `X-Emby-Token`
+and `X-MediaBrowser-Token` whatever the flag said, ignored the `Authorization` header, and
+opened without any credentials (keep-alive only). It now authenticates like every other
+request and, as in Jellyfin 12.2, refuses a connection without valid credentials with
+`403` before the upgrade. The bundled jellyfin-web 12.x is unaffected (it sends
+`?ApiKey=`), but a client whose socket sends `api_key` or a bare token header (jellyfin-web
+10.11, for one) now loses its live updates and remote control unless the flag is on.
+Clients built on jellyfin-sdk-kotlin send only the `Authorization` header on the socket;
+their socket now joins their session, so remote control and SyncPlay reach them.
+
+## Unreleased — a set-up server no longer starts without its database
+
+This applies if setup has been completed (`IsStartupWizardCompleted` is `true` in
+`config/system.json`, or in Jellyfin's `config/system.xml` for a configuration directory
+not yet adopted) and the database Ferrofin would open is missing, is an empty file, or
+records no migrations.
+
+Until now such a server started anyway: it created an empty database and seeded a new
+`admin` — with no password unless `FERROFIN_ADMIN_PASSWORD` is set — and every user, library
+and watch history was gone. A deployment whose configuration directory was persisted but
+whose database was not (a volume that did not mount, a wrong data directory) fell into
+this quietly. Ferrofin now refuses to start, as Jellyfin 12.2 does, and exits with:
+
+```
+This server has been set up before (IsStartupWizardCompleted is true in <config>/system.json),
+but the database does not exist (<data>/ferrofin.db). Ferrofin will not start an existing
+server with an empty database. …
+```
+
+Pick one of the three ways out it names:
+
+- **Restore the database** to the path it names — the usual fix when a mount or the data
+  directory is wrong. A backup scheduled with `POST /Backup/Restore` still applies on the
+  next start.
+- **Start over, keeping this server's settings:** set `IsStartupWizardCompleted` to
+  `false` in every file the message names (both `system.json` and `system.xml` on an
+  adopted install). The next start runs the setup wizard on an empty database; users,
+  watch history and everything else stored in the database do not come back.
+- **Set up a new server** with empty configuration and data directories (`--data-dir` /
+  `FERROFIN_DATA_DIR` / `data_dir`, and `FERROFIN_CONFIG_DIR` / `config_dir`).
+
+A fresh install, a first boot in a new container and the adoption of a Jellyfin
+directory that has its database are unaffected.
+
+## Unreleased — Intro Skipper analyses your library again, once
+
+This applies if Intro Skipper is enabled (Dashboard → Plugins), or if you are adopting a
+Jellyfin database whose Intro Skipper plugin stored segments.
+
+Intro Skipper now keeps its own record of every segment it found or you edited, and
+publishes it to the skip buttons. On the upgrade, the segments already published are
+copied into that record as automatic results with no settings fingerprint, as the
+upstream plugin's own schema upgrade does. What follows:
+
+- **The first analysis pass after the upgrade redoes the whole library**, and new
+  fingerprints are taken (the fingerprint command now matches upstream's, and old prints
+  are not reused). On a large library that is hours of ffmpeg time. It starts by itself
+  at the task's next scheduled run (daily at 00:00 unless you changed it); run **Detect and Analyze
+  Media Segments** from Dashboard → Scheduled Tasks to choose the time yourself.
+- **Each copied segment is replaced by what that pass detects, or removed if it detects
+  nothing.** Removed means the skip button for it disappears. With the same settings,
+  detection finds the same intros again, so most libraries see no change.
+- **Timestamps you corrected by hand are not kept.** Corrections made in Ferrofin before
+  this upgrade were never recorded as yours, so they are treated as automatic. After the
+  upgrade, a correction is recorded as yours and no later analysis replaces it.
+- **Adopting a Jellyfin database:** the plugin's own database (which records your hand
+  edits) and its settings file (`plugins/configurations/IntroSkipper.xml`) are not
+  imported. Ferrofin's Intro Skipper starts on default settings, so set them again on
+  its settings page before the first pass, or segments the plugin found under your old
+  settings may not be found again. Your hand edits do not carry over.
+
 ## Unreleased — library scans in this release
 
 Library scans keep the rule 1.3.0 introduced: an item is processed again only when
@@ -26,12 +615,44 @@ release changes what a refresh does once it runs:
 - WASM plugins that supply metadata run at their place in the library's order, and an
   `album.nfo` or `artist.nfo` now wins over every remote provider:
   [plugin metadata sources run at their rank](#unreleased--plugin-metadata-sources-run-at-their-rank).
+- In a library with **Extract trickplay images during the library scan** checked, a scan
+  generates trickplay images several at a time, up to the image-encoding limit (one per
+  CPU unless **Parallel image encoding limit** is set). Jellyfin generates one at a time.
+  Each is an ffmpeg process with its own memory and, with hardware acceleration, its own
+  GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). `FERROFIN_TRICKPLAY_CONCURRENCY` caps it (a new setting, default `auto`; `1`
+  matches Jellyfin; see [`CONFIG.md`](CONFIG.md)).
+- Sonarr's and Radarr's notifications now start a scan. They send camelCase keys
+  (`{"updates":[{"path":…}]}`), which 1.3.x answered with `204` and ignored; request bodies
+  now bind in any letter case, as Jellyfin's do. The reported path is scanned once
+  `LibraryMonitorDelay` has passed, so a library on a network share that the disk watcher
+  cannot see no longer waits for the next scheduled scan.
+- A series identified by name on TheTVDB is searched and chosen as the TVDB plugin does:
+  the search is the name without a trailing year or release tags (a `Show.2026` folder
+  searches "show", not "show 2026"); results whose title (in the metadata language, or an
+  alias) equals or contains the name rank first; and a known year drops every result more
+  than a year away. 1.3.x searched with the year left in the name and took TheTVDB's first
+  result unless one had exactly the item's year, so a folder whose name ends in a year
+  could match an unrelated show.
+  An already-matched series keeps its match: the ids that match stored (TheTVDB's, and the
+  IMDb and TheMovieDb ids that came with it) win over a new search. To re-match one, use
+  **Identify**, which replaces them; or clear its TheTVDB, IMDb and TheMovieDb ids in the
+  metadata editor, then choose **Refresh metadata → Replace all metadata**.
+- A season's and an episode's series name, and an episode's season name, are now those of
+  its series and season, as in Jellyfin. 1.3.x kept the series name the folder gave
+  ("Show 2026") on every season and episode, even after a provider named the series. The
+  first start after upgrading corrects the rows saved before, once, and logs how many (on
+  one test library, 3,223 seasons and episodes across 53 series); each changed row gets a
+  new `Etag`, so clients refetch it once.
 
-Apart from scans, who may delete an item now follows Jellyfin's rules:
-[who may delete an item](#unreleased--who-may-delete-an-item-follows-jellyfin-more-closely).
+Apart from scans, deleting an item now deletes its files, and who may delete one follows
+Jellyfin's rules:
+[deleting an item now deletes its files](#unreleased--deleting-an-item-now-deletes-its-files-as-in-jellyfin).
 
 **Upgrading from 1.3.x** causes no full pass: an unchanged item is still not reprocessed,
-and each change above reaches an item at its next refresh that asks its providers.
+and each change above reaches an item at its next refresh that asks its providers. The
+first scan does save every item once, because items are now stored as Jellyfin stores
+them:
+[the first scan after upgrading stores items as Jellyfin does](#unreleased--the-first-scan-after-upgrading-stores-items-as-jellyfin-does).
 
 **Upgrading from 1.2.x or earlier:** also read the 1.3.0 entries below, starting with
 [library scans process only what changed](#130--library-scans-process-only-what-changed):
@@ -42,22 +663,190 @@ dashboard, including **Date added behavior for new content** and
 
 Still open in this release:
 
-- Deleting an item leaves its media files on disk.
-- Sonarr's webhook notification is answered but not read: Sonarr sends camelCase keys
-  (`updates`, `path`), which Ferrofin does not bind yet, so nothing is scanned. Radarr
-  shares Sonarr's code and is expected to behave the same. A library Sonarr writes to is
-  updated by the disk watcher (where it can see the change) and by scheduled scans.
-- The first scan of an adopted Jellyfin database saves every item once, as described in
-  the 1.3.0 entry.
+- The first scan of an adopted Jellyfin database still rewrites two kinds of item: music
+  albums, whose cover Ferrofin copies into its own folder where Jellyfin points at the
+  album's `folder.jpg`; and music artists, whose running time Ferrofin sums from their
+  tracks where Jellyfin stored 0.
+- An episode that is not in a season folder is now filed under its series, as in
+  Jellyfin; the season made for it (a season with no folder of its own) links it as its
+  season, still lists it and still counts it, and clients still see that season as the
+  episode's parent. 1.3.x filed such an episode under that season, which made the first
+  scan of an adopted Jellyfin database save every one of them once (about 8,700 episodes
+  under 591 seasons on a Jellyfin 12.1 test library); it no longer does. On a database
+  1.3.x scanned, the first scan after upgrading saves each such episode once instead.
+- Seasons with no folder of their own now take the ids Jellyfin gives them (from the
+  series, the season number and the season's name). On a database an earlier Ferrofin
+  scanned, the first start after upgrading moves each such season to its new id, with
+  its watch state, images and episodes, after copying the database to
+  `jellyfin.db.pre-season-ids`. As in Jellyfin, a new season is named in the server's
+  display language ("Season 1", "Staffel 1", …, and "Season Unknown" for episodes with
+  no season number), and season 0 takes the library's season 0 display name
+  (`SeasonZeroDisplayName`). A season with no folder keeps the name and id it was
+  created with when either setting changes later.
 
-## Unreleased — who may delete an item follows Jellyfin more closely
+## Unreleased — the first scan after upgrading stores items as Jellyfin does
 
-This applies to accounts that delete items: the **Delete media**, **Delete Series**,
-**Delete Episode** or **Delete** entry in an item's menu, and `DELETE /Items/{itemId}` /
-`DELETE /Items?ids=`.
+Ferrofin now stores library items the way Jellyfin stores them. What the first library scan
+after upgrading does about it depends on where your database came from. Nothing on disk
+has to change, and no watch history is lost.
 
-Ferrofin 1.3.0–1.3.2 already refused a delete from an account without deletion rights. Three
-things are refined, to match Jellyfin:
+**A database Ferrofin created itself** (no `jellyfin.db.pre-ferrofin` next to it) is
+rewritten once by its next scan: every item is saved, and each item's `Etag` changes once.
+That scan probes no file and asks no metadata provider, except for an item whose kind
+changes (below), which is refreshed once as its new kind. It:
+
+- files every item under a folder item for its library location, as Jellyfin does (each
+  item's `TopParentId` and ancestors, and the parent of the items at the top of a
+  location). Until that scan has run, a library is read through both, so nothing
+  disappears in the meantime;
+- clears the movie flag (`IsMovie`) on every movie: Jellyfin sets it only on Live TV
+  programs and channels;
+- stores no modification time (`DateModified`) and the media type `Unknown` for every
+  folder-like item: series, seasons, albums, artists and folders;
+- stores the shared-folder flag (`IsInMixedFolder`) of episodes, tracks and books as
+  Jellyfin does;
+- stores a DVD or Blu-ray rip as a video, not a folder (`IsFolder` 1 → 0);
+- groups each movie's versions (`Movie - 1080p.mkv` beside `Movie - 2160p.mkv`) and
+  stacked parts (`Movie - cd1.mkv`, `Movie - cd2.mkv`) under one item, as Jellyfin lists
+  them, and likewise the versions and parts of an episode in one folder, so the movie and
+  episode counts drop by one per version and part. The rows older scans made for them
+  become that item's versions and parts;
+- moves an item whose kind changed to the id of its new kind: a clip in a home-videos
+  library, stored as a movie before, is now a video; files in a library with no content
+  type become the episodes or videos Jellyfin resolves; a stacked part becomes a video.
+  The item keeps its title, overview and artwork, but drops its provider ids unless it is
+  locked.
+
+Watch history, resume positions, favourites, playlist and collection entries and edits move
+with every item that is regrouped or changes kind. Jellyfin itself would delete such an
+item and create a new one.
+
+**DVD and Blu-ray rips and multi-disc sets** now resolve as one video each, as in Jellyfin:
+a folder holding `VIDEO_TS`, `BDMV` or `VIDEO_TS.IFO` is one video, and a folder of disc
+folders that stack (`Heat (1995) - Disc 1`, `Heat (1995) - Disc 2`) is one video whose
+other discs are parts. The rows older scans made per file or per disc fold into that video
+with their user data. As in Jellyfin, **a rip hides any other media in its folder**: apart
+from extras named for it, nothing else there or in its subfolders is resolved, and the scan
+removes those items, logging a warning that names the folder and the first of the files.
+Move such files out of a rip's folder to keep them in the library.
+
+**Items Jellyfin never lists are removed from the library** by that scan; their files stay
+on disk. Besides what a rip hides, that is a title inside a folder named like an extras
+folder below the top of a library (`Collection/Other/Film (2001)/`), an album in such a
+folder (one named `Other` inside an artist's folder), an album an older scan made of
+each disc folder of a multi-disc album (now one album), and the album an older scan made of
+a music library's loose top-level tracks (they are now tracks of their own). The watch
+history of a removed item is set aside, as for any item whose file disappears, and returns
+if the item is listed again.
+
+**A folder no longer refreshes because its modification time changed**, as in Jellyfin:
+adding an episode refreshes the new episode, not its season.
+
+**A database adopted from Jellyfin 10.11** has its local versions and stacked parts
+reshaped once at boot, before any scan, into the shape Jellyfin 12 gives them (Jellyfin's
+own 12.0 upgrade deletes those rows and lets the next scan create them again; Ferrofin
+keeps them with their user data). When there is work to do, the database file is first
+copied to `jellyfin.db.pre-rehome`, next to the database, and the copy is never touched
+again. Then the first scan rewrites only what Ferrofin still stores differently: on the
+benchmark library (a database Jellyfin 10.11.8 scanned, 20,497 items, remote metadata
+downloaders off), it updated 800 music albums (their cover) and 296 artists (their running
+time), two of the differences listed as still open above, probed no file, and the second
+scan wrote nothing. (The benchmark library keeps every episode in a season folder.)
+
+**A database whose episodes were grouped with Group versions**, such as one adopted from
+Jellyfin 12.1, has the copies of an episode that sit in one folder regrouped as that
+episode's local versions on its first scan, as Jellyfin's own current scanner groups them.
+On the Jellyfin 12.1 test database that rewrote about 828 episode rows.
+
+Adoption stays one-way: going back to Jellyfin means restoring the
+`jellyfin.db.pre-ferrofin` copy taken at adoption, which predates every change Ferrofin
+made. `jellyfin.db.pre-rehome` is not a way back either; it is the database as it was just
+before the reshaping above.
+
+## Unreleased — deleting an item now deletes its files, as in Jellyfin
+
+This applies to everyone who deletes media from Ferrofin: the **Delete media**,
+**Delete Series**, **Delete Episode** or **Delete** entry in an item's menu, and
+`DELETE /Items/{itemId}` / `DELETE /Items?ids=`.
+
+**Deleting an item now deletes its files**, exactly as Jellyfin does. Before, Ferrofin
+removed only the item from its database: the files stayed on disk and the next scan
+brought the item back. Now:
+
+- A movie (or other video) in its own folder takes **the whole folder** and everything in
+  it: its extras, its other versions, its artwork and subtitles.
+- A movie that shares a folder with others takes its file and every `.nfo`, image,
+  subtitle or lyric file in that folder whose name **starts with** the movie's file name.
+  Deleting `Alien.mkv` therefore also deletes `Aliens.nfo` and `Aliens-poster.jpg`, as
+  Jellyfin does.
+- A trailer or other extra kept beside its film, in the film's own folder, is deleted the
+  way Jellyfin deletes it: **with the film's whole folder.** Remove such an extra from disk
+  yourself if you want to keep the film.
+- The same rule reaches further than you might expect, exactly as in Jellyfin:
+  - a trailer or other extra kept **directly in a series folder** takes **the whole
+    series folder** with it, every season and episode included;
+  - one kept **directly in a season folder** takes **that season's folder**;
+  - a home video that is the only clip in a subfolder of a home-videos library takes
+    **that subfolder**, photos and anything else in it included.
+
+  Delete such items from disk yourself if you want to keep what is around them.
+- Three more cases are kept as Jellyfin has them:
+  - deleting **one version** of a film kept in the film's own folder deletes that whole
+    folder, **the other versions included**;
+  - a single video in a folder that also holds subfolders is not counted as sharing its
+    folder, so deleting it takes **the folder with its subfolders**;
+  - deleting a DVD or Blu-ray rip, or a multi-disc set, deletes its folder, **with any
+    other media inside it** that the rip or set hid from the library.
+- An item with other versions (another cut or resolution of the same film, kept beside
+  it or merged into it with **Group versions**) is replaced by its first remaining
+  version, as in Jellyfin: that version keeps its own watch history, the item's playlist
+  and collection entries move to it, and the other versions now belong to it. A film in
+  its own folder still takes the whole folder, the versions beside it included; the next
+  scan then removes those versions from the library. Deleting one version moves its
+  playlist and collection entries to the item it is a version of.
+- A series, season or album takes its folder; an episode takes only its own file.
+- A trickplay folder saved next to the media goes with the item.
+
+Check what a folder holds before deleting from it, and keep a backup of anything you are
+not sure about.
+
+Two safeguards differ from Jellyfin:
+
+- **Scan each library once after upgrading before deleting from it.** Until a full scan of
+  a library by this version has finished, a delete of an item in it is refused (`409
+  Conflict`, and jellyfin-web shows an error) and nothing is deleted: rows an earlier
+  Ferrofin stored can name more than the item — 1.3.x, for example, stored a music
+  library's own folder as an album, and deleting that album would have deleted the whole
+  library. Run **Scan All Libraries** (Dashboard → Libraries) or scan the library, then
+  delete again. The same applies to a database adopted from Jellyfin. Collections and
+  playlists are not affected.
+- **A library's own folder is never deleted**, nor any folder above one, nor the server's
+  collections and playlists folders. An item whose path is one of them shows no delete
+  entry, and deleting it by id answers `401`; Jellyfin would delete the folder. No delete
+  removes such a folder either: a video at a library's root that Ferrofin does not count
+  as sharing the folder is refused rather than taking the library with it.
+
+**If your media is mounted read-only** (a read-only NFS or SMB mount, a container volume
+mounted `:ro`), a delete now fails: the server answers with an error and nothing of your
+media is deleted, the item stays in the library. Some things have already happened by
+then, as in Jellyfin, and are not undone:
+
+- the artwork and metadata Ferrofin keeps for the item in its own data folder are
+  cleared. Art a metadata refresh downloads comes back on the item's next refresh; **an
+  image you uploaded, or art for a library whose image fetchers are turned off, does not
+  come back**;
+- if the item had other versions, the first remaining one has already taken its place:
+  it is its own item now, the item's playlist and collection entries have moved to it,
+  and versions whose files were already gone have been removed from the library;
+- if the item was itself a version, its playlist and collection entries have moved to
+  the item it is a version of, which no longer lists it.
+
+To let Ferrofin delete media, mount it read-write for the server's user; otherwise
+untick **Allow media deletion from** for your accounts so the delete entry is not
+offered.
+
+**Who may delete** follows Jellyfin more closely. Ferrofin 1.3.0–1.3.2 already refused
+accounts without deletion rights; three things are refined:
 
 - An account allowed to delete in some libraries only is matched to an item's library
   through the library tree, as Jellyfin does, instead of by comparing folder paths.
@@ -65,8 +854,9 @@ things are refined, to match Jellyfin:
   jellyfin-web shows its delete entry by, so the entry appears only where the delete is
   allowed. A *list* of playlists reports every playlist deletable, as Jellyfin's does;
   deleting a playlist still needs its owner or an administrator. A playlist with no owner
-  (made with an API key, or created before Ferrofin stored playlist owners) can now be
-  deleted by an administrator only; in 1.3.x any signed-in account could delete one.
+  (made with an API key by an earlier version, or created before Ferrofin stored playlist
+  owners) can now be deleted by an administrator only; in 1.3.x any signed-in account
+  could delete one.
 - Some items cannot be deleted at all, as in Jellyfin: an item with no file of its own (a
   season Ferrofin groups from a series folder without season folders, a streamed item), a
   missing (virtual) episode or season, and a video a DVR recording is still writing.
@@ -76,20 +866,22 @@ from**: **All libraries** lets the account delete in every library, or tick indi
 libraries. New accounts have neither; an administrator needs one of them too (the
 administrator Ferrofin creates on first start has **All libraries**). Deleting a collection
 needs **Allow this user to manage collections** or an administrator. An account that may
-not delete an item gets `401 Unauthorized`, and nothing is deleted.
+not delete an item gets `401 Unauthorized`, and nothing is deleted; an item in a library
+the account cannot see answers `404 Not Found`, as in Jellyfin, whatever its deletion
+rights.
 
-**Deleting an item still removes it from the library database only: its media files stay
-on disk**, and the next scan finds them again. Jellyfin also deletes the files; a later
-release will too, the way Jellyfin does.
-
-One more difference from Jellyfin remains: an account with **All libraries** deletion that can
-see only some libraries can still delete, by id, an item in a library it cannot see, where
-Jellyfin answers `404`. A later release closes this.
-
+A delete now finishes even if the app that asked for it is closed half way, and
 `DELETE /Items?ids=` handles the ids one at a time, in order, as Jellyfin does: if it
 reaches an id the account may not delete, it stops with `401`, and the items before that
-one are already deleted. A delete finishes even if the app that asked for it is closed
-half way.
+one are already deleted.
+
+**Trickplay saved next to media** is now looked for where Jellyfin puts it. For a video
+whose file name has more than one dot (`Alien.Resurrection.mkv`), that is
+`Alien.Resurrection.trickplay`; Ferrofin looked for `Alien.trickplay`, which belongs to
+`Alien.mkv`. For a folder item it is inside the folder. Ferrofin itself only writes
+trickplay to its data folder, so nothing it made is left behind; trickplay a Jellyfin
+install saved next to such files is now found, moved by the trickplay move task, and
+deleted with its item.
 
 ## Unreleased — plugin metadata sources run at their rank
 
@@ -257,7 +1049,7 @@ changed items; **Search for missing metadata** and **Replace all metadata** stil
 everything they cover. A change the disk watcher or a webhook reports refreshes the nearest
 item already in the library; that item's other children are checked, not processed.
 [What a library scan does](FEATURES.md#what-a-library-scan-does) has the details, and
-[`verify/`](../verify/README.md) checks a running server.
+[`gates/verify/`](../gates/verify/README.md) checks a running server.
 
 **The first scan after upgrading from 1.2.x or earlier is one full pass.** Those versions
 cleared, on every scan, the date an item was last refreshed, so this scan finds every item
@@ -300,8 +1092,10 @@ item's `Etag` changes once. It is a one-time cost: on the 20,497-item benchmark 
 database Jellyfin 10.11.8 scanned, remote metadata downloaders off), it took about 80 s and
 wrote about 9 GB, and every later scan of the unchanged library took about 2 s. With
 downloaders checked, both scans also pay for the re-asking described next. A Jellyfin
-database adopted and scanned by 1.2.x or earlier gets the full pass above instead. Storing
-these values as Jellyfin does, so that adoption needs no such pass, is open work.
+database adopted and scanned by 1.2.x or earlier gets the full pass above instead. From
+this release these values are stored as Jellyfin stores them, and that first scan rewrites
+far fewer items:
+[the first scan after upgrading stores items as Jellyfin does](#unreleased--the-first-scan-after-upgrading-stores-items-as-jellyfin-does).
 
 **Titles still missing metadata are asked about on every scan.** This is a Ferrofin rule
 that Jellyfin does not have, and the one kind of provider request a scan of an unchanged
@@ -386,8 +1180,10 @@ Ferrofin's scan groups files (they are open work, not intended behaviour):
 
 - **Alternate versions show as separate movies.** Jellyfin lists a movie with several
   versions (`Movie (2010) - 1080p.mkv` beside `Movie (2010) - 2160p.mkv`) once, with a
-  version picker. Ferrofin does not group versions yet, so after its scan each file is a
-  movie of its own, and the movie count rises by one per extra version.
+  version picker. Ferrofin 1.3.x does not group versions, so after its scan each file is a
+  movie of its own, and the movie count rises by one per extra version. From this release
+  versions are grouped as in Jellyfin
+  ([the first scan after upgrading](#unreleased--the-first-scan-after-upgrading-stores-items-as-jellyfin-does)).
 - **A plain subfolder in a movie library shows as an empty folder.** Jellyfin lists a
   folder that is not a movie's own (`Movies/Collection/Movie (2010)/…`) as a folder
   holding its movies. Ferrofin's scan lists those movies at the top of the library
@@ -516,15 +1312,22 @@ Behaviour that changed with the shape:
 - Localized user views (e.g. a Live TV view created under a translated name) are
   consolidated onto their name-independent id once, with channels, ancestors and
   display preferences moved along.
-- **Adopting a Jellyfin database** now accepts 12.0.0 and 12.1.0 as well as 10.11.8–10.11.11
-  (exact migration sets, still one-way; a 12.x database baselines `0030` and `0032`, whose
-  shape it already has). All six releases passed live adoption tests on 2026-09-16,
-  including both 10.11.8 → 12.1.0 and 10.11.8 → 12.0.0 → 12.1.0. See the
-  [support matrix and tested build](../adoption/README.md#supported-and-tested-versions).
+- **Adopting a Jellyfin database** now accepts 12.0.0, 12.1.0 and 12.2.0 as well as
+  10.11.8–10.11.11 (exact migration sets, still one-way; a 12.x database baselines `0030`
+  and `0032`, whose shape it already has). All six 10.11–12.1 releases passed live adoption
+  tests on 2026-09-16; the 12.2 paths passed synthetic tests on 2026-10-13. See the
+  [support matrix and tested build](../gates/adoption/README.md#supported-and-tested-versions).
 - A **Playlists** (or Collections) view is listed only when the user can see something in it,
-  as in Jellyfin 12.1. A library whose playlists all live inside music album folders — every
-  `.m3u` next to an album — has no Playlists view on the home screen; the playlists themselves
-  are unchanged and still found by search and `/Items`.
+  as in Jellyfin 12.2 — a playlist file inside a music album counts.
+- **Playlist files in music libraries become playlists.** The next library scan turns each
+  `.m3u`, `.m3u8`, `.pls`, `.wpl` and `.zpl` file in a music or untyped library, and each
+  folder named `… [playlist]` or holding a `playlist.xml`, into a playlist that every user
+  who can see the library can open, but nobody can edit; nothing inside such a folder stays
+  an item. A `.pls` that an older scan listed as a song is removed as a song. The Playlists
+  view now lists these, beside the ones made in the app.
+- An **adopted** Jellyfin database can carry playlist files Jellyfin left empty (where it
+  saved XML metadata beside them). Their entries are read when the file next changes; to read
+  them now, refresh the library's metadata with "Search for missing metadata".
 - Alternate-version groups are re-derived once from `LinkedChildren` (Jellyfin 12.1's
   `RepairAlternateVersionLinks`), and a version is hidden only while its primary exists in the
   same library: an item marked as a version of a row that no longer exists reappears in

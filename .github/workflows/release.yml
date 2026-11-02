@@ -9,7 +9,8 @@ name: Release
 #   vX.Y.Z-rc.N   → image :vX.Y.Z-rc.N only (never :latest, no release, no chart)
 #   chart-vA.B.C  → chart only @ A.B.C
 #
-# To release: run this workflow manually (workflow_dispatch) on main — it
+# To release: run this workflow manually (workflow_dispatch) on the current release/vX.Y.Z
+# branch (feature releases) or on main (patch releases of the version already out) — it
 # requires green CI on the commit, derives the next version from Conventional
 # Commits, and pushes the tag; the tag push then re-triggers this workflow to
 # build and publish. Requires the RELEASE_TOKEN secret: a PAT with
@@ -28,9 +29,37 @@ on:
 permissions: {} # each job grants only what it needs
 
 jobs:
+  # The CI run create-release requires may be days old: an advisory published since then
+  # blocks the release too. A job of its own, so the tools it installs never run beside
+  # create-release's RELEASE_TOKEN.
+  release-advisories:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        # Same master-commit pin as binaries (see the note there).
+        with:
+          toolchain: 1.98.1 # = rust-toolchain.toml
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --locked check advisories
+
   # ── the manual gate: derive next version, tag, push (mirrors create-release) ──
   create-release:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    # main (patch releases of the released line) or the current release/vX.Y.Z branch
+    # (feature releases; only one exists at a time). See RELEASE.md.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    needs: release-advisories
     runs-on: ubuntu-latest
     permissions:
       contents: read # the tag push uses RELEASE_TOKEN, not GITHUB_TOKEN
@@ -47,7 +76,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          conclusion=$(gh run list --commit "$GITHUB_SHA" --workflow CI --json conclusion -q '.[0].conclusion')
+          # The push run only: the release PR's run on the same commit skips every job.
+          conclusion=$(gh run list --commit "$GITHUB_SHA" --workflow CI --event push --json conclusion -q '.[0].conclusion')
           if [ "$conclusion" != "success" ]; then
             echo "CI for $GITHUB_SHA is '${conclusion:-missing}', not success — not releasing"
             exit 1
@@ -127,11 +157,16 @@ jobs:
           set -eu
           img="ghcr.io/$GITHUB_REPOSITORY:$GITHUB_REF_NAME"
           docker pull "$img"
-          docker run -d --rm --name smoke -p 8096:8096 "$img"
+          docker run -d --name smoke -p 8096:8096 "$img"
+          # The server binds at once and answers 503 to everything but its probes until
+          # startup is done (/health/live is 200 from the first moment): wait for
+          # /health/ready before asking it for anything.
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8096/health/live > live.json 2>/dev/null; then break; fi
+            if curl -fsS -o /dev/null http://127.0.0.1:8096/health/ready 2>/dev/null; then break; fi
             sleep 1
           done
+          curl -fsS http://127.0.0.1:8096/health/ready > /dev/null || { echo "never became ready"; docker logs smoke; exit 1; }
+          curl -fsS http://127.0.0.1:8096/health/live > live.json
           cat live.json
           grep -q "\"build\":\"$GITHUB_REF_NAME\"" live.json || { echo "version mismatch"; docker logs smoke; exit 1; }
           curl -fsS -o /dev/null http://127.0.0.1:8096/web/ || { echo "/web not served"; docker logs smoke; exit 1; }
@@ -140,10 +175,15 @@ jobs:
           docker exec smoke ffmpeg -version | head -1 | tee ffmpeg.txt
           grep -qi jellyfin ffmpeg.txt || { echo "ffmpeg in the image is not jellyfin-ffmpeg"; exit 1; }
           docker rm -f smoke
-      # Upgrade smoke: a database created by the PREVIOUS release must open under
-      # this one. v1.0.0 shipped with a modified released migration and locked every
-      # existing install out; a fresh-database boot cannot see that, this can.
-      - name: upgrade a database from the previous release
+      # Upgrade check: a populated install of the PREVIOUS release and of v1.0.0, the oldest,
+      # must keep its user data under this one. v1.0.0 shipped with a modified released
+      # migration and locked every existing install out; a fresh-database boot cannot see that,
+      # this can. Each start release adopts a synthetic Jellyfin 10.11.8 fixture built here
+      # (invented media and accounts), scans it and gets user state through its API; this
+      # image then boots on the same data and must keep the accounts, watch history and
+      # metadata (gates/adoption/README.md, "Populated Ferrofin upgrade"). Probed from the runner:
+      # release images have no curl.
+      - name: upgrade a populated install from earlier releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -152,31 +192,23 @@ jobs:
           if [ -z "$prev" ]; then echo "no previous release to upgrade from"; exit 0; fi
           img="ghcr.io/$GITHUB_REPOSITORY"
           echo "previous release: $prev"
-          docker volume create upg >/dev/null
-          # Probe from the runner: release images do not include curl.
-          docker run -d --rm --name old -v upg:/data -p 127.0.0.1:8096:8096 "$img:$prev"
-          ok=
-          for _ in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:8096/health/live >/dev/null 2>&1; then ok=1; break; fi
-            docker ps -q --filter name=old | grep -q . || break
-            sleep 1
-          done
-          if [ -z "$ok" ]; then
-            echo "the $prev image did not become healthy"; docker logs old 2>&1 | tail -20; exit 1
-          fi
-          docker rm -f old
-          docker run -d --rm --name new -v upg:/data -p 8096:8096 "$img:$GITHUB_REF_NAME"
-          ok=
-          for _ in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:8096/health/live > up.json 2>/dev/null; then ok=1; break; fi
-            docker ps -q --filter name=new | grep -q . || break
-            sleep 1
-          done
-          if [ -z "$ok" ] || ! grep -q "\"build\":\"$GITHUB_REF_NAME\"" up.json; then
-            echo "the $GITHUB_REF_NAME image cannot open a $prev database"; docker logs new 2>&1 | tail -20; exit 1
-          fi
-          echo "upgrade $prev → $GITHUB_REF_NAME: ok"
-          docker rm -f new
+          starts="--from $img:$prev"
+          [ "$prev" = v1.0.0 ] || starts="$starts --from $img:v1.0.0"
+          # The image build's cache is not needed again; the fixture and three images are.
+          docker builder prune --all --force >/dev/null
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-pil python3-icu
+          python3 gates/adoption/synthetic.py build --fixtures "$RUNNER_TEMP/adoption" --only jellyfin-10.11.8
+          # shellcheck disable=SC2086 # starts is a list of --from arguments
+          python3 gates/adoption/synthetic.py upgrade --fixtures "$RUNNER_TEMP/adoption" \
+            --image "$img:$GITHUB_REF_NAME" $starts
+          df -h /
+      # The failed copy, its server logs and snapshots; all synthetic data.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: upgrade-work
+          path: ${{ runner.temp }}/adoption/work
+          if-no-files-found: ignore
 
   # ── server binaries, one archive per target, attached to the Release ──
   # Linux x86_64 and aarch64 are the supported set. macOS and Windows are
@@ -222,13 +254,14 @@ jobs:
           key: ${{ matrix.target }}
           lookup-only: true # release builds never write the cache (poisoning surface)
       # Linux builds use zig as the C toolchain, linked against GLIBC_FLOOR (the
-      # aarch64 cross-build also needs it for bundled SQLite and ring).
+      # aarch64 cross-build also needs it for the C in bundled SQLite and aws-lc-sys).
       - if: contains(matrix.target, 'linux')
         run: |
-          pip install cargo-zigbuild
-          cargo zigbuild --release -p ferrofin-server --target "${{ matrix.target }}.$GLIBC_FLOOR"
+          # The pair v1.3.2's aarch64 build used; move both together, deliberately.
+          pip install cargo-zigbuild==0.23.4 ziglang==0.16.0
+          cargo zigbuild --locked --release -p ferrofin-server --target "${{ matrix.target }}.$GLIBC_FLOOR"
       - if: ${{ !contains(matrix.target, 'linux') }}
-        run: cargo build --release -p ferrofin-server --target ${{ matrix.target }}
+        run: cargo build --locked --release -p ferrofin-server --target ${{ matrix.target }}
       # The .deb depends on jellyfin-ffmpeg8 + jellyfin-web (the same runtime the
       # image bundles); package metadata and contents live in the server manifest.
       - name: build the Debian package
@@ -289,10 +322,13 @@ jobs:
               FERROFIN_WEB_DIR=/usr/share/jellyfin/web \
               /usr/bin/ferrofin-server --config /etc/ferrofin/config.toml --bind 127.0.0.1 --port 8096" \
               > /tmp/smoke.log 2>&1 &
+            # Ready, not live: until startup is done everything but the probes is 503.
             for _ in $(seq 1 30); do
-              if curl -fsS http://127.0.0.1:8096/health/live > /tmp/live.json 2>/dev/null; then break; fi
+              if curl -fsS -o /dev/null http://127.0.0.1:8096/health/ready 2>/dev/null; then break; fi
               sleep 1
             done
+            curl -fsS http://127.0.0.1:8096/health/ready > /dev/null || { echo "never became ready"; cat /tmp/smoke.log; exit 1; }
+            curl -fsS http://127.0.0.1:8096/health/live > /tmp/live.json
             cat /tmp/live.json
             curl -fsS -o /dev/null http://127.0.0.1:8096/web/ || { echo "/web not served"; cat /tmp/smoke.log; exit 1; }
             grep -Eq "libfdk_aac[=\":]+true" /tmp/smoke.log || { echo "server did not probe jellyfin-ffmpeg"; cat /tmp/smoke.log; exit 1; }
@@ -306,10 +342,14 @@ jobs:
           [ -x "$bin" ] || bin="$bin.exe"
           "$bin" --data-dir smoke-data --bind 127.0.0.1 --port 8096 > smoke.log 2>&1 &
           pid=$!
+          # Ready, not live: /health/live answers once the port binds, before the database
+          # is migrated, so only /health/ready shows the binary actually started.
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8096/health/live > live.json 2>/dev/null; then break; fi
+            if curl -fsS -o /dev/null http://127.0.0.1:8096/health/ready 2>/dev/null; then break; fi
             sleep 1
           done
+          curl -fsS http://127.0.0.1:8096/health/ready > /dev/null || { echo "never became ready"; kill "$pid" || true; cat smoke.log; exit 1; }
+          curl -fsS http://127.0.0.1:8096/health/live > live.json
           kill "$pid" || true
           cat live.json
           # /System/Info/Public reports the Jellyfin API version (10.11.8) for client

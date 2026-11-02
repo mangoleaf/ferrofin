@@ -8,12 +8,16 @@ use crate::common::NamingOptions;
 use crate::path;
 use crate::tv::{SeriesInfo, series_path_parser};
 
-/// Matches at-least-2-char words separated by dots/underscores, so `The_show`
-/// becomes `The show` while `S.H.O.W` is preserved.
-fn series_name_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
+/// Matches a run of dots or underscores that separates two words, where a
+/// word is at least 2 characters long, so `The_show` becomes `The show` while
+/// acronyms like `S.H.O.W` — whose single letters are a word on neither side —
+/// keep their dots. Whitespace bounds a word too, so the dot in
+/// `Marvel's Agents of S.H.I.E.L.D.` is read against the `S` beside it
+/// (upstream PR #17858; the lookbehind needs `fancy_regex`).
+fn series_name_regex() -> &'static fancy_regex::Regex {
+    static RE: OnceLock<fancy_regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"((?<a>[^\._]{2,})[\._]*)|([\._](?<b>[^\._]{2,}))")
+        fancy_regex::Regex::new(r"(?<=[^\s\._]{2})[\._]+|[\._]+(?=[^\s\._]{2})")
             .expect("series name regex valid")
     })
 }
@@ -57,10 +61,14 @@ pub fn resolve(options: &NamingOptions, path_str: &str) -> SeriesInfo {
     }
 
     if !series_name.is_empty() {
+        // A backtracking-limit error leaves the name unreplaced rather than
+        // failing the resolve.
         series_name = series_name_regex()
-            .replace_all(&series_name, "${a} ${b}")
-            .trim()
-            .to_string();
+            .try_replacen(&series_name, 0, " ")
+            .map_or_else(
+                |_| series_name.trim().to_string(),
+                |name| name.trim().to_string(),
+            );
     }
 
     let mut info = SeriesInfo::new(path_str);

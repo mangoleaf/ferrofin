@@ -15,11 +15,10 @@
 //!   are dropped for v1.
 //! - Streams (`Task<Stream>`) become `Result<Vec<u8>, ServiceError>` — the trait
 //!   returns the produced bytes rather than leaking `std::io::Stream` shapes.
-//! - The deeply ffmpeg-internal hardware-capability probes
-//!   (`IsVaapiDevice*`/`SupportsEncoder`/…) and the `EncodingJobInfo`/`StreamState`
-//!   coupled command-building methods are **not** ported here: they depend on
-//!   un-ported encoding-state structs and belong to the `ferrofin-core` encoder
-//!   implementation (Wave 6), not the DI seam.
+//! - The deeply ffmpeg-internal hardware-capability probes (`IsVaapiDevice*`/…)
+//!   and the `EncodingJobInfo`/`StreamState` coupled command-building methods
+//!   live with the encoder implementation, not on this seam. `SupportsEncoder`
+//!   is the exception the playback negotiation needs: [`EncoderSupport`].
 //!
 //! Every trait is object-safe and carries a `_assert_object_safe_*` assertion.
 //!
@@ -27,10 +26,11 @@
 //! result. [`MediaEncoder::get_media_info`] returns the narrower
 //! [`MediaSourceInfo`] (streams/container) most callers need;
 //! [`MediaEncoder::get_media_info_full`] returns the full
-//! [`MediaInfo`](ferrofin_model::media_info::MediaInfo) including the embedded
+//! [`MediaInfo`] including the embedded
 //! metadata the library scan reads from audio tags.
 
 use async_trait::async_trait;
+use ferrofin_model::drawing::ImageFormat;
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::Video3DFormat;
 use ferrofin_model::entities_media::{MediaAttachment, MediaStream};
@@ -176,6 +176,33 @@ pub trait MediaEncoder: Send + Sync {
         offset_ticks: Option<i64>,
     ) -> Result<String, ServiceError>;
 
+    /// Extracts one embedded image stream (a still picture or an attachment
+    /// ffmpeg exposes as a stream) of a video file to a temporary file in
+    /// `format`, returning its path. Port of the `ExtractVideoImage(inputFile,
+    /// container, mediaSource, imageStream, imageStreamIndex, targetFormat, …)`
+    /// overload `EmbeddedImageProvider` calls.
+    ///
+    /// The default reports the operation as unsupported, for encoders (and
+    /// test doubles) that only extract frames.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] when the encoder cannot extract images or
+    /// ffmpeg produces no picture.
+    async fn extract_image_stream(
+        &self,
+        input_file: &str,
+        container: &str,
+        media_source: &MediaSourceInfo,
+        stream_index: i32,
+        format: ImageFormat,
+    ) -> Result<String, ServiceError> {
+        let _ = (input_file, container, media_source, stream_index, format);
+        Err(ServiceError::backend(
+            "this media encoder cannot extract embedded image streams",
+        ))
+    }
+
     /// Builds the ffmpeg input argument for a single file. Port of
     /// `GetInputArgument(string inputFile, MediaSourceInfo)`.
     fn get_input_argument(&self, input_file: &str, media_source: &MediaSourceInfo) -> String;
@@ -191,6 +218,27 @@ pub trait MediaEncoder: Send + Sync {
 
 /// Compile-time assertion that [`MediaEncoder`] is object-safe.
 fn _assert_object_safe_media_encoder(_: &dyn MediaEncoder) {}
+
+/// The encoders the probed ffmpeg build has, as the playback negotiation
+/// reads them (`IMediaEncoder.SupportsEncoder`).
+pub trait EncoderSupport: Send + Sync {
+    /// Whether the encoder named `encoder` (an ffmpeg encoder name such as
+    /// `libopus`) is available, compared ignoring case.
+    fn supports_encoder(&self, encoder: &str) -> bool;
+}
+
+/// Compile-time assertion that [`EncoderSupport`] is object-safe.
+fn _assert_object_safe_encoder_support(_: &dyn EncoderSupport) {}
+
+/// No encoders: what a server without a usable ffmpeg has.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoEncoders;
+
+impl EncoderSupport for NoEncoders {
+    fn supports_encoder(&self, _encoder: &str) -> bool {
+        false
+    }
+}
 
 /// Extracts evenly spaced trickplay thumbnail frames from a video file.
 ///
@@ -240,6 +288,11 @@ pub struct TrickplayExtraction<'a> {
     /// The source video stream, or `None` when the item has none recorded —
     /// which forces the software path.
     pub video_stream: Option<&'a MediaStream>,
+    /// Every stream of the source, in stream order (`mediaSource.MediaStreams`).
+    /// The extractor finds `video_stream`'s ffmpeg index among them
+    /// (`EncodingHelper.FindIndex`) and maps it explicitly, so ffmpeg cannot
+    /// pick a cover image or another video track instead.
+    pub media_streams: &'a [MediaStream],
     /// Milliseconds between thumbnails.
     pub interval_ms: i32,
     /// The thumbnail width bound in pixels, forced even, aspect preserved.
@@ -248,6 +301,9 @@ pub struct TrickplayExtraction<'a> {
     pub qscale: i32,
     /// The ffmpeg thread count; `0` lets ffmpeg decide.
     pub threads: i32,
+    /// `TrickplayOptions.ProcessPriority`: the priority the extraction's
+    /// ffmpeg runs at.
+    pub priority: ferrofin_model::configuration::ProcessPriorityClass,
     /// Where the numbered JPEGs are written; created if absent.
     pub output_dir: &'a str,
     /// `TrickplayOptions.EnableHwAcceleration` — the trickplay-specific
@@ -264,6 +320,33 @@ pub struct TrickplayExtraction<'a> {
 
 /// Compile-time assertion that [`TrickplayFrameExtractor`] is object-safe.
 fn _assert_object_safe_trickplay_frame_extractor(_: &dyn TrickplayFrameExtractor) {}
+
+/// Extracts a video file's keyframe times.
+///
+/// Port of `Jellyfin.MediaEncoding.Hls.Extractors.IKeyframeExtractor`. Upstream
+/// registers two, each wrapped in a cache over the keyframe repository: one
+/// reading a Matroska file's cue index (metadata-based) and one running
+/// ffprobe. The HLS playlist generator keeps only the metadata-based ones; the
+/// "Keyframe Extractor" task tries them first and ffprobe after.
+#[async_trait]
+pub trait KeyframeExtractor: Send + Sync {
+    /// `IsMetadataBased`: whether the extractor reads container metadata
+    /// rather than the stream itself, which makes it cheap enough to run while
+    /// a client waits for a playlist.
+    fn is_metadata_based(&self) -> bool;
+
+    /// `TryExtractKeyframes`: the keyframes of `item_id`'s file at
+    /// `file_path`, or `None` when this extractor cannot produce any (the file
+    /// is not one it reads, extraction failed, or it found no keyframes).
+    async fn try_extract_keyframes(
+        &self,
+        item_id: Uuid,
+        file_path: &str,
+    ) -> Option<ferrofin_keyframes::keyframe_data::KeyframeData>;
+}
+
+/// Compile-time assertion that [`KeyframeExtractor`] is object-safe.
+fn _assert_object_safe_keyframe_extractor(_: &dyn KeyframeExtractor) {}
 
 /// Manages live transcode jobs: lookup, keep-alive pings, progress, teardown.
 ///
@@ -461,8 +544,23 @@ pub struct HlsStreamRequest {
     pub device_id: Option<String>,
     /// The desired segment container, e.g. `"ts"` or `"mp4"` (`segmentContainer`).
     pub segment_container: Option<String>,
+    /// Container requested by the progressive stream route or its query.
+    pub output_container: Option<String>,
+    /// Original request path used by native progressive audio-codec inference.
+    pub requested_url: Option<String>,
+    /// HEAD resolves the output format without starting a transcode.
+    pub is_head_request: bool,
+    /// Explicit context; ordinary video defaults to Streaming and audio to Static.
+    pub context: Option<ferrofin_model::dlna::EncodingContext>,
     /// The desired segment length in seconds (`segmentLength`).
     pub segment_length: Option<i32>,
+    /// The request's `User-Agent` header (`StreamState.UserAgent`): without a
+    /// `segment_length`, it picks a copied video's segment length.
+    pub user_agent: Option<String>,
+    /// This segment's starting position from the playlist's runtimeTicks query.
+    pub current_runtime_ticks: i64,
+    /// This segment's exact duration from actualSegmentLengthTicks.
+    pub actual_segment_length_ticks: i64,
     /// The desired output audio codec (`audioCodec`).
     pub audio_codec: Option<String>,
     /// The desired output video codec (`videoCodec`).
@@ -478,6 +576,8 @@ pub struct HlsStreamRequest {
     pub video_bitrate: Option<i32>,
     /// The negotiated audio bitrate cap in bit/s (`audioBitRate`).
     pub audio_bitrate: Option<i32>,
+    /// The per-request encoding thread limit (`cpuCoreLimit`), overriding the server setting.
+    pub cpu_core_limit: Option<i32>,
     /// The maximum output width in pixels (`maxWidth`) — bounds the scale
     /// filter on re-encode.
     pub max_width: Option<i32>,
@@ -492,6 +592,9 @@ pub struct HlsStreamRequest {
     pub allow_video_stream_copy: bool,
     /// Whether `-c:a copy` is permitted (`allowAudioStreamCopy`; default true).
     pub allow_audio_stream_copy: bool,
+    /// Whether the audio may be encoded VBR when the server's encoding options
+    /// enable it (`enableAudioVbrEncoding`; default true).
+    pub enable_audio_vbr_encoding: bool,
     /// Whether the client asked for a static (direct) stream (`static`).
     pub is_static: bool,
     /// The resume offset in ticks (`startTimeTicks`), when the client is resuming.
@@ -525,6 +628,14 @@ pub struct HlsStreamRequest {
     /// The negotiated subtitle delivery method name (`subtitleMethod`:
     /// `Encode`/`Embed`/`External`/`Hls`/`Drop`).
     pub subtitle_method: Option<String>,
+    /// The subtitle codecs an `Embed` delivery may write (`subtitleCodec`), a
+    /// comma list. `StreamingHelpers` splits it into `SupportedSubtitleCodecs`,
+    /// whose first entry names the embedded track's codec.
+    pub subtitle_codec: Option<String>,
+    /// Burn the selected subtitle into any video that is not stream-copied,
+    /// whatever its delivery method (`alwaysBurnInSubtitleWhenTranscoding`,
+    /// default `false`). Only the video HLS routes bind it upstream.
+    pub always_burn_in_subtitle_when_transcoding: bool,
     /// The client's transcode reasons (`transcodeReasons`), forwarded into the
     /// master playlist's variant URL when the query lacks it.
     pub transcode_reasons: Option<String>,
@@ -543,6 +654,11 @@ pub struct HlsStreamRequest {
     /// The access token of the requesting session, embedded as `ApiKey` in the
     /// master playlist's subtitle/trickplay URIs (`ClaimsPrincipal.GetToken()`).
     pub api_key: Option<String>,
+    /// Saved permissions of the authenticated user, never populated from query
+    /// parameters. `None` represents a userless API key. Video requests force
+    /// copying a stream when its transcoding permission is disabled, matching
+    /// `EncodingHelper.TryStreamCopy`; remuxing controls playback negotiation.
+    pub playback_permissions: Option<crate::library::PlaybackPermissions>,
     /// Whether the request came from the local network
     /// (`INetworkManager.IsInLocalNetwork(remoteIp)`): disables the adaptive
     /// bitrate variants, which "within the local network will likely do more
@@ -551,6 +667,24 @@ pub struct HlsStreamRequest {
     /// The raw request query string (including the leading `?`), forwarded into
     /// the generated playlist's segment URLs (`Request.QueryString`).
     pub query_string: String,
+    /// The requested output audio channels (`audioChannels`).
+    pub audio_channels: Option<i32>,
+    /// The maximum output audio channels (`maxAudioChannels`).
+    pub max_audio_channels: Option<i32>,
+    /// The maximum output audio bit depth (`maxAudioBitDepth`).
+    pub max_audio_bit_depth: Option<i32>,
+    /// The maximum reference-frame count (`maxRefFrames`).
+    pub max_ref_frames: Option<i32>,
+    /// The maximum output video bit depth (`maxVideoBitDepth`).
+    pub max_video_bit_depth: Option<i32>,
+    /// Whether the input is force-deinterlaced (`deInterlace`).
+    pub deinterlace: bool,
+    /// The audio track to transcode (`audioStreamIndex`); a video request only.
+    pub audio_stream_index: Option<i32>,
+    /// The video track to transcode (`videoStreamIndex`).
+    pub video_stream_index: Option<i32>,
+    /// The requested output audio sample rate (`audioSampleRate`).
+    pub audio_sample_rate: Option<i32>,
 }
 
 impl Default for HlsStreamRequest {
@@ -562,12 +696,20 @@ impl Default for HlsStreamRequest {
             play_session_id: None,
             device_id: None,
             segment_container: None,
+            output_container: None,
+            requested_url: None,
+            is_head_request: false,
+            context: None,
             segment_length: None,
+            user_agent: None,
+            current_runtime_ticks: 0,
+            actual_segment_length_ticks: 0,
             audio_codec: None,
             video_codec: None,
             transcoding_max_audio_channels: None,
             video_bitrate: None,
             audio_bitrate: None,
+            cpu_core_limit: None,
             max_width: None,
             max_height: None,
             max_framerate: None,
@@ -575,6 +717,7 @@ impl Default for HlsStreamRequest {
             // (the C# request DTO defaults both to true).
             allow_video_stream_copy: true,
             allow_audio_stream_copy: true,
+            enable_audio_vbr_encoding: true,
             is_static: false,
             start_time_ticks: None,
             profile: None,
@@ -585,6 +728,8 @@ impl Default for HlsStreamRequest {
             min_segments: None,
             subtitle_stream_index: None,
             subtitle_method: None,
+            subtitle_codec: None,
+            always_burn_in_subtitle_when_transcoding: false,
             transcode_reasons: None,
             // The master-playlist DTO defaults (`GetMasterHlsVideoPlaylist`):
             // no subtitle group, no adaptive variants, trickplay listed.
@@ -592,8 +737,18 @@ impl Default for HlsStreamRequest {
             enable_adaptive_bitrate_streaming: false,
             enable_trickplay: true,
             api_key: None,
+            playback_permissions: None,
             is_in_local_network: false,
             query_string: String::new(),
+            audio_channels: None,
+            max_audio_channels: None,
+            max_audio_bit_depth: None,
+            max_ref_frames: None,
+            max_video_bit_depth: None,
+            deinterlace: false,
+            audio_stream_index: None,
+            video_stream_index: None,
+            audio_sample_rate: None,
         }
     }
 }
@@ -605,13 +760,44 @@ impl Default for HlsStreamRequest {
 /// caller (a `ferrofin-api` handler) streams the file at [`path`](Self::path) with
 /// [`content_type`](Self::content_type); the transcode job that produced it is
 /// kept alive / torn down by the [`HlsStreamManager`] internally.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ServedFile {
     /// The absolute path of the file to serve.
     pub path: String,
     /// The MIME type to serve it as (e.g. `video/mp2t`, `application/x-mpegURL`).
     pub content_type: String,
+    /// Bound to the producing job at resolution, before any seek replacement.
+    pub progress: Option<std::sync::Arc<dyn TranscodeStreamProgress>>,
 }
+
+impl std::fmt::Debug for ServedFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServedFile")
+            .field("path", &self.path)
+            .field("content_type", &self.content_type)
+            .field("has_progress", &self.progress.is_some())
+            .finish()
+    }
+}
+
+/// Records the actual lifetime and reads of a transcode HTTP response.
+///
+/// Implementations bind to the producing job, so an older response cannot
+/// update the replacement job after a seek. Dropping an observer releases its
+/// active-consumer mark and completes the callback, including cancellation.
+pub trait TranscodeStreamProgress: Send + Sync {
+    /// Records bytes read from a progressive output file.
+    fn add_bytes(&self, bytes: usize);
+    /// Records response termination (the HLS segment's ending time).
+    fn complete(&self);
+    /// Whether the producing process has exited, terminating a growing body.
+    fn has_exited(&self) -> bool;
+    /// Whether this response reads a growing progressive output file.
+    fn is_progressive(&self) -> bool;
+}
+
+fn _assert_object_safe_transcode_stream_progress(_: &dyn TranscodeStreamProgress) {}
 
 /// Serves the dynamic-HLS + transcode-stream flow behind one seam.
 ///

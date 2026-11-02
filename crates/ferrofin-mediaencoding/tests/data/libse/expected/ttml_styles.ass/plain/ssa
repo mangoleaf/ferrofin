@@ -1,0 +1,24 @@
+[Script Info]
+; This is a Sub Station Alpha v4 script.
+Title: untitled
+ScriptType: v4.00
+Collisions: Normal
+PlayDepth: 0
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding
+Style: Default,Noto Sans,52,-986896,-65536,-16777216,-1694498816,0,0,1,2,1,2,60,60,40,0,1
+Style: Top & "Quoted",Arial,40.5,-16711936,-65536,-16777216,-16777216,-1,0,1,2,0,6,10,10,10,0,1
+Style: Unused,Times,30,-16776961,-65536,-16777216,-16777216,0,-1,1,2,0,2,10,10,10,0,1
+
+
+[Events]
+Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: Marked=0,0:00:01.00,0:00:02.00,*Default,NTP,0000,0000,0000,,{\an5}Centre middle
+Dialogue: Marked=0,0:00:02.00,0:00:03.00,Top & "Quoted",NTP,0000,0000,0000,,Quoted style name
+Dialogue: Marked=0,0:00:03.00,0:00:04.00,*Default,NTP,0000,0000,0000,,Raw {\i1}html{\i0} & {\b1}bold{\b0}
+Dialogue: Marked=0,0:00:04.00,0:00:05.00,*Default,NTP,0000,0000,0000,region=topLeft,Region from the effect
+Dialogue: Marked=0,0:00:05.00,0:00:06.00,*Default,NTP,0000,0000,0000,region=custom,{\an8}Region effect with an8
+Dialogue: Marked=0,0:00:06.00,0:00:07.00,*Default,NTP,0000,0000,0000,tts:fontSize=30|xml:space=preserve|tts:textAlign=center,Effects as attributes
+Dialogue: Marked=0,0:00:07.00,0:00:08.00,*Default,NTP,0000,0000,0000,,{\an8}
+Dialogue: Marked=0,0:00:08.00,0:00:09.00,*Default,NTP,0000,0000,0000,,Lower-case style name\NSecond line

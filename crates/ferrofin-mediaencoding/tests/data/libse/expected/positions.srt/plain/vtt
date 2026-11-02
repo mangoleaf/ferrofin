@@ -1,0 +1,28 @@
+WEBVTT
+
+00:00:01.000 --> 00:00:01.900 position:20%
+Position 1
+
+00:00:02.000 --> 00:00:02.900
+Position 2
+
+00:00:03.000 --> 00:00:03.900 position:80%
+Position 3
+
+00:00:04.000 --> 00:00:04.900 position:20% line:50%
+Position 4
+
+00:00:05.000 --> 00:00:05.900 line:50%
+Position 5
+
+00:00:06.000 --> 00:00:06.900 position:80% line:50%
+Position 6
+
+00:00:07.000 --> 00:00:07.900 position:20% line:20%
+Position 7
+
+00:00:08.000 --> 00:00:08.900 line:20%
+Position 8
+
+00:00:09.000 --> 00:00:09.900 position:80% line:20%
+Position 9

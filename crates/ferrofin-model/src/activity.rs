@@ -9,9 +9,11 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// The log severity of an activity log entry (mirrors
-/// `Microsoft.Extensions.Logging.LogLevel`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, ToSchema)]
+/// `Microsoft.Extensions.Logging.LogLevel`). A wire enum: an undefined stored or
+/// requested value is kept, as C# keeps it (`?severity=99` filters on 99).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
+#[repr(i32)]
 pub enum LogLevel {
     /// Trace-level logs.
     Trace,
@@ -28,6 +30,23 @@ pub enum LogLevel {
     Critical,
     /// Logging disabled.
     None,
+    /// An unnamed C# enum value, retained on read and written as a number.
+    #[serde(untagged)]
+    Unrecognized(i32),
+}
+
+// `Microsoft.Extensions.Logging.LogLevel` (not in Jellyfin's reflection
+// inventory): Trace = 0 … None = 6.
+crate::json::enums::wire_enum! {
+    LogLevel, None, {
+        Trace => ("Trace", 0),
+        Debug => ("Debug", 1),
+        Information => ("Information", 2),
+        Warning => ("Warning", 3),
+        Error => ("Error", 4),
+        Critical => ("Critical", 5),
+        None => ("None", 6),
+    }
 }
 
 /// An activity log entry.

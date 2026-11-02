@@ -41,3 +41,20 @@ fn json_body_dtos_deserialize_from_empty_object() {
         UserPolicy,
     );
 }
+
+/// A SyncPlay mode a body omits is the C# enum's `0` (`SyncPlayDtos` have no
+/// initializer for `Mode`): `RepeatOne`, `Sorted` and `Queue`, whatever the
+/// enum's own `Default` is.
+#[test]
+fn sync_play_mode_bodies_default_to_the_csharp_zero_value() {
+    use ferrofin_model::sync_play::{
+        GroupQueueMode, GroupRepeatMode, GroupShuffleMode, QueueRequestDto,
+        SetRepeatModeRequestDto, SetShuffleModeRequestDto,
+    };
+    let repeat: SetRepeatModeRequestDto = serde_json::from_str("{}").expect("repeat");
+    assert_eq!(repeat.mode, GroupRepeatMode::RepeatOne);
+    let shuffle: SetShuffleModeRequestDto = serde_json::from_str("{}").expect("shuffle");
+    assert_eq!(shuffle.mode, GroupShuffleMode::Sorted);
+    let queue: QueueRequestDto = serde_json::from_str("{}").expect("queue");
+    assert_eq!(queue.mode, GroupQueueMode::Queue);
+}

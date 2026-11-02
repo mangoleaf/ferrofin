@@ -3,9 +3,8 @@
 //! Ports `GET /Search/Hints`: a ranked list of [`SearchHint`]s for an
 //! autocomplete term, built through the
 //! [`SearchManager`](ferrofin_traits::library::SearchManager) seam and wrapped in a
-//! [`SearchHintResult`]. The per-hint image tags Jellyfin resolves through its
-//! `IImageProcessor` are left unset here (the image processor is a later wave);
-//! the search manager already fills the textual hint fields.
+//! [`SearchHintResult`]. The search manager fills every hint field, its
+//! artwork tags and channel name included.
 
 use axum::extract::State;
 use axum::routing::get;

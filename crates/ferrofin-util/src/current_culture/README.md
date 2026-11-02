@@ -1,0 +1,15 @@
+The portable search payloads use the official ICU78.1rc export used to generate the installed ICU4X2.3 compiled root. The archive contains44 search data/metadata files representing22 tailorings:21 search variants and Korean searchjl. See [PROVENANCE.json](PROVENANCE.json) and the exact source notices [LICENSE-ICU](LICENSE-ICU) and [LICENSE-CLDR](LICENSE-CLDR).
+
+ICU4X2.3 omits search payloads from its normal compiled bundle. The provider selects these tables for search and forwards ordinary collation, normalizer and other common data to the existing Baked providers. ICU retries a missing search-prefixed type as search before its ordinary default; the utility preserves public CultureInfo identity while selecting that actual comparison behavior.
+
+The official exporter removes conjoining-Jamo trie ranges. Its fixed22 exports retain the builder's final67 modern L/V/T records in CE32s. The converter restores them by copying private Small-trie index/data blocks, then checks every logical codepoint: exactly those67 values may change; contexts, expansion arrays, other mappings, high/error values remain unchanged. The tiny vendored ICU4X condition keeps the ordinary root shortcut and allows assigned tailoring Jamo to use existing expansion/prefix/contraction handling. Search operands canonically decompose all11,172 Hangul syllables so they follow that path. Korean search additionally expands its158 erased archaic-Jamo equality resets through the imported root equalities, including the transitive U1197 rule; actual Korean searchjl receives no such rewrite.
+
+Reproduce both generated payloads and the Korean reset table with Python3.11+, the exact export ZIP, and the two pinned CLDR XML files:
+
+```sh
+python3 tools/generate-search-collation-data.py ICU_EXPORT_ZIP crates/ferrofin-util/src/current_culture/generated_search_data.rs --cldr-root ROOT_XML --cldr-ko KO_XML --korean-output crates/ferrofin-util/src/current_culture/generated_korean_search_resets.rs
+```
+
+The input hashes are enforced. No data generator binary, host native ICU API or runtime network access is used. Existing output differences cause an error. Future source/version changes must regenerate and verify the pointer/vector assumptions rather than retain this fixed-format conversion blindly.
+
+Tests compare every source standardroot CE/context array and separate Jamo/diacritics payload with Baked, plus all1,102,940 nonsyllable root codepoints. Compatibility arrays exist only under cfg(test). Every22 payload is constructed. The public comparer regression retains all29 culture/error rows and1,276 pairs from actual .NET10.0.12 observations, including German search/leading fallback, Swedish, Korean search versus searchjl, Arabic/Thai, compatibility and archaic Jamo, canonically equivalent accents, case, punctuation and unknown keyword controls. It also checks every modern syllable's canonical equivalence and source search resets. Actual production integration gates remain required; the earlier isolated source60/V4 full oracle is separate evidence.

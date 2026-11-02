@@ -1,0 +1,562 @@
+"""Build meaningful adoption state through Jellyfin's own API, plus the few states no API
+can produce, written into the stopped 10.11.8 fixture (seed_database)."""
+
+import base64
+from contextlib import closing
+import hashlib
+from io import BytesIO
+import json
+from pathlib import Path, PurePosixPath
+import re
+import sqlite3
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+from PIL import Image
+
+from metadata import Api as MetadataApi, CheckError
+
+
+EPISODE_TYPE = "MediaBrowser.Controller.Entities.TV.Episode"
+AUDIO_TYPE = "MediaBrowser.Controller.Entities.Audio.Audio"
+# What %AppDataPath% expands to in the official image (JELLYFIN_DATA_DIR=/config).
+APP_DATA_PATH = "/config/data"
+# Ratings found only in other countries' tables (the library is US). Jellyfin 12.2 changed
+# two: "-12" scored -12 before it and 12 since, and "SAM 13" is new in its ar.json.
+SEEDED_RATINGS = (("allowed_movie", "SAM 13"), ("rated_movie", "FSK 16"), ("locked_movie", "-12"),
+                  ("versions_movie", "MA15+"), ("private_movie", "12A"))
+# The rows of upstream's HarmonizeConflictingUserDataTests, on the locked movie's two
+# provider keys: (provider, LastPlayedDate, PlayCount, PlaybackPositionTicks, Played).
+CONFLICT = (("Tmdb", "2023-08-14 00:00:00", 9, 0, 1), ("Imdb", "2021-12-31 00:00:00", 7, 490, 0))
+# The play state on the second item of the dangling parent chain.
+ORPHAN_PLAY = {"LastPlayedDate": "2025-05-05 00:00:00", "PlayCount": 3, "PlaybackPositionTicks": 0, "Played": 1}
+PASSWORD = "Synthetic-adoption-only-123!"
+USERS = ("synthetic-admin", "synthetic-adult", "synthetic-child")
+LIBRARIES = (("Synthetic Movies", "movies", "movies"),
+             ("Synthetic Private", "movies", "private"),
+             ("Synthetic Shows", "tvshows", "shows"),
+             ("Synthetic Music", "music", "music"),
+             ("Synthetic Books", "books", "books"),
+             ("Synthetic Photos", "homevideos", "photos"))
+# Jellyfin ships no media segment provider, so real databases hold the rows a plugin wrote.
+# The Intro Skipper plugin is the common writer; the rows carry its provider id.
+SEGMENT_PROVIDER = "Intro Skipper"
+# MediaSegmentType: (type, start seconds, end seconds) on the locked movie.
+SEGMENTS = ((5, 0, 30), (4, 570, 600))
+TICKS = 10_000_000
+#: How much of a refused request's response body its error keeps.
+REASON_BYTES = 200
+
+
+class Api:
+    def __init__(self, base, token=None, user=None, device=None):
+        self.base, self.token, self.user = base.rstrip("/"), token, user
+        self.device = device or f"synthetic-{user or 'setup'}"
+
+    def call(self, method, path, body=None, allowed=(200, 204), raw=None, binary=False, **query):
+        query = {key: value for key, value in query.items() if value is not None}
+        url = self.base + path + ("?" + urllib.parse.urlencode(query) if query else "")
+        data = raw if raw is not None else json.dumps(body).encode() if body is not None else None
+        auth = ('MediaBrowser Client="Jellyfin Web", Device="Synthetic adoption", '
+                f'DeviceId="{self.device}", Version="1"')
+        if self.token:
+            auth += f', Token="{self.token}"'
+        headers = {"Authorization": auth}
+        if data is not None:
+            headers["Content-Type"] = "image/png" if raw is not None else "application/json"
+        request = urllib.request.Request(url, data=data, method=method, headers=headers)
+        for attempt in range(60):
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    payload, code = response.read(), response.status
+            except urllib.error.HTTPError as error:
+                code, payload = error.code, error.read()
+                error.close()
+            if code != 503:
+                break
+            time.sleep(1)
+        if code not in allowed:
+            route = re.sub(r"/[0-9a-fA-F-]{32,36}(?=/|$)", "/<id>", path)
+            # The query and the body name what was refused (synthetic data only); Jellyfin logs
+            # the exception behind a bare "Error processing request." in the server log.
+            raise CheckError(f"synthetic fixture {method} {route} returned {code} "
+                             f"(query {sorted(query)}, body {payload[:REASON_BYTES]!r})")
+        if code >= 400:
+            return {"status": code}
+        return payload if binary else json.loads(payload) if payload else None
+
+    def get(self, path, **query):
+        return self.call("GET", path, **query)
+
+    def post(self, path, body=None, **query):
+        return self.call("POST", path, body, **query)
+
+    def request(self, path, method="GET"):
+        return self.call(method, path)
+
+    scan = MetadataApi.scan
+
+    def login(self, name):
+        for attempt in range(60):
+            try:
+                device = "synthetic-login-" + name
+                response = Api(self.base, device=device).post("/Users/AuthenticateByName", {"Username": name, "Pw": PASSWORD})
+                return Api(self.base, response["AccessToken"], response["User"]["Id"], device=device)
+            except OSError:
+                # Jellyfin may restart once after an upgrade. Authentication is
+                # safe to retry; fixture mutations are deliberately not retried.
+                if attempt == 59:
+                    raise
+                time.sleep(1)
+
+    def ready(self, timeout=300):
+        """Wait until the main host has started. Jellyfin 10.11+ first serves a SetupServer
+        while it migrates (SetupServer.cs): it answers /System/Info/Public and 503s everything
+        else, then hands the port over, resetting connections. Only the main host answers
+        /System/Ping, and its /System/Info/Public is 503 until startup completes."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            try:
+                self.get("/System/Ping")
+                self.get("/System/Info/Public")
+                return
+            except (OSError, CheckError):
+                time.sleep(1)
+        raise CheckError("synthetic server did not become ready")
+
+    def idle(self, timeout=300):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if all(t.get("State") == "Idle" for t in self.get("/ScheduledTasks")):
+                return
+            time.sleep(1)
+        raise CheckError("synthetic server tasks did not finish")
+
+
+def seed(base):
+    api = Api(base)
+    api.ready()
+    api.post("/Startup/Configuration", {"UICulture": "en-US", "MetadataCountryCode": "US",
+                                        "PreferredMetadataLanguage": "en"})
+    api.get("/Startup/User")
+    api.post("/Startup/User", {"Name": USERS[0], "Password": PASSWORD})
+    api.post("/Startup/RemoteAccess", {"EnableRemoteAccess": True, "EnableAutomaticPortMapping": False})
+    api.post("/Startup/Complete")
+    api = api.login(USERS[0])
+    api.post("/Auth/Keys", app="Synthetic adoption")
+    for name in USERS[1:]:
+        api.post("/Users/New", {"Name": name, "Password": PASSWORD})
+    types = ("Movie", "Series", "Season", "Episode", "MusicArtist", "MusicAlbum", "Audio", "Book",
+             "Photo", "PhotoAlbum", "Video")
+    options = {
+        "EnableRealtimeMonitor": False, "EnableInternetProviders": False,
+        # On, so Chapters carry images and TrickplayInfos holds rows.
+        "EnableChapterImageExtraction": True, "ExtractChapterImagesDuringLibraryScan": True,
+        "EnableTrickplayImageExtraction": True, "ExtractTrickplayImagesDuringLibraryScan": True,
+        "EnableLUFSScan": False, "SaveLocalMetadata": False, "MetadataSavers": [],
+        "AutomaticRefreshIntervalDays": 0, "PreferredMetadataLanguage": "en",
+        "MetadataCountryCode": "US", "SubtitleDownloadLanguages": ["eng"],
+        "DisabledSubtitleFetchers": [], "RequirePerfectSubtitleMatch": True,
+        "SaveSubtitlesWithMedia": False, "SkipSubtitlesIfEmbeddedSubtitlesPresent": True,
+        "SkipSubtitlesIfAudioTrackMatches": False,
+        "TypeOptions": [{"Type": kind, "MetadataFetchers": [], "ImageFetchers": [],
+                         "MetadataFetcherOrder": ["The Open Movie Database", "TheMovieDb"],
+                         "ImageFetcherOrder": ["Fanart", "TheMovieDb"]} for kind in types],
+    }
+    for name, kind, folder in LIBRARIES:
+        api.post("/Library/VirtualFolders", {"LibraryOptions": {
+            **options, "PathInfos": [{"Path": "/media/" + folder}]}},
+            name=name, collectionType=kind, refreshLibrary="false")
+    api.scan(300, interval=1)
+    api.idle()
+    # KeyframeData is written only by this task (it has no default trigger) or on demand by HLS.
+    keyframes = next((task for task in api.get("/ScheduledTasks") if task["Key"] == "KeyframeExtraction"), None)
+    if keyframes is None:
+        raise CheckError("synthetic server has no KeyframeExtraction task")
+    api.post(f"/ScheduledTasks/Running/{keyframes['Id']}")
+    api.idle()
+    users = {row["Name"]: row for row in api.get("/Users")}
+    libraries = {row["Name"]: row for row in api.get("/Library/VirtualFolders")}
+    child = users[USERS[2]]
+    ratings = api.get("/Localization/ParentalRatings")
+    # PG-13 (13): the seeded "SAM 13" is exactly at the child's limit, so the allowed
+    # movie stays visible while Jellyfin 12.2 scores it 13 (seed_database).
+    limit = next(row["Value"] for row in ratings if row["Name"] == "PG-13")
+    for name in USERS[1:]:
+        user = users[name]
+        policy = user["Policy"]
+        policy.update({"EnableContentDownloading": False, "EnableContentDeletion": False,
+                       "EnableRemoteControlOfOtherUsers": False, "EnableAllFolders": name != USERS[2]})
+        if name == USERS[2]:
+            policy.update({"MaxParentalRating": limit, "EnabledFolders": [
+                libraries[name]["ItemId"] for name, _, folder in LIBRARIES if folder != "private"]})
+        api.post(f"/Users/{user['Id']}/Policy", policy)
+        configuration = user["Configuration"]
+        configuration.update({"AudioLanguagePreference": "fra", "SubtitleLanguagePreference": "eng",
+                              "SubtitleMode": "Always", "PlayDefaultAudioTrack": False,
+                              "RememberAudioSelections": True, "RememberSubtitleSelections": True})
+        api.post("/Users/Configuration", configuration, userId=user["Id"])
+
+    rows = api.get("/Items", userId=api.user, recursive="true", limit=1000,
+                   fields="Path,ProviderIds,MediaSources,Genres,Studios,Tags")["Items"]
+    movies = {r["Name"]: r for r in rows if r["Type"] == "Movie"}
+    episodes = sorted((r for r in rows if r["Type"] == "Episode"),
+                      key=lambda r: (r["ParentIndexNumber"], r["IndexNumber"]))
+    tracks = sorted((r for r in rows if r["Type"] == "Audio"), key=lambda r: r["Path"])
+    if len(episodes) != 6 or len(tracks) != 6 or len(movies) < 8:
+        raise CheckError("synthetic media was not fully scanned")
+
+    adult = users[USERS[1]]["Id"]
+    movie = movies["Blue Orchard"]["Id"]
+    edited = api.get(f"/Items/{movie}", userId=api.user)
+    # 10.11.8 serves Trickplay but cannot read it back (TrickplayInfoDto has no bindable
+    # constructor: 500).
+    edited.pop("Trickplay", None)
+    edited.update({"Name": "Manually edited orchard", "Overview": "A deliberate manual description.",
+                   "ForcedSortName": "000 synthetic manual order", "LockData": True,
+                   "LockedFields": ["Name", "Overview", "Genres"],
+                   "Genres": ["Synthetic manual genre"], "ProviderIds": {"Tmdb": "999999991", "Imdb": "tt99999991"}})
+    api.post(f"/Items/{movie}", edited)
+    picture = BytesIO()
+    Image.new("RGB", (100, 150), "cyan").save(picture, format="PNG")
+    api.call("POST", f"/Items/{movie}/Images/Primary", raw=base64.b64encode(picture.getvalue()))
+
+    # Different accounts deliberately disagree on the same movie and series.
+    for index, item in enumerate([movies["Amber Harbor"]["Id"], *[r["Id"] for r in episodes[:3]]]):
+        api.post(f"/UserPlayedItems/{item}", userId=adult, datePlayed=f"2026-01-0{index+1}T12:00:00Z")
+    api.post(f"/UserPlayedItems/{episodes[0]['Id']}", userId=child["Id"], datePlayed="2026-01-02T12:00:00Z")
+    for user, item, ticks in [(adult, movie, 2_000_000_000), (adult, episodes[3]["Id"], 3_000_000_000),
+                               (child["Id"], movies["Amber Harbor"]["Id"], 1_000_000_000)]:
+        api.post(f"/UserItems/{item}/UserData", {"Played": False, "PlaybackPositionTicks": ticks,
+                 "LastPlayedDate": "2026-01-06T12:00:00Z"}, userId=user)
+    api.post(f"/UserFavoriteItems/{tracks[0]['Id']}", userId=adult)
+
+    # One save writes DisplayPreferences, ItemDisplayPreferences and, for the keys it does not
+    # map to a column, CustomItemDisplayPreferences (DisplayPreferencesController).
+    owner = api.login(USERS[1])
+    owner.post(f"/DisplayPreferences/{libraries['Synthetic Movies']['ItemId']}", {
+        "SortBy": "DateCreated", "SortOrder": "Descending", "RememberSorting": True, "RememberIndexing": False,
+        "ShowBackdrop": True, "ShowSidebar": False, "ScrollDirection": "Horizontal", "PrimaryImageHeight": 250,
+        "PrimaryImageWidth": 250, "ViewType": "Poster",
+        "CustomPrefs": {"homesection0": "resume", "homesection1": "latestmedia", "skipBackLength": "10000",
+                        "synthetic-view": "posters"}}, userId=owner.user, client="emby")
+    api.post("/Devices/Options", {"CustomName": "Synthetic living room"}, id=owner.device)
+
+    playlist = api.post("/Playlists", {"Name": "Synthetic mixed order", "MediaType": "Audio",
+        "Ids": [tracks[3]["Id"], tracks[0]["Id"], tracks[2]["Id"]], "UserId": adult,
+        "Users": [{"UserId": child["Id"], "CanEdit": False}], "IsPublic": False})["Id"]
+    private_playlist = api.post("/Playlists", {"Name": "Synthetic private playlist", "MediaType": "Video",
+        "Ids": [movie, movies["Amber Harbor"]["Id"]], "UserId": adult, "IsPublic": False})["Id"]
+    # The first collection creates the Collections library, and AddVirtualFolder queues a library
+    # scan for it in the background (CollectionManager.EnsureLibraryFolder). That scan can remove a
+    # collection created after it listed the folder, so the next one waits for it to finish.
+    collection = api.scan(300, interval=1, trigger=lambda: api.post(
+        "/Collections", name="Synthetic collection", ids=",".join([movies["Amber Harbor"]["Id"], movie]),
+        isLocked="true"))["Id"]
+    # The initial full collection refresh can reload an empty collection.xml.
+    # The normal add-members action settles membership after creation finishes.
+    api.post(f"/Collections/{collection}/Items", ids=",".join([movies["Amber Harbor"]["Id"], movie]))
+    # Containers whose LinkedChildren seed_database rewrites; each starts with one live member.
+    linked_playlist, linked_pathless = (api.post("/Playlists", {"Name": name, "MediaType": "Audio",
+        "Ids": [tracks[index]["Id"]], "UserId": adult, "IsPublic": False})["Id"]
+        for name, index in (("Synthetic linked playlist", 1), ("Synthetic path-less playlist", 2)))
+    linked_collection = api.post("/Collections", name="Synthetic linked collection",
+                                 ids=movies["Crimson Signal"]["Id"], isLocked="true")["Id"]
+    api.post(f"/Collections/{linked_collection}/Items", ids=movies["Crimson Signal"]["Id"])
+    api.idle()
+    manifest = {"version": 1, "users": {name: users[name]["Id"] for name in USERS},
+            "libraries": {name: row["ItemId"] for name, row in libraries.items()},
+            "locked_movie": movie, "allowed_movie": movies["Amber Harbor"]["Id"],
+            "rated_movie": movies["Crimson Signal"]["Id"],
+            "private_movie": movies["Hidden Meadow"]["Id"],
+            "versions_movie": movies["Twin Horizon"]["Id"],
+            "playlist": playlist, "private_playlist": private_playlist, "collection": collection,
+            "linked_playlist": linked_playlist, "linked_collection": linked_collection,
+            "linked_pathless": linked_pathless}
+
+    from user_accounts import seed as seed_accounts
+    seed_accounts(api, manifest)
+    return manifest
+
+
+LINKED_ROLES = ("collection", "playlist", "pathless")
+
+
+def live_member(conn, manifest, role):
+    """The linked `role` container's Path and its first LinkedChildren entry, the live
+    member seed() created; the entry is None until 10.11.8 has saved its ItemId."""
+    wanted = uuid.UUID(manifest["linked_" + role]).hex
+    row = conn.execute('SELECT "Path", "Data" FROM "BaseItems" WHERE lower(replace("Id", \'-\', \'\')) = ?',
+                       (wanted,)).fetchone()
+    if row is None:
+        raise CheckError("synthetic seed: no BaseItems row for a manifest id")
+    children = json.loads(row[1] or "{}").get("LinkedChildren")
+    first = children[0] if children else {}
+    return row[0], first if first.get("ItemId") and first.get("Path") else None
+
+
+def wait_for_live_members(db, manifest, timeout=300, interval=1):
+    """Wait, with 10.11.8 still running, until it has saved every linked container's live
+    member with its ItemId; seed_database needs both ItemId and Path.
+
+    10.11.8 saves a new playlist's or collection's LinkedChildren with a Path only
+    (LinkedChild.Create). The ItemId reaches the database when the refresh the add queued
+    saves the item (ProviderManager.QueueRefresh, ForceSave). That queue is no scheduled
+    task, so Api.idle() does not cover it, and no API reports it. The database is opened
+    read-only."""
+    end = time.monotonic() + timeout
+    while True:
+        with closing(sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+            pending = [role for role in LINKED_ROLES if live_member(conn, manifest, role)[1] is None]
+        if not pending:
+            return
+        if time.monotonic() >= end:
+            raise CheckError(f"synthetic seed: the linked {pending[0]} has no live member after {timeout} s")
+        time.sleep(interval)
+
+
+def seed_id(name):
+    """A fixed id for a seeded row, so a rerun writes the same rows again."""
+    return uuid.uuid5(uuid.NAMESPACE_URL, "ferrofin:adoption:synthetic:" + name)
+
+
+def seed_database(db, manifest):
+    """Write the adoption seeds into a STOPPED 10.11.8 fixture database, before any later
+    release boots a copy of it; returns the manifest entry describing them. Rerunning it
+    leaves the same state.
+
+    1. Non-US ratings on the five movies (SEEDED_RATINGS). Only OfficialRating changes;
+       each release scores it its own way, and Jellyfin 12.2's scores are the oracle.
+    2. Conflicting user data: the locked movie's adult rows become exactly two, one per
+       provider key, that disagree (CONFLICT). Jellyfin 12.2 and Ferrofin harmonize them.
+    3. A dangling parent chain: two copies of an episode, the first under a parent that
+       does not exist, the second under the first, with play state on the second. Jellyfin
+       (12.1+ from 10.11, or its post-scan clean-up) and Ferrofin's migration 0042 delete
+       them and keep the play state on the placeholder item. They carry no series, season
+       or top parent and no real path, so no browse list treats them as library content.
+       Jellyfin 12.0 cannot migrate the chain, so its lineage drops it first
+       (drop_dangling_chain); only 10.11.x, 12.1-from-10 and 12.2-from-10 carry it.
+    4. Legacy LinkedChildren entries on the three "linked" containers, beside the live member
+       10.11.8 wrote (collection_entries, playlist_entries, pathless_entries). 12.x's
+       MigrateLinkedChildren.ResolveChildId and Ferrofin's membership import must resolve
+       each the same way; "members" is what they resolve to. Every entry of the first two
+       has a Path that exists on disk, so 10.11.9+'s startup
+       CleanupCollectionAndPlaylistPathsTask keeps it; it drops the path-less ones.
+    5. Media segments on the locked movie (SEGMENTS), as a SEGMENT_PROVIDER plugin writes
+       them: no API creates one.
+    """
+    adult = uuid.UUID(manifest["users"][USERS[1]])
+    with closing(sqlite3.connect(db)) as conn:
+        # The chain's first item names a parent that does not exist, which only a
+        # connection without foreign-key enforcement can write. It must be set outside
+        # a transaction, so before the first statement.
+        conn.execute("PRAGMA foreign_keys = OFF")
+        with conn:
+            def stored(table, wanted):
+                row = conn.execute(f'SELECT "Id" FROM "{table}" WHERE lower(replace("Id", \'-\', \'\')) = ?',
+                                   (wanted.hex,)).fetchone()
+                if row is None:
+                    raise CheckError(f"synthetic seed: no {table} row for a manifest id")
+                return row[0]
+
+            def spelled(like, value):
+                text = str(value) if "-" in like else value.hex
+                return text.upper() if like == like.upper() else text
+
+            ratings = {}
+            for key, rating in SEEDED_RATINGS:
+                movie = uuid.UUID(manifest[key])
+                conn.execute('UPDATE "BaseItems" SET "OfficialRating" = ? WHERE "Id" = ?',
+                             (rating, stored("BaseItems", movie)))
+                ratings[movie.hex] = rating
+
+            locked = uuid.UUID(manifest["locked_movie"])
+            item, user = stored("BaseItems", locked), stored("Users", adult)
+            providers = dict(conn.execute(
+                'SELECT "ProviderId", "ProviderValue" FROM "BaseItemProviders" WHERE "ItemId" = ?', (item,)))
+            keys = [providers.get(provider) for provider, *_ in CONFLICT]
+            if not all(keys):
+                raise CheckError("synthetic seed: the locked movie lacks its Tmdb and Imdb ids")
+            conn.execute('DELETE FROM "UserData" WHERE "ItemId" = ? AND "UserId" = ?', (item, user))
+            for key, (_, date, plays, ticks, played) in zip(keys, CONFLICT):
+                conn.execute('INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite", '
+                             '"LastPlayedDate", "PlayCount", "PlaybackPositionTicks", "Played") '
+                             'VALUES (?, ?, ?, 0, ?, ?, ?, ?)', (item, user, key, date, plays, ticks, played))
+
+            source = conn.execute('SELECT "Id" FROM "BaseItems" WHERE "Type" = ? ORDER BY "Id" LIMIT 1',
+                                  (EPISODE_TYPE,)).fetchone()
+            if source is None:
+                raise CheckError("synthetic seed: no episode to copy")
+            columns = {row[1] for row in conn.execute('PRAGMA table_info("BaseItems")')}
+            first, second, missing = (seed_id(name) for name in ("orphan", "orphan-child", "missing-parent"))
+            for number, (orphan, parent) in enumerate(((first, missing), (second, first)), 1):
+                changes = {"Id": spelled(source[0], orphan), "ParentId": spelled(source[0], parent),
+                           "Name": f"Synthetic orphan {number}", "PresentationUniqueKey": orphan.hex,
+                           "Path": f"/media/shows/Synthetic orphans/{number}.mkv", "TopParentId": None,
+                           "SeriesId": None, "SeasonId": None, "SeriesName": None, "SeasonName": None,
+                           "SeriesPresentationUniqueKey": None}
+                changes = {column: value for column, value in changes.items() if column in columns}
+                conn.execute('DROP TABLE IF EXISTS temp."SeedOrphan"')
+                conn.execute('CREATE TEMP TABLE "SeedOrphan" AS SELECT * FROM "BaseItems" WHERE "Id" = ?', source)
+                conn.execute('UPDATE temp."SeedOrphan" SET ' + ", ".join(f'"{column}" = ?' for column in changes),
+                             tuple(changes.values()))
+                conn.execute('INSERT OR IGNORE INTO "BaseItems" SELECT * FROM temp."SeedOrphan"')
+                conn.execute('DROP TABLE temp."SeedOrphan"')
+            # Jellyfin's own key for an item's history: its id, dashed and lower-case.
+            history = str(second)
+            conn.execute('INSERT OR REPLACE INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite", '
+                         '"LastPlayedDate", "PlayCount", "PlaybackPositionTicks", "Played") '
+                         'VALUES (?, ?, ?, 0, ?, ?, ?, ?)',
+                         (spelled(source[0], second), user, history, *ORPHAN_PLAY.values()))
+
+            linked = {}
+            for role, entries_of in zip(LINKED_ROLES, (collection_entries, playlist_entries, pathless_entries)):
+                container = stored("BaseItems", uuid.UUID(manifest["linked_" + role]))
+                path, live = live_member(conn, manifest, role)
+                if live is None:
+                    raise CheckError(f"synthetic seed: the linked {role} has no live member")
+                folder = PurePosixPath(path.replace("%AppDataPath%", APP_DATA_PATH))
+                entries, members = entries_of(conn, manifest, folder, live)
+                conn.execute('UPDATE "BaseItems" SET "Data" = json_set("Data", \'$.LinkedChildren\', json(?)) '
+                             'WHERE "Id" = ?', (json.dumps(entries), container))
+                linked[role] = {"id": uuid.UUID(manifest["linked_" + role]).hex, "entries": entries, "members": members}
+
+            provider = segment_provider_id(SEGMENT_PROVIDER)
+            for kind, start, end in SEGMENTS:
+                conn.execute('INSERT OR REPLACE INTO "MediaSegments" ("Id", "EndTicks", "ItemId", "SegmentProviderId", '
+                             '"StartTicks", "Type") VALUES (?, ?, ?, ?, ?, ?)',
+                             (spelled(item, seed_id(f"segment-{kind}")), end * TICKS, item, provider,
+                              start * TICKS, kind))
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    return {"ratings": ratings,
+            "conflict": {"item": locked.hex, "user": adult.hex, "keys": keys},
+            "orphans": [first.hex, second.hex],
+            "orphan_history": {"user": adult.hex, "key": history, **ORPHAN_PLAY},
+            "linked_children": linked}
+
+
+def segment_provider_id(name):
+    """MediaSegmentManager.GetProviderId: the MD5 of the lower-cased name's UTF-16LE bytes,
+    read as a .NET Guid and written without dashes."""
+    return uuid.UUID(bytes_le=hashlib.md5(name.lower().encode("utf-16-le")).digest()).hex
+
+
+# Tables only seed_database fills; a fixture that skips it (synthetic.FRESH_INSTALL) has none.
+SEEDED_ONLY = ("MediaSegments",)
+
+
+def require_populated(db, unseeded=()):
+    """Fail the build unless every table the table digests compare holds a row: an empty
+    table is a check that compares nothing (a task that never ran, a media type lost).
+    `unseeded` names the tables a fixture without seed_database may leave empty."""
+    from table_digests import TABLES
+    with closing(sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        present = {name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        empty = [table for table in TABLES if table not in unseeded and (
+                 table not in present or conn.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone() is None)]
+    if empty:
+        raise CheckError("synthetic fixture has no rows in " + ", ".join(empty))
+
+
+def stale_id(role, name):
+    """A cached ItemId no row has, fixed so a rerun writes the same entries."""
+    return seed_id(f"linked-{role}-{name}").hex
+
+
+def item_path(conn, item):
+    row = conn.execute('SELECT "Path" FROM "BaseItems" WHERE lower(replace("Id", \'-\', \'\')) = ?',
+                       (item,)).fetchone()
+    if row is None:
+        raise CheckError("synthetic seed: no BaseItems row for a linked member")
+    return row[0]
+
+
+def other_track(conn, live):
+    """The first track (by path) other than the container's live member: (id, path)."""
+    row = conn.execute('SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ? AND "Path" <> ? ORDER BY "Path"',
+                       (AUDIO_TYPE, live["Path"])).fetchone()
+    if row is None:
+        raise CheckError("synthetic seed: no second track to link")
+    return uuid.UUID(row[0]).hex, row[1]
+
+
+def collection_entries(conn, manifest, folder, live):
+    """The linked box set's entries, its `live` one first, and the member ids ResolveChildId
+    makes of them, in order: one row per child.
+
+    10.11 resolves no LibraryItemId beside a Path, so its children stay the live member and
+    the by-path movie, both in the movie library: a child from another library would change
+    the box set's LibraryFolderIds, and 10.11's scan would save it with every id re-cached
+    (BoxSetMetadataService.BeforeSaveInternal)."""
+    member = uuid.UUID(live["ItemId"]).hex
+    by_path, by_library_id, outranked = (uuid.UUID(manifest[key]).hex
+                                         for key in ("allowed_movie", "locked_movie", "versions_movie"))
+    by_path_file = item_path(conn, by_path)
+    # On disk, but no item's path: the member's subtitle file.
+    unindexed = str(PurePosixPath(live["Path"]).with_suffix(".eng.srt"))
+    return [live,
+            # A stale id beside the member's own path collapses into it.
+            {"Path": live["Path"], "Type": "Manual", "ItemId": stale_id("collection", "repeat")},
+            {"Path": by_path_file, "Type": "Manual", "ItemId": stale_id("collection", "by-path")},
+            {"Path": unindexed, "Type": "Manual", "ItemId": stale_id("collection", "unindexed")},
+            {"Path": unindexed, "Type": "Manual", "LibraryItemId": by_library_id},
+            # A path that resolves outranks LibraryItemId: this collapses into the by-path
+            # movie, where taking LibraryItemId first would add the versions movie.
+            {"Path": by_path_file, "Type": "Manual", "LibraryItemId": outranked},
+            ], [member, by_path, by_library_id]
+
+
+def playlist_entries(conn, manifest, folder, live):
+    """The linked playlist's entries, its `live` one first, and the member ids ResolveChildId
+    makes of them, in order: a playlist keeps repeats."""
+    member = uuid.UUID(live["ItemId"]).hex
+    other, other_path = other_track(conn, live)
+    # Relative paths climb from the container's folder: all the way to "/" reaches the
+    # other track; one level short reaches no item, though from any shallower base (the
+    # working directory, the folder's parent, an unexpanded %AppDataPath%) it would. Both
+    # reach the track from "/", the official image's working directory, which is where
+    # 10.11.9+'s startup CleanupCollectionAndPlaylistPathsTask looks, so it keeps them.
+    climb = len(folder.parts) - 1
+    return [live,
+            {"Path": live["Path"], "Type": "Manual", "ItemId": stale_id("playlist", "repeat")},
+            # A relative path that resolves outranks LibraryItemId.
+            {"Path": "../" * climb + other_path.lstrip("/"), "Type": "Manual", "LibraryItemId": member},
+            {"Path": "../" * (climb - 1) + other_path.lstrip("/"), "Type": "Manual"},
+            # A cached ItemId whose row exists outranks the path.
+            {"Path": other_path, "Type": "Manual", "ItemId": member},
+            ], [member, member, other, member]
+
+
+def pathless_entries(conn, manifest, folder, live):
+    """The path-less playlist's entries, its `live` one first: LibraryItemId alone, the shape
+    10.11's BaseItemXmlParser reads from a playlist.xml or collection.xml entry with no path.
+    10.11.9+'s startup clean-up drops every entry without a Path (File.Exists(null) is
+    false), so only the 10.11.8 fixture and the 12.x ones built from it still hold them."""
+    member = uuid.UUID(live["ItemId"]).hex
+    other, _ = other_track(conn, live)
+    return [live,
+            {"Type": "Manual", "LibraryItemId": other},
+            {"Type": "Manual", "LibraryItemId": stale_id("pathless", "stale")},
+            ], [member, other]
+
+
+def drop_dangling_chain(db, seeds):
+    """Remove the seeded dangling chain (and its play state) from a STOPPED fixture copy.
+
+    Jellyfin 12.0's ChangeOwnerIdToGuid rebuilds BaseItems with foreign keys enforced and,
+    unlike 12.1's version of it, deletes no orphans first, so 12.0 cannot start on a
+    database that holds the chain ("FOREIGN KEY constraint failed"). No real database
+    carrying one reaches 12.0, so the 12.0 lineage starts without it; seed_state then
+    records no chain and seed_failures checks only that none survives.
+    """
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        with conn:
+            for item in seeds["orphans"]:
+                for table, column in (("UserData", "ItemId"), ("BaseItems", "Id")):
+                    conn.execute(f'DELETE FROM "{table}" WHERE lower(replace("{column}", \'-\', \'\')) = ?',
+                                 (item,))
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")

@@ -27,6 +27,7 @@ pub mod dto;
 pub mod error;
 pub mod events;
 pub mod filesystem;
+pub mod intro_skipper;
 pub mod library;
 pub mod localization;
 pub mod media_analysis;

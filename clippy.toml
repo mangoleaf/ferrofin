@@ -1,0 +1,5 @@
+# Query strings bind through `ferrofin_api::query::Query`, which matches keys
+# ignoring case as ASP.NET does; axum's own `Query` is case-sensitive.
+disallowed-types = [
+    { path = "axum::extract::Query", reason = "use ferrofin_api::query::Query (keys bind ignoring case, as ASP.NET's do)" },
+]

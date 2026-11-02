@@ -1,0 +1,18 @@
+[Script Info]
+; This is a Sub Station Alpha v4 script.
+Title: SSA sample
+ScriptType: v4.00
+Collisions: Normal
+PlayDepth: 0
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding
+Style: Default,Tahoma,24,16777215,65535,65535,-2147483640,-1,0,1,2,3,2,30,30,10,0,0
+Style: Song,Arial,18,65535,255,0,0,0,-1,1,1,0,6,15,15,15,0,0
+
+[Events]
+Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: Marked=0,0:00:01.00,0:00:02.50,Default,Narrator,0000,0000,0000,,Hello {\i1}world{\i0}\Nnext
+Dialogue: Marked=0,0:00:03.00,0:00:04.00,*Default,NTP,0000,0000,0000,,{\c&H00FF00&}green{\c} text
+Dialogue: Marked=1,0:00:05.00,0:00:06.00,Song,NTP,0010,0000,0005,Karaoke,{\fnCourier}mono{\fn} {\b1}bold
+Dialogue: Marked=0,0:00:07.00,0:00:08.00,Default,NTP,0000,0000,0000,,{\fs30\i1}big italic{\fs} done

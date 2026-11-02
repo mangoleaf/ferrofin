@@ -9,17 +9,16 @@
 //!
 //! Port rules applied:
 //! - The C# constructor's `IServerApplicationPaths` collapses to the single
-//!   [`image_cache_path`](ImageProcessor::new) the processor actually uses; the
-//!   `IServerConfigurationManager.ParallelImageEncodingLimit` semaphore is
-//!   dropped — concurrency limiting is the host's concern, not this port's, and
-//!   there is no oracle for it.
+//!   [`image_cache_path`](ImageProcessor::new) the processor actually uses.
+//!   The host supplies the startup `ParallelImageEncodingLimit` through
+//!   [`ImageProcessor::with_encoding_limit`], matching the C# constructor.
 //! - The overloaded `GetImageDimensions` / `GetImageCacheTag` methods collapse
 //!   onto the id-plus-[`ItemImageInfo`] forms the trait declares.
-//! - The `Photo` auto-orientation branch is **deferred**: the `Photo` entity is
-//!   not wired into [`ImageProcessingOptions`] here (it carries an
-//!   [`item_id`](ImageProcessingOptions::item_id), not a domain item), so
-//!   `auto_orient` is always `false`. The gate is preserved structurally so it
-//!   can be re-enabled once the entity lands.
+//! - The `Photo` auto-orientation branch is decided by the caller, which read
+//!   the item: [`ImageProcessingOptions`] carries an
+//!   [`item_id`](ImageProcessingOptions::item_id), not a domain item, so the
+//!   `autoOrient` the C# derives from `item is Photo` arrives as
+//!   [`auto_orient`](ImageProcessingOptions::auto_orient).
 //! - `MimeTypes.GetMimeType` is reused from [`ferrofin_model::net::mime_types`];
 //!   `GetMD5().ToString("N")` is reused from [`ferrofin_common::extensions::get_md5`]
 //!   plus [`Uuid::simple`] (32-char lowercase hex, identical to .NET `"N"`).
@@ -27,6 +26,7 @@
 //!   sit behind the small [`FileMeta`] seam so tests use a fake and the real
 //!   `std::fs` stat stays out of the parity/coverage numbers.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -122,9 +122,11 @@ impl FileMeta for StdFileMeta {
 pub struct ImageProcessor<F = StdFileMeta> {
     /// The codec that does the real pixel work.
     encoder: Arc<dyn ImageEncoder>,
+    /// Held until actual pixel work finishes, including after request cancellation.
+    encoding_slots: Arc<tokio::sync::Semaphore>,
 
     /// The base image-cache directory (`IServerApplicationPaths.ImageCachePath`).
-    image_cache_path: PathBuf,
+    image_cache_path: DirectoryPath,
 
     /// The filesystem-metadata seam (`File.Exists` / `GetLastWriteTimeUtc`).
     file_meta: F,
@@ -140,9 +142,12 @@ impl ImageProcessor<StdFileMeta> {
     /// beneath `image_cache_path`, using the real `std::fs`-backed [`FileMeta`]
     /// and the default [`cache_version`](Self::with_cache_version) of `'4'`.
     #[must_use]
-    pub fn new(encoder: Arc<dyn ImageEncoder>, image_cache_path: impl Into<PathBuf>) -> Self {
+    pub fn new(encoder: Arc<dyn ImageEncoder>, image_cache_path: impl Into<DirectoryPath>) -> Self {
         Self {
             encoder,
+            encoding_slots: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            )),
             image_cache_path: image_cache_path.into(),
             file_meta: StdFileMeta,
             cache_version: DEFAULT_CACHE_VERSION,
@@ -156,15 +161,27 @@ impl<F: FileMeta> ImageProcessor<F> {
     #[must_use]
     pub fn with_file_meta(
         encoder: Arc<dyn ImageEncoder>,
-        image_cache_path: impl Into<PathBuf>,
+        image_cache_path: impl Into<DirectoryPath>,
         file_meta: F,
     ) -> Self {
         Self {
             encoder,
+            encoding_slots: Arc::new(tokio::sync::Semaphore::new(
+                std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            )),
             image_cache_path: image_cache_path.into(),
             file_meta,
             cache_version: DEFAULT_CACHE_VERSION,
         }
+    }
+
+    /// Sets the startup ceiling for concurrent resized-image encodes.
+    /// The host resolves nonpositive dashboard values to its usable CPU count.
+    /// Zero at this lower-level seam clamps to one to avoid a deadlock.
+    #[must_use]
+    pub fn with_encoding_limit(mut self, limit: usize) -> Self {
+        self.encoding_slots = Arc::new(tokio::sync::Semaphore::new(limit.max(1)));
+        self
     }
 
     /// Overrides the [`cache_version`](DEFAULT_CACHE_VERSION) stamped into cache
@@ -298,6 +315,13 @@ impl<F: FileMeta> ImageProcessor<F> {
             filename.push_str(foreground_layer);
         }
 
+        // Ferrofin-local, not in upstream's key: earlier Ferrofin builds cached
+        // photos un-oriented under the same key, so an oriented encode needs
+        // its own. Only auto-oriented photos are re-encoded.
+        if options.auto_orient {
+            filename.push_str(",autoorient");
+        }
+
         filename.push_str(",v=");
         filename.push(self.cache_version);
 
@@ -378,6 +402,22 @@ fn extension_of(path: &str) -> String {
         Some(idx) => last_segment[idx..].to_ascii_lowercase(),
         None => String::new(),
     }
+}
+
+/// Whether an encode failure is logged at `debug` rather than `warn`.
+///
+/// `InvalidInput` is the requested size or the file's content as the encoder
+/// sees it: a size that rounds an axis to 0, a source the decoder rejects
+/// (corrupt, truncated, a read error mid-decode, over the `image` crate's
+/// allocation limit), a JPEG output past 65535 px, or a WebP output past
+/// 16383 px. A failed encode writes no
+/// cache file, so it recurs on every request for that image and its volume
+/// grows with items × requests; LOGGING.md §1 keeps that at `debug`.
+/// Everything else (cache-dir I/O, an unreadable or removed source, codec or
+/// encoder faults) is a degradation an operator can act on: `warn`, as a
+/// fallback was taken.
+fn encode_failure_logs_at_debug(err: &ServiceError) -> bool {
+    matches!(err, ServiceError::InvalidInput(_))
 }
 
 #[async_trait]
@@ -491,7 +531,7 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
 
     /// Port of `ProcessImage`: the full on-the-fly pipeline — `.tbn` passthrough,
     /// `SupportsImageEncoding` gate, missing-file / GIF passthrough, transparency
-    /// detection, the (deferred) `Photo` auto-orient branch, the
+    /// detection, the `Photo` auto-orient branch (decided by the caller), the
     /// `HasDefaultOptions` short-circuit, output-format selection, cache-key
     /// derivation, cache-hit skip, encode, `resultPath == original` short-circuit,
     /// and error-to-original fallback.
@@ -539,9 +579,8 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
         let requires_transparency =
             TRANSPARENT_IMAGE_TYPES.contains(&extension_of(&original_image_path).as_str());
 
-        // The Photo auto-orientation branch is deferred: no Photo entity is wired
-        // into the options, so auto_orient stays false. The gate is preserved.
-        let auto_orient = false;
+        // `autoOrient` for a Photo; the caller, which read the item, sets it.
+        let auto_orient = options.auto_orient;
 
         if options.has_default_options(&original_image_path, original_image_size)
             && (!auto_orient || !options.requires_auto_orientation)
@@ -581,12 +620,31 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
             Ok(Some(processed)) => Ok(processed),
             // `resultPath == originalPath` short-circuit (`Ok(None)`) and the C#
             // catch-all that returns the original on any encode error (`Err`)
-            // both fall through to the same original-file passthrough.
-            Ok(None) | Err(_) => Ok(ProcessedImage {
-                path: original_image_path.clone(),
-                mime_type: Some(get_mime_type(&original_image_path).to_owned()),
-                date_modified,
-            }),
+            // both fall through to the same original-file passthrough. Upstream
+            // logs the catch at Error; see `encode_failure_logs_at_debug` for
+            // why the level depends on the failure here.
+            result => {
+                if let Err(e) = result {
+                    if encode_failure_logs_at_debug(&e) {
+                        tracing::debug!(
+                            error = %e,
+                            path = %original_image_path,
+                            "image encode rejected; serving the original"
+                        );
+                    } else {
+                        tracing::warn!(
+                            error = %e,
+                            path = %original_image_path,
+                            "error encoding image; serving the original"
+                        );
+                    }
+                }
+                Ok(ProcessedImage {
+                    path: original_image_path.clone(),
+                    mime_type: Some(get_mime_type(&original_image_path).to_owned()),
+                    date_modified,
+                })
+            }
         }
     }
 
@@ -621,19 +679,33 @@ impl<F: FileMeta> ImageProcessor<F> {
         output_format: ImageFormat,
     ) -> Result<Option<ProcessedImage>, ServiceError> {
         if !self.file_meta.exists(cache_file_path) {
-            let result_path = self
-                .encoder
-                .encode_image(
-                    original_image_path,
-                    date_modified,
-                    cache_file_path,
-                    auto_orient,
-                    None,
-                    quality,
-                    options,
-                    output_format,
-                )
-                .await?;
+            let permit = Arc::clone(&self.encoding_slots)
+                .acquire_owned()
+                .await
+                .map_err(ServiceError::backend_source)?;
+            let encoder = Arc::clone(&self.encoder);
+            let input = original_image_path.to_owned();
+            let output = cache_file_path.to_owned();
+            let options = options.clone();
+            // Dropping a request cannot stop spawn_blocking pixel work. Keep
+            // its permit in an independent task until the encoder really ends.
+            let result_path = tokio::spawn(async move {
+                let _permit = permit;
+                encoder
+                    .encode_image(
+                        &input,
+                        date_modified,
+                        &output,
+                        auto_orient,
+                        None,
+                        quality,
+                        &options,
+                        output_format,
+                    )
+                    .await
+            })
+            .await
+            .map_err(ServiceError::backend_source)??;
 
             if result_path.eq_ignore_ascii_case(original_image_path) {
                 return Ok(None);
@@ -655,6 +727,7 @@ mod tests {
     //! option and carries `v=3`; default options pass the original through; a
     //! resize produces then hits the cache.
     use super::*;
+    use crate::error::DrawingError;
     use crate::image_encoder::ImageCrateEncoder;
     use chrono::TimeZone;
     use image::{DynamicImage, Rgba, RgbaImage};
@@ -700,6 +773,7 @@ mod tests {
     /// and lets a test dictate the returned path (to exercise the
     /// `resultPath == original` short-circuit) — no real pixels.
     struct CountingEncoder {
+        work: Option<Arc<EncodingWork>>,
         calls: AtomicUsize,
         /// When set, `encode_image` returns this path; else it returns
         /// `output_path`.
@@ -747,6 +821,16 @@ mod tests {
             _output_format: ImageFormat,
         ) -> Result<String, ServiceError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(work) = &self.work {
+                work.entered.add_permits(1);
+                let work = Arc::clone(work);
+                tokio::task::spawn_blocking(move || {
+                    let released = work.release.0.lock().unwrap();
+                    let _released = work.release.1.wait_while(released, |v| !*v).unwrap();
+                })
+                .await
+                .unwrap();
+            }
             match &self.return_original {
                 Some(p) => Ok(p.clone()),
                 None => Ok(output_path.to_owned()),
@@ -949,6 +1033,7 @@ mod tests {
         // fill bounds covering it → HasDefaultOptions holds.
         let input = fixture(&dir, "orig.jpg", 640, 480);
         let encoder = Arc::new(CountingEncoder {
+            work: None,
             calls: AtomicUsize::new(0),
             return_original: None,
         });
@@ -971,12 +1056,102 @@ mod tests {
         assert_eq!(processed.path, input);
         // No encode happened.
         assert_eq!(encoder.calls.load(Ordering::SeqCst), 0);
+
+        // `autoOrient` (a photo) defeats the passthrough, as upstream, and the
+        // oriented encode is cached under its own key.
+        let oriented = ImageProcessingOptions {
+            auto_orient: true,
+            ..options.clone()
+        };
+        let processed = proc.process_image(&oriented).await.expect("process");
+        assert_ne!(processed.path, input);
+        assert_eq!(encoder.calls.load(Ordering::SeqCst), 1);
+        let dt = Utc::now();
+        assert_ne!(
+            proc.cache_file_path(&input, &options, 95, dt, ImageFormat::Jpg)
+                .expect("key"),
+            proc.cache_file_path(&input, &oriented, 95, dt, ImageFormat::Jpg)
+                .expect("key")
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::bad_size_or_source(ServiceError::invalid_input("cannot resize to 0x1"), true)]
+    #[case::cache_write(DrawingError::io("mkdir", std::io::Error::other("full")).into(), false)]
+    #[case::encoder_backend(ServiceError::backend("encoder panicked"), false)]
+    #[case::vanished_source(ServiceError::not_found("image file not found: /x.png"), false)]
+    fn encode_failure_level_policy(#[case] err: ServiceError, #[case] at_debug: bool) {
+        assert_eq!(encode_failure_logs_at_debug(&err), at_debug);
+    }
+
+    #[tokio::test]
+    async fn cache_write_failure_serves_original() {
+        // The warn arm: a file where the resized-images directory belongs makes
+        // the encoder's mkdir fail (ENOTDIR, even as root), and the C#
+        // catch-all serves the original.
+        let dir = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        std::fs::write(cache.path().join("resized-images"), b"").expect("blocker");
+        let input = fixture(&dir, "orig.png", 60, 40);
+        let proc = processor_with(
+            Arc::new(ImageCrateEncoder::new()),
+            &cache,
+            FakeFs::with(&[&input]),
+        );
+        let options = ImageProcessingOptions {
+            image: ItemImageInfo {
+                path: input.clone(),
+                width: 60,
+                height: 40,
+                ..Default::default()
+            },
+            max_width: Some(30),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        let processed = proc.process_image(&options).await.expect("process");
+        assert_eq!(processed.path, input);
+
+        // The blocker was the only cause: without it the same request encodes.
+        std::fs::remove_file(cache.path().join("resized-images")).expect("unblock");
+        let processed = proc.process_image(&options).await.expect("process");
+        assert!(processed.path.contains("resized-images"));
+    }
+
+    #[tokio::test]
+    async fn zero_axis_resize_serves_original() {
+        // The encoder fails on a size that rounds one axis to 0 (Skia's empty
+        // surface), and the C# catch-all serves the original.
+        let dir = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let input = fixture(&dir, "orig.png", 60, 40);
+        let proc = processor_with(
+            Arc::new(ImageCrateEncoder::new()),
+            &cache,
+            FakeFs::with(&[&input]),
+        );
+        let options = ImageProcessingOptions {
+            image: ItemImageInfo {
+                path: input.clone(),
+                width: 60,
+                height: 40,
+                ..Default::default()
+            },
+            width: Some(1),
+            height: Some(i32::MAX),
+            max_height: Some(1_000_000_000),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        let processed = proc.process_image(&options).await.expect("process");
+        assert_eq!(processed.path, input);
     }
 
     #[tokio::test]
     async fn gif_passthrough_returns_original() {
         let cache = TempDir::new().expect("cache");
         let encoder = Arc::new(CountingEncoder {
+            work: None,
             calls: AtomicUsize::new(0),
             return_original: None,
         });
@@ -999,6 +1174,7 @@ mod tests {
     async fn missing_file_returns_original() {
         let cache = TempDir::new().expect("cache");
         let encoder = Arc::new(CountingEncoder {
+            work: None,
             calls: AtomicUsize::new(0),
             return_original: None,
         });
@@ -1021,12 +1197,14 @@ mod tests {
     async fn resize_produces_then_hits_cache() {
         let dir = TempDir::new().expect("tempdir");
         let cache = TempDir::new().expect("cache");
+        let current = Arc::new(std::sync::RwLock::new(cache.path().to_path_buf()));
+        let source = Arc::clone(&current);
         let input = fixture(&dir, "big.png", 1920, 1080);
         let fs = FakeFs::with(&[&input]);
         // A real encoder writes the resized file; a max-width forces a resize.
         let proc = ImageProcessor::with_file_meta(
             Arc::new(ImageCrateEncoder::new()),
-            cache.path().to_path_buf(),
+            DirectoryPath::live(move || source.read().expect("path").clone()),
             fs,
         );
 
@@ -1058,6 +1236,18 @@ mod tests {
         proc.file_meta.add(&first.path);
         let second = proc.process_image(&options).await.expect("process again");
         assert_eq!(first.path, second.path);
+        let replacement = TempDir::new().expect("replacement");
+        *current.write().expect("path") = replacement.path().to_path_buf();
+        let third = proc
+            .process_image(&options)
+            .await
+            .expect("after reconfiguration");
+        assert!(Path::new(&third.path).starts_with(replacement.path()));
+        assert!(Path::new(&third.path).is_file());
+        assert!(
+            Path::new(&first.path).is_file(),
+            "old cache is not relocated or deleted"
+        );
     }
 
     #[tokio::test]
@@ -1067,6 +1257,7 @@ mod tests {
         let input = fixture(&dir, "s.png", 800, 600);
         // Encoder claims it wrote the original path back → short-circuit to it.
         let encoder = Arc::new(CountingEncoder {
+            work: None,
             calls: AtomicUsize::new(0),
             return_original: Some(input.clone()),
         });
@@ -1179,6 +1370,7 @@ mod tests {
         // yComp = 5.33 * 1080 / 1920 ≈ 3.0 → floor 3, +1 = 4 (capped at 9).
         let proc = ImageProcessor::new(
             Arc::new(CountingEncoder {
+                work: None,
                 calls: AtomicUsize::new(0),
                 return_original: None,
             }),
@@ -1202,6 +1394,7 @@ mod tests {
     async fn item_dimensions_use_info_when_positive_else_probe() {
         let proc = ImageProcessor::new(
             Arc::new(CountingEncoder {
+                work: None,
                 calls: AtomicUsize::new(0),
                 return_original: None,
             }),
@@ -1247,5 +1440,87 @@ mod tests {
             proc.supported_image_output_formats(),
             vec![ImageFormat::Webp, ImageFormat::Jpg, ImageFormat::Png]
         );
+    }
+
+    struct EncodingWork {
+        entered: tokio::sync::Semaphore,
+        release: (Mutex<bool>, std::sync::Condvar),
+    }
+
+    struct ReleaseWork(Arc<EncodingWork>);
+    impl Drop for ReleaseWork {
+        fn drop(&mut self) {
+            *self.0.release.0.lock().unwrap() = true;
+            self.0.release.1.notify_all();
+        }
+    }
+
+    #[tokio::test]
+    async fn encoding_limit_survives_request_cancellation_until_pixel_work_finishes() {
+        for limit in [1, 2] {
+            let work = Arc::new(EncodingWork {
+                entered: tokio::sync::Semaphore::new(0),
+                release: (Mutex::new(false), std::sync::Condvar::new()),
+            });
+            let release = ReleaseWork(Arc::clone(&work));
+            let encoder = Arc::new(CountingEncoder {
+                work: Some(Arc::clone(&work)),
+                calls: AtomicUsize::new(0),
+                return_original: None,
+            });
+            let cache = TempDir::new().unwrap();
+            let processor = Arc::new(
+                processor_with(encoder.clone(), &cache, FakeFs::with(&["/input.jpg"]))
+                    .with_encoding_limit(limit),
+            );
+            let mut tasks = Vec::new();
+            for _ in 0..=limit {
+                let processor = Arc::clone(&processor);
+                tasks.push(tokio::spawn(async move {
+                    processor
+                        .process_image(&ImageProcessingOptions {
+                            image: ItemImageInfo {
+                                path: "/input.jpg".into(),
+                                ..Default::default()
+                            },
+                            width: Some(100),
+                            ..Default::default()
+                        })
+                        .await
+                }));
+            }
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                work.entered.acquire_many(u32::try_from(limit).unwrap()),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+            let first = tasks.remove(0);
+            first.abort();
+            let _ = first.await;
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), work.entered.acquire())
+                    .await
+                    .is_err(),
+                "cancelled caller released a running encode's slot"
+            );
+            assert_eq!(encoder.calls.load(Ordering::SeqCst), limit);
+            drop(release);
+            for task in tasks {
+                task.await.unwrap().unwrap();
+            }
+            let _permits = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                processor
+                    .encoding_slots
+                    .acquire_many(u32::try_from(limit).unwrap()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(encoder.calls.load(Ordering::SeqCst), limit + 1);
+        }
     }
 }

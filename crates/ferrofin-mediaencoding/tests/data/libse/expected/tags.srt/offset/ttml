@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttp="http://www.w3.org/ns/ttml#parameter" ttp:timeBase="media" xmlns:tts="http://www.w3.org/ns/ttml#styling" xml:lang="en" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">
+  <head>
+    <metadata>
+      <ttm:title></ttm:title>
+    </metadata>
+    <styling>
+      <style xml:id="s0" tts:backgroundColor="black" tts:fontStyle="normal" tts:fontSize="16px" tts:fontFamily="sansSerif" tts:color="white" />
+    </styling>
+    <layout>
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="start" xml:id="topLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="start" xml:id="centerLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="start" xml:id="bottomLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="center" xml:id="topCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="center" xml:id="centerCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="center" xml:id="bottomCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="end" xml:id="topRight" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="end" xml:id="centerRight" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="end" xml:id="bottomRight" />
+    </layout>
+  </head>
+  <body style="s0">
+    <div>
+      <p begin="0.999s" xml:id="p0" end="3.499s">
+        <span tts:fontStyle="italic">Italic line</span>
+        <br />
+        <span tts:fontWeight="bold">bold</span> and <span tts:textDecoration="underline">under</span></p>
+      <p begin="3.999s" xml:id="p1" end="5.999s">
+        <span tts:color="#ff0000">red hex</span>
+        <span tts:color="red">red name</span>
+        <br />
+        <span tts:color="Red">Red name</span>
+        <span tts:color="#00ff00ff">eight</span>
+      </p>
+      <p begin="6.499s" xml:id="p2" end="8.249s" region="topCenter">Top centred sign</p>
+      <p begin="8.999s" xml:id="p3" end="9.999s">Positioned &amp; "quoted" odd ab</p>
+      <p begin="9.999s" xml:id="p4" end="9.999s">Zero length</p>
+      <p begin="11.122s" xml:id="p5" end="12.986s">First paragraph<br /><br />second after a blank line</p>
+      <p begin="90062.344s" xml:id="p6" end="90064.004s">
+        <span tts:fontFamily="Arial">Face and size</span> &amp;amp; done</p>
+    </div>
+  </body>
+</tt>

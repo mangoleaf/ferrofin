@@ -1,0 +1,43 @@
+# Benchmark gate thresholds, read by gates/bench/report.py.
+#
+# A change against the baseline (the median of the baseline runs) is coloured as a
+# regression or an improvement only when it crosses BOTH thresholds of its row:
+# `relative_pct` of the baseline value and `absolute` in the row's unit. Smaller changes
+# are within the measured run-to-run noise and stay uncoloured.
+#
+# These are the owner's starting values, to be re-derived from the A/A noise measurement.
+# Change them only by a reviewed commit.
+
+[screens]       # screen p50, ms
+relative_pct = 15
+absolute = 2
+
+[endpoints]     # endpoint p50, ms
+relative_pct = 15
+absolute = 0.5
+
+[memory]        # peak under load and steady idle anon memory, MiB (and gate.py scan's peaks)
+relative_pct = 25
+absolute = 40
+
+[scan]          # library-scan and adoption-migration wall time (gate.py scan), s
+relative_pct = 15
+absolute = 1
+
+[ramp]          # throughput ceiling (highest rate with worst-screen p95 <= the bound), screens/s
+relative_pct = 15
+absolute = 5
+
+# One-hour anon-memory slope, MiB/h (soak.py): the candidate regresses only when its slope
+# exceeds this and the previous release's does not.
+[soak]
+max_slope_mib_per_hour = 20
+
+# A per-cell band from the A/A noise table replaces its row for that one cell, keyed
+# `<level>/screens/<screen>`, `<level>/endpoints/<endpoint>`, `memory/<row>` or, for
+# gate.py scan, `scan|migration/wall time|peak anon`. `ramp/ceiling` has no A/A, so only an
+# owner can set a band for it:
+#
+# [cells."loaded/screens/detail"]
+# relative_pct = 40
+# absolute = 5

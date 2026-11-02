@@ -40,7 +40,7 @@ pub enum LiveTvError {
         source: reqwest::Error,
     },
 
-    /// An I/O failure while reading a `file://`/local-path Live TV source.
+    /// An I/O failure while reading a local-path Live TV source.
     /// `context` names the operation and path.
     #[error("{context}: {source}")]
     Io {

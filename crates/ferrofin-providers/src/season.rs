@@ -26,21 +26,46 @@
 //! Language: upstream asks TheMovieDb in the lookup's `MetadataLanguage` and
 //! claims it as the answer's `ResultLanguage` (`:43-46`); TheTVDB's season
 //! answer names none, its overview being the translation in that language.
-//! So neither is ever a language fallback in the fold. Ferrofin's TMDB
-//! client asks in no language (TMDb's default, en-US) and names none either,
-//! so in a library of another language a season's TheMovieDb overview is
-//! English and still counts as the preferred one.
-//! TODO(parity, open work item — NOT an accepted divergence): the TMDB
-//! localisation item at the scan's `fetch_tmdb_metadata` (ask every
-//! `TmdbClientManager` call in the item's language and country) covers the
-//! season request too; the owner kept it out of the season port
-//! (2026-10-04).
+//! So neither is ever a language fallback in the fold. The scanner and the
+//! single-season refresh pass the resolved metadata language to TMDB.
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
 
 use crate::metadata_merge::MetadataResult;
 use crate::tmdb::SeasonDetails;
 use crate::tvdb::{TvdbClient, TvdbSeasonDetails};
+
+/// The configured name for season zero, including an explicitly empty name.
+#[must_use]
+pub fn zero_display_name(options: Option<&ferrofin_model::configuration::LibraryOptions>) -> &str {
+    options.map_or("Specials", |options| {
+        options.season_zero_display_name.as_str()
+    })
+}
+
+/// Applies `SeasonMetadataService.BeforeSaveInternal`'s season-zero naming
+/// rule. Item/name locks and ordinal case-only differences preserve the name.
+/// Returns whether the name changed; the caller settles the sort name.
+pub fn apply_zero_display_name(
+    item: &mut BaseItemEntity,
+    locked_fields: &[ferrofin_model::entities::MetadataField],
+    options: Option<&ferrofin_model::configuration::LibraryOptions>,
+) -> bool {
+    use ferrofin_model::entities::MetadataField;
+    let name = zero_display_name(options);
+    if item.type_.rsplit('.').next() != Some("Season")
+        || item.index_number != Some(0)
+        || item.is_locked
+        || locked_fields.contains(&MetadataField::Name)
+        || item.name.as_deref().is_some_and(|current| {
+            ferrofin_util::string_extensions::equals_ordinal_ignore_case(current, name)
+        })
+    {
+        return false;
+    }
+    item.name = Some(name.to_owned());
+    true
+}
 
 /// `TmdbSeasonProvider.GetMetadata`'s answer (`:41-158`) for season
 /// `season_number`, from the season's `/tv/{id}/season/{n}` response.
@@ -130,17 +155,16 @@ pub fn tvdb_answer(
 /// [`tvdb_answer`]. `None` is no answer — TheTVDB lists no such season, or
 /// a request failed (the failure is counted by the request).
 ///
-/// The scan's `IsAutomated` is `true` (`ImageRefreshOptions`' default, which
-/// a library scan and Identify keep), so the plugin always re-reads the
-/// season's id from the series ("the order has changed and we need to find
-/// the new season id", `:67-91`) and never resolves by an id already on the
-/// season. TODO(parity, open work item — NOT an accepted divergence):
-/// `ItemRefreshController` refreshes with `IsAutomated = false`
-/// (`ItemRefreshController.cs:86`), where the plugin first takes the
-/// season's own `Tvdb` id. To port: carry `IsAutomated` on
-/// `MetadataRefreshOptions` (false from the item-refresh route) and pass the
-/// season's id in here when it is false; the episode provider's
-/// `IsAutomated` branch (`TvdbEpisodeProvider.cs:171`) is the same item.
+/// At `5c4592f` the plugin re-reads the season's id from the series
+/// whenever the refresh is automated ("the order has changed and we need to
+/// find the new season id", `:67-91`), and a scan always is, so this never
+/// resolves by an id already on the season. TODO(parity, open work item
+/// gl-791 — NOT an accepted divergence): the plugin's latest release, `v24`,
+/// dropped that `IsAutomated` branch here and in `TvdbEpisodeProvider`
+/// (`228f7b3`): it takes the season's own `Tvdb` id whenever there is one
+/// and reads the series only when there is none. Porting that, with the
+/// rest of `5c4592f..v24`, is gl-791. (`MetadataRefreshOptions` carries
+/// `is_automated`, but the plugin no longer reads it.)
 ///
 /// The caller supplies `series_tvdb_id` only when the series has a `Tvdb`
 /// id. ACCEPTED DIVERGENCE (owner, 2026-10-04; don't-port-bugs): upstream
@@ -171,6 +195,44 @@ pub async fn tvdb_season(
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case::renamed(false, false, 0, "Old", "Bonus", "Bonus")]
+    #[case::item_lock(true, false, 0, "Mine", "Bonus", "Mine")]
+    #[case::name_lock(false, true, 0, "Mine", "Bonus", "Mine")]
+    #[case::regular(false, false, 1, "Season 1", "Bonus", "Season 1")]
+    #[case::case_only(false, false, 0, "ÉXTRAS", "éxtras", "ÉXTRAS")]
+    #[case::empty(false, false, 0, "Old", "", "")]
+    fn zero_name_respects_locks_and_ordinal_casing(
+        #[case] locked: bool,
+        #[case] name_locked: bool,
+        #[case] number: i64,
+        #[case] current: &str,
+        #[case] configured: &str,
+        #[case] expected: &str,
+    ) {
+        let mut row = ferrofin_db::entities::base_items::BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.TV.Season".to_owned(),
+            index_number: Some(number),
+            is_locked: locked,
+            name: Some(current.to_owned()),
+            ..Default::default()
+        };
+        let options = ferrofin_model::configuration::LibraryOptions {
+            season_zero_display_name: configured.to_owned(),
+            ..Default::default()
+        };
+        let fields = if name_locked {
+            vec![ferrofin_model::entities::MetadataField::Name]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            super::apply_zero_display_name(&mut row, &fields, Some(&options)),
+            current != expected
+        );
+        assert_eq!(row.name.as_deref(), Some(expected));
+    }
+
     use super::*;
     use crate::tmdb::TmdbPerson;
     use crate::tvdb::TvdbTranslation;

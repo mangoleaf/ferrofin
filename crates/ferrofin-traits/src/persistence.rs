@@ -99,6 +99,17 @@ pub struct MediaStreamQuery {
     pub index: Option<i32>,
 }
 
+/// An immediate Folder child together with the source of its membership.
+/// Linked-only children need the owning playlist/collection's per-user check;
+/// a physical child that is also linked retains its physical membership.
+#[derive(Debug, Clone)]
+pub struct FolderChild {
+    /// The stored child row.
+    pub item: BaseItemEntity,
+    /// True when membership comes only from a LinkedChildren edge.
+    pub linked: bool,
+}
+
 /// Filter selecting media attachments to fetch.
 ///
 /// Port of `MediaBrowser.Controller.Persistence.MediaAttachmentQuery`.
@@ -164,7 +175,8 @@ pub struct NextUpEpisodeBatchResult {
 /// manager's to apply — the repository only reads.
 #[derive(Debug, Clone)]
 pub struct PlaylistAccessColumns {
-    /// `FerrofinPlaylists.OwnerUserId` (`None` for a legacy or API-key playlist).
+    /// `FerrofinPlaylists.OwnerUserId` (`None` for a legacy playlist, an older
+    /// build's user-less API-key create, or a `Data` naming no owner).
     pub owner_user_id: Option<String>,
     /// `FerrofinPlaylists.OpenAccess` (`None` only when the meta row is absent).
     pub open_access: Option<i64>,
@@ -211,6 +223,48 @@ pub trait ItemRepository: Send + Sync {
     /// Propagates the repository failure.
     async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// Applies the pinned `UserViewBuilder.Filter` rules to already-visible
+    /// immediate children. Preserves input order; sorting, grouping, adjacency,
+    /// counting and paging belong to the caller. Request-only query filters
+    /// outside that source whitelist are ignored.
+    async fn filter_folder_children(
+        &self,
+        rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = (rows, filter);
+        Err(ServiceError::backend(
+            "folder child filtering is not implemented",
+        ))
+    }
+
+    /// Sorts an already-filtered child set without grouping or paging. Name
+    /// sorts use the pinned stable ordinal comparison and `AiredEpisodeOrder`
+    /// the stable aired-order comparer (non-episodes after the episodes); an
+    /// empty OrderBy keeps input order. Other sorts retain the repository's
+    /// existing consumer.
+    async fn sort_folder_children(
+        &self,
+        rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let _ = (rows, filter);
+        Err(ServiceError::backend(
+            "folder child sorting is not implemented",
+        ))
+    }
+
+    /// Loads immediate physical children followed by linked children in source
+    /// order. Does not filter, group or page; the Folder consumer applies access
+    /// and the pinned GetResult pipeline to these rows.
+    async fn get_folder_children(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<FolderChild>, ServiceError> {
+        let _ = query;
+        Err(ServiceError::backend("folder children are not implemented"))
+    }
+
     /// Batch extra owners for video versions and the series allowed to group.
     async fn get_extra_owner_ids_batch(
         &self,
@@ -237,6 +291,22 @@ pub trait ItemRepository: Send + Sync {
     /// as opposed to what a query returns — has to ask this, or it will treat
     /// every library as visible to everybody.
     async fn visible_library_ids(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError>;
+
+    /// The item query whose access settings bound what `user` may see through
+    /// the items behind a name, or `None` when no library, parental rating or
+    /// tag rule hides anything from them.
+    ///
+    /// Port of `PersonsController.BuildAccessFilter` (Jellyfin 12.2): an
+    /// `InternalItemsQuery(user) { IncludeOwnedItems = true }` with the user's
+    /// restrictions resolved and `ConfigureUserAccess` applied, built only when
+    /// `User.HasContentRestrictions()`. Repositories must supply policy
+    /// evaluation; the default fails closed.
+    async fn build_access_filter(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        Err(ServiceError::backend("access filtering is not configured"))
+    }
 
     /// Returns the ids of every item whose metadata the user has **locked**
     /// (`IsLocked = 1`).
@@ -293,32 +363,32 @@ pub trait ItemRepository: Send + Sync {
             .collect())
     }
 
-    /// The "latest media" rows of a **tvshows or music** library — port of C#
-    /// `BaseItemRepository.GetLatestItemList`.
+    /// The "latest media" rows of a **tvshows, music or movies** library — port
+    /// of C# `BaseItemRepository.GetLatestItemList`.
     ///
-    /// The two types answer differently, and they track different upstream
-    /// versions — the music arm is v12's rewrite, the tvshows arm is still
-    /// 10.11.8's (v12 replaced that one too, with `GetLatestTvShowItems`;
-    /// porting it is its own work item):
+    /// The three types answer differently (all v12):
     ///
-    /// - **tvshows** (v10.11.8) — one grouped-threshold statement: the filter's predicates
-    ///   are grouped by `SeriesName`, the newest `filter.limit` groups'
-    ///   `MAX(DateCreated)` are taken, and every row at or above the *smallest*
-    ///   of those maxima is returned in the filter's `order_by`, unpaged — so
-    ///   `limit` caps groups, not rows, and the caller buckets the rows by
-    ///   container afterwards;
+    /// - **tvshows** (`GetLatestTvShowItems`) — ONE row for each of the newest
+    ///   `filter.limit` series (by the newest row the filter matches, grouped
+    ///   by `SeriesName`): the Episode, Season or Series card chosen from that
+    ///   series' rows added within 24 hours of its newest one, a container the
+    ///   filter's parental limits hide replaced by the episode, newest first.
+    ///   The filter's `order_by` and `start_index` play no part;
     /// - **music** (v12) — the newest `filter.limit` `MusicAlbum` rows
     ///   themselves, ordered `DateCreated DESC, Id DESC`, scoped by the filter's
     ///   top parent ids — which reads no track at all — or, for an
     ///   ancestor-scoped caller, to the albums above a row the filter matches,
     ///   which is the one shape that still runs the caller's track query. The
-    ///   filter's `order_by` is not used, and the rows need no further grouping.
+    ///   filter's `order_by` is not used, and the rows need no further grouping;
+    /// - **movies** (`GetLatestMovieItems`) — the rows the filter matches that
+    ///   carry a presentation key, newest first (`DateCreated DESC, Id DESC`),
+    ///   the first of each key, `filter.limit` of them. The filter's `order_by`
+    ///   and `start_index` play no part, and the caller groups the rows.
     ///
     /// Any other collection type returns an empty list and the caller uses
     /// [`get_item_list`](Self::get_item_list) for it. Note that is wider than
-    /// the C# early exit, which also has `movies` and `unknown` arms — not
-    /// porting those two is an owner-scoped divergence, recorded where the
-    /// branch is taken (`ferrofin-core` `user_view_manager::items_for_latest_items`).
+    /// the C# early exit, which also has an `unknown` arm (a mixed library's
+    /// latest movies and shows): not ported yet, gl-383.
     async fn get_latest_item_list(
         &self,
         filter: &InternalItemsQuery,
@@ -356,6 +426,54 @@ pub trait ItemRepository: Send + Sync {
         Ok(map)
     }
 
+    /// [`Self::get_items_by_primary_version_batch`] with, beside each row,
+    /// whether some other row names it as its `PrimaryVersionId` — whether
+    /// it has versions of its own — read in the same query, so a walk down
+    /// a version group stops where nothing hangs below. The default reads
+    /// the rows alone and flags every one (a walk then asks again for each).
+    async fn get_items_by_primary_version_batch_flagged(
+        &self,
+        primary_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
+        Ok(self
+            .get_items_by_primary_version_batch(primary_ids)
+            .await?
+            .into_iter()
+            .map(|(id, rows)| (id, rows.into_iter().map(|row| (row, true)).collect()))
+            .collect())
+    }
+
+    /// The merged versions of `primary_id` — what
+    /// `LibraryManager.GetLinkedAlternateVersions` lists and
+    /// `DELETE /Videos/{id}/AlternateSources` splits: the children of its
+    /// `LinkedAlternateVersion` (3) rows, and the rows that point at it
+    /// (`PrimaryVersionId`) without being a local version of it — not owned
+    /// by it (`OwnerId`, no `ExtraType`) and no `LocalAlternateVersion` (2)
+    /// row under it (a merge Ferrofin modelled by the pointer alone). Never
+    /// a local version: those are the scan's.
+    ///
+    /// The default reads the pointers alone (for stub/fake repositories).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn get_merged_version_ids(&self, primary_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+        let primary = primary_id.hyphenated().to_string();
+        Ok(self
+            .get_items_by_primary_version(primary_id)
+            .await?
+            .into_iter()
+            .filter(|row| {
+                row.extra_type.is_some()
+                    || !row
+                        .owner_id
+                        .as_deref()
+                        .is_some_and(|owner| owner.eq_ignore_ascii_case(&primary))
+            })
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect())
+    }
+
     /// Returns every `(item_id, value)` pair stored under `provider_key` in
     /// `BaseItemProviders`.
     ///
@@ -376,30 +494,72 @@ pub trait ItemRepository: Send + Sync {
     /// yields an empty vector.
     async fn get_image_infos(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError>;
 
+    /// The image rows of several items in one read, keyed by item id, each
+    /// item's rows in the [`get_image_infos`](Self::get_image_infos) order; an
+    /// item without images is absent.
+    ///
+    /// The default reads one item at a time, so test doubles compile
+    /// unchanged; the concrete repository overrides it with a batched read.
+    async fn get_image_infos_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
+        let mut map = HashMap::new();
+        for &id in item_ids {
+            let images = self.get_image_infos(id).await?;
+            if !images.is_empty() {
+                map.insert(id, images);
+            }
+        }
+        Ok(map)
+    }
+
+    /// [`Self::get_image_infos`] in the same read as whether the item's images
+    /// are auto-oriented when served: `ImageProcessor.ProcessImage`'s
+    /// `autoOrient`, true for a `Photo` whose stored orientation is unknown or
+    /// not `TopLeft`. The default reads the rows and orients nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError`] on a storage failure.
+    async fn get_image_infos_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
+        Ok((self.get_image_infos(item_id).await?, false))
+    }
+
     /// Swaps the two `image_type` images at `index1` and `index2` for an item,
     /// reordering them.
     ///
-    /// Port of the persistence side of `BaseItem.SwapImagesAsync`: C# swaps the
-    /// on-disk files backing the two rows and clears their cached dimensions;
-    /// against the stored image rows the equivalent is to exchange the two rows'
-    /// `Path` (and reset `Width`/`Height` to `0` and stamp `DateModified`), so the
-    /// image that was at `index1` now resolves at `index2` and vice versa.
+    /// Port of `BaseItem.SwapImagesAsync`: exchanges the **contents** of the two
+    /// image files (each row keeps its path), then clears the rows' cached
+    /// dimensions and blur hash and re-reads their modified times from the
+    /// files, so the image that was at `index1` is now served at `index2` and
+    /// vice versa.
     ///
     /// Indices are `0`-based positions **within** the `image_type` group, in the
     /// same order [`get_image_infos`](Self::get_image_infos) returns. When either
     /// index is out of range the swap is a no-op (mirroring C#'s "nothing to do"
-    /// when `GetImageInfo` returns `null`).
+    /// when `GetImageInfo` returns `null`); so is a slot against itself, whose
+    /// file copy onto itself would throw upstream.
+    ///
+    /// Returns whether the two files were swapped — the only case in which
+    /// upstream reaches its repository save. A missing slot, or a non-local
+    /// (remote) path on either side, is "nothing to do".
     ///
     /// # Errors
     ///
-    /// [`ServiceError::Backend`] on a storage failure.
+    /// [`ServiceError::Backend`] when a file cannot be exchanged (missing, not
+    /// writable) — the rows and the other file are left as they were — or on a
+    /// storage failure.
     async fn swap_item_images(
         &self,
         item_id: Uuid,
         image_type: ImageType,
         index1: i32,
         index2: i32,
-    ) -> Result<(), ServiceError>;
+    ) -> Result<bool, ServiceError>;
 
     /// Gets genres with their item counts.
     async fn get_genres(
@@ -494,6 +654,21 @@ pub trait ItemRepository: Send + Sync {
         Ok(self.get_query_filters_legacy(filter).await?.years)
     }
 
+    /// Gets the tag names of the matching items, one per clean value, in value
+    /// order — the one facet `/Items/Filters2` needs from the legacy set. See
+    /// [`LibraryManager::get_tag_names`].
+    ///
+    /// The default reads the whole legacy filter aggregate; an implementation
+    /// that can answer the tags alone should override this.
+    ///
+    /// [`LibraryManager::get_tag_names`]: crate::library::LibraryManager::get_tag_names
+    async fn get_tag_names(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<String>, ServiceError> {
+        Ok(self.get_query_filters_legacy(filter).await?.tags)
+    }
+
     /// Reports whether all children of `id` are played for the given user.
     async fn get_is_played(
         &self,
@@ -542,6 +717,20 @@ pub trait ItemPersistenceService: Send + Sync {
     /// [`ServiceError::Backend`] on a storage failure; nothing is deleted
     /// then.
     async fn delete_items(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError>;
+
+    /// The rows [`Self::delete_items`] of `ids` would delete — the same
+    /// closure (the items, their `ParentId` descendants and the extras they
+    /// own, recursively) — each in full, read without deleting anything, in
+    /// discovery order (a row's descendants come after it). Ids with no
+    /// stored row are left out.
+    ///
+    /// A delete reads it first: it cleans each deleted row's metadata and
+    /// extracted data, which needs the rows' paths and kinds.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn deletion_closure(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
     /// Persists (inserts or updates) the given item rows.
     ///
@@ -628,6 +817,131 @@ pub trait ItemPersistenceService: Send + Sync {
         primary_version_id: Option<Uuid>,
     ) -> Result<(), ServiceError>;
 
+    /// Writes each primary video's local alternate versions — the files the
+    /// resolver grouped with it (`Video.LocalAlternateVersions`), as stored
+    /// ids in the resolver's order — the way upstream's save of a video does
+    /// (`ItemPersistenceService.SaveItems`, `ItemPersistenceService.cs:651-780`).
+    /// Per [`LocalVersionGroup`]:
+    ///
+    /// - each listed version gets a `LinkedChildren` row under the primary
+    ///   (`ChildType` 2, `LocalAlternateVersion`), first and in order; the
+    ///   pair's linked (3) row gives way to it (local outranks linked within
+    ///   the primary's own list, `:688-692`). A video is never its own
+    ///   version, and a version not stored is skipped (`:705-714`);
+    /// - each listed version whose `PrimaryVersionId` is not the primary is
+    ///   pointed at it (`PrimaryVersionId`, and `PresentationUniqueKey` = the
+    ///   primary's "N" id) — except the one the primary itself points at
+    ///   (`:731`);
+    /// - a version row of the primary the scanner made and no longer lists
+    ///   goes: its child is owned by the primary (`OwnerId`, no `ExtraType`)
+    ///   while the group is known, or is in `released`. Upstream also
+    ///   deletes such an owned child (`:758-781`); here the row stays for the
+    ///   scan's prune to judge (owner decision D9b). A released child still
+    ///   pointing at the primary and no longer owned by it points at nothing
+    ///   again. Every other version row (a merge's) is left alone, and rows
+    ///   under other parents are never touched.
+    ///
+    /// Reads the groups in batches, and writes — targeted columns and the
+    /// primaries' version rows only — just for the groups that differ. The
+    /// default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is written
+    /// then.
+    async fn sync_local_versions(&self, groups: &[LocalVersionGroup]) -> Result<(), ServiceError> {
+        let _ = groups;
+        Ok(())
+    }
+
+    /// Writes what a library scan read of the playlists it resolved off disk
+    /// (`PlaylistResolver`): each one's ownership row — owned by nobody,
+    /// open to everyone, as the resolver creates it — when it has none, and
+    /// the members its local reader found, when it ran
+    /// ([`ScannedPlaylist::members`]).
+    ///
+    /// The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn sync_scanned_playlists(
+        &self,
+        playlists: &[ScannedPlaylist],
+    ) -> Result<(), ServiceError> {
+        let _ = playlists;
+        Ok(())
+    }
+
+    /// Copies each owner video's metadata onto the videos it owns, as a save
+    /// (or refresh) of the owner does upstream, and returns how many owned
+    /// rows were written.
+    ///
+    /// - With `versions`, its local alternate versions (`OwnerId` =
+    ///   `PrimaryVersionId` = the owner, no `ExtraType`) take its overview,
+    ///   production year, premiere date, community rating, official rating,
+    ///   genres, provider ids and images — `Video.UpdateToRepositoryAsync`
+    ///   (`Video.cs:704-726`), run on every save of the primary.
+    /// - With `parts`, its stacked parts (owned, no `ExtraType`, no
+    ///   `PrimaryVersionId`) take its title metadata — genres, studios,
+    ///   production locations, community and critic rating, overview,
+    ///   official and custom rating, and the year and premiere date it has —
+    ///   the `copyTitleMetadata` every refresh of a primary runs for each part
+    ///   (`Video.RefreshedOwnedItems` → `BaseItem.RefreshMetadataForOwnedItem`,
+    ///   `BaseItem.cs:2805-2858`).
+    ///
+    /// Each written row's parental score follows the ratings it was given
+    /// (`BaseItem.OnMetadataChanged`, run by every save). Only a row that
+    /// differs is written, so a call over owners whose owned rows already
+    /// match writes nothing. The default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn copy_metadata_to_owned_videos(
+        &self,
+        owner_ids: &[Uuid],
+        versions: bool,
+        parts: bool,
+    ) -> Result<usize, ServiceError> {
+        let _ = (owner_ids, versions, parts);
+        Ok(0)
+    }
+
+    /// Gives the extras of each refreshed owner what its refresh gives them
+    /// upstream (`BaseItem.RefreshExtras`), and returns how many extras were
+    /// written. An owner's extras are those it owns (`OwnerId`, with an
+    /// `ExtraType`) and those its local alternate versions own, all of which
+    /// its primary maintains (`Video.GetOwnedVersionIds`) and whose metadata
+    /// they take; an alternate version linked rather than local refreshes no
+    /// extras (`Video.RefreshedOwnedItems`).
+    ///
+    /// - When a refresh of the group [`changed`](OwnerExtrasRefresh::changed)
+    ///   its extras or ran in full, or found fewer than are stored (one is
+    ///   gone), every extra takes the title metadata: genres, studios,
+    ///   production locations, community and critic rating, overview,
+    ///   official and custom rating, and the year and premiere date the owner
+    ///   has (`RefreshMetadataForOwnedItem`'s `copyTitleMetadata`).
+    /// - Otherwise each takes only the owner's year and premiere date
+    ///   (`InheritDatesFromOwner`), which an owner often learns after its
+    ///   extras were created.
+    ///
+    /// Each written row's parental score follows the ratings it was given,
+    /// and its genre and studio links follow its genres and studios. Only a
+    /// row that differs is written, so a quiet rescan writes nothing. The
+    /// default is a no-op (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn copy_owner_metadata_to_extras(
+        &self,
+        refreshes: &[OwnerExtrasRefresh],
+    ) -> Result<usize, ServiceError> {
+        let _ = refreshes;
+        Ok(0)
+    }
+
     /// Points an item's `ParentId` at `parent_id` without touching any other
     /// column, and without a write at all when it already does.
     ///
@@ -637,6 +951,26 @@ pub trait ItemPersistenceService: Send + Sync {
     /// and an unconditional `UPDATE` would take the writer lock on every
     /// `GET /Library/VirtualFolders`.
     async fn set_parent_id(&self, item_id: Uuid, parent_id: Uuid) -> Result<(), ServiceError>;
+
+    /// Merges `fields` into the `Data` JSON of item `item_id`, keeping every
+    /// other key — `Data` carries `CollectionType`, `PhysicalFolderIds`,
+    /// `PhysicalLocationsList` and the rest on a `CollectionFolder`. Writes
+    /// nothing when every field already holds its value, or when there is no
+    /// such row.
+    ///
+    /// The default (a stub/fake service) writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn merge_data_fields(
+        &self,
+        item_id: Uuid,
+        fields: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), ServiceError> {
+        let _ = (item_id, fields);
+        Ok(())
+    }
 
     /// Records a library folder's collection type (`movies`, `tvshows`, …) in
     /// the row's `Data` blob, leaving every other column and every other key in
@@ -668,6 +1002,23 @@ pub trait ItemPersistenceService: Send + Sync {
         item_id: Uuid,
         values: &[(i32, String)],
     ) -> Result<(), ServiceError>;
+
+    /// [`save_item_values`](Self::save_item_values) for several items, in one
+    /// write where the store can: the Live TV guide mirror rewrites the genres
+    /// of thousands of airings on a first import, and one transaction each
+    /// holds the single writer for every one of them.
+    ///
+    /// All or nothing per call where the store batches: a failure leaves none
+    /// of `items` written. The default writes the items one at a time.
+    async fn save_item_values_for_items(
+        &self,
+        items: &[(Uuid, Vec<(i32, String)>)],
+    ) -> Result<(), ServiceError> {
+        for (item_id, values) in items {
+            self.save_item_values(*item_id, values).await?;
+        }
+        Ok(())
+    }
 
     /// Whether an item row with this id exists (used to self-heal a library's
     /// `CollectionFolder` row before parenting scanned children to it).
@@ -754,6 +1105,24 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// [`Self::save_item_images`] for many items, each with its own image
+    /// list. The real service writes a chunk of items per transaction, for a
+    /// caller that writes thousands at once (a guide refresh's programmes);
+    /// the default writes them one at a time.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn save_items_images(
+        &self,
+        items: &[(Uuid, Vec<ItemImageInfo>)],
+    ) -> Result<(), ServiceError> {
+        for (item_id, images) in items {
+            self.save_item_images(*item_id, images).await?;
+        }
+        Ok(())
+    }
+
     /// The stored dimensions/blurhash of every image row attached to
     /// `item_ids`, read in one batch.
     ///
@@ -821,14 +1190,31 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(None)
     }
 
+    /// The stored seasons with no path (no folder of their own) whose
+    /// `ParentId` is one of `series_ids` — the seasons a series' episodes
+    /// with no season folder are grouped into, which the library scan keeps
+    /// by series and number (`SeriesMetadataService.CreateSeasonsAsync`).
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then plans each season's derived id.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn pathless_seasons(
+        &self,
+        series_ids: &[Uuid],
+    ) -> Result<Option<Vec<PathlessSeasonRow>>, ServiceError> {
+        let _ = series_ids;
+        Ok(None)
+    }
+
     /// The `TopParentId`s the items of `library` (a `CollectionFolder` id)
-    /// carry: the library itself, which is what every row Ferrofin writes
-    /// carries, and — on a database adopted from Jellyfin — the physical
-    /// folders its `PhysicalFolderIds` names, which is what Jellyfin wrote
-    /// (`BaseItem.GetTopParent`: the item's ancestor directly under the
-    /// `AggregateFolder`). An adopted row keeps the physical folder until a
-    /// scan saves it, so a library's rows are read by both until then. The
-    /// library id comes first; a native library answers it alone.
+    /// carry: the folders of its locations its `PhysicalFolderIds` names,
+    /// which is what Jellyfin and Ferrofin write (`BaseItem.GetTopParent`:
+    /// the item's ancestor directly under the `AggregateFolder`), and the
+    /// library itself, which rows an older Ferrofin scan wrote carry until a
+    /// scan saves them. The library id comes first.
     ///
     /// `Ok(None)` means the service cannot answer (the default, for
     /// stub/fake services); the scan then scopes the library by its own id.
@@ -844,9 +1230,10 @@ pub trait ItemPersistenceService: Send + Sync {
     /// The stored items whose `TopParentId` is one of `top_parent_ids` (a
     /// library's, [`library_top_parents`](Self::library_top_parents)) that a
     /// library scan's pruning weighs: every one of them but an owned
-    /// non-extra (a part or a version stored under its owner) and an
-    /// alternate version whose primary is in the same library — the rows a
-    /// library read lists. Only the columns the pruning needs, unordered.
+    /// non-extra (a part or a version stored under its owner); an unowned
+    /// alternate version is weighed too (Jellyfin 12.1's
+    /// `IncludeAlternateVersions` validation read). Only the columns the
+    /// pruning needs, unordered.
     ///
     /// `Ok(None)` means the service cannot answer (the default, for
     /// stub/fake services); the scan then reads the library through the item
@@ -904,6 +1291,183 @@ pub trait ItemPersistenceService: Send + Sync {
         parents: &[Uuid],
     ) -> Result<Option<Vec<ItemChildLink>>, ServiceError> {
         let _ = parents;
+        Ok(None)
+    }
+
+    /// The paths of every stored row in the local groups the items at
+    /// `paths` belong to: a primary video, its stacked parts and local
+    /// alternate versions, and theirs — the rows linked by `OwnerId` that are
+    /// no extra (an extra has an `ExtraType`), followed up from each item to
+    /// its group's primary and down from there. A path-scoped scan widens a
+    /// changed file to its whole group with it, as the full scan's walk plans
+    /// a group whole.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the scan then scans the paths themselves.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn local_group_paths(
+        &self,
+        paths: &[String],
+    ) -> Result<Option<Vec<String>>, ServiceError> {
+        let _ = paths;
+        Ok(None)
+    }
+
+    /// Takes the stacked parts and local alternate versions `ids` out of
+    /// their groups — `OwnerId` and `PrimaryVersionId` cleared, the
+    /// presentation key their own id again, the `LinkedChildren` rows that
+    /// list them as a local version (`ChildType` 2) gone — so deleting their
+    /// owner no longer takes them with it, and the next scan groups them
+    /// afresh. In one transaction; each released row is announced as
+    /// updated (`ItemUpdated`), as a save is. Returns whether it did: `false` (the
+    /// default, for stub/fake services) when the service cannot, and the
+    /// caller must then not delete their owner.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is written
+    /// then.
+    async fn release_owned_versions(&self, ids: &[Uuid]) -> Result<bool, ServiceError> {
+        let _ = ids;
+        Ok(false)
+    }
+
+    /// Every library (`CollectionFolder` row) with its media locations — the
+    /// `PhysicalLocationsList` of its `Data`, as stored — and the scanner
+    /// generation that last completed a full scan of it
+    /// ([`Self::record_library_scanned`]). The default (stub/fake services)
+    /// knows no library.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn library_locations(&self) -> Result<Vec<LibraryLocations>, ServiceError> {
+        Ok(Vec::new())
+    }
+
+    /// Records that a full scan of `library` by scanner generation
+    /// `generation` ran to its end (Ferrofin's own bookkeeping,
+    /// `FerrofinMeta`). The default (stub/fake services) records nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn record_library_scanned(
+        &self,
+        library: Uuid,
+        generation: &str,
+    ) -> Result<(), ServiceError> {
+        let _ = (library, generation);
+        Ok(())
+    }
+
+    /// A video's version rows — the `LinkedChildren` rows under `primary`
+    /// of `ChildType` 2 (`LocalAlternateVersion`) and 3
+    /// (`LinkedAlternateVersion`) — as `(child id, child type)`, each type in
+    /// `SortOrder` (`LinkedChildrenService.GetLinkedChildrenIds`, which
+    /// upstream's `GetLocalAlternateVersionIds` / `GetLinkedAlternateVersions`
+    /// read). The default (stub/fake services) knows none.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn version_links(&self, primary: Uuid) -> Result<Vec<(Uuid, i32)>, ServiceError> {
+        let _ = primary;
+        Ok(Vec::new())
+    }
+
+    /// Promotes one of a deleted primary video's versions in its place —
+    /// the writes `LibraryManager.DeleteItem` makes before it deletes a
+    /// primary (`LibraryManager.cs:461-537`), in one transaction:
+    ///
+    /// - the new primary is no version and owned by nothing any more
+    ///   (`PrimaryVersionId` and `OwnerId` cleared, its presentation key its
+    ///   own "N" id, `SetPrimaryVersionId(null)`), and its `Data`
+    ///   `LocalAlternateVersions` is [`VersionPromotion::local_versions`];
+    /// - the old primary's version rows (`ChildType` 2 and 3) move under it,
+    ///   in their order, except the one naming itself — what its save writes
+    ///   from the `LocalAlternateVersions` / `LinkedAlternateVersions` it took
+    ///   over;
+    /// - every other version points at it (`PrimaryVersionId`, presentation
+    ///   key), and is owned by it when it is a local version, by nothing
+    ///   otherwise.
+    ///
+    /// So deleting the old primary, which follows `OwnerId`, no longer takes
+    /// them. Each written row is announced as updated (`ItemUpdated`). The
+    /// default (stub/fake services) writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is written
+    /// then.
+    async fn promote_version(&self, promotion: &VersionPromotion) -> Result<(), ServiceError> {
+        let _ = promotion;
+        Ok(())
+    }
+
+    /// Takes a deleted version out of its primary's lists — what
+    /// `LibraryManager.DeleteItem` does before deleting an alternate version
+    /// (`LibraryManager.cs:539-552`): the primary's `LinkedAlternateVersion`
+    /// row for it goes, and so does `version_path` from the primary's `Data`
+    /// `LocalAlternateVersions` (compared ignoring case). The default
+    /// (stub/fake services) writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn drop_version(
+        &self,
+        primary: Uuid,
+        version: Uuid,
+        version_path: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let _ = (primary, version, version_path);
+        Ok(())
+    }
+
+    /// Moves each stored item of `moves` to its new id and type — the row
+    /// and every row that references it (user data, links, streams, images,
+    /// …) — so what is keyed to the old id follows the item: what a scan asks
+    /// when a file's item kind changed and its id with it (owner decisions D4
+    /// and D9b). A move whose old id is not stored, or whose new one already
+    /// is, is skipped — unless `from` is `to`: then the stored item stays
+    /// where it is and only its [`ItemRekey::merged`] rows fold into it.
+    /// After the move each merged row folds into the item: its user data (a
+    /// row the item already has for the same user and key kept by the later
+    /// `LastPlayedDate`, then the higher `PlayCount`), its playlist and
+    /// collection entries and every other row's reference to it follow, and
+    /// the row is deleted. Returns the moves made.
+    ///
+    /// The default (a stub/fake service) moves nothing; the scan then plans
+    /// the item anew and the old row is pruned.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure; nothing is moved then.
+    async fn rekey_items(&self, moves: &[ItemRekey]) -> Result<Vec<ItemRekey>, ServiceError> {
+        let _ = moves;
+        Ok(Vec::new())
+    }
+
+    /// What users made of each stored item of `ids` — its user data and the
+    /// playlists and collections that link it — for choosing which of
+    /// several rows standing for one item to keep
+    /// ([`ItemUserWeight::keep_rank`]). An id not stored is left out.
+    ///
+    /// `Ok(None)` means the service cannot answer (the default, for
+    /// stub/fake services); the rows are then ranked by id alone.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn item_user_weights(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<Option<Vec<ItemUserWeight>>, ServiceError> {
+        let _ = ids;
         Ok(None)
     }
 
@@ -991,6 +1555,36 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(HashMap::new())
     }
 
+    /// The repository save an image mutation performs after it changed an item
+    /// (`BaseItem.UpdateToRepositoryAsync(ItemUpdateType.ImageUpdate)`): stamps
+    /// the row's `DateLastSaved` (so its Etag moves) and announces `ItemUpdated`
+    /// to the library-changed notifier. Returns whether the row exists.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn touch_item_updated(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let _ = item_id;
+        Ok(false)
+    }
+
+    /// Announces `ItemAdded` for a row created outside
+    /// [`crate::library::LibraryManager::create_items`] (which announces its
+    /// own), as `LibraryManager.CreateItem` raises it for every new item.
+    /// Returns whether the row exists.
+    ///
+    /// The default announces nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn report_item_added(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let _ = item_id;
+        Ok(false)
+    }
+
     /// Writes an existing row's `DateLastMediaAdded`, when it differs, with
     /// its `DateLastSaved` stamp and nothing else — the targeted write of
     /// [`folder_last_media_added`](Self::folder_last_media_added)'s answer,
@@ -1011,6 +1605,25 @@ pub trait ItemPersistenceService: Send + Sync {
         at: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<bool, ServiceError> {
         let _ = (item_id, at);
+        Ok(false)
+    }
+
+    /// Writes an existing row's rating columns from `item` — `OfficialRating`,
+    /// `UnratedType` and the parental score (`InheritedParentalRatingValue` /
+    /// `…SubValue`) — with its `DateLastSaved` stamp and nothing else, then
+    /// announces `ItemUpdated`. The save behind a box set's or playlist's
+    /// re-rate from its members: a whole-row [`save_items`](Self::save_items)
+    /// of a row read earlier would put back every other column as it was
+    /// read, `Data` (the playlist shares) included. Returns whether the row
+    /// was written.
+    ///
+    /// The default writes nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn update_rating(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let _ = item;
         Ok(false)
     }
 
@@ -1047,6 +1660,20 @@ pub trait ItemPersistenceService: Send + Sync {
     ///
     /// [`ServiceError::Backend`] on a storage failure.
     async fn superseded_by_name_artists(&self) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(Vec::new())
+    }
+
+    /// The ids of the unlocked `MusicArtist` rows accessed by name (no
+    /// `ParentId`) whose `CleanName` no artist or album-artist value an item
+    /// still maps to carries, in id order: the by-name artists the library
+    /// no longer credits (upstream `ArtistsValidator`'s dead artists).
+    ///
+    /// The default knows of no row (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn dead_by_name_artists(&self) -> Result<Vec<Uuid>, ServiceError> {
         Ok(Vec::new())
     }
 
@@ -1129,7 +1756,7 @@ pub trait ItemPersistenceService: Send + Sync {
     }
 
     /// Sets a single image (`image`) on an item, replacing any existing rows of
-    /// the same [`ImageType`](ferrofin_model::entities::ImageType) — the write path
+    /// the same [`ImageType`] — the write path
     /// for an uploaded poster/backdrop/logo (`ImageController.SetItemImage`).
     ///
     /// The default is a no-op; the real service deletes the item's rows of that
@@ -1147,10 +1774,25 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
-    /// Deletes an item's image(s) of `image_type`, returning the on-disk paths of
+    /// Replaces a multiple-image slot or appends beyond the current last slot.
+    /// Single-image types retain the ordinary replacement operation.
+    ///
+    /// # Errors
+    /// Returns a storage failure. Hosts supporting indexed artwork override this
+    /// compatibility adapter; single-image stores use `set_item_image`.
+    async fn set_item_image_at_index(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+        _index: usize,
+    ) -> Result<(), ServiceError> {
+        self.set_item_image(item_id, image).await
+    }
+
+    /// Deletes one item image of `image_type`, returning the on-disk path of
     /// the removed rows so the caller can delete the files
-    /// (`ImageController.DeleteItemImage`). `index` is reserved for per-index
-    /// deletes; the current store deletes every row of the type.
+    /// (`ImageController.DeleteItemImage`). Deletes one slot in insertion order;
+    /// an omitted index selects zero and an invalid index removes nothing.
     ///
     /// The default removes nothing.
     ///
@@ -1235,6 +1877,22 @@ pub trait ItemPersistenceService: Send + Sync {
     /// delivered in separate scans. The default is a no-op for fake stores.
     async fn reattach_all_user_data(&self) -> Result<(), ServiceError> {
         Ok(())
+    }
+
+    /// A counter that moves whenever history is detached for recovery (an item
+    /// with user data deleted): two equal readings mean nothing was detached
+    /// between them, so compare readings for equality only (a database
+    /// restored from an older backup reads lower). It counts per database,
+    /// whichever service instance did the detaching, and survives a restart.
+    ///
+    /// `None` means the store cannot tell, so a caller must assume history was
+    /// detached; the default, for stub/fake services.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn user_data_detach_epoch(&self) -> Result<Option<i64>, ServiceError> {
+        Ok(None)
     }
 
     /// Recomputes and persists inherited values across the item tree.
@@ -1341,14 +1999,19 @@ pub trait ItemCountService: Send + Sync {
         ancestor_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError>;
 
-    /// Gets played/total counts from the linked-children of `parent_id`.
+    /// Gets played/total counts of the countable leaves below the links of
+    /// `parent_id` (a box set or playlist), following linked folders down
+    /// (`GetPlayedAndTotalCountFromLinkedChildren`).
     async fn get_played_and_total_count_from_linked_children(
         &self,
         filter: &InternalItemsQuery,
         parent_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError>;
 
-    /// Batch-fetches played/total counts for several folders.
+    /// Batch-fetches played/total counts for several folders. A folder whose
+    /// counts are 0/0 has no entry (`GetPlayedAndTotalCountBatch`): the DTO
+    /// fill counts it per item (`Folder.FillUserDataDtoValues`), while the
+    /// `IsPlayed` filter reads a missing entry as 0/0 (`UserViewBuilder.Filter`).
     async fn get_played_and_total_count_batch(
         &self,
         folder_ids: &[Uuid],
@@ -1361,6 +2024,17 @@ pub trait ItemCountService: Send + Sync {
         parent_ids: &[Uuid],
         user_id: Option<Uuid>,
     ) -> Result<HashMap<Uuid, i32>, ServiceError>;
+
+    /// [`Self::get_child_count_batch`] for a user the caller has already read:
+    /// the same counts, without reading the user's row again.
+    async fn get_child_count_batch_for(
+        &self,
+        parent_ids: &[Uuid],
+        user: Option<&UserEntity>,
+    ) -> Result<HashMap<Uuid, i32>, ServiceError> {
+        let user_id = user.and_then(|user| Uuid::parse_str(&user.id).ok());
+        self.get_child_count_batch(parent_ids, user_id).await
+    }
 
     /// How many LINKED children each of `parent_ids` has — C#
     /// `Folder.LinkedChildren.Length`, the playlist-entry / merged-version edge
@@ -1595,6 +2269,209 @@ pub struct ItemPathRow {
     pub path: Option<String>,
     /// Its `ParentId`: where a path-less item sits.
     pub parent_id: Option<Uuid>,
+    /// Its `ExtraType`, set for an extra (a trailer, a theme song, …) and
+    /// for nothing else — an owned part or alternate version has none.
+    pub extra_type: Option<i32>,
+}
+
+/// An owner whose extras a refresh reached
+/// ([`ItemPersistenceService::copy_owner_metadata_to_extras`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerExtrasRefresh {
+    /// The owner: a primary item, or one of its local alternate versions (an
+    /// extra is owned by the version it is named after).
+    pub owner: Uuid,
+    /// The extras of `owner` the refresh found, when it looked for all of
+    /// them (`FindExtras`, run by a library scan); `None` when it did not.
+    pub found: Option<Vec<Uuid>>,
+    /// Whether the refresh created, re-owned or renamed one of them, or
+    /// ran in full (`FullRefresh` or "Replace all metadata").
+    pub changed: bool,
+}
+
+/// One stored season with no folder of its own
+/// ([`ItemPersistenceService::pathless_seasons`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathlessSeasonRow {
+    /// The season's id.
+    pub id: Uuid,
+    /// Its `ParentId`: the series it belongs to.
+    pub series_id: Uuid,
+    /// Its `IndexNumber`, the season number (`None`: "Season Unknown").
+    pub index_number: Option<i64>,
+    /// Its `Name`, which its episodes carry as their `SeasonName`.
+    pub name: Option<String>,
+}
+
+/// One library's media locations and the scanner generation that last
+/// completed a full scan of it ([`ItemPersistenceService::library_locations`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LibraryLocations {
+    /// The library's `CollectionFolder` id.
+    pub id: Uuid,
+    /// Its media folders, as stored (`%AppDataPath%`-style tokens unexpanded).
+    pub locations: Vec<String>,
+    /// The scanner generation of its last completed full scan; `None` when
+    /// this build's scanner (or any Ferrofin since the marker exists) never
+    /// finished one.
+    pub scanned_by: Option<String>,
+}
+
+/// A deleted primary video's version promoted in its place
+/// ([`ItemPersistenceService::promote_version`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VersionPromotion {
+    /// The primary being deleted.
+    pub old_primary: Uuid,
+    /// The version that takes its place.
+    pub new_primary: Uuid,
+    /// The new primary's `LocalAlternateVersions`: the old primary's less
+    /// the new primary's own path.
+    pub local_versions: Vec<String>,
+    /// The other remaining versions, each with whether it is a local
+    /// version (owned by the new primary) or a linked one (owned by nothing).
+    pub others: Vec<(Uuid, bool)>,
+}
+
+/// One primary video's local alternate versions, as a scan resolved them
+/// ([`ItemPersistenceService::sync_local_versions`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalVersionGroup {
+    /// The primary video.
+    pub primary: Uuid,
+    /// Its local versions, in the resolver's order — `None` when the scan
+    /// does not know the group (it was cancelled before the primary, or did
+    /// not plan it): then only `released` is acted on, and every other row
+    /// stays as it is.
+    pub versions: Option<Vec<Uuid>>,
+    /// The versions the scan took out of the group: owned by the primary
+    /// before the scan's save, and no longer.
+    pub released: Vec<Uuid>,
+}
+
+/// One playlist a library scan resolved off disk
+/// ([`ItemPersistenceService::sync_scanned_playlists`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScannedPlaylist {
+    /// The playlist.
+    pub id: Uuid,
+    /// The members its local reader returned, in order — `None` when no
+    /// reader ran or none had anything to say (`HasMetadata` false), which
+    /// leaves the stored members alone. Entries that resolve to no stored
+    /// item are dropped.
+    pub members: Option<Vec<PlaylistMember>>,
+    /// Whether `members` are a playlist file's entries
+    /// (`PlaylistItemsProvider`), which count only when one of them names a
+    /// stored item; a `playlist.xml`'s count whatever they name.
+    pub from_file: bool,
+    /// Whether `members` replace the stored ones, or come first with the
+    /// stored ones not among them appended (`PlaylistMetadataService.
+    /// MergeData` with `replaceData` false).
+    pub replace: bool,
+}
+
+/// One entry a playlist's local reader returned — the C# `LinkedChild`: an
+/// item id, a path, or both (the path wins when it names a stored item).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaylistMember {
+    /// The item's id (`playlist.xml`'s `<ItemId>`), the fallback when its
+    /// path names no stored item.
+    pub item_id: Option<Uuid>,
+    /// The item's path, resolved as `LibraryManager.FindByPath` does.
+    pub path: Option<String>,
+}
+
+/// One stored item to move to a new identity
+/// ([`ItemPersistenceService::rekey_items`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemRekey {
+    /// The stored id.
+    pub from: Uuid,
+    /// The id the item's new kind derives.
+    pub to: Uuid,
+    /// The new kind's stored type name.
+    pub type_name: String,
+    /// The folders named after the item that were moved from the old id's
+    /// name to the new one's, `(old, new)`: stored paths under the old folder
+    /// (images, external streams, chapter images) follow.
+    pub dirs: Vec<(String, String)>,
+    /// Other stored rows standing for the same item (at its path), folded
+    /// into it once moved: their user data, links and references follow,
+    /// and they are deleted. It may hold `to` itself, stored: that row folds
+    /// into `from` first, and `from` then moves to its id.
+    pub merged: Vec<Uuid>,
+    /// Whether the item is an extra (planned so): a merged row's version
+    /// link is never carried to it — the containers' version entries for
+    /// that row go instead.
+    pub extra: bool,
+}
+
+/// [`ItemUserWeight::keep_rank`]: the highest is kept.
+pub type ItemKeepRank = (
+    bool,
+    Option<chrono::DateTime<chrono::Utc>>,
+    i64,
+    bool,
+    bool,
+    std::cmp::Reverse<Uuid>,
+);
+
+/// What users made of one stored item
+/// ([`ItemPersistenceService::item_user_weights`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemUserWeight {
+    /// The item's id.
+    pub id: Uuid,
+    /// Whether any user data names it.
+    pub has_user_data: bool,
+    /// The latest `LastPlayedDate` of its user data.
+    pub last_played: Option<chrono::DateTime<chrono::Utc>>,
+    /// The highest `PlayCount` of its user data.
+    pub play_count: i64,
+    /// Whether a user edited it: `IsLocked`, or a locked field
+    /// (`BaseItemMetadataFields`).
+    pub edited: bool,
+    /// Whether a playlist or collection links it (`LinkedChildren`).
+    pub linked: bool,
+}
+
+impl ItemUserWeight {
+    /// The rank of the row to keep when several stand for one item, the
+    /// highest kept: a row with user data first, by the latest
+    /// `LastPlayedDate` then the highest `PlayCount` — upstream's order for
+    /// duplicate user data (`ItemPersistenceService.cs:103-110`) — then a
+    /// row a user edited, then a row a playlist or collection links, then
+    /// the lower id.
+    #[must_use]
+    pub fn keep_rank(&self) -> ItemKeepRank {
+        (
+            self.has_user_data,
+            self.last_played,
+            self.play_count,
+            self.edited,
+            self.linked,
+            std::cmp::Reverse(self.id),
+        )
+    }
+
+    /// Whether users made nothing of the row: no user data, no edit.
+    #[must_use]
+    pub fn is_bare(&self) -> bool {
+        !self.has_user_data && !self.edited
+    }
+
+    /// No user data and no links: a stored row whose weights were not read.
+    #[must_use]
+    pub fn none(id: Uuid) -> Self {
+        Self {
+            id,
+            has_user_data: false,
+            last_played: None,
+            play_count: 0,
+            edited: false,
+            linked: false,
+        }
+    }
 }
 
 /// One stored row under another, as
@@ -1605,8 +2482,14 @@ pub struct ItemChildLink {
     pub id: Uuid,
     /// Its `ParentId`.
     pub parent_id: Option<Uuid>,
-    /// Its `OwnerId` (an extra's owner).
+    /// Its `SeasonId`: an episode of a virtual season is stored under its
+    /// series and names the season only here.
+    pub season_id: Option<Uuid>,
+    /// Its `OwnerId` (an extra's owner, or the primary of a stacked part or
+    /// a local alternate version).
     pub owner_id: Option<Uuid>,
+    /// Its `ExtraType`: set for an extra, `None` for a part or a version.
+    pub extra_type: Option<i32>,
     /// Its `Path`.
     pub path: Option<String>,
 }
@@ -1692,6 +2575,19 @@ pub trait PeopleRepository: Send + Sync {
             map.insert(id, people);
         }
         Ok(map)
+    }
+
+    /// Derives each name's configured by-name Person item id, in input order.
+    ///
+    /// This is the read-only identity half of Jellyfin's GetPerson: it uses
+    /// Person.GetPath and the configured item-id mode, never a credit-row id
+    /// or a generic matching-name row. Callers must verify the derived item
+    /// exists and is a Person. An unwired identity yields missing slots.
+    async fn get_person_item_ids(
+        &self,
+        names: &[String],
+    ) -> Result<Vec<Option<Uuid>>, ServiceError> {
+        Ok(vec![None; names.len()])
     }
 
     /// Replaces an item's people with the given set, materializing a browsable

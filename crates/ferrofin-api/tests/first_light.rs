@@ -26,7 +26,7 @@ use ferrofin_api::test_support::{
 use ferrofin_model::system::{PublicSystemInfo, SystemInfo};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::RequestContext;
-use ferrofin_traits::system::{ServerApplicationHost, SystemManager};
+use ferrofin_traits::system::{LocalApiAccess, ServerApplicationHost, SystemManager};
 use tower::ServiceExt;
 
 /// A [`SystemManager`] that returns canned info, letting the real handler run.
@@ -68,6 +68,13 @@ impl SystemManager for StubSystem {
 struct StubHost;
 
 #[async_trait]
+impl LocalApiAccess for StubHost {
+    async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+        unimplemented!()
+    }
+}
+
+#[async_trait]
 impl ServerApplicationHost for StubHost {
     fn core_startup_has_completed(&self) -> bool {
         true
@@ -88,6 +95,9 @@ impl ServerApplicationHost for StubHost {
     }
     fn friendly_name(&self) -> String {
         "ferrofin-test".to_owned()
+    }
+    fn base_url(&self) -> String {
+        String::new()
     }
     async fn get_smart_api_url(&self, _request: &RequestContext) -> Result<String, ServiceError> {
         unimplemented!()
@@ -177,9 +187,9 @@ async fn public_system_info_is_served_without_auth() {
 }
 
 #[tokio::test]
-async fn system_info_requires_auth() {
-    // The fake auth service rejects the tokenless request, so the authenticated
-    // full-info route is `401` — proving the route exists and is guarded.
+async fn system_info_is_available_during_first_time_setup() {
+    // FirstTimeSetupOrIgnoreParentalControl allows anonymous system information
+    // while setup is incomplete, matching the upstream wizard flow.
     let router = create_router(state_with_system("Ferrofin"));
     let response = router
         .oneshot(
@@ -190,7 +200,7 @@ async fn system_info_requires_auth() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

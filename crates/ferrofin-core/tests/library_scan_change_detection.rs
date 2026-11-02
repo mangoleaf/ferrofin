@@ -62,6 +62,7 @@ use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 #[derive(Default)]
 struct RecordingProbe {
     probed: Mutex<Vec<String>>,
+    metadata: Mutex<Option<ferrofin_model::media_info::MediaInfo>>,
 }
 
 impl RecordingProbe {
@@ -135,6 +136,24 @@ impl MediaEncoder for RecordingProbe {
             ..MediaSourceInfo::default()
         })
     }
+    async fn get_media_info_full(
+        &self,
+        request: &MediaInfoRequest,
+    ) -> Result<ferrofin_model::media_info::MediaInfo, ServiceError> {
+        let source = self.get_media_info(request).await?;
+        let mut info = self
+            .metadata
+            .lock()
+            .expect("metadata")
+            .clone()
+            .unwrap_or_default();
+        info.media_source = MediaSourceInfo {
+            name: info.media_source.name,
+            container: info.media_source.container,
+            ..source
+        };
+        Ok(info)
+    }
     async fn extract_audio_image(
         &self,
         _path: &str,
@@ -151,7 +170,14 @@ impl MediaEncoder for RecordingProbe {
         _threed_format: Option<Video3DFormat>,
         _offset_ticks: Option<i64>,
     ) -> Result<String, ServiceError> {
-        unreachable!("no frame extraction in a scan")
+        // A first scan grabs a frame for a video with no artwork (the
+        // Screen Grabber); a real ffmpeg delivers one.
+        let frame = std::env::temp_dir().join(format!(
+            "ferrofin-test-frame-{}.jpg",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&frame, b"FRAME").map_err(ServiceError::backend_source)?;
+        Ok(frame.to_string_lossy().into_owned())
     }
     fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
         input_file.to_owned()
@@ -275,6 +301,7 @@ impl Tmdb {
 /// scanner with the probe, TMDB and the item repository wired.
 struct Fixture {
     db: Database,
+    vf: Arc<dyn VirtualFolderManager>,
     scanner: LibraryScanner,
     probe: Arc<RecordingProbe>,
     tmdb: Tmdb,
@@ -325,19 +352,23 @@ impl Fixture {
         ));
         let probe = Arc::new(RecordingProbe::default());
         let tmdb = Tmdb::spawn();
-        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
-            .with_items(items)
-            .with_probe(
-                Arc::clone(&probe) as Arc<dyn MediaEncoder>,
-                Arc::new(FerrofinMediaStreamRepository::new(db.clone()))
-                    as Arc<dyn MediaStreamRepository>,
-                Arc::new(FerrofinChapterRepository::new(db.clone())),
-            )
-            .with_metadata(
-                Arc::new(TmdbClient::new().with_base_url(&tmdb.base)),
-                root.join("metadata"),
-            )
-            .with_progress_every(0);
+        let scanner = LibraryScanner::new(
+            Arc::clone(&vf),
+            Arc::new(FerrofinFileSystem::new()),
+            persistence,
+        )
+        .with_items(items)
+        .with_probe(
+            Arc::clone(&probe) as Arc<dyn MediaEncoder>,
+            Arc::new(FerrofinMediaStreamRepository::new(db.clone()))
+                as Arc<dyn MediaStreamRepository>,
+            Arc::new(FerrofinChapterRepository::new(db.clone())),
+        )
+        .with_metadata(
+            Arc::new(TmdbClient::new().with_base_url(&tmdb.base)),
+            root.join("metadata"),
+        )
+        .with_progress_every(0);
         let scanner = match omdb {
             Some(base) => scanner.with_omdb(Arc::new(
                 ferrofin_providers::OmdbClient::new("key").with_base_url(base),
@@ -347,6 +378,7 @@ impl Fixture {
         count_writes(&db).await;
         Self {
             db,
+            vf,
             scanner,
             probe,
             tmdb,
@@ -1035,6 +1067,15 @@ async fn a_new_replaced_or_deleted_poster_is_validated_on_an_unchanged_item() {
     std::fs::create_dir_all(file.parent().expect("dir")).expect("mkdir");
     std::fs::write(&file, b"0123").expect("write");
     let (db, scanner) = library(tmp.path(), &media, CollectionTypeOptions::movies, None).await;
+    // No frame grab for the Primary the poster comes and goes in: this is
+    // the local validation alone.
+    let scanner = scanner.with_metadata_options(|| {
+        vec![ferrofin_model::configuration::MetadataOptions {
+            item_type: Some("Movie".to_owned()),
+            disabled_image_fetchers: vec!["Screen Grabber".to_owned()],
+            ..Default::default()
+        }]
+    });
     let images = || async {
         sqlx::query_as::<_, (String, Option<String>)>(
             r#"SELECT "Path", "DateModified" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#,
@@ -1070,20 +1111,26 @@ async fn a_new_replaced_or_deleted_poster_is_validated_on_an_unchanged_item() {
     assert_eq!(scanner.scan_all().await.expect("rescan").unchanged, 1);
 }
 
-/// A new episode in an existing season: it is created, its season (whose
-/// directory mtime moved) is refreshed, and its sibling is left alone. The
-/// series is written only for the date of its newest episode
-/// (`UpdateDateLastMediaAdded`, which upstream's refresh of the series
-/// saves), and so its `DateLastSaved` moves.
+/// A new episode in an existing season: it is created, and its season and
+/// its sibling are left alone — the season too, though its directory's mtime
+/// moved: a directory has no `DateModified` (D2), and
+/// `BaseItem.RequiresRefresh` is false for a `MinValue` one
+/// (`BaseItem.cs:1721-1731`). The series is written only for the date of its
+/// newest episode (`UpdateDateLastMediaAdded`, which upstream's refresh of
+/// the series saves), and so its `DateLastSaved` moves.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
+async fn a_new_episode_leaves_its_season_and_its_siblings_alone() {
     let tmp = tempfile::tempdir().expect("tmp");
     let tv = tmp.path().join("tv");
     let season = tv.join("Show").join("Season 1");
     std::fs::create_dir_all(&season).expect("mkdir");
     std::fs::write(season.join("Show S01E01.mkv"), b"0123").expect("write");
+    // Two episodes already, so the new one leaves their mixed folder as it
+    // is (a second episode would flip the first's `IsInMixedFolder`, which
+    // upstream's `UpdateFromResolvedItem` saves).
+    std::fs::write(season.join("Show S01E03.mkv"), b"0123").expect("write");
     let (db, scanner) = library(tmp.path(), &tv, CollectionTypeOptions::tvshows, None).await;
-    assert_eq!(scanner.scan_all().await.expect("scan").created, 3);
+    assert_eq!(scanner.scan_all().await.expect("scan").created, 4);
     let saved = |path: PathBuf, kind: BaseItemKind| {
         let db = db.clone();
         async move {
@@ -1105,7 +1152,7 @@ async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
         saved(season.clone(), BaseItemKind::Season).await,
     );
     // The directory mtime moves by whole seconds only on some filesystems;
-    // make the drift unambiguous.
+    // make the drift unambiguous, so the season's staying put is not luck.
     std::fs::write(season.join("Show S01E02.mkv"), b"0123").expect("new episode");
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
     std::fs::File::open(&season)
@@ -1117,8 +1164,7 @@ async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
         scanner.scan_all().await.expect("rescan"),
         ScanOutcome {
             created: 1,
-            updated: 1,
-            unchanged: 2,
+            unchanged: 4,
             ..ScanOutcome::default()
         }
     );
@@ -1128,7 +1174,7 @@ async fn a_new_episode_refreshes_its_season_and_leaves_its_siblings_alone() {
         "its DateLastMediaAdded moved"
     );
     assert_eq!(saved(sibling, BaseItemKind::Episode).await, before.1);
-    assert_ne!(saved(season, BaseItemKind::Season).await, before.2);
+    assert_eq!(saved(season, BaseItemKind::Season).await, before.2);
 }
 
 /// A locked item: an unchanged rescan leaves it alone like any other; a
@@ -1287,7 +1333,12 @@ async fn a_locked_item_asks_no_provider_but_discovers_a_new_local_poster() {
         .await
         .expect("images")
     };
-    assert!(images().await.is_empty());
+    // The first scan grabbed a frame for the Primary (the Screen Grabber).
+    let grabbed = images().await;
+    assert!(
+        grabbed.len() == 1 && grabbed[0].ends_with("primary.jpg"),
+        "{grabbed:?}"
+    );
 
     std::fs::write(fx.heat.with_file_name("poster.jpg"), b"\xFF\xD8\xFFposter").expect("poster");
     touch(&fx.heat, 3_600);
@@ -1670,9 +1721,13 @@ async fn a_locked_item_keeps_its_metadata_and_asks_no_provider_in_every_mode() {
         fx.scan_with(&item_refresh(mode, replace_all)).await;
         let asked = fx.tmdb.take();
         // TMDB's details (`append_to_response`) or a search by the title is
-        // the metadata provider; the bare `/movie/{id}` lookup is its image
-        // provider (`TmdbClient::images_by_id`).
-        let for_matrix = |line: &&String| line.contains("/movie/603?") || line.contains("Matrix");
+        // the metadata provider; `/movie/{id}/images` is its image
+        // provider; dimensions and all candidates are needed for acquisition limits.
+        let for_matrix = |line: &&String| {
+            line.contains("/movie/603?")
+                || line.contains("/movie/603/images?")
+                || line.contains("Matrix")
+        };
         assert!(
             !asked
                 .iter()
@@ -1736,10 +1791,16 @@ async fn an_item_refresh_removes_nothing() {
     std::fs::remove_file(&fx.heat).expect("rm");
     let options = item_refresh(MetadataRefreshMode::Default, false);
     let outcome = refresh_item(&fx, &fx.heat, &options).await;
+    // The title's directory is no longer a title's own folder, so it is a
+    // plain folder — the one row a refresh of the item carries along from
+    // above it; nothing else is planned and nothing is removed.
     assert_eq!(
         outcome,
-        ScanOutcome::default(),
-        "nothing planned, nothing removed"
+        ScanOutcome {
+            created: 1,
+            ..ScanOutcome::default()
+        },
+        "the emptied folder carried along, nothing removed"
     );
     assert!(
         fx.stamps(&fx.heat).await.1.is_some(),
@@ -2720,10 +2781,12 @@ async fn a_locked_seasons_number_is_refilled_on_a_full_refresh() {
     assert_eq!(number, Some(1));
 }
 
-/// Jellyfin stores a local movie version as a generic Video with a different
-/// path-derived id. Scanning it as a new Movie duplicated it in the library.
+/// Jellyfin 10.11 stores a local movie version as a generic Video with a
+/// different path-derived id. The scan plans a Movie there and moves the row
+/// to the Movie id (owner decision D9b) — one row, never a duplicate, its
+/// version link kept — and the next scan leaves it there.
 #[tokio::test(flavor = "multi_thread")]
-async fn adopted_generic_video_version_keeps_its_identity_across_scans() {
+async fn adopted_generic_video_version_moves_to_the_movie_id_once() {
     use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_traits::persistence::ItemPersistenceService as _;
     let tmp = tempfile::tempdir().unwrap();
@@ -2741,6 +2804,7 @@ async fn adopted_generic_video_version_keeps_its_identity_across_scans() {
         .await
         .unwrap();
     let id = derive_item_id(BaseItemKind::Video, &path.to_string_lossy()).unwrap();
+    let movie = derive_item_id(BaseItemKind::Movie, &path.to_string_lossy()).unwrap();
     alternate.id = guid_to_db(id);
     alternate.path = Some(path.to_string_lossy().into_owned());
     alternate.type_ = "MediaBrowser.Controller.Entities.Video".to_owned();
@@ -2750,12 +2814,98 @@ async fn adopted_generic_video_version_keeps_its_identity_across_scans() {
     persistence.save_items(&[alternate]).await.unwrap();
     for _ in 0..2 {
         fx.scan().await;
-        let rows: Vec<(String, Option<String>)> =
-            sqlx::query_as(r#"SELECT "Id", "PrimaryVersionId" FROM "BaseItems" WHERE "Path"=?"#)
-                .bind(path.to_string_lossy().as_ref())
-                .fetch_all(fx.db.pool())
-                .await
-                .unwrap();
-        assert_eq!(rows, vec![(guid_to_db(id), Some(primary.clone()))]);
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            r#"SELECT "Id", "Type", "PrimaryVersionId" FROM "BaseItems" WHERE "Path"=?"#,
+        )
+        .bind(path.to_string_lossy().as_ref())
+        .fetch_all(fx.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                guid_to_db(movie),
+                "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+                Some(primary.clone())
+            )]
+        );
+        let old: i64 = sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Id"=?"#)
+            .bind(guid_to_db(id))
+            .fetch_one(fx.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(old, 0);
     }
+}
+
+/// An NFO wins initial discovery. On Search for missing metadata the prober
+/// first changes the stored title, which the fill-only NFO merge then keeps.
+/// A Name lock still preserves the user's title on a changed-file scan.
+#[tokio::test]
+async fn embedded_title_obeys_refresh_merge_and_name_locks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = Fixture::new(tmp.path(), 0).await;
+    let mut options = fixture
+        .vf
+        .get_virtual_folders()
+        .await
+        .unwrap()
+        .remove(0)
+        .library_options
+        .unwrap();
+    options.enable_embedded_titles = true;
+    options.type_options = vec![ferrofin_model::configuration::TypeOptions {
+        type_: Some("Movie".to_owned()),
+        ..Default::default()
+    }];
+    fixture
+        .vf
+        .update_library_options("Movies", &options)
+        .await
+        .unwrap();
+    let mut info = ferrofin_model::media_info::MediaInfo::default();
+    info.media_source.name = Some("Embedded".to_owned());
+    info.media_source.container = Some("matroska".to_owned());
+    *fixture.probe.metadata.lock().unwrap() = Some(info);
+    std::fs::write(
+        fixture.heat.with_extension("nfo"),
+        "<movie><title>NFO title</title></movie>",
+    )
+    .unwrap();
+    fixture.scan().await;
+    let names = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT Name FROM BaseItems WHERE Type LIKE '%Movie' ORDER BY Path",
+        )
+        .fetch_all(fixture.db.pool())
+        .await
+        .unwrap()
+    };
+    assert_eq!(names().await, ["NFO title", "Embedded"]);
+    fixture
+        .set(&fixture.matrix, "Name", Some("Edited".to_owned()))
+        .await;
+    touch(&fixture.matrix, 5);
+    fixture
+        .scan_with(&MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+            image_refresh_mode: MetadataRefreshMode::None,
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(names().await, ["Embedded", "Embedded"]);
+    fixture
+        .set(&fixture.matrix, "Name", Some("Locked".to_owned()))
+        .await;
+    sqlx::query("INSERT INTO BaseItemMetadataFields (Id, ItemId) VALUES (?1, ?2)")
+        .bind(ferrofin_db::enums::metadata_field::to_i32(
+            ferrofin_model::entities::MetadataField::Name,
+        ))
+        .bind(Fixture::id(&fixture.matrix))
+        .execute(fixture.db.writer())
+        .await
+        .unwrap();
+    touch(&fixture.matrix, 10);
+    fixture.scan().await;
+    assert_eq!(names().await, ["Embedded", "Locked"]);
 }

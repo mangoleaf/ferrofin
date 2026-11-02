@@ -5,7 +5,7 @@
 
 use std::io::{Read as _, Write as _};
 use std::net::TcpListener;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
@@ -97,7 +97,10 @@ impl PluginManager for EnabledStub {
 }
 
 /// Library stub: records the query, returns one canned movie row. Only
-/// `get_item_list` is reachable from `query-items`; everything else panics.
+/// `get_item_list` (from `query-items` and the analysis pass) and
+/// `get_item_ids` (the analysis pass) are reachable; everything else
+/// panics. `seen` holds the last filter query: a lookup by id, the analysis
+/// pass loading a page, does not replace it.
 pub struct OneMovieLibrary {
     pub seen: Mutex<Option<InternalItemsQuery>>,
 }
@@ -130,14 +133,21 @@ impl LibraryManager for OneMovieLibrary {
     ) -> Result<ferrofin_model::querying::QueryResult<BaseItemEntity>, ServiceError> {
         unimplemented!("stub")
     }
-    async fn get_item_ids(&self, _query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!("stub")
+    async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
+        *self.seen.lock().unwrap() = Some(query.clone());
+        Ok(vec![
+            Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01").unwrap(),
+        ])
     }
     async fn get_item_list(
         &self,
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        *self.seen.lock().unwrap() = Some(query.clone());
+        // A lookup by id is the analysis pass loading a page of the ids it
+        // queried: `seen` keeps that query.
+        if query.item_ids.is_empty() {
+            *self.seen.lock().unwrap() = Some(query.clone());
+        }
         let entity = BaseItemEntity {
             id: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEFF01".to_owned(),
             name: Some("Big Buck Bunny".to_owned()),
@@ -769,7 +779,7 @@ impl ferrofin_traits::stubs::LyricManager for StubLyrics {
         &self,
         item_id: Uuid,
         format: &str,
-        lyrics: &str,
+        lyrics: &[u8],
     ) -> Result<Option<LyricDto>, ServiceError> {
         self.writes.lock().unwrap().push((
             "lyric".into(),
@@ -893,7 +903,7 @@ impl ferrofin_traits::collections::CollectionManager for StubCollections {
     }
     async fn get_collections_containing_item(
         &self,
-        _user_id: Uuid,
+        _user: &ferrofin_db::entities::users::UserEntity,
         _item_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("stub")
@@ -1047,4 +1057,46 @@ pub fn metadata_provider_fixture(id: &str, provider_name: &str, answer: LookupAn
         .replace("(data (i32.const 488) \"Movie\")", &data)
         .replace(original_info, &provider_info)
         .replace(original_lookup, &lookup)
+}
+
+/// Stores a real movie under an isolated library path for live policy tests.
+pub async fn persisted_movie_library(
+    db: &ferrofin_db::Database,
+    media: &std::path::Path,
+    id: Uuid,
+) -> Arc<dyn LibraryManager> {
+    use ferrofin_traits::persistence::ItemPersistenceService;
+    std::fs::create_dir_all(media).unwrap();
+    let path = media.join("fixture.mkv");
+    std::fs::write(&path, b"fixture video").unwrap();
+    let persistence = Arc::new(ferrofin_core::FerrofinItemPersistenceService::new(
+        db.clone(),
+    ));
+    persistence
+        .save_items(&[BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            name: Some("Policy fixture".to_owned()),
+            type_: ferrofin_core::item_type_lookup::stored_type_name(
+                ferrofin_model::data::BaseItemKind::Movie,
+            )
+            .unwrap()
+            .to_owned(),
+            path: Some(path.to_string_lossy().into_owned()),
+            date_created: Some(chrono::Utc::now()),
+            run_time_ticks: Some(5_000_000_000),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+        Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+    Arc::new(ferrofin_core::FerrofinLibraryManager::new(
+        Arc::new(ferrofin_core::FerrofinItemRepository::new(
+            db.clone(),
+            lookup,
+        )),
+        Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+        persistence,
+        Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+    ))
 }

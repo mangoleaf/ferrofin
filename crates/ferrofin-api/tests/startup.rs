@@ -199,7 +199,6 @@ impl UserManager for MemUsers {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
-            has_password: Some(user.password.is_some()),
             policy: Some(UserPolicy {
                 is_administrator: is_admin,
                 ..UserPolicy::default()
@@ -300,11 +299,17 @@ impl QuickConnect for OkQuickConnect {
     async fn authorize_request(&self, _user_id: Uuid, _code: &str) -> Result<bool, ServiceError> {
         Ok(true)
     }
-    async fn get_authorized_request(&self, _secret: &str) -> Result<SessionInfoDto, ServiceError> {
-        Ok(SessionInfoDto {
-            user_id: ADMIN_ID,
-            user_name: Some("admin".to_owned()),
-            ..SessionInfoDto::default()
+    async fn get_authorized_request(
+        &self,
+        _secret: &str,
+    ) -> Result<AuthenticationResultData, ServiceError> {
+        Ok(AuthenticationResultData {
+            session: SessionInfoDto {
+                user_id: ADMIN_ID,
+                user_name: Some("admin".to_owned()),
+                ..SessionInfoDto::default()
+            },
+            access_token: "qc-token".into(),
         })
     }
 }
@@ -322,7 +327,7 @@ impl SessionManager for NoopSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }

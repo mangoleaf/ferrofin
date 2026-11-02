@@ -213,6 +213,9 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
         info.media_source.media_attachments = media_attachments;
 
         if is_audio {
+            // AudioFileProber applies its library settings to the original
+            // values, not these general-purpose normalized artist arrays.
+            info.raw_audio_tags = Some(tags.clone());
             set_audio_runtime_ticks(&data, &mut info);
             set_audio_info_from_tags(&mut info, &tags);
         } else {
@@ -317,9 +320,10 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
                 stream.localized_default = Some(self.localization.get_localized_string("Default"));
                 stream.localized_external =
                     Some(self.localization.get_localized_string("External"));
+                stream.localized_original =
+                    Some(self.localization.get_localized_string("Original"));
                 if let Some(lang) = stream.language.as_deref().filter(|l| !l.is_empty()) {
-                    stream.localized_language =
-                        Some(self.localization.get_language_display_name(lang));
+                    stream.localized_language = self.localization.get_language_display_name(lang);
                 }
 
                 stream.channels = stream_info.channels;
@@ -360,8 +364,7 @@ impl<L: LocalizationManager> ProbeResultNormalizer<L> {
                 stream.localized_hearing_impaired =
                     Some(self.localization.get_localized_string("HearingImpaired"));
                 if let Some(lang) = stream.language.as_deref().filter(|l| !l.is_empty()) {
-                    stream.localized_language =
-                        Some(self.localization.get_language_display_name(lang));
+                    stream.localized_language = self.localization.get_language_display_name(lang);
                 }
 
                 if stream.title.as_deref().is_none_or(str::is_empty)

@@ -209,9 +209,10 @@
     ;; limit): method p0/p1, path p2/p3, query p4/p5, headers p6/p7,
     ;; body tag/ptr/len p8-p10, user-id tag/ptr/len p11-p13,
     ;; is-admin p14, is-authenticated p15.
-    ;; A path starting "/b" ("/boom") traps (containment tests); anything else
-    ;; answers 200 "pong" with no headers. Ret area @1088: status,
-    ;; headers ptr/len, body ptr/len.
+    ;; A path starting "/b" ("/boom") traps (containment tests); one starting
+    ;; "/s" ("/spin") spins until the epoch deadline (back-pressure tests);
+    ;; anything else answers 200 "pong" with no headers. Ret area @1088:
+    ;; status, headers ptr/len, body ptr/len.
     (func (export "handle-request")
       (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32)
       (result i32)
@@ -219,6 +220,10 @@
             (i32.ge_u (local.get 3) (i32.const 2))
             (i32.eq (i32.load8_u (i32.add (local.get 2) (i32.const 1))) (i32.const 98)))
         (then unreachable))
+      (if (i32.and
+            (i32.ge_u (local.get 3) (i32.const 2))
+            (i32.eq (i32.load8_u (i32.add (local.get 2) (i32.const 1))) (i32.const 115)))
+        (then (loop $spin (br $spin))))
       (i32.store (i32.const 1088) (i32.const 200))
       (i32.store (i32.const 1092) (i32.const 0))
       (i32.store (i32.const 1096) (i32.const 0))

@@ -100,6 +100,7 @@ impl AuthService for AdminAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             user: Some(user_entity(ADMIN_ID, "admin", Some("hash"))),
+            token: Some("current-session".into()),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -112,12 +113,20 @@ impl AuthService for AdminAuth {
 struct MemUsers {
     /// Records the last (user_id, new_password) passed to `change_password`.
     changed_password: Mutex<Option<(Uuid, String)>>,
+    fail_password_change: std::sync::atomic::AtomicBool,
     /// Records the last policy passed to `update_policy`.
     updated_policy: Mutex<Option<(Uuid, UserPolicy)>>,
     /// Records the last configuration passed to `update_configuration`.
     updated_configuration: Mutex<Option<(Uuid, UserConfiguration)>>,
+    /// Records the last (user_id, new_name) passed to `rename_user`.
+    renamed: Mutex<Option<(Uuid, String)>>,
     /// Records whether `delete_user` was called and for whom.
     deleted: Mutex<Option<Uuid>>,
+    /// Makes `delete_user` refuse, as the last user or the last admin.
+    refuse_delete: std::sync::atomic::AtomicBool,
+    /// Makes `get_user_dto` answer the policy last saved for that user, so the
+    /// device check after a policy save reads what was saved.
+    echo_saved_policy: std::sync::atomic::AtomicBool,
 }
 
 /// The fixed two-user table shared by [`MemUsers`] and the assertions.
@@ -157,10 +166,11 @@ impl UserManager for MemUsers {
     }
     async fn rename_user(
         &self,
-        _user_id: Uuid,
+        user_id: Uuid,
         _old_name: &str,
-        _new_name: &str,
+        new_name: &str,
     ) -> Result<(), ServiceError> {
+        *self.renamed.lock().unwrap() = Some((user_id, new_name.to_owned()));
         Ok(())
     }
     async fn update_user(&self, _user: &UserEntity) -> Result<(), ServiceError> {
@@ -170,6 +180,11 @@ impl UserManager for MemUsers {
         Ok(user_entity(Uuid::from_u128(0x0E11), name, None))
     }
     async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError> {
+        if self.refuse_delete.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ServiceError::invalid_input(
+                "there must be at least one admin user in the system",
+            ));
+        }
         *self.deleted.lock().unwrap() = Some(user_id);
         Ok(())
     }
@@ -177,6 +192,12 @@ impl UserManager for MemUsers {
         Ok(())
     }
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError> {
+        if self
+            .fail_password_change
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ServiceError::backend("password store unavailable"));
+        }
         *self.changed_password.lock().unwrap() = Some((user_id, new_password.to_owned()));
         Ok(())
     }
@@ -202,15 +223,23 @@ impl UserManager for MemUsers {
     ) -> Result<UserDto, ServiceError> {
         // The admin user reports IsAdministrator; everyone else does not.
         let is_admin = user.id == ADMIN_ID.to_string();
+        let saved = self
+            .echo_saved_policy
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| self.updated_policy.lock().unwrap().clone())
+            .flatten()
+            .filter(|(id, _)| id.to_string() == user.id)
+            .map(|(_, policy)| policy);
         Ok(UserDto {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
-            has_password: Some(user.password.is_some()),
-            policy: Some(UserPolicy {
+            policy: Some(saved.unwrap_or_else(|| UserPolicy {
                 is_administrator: is_admin,
+                // This account fixture has no device restrictions.
+                enable_all_devices: true,
                 ..UserPolicy::default()
-            }),
+            })),
             configuration: Some(UserConfiguration::default()),
             ..UserDto::default()
         })
@@ -308,18 +337,28 @@ impl QuickConnect for OkQuickConnect {
     async fn authorize_request(&self, _user_id: Uuid, _code: &str) -> Result<bool, ServiceError> {
         Ok(true)
     }
-    async fn get_authorized_request(&self, _secret: &str) -> Result<SessionInfoDto, ServiceError> {
-        Ok(SessionInfoDto {
-            user_id: ADMIN_ID,
-            user_name: Some("admin".to_owned()),
-            ..SessionInfoDto::default()
+    async fn get_authorized_request(
+        &self,
+        _secret: &str,
+    ) -> Result<AuthenticationResultData, ServiceError> {
+        Ok(AuthenticationResultData {
+            session: SessionInfoDto {
+                user_id: ADMIN_ID,
+                user_name: Some("admin".to_owned()),
+                ..SessionInfoDto::default()
+            },
+            access_token: "qc-token".into(),
         })
     }
 }
 
-/// A [`SessionManager`] whose `revoke_user_tokens` no-ops (used by delete/policy);
-/// every other method is unused by these tests.
-struct NoopSessions;
+/// Records token revocation and user-session pushes while leaving unrelated
+/// session methods unused.
+#[derive(Default)]
+struct NoopSessions {
+    revoked: Mutex<Vec<(Uuid, String)>>,
+    pushed: Mutex<Vec<(Vec<Uuid>, SessionMessageType)>>,
+}
 
 #[async_trait]
 impl SessionManager for NoopSessions {
@@ -330,7 +369,7 @@ impl SessionManager for NoopSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }
@@ -398,12 +437,16 @@ impl SessionManager for NoopSessions {
     }
     async fn send_message_to_user_sessions(
         &self,
-        _user_ids: &[Uuid],
-        _message_type: SessionMessageType,
+        user_ids: &[Uuid],
+        message_type: SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {
         // The user-update handlers push UserUpdated/UserDeleted here
         // best-effort; delivery is covered by ferrofin-core's tests.
+        self.pushed
+            .lock()
+            .unwrap()
+            .push((user_ids.to_vec(), message_type));
         Ok(())
     }
     async fn send_message_to_user_device_sessions(
@@ -493,9 +536,13 @@ impl SessionManager for NoopSessions {
     }
     async fn revoke_user_tokens(
         &self,
-        _user_id: Uuid,
-        _current_access_token: &str,
+        user_id: Uuid,
+        current_access_token: &str,
     ) -> Result<(), ServiceError> {
+        self.revoked
+            .lock()
+            .unwrap()
+            .push((user_id, current_access_token.to_owned()));
         Ok(())
     }
     async fn close_live_stream_if_needed(
@@ -534,13 +581,49 @@ fn state_with_auth(
     activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
     auth: Arc<dyn AuthService>,
 ) -> AppState {
+    state_with_sessions(
+        users,
+        config,
+        activity,
+        auth,
+        Arc::new(NoopSessions::default()),
+    )
+}
+
+fn state_with_sessions(
+    users: Arc<MemUsers>,
+    config: Arc<MemConfig>,
+    activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
+    auth: Arc<dyn AuthService>,
+    sessions: Arc<dyn SessionManager>,
+) -> AppState {
+    state_with_playlists(
+        users,
+        config,
+        activity,
+        auth,
+        sessions,
+        Arc::new(ferrofin_api::test_support::FakePlaylists),
+    )
+}
+
+/// [`state_with_sessions`] with a caller-supplied [`PlaylistManager`]
+/// (`ferrofin_traits::collections::PlaylistManager`).
+fn state_with_playlists(
+    users: Arc<MemUsers>,
+    config: Arc<MemConfig>,
+    activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
+    auth: Arc<dyn AuthService>,
+    sessions: Arc<dyn SessionManager>,
+    playlists: Arc<dyn ferrofin_traits::collections::PlaylistManager>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         users,
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
-        Arc::new(NoopSessions),
+        sessions,
         Arc::new(FakeSystem),
         Arc::new(ferrofin_api::test_support::FakeAppHost),
         config,
@@ -552,7 +635,7 @@ fn state_with_auth(
         Arc::new(FakeAuthContext),
         auth,
         Arc::new(OkQuickConnect),
-        Arc::new(ferrofin_api::test_support::FakePlaylists),
+        playlists,
         Arc::new(ferrofin_api::test_support::FakeCollections),
         Arc::new(ferrofin_api::test_support::FakeTvSeries),
         Arc::new(ferrofin_api::test_support::FakeSubtitles),
@@ -1158,7 +1241,7 @@ impl SessionManager for OkSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!()
     }
@@ -1513,6 +1596,197 @@ async fn delete_user_writes_a_user_deleted_activity_entry() {
     );
 }
 
+/// A [`PlaylistManager`](ferrofin_traits::collections::PlaylistManager) that
+/// records each `remove_playlists` call with whether the user was already
+/// deleted then; every other method is unused here.
+struct RecordingPlaylists {
+    users: Arc<MemUsers>,
+    removed: Mutex<Vec<(Uuid, bool)>>,
+    fail: bool,
+}
+
+impl RecordingPlaylists {
+    fn new(users: Arc<MemUsers>, fail: bool) -> Self {
+        Self {
+            users,
+            removed: Mutex::new(Vec::new()),
+            fail,
+        }
+    }
+}
+
+#[async_trait]
+impl ferrofin_traits::collections::PlaylistManager for RecordingPlaylists {
+    async fn get_playlist_access(
+        &self,
+        _playlist_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<ferrofin_traits::collections::PlaylistAccess, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn get_playlist_for_user(
+        &self,
+        _playlist_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<BaseItemEntity, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn create_playlist(
+        &self,
+        _request: &ferrofin_model::playlists::PlaylistCreationRequest,
+    ) -> Result<ferrofin_model::playlists::PlaylistCreationResult, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn update_playlist(
+        &self,
+        _request: &ferrofin_model::playlists::PlaylistUpdateRequest,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn get_playlists(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn get_playlist_items(
+        &self,
+        _playlist_id: Uuid,
+        _user_id: Uuid,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn add_user_to_shares(
+        &self,
+        _request: &ferrofin_model::playlists::PlaylistUserUpdateRequest,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn remove_user_from_shares(
+        &self,
+        _playlist_id: Uuid,
+        _user_id: Uuid,
+        _share: &ferrofin_model::entities_media::PlaylistUserPermissions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn get_playlist_shares(
+        &self,
+        _playlist_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::entities_media::PlaylistUserPermissions>, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn add_item_to_playlist(
+        &self,
+        _playlist_id: Uuid,
+        _item_ids: &[Uuid],
+        _position: Option<i32>,
+        _user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn remove_item_from_playlist(
+        &self,
+        _playlist_id: &str,
+        _entry_ids: &[String],
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn move_item(
+        &self,
+        _playlist_id: &str,
+        _entry_id: &str,
+        _new_index: i32,
+        _calling_user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn remove_playlists(&self, user_id: Uuid) -> Result<(), ServiceError> {
+        let deleted = self.users.deleted.lock().unwrap().is_some();
+        self.removed.lock().unwrap().push((user_id, deleted));
+        if self.fail {
+            return Err(ServiceError::backend("playlist store unavailable"));
+        }
+        Ok(())
+    }
+}
+
+/// The admin's state with `playlists` as the playlist manager.
+fn recording_state(
+    users: Arc<MemUsers>,
+    activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
+    playlists: Arc<RecordingPlaylists>,
+) -> AppState {
+    state_with_playlists(
+        users,
+        Arc::new(MemConfig::new(true)),
+        activity,
+        Arc::new(AdminAuth),
+        Arc::new(NoopSessions::default()),
+        playlists,
+    )
+}
+
+async fn delete_bob(state: AppState) -> StatusCode {
+    create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/Users/{BOB_ID}"))
+                .header("X-Emby-Token", "t")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// `UserController.DeleteUser` → `RemovePlaylistsAsync(userId)`: the deleted
+/// user's playlists are handed over or deleted, once the delete has succeeded.
+#[tokio::test]
+async fn delete_user_hands_over_the_users_playlists_after_the_delete() {
+    let users = Arc::new(MemUsers::default());
+    let playlists = Arc::new(RecordingPlaylists::new(users.clone(), false));
+    let state = recording_state(
+        users,
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        playlists.clone(),
+    );
+    assert_eq!(delete_bob(state).await, StatusCode::NO_CONTENT);
+    assert_eq!(*playlists.removed.lock().unwrap(), vec![(BOB_ID, true)]);
+}
+
+/// A refused delete (the last user or the last admin) leaves the user's
+/// playlists alone; upstream has already given them away by then.
+#[tokio::test]
+async fn a_refused_delete_leaves_the_users_playlists_alone() {
+    let users = Arc::new(MemUsers::default());
+    users
+        .refuse_delete
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let playlists = Arc::new(RecordingPlaylists::new(users.clone(), false));
+    let state = recording_state(
+        users,
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        playlists.clone(),
+    );
+    assert_eq!(delete_bob(state).await, StatusCode::BAD_REQUEST);
+    assert!(playlists.removed.lock().unwrap().is_empty());
+}
+
+/// A failed hand-over fails the request, but the deletion it follows still
+/// gets its `UserDeleted` activity entry.
+#[tokio::test]
+async fn a_failed_playlist_hand_over_still_logs_the_deletion() {
+    let users = Arc::new(MemUsers::default());
+    let activity = Arc::new(ferrofin_api::test_support::RecordingActivity::default());
+    let playlists = Arc::new(RecordingPlaylists::new(users.clone(), true));
+    let state = recording_state(users.clone(), activity.clone(), playlists);
+    assert!(delete_bob(state).await.is_server_error());
+    assert_eq!(*users.deleted.lock().unwrap(), Some(BOB_ID));
+    let entries = activity.entries.lock().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].type_, "UserDeleted");
+}
+
 #[tokio::test]
 async fn update_policy_records_and_guards_last_admin() {
     let users = Arc::new(MemUsers::default());
@@ -1527,9 +1801,7 @@ async fn update_policy_records_and_guards_last_admin() {
                 .uri(format!("/Users/{ADMIN_ID}/Policy"))
                 .header("X-Emby-Token", "t")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&UserPolicy::default()).unwrap(),
-                ))
+                .body(Body::from(serde_json::to_vec(&complete_policy()).unwrap()))
                 .unwrap(),
         )
         .await
@@ -1539,7 +1811,7 @@ async fn update_policy_records_and_guards_last_admin() {
     // Updating bob's policy is fine and is recorded.
     let policy = UserPolicy {
         max_active_sessions: 5,
-        ..UserPolicy::default()
+        ..complete_policy()
     };
     let ok = router
         .oneshot(
@@ -1559,8 +1831,229 @@ async fn update_policy_records_and_guards_last_admin() {
     assert_eq!(recorded.1.max_active_sessions, 5);
 }
 
+/// Upstream binds the body into `new UserPolicy()`, so a member it leaves out
+/// keeps the constructor's value (`UserPolicy.cs`), not `false`/`0`. With
+/// `EnableAllDevices` kept, `DeviceAccessHost` signs no device out: the saved
+/// policy is what the device check reads here, and a check that went on to the
+/// devices would reach `FakeDevices`, which panics.
 #[tokio::test]
-async fn forgot_password_unknown_user_reports_contact_admin() {
+async fn update_policy_partial_body_keeps_the_constructor_defaults() {
+    let users = Arc::new(MemUsers::default());
+    users
+        .echo_saved_policy
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let body = serde_json::json!({
+        "AuthenticationProviderId": "a",
+        "PasswordResetProviderId": "b",
+        "IsDisabled": false,
+    });
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users/{BOB_ID}/Policy"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (_, saved) = users.updated_policy.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        saved,
+        UserPolicy {
+            is_hidden: true,
+            enable_user_preference_access: true,
+            enable_shared_device_control: true,
+            enable_remote_access: true,
+            enable_live_tv_management: true,
+            enable_live_tv_access: true,
+            enable_media_playback: true,
+            enable_audio_playback_transcoding: true,
+            enable_video_playback_transcoding: true,
+            enable_playback_remuxing: true,
+            enable_content_downloading: true,
+            enable_sync_transcoding: true,
+            enable_media_conversion: true,
+            enable_all_devices: true,
+            enable_all_channels: true,
+            enable_all_folders: true,
+            login_attempts_before_lockout: -1,
+            enable_public_sharing: true,
+            authentication_provider_id: "a".to_owned(),
+            password_reset_provider_id: "b".to_owned(),
+            ..UserPolicy::default()
+        }
+    );
+}
+
+/// `UserManager.GetUserById(Guid.Empty)` throws `ArgumentException`, a `400`:
+/// a nil route id, a nil `?userId=`, or an API key's empty user claim when
+/// `userId` is left out (`userId ?? User.GetUserId()`).
+#[rstest::rstest]
+#[case::get("GET", "/Users/00000000-0000-0000-0000-000000000000", "", false)]
+#[case::delete("DELETE", "/Users/00000000-0000-0000-0000-000000000000", "", false)]
+#[case::policy(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000/Policy",
+    r#"{"AuthenticationProviderId":"a","PasswordResetProviderId":"b"}"#,
+    false
+)]
+#[case::update(
+    "POST",
+    "/Users?userId=00000000-0000-0000-0000-000000000000",
+    r#"{"Name":"bob","Policy":null}"#,
+    false
+)]
+#[case::update_path(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000",
+    r#"{"Name":"bob","Policy":null}"#,
+    false
+)]
+#[case::configuration(
+    "POST",
+    "/Users/Configuration?userId=00000000-0000-0000-0000-000000000000",
+    "{}",
+    false
+)]
+#[case::configuration_path(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000/Configuration",
+    "{}",
+    false
+)]
+#[case::password_path(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000/Password",
+    r#"{"ResetPassword":true}"#,
+    false
+)]
+#[case::password(
+    "POST",
+    "/Users/Password?userId=00000000-0000-0000-0000-000000000000",
+    r#"{"ResetPassword":true}"#,
+    false
+)]
+#[case::api_key_update("POST", "/Users", r#"{"Name":"bob","Policy":null}"#, true)]
+#[case::api_key_configuration("POST", "/Users/Configuration", "{}", true)]
+#[case::api_key_password("POST", "/Users/Password", r#"{"ResetPassword":true}"#, true)]
+#[tokio::test]
+async fn a_nil_user_id_is_a_bad_request(
+    #[case] method: &str,
+    #[case] uri: &str,
+    #[case] body: &str,
+    #[case] api_key: bool,
+) {
+    let users = Arc::new(MemUsers::default());
+    let auth: Arc<dyn AuthService> = if api_key {
+        Arc::new(ferrofin_api::test_support::ApiKeyAuthService)
+    } else {
+        Arc::new(AdminAuth)
+    };
+    let router = create_router(state_with_auth(
+        users.clone(),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        auth,
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(users.updated_policy.lock().unwrap().is_none());
+    assert!(users.deleted.lock().unwrap().is_none());
+    assert!(users.updated_configuration.lock().unwrap().is_none());
+}
+
+/// A policy whose two `[Required]` provider ids are set, as every client that
+/// echoes a `GET /Users/{id}` policy back sends it.
+fn complete_policy() -> UserPolicy {
+    UserPolicy {
+        authentication_provider_id:
+            "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider".to_owned(),
+        password_reset_provider_id:
+            "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider".to_owned(),
+        ..UserPolicy::default()
+    }
+}
+
+/// `UserPolicy`'s provider ids are `[Required(AllowEmptyStrings = false)]`, so
+/// ASP.NET's model validation refuses a policy body that leaves either out,
+/// sends it null or blank, before the action runs (ahead of the unknown user's
+/// 404), naming each failing member. Measured on a live Jellyfin 12.2.
+#[rstest::rstest]
+#[case::empty_body(r"{}", BOB_ID, &["AuthenticationProviderId", "PasswordResetProviderId"])]
+#[case::no_reset_provider(r#"{"AuthenticationProviderId":"a"}"#, BOB_ID, &["PasswordResetProviderId"])]
+#[case::empty_auth_provider(
+    r#"{"AuthenticationProviderId":"","PasswordResetProviderId":"b"}"#,
+    BOB_ID,
+    &["AuthenticationProviderId"]
+)]
+#[case::blank_auth_provider(
+    r#"{"AuthenticationProviderId":"  ","PasswordResetProviderId":"b"}"#,
+    BOB_ID,
+    &["AuthenticationProviderId"]
+)]
+#[case::null_reset_provider(
+    r#"{"AuthenticationProviderId":"a","PasswordResetProviderId":null}"#,
+    BOB_ID,
+    &["PasswordResetProviderId"]
+)]
+#[case::unknown_user(r"{}", Uuid::from_u128(0xDEAD), &["AuthenticationProviderId", "PasswordResetProviderId"])]
+#[case::nil_user(r"{}", Uuid::nil(), &["AuthenticationProviderId", "PasswordResetProviderId"])]
+#[tokio::test]
+async fn update_policy_requires_both_provider_ids(
+    #[case] body: &str,
+    #[case] user: Uuid,
+    #[case] failing: &[&str],
+) {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users/{user}/Policy"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    let errors = json["errors"].as_object().expect("validation errors");
+    let mut keys: Vec<&str> = errors.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, failing);
+    for member in failing {
+        assert_eq!(
+            errors[*member][0],
+            format!("The {member} field is required.")
+        );
+    }
+    assert!(
+        users.updated_policy.lock().unwrap().is_none(),
+        "nothing saved"
+    );
+}
+
+#[tokio::test]
+async fn forgot_password_unknown_user_returns_the_uniform_pin_response() {
     // An unknown username must not disclose account existence, and touches no
     // filesystem (the user lookup returns `None` before a pin is issued).
     let router = create_router(state(
@@ -1581,58 +2074,138 @@ async fn forgot_password_unknown_user_reports_contact_admin() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_json(response).await["Action"], "ContactAdmin");
+    let body = body_json(response).await;
+    assert_eq!(body["Action"], "PinCode");
+    assert!(body["PinExpirationDate"].is_string());
+    assert!(!std::path::Path::new(body["PinFile"].as_str().unwrap()).exists());
 }
 
-#[tokio::test]
-async fn forgot_password_known_user_issues_and_redeems_pin() {
-    let users = Arc::new(MemUsers::default());
-    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
-
-    // 1) Request a pin for a known user → PinCode + a real pin file.
-    let response = router
+async fn recovery_request(
+    router: &axum::Router,
+    path: &str,
+    body: serde_json::Value,
+    peer: &str,
+) -> axum::response::Response {
+    router
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/Users/ForgotPassword")
+                .uri(path)
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "EnteredUsername": "bob" }).to_string(),
+                .extension(axum::extract::ConnectInfo(
+                    peer.parse::<std::net::SocketAddr>().unwrap(),
                 ))
+                .body(Body::from(body.to_string()))
                 .unwrap(),
         )
         .await
-        .unwrap();
+        .unwrap()
+}
+
+#[tokio::test]
+async fn forgot_password_local_only_preserves_failed_updates_and_consumes_once() {
+    use std::sync::atomic::Ordering;
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let start = "/Users/ForgotPassword";
+    let redeem = "/Users/ForgotPassword/Pin";
+    let local = "127.0.0.1:4321";
+    let response = recovery_request(
+        &router,
+        start,
+        serde_json::json!({"EnteredUsername":"bob"}),
+        "203.0.113.8:4321",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let remote = body_json(response).await;
+    assert_eq!(remote["Action"], "PinCode");
+    assert!(!std::path::Path::new(remote["PinFile"].as_str().unwrap()).exists());
+    let response = recovery_request(
+        &router,
+        start,
+        serde_json::json!({"EnteredUsername":"bob"}),
+        local,
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
     assert_eq!(body["Action"], "PinCode");
-    let pin_file = body["PinFile"].as_str().expect("pin file path").to_owned();
-    let record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&pin_file).unwrap()).unwrap();
-    let pin = record["Pin"].as_str().unwrap().to_owned();
-
-    // 2) Redeem the pin → success, bob reset, password set to the pin, file gone.
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/Users/ForgotPassword/Pin")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::json!({ "Pin": pin }).to_string()))
-                .unwrap(),
+    assert_eq!(body["PinFile"], remote["PinFile"]);
+    let file = std::path::PathBuf::from(body["PinFile"].as_str().unwrap());
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    record["Pin"] = serde_json::json!("A1-B2-C3-D4");
+    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    let wrong = recovery_request(
+        &router,
+        redeem,
+        serde_json::json!({"Pin":"a1-b2-c3-d4"}),
+        local,
+    )
+    .await;
+    assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
+    assert!(file.exists());
+    users.fail_password_change.store(true, Ordering::SeqCst);
+    let failed = recovery_request(
+        &router,
+        redeem,
+        serde_json::json!({"Pin":"A1B2C3D4"}),
+        local,
+    )
+    .await;
+    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(file.exists(), "failed password update preserves recovery");
+    users.fail_password_change.store(false, Ordering::SeqCst);
+    // Two concurrent redemption attempts must produce exactly one reset.
+    let (first, second) = tokio::join!(
+        recovery_request(
+            &router,
+            redeem,
+            serde_json::json!({"Pin":"A1B2C3D4"}),
+            local
+        ),
+        recovery_request(
+            &router,
+            redeem,
+            serde_json::json!({"Pin":"A1B2C3D4"}),
+            local
         )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_json(response).await;
-    assert_eq!(body["Success"], true);
-    assert_eq!(body["UsersReset"][0], "bob");
-
+    );
+    let mut statuses = [first.status(), second.status()];
+    statuses.sort();
+    assert_eq!(statuses, [StatusCode::OK, StatusCode::NOT_FOUND]);
     let (id, pw) = users.changed_password.lock().unwrap().clone().unwrap();
     assert_eq!(id, BOB_ID);
-    assert_eq!(pw, pin);
-    assert!(!std::path::Path::new(&pin_file).exists());
+    assert_eq!(
+        pw, "A1B2C3D4",
+        "the exact entered form becomes the password"
+    );
+    assert!(!file.exists());
+    // A matched file for a deleted user also remains recoverable after failure.
+    record["UserName"] = serde_json::json!("deleted");
+    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    let missing = recovery_request(
+        &router,
+        redeem,
+        serde_json::json!({"Pin":"A1B2C3D4"}),
+        local,
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert!(file.exists());
+    record["ExpirationDate"] = serde_json::json!("2000-01-01T00:00:00Z");
+    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    let expired = recovery_request(
+        &router,
+        redeem,
+        serde_json::json!({"Pin":"A1B2C3D4"}),
+        local,
+    )
+    .await;
+    assert_eq!(expired.status(), StatusCode::NOT_FOUND);
+    assert!(!file.exists());
 }
 
 #[tokio::test]
@@ -1658,6 +2231,49 @@ async fn authenticate_by_name_returns_authentication_result() {
     assert_eq!(json["ServerId"], "server-1");
     // ...and the minted access token the client must present on later requests.
     assert_eq!(json["AccessToken"], "canned-token");
+}
+
+/// The obsolete `UserController.AuthenticateUser` (`POST /Users/{userId}/
+/// Authenticate?pw=`, hidden from the OpenAPI document but served): anonymous,
+/// 400 for a nil id, 404 for an unknown user, `[Required] pw`, else
+/// `AuthenticateUserByName`.
+#[tokio::test]
+async fn authenticate_by_id_signs_in_as_that_user() {
+    let post = |uri: String| async move {
+        create_router(ok_state(Uuid::from_u128(1), ""))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    };
+    let response = post(format!("/Users/{USER_ID}/Authenticate?pw=secret")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    assert_eq!(json["User"]["Name"], "alice");
+    assert_eq!(json["AccessToken"], "canned-token");
+    let response = post(format!(
+        "/Users/{}/Authenticate?pw=secret",
+        Uuid::from_u128(0xdead)
+    ))
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = post(format!("/Users/{}/Authenticate?pw=secret", Uuid::nil())).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "GetUserById(Guid.Empty) throws"
+    );
+    let response = post(format!("/Users/{USER_ID}/Authenticate")).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "pw is [Required]"
+    );
 }
 
 /// C# `UserController.AuthenticateUserByName` sets
@@ -1718,7 +2334,7 @@ async fn user_scoped_update_user_forwards() {
     let users = Arc::new(MemUsers::default());
     let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
     // Same name → no rename; the configuration write is the observable effect.
-    let body = serde_json::json!({ "Name": "bob", "Configuration": {} });
+    let body = serde_json::json!({ "Name": "bob", "Configuration": {}, "Policy": null });
     let response = router
         .oneshot(
             Request::builder()
@@ -1735,6 +2351,189 @@ async fn user_scoped_update_user_forwards() {
     // The path user id reaches the manager (proving the alias forwarded).
     let (id, _) = users.updated_configuration.lock().unwrap().clone().unwrap();
     assert_eq!(id, BOB_ID);
+}
+
+/// Posts `body` to `POST /Users?userId={bob}` as the administrator, returning
+/// the status, the JSON body (`Null` when empty) and the store it wrote to.
+async fn update_bob(body: &str) -> (StatusCode, serde_json::Value, Arc<MemUsers>) {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users?userId={BOB_ID}"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json, users)
+}
+
+/// ASP.NET validates the `Policy` nested in a `UserDto` body before the
+/// action runs. A body without one carries `UserDto`'s constructor policy,
+/// whose `[Required]` provider ids are null, so it is a 400 keyed
+/// `Policy.{member}`; only a complete policy or `"Policy": null` passes.
+/// Measured on a live Jellyfin 12.2.
+#[rstest::rstest]
+#[case::no_policy(
+    r#"{"Name":"bob"}"#,
+    &["Policy.AuthenticationProviderId", "Policy.PasswordResetProviderId"]
+)]
+#[case::empty_policy(
+    r#"{"Name":"bob","Policy":{}}"#,
+    &["Policy.AuthenticationProviderId", "Policy.PasswordResetProviderId"]
+)]
+#[case::blank_reset_provider(
+    r#"{"Name":"bob","Policy":{"AuthenticationProviderId":"a","PasswordResetProviderId":" "}}"#,
+    &["Policy.PasswordResetProviderId"]
+)]
+#[case::null_auth_provider(
+    r#"{"Name":"bob","Policy":{"AuthenticationProviderId":null,"PasswordResetProviderId":"b"}}"#,
+    &["Policy.AuthenticationProviderId"]
+)]
+#[tokio::test]
+async fn update_user_validates_the_nested_policy(#[case] body: &str, #[case] failing: &[&str]) {
+    let (status, json, users) = update_bob(body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let errors = json["errors"].as_object().expect("validation errors");
+    let mut keys: Vec<&str> = errors.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, failing);
+    assert!(users.updated_configuration.lock().unwrap().is_none());
+}
+
+/// The hidden `POST /Users/{userId}` forwards to the same validation.
+#[tokio::test]
+async fn user_scoped_update_user_validates_the_nested_policy() {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users/{BOB_ID}"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"Name":"bob"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert!(json["errors"]["Policy.AuthenticationProviderId"].is_array());
+    assert!(users.updated_configuration.lock().unwrap().is_none());
+}
+
+#[rstest::rstest]
+#[case::null_policy(r#"{"Name":"bob","Policy":null}"#)]
+#[case::complete_policy(
+    r#"{"Name":"bob","Policy":{"AuthenticationProviderId":"a","PasswordResetProviderId":"b"}}"#
+)]
+#[tokio::test]
+async fn update_user_accepts_a_complete_or_null_policy(#[case] body: &str) {
+    let (status, _, _) = update_bob(body).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// C# compares the stored name with `updateUser.Name` and renames when they
+/// differ, so a missing or null name is handed to `RenameUser`, whose
+/// `ThrowIfInvalidUsername` refuses it (the real manager's
+/// `require_valid_username`, a 400). The same name renames nothing.
+#[rstest::rstest]
+#[case::no_name(r#"{"Policy":null}"#, Some(""))]
+#[case::null_name(r#"{"Name":null,"Policy":null}"#, Some(""))]
+#[case::same_name(r#"{"Name":"bob","Policy":null}"#, None)]
+#[tokio::test]
+async fn update_user_renames_whenever_the_name_differs(
+    #[case] body: &str,
+    #[case] renamed_to: Option<&str>,
+) {
+    let (status, _, users) = update_bob(body).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the fake store renames to anything"
+    );
+    let renamed = users.renamed.lock().unwrap().clone();
+    assert_eq!(renamed.as_ref().map(|(_, name)| name.as_str()), renamed_to);
+}
+
+/// v12.2 raises `UserUpdatedEventArgs`, whose `UserUpdatedNotifier` is the only
+/// sender of `UserUpdated`, from `RenameUser` and `UpdatePolicyAsync` alone:
+/// `UpdateUser` renames only when the name changed, and
+/// `UpdateConfigurationAsync` raises nothing.
+#[rstest::rstest]
+#[case::update_without_rename("/Users?userId=BOB", r#"{"Name":"bob","Policy":null}"#, false)]
+#[case::update_with_rename("/Users?userId=BOB", r#"{"Name":"robert","Policy":null}"#, true)]
+#[case::user_scoped_update("/Users/BOB", r#"{"Name":"bob","Policy":null}"#, false)]
+#[case::configuration("/Users/Configuration?userId=BOB", "{}", false)]
+#[case::user_scoped_configuration("/Users/BOB/Configuration", "{}", false)]
+#[case::policy("/Users/BOB/Policy", "POLICY", true)]
+#[tokio::test]
+async fn only_a_rename_or_a_policy_save_pushes_user_updated(
+    #[case] uri: &str,
+    #[case] body: &str,
+    #[case] pushes: bool,
+) {
+    let sessions = Arc::new(NoopSessions::default());
+    let router = create_router(state_with_sessions(
+        Arc::new(MemUsers::default()),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(AdminAuth),
+        sessions.clone(),
+    ));
+    let body = if body == "POLICY" {
+        serde_json::to_string(&complete_policy()).unwrap()
+    } else {
+        body.to_owned()
+    };
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri.replace("BOB", &BOB_ID.to_string()))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let expected = if pushes {
+        vec![(vec![BOB_ID], SessionMessageType::UserUpdated)]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(*sessions.pushed.lock().unwrap(), expected);
+}
+
+/// `UserDto`'s constructor supplies a default `UserConfiguration`, so a body
+/// without `Configuration` resets the stored settings to the defaults, as a
+/// live Jellyfin 12.2 does. `"Configuration": null` (a 500 upstream) saves
+/// nothing.
+#[tokio::test]
+async fn update_user_without_configuration_saves_the_default_configuration() {
+    let (status, _, users) = update_bob(r#"{"Name":"bob","Policy":null}"#).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let saved = users.updated_configuration.lock().unwrap().clone();
+    assert_eq!(saved, Some((BOB_ID, UserConfiguration::default())));
+
+    let (status, _, users) =
+        update_bob(r#"{"Name":"bob","Policy":null,"Configuration":null}"#).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(users.updated_configuration.lock().unwrap().is_none());
 }
 
 #[tokio::test]
@@ -1789,8 +2588,8 @@ async fn user_scoped_configuration_forwards() {
 /// id. `AuthorizationInfo::user_id()` is the nil GUID for a caller with no user
 /// (an API key), so degrading an unparseable *target* id to nil as well made the
 /// two compare equal and granted the update — C# compares against `User.Id`, a
-/// `Guid` that is never `Guid.Empty` for a loaded user. A userless caller must
-/// be refused whatever the target row looks like.
+/// `Guid` that is never `Guid.Empty` for a loaded user. Even an elevated API
+/// key must not turn an invalid stored id into an anonymous self-update.
 #[tokio::test]
 async fn a_userless_caller_cannot_update_a_user_whose_stored_id_is_malformed() {
     let users = Arc::new(MemUsers::default());
@@ -1807,7 +2606,7 @@ async fn a_userless_caller_cannot_update_a_user_whose_stored_id_is_malformed() {
                 .uri(format!("/Users?userId={CORRUPT_ID}"))
                 .header("X-Emby-Token", "t")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"Name":"pwned"}"#))
+                .body(Body::from(r#"{"Name":"pwned","Policy":null}"#))
                 .unwrap(),
         )
         .await
@@ -1817,4 +2616,92 @@ async fn a_userless_caller_cannot_update_a_user_whose_stored_id_is_malformed() {
         StatusCode::FORBIDDEN,
         "a caller with no user must not be able to update a corrupt-id row"
     );
+}
+
+#[tokio::test]
+async fn changing_password_preserves_the_requesting_session() {
+    let users = Arc::new(MemUsers::default());
+    let sessions = Arc::new(NoopSessions::default());
+    let app = state_with_sessions(
+        users,
+        Arc::new(MemConfig::new(true)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(AdminAuth),
+        sessions.clone(),
+    );
+    let router = create_router(app);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/Password")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"NewPw":"replacement"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        *sessions.revoked.lock().unwrap(),
+        vec![(ADMIN_ID, "current-session".to_owned())]
+    );
+}
+
+/// A normal account editing itself with preferences disabled must be denied,
+/// while an API key retains its upstream administrator role.
+#[tokio::test]
+async fn account_updates_respect_preferences_and_api_key_elevation() {
+    struct BobAuth;
+    #[async_trait]
+    impl AuthService for BobAuth {
+        async fn authenticate(
+            &self,
+            _: &RequestContext,
+        ) -> Result<AuthorizationInfo, ServiceError> {
+            Ok(AuthorizationInfo {
+                user: Some(user_entity(BOB_ID, "bob", None)),
+                is_authenticated: true,
+                ..Default::default()
+            })
+        }
+    }
+    for (path, body) in [
+        ("/Users", r#"{"Name":"new-name","Policy":null}"#),
+        ("/Users/Password", r#"{"NewPw":"replacement"}"#),
+        (
+            "/Users/Configuration",
+            r#"{"AudioLanguagePreference":"fr"}"#,
+        ),
+    ] {
+        for (auth, expected) in [
+            (
+                Arc::new(BobAuth) as Arc<dyn AuthService>,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Arc::new(ferrofin_api::test_support::ApiKeyAuthService) as Arc<dyn AuthService>,
+                StatusCode::NO_CONTENT,
+            ),
+        ] {
+            let app = state_with_auth(
+                Arc::new(MemUsers::default()),
+                Arc::new(MemConfig::new(true)),
+                Arc::new(ferrofin_api::test_support::FakeActivity),
+                auth,
+            );
+            let response = create_router(app)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("{path}?userId={BOB_ID}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_owned()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
 }

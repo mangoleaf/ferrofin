@@ -2,18 +2,22 @@
 //!
 //! The handler unit tests in `handlers::websocket` cover frame parsing and the
 //! bounded push queue in isolation; these drive an actual TCP connection through
-//! `axum::serve`, which is the only way to exercise the inbound framing — the
-//! part affected by the socket's read-buffer capacity.
+//! `axum::serve`, which is the only way to exercise the inbound framing (the
+//! part affected by the socket's read-buffer capacity) and the authentication
+//! that decides whether the upgrade happens at all.
 
 use std::net::SocketAddr;
 
+use ferrofin_api::state::AppState;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-/// Serves the real router on an ephemeral loopback port and returns its address.
-async fn serve() -> SocketAddr {
-    let app = ferrofin_api::create_router(ferrofin_api::test_support::fake_state());
+/// Serves the real router over `state` on an ephemeral loopback port and
+/// returns its address.
+async fn serve(state: AppState) -> SocketAddr {
+    let app = ferrofin_api::create_router(state);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
@@ -46,7 +50,7 @@ where
 /// reads and answered exactly as a small one is.
 #[tokio::test]
 async fn a_frame_many_times_the_read_buffer_is_still_answered() {
-    let addr = serve().await;
+    let addr = serve(ferrofin_api::test_support::authed_fake_state()).await;
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/socket"))
         .await
         .expect("upgrade");
@@ -84,4 +88,74 @@ async fn a_frame_many_times_the_read_buffer_is_still_answered() {
             .is_some_and(|id| id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())),
         "every outbound message carries a dashless MessageId: {large}"
     );
+}
+
+/// The socket authenticates through the same `AuthService` as every HTTP
+/// request (C# `WebSocketManager.WebSocketRequestHandler`), so whether an
+/// Emby-era credential counts is `EnableLegacyAuthorization`'s call, not the
+/// socket's. With an auth service that accepts nothing, every credential form,
+/// including the `api_key` and bare-token headers the socket once read itself,
+/// is upstream's `403` "Token is required", and the connection is never upgraded.
+#[tokio::test]
+async fn a_socket_the_auth_service_rejects_is_refused_before_the_upgrade() {
+    let addr = serve(ferrofin_api::test_support::fake_state()).await;
+    for (label, query, header) in [
+        ("no credentials", "", None),
+        ("?api_key=", "?api_key=tok", None),
+        ("?ApiKey=", "?ApiKey=tok", None),
+        ("X-Emby-Token", "", Some(("X-Emby-Token", "tok"))),
+        (
+            "X-MediaBrowser-Token",
+            "",
+            Some(("X-MediaBrowser-Token", "tok")),
+        ),
+        (
+            "Authorization: MediaBrowser",
+            "",
+            Some(("Authorization", r#"MediaBrowser Token="tok""#)),
+        ),
+    ] {
+        let mut request = format!("ws://{addr}/socket{query}")
+            .into_client_request()
+            .expect("request");
+        if let Some((name, value)) = header {
+            request
+                .headers_mut()
+                .insert(name, value.parse().expect("header value"));
+        }
+        match tokio_tungstenite::connect_async(request).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), 403, "{label}");
+            }
+            other => panic!("{label}: expected a 403 refusal, got {other:?}"),
+        }
+    }
+}
+
+/// A lost socket closes only when it has a session to end
+/// (`SessionWebSocketListener.KeepAliveSockets` disposes it since Jellyfin
+/// 12.0-rc3; every socket has a session there). One without a session (this
+/// fake's auth carries no token, so it resolves none) was never greeted, so it is only dropped from the
+/// watch and stays open past `WebSocketLostTimeout`. The clock is paused once
+/// the upgrade is done, so the timeout passes at once.
+#[tokio::test]
+async fn a_lost_sessionless_socket_stays_open() {
+    let addr = serve(ferrofin_api::test_support::authed_fake_state()).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/socket"))
+        .await
+        .expect("upgrade");
+    tokio::time::pause();
+
+    // Read the server's prompts, never answering, well past the lost timeout.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+
+    assert!(closed.is_err(), "a sessionless socket was closed when lost");
 }

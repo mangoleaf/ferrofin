@@ -39,11 +39,17 @@ pub struct UserDto {
     pub primary_image_tag: Option<String>,
 
     /// Gets or sets a value indicating whether this instance has password.
+    ///
+    /// Deprecated: this information is no longer provided. Jellyfin 12 leaves it
+    /// at its default, `true`, for every user (`[Obsolete]` on `UserDto`); it is
+    /// still serialized because the contract carries it.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub has_password: Option<bool>,
 
     /// Gets or sets a value indicating whether this instance has configured password.
+    ///
+    /// Deprecated: this is always `true` (`[Obsolete]` on Jellyfin 12's `UserDto`).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default, deserialize_with = "crate::json::value::nullable")]
     pub has_configured_password: Option<bool>,

@@ -388,7 +388,7 @@ mod tests {
     }
 
     /// Builds an `ActivityLogEntity` with the given `LogSeverity` discriminant,
-    /// for exercising `log_level_from_i32`.
+    /// for exercising the `LogLevel` conversion.
     fn activity_log(log_severity: i32) -> ActivityLogEntity {
         ActivityLogEntity {
             id: 1,
@@ -423,14 +423,9 @@ mod tests {
     }
 
     #[test]
-    fn activity_log_rejects_bad_severity() {
-        assert!(matches!(
-            ActivityLogEntry::try_from(activity_log(7)),
-            Err(DbError::InvalidEnumValue {
-                enum_name: "LogLevel",
-                value: 7,
-            })
-        ));
+    fn activity_log_keeps_an_undefined_severity() {
+        let dto = ActivityLogEntry::try_from(activity_log(7)).expect("converts");
+        assert_eq!(dto.severity, LogLevel::Unrecognized(7));
     }
 
     /// Builds a `DisplayPreferencesEntity` with the given `IndexBy` and

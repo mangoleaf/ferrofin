@@ -22,7 +22,8 @@ use uuid::Uuid;
 use crate::config::Config;
 
 /// The outcome of a [`seed_default_admin`] call, so the composition root can log
-/// exactly what happened (and surface a generated password once).
+/// exactly what happened (and warn about an administrator seeded without a
+/// password).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeedOutcome {
     /// Users already existed; nothing was seeded.
@@ -35,8 +36,10 @@ pub enum SeedOutcome {
     /// A default administrator was created **without a password** (no
     /// `admin_password` was configured), matching Jellyfin's `InitializeAsync`
     /// default so the web setup wizard can set the password via
-    /// `POST /Startup/User`. The account cannot authenticate until a password is
-    /// set (through the wizard, or by configuring `admin_password`).
+    /// `POST /Startup/User`. Until a password is set (through the wizard, or by
+    /// configuring `admin_password`), the account signs in with an EMPTY password,
+    /// as in Jellyfin — which is why a server that has been set up refuses to
+    /// start on a missing or empty database instead of reaching this seed.
     SeededPasswordless {
         /// The seeded administrator's username.
         username: String,
@@ -58,7 +61,7 @@ pub enum SeedOutcome {
 ///    password, so a passwordless admin is valid until the wizard sets one).
 ///
 /// Returns the [`SeedOutcome`] so the caller can log the result and, for a
-/// generated password, surface it to the operator exactly once.
+/// passwordless administrator, warn the operator to finish setup.
 ///
 /// # Errors
 ///

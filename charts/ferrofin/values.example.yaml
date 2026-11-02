@@ -160,9 +160,30 @@ ferrofin:
     # How many ffprobe processes a library scan runs at once (default: 8, capped
     # at the core count). Lower it for libraries on NFS or spinning disks.
     # FERROFIN_SCAN_PROBE_CONCURRENCY: "4"
+    # A scan lists each folder once and keeps the listings for its items: they
+    # are dropped past this many records (default 100000, Jellyfin's
+    # MaxCachedRecords) or after this many idle seconds (default 300).
+    # FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS: "100000"
+    # FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS: "300"
+    # Seconds a resolved access token, and a user's permissions with the libraries'
+    # rows and options, are served from memory (5-300, default 30 each). Changes
+    # made through the server apply at once; these only bound changes made outside it.
+    # FERROFIN_AUTH_CACHE_TTL_SECS: "30"
+    # FERROFIN_ROW_CACHE_TTL_SECS: "30"
+    # How many trickplay images are generated at once (default: auto, up to the
+    # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
+    # hardware acceleration holds GPU memory; "1" matches Jellyfin.
+    # FERROFIN_TRICKPLAY_CONCURRENCY: "1"
+    # Trade frame quality for speed when extracting chapter images, video
+    # thumbnails and embedded pictures: keyframes only, no 24-frame sampling
+    # (default "false", Jellyfin's FFmpeg:imgExtractPerfTradeoff).
+    # FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF: "true"
     # How long TheTVDB lookups (episode ids, a series' season list) are reused,
     # in whole hours (default 1, the TVDB plugin's CacheDurationInHours).
     # FERROFIN_TVDB_CACHE_HOURS: "1"
+    # How many days TheTVDB's sign-in token is reused before signing in again
+    # (default 25, the TVDB plugin's value; 1 to 29, as tokens expire after a month).
+    # FERROFIN_TVDB_TOKEN_DAYS: "25"
 
     # Export sampled request traces over OTLP gRPC to your collector (→ Tempo/Jaeger).
     # Off unless set; stdout stays structured JSON with a trace_id on each line.

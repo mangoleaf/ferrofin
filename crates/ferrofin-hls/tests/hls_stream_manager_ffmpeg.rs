@@ -133,8 +133,13 @@ impl ServerApplicationPaths for TempPaths {
     fn cache_path(&self) -> String {
         String::new()
     }
+    // The test's temp dir: ffmpeg's `FFmpeg.Transcode-*.log` goes there,
+    // never into the working directory (the crate).
     fn log_directory_path(&self) -> String {
-        String::new()
+        Path::new(&self.transcode)
+            .parent()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
     fn transcode_path(&self) -> String {
         self.transcode.clone()
@@ -242,6 +247,7 @@ impl StreamStatePlanner for FfmpegPlanner {
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 2,
             wait_for_path,
             segment_container: Some(seg_ext.to_owned()),
@@ -260,6 +266,8 @@ impl StreamStatePlanner for FfmpegPlanner {
             segment_container: seg_ext.to_owned(),
             encoding_options: EncodingOptions::default(),
             min_segments: 3,
+            is_dovi_removed: false,
+            is_hdr10_plus_removed: false,
         })
     }
 }

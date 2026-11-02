@@ -534,6 +534,24 @@ impl DeviceManager for FerrofinDeviceManager {
         self.access_allows(&access, device_id)
     }
 
+    async fn can_access_devices(
+        &self,
+        user: &UserEntity,
+        device_ids: &[&str],
+    ) -> Result<Vec<bool>, ServiceError> {
+        if device_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if device_ids.iter().any(|id| id.is_empty()) {
+            return Err(ServiceError::invalid_input("deviceId must not be empty"));
+        }
+        let access = self.resolve_access(Some(user)).await?;
+        device_ids
+            .iter()
+            .map(|id| self.access_allows(&access, id))
+            .collect()
+    }
+
     async fn update_device_options(
         &self,
         device_id: &str,
@@ -731,7 +749,7 @@ mod tests {
 
         // Granting EnableAllDevices re-opens it.
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &user.id,
             PermissionKind::EnableAllDevices,
             true,
@@ -801,7 +819,7 @@ mod tests {
 
         // Only the explicitly enabled device becomes visible.
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &user.id,
             PreferenceKind::EnabledDevices,
             &["dev-mid".to_owned()],
@@ -831,7 +849,7 @@ mod tests {
 
         // `EnableAllDevices` opens all three, still newest-activity first.
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &user.id,
             PermissionKind::EnableAllDevices,
             true,
@@ -860,7 +878,7 @@ mod tests {
         assert!(ids(&mgr.get_devices_for_user(Some(uid)).await.expect("list")).is_empty());
 
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &user.id,
             PermissionKind::IsAdministrator,
             true,
@@ -912,7 +930,7 @@ mod tests {
             .expect("options");
 
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &user_a.id,
             PermissionKind::IsAdministrator,
             true,

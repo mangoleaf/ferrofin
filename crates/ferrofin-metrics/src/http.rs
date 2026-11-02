@@ -96,11 +96,11 @@ pub async fn track_http(req: Request, next: Next) -> Response {
             .unwrap_or(("", "", matched.as_str()));
     let shared = shared_labels(&method, controller, action, endpoint);
 
-    inst.in_progress.add(1, &shared);
+    let in_progress = InProgress::enter(&inst.in_progress, &shared);
     let start = Instant::now();
     let response = next.run(req).await;
     let elapsed = start.elapsed().as_secs_f64();
-    inst.in_progress.add(-1, &shared);
+    drop(in_progress);
 
     let mut labelled = shared;
     labelled.push(KeyValue::new(
@@ -113,13 +113,53 @@ pub async fn track_http(req: Request, next: Next) -> Response {
     response
 }
 
+/// Counts one request in `http_requests_in_progress` until dropped, so a
+/// request whose future is dropped mid-handler (client disconnect, panic) still
+/// leaves the gauge — prometheus-net's `using (… TrackInProgress())`.
+struct InProgress<'a> {
+    gauge: &'a UpDownCounter<i64>,
+    labels: &'a [KeyValue],
+}
+
+impl<'a> InProgress<'a> {
+    fn enter(gauge: &'a UpDownCounter<i64>, labels: &'a [KeyValue]) -> Self {
+        gauge.add(1, labels);
+        Self { gauge, labels }
+    }
+}
+
+impl Drop for InProgress<'_> {
+    fn drop(&mut self) {
+        self.gauge.add(-1, self.labels);
+    }
+}
+
+/// The `method` label: the nine standard methods by name, anything else
+/// `_OTHER` (OTel HTTP semantic conventions). prometheus-net reports the raw
+/// method, but hyper accepts any token, so that would let any client mint
+/// series (METRICS.md rule 5).
+fn method_label(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::CONNECT => "CONNECT",
+        Method::OPTIONS => "OPTIONS",
+        Method::TRACE => "TRACE",
+        Method::PATCH => "PATCH",
+        _ => "_OTHER",
+    }
+}
+
 /// The labels shared by every `http_*` instrument (in-progress omits `code`,
 /// which the caller appends for the other two). `page` is always empty — it is a
 /// Razor-Pages artifact prometheus-net emits on every series (fixture parity);
 /// Ferrofin has no pages, so it is a constant `""`.
 fn shared_labels(method: &Method, controller: &str, action: &str, endpoint: &str) -> Vec<KeyValue> {
     vec![
-        KeyValue::new("method", method.as_str().to_owned()),
+        KeyValue::new("method", method_label(method)),
         KeyValue::new("controller", controller.to_owned()),
         KeyValue::new("action", action.to_owned()),
         KeyValue::new("page", ""),

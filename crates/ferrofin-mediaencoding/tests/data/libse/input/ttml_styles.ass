@@ -1,0 +1,22 @@
+[Script Info]
+Title: TTML styles
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Noto Sans,52,&H00F0F0F0,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,1,2,60,60,40,1
+Style: Top & "Quoted",Arial,40.50,&H0000FF00,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,8,10,10,10,1
+Style: Unused,Times,30,&H00FF0000,&H000000FF,&H00000000,&H00000000,0,-1,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\an5}Centre middle
+Dialogue: 0,0:00:02.00,0:00:03.00,Top & "Quoted",,0,0,0,,Quoted style name
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,Raw <i>html</i> & <b>bold</b>
+Dialogue: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,region=topLeft,Region from the effect
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,region=custom,{\an8}Region effect with an8
+Dialogue: 0,0:00:06.00,0:00:07.00,Default,,0,0,0,tts:fontSize=30|xml:space=preserve|tts:textAlign=center,Effects as attributes
+Dialogue: 0,0:00:07.00,0:00:08.00,Nope,,0,0,0,,{\an8}
+Dialogue: 0,0:00:08.00,0:00:09.00,default,,0,0,0,,Lower-case style name\NSecond line

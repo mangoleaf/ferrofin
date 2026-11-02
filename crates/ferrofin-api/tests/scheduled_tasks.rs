@@ -377,6 +377,42 @@ async fn get_tasks_query_keys_bind_ignoring_case() {
     );
 }
 
+/// Query VALUES convert like ASP.NET's `SimpleTypeModelBinder`: `bool.TryParse`
+/// ignores case and surrounding whitespace, and an empty value is `null`
+/// (measured on a live Jellyfin 12.2: `?isFavorite=True` filters,
+/// `?isFavorite=` is 200 and unfiltered).
+#[tokio::test]
+async fn get_tasks_query_values_bind_like_the_model_binder() {
+    for (query, expected) in [
+        (
+            "isHidden=TRUE&isEnabled=%20False%20",
+            (Some(true), Some(false)),
+        ),
+        ("isHidden=&isEnabled=", (None, None)),
+        ("isHidden=%20&isEnabled=true", (None, Some(true))),
+    ] {
+        let tasks = Arc::new(
+            StubTasks::new(vec![task_info("cleanup", "Cleanup", true)]).configurable(&["cleanup"]),
+        );
+        let (status, _) = send(
+            Arc::clone(&tasks),
+            true,
+            "GET",
+            &format!("/ScheduledTasks?{query}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        assert_eq!(
+            *tasks.filters.lock().expect("lock"),
+            vec![expected],
+            "{query}"
+        );
+    }
+    let tasks = Arc::new(StubTasks::new(vec![]));
+    let (status, _) = send(tasks, true, "GET", "/ScheduledTasks?isHidden=yes").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn get_tasks_is_enabled_false_returns_none() {
     let tasks =

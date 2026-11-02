@@ -406,6 +406,20 @@ fn collection_folder_scans_physical_locations() {
     assert!(CollectionFolderLocalImageProvider::supports(&item));
 }
 
+/// `LocalImageProvider.GetImages(item, paths, …)` lists each path with
+/// `GetFiles(path, SupportedImageExtensions, true, false)`: not recursively,
+/// so a title's poster in a subfolder of a library's location is not the
+/// library's.
+#[test]
+fn collection_folder_reads_its_locations_without_their_subfolders() {
+    let mut item = ImageItem::new(ImageItemKind::CollectionFolder);
+    item.physical_locations = vec!["/media/movies".to_owned()];
+    let mut fs = FakeDirectoryService::new();
+    fs.dir("/media/movies", "Heat (1995)")
+        .file("/media/movies/Heat (1995)", "poster.png");
+    assert!(CollectionFolderLocalImageProvider::get_images(&item, &fs).is_empty());
+}
+
 #[test]
 fn internal_metadata_provider_scans_given_path() {
     let item = ImageItem::new(ImageItemKind::Movie);

@@ -20,6 +20,7 @@
 //! - **`imdbVotes` is not persisted** — C# parses it and then leaves the
 //!   assignment commented out, so nothing observable is lost.
 
+use ferrofin_util::directory_path::DirectoryPath;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -51,7 +52,7 @@ pub struct OmdbClient {
     /// Where responses are cached (`{cache}/omdb`), when the composition
     /// root wired one ([`Self::with_cache_dir`]); without it every lookup is
     /// a request.
-    cache_dir: Option<PathBuf>,
+    cache_dir: Option<DirectoryPath>,
     /// The OMDb plugin's dashboard settings (`CastAndCrew`).
     plugin: crate::plugin_config::ConfigSource,
 }
@@ -109,8 +110,8 @@ impl OmdbClient {
     /// `{cache}/omdb`, where C# `GetDataFilePath`/`GetSeasonFilePath` keep
     /// them.
     #[must_use]
-    pub fn with_cache_dir(mut self, dir: PathBuf) -> Self {
-        self.cache_dir = Some(dir);
+    pub fn with_cache_dir(mut self, dir: impl Into<DirectoryPath>) -> Self {
+        self.cache_dir = Some(dir.into());
         self
     }
 
@@ -537,8 +538,12 @@ impl OmdbItem {
     pub fn rotten_tomatoes(&self) -> Option<f32> {
         self.ratings
             .iter()
-            .find(|r| r.source.eq_ignore_ascii_case(ROTTEN_TOMATOES))
-            .and_then(|r| parse_percent(&r.value))
+            .find(|r| {
+                r.source
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(ROTTEN_TOMATOES))
+            })
+            .and_then(|r| r.value.as_deref().and_then(parse_percent))
     }
 
     /// The IMDb community rating as `0.0`–`10.0` (C# `item.CommunityRating`).
@@ -607,20 +612,67 @@ pub enum OmdbPersonKind {
 /// One `Ratings` entry (`{"Source": "...", "Value": "..."}`).
 #[derive(Debug, Clone, Deserialize)]
 struct OmdbRating {
-    #[serde(rename = "Source")]
-    source: String,
-    #[serde(rename = "Value")]
-    value: String,
+    #[serde(rename = "Source", default, deserialize_with = "na_option")]
+    source: Option<String>,
+    #[serde(rename = "Value", default, deserialize_with = "na_option")]
+    value: Option<String>,
 }
 
 /// Deserializes a string field, mapping OMDb's `"N/A"` sentinel and the empty
-/// string to `None` (C# `JsonOmdbNotAvailableStringConverter`).
+/// string to `None` and decoding HTML entities in every other value
+/// (C# `JsonOmdbNotAvailableStringConverter`).
 fn na_option<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let raw = Option::<String>::deserialize(deserializer)?;
-    Ok(raw.and_then(|v| trimmed(Some(v.as_str()))))
+    Ok(raw
+        .and_then(|v| trimmed(Some(v.as_str())))
+        .map(decode_html_entities))
+}
+
+/// Decodes the HTML/XML entities OMDb responses contain (named five + numeric).
+fn decode_html_entities(input: String) -> String {
+    if !input.contains('&') {
+        return input;
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest: &str = &input;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        if let Some(semi) = rest.find(';') {
+            let entity = &rest[1..semi];
+            let decoded = match entity {
+                "amp" => Some('&'),
+                "apos" => Some('\''),
+                "quot" => Some('"'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                _ if entity.starts_with('#') => parse_numeric_ref(&entity[1..]),
+                _ => None,
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                rest = &rest[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = &rest[1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Parses `&#NNN;` (decimal) or `&#xHHH;` (hex) character references.
+fn parse_numeric_ref(s: &str) -> Option<char> {
+    let code = if let Some(hex) = s.strip_prefix(['x', 'X']) {
+        u32::from_str_radix(hex, 16).ok()?
+    } else {
+        s.parse::<u32>().ok()?
+    };
+    char::from_u32(code)
 }
 
 /// Deserializes a numeric field that may arrive as a number, a numeric string,
@@ -895,13 +947,22 @@ mod tests {
     #[tokio::test]
     async fn a_title_record_is_cached_on_disk_for_a_day() {
         let cache = tempfile::tempdir().unwrap();
+        let current = std::sync::Arc::new(std::sync::RwLock::new(cache.path().to_path_buf()));
+        let source = std::sync::Arc::clone(&current);
         let server = MockServer::start(vec![("/", movie_body())]).await;
         let client = OmdbClient::new("key")
             .with_base_url(&server.base_url)
-            .with_cache_dir(cache.path().to_path_buf());
+            .with_cache_dir(DirectoryPath::live(move || {
+                source.read().expect("path").clone()
+            }));
         let file = cache.path().join("tt1375666.json");
         assert!(client.item("1375666").await.is_some());
         assert!(file.exists(), "cached under the `tt` id");
+        let replacement = tempfile::tempdir().expect("cache");
+        *current.write().expect("path") = replacement.path().to_path_buf();
+        assert!(client.item("1375666").await.is_some());
+        assert!(replacement.path().join("tt1375666.json").is_file());
+        *current.write().expect("path") = cache.path().to_path_buf();
         drop(server);
 
         assert!(
@@ -1035,5 +1096,41 @@ mod tests {
         let server = MockServer::start(vec![("/", season_body())]).await;
         let client = OmdbClient::new("key").with_base_url(&server.base_url);
         assert!(client.episode("tt0903747", 1, 42, None).await.is_none());
+    }
+
+    #[test]
+    fn html_entities_in_strings_are_decoded() {
+        // Transliterated from C# JsonOmdbConverterTests.
+        let cases: &[(&str, &str)] = &[
+            (r#""Vincent D&apos;Onofrio""#, "Vincent D'Onofrio"),
+            (
+                r#""Alan Moore &#39;Swamp Thing&#39;""#,
+                "Alan Moore 'Swamp Thing'",
+            ),
+            (r#""Tom &amp; Jerry""#, "Tom & Jerry"),
+            (
+                r#""Mail &lt;a@b.com&gt; for a translation""#,
+                "Mail <a@b.com> for a translation",
+            ),
+            (r#""Elisa Montés""#, "Elisa Montés"),
+            (r#""R&D and 100% & more""#, "R&D and 100% & more"),
+        ];
+        for (input, expected) in cases {
+            let item: OmdbItem =
+                serde_json::from_str(&format!(r#"{{"Title":{input}}}"#)).expect("parse");
+            let result = item.title;
+            assert_eq!(result.as_deref(), Some(*expected), "input: {input}");
+        }
+    }
+
+    #[test]
+    fn html_encoded_credits_are_decoded() {
+        let input = r#"{"Actors":"Matthew Modine, R. Lee Ermey, Vincent D&apos;Onofrio"}"#;
+        let item: OmdbItem = serde_json::from_str(input).expect("parse");
+        let names: Vec<_> = item.people().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            ["Matthew Modine", "R. Lee Ermey", "Vincent D'Onofrio"]
+        );
     }
 }

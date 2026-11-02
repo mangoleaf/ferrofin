@@ -52,6 +52,12 @@ pub fn get_keyframe_data(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
+    // Upstream lowers the probe to `BelowNormal` and ignores a failure: it
+    // has no logger here, and the probe runs either way.
+    let _ = ferrofin_util::process_priority::set_process_priority(
+        &process,
+        ferrofin_util::process_priority::ProcessPriority::BelowNormal,
+    );
 
     let stdout = process
         .stdout
@@ -239,6 +245,42 @@ mod tests {
             get_keyframe_data(script, "/does/not/matter.mkv").expect("fake ffprobe should succeed");
         assert_eq!(data.keyframe_ticks, vec![10_000_000]);
         assert_eq!(data.total_duration, 10_000_000);
+    }
+
+    /// The probe runs at `BelowNormal` (nice 10), as upstream's extractor
+    /// sets it, unless this host refuses that (raising a priority past
+    /// `RLIMIT_NICE`), when it keeps the one it started with. The fake
+    /// reports its niceness as the duration.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn get_keyframe_data_runs_the_probe_below_normal_priority() {
+        use ferrofin_util::process_priority::{ProcessPriority, set_process_priority};
+        let own: i64 = String::from_utf8_lossy(
+            &std::process::Command::new("nice")
+                .output()
+                .expect("run nice")
+                .stdout,
+        )
+        .trim()
+        .parse()
+        .expect("a number");
+        let mut probe = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep");
+        let expected = match set_process_priority(&probe, ProcessPriority::BelowNormal) {
+            Ok(()) => i64::from(ProcessPriority::BelowNormal.nice()),
+            Err(_) => own,
+        };
+        probe.kill().ok();
+        probe.wait().ok();
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/fake_ffprobe_nice.sh"
+        );
+
+        let data = get_keyframe_data(script, "/does/not/matter.mkv").expect("fake ffprobe");
+        assert_eq!(data.total_duration, expected * TICKS_PER_SECOND);
     }
 
     #[test]

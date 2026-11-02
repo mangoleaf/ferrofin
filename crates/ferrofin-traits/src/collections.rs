@@ -5,7 +5,7 @@
 //!
 //! Port rules applied:
 //! - The C# `BoxSet` / `Folder` / `Playlist` domain items become
-//!   [`BaseItemEntity`](ferrofin_db::entities::base_items::BaseItemEntity) rows
+//!   [`BaseItemEntity`] rows
 //!   (a box set and a playlist are both `BaseItem`s); item and user identities
 //!   become [`uuid::Uuid`].
 //! - `CollectionCreationOptions` lives under `MediaBrowser.Controller`
@@ -16,9 +16,8 @@
 //!   ([`PlaylistCreationRequest`]/[`PlaylistCreationResult`]/
 //!   [`PlaylistUpdateRequest`]/[`PlaylistUserUpdateRequest`]/
 //!   [`PlaylistUserPermissions`]).
-//! - The `CollapseItemsWithinBoxSets` helper (operates on the un-ported domain
-//!   `BaseItem` tree) and the `.NET` collection events are dropped; they
-//!   resurface as `ferrofin-core` logic in Wave 6.
+//! - Collection collapsing consumes item rows; `.NET` collection events remain
+//!   outside the trait surface.
 //! - `IEnumerable`/`IReadOnlyCollection` → `Vec`; `Task<T>` → `async fn ->
 //!   Result<T, ServiceError>`.
 //!
@@ -28,6 +27,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::entities_media::PlaylistUserPermissions;
 use ferrofin_model::playlists::{
     PlaylistCreationRequest, PlaylistCreationResult, PlaylistUpdateRequest,
@@ -83,12 +83,25 @@ pub trait CollectionManager: Send + Sync {
         item_ids: &[Uuid],
     ) -> Result<(), ServiceError>;
 
-    /// Gets the collections accessible to a user that contain the given item.
+    /// Gets the collections visible to `user` that manually link the given item
+    /// (`ICollectionManager.GetCollectionsContainingItem`); callers sort.
     async fn get_collections_containing_item(
         &self,
-        user_id: Uuid,
+        user: &UserEntity,
         item_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
+    /// Substitute visible collections for their Movie/Series members, retaining
+    /// the order and identity of the other children (Folder post-filter path).
+    async fn collapse_items_within_box_sets(
+        &self,
+        _items: &[BaseItemEntity],
+        _user: Option<&ferrofin_db::entities::users::UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        Err(ServiceError::backend(
+            "collection collapsing is not configured",
+        ))
+    }
 
     /// Gets the folder collections are stored under, creating it if requested.
     async fn get_collections_folder(
@@ -143,8 +156,15 @@ pub trait PlaylistManager: Send + Sync {
     /// Returns [`ServiceError::NotFound`] when the playlist does not exist **or**
     /// is not visible to `user_id` — the C# `GetPlaylistForUser` returns `null`
     /// for both, and no endpoint distinguishes them. A playlist with no recorded
-    /// owner (created before owner tracking, or by an API key) grants
-    /// [`PlaylistAccessLevel::Owner`] to every caller for back-compat.
+    /// owner (created before owner tracking, by an older build's user-less
+    /// API-key create, or imported from a `Data` naming no owner) grants
+    /// [`PlaylistAccessLevel::Owner`] to every caller for
+    /// back-compat. A nil `user_id` is [`ServiceError::InvalidInput`]
+    /// (upstream's `GetUserById(Guid.Empty)` throw), here and in
+    /// [`get_playlist_for_user`](Self::get_playlist_for_user),
+    /// [`create_playlist`](Self::create_playlist),
+    /// [`get_playlists`](Self::get_playlists) and
+    /// [`get_playlist_items`](Self::get_playlist_items).
     async fn get_playlist_access(
         &self,
         playlist_id: Uuid,
@@ -218,7 +238,9 @@ pub trait PlaylistManager: Send + Sync {
         user_id: Uuid,
     ) -> Result<(), ServiceError>;
 
-    /// Removes entries from a playlist by their entry ids.
+    /// Removes entries from a playlist by their entry ids. An id that names no
+    /// playlist is [`ServiceError::InvalidInput`] (C# `ArgumentException`),
+    /// which the handler answers with upstream's bare `404`.
     async fn remove_item_from_playlist(
         &self,
         playlist_id: &str,
@@ -234,7 +256,10 @@ pub trait PlaylistManager: Send + Sync {
         calling_user_id: Uuid,
     ) -> Result<(), ServiceError>;
 
-    /// Removes all playlists owned by a user (transferring shared ones).
+    /// Disposes of the playlists a deleted user owned (C#
+    /// `RemovePlaylistsAsync`): one shared with users who still exist goes to
+    /// the first of them with edit rights, else the first of them; any other
+    /// is deleted unless it is open access, which keeps it as it is.
     async fn remove_playlists(&self, user_id: Uuid) -> Result<(), ServiceError>;
 }
 

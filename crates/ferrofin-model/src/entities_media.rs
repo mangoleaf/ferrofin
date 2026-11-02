@@ -276,14 +276,20 @@ impl ParentalRating {
 }
 
 /// Class to hold data on user permissions for playlists.
+///
+/// Upstream's only constructor is `(Guid userId, bool canEdit = false)`, so
+/// System.Text.Json binds through it and a member the body leaves out takes
+/// that parameter's default: `Guid.Empty` and `false`. A `null` `CanEdit` still
+/// fails (a non-nullable `bool`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct PlaylistUserPermissions {
     /// The user id.
     #[schema(value_type = String, format = "uuid")]
-    #[serde(with = "crate::json::guid")]
+    #[serde(default, with = "crate::json::guid")]
     pub user_id: Uuid,
     /// A value indicating whether the user has edit permissions.
+    #[serde(default)]
     pub can_edit: bool,
 }
 
@@ -365,6 +371,108 @@ pub struct VirtualFolderInfo {
     /// The refresh status.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_status: Option<String>,
+}
+
+impl VirtualFolderInfo {
+    /// Whether one of this library's locations holds `path` — the location
+    /// itself or anything under it, compared as upstream compares physical
+    /// locations (`OrdinalIgnoreCase`).
+    #[must_use]
+    pub fn holds_path(&self, path: &str) -> bool {
+        self.location_holding(path).is_some()
+    }
+
+    /// The longest of this library's locations that holds `path`.
+    fn location_holding(&self, path: &str) -> Option<&str> {
+        let path = trim_separators(path);
+        self.locations
+            .iter()
+            .map(|location| trim_separators(location))
+            .filter(|location| {
+                path.len() >= location.len()
+                    && path.is_char_boundary(location.len())
+                    && path[..location.len()].eq_ignore_ascii_case(location)
+                    && (path.len() == location.len()
+                        || location.ends_with(['/', '\\'])
+                        || path[location.len()..].starts_with(['/', '\\']))
+            })
+            .max_by_key(|location| location.len())
+    }
+
+    /// Whether `id` (a stored item id such as a `TopParentId`, in any GUID
+    /// form) is this library's collection folder.
+    #[must_use]
+    pub fn is_collection_folder(&self, id: &str) -> bool {
+        match (
+            self.item_id
+                .as_deref()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok()),
+            uuid::Uuid::parse_str(id).ok(),
+        ) {
+            (Some(own), Some(top)) => own == top,
+            _ => false,
+        }
+    }
+}
+
+/// A location without its trailing separators (the root stays itself).
+fn trim_separators(path: &str) -> &str {
+    match path.trim_end_matches(['/', '\\']) {
+        "" if !path.is_empty() => &path[..1],
+        trimmed => trimmed,
+    }
+}
+
+/// Every configured library one of whose locations holds `path` —
+/// `LibraryManager.GetCollectionFolders(item)`, which walks to the item's
+/// top-level physical folder and returns each collection folder whose
+/// physical locations contain it, so a folder two libraries share is in both.
+#[must_use]
+pub fn libraries_holding<'a>(
+    folders: &'a [VirtualFolderInfo],
+    path: &str,
+) -> Vec<&'a VirtualFolderInfo> {
+    folders.iter().filter(|f| f.holds_path(path)).collect()
+}
+
+/// The configured library that owns an item stored with `top_parent_id` at
+/// `path` (its own path, or for a path-less item its nearest ancestor's):
+/// the library whose collection folder is the `TopParentId` (a row an older
+/// Ferrofin scan wrote), else the one a location of which holds the path —
+/// the innermost, where locations nest. Upstream reads library options and
+/// collection folders through the item's location the same way
+/// (`LibraryManager.GetLibraryOptions` → `GetCollectionFolders`).
+#[must_use]
+pub fn owning_library<'a>(
+    folders: &'a [VirtualFolderInfo],
+    top_parent_id: Option<&str>,
+    path: Option<&str>,
+) -> Option<&'a VirtualFolderInfo> {
+    if let Some(top) = top_parent_id
+        && let Some(folder) = folders.iter().find(|f| f.is_collection_folder(top))
+    {
+        return Some(folder);
+    }
+    let path = path?;
+    // Between libraries holding the path through equally deep locations (one
+    // folder two libraries share), the first by `SortName` wins, as upstream's
+    // `GetCollectionFolders(item).Find(…)` takes the first of the user root's
+    // children, read in `SortName` order; never the listing's order, which is
+    // the file system's.
+    folders
+        .iter()
+        .filter_map(|f| f.location_holding(path).map(|location| (location.len(), f)))
+        .max_by(|(a_len, a), (b_len, b)| {
+            a_len
+                .cmp(b_len)
+                .then_with(|| sort_name_of(b).cmp(&sort_name_of(a)))
+        })
+        .map(|(_, f)| f)
+}
+
+/// A library's `SortName`, the key upstream orders the user root's children by.
+fn sort_name_of(folder: &VirtualFolderInfo) -> String {
+    ferrofin_util::sort_name::create_sort_name(folder.name.as_deref().unwrap_or_default())
 }
 
 /// Since `BaseItem` and `DTOBaseItem` both have provider ids, this trait helps
@@ -486,20 +594,17 @@ pub struct MediaStream {
     /// The localized "hearing impaired" label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub localized_hearing_impaired: Option<String>,
-    /// The localized language name.
-    ///
-    /// NEVER put on the wire. `LocalizedLanguage` is a post-10.11.8 addition
-    /// (upstream master `MediaStreamRepository.cs:175`); it is absent from
-    /// `contracts/jellyfin-openapi-10.11.8.json`'s `MediaStream`, whose
-    /// `additionalProperties` is `false`, so serializing it makes every body
-    /// carrying a language-tagged stream schema-invalid.
-    ///
-    /// The field stays because [`MediaStream::display_title`] uses it as the
-    /// pre-expanded `eng -> English` form; v10.11.8's `MediaStream.DisplayTitle`
-    /// getter (`MediaStream.cs:270-296`) does that same expansion inline via
-    /// `CultureInfo`, so the resulting `DisplayTitle` matches upstream.
-    #[serde(skip_serializing)]
+    /// The localized language display name (`MediaStreamRepository.Map` via
+    /// `GetLanguageDisplayName`, Jellyfin 12.0); `None` when the code is
+    /// unknown, and then omitted from JSON. [`MediaStream::display_title`] uses
+    /// it in place of the raw `Language` code (`MediaStream.cs:276-280`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub localized_language: Option<String>,
+    /// The localized "original" label (Jellyfin 12.0 `LocalizedOriginal`; set
+    /// on every audio stream by `MediaStreamRepository.Map` and the probe,
+    /// whether or not [`Self::is_original`] is set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub localized_original: Option<String>,
     /// The NAL length size.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nal_length_size: Option<String>,
@@ -542,11 +647,10 @@ pub struct MediaStream {
     pub is_forced: bool,
     /// A value indicating whether this instance is for the hearing impaired.
     pub is_hearing_impaired: bool,
-    /// Whether the stream is in the title's original language (ffprobe's
-    /// `disposition.original`; Jellyfin 12.0 `IsOriginal`). Carried from the
-    /// probe to the `MediaStreamInfos` row only — the vendored 10.11.8 contract
-    /// has no such property, so it is never serialized.
-    #[serde(skip)]
+    /// Whether the stream is in the title's original language (Jellyfin 12.0
+    /// `IsOriginal`): set from ffprobe's `disposition.original`, persisted in
+    /// `MediaStreamInfos.IsOriginal`, and always serialized (non-nullable in
+    /// the 12.1 spec).
     pub is_original: bool,
     /// The height.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -766,7 +870,17 @@ impl MediaStream {
                     attributes.push(localized_or(self.localized_external.as_ref(), "External"));
                 }
 
-                Some(join_with_title(self.title.as_deref(), &attributes, " - "))
+                // MediaStream.cs:310-313 — after External, audio only.
+                if self.is_original {
+                    attributes.push(localized_or(self.localized_original.as_ref(), "Original"));
+                }
+
+                Some(join_with_title(
+                    self.title.as_deref(),
+                    &attributes,
+                    " - ",
+                    " - ",
+                ))
             }
             MediaStreamType::Video => {
                 let mut attributes: Vec<String> = Vec::new();
@@ -788,7 +902,14 @@ impl MediaStream {
                     }
                 }
 
-                Some(join_with_title(self.title.as_deref(), &attributes, " "))
+                // MediaStream.cs:358-373: a Title gets its missing tags appended
+                // with " - " (:366); without one the tags join with a space (:373).
+                Some(join_with_title(
+                    self.title.as_deref(),
+                    &attributes,
+                    " - ",
+                    " ",
+                ))
             }
             MediaStreamType::Subtitle => {
                 let mut attributes: Vec<String> = Vec::new();
@@ -823,7 +944,12 @@ impl MediaStream {
                     attributes.push(localized_or(self.localized_external.as_ref(), "External"));
                 }
 
-                Some(join_with_title(self.title.as_deref(), &attributes, " - "))
+                Some(join_with_title(
+                    self.title.as_deref(),
+                    &attributes,
+                    " - ",
+                    " - ",
+                ))
             }
             _ => None,
         }
@@ -963,6 +1089,16 @@ impl MediaStream {
             return (VideoRange::Unknown, VideoRangeType::Unknown);
         }
 
+        let color_transfer = self.color_transfer.as_deref();
+        let is_pq = color_transfer.is_some_and(|t| t.eq_ignore_ascii_case("smpte2084"));
+        let is_hlg = color_transfer.is_some_and(|t| t.eq_ignore_ascii_case("arib-std-b67"));
+        // Invalid DV only retains HDR when the base layer explicitly signals PQ or HLG.
+        let base_video_range = if is_pq || is_hlg {
+            VideoRange::Hdr
+        } else {
+            VideoRange::Sdr
+        };
+
         let codec_tag = self.codec_tag.as_deref();
         let dv_profile = self.dv_profile;
         let rpu_present_flag = self.rpu_present_flag == Some(1);
@@ -987,7 +1123,7 @@ impl MediaStream {
                     Some(4) => (VideoRange::Hdr, VideoRangeType::DoviWithHlg),
                     Some(2) => (VideoRange::Sdr, VideoRangeType::DoviWithSdr),
                     // Out of Dolby Spec files should be marked as invalid.
-                    _ => (VideoRange::Hdr, VideoRangeType::DoviInvalid),
+                    _ => (base_video_range, VideoRangeType::DoviInvalid),
                 },
                 Some(7) => (VideoRange::Hdr, VideoRangeType::DoviWithEl),
                 Some(10) => match dv_bl_compat_id {
@@ -996,10 +1132,28 @@ impl MediaStream {
                     Some(2) => (VideoRange::Sdr, VideoRangeType::DoviWithSdr),
                     Some(4) => (VideoRange::Hdr, VideoRangeType::DoviWithHlg),
                     // Out of Dolby Spec files should be marked as invalid.
-                    _ => (VideoRange::Hdr, VideoRangeType::DoviInvalid),
+                    _ => (base_video_range, VideoRangeType::DoviInvalid),
                 },
                 _ => (VideoRange::Sdr, VideoRangeType::Sdr),
             };
+
+            // A base layer whose colours do not match its declared
+            // compatibility makes the stream invalid (jellyfin#17806).
+            let expected_transfer = match dv_range_set.1 {
+                VideoRangeType::DoviWithHdr10 | VideoRangeType::DoviWithEl => Some("smpte2084"),
+                VideoRangeType::DoviWithHlg => Some("arib-std-b67"),
+                _ => None,
+            };
+            let matches_ci = |value: Option<&str>, expected: &str| {
+                value.is_some_and(|v| v.eq_ignore_ascii_case(expected))
+            };
+            if let Some(expected_transfer) = expected_transfer
+                && (!matches_ci(self.color_space.as_deref(), "bt2020nc")
+                    || !matches_ci(color_transfer, expected_transfer)
+                    || !matches_ci(self.color_primaries.as_deref(), "bt2020"))
+            {
+                return (base_video_range, VideoRangeType::DoviInvalid);
+            }
 
             if self.hdr10_plus_present_flag == Some(true) {
                 return match dv_range_set.1 {
@@ -1016,15 +1170,13 @@ impl MediaStream {
             return dv_range_set;
         }
 
-        let color_transfer = self.color_transfer.as_deref();
-
-        if color_transfer.is_some_and(|t| t.eq_ignore_ascii_case("smpte2084")) {
+        if is_pq {
             return if self.hdr10_plus_present_flag == Some(true) {
                 (VideoRange::Hdr, VideoRangeType::Hdr10Plus)
             } else {
                 (VideoRange::Hdr, VideoRangeType::Hdr10)
             };
-        } else if color_transfer.is_some_and(|t| t.eq_ignore_ascii_case("arib-std-b67")) {
+        } else if is_hlg {
             return (VideoRange::Hdr, VideoRangeType::Hlg);
         }
 
@@ -1066,20 +1218,27 @@ fn video_range_to_string(range: VideoRange) -> String {
     range.json_name().into_owned()
 }
 
-/// Joins `attributes` with `separator`; if a `title` is present, appends only
-/// the attributes not already contained (case-insensitively) in the title.
-fn join_with_title(title: Option<&str>, attributes: &[String], separator: &str) -> String {
+/// Builds a `DisplayTitle` from its attributes. With a `title`, appends each
+/// attribute the title does not already contain (case-insensitively), each
+/// preceded by `title_separator`; without one, joins the attributes with
+/// `join_separator`.
+fn join_with_title(
+    title: Option<&str>,
+    attributes: &[String],
+    title_separator: &str,
+    join_separator: &str,
+) -> String {
     if let Some(title) = non_empty(title) {
         let mut result = String::from(title);
         for tag in attributes {
             if !contains_ignore_ascii_case(title, tag) {
-                result.push_str(separator);
+                result.push_str(title_separator);
                 result.push_str(tag);
             }
         }
         result
     } else {
-        attributes.join(separator)
+        attributes.join(join_separator)
     }
 }
 
@@ -1242,8 +1401,182 @@ pub fn remove_provider_id_for<T: IHasProviderIds + ?Sized>(
     remove_provider_id(instance, provider.as_name());
 }
 
+/// Numeric/date snapshot used to sort normal episodes and positioned specials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AiredEpisodeOrder {
+    /// Physical parent season number.
+    pub season: Option<i64>,
+    /// Episode number within its parent season.
+    pub episode: Option<i64>,
+    /// Known premiere date, used to break regular episode ties.
+    pub premiere: Option<chrono::DateTime<chrono::Utc>>,
+    /// Season before which a special airs.
+    pub airs_before_season: Option<i64>,
+    /// Season after which a special airs.
+    pub airs_after_season: Option<i64>,
+    /// Episode before which a special airs.
+    pub airs_before_episode: Option<i64>,
+}
+
+impl AiredEpisodeOrder {
+    /// Whether this snapshot represents season zero.
+    #[must_use]
+    pub fn is_special(&self) -> bool {
+        self.season.unwrap_or(-1) == 0
+    }
+
+    /// Compare aired positions exactly as Jellyfin's `AiredEpisodeOrderComparer`.
+    #[must_use]
+    pub fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.is_special(), other.is_special()) {
+            (true, true) => self.special_value().cmp(&other.special_value()),
+            (false, false) => self.compare_episodes(other),
+            (false, true) => self.compare_episode_to_special(other),
+            (true, false) => other.compare_episode_to_special(self).reverse(),
+        }
+    }
+
+    /// `CompareEpisodeToSpecial(x = self, y = special)`.
+    fn compare_episode_to_special(&self, special: &Self) -> std::cmp::Ordering {
+        let x_season = self.season.unwrap_or(-1);
+        let y_season = special
+            .airs_after_season
+            .or(special.airs_before_season)
+            .unwrap_or(-1);
+        if x_season != y_season {
+            return x_season.cmp(&y_season);
+        }
+        // Special comes after the episode's season.
+        if special.airs_after_season.is_some() {
+            return std::cmp::Ordering::Less;
+        }
+        // Special comes before the season.
+        let Some(y_episode) = special.airs_before_episode else {
+            return std::cmp::Ordering::Greater;
+        };
+        // Can't really compare if this happens.
+        let Some(x_episode) = self.episode else {
+            return std::cmp::Ordering::Equal;
+        };
+        // Special comes before the episode it names.
+        if x_episode == y_episode {
+            return std::cmp::Ordering::Greater;
+        }
+        x_episode.cmp(&y_episode)
+    }
+
+    /// `GetSpecialCompareValue`: season, then airs-after, then the episode
+    /// it airs before, then the special's own number.
+    fn special_value(&self) -> i64 {
+        let mut value = self
+            .airs_after_season
+            .or(self.airs_before_season)
+            .unwrap_or(0)
+            .saturating_mul(1_000_000_000);
+        if self.airs_after_season.is_some() {
+            value = value.saturating_add(1_000_000);
+        }
+        value = value.saturating_add(self.airs_before_episode.unwrap_or(0).saturating_mul(1_000));
+        value.saturating_add(self.episode.unwrap_or(0))
+    }
+
+    /// `CompareEpisodes`: `(season ?? -1) * 1000 + (episode ?? -1)`, then the
+    /// premiere dates when both are known.
+    fn compare_episodes(&self, other: &Self) -> std::cmp::Ordering {
+        let value = |o: &Self| {
+            o.season
+                .unwrap_or(-1)
+                .saturating_mul(1_000)
+                .saturating_add(o.episode.unwrap_or(-1))
+        };
+        let by_number = value(self).cmp(&value(other));
+        if by_number != std::cmp::Ordering::Equal {
+            return by_number;
+        }
+        match (self.premiere, other.premiere) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_library_owning_an_item_is_found_by_its_collection_folder_or_location() {
+        let library = |id: &str, locations: &[&str]| super::VirtualFolderInfo {
+            item_id: Some(id.to_owned()),
+            locations: locations.iter().map(|l| (*l).to_owned()).collect(),
+            ..super::VirtualFolderInfo::default()
+        };
+        let movies = library("11111111-1111-1111-1111-111111111111", &["/media/Movies/"]);
+        let kids = library(
+            "22222222-2222-2222-2222-222222222222",
+            &["/media/movies/Kids"],
+        );
+        let all = [movies, kids];
+        let name = |f: Option<&super::VirtualFolderInfo>| f.and_then(|f| f.item_id.clone());
+        // An older row's collection folder, in the database's GUID form.
+        assert_eq!(
+            name(super::owning_library(
+                &all,
+                Some(
+                    "11111111-1111-1111-1111-111111111111"
+                        .to_uppercase()
+                        .as_str()
+                ),
+                None
+            )),
+            all[0].item_id
+        );
+        // By path: case-insensitive, the innermost location wins.
+        assert_eq!(
+            name(super::owning_library(
+                &all,
+                Some("not-a-library"),
+                Some("/media/MOVIES/Heat/Heat.mkv")
+            )),
+            all[0].item_id
+        );
+        assert_eq!(
+            name(super::owning_library(
+                &all,
+                None,
+                Some("/media/movies/Kids/Up/Up.mkv")
+            )),
+            all[1].item_id
+        );
+        assert_eq!(
+            name(super::owning_library(&all, None, Some("/media/movies"))),
+            all[0].item_id
+        );
+        // A sibling that only shares a prefix is no location's.
+        assert!(super::owning_library(&all, None, Some("/media/Movies2/x.mkv")).is_none());
+        assert_eq!(
+            super::libraries_holding(&all, "/media/movies/Kids/Up").len(),
+            2
+        );
+    }
+
+    /// A folder two libraries share is owned by the first of them by
+    /// `SortName` (case-insensitive: `alpha` before `Zeta`, which an ordinal
+    /// compare would reverse), in whichever order the libraries are listed.
+    #[test]
+    fn a_shared_location_is_owned_by_the_first_library_by_name() {
+        let library = |name: &str| super::VirtualFolderInfo {
+            name: Some(name.to_owned()),
+            locations: vec!["/media/shared".to_owned()],
+            ..super::VirtualFolderInfo::default()
+        };
+        for all in [
+            [library("alpha"), library("Zeta")],
+            [library("Zeta"), library("alpha")],
+        ] {
+            let owner = super::owning_library(&all, None, Some("/media/shared/film.mkv"));
+            assert_eq!(owner.and_then(|f| f.name.as_deref()), Some("alpha"));
+        }
+    }
     use super::*;
 
     #[test]
@@ -1416,6 +1749,34 @@ mod tests {
         assert_eq!(json["CanEdit"], true);
         let back: PlaylistUserPermissions = serde_json::from_value(json).unwrap();
         assert_eq!(perm, back);
+    }
+
+    /// Upstream binds through `PlaylistUserPermissions(Guid userId, bool canEdit
+    /// = false)`: a missing member takes the parameter default, a `null`
+    /// `UserId` is `Guid.Empty` (`JsonGuidConverter`), a `null` `CanEdit` fails.
+    /// Measured on a live Jellyfin 12.2 through `POST /Playlists`.
+    #[rstest::rstest]
+    #[case::no_can_edit(
+        r#"{"UserId":"00000000000000000000000000000009"}"#,
+        Uuid::from_u128(9),
+        false
+    )]
+    #[case::no_user_id(r#"{"CanEdit":true}"#, Uuid::nil(), true)]
+    #[case::empty(r"{}", Uuid::nil(), false)]
+    #[case::null_user_id(r#"{"UserId":null,"CanEdit":true}"#, Uuid::nil(), true)]
+    fn playlist_user_permissions_bind_through_the_constructor_defaults(
+        #[case] body: &str,
+        #[case] user_id: Uuid,
+        #[case] can_edit: bool,
+    ) {
+        let perm: PlaylistUserPermissions = serde_json::from_str(body).unwrap();
+        assert_eq!(perm, PlaylistUserPermissions::new(user_id, can_edit));
+    }
+
+    #[test]
+    fn playlist_user_permissions_refuse_a_null_can_edit() {
+        let body = r#"{"UserId":"00000000000000000000000000000009","CanEdit":null}"#;
+        assert!(serde_json::from_str::<PlaylistUserPermissions>(body).is_err());
     }
 
     #[test]
@@ -1665,11 +2026,7 @@ mod tests {
         );
 
         // Profile 8 compat 1 → DoviWithHdr10; with HDR10+ flag → DoviWithHdr10Plus.
-        let mut p8 = stream(MediaStreamType::Video);
-        p8.dv_profile = Some(8);
-        p8.rpu_present_flag = Some(1);
-        p8.bl_present_flag = Some(1);
-        p8.dv_bl_signal_compatibility_id = Some(1);
+        let mut p8 = self::dovi(8, 1);
         assert_eq!(p8.video_range_type(), VideoRangeType::DoviWithHdr10);
         p8.hdr10_plus_present_flag = Some(true);
         assert_eq!(p8.video_range_type(), VideoRangeType::DoviWithHdr10Plus);
@@ -1697,13 +2054,23 @@ mod tests {
         );
     }
 
-    /// A DoVi video stream at `profile`/`compat`, with RPU+BL present.
+    /// A DoVi video stream at `profile`/`compat`, with RPU+BL present and
+    /// the base-layer colours its compatibility id declares: BT.2020 with
+    /// HLG for compat 4, BT.709 for compat 2, BT.2020 with PQ otherwise.
     fn dovi(profile: i32, compat: i32) -> MediaStream {
         let mut s = stream(MediaStreamType::Video);
         s.dv_profile = Some(profile);
         s.rpu_present_flag = Some(1);
         s.bl_present_flag = Some(1);
         s.dv_bl_signal_compatibility_id = Some(compat);
+        let (space, transfer, primaries) = match compat {
+            4 => ("bt2020nc", "arib-std-b67", "bt2020"),
+            2 => ("bt709", "bt709", "bt709"),
+            _ => ("bt2020nc", "smpte2084", "bt2020"),
+        };
+        s.color_space = Some(space.to_owned());
+        s.color_transfer = Some(transfer.to_owned());
+        s.color_primaries = Some(primaries.to_owned());
         s
     }
 
@@ -1737,6 +2104,194 @@ mod tests {
         let mut tagged = stream(MediaStreamType::Video);
         tagged.codec_tag = Some("dvh1".to_owned());
         assert_eq!(tagged.video_range_type(), VideoRangeType::Sdr);
+    }
+
+    // Transliterated from upstream's `MediaStreamVideoRangeTests` (v12.2,
+    // `tests/Jellyfin.Model.Tests/Entities/MediaStreamVideoRangeTests.cs`).
+
+    /// Upstream's `CreateDovi`: RPU and base layer present, an enhancement
+    /// layer for profile 7, and the given base-layer colours.
+    fn create_dovi(
+        profile: i32,
+        compatibility_id: i32,
+        (space, transfer, primaries): (Option<&str>, Option<&str>, Option<&str>),
+        hdr10_plus: bool,
+    ) -> MediaStream {
+        MediaStream {
+            stream_type: MediaStreamType::Video,
+            dv_profile: Some(profile),
+            dv_bl_signal_compatibility_id: Some(compatibility_id),
+            rpu_present_flag: Some(1),
+            bl_present_flag: Some(1),
+            el_present_flag: Some(i32::from(profile == 7)),
+            color_space: space.map(str::to_owned),
+            color_transfer: transfer.map(str::to_owned),
+            color_primaries: primaries.map(str::to_owned),
+            hdr10_plus_present_flag: Some(hdr10_plus),
+            ..MediaStream::default()
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(7, 6, "smpte2084", false, VideoRangeType::DoviWithEl)]
+    #[case(7, 6, "smpte2084", true, VideoRangeType::DoviWithElhdr10Plus)]
+    #[case(8, 1, "smpte2084", false, VideoRangeType::DoviWithHdr10)]
+    #[case(8, 1, "smpte2084", true, VideoRangeType::DoviWithHdr10Plus)]
+    #[case(8, 4, "arib-std-b67", false, VideoRangeType::DoviWithHlg)]
+    #[case(10, 1, "smpte2084", false, VideoRangeType::DoviWithHdr10)]
+    #[case(10, 1, "smpte2084", true, VideoRangeType::DoviWithHdr10Plus)]
+    #[case(10, 4, "arib-std-b67", false, VideoRangeType::DoviWithHlg)]
+    #[case(8, 1, "SMPTE2084", false, VideoRangeType::DoviWithHdr10)]
+    #[case(8, 4, "ARIB-STD-B67", false, VideoRangeType::DoviWithHlg)]
+    fn get_video_color_range_valid_dovi_preserves_range_type(
+        #[case] profile: i32,
+        #[case] compatibility_id: i32,
+        #[case] transfer: &str,
+        #[case] hdr10_plus: bool,
+        #[case] expected: VideoRangeType,
+    ) {
+        let stream = create_dovi(
+            profile,
+            compatibility_id,
+            (Some("BT2020NC"), Some(transfer), Some("BT2020")),
+            hdr10_plus,
+        );
+        assert_eq!(stream.get_video_color_range(), (VideoRange::Hdr, expected));
+    }
+
+    #[rstest::rstest]
+    #[case(Some("bt709"), Some("bt709"), Some("bt709"), VideoRange::Sdr)]
+    #[case(Some("bt2020nc"), Some("bt709"), Some("bt2020"), VideoRange::Sdr)]
+    #[case(Some("bt2020nc"), None, Some("bt2020"), VideoRange::Sdr)]
+    #[case(Some("bt2020nc"), Some(""), Some("bt2020"), VideoRange::Sdr)]
+    #[case(Some("bt2020nc"), Some("unknown"), Some("bt2020"), VideoRange::Sdr)]
+    #[case(Some("bt2020nc"), Some("bt2020-10"), Some("bt2020"), VideoRange::Sdr)]
+    #[case(None, None, None, VideoRange::Sdr)]
+    #[case(Some("bt709"), Some("smpte2084"), Some("bt2020"), VideoRange::Hdr)]
+    #[case(Some("bt2020nc"), Some("smpte2084"), Some("bt709"), VideoRange::Hdr)]
+    #[case(None, Some("smpte2084"), Some("bt2020"), VideoRange::Hdr)]
+    #[case(Some("bt2020nc"), Some("smpte2084"), None, VideoRange::Hdr)]
+    #[case(Some("bt709"), Some("arib-std-b67"), Some("bt2020"), VideoRange::Hdr)]
+    #[case(Some("bt2020nc"), Some("arib-std-b67"), Some("bt709"), VideoRange::Hdr)]
+    #[case(None, Some("arib-std-b67"), Some("bt2020"), VideoRange::Hdr)]
+    #[case(Some("bt2020nc"), Some("arib-std-b67"), None, VideoRange::Hdr)]
+    fn get_video_color_range_invalid_dovi_colors_uses_base_layer_range(
+        #[case] space: Option<&str>,
+        #[case] transfer: Option<&str>,
+        #[case] primaries: Option<&str>,
+        #[case] expected: VideoRange,
+    ) {
+        // Every HDR-compatible DV profile, including the HDR10+ variants.
+        for (profile, compatibility_id) in [(7, 6), (8, 1), (8, 4), (10, 1), (10, 4)] {
+            for hdr10_plus in [false, true] {
+                let stream = create_dovi(
+                    profile,
+                    compatibility_id,
+                    (space, transfer, primaries),
+                    hdr10_plus,
+                );
+                let at = format!("{profile}.{compatibility_id}, HDR10+ {hdr10_plus}");
+                assert_eq!(stream.video_range(), expected, "{at}");
+                assert_eq!(
+                    stream.video_range_type(),
+                    VideoRangeType::DoviInvalid,
+                    "{at}"
+                );
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(7, 6, "arib-std-b67")]
+    #[case(8, 1, "arib-std-b67")]
+    #[case(8, 4, "smpte2084")]
+    #[case(10, 1, "arib-std-b67")]
+    #[case(10, 4, "smpte2084")]
+    fn get_video_color_range_wrong_hdr_transfer_invalid_but_still_hdr(
+        #[case] profile: i32,
+        #[case] compatibility_id: i32,
+        #[case] transfer: &str,
+    ) {
+        let stream = create_dovi(
+            profile,
+            compatibility_id,
+            (Some("bt2020nc"), Some(transfer), Some("bt2020")),
+            true,
+        );
+        assert_eq!(
+            stream.get_video_color_range(),
+            (VideoRange::Hdr, VideoRangeType::DoviInvalid)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(5, 0, None, VideoRange::Hdr, VideoRangeType::Dovi)]
+    #[case(10, 0, None, VideoRange::Hdr, VideoRangeType::Dovi)]
+    #[case(8, 2, Some("bt709"), VideoRange::Sdr, VideoRangeType::DoviWithSdr)]
+    #[case(10, 2, Some("bt709"), VideoRange::Sdr, VideoRangeType::DoviWithSdr)]
+    fn get_video_color_range_other_dovi_profiles_preserves_classification(
+        #[case] profile: i32,
+        #[case] compatibility_id: i32,
+        #[case] transfer: Option<&str>,
+        #[case] range: VideoRange,
+        #[case] range_type: VideoRangeType,
+    ) {
+        let stream = create_dovi(
+            profile,
+            compatibility_id,
+            (Some("bt709"), transfer, Some("bt709")),
+            false,
+        );
+        assert_eq!(stream.get_video_color_range(), (range, range_type));
+    }
+
+    #[rstest::rstest]
+    #[case(8, None, VideoRange::Sdr)]
+    #[case(8, Some("bt709"), VideoRange::Sdr)]
+    #[case(8, Some("smpte2084"), VideoRange::Hdr)]
+    #[case(10, None, VideoRange::Sdr)]
+    #[case(10, Some("arib-std-b67"), VideoRange::Hdr)]
+    fn get_video_color_range_invalid_compatibility_id_uses_base_layer_range(
+        #[case] profile: i32,
+        #[case] transfer: Option<&str>,
+        #[case] expected: VideoRange,
+    ) {
+        let stream = create_dovi(
+            profile,
+            6,
+            (Some("bt2020nc"), transfer, Some("bt2020")),
+            false,
+        );
+        assert_eq!(
+            stream.get_video_color_range(),
+            (expected, VideoRangeType::DoviInvalid)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(Some("bt709"), false, VideoRange::Sdr, VideoRangeType::Sdr)]
+    #[case(None, false, VideoRange::Sdr, VideoRangeType::Sdr)]
+    #[case(Some("smpte2084"), false, VideoRange::Hdr, VideoRangeType::Hdr10)]
+    #[case(Some("smpte2084"), true, VideoRange::Hdr, VideoRangeType::Hdr10Plus)]
+    #[case(Some("arib-std-b67"), false, VideoRange::Hdr, VideoRangeType::Hlg)]
+    fn get_video_color_range_without_dovi_preserves_classification(
+        #[case] transfer: Option<&str>,
+        #[case] hdr10_plus: bool,
+        #[case] range: VideoRange,
+        #[case] range_type: VideoRangeType,
+    ) {
+        let mut stream = MediaStream {
+            stream_type: MediaStreamType::Video,
+            color_transfer: transfer.map(str::to_owned),
+            hdr10_plus_present_flag: Some(hdr10_plus),
+            ..MediaStream::default()
+        };
+        assert_eq!(stream.get_video_color_range(), (range, range_type));
+        stream.stream_type = MediaStreamType::Audio;
+        assert_eq!(
+            stream.get_video_color_range(),
+            (VideoRange::Unknown, VideoRangeType::Unknown)
+        );
     }
 
     #[test]
@@ -1870,5 +2425,139 @@ mod tests {
         assert!(json.get("LibraryOptions").is_some());
         let back: VirtualFolderInfo = serde_json::from_value(json).unwrap();
         assert_eq!(back, info);
+    }
+}
+
+#[cfg(test)]
+mod aired_episode_order_tests {
+    use super::AiredEpisodeOrder;
+    use rstest::rstest;
+    use std::cmp::Ordering;
+    fn ts(value: &str) -> chrono::DateTime<chrono::Utc> {
+        value.parse().unwrap()
+    }
+    /// A comparer operand: `(season, episode, before_season, after_season,
+    /// before_episode, premiere)`.
+    fn order(
+        season: Option<i64>,
+        episode: Option<i64>,
+        before_season: Option<i64>,
+        after_season: Option<i64>,
+        before_episode: Option<i64>,
+        premiere: Option<&str>,
+    ) -> AiredEpisodeOrder {
+        AiredEpisodeOrder {
+            season,
+            episode,
+            premiere: premiere.map(ts),
+            airs_before_season: before_season,
+            airs_after_season: after_season,
+            airs_before_episode: before_episode,
+        }
+    }
+
+    #[rstest]
+    #[case(
+        order(None, None, None, None, None, None),
+        order(None, None, None, None, None, None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(2), None, None, None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(2), Some(1), None, None, None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(0), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(0), Some(2), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(0), Some(2), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(2), None, None, None, None),
+        order(Some(0), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(0), Some(1), None, Some(1), None, None),
+        order(Some(1), Some(1), None, None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(3), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, Some(1), None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(3), Some(1), None, None, None, None),
+        order(Some(0), Some(1), None, Some(1), Some(2), None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, None, None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(2), None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, Some(2), None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), None, None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, Some(2), None),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(3), None, None, None, None),
+        order(Some(0), Some(1), Some(1), None, Some(2), None),
+        Ordering::Greater
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        Ordering::Equal
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, Some("2021-09-11T00:00:00Z")),
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        Ordering::Less
+    )]
+    #[case(
+        order(Some(1), Some(1), None, None, None, Some("2021-09-12T00:00:00Z")),
+        order(Some(1), Some(1), None, None, None, Some("2021-09-11T00:00:00Z")),
+        Ordering::Greater
+    )]
+    fn aired_episode_order_compare(
+        #[case] x: AiredEpisodeOrder,
+        #[case] y: AiredEpisodeOrder,
+        #[case] expected: Ordering,
+    ) {
+        assert_eq!(x.compare(&y), expected);
+        assert_eq!(y.compare(&x), expected.reverse());
     }
 }

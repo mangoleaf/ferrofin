@@ -1,9 +1,10 @@
-//! Bitstream filters: container fixups, and stripping dynamic HDR metadata a
-//! client cannot handle.
+//! Bitstream filters: container fixups, stripping dynamic HDR metadata a
+//! client cannot handle, and the HLS copied-audio trim.
 //!
 //! Port of C# `EncodingHelper.ShouldRemoveDynamicHdrMetadata`,
-//! `CanEncoderRemoveDynamicHdrMetadata`, `IsDoviRemoved`, `IsHdr10PlusRemoved`
-//! and `GetBitStreamArgs` (10.11.z 1403-1540).
+//! `CanEncoderRemoveDynamicHdrMetadata`, `IsDoviRemoved`, `IsHdr10PlusRemoved`,
+//! `GetBitStreamArgs` (10.11.z 1403-1540), `GetCopiedAudioTrimBsf` and
+//! `GetAudioBitStreamArguments`.
 //!
 //! **Why this exists at all: it is what lets a Dolby Vision file stream-copy to
 //! a client that cannot play it.** Without these filters the only options are
@@ -28,9 +29,11 @@
 use ferrofin_model::data::{VideoRange, VideoRangeType};
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::entities_media::MediaStream;
+use ferrofin_traits::media_encoding::TranscodingJobType;
 
 use super::hw::capabilities::{BsfOption, FfmpegCapabilities};
 use super::transcode_state::EncodingJobInfo;
+use crate::encoder::FfmpegVersion;
 
 /// What, if anything, has to be stripped from the bitstream.
 /// Port of C# `DynamicHdrMetadataRemovalPlan`.
@@ -89,7 +92,10 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
     let Some(video) = state.video_stream.as_ref() else {
         return HdrMetadataRemoval::None;
     };
-    if video.video_range != Some(VideoRange::Hdr) {
+    let range_type = video.video_range_type();
+    // An out-of-spec Dolby Vision stream on an SDR base layer still needs its
+    // plan: a Dolby Vision client may not play it (jellyfin#17806).
+    if video.video_range() != VideoRange::Hdr && range_type != VideoRangeType::DoviInvalid {
         return HdrMetadataRemoval::None;
     }
     let requested = state.requested_range_types(video.codec.as_deref().unwrap_or_default());
@@ -106,23 +112,22 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
     let has_dovi = wants(VideoRangeType::Dovi);
     let has_dovi_with_el = wants(VideoRangeType::DoviWithEl);
     let has_dovi_with_el_hdr10plus = wants(VideoRangeType::DoviWithElhdr10Plus);
-    let range_type = video.video_range_type;
 
     let mut remove_hdr10plus = false;
     // Case 1: the client plays HDR10 but not an enhancement layer, and this
     // file has one.
     let mut remove_dovi =
-        !has_dovi_with_el && has_hdr10 && range_type == Some(VideoRangeType::DoviWithEl);
+        !has_dovi_with_el && has_hdr10 && range_type == VideoRangeType::DoviWithEl;
 
     // Case 2: a Dolby Vision player refuses a broken DOVI configuration. A
     // client that never claimed DOVI is deliberately left alone — an HDR10
     // player ignores metadata it does not understand rather than crashing, so
     // copying the bad data through is safe and cheaper.
-    remove_dovi = remove_dovi || (has_dovi && range_type == Some(VideoRangeType::DoviInvalid));
+    remove_dovi = remove_dovi || (has_dovi && range_type == VideoRangeType::DoviInvalid);
 
     // Both an enhancement layer and HDR10+ in one file. A client that handles
     // EL but not the combination loses HDR10+; anything else loses DOVI.
-    if range_type == Some(VideoRangeType::DoviWithElhdr10Plus) {
+    if range_type == VideoRangeType::DoviWithElhdr10Plus {
         remove_hdr10plus = has_dovi_with_el && !has_dovi_with_el_hdr10plus;
         remove_dovi = remove_dovi || !remove_hdr10plus;
     }
@@ -133,7 +138,7 @@ pub fn should_remove_dynamic_hdr_metadata(state: &EncodingJobInfo) -> HdrMetadat
 
     // A Dolby Vision player is confused by coexisting HDR10+ metadata.
     remove_hdr10plus =
-        remove_hdr10plus || (has_dovi && range_type == Some(VideoRangeType::DoviWithHdr10Plus));
+        remove_hdr10plus || (has_dovi && range_type == VideoRangeType::DoviWithHdr10Plus);
     if remove_hdr10plus {
         HdrMetadataRemoval::RemoveHdr10Plus
     } else {
@@ -278,10 +283,88 @@ pub fn bit_stream_args(
     None
 }
 
+/// The minimum ffmpeg version for the `noise` bitstream filter's `drop`
+/// parameter (ffmpeg 5.0).
+const MIN_FFMPEG_NOISE_BSF_DROP: FfmpegVersion = FfmpegVersion::new(5, 0);
+
+/// The `noise` bsf filter that trims copied audio packets before the seek
+/// target, achieving the same trim precision as the video decoder's
+/// `accurate_seek` without re-encoding audio.
+///
+/// Port of `GetCopiedAudioTrimBsf`. Returns the bare filter expression
+/// (without `-bsf:a`); `None` when the job does not qualify.
+///
+/// Upstream cuts at the seek on the source's timeline, which its `-copyts`
+/// keeps. `timeline_origin_ticks` is the source time the filtered packets
+/// count from instead: 0 under `-copyts`, the input seek (`-ss`) without it,
+/// so the cutoff is the seek less that origin.
+fn copied_audio_trim_bsf(
+    state: &EncodingJobInfo,
+    timeline_origin_ticks: i64,
+    ffmpeg_version: Option<FfmpegVersion>,
+) -> Option<String> {
+    if state.transcoding_type != TranscodingJobType::Hls
+        || !state.is_input_video
+        || EncodingJobInfo::is_copy_codec(state.output_video_codec.as_deref())
+        || !EncodingJobInfo::is_copy_codec(state.output_audio_codec.as_deref())
+        || state
+            .input_container
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case("wtv"))
+        || ffmpeg_version.is_none_or(|v| v < MIN_FFMPEG_NOISE_BSF_DROP)
+    {
+        return None;
+    }
+    let ticks = state.base_request.start_time_ticks.filter(|&t| t > 0)?;
+    #[allow(clippy::cast_precision_loss, reason = "tick → seconds, f64 is fine")]
+    let seek_seconds = ticks.saturating_sub(timeline_origin_ticks) as f64 / 10_000_000.0;
+    Some(format!("noise=drop='lt(pts*tb\\,{seek_seconds:.3})'"))
+}
+
+/// The `-bsf:a` argument for audio in an HLS or progressive job, combining
+/// the copied-audio trim and the `aac_adtstoasc` container fixup.
+///
+/// Port of `GetAudioBitStreamArguments`. `media_source_container` is the
+/// source's container (upstream's `MediaSource.Container`, which is the same
+/// as `state.InputContainer` in production but passed separately so the
+/// container-fixup check reads it independently of the noise-bsf's wtv
+/// gate). `timeline_origin_ticks` is the source time the job's packet
+/// timestamps start from (see `copied_audio_trim_bsf`). Returns the full
+/// argument (e.g. `"-bsf:a noise=drop='…',aac_adtstoasc"`), ready for
+/// `push_split`.
+#[must_use]
+pub fn audio_bit_stream_arguments(
+    state: &EncodingJobInfo,
+    segment_container: &str,
+    media_source_container: &str,
+    timeline_origin_ticks: i64,
+    ffmpeg_version: Option<FfmpegVersion>,
+) -> Option<String> {
+    let mut filters: Vec<&str> = Vec::new();
+    let noise = copied_audio_trim_bsf(state, timeline_origin_ticks, ffmpeg_version);
+    if let Some(ref f) = noise {
+        filters.push(f);
+    }
+    let segment_is_mp4 = segment_container.eq_ignore_ascii_case("mp4");
+    if segment_is_mp4
+        && (media_source_container.eq_ignore_ascii_case("ts")
+            || media_source_container.eq_ignore_ascii_case("aac")
+            || media_source_container.eq_ignore_ascii_case("hls"))
+        && is_aac(state.audio_stream.as_ref())
+    {
+        filters.push("aac_adtstoasc");
+    }
+    if filters.is_empty() {
+        return None;
+    }
+    Some(format!("-bsf:a {}", filters.join(",")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::encoding_helper::hw::capabilities::FfmpegCapabilities;
+    use crate::encoding_helper::test_streams::{invalid_dovi, with_range};
     use ferrofin_model::entities::MediaStreamType;
     use rstest::rstest;
 
@@ -289,14 +372,14 @@ mod tests {
     // transliteration written without reference to this file.
 
     fn video(codec: &str, range_type: VideoRangeType) -> MediaStream {
-        MediaStream {
-            codec: Some(codec.to_owned()),
-            index: 0,
-            stream_type: MediaStreamType::Video,
-            video_range: Some(VideoRange::Hdr),
-            video_range_type: Some(range_type),
-            ..MediaStream::default()
-        }
+        with_range(
+            MediaStream {
+                codec: Some(codec.to_owned()),
+                index: 0,
+                ..MediaStream::default()
+            },
+            range_type,
+        )
     }
 
     /// A job carrying `streams`, with nothing else set that matters here.
@@ -332,6 +415,7 @@ mod tests {
             transcoding_type: ferrofin_traits::media_encoding::TranscodingJobType::Progressive,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 0,
             wait_for_path: None,
             segment_container: None,
@@ -436,14 +520,92 @@ mod tests {
     }
 
     #[test]
-    fn an_sdr_stream_never_reaches_the_decision_at_all() {
-        // The range check comes first, before the client's list is even read.
-        let mut stream = video("hevc", VideoRangeType::DoviWithElhdr10Plus);
-        stream.video_range = Some(VideoRange::Sdr);
-        let state = state_with(stream, &["HDR10"]);
+    fn an_sdr_dolby_vision_stream_is_left_alone() {
+        // Dolby Vision on an SDR base layer needs nothing removed. The early
+        // range check only short-cuts it: no SDR range type meets a removal
+        // rule here.
+        let state = state_with(video("hevc", VideoRangeType::DoviWithSdr), &["HDR10"]);
         assert_eq!(
             should_remove_dynamic_hdr_metadata(&state),
             HdrMetadataRemoval::None
+        );
+    }
+
+    // Transliterated from upstream's `EncodingHelperDoviTests` (v12.2,
+    // `tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs`).
+    // Its `CanStreamCopyVideo_InvalidDovi_RequiresRemovalSupportOnlyForDoviClients`
+    // is not ported here: it needs `CanStreamCopyVideo`'s range block (gl-737).
+
+    /// Upstream's `CreateState`: a copy of [`invalid_dovi`].
+    fn invalid_dovi_state(codec: &str, transfer: Option<&str>) -> EncodingJobInfo {
+        let mut state = job(vec![invalid_dovi(codec, transfer)]);
+        state.output_video_codec = Some("copy".to_owned());
+        state
+    }
+
+    /// Only a client that asked for DOVI gets an invalid stream's Dolby
+    /// Vision stripped, whatever its base layer: an SDR base no longer
+    /// skips the decision.
+    #[rstest]
+    #[case("hevc", None, "hevc_metadata=remove_dovi=1")]
+    #[case("hevc", Some("bt709"), "hevc_metadata=remove_dovi=1")]
+    #[case("hevc", Some("smpte2084"), "hevc_metadata=remove_dovi=1")]
+    #[case("hevc", Some("arib-std-b67"), "hevc_metadata=remove_dovi=1")]
+    #[case("av1", None, "av1_metadata=remove_dovi=1")]
+    #[case("av1", Some("bt709"), "av1_metadata=remove_dovi=1")]
+    #[case("av1", Some("smpte2084"), "av1_metadata=remove_dovi=1")]
+    #[case("av1", Some("arib-std-b67"), "av1_metadata=remove_dovi=1")]
+    fn get_bit_stream_args_invalid_dovi_preserves_client_dependent_removal(
+        #[case] codec: &str,
+        #[case] transfer: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let mut state = invalid_dovi_state(codec, transfer);
+        let removal = all_bsf();
+        let no_removal = caps_with(&[]);
+        for (requested, remove_dovi) in [
+            (None, false),
+            (Some("SDR"), false),
+            (Some("HDR10"), false),
+            (Some("DOVIWithEL"), false),
+            (Some("DOVI"), true),
+            (Some("SDR,DOVI"), true),
+        ] {
+            state.base_request.video_range_type = requested.map(str::to_owned);
+            assert_eq!(
+                is_dovi_removed(&removal, &state),
+                remove_dovi,
+                "{requested:?}"
+            );
+            let args = bit_stream_args(&removal, &state, MediaStreamType::Video);
+            if remove_dovi {
+                assert!(
+                    args.as_deref().is_some_and(|a| a.contains(expected)),
+                    "{requested:?}: {args:?}"
+                );
+            } else {
+                assert_eq!(
+                    args.as_deref(),
+                    (codec == "hevc").then_some("-bsf:v hevc_mp4toannexb"),
+                    "{requested:?}"
+                );
+            }
+            assert!(!is_dovi_removed(&no_removal, &state), "{requested:?}");
+        }
+    }
+
+    #[test]
+    fn get_bit_stream_args_valid_dovi_preserves_metadata() {
+        let mut state = invalid_dovi_state("hevc", Some("smpte2084"));
+        let video = state.video_stream.as_mut().unwrap();
+        video.color_space = Some("bt2020nc".to_owned());
+        video.color_primaries = Some("bt2020".to_owned());
+        state.base_request.video_range_type = Some("DOVIWithEL".to_owned());
+        let caps = all_bsf();
+        assert!(!is_dovi_removed(&caps, &state));
+        assert_eq!(
+            bit_stream_args(&caps, &state, MediaStreamType::Video).as_deref(),
+            Some("-bsf:v hevc_mp4toannexb")
         );
     }
 
@@ -618,6 +780,167 @@ mod tests {
         assert_eq!(
             bit_stream_args(&all_bsf(), &state, MediaStreamType::Video),
             None
+        );
+    }
+
+    // ----- GetAudioBitStreamArguments (EncodingHelperAudioBitStreamTests) -----
+
+    /// `DefaultSeekTicks` from upstream's test — 63.063 seconds.
+    const DEFAULT_SEEK_TICKS: i64 = 630_630_000;
+
+    const BOTH_FILTERS: &str = "-bsf:a noise=drop='lt(pts*tb\\,63.063)',aac_adtstoasc";
+    const NOISE_ONLY: &str = "-bsf:a noise=drop='lt(pts*tb\\,63.063)'";
+    const ADTS_ONLY: &str = "-bsf:a aac_adtstoasc";
+
+    fn audio_bsf_state(
+        job_type: ferrofin_traits::media_encoding::TranscodingJobType,
+        output_video_codec: &str,
+        output_audio_codec: &str,
+        audio_stream_codec: &str,
+        input_container: &str,
+        start_ticks: i64,
+    ) -> EncodingJobInfo {
+        EncodingJobInfo {
+            display: crate::encoding_helper::transcode_state::TranscodeDisplayNames::default(),
+            base_request: crate::BaseEncodingJobOptions {
+                start_time_ticks: Some(start_ticks),
+                ..crate::BaseEncodingJobOptions::default()
+            },
+            video_stream: Some(MediaStream {
+                codec: Some("h264".to_owned()),
+                index: 0,
+                stream_type: MediaStreamType::Video,
+                ..MediaStream::default()
+            }),
+            audio_stream: Some(MediaStream {
+                codec: Some(audio_stream_codec.to_owned()),
+                index: 1,
+                stream_type: MediaStreamType::Audio,
+                ..MediaStream::default()
+            }),
+            subtitle_stream: None,
+            media_source: ferrofin_model::dto::MediaSourceInfo::default(),
+            output_video_codec: Some(output_video_codec.to_owned()),
+            output_audio_codec: Some(output_audio_codec.to_owned()),
+            output_video_bitrate: None,
+            output_audio_bitrate: None,
+            output_audio_channels: None,
+            output_container: None,
+            output_video_sync: None,
+            output_file_path: String::new(),
+            input_container: Some(input_container.to_owned()),
+            is_input_video: true,
+            subtitle_delivery_method: ferrofin_model::dlna::enums::SubtitleDeliveryMethod::Encode,
+            run_time_ticks: Some(6_000_000_000),
+            transcoding_type: job_type,
+            supported_video_codecs: Vec::new(),
+            supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
+            segment_length_secs: 0,
+            wait_for_path: None,
+            segment_container: None,
+            play_session_id: None,
+            device_id: None,
+        }
+    }
+
+    /// Port of `EncodingHelperAudioBitStreamTests.AudioBitStreamArguments_AppliesGates`.
+    /// Upstream passes `mediaSourceContainer` separately from
+    /// `state.InputContainer` (in production they are the same value), and
+    /// its timeline is the source's (`-copyts`): origin 0.
+    #[rstest]
+    #[case::hls_aac_ts_to_mp4(TranscodingJobType::Hls, ("libx264", "copy", "aac", "ts"), DEFAULT_SEEK_TICKS, (5, 0), ("mp4", "ts"), BOTH_FILTERS)]
+    #[case::hls_aac_aac_to_mp4(TranscodingJobType::Hls, ("libx264", "copy", "aac", "ts"), DEFAULT_SEEK_TICKS, (5, 0), ("mp4", "aac"), BOTH_FILTERS)]
+    #[case::hls_aac_hls_to_mp4(TranscodingJobType::Hls, ("libx264", "copy", "aac", "ts"), DEFAULT_SEEK_TICKS, (5, 0), ("mp4", "hls"), BOTH_FILTERS)]
+    #[case::progressive(TranscodingJobType::Progressive, ("libx264", "copy", "aac", "ts"), DEFAULT_SEEK_TICKS, (5, 0), ("mp4", "ts"), ADTS_ONLY)]
+    #[case::video_copy(TranscodingJobType::Hls, ("copy", "copy", "aac", "ts"), DEFAULT_SEEK_TICKS, (5, 0), ("mp4", "ts"), ADTS_ONLY)]
+    #[case::audio_not_copy(TranscodingJobType::Hls, ("libx264", "aac", "aac", "ts"), DEFAULT_SEEK_TICKS, (5, 0), ("mp4", "ts"), ADTS_ONLY)]
+    #[case::wtv_input(TranscodingJobType::Hls, ("libx264", "copy", "aac", "wtv"), DEFAULT_SEEK_TICKS, (5, 0), ("mp4", "ts"), ADTS_ONLY)]
+    #[case::zero_seek(TranscodingJobType::Hls, ("libx264", "copy", "aac", "ts"), 0, (5, 0), ("mp4", "ts"), ADTS_ONLY)]
+    #[case::old_ffmpeg(TranscodingJobType::Hls, ("libx264", "copy", "aac", "ts"), DEFAULT_SEEK_TICKS, (4, 4), ("mp4", "ts"), ADTS_ONLY)]
+    #[case::ts_segment(TranscodingJobType::Hls, ("libx264", "copy", "aac", "ts"), DEFAULT_SEEK_TICKS, (5, 0), ("ts", "ts"), NOISE_ONLY)]
+    #[case::mkv_source(TranscodingJobType::Hls, ("libx264", "copy", "aac", "ts"), DEFAULT_SEEK_TICKS, (5, 0), ("mp4", "mkv"), NOISE_ONLY)]
+    #[case::ac3_audio(TranscodingJobType::Hls, ("libx264", "copy", "ac3", "ts"), DEFAULT_SEEK_TICKS, (5, 0), ("mp4", "ts"), NOISE_ONLY)]
+    fn audio_bit_stream_arguments_applies_gates(
+        #[case] job_type: TranscodingJobType,
+        #[case] codecs: (&str, &str, &str, &str),
+        #[case] start_ticks: i64,
+        #[case] ffmpeg_ver: (i32, i32),
+        #[case] containers: (&str, &str),
+        #[case] expected: &str,
+    ) {
+        let (output_video_codec, output_audio_codec, audio_stream_codec, input_container) = codecs;
+        let (segment_container, media_source_container) = containers;
+        let state = audio_bsf_state(
+            job_type,
+            output_video_codec,
+            output_audio_codec,
+            audio_stream_codec,
+            input_container,
+            start_ticks,
+        );
+        let version = Some(FfmpegVersion::new(ffmpeg_ver.0, ffmpeg_ver.1));
+        assert_eq!(
+            audio_bit_stream_arguments(
+                &state,
+                segment_container,
+                media_source_container,
+                0,
+                version
+            )
+            .as_deref(),
+            Some(expected),
+        );
+    }
+
+    /// No audio stream suppresses the adtstoasc fixup but not the noise
+    /// trim (the caller guards the whole call behind `audio_stream.is_some()`
+    /// anyway — upstream's `GetAudioArguments` does the same null check).
+    #[test]
+    fn audio_bsf_without_audio_stream_still_emits_noise_trim() {
+        let mut state = audio_bsf_state(
+            ferrofin_traits::media_encoding::TranscodingJobType::Hls,
+            "libx264",
+            "copy",
+            "aac",
+            "ts",
+            DEFAULT_SEEK_TICKS,
+        );
+        state.audio_stream = None;
+        assert_eq!(
+            audio_bit_stream_arguments(&state, "mp4", "ts", 0, Some(FfmpegVersion::new(5, 0)),)
+                .as_deref(),
+            Some(NOISE_ONLY),
+        );
+    }
+
+    /// Without `-copyts` the packets count from the input seek, so the cut
+    /// is the seek less that origin: 0 at the seek itself, the rest when the
+    /// seek was clamped earlier (gl-1018).
+    #[rstest]
+    #[case::at_the_seek(DEFAULT_SEEK_TICKS, "0.000")]
+    #[case::clamped_earlier(DEFAULT_SEEK_TICKS - 30_000_000, "3.000")]
+    fn copied_audio_trim_counts_from_the_timeline_origin(
+        #[case] origin_ticks: i64,
+        #[case] cutoff: &str,
+    ) {
+        let state = audio_bsf_state(
+            TranscodingJobType::Hls,
+            "libx264",
+            "copy",
+            "ac3",
+            "mkv",
+            DEFAULT_SEEK_TICKS,
+        );
+        assert_eq!(
+            audio_bit_stream_arguments(
+                &state,
+                "mp4",
+                "mkv",
+                origin_ticks,
+                Some(FfmpegVersion::new(5, 0))
+            ),
+            Some(format!("-bsf:a noise=drop='lt(pts*tb\\,{cutoff})'")),
         );
     }
 }

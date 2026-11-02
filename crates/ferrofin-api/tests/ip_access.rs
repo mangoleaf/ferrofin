@@ -107,6 +107,52 @@ async fn a_loopback_peer_is_never_filtered() {
     }
 }
 
+/// C# `IsLocal()` is the connection's local address equal to its remote one:
+/// a request from this machine to one of its own non-loopback addresses (this
+/// server's ffmpeg and DVR reading a Live TV stream through the local access
+/// URL) is exempt too, even where the policy would refuse that address. A
+/// peer that merely shares the subnet is not.
+#[tokio::test]
+async fn a_peer_equal_to_the_connection_s_local_address_is_never_filtered() {
+    async fn status(config: NetworkConfiguration, request: Request<Body>) -> StatusCode {
+        create_router(state_with_network(config))
+            .oneshot(request)
+            .await
+            .expect("response")
+            .status()
+    }
+    let config = NetworkConfiguration {
+        remote_ip_filter: vec!["198.51.100.0/24".to_owned()],
+        is_remote_ip_filter_blacklist: false,
+        ..NetworkConfiguration::default()
+    };
+    let from_self = |peer: &str| {
+        let mut request = Request::builder()
+            .uri("/System/Info/Public")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().expect("peer address"),
+        ));
+        request
+            .extensions_mut()
+            .insert(ferrofin_api::ip_access::ConnectionLocalAddr(
+                "203.0.113.7:8096".parse().expect("local address"),
+            ));
+        request
+    };
+    assert_eq!(
+        status(config.clone(), from_self("203.0.113.7:51000")).await,
+        StatusCode::OK,
+        "the server's own address"
+    );
+    assert_eq!(
+        status(config, from_self("203.0.113.8:51000")).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "another host"
+    );
+}
+
 /// `EnableRemoteAccess = false` is the coarse form of the same gate: the LAN
 /// still works, everything off it does not.
 #[tokio::test]

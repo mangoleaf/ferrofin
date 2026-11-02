@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttp="http://www.w3.org/ns/ttml#parameter" ttp:timeBase="media" xmlns:tts="http://www.w3.org/ns/ttml#styling" xml:lang="en" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">
+  <head>
+    <metadata>
+      <ttm:title></ttm:title>
+    </metadata>
+    <styling>
+      <style xml:id="s0" tts:backgroundColor="black" tts:fontStyle="normal" tts:fontSize="16px" tts:fontFamily="sansSerif" tts:color="white" />
+    </styling>
+    <layout>
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="start" xml:id="topLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="start" xml:id="centerLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="start" xml:id="bottomLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="center" xml:id="topCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="center" xml:id="centerCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="center" xml:id="bottomCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="end" xml:id="topRight" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="end" xml:id="centerRight" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="end" xml:id="bottomRight" />
+    </layout>
+  </head>
+  <body style="s0">
+    <div>
+      <p begin="2.0s" xml:id="p0" end="3.5s">
+        <span tts:fontStyle="italic">
+          <span tts:fontWeight="bold">both</span>
+        </span> after</p>
+      <p begin="4.0s" xml:id="p1" end="5.5s">
+        <span tts:fontStyle="italic">line one<br />line two</span>
+      </p>
+      <p begin="6.0s" xml:id="p2" end="7.5s">unknown and <span style="ruby-base">ruby</span><span style="bouten-dot">dot</span></p>
+      <p begin="8.0s" xml:id="p3" end="9.5s">
+        <span tts:fontFamily="Arial" tts:color="red">order</span>
+        <span tts:color="blue">single</span>
+      </p>
+      <p begin="10.0s" xml:id="p4" end="11.5s">a  b</p>
+      <p begin="12.0s" xml:id="p5" end="13.5s">odd ]] end</p>
+      <p begin="14.0s" xml:id="p6" end="15.5s">ns:tagundeclared/ns:tag</p>
+      <p begin="16.0s" xml:id="p7" end="17.5s">nbsp&amp;nbsp;here &amp;amp; amp</p>
+      <p begin="18.0s" xml:id="p8" end="19.5s">
+        <span tts:fontStyle="italic">unclosed italic</span>
+      </p>
+      <p begin="20.0s" xml:id="p9" end="21.5s">
+        <span tts:fontStyle="italic">closing only</span>
+      </p>
+      <p begin="22.0s" xml:id="p10" end="23.5s">
+        <span tts:fontStyle="italic">Foo<br />Bar</span>
+      </p>
+      <p begin="24.0s" xml:id="p11" end="25.5s">FALCONE: <span tts:fontStyle="italic">I didn't think<br />it was going to be you,</span></p>
+      <p begin="26.0s" xml:id="p12" end="27.5s">
+        <span tts:fontStyle="italic">upper</span> and <span tts:fontStyle="italic">spaced</span></p>
+      <p begin="28.0s" xml:id="p13" end="29.5s" region="topCenter" />
+      <p begin="30.0s" xml:id="p14" end="31.5s">Tabs	and  double  spaces</p>
+      <p begin="32.0s" xml:id="p15" end="33.5s">日本語のテキスト <span tts:fontWeight="bold">太字</span></p>
+      <p begin="34.0s" xml:id="p16" end="35.5s">
+        <span tts:fontWeight="bold">x</span>
+        <span tts:fontStyle="italic">y</span>
+        <span tts:textDecoration="underline">z</span>
+      </p>
+      <p begin="36.0s" xml:id="p17" end="37.5s">empty italic tag</p>
+      <p begin="38.0s" xml:id="p18" end="39.5s">raw span</p>
+    </div>
+  </body>
+</tt>

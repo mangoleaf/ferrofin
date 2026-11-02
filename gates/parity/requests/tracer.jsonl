@@ -1,0 +1,1 @@
+{"id": "detail-item", "method": "GET", "path": "/Users/{user}/Items/{movie}", "source": "jellyfin-web src/controllers/itemDetails/index.js (gates/bench/screens.js detail:item)"}

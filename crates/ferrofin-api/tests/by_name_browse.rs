@@ -155,10 +155,21 @@ fn named_entity(id: Uuid, name: &str) -> BaseItemEntity {
 /// filter reads return one seeded row so every Batch 1 route resolves.
 ///
 /// `created` records every `CreateItemByName` the handlers trigger, so a test
-/// can assert the slug branch resolves WITHOUT materializing anything.
+/// can assert the slug branch resolves WITHOUT materializing anything; `seen`
+/// records the query each by-name list ran with.
 #[derive(Default, Clone)]
 struct ByNameLibrary {
     created: Arc<std::sync::Mutex<Vec<(BaseItemKind, String)>>>,
+    seen: Arc<std::sync::Mutex<Vec<InternalItemsQuery>>>,
+    /// The people queries `GET /Persons` ran with.
+    seen_people: Arc<std::sync::Mutex<Vec<InternalPeopleQuery>>>,
+}
+
+impl ByNameLibrary {
+    /// Records the query a by-name list ran with.
+    fn saw(&self, query: &InternalItemsQuery) {
+        self.seen.lock().expect("lock").push(query.clone());
+    }
 }
 
 const GENRE_ID: Uuid = Uuid::from_u128(0xAA01);
@@ -169,6 +180,10 @@ const MUSIC_GENRE_ID: Uuid = Uuid::from_u128(0xAA05);
 const SLUG_GENRE_ID: Uuid = Uuid::from_u128(0xAA07);
 const LITERAL_HYPHEN_GENRE_ID: Uuid = Uuid::from_u128(0xAA08);
 const YEAR_ID: Uuid = Uuid::from_u128(0xAA06);
+const MUSIC_LIBRARY_ID: Uuid = Uuid::from_u128(0xBB01);
+const MUSIC_VIDEOS_LIBRARY_ID: Uuid = Uuid::from_u128(0xBB02);
+const MOVIES_LIBRARY_ID: Uuid = Uuid::from_u128(0xBB03);
+const MUSIC_FOLDER_ID: Uuid = Uuid::from_u128(0xBB04);
 
 fn one_aggregate(id: Uuid, name: &str) -> QueryResult<ItemWithCounts> {
     QueryResult::new(
@@ -203,32 +218,37 @@ impl LibraryManager for ByNameLibrary {
 
     async fn get_genres(
         &self,
-        _q: &InternalItemsQuery,
+        q: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        self.saw(q);
         Ok(one_aggregate(GENRE_ID, "Drama"))
     }
     async fn get_music_genres(
         &self,
-        _q: &InternalItemsQuery,
+        q: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        self.saw(q);
         Ok(one_aggregate(MUSIC_GENRE_ID, "Jazz"))
     }
     async fn get_studios(
         &self,
-        _q: &InternalItemsQuery,
+        q: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        self.saw(q);
         Ok(one_aggregate(STUDIO_ID, "A24"))
     }
     async fn get_artists(
         &self,
-        _q: &InternalItemsQuery,
+        q: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        self.saw(q);
         Ok(one_aggregate(ARTIST_ID, "Miles Davis"))
     }
     async fn get_album_artists(
         &self,
-        _q: &InternalItemsQuery,
+        q: &InternalItemsQuery,
     ) -> Result<QueryResult<ItemWithCounts>, ServiceError> {
+        self.saw(q);
         Ok(one_aggregate(ARTIST_ID, "Miles Davis"))
     }
     /// `CreateItemByName<T>`: resolve, and mint a row when nothing matches —
@@ -291,8 +311,16 @@ impl LibraryManager for ByNameLibrary {
         };
         Ok(row.into_iter().collect())
     }
+    /// No content restrictions in this fixture.
+    async fn build_access_filter(
+        &self,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        Ok(None)
+    }
     /// Backs the `get_people_items` default for `GET /Persons`.
     async fn get_people(&self, q: &InternalPeopleQuery) -> Result<Vec<PeopleEntity>, ServiceError> {
+        self.seen_people.lock().expect("lock").push(q.clone());
         // Nobody is favorited in this fixture: a favorites-scoped query (the
         // handler must fold `Filters=IsFavorite` onto `is_favorite`) is empty.
         if q.is_favorite == Some(true) {
@@ -308,18 +336,32 @@ impl LibraryManager for ByNameLibrary {
     /// Backs the `get_years` default: one distinct production year.
     async fn get_query_filters_legacy(
         &self,
-        _q: &InternalItemsQuery,
+        q: &InternalItemsQuery,
     ) -> Result<QueryFiltersLegacy, ServiceError> {
+        self.saw(q);
         Ok(QueryFiltersLegacy {
             years: vec![1999],
             ..QueryFiltersLegacy::default()
         })
     }
 
-    // ---- Remaining methods are never reached by these tests. ----
-    async fn get_item_by_id(&self, _id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        unimplemented!()
+    /// The `/Genres?parentId=` parents: libraries of each collection type, plus
+    /// a plain folder whose `Data` claims music (not an `ICollectionFolder`).
+    async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let (type_, collection_type) = match id {
+            MUSIC_LIBRARY_ID => ("CollectionFolder", "music"),
+            MUSIC_VIDEOS_LIBRARY_ID => ("CollectionFolder", "musicvideos"),
+            MOVIES_LIBRARY_ID => ("CollectionFolder", "movies"),
+            MUSIC_FOLDER_ID => ("Folder", "music"),
+            _ => return Ok(None),
+        };
+        let mut row = named_entity(id, "Library");
+        row.type_ = format!("MediaBrowser.Controller.Entities.{type_}");
+        row.data = Some(format!(r#"{{"CollectionType":"{collection_type}"}}"#));
+        Ok(Some(row))
     }
+
+    // ---- Remaining methods are never reached by these tests. ----
     async fn query_items(
         &self,
         _q: &InternalItemsQuery,
@@ -546,6 +588,38 @@ impl AuthorizationContext for OkAuth {
     }
 }
 
+/// An [`AuthService`]/[`AuthorizationContext`] pair for an API key: an
+/// authenticated request with no user, as `AuthorizationContext` builds it for
+/// a server key.
+struct ApiKeyAuth;
+
+impl ApiKeyAuth {
+    fn info() -> AuthorizationInfo {
+        AuthorizationInfo {
+            is_api_key: true,
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        }
+    }
+}
+
+#[async_trait]
+impl AuthService for ApiKeyAuth {
+    async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::info())
+    }
+}
+
+#[async_trait]
+impl AuthorizationContext for ApiKeyAuth {
+    async fn get_authorization_info(
+        &self,
+        _r: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::info())
+    }
+}
+
 fn by_name_state() -> AppState {
     by_name_state_with(Arc::new(OkDto), ByNameLibrary::default())
 }
@@ -564,6 +638,16 @@ fn by_name_state_with_dto(dto: Arc<dyn DtoService>) -> AppState {
 
 /// The by-name test state with both seams injected.
 fn by_name_state_with(dto: Arc<dyn DtoService>, library: ByNameLibrary) -> AppState {
+    by_name_state_authed(dto, library, Arc::new(OkAuth))
+}
+
+/// The by-name test state with both seams injected, authenticating every
+/// request through `auth`.
+fn by_name_state_authed<A: AuthService + AuthorizationContext + 'static>(
+    dto: Arc<dyn DtoService>,
+    library: ByNameLibrary,
+    auth: Arc<A>,
+) -> AppState {
     AppState::new(
         Arc::new(library),
         Arc::new(OkUsers),
@@ -579,8 +663,8 @@ fn by_name_state_with(dto: Arc<dyn DtoService>, library: ByNameLibrary) -> AppSt
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         dto,
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        auth.clone(),
+        auth,
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -646,6 +730,33 @@ async fn genres_list_folds_counts_when_include_item_types_set() {
     let response = get("/Genres").await;
     let body = json_body(response).await;
     assert!(body["Items"][0].get("ChildCount").is_none());
+}
+
+/// `GenresController.GetGenres` answers from `GetMusicGenres` when the parent
+/// is a music or music-videos collection folder (`GenresController.cs:141-150`);
+/// any other parent, or none, keeps the `Genre` rows. The fake serves "Jazz"
+/// from `get_music_genres` and "Drama" from `get_genres`.
+#[rstest::rstest]
+#[case::music_library(Some(MUSIC_LIBRARY_ID), MUSIC_GENRE_ID, "Jazz")]
+#[case::music_videos_library(Some(MUSIC_VIDEOS_LIBRARY_ID), MUSIC_GENRE_ID, "Jazz")]
+#[case::movies_library(Some(MOVIES_LIBRARY_ID), GENRE_ID, "Drama")]
+#[case::plain_folder_claiming_music(Some(MUSIC_FOLDER_ID), GENRE_ID, "Drama")]
+#[case::no_parent(None, GENRE_ID, "Drama")]
+#[tokio::test]
+async fn genres_list_switches_to_music_genres_under_a_music_library(
+    #[case] parent: Option<Uuid>,
+    #[case] id: Uuid,
+    #[case] name: &str,
+) {
+    let uri = parent.map_or_else(
+        || "/Genres".to_owned(),
+        |parent| format!("/Genres?parentId={}", parent.simple()),
+    );
+    let response = get(&uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["Items"][0]["Name"], name, "{uri}");
+    assert_eq!(body["Items"][0]["Id"], id.simple().to_string(), "{uri}");
 }
 
 #[tokio::test]
@@ -777,6 +888,110 @@ async fn artists_list_album_artists_and_by_name() {
     let response = get("/Artists/Miles%20Davis").await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json_body(response).await["Name"], "Miles Davis");
+}
+
+/// The kind lists reach the repository as the client sent them: a Live TV kind
+/// with no stored type name (`Program`) survives the lenient parse, so the
+/// repository can answer it with nothing as `TranslateQuery` does, and a kind
+/// both included and excluded arrives in both lists, for the repository to
+/// apply the include alone (v12.2 `TranslateQuery.cs:282-313`).
+#[tokio::test]
+async fn by_name_lists_pass_the_kind_lists_through() {
+    let library = ByNameLibrary::default();
+    let state = by_name_state_with_library(library.clone());
+    for route in [
+        "/Genres",
+        "/MusicGenres",
+        "/Studios",
+        "/Artists",
+        "/Artists/AlbumArtists",
+    ] {
+        for (params, include, exclude) in [
+            (
+                "includeItemTypes=Program",
+                vec![BaseItemKind::Program],
+                vec![],
+            ),
+            (
+                "includeItemTypes=Movie&excludeItemTypes=Movie",
+                vec![BaseItemKind::Movie],
+                vec![BaseItemKind::Movie],
+            ),
+        ] {
+            let uri = format!("{route}?{params}");
+            let response = create_router(state.clone())
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let seen = library.seen.lock().expect("lock");
+            let query = seen.last().expect("a by-name query ran");
+            assert_eq!(query.include_item_types, include, "{uri}");
+            assert_eq!(query.exclude_item_types, exclude, "{uri}");
+        }
+    }
+}
+
+/// `studios` on the artist routes (v12.2 `ArtistsController.cs:182-195`,
+/// `:336-349`): non-empty, the names' studio ids REPLACE `studioIds`. Upstream's
+/// `GetStudio` mints a row for an unknown name, whose id nothing references;
+/// here the lookup writes nothing and an unknown name keeps a no-match id, so a
+/// list of unknown names never turns into no filter at all. The Genres and
+/// Studios controllers declare no `studios`, so it never reaches their query.
+/// The assertions are on the query the library receives: this fake answers
+/// every list with one row, so the response's count says nothing here (the
+/// repository's `studio_ids_naming_no_row_match_nothing` covers the empty
+/// answer).
+#[tokio::test]
+async fn artist_lists_resolve_studio_names_without_creating_studios() {
+    const OTHER_STUDIO: &str = "0000000000000000000000000000ab09";
+    let other = Uuid::parse_str(OTHER_STUDIO).expect("uuid");
+    let library = ByNameLibrary::default();
+    let state = by_name_state_with_library(library.clone());
+    let studio_ids_for = async |uri: String| {
+        let response = create_router(state.clone())
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let seen = library.seen.lock().expect("lock");
+        seen.last().expect("a by-name query ran").studio_ids.clone()
+    };
+    for route in ["/Artists", "/Artists/AlbumArtists"] {
+        for (params, expected) in [
+            (
+                format!("studios=A24&studioIds={OTHER_STUDIO}"),
+                vec![STUDIO_ID],
+            ),
+            ("studios=Nope".to_owned(), vec![Uuid::nil()]),
+            (
+                "studios=A24%7CNope".to_owned(),
+                vec![STUDIO_ID, Uuid::nil()],
+            ),
+            // `|` alone names nothing, so `studioIds` stands.
+            (format!("studioIds={OTHER_STUDIO}&studios=%7C"), vec![other]),
+            // So does a whitespace-only value: the query layer binds it to null
+            // for every member (`ConvertEmptyStringToNull`). Upstream's pipe
+            // binder sees the raw value and keeps it as the name `""` instead
+            // (gl-855).
+            (format!("studioIds={OTHER_STUDIO}&studios=%20"), vec![other]),
+            // A blank entry beside a name is dropped. Upstream keeps it as the
+            // name `""`, an id that matches nothing, so it sends one more id
+            // than the `[A24]` here; the artist routes answer the same.
+            ("studios=A24%7C%20".to_owned(), vec![STUDIO_ID]),
+        ] {
+            let uri = format!("{route}?{params}");
+            assert_eq!(studio_ids_for(uri.clone()).await, expected, "{uri}");
+        }
+    }
+    for route in ["/Genres", "/MusicGenres", "/Studios"] {
+        let ids = studio_ids_for(format!("{route}?studios=A24")).await;
+        assert!(ids.is_empty(), "{route} took studios: {ids:?}");
+    }
+    assert!(
+        library.created.lock().expect("lock").is_empty(),
+        "a studios filter must not mint a studio row"
+    );
 }
 
 #[tokio::test]
@@ -1046,4 +1261,138 @@ async fn by_name_browses_honour_image_and_user_data_toggles() {
     let base = options_for("/Studios").await;
     assert!(base.enable_images);
     assert_eq!(base.image_type_limit, i32::MAX);
+}
+
+/// An API key that names no `userId` has no user, and every by-name list runs
+/// with none, unscoped: v12.2 `GenresController.GetGenres` and its siblings
+/// build `new InternalItemsQuery(user)` with `user` null
+/// (`GenresController.cs:106-112`, `PersonsController.cs:98-118`,
+/// `YearsController.cs:95-100`), and `/Persons` builds no access filter
+/// (`BuildAccessFilter(null)`). Never the `400` of a request with no user.
+#[rstest::rstest]
+#[case::genres("/Genres")]
+#[case::music_genres("/MusicGenres")]
+#[case::studios("/Studios")]
+#[case::artists("/Artists")]
+#[case::album_artists("/Artists/AlbumArtists")]
+#[case::persons("/Persons")]
+#[case::years("/Years")]
+#[tokio::test]
+async fn an_api_key_lists_by_name_items_with_no_user(#[case] uri: &str) {
+    let library = ByNameLibrary::default();
+    let state = by_name_state_authed(Arc::new(OkDto), library.clone(), Arc::new(ApiKeyAuth));
+    let response = create_router(state)
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    let body = json_body(response).await;
+    assert_eq!(body["TotalRecordCount"], 1, "{uri}");
+    let people = library.seen_people.lock().expect("lock");
+    let items = library.seen.lock().expect("lock");
+    assert!(
+        !people.is_empty() || !items.is_empty(),
+        "{uri} ran no query"
+    );
+    for query in people.iter() {
+        assert!(query.user_id.is_none(), "{uri} ran as a user");
+        assert!(
+            query.access_filter.is_none(),
+            "{uri} built an access filter"
+        );
+    }
+    for query in items.iter() {
+        assert!(query.user.is_none(), "{uri} ran as a user");
+    }
+}
+
+/// The single by-name routes serve an API key with no user too: v12.2
+/// `GetGenre`, `GetMusicGenre`, `GetStudio`, `GetArtistByName`, `GetPerson`
+/// and `GetYear` project the item with no user when `userId` is empty.
+#[rstest::rstest]
+#[case::genre("/Genres/Drama", "Drama")]
+#[case::music_genre("/MusicGenres/Jazz", "Jazz")]
+#[case::studio("/Studios/A24", "A24")]
+#[case::artist("/Artists/Miles%20Davis", "Miles Davis")]
+#[case::person("/Persons/Uma", "Uma")]
+#[case::year("/Years/1999", "1999")]
+#[tokio::test]
+async fn an_api_key_reads_a_by_name_item_with_no_user(#[case] uri: &str, #[case] name: &str) {
+    let state = by_name_state_authed(
+        Arc::new(OkDto),
+        ByNameLibrary::default(),
+        Arc::new(ApiKeyAuth),
+    );
+    let response = create_router(state)
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    assert_eq!(json_body(response).await["Name"], name, "{uri}");
+}
+
+/// v12.2 `LibraryManager.GetParentItem` (`LibraryManager.cs:3276-3289`), which
+/// every by-name list calls, throws `ArgumentException("Invalid parent id: …")`
+/// for a `parentId` naming no item, the zero id included (`GetItemById`), and
+/// `ExceptionMiddleware` answers it `400`; nothing is listed. A parent that
+/// exists still scopes the list.
+#[rstest::rstest]
+#[case::genres("/Genres")]
+#[case::music_genres("/MusicGenres")]
+#[case::studios("/Studios")]
+#[case::artists("/Artists")]
+#[case::album_artists("/Artists/AlbumArtists")]
+#[case::years("/Years")]
+#[tokio::test]
+async fn a_by_name_list_refuses_a_parent_naming_no_item(#[case] route: &str) {
+    for parent in [
+        Uuid::from_u128(0xBBFF).simple().to_string(),
+        Uuid::nil().to_string(),
+    ] {
+        let library = ByNameLibrary::default();
+        let response = create_router(by_name_state_with_library(library.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{route}?parentId={parent}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{route} {parent}"
+        );
+        assert!(
+            library.seen.lock().expect("lock").is_empty(),
+            "{route} {parent}: nothing is listed"
+        );
+    }
+
+    let library = ByNameLibrary::default();
+    let response = create_router(by_name_state_with_library(library.clone()))
+        .oneshot(
+            Request::builder()
+                .uri(format!("{route}?parentId={}", MOVIES_LIBRARY_ID.simple()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{route} under a library");
+    let seen = library.seen.lock().expect("lock");
+    let query = seen.last().expect("the list ran");
+    if route == "/Years" {
+        assert_eq!(
+            query.parent_id, MOVIES_LIBRARY_ID,
+            "{route} scoped by its parent"
+        );
+    } else {
+        assert_eq!(
+            query.ancestor_ids,
+            [MOVIES_LIBRARY_ID],
+            "{route} scoped by its parent"
+        );
+    }
 }

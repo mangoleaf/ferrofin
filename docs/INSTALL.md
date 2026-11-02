@@ -123,10 +123,10 @@ Open `http://host:8096/web`.
 ### Migrate an existing Jellyfin installation
 
 Ferrofin supports database adoption from **Jellyfin 10.11.8, 10.11.9, 10.11.10, 10.11.11,
-12.0.0 and 12.1.0**. All six releases passed the live adoption suite on 2026-09-16,
-including 12.1.0 reached directly from 10.11.8 and through 12.0.0. The
-[support matrix and test record](../adoption/README.md#supported-and-tested-versions)
-identify the seven tested fixture paths and the server image used.
+12.0.0, 12.1.0 and 12.2.0**. The 10.11–12.1 releases passed the live adoption suite on
+2026-09-16; the 12.2 paths passed synthetic tests on 2026-10-13. The
+[support matrix and test record](../gates/adoption/README.md#supported-and-tested-versions)
+identify the nine tested fixture paths and the server images used.
 
 The gate checks the exact migration history and refuses unknown or incomplete histories;
 support does not extend automatically to other 10.11.x or 12.x releases. Upgrade an older
@@ -210,6 +210,11 @@ Verify the following before resuming normal use:
   the adopted database. Investigate any configuration-import warnings.
 - Your existing users can log in, and watch history, libraries, library settings, and
   artwork are present. Library `options.xml` files are imported into `options.json`.
+- The server keeps Jellyfin's identity: `/System/Info/Public` reports the same `Id` as
+  Jellyfin's `data/device.txt`, so apps that already know the server reconnect without
+  being added again. Ferrofin reads it from `data/device.txt` under its data directory on
+  the first start, before it has stored an id of its own (`config/system_id`); if you
+  copied only `jellyfin.db`, copy `device.txt` to that place too.
 - Remote access, IP filters, trusted proxies, and local-network definitions match your
   intended policy; check them before exposing the replacement server to remote clients.
 - Playback uses the configured jellyfin-ffmpeg executable.

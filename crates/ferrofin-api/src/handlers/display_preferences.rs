@@ -17,7 +17,8 @@
 //! The row's `HomeSection` children round-trip through the same `CustomPrefs`
 //! map as `homesection{n}` keys: the GET emits one per stored section, and the
 //! POST parses them back, substituting the C# per-order default when a value
-//! does not name a `HomeSectionType`. They are loaded and rewritten through the
+//! does not parse as a `HomeSectionType` (`Enum.TryParse`: a name list or an
+//! integer). They are loaded and rewritten through the
 //! display-preferences seam's `list_home_sections`/`set_home_sections`, which
 //! stand in for EF's `.Include(HomeSections)` eager-load.
 
@@ -31,8 +32,9 @@ use ferrofin_common::extensions::get_md5;
 use ferrofin_db::entities::display_preferences::{
     DisplayPreferencesEntity, ItemDisplayPreferencesEntity,
 };
-use ferrofin_db::enums::{HomeSectionType, ViewType};
+use ferrofin_db::enums::{ChromecastVersion, HomeSectionType, IndexingKind, ViewType};
 use ferrofin_model::dto::{DisplayPreferencesDto, ScrollDirection, SortOrder};
+use ferrofin_util::guid_extensions::parse_dotnet_guid;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -69,9 +71,11 @@ struct DisplayPreferencesParams {
 }
 
 /// Resolves a `displayPreferencesId` into an item id: parse it as a `Guid`, else
-/// hash it with MD5 (C# `Guid.TryParse … else GetMD5()`).
+/// hash it with MD5 (C# `Guid.TryParse … else GetMD5()`). `Guid.TryParse`'s
+/// spellings, not `Uuid::parse_str`'s: an `urn:uuid:` id is hashed, and a
+/// `(…)`, `{0x…}` or padded one is parsed.
 fn resolve_item_id(raw: &str) -> Uuid {
-    Uuid::parse_str(raw).unwrap_or_else(|_| get_md5(raw))
+    parse_dotnet_guid(raw).unwrap_or_else(|| get_md5(raw))
 }
 
 /// Reads a C# enum without discarding unnamed integer values.
@@ -94,23 +98,40 @@ fn sort_order_to_i32(order: SortOrder) -> i32 {
     order.json_value()
 }
 
-/// The `IndexingKind` display name for a stored discriminant (C# `IndexBy?.ToString()`).
+/// The `IndexingKind` display name for a stored discriminant (C#
+/// `IndexBy?.ToString()`), which writes an unnamed value as its number.
 fn index_by_name(value: Option<i32>) -> Option<String> {
-    match value {
-        Some(0) => Some("PremiereDate".to_owned()),
-        Some(1) => Some("ProductionYear".to_owned()),
-        Some(2) => Some("CommunityRating".to_owned()),
-        _ => None,
-    }
+    value.map(|v| IndexingKind::try_from(v).map_or_else(|_| v.to_string(), |k| format!("{k:?}")))
 }
 
-/// Parses an `IndexingKind` display name back to its stored discriminant.
+/// Parses an `IndexingKind` back to its stored discriminant, as C#
+/// `Enum.TryParse<IndexingKind>(value, true, …) ? indexBy : null` does.
 fn index_by_from_name(name: Option<&str>) -> Option<i32> {
-    match name.map(str::to_ascii_lowercase) {
-        Some(n) if n == "premieredate" => Some(0),
-        Some(n) if n == "productionyear" => Some(1),
-        Some(n) if n == "communityrating" => Some(2),
-        _ => None,
+    name.and_then(|n| enum_try_parse(n, IndexingKind::ALL))
+}
+
+/// C# `int.Parse(value, CultureInfo.InvariantCulture)` (`NumberStyles.Integer`):
+/// a sign and ASCII digits, with the white space it allows around them
+/// (U+0009–U+000D, U+0020) and the trailing NULs .NET ignores. `None` where
+/// upstream throws (a 500 not ported).
+fn parse_dotnet_int(value: &str) -> Option<i32> {
+    value
+        .trim_end_matches('\0')
+        .trim_matches(|c| matches!(c, '\t'..='\r' | ' '))
+        .parse()
+        .ok()
+}
+
+/// C# `bool.Parse`: `True` or `False` in any case, ignoring white space and
+/// NULs around it. `None` where upstream throws (a 500 not ported).
+fn parse_dotnet_bool(value: &str) -> Option<bool> {
+    let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    if value.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -271,20 +292,24 @@ async fn update_display_preferences(
 
     // Pull the scalar row fields out of CustomPrefs (removing each, as the C#
     // does, so they are not persisted as arbitrary custom prefs).
-    prefs.chromecast_version = take_pref(&mut dto.custom_prefs, "chromecastVersion")
-        .and_then(|v| chromecast_from_name(&v))
-        .unwrap_or(0);
+    // C# `Enum.Parse<ChromecastVersion>(value, true)` for a non-empty value,
+    // else `Stable`. `Enum.Parse` keeps an unnamed integer, and throws
+    // `ArgumentException` (a 400) for anything it cannot read.
+    prefs.chromecast_version = match take_pref(&mut dto.custom_prefs, "chromecastVersion") {
+        Some(v) if !v.is_empty() => enum_try_parse(&v, ChromecastVersion::ALL)
+            .ok_or_else(|| ApiError::BadRequest(format!("Requested value '{v}' was not found.")))?,
+        _ => 0,
+    };
     prefs.enable_next_video_info_overlay =
         take_pref(&mut dto.custom_prefs, "enableNextVideoInfoOverlay")
-            // Case-insensitive like C# `bool.Parse`: the client echoes back the
-            // "True"/"False" we send, which Rust's `parse::<bool>` rejects.
-            // Default true when absent/empty/garbage; only an explicit "false" is false.
-            .is_none_or(|v| v.is_empty() || !v.eq_ignore_ascii_case("false"));
+            // True when absent or empty; only a value `bool.Parse` reads as
+            // false is false (one it cannot read, a 500 upstream, stays true).
+            .is_none_or(|v| v.is_empty() || parse_dotnet_bool(&v) != Some(false));
     prefs.skip_backward_length = take_pref(&mut dto.custom_prefs, "skipBackLength")
-        .and_then(|v| v.parse::<i32>().ok())
+        .and_then(|v| parse_dotnet_int(&v))
         .unwrap_or(DEFAULT_SKIP_BACK_LENGTH_MS);
     prefs.skip_forward_length = take_pref(&mut dto.custom_prefs, "skipForwardLength")
-        .and_then(|v| v.parse::<i32>().ok())
+        .and_then(|v| parse_dotnet_int(&v))
         .unwrap_or(DEFAULT_SKIP_FORWARD_LENGTH_MS);
     // C# `TryGetValue(key, out var v) ? v : string.Empty` over a
     // `Dictionary<string, string?>`: an absent key stores the empty string, but a
@@ -295,18 +320,17 @@ async fn update_display_preferences(
     prefs.tv_home = take_nullable_pref(&mut dto.custom_prefs, "tvhome");
 
     // Home sections: every `homesection{order}` key is consumed off CustomPrefs
-    // and turned into a `HomeSection` row. A value that does not name a
-    // `HomeSectionType` falls back to the per-order default, and an order at or
-    // beyond that table falls back to `None` — C#
+    // and turned into a `HomeSection` row. A value that does not parse as a
+    // `HomeSectionType` (`enum_try_parse`) falls back to the per-order default,
+    // and an order at or beyond that table falls back to `None` — C#
     // `type = order < 8 ? defaults[order] : HomeSectionType.None;`.
     let mut home_sections: Vec<(i32, i32)> = Vec::new();
     let home_section_keys: Vec<String> = dto
         .custom_prefs
         .keys()
-        .filter(|k| {
-            k.len() > "homesection".len()
-                && k[.."homesection".len()].eq_ignore_ascii_case("homesection")
-        })
+        // A bare `homesection` is left alone: C# matches it too and then
+        // throws on `int.Parse("")`, a 500 not worth porting.
+        .filter(|k| k.len() > "homesection".len() && has_prefix_ignore_case(k, "homesection"))
         .cloned()
         .collect();
     for key in home_section_keys {
@@ -314,12 +338,12 @@ async fn update_display_preferences(
         // C# `int.Parse` throws on a non-numeric suffix; Ferrofin drops the key
         // instead of 500-ing, which is the same observable state for a client
         // that never sends one.
-        let Ok(order) = key["homesection".len()..].parse::<i32>() else {
+        let Some(order) = parse_dotnet_int(&key["homesection".len()..]) else {
             continue;
         };
         let type_ = value
             .as_deref()
-            .and_then(home_section_from_name)
+            .and_then(|value| enum_try_parse(value, HomeSectionType::ALL))
             .unwrap_or_else(|| {
                 usize::try_from(order)
                     .ok()
@@ -329,17 +353,21 @@ async fn update_display_preferences(
         home_sections.push((order, type_));
     }
 
-    // `landing-*` keys naming something that is not a `ViewType` are dropped
-    // rather than persisted (C# logs and removes them).
+    // `landing-*` keys: an empty value (jellyfin-web's "default screen") is
+    // dropped silently, one naming something that is not a `ViewType` is
+    // logged and dropped (C#).
     dto.custom_prefs.retain(|key, value| {
-        if key.len() <= "landing-".len()
-            || !key[.."landing-".len()].eq_ignore_ascii_case("landing-")
-        {
+        if !has_prefix_ignore_case(key, "landing-") {
             return true;
         }
-        let valid = value.as_deref().is_some_and(is_view_type_name);
+        let Some(value) = value.as_deref().filter(|v| !v.is_empty()) else {
+            return false;
+        };
+        let valid = is_view_type_name(value);
         if !valid {
-            tracing::error!(landing_screen_option = ?value, "Invalid ViewType");
+            // C# logs this at error; it is bad client input, a warning by
+            // docs/conventions/LOGGING.md.
+            tracing::warn!(landing_screen_option = value, "Invalid ViewType");
         }
         valid
     });
@@ -386,22 +414,12 @@ fn take_nullable_pref(prefs: &mut HashMap<String, Option<String>>, key: &str) ->
     prefs.remove(key).unwrap_or_else(|| Some(String::new()))
 }
 
-/// The `ChromecastVersion` display name for a stored discriminant.
+/// The `ChromecastVersion` display name for a stored discriminant (C#
+/// `ChromecastVersion.ToString().ToLowerInvariant()`), which writes an unnamed
+/// value as its number.
 fn chromecast_name(value: i32) -> String {
-    if value == 1 {
-        "unstable".to_owned()
-    } else {
-        "stable".to_owned()
-    }
-}
-
-/// Parses a `ChromecastVersion` name back to its stored discriminant.
-fn chromecast_from_name(name: &str) -> Option<i32> {
-    match name.to_ascii_lowercase().as_str() {
-        "stable" => Some(0),
-        "unstable" => Some(1),
-        _ => None,
-    }
+    ChromecastVersion::try_from(value)
+        .map_or_else(|_| value.to_string(), |v| format!("{v:?}").to_lowercase())
 }
 
 /// The per-`Order` fallback home-section types, verbatim from the C#
@@ -420,73 +438,49 @@ const HOME_SECTION_DEFAULTS: [i32; 8] = [
 ];
 
 /// The `HomeSectionType` name for a stored discriminant — C#
-/// `homeSection.Type.ToString().ToLowerInvariant()`.
+/// `homeSection.Type.ToString().ToLowerInvariant()`, which writes an unnamed
+/// value (one `Enum.TryParse` stored from an integer) as the number itself.
 fn home_section_name(value: i32) -> String {
     HomeSectionType::try_from(value)
-        .map_or_else(|_| "none".to_owned(), |t| format!("{t:?}").to_lowercase())
+        .map_or_else(|_| value.to_string(), |t| format!("{t:?}").to_lowercase())
 }
 
-/// Parses a `HomeSectionType` name back to its stored discriminant, case
-/// insensitively (C# `Enum.TryParse<HomeSectionType>(value, true, out _)`).
-fn home_section_from_name(name: &str) -> Option<i32> {
-    HOME_SECTION_TYPES
-        .iter()
-        .find(|t| format!("{t:?}").eq_ignore_ascii_case(name))
-        .map(|t| i32::from(*t))
+/// C# `Enum.TryParse<TEnum>(value, ignoreCase: true, out var result)` for an
+/// `int`-backed enum with the members `all`: a value starting with a digit or a
+/// sign is an integer of the underlying type, named or not; anything else is a
+/// comma-separated list of member names, case insensitive, whose values are
+/// OR'd. Surrounding whitespace is ignored; anything else is `None`.
+fn enum_try_parse<T>(value: &str, all: &[T]) -> Option<i32>
+where
+    T: Copy + std::fmt::Debug,
+    i32: From<T>,
+{
+    let value = value.trim();
+    if value.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '+') {
+        return value.parse::<i32>().ok();
+    }
+    if value.is_empty() {
+        return None;
+    }
+    value.split(',').try_fold(0, |acc, name| {
+        all.iter()
+            .find(|member| format!("{member:?}").eq_ignore_ascii_case(name.trim()))
+            .map(|member| acc | i32::from(*member))
+    })
 }
 
-/// Every `HomeSectionType` variant, so a name lookup can enumerate them (the
-/// `db_enum!` macro generates only the numeric conversions).
-const HOME_SECTION_TYPES: [HomeSectionType; 10] = [
-    HomeSectionType::None,
-    HomeSectionType::SmallLibraryTiles,
-    HomeSectionType::LibraryButtons,
-    HomeSectionType::ActiveRecordings,
-    HomeSectionType::Resume,
-    HomeSectionType::ResumeAudio,
-    HomeSectionType::LatestMedia,
-    HomeSectionType::NextUp,
-    HomeSectionType::LiveTv,
-    HomeSectionType::ResumeBook,
-];
-
-/// Whether `name` parses as a `ViewType`, case insensitively (C#
-/// `Enum.TryParse<ViewType>(value, true, out _)`).
-fn is_view_type_name(name: &str) -> bool {
-    VIEW_TYPES
-        .iter()
-        .any(|v| format!("{v:?}").eq_ignore_ascii_case(name))
+/// Whether `value` parses as a `ViewType` ([`enum_try_parse`]).
+fn is_view_type_name(value: &str) -> bool {
+    enum_try_parse(value, ViewType::ALL).is_some()
 }
 
-/// Every `ViewType` variant, for the `landing-*` validity check.
-const VIEW_TYPES: [ViewType; 26] = [
-    ViewType::Albums,
-    ViewType::AlbumArtists,
-    ViewType::Artists,
-    ViewType::Channels,
-    ViewType::Collections,
-    ViewType::Episodes,
-    ViewType::Favorites,
-    ViewType::Genres,
-    ViewType::Guide,
-    ViewType::Movies,
-    ViewType::Networks,
-    ViewType::Playlists,
-    ViewType::Programs,
-    ViewType::Recordings,
-    ViewType::Schedule,
-    ViewType::Series,
-    ViewType::Shows,
-    ViewType::Songs,
-    ViewType::Suggestions,
-    ViewType::Trailers,
-    ViewType::Upcoming,
-    ViewType::Authors,
-    ViewType::Books,
-    ViewType::Folders,
-    ViewType::Mixed,
-    ViewType::Photos,
-];
+/// Whether `key` starts with the ASCII `prefix`, ignoring case (C#
+/// `StartsWith(prefix, StringComparison.OrdinalIgnoreCase)`). Never slices
+/// inside a multi-byte character.
+fn has_prefix_ignore_case(key: &str, prefix: &str) -> bool {
+    key.get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+}
 
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {

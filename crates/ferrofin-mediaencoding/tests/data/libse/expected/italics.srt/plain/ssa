@@ -1,0 +1,39 @@
+[Script Info]
+; This is a Sub Station Alpha v4 script.
+Title: untitled
+ScriptType: v4.00
+Collisions: Normal
+PlayDepth: 0
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding
+Style: Default,Arial,20,16777215,65535,0,0,0,0,1,1,1,2,10,10,10,0,1
+
+[Events]
+Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: Marked=0,0:00:02.00,0:00:03.50,*Default,NTP,0000,0000,0000,,{\i1}first\N{\i1}second
+Dialogue: Marked=0,0:00:04.00,0:00:05.50,*Default,NTP,0000,0000,0000,,{\i1}one{\i1}two
+Dialogue: Marked=0,0:00:06.00,0:00:07.50,*Default,NTP,0000,0000,0000,,{\i0}-{\i1}- dash start{\i0}
+Dialogue: Marked=0,0:00:08.00,0:00:09.50,*Default,NTP,0000,0000,0000,,{\i0}lead closing {\i1}mid{\i0}
+Dialogue: Marked=0,0:00:10.00,0:00:11.50,*Default,NTP,0000,0000,0000,,mid {\i0}closing {\i1}again{\i0}
+Dialogue: Marked=0,0:00:12.00,0:00:13.50,*Default,NTP,0000,0000,0000,,{\i1}Line one{\i0}\N{\i1}Line two
+Dialogue: Marked=0,0:00:14.00,0:00:15.50,*Default,NTP,0000,0000,0000,,{\i1}a {\i1}b{\i0} c
+Dialogue: Marked=0,0:00:16.00,0:00:17.50,*Default,NTP,0000,0000,0000,,{\i1}- You think they're gone?{\i1}\N{\i1}- That can't be.{\i0}
+Dialogue: Marked=0,0:00:18.00,0:00:19.50,*Default,NTP,0000,0000,0000,,- foo.{\i0}\N- bar.{\i0}
+Dialogue: Marked=0,0:00:20.00,0:00:21.50,*Default,NTP,0000,0000,0000,,x{\i0} y{\i0}
+Dialogue: Marked=0,0:00:22.00,0:00:23.50,*Default,NTP,0000,0000,0000,,{\i0}one{\i0}\N{\i0}two{\i0}
+Dialogue: Marked=0,0:00:24.00,0:00:25.50,*Default,NTP,0000,0000,0000,,{\i1}one{\i1}\N{\i1}two{\i1}
+Dialogue: Marked=0,0:00:26.00,0:00:27.50,*Default,NTP,0000,0000,0000,,{\i1}a{\i0}\N{\i1}b\Nc{\i0}
+Dialogue: Marked=0,0:00:28.00,0:00:29.50,*Default,NTP,0000,0000,0000,,{\i1}a\Nb{\i0}\N{\i1}c
+Dialogue: Marked=0,0:00:30.00,0:00:31.50,*Default,NTP,0000,0000,0000,,- Foo{\i0}\N- Bar.
+Dialogue: Marked=0,0:00:32.00,0:00:33.50,*Default,NTP,0000,0000,0000,,Foo.{\i0}
+Dialogue: Marked=0,0:00:34.00,0:00:35.50,*Default,NTP,0000,0000,0000,,{\i1\i0}empty pair
+Dialogue: Marked=0,0:00:36.00,0:00:37.50,*Default,NTP,0000,0000,0000,,word{\i0} {\i1}joined
+Dialogue: Marked=0,0:00:38.00,0:00:39.50,*Default,NTP,0000,0000,0000,,{\i1} spaced {\i0} {\i1} pair {\i0}
+Dialogue: Marked=0,0:00:40.00,0:00:41.50,*Default,NTP,0000,0000,0000,,[sound]{\i1} text
+Dialogue: Marked=0,0:00:42.00,0:00:43.50,*Default,NTP,0000,0000,0000,,{\b1\i1}foobar{\b0}
+Dialogue: Marked=0,0:00:44.00,0:00:45.50,*Default,NTP,0000,0000,0000,,{\i1}trailing {\i0}\Nnext line
+Dialogue: Marked=0,0:00:46.00,0:00:47.50,*Default,NTP,0000,0000,0000,,@ at {\i0} {\i1} sign
+Dialogue: Marked=0,0:00:48.00,0:00:49.50,*Default,NTP,0000,0000,0000,,ALICE:{\i1} Hi there{\i0}\N{\i1}BOB: 10:30{\i0}
+Dialogue: Marked=0,0:00:50.00,0:00:51.50,*Default,NTP,0000,0000,0000,,< I >upper spaced< / I >
+Dialogue: Marked=0,0:00:52.00,0:00:53.50,*Default,NTP,0000,0000,0000,,{\i1}x{\i0\i1}y{\i0}

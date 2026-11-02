@@ -204,7 +204,6 @@ impl UserManager for MemUsers {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
-            has_password: Some(user.password.is_some()),
             policy: Some(UserPolicy {
                 is_administrator: is_admin,
                 ..UserPolicy::default()
@@ -310,11 +309,17 @@ impl QuickConnect for OkQuickConnect {
         *self.authorized_for.lock().unwrap() = Some(user_id);
         Ok(true)
     }
-    async fn get_authorized_request(&self, _secret: &str) -> Result<SessionInfoDto, ServiceError> {
-        Ok(SessionInfoDto {
-            user_id: ADMIN_ID,
-            user_name: Some("admin".to_owned()),
-            ..SessionInfoDto::default()
+    async fn get_authorized_request(
+        &self,
+        _secret: &str,
+    ) -> Result<AuthenticationResultData, ServiceError> {
+        Ok(AuthenticationResultData {
+            session: SessionInfoDto {
+                user_id: ADMIN_ID,
+                user_name: Some("admin".to_owned()),
+                ..SessionInfoDto::default()
+            },
+            access_token: "qc-token".into(),
         })
     }
 }
@@ -332,7 +337,7 @@ impl SessionManager for NoopSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }
@@ -728,4 +733,67 @@ async fn quick_connect_authorize_self_as_non_admin_is_allowed() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(*qc.authorized_for.lock().unwrap(), Some(BOB_ID));
+}
+
+/// C# `UserController.AuthenticateWithQuickConnect` returns the
+/// `AuthenticationResult` that `AuthorizeRequest` stored; it never
+/// authenticates again. A second login counted the authorize-time session
+/// against `MaxActiveSessions` (403) and left that session's token behind.
+/// (`NoopSessions::authenticate_direct` panics, so a second login fails here.)
+#[tokio::test]
+async fn authenticate_with_quick_connect_returns_the_authorized_session() {
+    let router = create_router(state(
+        Arc::new(MemUsers::default()),
+        Arc::new(MemConfig::new(true)),
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Users/AuthenticateWithQuickConnect")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"Secret":"sec"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["AccessToken"], "qc-token");
+    assert_eq!(body["SessionInfo"]["UserName"], "admin");
+}
+
+/// `QuickConnectDto.Secret` is `[Required]`: a missing, `null` or blank secret
+/// is a model-validation 400 keyed `Secret`, before the manager is asked (the
+/// fake would accept any secret).
+#[tokio::test]
+async fn authenticate_with_quick_connect_requires_a_secret() {
+    for body in [
+        "{}",
+        r#"{"Secret":null}"#,
+        r#"{"Secret":""}"#,
+        r#"{"Secret":"  "}"#,
+    ] {
+        let router = create_router(state(
+            Arc::new(MemUsers::default()),
+            Arc::new(MemConfig::new(true)),
+        ));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/Users/AuthenticateWithQuickConnect")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let json = body_json(response).await;
+        assert_eq!(
+            json["errors"]["Secret"][0], "The Secret field is required.",
+            "{body}"
+        );
+    }
 }

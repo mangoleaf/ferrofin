@@ -16,7 +16,12 @@
 Ferrofin speaks the **same HTTP API** as [Jellyfin](https://github.com/jellyfin/jellyfin), so
 existing Jellyfin clients (the web UI and native TV/mobile apps such as Swiftfin, Findroid, and
 Wolphin) connect to it **unchanged**. A client only ever sees an HTTP endpoint; it cannot tell
-the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopts it in place.
+the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopts it in place
+(one-way: back up first).
+
+Ferrofin is an independent project. It is not affiliated with or endorsed by the Jellyfin
+project. It exists because of the work of the Jellyfin team and contributors: the API it speaks,
+the clients that connect to it, and the server code it ports. Thank you.
 
 - **Want to try it?** → [Quickstart](#quickstart)
 - **Coming from Jellyfin?** → [Migrating from Jellyfin](#migrating-from-jellyfin) (read the
@@ -26,21 +31,21 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
 
 ## Why Ferrofin
 
-- **Faster, and a fraction of the memory.** On the same machine and library, Ferrofin
-  renders the home screen **3.4× faster** than Jellyfin 12.0-rc7, cold-starts **15.8×
-  faster**, and sits at **61 MiB idle against 409 MiB** (6.7× lighter), with peak memory
-  under load 3.8× lower. Numbers, method and caveats are in [Benchmarks](#benchmarks).
+- **Measured against Jellyfin, every release.** Each release is measured against Jellyfin on the same
+  machine and library: speed, time to first screen and memory. [Results](#results) summarises the
+  latest release; its own page graphs every comparable cell and lists the rest with the reason they are
+  withheld.
 - **One binary, no runtime.** A single `ferrofin-server` executable plus ffmpeg. No .NET
   runtime, no JIT warm-up. The Docker image bundles both jellyfin-ffmpeg and the jellyfin-web
   client, so `docker run` gives you the whole server, web UI included.
 - **Drop-in compatible.** Same API contract, same on-disk database format (pinned to
   Jellyfin 12.0), same password hashes. Adopt an existing Jellyfin 10.11.8–10.11.11,
-  12.0.0 or 12.1.0 library with no re-scan; see [supported and tested versions](adoption/README.md#supported-and-tested-versions).
+  12.0.0, 12.1.0 or 12.2.0 library with no re-scan; see [supported and tested versions](gates/adoption/README.md#supported-and-tested-versions).
 - **Plugins cannot own your server.** Jellyfin loads plugins as full-trust .NET code inside
   the server process. Ferrofin does not, and will not. Third-party plugins run as
   sandboxed WASM with no filesystem or network access of their own. This is the one place
   Ferrofin deliberately diverges from Jellyfin; see [Plugins](#plugins-the-one-deliberate-divergence).
-- **Every route ported** All 412 operations in the Jellyfin API contract are wired to
+- **Every route ported.** All 412 operations in the Jellyfin API contract are wired to
   working handlers, developed by cross-checking responses against a real Jellyfin server.
   No `501` stubs, no fake `200`s.
 
@@ -60,43 +65,10 @@ Rust there was more code than I could read, and the agents made questionable dec
 times without asking. The performance gains over Jellyfin have been verified and the benchmarks back them
 up, but there is still room for improvement.
 
-Up until this first public release I have worked on Ferrofin solo. Most of my attention was on my 
+Up until this first public release I have worked on Ferrofin solo. Most of my attention was on my
 personal definition of the golden path. Areas that could use more attention include Live TV and the large number of settings.
 If something does not behave the way Jellyfin does, opening an issue describing the current and expected behaviour would be appreciated.
 PRs or plugin development are welcome too if anyone wants to get involved!
-
-## Benchmarks
-
-<!-- BEGIN GENERATED BENCHMARKS — do not edit by hand. Regenerate with:
-     python3 bench/report.py --readme README.md bench/runs/v1.0.0 bench/runs/v1.0.0-run2 bench/runs/v1.0.0-run3 -->
-Ferrofin `v1.0.0` against **Jellyfin 12.0-rc7** and **Jellyfin 10.11.8**, measured 2026-09-04 on one machine (AMD Ryzen 9 9950X3D), each server alone in a container pinned to 8 dedicated cores with an 8 GiB limit and no swap, over the same library of 3,001 movies, 250 series and 7,490 episodes. Every figure is the **median of 3 full runs**. No request failed on any server at any load level.
-
-The screen rows are what a client actually does: each is the exact request set jellyfin-web issues for that screen, replayed at 5 screens per second (the "loaded" level). Latency reads **p50 / p95 / p99 in milliseconds**; the last column compares p50 with Jellyfin 12.0-rc7.
-
-| | Jellyfin 12.0-rc7 | Jellyfin 10.11.8 | **Ferrofin** | Ferrofin vs 12.0-rc7 |
-|---|---|---|---|---|
-| **home** screen | 44 / 51 / 57 | 64 / 73 / 77 | **13 / 16 / 19** | **3.4× faster** |
-| **movies** screen | 38 / 43 / 47 | 24 / 28 / 31 | **25 / 30 / 32** | **1.5× faster** |
-| **detail** screen | 98 / 161 / 165 | 20 / 29 / 33 | **9 / 12 / 13** | **10.9× faster** ⚠[1] |
-| **series** screen | 97 / 101 / 224 | 18 / 21 / 27 | **8 / 10 / 11** | **12.1× faster** |
-| **search** screen | 70 / 234 / 255 | 98 / 121 / 184 | **26 / 36 / 42** | **2.7× faster** |
-| **playback** screen | 31 / 37 / 55 | 5 / 20 / 33 | **10 / 13 / 45** | **3.1× faster** ⚠[2] |
-| cold start (restart → home screen) | 2746 ms | 2162 ms | **174 ms** | **15.8× faster** |
-| direct-play TTFB (1 MiB range) | 4.61 ms | 1.01 ms | **0.48 ms** | **9.6× faster** |
-| peak under load memory | 588 MiB | 548 MiB | **155 MiB** | **3.8× lighter** |
-| steady idle memory | 409 MiB | 356 MiB | **61.4 MiB** | **6.7× lighter** |
-
-Per endpoint, same level and runs, Ferrofin is faster than Jellyfin 12.0-rc7 on all 28 compared requests, from 1.1× (`movies:items`) to 20.7× (`home:resume-book`); the full three-server table with p95/p99 is in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
-
-⚠ marks a row where the servers did not do identical work, so the multiple is an indication rather than a like-for-like result:
-
-1. detail: detail:item: missing MediaSources[].MediaStreams[].IsOriginal, MediaSources[].MediaStreams[].LocalizedOriginal, MediaStreams[].IsOriginal (+1 more)
-2. playback: playback:playbackinfo: missing MediaSources[].MediaStreams[].IsOriginal, MediaSources[].MediaStreams[].LocalizedOriginal
-
-Ferrofin implements the Jellyfin 10.11.8 contract, so a field that 12.0 added and 10.11.8 lacks shows up here as missing on both of them; the row is still Ferrofin's own work for everything else in it.
-
-How steady are these numbers? Across the 3 runs, 3 of the 102 medians in the loaded-level tables moved by more than 15 % of their value, against 68 of the 204 p95/p99 tails, so read the p50s as the numbers and the tails as shape. Run-to-run ranges for every cell, and every place the servers did different work, are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); the harness and the one-sentence definition of each number are in [`bench/README.md`](bench/README.md). It is a deliberate, local instrument, not a CI job.
-<!-- END GENERATED BENCHMARKS -->
 
 ## Quickstart
 
@@ -104,11 +76,24 @@ How steady are these numbers? Across the 3 runs, 3 of the 102 medians in the loa
 
 ```sh
 docker run -d --name ferrofin \
-  -p 8096:8096 \
+  -p 127.0.0.1:8096:8096 \
   -v ferrofin-data:/data \
   -v /path/to/media:/media:ro \
   ghcr.io/mangoleaf/ferrofin:latest
 ```
+
+This publishes the port on loopback only, because a fresh server's `admin` account has no
+password (see [below](#first-start-the-passwordless-admin)). Open `http://localhost:8096/web`
+on the Docker host and finish the setup wizard. Then recreate the container with
+`-p 8096:8096` so that other devices can reach it. For a headless install, add
+`-e FERROFIN_ADMIN_PASSWORD='<choose-a-password>'` to seed the password; the port can then be
+published on all interfaces from the start.
+
+`:latest` follows final releases only, never a release candidate. Adoption and the database
+migrations are one-way, so re-pulling `:latest` and recreating the container upgrades the
+install whether or not you planned to. For a long-running install, pin a release tag
+(`ghcr.io/mangoleaf/ferrofin:vX.Y.Z`, from the
+[releases page](https://github.com/mangoleaf/ferrofin/releases)) and upgrade on purpose.
 
 For automatic LAN server discovery, see [server discovery deployment](docs/SERVER_DISCOVERY.md).
 The TCP mapping above supports manual URL connections; it does not forward discovery broadcasts.
@@ -134,8 +119,14 @@ disables transcoding):
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
 ```
 
-On a fresh database Ferrofin seeds an `admin` user and **logs a generated password. Record
-it**, or set `FERROFIN_ADMIN_PASSWORD` for a headless install. Then:
+### First start: the passwordless admin
+
+On a fresh database Ferrofin seeds an `admin` user **with no password**, as Jellyfin does,
+and logs a warning: the setup wizard at `/web` sets the password. Until it does, anyone who
+can reach the server can sign in as that administrator. Keep it bound to loopback until setup
+is done: that is `--bind 127.0.0.1` from source, and for the container image, which listens
+on all interfaces, the `-p 127.0.0.1:8096:8096` mapping in the Docker command above. For a
+headless install, set `FERROFIN_ADMIN_PASSWORD` to seed the password instead. Then:
 
 ```sh
 curl http://localhost:8096/System/Info/Public   # smoke test
@@ -148,21 +139,22 @@ Configuration is via CLI flags, `FERROFIN_*` environment variables, or
 
 ## Migrating from Jellyfin
 
-Ferrofin reads Jellyfin's database directly. Point it at a data directory containing a
-Jellyfin **10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0 or 12.1.0** `jellyfin.db` and on first boot it detects the database,
-validates its migration set (and refuses loudly rather than half-adopting an unexpected version), and
-adopts it in place: **no re-scan, no re-import**. Users, watch state, playlists, and Live TV
-configuration carry forward. Ferrofin retains the `Users.NormalizedUsername` column and
-unique index from Jellyfin 10.11.10/10.11.11 and adds them to older databases. Login,
-creation, and renaming use Unicode-aware invariant uppercase keys compatible with
-Jellyfin, while the original spelling remains visible. If existing usernames collide
-under these rules, startup stops with the conflicting account IDs and names; resolve
-the names in the original server before retrying. Accounts are never merged.
+Ferrofin reads Jellyfin's database directly. Point it at a data directory containing a Jellyfin
+**10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0 or 12.2.0** `jellyfin.db` and on first boot
+it detects the database, validates its migration set (and refuses loudly rather than half-adopting
+an unexpected version), and adopts it in place: **no re-scan, no re-import**. Users, watch state,
+playlists, and Live TV configuration carry forward. A 10.11 database also loses the items whose
+files are gone (see [below](#items-whose-files-are-gone-1011-databases)). Ferrofin retains the
+`Users.NormalizedUsername` column and unique index from Jellyfin 10.11.10/10.11.11 and adds them to
+older databases. Login, creation, and renaming use Unicode-aware invariant uppercase keys compatible
+with Jellyfin, while the original spelling remains visible. If existing usernames collide under
+these rules, startup stops with the conflicting account IDs and names; resolve the names in the
+original server before retrying. Accounts are never merged.
 
-All six supported releases passed the live adoption suite on 2026-09-16: seven fixture
-paths, including both 10.11.8 → 12.1.0 and 10.11.8 → 12.0.0 → 12.1.0. Checks cover API
-summaries against Jellyfin 12.1, database integrity, and stable responses without repeated
-repairs after restart. See the [support matrix and tested build](adoption/README.md#supported-and-tested-versions).
+Every release's gates session adopts each supported version and upgrade route, and the latest
+release's status is in [Results](#adopting-an-existing-jellyfin-database). Checks cover API
+summaries against Jellyfin 12.2, database integrity, and stable responses without repeated
+repairs after restart. See the [support matrix and tested build](gates/adoption/README.md#supported-and-tested-versions).
 Support is determined by the exact migration history; these version numbers do not imply
 support for every 10.11.x or 12.x release.
 
@@ -202,6 +194,56 @@ support for every 10.11.x or 12.x release.
 
 Existing Ferrofin databases upgrade in place across releases; steps that need operator
 action are listed in [`docs/UPGRADING.md`](docs/UPGRADING.md).
+
+### Items whose files are gone (10.11 databases)
+
+On the first boot of a database adopted from Jellyfin 10.11, Ferrofin removes the items whose
+file or folder is gone, and the items whose library was removed, as Jellyfin 12 does when it
+upgrades a 10.11 database. This also applies to a 10.11 database that Ferrofin 1.2.0 or later
+already adopted. Items under a media folder that is missing or empty are kept, because that
+looks the same as storage that did not mount. Play state for a removed item moves to a
+placeholder, as in Jellyfin, and no media file is touched. Before the first removal Ferrofin
+snapshots the database to `jellyfin.db.pre-missing-items`. Restoring that copy brings the items
+back in Ferrofin; it is not a way back to Jellyfin, which is `jellyfin.db.pre-ferrofin`. The
+details are in [`docs/UPGRADING.md`](docs/UPGRADING.md).
+
+## Results
+
+<!-- BEGIN GENERATED RESULTS — do not edit by hand. Regenerate with: make publish-results (gates/publish.py) -->
+### Speed and memory against Jellyfin
+
+Ferrofin **v1.4.0** against **Jellyfin 12.2.0**: the median of 3 runs on one host (32 cores, 125 GiB), each server alone in its container, over the same library, 2026-10-26. One host and one library: other hardware and libraries give other numbers.
+
+**12.1× faster cold start** · **2.2–4.1× the speed on 5 screens at 5 screens/s** · **2.6× lighter peak memory under load** · **2.6× lighter idle memory**
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/screens-loaded-dark.svg">
+  <img alt="Screens at 5 screens/s (loaded): p50 latency: Ferrofin against Jellyfin 12.2.0 on 5 comparable cells, as fast or faster on 5; from 2.2× faster to 4.1× faster." src="docs/results/v1.4.0/screens-loaded.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/startup-dark.svg">
+  <img alt="Time to first screen: speed-up: Ferrofin against Jellyfin 12.2.0 on 3 comparable cells, as fast or faster on 3; from 2.3× faster to 12.1× faster." src="docs/results/v1.4.0/startup.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/memory-dark.svg">
+  <img alt="Memory: Ferrofin against Jellyfin 12.2.0 on 2 comparable cells, as fast or faster on 2; from 2.6× lighter to 2.6× lighter." src="docs/results/v1.4.0/memory.svg">
+</picture>
+
+Not compared in this release, because the two servers did different work there or the evidence is incomplete: the search screen, the search endpoints, the image endpoints, CPU per screen. The search screen therefore has no comparison yet.
+
+Measured from commit `5112240e`. Every graph and table, the withheld cells and the sources: [docs/results/v1.4.0/README.md](docs/results/v1.4.0/README.md); every number with its range: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+
+### Adopting an existing Jellyfin database
+
+Each supported Jellyfin version and upgrade route, adopted in place by Ferrofin **v1.4.0** (commit `5112240e1923`, 2026-10-26): **13 of 14 passed**. Adoption is one-way; see [Migrating from Jellyfin](#migrating-from-jellyfin). Every route: [docs/results/v1.4.0/README.md](docs/results/v1.4.0/README.md).
+
+### Answering like Jellyfin
+
+The parity gate replays the **2,353** requests jellyfin-web makes against Jellyfin 12.2.0 and Ferrofin **v1.4.0** (commit `5112240e`, 2026-10-26) and compares the answers. Of the 2,307 it could compare, **1,242 are identical** and **1,051 are known differences**, each recorded in the parity ledger with the issue that tracks it, or the parity row that accepts it; **2 are filed as issues** and **12 are new**. 46 were not compared because Jellyfin itself failed them. **The parity gate did not pass** (new differences): 14 requests differ in ways the ledger does not cover yet. Every API area: [docs/results/v1.4.0/README.md](docs/results/v1.4.0/README.md).
+
+<!-- END GENERATED RESULTS -->
 
 ## Plugins: the one deliberate divergence
 
@@ -253,7 +295,7 @@ All 412 operations in the vendored Jellyfin 10.11.8 contract are implemented. Wo
 end-to-end: authentication, users and QuickConnect; library scan with live filesystem
 watching; browse and query; images; sessions, playstate and remote control; WebSocket push;
 playlists and collections; direct play and live HLS transcoding (NVENC, VAAPI and QSV
-hardware paths); Live TV with M3U/XMLTV and DVR; SyncPlay; all 20 scheduled tasks;
+hardware paths); Live TV with M3U/XMLTV and DVR; SyncPlay; 20 scheduled tasks;
 metrics and tracing; trickplay, chapters, lyrics and media segments; photo and book
 libraries; backup and restore.
 
@@ -310,7 +352,8 @@ Crate map, the C#-to-Rust mapping, and the porting rules: [`docs/ARCHITECTURE.md
 ## Contributing
 
 Every change is gated behind `cargo fmt`, `clippy -D warnings`, the full test suite, and
-an 80 % per-crate line-coverage floor. Perf-touching changes need a measured before/after.
+an 80 % per-crate line-coverage floor. Performance and memory are benchmarked before each
+release.
 See [`CONTRIBUTING.md`](CONTRIBUTING.md); the deeper operating guide is [`CLAUDE.md`](CLAUDE.md).
 
 Security policy: [`SECURITY.md`](SECURITY.md). Changelog: [`CHANGELOG.md`](CHANGELOG.md).
@@ -318,7 +361,7 @@ Releasing: [`RELEASE.md`](RELEASE.md).
 
 ## License
 
-**GPL-3.0-only.** Ferrofin is a source-level derivative of Jellyfin. The Jellyfin repository
-is internally inconsistent on this point (the root `LICENSE` is GPL-2.0, but the library
-`.csproj` packages being ported declare `GPL-3.0-only`); Ferrofin follows the
-`GPL-3.0-only` metadata on the specific crates it derives from. See [`LICENSE`](LICENSE).
+**GPL-3.0-only.** Ferrofin is a source-level derivative of Jellyfin. Jellyfin's root
+`LICENSE` is GPL-2.0, and the library `.csproj` packages that Ferrofin ports declare
+`GPL-3.0-only`. Ferrofin follows the `GPL-3.0-only` metadata of the packages it derives from.
+See [`LICENSE`](LICENSE).

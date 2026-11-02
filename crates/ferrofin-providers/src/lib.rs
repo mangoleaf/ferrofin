@@ -10,11 +10,15 @@
 pub mod audiodb;
 pub mod books;
 pub mod builtin_plugins;
+pub mod chapter_names;
 pub mod container_types;
+pub mod episode;
 pub mod error;
 pub mod external_ids;
 pub mod fanart;
 mod image_download;
+pub mod image_policy;
+pub mod image_save;
 pub mod library_options;
 pub mod listenbrainz;
 pub mod local_images;
@@ -27,6 +31,7 @@ pub mod metrics;
 #[cfg(test)]
 mod mock_http;
 pub mod musicbrainz;
+pub mod nfo_save;
 pub mod omdb;
 #[cfg(feature = "opensubtitles")]
 pub mod opensubtitles;
@@ -38,6 +43,8 @@ pub mod refresh_plan;
 pub mod season;
 pub mod similarity;
 pub mod studios;
+#[cfg(test)]
+mod test_localization;
 pub mod tmdb;
 pub mod tvdb;
 pub mod xbmc;
@@ -49,7 +56,9 @@ pub use local_xml::{
     LocalContainerXml, LocalLinkedChild, parse_container_xml, save_collection_xml,
     save_playlist_xml,
 };
-pub use playlist_file::{is_playlist_file, read_playlist_file, write_playlist_file};
+pub use playlist_file::{
+    decode_playlist, is_playlist_file, playlist_xml_path, read_playlist_file, write_playlist_file,
+};
 
 #[cfg(feature = "lrclib")]
 pub use lrclib::{LrcLibConfig, LrcLibProvider};
@@ -59,6 +68,7 @@ pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
 pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
+pub use image_download::{ArtworkDownload, ArtworkDownloadFailure, sniff_image_ext};
 pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
 pub use musicbrainz::{
     AlbumDetails, AlbumIds, ArtistDetails, ArtistHit, MusicBrainzClient, PartialDate,

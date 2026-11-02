@@ -1,0 +1,14 @@
+WEBVTT
+
+00:00:00.000 --> 00:00:00.000
+Hello <i>world</i>
+next
+
+00:00:00.500 --> 00:00:01.500
+<c.lime>green</c> text
+
+00:00:02.500 --> 00:00:03.500
+<font face="Courier">mono</c> <b>bold</b>
+
+00:00:04.500 --> 00:00:05.500
+<font size="30"><i>big italic</c> done</i>

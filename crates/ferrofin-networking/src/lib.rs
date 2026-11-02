@@ -25,6 +25,7 @@
 pub mod config_keys;
 pub mod error;
 mod interfaces;
+pub mod known_proxies;
 pub mod logger;
 #[cfg(target_os = "macos")]
 mod macos_interfaces;
@@ -35,7 +36,8 @@ pub mod network_configuration;
 pub mod remote_access_policy_result;
 
 pub use error::NetworkingError;
+pub use known_proxies::KnownProxies;
 pub use logger::{Logger, NullLogger};
-pub use manager::{NetworkManager, StartupConfig};
+pub use manager::{HostLookup, NetworkManager, StartupConfig, published_urls_missing_base_url};
 pub use network_configuration::{NetworkConfiguration, normalize_base_url};
 pub use remote_access_policy_result::RemoteAccessPolicyResult;

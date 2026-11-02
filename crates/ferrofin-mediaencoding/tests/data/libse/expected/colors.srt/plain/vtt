@@ -1,0 +1,10 @@
+WEBVTT
+
+00:00:01.000 --> 00:00:02.000
+<c.yellow>yellow</c> <c.yellow>upper hex</c> <c.white>short</c>
+
+00:00:02.000 --> 00:00:03.000
+<c.add8e6ff>LightBlue</c> <c.lime>bare</c> <c.color123456>dark</c>
+
+00:00:03.000 --> 00:00:04.000
+<font color="rgb(255,0,0)">rgb</c> <c.colorffffff80>alpha</c> <font face="Times" color="#0000ff">both</c>

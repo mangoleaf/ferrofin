@@ -120,6 +120,29 @@ fn is_nonspacing_mark(c: char) -> bool {
         0x20D0..=0x20FF) // Combining Diacritical Marks for Symbols
 }
 
+/// Case-insensitive `String.Replace` of every occurrence of `from` with `to`.
+///
+/// Mirrors C# `string.Replace(old, new, StringComparison.OrdinalIgnoreCase)`.
+/// Empty search or replacement strings leave the input unchanged.
+#[must_use]
+pub fn replace_ignore_ascii_case(haystack: &str, from: &str, to: &str) -> String {
+    if from.is_empty() || to.is_empty() {
+        return haystack.to_owned();
+    }
+    let lower_hay = haystack.to_ascii_lowercase();
+    let lower_from = from.to_ascii_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut cursor = 0;
+    while let Some(rel) = lower_hay[cursor..].find(&lower_from) {
+        let start = cursor + rel;
+        out.push_str(&haystack[cursor..start]);
+        out.push_str(to);
+        cursor = start + from.len();
+    }
+    out.push_str(&haystack[cursor..]);
+    out
+}
+
 /// Counts the number of occurrences of `needle` in `value`.
 ///
 /// C# operated on a `ReadOnlySpan<char>` (UTF-16 code units); this operates on
@@ -251,6 +274,22 @@ pub fn equals_ordinal_ignore_case(left: &str, right: &str) -> bool {
     left.chars()
         .map(to_upper_invariant)
         .eq(right.chars().map(to_upper_invariant))
+}
+
+/// `StringComparer.OrdinalIgnoreCase.Compare(a, b)`: the same simple invariant
+/// uppercase mapping as [`equals_ordinal_ignore_case`], then an ordinal
+/// comparison of UTF-16 code units (so a supplementary-plane character sorts by
+/// its surrogate pair, as in .NET, not by its scalar value).
+#[must_use]
+pub fn compare_ordinal_ignore_case(left: &str, right: &str) -> std::cmp::Ordering {
+    let utf16 = |text: &str| -> Vec<u16> {
+        text.chars()
+            .map(to_upper_invariant)
+            .collect::<String>()
+            .encode_utf16()
+            .collect()
+    };
+    utf16(left).cmp(&utf16(right))
 }
 
 /// .NET invariant uppercase for a string, using ICU's simple mappings.
@@ -514,6 +553,18 @@ mod tests {
         assert!(!equals_ordinal_ignore_case("straße", "STRASSE"));
         assert!(!equals_ordinal_ignore_case("\u{212a}elvin", "kelvin"));
         assert_eq!("\u{212a}".to_lowercase(), "k", "the trap this avoids");
+    }
+
+    #[test]
+    fn compare_ordinal_ignore_case_matches_dotnet() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        assert_eq!(compare_ordinal_ignore_case("alien", "ALIEN"), Equal);
+        assert_eq!(compare_ordinal_ignore_case("alien", "Blade"), Less);
+        // Uppercased first: `_` (0x5F) sorts after `A` (0x41) but before `a`.
+        assert_eq!(compare_ordinal_ignore_case("_x", "ax"), Greater);
+        assert_eq!(compare_ordinal_ignore_case("", "a"), Less);
+        // UTF-16 order: a surrogate (0xD83C…) sorts below U+FF21 `Ａ`.
+        assert_eq!(compare_ordinal_ignore_case("\u{1F3AC}", "\u{FF21}"), Less);
     }
 
     /// `ToUpperInvariant` is the simple mapping: one char in, one char out.

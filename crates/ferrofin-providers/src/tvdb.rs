@@ -8,26 +8,17 @@
 //! episodes, and people, and lists series artwork.
 //!
 //! Auth: `POST /login` with `{ apikey, pin }` returns a bearer token; the token
-//! is cached and re-fetched on demand. Every other call sends
+//! is cached and fetched again once it is older than the token max age
+//! ([`DEFAULT_TOKEN_MAX_AGE`]). Every other call sends
 //! `Authorization: Bearer <token>`.
 //!
 //! Faithful port notes (the C# is the oracle):
-//! - Translations: v4 returns a base `name`/`overview` plus per-language
-//!   translations; this port maps the base fields of a series and an
-//!   episode. A season record has no base overview, so the season provider
-//!   reads its translation in the item's metadata language
-//!   ([`TvdbSeasonDetails::translated_overview`], `IsMatch`).
-//!   TODO(parity, open work item — NOT an accepted divergence): port the
-//!   plugin's translation chain for the series and the episode — the
-//!   name/overview translation in the item's metadata language, then each
-//!   configured `FallbackLanguages` entry, then the base field only under
-//!   `FallbackToOriginalLanguage` (`TvdbSdkExtensions.
-//!   GetTranslatedNamedOrDefault`/`GetTranslatedOverviewOrDefault`,
-//!   `TvdbUtils.ReturnOriginalLanguageOrDefault`, `TvdbSeriesProvider.cs:
-//!   445-446`) — with the plugin's settings page (`FallbackLanguages`,
-//!   `FallbackToOriginalLanguage`, `ImportSeasonName`), which Ferrofin does
-//!   not expose yet, so their defaults hold everywhere, the season
-//!   provider's included.
+//! - Translations: series and episodes keep their name/overview translations.
+//!   The scanner selects the configured metadata language, excluding name
+//!   aliases, under the plugin defaults: no fallback languages and no original
+//!   language fallback. The separate plugin configuration page remains an open
+//!   settings work item; it is not implemented by these library preferences.
+//!   Seasons select their translated overview through `IsMatch` too.
 //! - Episode ordering: TVDB has multiple orderings (`official` = aired, `dvd`,
 //!   `absolute`, …). The episode lookup takes a `season_type`, defaulting to
 //!   `official`; season 0 is specials.
@@ -50,6 +41,57 @@ const PROJECT_API_KEY: &str = "7f7eed88-2530-4f84-8ee7-f154471b8f87";
 /// The default episode ordering — TVDB "official" (aired) order.
 pub const DEFAULT_SEASON_TYPE: &str = "official";
 
+/// TVDB's episode image provider uses supported series display orders; absolute
+/// episodes use season one except specials, which retain official numbering.
+#[must_use]
+pub fn episode_image_order(order: &str, season: i32) -> (&str, i32) {
+    match order {
+        "absolute" if season == 0 => (DEFAULT_SEASON_TYPE, 0),
+        "absolute" => ("absolute", 1),
+        "regional" | "alternate" | "altdvd" | "dvd" | "alttwo" => (order, season),
+        _ => (DEFAULT_SEASON_TYPE, season),
+    }
+}
+
+/// The raw `DisplayOrder` a series row stores (`SeasonInfo`/`EpisodeInfo.
+/// SeriesDisplayOrder`): empty when the row has none.
+#[must_use]
+pub fn display_order_of(data: Option<&str>) -> String {
+    data.and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .and_then(|data| {
+            data.get("DisplayOrder")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+/// The ordering `TvdbSeasonProvider.GetMetadata` looks a season up in: the
+/// series' display order, `official` when blank (`:65-74`).
+#[must_use]
+pub fn season_lookup_order(display_order: &str) -> &str {
+    if display_order.trim().is_empty() {
+        DEFAULT_SEASON_TYPE
+    } else {
+        display_order
+    }
+}
+
+/// `TvdbClientManager.GetEpisodeTvdbId`'s season-number lookup for one
+/// episode: the TVDB ordering to ask, the season and the episode number. A
+/// season-less episode is in season 1; absolute order is always season 1
+/// except for specials, which use official order; an order the client does
+/// not know is official (the plugin's `switch` is case-sensitive).
+#[must_use]
+pub fn episode_lookup(
+    display_order: &str,
+    parent_index: Option<i32>,
+    index: i32,
+) -> (&str, i32, i32) {
+    let (order, season) = episode_image_order(display_order, parent_index.unwrap_or(1));
+    (order, season, index)
+}
+
 /// How long a resolved TVDB id is reused unless configured otherwise
 /// ([`TvdbClient::with_cache_duration`], the server's
 /// `FERROFIN_TVDB_CACHE_HOURS`): the plugin's `CacheDurationInHours` default
@@ -58,6 +100,13 @@ pub const DEFAULT_SEASON_TYPE: &str = "official";
 /// `GetSeriesExtendedByIdAsync` the series record a season's id is read
 /// from (`:251-271`).
 pub const DEFAULT_CACHE_DURATION: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// How old the bearer token may get before the client logs in again, unless
+/// configured otherwise ([`TvdbClient::with_token_max_age`], the server's
+/// `FERROFIN_TVDB_TOKEN_DAYS`): the plugin's 25 days
+/// (`TvdbClientManager.LoginAsync`'s `IsTokenInvalid`), inside the month a
+/// TVDB v4 token is valid for.
+pub const DEFAULT_TOKEN_MAX_AGE: std::time::Duration = std::time::Duration::from_hours(25 * 24);
 
 /// `(series id, season type, season, episode)` → the episode's TVDB id and
 /// when it was resolved.
@@ -116,6 +165,10 @@ pub struct TvdbSeriesDetails {
     pub name: Option<String>,
     /// The overview.
     pub overview: Option<String>,
+    /// Name translations returned by the extended-record endpoint.
+    pub name_translations: Vec<TvdbTranslation>,
+    /// Overview translations returned by the extended-record endpoint.
+    pub overview_translations: Vec<TvdbTranslation>,
     /// First aired date (`YYYY-MM-DD`).
     pub premiere_date: Option<String>,
     /// Production year, derived from `firstAired`.
@@ -156,17 +209,23 @@ pub struct TvdbSeriesDetails {
 }
 
 impl TvdbSeriesDetails {
+    /// Applies the metadata language with the plugin's default empty fallback
+    /// list and `FallbackToOriginalLanguage=false`. Alias names are excluded.
+    pub fn localize(&mut self, language: &str, three_letter_names: &[String]) {
+        self.name = translated_text(&self.name_translations, language, three_letter_names, true);
+        self.overview = translated_text(
+            &self.overview_translations,
+            language,
+            three_letter_names,
+            false,
+        );
+    }
+
     /// The artwork as plain type+URL [`RemoteImage`] pairs for the scan-download
     /// path.
     #[must_use]
     pub fn download_images(&self) -> Vec<RemoteImage> {
-        self.images
-            .iter()
-            .map(|i| RemoteImage {
-                image_type: i.image_type,
-                url: i.url.clone(),
-            })
-            .collect()
+        self.images.iter().cloned().map(RemoteImage::from).collect()
     }
 }
 
@@ -187,6 +246,10 @@ pub struct TvdbEpisodeDetails {
     pub name: Option<String>,
     /// The overview.
     pub overview: Option<String>,
+    /// Name translations returned by the extended-record endpoint.
+    pub name_translations: Vec<TvdbTranslation>,
+    /// Overview translations returned by the extended-record endpoint.
+    pub overview_translations: Vec<TvdbTranslation>,
     /// Aired date (`YYYY-MM-DD`).
     pub aired: Option<String>,
     /// Production year, derived from `aired`.
@@ -195,6 +258,34 @@ pub struct TvdbEpisodeDetails {
     pub image_url: Option<String>,
     /// Cast + crew credited on the episode.
     pub people: Vec<TvdbPerson>,
+}
+
+impl TvdbEpisodeDetails {
+    /// Applies the metadata language with the plugin's default fallback rules.
+    pub fn localize(&mut self, language: &str, three_letter_names: &[String]) {
+        self.name = translated_text(&self.name_translations, language, three_letter_names, true);
+        self.overview = translated_text(
+            &self.overview_translations,
+            language,
+            three_letter_names,
+            false,
+        );
+    }
+}
+
+fn translated_text(
+    translations: &[TvdbTranslation],
+    language: &str,
+    three_letter_names: &[String],
+    exclude_aliases: bool,
+) -> Option<String> {
+    translations
+        .iter()
+        .find(|translation| {
+            (!exclude_aliases || !translation.is_alias)
+                && translation_matches(&translation.language, language, three_letter_names)
+        })
+        .and_then(|translation| translation.text.clone())
 }
 
 /// Mapped season metadata (`/seasons/{id}/extended?meta=translations`, the
@@ -341,9 +432,12 @@ struct SearchItem {
     #[serde(alias = "tvdb_id")]
     tvdb_id: Option<String>,
     name: Option<String>,
-    year: Option<String>,
+    first_air_time: Option<String>,
     overview: Option<String>,
     image_url: Option<String>,
+    aliases: Option<Vec<String>>,
+    /// Language (ISO 639-2) → name.
+    translations: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,8 +480,17 @@ struct ArtworkWire {
     height: Option<i32>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArtworkTypeWire {
+    id: Option<i64>,
+    name: Option<String>,
+    record_type: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SeriesExtendedWire {
+    translations: Option<TranslationsWire>,
     lists: Option<Vec<ListWire>>,
     seasons: Option<Vec<SeasonRefWire>>,
     name: Option<String>,
@@ -468,6 +571,7 @@ struct ListWire {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EpisodeExtendedWire {
+    translations: Option<TranslationsWire>,
     remote_ids: Option<Vec<RemoteIdWire>>,
     airs_before_episode: Option<i64>,
     airs_after_season: Option<i64>,
@@ -579,7 +683,14 @@ pub struct TvdbClient {
     limiter: RateLimiter,
     api_key: SecretString,
     pin: Option<String>,
-    token: Mutex<Option<String>>,
+    /// The bearer token and when it was obtained, by the wall clock as the
+    /// plugin's `DateTime.UtcNow` (TheTVDB expires it by wall time, which a
+    /// monotonic clock stops counting while the host is suspended). A tokio
+    /// mutex, held across the `/login` request, so concurrent callers share
+    /// one login.
+    token: tokio::sync::Mutex<Option<(std::time::SystemTime, String)>>,
+    /// How old [`token`](Self::token) may get before a new login.
+    token_max_age: std::time::Duration,
     base_url: String,
     /// The episode ids [`episode_by_number`](Self::episode_by_number)
     /// resolved, kept for `cache_duration` as the
@@ -590,6 +701,7 @@ pub struct TvdbClient {
     /// `cache_duration` as the plugin keeps the
     /// record ([`season_id`](Self::season_id)).
     season_ids: Mutex<SeasonIdCache>,
+    artwork_types: Mutex<Option<(std::time::Instant, Vec<ArtworkTypeWire>)>>,
     /// How long both caches keep an entry: the plugin's
     /// `CacheDurationInHours` ([`DEFAULT_CACHE_DURATION`] unless set).
     cache_duration: std::time::Duration,
@@ -599,7 +711,10 @@ impl std::fmt::Debug for TvdbClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TvdbClient")
             .field("has_pin", &self.pin.is_some())
-            .field("has_token", &self.token.lock().is_ok_and(|t| t.is_some()))
+            .field(
+                "has_token",
+                &self.token.try_lock().is_ok_and(|t| t.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -631,10 +746,12 @@ impl TvdbClient {
             limiter: RateLimiter::new("tvdb"),
             api_key: SecretString::from(key.to_owned()),
             pin: (!pin.is_empty()).then(|| pin.to_owned()),
-            token: Mutex::new(None),
+            token: tokio::sync::Mutex::new(None),
+            token_max_age: DEFAULT_TOKEN_MAX_AGE,
             base_url: API_BASE.to_owned(),
             episode_ids: Mutex::new(EpisodeIdCache::new()),
             season_ids: Mutex::new(SeasonIdCache::new()),
+            artwork_types: Mutex::new(None),
             cache_duration: DEFAULT_CACHE_DURATION,
         }
     }
@@ -645,6 +762,14 @@ impl TvdbClient {
     #[must_use]
     pub fn with_cache_duration(mut self, duration: std::time::Duration) -> Self {
         self.cache_duration = duration;
+        self
+    }
+
+    /// Sets how old the bearer token may get before the client logs in again
+    /// ([`DEFAULT_TOKEN_MAX_AGE`] unless set).
+    #[must_use]
+    pub fn with_token_max_age(mut self, max_age: std::time::Duration) -> Self {
+        self.token_max_age = max_age;
         self
     }
 
@@ -662,11 +787,16 @@ impl TvdbClient {
         self
     }
 
-    /// The cached bearer token, logging in on first use. Returns `None` if login
-    /// fails (the caller then yields no data — best-effort, like the plugin).
+    /// The cached bearer token, logging in on first use and again once it is
+    /// older than the token max age (the plugin's `LoginAsync`). The lock is
+    /// held across the login, so concurrent callers send one `/login`.
+    /// Returns `None` if login fails (the caller then yields no data —
+    /// best-effort, like the plugin).
     async fn token(&self) -> Option<String> {
-        if let Ok(guard) = self.token.lock()
-            && let Some(token) = guard.as_ref()
+        let mut guard = self.token.lock().await;
+        // A clock set back since the login (`elapsed` fails) renews too.
+        if let Some((obtained, token)) = guard.as_ref()
+            && obtained.elapsed().is_ok_and(|age| age < self.token_max_age)
         {
             return Some(token.clone());
         }
@@ -687,9 +817,7 @@ impl TvdbClient {
             .ok()?;
         let env: Envelope<LoginData> = resp.counted_json().await.ok()?;
         let token = env.data?.token;
-        if let Ok(mut guard) = self.token.lock() {
-            *guard = Some(token.clone());
-        }
+        *guard = Some((std::time::SystemTime::now(), token.clone()));
         Some(token)
     }
 
@@ -713,30 +841,98 @@ impl TvdbClient {
         env.data
     }
 
-    /// Searches TVDB for a series by name (optionally narrowed by year),
-    /// returning ranked candidates. Port of `FindSeries`.
-    pub async fn search(&self, name: &str, year: Option<i32>) -> Vec<TvdbSearchHit> {
-        let mut query = vec![
-            ("query", name.to_owned()),
+    /// Searches TVDB for a series by name. Port of the query, ranking and
+    /// filter of `TvdbSeriesProvider.FindSeries` and `FindSeriesInternal`;
+    /// each hit carries its Tvdb id only (upstream also reads every hit's
+    /// extended record for its IMDb, Zap2It and TMDb ids, which this does not):
+    ///
+    /// - the query is `name` parsed (`ParseName`: no trailing year, no release
+    ///   clutter) in its comparable form ([`comparable_name`]), five results,
+    ///   no year in the request — a `Show.2026` folder searches `show`;
+    /// - each hit's titles are its name in `language` (else its name) and its
+    ///   aliases, and its year is its first air date's;
+    /// - the hits are ranked: a title equal to `name`, then a title containing
+    ///   the parsed name, then the year parsed from `name`, then a title
+    ///   containing the comparable name, then TVDB's order;
+    /// - a known `year` drops every hit dated more than a year from it (a hit
+    ///   without a date is kept).
+    ///
+    /// `three_letter_names` are `language`'s ISO 639-2 codes
+    /// ([`three_letter_language_names`]), which the translations are keyed by.
+    pub async fn search(
+        &self,
+        name: &str,
+        year: Option<i32>,
+        language: &str,
+        three_letter_names: &[String],
+    ) -> Vec<TvdbSearchHit> {
+        let options = crate::provider_manager::naming_options();
+        let parsed = ferrofin_naming::video::video_resolver::clean_date_time(name, options);
+        let parsed_year = parsed.year;
+        let parsed_name =
+            ferrofin_naming::video::video_resolver::try_clean_string(Some(&parsed.name), options)
+                .unwrap_or(parsed.name);
+        let comparable = comparable_name(&parsed_name);
+        let query = vec![
+            ("query", comparable.clone()),
             ("type", "series".to_owned()),
-            ("limit", "10".to_owned()),
+            ("limit", "5".to_owned()),
         ];
-        if let Some(y) = year {
-            query.push(("year", y.to_string()));
-        }
         let items: Vec<SearchItem> = self.get("/search", &query).await.unwrap_or_default();
-        items
+        let mut ranked: Vec<(Vec<String>, TvdbSearchHit)> = items
             .into_iter()
             .filter_map(|it| {
                 let tvdb_id = it.tvdb_id.as_deref()?.parse::<i64>().ok()?;
-                let name = it.name?;
-                Some(TvdbSearchHit {
-                    tvdb_id,
-                    name,
-                    year: it.year.as_deref().and_then(|y| y.parse::<i32>().ok()),
-                    image_url: it.image_url,
-                    overview: it.overview,
-                })
+                let title = it
+                    .translations
+                    .as_ref()
+                    .and_then(|translations| {
+                        translations.iter().find_map(|(lang, title)| {
+                            translation_matches(lang, language, three_letter_names)
+                                .then(|| title.clone())
+                        })
+                    })
+                    .or(it.name)?;
+                let mut titles = vec![title.clone()];
+                titles.extend(it.aliases.unwrap_or_default());
+                // `DateTime.TryParse(First_air_time)`; never the `year` field.
+                let year = it.first_air_time.as_deref().and_then(year_of);
+                Some((
+                    titles,
+                    TvdbSearchHit {
+                        tvdb_id,
+                        name: title,
+                        year,
+                        image_url: it.image_url,
+                        overview: it.overview,
+                    },
+                ))
+            })
+            .collect();
+        let contains = |titles: &[String], needle: &str| {
+            let needle = needle.to_lowercase();
+            titles
+                .iter()
+                .any(|title| title.to_lowercase().contains(&needle))
+        };
+        // `OrderBy` … `ThenBy(list.IndexOf)`: a stable sort keeps TVDB's order.
+        ranked.sort_by_key(|(titles, hit)| {
+            (
+                !titles
+                    .iter()
+                    .any(|title| title.to_lowercase() == name.to_lowercase()),
+                !contains(titles, &parsed_name),
+                !(hit.year.is_some() && hit.year == parsed_year),
+                !contains(titles, &comparable),
+            )
+        });
+        ranked
+            .into_iter()
+            .map(|(_, hit)| hit)
+            .filter(|hit| match (year, hit.year) {
+                // "Allow one year tolerance".
+                (Some(year), Some(hit_year)) => (year - hit_year).abs() <= 1,
+                _ => true,
             })
             .collect()
     }
@@ -803,6 +999,9 @@ impl TvdbClient {
             )
             .await?;
         let production_year = wire.aired.as_deref().and_then(year_of);
+        let (names, overviews) = wire.translations.map_or((None, None), |t| {
+            (t.name_translations, t.overview_translations)
+        });
         Some(TvdbEpisodeDetails {
             tvdb_id: episode_id,
             imdb_id: wire
@@ -821,6 +1020,8 @@ impl TvdbClient {
             airs_before_season: wire.airs_before_season,
             name: wire.name,
             overview: wire.overview,
+            name_translations: translations_of(names, |t| t.name),
+            overview_translations: translations_of(overviews, |t| t.overview),
             aired: wire.aired,
             production_year,
             image_url: wire.image,
@@ -944,6 +1145,91 @@ impl TvdbClient {
         seasons
     }
 
+    /// `TvdbSeasonImageProvider`: the selected ordering's artwork, falling
+    /// back to the official season only when the selected season has no art.
+    pub async fn season_images(
+        &self,
+        series_id: i64,
+        season_type: &str,
+        number: i32,
+    ) -> Vec<TmdbImage> {
+        #[derive(Deserialize)]
+        struct SeasonArtwork {
+            artwork: Option<Vec<ArtworkWire>>,
+        }
+        let Some(types) = self.image_types().await else {
+            return Vec::new();
+        };
+        let orders = if season_type.eq_ignore_ascii_case(DEFAULT_SEASON_TYPE) {
+            vec![DEFAULT_SEASON_TYPE]
+        } else {
+            vec![season_type, DEFAULT_SEASON_TYPE]
+        };
+        for order in orders {
+            let Some(id) = self.season_id(series_id, order, number).await else {
+                continue;
+            };
+            let Some(wire) = self
+                .get::<SeasonArtwork>(&format!("/seasons/{id}/extended"), &[])
+                .await
+            else {
+                continue;
+            };
+            let artwork = wire.artwork.unwrap_or_default();
+            if artwork.is_empty() {
+                continue;
+            }
+            return artwork
+                .into_iter()
+                .filter_map(|art| {
+                    let kind = types.iter().find(|kind| {
+                        kind.id.is_some()
+                            && kind.id == art.type_
+                            && kind
+                                .record_type
+                                .as_deref()
+                                .is_some_and(|record| record.eq_ignore_ascii_case("season"))
+                    })?;
+                    let image_type = match kind.name.as_deref()?.to_ascii_lowercase().as_str() {
+                        "poster" => ImageType::Primary,
+                        "banner" => ImageType::Banner,
+                        "background" => ImageType::Backdrop,
+                        "clearlogo" => ImageType::Logo,
+                        "clearart" => ImageType::Art,
+                        _ => return None,
+                    };
+                    Some(TmdbImage {
+                        image_type,
+                        url: art.image?,
+                        width: Some(art.width.unwrap_or(0)),
+                        height: Some(art.height.unwrap_or(0)),
+                        language: art.language,
+                        community_rating: None,
+                        vote_count: None,
+                    })
+                })
+                .collect();
+        }
+        Vec::new()
+    }
+
+    async fn image_types(&self) -> Option<Vec<ArtworkTypeWire>> {
+        // TvdbClientManager caches reference lists for seven days by default.
+        if let Some(types) = self.artwork_types.lock().ok().and_then(|cache| {
+            cache
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < std::time::Duration::from_hours(168))
+                .map(|(_, types)| types.clone())
+        }) {
+            return Some(types);
+        }
+        let types: Vec<ArtworkTypeWire> = self.get("/artwork/types", &[]).await?;
+        if let Ok(mut cache) = self.artwork_types.lock() {
+            *cache = Some((std::time::Instant::now(), types.clone()));
+        }
+        Some(types)
+    }
+
     /// Fetches and maps a season's record with its translations
     /// (`GetSeasonByIdAsync`, `/seasons/{id}/extended?meta=translations`,
     /// `TvdbClientManager.cs:309-327`).
@@ -987,6 +1273,32 @@ impl TvdbClient {
         let resp = crate::image_download::send(&self.http, url).await.ok()?;
         resp.counted_bytes().await.ok()
     }
+}
+
+/// `TvdbUtils.GetComparableName`: lower-cased (NFC), `", the"` and `"the "`
+/// removed, `&` spelled "and", modifier letters and non-spacing marks
+/// removed, and every run of non-word characters (and `_`) one space.
+///
+/// ACCEPTED DIVERGENCE (don't-port-bugs): upstream removes `"the "` inside a
+/// word too, so "Breathe Easy" searches as "brea easy"; here it must start a
+/// word.
+#[must_use]
+pub fn comparable_name(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    static THE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\bthe ").expect("valid regex"));
+    static MARKS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"[\p{Lm}\p{Mn}]").expect("valid regex"));
+    static SEPARATORS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"[\W\p{Pc}]+").expect("valid regex"));
+    let name = name
+        .to_lowercase()
+        .nfc()
+        .collect::<String>()
+        .replace(", the", "");
+    let name = THE.replace_all(&name, " ").replace('&', " and ");
+    let name = MARKS.replace_all(&name, "");
+    SEPARATORS.replace_all(&name, " ").trim().to_owned()
 }
 
 /// The four-digit year in a `YYYY-MM-DD` (or `YYYY…`) date string.
@@ -1037,6 +1349,9 @@ fn map_characters(characters: Option<Vec<CharacterWire>>) -> Vec<TvdbPerson> {
 /// content rating (country match then USA fallback), networks, remote ids, and
 /// artwork. Pure — the oracle for the mapping tests.
 fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> TvdbSeriesDetails {
+    let (names, overviews) = wire.translations.map_or((None, None), |t| {
+        (t.name_translations, t.overview_translations)
+    });
     let production_year = wire.first_aired.as_deref().and_then(year_of);
     // `lastAired` is the end date only for series that have ended.
     let end_date = wire
@@ -1107,6 +1422,8 @@ fn map_series(tvdb_id: i64, wire: SeriesExtendedWire, country_code: &str) -> Tvd
         tvdb_id,
         name: wire.name,
         overview: wire.overview,
+        name_translations: translations_of(names, |t| t.name),
+        overview_translations: translations_of(overviews, |t| t.overview),
         premiere_date: wire.first_aired,
         production_year,
         end_date,
@@ -1162,7 +1479,103 @@ fn remote_id_to_string(value: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[rstest::rstest]
+    #[case("", Some(2), 5, "official", 2, 5)]
+    #[case("", None, 5, "official", 1, 5)]
+    #[case("official", Some(0), 3, "official", 0, 3)]
+    #[case("dvd", Some(2), 5, "dvd", 2, 5)]
+    #[case("alttwo", None, 5, "alttwo", 1, 5)]
+    #[case("regional", Some(3), 1, "regional", 3, 1)]
+    #[case("absolute", Some(4), 61, "absolute", 1, 61)]
+    #[case("absolute", None, 61, "absolute", 1, 61)]
+    #[case("absolute", Some(0), 2, "official", 0, 2)]
+    // The plugin's switch is case-sensitive: anything else is aired order.
+    #[case("Absolute", Some(4), 61, "official", 4, 61)]
+    #[case("PremiereDate", Some(2), 5, "official", 2, 5)]
+    fn episode_lookup_follows_the_plugin_switch(
+        #[case] order: &str,
+        #[case] parent: Option<i32>,
+        #[case] index: i32,
+        #[case] expected_order: &str,
+        #[case] expected_season: i32,
+        #[case] expected_index: i32,
+    ) {
+        assert_eq!(
+            super::episode_lookup(order, parent, index),
+            (expected_order, expected_season, expected_index)
+        );
+    }
+
+    #[test]
+    fn display_order_is_read_raw_and_season_lookups_default_to_official() {
+        assert_eq!(
+            super::display_order_of(Some(r#"{"DisplayOrder":"dvd"}"#)),
+            "dvd"
+        );
+        assert_eq!(
+            super::display_order_of(Some(r#"{"DisplayOrder":null}"#)),
+            ""
+        );
+        assert_eq!(super::display_order_of(Some("not json")), "");
+        assert_eq!(super::display_order_of(None), "");
+        assert_eq!(super::season_lookup_order(""), "official");
+        assert_eq!(super::season_lookup_order("  "), "official");
+        assert_eq!(super::season_lookup_order("dvd"), "dvd");
+        assert_eq!(super::season_lookup_order("Absolute"), "Absolute");
+    }
+
     use super::*;
+
+    #[test]
+    fn series_and_episode_localization_exclude_aliases_and_do_not_fall_back_to_base_text() {
+        let names = vec![
+            TvdbTranslation {
+                language: "deu".into(),
+                text: Some("Alias".into()),
+                is_alias: true,
+            },
+            TvdbTranslation {
+                language: "deu".into(),
+                text: Some("Deutsch".into()),
+                is_alias: false,
+            },
+            TvdbTranslation {
+                language: "eng".into(),
+                text: Some("English".into()),
+                is_alias: false,
+            },
+        ];
+        let overviews = vec![TvdbTranslation {
+            language: "deu".into(),
+            text: Some("Beschreibung".into()),
+            is_alias: false,
+        }];
+        let mut series = TvdbSeriesDetails {
+            name: Some("Base name".into()),
+            overview: Some("Base overview".into()),
+            name_translations: names.clone(),
+            overview_translations: overviews.clone(),
+            ..Default::default()
+        };
+        let mut episode = TvdbEpisodeDetails {
+            name: Some("Base episode".into()),
+            overview: Some("Base synopsis".into()),
+            name_translations: names,
+            overview_translations: overviews,
+            ..Default::default()
+        };
+        let codes = ["deu".to_owned(), "ger".to_owned()];
+        series.localize("de", &codes);
+        episode.localize("de", &codes);
+        assert_eq!(series.name.as_deref(), Some("Deutsch"));
+        assert_eq!(episode.name, series.name);
+        assert_eq!(series.overview.as_deref(), Some("Beschreibung"));
+        assert_eq!(episode.overview, series.overview);
+        series.localize("fr", &["fra".into()]);
+        episode.localize("fr", &["fra".into()]);
+        assert_eq!((series.name, series.overview), (None, None));
+        assert_eq!((episode.name, episode.overview), (None, None));
+    }
 
     fn series_fixture() -> SeriesExtendedWire {
         serde_json::from_str(
@@ -1312,7 +1725,7 @@ mod tests {
         // name is dropped.
         let items: Vec<SearchItem> = serde_json::from_str(
             r#"[
-              { "tvdb_id": "121361", "name": "Game of Thrones", "year": "2011", "image_url": "/p.jpg" },
+              { "tvdb_id": "121361", "name": "Game of Thrones", "first_air_time": "2011-04-17", "image_url": "/p.jpg" },
               { "name": "No Id" },
               { "tvdb_id": "abc", "name": "Bad Id" }
             ]"#,
@@ -1325,7 +1738,7 @@ mod tests {
                 Some(TvdbSearchHit {
                     tvdb_id,
                     name: it.name?,
-                    year: it.year.as_deref().and_then(|y| y.parse().ok()),
+                    year: it.first_air_time.as_deref().and_then(year_of),
                     image_url: it.image_url,
                     overview: it.overview,
                 })
@@ -1334,6 +1747,74 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].tvdb_id, 121_361);
         assert_eq!(hits[0].year, Some(2011));
+    }
+
+    #[rstest::rstest]
+    #[case::lower_cased("Show", "show")]
+    #[case::trailing_article(", The Show", "show")]
+    #[case::leading_article("The Show", "show")]
+    #[case::inner_article("Back to the Future", "back to future")]
+    #[case::article_inside_a_word_kept("Breathe Easy", "breathe easy")]
+    #[case::article_before_punctuation_kept("The-Show", "the show")]
+    #[case::trailing_article_kept("Kill the", "kill the")]
+    #[case::lone_article_kept("The", "the")]
+    #[case::ampersand("Law & Order", "law and order")]
+    #[case::punctuation_runs("Star Trek: The Next Generation", "star trek next generation")]
+    #[case::underscore("Mr_Robot", "mr robot")]
+    #[case::combining_mark("Cafe\u{301}", "café")]
+    fn comparable_name_follows_get_comparable_name(#[case] name: &str, #[case] expected: &str) {
+        assert_eq!(comparable_name(name), expected);
+    }
+
+    #[tokio::test]
+    async fn search_queries_the_bare_name_ranks_like_find_series_and_keeps_hits_within_a_year() {
+        use crate::mock_http::MockServer;
+        // Only the request FindSeriesInternal sends is answered: the year and
+        // the release clutter are parsed off the name and never sent.
+        let server = MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
+            (
+                "/search?query=show&type=series&limit=5",
+                r#"{"data":[
+                  {"tvdb_id":"1","name":"Unrelated","first_air_time":"2020-01-01"},
+                  {"tvdb_id":"2","name":"Show","first_air_time":"2025-12-31"},
+                  {"tvdb_id":"3","name":"Show Again"},
+                  {"tvdb_id":"4","name":"Show Later","year":"2028"},
+                  {"tvdb_id":"5","name":"Serie","translations":{"deu":"Serie","eng":"Show"}}
+                ]}"#
+                .to_owned(),
+            ),
+        ])
+        .await;
+        let c = TvdbClient::new().with_base_url(&server.base_url);
+        let english = vec!["eng".to_owned()];
+        let ids = |hits: Vec<TvdbSearchHit>| hits.iter().map(|h| h.tvdb_id).collect::<Vec<_>>();
+
+        // OrderBy: a title equal to the name (5's English name too), then a
+        // title containing it, then TVDB's order.
+        assert_eq!(
+            ids(c.search("Show", None, "en", &english).await),
+            [2, 5, 3, 4, 1]
+        );
+        // Without the language, 5 ranks by its own name.
+        assert_eq!(ids(c.search("Show", None, "", &[]).await), [2, 3, 4, 1, 5]);
+        // A year in the name is parsed off the query. No title equals the
+        // raw name, so the titles containing "Show" keep TVDB's order; the
+        // known year keeps the hits first aired within a year of it, and
+        // those with no first air date (4 has only TVDB's `year`).
+        assert_eq!(
+            ids(c
+                .search("Show.2026.1080p", Some(2026), "en", &english)
+                .await),
+            [2, 3, 4, 5]
+        );
+        let first = c.search("Show", None, "en", &english).await;
+        assert_eq!(first[1].name, "Show", "the hit carries its translated name");
+        assert_eq!(
+            first[0].year,
+            Some(2025),
+            "the year is the first air date's"
+        );
     }
 
     #[tokio::test]
@@ -1376,7 +1857,7 @@ mod tests {
         .await;
         let c = TvdbClient::new().with_base_url(&server.base_url);
 
-        let hits = c.search("Game of Thrones", Some(2011)).await;
+        let hits = c.search("Game of Thrones", Some(2011), "en", &[]).await;
         assert_eq!(hits.first().map(|h| h.tvdb_id), Some(121_361));
 
         let d = c.series_details(121_361, "usa").await.expect("series");
@@ -1413,15 +1894,60 @@ mod tests {
         // No /login route → token() fails → every call returns None/empty.
         let server = MockServer::start(vec![("/search", "{}".to_owned())]).await;
         let c = TvdbClient::new().with_base_url(&server.base_url);
-        assert!(c.search("x", None).await.is_empty());
+        assert!(c.search("x", None, "en", &[]).await.is_empty());
         assert!(c.series_details(1, "usa").await.is_none());
+    }
+
+    /// The bearer token is reused until it is older than the token max age
+    /// (the plugin's 25 days, `FERROFIN_TVDB_TOKEN_DAYS`), then the client
+    /// logs in again; concurrent callers share one login.
+    #[tokio::test]
+    async fn the_token_is_renewed_once_older_than_its_max_age() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let logins = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&logins);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let payload = if req.contains("/login") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    r#"{"data":{"token":"tok"}}"#
+                } else {
+                    r#"{"data":{"name":"An episode"}}"#
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        let base = format!("http://{addr}");
+        let c = TvdbClient::new().with_base_url(&base);
+        let (a, b) = tokio::join!(c.episode_details(8), c.episode_details(9));
+        assert!(a.is_some() && b.is_some());
+        assert!(c.episode_details(8).await.is_some());
+        assert_eq!(logins.load(Ordering::SeqCst), 1, "one login, shared");
+        let c = TvdbClient::new()
+            .with_base_url(&base)
+            .with_token_max_age(std::time::Duration::ZERO);
+        for _ in 0..2 {
+            assert!(c.episode_details(8).await.is_some());
+        }
+        assert_eq!(logins.load(Ordering::SeqCst), 3, "an old token is renewed");
     }
 
     #[tokio::test]
     #[ignore = "hits the live TVDB API; run with --ignored"]
     async fn live_search_and_details_smoke() {
         let c = TvdbClient::new();
-        let hits = c.search("Game of Thrones", None).await;
+        let hits = c.search("Game of Thrones", None, "en", &[]).await;
         assert!(
             hits.iter().any(|h| h.tvdb_id == 121_361),
             "expected GoT (121361) in {hits:?}"
@@ -1540,5 +2066,51 @@ mod tests {
         }
         assert_eq!(season_lists.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(episode_lists.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+    #[rstest::rstest]
+    #[case("absolute", 0, "official", 0)]
+    #[case("absolute", 2, "absolute", 1)]
+    #[case("dvd", 2, "dvd", 2)]
+    #[case("invalid", 2, "official", 2)]
+    #[test]
+    fn episode_artwork_order(
+        #[case] input: &str,
+        #[case] season: i32,
+        #[case] expected: &str,
+        #[case] expected_season: i32,
+    ) {
+        assert_eq!(
+            super::episode_image_order(input, season),
+            (expected, expected_season)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::missing_order("missing", "[]", 1)]
+    #[case::empty_order("dvd", "[]", 1)]
+    #[case::unmapped_art_does_not_fall_back("dvd", r#"[{"type":99,"image":"unknown"}]"#, 0)]
+    #[tokio::test]
+    async fn season_artwork_uses_reference_types_and_official_fallback(
+        #[case] order: &str,
+        #[case] alternate: &str,
+        #[case] count: usize,
+    ) {
+        let server = crate::mock_http::MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
+            ("/artwork/types", r#"{"data":[{"id":71,"name":"Poster","recordType":"season"},{"id":72,"name":"Poster","recordType":"series"}]}"#.to_owned()),
+            ("/series/5/extended", r#"{"data":{"seasons":[{"id":51,"number":1,"type":{"type":"dvd"}},{"id":52,"number":1,"type":{"type":"official"}}]}}"#.to_owned()),
+            ("/seasons/51/extended", format!(r#"{{"data":{{"artwork":{alternate}}}}}"#)),
+            ("/seasons/52/extended", r#"{"data":{"artwork":[{"type":71,"image":"poster.jpg","language":"fre","width":800},{"type":72,"image":"wrong.jpg"}]}}"#.to_owned()),
+        ]).await;
+        let client = TvdbClient::new().with_base_url(&server.base_url);
+        let images = client.season_images(5, order, 1).await;
+        assert_eq!(images.len(), count);
+        if count > 0 {
+            assert_eq!(images[0].image_type, ImageType::Primary);
+            assert_eq!(images[0].url, "poster.jpg");
+            assert_eq!((images[0].width, images[0].height), (Some(800), Some(0)));
+        }
+        assert!(client.artwork_types.lock().unwrap().is_some());
+        assert!(client.season_images(5, "official", 99).await.is_empty());
     }
 }

@@ -28,19 +28,21 @@ pub fn parse(path: &str, naming_options: &NamingOptions) -> Format3DResult {
 }
 
 /// Splits `chars` the way the C# loop does: on the next delimiter, or — when no
-/// delimiter remains — on the last character (upstream's `Length - 1` fallback,
-/// which deliberately drops that final char).
+/// delimiter remains — the whole remainder is the last token (upstream
+/// commit 5be844e1b7; before it the final char was dropped, so a directory
+/// rip ending in `3d hsbs` was never 3D).
 fn split_tokens<'a>(chars: &'a [char], delimiters: &[char]) -> Vec<&'a [char]> {
     let mut tokens = Vec::new();
     let mut start = 0usize;
     while start < chars.len() {
         let remaining = &chars[start..];
-        let index = remaining
-            .iter()
-            .position(|c| delimiters.contains(c))
-            .unwrap_or(remaining.len() - 1);
-        tokens.push(&remaining[..index]);
-        start += index + 1;
+        if let Some(index) = remaining.iter().position(|c| delimiters.contains(c)) {
+            tokens.push(&remaining[..index]);
+            start += index + 1;
+        } else {
+            tokens.push(remaining);
+            start = chars.len();
+        }
     }
     tokens
 }

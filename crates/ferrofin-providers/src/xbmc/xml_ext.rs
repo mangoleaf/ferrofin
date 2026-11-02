@@ -53,19 +53,12 @@ pub fn try_read_date_time(reader: &mut XmlCursor) -> Option<DateTime<Utc>> {
 /// Parses a `DateTime` from the current node using an exact format
 /// (`XmlReaderExtensions.TryReadDateTimeExact`).
 ///
-/// Only the `yyyy-MM-dd` format string is used by the NFO configuration; it is
-/// matched against a bare date (midnight UTC).
+/// `DateTime.TryParseExact(content, format, InvariantCulture, AssumeUniversal |
+/// AdjustToUniversal)`: the element text is matched as written (no trimming)
+/// against any .NET date pattern, see [`super::dotnet_date`]. A malformed
+/// pattern yields no date; upstream's `FormatException` would abort the read.
 pub fn try_read_date_time_exact(reader: &mut XmlCursor, format: &str) -> Option<DateTime<Utc>> {
-    let text = reader.read_element_content_as_string();
-    let text = text.trim();
-    if format == "yyyy-MM-dd" {
-        NaiveDate::parse_from_str(text, "%Y-%m-%d")
-            .ok()
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .map(|dt| Utc.from_utc_datetime(&dt))
-    } else {
-        parse_date_time_flexible(text)
-    }
+    super::dotnet_date::try_parse_exact(&reader.read_element_content_as_string(), format)
 }
 
 /// Parses a date-time in any of the NFO-supported layouts as UTC.
@@ -122,7 +115,8 @@ pub fn get_person_array(reader: &mut XmlCursor, kind: PersonKind) -> Vec<PersonI
 /// (`XmlReaderExtensions.GetPersonFromXmlNode`).
 ///
 /// Returns `None` for an empty element or a person with a blank name. Missing
-/// `<type>` defaults to [`PersonKind::Actor`]. Recognized child tags:
+/// `<type>` defaults to [`PersonKind::Actor`]; one that does not parse is
+/// [`PersonKind::Unknown`]. Recognized child tags:
 /// `name`/`Name`, `role`/`Role`, `type`/`Type`, `order`/`sortorder`/`SortOrder`,
 /// `thumb`.
 pub fn get_person_from_xml_node(reader: &mut XmlCursor) -> Option<PersonInfo> {
@@ -150,10 +144,15 @@ pub fn get_person_from_xml_node(reader: &mut XmlCursor) -> Option<PersonInfo> {
         match subtree.name() {
             "name" | "Name" => name = read_normalized_string(&mut subtree),
             "role" | "Role" => role = read_normalized_string(&mut subtree),
+            // `Enum.TryParse(text, true, out type)`: any member name in any
+            // case; a value that does not parse leaves `default(PersonKind)`,
+            // `Unknown` — only a missing `<type>` keeps `Actor`.
             "type" | "Type" => {
-                if let Some(parsed) = parse_person_kind(&subtree.read_element_content_as_string()) {
-                    type_ = parsed;
-                }
+                type_ = ferrofin_model::json::enums::try_parse(
+                    &subtree.read_element_content_as_string(),
+                    true,
+                )
+                .unwrap_or(PersonKind::Unknown);
             }
             "order" | "sortorder" | "SortOrder" => {
                 if let Some(v) = try_read_int(&mut subtree) {
@@ -179,46 +178,6 @@ pub fn get_person_from_xml_node(reader: &mut XmlCursor) -> Option<PersonInfo> {
         image_url,
         ..PersonInfo::default()
     })
-}
-
-/// Parses a [`PersonKind`] name case-insensitively (`Enum.TryParse<PersonKind>`).
-///
-/// Covers every `PersonKind` variant, matching `Enum.TryParse`'s acceptance of
-/// any enum member name (so `<type>Lyricist</type>` resolves, not falling back
-/// to the `Actor` default).
-fn parse_person_kind(text: &str) -> Option<PersonKind> {
-    const KINDS: [PersonKind; 26] = [
-        PersonKind::Unknown,
-        PersonKind::Actor,
-        PersonKind::Director,
-        PersonKind::Composer,
-        PersonKind::Writer,
-        PersonKind::GuestStar,
-        PersonKind::Producer,
-        PersonKind::Conductor,
-        PersonKind::Lyricist,
-        PersonKind::Arranger,
-        PersonKind::Engineer,
-        PersonKind::Mixer,
-        PersonKind::Remixer,
-        PersonKind::Creator,
-        PersonKind::Artist,
-        PersonKind::AlbumArtist,
-        PersonKind::Author,
-        PersonKind::Illustrator,
-        PersonKind::Penciller,
-        PersonKind::Inker,
-        PersonKind::Colorist,
-        PersonKind::Letterer,
-        PersonKind::CoverArtist,
-        PersonKind::Editor,
-        PersonKind::Translator,
-        PersonKind::Narrator,
-    ];
-    let text = text.trim();
-    KINDS
-        .into_iter()
-        .find(|k| format!("{k:?}").eq_ignore_ascii_case(text))
 }
 
 /// Returns the portion of `text` before the first `separator`

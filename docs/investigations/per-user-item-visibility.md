@@ -34,7 +34,7 @@ identified this gap but needs two corrections:
 
 ## Baseline evidence
 
-Source oracle: the repository's `UPSTREAM_TAG`, **v12.0-rc7**, commit
+Source oracle: the repository's then-current `UPSTREAM_TAG`, **v12.0-rc7**, commit
 `4910aafa1a8227a65a037d3d2d299a32691e4de3`, inspected in the local Jellyfin checkout.
 Live oracle: the available **Jellyfin 12.1.0** binary. These are separate evidence
 sources; the runtime tests are not represented as a run of rc7.
@@ -254,9 +254,9 @@ The reproducible harness is now checked in:
 
 ```sh
 RUSTC_WRAPPER= cargo build --locked --offline -p ferrofin-server
-python3 bench/per_user_visibility.py jellyfin /path/to/jellyfin.dll \
+python3 gates/bench/per_user_visibility.py jellyfin /path/to/jellyfin.dll \
   --dotnet /path/to/dotnet
-python3 bench/per_user_visibility.py ferrofin target/debug/ferrofin-server \
+python3 gates/bench/per_user_visibility.py ferrofin target/debug/ferrofin-server \
   --reference /tmp/ferrofin-visibility-jellyfin-EXAMPLE/results.json
 ```
 
@@ -304,9 +304,9 @@ database with 64 movies in two libraries; the allowed SyncPlay queue contained
 after, after, before, before, after; our compilation and coverage jobs had finished.
 
 ```sh
-python3 bench/per_user_visibility.py ferrofin /path/to/before/ferrofin-server \
+python3 gates/bench/per_user_visibility.py ferrofin /path/to/before/ferrofin-server \
   --benchmark 100 --library-size 64
-python3 bench/per_user_visibility.py ferrofin target/debug/ferrofin-server \
+python3 gates/bench/per_user_visibility.py ferrofin target/debug/ferrofin-server \
   --benchmark 100 --library-size 64
 ```
 

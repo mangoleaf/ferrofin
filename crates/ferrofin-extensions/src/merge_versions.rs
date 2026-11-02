@@ -45,10 +45,6 @@
 //!   the upstream `OwnerId`/`LocalAlternateVersions`/`LinkedAlternateVersions`
 //!   columns and the linked-child reroute are Jellyfin-internal representation
 //!   with no Ferrofin equivalent.
-//! - No `VideoType`/`Video3DFormat` columns exist, so primary selection cannot
-//!   demote 3D/non-file videos — the widest wins.
-//! - No `IndexNumberEnd` column exists, so that merge-key component is always
-//!   empty (only multi-episode files could tell the difference).
 //! - The upstream movie loops run their async merges inside `Parallel.ForEach`
 //!   fire-and-forget lambdas (dropping errors); Ferrofin awaits sequentially.
 
@@ -261,6 +257,13 @@ pub struct MergeVersionsService {
     library: Arc<dyn LibraryManager>,
     virtual_folders: Arc<dyn VirtualFolderManager>,
     plugins: Arc<dyn PluginManager>,
+    /// Held for the whole of a bulk merge or split. Each rewrites version
+    /// links across the library, so two interleaving (a route and a daily
+    /// task, or two route calls) would leave the links in whichever mix of
+    /// both runs wrote last; a second call waits for the first instead.
+    /// Upstream has no such lock. The routes and both tasks share this
+    /// service, so this one lock covers every caller.
+    bulk_run: tokio::sync::Mutex<()>,
 }
 
 impl MergeVersionsService {
@@ -282,6 +285,7 @@ impl MergeVersionsService {
             library,
             virtual_folders,
             plugins,
+            bulk_run: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -334,6 +338,11 @@ impl MergeVersionsService {
             .await?;
         Ok(items
             .into_iter()
+            // Upstream's query keeps owned rows out (`TranslateQuery`'s
+            // `OwnerId == null || ExtraType != null`): a stacked part or a
+            // local alternate belongs to its primary's file group, which the
+            // scan writes, and is never merged on its own.
+            .filter(|item| !is_owned_version(item))
             .filter(|item| !in_excluded_location(&excluded, item.path.as_deref()))
             .filter(|item| {
                 kind != BaseItemKind::Movie || !in_inactive_library(&folders, item.path.as_deref())
@@ -346,33 +355,51 @@ impl MergeVersionsService {
     /// `PrimaryVersionId` pointer up and every row pointing at it down, to
     /// fixpoint. Merging into an already-merged item thus re-groups the whole
     /// family instead of nesting groups.
+    ///
+    /// An owned row (a stacked part or a local alternate,
+    /// [`is_owned_version`]) is never a member — upstream's
+    /// `GetAllAlternateVersions` lists linked versions only — but the
+    /// members it is a version of are returned as the second set: a video
+    /// with local versions has `MediaSourceCount > 1`, which the primary
+    /// choice reads. The walk goes on through an owned row, up and down: a
+    /// merge left on a version a scan later grouped under another primary
+    /// points at that local version, one level below the group's primary.
+    /// Each row is walked once, so a pointer chain that loops ends.
     async fn expand_group(
         &self,
         seed: &[BaseItemEntity],
-    ) -> Result<HashMap<String, BaseItemEntity>, ServiceError> {
+    ) -> Result<(HashMap<String, BaseItemEntity>, HashSet<String>), ServiceError> {
         let mut group: HashMap<String, BaseItemEntity> = HashMap::new();
+        let mut local: HashSet<String> = HashSet::new();
+        let mut walked: HashSet<String> = HashSet::new();
         let mut pending: VecDeque<BaseItemEntity> = seed.iter().cloned().collect();
         while let Some(item) = pending.pop_front() {
-            if group.contains_key(&item.id) {
+            if !walked.insert(item.id.clone()) {
                 continue;
             }
             if let Some(pid) = item.primary_version_id.as_deref()
-                && !group.contains_key(pid)
+                && !walked.contains(pid)
                 && let Ok(pid) = Uuid::parse_str(pid)
                 && let Some(primary) = self.items.retrieve_item(pid).await?
             {
                 pending.push_back(primary);
             }
+            let owned = is_owned_version(&item);
             if let Ok(id) = Uuid::parse_str(&item.id) {
                 for alt in self.items.get_items_by_primary_version(id).await? {
-                    if !group.contains_key(&alt.id) {
+                    if is_owned_version(&alt) && !owned {
+                        local.insert(item.id.clone());
+                    }
+                    if !walked.contains(&alt.id) {
                         pending.push_back(alt);
                     }
                 }
             }
-            group.insert(item.id.clone(), item);
+            if !owned {
+                group.insert(item.id.clone(), item);
+            }
         }
-        Ok(group)
+        Ok((group, local))
     }
 
     /// Merges one duplicate group — port of the upstream private
@@ -382,32 +409,37 @@ impl MergeVersionsService {
     /// no-op (the C# returns), unlike the strict `POST /Videos/MergeVersions`
     /// route.
     ///
-    /// `scope`, when given, is the library (`TopParentId`) the group belongs
-    /// to: expansion can walk a stale pointer out of that library, and any
-    /// member it drags in from elsewhere is unlinked and dropped instead of
-    /// re-merged. Callers with no library scope (episodes, whose merge key is
-    /// already series-scoped) pass `None` for upstream's semantics.
-    async fn merge_group(&self, ids: &[Uuid], scope: Option<&str>) -> Result<(), ServiceError> {
+    /// `scope`, when given, is the library ([`library_key`], read against
+    /// the configured libraries) the group belongs to: expansion can walk a
+    /// stale pointer out of that library, and any member it drags in from
+    /// elsewhere is unlinked and dropped instead of re-merged. Callers with no
+    /// library scope (episodes, whose merge key is already series-scoped) pass
+    /// `None` for upstream's semantics.
+    async fn merge_group(
+        &self,
+        ids: &[Uuid],
+        scope: Option<(&str, &[VirtualFolderInfo])>,
+    ) -> Result<(), ServiceError> {
         let mut items = Vec::new();
         for &id in ids {
             if let Some(row) = self.items.retrieve_item(id).await? {
                 items.push(row);
             }
         }
+        items.retain(|item| !is_owned_version(item));
         items.sort_by(|a, b| a.id.cmp(&b.id));
         items.dedup_by(|a, b| a.id == b.id);
         if items.len() < 2 {
             return Ok(());
         }
 
-        let mut group = self.expand_group(&items).await?;
-        if let Some(scope) = scope {
+        let (mut group, local) = self.expand_group(&items).await?;
+        if let Some((scope, folders)) = scope {
             let foreign: Vec<BaseItemEntity> = group
                 .values()
                 // The empty scope is the unscoped bucket: it matches exactly
-                // the movies with no `TopParentId`, the same way grouping
-                // keys them.
-                .filter(|item| item.top_parent_id.as_deref().unwrap_or("") != scope)
+                // the movies in no library, the same way grouping keys them.
+                .filter(|item| library_key(folders, item) != scope)
                 .cloned()
                 .collect();
             for item in &foreign {
@@ -436,23 +468,18 @@ impl MergeVersionsService {
         // Primary selection: the first supplied item (id order) that already
         // owns alternates and is not itself an alternate — the C#
         // `MediaSourceCount > 1 && !PrimaryVersionId.HasValue` probe — else
-        // the widest (`Video3DFormat`/`VideoType` demotion is not modeled).
+        // plain files before 3D and disc videos, then the widest.
         let owns_alternates = |item: &BaseItemEntity| {
-            group
-                .values()
-                .any(|other| other.primary_version_id.as_deref() == Some(item.id.as_str()))
+            local.contains(&item.id)
+                || group
+                    .values()
+                    .any(|other| other.primary_version_id.as_deref() == Some(item.id.as_str()))
         };
         let primary = items
             .iter()
             .find(|i| i.primary_version_id.is_none() && owns_alternates(i))
             .unwrap_or_else(|| {
-                let mut best = &items[0];
-                for item in &items[1..] {
-                    if item.width.unwrap_or(0) > best.width.unwrap_or(0) {
-                        best = item;
-                    }
-                }
-                best
+                &items[ferrofin_core::video_versions::preferred_primary_version(&items)]
             });
         let primary_id = primary.id.clone();
 
@@ -505,10 +532,30 @@ impl MergeVersionsService {
     }
 }
 
+/// The library `item` belongs to, as merging scopes it: the configured
+/// library whose collection folder is its `TopParentId` or one of whose
+/// locations holds it (a location's folder is the `TopParentId` of what it
+/// holds, and two locations are one library), else the raw `TopParentId` —
+/// empty when it has none.
+fn library_key(folders: &[VirtualFolderInfo], item: &BaseItemEntity) -> String {
+    ferrofin_model::entities_media::owning_library(
+        folders,
+        item.top_parent_id.as_deref(),
+        item.path.as_deref(),
+    )
+    .and_then(|folder| folder.item_id.as_deref())
+    .and_then(|id| Uuid::parse_str(id).ok())
+    .map_or_else(
+        || item.top_parent_id.clone().unwrap_or_default(),
+        |id| id.simple().to_string(),
+    )
+}
+
 #[async_trait]
 impl MergeVersionsManager for MergeVersionsService {
     async fn merge_movies(&self, progress: Option<MergeProgress<'_>>) -> Result<(), ServiceError> {
         self.ensure_enabled().await?;
+        let _bulk_run = self.bulk_run.lock().await;
         tracing::info!("merge versions: scanning for repeated movies");
         let movies = self.eligible_items(BaseItemKind::Movie).await?;
         let tmdb: HashMap<Uuid, String> = self
@@ -518,14 +565,15 @@ impl MergeVersionsManager for MergeVersionsService {
             .into_iter()
             .collect();
 
-        // The owning library (`TopParentId`) per movie — the merge scope. A
-        // movie with no `TopParentId` (never scanned into a library) is
-        // "unscoped": it groups under the empty key with its own kind, and is
-        // never itself healed, since it has no library to be in the wrong
-        // one of.
-        let library_of: HashMap<&str, &str> = movies
+        // The owning library per movie ([`library_key`]) — the merge scope. A
+        // movie in no library (never scanned into one) is "unscoped": it
+        // groups under the empty key with its own kind, and is never itself
+        // healed, since it has no library to be in the wrong one of.
+        let folders = self.virtual_folders.get_virtual_folders().await?;
+        let library_of: HashMap<&str, String> = movies
             .iter()
-            .filter_map(|m| Some((m.id.as_str(), m.top_parent_id.as_deref()?)))
+            .map(|m| (m.id.as_str(), library_key(&folders, m)))
+            .filter(|(_, library)| !library.is_empty())
             .collect();
 
         // Self-heal before grouping: unlink any alternate whose library
@@ -552,7 +600,7 @@ impl MergeVersionsManager for MergeVersionsService {
                 continue;
             }
             let primary_lib = if let Some(found) = library_of.get(pid) {
-                Some(*found)
+                Some(found.as_str())
             } else {
                 if !fetched.contains_key(pid) {
                     let row = match Uuid::parse_str(pid) {
@@ -562,12 +610,12 @@ impl MergeVersionsManager for MergeVersionsService {
                     // A primary that exists but sits in no library is
                     // "unscoped" — the same empty key grouping uses — so an
                     // alternate in a real library is still healed.
-                    fetched.insert(pid, row.map(|p| p.top_parent_id.unwrap_or_default()));
+                    fetched.insert(pid, row.map(|p| library_key(&folders, &p)));
                 }
                 fetched[pid].as_deref()
             };
             if let Some(primary_lib) = primary_lib
-                && *lib != primary_lib
+                && lib != primary_lib
             {
                 self.persistence.set_primary_version_id(id, None).await?;
                 healed.insert(id);
@@ -597,7 +645,7 @@ impl MergeVersionsManager for MergeVersionsService {
             let Some(value) = tmdb.get(&id) else {
                 continue; // no Tmdb id → skipped (`ProviderIds.ContainsKey`)
             };
-            let library = library_of.get(movie.id.as_str()).copied().unwrap_or("");
+            let library = library_of.get(movie.id.as_str()).map_or("", String::as_str);
             let entry = groups.entry((library, value.as_str())).or_default();
             entry.0.push(id);
             entry.1 |= movie.primary_version_id.is_none() || healed.contains(&id);
@@ -610,7 +658,7 @@ impl MergeVersionsManager for MergeVersionsService {
 
         for (index, (library, ids)) in duplicates.iter().enumerate() {
             report(progress, percent(index, duplicates.len()));
-            self.merge_group(ids, Some(library)).await?;
+            self.merge_group(ids, Some((library, &folders))).await?;
         }
         report(progress, 100.0);
         Ok(())
@@ -618,6 +666,7 @@ impl MergeVersionsManager for MergeVersionsService {
 
     async fn split_movies(&self, progress: Option<MergeProgress<'_>>) -> Result<(), ServiceError> {
         self.ensure_enabled().await?;
+        let _bulk_run = self.bulk_run.lock().await;
         tracing::info!("merge versions: splitting all movies");
         // Upstream `SplitMovies` iterates `GetMoviesFromLibrary`, which keeps
         // only Tmdb-carrying eligible movies — the same set the merge scans.
@@ -641,6 +690,7 @@ impl MergeVersionsManager for MergeVersionsService {
         progress: Option<MergeProgress<'_>>,
     ) -> Result<(), ServiceError> {
         self.ensure_enabled().await?;
+        let _bulk_run = self.bulk_run.lock().await;
         tracing::info!("merge versions: scanning for repeated episodes");
         let episodes = self.eligible_items(BaseItemKind::Episode).await?;
 
@@ -731,6 +781,7 @@ impl MergeVersionsManager for MergeVersionsService {
         progress: Option<MergeProgress<'_>>,
     ) -> Result<(), ServiceError> {
         self.ensure_enabled().await?;
+        let _bulk_run = self.bulk_run.lock().await;
         tracing::info!("merge versions: splitting all episodes");
         let episodes = self.eligible_items(BaseItemKind::Episode).await?;
         let ids: Vec<Uuid> = episodes
@@ -781,9 +832,15 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
         }
     }
     if let (Some(parent), Some(index)) = (ep.parent_index_number, ep.index_number) {
-        // No `IndexNumberEnd` column exists in Ferrofin's schema; the trailing
-        // component is empty, exactly as the C# renders a null.
-        return format!("{series}|number:{parent}:{index}:");
+        // `IndexNumberEnd` lives in the `Data` blob; a null renders as
+        // nothing, as in the C# interpolation.
+        let end = ferrofin_core::item_data::read_data_i32(
+            &ferrofin_core::item_data::parse_data(ep.data.as_deref()),
+            "IndexNumberEnd",
+        )
+        .map(|end| end.to_string())
+        .unwrap_or_default();
+        return format!("{series}|number:{parent}:{index}:{end}");
     }
     format!(
         "{series}|title:{}:{}:{}",
@@ -793,6 +850,15 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
             .map(|y| y.to_string())
             .unwrap_or_default()
     )
+}
+
+/// Whether `item` is an owned row that is no extra — a stacked part or a
+/// local alternate version, which belongs to its owner's file group. The
+/// general item query keeps these out (`BaseItemRepository.TranslateQuery`:
+/// `OwnerId == null || ExtraType != null`), so upstream never merges or
+/// splits one.
+fn is_owned_version(item: &BaseItemEntity) -> bool {
+    item.owner_id.is_some() && item.extra_type.is_none()
 }
 
 /// Whether `path` sits under any of the excluded locations — the upstream
@@ -922,13 +988,28 @@ mod tests {
     }
 
     /// A virtual-folder manager exposing a fixed set of library locations.
-    struct FakeVirtualFolders(Vec<String>);
+    ///
+    /// Every merge and split lists the folders, so the listing doubles as a
+    /// probe of how many operations run at once: each one is held open for
+    /// `hold`, and the most seen together is kept.
+    #[derive(Default)]
+    struct FakeVirtualFolders {
+        locations: Vec<String>,
+        hold: std::time::Duration,
+        listing_now: std::sync::atomic::AtomicUsize,
+        most_at_once: std::sync::atomic::AtomicUsize,
+    }
 
     #[async_trait]
     impl VirtualFolderManager for FakeVirtualFolders {
         async fn get_virtual_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let now = self.listing_now.fetch_add(1, SeqCst) + 1;
+            self.most_at_once.fetch_max(now, SeqCst);
+            tokio::time::sleep(self.hold).await;
+            self.listing_now.fetch_sub(1, SeqCst);
             Ok(vec![VirtualFolderInfo {
-                locations: self.0.clone(),
+                locations: self.locations.clone(),
                 ..VirtualFolderInfo::default()
             }])
         }
@@ -937,7 +1018,7 @@ mod tests {
             _name: &str,
             _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
             _options: &ferrofin_model::configuration::LibraryOptions,
-        ) -> Result<(), ServiceError> {
+        ) -> Result<Option<uuid::Uuid>, ServiceError> {
             unimplemented!()
         }
         async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
@@ -993,6 +1074,21 @@ mod tests {
         plugins: Arc<dyn PluginManager>,
         locations: Vec<String>,
     ) -> MergeVersionsService {
+        service_with_folders(
+            db,
+            plugins,
+            Arc::new(FakeVirtualFolders {
+                locations,
+                ..FakeVirtualFolders::default()
+            }),
+        )
+    }
+
+    fn service_with_folders(
+        db: &Database,
+        plugins: Arc<dyn PluginManager>,
+        folders: Arc<FakeVirtualFolders>,
+    ) -> MergeVersionsService {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
         let items = Arc::new(FerrofinItemRepository::new(db.clone(), lookup));
@@ -1003,13 +1099,7 @@ mod tests {
             persistence.clone(),
             Arc::new(FerrofinPeopleRepository::new(db.clone())),
         ));
-        MergeVersionsService::new(
-            items,
-            persistence,
-            library,
-            Arc::new(FakeVirtualFolders(locations)),
-            plugins,
-        )
+        MergeVersionsService::new(items, persistence, library, folders, plugins)
     }
 
     fn stored_type(kind: BaseItemKind) -> &'static str {
@@ -1168,6 +1258,14 @@ mod tests {
     fn episode_merge_key_falls_back_to_numbers_then_title() {
         let ep = episode("Show", "Season 1", "Pilot", Some((1, 2)));
         assert_eq!(episode_merge_key(&ep, |_| None), "Show|number:1:2:");
+        // A multi-episode file's range end is the last component, as the C#
+        // renders `IndexNumberEnd`: a double episode is not a version of
+        // its first half.
+        let double = BaseItemEntity {
+            data: Some(r#"{"IndexNumberEnd":3,"Container":"mkv"}"#.to_owned()),
+            ..ep.clone()
+        };
+        assert_eq!(episode_merge_key(&double, |_| None), "Show|number:1:2:3");
         let ep = episode("Show", "Season 1", "Pilot", None);
         assert_eq!(
             episode_merge_key(&ep, |_| None),
@@ -1244,6 +1342,83 @@ mod tests {
         );
         assert_eq!(primary_of(&db, &svc, lonely).await, None);
         assert_eq!(primary_of(&db, &svc, no_id).await, None);
+    }
+
+    /// gl-72: the bulk merges and splits rewrite version links across the
+    /// whole library, so two of them must never interleave: whatever starts
+    /// them (the four routes, the two daily tasks), they run one at a time.
+    ///
+    /// The probe is the folder listing every operation makes while it holds
+    /// the lock (`eligible_items`); an operation that stopped listing folders
+    /// would no longer be observed here.
+    #[tokio::test]
+    async fn bulk_merges_and_splits_never_run_at_once() {
+        let db = test_db().await;
+        let (a, b) = (Uuid::from_u128(0x491), Uuid::from_u128(0x492));
+        seed(&db, a, BaseItemKind::Movie, None, 1920).await;
+        seed(&db, b, BaseItemKind::Movie, None, 640).await;
+        set_provider_id(&db, a, "Tmdb", "603").await;
+        set_provider_id(&db, b, "Tmdb", "603").await;
+        let folders = Arc::new(FakeVirtualFolders {
+            hold: std::time::Duration::from_millis(20),
+            ..FakeVirtualFolders::default()
+        });
+        let svc = service_with_folders(&db, FakePlugins::enabled(), Arc::clone(&folders));
+
+        let (merge, split, merge_episodes, split_episodes) = tokio::join!(
+            svc.merge_movies(None),
+            svc.split_movies(None),
+            svc.merge_episodes(None),
+            svc.split_episodes(None),
+        );
+        for result in [merge, split, merge_episodes, split_episodes] {
+            result.expect("bulk operation");
+        }
+        assert_eq!(
+            folders
+                .most_at_once
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    /// The plugin puts 3D and disc (non-`VideoFile`) videos after plain
+    /// files before it compares widths (`MergeVersionsManager.cs:199-202`).
+    #[tokio::test]
+    async fn merge_movies_demotes_3d_and_disc_copies_below_a_plain_file() {
+        let db = test_db().await;
+        let three_d = Uuid::from_u128(0x411);
+        let disc = Uuid::from_u128(0x412);
+        let plain = Uuid::from_u128(0x413);
+        for (id, width, data) in [
+            (three_d, 3840, r#"{"Video3DFormat":"HalfSideBySide"}"#),
+            (disc, 1920, r#"{"VideoType":"BluRay"}"#),
+            (plain, 1280, "{}"),
+        ] {
+            FerrofinItemPersistenceService::new(db.clone())
+                .save_items(&[BaseItemEntity {
+                    id: id.to_string(),
+                    type_: stored_type(BaseItemKind::Movie).to_owned(),
+                    width: Some(width),
+                    data: Some(data.to_owned()),
+                    ..BaseItemEntity::default()
+                }])
+                .await
+                .expect("seed item");
+            set_provider_id(&db, id, "Tmdb", "603").await;
+        }
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+
+        svc.merge_movies(None).await.expect("merge movies");
+
+        assert_eq!(primary_of(&db, &svc, plain).await, None);
+        for id in [three_d, disc] {
+            assert_eq!(
+                primary_of(&db, &svc, id).await.as_deref(),
+                Some(plain.to_string().as_str()),
+                "the wider 3D or disc copy is an alternate of the plain file"
+            );
+        }
     }
 
     /// Seeds a movie owned by `library` (`TopParentId`). Unlike [`seed`],
@@ -1491,6 +1666,109 @@ mod tests {
                 Some(primary.to_string().as_str()),
                 "{id}"
             );
+        }
+    }
+
+    /// A local alternate (owned by its primary, as the scan stores it) is
+    /// its primary's file group, never a merge member: upstream's movie
+    /// query leaves owned rows out. Its primary still counts as a video with
+    /// several sources (`MediaSourceCount > 1`), so it heads the merge though
+    /// the copy merged into it is wider.
+    #[tokio::test]
+    async fn merge_movies_leaves_owned_versions_alone() {
+        let db = test_db().await;
+        let primary = Uuid::from_u128(0x441);
+        let local = Uuid::from_u128(0x442);
+        let copy = Uuid::from_u128(0x443);
+        let lonely = Uuid::from_u128(0x444);
+        let lonely_local = Uuid::from_u128(0x445);
+        seed(&db, primary, BaseItemKind::Movie, None, 1920).await;
+        seed(&db, copy, BaseItemKind::Movie, None, 2560).await;
+        seed(&db, lonely, BaseItemKind::Movie, None, 1920).await;
+        for (id, owner) in [(local, primary), (lonely_local, lonely)] {
+            FerrofinItemPersistenceService::new(db.clone())
+                .save_items(&[BaseItemEntity {
+                    id: id.to_string(),
+                    type_: stored_type(BaseItemKind::Movie).to_owned(),
+                    width: Some(3840),
+                    owner_id: Some(owner.to_string()),
+                    primary_version_id: Some(owner.to_string()),
+                    ..BaseItemEntity::default()
+                }])
+                .await
+                .expect("seed local version");
+        }
+        set_provider_id(&db, primary, "Tmdb", "603").await;
+        set_provider_id(&db, local, "Tmdb", "603").await;
+        set_provider_id(&db, copy, "Tmdb", "603").await;
+        set_provider_id(&db, lonely, "Tmdb", "604").await;
+        set_provider_id(&db, lonely_local, "Tmdb", "604").await;
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+
+        svc.merge_movies(None).await.expect("merge movies");
+
+        let points_at = |row: Option<String>| row.and_then(|p| Uuid::parse_str(&p).ok());
+        assert_eq!(primary_of(&db, &svc, primary).await, None);
+        assert_eq!(points_at(primary_of(&db, &svc, copy).await), Some(primary));
+        // The local versions keep their primary; a primary whose only other
+        // copy is its own local version has nothing to merge.
+        assert_eq!(points_at(primary_of(&db, &svc, local).await), Some(primary));
+        assert_eq!(primary_of(&db, &svc, lonely).await, None);
+        assert_eq!(
+            points_at(primary_of(&db, &svc, lonely_local).await),
+            Some(lonely)
+        );
+
+        // Splitting every movie splits the merge, not the local versions.
+        svc.split_movies(None).await.expect("split movies");
+        assert_eq!(primary_of(&db, &svc, copy).await, None);
+        assert_eq!(points_at(primary_of(&db, &svc, local).await), Some(primary));
+    }
+
+    /// A copy merged onto a version that a scan later grouped as another
+    /// video's local version sits two levels below that video: the group
+    /// walk reaches the video through the owned version, which stays no
+    /// member, from either end.
+    #[tokio::test]
+    async fn expand_group_walks_through_an_owned_version() {
+        let db = test_db().await;
+        let (head, local, copy) = (
+            Uuid::from_u128(0x451),
+            Uuid::from_u128(0x452),
+            Uuid::from_u128(0x453),
+        );
+        seed(&db, head, BaseItemKind::Episode, None, 1920).await;
+        for (id, owner, primary) in [(local, Some(head), head), (copy, None, local)] {
+            FerrofinItemPersistenceService::new(db.clone())
+                .save_items(&[BaseItemEntity {
+                    id: id.to_string(),
+                    type_: stored_type(BaseItemKind::Episode).to_owned(),
+                    width: Some(1280),
+                    owner_id: owner.map(|o| o.to_string()),
+                    primary_version_id: Some(primary.to_string()),
+                    ..BaseItemEntity::default()
+                }])
+                .await
+                .expect("seed version");
+        }
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+        let row = |id: Uuid| {
+            let svc = &svc;
+            async move { svc.items.retrieve_item(id).await.unwrap().unwrap() }
+        };
+        for seed_id in [copy, head] {
+            let (group, owners) = svc.expand_group(&[row(seed_id).await]).await.unwrap();
+            let mut members: Vec<Uuid> = group
+                .keys()
+                .map(|id| Uuid::parse_str(id).unwrap())
+                .collect();
+            members.sort();
+            assert_eq!(members, vec![head, copy], "from {seed_id}");
+            let owners: Vec<Uuid> = owners
+                .iter()
+                .map(|id| Uuid::parse_str(id).unwrap())
+                .collect();
+            assert_eq!(owners, vec![head]);
         }
     }
 
@@ -1833,8 +2111,17 @@ mod tests {
             )),
             plugins,
             fingerprinter: None,
-            cache_dir: std::env::temp_dir(),
+            ffmpeg: Arc::new(crate::ffmpeg::FakeFfmpeg::default()),
+            cache_dir: std::env::temp_dir().into(),
             merge_versions: svc,
+            intro_skipper: Arc::new(
+                ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),
+            ),
+            intro_skipper_runtime: Arc::default(),
+            virtual_folders: Arc::new(
+                ferrofin_traits::stubs::virtual_folders::DisabledVirtualFolderManager,
+            ),
+            chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);

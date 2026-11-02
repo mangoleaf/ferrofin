@@ -7,7 +7,7 @@
 //!
 //! Port rules applied throughout:
 //! - `HttpRequest` arguments become the transport-agnostic
-//!   [`RequestContext`](crate::net::RequestContext).
+//!   [`RequestContext`].
 //! - `IServerApplicationHost`/`IServerApplicationPaths` extend the generic
 //!   `IApplicationHost`/`IApplicationPaths` bases. Those bases carry plugin/DI
 //!   machinery that is out of scope here; only the server-relevant members plus
@@ -56,15 +56,55 @@ pub trait SystemManager: Send + Sync {
     /// step Jellyfin's backup takes through its database provider). `dest` must
     /// not exist beforehand.
     ///
-    /// The default writes nothing — implementations without a database (test
-    /// fakes); the server's implementation snapshots the live SQLite file.
+    /// The default writes nothing, for implementations without a database, so
+    /// a backup that selects the database fails on them; the server's
+    /// implementation snapshots the live SQLite file.
     async fn snapshot_database(&self, dest: &std::path::Path) -> Result<(), ServiceError> {
         let _ = dest;
         Ok(())
     }
+
+    /// The free space, in bytes, of the filesystem holding `path`:
+    /// `StorageHelper.GetFreeSpaceOf(path).FreeSpace`, the space an
+    /// unprivileged writer may still use, or `-1` when it cannot be read (the
+    /// C# catch arm). The backup's free-space check reads it.
+    ///
+    /// The default reports `-1`: an implementation with no filesystem to probe
+    /// (a test fake) cannot know; the server's implementation probes the real
+    /// one.
+    async fn free_space_of(&self, path: &std::path::Path) -> i64 {
+        let _ = path;
+        -1
+    }
 }
 
 fn _assert_object_safe_system_manager(_: &dyn SystemManager) {}
+
+/// The URL this server's own processes reach its API at.
+///
+/// The one `IServerApplicationHost` member the Live TV stream buffer, the DVR
+/// and the File Transformation callbacks need, split out so they depend on
+/// nothing else of the host.
+#[async_trait]
+pub trait LocalApiAccess: Send + Sync {
+    /// C# `GetApiUrlForLocalAccess()`: the server's own bind address
+    /// (`NetworkManager.GetBindAddress(null)`), its listen scheme and port and
+    /// the base URL, computed per call from the live network state. It never
+    /// consults the published server URL.
+    async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError>;
+
+    /// C# `GetApiUrlForLocalAccess(allowHttps: false)`: the same address over
+    /// plain HTTP on the HTTP port, for in-process callers whose HTTP client
+    /// would not accept the server's own certificate.
+    ///
+    /// The default is [`Self::get_api_url_for_local_access`], right for a host
+    /// that never listens with HTTPS.
+    async fn get_http_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+        self.get_api_url_for_local_access().await
+    }
+}
+
+fn _assert_object_safe_local_api_access(_: &dyn LocalApiAccess) {}
 
 /// Exposes host-level networking facts and URL construction.
 ///
@@ -72,7 +112,7 @@ fn _assert_object_safe_system_manager(_: &dyn SystemManager) {}
 /// `IApplicationHost` base). URL builders are fallible `async fn` (they consult
 /// live network state); the simple facts are synchronous getters.
 #[async_trait]
-pub trait ServerApplicationHost: Send + Sync {
+pub trait ServerApplicationHost: LocalApiAccess + Send + Sync {
     /// Whether core startup has finished.
     fn core_startup_has_completed(&self) -> bool;
 
@@ -98,6 +138,11 @@ pub trait ServerApplicationHost: Send + Sync {
     /// both as distinct fields (`ProductName` / `ServerName`).
     /// `GET`/`POST /System/Ping` and `PublicSystemInfo.ProductName` return this.
     fn name(&self) -> String;
+
+    /// The base URL prefix the HTTP API is mounted under (Jellyfin's
+    /// `NetworkConfiguration.BaseUrl`): a leading `/` and no trailing one,
+    /// empty when the server is mounted at the root.
+    fn base_url(&self) -> String;
 
     /// Builds the best externally reachable API URL for a request.
     async fn get_smart_api_url(&self, request: &RequestContext) -> Result<String, ServiceError>;
@@ -181,6 +226,17 @@ pub trait ServerApplicationPaths: Send + Sync {
     /// The internal metadata directory (custom or default).
     fn internal_metadata_path(&self) -> String;
 
+    /// The default internal metadata directory, whatever `MetadataPath` says
+    /// (`DefaultInternalMetadataPath`). A backup with metadata also archives
+    /// it when the configured directory is elsewhere. Defaults to
+    /// `{program-data}/metadata`, the server layout.
+    fn default_internal_metadata_path(&self) -> String {
+        std::path::Path::new(&self.program_data_path())
+            .join("metadata")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// The program data directory.
     fn program_data_path(&self) -> String;
 
@@ -209,6 +265,22 @@ pub trait ServerApplicationPaths: Send + Sync {
             .into_owned()
     }
 
+    /// Resolves and prepares the current transcode directory (`GetTranscodePath`).
+    ///
+    /// Blocking: it walks the whole transcode tree for a conflicting marker. An
+    /// async caller uses [`prepare_transcode_path_off_runtime`] instead.
+    ///
+    /// # Errors
+    /// Returns directory/marker creation errors or a conflicting ownership marker.
+    fn prepare_transcode_path(&self) -> Result<String, ServiceError> {
+        let path = self.transcode_path();
+        ferrofin_util::directory_path::prepare_transcode_directory(std::path::Path::new(&path))
+            .map_err(|error| {
+                ServiceError::backend(format!("prepare transcode directory {path}: {error}"))
+            })?;
+        Ok(path)
+    }
+
     /// The scratch directory single-frame extractions write to before the
     /// result is moved into place (the C# `TempDirectory`). A `temp`
     /// subdirectory of [`cache_path`](Self::cache_path).
@@ -226,16 +298,91 @@ pub trait ServerApplicationPaths: Send + Sync {
 
 fn _assert_object_safe_server_application_paths(_: &dyn ServerApplicationPaths) {}
 
+/// [`ServerApplicationPaths::prepare_transcode_path`] on the blocking pool.
+///
+/// Preparing the directory walks the whole transcode tree for a conflicting
+/// ownership marker, as upstream's `CreateAndCheckMarker(path, "transcode",
+/// true)` does on every `GetTranscodePath`. HLS prepares it on every segment
+/// request, and the tree holds every segment of every live transcode, so an
+/// async caller runs it here rather than on a runtime worker.
+///
+/// # Errors
+/// As [`ServerApplicationPaths::prepare_transcode_path`], or the blocking task
+/// failing.
+pub async fn prepare_transcode_path_off_runtime(
+    paths: std::sync::Arc<dyn ServerApplicationPaths>,
+) -> Result<String, ServiceError> {
+    tokio::task::spawn_blocking(move || paths.prepare_transcode_path())
+        .await
+        .map_err(|error| ServiceError::backend(format!("prepare transcode directory: {error}")))?
+}
+
+/// Prepares the transcode directory at `path`, which a caller resolved itself,
+/// on the blocking pool; see [`prepare_transcode_path_off_runtime`].
+///
+/// # Errors
+/// Directory or marker creation errors, a conflicting ownership marker, or the
+/// blocking task failing.
+pub async fn prepare_transcode_directory_off_runtime(
+    path: std::path::PathBuf,
+) -> Result<std::path::PathBuf, ServiceError> {
+    tokio::task::spawn_blocking(move || {
+        ferrofin_util::directory_path::prepare_transcode_directory(&path).map_err(|error| {
+            ServiceError::backend(format!(
+                "prepare transcode directory {}: {error}",
+                path.display()
+            ))
+        })?;
+        Ok(path)
+    })
+    .await
+    .map_err(|error| ServiceError::backend(format!("prepare transcode directory: {error}")))?
+}
+
+/// Where an item's media sits on disk: the two `BaseItem` properties
+/// `IPathManager` reads off the item.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MediaLocation<'a> {
+    /// `BaseItem.Path`; empty for an item with no path.
+    pub path: &'a str,
+    /// `BaseItem.ContainingFolderPath`: the item's own folder for a folder
+    /// or a disc rip, else the directory its file is in.
+    pub containing_folder: &'a str,
+}
+
+impl<'a> MediaLocation<'a> {
+    /// The location of a file item, whose containing folder is the file's
+    /// directory (`BaseItem.ContainingFolderPath` when `!IsFolder`).
+    #[must_use]
+    pub fn of_file(path: &'a str) -> Self {
+        let containing_folder = std::path::Path::new(path)
+            .parent()
+            .and_then(std::path::Path::to_str)
+            .unwrap_or("");
+        Self {
+            path,
+            containing_folder,
+        }
+    }
+}
+
 /// Computes on-disk paths for an item's derived/extracted data.
 ///
 /// Port of `IPathManager`. The C# `BaseItem` arguments collapse to an
-/// `item_id: `[`Uuid`] plus the item's media path (`media_path`), which the C#
-/// implementation reads off the item. Methods return `Option<String>` where the
-/// C# returns `null` for an invalid media-source id.
+/// `item_id: `[`Uuid`] plus what the C# implementation reads off the item:
+/// its media path, or its [`MediaLocation`] where the containing folder
+/// matters. Methods return `Option<String>` where the C# returns `null` for
+/// an invalid media-source id.
 pub trait PathManager: Send + Sync {
-    /// The base folder for an item's trickplay tiles.
-    fn trickplay_directory(&self, item_id: Uuid, media_path: &str, save_with_media: bool)
-    -> String;
+    /// The base folder for an item's trickplay tiles: the internal one, or —
+    /// `save_with_media` — `{ContainingFolderPath}/{file name with the
+    /// extension .trickplay}` beside (or, for a folder, inside) the media.
+    fn trickplay_directory(
+        &self,
+        item_id: Uuid,
+        media: MediaLocation<'_>,
+        save_with_media: bool,
+    ) -> String;
 
     /// The path to a subtitle file for a media source + stream index.
     fn subtitle_path(
@@ -257,16 +404,26 @@ pub trait PathManager: Send + Sync {
     /// The folder holding an item's chapter images.
     fn chapter_image_folder_path(&self, item_id: Uuid, media_path: &str) -> String;
 
-    /// The path to a chapter image at a given position (in ticks).
+    /// An item's own internal metadata folder
+    /// (`{internal metadata}/library/{xx}/{id}`, `BaseItem.GetInternalMetadataPath`),
+    /// where its chapter images and the subtitles saved for it live. `None`
+    /// (the default) from a manager that keeps no such folder.
+    fn item_metadata_folder(&self, item_id: Uuid) -> Option<String> {
+        let _ = item_id;
+        None
+    }
+
+    /// The path to a chapter image, keyed by file modification and position ticks.
     fn chapter_image_path(
         &self,
         item_id: Uuid,
         media_path: &str,
         chapter_position_ticks: i64,
+        date_modified_ticks: i64,
     ) -> String;
 
     /// All folders holding an item's extracted data.
-    fn extracted_data_paths(&self, item_id: Uuid, media_path: &str) -> Vec<String>;
+    fn extracted_data_paths(&self, item_id: Uuid, media: MediaLocation<'_>) -> Vec<String>;
 }
 
 fn _assert_object_safe_path_manager(_: &dyn PathManager) {}
@@ -274,14 +431,15 @@ fn _assert_object_safe_path_manager(_: &dyn PathManager) {}
 /// Deletes an item's external (filesystem-side) data.
 ///
 /// Port of `IExternalDataManager`. The `BaseItem` argument collapses to an
-/// `item_id: `[`Uuid`] plus its media path; `CancellationToken` is dropped.
+/// `item_id: `[`Uuid`] plus its [`MediaLocation`]; `CancellationToken` is
+/// dropped.
 #[async_trait]
 pub trait ExternalDataManager: Send + Sync {
     /// Deletes all external data for an item (DB- and filesystem-side).
     async fn delete_external_item_data(
         &self,
         item_id: Uuid,
-        media_path: &str,
+        media: MediaLocation<'_>,
     ) -> Result<(), ServiceError>;
 
     /// Deletes only the filesystem-side external data (attachments, subtitles,
@@ -289,8 +447,39 @@ pub trait ExternalDataManager: Send + Sync {
     async fn delete_external_item_files(
         &self,
         item_id: Uuid,
-        media_path: &str,
+        media: MediaLocation<'_>,
     ) -> Result<(), ServiceError>;
 }
 
 fn _assert_object_safe_external_data_manager(_: &dyn ExternalDataManager) {}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_transcode_directory_off_runtime;
+
+    /// The helper hands back the prepared path, and a conflicting marker keeps
+    /// the error text the callers reported before it moved off the runtime.
+    #[tokio::test]
+    async fn preparing_a_directory_off_the_runtime_returns_it_or_the_conflict() {
+        let root =
+            std::env::temp_dir().join(format!("ferrofin-transcode-{}", uuid::Uuid::new_v4()));
+        let prepared = prepare_transcode_directory_off_runtime(root.clone())
+            .await
+            .expect("an empty directory is ours");
+        assert_eq!(prepared, root);
+        assert!(root.join(".jellyfin-transcode").is_file());
+
+        std::fs::create_dir_all(root.join("job")).expect("a nested directory");
+        std::fs::write(root.join("job").join(".jellyfin-data"), b"").expect("foreign marker");
+        let error = prepare_transcode_directory_off_runtime(root.clone())
+            .await
+            .expect_err("conflicting owner")
+            .to_string();
+        assert!(
+            error.contains(&format!("prepare transcode directory {}: ", root.display()))
+                && error.contains(".jellyfin-data"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+}

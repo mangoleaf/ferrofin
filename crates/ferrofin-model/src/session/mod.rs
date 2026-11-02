@@ -478,7 +478,7 @@ bitflags! {
     /// Bit positions are taken verbatim from `MediaBrowser.Model.Session.
     /// TranscodeReason` so accumulated masks match the upstream stream-builder
     /// logic exactly.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
     pub struct TranscodeReasons: u32 {
         /// The container is not supported.
         const CONTAINER_NOT_SUPPORTED = 1 << 0;

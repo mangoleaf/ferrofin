@@ -34,6 +34,7 @@ async fn boot() -> (WiredApp, Database, tempfile::TempDir) {
     let db = Database::connect_in_memory().await.unwrap();
     db.run_migrations().await.unwrap();
     let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        encoder_app_path_display: None,
         ffmpeg: "ffmpeg".into(),
         ffprobe: "ffprobe".into(),
         capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),

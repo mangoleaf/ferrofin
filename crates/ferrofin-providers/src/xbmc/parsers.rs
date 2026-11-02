@@ -147,11 +147,16 @@ fn parse_set_xml(inner: &str) -> Option<String> {
 pub struct EpisodeNfoParser;
 
 impl EpisodeNfoParser {
-    /// Runs the multi-episode aware fetch (`EpisodeNfoParser.Fetch` override).
+    /// Runs the multi-episode aware fetch (`EpisodeNfoParser.Fetch` override,
+    /// v12.2, with PR 17805's ordering).
     ///
-    /// Splits the document on `</episodedetails>`: the first block populates the
-    /// item, and each subsequent block appends its name/overview/originaltitle
-    /// (joined with `" / "`) and extends `IndexNumberEnd`.
+    /// Splits the document into its `</episodedetails>` blocks (the whole
+    /// document when none closes). A single block is read as is. Several are
+    /// each parsed and stably sorted by `<episode>` (missing numbers last),
+    /// because they are not guaranteed to be in ascending order: Sonarr
+    /// writes the higher episode first. The lowest block populates the item,
+    /// and the others append their name, overview and original title with
+    /// `" / "` and extend `IndexNumberEnd`, in ascending order.
     pub fn fetch(
         &self,
         base: &BaseNfoParser<'_>,
@@ -161,24 +166,42 @@ impl EpisodeNfoParser {
         result.reset_people();
 
         let needle = "</episodedetails>";
+        let mut blocks = Vec::new();
         let mut remaining = xml;
-        let (first, rest) =
-            split_after_ci(remaining, needle).map_or((remaining, ""), |(head, tail)| (head, tail));
-        remaining = rest;
+        while let Some((block, tail)) = split_after_ci(remaining, needle) {
+            blocks.push(block);
+            remaining = tail;
+        }
+        if blocks.is_empty() {
+            // No closing tag: let the reader deal with whatever is there.
+            blocks.push(remaining);
+        }
+        // C# reads inside `catch (XmlException)`: one block keeps what it read
+        // before a malformed spot, and with several a malformed block ends the
+        // read before anything is merged into the item.
+        if let [only] = blocks.as_slice() {
+            self.read_details(base, result, only);
+            return;
+        }
 
-        // First block populates the result item directly.
-        self.read_details(base, result, first);
+        let mut episodes: Vec<(&str, MetadataResult<NfoBaseItem>)> = Vec::new();
+        for block in blocks {
+            let mut episode = MetadataResult::new(NfoBaseItem::new(NfoItemKind::Episode));
+            if !self.read_details(base, &mut episode, block) {
+                return;
+            }
+            episodes.push((block, episode));
+        }
+        // Stable, as LINQ's `OrderBy` is.
+        episodes.sort_by_key(|(_, episode)| episode.item.index_number.unwrap_or(i32::MAX));
+
+        // The lowest-numbered episode populates the item itself.
+        self.read_details(base, result, episodes[0].0);
 
         let mut name = result.item.name.clone().unwrap_or_default();
         let mut original_title = result.item.original_title.clone().unwrap_or_default();
         let mut overview = result.item.overview.clone().unwrap_or_default();
-
-        while let Some((block, tail)) = split_after_ci(remaining, needle) {
-            remaining = tail;
-
-            let mut additional = MetadataResult::new(NfoBaseItem::new(NfoItemKind::Episode));
-            self.read_details(base, &mut additional, block);
-
+        for (_, additional) in &episodes[1..] {
             if let Some(n) = additional.item.name.as_deref().filter(|s| !s.is_empty()) {
                 name.push_str(" / ");
                 name.push_str(n);
@@ -212,16 +235,15 @@ impl EpisodeNfoParser {
         result.item.overview = Some(overview);
     }
 
-    /// Streams one `<episodedetails>` block through the element switch.
+    /// Streams one `<episodedetails>` block through the element switch, up to
+    /// its first malformed spot. Returns whether the block was well-formed.
     fn read_details(
         self,
         base: &BaseNfoParser<'_>,
         result: &mut MetadataResult<NfoBaseItem>,
         xml: &str,
-    ) {
-        let Ok(mut reader) = XmlCursor::new(xml) else {
-            return;
-        };
+    ) -> bool {
+        let (mut reader, clean) = XmlCursor::up_to_error(xml);
         reader.move_to_content();
         reader.read();
         while !reader.eof() {
@@ -231,6 +253,7 @@ impl EpisodeNfoParser {
                 reader.read();
             }
         }
+        clean
     }
 }
 

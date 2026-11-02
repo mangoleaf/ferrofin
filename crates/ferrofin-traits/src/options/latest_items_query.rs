@@ -34,8 +34,10 @@ pub struct LatestItemsQuery {
     /// `parent_id` is a music library (the user's-views fallback keeps it),
     /// as upstream orders the two steps.
     pub is_played: Option<bool>,
-    /// The number of **groups** to return (C# `Limit`); the SQL over-fetches
-    /// `limit * 5` rows. `None` falls back to [`LATEST_ITEMS_FALLBACK_LIMIT`]
+    /// The number of **groups** to return (C# `Limit`); the plain query
+    /// over-fetches `limit * 5` rows (a grouped request whose first typed
+    /// library is tvshows, music or movies takes that type's query instead,
+    /// which `limit` caps directly). `None` falls back to [`LATEST_ITEMS_FALLBACK_LIMIT`]
     /// for the over-fetch and never stops the grouping early (C#'s
     /// `list.Count >= null` is always false).
     pub limit: Option<i32>,

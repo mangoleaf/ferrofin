@@ -273,6 +273,14 @@ fn log_invalid_subnet(logger: Option<&dyn Logger>, value: &str) {
     logger.warn(&format!("Invalid subnet '{value}' will be ignored."));
 }
 
+/// Looks a host name up (`Dns.GetHostAddresses`), returning `None` when the
+/// lookup fails or finds nothing.
+///
+/// Production uses the operating system's resolver (`resolve_host`); tests pass
+/// a fixed table to [`try_parse_host_with`] or `NetworkManager::with_resolver`,
+/// so they never depend on live DNS.
+pub type HostResolver = fn(&str) -> Option<Vec<IpAddr>>;
+
 /// Attempts to parse a host span into resolved addresses
 /// (`NetworkUtils.TryParseHost`).
 ///
@@ -280,11 +288,24 @@ fn log_invalid_subnet(logger: Option<&dyn Logger>, value: &str) {
 /// DNS resolution is delegated to the OS (`IPAddress`/hostname lookup); an
 /// address-family filter mirrors the `isIPv4Enabled`/`isIPv6Enabled` gates.
 /// Returns `None` when the host cannot be parsed into at least one address.
+/// [`try_parse_host_with`] takes another resolver.
 #[must_use]
 pub fn try_parse_host(
     host: &str,
     is_ipv4_enabled: bool,
     is_ipv6_enabled: bool,
+) -> Option<Vec<IpAddr>> {
+    try_parse_host_with(host, is_ipv4_enabled, is_ipv6_enabled, resolve_host)
+}
+
+/// [`try_parse_host`] with host names looked up by `resolve` instead of the
+/// operating system's resolver.
+#[must_use]
+pub fn try_parse_host_with(
+    host: &str,
+    is_ipv4_enabled: bool,
+    is_ipv6_enabled: bool,
+    resolve: HostResolver,
 ) -> Option<Vec<IpAddr>> {
     let host = host.trim();
     if host.is_empty() {
@@ -301,7 +322,7 @@ pub fn try_parse_host(
             if i < 2 {
                 return None;
             }
-            return try_parse_host(&host[1..i - 1], true, false);
+            return try_parse_host_with(&host[1..i - 1], true, false, resolve);
         }
 
         return None;
@@ -314,7 +335,7 @@ pub fn try_parse_host(
 
         // Hostname or hostname:port.
         if is_match(first_part)
-            && let Some(addrs) = resolve_host(first_part)
+            && let Some(addrs) = resolve(first_part)
         {
             return Some(addrs);
         }
@@ -398,7 +419,7 @@ fn is_match(value: &str) -> bool {
 /// Mirrors `Dns.GetHostAddresses`: socket errors are swallowed (the caller only
 /// cares whether *any* address came back). A DNS lookup that returns nothing
 /// yields `None` so the caller falls through, matching the C# empty-array path.
-fn resolve_host(host: &str) -> Option<Vec<IpAddr>> {
+pub(crate) fn resolve_host(host: &str) -> Option<Vec<IpAddr>> {
     use std::net::ToSocketAddrs;
 
     // Port is irrelevant; we only want the addresses.
@@ -413,7 +434,7 @@ fn resolve_host(host: &str) -> Option<Vec<IpAddr>> {
 
 /// Unwraps an IPv4-mapped IPv6 address to plain IPv4 (`IsIPv4MappedToIPv6` +
 /// `MapToIPv4`); other addresses pass through unchanged.
-fn unmap_v4_mapped(address: IpAddr) -> IpAddr {
+pub(crate) fn unmap_v4_mapped(address: IpAddr) -> IpAddr {
     if let IpAddr::V6(v6) = address
         && let Some(v4) = v6.to_ipv4_mapped()
     {
@@ -584,6 +605,30 @@ mod tests {
     #[test]
     fn ip_none_is_broadcast() {
         assert_eq!(ip_none(), IpAddr::V4(Ipv4Addr::BROADCAST));
+    }
+
+    /// Stands in for DNS: only `example.test` resolves.
+    fn stub_dns(host: &str) -> Option<Vec<IpAddr>> {
+        (host == "example.test").then(|| vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))])
+    }
+
+    #[test]
+    fn try_parse_host_with_resolves_names_through_the_given_resolver() {
+        let expected = Some(vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))]);
+        assert_eq!(
+            try_parse_host_with("example.test", true, true, stub_dns),
+            expected
+        );
+        // `host:port` resolves the host part.
+        assert_eq!(
+            try_parse_host_with("example.test:8096", true, true, stub_dns),
+            expected
+        );
+        // A name the resolver does not know parses to nothing.
+        assert_eq!(
+            try_parse_host_with("other.test", true, true, stub_dns),
+            None
+        );
     }
 
     #[test]

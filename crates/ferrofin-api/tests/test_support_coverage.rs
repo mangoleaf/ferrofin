@@ -171,10 +171,15 @@ fn fake_media_sources_methods_panic() {
     assert_panics(f.close_live_stream("id"));
 }
 
+#[tokio::test]
+async fn fake_sessions_close_a_last_socket_quietly() {
+    assert!(FakeSessions.close_if_needed("s").await.is_ok());
+}
+
 #[test]
 fn fake_sessions_methods_panic() {
     let f = FakeSessions;
-    assert_panics(f.log_session_activity("a", "v", "d", "n", "e", &user()));
+    assert_panics(f.log_session_activity("a", "v", "d", "n", "e", Some(&user())));
     assert_panics(f.update_device_name("s", "n"));
     assert_panics(f.on_playback_start(&ferrofin_model::session::PlaybackStartInfo::default()));
     assert_panics(f.on_playback_progress(
@@ -199,8 +204,8 @@ fn fake_sessions_methods_panic() {
         ferrofin_model::session::SessionMessageType::ForceKeepAlive,
         "d",
     ));
-    // A no-op (not a panic): the user-data handlers push `UserDataChanged`
-    // through it best-effort on every played/favorite/rating write.
+    // A no-op (not a panic): the user-data manager's batched
+    // `UserDataChanged` goes out through it.
     assert!(
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -275,6 +280,7 @@ fn fake_system_methods_run_and_panic() {
         headers: Vec::new(),
         query_string: None,
         remote_endpoint: None,
+        scheme: None,
     };
     // The two info getters return `Ok`, so they run without panicking.
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -300,12 +306,20 @@ fn fake_app_host_methods_run() {
     assert_eq!(f.name(), "Jellyfin Server");
     assert_eq!(f.expand_virtual_path("/p"), "/p");
     assert_eq!(f.reverse_virtual_path("/p"), "/p");
+    assert_eq!(f.base_url(), "");
     let ctx = RequestContext {
         headers: Vec::new(),
         query_string: None,
         remote_endpoint: None,
+        scheme: None,
     };
-    assert_panics(f.get_smart_api_url(&ctx));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert_eq!(
+        rt.block_on(f.get_smart_api_url(&ctx)).unwrap(),
+        "http://localhost:8096"
+    );
     assert_panics(f.get_local_api_url("host", None, None));
 }
 

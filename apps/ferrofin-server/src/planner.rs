@@ -16,19 +16,20 @@
 //! `ferrofin-core` (`RULES_CODE_REUSE`), so the concrete planner is injected from
 //! above through the trait.
 //!
-//! # First-Light scope
+//! # Scope
 //!
-//! The planner honours the request-declared target codecs and **copies when it
-//! can** (the cheapest correct path): [`EncodingHelper::can_stream_copy_video`] /
+//! The planner honours the target codecs the request declares (the device
+//! profile was negotiated by `PlaybackInfo` before the client built the URL)
+//! and **copies when it can** (the cheapest correct path):
+//! [`EncodingHelper::can_stream_copy_video`] /
 //! [`EncodingHelper::can_stream_copy_audio`] decide per stream, and a copyable
 //! stream becomes a `-c:v copy` / `-c:a copy` remux. When it must re-encode, it
-//! uses **NVENC** hardware encoding (h264/hevc/av1 + NVDEC decode) if the
-//! persisted encoding options select it, else software `libx264`. What it does
-//! *not* do is the full device-profile negotiation, the rest of the
-//! hardware-acceleration matrix (QSV/VAAPI/AMF), or subtitle provider fan-out
-//! (only stored/embedded burn-in). The hardware matrix is the work of
-//! the hardware-transcoding roadmap; the subtitle-provider fan-out is work item 5
-//! in that plan's list.
+//! uses the hardware decoder, filter chain and encoder of the accelerator the
+//! persisted encoding options select, **NVENC, VAAPI or QSV**
+//! (`hardware_path_is_ported`), else the software encoder. AMF, VideoToolbox,
+//! RKMPP and V4L2M2M are not supported (owner decision 2026-08-26): selecting
+//! one runs the software path with a warning. A subtitle delivered as `Encode`
+//! is burned in, on the GPU by the vendor chain on the hardware path.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,41 +37,70 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ferrofin_core::FerrofinServerApplicationPaths;
 use ferrofin_hls::{PlaylistKind, StreamStatePlanner, TranscodePlan};
+use ferrofin_mediaencoding::encoder::{FfmpegVersion, split_args};
 use ferrofin_mediaencoding::encoding_helper::helper::{
-    is_video_encoding_disallowed, shift_audio_codecs_if_needed, shift_video_codecs_if_needed,
+    shift_audio_codecs_if_needed, shift_video_codecs_if_needed, should_encode_subtitle,
 };
-use ferrofin_mediaencoding::encoding_helper::hw;
+use ferrofin_mediaencoding::encoding_helper::{bitstream, hw};
 use ferrofin_mediaencoding::{
     BaseEncodingJobOptions, EncodingHelper, EncodingJobInfo, FfmpegCapabilities,
 };
 use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_model::entities::{
-    EncoderPreset, HardwareAccelerationType, MediaStreamType, VideoType,
-};
+use ferrofin_model::entities::{EncoderPreset, HardwareAccelerationType, MediaStreamType};
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::MediaSourceManager;
 use ferrofin_traits::media_encoding::{
-    HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodingJobType,
+    AttachmentExtractor, HlsStreamRequest, MediaEncoder, SubtitleEncoder, TranscodingJobType,
 };
-use ferrofin_traits::system::ServerApplicationPaths as _;
-use uuid::Uuid;
+use ferrofin_traits::system::PathManager;
 
-/// The default HLS segment length, in seconds.
-///
-/// Matches Jellyfin's `StreamState.SegmentLength` default of `3` for H.264/HEVC
-/// output: the first segment file can't close (and playback can't begin) until
-/// this many seconds are encoded, so it directly sets time-to-first-segment.
-/// Used when the request declares no `SegmentLength`.
+use crate::encoding_options::EncodingOptionsReader;
+
+/// The HLS segment length, in seconds, of a re-encoded video (and of a copied
+/// live stream) when the request declares no `SegmentLength`
+/// (`StreamState.SegmentLength`): the first segment file can't close (and
+/// playback can't begin) until this many seconds are encoded, so it directly
+/// sets time-to-first-segment.
 const DEFAULT_SEGMENT_LENGTH_SECS: i32 = 3;
 
-/// Assumed output frame rate for the NVENC GOP keyframe calc when the source
-/// frame rate is unknown (probing returned none). Only fires on pathological
-/// sources; `25` is a safe PAL-ish default. Candidate setting.
-const DEFAULT_KEYFRAME_FPS: f32 = 25.0;
+/// The HLS segment length, in seconds, of a copied video when the request
+/// declares no `SegmentLength` (`StreamState.SegmentLength`).
+const COPY_SEGMENT_LENGTH_SECS: i32 = 6;
+
+/// `StreamState.SegmentLength` for a request that declares none: a copied
+/// video gets [`COPY_SEGMENT_LENGTH_SECS`] unless it is a segmented live stream
+/// (`live`: no runtime) that no Apple client asked for; anything else gets
+/// [`DEFAULT_SEGMENT_LENGTH_SECS`].
+fn default_segment_length_secs(copied_video: bool, user_agent: Option<&str>, live: bool) -> i32 {
+    const APPLE_USER_AGENTS: [&str; 5] = ["appletv", "cfnetwork", "ipad", "iphone", "ipod"];
+    if !copied_video {
+        return DEFAULT_SEGMENT_LENGTH_SECS;
+    }
+    let user_agent = user_agent.unwrap_or_default().to_ascii_lowercase();
+    if live
+        && !APPLE_USER_AGENTS
+            .iter()
+            .any(|name| user_agent.contains(name))
+    {
+        DEFAULT_SEGMENT_LENGTH_SECS
+    } else {
+        COPY_SEGMENT_LENGTH_SECS
+    }
+}
+
+/// The first ffmpeg that takes `-hls_segment_options`; older ones call the
+/// option `-hls_ts_options`. Port of `DynamicHlsController`'s
+/// `_minFFmpegHlsSegmentOptions` (an option rename, not a tuning value).
+const MIN_FFMPEG_HLS_SEGMENT_OPTIONS: FfmpegVersion = FfmpegVersion::new(5, 0);
+
+/// The first ffmpeg whose libx265 B-frames play in fMP4 HLS on iOS; older
+/// ones encode HLS libx265 with `-bf 0`. Port of `DynamicHlsController`'s
+/// `_minFFmpegX265BframeInFmp4` (an ffmpeg fix, not a tuning value).
+const MIN_FFMPEG_X265_BFRAME_IN_FMP4: FfmpegVersion = FfmpegVersion::with_build(7, 0, 1);
 
 /// The default HLS segment container when the request declares none.
 ///
@@ -90,7 +120,7 @@ const DEFAULT_VIDEO_CODEC: &str = "h264";
 const DEFAULT_AUDIO_CODEC: &str = "aac";
 
 /// The default encoder preset handed to [`EncodingHelper::video_quality_param`]
-/// when the configured preset is `auto`, for a VOD job. Port of
+/// for a VOD job. A configured non-nullable preset, including auto, wins. Port of
 /// `DynamicHlsController.DefaultVodEncoderPreset = EncoderPreset.veryfast`.
 const DEFAULT_ENCODER_PRESET: EncoderPreset = EncoderPreset::veryfast;
 
@@ -102,6 +132,11 @@ const DEFAULT_EVENT_ENCODER_PRESET: EncoderPreset = EncoderPreset::superfast;
 /// The number of ffmpeg ticks per second (100 ns units). Port of
 /// `TimeSpan.TicksPerSecond`.
 const TICKS_PER_SECOND: i64 = 10_000_000;
+
+/// How far past an HLS remux segment's start the input seek goes: upstream's
+/// 0.5 s (`GetFastSeekCommandLineParameter`), so ffmpeg lands on the
+/// keyframe the segment starts at rather than the one before it.
+const HLS_REMUX_SEEK_OFFSET_TICKS: i64 = 5_000_000;
 
 /// The number of milliseconds per second.
 const MS_PER_SECOND: i32 = 1000;
@@ -121,6 +156,8 @@ pub struct FerrofinStreamStatePlanner {
     /// The server config manager — read for the persisted `encoding` options
     /// (hardware-acceleration type, presets) on each plan.
     config: Arc<dyn ServerConfigurationManager>,
+    /// Reads `encoding.json` for each plan and reports a broken file once.
+    encoding_reader: EncodingOptionsReader,
     paths: Arc<FerrofinServerApplicationPaths>,
     /// The subtitle encoder — resolves a burned **text** subtitle to its small
     /// extracted/external file (cached across requests), so the `subtitles`
@@ -136,11 +173,18 @@ pub struct FerrofinStreamStatePlanner {
     /// ffmpeg path and the boot capabilities — is already held, and it is
     /// pure cache in front of a probe.
     vaapi_prober: crate::vaapi_probe::VaapiProber,
-    /// Resolves item/series/library display names onto the plan's
-    /// [`TranscodeDisplayNames`] so transcode logs name what they play.
+    /// Resolves item/series/library display names for a starting job (see
+    /// `display_names`) so transcode logs name what they play.
     /// Optional: `None` (the composition unit test) leaves the names empty —
     /// they are logging metadata, never load-bearing.
     library: Option<Arc<dyn ferrofin_traits::library::LibraryManager>>,
+    /// The configured libraries, which name the library an item's location
+    /// belongs to. `None` leaves the library name empty.
+    virtual_folders: Option<Arc<dyn ferrofin_traits::library::VirtualFolderManager>>,
+    /// Extracts a file's attachments (its fonts) before a subtitle burn-in
+    /// that may need them, and names the folder the `subtitles` filter reads
+    /// them from. `None` (unit tests that do not burn in) skips both.
+    attachments: Option<(Arc<dyn AttachmentExtractor>, Arc<dyn PathManager>)>,
 }
 
 impl FerrofinStreamStatePlanner {
@@ -175,11 +219,28 @@ impl FerrofinStreamStatePlanner {
             encoder,
             encoding_helper,
             config,
+            encoding_reader: EncodingOptionsReader::new("transcode planner"),
             paths,
             subtitles,
             supports_tonemapx,
             library: None,
+            virtual_folders: None,
+            attachments: None,
         }
+    }
+
+    /// Wires attachment extraction, so a burned-in text subtitle finds the
+    /// fonts its file ships (`TranscodeManager.StartFfMpeg`'s
+    /// `ExtractAllAttachments`, and `GetTextSubtitlesFilter`'s `fontsdir`
+    /// from `GetAttachmentFolderPath`). The composition root calls this.
+    #[must_use]
+    pub fn with_attachments(
+        mut self,
+        extractor: Arc<dyn AttachmentExtractor>,
+        path_manager: Arc<dyn PathManager>,
+    ) -> Self {
+        self.attachments = Some((extractor, path_manager));
+        self
     }
 
     /// Wires the library seam so transcode logs carry item/series/library
@@ -193,85 +254,39 @@ impl FerrofinStreamStatePlanner {
         self
     }
 
-    /// Resolves the human-readable names for the playing item — its own title,
-    /// its series (episodes), and its library — for the transcode logs.
-    /// Best-effort by design: any miss leaves the field empty.
-    async fn display_names(
-        &self,
-        item_id: uuid::Uuid,
-    ) -> ferrofin_mediaencoding::TranscodeDisplayNames {
-        let mut names = ferrofin_mediaencoding::TranscodeDisplayNames::default();
-        let Some(library) = &self.library else {
-            return names;
-        };
-        let Ok(Some(item)) = library.get_item_by_id(item_id).await else {
-            return names;
-        };
-        names.item_name = item.name.clone();
-        names.series_name = item.series_name.clone();
-        if let Some(top) = item
-            .top_parent_id
-            .as_deref()
-            .and_then(|s| uuid::Uuid::parse_str(s).ok())
-            && let Ok(Some(folder)) = library.get_item_by_id(top).await
-        {
-            names.library_name = folder.name;
-        }
-        names
+    /// Wires the configured libraries, which the transcode logs name an
+    /// item's library by.
+    #[must_use]
+    pub fn with_virtual_folders(
+        mut self,
+        folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager>,
+    ) -> Self {
+        self.virtual_folders = Some(folders);
+        self
     }
 
     /// The effective [`EncodingOptions`] for this planner, read from the persisted
     /// named `encoding` config (falling back to [`EncodingOptions::default`] when
-    /// unset or unreadable). This is what carries the user's hardware-acceleration
-    /// choice (e.g. NVENC) into the transcode arg builder.
+    /// unset or unreadable, and saying so). This is what carries the user's
+    /// hardware-acceleration choice (e.g. NVENC) into the transcode arg builder.
     async fn encoding_options(&self) -> EncodingOptions {
-        self.config.get_encoding_options().await.unwrap_or_default()
+        self.encoding_reader.read(self.config.as_ref()).await
     }
 
-    /// Resolves the [`MediaSourceInfo`] for `request`.
-    ///
-    /// Port of the media-source resolution in `StreamingHelpers.GetStreamingState`:
-    /// an open live stream (`live_stream_id`) wins outright and is returned as
-    /// its own source; otherwise fetch the item's static media sources and
-    /// select the one matching the request's `media_source_id` (defaulting to
-    /// the first when unspecified).
+    /// Resolves the [`MediaSourceInfo`] for `request` through
+    /// [`MediaSourceManager::get_stream_media_source`], the selection the
+    /// direct-play routes share.
     async fn resolve_media_source(
         &self,
         request: &HlsStreamRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
-        // `StreamingHelpers.GetStreamingState`: an open live stream wins over
-        // everything — its source is the buffered copy of the tuner, and going
-        // back to the static sources here would dial the tuner a second time.
-        if let Some(live_stream_id) = request
-            .live_stream_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-        {
-            return self.media_sources.get_live_stream(live_stream_id).await;
-        }
-
-        let sources = self
-            .media_sources
-            .get_static_media_sources(request.item_id, false, None)
-            .await?;
-
-        // Match the requested id, else when the "media source id" is really the
-        // item id, the first source.
-        let chosen = match request.media_source_id.as_deref() {
-            Some(id) => match sources.iter().position(|s| s.id_matches(id)) {
-                Some(i) => sources.into_iter().nth(i),
-                None if Uuid::parse_str(id).is_ok_and(|g| g == request.item_id) => {
-                    sources.into_iter().next()
-                }
-                None => None,
-            },
-            None => sources.into_iter().next(),
-        };
-
-        chosen.ok_or_else(|| {
-            ServiceError::NotFound(format!("no media source for item {}", request.item_id))
-        })
+        self.media_sources
+            .get_stream_media_source(
+                request.item_id,
+                request.media_source_id.as_deref(),
+                request.live_stream_id.as_deref(),
+            )
+            .await
     }
 }
 
@@ -316,6 +331,25 @@ fn hardware_path_is_ported(options: &EncodingOptions) -> bool {
     )
 }
 
+/// `GetVideoProcessingFilterParam`'s placement of the frame-rate cap in the
+/// main chain: behind a deinterlacer, which needs the neighbouring frames, at
+/// the end (PR 17058); otherwise at the head, so the rest of the chain filters
+/// only the frames kept.
+fn with_frame_rate_cap(
+    mut main: Vec<String>,
+    fps: Option<&str>,
+    deinterlaced: bool,
+) -> Vec<String> {
+    if let Some(fps) = fps {
+        if deinterlaced {
+            main.push(fps.to_owned());
+        } else {
+            main.insert(0, fps.to_owned());
+        }
+    }
+    main
+}
+
 /// Says once, loudly, that a configured accelerator will not be used.
 ///
 /// Without this the operator picks AMF in the dashboard, gets a working but
@@ -338,74 +372,65 @@ fn warn_unsupported_accelerator(options: &EncodingOptions) {
     }
 }
 
-/// Whether hardware transcoding is enabled and the running ffmpeg has an
-/// encoder for `codec` on the configured accelerator.
+/// The `-filter_complex` pads of a subtitle burn-in, for the hardware chains
+/// and the software overlay alike.
 ///
-/// Asks the ported encoder dispatch rather than a hand-kept table: a codec is
-/// hardware-encodable exactly when that dispatch returns something other than
-/// the software encoder it would otherwise pick.
-fn hardware_encodes(
-    codec: &str,
-    caps: &FfmpegCapabilities,
-    options: &EncodingOptions,
-    video_type: Option<VideoType>,
-) -> bool {
-    if !options.enable_hardware_encoding || !hardware_path_is_ported(options) {
-        return false;
+/// As upstream's `GetVideoProcessingFilterParam`: the video by `find_index`
+/// and the subtitle by its ffmpeg index (`GetSubtitleStreamIndexForFfmpeg`,
+/// `find_index` plus a Blu-ray source's TrueHD/Atmos streams before it, which
+/// ffprobe does not list but ffmpeg counts), not by the streams' own `index`:
+/// the pads have to name the same numbers `map_args` does, and the two diverge
+/// as soon as a source's streams are not contiguously indexed. It matters most
+/// for an external subtitle, which is input 1 with a single stream at index 0
+/// whatever its index in the parent source. A stream missing from the source
+/// is `-1`, which ffmpeg refuses rather than reading some other stream.
+fn stream_pads(
+    media_source: &MediaSourceInfo,
+    subtitle: Option<&MediaStream>,
+    video: Option<&MediaStream>,
+) -> hw::sw_chain::StreamPads {
+    use ferrofin_mediaencoding::encoding_helper::helper::{
+        find_index, get_subtitle_stream_index_for_ffmpeg,
+    };
+    hw::sw_chain::StreamPads {
+        subtitle_is_external: subtitle.is_some_and(|s| s.is_external),
+        subtitle_index: subtitle
+            .map_or(0, |s| get_subtitle_stream_index_for_ffmpeg(media_source, s)),
+        video_index: video.map_or(0, |v| find_index(&media_source.media_streams, v)),
     }
-    // The video type is load-bearing, not decoration: hardware encoding is
-    // refused for some disc/folder rips, and answering "yes" for one of those
-    // lets a codec be chosen on the strength of a hardware encoder and then
-    // land on software libsvtav1/libx265 — the sub-realtime stall this
-    // function exists to avoid.
-    let hw = hw::encoder::video_encoder(
-        Some(codec),
-        caps,
-        options.hardware_acceleration_type,
-        video_type,
-        true,
-    );
-    let sw = hw::encoder::video_encoder(
-        Some(codec),
-        caps,
-        HardwareAccelerationType::none,
-        video_type,
-        false,
-    );
-    hw != sw
 }
 
-/// The transcode **target** video codec: the first client preference Ferrofin can
-/// encode in realtime, else h264.
+/// The rate ffmpeg encodes a constant-rate output at when no `-r` is set.
 ///
-/// Clients send preferred codecs most-preferred-first (e.g. `av1,h264,vp9`).
-/// With NVENC the hardware encodes h264/hevc/av1, so the client's top pick
-/// (av1 for browsers — which keeps 10-bit HDR) is honoured. Without hardware,
-/// only software libx264 (h264) is realtime-viable — software av1/vp9/hevc
-/// (libaom-av1 etc.) run far below realtime and stall the player — so we fall
-/// back to the broadly-compatible h264. A bare `copy` request is honoured.
+/// Port of the first rule of libavformat's `av_guess_frame_rate`, whose
+/// constants these are: the source's real rate (`r_frame_rate`), not its
+/// average, which would misplace every cut on a VFR source; but the average
+/// when the real rate is a timestamp-grid artefact (above 210 against an
+/// average below 70, e.g. `1000/1` on a millisecond grid). Divergence:
+/// upstream reads `RealFrameRate` alone, which pins a GOP of 3000 frames
+/// (100 s at the 30 fps ffmpeg encodes at) on such a file. ffmpeg's
+/// field-coding rule is not ported: it needs the codec frame rate, which
+/// ffprobe does not report, so a doubled-`tbr` source (`25 fps, 50 tbr`)
+/// gets a GOP of two segments. No segment is cut by that GOP alone: libsvtav1
+/// also forces keyframes on time (`hls_video_key_frame_arguments`), and the
+/// encoders that take a GOP alone, AMF and RKMPP, are never selected.
+fn guessed_frame_rate(video: &MediaStream) -> Option<f32> {
+    match (video.real_frame_rate, video.average_frame_rate) {
+        (Some(real), Some(average)) if real > 210.0 && average > 0.0 && average < 70.0 => {
+            Some(average)
+        }
+        (real, _) => real,
+    }
+}
+
+/// The first client video codec after the native allow-encoding reordering.
 ///
-/// Skipping a non-realtime preference must not land on a codec the encoding
-/// options forbid (`vp9,av1,h264` with AV1 disallowed is h264, not av1), so a
-/// disallowed codec is only a candidate when the client lists nothing else,
-/// which is when `ShiftVideoCodecsIfNeeded` also leaves the order alone.
-fn preferred_transcode_video_codec(
-    codecs: &[String],
-    caps: &FfmpegCapabilities,
-    options: &EncodingOptions,
-    video_type: Option<VideoType>,
-) -> String {
-    let any_allowed = codecs
-        .iter()
-        .any(|c| !is_video_encoding_disallowed(c, options));
+/// `AttachMediaSourceInfo` keeps a single/all-disallowed list intact, preserving
+/// direct copy and explicit client choices. Software encoder dispatch remains
+/// available when no supported hardware encoder is selected.
+fn preferred_transcode_video_codec(codecs: &[String]) -> String {
     codecs
-        .iter()
-        .filter(|c| !any_allowed || !is_video_encoding_disallowed(c, options))
-        .find(|c| {
-            EncodingJobInfo::is_copy_codec(Some(c))
-                || c.eq_ignore_ascii_case("h264")
-                || hardware_encodes(c, caps, options, video_type)
-        })
+        .first()
         .cloned()
         .unwrap_or_else(|| DEFAULT_VIDEO_CODEC.to_owned())
 }
@@ -430,18 +455,33 @@ fn supported_codecs(codecs: &[String], source: Option<&MediaStream>, target: &st
     }
 }
 
-/// The default stream of `stream_type` from `streams`: the first flagged
-/// `is_default`, else the first of that type.
-///
-/// Port of the `GetDefaultStream` selection `StreamingHelpers` applies to pick
-/// the video/audio stream to transcode.
-fn default_stream(streams: &[MediaStream], stream_type: MediaStreamType) -> Option<MediaStream> {
-    streams
+/// The `stream_type` stream to transcode. Port of `EncodingHelper.GetMediaStream`
+/// (`returnFirstIfNoIndex: true`), as `AttachMediaSourceInfo` calls it: the
+/// stream at `desired_index` when the request names one that exists, else — by
+/// stream index — the first audio stream with channels (then any audio), or
+/// the first stream of another type. `IsDefault` plays no part: the client's
+/// choice reaches the server as the index (`StreamInfo::to_url`).
+fn media_stream(
+    streams: &[MediaStream],
+    desired_index: Option<i32>,
+    stream_type: MediaStreamType,
+) -> Option<MediaStream> {
+    let mut of_type: Vec<&MediaStream> = streams
         .iter()
         .filter(|s| s.stream_type == stream_type)
-        .find(|s| s.is_default)
-        .or_else(|| streams.iter().find(|s| s.stream_type == stream_type))
-        .cloned()
+        .collect();
+    of_type.sort_by_key(|s| s.index);
+    if let Some(index) = desired_index
+        && let Some(stream) = of_type.iter().find(|s| s.index == index)
+    {
+        return Some((*stream).clone());
+    }
+    if stream_type == MediaStreamType::Audio
+        && let Some(stream) = of_type.iter().find(|s| s.channels.is_some_and(|c| c > 0))
+    {
+        return Some((*stream).clone());
+    }
+    of_type.first().map(|s| (*s).clone())
 }
 
 /// The subtitle stream at `index` from `streams`, if present.
@@ -520,6 +560,69 @@ fn parse_subtitle_method(value: &str) -> Option<SubtitleDeliveryMethod> {
     Some(method)
 }
 
+/// Source StreamingHelpers.GetOutputFileExtension for the ordinary stream routes.
+fn progressive_container(
+    request: &HlsStreamRequest,
+    is_audio: bool,
+    source: &MediaSourceInfo,
+    video_codec: Option<&str>,
+    audio_codec: Option<&str>,
+) -> Result<String, ServiceError> {
+    if let Some(container) = request.output_container.as_deref() {
+        if !ferrofin_model::media_info::is_valid_stream_identifier(container) {
+            return Err(ServiceError::InvalidInput(
+                "invalid streaming container".to_owned(),
+            ));
+        }
+        let container = container.trim_start_matches('.');
+        if !container.is_empty() {
+            return Ok(container.to_owned());
+        }
+    }
+    if request
+        .output_container
+        .as_deref()
+        .is_none_or(str::is_empty)
+        && (request
+            .live_stream_id
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+            || source.is_infinite_stream)
+    {
+        return Ok("ts".to_owned());
+    }
+    let codec = if is_audio { audio_codec } else { video_codec };
+    let inferred = codec.and_then(|codec| match codec.to_ascii_lowercase().as_str() {
+        "h264" if !is_audio => Some("ts"),
+        "hevc" | "av1" if !is_audio => Some("mp4"),
+        "theora" if !is_audio => Some("ogv"),
+        "vp8" | "vp9" | "vpx" if !is_audio => Some("webm"),
+        "wmv" if !is_audio => Some("asf"),
+        "aac" if is_audio => Some("aac"),
+        "mp3" if is_audio => Some("mp3"),
+        "vorbis" if is_audio => Some("ogg"),
+        "wma" if is_audio => Some("wma"),
+        _ => None,
+    });
+    inferred
+        .map(str::to_owned)
+        .or_else(|| {
+            source
+                .container
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .map(|value| {
+                    value
+                        .split(',')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_owned()
+                })
+        })
+        .ok_or_else(|| ServiceError::backend("failed to find a progressive output container"))
+}
+
 /// The file extension for `segment_container` (`ts` → `ts`, `mp4` → `mp4`).
 ///
 /// Port of `GetSegmentFileExtension`: the extension is the container name
@@ -540,6 +643,19 @@ fn is_hevc(codec: &str) -> bool {
     codec.eq_ignore_ascii_case("hevc") || codec.eq_ignore_ascii_case("h265")
 }
 
+/// Selects the HEVC Dolby Vision MP4 sample entry tag.
+///
+/// Profile 8 uses `hvc1` (what Dolby's official streams use; `dvh1` breaks
+/// strict-tag players like Safari). All other profiles use `dvh1`. Port of
+/// `DynamicHlsController.GetDolbyVisionHevcCodecTag`.
+fn dolby_vision_hevc_codec_tag(stream: Option<&MediaStream>) -> &'static str {
+    if stream.and_then(|s| s.dv_profile) == Some(8) {
+        "hvc1"
+    } else {
+        "dvh1"
+    }
+}
+
 /// The HLS `-hls_segment_type` token for `segment_container`.
 ///
 /// Port of the `hls_segment_type` selection: `mp4` → `fmp4`, else `mpegts`.
@@ -553,6 +669,38 @@ fn hls_segment_type(segment_container: &str) -> &'static str {
 
 #[async_trait]
 impl StreamStatePlanner for FerrofinStreamStatePlanner {
+    /// Resolves the human-readable names for the playing item — its own title,
+    /// its series (episodes), and its library — for the transcode logs.
+    /// Best-effort by design: any miss leaves the field empty. Asked only when
+    /// a job starts: the library lookup walks every configured library.
+    async fn display_names(
+        &self,
+        item_id: uuid::Uuid,
+    ) -> ferrofin_mediaencoding::TranscodeDisplayNames {
+        let mut names = ferrofin_mediaencoding::TranscodeDisplayNames::default();
+        let Some(library) = &self.library else {
+            return names;
+        };
+        let Ok(Some(item)) = library.get_item_by_id(item_id).await else {
+            return names;
+        };
+        names.item_name = item.name.clone();
+        names.series_name = item.series_name.clone();
+        // The library whose location holds the item (its `TopParentId` is
+        // that location's folder; a row an older scan wrote names the library).
+        if let Some(folders) = &self.virtual_folders
+            && let Ok(folders) = folders.get_virtual_folders().await
+        {
+            names.library_name = ferrofin_model::entities_media::owning_library(
+                &folders,
+                item.top_parent_id.as_deref(),
+                item.path.as_deref(),
+            )
+            .and_then(|folder| folder.name.clone());
+        }
+        names
+    }
+
     // The plan is the linear `GetStreamingState` → `GetCommandLineArguments`
     // orchestration: five clearly-labelled steps (resolve source, copy-vs-
     // transcode, populate state, build args, return). Splitting it would only
@@ -581,17 +729,37 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             (requested, _) => requested,
         };
         let media_path = media_source
-            .path
-            .clone()
+            .encoder_path
+            .as_ref()
+            .filter(|path| !path.is_empty() && media_source.encoder_protocol.is_some())
+            .or(media_source.path.as_ref())
+            .cloned()
             .ok_or_else(|| ServiceError::backend("media source has no path"))?;
         let run_time_ticks = media_source.run_time_ticks.unwrap_or(0);
-
-        let video_stream = if is_audio {
-            None
+        let is_input_video = if let Some(library) = &self.library {
+            library
+                .get_item_by_id(request.item_id)
+                .await?
+                .is_some_and(|item| item.media_type.as_deref() == Some("Video"))
         } else {
-            default_stream(&media_source.media_streams, MediaStreamType::Video)
+            !is_audio
+                || media_source
+                    .media_streams
+                    .iter()
+                    .any(|stream| stream.stream_type == MediaStreamType::Video)
         };
-        let audio_stream = default_stream(&media_source.media_streams, MediaStreamType::Audio);
+
+        // `AttachMediaSourceInfo`: a video request picks its tracks by the
+        // requested indexes; an audio request takes the first audio stream.
+        let streams = &media_source.media_streams;
+        let (video_stream, audio_stream) = if is_audio {
+            (None, media_stream(streams, None, MediaStreamType::Audio))
+        } else {
+            (
+                media_stream(streams, request.video_stream_index, MediaStreamType::Video),
+                media_stream(streams, request.audio_stream_index, MediaStreamType::Audio),
+            )
+        };
         // The transcode URL carries both the subtitle index and the negotiated
         // delivery (`SubtitleMethod`, written by `StreamInfo::to_url`). Honour
         // the method: only `Encode` burns the track into the video. Treating a
@@ -617,20 +785,49 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             // it must not read as `Hls` when nothing was selected.
             requested_subtitle_method.unwrap_or(SubtitleDeliveryMethod::External)
         };
+        // `AttachMediaSourceInfo`'s `NormalizeSubtitleEmbed`, in its video-request
+        // branch: a DVB subtitle is burned in rather than embedded, before the
+        // copy decision reads the method.
+        let subtitle_delivery_method = if is_audio {
+            subtitle_delivery_method
+        } else {
+            ferrofin_mediaencoding::encoding_helper::helper::normalize_subtitle_embed(
+                subtitle_stream.as_ref(),
+                subtitle_delivery_method,
+            )
+        };
 
+        // `StreamingHelpers.GetStreamingState`: a non-blank `subtitleCodec`
+        // becomes `SupportedSubtitleCodecs`, split on commas with empty entries
+        // dropped (`Split(',', RemoveEmptyEntries)`, which trims nothing). The
+        // ordinary stream routes validate it (`validate_stream_request`), and
+        // the embed arguments check it again before writing it.
+        let supported_subtitle_codecs: Vec<String> = request
+            .subtitle_codec
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .split(',')
+                    .filter(|codec| !codec.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let progressive = kind == PlaylistKind::Progressive;
         let options = self.encoding_options().await;
         // `StreamState.SegmentLength`: an explicit `SegmentLength` from the
-        // client wins outright, otherwise the 3s default. The request value was
+        // client wins outright; without one the length depends on the output
+        // video codec, so it is settled after step (2)
+        // ([`default_segment_length_secs`]). The request value was
         // previously gated on `encoding_thread_count >= 0` — an unrelated knob
         // that defaults to -1 (auto), so a client's negotiated `SegmentLength`
         // (device profiles emit it, `StreamInfo::to_url` forwards it) was
         // silently dropped on every default install: a 6s-segment profile got
         // 3s segments, doubling both the playlist and the number of segment
         // requests a client makes over a film.
-        let segment_length_secs = request
-            .segment_length
-            .filter(|&secs| secs > 0)
-            .unwrap_or(DEFAULT_SEGMENT_LENGTH_SECS);
+        let requested_segment_length = request.segment_length.filter(|&secs| secs > 0);
         let segment_container = request
             .segment_container
             .clone()
@@ -646,32 +843,67 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // passed-through list makes ffmpeg exit immediately and the whole
         // transcode (hence playback) fails.
         let mut video_codecs = split_codecs(request.video_codec.as_deref());
-        let mut audio_codecs = split_codecs(request.audio_codec.as_deref());
+        let inferred_audio_codec =
+            if progressive && request.audio_codec.as_deref().is_none_or(str::is_empty) {
+                let url = request.requested_url.as_deref().unwrap_or_default();
+                let suffix = url.rsplit_once('.').map_or(url, |(_, suffix)| suffix);
+                Some(ferrofin_mediaencoding::encoding_helper::helper::infer_audio_codec(suffix))
+            } else {
+                None
+            };
+        let mut audio_codecs = split_codecs(
+            inferred_audio_codec
+                .as_deref()
+                .or(request.audio_codec.as_deref()),
+        );
         // `AttachMediaSourceInfo`: codecs the server may not or should not
         // produce drop to the end, so they are neither the target nor preferred.
         shift_video_codecs_if_needed(&mut video_codecs, &options);
         shift_audio_codecs_if_needed(&mut audio_codecs, audio_stream.as_ref());
 
-        // The requested/target codecs (defaulting to the broadly-compatible
-        // h264/aac). A `copy` request is honoured verbatim. The video target is
-        // NOT simply the client's first preference: browsers list av1/vp9 ahead
-        // of h264 for efficiency, but encoding either in software (libaom-av1
-        // etc.) runs far slower than realtime and stalls HLS
-        // (fragLoadTimeOut). Pick the first preference the running ffmpeg can
-        // actually encode in realtime — which now includes the hardware
-        // encoders, so a client asking for av1 on an NVENC server gets it.
-        let requested_video_codec = preferred_transcode_video_codec(
-            &video_codecs,
-            self.encoding_helper.capabilities(),
-            &options,
-            media_source.video_type,
-        );
+        // Native AttachMediaSourceInfo selects the first codec after shifting
+        // disallowed encodings, independently of the software/hardware encoder.
+        let requested_video_codec = preferred_transcode_video_codec(&video_codecs);
         let requested_audio_codec = audio_codecs
             .iter()
             .find(|c| self.encoding_helper.can_encode_to_audio_codec(c))
             .or_else(|| audio_codecs.first())
             .cloned()
             .unwrap_or_else(|| DEFAULT_AUDIO_CODEC.to_owned());
+        let output_container = if progressive {
+            progressive_container(
+                request,
+                is_audio,
+                &media_source,
+                (!video_codecs.is_empty()).then_some(requested_video_codec.as_str()),
+                (!audio_codecs.is_empty()).then_some(requested_audio_codec.as_str()),
+            )?
+        } else {
+            segment_container.clone()
+        };
+        let state_output_container = if progressive {
+            request
+                .output_container
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .map_or_else(
+                    || output_container.clone(),
+                    |value| value.trim_start_matches('.').to_owned(),
+                )
+        } else {
+            output_container.clone()
+        };
+        let output_extension = match output_container.to_ascii_lowercase().as_str() {
+            "mpegts" => "ts".to_owned(),
+            "matroska" => "mkv".to_owned(),
+            _ => output_container.to_ascii_lowercase(),
+        };
+        if progressive && !ferrofin_model::media_info::is_valid_stream_identifier(&output_extension)
+        {
+            return Err(ServiceError::InvalidInput(
+                "invalid progressive output container".to_owned(),
+            ));
+        }
 
         // Build the base options from the request so the copy decision + arg
         // builder read the client's declared targets/limits. The subtitle index
@@ -681,18 +913,45 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         let base_request = BaseEncodingJobOptions {
             audio_codec: Some(requested_audio_codec.clone()),
             transcoding_max_audio_channels: request.transcoding_max_audio_channels,
+            // The typed `DynamicHlsController` members `GetRequested*` read
+            // before falling back to a per-codec stream option.
+            audio_channels: request.audio_channels,
+            max_audio_channels: request.max_audio_channels,
+            max_audio_bit_depth: request.max_audio_bit_depth,
+            max_ref_frames: request.max_ref_frames,
+            max_video_bit_depth: request.max_video_bit_depth,
+            deinterlace: request.deinterlace,
+            audio_sample_rate: request.audio_sample_rate,
             is_static: request.is_static,
+            context: request.context.unwrap_or(if progressive && is_audio {
+                ferrofin_model::dlna::EncodingContext::Static
+            } else {
+                ferrofin_model::dlna::EncodingContext::Streaming
+            }),
+            // A segment's transcode starts at the playlist time its URL
+            // carries (`StartTimeTicks = CurrentRuntimeTicks` in
+            // `GetDynamicSegment`), which for a remux cut on keyframes is not
+            // `segment_id * segment_length`.
+            start_time_ticks: if progressive {
+                request.start_time_ticks
+            } else {
+                segment_id
+                    .map(|_| request.current_runtime_ticks)
+                    .filter(|ticks| *ticks > 0)
+            },
             subtitle_stream_index: subtitle_index,
             // The PlaybackInfo-negotiated caps: they drive the bitrate params
             // (`-maxrate`/`-b:a`), the downscale filter, the framerate cap, and
             // the copy veto.
             video_bit_rate: requested_video_bitrate,
             audio_bit_rate: request.audio_bitrate,
+            cpu_core_limit: request.cpu_core_limit,
             max_width: request.max_width,
             max_height: request.max_height,
             max_framerate: request.max_framerate,
             allow_video_stream_copy: request.allow_video_stream_copy,
             allow_audio_stream_copy: request.allow_audio_stream_copy,
+            enable_audio_vbr_encoding: request.enable_audio_vbr_encoding,
             // The profile/level/framerate/size requests feed the master
             // playlist's CODECS/RESOLUTION/FRAME-RATE fields (and the level
             // clamp) exactly as `BaseEncodingJobOptions` does upstream.
@@ -711,6 +970,13 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             // live MPEG-TS usually probes with no bitrate, so leaving it unset
             // software-transcodes every channel that could have been copied.
             live_stream_id: request.live_stream_id.clone(),
+            // Only the video HLS actions bind `alwaysBurnInSubtitleWhenTranscoding`
+            // upstream; the audio HLS actions pin it false and the progressive
+            // stream actions never read it.
+            always_burn_in_subtitle_when_transcoding: request
+                .always_burn_in_subtitle_when_transcoding
+                && !is_audio
+                && !progressive,
             ..BaseEncodingJobOptions::default()
         };
 
@@ -724,7 +990,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // A probe state used only for the copy decision (the final state is
         // populated below with the resolved output codecs).
         let mut probe_state = EncodingJobInfo {
-            display: self.display_names(request.item_id).await,
+            display: ferrofin_mediaencoding::TranscodeDisplayNames::default(),
             base_request: base_request.clone(),
             video_stream: video_stream.clone(),
             audio_stream: audio_stream.clone(),
@@ -735,17 +1001,23 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             output_video_bitrate: None,
             output_audio_bitrate: None,
             output_audio_channels: None,
-            output_container: Some(segment_container.clone()),
+            output_container: Some(state_output_container),
             output_video_sync: None,
             output_file_path: String::new(),
             input_container: media_source.container.clone(),
-            is_input_video: !is_audio,
+            is_input_video,
             subtitle_delivery_method,
             run_time_ticks: media_source.run_time_ticks,
-            transcoding_type: TranscodingJobType::Hls,
+            transcoding_type: if progressive {
+                TranscodingJobType::Progressive
+            } else {
+                TranscodingJobType::Hls
+            },
             supported_video_codecs: supported_video_codecs.clone(),
             supported_audio_codecs: supported_audio_codecs.clone(),
-            segment_length_secs,
+            supported_subtitle_codecs,
+            // Settled after step (2).
+            segment_length_secs: 0,
             wait_for_path: None,
             segment_container: Some(segment_container.clone()),
             play_session_id: request.play_session_id.clone(),
@@ -798,20 +1070,19 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             (value > 0).then_some(value)
         };
 
+        // EncodingHelper.TryStreamCopy: a user's transcoding veto wins even
+        // over incompatible codecs, bitrate caps, subtitles and client copy
+        // vetoes. There is no administrator bypass or remux-permission HTTP gate.
         let copy_video = video_stream
             .as_ref()
-            .is_some_and(|v| self.encoding_helper.can_stream_copy_video(&probe_state, v));
-        // `TryStreamCopy` runs only under `if (state.VideoRequest is not null)`:
-        // an audio-only HLS request never stream-copies its audio (the variant
-        // URL keeps `audioCodec=aac`, and ffmpeg re-encodes).
-        let copy_audio = !is_audio
-            && audio_stream.as_ref().is_some_and(|a| {
-                self.encoding_helper
-                    .can_stream_copy_audio(&probe_state, a, &supported_audio_codecs)
-                    .0
-            });
-
-        // Resolve the effective output codecs from the copy decision.
+            .is_some_and(|v| self.encoding_helper.can_stream_copy_video(&probe_state, v))
+            || (!is_audio
+                && request
+                    .playback_permissions
+                    .is_some_and(|p| !p.video_transcoding));
+        // Resolve the effective output video codec from the copy decision.
+        // `TryStreamCopy` writes it to the state before the audio decision,
+        // which reads it (`preventHlsAudioCopy`).
         let output_video_codec = video_stream.as_ref().map(|_| {
             if copy_video {
                 "copy".to_owned()
@@ -819,6 +1090,30 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
                 requested_video_codec.clone()
             }
         });
+        probe_state
+            .output_video_codec
+            .clone_from(&output_video_codec);
+        // The `HlsAudioSeekStrategy` veto: an HLS job re-encoding its video
+        // re-encodes copyable audio too when the administrator chose
+        // `TranscodeAudio`.
+        let prevent_hls_audio_copy =
+            ferrofin_mediaencoding::encoding_helper::helper::prevent_hls_audio_copy(
+                &probe_state,
+                &options,
+            );
+        // Upstream only invokes TryStreamCopy for a VideoRequest. Audio-only
+        // requests retain their requested codec; negotiation enforces that flag.
+        let copy_audio = !is_audio
+            && ((!prevent_hls_audio_copy
+                && audio_stream.as_ref().is_some_and(|a| {
+                    self.encoding_helper
+                        .can_stream_copy_audio(&probe_state, a, &supported_audio_codecs)
+                        .0
+                }))
+                || request
+                    .playback_permissions
+                    .is_some_and(|p| !p.audio_transcoding));
+
         // Upstream's `OutputAudioCodec` is never null (it is the requested
         // codec, `"copy"` after `TryStreamCopy`), even for a source with no
         // audio stream — the master playlist's `AudioCodec` rewrite compares
@@ -829,22 +1124,46 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             requested_audio_codec.clone()
         });
         let is_remuxing_video = EncodingJobInfo::is_copy_codec(output_video_codec.as_deref());
+        // `StreamState.SegmentLength`, now that the output video codec is
+        // known; every reader (`-hls_time`, the playlist, `MinSegments`) takes
+        // this one value.
+        let segment_length_secs = requested_segment_length.unwrap_or_else(|| {
+            default_segment_length_secs(
+                is_remuxing_video,
+                request.user_agent.as_deref(),
+                !progressive && probe_state.run_time_ticks.is_none(),
+            )
+        });
+        probe_state.segment_length_secs = segment_length_secs;
 
         // ---- (3) POPULATE EncodingJobInfo -----------------------------------
         // The deterministic output id (StreamingHelpers hash): a re-request with
         // the same item/source/session/device/container reuses the same job.
-        let output_id = output_id(request, &segment_container, is_audio);
-        let transcode_root = PathBuf::from(self.paths.transcode_path());
-        let playlist_path = transcode_root.join(format!("{output_id}.m3u8"));
-        let wait_for_path = segment_path(
-            &playlist_path,
-            segment_id.unwrap_or(0),
-            segment_file_extension(&segment_container),
+        let output_id = output_id(request, &output_container, is_audio);
+        // Different delivery modes must not share an output file.
+        let output_id = if progressive {
+            format!("{output_id}-stream")
+        } else {
+            output_id
+        };
+        let transcode_root = PathBuf::from(
+            ferrofin_traits::system::prepare_transcode_path_off_runtime(self.paths.clone()).await?,
         );
+        let playlist_path = transcode_root.join(if progressive {
+            format!("{output_id}.{output_extension}")
+        } else {
+            format!("{output_id}.m3u8")
+        });
+        let wait_for_path = if progressive {
+            playlist_path.clone()
+        } else {
+            segment_path(
+                &playlist_path,
+                segment_id.unwrap_or(0),
+                segment_file_extension(&segment_container),
+            )
+        };
 
-        probe_state
-            .output_video_codec
-            .clone_from(&output_video_codec);
         probe_state
             .output_audio_codec
             .clone_from(&output_audio_codec);
@@ -903,23 +1222,70 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         probe_state.wait_for_path = Some(wait_for_path);
         let state = probe_state;
 
+        // `TranscodeManager.StartFfMpeg`: "If subtitles get burned in fonts may
+        // need to be extracted from the media file", from the media and from
+        // an external `.mks` subtitle, before the ffmpeg this plan starts (a
+        // segment or a progressive stream; a playlist build and a HEAD request
+        // start none). The condition is upstream's, which reads the method and
+        // the always-burn-in flag, not whether the video is copied.
+        // TODO(gl-480): upstream extracts a DVD or Blu-ray rip's attachments
+        // from its `{cache}/concat/{id}.concat` input; the planner builds no
+        // concat input yet, so a rip's attachments are read from its path.
+        let starts_ffmpeg = !request.is_head_request && (progressive || segment_id.is_some());
+        if starts_ffmpeg
+            && (state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
+                || state.base_request.always_burn_in_subtitle_when_transcoding)
+            && let Some(sub) = state.subtitle_stream.as_ref()
+            && let Some((extractor, _)) = &self.attachments
+        {
+            extractor
+                .extract_all_attachments(&media_path, &state.media_source)
+                .await?;
+            if let Some(mks) = sub
+                .path
+                .as_deref()
+                .filter(|path| sub.is_external && is_mks(path))
+            {
+                extractor
+                    .extract_all_attachments(mks, &state.media_source)
+                    .await?;
+            }
+        }
+
         // Resolve a burned *text* subtitle to its standalone file (extracting to
         // the subtitle cache once; the C# `GetSubtitleFilePath`). The `subtitles`
         // filter otherwise re-demuxes the entire source file to load cues on
         // every ffmpeg (re)start — tens of seconds added to every play/seek.
         // On resolution failure fall back to `si=` on the original input.
-        let burn_subtitle_path = if state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
+        let burned_text = if !request.is_head_request
+            && should_encode_subtitle(&state)
             && let Some(sub) = state
                 .subtitle_stream
                 .as_ref()
                 .filter(|s| s.is_text_subtitle_stream())
         {
-            self.subtitles
+            let path = self
+                .subtitles
                 .get_subtitle_file_path(sub, &media_source)
                 .await
-                .ok()
+                .ok();
+            // Read only for an ffmpeg that will run: a playlist build's
+            // arguments are never started.
+            let charset = if starts_ffmpeg {
+                self.external_subtitle_charset(sub, path.as_deref(), &media_source)
+                    .await
+            } else {
+                None
+            };
+            BurnedTextSubtitle {
+                path,
+                charset,
+                fonts_dir: self.attachments.as_ref().and_then(|(_, paths)| {
+                    paths.attachment_folder_path(media_source.id.as_deref().unwrap_or_default())
+                }),
+            }
         } else {
-            None
+            BurnedTextSubtitle::default()
         };
 
         // ---- (4) BUILD FFMPEG ARGS (GetCommandLineArguments) ----------------
@@ -934,7 +1300,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             &segment_container,
             &playlist_path,
             &options,
-            burn_subtitle_path.as_deref(),
+            &burned_text,
             kind,
             &probed_caps,
         );
@@ -945,6 +1311,8 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         let min_segments = request
             .min_segments
             .unwrap_or(if segment_length_secs >= 10 { 2 } else { 3 });
+        let is_dovi_removed = bitstream::is_dovi_removed(&probed_caps, &state);
+        let is_hdr10_plus_removed = bitstream::is_hdr10_plus_removed(&probed_caps, &state);
         Ok(TranscodePlan {
             state,
             playlist_path,
@@ -957,27 +1325,76 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             segment_container,
             encoding_options: options,
             min_segments,
+            is_dovi_removed,
+            is_hdr10_plus_removed,
         })
     }
 }
 
+/// What the `subtitles` filter burning a text subtitle reads: the file (when
+/// the subtitle encoder resolved one), its character set (`:charenc=`) and
+/// the folder of the fonts the media ships (`:fontsdir=`). Empty when no text
+/// subtitle is burned in.
+#[derive(Debug, Default)]
+struct BurnedTextSubtitle {
+    path: Option<String>,
+    charset: Option<String>,
+    fonts_dir: Option<String>,
+}
+
+/// Whether `path` names a Matroska subtitle container (`.mks`), ignoring case.
+fn is_mks(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mks"))
+}
+
 impl FerrofinStreamStatePlanner {
+    /// The character set an external text subtitle is read in, or `None`.
+    ///
+    /// `GetTextSubtitlesFilter` asks the subtitle encoder for an external
+    /// subtitle with a language and passes a non-empty answer as `:charenc=`.
+    /// Only the file the filter reads is asked about: `resolved` (the
+    /// encoder's file) differs from the stream's own when the encoder
+    /// converted or extracted it, already as UTF-8, and an `.mks` container is
+    /// no text to detect on. A detection that fails (the file cannot be read)
+    /// leaves the option out, and the filter then names the unreadable file.
+    async fn external_subtitle_charset(
+        &self,
+        sub: &MediaStream,
+        resolved: Option<&str>,
+        media_source: &MediaSourceInfo,
+    ) -> Option<String> {
+        let own = sub.path.as_deref().filter(|_| sub.is_external)?;
+        let language = sub.language.as_deref().filter(|l| !l.is_empty())?;
+        if resolved.is_some_and(|path| path != own) || is_mks(own) {
+            return None;
+        }
+        match self
+            .subtitles
+            .get_subtitle_file_character_set(sub, language, media_source)
+            .await
+        {
+            Ok(charset) => Some(charset).filter(|c| !c.is_empty()),
+            Err(error) => {
+                tracing::debug!(%error, path = own, "subtitle character set not detected");
+                None
+            }
+        }
+    }
+
     /// The `subtitles` filter that burns a text subtitle in, in one of its two
-    /// spellings. Port of `GetTextSubtitlesFilter`, with three divergences.
+    /// spellings. Port of `GetTextSubtitlesFilter`: the file, then
+    /// `:charenc=` for an external one in a detected character set, the
+    /// `alpha`/`sub2video` pair, and `:fontsdir=` naming the folder the media
+    /// file's attachments are extracted to. Two divergences.
     ///
     /// Upstream always pre-extracts the track to its own file; Ferrofin keeps a
     /// fallback that reads it straight out of the media (`si=` selects among the
     /// embedded subtitle streams) for when no extraction is cached, which is
     /// correct but re-demuxes the source.
     ///
-    /// The second is an open work item, not a choice: upstream appends
-    /// `:fontsdir='{attachment folder}'` on both branches, and `:charenc=` on
-    /// the external one. Ferrofin emits neither, so an ASS/SSA subtitle that
-    /// ships its own fonts as attachments renders in a system font instead.
-    /// Un-defer path: `GetAttachmentFolderPath(MediaSource.Id)` → `:fontsdir=`,
-    /// and the subtitle encoder's detected character set → `:charenc=`.
-    ///
-    /// The third, the `setpts` wrapper, is Ferrofin's and is why `offset_secs`
+    /// The second, the `setpts` wrapper, is Ferrofin's and is why `offset_secs`
     /// exists.
     /// Upstream emits none for HLS because it seeks once, streams, and copies
     /// timestamps, so its frames carry absolute PTS throughout. Ferrofin spawns
@@ -994,7 +1411,7 @@ impl FerrofinStreamStatePlanner {
         state: &EncodingJobInfo,
         sub: &MediaStream,
         media_path: &str,
-        burn_subtitle_path: Option<&str>,
+        text: &BurnedTextSubtitle,
         alpha_sub2video: bool,
         offset_secs: Option<i64>,
     ) -> String {
@@ -1003,10 +1420,15 @@ impl FerrofinStreamStatePlanner {
         if let Some(off) = offset_secs {
             let _ = write!(chain, "setpts=PTS+{off}/TB,");
         }
-        let external_path =
-            burn_subtitle_path.or_else(|| sub.path.as_deref().filter(|_| sub.is_external));
+        let external_path = text
+            .path
+            .as_deref()
+            .or_else(|| sub.path.as_deref().filter(|_| sub.is_external));
         if let Some(path) = external_path {
             let _ = write!(chain, "subtitles=f='{}'", escape_subtitle_filter_path(path));
+            if let Some(charset) = text.charset.as_deref() {
+                let _ = write!(chain, ":charenc={charset}");
+            }
         } else {
             let si = state
                 .media_source
@@ -1024,6 +1446,9 @@ impl FerrofinStreamStatePlanner {
         if alpha_sub2video {
             chain.push_str(":alpha=1:sub2video=1");
         }
+        if let Some(fonts) = text.fonts_dir.as_deref() {
+            let _ = write!(chain, ":fontsdir='{}'", escape_subtitle_filter_path(fonts));
+        }
         if let Some(off) = offset_secs {
             let _ = write!(chain, ",setpts=PTS-{off}/TB");
         }
@@ -1033,10 +1458,11 @@ impl FerrofinStreamStatePlanner {
     /// The ffmpeg video encoder for `state`. Port of `GetVideoEncoder`.
     ///
     /// One dispatch decides software and hardware alike — it returns the
-    /// vendor encoder when the configured accelerator has one for the target
-    /// codec and the running ffmpeg was built with it, and the software encoder
-    /// otherwise. A copy request short-circuits ahead of it, since `copy` is
-    /// not an encoder at all.
+    /// vendor encoder when hardware encoding is enabled, the configured
+    /// accelerator is a supported one ([`hardware_path_is_ported`]) with an
+    /// encoder for the target codec, and the running ffmpeg was built with it,
+    /// and the software encoder otherwise. A copy request short-circuits ahead
+    /// of it, since `copy` is not an encoder at all.
     fn resolve_video_encoder(&self, state: &EncodingJobInfo, options: &EncodingOptions) -> String {
         let codec = state.output_video_codec.as_deref().unwrap_or("copy");
         if EncodingJobInfo::is_copy_codec(Some(codec)) {
@@ -1071,25 +1497,31 @@ impl FerrofinStreamStatePlanner {
         segment_container: &str,
         playlist_path: &std::path::Path,
         options: &EncodingOptions,
-        burn_subtitle_path: Option<&str>,
+        burned_text: &BurnedTextSubtitle,
         kind: PlaylistKind,
         probed_caps: &FfmpegCapabilities,
     ) -> (Vec<String>, Vec<(String, String)>) {
         let mut args: Vec<String> = Vec::new();
         let is_event_playlist = kind == PlaylistKind::Event;
+        let progressive = kind == PlaylistKind::Progressive;
 
-        // Resolve the video encoder up front (it decides input hwaccel too). NVENC
-        // maps the target codec to its hardware encoder; otherwise the software
-        // `EncodingHelper` path (libx264 / copy) is used.
+        // Resolve the video encoder up front (it decides input hwaccel too). A
+        // supported accelerator (NVENC, VAAPI, QSV) with hardware encoding on
+        // maps the target codec to its hardware encoder when the build has
+        // it; otherwise a software encoder (e.g. libx264, libx265, libsvtav1)
+        // or `copy` is used.
         let video_encoder = self.resolve_video_encoder(state, options);
         let copying_video = EncodingJobInfo::is_copy_codec(Some(&video_encoder));
-        // The encoder is NVENC. Distinct from `hw_filters` below and used only
-        // where a fact about the *encoder* is what matters.
-        let nvenc_video = video_encoder.ends_with("_nvenc");
-        // Everything the ported hardware matrix reads about the job. The
-        // render-node arguments are VAAPI/QSV territory and unused by the CUDA
-        // branch; the hardware-transcoding roadmap phase 4 resolves them from the encoding
-        // options, which are not readable this early today.
+        // HLS segments of a copied video start at keyframes, but ffmpeg seeks
+        // to the keyframe before an exact frame time. Upstream seeks half a
+        // second later to land on the keyframe itself
+        // (`GetFastSeekCommandLineParameter`).
+        let remux_seek_offset = if !progressive && copying_video && state.video_stream.is_some() {
+            HLS_REMUX_SEEK_OFFSET_TICKS
+        } else {
+            0
+        };
+        // Everything the ported hardware matrix reads about the job.
         let caps = probed_caps;
         let requested = hw::decoder::RequestedSize {
             width: state.base_request.width,
@@ -1105,19 +1537,18 @@ impl FerrofinStreamStatePlanner {
             output_video_codec: state.output_video_codec.as_deref(),
             requested,
         };
-        // Only NVENC has a ported filter chain today, so only NVENC may take
+        // Only an accelerator with a ported chain (NVENC, VAAPI, QSV) may take
         // the hardware path at all. This is a **scope gate, not a capability
         // gate**: `input_video_hwaccel_args` happily produces a device graph
-        // for every vendor, and `resolve_video_encoder` happily names their
-        // encoders, but the chain behind them lands with phases 4-7. Letting a
-        // VAAPI or QSV server through today gives it a vendor encoder with no
-        // encoder parameters, no filter graph at all — so the client's
-        // `MaxWidth` is silently ignored and it receives a full-resolution
-        // encode — and a silently dropped subtitle burn-in. That is worse than
-        // the software transcode it has now, not merely less optimal.
-        //
-        // Each vendor's phase removes itself from this gate as its chain and
-        // its `GetEncoderParam`/`GetVideoBitrateParam` arms land.
+        // for AMF, VideoToolbox and RKMPP too, and `hw::encoder::video_encoder`
+        // happily names their encoders, but a server let through would get a
+        // vendor encoder with no encoder parameters and no filter graph at all
+        // — so the client's `MaxWidth` is silently ignored and it receives a
+        // full-resolution encode — and a silently dropped subtitle burn-in.
+        // That is worse than the software transcode it gets instead (with a
+        // one-time warning). `resolve_video_encoder` applies the same gate, so
+        // the encoder, the device graph and the filters fall back together;
+        // see `hardware_path_is_ported`.
         let hw_ported = hardware_path_is_ported(options);
         warn_unsupported_accelerator(options);
         // The configured render node, resolved against the filesystem. An
@@ -1155,22 +1586,36 @@ impl FerrofinStreamStatePlanner {
         //   arguments, but the chain still has a software fallback of its own,
         //   and that fallback is the ported one.
         let hw_filters = !copying_video && hw_ported;
-        // Burning a graphical subtitle needs the decoded frames in system memory
-        // for the `overlay` filter, so we can't keep them on the GPU
-        // (`-hwaccel_output_format cuda`); NVENC still uploads the filtered frames.
+        // A graphical subtitle (PGS/DVDSUB) is burned in with `overlay` on the
+        // software path; on the hardware path the vendor chain composites it on
+        // the GPU (`overlay_cuda`, `overlay_vaapi`, `overlay_qsv`), so the
+        // decoded frames stay there.
         let burn_graphical =
             ferrofin_mediaencoding::encoding_helper::helper::burns_graphical_subtitle(state);
-        // Burning a *text* subtitle (the Encode delivery for srt/ass/…) uses the
-        // `subtitles` filter, which likewise needs frames in system memory.
+        // A *text* subtitle (the Encode delivery for srt/ass/…) is rendered by
+        // the `subtitles` filter: into the frames on the software path, onto a
+        // transparent plane the vendor chain overlays on the hardware path.
         let burn_text = burns_text_subtitle(state);
         let burn_sub = burn_graphical || burn_text;
 
-        // The software re-encode's video filters (order matters): the bounded
-        // downscale first (tonemap/burn-in then run on fewer pixels), then the
-        // HDR→SDR tonemap chain — or a bare 8-bit down-convert for 10-bit SDR
-        // sources (libx264 would otherwise emit High10, undecodable in browser
-        // MSE). This is the software path only — a job the hardware matrix
-        // claimed builds its whole graph above.
+        // The software re-encode's video filters, in `GetSwVidFilterChain`'s
+        // order: the HDR `setparams` (upstream also tags SDR frames; this list
+        // does only for tonemapx), the deinterlacer, the bounded downscale
+        // (tonemap/burn-in then run on fewer pixels), then the HDR→SDR tonemap
+        // chain — or a bare 8-bit down-convert for 10-bit SDR sources (libx264
+        // would otherwise emit High10, undecodable in browser MSE). This is the
+        // software path only — a job the hardware matrix claimed builds its
+        // whole graph above.
+        let sw_deinterlace = !copying_video && !hw_filters && state.is_deinterlace_available();
+        // `GetVideoProcessingFilterParam`'s frame-rate cap on the software
+        // chain, placed by [`with_frame_rate_cap`] where each graph below is
+        // assembled (a burned-in text subtitle goes between the two). Printed
+        // as upstream does: its `float` widened to the `double?` that
+        // `GetFramerateParam` returns.
+        let sw_fps = (!copying_video && !hw_filters)
+            .then(|| self.encoding_helper.framerate_param(state))
+            .flatten()
+            .map(|rate| format!("fps={}", f64::from(rate)));
         let sw_filters: Vec<String> = if !copying_video && !hw_filters {
             let mut filters = Vec::new();
             let tonemap =
@@ -1190,6 +1635,17 @@ impl FerrofinStreamStatePlanner {
                     )
                     .to_owned(),
                 );
+            }
+            // `GetSwDeinterlaceFilter` whenever `IsDeinterlaceAvailable`: an
+            // interlaced source is deinterlaced before anything resizes it.
+            if sw_deinterlace {
+                filters.push(hw::filters::sw_deinterlace_filter(
+                    options,
+                    state
+                        .video_stream
+                        .as_ref()
+                        .and_then(MediaStream::reference_frame_rate),
+                ));
             }
             if let Some(scale) = ferrofin_mediaencoding::encoding_helper::helper::scale_filter(
                 state.video_stream.as_ref(),
@@ -1220,46 +1676,140 @@ impl FerrofinStreamStatePlanner {
         };
 
         // ---- input ------------------------------------------------------------
-        // Seek to the segment start (GetTimeParameter): segment_id * segment_len.
-        if let Some(id) = segment_id.filter(|&id| id > 0) {
-            let seek_ticks =
-                i64::from(id) * i64::from(state.segment_length_secs) * TICKS_PER_SECOND;
-            let ss = self.encoder.get_time_parameter(seek_ticks);
+        // Seek to the segment start (`GetFastSeekCommandLineParameter`): the
+        // playlist time its URL carries.
+        let input_seek_ticks = fast_seek_ticks(state, remux_seek_offset);
+        // A seek-restarted HLS segment's timestamps start at the input seek
+        // (see `-output_ts_offset` below and `text_subtitle_filter`). A seek
+        // clamped to the very start shifts nothing.
+        let segment_seek_ticks = input_seek_ticks.filter(|ticks| !progressive && *ticks > 0);
+        // The `-ss` value, which the external inputs take too.
+        let fast_seek = input_seek_ticks.map(|ticks| {
+            self.encoder
+                .get_time_parameter(ticks)
+                .trim_start_matches("-ss")
+                .trim()
+                .to_owned()
+        });
+        if let Some(ss) = fast_seek.as_deref() {
             push_split(&mut args, "-ss");
-            push_split(&mut args, ss.trim_start_matches("-ss").trim());
+            push_split(&mut args, ss);
             // A copied video stream restarts at the keyframe *before* the seek
             // target, but ffmpeg's default accurate seek still trims re-encoded
             // audio forward to the exact target — the muxed audio then leads the
             // video by (target − keyframe), an audible desync on every seeked
             // copy-video stream (measured 0.7–1.6 s on real media). Start the
             // audio at the same keyframe instead; the segment already begins
-            // there for video anyway.
-            if copying_video {
+            // there for video anyway. Never on a wtv input: every upstream
+            // version that passed the flag kept it off wtv, "because it breaks
+            // seeking" (as `copied_audio_trim_bsf` does for its trim).
+            //
+            // TS segments keep it, even though 10.11.8 left it off them ("the
+            // timestamps issue on some clients") and v12 dropped it
+            // altogether: the copied video starts at the earlier keyframe with
+            // or without it, and only with it does the audio start there as
+            // well. Measured on a seek to 18 s between keyframes at 15 and
+            // 20 s, TS segments (PTS carry the TS muxer's 1.4 s start offset):
+            // first video / audio PTS 16.40 / 16.39 s with the flag, 16.40 /
+            // 19.38 s without (the audio a whole 3 s after the video).
+            let wtv = state
+                .input_container
+                .as_deref()
+                .is_some_and(|c| c.eq_ignore_ascii_case("wtv"));
+            if copying_video && !progressive && !wtv {
                 args.push("-noaccurate_seek".to_owned());
             }
         }
         // The device graph and the hardware decoder, straight from the ported
         // matrix — `-init_hw_device`, `-filter_hw_device`, `-hwaccel` and
-        // `-hwaccel_output_format` in upstream's order. Splitting on whitespace
-        // is safe because nothing it produces contains any: the device
-        // arguments phase 4 adds do carry paths, but they are render nodes
-        // (`/dev/dri/renderD*`), which cannot contain a space.
-        push_split(&mut args, &hwaccel_input.args);
-        // GetInputArgument yields the full `-i file:"…"` fragment.
+        // `-hwaccel_output_format` in upstream's order. The string is
+        // shell-quoted like every other ffmpeg command line (AMD's OpenCL
+        // device is `device_vendor="Advanced Micro Devices"`), so it takes the
+        // shared splitter, with the same one-token fallback as the input. The
+        // device builders quote a configured render-node path, so the
+        // fallback is only a safety net; if it ever fires, say why.
+        args.extend(split_args(&hwaccel_input.args).unwrap_or_else(|error| {
+            tracing::warn!(%error, "hardware device arguments do not split; passing them as one");
+            vec![hwaccel_input.args.clone()]
+        }));
+        // `GetGraphicalSubCanvasSize`, next in `GetInputArgument`: a burned-in
+        // bitmap subtitle is decoded onto the canvas it was authored for, not
+        // one the size of the video.
+        args.extend(
+            hw::input_args::graphical_sub_canvas_size(
+                state.subtitle_stream.as_ref(),
+                ferrofin_mediaencoding::encoding_helper::helper::should_encode_subtitle(state),
+            )
+            .split_whitespace()
+            .map(str::to_owned),
+        );
+        // `GetInputModifier`'s `GetFfmpegAnalyzeDurationArg` (the source's own
+        // `AnalyzeDurationMs`, the 3 s a Live TV source carries, else the
+        // `FFmpeg:analyzeduration` default) and `GetFfmpegProbesizeArg`;
+        // GetInputArgument then yields the full `-i file:"…"` fragment.
         push_split(&mut args, "-analyzeduration");
-        args.push("200M".to_owned());
+        args.push(
+            ferrofin_mediaencoding::encoder::media_encoder::analyze_duration_value(
+                state.media_source.analyze_duration_ms,
+                ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_ANALYZE_DURATION,
+            ),
+        );
         push_split(&mut args, "-probesize");
-        args.push("1G".to_owned());
+        args.push(ferrofin_mediaencoding::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned());
+        // `GetUserAgentParam`, then `GetRefererParam`: the headers a remote
+        // source (a tuner, a playlist channel) requires, as the probe sends
+        // them. Each value is one argv element, never parsed as options.
+        for (header, flag) in [("User-Agent", "-user_agent"), ("Referer", "-referer")] {
+            if let Some(value) = state.media_source.required_http_headers.get(header) {
+                args.push(flag.to_owned());
+                args.push(value.clone());
+            }
+        }
+        // `GetInputModifier`: timestamp sync, then pacing, then the options
+        // the live-TV source settings drive (ignore DTS, stream looping).
+        args.extend(
+            ferrofin_mediaencoding::transcoding::segment_cleaner::input_sync_arguments(
+                state,
+                caps.ffmpeg_version(),
+            ),
+        );
+        args.extend(
+            ferrofin_mediaencoding::transcoding::segment_cleaner::input_rate_arguments(
+                state,
+                options,
+                caps.ffmpeg_version(),
+            ),
+        );
+        args.extend(
+            ferrofin_mediaencoding::transcoding::segment_cleaner::input_source_arguments(state),
+        );
         push_split(&mut args, "-i");
-        let input = self
-            .encoder
-            .get_input_argument(media_path, &state.media_source);
-        // `get_input_argument` shell-quotes the path (`file:"…"`, inner quotes
-        // `\"`-escaped) for the string-command probe path. The segment transcoder
+        let mut input_source = state.media_source.clone();
+        input_source.protocol =
+            ferrofin_mediaencoding::transcoding::throttler::effective_input_protocol(state);
+        let input = self.encoder.get_input_argument(media_path, &input_source);
+        // `get_input_argument` shell-quotes the path (`file:"…"`, inner `\` and
+        // `"` escaped) for the string-command probe path. The segment transcoder
         // spawns ffmpeg via argv (no shell), so those quotes would become part of
         // the filename and ffmpeg would fail to open it (exit 254) for any path
-        // containing a space. Unquote it back into a single argv token with shlex.
-        args.extend(shlex::split(&input).unwrap_or_else(|| vec![input]));
+        // containing a space. Unquote it back into a single argv token. `quote`
+        // always balances, and the fallback is one token, which can never add an
+        // option.
+        args.extend(split_args(&input).unwrap_or_else(|error| {
+            tracing::debug!(%error, "input argument does not split; passing it as one");
+            vec![input]
+        }));
+        // The rest of `GetInputArgument`: an external subtitle the job embeds
+        // or overlays, then an external audio track, as the inputs the maps
+        // and the overlay pads below number 1 and 2, each on the media
+        // file's clock.
+        args.extend(
+            ferrofin_mediaencoding::encoding_helper::helper::external_stream_input_arguments(
+                state,
+                fast_seek.as_deref(),
+                caps.ffmpeg_version(),
+            ),
+        );
 
         // ---- hardware video filters ------------------------------------------
         // The ported vendor chain owns the whole graph on the hardware path —
@@ -1271,9 +1821,7 @@ impl FerrofinStreamStatePlanner {
         // (`negativeMapArgs + args + videoProcessParam`).
         let mut hw_graph: Option<(&'static str, String)> = None;
         if hw_filters {
-            let seek_offset = segment_id
-                .filter(|&id| id > 0)
-                .map(|id| i64::from(id) * i64::from(state.segment_length_secs));
+            let seek_offset = segment_seek_ticks.map(round_to_whole_seconds);
             let sub_stream = state.subtitle_stream.as_ref().filter(|_| burn_sub);
             let (plain, alpha_sub2video) = sub_stream
                 .filter(|_| burn_text)
@@ -1283,7 +1831,7 @@ impl FerrofinStreamStatePlanner {
                             state,
                             sub,
                             media_path,
-                            burn_subtitle_path,
+                            burned_text,
                             false,
                             seek_offset,
                         ),
@@ -1291,7 +1839,7 @@ impl FerrofinStreamStatePlanner {
                             state,
                             sub,
                             media_path,
-                            burn_subtitle_path,
+                            burned_text,
                             true,
                             seek_offset,
                         ),
@@ -1339,11 +1887,7 @@ impl FerrofinStreamStatePlanner {
                 // the seek would put it in a time range the video never
                 // reaches, and nothing would be drawn at all.
                 start_time_ticks: 0,
-                // `doDeintH264 || doDeintHevc` — upstream asks under each
-                // spelling of the two codecs it deinterlaces.
-                deinterlace: ["h264", "avc", "h265", "hevc"]
-                    .iter()
-                    .any(|c| state.deinterlace(Some(c), true)),
+                deinterlace: state.is_deinterlace_available(),
                 // Computed, not assumed: the vendor chain falls back to the
                 // software chain on a build without the vendor's tonemap
                 // filter, and that fallback is the only tonemap an HDR source
@@ -1363,25 +1907,11 @@ impl FerrofinStreamStatePlanner {
                     video_stream,
                 ),
                 source_codec: video_stream.and_then(|v| v.codec.as_deref()),
-                is_dovi: hw::tonemap::is_dovi(video_stream),
+                requires_dovi_reshaping: hw::tonemap::requires_dovi_reshaping(video_stream),
                 is_hevc_rext: hw::decoder::is_video_stream_hevc_rext(video_stream),
                 subtitle,
             };
-            // `find_index`, not the stream's own `index` — the pads have to
-            // name the same numbers `map_args` does, and the two diverge as soon
-            // as a source's streams are not contiguously indexed. It matters
-            // most for an external subtitle, which is input 1 with a single
-            // stream at index 0 whatever its index in the parent source.
-            let streams = &state.media_source.media_streams;
-            let pads = hw::sw_chain::StreamPads {
-                subtitle_is_external: sub_stream.is_some_and(|s| s.is_external),
-                subtitle_index: sub_stream.map_or(0, |s| {
-                    ferrofin_mediaencoding::encoding_helper::helper::find_index(streams, s)
-                }),
-                video_index: video_stream.map_or(0, |v| {
-                    ferrofin_mediaencoding::encoding_helper::helper::find_index(streams, v)
-                }),
-            };
+            let pads = stream_pads(&state.media_source, sub_stream, video_stream);
             // Upstream dispatches `GetVideoProcessingFilterParam` on the
             // accelerator, and each vendor chain falls back to the software one
             // itself when its own pipeline cannot run.
@@ -1393,6 +1923,7 @@ impl FerrofinStreamStatePlanner {
             hw_graph = hw::sw_chain::video_processing_filter_args(
                 vendor_chain,
                 self.encoding_helper.framerate_param(state).map(f64::from),
+                state.is_deinterlace_available(),
                 pads,
                 burn_sub,
                 burn_text,
@@ -1428,19 +1959,37 @@ impl FerrofinStreamStatePlanner {
         // ---- video -----------------------------------------------------------
         push_split(&mut args, "-c:v");
         args.push(video_encoder.clone());
-        // HEVC output needs the `hvc1` codec tag to decode in browser MSE (only
-        // meaningful in fMP4). Keyed on the *output* codec: the source codec when
-        // copying, else the negotiated target (so `hevc_nvenc` tags too). Port of
-        // `DynamicHlsController`'s `-tag:v:0 hvc1`.
+        // Port of `DynamicHlsController.GetVideoArguments` tag selection:
+        // fMP4 HEVC/AV1 needs a codec tag so players can decode it.
         let output_codec = if copying_video {
             state.video_stream.as_ref().and_then(|s| s.codec.as_deref())
         } else {
             state.output_video_codec.as_deref()
         };
         let output_is_hevc = output_codec.is_some_and(is_hevc);
-        if output_is_hevc && segment_container.eq_ignore_ascii_case("mp4") {
-            push_split(&mut args, "-tag:v:0");
-            args.push("hvc1".to_owned());
+        let output_is_av1 = output_codec.is_some_and(|c| c.eq_ignore_ascii_case("av1"));
+        if (output_is_hevc || output_is_av1) && segment_container.eq_ignore_ascii_case("mp4") {
+            let video_is_dovi = hw::tonemap::is_dovi(state.video_stream.as_ref());
+            let actual_codec = state.actual_output_video_codec();
+            let client_supports_dovi = actual_codec
+                .map(|c| state.requested_range_types(c))
+                .is_some_and(|r| r.iter().any(|s| s.eq_ignore_ascii_case("DOVI")));
+            if copying_video
+                && video_is_dovi
+                && client_supports_dovi
+                && !bitstream::is_dovi_removed(caps, state)
+            {
+                push_split(&mut args, "-tag:v:0");
+                if output_is_hevc {
+                    args.push(dolby_vision_hevc_codec_tag(state.video_stream.as_ref()).to_owned());
+                } else {
+                    args.push("dav1".to_owned());
+                }
+                push_split(&mut args, "-strict -2");
+            } else if output_is_hevc {
+                push_split(&mut args, "-tag:v:0");
+                args.push("hvc1".to_owned());
+            }
         }
         // ---- bitstream filters -----------------------------------------------
         // Only on a stream copy: a re-encode produces a fresh bitstream that
@@ -1453,6 +2002,11 @@ impl FerrofinStreamStatePlanner {
         // already in Annex B form gets no `-bsf:v` at all, so its Dolby Vision
         // RPU survives even when the client asked for it gone.
         if copying_video
+            && (!progressive
+                || state
+                    .output_container
+                    .as_deref()
+                    .is_some_and(|container| container.eq_ignore_ascii_case("ts")))
             && state
                 .video_stream
                 .as_ref()
@@ -1477,13 +2031,16 @@ impl FerrofinStreamStatePlanner {
                 &mut args,
                 &hw::quality::hardware_quality_preamble(&decode_ctx, options, &video_encoder),
             );
+            // The probed capabilities, not the helper's boot ones: only the
+            // probe knows whether the VAAPI driver is iHD.
             push_split(
                 &mut args,
-                &self.encoding_helper.video_quality_param(
+                &self.encoding_helper.video_quality_param_with(
+                    caps,
                     state,
                     &video_encoder,
                     options,
-                    if is_event_playlist {
+                    if is_event_playlist || progressive {
                         DEFAULT_EVENT_ENCODER_PRESET
                     } else {
                         DEFAULT_ENCODER_PRESET
@@ -1491,48 +2048,48 @@ impl FerrofinStreamStatePlanner {
                 ),
             );
             let output_framerate = self.encoding_helper.framerate_param(state);
-            // Force a keyframe at every segment boundary so the HLS muxer cuts
+            // Put a keyframe at every segment boundary so the HLS muxer cuts
             // exactly on `-hls_time`. Without this, ffmpeg can only cut at the
             // encoder's natural GOP (libx264 keyint ≈250 frames ≈10 s), so the
             // first segment overruns its target length and time-to-first-segment
-            // — the dominant startup latency — balloons. Port of Jellyfin's
-            // `keyFrameArg`/`gopArg`.
-            if nvenc_video {
-                // NVENC ignores the `-force_key_frames` expression; pin the GOP
-                // instead (Jellyfin's gopArg): N = ceil(segment_len × fps).
-                let fps = output_framerate
-                    .or_else(|| {
-                        state
-                            .video_stream
-                            .as_ref()
-                            .and_then(MediaStream::reference_frame_rate)
-                    })
-                    .unwrap_or(DEFAULT_KEYFRAME_FPS);
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "keyint is a small positive frame count"
-                )]
-                let keyint = (f64::from(fps) * f64::from(state.segment_length_secs)).ceil() as i64;
-                push_split(&mut args, "-g:v:0");
-                args.push(keyint.to_string());
-                push_split(&mut args, "-keyint_min:v:0");
-                args.push(keyint.to_string());
-                push_split(&mut args, "-sc_threshold:v:0");
-                args.push("0".to_owned());
+            // — the dominant startup latency — balloons.
+            if progressive {
+                // `GetProgressiveVideoArguments`' fixed five-second interval.
+                push_split(&mut args, "-force_key_frames:0 expr:gte(t,n_forced*5)");
             } else {
-                push_split(&mut args, "-force_key_frames:0");
-                args.push(format!(
-                    "expr:gte(t,n_forced*{})",
-                    state.segment_length_secs
-                ));
+                // The GOP counts output frames, and ffmpeg encodes an hls
+                // output at a constant rate: the `-r` this job sets, else the
+                // rate it guesses from the source. Divergence: upstream reads
+                // `RealFrameRate` alone, which pins a GOP of two segments when
+                // `-r` halves the rate; see `guessed_frame_rate` for the other.
+                let frame_rate = output_framerate
+                    .or_else(|| state.video_stream.as_ref().and_then(guessed_frame_rate));
+                push_split(
+                    &mut args,
+                    &ferrofin_mediaencoding::encoding_helper::helper::hls_video_key_frame_arguments(
+                        caps,
+                        &video_encoder,
+                        state.segment_length_secs,
+                        frame_rate,
+                    ),
+                );
+                // "Currently b-frames in libx265 breaks the FMP4-HLS playback
+                // on iOS": every HLS libx265 job on an older ffmpeg, whatever
+                // its segment container. An unknown version counts as older,
+                // as C#'s `null < version` does.
+                if video_encoder.eq_ignore_ascii_case("libx265")
+                    && !caps.ffmpeg_at_least(MIN_FFMPEG_X265_BFRAME_IN_FMP4)
+                {
+                    push_split(&mut args, "-bf 0");
+                }
             }
             // The plain software filter chain (downscale/tonemap/8-bit); the
             // burn-in branches below fold `sw_filters` into their own graphs
             // instead (two `-vf`s would override each other).
-            if !burn_sub && !sw_filters.is_empty() {
+            let main = with_frame_rate_cap(sw_filters.clone(), sw_fps.as_deref(), sw_deinterlace);
+            if !burn_sub && !main.is_empty() {
                 args.push("-vf".to_owned());
-                args.push(sw_filters.join(","));
+                args.push(main.join(","));
             }
         }
         // `GetVideoArguments`' "TODO why was this not enabled for VOD?": an
@@ -1544,6 +2101,18 @@ impl FerrofinStreamStatePlanner {
             push_split(&mut args, "-flags -global_header");
         }
 
+        if progressive && state.video_stream.is_some() {
+            push_split(&mut args, "-map_metadata -1 -map_chapters -1");
+            if copying_video && state.run_time_ticks.is_none() {
+                push_split(&mut args, "-fflags +genpts");
+            }
+            if state.base_request.copy_timestamps && state.run_time_ticks.is_some() {
+                push_split(
+                    &mut args,
+                    "-copyts -avoid_negative_ts disabled -start_at_zero",
+                );
+            }
+        }
         // ---- threads ---------------------------------------------------------
         let threads = self.encoding_helper.number_of_threads(Some(state), options);
         push_split(&mut args, "-threads");
@@ -1554,22 +2123,88 @@ impl FerrofinStreamStatePlanner {
             let audio_encoder = self.encoding_helper.audio_encoder(state);
             push_split(&mut args, "-c:a");
             args.push(audio_encoder.clone());
+            let source_container = state.input_container.as_deref().unwrap_or_default();
+            // Without upstream's `-copyts` (see `-output_ts_offset` below), a
+            // seeked segment's packets count from the input seek, and so must
+            // the copied-audio trim.
+            if let Some(bsf) =
+                ferrofin_mediaencoding::encoding_helper::bitstream::audio_bit_stream_arguments(
+                    state,
+                    segment_container,
+                    source_container,
+                    segment_seek_ticks.unwrap_or(0),
+                    caps.ffmpeg_version(),
+                )
+            {
+                push_split(&mut args, &bsf);
+            }
             if !EncodingJobInfo::is_copy_codec(Some(&audio_encoder)) {
-                if let Some(bitrate) = self.encoding_helper.audio_bitrate_param(
-                    state.output_audio_bitrate,
-                    Some(&audio_encoder),
-                    state.audio_stream.as_ref(),
-                    state.output_audio_channels,
-                ) {
-                    push_split(&mut args, "-b:a");
-                    args.push(bitrate.to_string());
+                // `-ab state.OutputAudioBitrate` as planned, skipped for a
+                // lossless encoder. Recomputing it from the encoder name
+                // (`libmp3lame`, not `mp3`) dropped the client's bitrate cap.
+                if let Some(bitrate) = state
+                    .output_audio_bitrate
+                    .filter(|_| !is_lossless_audio_codec(&audio_encoder))
+                {
+                    // `EnableAudioVbr && state.EnableAudioVbrEncoding`: the VBR
+                    // quality `GetAudioVbrModeParam` picks for the encoder,
+                    // else `-ab`.
+                    let vbr = (options.enable_audio_vbr
+                        && state.base_request.enable_audio_vbr_encoding)
+                        .then(|| {
+                            ferrofin_mediaencoding::encoding_helper::helper::audio_vbr_mode_param(
+                                &audio_encoder,
+                                bitrate,
+                                state.output_audio_channels.unwrap_or(2),
+                            )
+                        })
+                        .flatten();
+                    if let Some(vbr) = vbr {
+                        push_split(&mut args, &vbr);
+                    } else {
+                        push_split(&mut args, "-b:a");
+                        args.push(bitrate.to_string());
+                    }
                 }
-                if let Some(channels) = state.output_audio_channels {
+                // Suppress `-ac` when the downmix algorithm filter is active:
+                // the `pan=stereo|…` filter already sets the output to stereo,
+                // and an explicit `-ac 2` would conflict. Port of the
+                // `useDownMixAlgorithm` guard in `GetDynamicHlsAudioArgs`.
+                if let Some(channels) = state.output_audio_channels
+                    && !ferrofin_mediaencoding::encoding_helper::downmix::uses_downmix_algorithm(
+                        state, options,
+                    )
+                {
                     push_split(&mut args, "-ac");
                     args.push(channels.to_string());
                 }
-                // Downmix volume boost (GetAudioFilterParam): a >stereo →
-                // stereo downmix is roughly half as loud, so boost it back.
+                // `DynamicHlsController.GetAudioArguments`: the output sample
+                // rate, else (video output only) 48 kHz for ac-4, whose odd
+                // native rates most encoders refuse. An opus encode snaps the
+                // rate to one libopus accepts, as upstream's progressive path
+                // does (`GetProgressiveAudioFullCommandLine`); upstream's HLS
+                // arm passes it unsnapped and libopus then fails to start
+                // ("sample rate … is not supported"), which is not ported.
+                if let Some(rate) = state.output_audio_sample_rate() {
+                    let rate = if audio_encoder.contains("opus") {
+                        opus_sample_rate(rate)
+                    } else {
+                        rate
+                    };
+                    push_split(&mut args, "-ar");
+                    args.push(rate.to_string());
+                } else if state.is_input_video
+                    && state
+                        .audio_stream
+                        .as_ref()
+                        .and_then(|a| a.codec_tag.as_deref())
+                        == Some("ac-4")
+                {
+                    push_split(&mut args, "-ar");
+                    args.push("48000".to_owned());
+                }
+                // Downmix filters (GetAudioFilterParam): algorithm pan=
+                // filter (if configured) + volume boost for >stereo → stereo.
                 if let Some(af) =
                     ferrofin_mediaencoding::encoding_helper::helper::audio_filter_param(
                         state, options,
@@ -1593,54 +2228,119 @@ impl FerrofinStreamStatePlanner {
             && !hw_filters
             && let Some(sub) = state.subtitle_stream.as_ref()
         {
-            use std::fmt::Write as _;
-            let mut chain = String::new();
             // Downscale/tonemap ahead of the subtitle render, so the text is
             // drawn at output resolution in SDR.
-            for filter in &sw_filters {
-                let _ = write!(chain, "{filter},");
-            }
-            let offset_secs = segment_id
-                .filter(|&id| id > 0)
-                .map(|id| i64::from(id) * i64::from(state.segment_length_secs));
-            chain.push_str(&Self::text_subtitle_filter(
+            let mut chain = sw_filters.clone();
+            let offset_secs = segment_seek_ticks.map(round_to_whole_seconds);
+            chain.push(Self::text_subtitle_filter(
                 state,
                 sub,
                 media_path,
-                burn_subtitle_path,
+                burned_text,
                 false,
                 offset_secs,
             ));
             args.push("-vf".to_owned());
-            args.push(chain);
+            args.push(with_frame_rate_cap(chain, sw_fps.as_deref(), sw_deinterlace).join(","));
         }
 
         // ---- graphical subtitle burn-in --------------------------------------
-        // Composite the (bitmap) subtitle stream onto the video: `overlay` takes
-        // the base video and the decoded subtitle as its two inputs and emits the
+        // `GetSwVidFilterChain`'s graphical branch, assembled as
+        // `GetVideoProcessingFilterParam` does: the subtitle is first fitted to
+        // the output frame (`GetGraphicalSubPreProcessFilters`), so a bitmap
+        // authored for one canvas lands where it should on another (a 1080p
+        // PGS on a 720p or a 2160p encode), then overlaid on the base video,
+        // which is downscaled and tonemapped first. The graph ends in the
         // labelled `[v]` that `map_args` maps in place of the raw video.
         if burn_graphical
             && !hw_filters
             && let Some(sub) = state.subtitle_stream.as_ref()
         {
-            let sub_idx = sub.index.max(0);
-            let vid_idx = state.video_stream.as_ref().map_or(0, |v| v.index.max(0));
-            // No hardware format conversion here: this block runs only when
-            // the matrix did not claim the job, so the frames are in system
-            // memory and the software chain above has already set the format.
-            push_split(&mut args, "-filter_complex");
-            if sw_filters.is_empty() {
-                args.push(format!("[0:{vid_idx}][0:{sub_idx}]overlay[v]"));
+            let video = state.video_stream.as_ref();
+            let pads = stream_pads(&state.media_source, Some(sub), video);
+            // The scaler sees the transpose of a frame rotated by 90 degrees.
+            let (width, height) = (video.and_then(|v| v.width), video.and_then(|v| v.height));
+            let (width, height) = if video.and_then(|v| v.rotation).unwrap_or(0).abs() == 90 {
+                (height, width)
             } else {
-                // Downscale/tonemap the base video before compositing, so the
-                // bitmap subtitle is overlaid in SDR at output resolution.
-                args.push(format!(
-                    "[0:{vid_idx}]{}[base];[base][0:{sub_idx}]overlay[v]",
-                    sw_filters.join(",")
-                ));
+                (width, height)
+            };
+            let fit = hw::filters::graphical_sub_preprocess_filters(
+                width, height, sub.width, sub.height, requested,
+            );
+            let chain = hw::sw_chain::FilterChain {
+                // No hardware format conversion here: this block runs only when
+                // the matrix did not claim the job, so the frames are in system
+                // memory and the software chain above has already set the
+                // format. The frame-rate cap is already in place.
+                main: with_frame_rate_cap(sw_filters.clone(), sw_fps.as_deref(), sw_deinterlace),
+                // With no output size to fit to (a video stream without
+                // dimensions), `null` keeps the subtitle as authored.
+                sub: vec![if fit.is_empty() {
+                    "null".to_owned()
+                } else {
+                    fit
+                }],
+                overlay: vec!["overlay=eof_action=pass:repeatlast=0".to_owned()],
+            };
+            // Always a graph: the sub and overlay lists are never empty here.
+            if let Some((flag, graph)) = hw::sw_chain::video_processing_filter_args(
+                chain,
+                None,
+                sw_deinterlace,
+                pads,
+                true,
+                false,
+            ) {
+                args.push(flag.to_owned());
+                args.push(format!("{graph}[v]"));
             }
         }
 
+        if progressive {
+            // The native progressive muxer writes one growing file. MP4 needs
+            // its initial movie header before the complete file is available.
+            let container = state.output_container.as_deref().unwrap_or_default();
+            if state.video_stream.is_none() {
+                push_split(&mut args, "-vn -id3v2_version 3 -write_id3v1 1");
+                let encoder = self.encoding_helper.audio_encoder(state);
+                if container.eq_ignore_ascii_case("pcm")
+                    && let Some(raw) = encoder.strip_prefix("pcm_")
+                {
+                    push_split(&mut args, "-f");
+                    args.push(raw.to_owned());
+                }
+                if ["mp4", "m4a", "m4b", "mov"]
+                    .iter()
+                    .any(|candidate| container.eq_ignore_ascii_case(candidate))
+                {
+                    push_split(&mut args, "-movflags empty_moov+delay_moov");
+                }
+            } else {
+                // `GetProgressiveVideoFullCommandLine`: the subtitle embed
+                // arguments follow the audio's, ahead of the output format.
+                push_split(
+                    &mut args,
+                    &ferrofin_mediaencoding::encoding_helper::helper::subtitle_embed_arguments(
+                        state,
+                    ),
+                );
+                if playlist_path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
+                    && state.base_request.context
+                        == ferrofin_model::dlna::EncodingContext::Streaming
+                {
+                    push_split(
+                        &mut args,
+                        "-f mp4 -movflags frag_keyframe+empty_moov+delay_moov",
+                    );
+                }
+            }
+            push_split(&mut args, "-y");
+            args.push(playlist_path.to_string_lossy().into_owned());
+            return (args, hwaccel_input.env);
+        }
         // ---- HLS muxer -------------------------------------------------------
         let dir = playlist_path
             .parent()
@@ -1649,6 +2349,10 @@ impl FerrofinStreamStatePlanner {
             .file_stem()
             .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
         let ext = segment_file_extension(segment_container);
+        // DynamicHlsController floors the output muxing queue at 128. This
+        // applies to both copied and encoded streams, including audio-only HLS.
+        push_split(&mut args, "-max_muxing_queue_size");
+        args.push(options.max_muxing_queue_size.max(128).to_string());
         push_split(&mut args, "-f");
         args.push("hls".to_owned());
         push_split(&mut args, "-hls_time");
@@ -1672,6 +2376,24 @@ impl FerrofinStreamStatePlanner {
         if segment_container.eq_ignore_ascii_case("mp4") {
             push_split(&mut args, "-hls_fmp4_init_filename");
             args.push(format!("{stem}-1.{ext}"));
+            // fMP4 with video (`DynamicHlsController.cs:1610-1617`, PR 17501):
+            // `frag_discont` writes each track's real start DTS, the audio
+            // priming delay included, into the fragments' `tfdt`; `skip_sidx`
+            // stops movenc rewriting an open-GOP boundary packet's PTS for a
+            // SIDX that HLS never reads. An audio request has no video stream
+            // here, which is upstream's `VideoStream is not null &&
+            // IsOutputVideo`.
+            if state.video_stream.is_some() {
+                push_split(
+                    &mut args,
+                    if caps.ffmpeg_at_least(MIN_FFMPEG_HLS_SEGMENT_OPTIONS) {
+                        "-hls_segment_options"
+                    } else {
+                        "-hls_ts_options"
+                    },
+                );
+                args.push("movflags=+frag_discont+skip_sidx".to_owned());
+            }
         }
         // Number the output segments from the requested index (GetStartNumber).
         // A seek asks for segment N: we seek the input (`-ss`) to N and restart
@@ -1691,17 +2413,17 @@ impl FerrofinStreamStatePlanner {
             args.push(format!("hls/{stem}/"));
         }
         // Align a seek-restarted transcode's timestamps to this segment's place
-        // in the playlist. The `-ss` input seek makes ffmpeg reset output PTS to
-        // ~0, so segment N would carry PTS ~0 instead of N*segment_len — the
-        // player then sees a discontinuity across the seek boundary and stalls.
-        // Shift the (zero-based) output timestamps forward by the seek time so
-        // segment N's PTS is ≈ N*segment_len and hls.js can splice it in. (Not
-        // `-copyts`, which preserves the source's arbitrary start offset and
-        // desyncs the muxer's segment numbering.)
-        if let Some(id) = segment_id.filter(|&id| id > 0) {
-            let offset_secs = i64::from(id) * i64::from(state.segment_length_secs);
+        // in the playlist. The `-ss` input seek makes ffmpeg subtract the seek
+        // time from the output PTS, so segment N would carry PTS ~0 instead of
+        // its playlist time — the player then sees a discontinuity across the
+        // seek boundary and stalls. Shift the output timestamps forward by that
+        // same seek time (a remux's half second and the end-of-file clamp
+        // included), so they keep the source's timeline and hls.js can splice
+        // the segment in. (Not `-copyts`, which preserves the source's
+        // arbitrary start offset and desyncs the muxer's segment numbering.)
+        if let Some(ticks) = segment_seek_ticks {
             push_split(&mut args, "-output_ts_offset");
-            args.push(offset_secs.to_string());
+            args.push(seconds_from_ticks(ticks));
         }
         push_split(&mut args, "-hls_segment_filename");
         args.push(format!("{dir}/{stem}%d.{ext}"));
@@ -1713,18 +2435,6 @@ impl FerrofinStreamStatePlanner {
     }
 }
 
-/// The output audio channel count for `-ac`, a focused port of
-/// `EncodingHelper.GetAudioChannels`.
-///
-/// Resolves the client-requested channels (`GetRequestedAudioChannels`, which
-/// already prefers an explicit request over `TranscodingMaxAudioChannels`),
-/// clamps to the source stream's channel count, and — when the audio is being
-/// re-encoded — clamps again to `TranscodingMaxAudioChannels` as a hard ceiling.
-/// Returns `None` when no cap applies, leaving the source channels untouched.
-///
-/// The full C# method additionally imposes the encoder's 8-channel ceiling and a
-/// 3/5/7-channel HLS layout fix (adding an LFE channel); those are omitted —
-/// web/TV profiles cap at 2 or 6 channels, where neither branch fires.
 /// The per-encoder transcode channel ceiling. Port of Jellyfin's
 /// `_audioTranscodeChannelLookup`: lossy stereo-only encoders cap at 2, the
 /// surround codecs cap at 6 (5.1), and anything unlisted defaults to 8 to avoid
@@ -1738,6 +2448,16 @@ fn audio_transcode_channel_limit(encoder: &str) -> i32 {
     }
 }
 
+/// The output audio channel count for `-ac`, a port of
+/// `EncodingHelper.GetAudioChannels`.
+///
+/// Resolves the client-requested channels (`GetRequestedAudioChannels`, which
+/// already prefers an explicit request over `TranscodingMaxAudioChannels`) and
+/// clamps them to the source stream's channel count. When the audio is being
+/// re-encoded it clamps again, to the encoder's ceiling
+/// ([`audio_transcode_channel_limit`]) and to `TranscodingMaxAudioChannels`,
+/// then moves a 3/5/7-channel HLS layout to one HLS carries. Returns `None`
+/// when no cap applies, leaving the source channels untouched.
 fn resolve_output_audio_channels(
     state: &EncodingJobInfo,
     output_audio_codec: Option<&str>,
@@ -1785,9 +2505,10 @@ fn resolve_output_audio_channels(
 /// via the `subtitles` filter. The graphical (PGS/DVDSUB) counterpart is
 /// [`burns_graphical_subtitle`](ferrofin_mediaencoding::encoding_helper::helper::burns_graphical_subtitle);
 /// text subs are normally delivered externally, so this only fires when the
-/// client explicitly asks for Encode (e.g. the "burn all subtitles" setting).
+/// client asks for Encode or sets `alwaysBurnInSubtitleWhenTranscoding`
+/// (`ShouldEncodeSubtitle`).
 fn burns_text_subtitle(state: &EncodingJobInfo) -> bool {
-    state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
+    should_encode_subtitle(state)
         && state.video_stream.is_some()
         && state
             .subtitle_stream
@@ -1802,6 +2523,62 @@ fn escape_subtitle_filter_path(path: &str) -> String {
     path.replace('\\', "/")
         .replace(':', "\\:")
         .replace('\'', "'\\\\\\''")
+}
+
+/// The libopus sample rate for a requested `rate` — the snapping upstream's
+/// `GetProgressiveAudioFullCommandLine` applies (opus encodes only these).
+fn opus_sample_rate(rate: i32) -> i32 {
+    match rate {
+        ..=8_000 => 8_000,
+        8_001..=12_000 => 12_000,
+        12_001..=16_000 => 16_000,
+        16_001..=24_000 => 24_000,
+        _ => 48_000,
+    }
+}
+
+/// Where the input seek lands, in ticks, or `None` when the job starts at the
+/// beginning. Port of `GetFastSeekCommandLineParameter`'s arithmetic.
+///
+/// The requested start (`start_time_ticks`: a segment's playlist time, or a
+/// progressive stream's offset) plus `remux_offset` (an HLS remux's half
+/// second), clamped to `[0, runtime − 5 s]` whenever the runtime is known,
+/// for every job type: "seeking beyond EOF makes no sense in transcoding".
+/// The 5 s is upstream's fixed `50000000L`. The request keeps the unclamped
+/// value, which is what the job logs report.
+fn fast_seek_ticks(state: &EncodingJobInfo, remux_offset: i64) -> Option<i64> {
+    let time = state
+        .base_request
+        .start_time_ticks
+        .filter(|ticks| *ticks > 0)?;
+    let seek = time.saturating_add(remux_offset);
+    Some(match state.run_time_ticks.filter(|runtime| *runtime > 0) {
+        Some(runtime) => seek.clamp(0, runtime.saturating_sub(5 * TICKS_PER_SECOND).max(0)),
+        None => seek,
+    })
+}
+
+/// Positive `ticks` in whole seconds, rounded half to even as upstream's
+/// subtitle filters round `TimeSpan.TotalSeconds` (`Math.Round`).
+fn round_to_whole_seconds(ticks: i64) -> i64 {
+    let (whole, rest) = (ticks / TICKS_PER_SECOND, ticks % TICKS_PER_SECOND);
+    match (2 * rest).cmp(&TICKS_PER_SECOND) {
+        std::cmp::Ordering::Less => whole,
+        std::cmp::Ordering::Greater => whole + 1,
+        std::cmp::Ordering::Equal => whole + (whole & 1),
+    }
+}
+
+/// Positive `ticks` as ffmpeg seconds: `6` for a whole second, `7.12` otherwise.
+fn seconds_from_ticks(ticks: i64) -> String {
+    let (whole, fraction) = (ticks / TICKS_PER_SECOND, ticks % TICKS_PER_SECOND);
+    if fraction == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction:07}")
+            .trim_end_matches('0')
+            .to_owned()
+    }
 }
 
 /// Pushes each whitespace-separated token of `fragment` as its own arg.
@@ -1833,12 +2610,32 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     request.live_stream_id.hash(&mut hasher);
     request.audio_codec.hash(&mut hasher);
     request.video_codec.hash(&mut hasher);
+    // Saved policy can change the effective codecs on an otherwise identical
+    // URL. Do not serve a previous encoder job after a permission change.
+    request.playback_permissions.hash(&mut hasher);
+    // ForceRemoteSourceTranscoding changes these negotiated vetoes. A new
+    // encoding request must not reuse a copied stream with the same session.
+    request.allow_video_stream_copy.hash(&mut hasher);
+    request.allow_audio_stream_copy.hash(&mut hasher);
+    // A newly negotiated internet bitrate limit changes the encoded output,
+    // even when a client retains its playback session and codec selection.
+    request.video_bitrate.hash(&mut hasher);
+    request.audio_bitrate.hash(&mut hasher);
     // A burned-in subtitle changes the video, so it must key the cache — else a
     // subtitled and non-subtitled transcode of the same item would collide. The
     // method keys it too: the same index with `SubtitleMethod=Encode` vs `Embed`
     // produces different video.
     query_param_i32(&request.query_string, "SubtitleStreamIndex").hash(&mut hasher);
     query_param(&request.query_string, "SubtitleMethod").hash(&mut hasher);
+    request
+        .always_burn_in_subtitle_when_transcoding
+        .hash(&mut hasher);
+    // The chosen tracks and the output rate shape the output as well: a
+    // re-request on the same session naming another audio track must not
+    // replay the previous track's segments.
+    request.audio_stream_index.hash(&mut hasher);
+    request.video_stream_index.hash(&mut hasher);
+    request.audio_sample_rate.hash(&mut hasher);
     segment_container.hash(&mut hasher);
     is_audio.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
@@ -1856,10 +2653,52 @@ fn segment_path(playlist: &std::path::Path, index: i32, extension: &str) -> Path
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ferrofin_traits::system::ServerApplicationPaths as _;
+
+    use ferrofin_model::configuration::HlsAudioSeekStrategy;
     use ferrofin_model::entities_media::MediaAttachment;
     use ferrofin_model::media_info::LiveStreamRequest;
+    use rstest::rstest;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    #[rstest]
+    #[case(Some(8), "hvc1")]
+    #[case(Some(5), "dvh1")]
+    #[case(Some(7), "dvh1")]
+    #[case(None, "dvh1")]
+    fn dolby_vision_hevc_codec_tag_selects_tag_for_profile(
+        #[case] profile: Option<i32>,
+        #[case] expected: &str,
+    ) {
+        let stream = MediaStream {
+            dv_profile: profile,
+            ..MediaStream::default()
+        };
+        assert_eq!(dolby_vision_hevc_codec_tag(Some(&stream)), expected);
+    }
+
+    #[test]
+    fn raw_query_params_match_keys_ignoring_case() {
+        // The transcode URL reaches the planner as sent (the server no longer
+        // folds query keys), and ASP.NET's `IQueryCollection` ignores case.
+        for query in [
+            "?SubtitleStreamIndex=3&SubtitleMethod=Encode",
+            "?subtitleStreamIndex=3&subtitleMethod=Encode",
+            "?SUBTITLESTREAMINDEX=3&subtitlemethod=Encode",
+        ] {
+            assert_eq!(
+                query_param_i32(query, "SubtitleStreamIndex"),
+                Some(3),
+                "{query}"
+            );
+            assert_eq!(
+                query_param(query, "SubtitleMethod"),
+                Some("Encode"),
+                "{query}"
+            );
+        }
+    }
 
     /// A fake [`MediaSourceManager`] returning a fixed source list, plus the
     /// open live streams `get_live_stream` can hand back.
@@ -1974,8 +2813,13 @@ mod tests {
             Ok(String::new())
         }
         fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
-            // Mirror the real encoder, which shell-quotes the path.
-            format!("file:\"{input_file}\"")
+            // The real encoder's quoting, so the planner's unquoting is tested
+            // against it.
+            ferrofin_mediaencoding::encoder::get_input_argument(
+                "file",
+                input_file,
+                ferrofin_model::media_info::MediaProtocol::File,
+            )
         }
         fn get_time_parameter(&self, ticks: i64) -> String {
             format!("-ss {ticks}")
@@ -2117,15 +2961,16 @@ mod tests {
     ) -> FerrofinStreamStatePlanner {
         let encoder: Arc<dyn MediaEncoder> = Arc::new(FakeEncoder);
         let helper = EncodingHelper::with_processor_count(caps, 8);
+        let temp = tempfile::tempdir().expect("owned transcode cache");
         let paths = Arc::new(FerrofinServerApplicationPaths::new(
             "/data",
             std::path::PathBuf::from("/data/log"),
             "/config",
-            "/cache",
+            temp.path().join("cache"),
             "/web",
         ));
         let config: Arc<dyn ServerConfigurationManager> =
-            Arc::new(FakeConfig(Arc::clone(&paths), options));
+            Arc::new(FakeConfig(Arc::clone(&paths), options, temp));
         // The disabled stub always errors, exercising the `si=` burn fallback.
         let subtitles: Arc<dyn SubtitleEncoder> =
             Arc::new(ferrofin_traits::stubs::DisabledSubtitleEncoder);
@@ -2141,7 +2986,11 @@ mod tests {
     }
 
     /// A fake [`ServerConfigurationManager`] exposing only the application paths.
-    struct FakeConfig(Arc<FerrofinServerApplicationPaths>, EncodingOptions);
+    struct FakeConfig(
+        Arc<FerrofinServerApplicationPaths>,
+        EncodingOptions,
+        #[allow(dead_code)] tempfile::TempDir,
+    );
 
     #[async_trait]
     impl ServerConfigurationManager for FakeConfig {
@@ -2190,6 +3039,514 @@ mod tests {
         }
     }
 
+    /// `request` as the URL of `segment` carries it in a playlist with a
+    /// nominal 3 s spacing: `runtimeTicks` is where the segment starts.
+    fn at_segment(request: HlsStreamRequest, segment: i64) -> HlsStreamRequest {
+        HlsStreamRequest {
+            current_runtime_ticks: segment * 3 * TICKS_PER_SECOND,
+            ..request
+        }
+    }
+
+    /// A planner with actual persisted encoding configuration and owned paths.
+    async fn planner_with_persisted_encoding(
+        sources: Vec<MediaSourceInfo>,
+        root: &std::path::Path,
+    ) -> (FerrofinStreamStatePlanner, PathBuf) {
+        let mut planner = planner(sources);
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            root.join("data"),
+            root.join("log"),
+            root.join("config"),
+            root.join("cache"),
+            root.join("web"),
+        ));
+        let file =
+            PathBuf::from(paths.user_configuration_directory_path()).join("named/encoding.json");
+        planner.config = Arc::new(
+            ferrofin_core::FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+                .await
+                .expect("persisted configuration"),
+        );
+        planner.paths = paths;
+        (planner, file)
+    }
+
+    /// A broken `encoding.json` plans on the defaults, as upstream's
+    /// `BaseConfigurationManager.LoadConfiguration` does, which turns a
+    /// configured hardware accelerator off. That must leave a trace naming the
+    /// file — once, not once per job (LOGGING.md §1).
+    #[tokio::test]
+    async fn a_broken_encoding_file_is_warned_about_once_with_its_path() {
+        let root = tempfile::tempdir().expect("owned configuration");
+        let (planner, file) = planner_with_persisted_encoding(Vec::new(), root.path()).await;
+        std::fs::create_dir_all(file.parent().expect("named dir")).expect("named dir");
+        std::fs::write(&file, b"{ \"HardwareAccelerationType\": \"nvenc\", }")
+            .expect("encoding.json");
+
+        let logs = crate::test_logs::CapturedLogs::default();
+        let guard = logs.install();
+        let first = planner.encoding_options().await;
+        let second = planner.encoding_options().await;
+        drop(guard);
+
+        assert_eq!(first, EncodingOptions::default());
+        assert_eq!(second, EncodingOptions::default());
+        let warnings = logs.lines_at("WARN");
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(
+            warnings[0].contains(&file.display().to_string()),
+            "{warnings:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_encoding_threads_and_request_limit_reach_new_job_arguments() {
+        let root = tempfile::tempdir().expect("owned configuration");
+        let (planner, file) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![video_stream("hevc"), audio_stream("aac")],
+            )],
+            root.path(),
+        )
+        .await;
+        for (configured, limit, expected) in [
+            (-1, None, 0),
+            (0, None, 0),
+            (3, None, 3),
+            (i32::MAX, None, 8),
+            (7, Some(2), 2),
+            (7, Some(0), 0),
+            (7, Some(-1), 0),
+            (0, Some(3), 3),
+        ] {
+            let options = EncodingOptions {
+                encoding_thread_count: configured,
+                ..EncodingOptions::default()
+            };
+            ferrofin_util::file_helper::atomic_write(
+                &file,
+                &serde_json::to_vec(&options).expect("serialize"),
+            )
+            .expect("save encoding options");
+            let mut req = request("abc");
+            req.video_codec = Some("h264".into());
+            req.cpu_core_limit = limit;
+            let plan = planner
+                .plan(&req, false, Some(0), PlaylistKind::Vod)
+                .await
+                .expect("plan");
+            let index = plan
+                .arguments
+                .iter()
+                .position(|argument| argument == "-threads")
+                .expect("threads");
+            assert_eq!(
+                plan.arguments[index + 1],
+                expected.to_string(),
+                "configured={configured} limit={limit:?}"
+            );
+            assert_eq!(plan.encoding_options.encoding_thread_count, configured);
+            assert_eq!(plan.state.base_request.cpu_core_limit, limit);
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_auto_and_explicit_presets_reach_event_and_vod_jobs() {
+        let root = tempfile::tempdir().expect("owned configuration");
+        let (planner, file) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![video_stream("hevc"), audio_stream("aac")],
+            )],
+            root.path(),
+        )
+        .await;
+        for (preset, expected) in [
+            (EncoderPreset::auto, "veryfast"),
+            (EncoderPreset::superfast, "superfast"),
+            (EncoderPreset::medium, "medium"),
+        ] {
+            let options = EncodingOptions {
+                encoder_preset: preset,
+                h264_crf: 18,
+                ..EncodingOptions::default()
+            };
+            ferrofin_util::file_helper::atomic_write(
+                &file,
+                &serde_json::to_vec(&options).expect("serialize"),
+            )
+            .expect("save encoding options");
+            for kind in [PlaylistKind::Vod, PlaylistKind::Event] {
+                let mut req = request("abc");
+                req.video_codec = Some("h264".into());
+                let plan = planner
+                    .plan(&req, false, Some(0), kind)
+                    .await
+                    .expect("plan");
+                let preset_index = plan
+                    .arguments
+                    .iter()
+                    .position(|argument| argument == "-preset")
+                    .expect("preset");
+                let crf_index = plan
+                    .arguments
+                    .iter()
+                    .position(|argument| argument == "-crf")
+                    .expect("CRF");
+                assert_eq!(plan.arguments[preset_index + 1], expected);
+                assert_eq!(plan.arguments[crf_index + 1], "18");
+                assert_eq!(plan.encoding_options.encoder_preset, preset);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_codec_allow_flags_reorder_new_jobs_without_disabling_direct_copy() {
+        for (source_codec, requested, allow_hevc, allow_av1, copy_allowed, output, encoder) in [
+            ("mpeg4", "hevc,h264", false, false, false, "h264", "libx264"),
+            ("mpeg4", "hevc,h264", true, false, false, "hevc", "libx265"),
+            ("mpeg4", "h265,h264", true, false, false, "h265", "libx265"),
+            ("mpeg4", "av1,h264", false, false, false, "h264", "libx264"),
+            ("mpeg4", "av1,h264", false, true, false, "av1", "libsvtav1"),
+            ("mpeg4", "av1,hevc", false, false, false, "av1", "libsvtav1"),
+            ("mpeg4", "hevc", false, false, false, "hevc", "libx265"),
+            ("hevc", "hevc,h264", false, false, true, "copy", "copy"),
+            ("av1", "av1,h264", false, false, true, "copy", "copy"),
+            ("hevc", "copy", false, false, true, "copy", "copy"),
+        ] {
+            let root = tempfile::tempdir().expect("owned configuration");
+            let (planner, file) = planner_with_persisted_encoding(
+                vec![source(
+                    "abc",
+                    vec![video_stream(source_codec), audio_stream("aac")],
+                )],
+                root.path(),
+            )
+            .await;
+            let options = EncodingOptions {
+                allow_hevc_encoding: allow_hevc,
+                allow_av1_encoding: allow_av1,
+                ..EncodingOptions::default()
+            };
+            ferrofin_util::file_helper::atomic_write(
+                &file,
+                &serde_json::to_vec(&options).expect("serialize"),
+            )
+            .expect("save encoding options");
+            let mut req = request("abc");
+            req.video_codec = Some(requested.into());
+            req.allow_video_stream_copy = copy_allowed;
+            let plan = planner
+                .plan(&req, false, Some(0), PlaylistKind::Vod)
+                .await
+                .expect("plan");
+            assert_eq!(
+                plan.state.output_video_codec.as_deref(),
+                Some(output),
+                "{requested} source={source_codec}"
+            );
+            let index = plan
+                .arguments
+                .iter()
+                .position(|argument| argument == "-c:v")
+                .expect("video encoder");
+            assert_eq!(
+                plan.arguments[index + 1],
+                encoder,
+                "{requested} source={source_codec}"
+            );
+            assert_eq!(plan.encoding_options.allow_hevc_encoding, allow_hevc);
+            assert_eq!(plan.encoding_options.allow_av1_encoding, allow_av1);
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_codec_allow_flags_reach_hdr_master_variants_with_direct_copy_intact() {
+        for codec in ["hevc", "av1"] {
+            let root = tempfile::tempdir().expect("owned configuration");
+            let mut video = video_stream(codec);
+            video.width = Some(3840);
+            video.height = Some(2160);
+            video.bit_depth = Some(10);
+            video.color_transfer = Some("smpte2084".into());
+            video.color_primaries = Some("bt2020".into());
+            video.profile = Some(if codec == "hevc" { "Main 10" } else { "Main" }.into());
+            video.level = Some(if codec == "hevc" { 153.0 } else { 13.0 });
+            let (planner, file) = planner_with_persisted_encoding(
+                vec![source("abc", vec![video, audio_stream("aac")])],
+                root.path(),
+            )
+            .await;
+            for allowed in [false, true] {
+                let options = EncodingOptions {
+                    allow_hevc_encoding: allowed,
+                    allow_av1_encoding: allowed,
+                    ..EncodingOptions::default()
+                };
+                ferrofin_util::file_helper::atomic_write(
+                    &file,
+                    &serde_json::to_vec(&options).expect("serialize"),
+                )
+                .expect("save encoding options");
+                let mut req = request("abc");
+                req.video_codec = Some(codec.into());
+                req.query_string =
+                    format!("?VideoCodec={codec}&AudioCodec=aac&SegmentContainer=ts");
+                let plan = planner
+                    .plan(&req, false, Some(0), PlaylistKind::Vod)
+                    .await
+                    .expect("plan");
+                assert_eq!(plan.state.output_video_codec.as_deref(), Some("copy"));
+                let playlist = ferrofin_hls::build_master_playlist(
+                    &plan,
+                    &req,
+                    &ferrofin_hls::MasterPlaylistContext::default(),
+                );
+                let has_sdr = playlist.lines().any(|line| {
+                    line.contains(&format!("VideoCodec={codec}&"))
+                        && line.contains("AllowVideoStreamCopy=false")
+                });
+                assert_eq!(has_sdr, allowed, "{codec} allowed={allowed}: {playlist}");
+                assert!(
+                    playlist
+                        .lines()
+                        .any(|line| line.contains("VideoCodec=h264&")
+                            && line.contains("AllowVideoStreamCopy=false")),
+                    "{playlist}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn renegotiated_bitrate_caps_change_encoding_and_cached_output() {
+        let mut video = video_stream("h264");
+        video.bit_rate = Some(8_000_000);
+        let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
+        let mut req = request("abc");
+        req.allow_video_stream_copy = false;
+        req.allow_audio_stream_copy = false;
+        req.video_bitrate = Some(2_000_000);
+        req.audio_bitrate = Some(128_000);
+        let first = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        req.video_bitrate = Some(500_000);
+        let limited = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_eq!(limited.state.output_video_bitrate, Some(500_000));
+        assert!(limited.arguments.join(" ").contains("-maxrate 500000"));
+        assert_ne!(first.playlist_path, limited.playlist_path);
+        req.audio_bitrate = Some(64_000);
+        let audio_limited = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_eq!(audio_limited.state.output_audio_bitrate, Some(64_000));
+        assert!(audio_limited.arguments.join(" ").contains("-b:a 64000"));
+        assert_ne!(limited.playlist_path, audio_limited.playlist_path);
+    }
+
+    /// With "Enable VBR audio encoding" on (`EncodingOptions.EnableAudioVbr`)
+    /// and the request allowing it (`EnableAudioVbrEncoding`, true by
+    /// default), the audio is encoded at the VBR quality
+    /// `GetAudioVbrModeParam` picks for the encoder and the bitrate per
+    /// channel, in progressive and HLS output alike.
+    #[tokio::test]
+    async fn vbr_audio_encodes_at_the_encoders_quality_for_the_bitrate() {
+        let mut flac = audio_stream("flac");
+        flac.channels = Some(2);
+        let p = planner_over_with(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![flac])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            &[],
+            EncodingOptions {
+                enable_audio_vbr: true,
+                ..EncodingOptions::default()
+            },
+        );
+        let mut req = request("abc");
+        req.output_container = Some("mp3".to_owned());
+        req.audio_codec = Some("mp3".to_owned());
+        req.audio_bitrate = Some(128_000);
+        for kind in [PlaylistKind::Progressive, PlaylistKind::Vod] {
+            let args = p
+                .plan(&req, true, None, kind)
+                .await
+                .unwrap()
+                .arguments
+                .join(" ");
+            assert!(args.contains("-c:a libmp3lame"), "{args}");
+            // 64 kbit/s per channel.
+            assert!(args.contains("-qscale:a 4"), "{args}");
+            assert!(!args.contains("-b:a"), "{args}");
+        }
+
+        // The request refusing it (`enableAudioVbrEncoding=false`) keeps the
+        // constant bitrate.
+        req.enable_audio_vbr_encoding = false;
+        let args = p
+            .plan(&req, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap()
+            .arguments
+            .join(" ");
+        assert!(args.contains("-b:a 128000"), "{args}");
+        assert!(!args.contains("-qscale:a"), "{args}");
+
+        // So does an encoder without a VBR mode: opus.
+        req.enable_audio_vbr_encoding = true;
+        req.output_container = Some("ogg".to_owned());
+        req.audio_codec = Some("opus".to_owned());
+        let args = p
+            .plan(&req, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap()
+            .arguments
+            .join(" ");
+        assert!(args.contains("-c:a libopus"), "{args}");
+        assert!(args.contains("-b:a 128000"), "{args}");
+    }
+
+    /// `GetProgressiveAudioFullCommandLine` emits `-ab state.OutputAudioBitrate`:
+    /// a stereo FLAC transcoded to mp3 under a 128 kbit/s cap is encoded at
+    /// 128 kbit/s, not at the 128 kbit/s-per-channel default the `libmp3lame`
+    /// encoder name would select.
+    #[tokio::test]
+    async fn progressive_audio_honours_the_requested_bitrate() {
+        let mut flac = audio_stream("flac");
+        flac.channels = Some(2);
+        let p = planner(vec![source("abc", vec![flac])]);
+        let mut req = request("abc");
+        req.output_container = Some("mp3".to_owned());
+        req.audio_codec = Some("mp3".to_owned());
+        req.audio_bitrate = Some(128_000);
+        let plan = p
+            .plan(&req, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert_eq!(plan.state.output_audio_bitrate, Some(128_000));
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:a libmp3lame"), "{args}");
+        assert!(args.contains("-b:a 128000"), "{args}");
+
+        // The audio HLS segments of the same request encode to the same cap.
+        let hls = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
+        let args = hls.arguments.join(" ");
+        assert!(args.contains("-c:a libmp3lame"), "{args}");
+        assert!(args.contains("-b:a 128000"), "{args}");
+
+        // A lossless encoder takes no bitrate.
+        let mut alac = audio_stream("alac");
+        alac.channels = Some(2);
+        let p = planner(vec![source("abc", vec![alac])]);
+        req.output_container = Some("flac".to_owned());
+        req.audio_codec = Some("flac".to_owned());
+        let plan = p
+            .plan(&req, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:a flac"), "{args}");
+        assert!(!args.contains("-b:a"), "{args}");
+    }
+
+    /// `GetInputModifier` → `GetFfmpegAnalyzeDurationArg` (v12.2
+    /// `EncodingHelper.cs:7330-7348`): a source's own `AnalyzeDurationMs` (the
+    /// 3 s every Live TV source carries) is passed in microseconds; any other
+    /// source takes the `FFmpeg:analyzeduration` default, `200M`. `-probesize`
+    /// is the `FFmpeg:probesize` default, `1G`, either way.
+    #[tokio::test]
+    async fn analyzeduration_prefers_the_sources_own_value() {
+        let mut live = source("live", vec![video_stream("h264"), audio_stream("aac")]);
+        live.analyze_duration_ms = Some(3000);
+        let file = source("file", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner(vec![live, file]);
+        for (id, analyze) in [("live", "3000000"), ("file", "200M")] {
+            let plan = p
+                .plan(&request(id), false, Some(0), PlaylistKind::Vod)
+                .await
+                .unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(
+                args.contains(&format!("-analyzeduration {analyze} -probesize 1G")),
+                "{id}: {args}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_transcoding_permissions_override_client_copy_vetoes() {
+        use ferrofin_traits::library::PlaybackPermissions;
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        let mut paths = std::collections::HashSet::new();
+        for bits in 0..8 {
+            let mut req = request("abc");
+            let permissions = PlaybackPermissions {
+                video_transcoding: bits & 1 != 0,
+                audio_transcoding: bits & 2 != 0,
+                remuxing: bits & 4 != 0,
+            };
+            req.playback_permissions = Some(permissions);
+            req.allow_video_stream_copy = false;
+            req.allow_audio_stream_copy = false;
+            req.video_codec = Some("h264".to_owned());
+            req.audio_codec = Some("aac".to_owned());
+            req.max_width = Some(160);
+            req.video_bitrate = Some(100_000);
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            assert_eq!(
+                plan.state.output_video_codec.as_deref(),
+                Some(if permissions.video_transcoding {
+                    "h264"
+                } else {
+                    "copy"
+                })
+            );
+            assert_eq!(
+                plan.state.output_audio_codec.as_deref(),
+                Some(if permissions.audio_transcoding {
+                    "aac"
+                } else {
+                    "copy"
+                })
+            );
+            let args = plan.arguments.join(" ");
+            assert_eq!(
+                args.contains("-c:v copy"),
+                !permissions.video_transcoding,
+                "{args}"
+            );
+            assert_eq!(
+                args.contains("-c:a copy"),
+                !permissions.audio_transcoding,
+                "{args}"
+            );
+            assert!(
+                paths.insert(output_id(&req, "ts", false)),
+                "policy changes must not reuse old encoded segments"
+            );
+        }
+        // Userless API keys still follow the client's copy vetoes.
+        let mut req = request("abc");
+        req.allow_video_stream_copy = false;
+        req.allow_audio_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_ne!(plan.state.output_video_codec.as_deref(), Some("copy"));
+        assert_ne!(plan.state.output_audio_codec.as_deref(), Some("copy"));
+        // TryStreamCopy is only called for a VideoRequest upstream. Preserve
+        // that exception for direct audio-only requests with a known URL.
+        req.playback_permissions = Some(PlaybackPermissions {
+            video_transcoding: false,
+            audio_transcoding: false,
+            remuxing: false,
+        });
+        let plan = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
+        assert_ne!(plan.state.output_audio_codec.as_deref(), Some("copy"));
+    }
+
     #[tokio::test]
     async fn plan_resolves_source_and_fills_runtime() {
         let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
@@ -2200,8 +3557,52 @@ mod tests {
             .unwrap();
         assert_eq!(plan.media_path, "/media/movie.mkv");
         assert_eq!(plan.run_time_ticks, 90 * 60 * TICKS_PER_SECOND);
-        assert_eq!(plan.segment_length_ms, 3000);
+        // The H.264 source is copied: a copied video's 6 s segments.
+        assert_eq!(plan.segment_length_ms, 6000);
         assert_eq!(plan.segment_container, "ts");
+    }
+
+    /// Every dynamic HLS segment and playlist request plans, and planning
+    /// prepares the transcode directory, a walk of the whole tree. That walk
+    /// runs on the blocking pool: with the pool's only thread held busy the
+    /// plan cannot finish, which an inline walk would ignore.
+    #[test]
+    fn plan_prepares_the_transcode_directory_on_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+            let p = planner(vec![src]);
+
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+
+            let starved = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                p.plan(&request("abc"), false, None, PlaylistKind::Vod),
+            )
+            .await;
+            assert!(
+                starved.is_err(),
+                "the plan finished with the blocking pool starved, so the walk ran inline"
+            );
+
+            release_tx.send(()).unwrap();
+            hog.await.unwrap();
+            let plan = p
+                .plan(&request("abc"), false, None, PlaylistKind::Vod)
+                .await
+                .unwrap();
+            assert_eq!(plan.media_path, "/media/movie.mkv");
+        });
     }
 
     #[tokio::test]
@@ -2232,80 +3633,28 @@ mod tests {
         );
     }
 
-    /// An ffmpeg build with every NVENC encoder, so the ported dispatch has
-    /// something to find. Selection is a probe result now, not a fixed table:
-    /// a build without `av1_nvenc` must fall back even with NVENC configured.
-    fn nvenc_caps() -> FfmpegCapabilities {
-        FfmpegCapabilities::builder()
-            .encoders(["h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264"])
-            .build()
-    }
-
     #[test]
-    fn transcode_target_skips_codecs_ferrofin_cannot_encode() {
-        // Software-only: browsers list av1/vp9 first, but only libx264 (h264) is
-        // realtime-viable — picking av1 would launch libaom-av1 and stall HLS.
-        let sw = EncodingOptions::default();
-        let av1_first = vec!["av1".to_owned(), "h264".to_owned(), "vp9".to_owned()];
-        assert_eq!(
-            preferred_transcode_video_codec(&av1_first, &nvenc_caps(), &sw, None),
-            "h264"
-        );
-        // A bare `copy` request is honoured verbatim.
-        assert_eq!(
-            preferred_transcode_video_codec(&["copy".to_owned()], &nvenc_caps(), &sw, None),
-            "copy"
-        );
-        // No encodable preference (or none at all) → the h264 default.
-        assert_eq!(
-            preferred_transcode_video_codec(
-                &["av1".to_owned(), "vp9".to_owned()],
-                &nvenc_caps(),
-                &sw,
-                None,
-            ),
-            "h264"
-        );
-        assert_eq!(
-            preferred_transcode_video_codec(&[], &nvenc_caps(), &sw, None),
-            "h264"
-        );
-    }
-
-    #[test]
-    fn transcode_target_prefers_client_order_with_nvenc() {
-        // With NVENC the hardware encodes av1/hevc/h264, so the client's top pick
-        // (av1 — keeping 10-bit HDR) is honoured instead of forcing h264, once
-        // the options allow AV1 and HEVC encoding.
-        let nv = EncodingOptions {
-            enable_hardware_encoding: true,
-            hardware_acceleration_type: HardwareAccelerationType::nvenc,
-            allow_av1_encoding: true,
-            allow_hevc_encoding: true,
-            ..EncodingOptions::default()
-        };
-        let av1_first = vec!["av1".to_owned(), "h264".to_owned(), "vp9".to_owned()];
-        assert_eq!(
-            preferred_transcode_video_codec(&av1_first, &nvenc_caps(), &nv, None),
-            "av1"
-        );
-        // vp9 has no NVENC encoder → skipped in favour of the next encodable.
-        assert_eq!(
-            preferred_transcode_video_codec(
-                &["vp9".to_owned(), "hevc".to_owned()],
-                &nvenc_caps(),
-                &nv,
-                None,
-            ),
-            "hevc"
-        );
+    fn transcode_target_keeps_the_already_shifted_native_order() {
+        for (codecs, expected) in [
+            (vec![], "h264"),
+            (vec!["copy"], "copy"),
+            (vec!["hevc", "h264"], "hevc"),
+            (vec!["av1"], "av1"),
+            (vec!["vp9", "hevc"], "vp9"),
+        ] {
+            assert_eq!(
+                preferred_transcode_video_codec(
+                    &codecs.into_iter().map(str::to_owned).collect::<Vec<_>>()
+                ),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
     async fn plan_transcodes_hevc_source_to_libx264_not_av1() {
-        // A HEVC source a browser can't decode (av1-preferred profile) must
-        // transcode to libx264 (realtime), NOT `-c:v av1` (libaom-av1, far below
-        // realtime -> fragLoadTimeOut).
+        // The default AllowAv1Encoding=false shifts the leading AV1 target
+        // behind H.264, while HEVC cannot copy into the client's codec set.
         let src = source("abc", vec![video_stream("hevc"), audio_stream("aac")]);
         let p = planner(vec![src]);
         let mut req = request("abc");
@@ -2337,6 +3686,155 @@ mod tests {
             pos.map(|i| plan.arguments[i + 1].as_str()),
             Some("2"),
             "expected `-ac 2`, got: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[test]
+    fn media_stream_follows_get_media_stream() {
+        let mut first = audio_stream("aac");
+        first.index = 1;
+        first.channels = Some(0);
+        first.is_default = true;
+        let mut second = audio_stream("ac3");
+        second.index = 2;
+        second.channels = Some(6);
+        second.is_default = false;
+        let mut third = audio_stream("eac3");
+        third.index = 3;
+        third.channels = Some(2);
+        third.is_default = false;
+        // Out of index order, so only the sort makes stream 2 the first with
+        // channels.
+        let streams = vec![video_stream("h264"), third, second.clone(), first];
+        // The requested index wins.
+        assert_eq!(
+            media_stream(&streams, Some(2), MediaStreamType::Audio).map(|s| s.index),
+            Some(2)
+        );
+        // Without one (or with one that does not exist): the first audio stream
+        // with channels, by index — not the `IsDefault` one.
+        for desired in [None, Some(9)] {
+            assert_eq!(
+                media_stream(&streams, desired, MediaStreamType::Audio).map(|s| s.index),
+                Some(2)
+            );
+        }
+        assert_eq!(
+            media_stream(&streams, Some(5), MediaStreamType::Video).map(|s| s.index),
+            Some(0)
+        );
+        assert!(media_stream(&streams, None, MediaStreamType::Subtitle).is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_transcodes_the_requested_audio_track_at_the_requested_rate() {
+        let mut eng = audio_stream("aac");
+        eng.index = 1;
+        eng.channels = Some(2);
+        let mut fra = audio_stream("ac3");
+        fra.index = 2;
+        fra.channels = Some(6);
+        fra.is_default = false;
+        let src = source("abc", vec![video_stream("hevc"), eng, fra]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        req.audio_stream_index = Some(2);
+        req.audio_sample_rate = Some(44_100);
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert_eq!(plan.state.audio_stream.as_ref().map(|a| a.index), Some(2));
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-ar 44100"), "{args}");
+    }
+
+    #[test]
+    fn opus_rates_snap_to_what_libopus_encodes() {
+        for (rate, snapped) in [
+            (8_000, 8_000),
+            (11_025, 12_000),
+            (16_000, 16_000),
+            (22_050, 24_000),
+            (44_100, 48_000),
+            (96_000, 48_000),
+        ] {
+            assert_eq!(opus_sample_rate(rate), snapped, "{rate}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_audio_request_ignores_the_requested_audio_track() {
+        // `AttachMediaSourceInfo`: only a video request reads `AudioStreamIndex`.
+        let mut first = audio_stream("flac");
+        first.index = 0;
+        first.channels = Some(2);
+        let mut second = audio_stream("mp3");
+        second.index = 1;
+        second.channels = Some(2);
+        second.is_default = false;
+        let src = source("abc", vec![first, second]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        req.audio_stream_index = Some(1);
+        let plan = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
+        assert_eq!(plan.state.audio_stream.as_ref().map(|a| a.index), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_different_audio_track_is_a_different_job() {
+        let req = request("abc");
+        let mut other = req.clone();
+        other.audio_stream_index = Some(2);
+        assert_ne!(output_id(&req, "ts", false), output_id(&other, "ts", false));
+    }
+
+    #[tokio::test]
+    async fn plan_resamples_ac4_to_48k_without_a_requested_rate() {
+        let mut audio = audio_stream("ac4");
+        audio.codec_tag = Some("ac-4".to_owned());
+        audio.channels = Some(2);
+        let src = source("abc", vec![video_stream("hevc"), audio]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-ar 48000"), "{args}");
+    }
+
+    #[tokio::test]
+    async fn plan_honours_the_typed_audio_channels_member() {
+        // `audioChannels` is a typed `DynamicHlsController` member: it reaches
+        // `GetRequestedAudioChannels` through the base request, not only as a
+        // lower-case per-codec stream option (casing: hls.rs binding tests).
+        let mut audio = audio_stream("dts");
+        audio.channels = Some(8);
+        let src = source("abc", vec![video_stream("hevc"), audio]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.audio_codec = Some("aac".to_owned());
+        req.audio_channels = Some(2);
+        req.max_audio_channels = Some(6);
+        req.max_audio_bit_depth = Some(24);
+        req.max_ref_frames = Some(4);
+        req.max_video_bit_depth = Some(10);
+        req.deinterlace = true;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        // Every typed member lands on the base request…
+        let base = &plan.state.base_request;
+        assert_eq!(base.audio_channels, Some(2));
+        assert_eq!(base.max_audio_channels, Some(6));
+        assert_eq!(base.max_audio_bit_depth, Some(24));
+        assert_eq!(base.max_ref_frames, Some(4));
+        assert_eq!(base.max_video_bit_depth, Some(10));
+        assert!(base.deinterlace);
+        // …and `GetRequestedAudioChannels` takes MaxAudioChannels first.
+        let pos = plan.arguments.iter().position(|a| a == "-ac");
+        assert_eq!(
+            pos.map(|i| plan.arguments[i + 1].as_str()),
+            Some("6"),
+            "expected `-ac 6`, got: {:?}",
             plan.arguments
         );
     }
@@ -2623,6 +4121,54 @@ mod tests {
         }
     }
 
+    /// `GetInputModifier`'s `GetUserAgentParam` and `GetRefererParam`: the
+    /// source's `RequiredHttpHeaders` reach ffmpeg after `-probesize`, each
+    /// value one argv element however it is spelled (a tuner or playlist sets
+    /// them).
+    #[tokio::test]
+    async fn plan_sends_the_sources_user_agent_and_referer_to_ffmpeg() {
+        let mut src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        src.required_http_headers = [
+            ("User-Agent", r#"TunerBox/1.0 (Linux; "x")"#),
+            ("Referer", "http://portal.example/tv"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let p = planner(vec![src]);
+        let plan = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let args = &plan.arguments;
+        let at = |flag: &str| args.iter().position(|a| a == flag).expect(flag);
+        assert_eq!(args[at("-user_agent") + 1], r#"TunerBox/1.0 (Linux; "x")"#);
+        assert_eq!(args[at("-referer") + 1], "http://portal.example/tv");
+        assert!(at("-probesize") < at("-user_agent"), "{args:?}");
+        assert!(at("-user_agent") < at("-referer"), "{args:?}");
+        assert!(at("-referer") < at("-i"), "{args:?}");
+    }
+
+    #[tokio::test]
+    async fn plan_without_http_headers_sends_none() {
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        let plan = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            !plan
+                .arguments
+                .iter()
+                .any(|a| a == "-user_agent" || a == "-referer"),
+            "{:?}",
+            plan.arguments
+        );
+    }
+
     #[tokio::test]
     async fn plan_falls_back_to_the_first_source_when_the_id_is_the_item_id() {
         // `StreamingHelpers`: a MediaSourceId equal to the item id selects the first source.
@@ -2671,6 +4217,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_text_codec_burns_with_the_subtitles_filter_alone() {
+        // `MediaStream.IsTextFormat` is a deny-list of the bitmap codecs, so
+        // SAMI, TTML or SubViewer is text too. Its burn-in is the `-vf
+        // subtitles` chain alone: an overlay graph and `-map [v]` beside it
+        // make ffmpeg refuse the command.
+        for codec in ["sami", "ttml", "subviewer"] {
+            let p = planner(vec![source(
+                "abc",
+                vec![
+                    video_stream("h264"),
+                    audio_stream("aac"),
+                    subtitle_stream(codec, 2),
+                ],
+            )]);
+            let mut req = request("abc");
+            req.video_codec = Some("h264".to_owned());
+            req.allow_video_stream_copy = false;
+            req.subtitle_stream_index = Some(2);
+            req.subtitle_method = Some("Encode".to_owned());
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(
+                args.contains("subtitles=f='/media/movie.mkv':si=0"),
+                "{codec}: {args}"
+            );
+            assert!(!args.contains("overlay"), "{codec}: {args}");
+            assert!(!args.contains("-map [v]"), "{codec}: {args}");
+            assert_eq!(args.matches(" -vf ").count(), 1, "{codec}: {args}");
+        }
+    }
+
+    #[tokio::test]
     async fn plan_seek_wraps_text_burn_in_setpts_shift() {
         // A seek restart input-seeks with `-ss`, resetting frame PTS to ~0; the
         // subtitles filter picks cues by PTS, so the chain must shift PTS to
@@ -2686,6 +4264,8 @@ mod tests {
         let p = planner(vec![src]);
         let mut req = request("abc");
         req.query_string = "?SubtitleStreamIndex=2".to_owned();
+        // Segment 3 of a 3 s playlist starts at 9 s.
+        req.current_runtime_ticks = 9 * TICKS_PER_SECOND;
         let plan = p
             .plan(&req, false, Some(3), PlaylistKind::Vod)
             .await
@@ -2701,6 +4281,482 @@ mod tests {
             vf.starts_with("setpts=PTS+9/TB,subtitles=") && vf.contains(",setpts=PTS-9/TB"),
             "expected setpts sandwich, got: {vf}"
         );
+    }
+
+    /// An [`AttachmentExtractor`] recording the inputs it was asked to
+    /// extract every attachment of, and failing when told to.
+    #[derive(Default)]
+    struct FakeAttachments {
+        inputs: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl ferrofin_traits::media_encoding::AttachmentExtractor for FakeAttachments {
+        async fn get_attachment(
+            &self,
+            _item_id: Uuid,
+            _media_source_id: &str,
+            _attachment_stream_index: i32,
+        ) -> Result<ferrofin_traits::media_encoding::ExtractedAttachment, ServiceError> {
+            Err(ServiceError::backend("not used"))
+        }
+        async fn extract_all_attachments(
+            &self,
+            input_file: &str,
+            _media_source: &MediaSourceInfo,
+        ) -> Result<(), ServiceError> {
+            self.inputs.lock().unwrap().push(input_file.to_owned());
+            if self.fail {
+                Err(ServiceError::backend("extraction failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A [`SubtitleEncoder`] resolving every burned subtitle to `path` (or
+    /// failing, for the `si=` fallback) and detecting `charset` in every file,
+    /// counting the detections.
+    struct FakeSubtitles {
+        path: Option<String>,
+        charset: String,
+        detections: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SubtitleEncoder for FakeSubtitles {
+        async fn get_subtitles(
+            &self,
+            _item_id: Uuid,
+            _media_source_id: &str,
+            _subtitle_stream_index: i32,
+            _output_format: &str,
+            _start_time_ticks: i64,
+            _end_time_ticks: i64,
+            _preserve_original_timestamps: bool,
+        ) -> Result<Vec<u8>, ServiceError> {
+            Err(ServiceError::backend("not used"))
+        }
+        async fn get_subtitle_file_character_set(
+            &self,
+            _subtitle_stream: &MediaStream,
+            _language: &str,
+            _media_source: &MediaSourceInfo,
+        ) -> Result<String, ServiceError> {
+            self.detections
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.charset.clone())
+        }
+        async fn get_subtitle_file_path(
+            &self,
+            _subtitle_stream: &MediaStream,
+            _media_source: &MediaSourceInfo,
+        ) -> Result<String, ServiceError> {
+            self.path
+                .clone()
+                .ok_or_else(|| ServiceError::backend("not extracted"))
+        }
+        async fn extract_all_extractable_subtitles(
+            &self,
+            _media_source: &MediaSourceInfo,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// A media source id that is a GUID, so it has an attachment folder.
+    const GUID_SOURCE: &str = "0f2c8d1e111122223333444455556666";
+
+    /// The attachment folder the real path manager gives [`GUID_SOURCE`]
+    /// under the test planner's data directory (`/data/data`).
+    const GUID_FONTS: &str = "/data/data/attachments/0f/0f2c8d1e-1111-2222-3333-444455556666";
+
+    /// `p` extracting through `attachments`, with the real path manager over
+    /// the test planner's `/data` root.
+    fn with_fake_attachments(
+        p: FerrofinStreamStatePlanner,
+        attachments: Arc<FakeAttachments>,
+    ) -> FerrofinStreamStatePlanner {
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            "/data",
+            std::path::PathBuf::from("/data/log"),
+            "/config",
+            std::path::PathBuf::from("/data/cache"),
+            "/web",
+        ));
+        p.with_attachments(
+            attachments,
+            Arc::new(ferrofin_core::path_manager::FerrofinPathManager::new(paths)),
+        )
+    }
+
+    /// `planner` over one GUID-identified source with `streams`, burning
+    /// through `subtitles`, extracting attachments through `attachments`.
+    fn burning_planner(
+        streams: Vec<MediaStream>,
+        subtitles: FakeSubtitles,
+        attachments: Arc<FakeAttachments>,
+    ) -> (FerrofinStreamStatePlanner, Arc<FakeSubtitles>) {
+        burning_planner_for(GUID_SOURCE, streams, subtitles, attachments)
+    }
+
+    /// [`burning_planner`] over a source with the id `source_id`.
+    fn burning_planner_for(
+        source_id: &str,
+        streams: Vec<MediaStream>,
+        subtitles: FakeSubtitles,
+        attachments: Arc<FakeAttachments>,
+    ) -> (FerrofinStreamStatePlanner, Arc<FakeSubtitles>) {
+        let mut p = planner(vec![source(source_id, streams)]);
+        let subtitles = Arc::new(subtitles);
+        p.subtitles = Arc::clone(&subtitles) as Arc<dyn SubtitleEncoder>;
+        (with_fake_attachments(p, attachments), subtitles)
+    }
+
+    fn fake_subtitles(path: Option<&str>, charset: &str) -> FakeSubtitles {
+        FakeSubtitles {
+            path: path.map(str::to_owned),
+            charset: charset.to_owned(),
+            detections: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn burn_request(index: i32) -> HlsStreamRequest {
+        let mut req = request(GUID_SOURCE);
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.subtitle_stream_index = Some(index);
+        req.subtitle_method = Some("Encode".to_owned());
+        req
+    }
+
+    /// The `-vf` (software) or `-filter_complex` (hardware) graph.
+    fn video_graph(args: &[String]) -> &str {
+        args.iter()
+            .position(|a| a == "-vf" || a == "-filter_complex")
+            .map(|i| args[i + 1].as_str())
+            .expect("a video graph")
+    }
+
+    /// `GetTextSubtitlesFilter` hands the `subtitles` filter the media
+    /// source's attachment folder (`:fontsdir=`, after `alpha`/`sub2video`),
+    /// and `TranscodeManager.StartFfMpeg` extracts the file's attachments
+    /// there first, so an ASS track's own fonts are used. The extracted
+    /// track, and the `si=` fallback, both get it.
+    #[rstest::rstest]
+    #[case::extracted(
+        Some("/data/subtitles/ab/track.ass"),
+        "subtitles=f='/data/subtitles/ab/track.ass':fontsdir='"
+    )]
+    #[case::from_the_media(None, "subtitles=f='/media/movie.mkv':si=0:fontsdir='")]
+    #[tokio::test]
+    async fn a_burned_text_subtitle_reads_the_fonts_its_file_ships(
+        #[case] extracted: Option<&str>,
+        #[case] filter: &str,
+    ) {
+        let attachments = Arc::new(FakeAttachments::default());
+        let (p, subtitles) = burning_planner(
+            vec![
+                video_stream("h264"),
+                audio_stream("aac"),
+                subtitle_stream("ass", 2),
+            ],
+            fake_subtitles(extracted, "windows-1251"),
+            Arc::clone(&attachments),
+        );
+
+        let plan = p
+            .plan(&burn_request(2), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let vf = video_graph(&plan.arguments);
+        assert!(vf.contains(&format!("{filter}{GUID_FONTS}'")), "{vf}");
+        // An embedded track gets no character set: only an external file can
+        // be in a legacy encoding.
+        assert!(!vf.contains("charenc"), "{vf}");
+        assert_eq!(
+            subtitles
+                .detections
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(*attachments.inputs.lock().unwrap(), ["/media/movie.mkv"]);
+    }
+
+    /// The hardware chains build both `subtitles` spellings from the same
+    /// filter, so the fonts reach the `alpha`/`sub2video` one too.
+    #[tokio::test]
+    async fn the_hardware_text_burn_in_reads_the_fonts_too() {
+        let attachments = Arc::new(FakeAttachments::default());
+        let mut p = nvenc_planner(vec![source(
+            GUID_SOURCE,
+            vec![
+                nvdec_decodable_video_stream(),
+                audio_stream("aac"),
+                subtitle_stream("ass", 2),
+            ],
+        )]);
+        p.subtitles = Arc::new(fake_subtitles(Some("/data/subtitles/ab/track.ass"), ""));
+        let p = with_fake_attachments(p, Arc::clone(&attachments));
+
+        let plan = p
+            .plan(&burn_request(2), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let graph = video_graph(&plan.arguments);
+        assert!(
+            graph.contains(&format!(
+                "subtitles=f='/data/subtitles/ab/track.ass':alpha=1:sub2video=1:fontsdir='{GUID_FONTS}'"
+            )),
+            "{graph}"
+        );
+        assert_eq!(*attachments.inputs.lock().unwrap(), ["/media/movie.mkv"]);
+    }
+
+    /// An external text file with a language is read in its own character
+    /// set (`:charenc=`, after `f=`), as `GetTextSubtitlesFilter` asks the
+    /// subtitle encoder. Only for the file the filter actually reads: a file
+    /// the encoder converted is UTF-8 already, and one with no language is
+    /// never asked about, as upstream skips it.
+    #[rstest::rstest]
+    #[case::read_as_is(
+        Some("/media/movie.ru.srt"),
+        Some("rus"),
+        "windows-1251",
+        Some("windows-1251")
+    )]
+    #[case::utf8(Some("/media/movie.ru.srt"), Some("rus"), "", None)]
+    #[case::converted(
+        Some("/data/subtitles/ab/track.srt"),
+        Some("rus"),
+        "windows-1251",
+        None
+    )]
+    #[case::no_language(Some("/media/movie.ru.srt"), None, "windows-1251", None)]
+    #[case::not_resolved(None, Some("rus"), "windows-1251", Some("windows-1251"))]
+    #[tokio::test]
+    async fn an_external_text_subtitle_is_read_in_its_character_set(
+        #[case] resolved: Option<&str>,
+        #[case] language: Option<&str>,
+        #[case] detected: &str,
+        #[case] charenc: Option<&str>,
+    ) {
+        let external = MediaStream {
+            is_external: true,
+            path: Some("/media/movie.ru.srt".to_owned()),
+            language: language.map(str::to_owned),
+            ..subtitle_stream("subrip", 2)
+        };
+        let (p, subtitles) = burning_planner(
+            vec![video_stream("h264"), audio_stream("aac"), external],
+            fake_subtitles(resolved, detected),
+            Arc::new(FakeAttachments::default()),
+        );
+
+        let plan = p
+            .plan(&burn_request(2), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let vf = video_graph(&plan.arguments);
+        let read = resolved.unwrap_or("/media/movie.ru.srt");
+        let expected = match charenc {
+            Some(charset) => format!("subtitles=f='{read}':charenc={charset}:fontsdir="),
+            None => format!("subtitles=f='{read}':fontsdir="),
+        };
+        assert!(vf.contains(&expected), "{vf}");
+        let asked = usize::from(language.is_some() && read == "/media/movie.ru.srt");
+        assert_eq!(
+            subtitles
+                .detections
+                .load(std::sync::atomic::Ordering::SeqCst),
+            asked
+        );
+    }
+
+    /// `StartFfMpeg` extracts before the ffmpeg it starts: the media file,
+    /// then an external `.mks` subtitle (which ships its own fonts), for a
+    /// selected subtitle that is burned in or under
+    /// `alwaysBurnInSubtitleWhenTranscoding`. A playlist build or a HEAD
+    /// request starts no ffmpeg and extracts nothing; nor does a subtitle
+    /// the client renders itself.
+    #[rstest::rstest]
+    #[case::segment(Some(0), false, "Encode", false, &["/media/movie.mkv", "/media/movie.en.mks"])]
+    #[case::always_burn_in(Some(0), false, "External", true, &["/media/movie.mkv", "/media/movie.en.mks"])]
+    #[case::playlist(None, false, "Encode", false, &[])]
+    #[case::head(Some(0), true, "Encode", false, &[])]
+    #[case::client_renders_it(Some(0), false, "External", false, &[])]
+    #[tokio::test]
+    async fn attachments_are_extracted_before_a_burn_in_starts(
+        #[case] segment: Option<i32>,
+        #[case] head: bool,
+        #[case] method: &str,
+        #[case] always_burn_in: bool,
+        #[case] extracted: &[&str],
+    ) {
+        let mks = MediaStream {
+            is_external: true,
+            path: Some("/media/movie.en.mks".to_owned()),
+            ..subtitle_stream("ass", 2)
+        };
+        let attachments = Arc::new(FakeAttachments::default());
+        let (p, _) = burning_planner(
+            vec![video_stream("h264"), audio_stream("aac"), mks],
+            fake_subtitles(Some("/data/subtitles/ab/track.ass"), ""),
+            Arc::clone(&attachments),
+        );
+        let mut req = burn_request(2);
+        req.subtitle_method = Some(method.to_owned());
+        req.is_head_request = head;
+        req.always_burn_in_subtitle_when_transcoding = always_burn_in;
+
+        p.plan(&req, false, segment, PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        assert_eq!(*attachments.inputs.lock().unwrap(), extracted);
+    }
+
+    /// A progressive stream starts its ffmpeg on the plan too.
+    #[tokio::test]
+    async fn a_progressive_burn_in_extracts_the_attachments() {
+        let attachments = Arc::new(FakeAttachments::default());
+        let (p, _) = burning_planner(
+            vec![
+                video_stream("h264"),
+                audio_stream("aac"),
+                subtitle_stream("ass", 2),
+            ],
+            fake_subtitles(Some("/data/subtitles/ab/track.ass"), ""),
+            Arc::clone(&attachments),
+        );
+        let mut req = burn_request(2);
+        req.output_container = Some("mkv".to_owned());
+        p.plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert_eq!(*attachments.inputs.lock().unwrap(), ["/media/movie.mkv"]);
+    }
+
+    /// Upstream's condition reads the method and the always-burn-in flag only:
+    /// a burned-in bitmap extracts too, and so does an always-burn-in request
+    /// whose video is copied (nothing is burned in then).
+    #[rstest::rstest]
+    #[case::bitmap_burn_in(subtitle_stream("PGSSUB", 2), "Encode", true, false)]
+    #[case::always_burn_in_copied(subtitle_stream("ass", 2), "External", true, true)]
+    #[tokio::test]
+    async fn the_extraction_follows_upstreams_condition_not_the_burn_in(
+        #[case] sub: MediaStream,
+        #[case] method: &str,
+        #[case] always_burn_in: bool,
+        #[case] copy: bool,
+    ) {
+        let attachments = Arc::new(FakeAttachments::default());
+        let (p, _) = burning_planner(
+            vec![video_stream("h264"), audio_stream("aac"), sub],
+            fake_subtitles(None, ""),
+            Arc::clone(&attachments),
+        );
+        let mut req = burn_request(2);
+        req.subtitle_method = Some(method.to_owned());
+        req.always_burn_in_subtitle_when_transcoding = always_burn_in;
+        req.allow_video_stream_copy = copy;
+
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
+            copy,
+            "{:?}",
+            plan.arguments
+        );
+        assert_eq!(*attachments.inputs.lock().unwrap(), ["/media/movie.mkv"]);
+    }
+
+    /// A source whose id is not a GUID (a Live TV stream) has no attachment
+    /// folder: the filter names none, and the extractor skips it itself.
+    #[tokio::test]
+    async fn a_source_without_an_attachment_folder_reads_no_fonts() {
+        let attachments = Arc::new(FakeAttachments::default());
+        let (p, _) = burning_planner_for(
+            "abc",
+            vec![
+                video_stream("h264"),
+                audio_stream("aac"),
+                subtitle_stream("ass", 2),
+            ],
+            fake_subtitles(Some("/data/subtitles/ab/track.ass"), ""),
+            Arc::clone(&attachments),
+        );
+        let mut req = burn_request(2);
+        req.media_source_id = Some("abc".to_owned());
+
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let vf = video_graph(&plan.arguments);
+        assert!(!vf.contains("fontsdir"), "{vf}");
+        assert_eq!(*attachments.inputs.lock().unwrap(), ["/media/movie.mkv"]);
+    }
+
+    /// A playlist build starts no ffmpeg, so an external file's character
+    /// set is not read for it.
+    #[tokio::test]
+    async fn a_playlist_build_reads_no_character_set() {
+        let external = MediaStream {
+            is_external: true,
+            path: Some("/media/movie.ru.srt".to_owned()),
+            language: Some("rus".to_owned()),
+            ..subtitle_stream("subrip", 2)
+        };
+        let (p, subtitles) = burning_planner(
+            vec![video_stream("h264"), audio_stream("aac"), external],
+            fake_subtitles(Some("/media/movie.ru.srt"), "windows-1251"),
+            Arc::new(FakeAttachments::default()),
+        );
+        p.plan(&burn_request(2), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert_eq!(
+            subtitles
+                .detections
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    /// A failed extraction fails the plan, as an exception from
+    /// `ExtractAllAttachments` fails upstream's `StartFfMpeg`.
+    #[tokio::test]
+    async fn a_failed_attachment_extraction_fails_the_plan() {
+        let attachments = Arc::new(FakeAttachments {
+            fail: true,
+            ..FakeAttachments::default()
+        });
+        let (p, _) = burning_planner(
+            vec![
+                video_stream("h264"),
+                audio_stream("aac"),
+                subtitle_stream("ass", 2),
+            ],
+            fake_subtitles(Some("/data/subtitles/ab/track.ass"), ""),
+            attachments,
+        );
+        let Err(error) = p
+            .plan(&burn_request(2), false, Some(0), PlaylistKind::Vod)
+            .await
+        else {
+            panic!("the plan must fail with the extraction");
+        };
+        assert!(matches!(error, ServiceError::Backend(_)), "{error:?}");
     }
 
     #[tokio::test]
@@ -2775,6 +4831,440 @@ mod tests {
         assert!(
             args.contains("subtitles=f='/media/movie.mkv':si=0"),
             "explicit Encode must burn: {args}"
+        );
+    }
+
+    /// A progressive transcode that embeds the subtitle (`SubtitleMethod=Embed`)
+    /// names the track's codec and marks it default, as
+    /// `GetProgressiveVideoFullCommandLine` appends `GetSubtitleEmbedArguments`
+    /// after the audio arguments: `copy` when `subtitleCodec` is empty or names
+    /// the source codec (ignoring case), else its first entry.
+    #[rstest::rstest]
+    #[case::bitmap_without_a_codec("PGSSUB", None, "copy")]
+    #[case::text_into_another_codec("subrip", Some("ass,srt"), "ass")]
+    #[case::the_source_codec_is_copied("subrip", Some("SUBRIP,ass"), "copy")]
+    #[case::empty_entries_are_dropped("subrip", Some(",ass"), "ass")]
+    #[case::a_blank_list_is_none("subrip", Some(" "), "copy")]
+    #[tokio::test]
+    async fn progressive_embed_names_the_subtitle_codec_and_default(
+        #[case] source_codec: &str,
+        #[case] subtitle_codec: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream(source_codec, 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.output_container = Some("mkv".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Embed".to_owned());
+        req.subtitle_codec = subtitle_codec.map(str::to_owned);
+        let plan = p
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        let args = &plan.arguments;
+        let position = |pair: [&str; 2]| {
+            args.windows(2)
+                .position(|window| window == pair)
+                .unwrap_or_else(|| panic!("{pair:?} missing: {args:?}"))
+        };
+        let map = position(["-map", "0:2"]);
+        let codec = position(["-codec:s:0", expected]);
+        let disposition = position(["-disposition:s:0", "default"]);
+        let audio = args
+            .iter()
+            .position(|arg| arg == "-c:a")
+            .unwrap_or_else(|| panic!("audio args: {args:?}"));
+        let output = args.len() - 1;
+        assert!(
+            map < audio && audio < codec && codec < disposition && disposition < output,
+            "map, audio, codec, disposition, output in order: {args:?}"
+        );
+    }
+
+    /// In an MP4 stream the embed arguments come before the format flags, as
+    /// `GetProgressiveVideoFullCommandLine` orders them.
+    #[tokio::test]
+    async fn progressive_mp4_embed_arguments_precede_the_format() {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream("mov_text", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.output_container = Some("mp4".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.context = Some(ferrofin_model::dlna::EncodingContext::Streaming);
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Embed".to_owned());
+        let plan = p
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        let args = &plan.arguments;
+        let position = |pair: [&str; 2]| {
+            args.windows(2)
+                .position(|window| window == pair)
+                .unwrap_or_else(|| panic!("{pair:?} missing: {args:?}"))
+        };
+        let disposition = position(["-disposition:s:0", "default"]);
+        let format = position(["-f", "mp4"]);
+        assert!(
+            position(["-codec:s:0", "copy"]) < disposition && disposition < format,
+            "{args:?}"
+        );
+        assert_eq!(args.last().map(String::as_str), plan.playlist_path.to_str());
+    }
+
+    /// `NormalizeSubtitleEmbed`: a remuxed DVB subtitle is mispositioned, so an
+    /// `Embed` of one is burned in (`Encode`) before anything reads the method.
+    #[tokio::test]
+    async fn an_embedded_dvb_subtitle_is_burned_in() {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream("DVBSUB", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.output_container = Some("mkv".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Embed".to_owned());
+        let plan = p
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.state.subtitle_delivery_method,
+            SubtitleDeliveryMethod::Encode
+        );
+        assert!(
+            plan.arguments.iter().any(|arg| arg.contains("overlay")),
+            "burned in: {:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan.arguments.iter().any(|arg| arg.starts_with("-codec:s")),
+            "not embedded: {:?}",
+            plan.arguments
+        );
+    }
+
+    /// The burn-in overlay names a Blu-ray source's embedded subtitle by its
+    /// ffmpeg index (`GetSubtitleStreamIndexForFfmpeg`): the TrueHD stream
+    /// before it, which ffprobe does not list but ffmpeg counts, shifts it by
+    /// one.
+    #[tokio::test]
+    async fn a_blu_ray_subtitle_is_overlaid_by_its_ffmpeg_index() {
+        let mut src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("truehd"),
+                subtitle_stream("PGSSUB", 2),
+            ],
+        );
+        src.video_type = Some(ferrofin_model::entities::VideoType::BluRay);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("overlay"), "burned in: {args}");
+        assert!(args.contains("[0:3]"), "the ffmpeg index, 2 + 1: {args}");
+        assert!(!args.contains("[0:2]"), "{args}");
+    }
+
+    /// An external subtitle sidecar: `path` beside the movie.
+    fn sidecar(codec: &str, index: i32, path: &str) -> MediaStream {
+        MediaStream {
+            is_external: true,
+            supports_external_stream: true,
+            path: Some(path.to_owned()),
+            ..subtitle_stream(codec, index)
+        }
+    }
+
+    /// The arguments between the first `-i` and the maps: the inputs that
+    /// follow the media file.
+    fn inputs_after_the_media(args: &[String]) -> &[String] {
+        let first = args.iter().position(|a| a == "-i").expect("-i") + 2;
+        let maps = args.iter().position(|a| a == "-map").expect("-map");
+        &args[first..maps]
+    }
+
+    /// `GetInputArgument` adds a burned-in external bitmap as ffmpeg input 1,
+    /// seeked like the media file and decoded onto its own canvas, and the
+    /// overlay reads its first stream there. Without the input, ffmpeg refused
+    /// the overlay's `[1:0]` and the playback never started.
+    #[rstest::rstest]
+    #[case::software(false)]
+    #[case::nvenc(true)]
+    #[tokio::test]
+    async fn a_burned_in_external_bitmap_is_input_1(#[case] hardware: bool) {
+        let mut sup = sidecar("PGSSUB", 2, "/media/movie.en.sup");
+        sup.width = Some(1920);
+        sup.height = Some(1080);
+        let (video, p): (_, fn(Vec<MediaSourceInfo>) -> FerrofinStreamStatePlanner) = if hardware {
+            (nvdec_decodable_video_stream(), nvenc_planner)
+        } else {
+            (video_stream("h264"), planner)
+        };
+        let p = p(vec![source("abc", vec![video, audio_stream("aac"), sup])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        req.current_runtime_ticks = 9 * TICKS_PER_SECOND;
+
+        let plan = p
+            .plan(&req, false, Some(3), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        // The NVENC probe reports ffmpeg 7.0.1, which takes `-isync`: the
+        // sidecar is then read from its start on the movie's clock. The plain
+        // probe reports no version, which keeps upstream's seeked input.
+        let timing: &[&str] = if hardware {
+            &["-canvas_size", "1920x1080", "-isync", "0"]
+        } else {
+            &["-ss", "90000000", "-canvas_size", "1920x1080"]
+        };
+        let expected: Vec<&str> = ["-analyzeduration", "200M", "-probesize", "1G"]
+            .into_iter()
+            .chain(timing.iter().copied())
+            .chain(["-i", "file:/media/movie.en.sup"])
+            .collect();
+        assert_eq!(inputs_after_the_media(args), expected, "{args:?}");
+        let joined = args.join(" ");
+        assert!(joined.contains("[1:0]"), "{joined}");
+        assert!(joined.contains("-map 1:0 -sn"), "{joined}");
+    }
+
+    /// An external track embedded into a progressive MKV is input 1, mapped
+    /// as `1:0`, text or bitmap alike (upstream PR 16448's StreamBuilder and
+    /// map halves were ported; this is the input half).
+    #[rstest::rstest]
+    #[case::srt("srt", "/media/movie.en.srt")]
+    #[case::pgs("PGSSUB", "/media/movie.en.sup")]
+    #[tokio::test]
+    async fn an_embedded_external_track_is_input_1(#[case] codec: &str, #[case] path: &str) {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("h264"),
+                audio_stream("aac"),
+                sidecar(codec, 2, path),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.output_container = Some("mkv".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Embed".to_owned());
+
+        let plan = p
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        assert_eq!(
+            inputs_after_the_media(args),
+            [
+                "-analyzeduration",
+                "200M",
+                "-probesize",
+                "1G",
+                "-i",
+                &format!("file:{path}"),
+            ],
+            "{args:?}"
+        );
+        assert!(args.join(" ").contains("-map 1:0 "), "{args:?}");
+    }
+
+    /// An external audio track selected for a transcode is the next input.
+    #[tokio::test]
+    async fn a_selected_external_audio_track_is_input_1() {
+        let commentary = MediaStream {
+            index: 2,
+            is_external: true,
+            path: Some("/media/movie.commentary.mka".to_owned()),
+            ..audio_stream("aac")
+        };
+        let src = source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac"), commentary],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.audio_stream_index = Some(2);
+
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        assert_eq!(
+            inputs_after_the_media(args),
+            ["-i", "/media/movie.commentary.mka"],
+            "{args:?}"
+        );
+        assert!(args.windows(2).any(|w| w == ["-map", "1:0"]), "{args:?}");
+    }
+
+    /// Upstream appends the embed arguments to the progressive command only.
+    #[tokio::test]
+    async fn hls_never_gets_subtitle_embed_arguments() {
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=Embed".to_owned();
+        req.subtitle_codec = Some("ass".to_owned());
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.state.subtitle_delivery_method,
+            SubtitleDeliveryMethod::Embed
+        );
+        assert_eq!(plan.state.supported_subtitle_codecs, ["ass"]);
+        assert!(
+            !plan
+                .arguments
+                .iter()
+                .any(|arg| arg.starts_with("-codec:s") || arg.starts_with("-disposition")),
+            "{:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_always_burn_in_burns_a_transcoded_video_whatever_the_method() {
+        // `ShouldEncodeSubtitle`: `alwaysBurnInSubtitleWhenTranscoding` burns
+        // the selected track into any video that is not stream-copied, even
+        // when the negotiated method is External.
+        let src = source(
+            "abc",
+            vec![
+                video_stream("hevc"),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=External".to_owned();
+        req.always_burn_in_subtitle_when_transcoding = true;
+        req.allow_video_stream_copy = false;
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(
+            args.contains("subtitles=f='/media/movie.mkv':si=0"),
+            "always-burn-in must burn a transcoded video: {args}"
+        );
+
+        // A stream-copied video cannot take a filter, so the flag yields.
+        req.video_codec = Some("hevc".to_owned());
+        req.allow_video_stream_copy = true;
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.windows(2).any(|a| a == ["-c:v", "copy"]),
+            "the video is copied: {:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan.arguments.iter().any(|a| a.contains("subtitles=")),
+            "a copied video is never burned: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_ignores_always_burn_in_outside_video_hls() {
+        // Upstream binds the flag on the video HLS routes only; the
+        // progressive stream routes leave it false.
+        let root = tempfile::tempdir().unwrap();
+        let (planner, _) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![
+                    video_stream("hevc"),
+                    audio_stream("aac"),
+                    subtitle_stream("subrip", 2),
+                ],
+            )],
+            root.path(),
+        )
+        .await;
+        let mut req = request("abc");
+        req.output_container = Some("mp4".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=External".to_owned();
+        req.always_burn_in_subtitle_when_transcoding = true;
+        let plan = planner
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert!(
+            !plan.arguments.iter().any(|a| a.contains("subtitles=")),
+            "progressive must not burn: {:?}",
+            plan.arguments
+        );
+    }
+
+    #[test]
+    fn output_id_keys_on_always_burn_in() {
+        let mut req = request("abc");
+        req.query_string = "?SubtitleStreamIndex=2&SubtitleMethod=External".to_owned();
+        let external = output_id(&req, "ts", false);
+        req.always_burn_in_subtitle_when_transcoding = true;
+        assert_ne!(
+            external,
+            output_id(&req, "ts", false),
+            "burn vs no-burn must not share cache files"
         );
     }
 
@@ -2866,6 +5356,67 @@ mod tests {
                 .iter()
                 .any(|a| a == "-hls_fmp4_init_filename")
         );
+    }
+
+    /// `DynamicHlsController.GetCommandLineArguments` (v12.2, :1610-1617; PR
+    /// 17501): fMP4 HLS with video carries `movflags=+frag_discont+skip_sidx`
+    /// as `-hls_segment_options`, or as `-hls_ts_options` on ffmpeg older than
+    /// 5.0 (`_minFFmpegHlsSegmentOptions`) and when the version is unknown (a
+    /// null `EncoderVersion` compares below 5.0). Audio-only output, a source
+    /// without video and MPEG-TS segments get neither.
+    #[rstest::rstest]
+    #[case::fmp4_video(Some((7, 1)), "mp4", false, true, Some("-hls_segment_options"))]
+    #[case::fmp4_video_on_5_0(Some((5, 0)), "mp4", false, true, Some("-hls_segment_options"))]
+    #[case::fmp4_video_before_5_0(Some((4, 4)), "mp4", false, true, Some("-hls_ts_options"))]
+    #[case::fmp4_video_unknown_version(None, "mp4", false, true, Some("-hls_ts_options"))]
+    #[case::fmp4_audio_request(Some((7, 1)), "mp4", true, true, None)]
+    #[case::fmp4_source_without_video(Some((7, 1)), "mp4", false, false, None)]
+    #[case::mpegts_video(Some((7, 1)), "ts", false, true, None)]
+    #[tokio::test]
+    async fn fmp4_video_segments_carry_frag_discont_and_skip_sidx(
+        #[case] version: Option<(i32, i32)>,
+        #[case] segment_container: &str,
+        #[case] is_audio: bool,
+        #[case] has_video: bool,
+        #[case] option: Option<&str>,
+    ) {
+        use ferrofin_mediaencoding::encoder::FfmpegVersion;
+
+        let mut streams = vec![audio_stream("aac")];
+        if has_video {
+            streams.insert(0, video_stream("h264"));
+        }
+        let mut capabilities = FfmpegCapabilities::builder();
+        if let Some((major, minor)) = version {
+            capabilities = capabilities.ffmpeg_version(FfmpegVersion::new(major, minor));
+        }
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", streams)],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            capabilities.build(),
+            EncodingOptions::default(),
+        );
+        let mut req = request("abc");
+        req.segment_container = Some(segment_container.to_owned());
+        let plan = p
+            .plan(&req, is_audio, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let found: Vec<_> = plan
+            .arguments
+            .windows(2)
+            .filter(|w| w[0] == "-hls_segment_options" || w[0] == "-hls_ts_options")
+            .map(|w| (w[0].as_str(), w[1].as_str()))
+            .collect();
+        let expected: Vec<_> = option
+            .map(|name| (name, "movflags=+frag_discont+skip_sidx"))
+            .into_iter()
+            .collect();
+        assert_eq!(found, expected, "{:?}", plan.arguments);
     }
 
     #[tokio::test]
@@ -2961,12 +5512,13 @@ mod tests {
             plan.arguments
         );
 
-        // Absent → the 3s default.
+        // Absent → the default, 6 s for this copied H.264 video
+        // ([`plan_defaults_the_segment_length_by_the_output_video_codec`]).
         let plan = p
             .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
             .await
             .unwrap();
-        assert_eq!(plan.segment_length_ms, 3000);
+        assert_eq!(plan.segment_length_ms, 6000);
 
         // A degenerate 0 would make the playlist generator divide by zero
         // (`HlsError::InvalidOperation` → 500); it falls back to the default
@@ -2977,7 +5529,453 @@ mod tests {
             .plan(&req, false, Some(0), PlaylistKind::Vod)
             .await
             .unwrap();
+        assert_eq!(plan.segment_length_ms, 6000);
+    }
+
+    /// `StreamState.SegmentLength`'s defaults, its user-agent match ignoring
+    /// case.
+    #[rstest]
+    #[case(false, None, false, 3)]
+    #[case(false, Some("AppleTV/11.1"), true, 3)]
+    #[case(true, None, false, 6)]
+    #[case(true, None, true, 3)]
+    #[case(true, Some("Mozilla/5.0 (X11; Linux x86_64)"), true, 3)]
+    #[case(true, Some("AppleTV/11.1"), true, 6)]
+    #[case(true, Some("AppleCoreMedia CFNetwork/1410"), true, 6)]
+    #[case(true, Some("Mozilla/5.0 (iPad; CPU OS 17_0)"), true, 6)]
+    #[case(true, Some("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)"), true, 6)]
+    #[case(true, Some("Mozilla/5.0 (iPod touch)"), true, 6)]
+    fn default_segment_length_follows_stream_state(
+        #[case] copied_video: bool,
+        #[case] user_agent: Option<&str>,
+        #[case] live: bool,
+        #[case] expected: i32,
+    ) {
+        assert_eq!(
+            default_segment_length_secs(copied_video, user_agent, live),
+            expected
+        );
+    }
+
+    /// `StreamState.SegmentLength` without a requested length: a copied video
+    /// gets 6 s segments, 3 s when it is a live stream without a runtime
+    /// unless an Apple user agent asks; a transcoded video gets 3 s. Every
+    /// reader sees that one value: `-hls_time`, the playlist and `MinSegments`.
+    #[tokio::test]
+    async fn plan_defaults_the_segment_length_by_the_output_video_codec() {
+        let copied = |req: &mut HlsStreamRequest| {
+            req.video_codec = Some("copy".to_owned());
+            req.audio_codec = Some("copy".to_owned());
+        };
+        let hls_time = |plan: &TranscodePlan| {
+            plan.arguments
+                .windows(2)
+                .find(|w| w[0] == "-hls_time")
+                .map(|w| w[1].clone())
+        };
+
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        let mut req = request("abc");
+        copied(&mut req);
+        // Segment 2 of a 6 s playlist, whose URL carries its playlist time.
+        req.current_runtime_ticks = 12 * TICKS_PER_SECOND;
+        let plan = p
+            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(plan.is_remuxing_video);
+        assert_eq!(plan.segment_length_ms, 6000);
+        assert_eq!(
+            hls_time(&plan).as_deref(),
+            Some("6"),
+            "{:?}",
+            plan.arguments
+        );
+        // Its playlist time, 12 s, plus the half second a remuxed HLS
+        // segment seeks late (the fake renders `-ss` in ticks).
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-ss", "125000000"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments
+                .windows(2)
+                .any(|w| w == ["-output_ts_offset", "12.5"]),
+            "segment 2 of a 6 s playlist starts at its playlist time: {:?}",
+            plan.arguments
+        );
+
+        // A requested length still wins.
+        req.segment_length = Some(4);
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert_eq!(plan.segment_length_ms, 4000);
+
+        // A transcoded video: 3 s.
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("mpeg4"), audio_stream("aac")],
+        )]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(!plan.is_remuxing_video);
         assert_eq!(plan.segment_length_ms, 3000);
+        assert_eq!(
+            hls_time(&plan).as_deref(),
+            Some("3"),
+            "{:?}",
+            plan.arguments
+        );
+
+        // A copied live stream (no runtime): 3 s, but 6 s for an Apple client.
+        let mut live = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        live.run_time_ticks = None;
+        let p = planner(vec![live]);
+        let mut req = request("abc");
+        copied(&mut req);
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(plan.is_remuxing_video);
+        assert_eq!(plan.segment_length_ms, 3000);
+        req.user_agent = Some("AppleCoreMedia/1.0.0.21A329 (iPhone; U; CPU OS 17_0)".to_owned());
+        let plan = p
+            .plan(&req, false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert_eq!(plan.segment_length_ms, 6000);
+    }
+
+    /// The live-TV tuner settings reach the transcode's input options in
+    /// `GetInputModifier`'s order: timestamp sync, pacing, `-fflags +igndts`,
+    /// then the looping reconnect options — all ahead of `-i`, none after.
+    #[tokio::test]
+    async fn tuner_input_settings_become_ordered_input_options() {
+        use ferrofin_mediaencoding::encoder::FfmpegVersion;
+
+        let mut src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        src.read_at_native_framerate = true;
+        src.ignore_dts = true;
+        src.requires_looping = true;
+        let capabilities = FfmpegCapabilities::builder()
+            .ffmpeg_version(FfmpegVersion::new(5, 0))
+            .build();
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![src],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            capabilities,
+            EncodingOptions::default(),
+        );
+        let plan = p
+            .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let input = plan
+            .arguments
+            .iter()
+            .position(|argument| argument == "-i")
+            .unwrap();
+        let before = plan.arguments[..input].join(" ");
+        // Version 5.0 has neither `-fps_mode` nor the read-rate catch-up.
+        let expected = "-async 1 -vsync -1 -re -fflags +igndts -stream_loop -1 \
+            -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2";
+        assert!(before.contains(expected), "{before}");
+        let after = plan.arguments[input + 1..].join(" ");
+        assert!(
+            !after.contains("igndts") && !after.contains("stream_loop"),
+            "{after}"
+        );
+    }
+
+    /// `DynamicHlsController.GetVideoArguments`: before ffmpeg 7.0.1,
+    /// libx265's B-frames break fMP4 HLS on iOS, so an HLS libx265 encode
+    /// turns them off right after its keyframe arguments. The gate reads the
+    /// encoder and the version only (an unknown version is older, as C#'s
+    /// `null < version` is), and the progressive path has no such arm.
+    #[rstest::rstest]
+    #[case::before_7_0_1(Some(FfmpegVersion::new(7, 0)), PlaylistKind::Vod, "mp4", true)]
+    #[case::mpegts_segments(Some(FfmpegVersion::new(6, 1)), PlaylistKind::Vod, "ts", true)]
+    #[case::event_playlist(Some(FfmpegVersion::new(6, 1)), PlaylistKind::Event, "mp4", true)]
+    #[case::from_7_0_1(
+        Some(FfmpegVersion::with_build(7, 0, 1)),
+        PlaylistKind::Vod,
+        "mp4",
+        false
+    )]
+    #[case::unknown_version(None, PlaylistKind::Vod, "mp4", true)]
+    #[case::progressive(
+        Some(FfmpegVersion::new(6, 1)),
+        PlaylistKind::Progressive,
+        "mp4",
+        false
+    )]
+    #[tokio::test]
+    async fn libx265_hls_drops_b_frames_before_ffmpeg_7_0_1(
+        #[case] version: Option<FfmpegVersion>,
+        #[case] kind: PlaylistKind,
+        #[case] segment_container: &str,
+        #[case] no_b_frames: bool,
+    ) {
+        let mut capabilities = FfmpegCapabilities::builder();
+        if let Some(version) = version {
+            capabilities = capabilities.ffmpeg_version(version);
+        }
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![video_stream("mpeg4"), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            capabilities.build(),
+            EncodingOptions::default(),
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("hevc".to_owned());
+        req.segment_container = Some(segment_container.to_owned());
+        req.output_container = Some("mkv".to_owned());
+        let segment = (kind != PlaylistKind::Progressive).then_some(0);
+
+        let plan = p.plan(&req, false, segment, kind).await.unwrap();
+
+        let args = &plan.arguments;
+        assert!(
+            args.windows(2).any(|w| w == ["-c:v", "libx265"]),
+            "{args:?}"
+        );
+        assert_eq!(
+            args.windows(2).any(|w| w == ["-bf", "0"]),
+            no_b_frames,
+            "{args:?}"
+        );
+        if no_b_frames {
+            // Right after the keyframe arguments, as upstream appends it.
+            let bf = args.iter().position(|a| a == "-bf").unwrap();
+            assert_eq!(args[bf - 2], "-force_key_frames:0", "{args:?}");
+        }
+    }
+
+    /// The same encoder through a libx264 job never loses its B-frames.
+    #[tokio::test]
+    async fn libx264_hls_keeps_its_b_frames_on_old_ffmpeg() {
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![video_stream("mpeg4"), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            FfmpegCapabilities::builder()
+                .ffmpeg_version(FfmpegVersion::new(6, 1))
+                .build(),
+            EncodingOptions::default(),
+        );
+        let plan = p
+            .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "libx264"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(!plan.arguments.iter().any(|a| a == "-bf"));
+    }
+
+    #[tokio::test]
+    async fn deletion_copy_pacing_is_a_version_gated_input_option() {
+        use ferrofin_mediaencoding::encoder::FfmpegVersion;
+
+        for (version, enabled, native, expected) in [
+            (None, true, false, Vec::new()),
+            (Some(FfmpegVersion::new(4, 4)), true, false, Vec::new()),
+            (
+                Some(FfmpegVersion::new(5, 0)),
+                true,
+                false,
+                vec!["-readrate", "10"],
+            ),
+            (
+                Some(FfmpegVersion::new(7, 1)),
+                true,
+                false,
+                vec!["-readrate", "10"],
+            ),
+            (
+                Some(FfmpegVersion::new(8, 0)),
+                true,
+                false,
+                vec!["-readrate", "10", "-readrate_catchup", "1000"],
+            ),
+            (Some(FfmpegVersion::new(8, 0)), false, false, Vec::new()),
+            (
+                Some(FfmpegVersion::new(8, 0)),
+                false,
+                true,
+                vec!["-re", "-readrate_catchup", "100"],
+            ),
+        ] {
+            let mut src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+            src.read_at_native_framerate = native;
+            let mut capabilities = FfmpegCapabilities::builder();
+            if let Some(version) = version {
+                capabilities = capabilities.ffmpeg_version(version);
+            }
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![src],
+                    live_streams: HashMap::new(),
+                }),
+                false,
+                capabilities.build(),
+                EncodingOptions {
+                    enable_segment_deletion: enabled,
+                    ..EncodingOptions::default()
+                },
+            );
+            let plan = p
+                .plan(&request("abc"), false, Some(0), PlaylistKind::Vod)
+                .await
+                .unwrap();
+            assert!(plan.is_remuxing_video);
+            let input = plan
+                .arguments
+                .iter()
+                .position(|argument| argument == "-i")
+                .unwrap();
+            let actual: Vec<_> = plan.arguments[..input]
+                .iter()
+                .filter(|argument| {
+                    matches!(
+                        argument.as_str(),
+                        "-re" | "-readrate" | "-readrate_catchup" | "10" | "100" | "1000"
+                    )
+                })
+                .map(String::as_str)
+                .collect();
+            assert_eq!(actual, expected, "{:?}", plan.arguments);
+            assert!(!plan.arguments[input + 1..].iter().any(|argument| matches!(
+                argument.as_str(),
+                "-re" | "-readrate" | "-readrate_catchup"
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn hls_muxing_queue_obeys_the_saved_value_and_upstream_floor() {
+        // Pin DynamicHlsController.GetCommandLineArguments' signed boundary,
+        // output-option position and every HLS playlist/container family.
+        for configured in [i32::MIN, -1, 0, 127, 128, 129, 2048, i32::MAX] {
+            for kind in [PlaylistKind::Vod, PlaylistKind::Event] {
+                for container in ["ts", "mp4"] {
+                    for is_audio in [false, true] {
+                        let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+                        let p = planner_over_with(
+                            Arc::new(FakeMediaSources {
+                                sources: vec![src],
+                                live_streams: HashMap::new(),
+                            }),
+                            false,
+                            &[],
+                            EncodingOptions {
+                                max_muxing_queue_size: configured,
+                                ..EncodingOptions::default()
+                            },
+                        );
+                        let mut req = request("abc");
+                        req.segment_container = Some(container.to_owned());
+                        let plan = p.plan(&req, is_audio, Some(0), kind).await.unwrap();
+                        let queue = plan
+                            .arguments
+                            .iter()
+                            .position(|arg| arg == "-max_muxing_queue_size")
+                            .unwrap();
+                        let input = plan.arguments.iter().position(|arg| arg == "-i").unwrap();
+                        let muxer = plan.arguments.iter().position(|arg| arg == "-f").unwrap();
+                        assert!(input < queue && queue < muxer, "{:?}", plan.arguments);
+                        assert_eq!(
+                            plan.arguments[queue + 1],
+                            if configured > 128 {
+                                configured.to_string()
+                            } else {
+                                "128".to_owned()
+                            },
+                        );
+                        assert_eq!(
+                            plan.arguments
+                                .iter()
+                                .filter(|arg| *arg == "-max_muxing_queue_size")
+                                .count(),
+                            1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn progressive_output_excludes_the_hls_muxing_queue_option() {
+        for configured in [-1, 8192] {
+            for is_audio in [false, true] {
+                let p = planner_over_with(
+                    Arc::new(FakeMediaSources {
+                        sources: vec![source(
+                            "abc",
+                            vec![video_stream("h264"), audio_stream("aac")],
+                        )],
+                        live_streams: HashMap::new(),
+                    }),
+                    false,
+                    &[],
+                    EncodingOptions {
+                        max_muxing_queue_size: configured,
+                        ..EncodingOptions::default()
+                    },
+                );
+                let mut request = request("abc");
+                request.output_container = Some(if is_audio { "m4a" } else { "mp4" }.to_owned());
+                let plan = p
+                    .plan(&request, is_audio, None, PlaylistKind::Progressive)
+                    .await
+                    .unwrap();
+                assert_eq!(plan.state.transcoding_type, TranscodingJobType::Progressive);
+                assert!(
+                    !plan
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "-max_muxing_queue_size"),
+                    "{:?}",
+                    plan.arguments
+                );
+                assert!(
+                    !plan
+                        .arguments
+                        .iter()
+                        .any(|argument| argument.starts_with("-hls_")),
+                    "{:?}",
+                    plan.arguments
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2989,7 +5987,8 @@ mod tests {
             .await
             .unwrap();
         assert!(plan.arguments.windows(2).any(|w| w == ["-f", "hls"]));
-        assert!(plan.arguments.windows(2).any(|w| w == ["-hls_time", "3"]));
+        // The H.264 source is copied: 6 s segments.
+        assert!(plan.arguments.windows(2).any(|w| w == ["-hls_time", "6"]));
         assert!(
             plan.arguments
                 .windows(2)
@@ -3018,10 +6017,15 @@ mod tests {
         let src = source("abc", vec![video_stream("mpeg4"), audio_stream("aac")]);
         let p = planner(vec![src]);
         let plan = p
-            .plan(&request("abc"), true, Some(2), PlaylistKind::Vod)
+            .plan(
+                &at_segment(request("abc"), 2),
+                true,
+                Some(2),
+                PlaylistKind::Vod,
+            )
             .await
             .unwrap();
-        // Audio-only plan: segment 2 seeks to 2 * 3s = 6s worth of ticks.
+        // Audio-only plan: segment 2 seeks to its playlist time, 2 * 3s = 6s.
         assert!(
             plan.arguments.iter().any(|a| a == "-ss"),
             "{:?}",
@@ -3038,15 +6042,283 @@ mod tests {
             plan.arguments
         );
         // ...and shift output timestamps to the segment's playlist time (2 * 3s =
-        // 12s) so the player can splice the seek-restarted segment (else PTS ~0
+        // 6s) so the player can splice the seek-restarted segment (else PTS ~0
         // → discontinuity → stall).
         assert!(
             plan.arguments
                 .windows(2)
                 .any(|w| w == ["-output_ts_offset", "6"]),
-            "seek segment must set -output_ts_offset to N*segment_len: {:?}",
+            "seek segment must set -output_ts_offset to its playlist time: {:?}",
             plan.arguments
         );
+    }
+
+    #[tokio::test]
+    async fn a_seek_starts_at_the_segments_playlist_time_not_its_index() {
+        // A remux playlist is cut on keyframes, so segment 2 can start at
+        // 13.32 s where 2 * 3 s would be 6 s. The URL's runtimeTicks wins
+        // (`StartTimeTicks = CurrentRuntimeTicks`).
+        let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.current_runtime_ticks = 133_200_000;
+
+        let plan = p
+            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert_eq!(plan.state.base_request.start_time_ticks, Some(133_200_000));
+        // The input seek goes half a second past the keyframe, so ffmpeg does
+        // not land on the keyframe before it (the fake renders raw ticks).
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-ss", "138200000"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments
+                .windows(2)
+                .any(|w| w == ["-output_ts_offset", "13.82"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments
+                .windows(2)
+                .any(|w| w == ["-start_number", "2"]),
+            "{:?}",
+            plan.arguments
+        );
+    }
+
+    /// Only a seeked HLS segment of a copied video seeks half a second late:
+    /// an HLS transcode and a progressive stream seek to the exact time.
+    #[rstest::rstest]
+    #[case::hls_remux(PlaylistKind::Vod, true, "65000000", Some("6.5"))]
+    #[case::hls_transcode(PlaylistKind::Vod, false, "60000000", Some("6"))]
+    #[case::progressive_remux(PlaylistKind::Progressive, true, "60000000", None)]
+    #[tokio::test]
+    async fn the_half_second_seek_offset_is_for_hls_remuxes_only(
+        #[case] kind: PlaylistKind,
+        #[case] copy_allowed: bool,
+        #[case] seek: &str,
+        #[case] ts_offset: Option<&str>,
+    ) {
+        let src = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = copy_allowed;
+        let segment = if kind == PlaylistKind::Progressive {
+            req.start_time_ticks = Some(6 * TICKS_PER_SECOND);
+            None
+        } else {
+            req.current_runtime_ticks = 6 * TICKS_PER_SECOND;
+            Some(2)
+        };
+
+        let plan = p.plan(&req, false, segment, kind).await.unwrap();
+
+        assert_eq!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
+            copy_allowed,
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-ss", seek]),
+            "{:?}",
+            plan.arguments
+        );
+        let offset = plan
+            .arguments
+            .windows(2)
+            .find(|w| w[0] == "-output_ts_offset")
+            .map(|w| w[1].as_str());
+        assert_eq!(offset, ts_offset, "{:?}", plan.arguments);
+    }
+
+    /// `GetFastSeekCommandLineParameter` clamps every seek to `[0, runtime −
+    /// 5 s]`, HLS segments included, after the remux's half second. The
+    /// timestamps follow the clamped seek, so the segment keeps the source's
+    /// timeline: the output offset and the burned-in subtitle's clock both
+    /// name where the input really starts.
+    #[rstest::rstest]
+    #[case::hls_remux(true, None)]
+    #[case::hls_transcode(false, None)]
+    #[case::hls_text_burn_in(false, Some(2))]
+    #[tokio::test]
+    async fn an_hls_seek_into_the_last_five_seconds_starts_five_seconds_before_the_end(
+        #[case] copy_allowed: bool,
+        #[case] subtitle: Option<i32>,
+    ) {
+        // 90 minutes: the last seekable tick is 5395 s.
+        let src = source(
+            "abc",
+            vec![
+                video_stream("h264"),
+                audio_stream("aac"),
+                subtitle_stream("subrip", 2),
+            ],
+        );
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = copy_allowed;
+        req.current_runtime_ticks = 5398 * TICKS_PER_SECOND;
+        if let Some(index) = subtitle {
+            req.subtitle_stream_index = Some(index);
+            req.subtitle_method = Some("Encode".to_owned());
+        }
+
+        let plan = p
+            .plan(&req, false, Some(1799), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        assert_eq!(
+            args.windows(2).any(|w| w == ["-c:v", "copy"]),
+            copy_allowed,
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["-ss", "53950000000"]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["-output_ts_offset", "5395"]),
+            "{args:?}"
+        );
+        // The request still names the segment's own playlist time.
+        assert_eq!(
+            plan.state.base_request.start_time_ticks,
+            Some(5398 * TICKS_PER_SECOND)
+        );
+        if subtitle.is_some() {
+            let vf = args
+                .iter()
+                .position(|a| a == "-vf")
+                .map(|i| args[i + 1].as_str())
+                .expect("-vf present");
+            assert!(
+                vf.starts_with("setpts=PTS+5395/TB,") && vf.ends_with(",setpts=PTS-5395/TB"),
+                "{vf}"
+            );
+        }
+    }
+
+    /// `GetCopiedAudioTrimBsf` cuts copied audio at the seek on the source's
+    /// timeline, which upstream's `-copyts` keeps. These jobs pass no
+    /// `-copyts`, so the packets the filter sees count from the input seek:
+    /// the cutoff is the requested start less that seek, 0 unless the seek
+    /// was clamped before the end, where upstream also cuts the audio up to
+    /// the requested start (gl-1018: cut at the absolute 150 s, a seek
+    /// to 2:30 dropped every audio packet and fMP4 segments came out empty).
+    #[rstest::rstest]
+    #[case::seek(50, 150, "150", "0.000")]
+    #[case::clamped_before_the_end(1799, 5398, "5395", "3.000")]
+    #[tokio::test]
+    async fn the_copied_audio_trim_counts_from_the_input_seek(
+        #[case] segment: i32,
+        #[case] start_secs: i64,
+        #[case] output_offset: &str,
+        #[case] cutoff: &str,
+    ) {
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("ac3")]);
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![src],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            FfmpegCapabilities::builder()
+                .ffmpeg_version(FfmpegVersion::new(5, 0))
+                .build(),
+            EncodingOptions::default(),
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.audio_codec = Some("ac3".to_owned());
+        req.current_runtime_ticks = start_secs * TICKS_PER_SECOND;
+
+        let plan = p
+            .plan(&req, false, Some(segment), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        assert!(args.windows(2).any(|w| w == ["-c:a", "copy"]), "{args:?}");
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-output_ts_offset", output_offset]),
+            "{args:?}"
+        );
+        let trim = format!("noise=drop='lt(pts*tb\\,{cutoff})'");
+        assert!(
+            args.windows(2).any(|w| w[0] == "-bsf:a" && w[1] == trim),
+            "{args:?}"
+        );
+    }
+
+    /// `GetFastSeekCommandLineParameter`'s arithmetic: the remux offset is
+    /// added first, the clamp needs a known runtime, and a file shorter than
+    /// the 5 s margin seeks to its start.
+    #[rstest::rstest]
+    #[case::no_start(None, Some(100), 0, None)]
+    #[case::in_range(Some(10), Some(100), 0, Some(10 * TICKS_PER_SECOND))]
+    #[case::remux_in_range(Some(10), Some(100), HLS_REMUX_SEEK_OFFSET_TICKS, Some(105_000_000))]
+    #[case::remux_past_the_margin(
+        Some(95),
+        Some(100),
+        HLS_REMUX_SEEK_OFFSET_TICKS,
+        Some(95 * TICKS_PER_SECOND)
+    )]
+    #[case::past_the_end(Some(200), Some(100), 0, Some(95 * TICKS_PER_SECOND))]
+    #[case::shorter_than_the_margin(Some(2), Some(3), 0, Some(0))]
+    #[case::unknown_runtime(Some(200), None, 0, Some(200 * TICKS_PER_SECOND))]
+    #[case::zero_runtime(Some(200), Some(0), 0, Some(200 * TICKS_PER_SECOND))]
+    #[tokio::test]
+    async fn fast_seek_ticks_clamps_the_offset_seek_before_the_end(
+        #[case] start_secs: Option<i64>,
+        #[case] runtime_secs: Option<i64>,
+        #[case] remux_offset: i64,
+        #[case] expected: Option<i64>,
+    ) {
+        let p = planner(vec![source("abc", vec![video_stream("h264")])]);
+        let mut state = p
+            .plan(&request("abc"), false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .state;
+        state.base_request.start_time_ticks = start_secs.map(|s| s * TICKS_PER_SECOND);
+        state.run_time_ticks = runtime_secs.map(|s| s * TICKS_PER_SECOND);
+        assert_eq!(fast_seek_ticks(&state, remux_offset), expected);
+    }
+
+    #[rstest::rstest]
+    #[case(60_000_000, 6)]
+    #[case(64_999_999, 6)]
+    #[case(65_000_000, 6)]
+    #[case(75_000_000, 8)]
+    #[case(133_200_000, 13)]
+    fn seek_seconds_round_half_to_even(#[case] ticks: i64, #[case] seconds: i64) {
+        assert_eq!(round_to_whole_seconds(ticks), seconds);
+    }
+
+    #[rstest::rstest]
+    #[case(60_000_000, "6")]
+    #[case(71_200_000, "7.12")]
+    #[case(1, "0.0000001")]
+    fn seconds_from_ticks_renders_ffmpeg_seconds(#[case] ticks: i64, #[case] seconds: &str) {
+        assert_eq!(seconds_from_ticks(ticks), seconds);
     }
 
     #[tokio::test]
@@ -3062,7 +6334,7 @@ mod tests {
         req.segment_container = Some("mp4".to_owned());
         req.video_codec = Some("hevc".to_owned()); // client supports hevc → copy
         let plan = p
-            .plan(&req, false, Some(2), PlaylistKind::Vod)
+            .plan(&at_segment(req, 2), false, Some(2), PlaylistKind::Vod)
             .await
             .unwrap();
         assert!(
@@ -3081,7 +6353,12 @@ mod tests {
         let src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
         let p = planner(vec![src]);
         let plan = p
-            .plan(&request("abc"), false, Some(2), PlaylistKind::Vod)
+            .plan(
+                &at_segment(request("abc"), 2),
+                false,
+                Some(2),
+                PlaylistKind::Vod,
+            )
             .await
             .unwrap();
         assert!(
@@ -3103,6 +6380,53 @@ mod tests {
         assert!(
             !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
             "no seek, no flag: {:?}",
+            plan.arguments
+        );
+
+        // TS segments take it as fMP4 ones do: the copied video starts at the
+        // keyframe either way, and the flag starts the audio there too.
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.segment_container = Some("ts".to_owned());
+        req.video_codec = Some("hevc".to_owned());
+        let plan = p
+            .plan(&at_segment(req, 2), false, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
+            "TS segments keep the flag: {:?}",
+            plan.arguments
+        );
+
+        // A wtv input never takes it: every upstream version that passed the
+        // flag kept it off wtv, "because it breaks seeking".
+        let mut src = source("abc", vec![video_stream("hevc"), audio_stream("eac3")]);
+        src.container = Some("wtv".to_owned());
+        let p = planner(vec![src]);
+        let mut req = request("abc");
+        req.segment_container = Some("mp4".to_owned());
+        req.video_codec = Some("hevc".to_owned());
+        let plan = p
+            .plan(&at_segment(req, 2), false, Some(2), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:v", "copy"]),
+            "{:?}",
+            plan.arguments
+        );
+        // It still seeks, half a second past the segment start as any HLS
+        // remux does.
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-ss", "65000000"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(
+            !plan.arguments.iter().any(|a| a == "-noaccurate_seek"),
+            "wtv input keeps accurate seek: {:?}",
             plan.arguments
         );
     }
@@ -3148,6 +6472,20 @@ mod tests {
         assert_eq!(hls_segment_type("mp4"), "fmp4");
     }
 
+    /// Gives `video` the metadata of an out-of-spec Dolby Vision stream on a
+    /// PQ base layer (profile 8 with compatibility id 6): `DOVIInvalid`, HDR.
+    fn invalid_dovi(video: &mut MediaStream) {
+        video.color_transfer = Some("smpte2084".to_owned());
+        video.dv_profile = Some(8);
+        video.dv_bl_signal_compatibility_id = Some(6);
+        video.rpu_present_flag = Some(1);
+        video.bl_present_flag = Some(1);
+        assert_eq!(
+            video.video_range_type(),
+            ferrofin_model::data::VideoRangeType::DoviInvalid
+        );
+    }
+
     /// A 4K HDR10 HEVC video stream (the heavy-transcode benchmark shape).
     fn hdr_4k_video_stream(codec: &str) -> MediaStream {
         MediaStream {
@@ -3182,7 +6520,7 @@ mod tests {
         // Force a keyframe on every 3 s segment boundary so the HLS muxer cuts on
         // `-hls_time` instead of libx264's ~10 s natural GOP — halving TTFS.
         assert!(
-            args.contains("-force_key_frames:0 expr:gte(t,n_forced*3)"),
+            args.contains("-force_key_frames:0 expr:gte(t,n_forced*3) -sc_threshold:v:0 0"),
             "segment-boundary keyframes expected: {args}"
         );
         assert!(
@@ -3422,6 +6760,13 @@ mod tests {
         // Gone with the bolt-on: the fixed constant-quality target and `-crf`.
         assert!(!args.contains("-cq"), "{args}");
         assert!(!args.contains("-crf"), "{args}");
+        // NVENC's forced keyframes cut segments once they are IDR frames, and
+        // need no frame rate: this source has none.
+        assert!(
+            args.contains("-forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"),
+            "{args}"
+        );
+        assert!(!args.contains("-g:v:0"), "{args}");
     }
 
     /// This machine's actual ffmpeg n9.0.1: the CUDA filters are present but
@@ -3506,7 +6851,11 @@ mod tests {
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         let args = plan.arguments.join(" ");
         assert!(args.contains("-map [v]"), "{args}");
-        assert!(args.contains("[0:0][0:2]overlay[v]"), "{args}");
+        assert!(args.contains("[0:2]scale,"), "{args}");
+        assert!(
+            args.contains("[sub];[0:0][sub]overlay=eof_action=pass:repeatlast=0[v]"),
+            "{args}"
+        );
         // ...and no negative map, because this graph's output IS labelled.
         assert!(!args.contains("-map -0:0"), "{args}");
     }
@@ -3608,16 +6957,7 @@ mod tests {
     /// planner's VAAPI prober at it.
     fn stub_vaapi_ffmpeg(dir: &std::path::Path, driver: &str) {
         let path = dir.join("stub-ffmpeg");
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\necho 'VAAPI driver: {driver}' >&2\n"),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        crate::test_exec::stub_script(&path, &format!("echo 'VAAPI driver: {driver}' >&2\n"));
         FAKE_FFMPEG.with(|p| *p.borrow_mut() = path.to_string_lossy().into_owned());
     }
 
@@ -3700,11 +7040,11 @@ mod tests {
             ("av1,hevc,h264", false, true, "hevc_vaapi"),
             ("av1,hevc,h264", false, false, "h264_vaapi"),
             ("av1,hevc,h264", true, true, "av1_vaapi"),
-            ("vp9,av1,h264", false, false, "h264_vaapi"),
-            ("vp9,av1,h264", true, false, "av1_vaapi"),
-            ("vp9,hevc,h264", false, false, "h264_vaapi"),
-            ("vp9,hevc,h264", false, true, "hevc_vaapi"),
-            ("vp9,h265,h264", false, false, "h264_vaapi"),
+            ("vp9,av1,h264", false, false, "vp9"),
+            ("vp9,av1,h264", true, false, "vp9"),
+            ("vp9,hevc,h264", false, false, "vp9"),
+            ("vp9,hevc,h264", false, true, "vp9"),
+            ("vp9,h265,h264", false, false, "vp9"),
             ("av1,hevc", false, false, "av1_vaapi"),
         ] {
             assert_eq!(
@@ -3713,6 +7053,40 @@ mod tests {
                 "{codecs} with AllowAv1Encoding={allow_av1}, AllowHevcEncoding={allow_hevc}"
             );
         }
+    }
+
+    /// `GetEncoderParam`'s VAAPI arm keys on `IsVaapiDeviceInteliHD`, which
+    /// only the per-job probe learns: an explicit preset on a probed iHD device
+    /// becomes `-compression_level`. The boot capabilities the encoding helper
+    /// was built with never carry the driver, so reading those would leave the
+    /// arm dead on every Intel server.
+    #[tokio::test]
+    async fn a_probed_ihd_device_maps_the_preset_to_compression_level() {
+        let dir = tempfile::tempdir().unwrap();
+        stub_vaapi_ffmpeg(dir.path(), "Intel iHD driver");
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            vaapi_caps(),
+            EncodingOptions {
+                encoder_preset: EncoderPreset::slow,
+                ..vaapi_options()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+
+        assert!(args.contains("-c:v h264_vaapi"), "{args}");
+        assert!(args.contains(" -compression_level 3"), "{args}");
     }
 
     #[tokio::test]
@@ -3758,6 +7132,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_amd_opencl_vendor_reaches_ffmpeg_as_one_argument() {
+        // The device graph is one string, and AMD's OpenCL tonemap names its
+        // vendor with spaces in it. A whitespace split handed ffmpeg
+        // `device_vendor="Advanced`, `Micro` and `Devices"` as three arguments.
+        let dir = tempfile::tempdir().unwrap();
+        stub_vaapi_ffmpeg(dir.path(), "Mesa Gallium driver 24.0.0 for AMD Radeon");
+        let mut video = hdr_4k_video_stream("hevc");
+        video.pixel_format = Some("yuv420p10le".to_owned());
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![video, audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            vaapi_caps(),
+            EncodingOptions {
+                enable_tonemapping: true,
+                ..vaapi_options()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(
+            plan.arguments
+                .iter()
+                .any(|a| a == "opencl=ocl:.0,device_vendor=Advanced Micro Devices"),
+            "{:?}",
+            plan.arguments
+        );
+    }
+
+    #[tokio::test]
     async fn an_unrecognised_vaapi_driver_gets_no_device_and_no_low_power() {
         // Real hardware lands here: NVIDIA's VAAPI shim reports a driver name
         // none of the three match. The chain still runs, but nothing Intel-only
@@ -3788,6 +7196,50 @@ mod tests {
         assert!(args.contains("scale_vaapi="), "{args}");
     }
 
+    #[tokio::test]
+    async fn only_an_amd_hevc_vaapi_hls_encode_extracts_the_extradata() {
+        // AMD's HEVC encoder writes in-band parameter sets that disagree with
+        // the extradata, which breaks `hvc1` decoding. The probed driver is the
+        // only source of the AMD flag, so this goes through the prober.
+        const AMD: &str = "Mesa Gallium driver 24.0.0 for AMD Radeon";
+        const EXTRACT: &str = "-flags:v -global_header -bsf:v extract_extradata=remove=0";
+        for (driver, codec, kind, expected) in [
+            (AMD, "hevc", PlaylistKind::Vod, true),
+            (AMD, "h264", PlaylistKind::Vod, false),
+            ("Intel iHD driver", "hevc", PlaylistKind::Vod, false),
+            (AMD, "hevc", PlaylistKind::Progressive, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            stub_vaapi_ffmpeg(dir.path(), driver);
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source(
+                        "abc",
+                        vec![nvdec_decodable_video_stream(), audio_stream("aac")],
+                    )],
+                    live_streams: HashMap::new(),
+                }),
+                false,
+                vaapi_caps(),
+                EncodingOptions {
+                    allow_hevc_encoding: true,
+                    ..vaapi_options()
+                },
+            );
+            let mut req = request("abc");
+            req.video_codec = Some(codec.to_owned());
+            req.allow_video_stream_copy = false;
+            let plan = p.plan(&req, false, None, kind).await.unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(args.contains(&format!("-c:v {codec}_vaapi")), "{args}");
+            assert_eq!(
+                args.contains(EXTRACT),
+                expected,
+                "{driver} {codec} {kind:?}: {args}"
+            );
+        }
+    }
+
     /// A QSV-capable ffmpeg on `platform`.
     fn qsv_caps(
         platform: ferrofin_mediaencoding::encoding_helper::hw::Platform,
@@ -3815,7 +7267,6 @@ mod tests {
         if tonemap {
             video.pixel_format = Some("yuv420p10le".to_owned());
             video.bit_depth = Some(10);
-            video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
             video.color_transfer = Some("smpte2084".to_owned());
             video.codec = Some("hevc".to_owned());
         }
@@ -3878,6 +7329,79 @@ mod tests {
             ),
             "{args}"
         );
+        // QSV's forced I-frames are not IDR frames until `forced_idr` says so,
+        // and only IDR frames can cut a segment (not yet run on an Intel GPU).
+        assert!(
+            args.contains("-forced_idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"),
+            "{args}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_libsvtav1_gop_is_one_segment_of_output_frames() {
+        // libsvtav1 forces a keyframe at every segment boundary, and keeps
+        // upstream's GOP, sized in output frames: the `-r` a `MaxFramerate`
+        // sets, else the rate ffmpeg guesses and encodes at.
+        for (average, real, max_framerate, gop) in [
+            (None, Some(23.976), None, Some(72)),
+            (Some(59.94), Some(59.94), Some(30.0), Some(90)),
+            // A VFR phone clip: its average (24.04) would give 73 and cut
+            // 4.9 s / 2.4 s segments.
+            (Some(24.04), Some(30.0), None, Some(90)),
+            // A millisecond timestamp grid: ffmpeg encodes at the average, not
+            // at the real 1000 that upstream sizes a 100 s GOP by.
+            (Some(30.0), Some(1000.0), None, Some(90)),
+            // ffmpeg's bounds: a real 240 fps source, a real rate of 210 or
+            // less, an average of 70 or more, and no usable average all keep
+            // the real rate.
+            (Some(240.0), Some(240.0), None, Some(720)),
+            (Some(30.0), Some(210.0), None, Some(630)),
+            (Some(70.0), Some(1000.0), None, Some(3000)),
+            (Some(120.0), Some(1000.0), None, Some(3000)),
+            (Some(0.0), Some(1000.0), None, Some(3000)),
+            (None, Some(1000.0), None, Some(3000)),
+            // No real rate, no GOP, as upstream.
+            (Some(23.976), None, None, None),
+        ] {
+            let video = MediaStream {
+                average_frame_rate: average,
+                real_frame_rate: real,
+                ..video_stream("mpeg4")
+            };
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source("abc", vec![video, audio_stream("aac")])],
+                    live_streams: HashMap::new(),
+                }),
+                false,
+                FfmpegCapabilities::builder()
+                    .encoders(["libx264", "libsvtav1"])
+                    .build(),
+                EncodingOptions {
+                    allow_av1_encoding: true,
+                    ..EncodingOptions::default()
+                },
+            );
+            let mut req = request("abc");
+            req.video_codec = Some("av1".to_owned());
+            req.allow_video_stream_copy = false;
+            req.max_framerate = max_framerate;
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            let args = plan.arguments.join(" ");
+            assert!(args.contains("-c:v libsvtav1"), "{args}");
+            let case = format!("{average:?}/{real:?}/{max_framerate:?}: {args}");
+            match gop {
+                Some(gop) => assert!(
+                    args.contains(&format!("-g:v:0 {gop} -keyint_min:v:0 {gop}")),
+                    "{case}"
+                ),
+                None => assert!(!args.contains("-g:v:0"), "{case}"),
+            }
+            assert!(
+                args.contains("-force_key_frames:0 expr:gte(t,n_forced*3)"),
+                "{case}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3922,8 +7446,7 @@ mod tests {
         // The whole point of the bitstream filters: this file copies through to
         // an HDR10 client instead of being re-encoded.
         let mut video = video_stream("hevc");
-        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
-        video.video_range_type = Some(ferrofin_model::data::VideoRangeType::DoviInvalid);
+        invalid_dovi(&mut video);
         video.nal_length_size = Some("4".to_owned());
         let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
         let mut req = request("abc");
@@ -3944,14 +7467,78 @@ mod tests {
         );
     }
 
+    /// `IsDoviRemoved` reaches the plan for the master playlist: true when the
+    /// client needs the Dolby Vision metadata gone and this ffmpeg can remove
+    /// it, false when the build has no filter that can (upstream's
+    /// `CanEncoderRemoveDynamicHdrMetadata`, the test capabilities' default).
+    #[tokio::test]
+    async fn the_plan_records_whether_dolby_vision_is_stripped() {
+        use ferrofin_mediaencoding::BsfOption;
+        let mut video = video_stream("hevc");
+        invalid_dovi(&mut video);
+        video.nal_length_size = Some("4".to_owned());
+        let mut req = request("abc");
+        req.video_codec = Some("copy".to_owned());
+        req.query_string = "hevc-rangetype=DOVI".to_owned();
+        for (supports_strip, expected) in [(true, true), (false, false)] {
+            let p = planner_over_caps(
+                Arc::new(FakeMediaSources {
+                    sources: vec![source("abc", vec![video.clone(), audio_stream("aac")])],
+                    live_streams: HashMap::new(),
+                }),
+                false,
+                FfmpegCapabilities::builder()
+                    .bsf_option(BsfOption::DoviRpuStrip, supports_strip)
+                    .build(),
+                EncodingOptions::default(),
+            );
+            let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+            assert_eq!(
+                plan.is_dovi_removed, expected,
+                "strip filter: {supports_strip}"
+            );
+            assert!(!plan.is_hdr10_plus_removed);
+        }
+
+        // `IsHdr10PlusRemoved`: a Dolby Vision client is confused by HDR10+
+        // beside a valid profile 8.1 layer, and this build can strip it.
+        let mut both = video_stream("hevc");
+        both.color_transfer = Some("smpte2084".to_owned());
+        both.color_primaries = Some("bt2020".to_owned());
+        both.color_space = Some("bt2020nc".to_owned());
+        both.dv_profile = Some(8);
+        both.dv_bl_signal_compatibility_id = Some(1);
+        both.rpu_present_flag = Some(1);
+        both.bl_present_flag = Some(1);
+        both.hdr10_plus_present_flag = Some(true);
+        both.nal_length_size = Some("4".to_owned());
+        assert_eq!(
+            both.video_range_type(),
+            ferrofin_model::data::VideoRangeType::DoviWithHdr10Plus
+        );
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![both, audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            FfmpegCapabilities::builder()
+                .bsf_option(BsfOption::HevcMetadataRemoveHdr10Plus, true)
+                .build(),
+            EncodingOptions::default(),
+        );
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        assert!(plan.is_hdr10_plus_removed);
+        assert!(!plan.is_dovi_removed);
+    }
+
     #[tokio::test]
     async fn a_stream_already_in_annex_b_gets_no_bitstream_filter() {
         // Upstream's `NalLengthSize == "0"` gate, which suppresses the metadata
         // removal as well as the container fixup — so the Dolby Vision RPU
         // survives here even though the client asked for it gone.
         let mut video = video_stream("hevc");
-        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
-        video.video_range_type = Some(ferrofin_model::data::VideoRangeType::DoviInvalid);
+        invalid_dovi(&mut video);
         video.nal_length_size = Some("0".to_owned());
         let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
         let mut req = request("abc");
@@ -3968,8 +7555,7 @@ mod tests {
         // A fresh bitstream needs neither the fixup nor the strip.
         let mut video = nvdec_decodable_video_stream();
         video.codec = Some("hevc".to_owned());
-        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
-        video.video_range_type = Some(ferrofin_model::data::VideoRangeType::DoviInvalid);
+        invalid_dovi(&mut video);
         video.nal_length_size = Some("4".to_owned());
         let p = planner(vec![source("abc", vec![video, audio_stream("aac")])]);
         let mut req = request("abc");
@@ -4016,6 +7602,30 @@ mod tests {
         assert!(!args.contains("alpha_format"), "{args}");
     }
 
+    /// The hardware chains' subtitle pad is the ffmpeg index too: a Blu-ray
+    /// source's TrueHD stream before the subtitle shifts it by one.
+    #[tokio::test]
+    async fn a_blu_ray_subtitle_pad_on_the_gpu_is_its_ffmpeg_index() {
+        let mut src = source(
+            "abc",
+            vec![
+                nvdec_decodable_video_stream(),
+                audio_stream("truehd"),
+                subtitle_stream("pgssub", 2),
+            ],
+        );
+        src.video_type = Some(ferrofin_model::entities::VideoType::BluRay);
+        let p = nvenc_planner(vec![src]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("[0:3]scale,scale="), "{args}");
+    }
+
     #[tokio::test]
     async fn an_exact_requested_size_reaches_the_hardware_scaler() {
         // `Width`/`Height` are a different request from `MaxWidth`/`MaxHeight`:
@@ -4059,7 +7669,12 @@ mod tests {
         req.subtitle_stream_index = Some(2);
         req.subtitle_method = Some("Encode".to_owned());
         let plan = p
-            .plan(&req, false, Some(10), PlaylistKind::Vod)
+            .plan(
+                &at_segment(req.clone(), 10),
+                false,
+                Some(10),
+                PlaylistKind::Vod,
+            )
             .await
             .unwrap();
         let args = plan.arguments.join(" ");
@@ -4074,6 +7689,325 @@ mod tests {
         // Segment 0 needs no shift at all.
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert!(!plan.arguments.join(" ").contains("setpts"));
+    }
+
+    /// A 1080i H.264 source at `rate` fps, re-encoded under `options` with a
+    /// 1280-wide bound (so the software chain also scales) and, when given, a
+    /// frame-rate cap: the joined ffmpeg arguments.
+    async fn software_args(
+        interlaced: bool,
+        rate: f32,
+        options: EncodingOptions,
+        max_framerate: Option<f32>,
+    ) -> String {
+        let mut video = video_stream("h264");
+        video.is_interlaced = interlaced;
+        video.width = Some(1920);
+        video.height = Some(1080);
+        video.average_frame_rate = Some(rate);
+        video.real_frame_rate = Some(rate);
+        let p = planner_over_with(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![video, audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            &[],
+            options,
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_width = Some(1280);
+        req.max_framerate = max_framerate;
+        p.plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .arguments
+            .join(" ")
+    }
+
+    /// With no accelerator (the default) an interlaced source is deinterlaced
+    /// in software, as upstream's `GetSwVidFilterChain` does whenever
+    /// `IsDeinterlaceAvailable`: `yadif` or `bwdif` per "Deinterlacing
+    /// method", at field rate (`=1`) with "Double the frame rate when
+    /// deinterlacing" on and a source of 30 fps or less, ahead of the scale.
+    #[rstest]
+    #[case::yadif(
+        ferrofin_model::entities::DeinterlaceMethod::yadif,
+        false,
+        25.0,
+        "-vf yadif=0:-1:0,scale="
+    )]
+    #[case::bwdif(
+        ferrofin_model::entities::DeinterlaceMethod::bwdif,
+        false,
+        25.0,
+        "-vf bwdif=0:-1:0,scale="
+    )]
+    #[case::double_rate(
+        ferrofin_model::entities::DeinterlaceMethod::yadif,
+        true,
+        25.0,
+        "-vf yadif=1:-1:0,scale="
+    )]
+    #[case::double_rate_above_30_fps(
+        ferrofin_model::entities::DeinterlaceMethod::yadif,
+        true,
+        59.94,
+        "-vf yadif=0:-1:0,scale="
+    )]
+    #[tokio::test]
+    async fn an_interlaced_source_deinterlaces_in_software(
+        #[case] method: ferrofin_model::entities::DeinterlaceMethod,
+        #[case] double_rate: bool,
+        #[case] rate: f32,
+        #[case] expected: &str,
+    ) {
+        let options = EncodingOptions {
+            deinterlace_method: method,
+            deinterlace_double_rate: double_rate,
+            ..EncodingOptions::default()
+        };
+        let args = software_args(true, rate, options, None).await;
+        assert!(args.contains(expected), "{args}");
+    }
+
+    /// A progressive source is not deinterlaced.
+    #[tokio::test]
+    async fn a_progressive_source_is_not_deinterlaced_in_software() {
+        let args = software_args(false, 25.0, EncodingOptions::default(), None).await;
+        assert!(!args.contains("yadif") && !args.contains("bwdif"), "{args}");
+    }
+
+    /// `GetVideoProcessingFilterParam` adds the requested frame rate to the
+    /// software chain too: at the end behind a deinterlacer, which needs the
+    /// neighbouring frames (PR 17058), else at the head, so the rest of the
+    /// chain filters only the frames kept. The rate prints as upstream's: the
+    /// request's `float` widened to the `double?` `GetFramerateParam` returns.
+    #[rstest]
+    #[case::interlaced(true, 24.0, "-vf yadif=0:-1:0,scale=1280:720,fps=24 ")]
+    #[case::progressive(false, 24.0, "-vf fps=24,scale=1280:720 ")]
+    #[case::fractional(false, 23.976, "-vf fps=23.97599983215332,scale=1280:720 ")]
+    #[tokio::test]
+    async fn a_frame_rate_cap_joins_the_software_chain(
+        #[case] interlaced: bool,
+        #[case] cap: f32,
+        #[case] expected: &str,
+    ) {
+        let args = software_args(interlaced, 50.0, EncodingOptions::default(), Some(cap)).await;
+        assert!(args.contains(expected), "{args}");
+        assert_eq!(args.matches("fps=").count(), 1, "{args}");
+    }
+
+    /// `GetSwVidFilterChain` fits a burned-in bitmap subtitle to the output
+    /// frame before the overlay (`GetGraphicalSubPreProcessFilters`): a plain
+    /// rescale when the shapes match, a pad onto a transparent canvas when
+    /// they do not. Overlaid at its authored size instead, a 1080p PGS on a
+    /// 720p encode is drawn below the frame, and on 2160p video in its top-left
+    /// quarter.
+    ///
+    /// A video rotated by 90 degrees is fitted as the scaler sees it,
+    /// transposed (`swpInW`/`swpInH`); a video with no size has no frame to
+    /// fit to, and its subtitle is overlaid as authored (`null`).
+    #[rstest]
+    #[case::downscaled(
+        Some((1920, 1080)),
+        None,
+        Some(1280),
+        (1920, 1080),
+        "scale,scale=1280:720:fast_bilinear"
+    )]
+    #[case::larger_video(
+        Some((3840, 2160)),
+        None,
+        None,
+        (1920, 1080),
+        "scale,scale=3840:2160:fast_bilinear"
+    )]
+    #[case::another_shape(
+        Some((1920, 1080)),
+        None,
+        None,
+        (720, 480),
+        "scale,scale=-1:1080:fast_bilinear,crop,pad=max(1920\\,iw):max(1080\\,ih):\
+         (ow-iw)/2:(oh-ih)/2:black@0,crop=1920:1080"
+    )]
+    #[case::rotated(
+        Some((1080, 1920)),
+        Some(90),
+        None,
+        (1920, 1080),
+        "scale,scale=1920:1080:fast_bilinear"
+    )]
+    #[case::no_video_size(None, None, None, (1920, 1080), "null")]
+    #[tokio::test]
+    async fn a_software_bitmap_burn_in_fits_the_subtitle_to_the_output_frame(
+        #[case] video_size: Option<(i32, i32)>,
+        #[case] rotation: Option<i32>,
+        #[case] max_width: Option<i32>,
+        #[case] subtitle_size: (i32, i32),
+        #[case] fit: &str,
+    ) {
+        let mut video = video_stream("h264");
+        video.width = video_size.map(|(width, _)| width);
+        video.height = video_size.map(|(_, height)| height);
+        video.rotation = rotation;
+        let mut sub = subtitle_stream("pgssub", 2);
+        sub.width = Some(subtitle_size.0);
+        sub.height = Some(subtitle_size.1);
+        let p = planner(vec![source("abc", vec![video, audio_stream("aac"), sub])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_width = max_width;
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        let arguments = p
+            .plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .arguments;
+        let graph = arguments
+            .iter()
+            .position(|arg| arg == "-filter_complex")
+            .and_then(|at| arguments.get(at + 1))
+            .unwrap_or_else(|| panic!("no -filter_complex: {arguments:?}"));
+        assert!(
+            graph.starts_with(&format!("[0:2]{fit}[sub];[0:0]")),
+            "{graph}"
+        );
+        assert!(
+            graph.ends_with("[sub]overlay=eof_action=pass:repeatlast=0[v]"),
+            "{graph}"
+        );
+    }
+
+    /// `GetInputArgument` appends `GetGraphicalSubCanvasSize` after the input
+    /// hardware arguments: a burned-in bitmap subtitle is decoded onto the
+    /// canvas it was authored for (`-canvas_size WxH`, an input option), not
+    /// one the size of the video. Never for a text subtitle, DVBSUB (a fixed
+    /// 720x576), a subtitle that is not burned in, or one with no size.
+    #[rstest]
+    #[case::bitmap("pgssub", Some((1920, 1080)), "Encode", Some("1920x1080"))]
+    #[case::bitmap_not_burned_in("pgssub", Some((1920, 1080)), "External", None)]
+    #[case::bitmap_without_a_size("pgssub", None, "Encode", None)]
+    #[case::dvbsub("dvbsub", Some((720, 576)), "Encode", None)]
+    #[case::text("subrip", Some((1920, 1080)), "Encode", None)]
+    #[tokio::test]
+    async fn a_burned_in_bitmap_subtitle_is_decoded_on_its_own_canvas(
+        #[case] codec: &str,
+        #[case] size: Option<(i32, i32)>,
+        #[case] method: &str,
+        #[case] canvas: Option<&str>,
+    ) {
+        let mut video = video_stream("h264");
+        video.width = Some(3840);
+        video.height = Some(2160);
+        let mut sub = subtitle_stream(codec, 2);
+        sub.width = size.map(|(width, _)| width);
+        sub.height = size.map(|(_, height)| height);
+        sub.populate_computed_fields();
+        let p = planner(vec![source("abc", vec![video, audio_stream("aac"), sub])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some(method.to_owned());
+        let arguments = p
+            .plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .arguments;
+        let at = |flag: &str| arguments.iter().position(|arg| arg == flag);
+        let given = at("-canvas_size").map(|flag| arguments[flag + 1].as_str());
+        assert_eq!(given, canvas, "{arguments:?}");
+        if given.is_some() {
+            assert!(
+                at("-canvas_size") < at("-i"),
+                "an input option: {arguments:?}"
+            );
+        }
+    }
+
+    /// The burn-in graphs keep upstream's main-chain order: a text subtitle is
+    /// drawn before the cap that ends a deinterlaced chain
+    /// (`…,subtitles=…,fps=`), and a graphical one is overlaid on the base
+    /// chain that carries it.
+    #[rstest]
+    #[case::text("subrip", "-vf")]
+    #[case::graphical("pgssub", "-filter_complex")]
+    #[tokio::test]
+    async fn a_deinterlaced_burn_in_keeps_the_frame_rate_cap_last(
+        #[case] codec: &str,
+        #[case] flag: &str,
+    ) {
+        let mut video = video_stream("h264");
+        video.is_interlaced = true;
+        video.width = Some(1920);
+        video.height = Some(1080);
+        video.average_frame_rate = Some(50.0);
+        let p = planner(vec![source(
+            "abc",
+            vec![video, audio_stream("aac"), subtitle_stream(codec, 2)],
+        )]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_width = Some(1280);
+        req.max_framerate = Some(24.0);
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Encode".to_owned());
+        let arguments = p
+            .plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .arguments;
+        let graph = arguments
+            .iter()
+            .position(|arg| arg == flag)
+            .and_then(|at| arguments.get(at + 1))
+            .unwrap_or_else(|| panic!("no {flag}: {arguments:?}"));
+        if flag == "-vf" {
+            assert!(
+                graph.starts_with("yadif=0:-1:0,scale=1280:720,subtitles=")
+                    && graph.ends_with(",fps=24"),
+                "{graph}"
+            );
+        } else {
+            assert_eq!(
+                graph,
+                "[0:2]scale,scale=-1:720:fast_bilinear,crop,pad=max(1280\\,iw):max(720\\,ih):\
+                 (ow-iw)/2:(oh-ih)/2:black@0,crop=1280:720[sub];\
+                 [0:0]yadif=0:-1:0,scale=1280:720,fps=24[main];\
+                 [main][sub]overlay=eof_action=pass:repeatlast=0[v]"
+            );
+        }
+    }
+
+    /// A frame-rate cap on a deinterlaced GPU chain goes behind the
+    /// deinterlacer, which needs the neighbouring frames
+    /// (`GetVideoProcessingFilterParam`, PR 17058); before it, a field-rate
+    /// deinterlacer would also double the capped rate.
+    #[tokio::test]
+    async fn a_capped_interlaced_gpu_transcode_deinterlaces_before_the_cap() {
+        let mut video = nvdec_decodable_video_stream();
+        video.is_interlaced = true;
+        video.average_frame_rate = Some(50.0);
+        let p = nvenc_planner(vec![source("abc", vec![video, audio_stream("aac")])]);
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.allow_video_stream_copy = false;
+        req.max_framerate = Some(24.0);
+        let args = p
+            .plan(&req, false, None, PlaylistKind::Vod)
+            .await
+            .unwrap()
+            .arguments
+            .join(" ");
+        let deinterlace = args.find("yadif_cuda=").expect("deinterlaced");
+        let cap = args.find("fps=24").expect("capped");
+        assert!(deinterlace < cap, "{args}");
     }
 
     #[tokio::test]
@@ -4093,7 +8027,6 @@ mod tests {
     async fn an_hdr_source_tonemaps_on_the_gpu() {
         let mut video = hdr_4k_video_stream("hevc");
         video.pixel_format = Some("yuv420p10le".to_owned());
-        video.video_range = Some(ferrofin_model::data::VideoRange::Hdr);
         // Both switches are off by default and both are load-bearing here:
         // HEVC is not in the default hardware-decode list, and tonemapping is
         // opt-in.
@@ -4229,8 +8162,10 @@ mod tests {
         assert!(args.contains("hwdownload,format=yuv420p"), "{args}");
     }
 
-    /// The parity fixture (320x240 h264 @ ~6 Mbps container bitrate, mono aac)
-    /// under the harness query. `GetStreamingState` yields
+    /// The parity fixture (320x240 8-bit h264 @ ~6 Mbps container bitrate, mono
+    /// aac) under the harness query. The bit depth matters: an unknown or 10-bit
+    /// source gets `GetBitDepthCompensatedBitrate`'s factor (×1.2 here).
+    /// `GetStreamingState` yields
     /// `OutputAudioBitrate = min(1 × 128000, 128000)` and `OutputVideoBitrate =
     /// min(ScaleBitrate(GetMinBitrate(6M, 1M)), 1M) = 1_000_000` — the
     /// 1_128_000 BANDWIDTH Jellyfin advertises. A remux carries the video
@@ -4242,6 +8177,7 @@ mod tests {
         video.width = Some(320);
         video.height = Some(240);
         video.bit_rate = Some(6_000_000);
+        video.bit_depth = Some(8);
         let mut audio = audio_stream("aac");
         audio.channels = Some(1);
         let src = source("abc", vec![video, audio]);
@@ -4264,6 +8200,7 @@ mod tests {
         let args = plan.arguments.join(" ");
         assert!(args.contains("-maxrate 1000000"), "re-encode caps: {args}");
         assert!(args.contains("-b:a 128000"), "audio bitrate: {args}");
+        let encoded_playlist = plan.playlist_path.clone();
 
         // A copy-eligible request (8 Mbps cap above the 6 Mbps source): both
         // streams copy, the bitrates are still the GetStreamingState values
@@ -4287,6 +8224,10 @@ mod tests {
             "copy has no bitrate args: {args}"
         );
         assert!(!args.contains("-b:a"), "copy has no audio bitrate: {args}");
+        assert_ne!(
+            plan.playlist_path, encoded_playlist,
+            "copy vetoes must separate encoded and copied output"
+        );
         assert_eq!(
             plan.min_segments, 3,
             "3s segments → 3 (StreamState.MinSegments)"
@@ -4414,8 +8355,8 @@ mod tests {
     }
 
     /// An EVENT plan (`live.m3u8`) writes an event playlist with routed
-    /// segment URIs, the `superfast` preset and, for mpegts, no global header;
-    /// a VOD plan keeps `vod`/`veryfast` and neither flag.
+    /// segment URIs and, for mpegts, no global header. The configured auto
+    /// preset is veryfast on both EVENT and VOD jobs.
     #[tokio::test]
     async fn plan_event_playlist_args_follow_get_live_hls_stream() {
         let src = source("abc", vec![video_stream("hevc"), audio_stream("aac")]);
@@ -4434,8 +8375,8 @@ mod tests {
             "{args}"
         );
         assert!(args.contains("-flags -global_header"), "{args}");
-        assert!(args.contains("-preset superfast"), "{args}");
-        assert!(!args.contains("-preset veryfast"), "{args}");
+        assert!(args.contains("-preset veryfast"), "{args}");
+        assert!(!args.contains("-preset superfast"), "{args}");
 
         let p = planner(vec![src.clone()]);
         let plan = p
@@ -4496,6 +8437,500 @@ mod tests {
         assert_eq!(
             plan.state.subtitle_stream.as_ref().map(|s| s.index),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn progressive_container_matches_native_request_and_codec_inference() {
+        let source = source("abc", vec![video_stream("h264")]);
+        for (audio, codec, container) in [
+            (false, "h264", "ts"),
+            (false, "hevc", "mp4"),
+            (false, "av1", "mp4"),
+            (false, "vp9", "webm"),
+            (true, "aac", "aac"),
+            (true, "mp3", "mp3"),
+            (true, "vorbis", "ogg"),
+        ] {
+            let mut request = request("abc");
+            if audio {
+                request.audio_codec = Some(codec.to_owned());
+            } else {
+                request.video_codec = Some(codec.to_owned());
+            }
+            assert_eq!(
+                progressive_container(&request, audio, &source, Some(codec), Some(codec)).unwrap(),
+                container
+            );
+            request.output_container = Some(".MKV".to_owned());
+            assert_eq!(
+                progressive_container(&request, audio, &source, Some(codec), Some(codec)).unwrap(),
+                "MKV"
+            );
+        }
+        let bare = request("abc");
+        assert_eq!(
+            progressive_container(&bare, false, &source, None, None).unwrap(),
+            "mkv"
+        );
+        let mut source = source;
+        source.is_infinite_stream = true;
+        let mut request = request("abc");
+        request.output_container = Some("..".to_owned());
+        assert_eq!(
+            progressive_container(&request, false, &source, Some("hevc"), None).unwrap(),
+            "mp4"
+        );
+    }
+
+    #[tokio::test]
+    async fn progressive_video_uses_single_file_seek_and_native_muxing() {
+        let root = tempfile::tempdir().unwrap();
+        let (planner, _) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![video_stream("hevc"), audio_stream("aac")],
+            )],
+            root.path(),
+        )
+        .await;
+        let mut request = request("abc");
+        request.output_container = Some("mp4".to_owned());
+        request.video_codec = Some("h264".to_owned());
+        request.allow_video_stream_copy = false;
+        request.start_time_ticks = Some(90 * TICKS_PER_SECOND);
+        request.context = Some(ferrofin_model::dlna::EncodingContext::Streaming);
+        let plan = planner
+            .plan(&request, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert_eq!(plan.state.transcoding_type, TranscodingJobType::Progressive);
+        assert_eq!(plan.playlist_path.extension().unwrap(), "mp4");
+        assert_eq!(
+            plan.state.wait_for_path.as_ref().unwrap(),
+            &plan.playlist_path
+        );
+        assert_eq!(
+            plan.state.base_request.start_time_ticks,
+            Some(90 * TICKS_PER_SECOND)
+        );
+        for pair in [
+            ["-f", "mp4"],
+            ["-movflags", "frag_keyframe+empty_moov+delay_moov"],
+            ["-preset", "veryfast"],
+            ["-force_key_frames:0", "expr:gte(t,n_forced*5)"],
+            ["-map_metadata", "-1"],
+            ["-map_chapters", "-1"],
+            ["-ss", "900000000"],
+        ] {
+            assert!(
+                plan.arguments.windows(2).any(|args| args == pair),
+                "{pair:?}: {:?}",
+                plan.arguments
+            );
+        }
+        assert!(!plan.arguments.iter().any(|arg| arg.starts_with("-hls_")));
+        request.context = Some(ferrofin_model::dlna::EncodingContext::Static);
+        let static_context = planner
+            .plan(&request, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert_eq!(
+            static_context.state.base_request.context,
+            ferrofin_model::dlna::EncodingContext::Static
+        );
+        assert!(
+            !static_context
+                .arguments
+                .iter()
+                .any(|arg| arg == "frag_keyframe+empty_moov+delay_moov")
+        );
+        assert!(
+            !static_context
+                .arguments
+                .windows(2)
+                .any(|args| args == ["-f", "mp4"])
+        );
+        request.current_runtime_ticks = 3 * TICKS_PER_SECOND;
+        let hls = planner
+            .plan(&request, false, Some(1), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        assert_ne!(hls.playlist_path, plan.playlist_path);
+        assert_eq!(
+            hls.state.base_request.start_time_ticks,
+            Some(3 * TICKS_PER_SECOND)
+        );
+    }
+
+    #[tokio::test]
+    async fn progressive_audio_from_video_is_eligible_input_but_emits_only_audio() {
+        let root = tempfile::tempdir().unwrap();
+        let (planner, _) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![video_stream("h264"), audio_stream("aac")],
+            )],
+            root.path(),
+        )
+        .await;
+        let mut request = request("abc");
+        request.output_container = Some("m4a".to_owned());
+        request.audio_codec = Some("aac".to_owned());
+        let plan = planner
+            .plan(&request, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert!(plan.state.is_input_video);
+        assert_eq!(
+            plan.state.base_request.context,
+            ferrofin_model::dlna::EncodingContext::Static
+        );
+        assert!(plan.state.video_stream.is_none());
+        assert!(plan.arguments.iter().any(|arg| arg == "-vn"));
+        assert!(
+            plan.arguments
+                .windows(2)
+                .any(|args| args == ["-movflags", "empty_moov+delay_moov"])
+        );
+        assert!(!plan.arguments.iter().any(|arg| arg.starts_with("-hls_")));
+    }
+
+    #[tokio::test]
+    async fn progressive_output_inference_follows_saved_codec_order_and_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let (planner, file) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![video_stream("h264"), audio_stream("aac")],
+            )],
+            root.path(),
+        )
+        .await;
+        for (allowed, expected_codec, expected_extension) in
+            [(false, "h264", "ts"), (true, "hevc", "mp4")]
+        {
+            let mut options = planner.config.get_encoding_options().await.unwrap();
+            options.allow_hevc_encoding = allowed;
+            options.encoding_thread_count = 7;
+            options.encoder_preset = EncoderPreset::medium;
+            ferrofin_util::file_helper::atomic_write(&file, &serde_json::to_vec(&options).unwrap())
+                .unwrap();
+            let mut request = request("abc");
+            request.video_codec = Some("hevc,h264".to_owned());
+            request.cpu_core_limit = Some(2);
+            request.allow_video_stream_copy = false;
+            let plan = planner
+                .plan(&request, false, None, PlaylistKind::Progressive)
+                .await
+                .unwrap();
+            assert_eq!(
+                plan.state.output_video_codec.as_deref(),
+                Some(expected_codec)
+            );
+            assert_eq!(plan.playlist_path.extension().unwrap(), expected_extension);
+            assert!(
+                plan.arguments
+                    .windows(2)
+                    .any(|args| args == ["-threads", "2"])
+            );
+            assert!(
+                plan.arguments
+                    .windows(2)
+                    .any(|args| args == ["-preset", "medium"])
+            );
+        }
+        for (container, extension) in [("mpegts", "ts"), ("matroska", "mkv"), ("..", "mkv")] {
+            let mut request = request("abc");
+            request.output_container = Some(container.to_owned());
+            let plan = planner
+                .plan(&request, false, None, PlaylistKind::Progressive)
+                .await
+                .unwrap();
+            assert_eq!(plan.playlist_path.extension().unwrap(), extension);
+            assert_eq!(
+                plan.state.output_container.as_deref(),
+                Some(if container == ".." { "" } else { container })
+            );
+        }
+        for container in ["ts/../../outside", "../", "%2f", "a;b", &"a".repeat(41)] {
+            let mut request = request("abc");
+            request.output_container = Some(container.to_owned());
+            assert!(matches!(
+                planner
+                    .plan(&request, false, None, PlaylistKind::Progressive)
+                    .await,
+                Err(ServiceError::InvalidInput(_))
+            ));
+        }
+    }
+    #[tokio::test]
+    async fn progressive_plan_keeps_committed_output_root_when_settings_change() {
+        let root = tempfile::tempdir().unwrap();
+        let (planner, file) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![video_stream("h264"), audio_stream("aac")],
+            )],
+            root.path(),
+        )
+        .await;
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        let publish = |path: &std::path::Path| {
+            let options = EncodingOptions {
+                transcoding_temp_path: Some(path.to_string_lossy().into_owned()),
+                ..EncodingOptions::default()
+            };
+            let json = serde_json::to_string(&options).unwrap();
+            ferrofin_util::file_helper::atomic_write(&file, json.as_bytes()).unwrap();
+            planner
+                .config
+                .named_configuration_updated("encoding", json.into());
+        };
+        publish(&first);
+        let mut request = request("abc");
+        request.output_container = Some("mkv".to_owned());
+        let existing = planner
+            .plan(&request, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        publish(&second);
+        request.play_session_id = Some("fresh-session".to_owned());
+        let fresh = planner
+            .plan(&request, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert!(existing.playlist_path.starts_with(&first));
+        assert!(
+            existing
+                .state
+                .wait_for_path
+                .as_ref()
+                .unwrap()
+                .starts_with(&first)
+        );
+        assert!(std::path::Path::new(&existing.state.output_file_path).starts_with(&first));
+        assert_eq!(
+            existing.arguments.last().unwrap(),
+            &existing.state.output_file_path
+        );
+        assert!(fresh.playlist_path.starts_with(&second));
+        assert!(
+            fresh
+                .state
+                .wait_for_path
+                .as_ref()
+                .unwrap()
+                .starts_with(&second)
+        );
+        assert_eq!(
+            fresh.arguments.last().unwrap(),
+            &fresh.state.output_file_path
+        );
+        assert!(first.join(".jellyfin-transcode").is_file());
+        assert!(second.join(".jellyfin-transcode").is_file());
+    }
+
+    #[tokio::test]
+    async fn progressive_audio_codec_infers_the_actual_url_before_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let (planner, file) = planner_with_persisted_encoding(
+            vec![source("abc", vec![audio_stream("aac")])],
+            root.path(),
+        )
+        .await;
+        let options = EncodingOptions {
+            encoding_thread_count: 7,
+            encoder_preset: EncoderPreset::medium,
+            ..EncodingOptions::default()
+        };
+        ferrofin_util::file_helper::atomic_write(&file, &serde_json::to_vec(&options).unwrap())
+            .unwrap();
+        for (extension, codec) in [
+            ("mp3", "mp3"),
+            ("MP3", "mp3"),
+            ("webm", "opus"),
+            ("m4a", "aac"),
+            ("mkv", "aac"),
+            ("ts", "mp3"),
+            ("flac", "flac"),
+        ] {
+            let mut request = request("abc");
+            request.output_container = Some(extension.to_owned());
+            request.requested_url = Some(format!("/Audio/{}/stream.{extension}", request.item_id));
+            request.cpu_core_limit = Some(2);
+            let plan = planner
+                .plan(&request, true, None, PlaylistKind::Progressive)
+                .await
+                .unwrap();
+            assert_eq!(plan.state.output_audio_codec.as_deref(), Some(codec));
+            assert!(
+                plan.arguments
+                    .windows(2)
+                    .any(|args| args == ["-threads", "2"])
+            );
+        }
+        let mut request = request("abc");
+        request.output_container = Some("mp3".to_owned());
+        request.requested_url = Some(format!("/Audio/{}/stream", request.item_id));
+        let plan = planner
+            .plan(&request, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.state.output_audio_codec.as_deref(),
+            Some("aac"),
+            "extensionless URL falls back to aac rather than passing the URL as a codec"
+        );
+        request.audio_codec = Some("mp3".to_owned());
+        let plan = planner
+            .plan(&request, true, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert_eq!(plan.state.output_audio_codec.as_deref(), Some("mp3"));
+    }
+
+    #[tokio::test]
+    async fn progressive_seek_clamps_before_eof_but_preserves_reported_offset() {
+        let root = tempfile::tempdir().unwrap();
+        let mut source = source("abc", vec![video_stream("h264"), audio_stream("aac")]);
+        source.run_time_ticks = Some(300 * TICKS_PER_SECOND);
+        let (planner, _) = planner_with_persisted_encoding(vec![source], root.path()).await;
+        let mut request = request("abc");
+        request.output_container = Some("mkv".to_owned());
+        request.video_codec = Some("copy".to_owned());
+        request.start_time_ticks = Some(400 * TICKS_PER_SECOND);
+        let plan = planner
+            .plan(&request, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.state.base_request.start_time_ticks,
+            Some(400 * TICKS_PER_SECOND)
+        );
+        assert!(
+            plan.arguments
+                .windows(2)
+                .any(|args| args == ["-ss", "2950000000"]),
+            "{:?}",
+            plan.arguments
+        );
+        assert!(!plan.arguments.iter().any(|arg| arg == "-noaccurate_seek"));
+    }
+
+    /// `HlsAudioSeekStrategy` (`EncodingHelper.TryStreamCopy`'s
+    /// `preventHlsAudioCopy`): with `TranscodeAudio`, an HLS job that
+    /// re-encodes its video re-encodes copyable audio too; a remux (compatible,
+    /// or forced because the user may not transcode video), a progressive
+    /// stream, the default strategy and a user without the audio-transcoding
+    /// permission all keep the copy.
+    #[rstest::rstest]
+    #[case::hls_transcode_audio(
+        "hevc",
+        HlsAudioSeekStrategy::TranscodeAudio,
+        PlaylistKind::Vod,
+        true,
+        true,
+        false
+    )]
+    #[case::event_transcode_audio(
+        "hevc",
+        HlsAudioSeekStrategy::TranscodeAudio,
+        PlaylistKind::Event,
+        true,
+        true,
+        false
+    )]
+    #[case::hls_default_strategy(
+        "hevc",
+        HlsAudioSeekStrategy::TrimCopiedAudio,
+        PlaylistKind::Vod,
+        true,
+        true,
+        true
+    )]
+    #[case::hls_video_remux(
+        "h264",
+        HlsAudioSeekStrategy::TranscodeAudio,
+        PlaylistKind::Vod,
+        true,
+        true,
+        true
+    )]
+    #[case::forced_video_remux(
+        "hevc",
+        HlsAudioSeekStrategy::TranscodeAudio,
+        PlaylistKind::Vod,
+        false,
+        true,
+        true
+    )]
+    #[case::progressive(
+        "hevc",
+        HlsAudioSeekStrategy::TranscodeAudio,
+        PlaylistKind::Progressive,
+        true,
+        true,
+        true
+    )]
+    #[case::no_audio_transcoding_permission(
+        "hevc",
+        HlsAudioSeekStrategy::TranscodeAudio,
+        PlaylistKind::Vod,
+        true,
+        false,
+        true
+    )]
+    #[tokio::test]
+    async fn hls_audio_seek_strategy_decides_the_audio_copy(
+        #[case] source_video_codec: &str,
+        #[case] strategy: HlsAudioSeekStrategy,
+        #[case] kind: PlaylistKind,
+        #[case] video_transcoding: bool,
+        #[case] audio_transcoding: bool,
+        #[case] expect_copy: bool,
+    ) {
+        use ferrofin_traits::library::PlaybackPermissions;
+        let p = planner_over_with(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![video_stream(source_video_codec), audio_stream("aac")],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            &[],
+            EncodingOptions {
+                hls_audio_seek_strategy: strategy,
+                ..EncodingOptions::default()
+            },
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.audio_codec = Some("aac".to_owned());
+        req.playback_permissions = Some(PlaybackPermissions {
+            video_transcoding,
+            audio_transcoding,
+            remuxing: true,
+        });
+        if kind == PlaylistKind::Progressive {
+            req.output_container = Some("mkv".to_owned());
+        }
+        let plan = p.plan(&req, false, Some(0), kind).await.unwrap();
+        assert_eq!(
+            plan.is_remuxing_video,
+            source_video_codec == "h264" || !video_transcoding,
+            "{:?}",
+            plan.arguments
+        );
+        let expected = if expect_copy { "copy" } else { "aac" };
+        assert_eq!(plan.state.output_audio_codec.as_deref(), Some(expected));
+        assert!(
+            plan.arguments.windows(2).any(|w| w == ["-c:a", expected]),
+            "{:?}",
+            plan.arguments
         );
     }
 }

@@ -14,7 +14,7 @@
 //! - the library's own folders are never pruned: the collection folder, the
 //!   physical folders it names, a row at one of its locations;
 //! - no row whose path is still on disk is pruned, whatever its kind (an
-//!   adopted plain-subfolder `Folder` row, which the scan never plans);
+//!   adopted `Folder` row of a kind the scan never plans);
 //! - an empty or missing location prunes nothing;
 //! - a native library (no `PhysicalFolderIds`) behaves as it always did.
 
@@ -39,8 +39,8 @@ use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 use uuid::Uuid;
 
 /// The movie files of the fixture library, relative to its location: three
-/// per-title folders and one title under a plain subfolder, which Jellyfin
-/// stores as a `Folder` row and Ferrofin never plans.
+/// per-title folders and one title under a plain subfolder, which both
+/// Jellyfin and Ferrofin store as a `Folder` row parenting the title.
 const MOVIES: [&str; 4] = [
     "A (2001)/A (2001).mkv",
     "B (2002)/B (2002).mkv",
@@ -62,7 +62,7 @@ struct Library {
     cf: Uuid,
     /// The physical folder at the location (adopted only).
     physical: Uuid,
-    /// The plain subfolder's `Folder` row (adopted only).
+    /// The plain subfolder's `Folder` row.
     subfolder: Uuid,
 }
 
@@ -110,7 +110,11 @@ impl Library {
             LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
                 .with_items(Arc::clone(&items));
         let first = scanner.scan_all().await.expect("first scan");
-        assert_eq!(first.created, MOVIES.len(), "{first:?}");
+        assert_eq!(
+            first.created,
+            MOVIES.len() + 1,
+            "the movies and the plain subfolder: {first:?}"
+        );
         let folder_id = |path: &Path| {
             derive_item_id(BaseItemKind::Folder, &path.to_string_lossy()).expect("folder id")
         };
@@ -129,7 +133,6 @@ impl Library {
             library.adopt().await;
         } else {
             library.physical = Uuid::nil();
-            library.subfolder = Uuid::nil();
         }
         library
     }
@@ -138,24 +141,16 @@ impl Library {
     /// physical `Folder` row at the location (its own top parent, as a child
     /// of the aggregate folder is) that the collection folder names in its
     /// `PhysicalFolderIds`, every item carrying it as `TopParentId` and the
-    /// top-level ones as `ParentId`, and the plain subfolder a `Folder` row
-    /// that parents the title under it.
+    /// top-level ones (the plain subfolder's `Folder` row among them) as
+    /// `ParentId`; the title under the subfolder stays its child.
     async fn adopt(&self) {
-        let (physical, subfolder) = (guid_to_db(self.physical), guid_to_db(self.subfolder));
+        let physical = guid_to_db(self.physical);
         insert_folder(
             &self.db,
             &physical,
             None,
             &physical,
             &self.media.to_string_lossy(),
-        )
-        .await;
-        insert_folder(
-            &self.db,
-            &subfolder,
-            Some(&physical),
-            &physical,
-            &self.media.join("Collection").to_string_lossy(),
         )
         .await;
         self.set_physical_folder_ids(&[self.physical]).await;
@@ -171,12 +166,6 @@ impl Library {
                 .await
                 .expect("adopt");
         }
-        sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?2 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(self.movie(3)))
-            .bind(&subfolder)
-            .execute(self.db.writer())
-            .await
-            .expect("parent under the subfolder");
     }
 
     /// Stamps the collection folder's `Data` as Jellyfin serializes it.
@@ -297,20 +286,42 @@ async fn insert_version(
     .expect("insert version");
 }
 
-/// Both prunes weigh exactly the rows a library read lists: an owned
-/// non-extra (Jellyfin's part or version stored under its owner) and an
-/// alternate version whose primary is in the library are never weighed —
-/// not even when the scan plans a new item at the same path (the
-/// "superseded" rule) or the version's own file is gone — while a version
-/// whose primary is in no library is listed, and pruned once its file is
-/// gone. The same for a path-scoped scan and a library scan.
+/// Writes an empty file at `relative` under the media root and stores an
+/// unowned version of B there as `kind`, under the id `kind` derives for it.
+async fn present_version(lib: &Library, relative: &str, kind: BaseItemKind) -> Uuid {
+    let path = lib.media.join(relative);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, b"").expect("write");
+    let id = derive_item_id(kind, &path.to_string_lossy()).expect("id");
+    insert_version(
+        &lib.db,
+        id,
+        kind,
+        &path,
+        lib.physical,
+        None,
+        Some(lib.movie(1)),
+    )
+    .await;
+    id
+}
+
+/// Both prunes weigh every unowned row, alternate versions included
+/// (Jellyfin 12.1's `Folder.GetChildrenForValidation`,
+/// `IncludeAlternateVersions = true`): a version whose file is gone is
+/// pruned, whether its primary is in the library or in none. An owned
+/// non-extra (Jellyfin's part or version stored under its owner) is never
+/// weighed, and an owned `Video` at a path the scan plans as a `Movie` is not
+/// pruned: it moves to the `Movie` id (owner decision D9b). The same for a
+/// path-scoped scan and a library scan.
 #[tokio::test]
-async fn a_version_a_library_read_does_not_list_is_never_pruned() {
+async fn an_unowned_version_whose_file_is_gone_is_pruned() {
     let lib = Library::new(true).await;
-    // A part Ferrofin plans as a movie of its own: its path is claimed.
+    // A version Ferrofin plans as a movie of its own: it moves to that id.
     let part_path = lib.media.join("A (2001)/A (2001) - 1080p.mkv");
     std::fs::write(&part_path, b"").expect("write");
     let part = derive_item_id(BaseItemKind::Video, &part_path.to_string_lossy()).expect("id");
+    let moved = derive_item_id(BaseItemKind::Movie, &part_path.to_string_lossy()).expect("id");
     insert_version(
         &lib.db,
         part,
@@ -334,6 +345,19 @@ async fn a_version_a_library_read_does_not_list_is_never_pruned() {
         Some(lib.movie(1)),
     )
     .await;
+    // A version of B merged by hand whose file is still there: planned under
+    // its own id, so kept.
+    let present = present_version(&lib, "B Cut (2002)/B Cut (2002).mkv", BaseItemKind::Movie).await;
+    // A version of B stored as a `Video` at a path the scan plans as a
+    // `Movie`: it moves to the `Movie` id, not pruned.
+    let video = present_version(&lib, "B Alt (2002)/B Alt (2002).mkv", BaseItemKind::Video).await;
+    let video_moved = derive_item_id(
+        BaseItemKind::Movie,
+        &lib.media
+            .join("B Alt (2002)/B Alt (2002).mkv")
+            .to_string_lossy(),
+    )
+    .expect("id");
     // A version whose primary is in no library, its file gone.
     let orphan = Uuid::from_u128(0x0A_0003);
     let orphan_path = lib.media.join("C (2003)/C (2003) - 720p.mkv");
@@ -354,13 +378,32 @@ async fn a_version_a_library_read_does_not_list_is_never_pruned() {
             lib.media.join("A (2001)").to_string_lossy().into_owned(),
             version_path.to_string_lossy().into_owned(),
             orphan_path.to_string_lossy().into_owned(),
+            lib.media
+                .join("B Cut (2002)")
+                .to_string_lossy()
+                .into_owned(),
+            lib.media
+                .join("B Alt (2002)")
+                .to_string_lossy()
+                .into_owned(),
         ])
         .await
         .expect("scan");
-    assert_eq!(scoped.removed, 1, "{scoped:?}");
+    assert_eq!(scoped.removed, 2, "{scoped:?}");
     let rows = lib.rows().await;
-    assert!(rows.contains_key(&part), "an owned part is not weighed");
-    assert!(rows.contains_key(&version), "a version of B is not weighed");
+    assert!(
+        rows.contains_key(&moved) && !rows.contains_key(&part),
+        "an owned Video planned as a Movie moves"
+    );
+    assert!(
+        !rows.contains_key(&version),
+        "a version of B whose file is gone"
+    );
+    assert!(rows.contains_key(&present), "a version whose file is there");
+    assert!(
+        rows.contains_key(&video_moved) && !rows.contains_key(&video),
+        "a version planned as another kind moves"
+    );
     assert!(
         !rows.contains_key(&orphan),
         "a listed row whose file is gone"
@@ -369,7 +412,8 @@ async fn a_version_a_library_read_does_not_list_is_never_pruned() {
     let full = lib.scanner.scan_all().await.expect("scan");
     assert_eq!(full.removed, 0, "{full:?}");
     let rows = lib.rows().await;
-    assert!(rows.contains_key(&part) && rows.contains_key(&version));
+    assert!(rows.contains_key(&moved));
+    assert!(rows.contains_key(&present) && rows.contains_key(&video_moved));
 }
 
 /// The first scan of an adopted library saves what it plans under the
@@ -393,13 +437,20 @@ async fn an_adopted_library_is_browsed_and_pruned_by_both_top_parents() {
     let rows = lib.rows().await;
     assert!(!rows.contains_key(&lib.movie(2)), "C was deleted from disk");
     for n in [0, 1, 3] {
+        // The title under the plain subfolder is that folder's child.
+        let parent = if n == 3 { lib.subfolder } else { lib.cf };
         assert_eq!(
             rows[&lib.movie(n)],
-            (Some(lib.cf), Some(lib.cf)),
+            (Some(lib.cf), Some(parent)),
             "{} saved under the collection folder",
             MOVIES[n]
         );
     }
+    assert_eq!(
+        rows[&lib.subfolder],
+        (Some(lib.cf), Some(lib.cf)),
+        "the plain subfolder is saved under the collection folder too"
+    );
     assert!(
         rows.contains_key(&lib.physical),
         "the physical folder is the library's own"
@@ -533,43 +584,51 @@ async fn a_library_s_own_folders_and_folders_on_disk_are_never_pruned() {
     assert!(rows.contains_key(&lib.cf));
 }
 
-/// A native library — no `PhysicalFolderIds`, no physical folder — is read
-/// by its collection folder alone and pruned as it always was, and a row of
-/// a kind the scan never plans is kept while its path is on disk.
+/// A native library names its location's folder in `PhysicalFolderIds` as
+/// Jellyfin's does (owner decision D1), so it is read by its collection folder
+/// and that folder, and pruned as it always was; a row of a kind the scan
+/// never plans is kept while its path is on disk.
 #[tokio::test]
-async fn a_native_library_is_read_by_its_collection_folder_alone() {
+async fn a_native_library_is_read_by_its_collection_folder_and_location() {
     let lib = Library::new(false).await;
+    let location = derive_item_id(BaseItemKind::Folder, &lib.media.to_string_lossy()).expect("id");
     assert_eq!(
         lib.persistence
             .library_top_parents(lib.cf)
             .await
             .expect("read")
             .expect("answers"),
-        vec![lib.cf]
+        vec![lib.cf, location]
     );
-    let stray = derive_item_id(
-        BaseItemKind::Folder,
-        &lib.media.join("Collection").to_string_lossy(),
-    )
-    .expect("id");
+    // A row of a kind the scan never plans (a box set) at a path that is on
+    // disk but no media: it is not a path the scan resolves, so it is kept.
+    let stray = Uuid::from_u128(0x0A_0003);
+    std::fs::write(lib.media.join("poster.jpg"), b"").expect("a file the scan ignores");
     let cf = guid_to_db(lib.cf);
     insert_folder(
         &lib.db,
         &guid_to_db(stray),
         Some(&cf),
         &cf,
-        &lib.media.join("Collection").to_string_lossy(),
+        &lib.media.join("poster.jpg").to_string_lossy(),
     )
     .await;
+    sqlx::query(r#"UPDATE "BaseItems" SET "Type" = ?2 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(stray))
+        .bind(stored_type_name(BaseItemKind::BoxSet).expect("box set type"))
+        .execute(lib.db.writer())
+        .await
+        .expect("a kind the scan never plans");
 
     lib.delete(0);
     let outcome = lib.scanner.scan_all().await.expect("scan");
     assert_eq!(outcome.removed, 1, "{outcome:?}");
     let rows = lib.rows().await;
     assert!(!rows.contains_key(&lib.movie(0)));
-    assert!(rows.contains_key(&stray), "its directory is on disk");
+    assert!(rows.contains_key(&stray), "its path is on disk");
     for n in [1, 2, 3] {
-        assert_eq!(rows[&lib.movie(n)], (Some(lib.cf), Some(lib.cf)));
+        let parent = if n == 3 { lib.subfolder } else { lib.cf };
+        assert_eq!(rows[&lib.movie(n)], (Some(lib.cf), Some(parent)));
     }
     assert_eq!(lib.browse().await, ["B", "C", "D"]);
 }

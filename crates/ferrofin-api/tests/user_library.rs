@@ -70,7 +70,8 @@ fn user_entity(id: Uuid, username: &str) -> UserEntity {
         enable_auto_login: false,
         enable_local_password: false,
         enable_next_episode_auto_play: false,
-        enable_user_preference_access: false,
+        // Jellyfin's default for a new user.
+        enable_user_preference_access: true,
         hide_played_in_latest: false,
         internal_id: 0,
         invalid_login_attempt_count: 0,
@@ -184,6 +185,20 @@ fn item_entity(id: Uuid, name: &str, kind: BaseItemKind) -> BaseItemEntity {
 /// ordinary clients.
 struct OkAuth {
     elevated: bool,
+    /// The user's `EnableUserPreferenceAccess` is off.
+    restricted: bool,
+    /// A server API key, which carries no user at all.
+    keyless_user: bool,
+}
+
+impl OkAuth {
+    /// The authenticated user, restricted or not; none for a server API key.
+    fn user(&self) -> Option<UserEntity> {
+        (!self.keyless_user).then(|| UserEntity {
+            enable_user_preference_access: !self.restricted,
+            ..user_entity(USER_ID, "alice")
+        })
+    }
 }
 
 #[async_trait]
@@ -193,8 +208,8 @@ impl AuthService for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
-            is_api_key: self.elevated,
+            user: self.user(),
+            is_api_key: self.elevated || self.keyless_user,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -208,8 +223,8 @@ impl AuthorizationContext for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
-            is_api_key: self.elevated,
+            user: self.user(),
+            is_api_key: self.elevated || self.keyless_user,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -708,6 +723,25 @@ fn state_as(elevated: bool) -> AppState {
 }
 
 fn state_with_views(elevated: bool, views: StubUserViews) -> AppState {
+    state_with(elevated, false, views)
+}
+
+/// [`state_with_views`], the user's preference access off when `restricted`.
+fn state_with(elevated: bool, restricted: bool, views: StubUserViews) -> AppState {
+    state_authed(
+        OkAuth {
+            elevated,
+            restricted,
+            keyless_user: false,
+        },
+        views,
+    )
+}
+
+/// An [`AppState`] wired with the user-library stubs, authenticating every
+/// request as `auth`.
+fn state_authed(auth: OkAuth, views: StubUserViews) -> AppState {
+    let auth = Arc::new(auth);
     AppState::new(
         Arc::new(StubLibrary),
         Arc::new(OkUsers::default()),
@@ -723,8 +757,8 @@ fn state_with_views(elevated: bool, views: StubUserViews) -> AppState {
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(OkDto),
-        Arc::new(OkAuth { elevated }),
-        Arc::new(OkAuth { elevated }),
+        auth.clone(),
+        auth,
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -853,6 +887,55 @@ async fn get_and_update_user_data() {
     assert_eq!(status, StatusCode::OK);
     let dto: UserItemDataDto = serde_json::from_slice(&body).expect("dto");
     assert!(dto.is_favorite);
+}
+
+/// `ItemsController.GetItemUserData` / `UpdateItemUserData` check
+/// `AssertCanUpdateUser(User, user, restrictUserPreferences: true)` right after
+/// resolving the user: a user whose `EnableUserPreferenceAccess` is off gets
+/// 403 on both routes and their `/Users/{userId}/…` forms, before the item is
+/// looked up. An API key may.
+#[tokio::test]
+async fn user_data_routes_require_preference_access() {
+    let payload = || {
+        Body::from(
+            serde_json::to_vec(&UpdateUserItemDataDto {
+                is_favorite: Some(true),
+                ..UpdateUserItemDataDto::default()
+            })
+            .expect("payload"),
+        )
+    };
+    let missing = Uuid::from_u128(0xDEAD);
+    for (method, uri) in [
+        ("GET", format!("/UserItems/{ITEM_ID}/UserData")),
+        ("POST", format!("/UserItems/{ITEM_ID}/UserData")),
+        ("GET", format!("/Users/{USER_ID}/Items/{ITEM_ID}/UserData")),
+        ("POST", format!("/Users/{USER_ID}/Items/{ITEM_ID}/UserData")),
+        ("GET", format!("/UserItems/{missing}/UserData")),
+        ("POST", format!("/UserItems/{missing}/UserData")),
+    ] {
+        let body = if method == "POST" {
+            payload()
+        } else {
+            Body::empty()
+        };
+        let (status, _) = send_with_state(
+            state_with(false, true, StubUserViews::default()),
+            method,
+            &uri,
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    let (status, _) = send_with_state(
+        state_with(true, true, StubUserViews::default()),
+        "POST",
+        &format!("/UserItems/{ITEM_ID}/UserData"),
+        payload(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "an API key may");
 }
 
 #[tokio::test]
@@ -1069,6 +1152,26 @@ async fn media_folders_returns_collection_folders() {
              with no user: {item}"
         );
     }
+}
+
+/// A server API key carries no user, and upstream's `GetMediaFolders` reads
+/// none (`LibraryController.cs`, `RequiresElevation`), so it lists the media
+/// folders. It was a `400` ("no user for request").
+#[tokio::test]
+async fn an_api_key_lists_the_media_folders() {
+    let state = state_authed(
+        OkAuth {
+            elevated: false,
+            restricted: false,
+            keyless_user: true,
+        },
+        StubUserViews::default(),
+    );
+    let (status, body) =
+        send_with_state(state, "GET", "/Library/MediaFolders", Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("folders");
+    assert_eq!(result.items.len(), 5);
 }
 
 // The remaining path-scoped `/Users/{userId}/…` aliases forward to the modern
@@ -1402,8 +1505,16 @@ fn latest_state(
             (Arc::new(HidingAuth), Arc::new(HidingAuth))
         } else {
             (
-                Arc::new(OkAuth { elevated: false }),
-                Arc::new(OkAuth { elevated: false }),
+                Arc::new(OkAuth {
+                    elevated: false,
+                    restricted: false,
+                    keyless_user: false,
+                }),
+                Arc::new(OkAuth {
+                    elevated: false,
+                    restricted: false,
+                    keyless_user: false,
+                }),
             )
         };
     AppState::new(
@@ -1870,7 +1981,7 @@ impl SessionManager for ResumeSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!("fake")
     }
@@ -2144,8 +2255,16 @@ fn resume_state(excludes: Vec<Uuid>) -> (AppState, Arc<RecordingResumeLibrary>) 
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(LatestDto),
-        Arc::new(OkAuth { elevated: false }),
-        Arc::new(OkAuth { elevated: false }),
+        Arc::new(OkAuth {
+            elevated: false,
+            restricted: false,
+            keyless_user: false,
+        }),
+        Arc::new(OkAuth {
+            elevated: false,
+            restricted: false,
+            keyless_user: false,
+        }),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),

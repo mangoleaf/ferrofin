@@ -12,9 +12,9 @@
 //!   the configuration directory. The wire shape is unchanged — it is the same
 //!   [`ServerConfiguration`] the API returns.
 //! - `ReplaceConfiguration` fires a `ConfigurationUpdating` event and validates
-//!   the metadata path against the filesystem. The event bus is out of scope for
-//!   this unit; the metadata-path validation is preserved
-//!   ([`validate_metadata_path`](Self::validate_metadata_path)): a new, non-empty
+//!   the metadata path against the filesystem. Successful saves notify registered
+//!   observers; the metadata-path validation is preserved
+//!   ([`prepare_metadata_path`]): a new, non-empty
 //!   metadata path that differs from the current one must already exist on disk.
 //! - `OnConfigurationUpdated` recomputes the internal metadata path; that is
 //!   reproduced by pushing the new `MetadataPath` into the shared
@@ -58,7 +58,9 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use ferrofin_model::branding::BrandingOptions;
 use ferrofin_model::configuration::{EncodingOptions, MetadataConfiguration, ServerConfiguration};
-use ferrofin_traits::configuration::ServerConfigurationManager;
+use ferrofin_traits::configuration::{
+    ConfigurationListener, ConfigurationUpdate, ServerConfigurationManager,
+};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::system::ServerApplicationPaths;
 
@@ -125,16 +127,9 @@ pub fn default_server_configuration() -> ServerConfiguration {
         metadata_path: String::new(),
         preferred_metadata_language: "en".to_owned(),
         metadata_country_code: "US".to_owned(),
-        sort_replace_characters: vec![".".to_owned(), "+".to_owned(), "%".to_owned()],
-        sort_remove_characters: vec![
-            ",".to_owned(),
-            "&".to_owned(),
-            "-".to_owned(),
-            "{".to_owned(),
-            "}".to_owned(),
-            "'".to_owned(),
-        ],
-        sort_remove_words: vec!["the".to_owned(), "a".to_owned(), "an".to_owned()],
+        sort_replace_characters: ferrofin_model::configuration::default_sort_replace_characters(),
+        sort_remove_characters: ferrofin_model::configuration::default_sort_remove_characters(),
+        sort_remove_words: ferrofin_model::configuration::default_sort_remove_words(),
         min_resume_pct: 5,
         max_resume_pct: 90,
         min_resume_duration_seconds: 300,
@@ -212,16 +207,62 @@ pub struct FerrofinServerConfigurationManager {
     branding_file: PathBuf,
     encoding_file: PathBuf,
     metadata_file: PathBuf,
+    network_file: PathBuf,
+    xbmc_metadata_file: PathBuf,
+    live_tv_file: PathBuf,
     /// The `metadata.json` the last "unusable" warning was logged for, so a
     /// broken document warns once per change, not on every read.
     metadata_warned: std::sync::Mutex<Option<WarnedFile>>,
-    configuration: RwLock<Arc<ServerConfiguration>>,
+    /// The same for `branding.json`.
+    branding_warned: std::sync::Mutex<Option<WarnedFile>>,
+    /// The same for `encoding.json`.
+    encoding_warned: std::sync::Mutex<Option<WarnedFile>>,
+    /// The same for `network.json`.
+    network_warned: std::sync::Mutex<Option<WarnedFile>>,
+    /// The same for `xbmcmetadata.json`.
+    xbmc_metadata_warned: std::sync::Mutex<Option<WarnedFile>>,
+    /// The same for `livetv.json`.
+    live_tv_warned: std::sync::Mutex<Option<WarnedFile>>,
+    configuration: Arc<RwLock<Arc<ServerConfiguration>>>,
+    write_lock: Arc<tokio::sync::Mutex<()>>,
+    listeners: Arc<RwLock<Vec<Arc<ConfigurationListener>>>>,
 }
 
 /// A file a warning was logged for, by its modification time (`None` when
 /// it has none to read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WarnedFile(Option<std::time::SystemTime>);
+
+/// Whether the unusable `path` as it stands now has not been warned about
+/// yet, by `warned`; records that it now has.
+fn first_warning(warned: &std::sync::Mutex<Option<WarnedFile>>, path: &std::path::Path) -> bool {
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut warned = warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    warned.replace(WarnedFile(mtime)) != Some(WarnedFile(mtime))
+}
+
+/// Forgets the last warning in `warned`, so a file that breaks again warns anew.
+fn forget_warning(warned: &std::sync::Mutex<Option<WarnedFile>>) {
+    warned
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+}
+
+/// Hands the settings that shape derived keys to their derivations: the two
+/// that shape item ids, and the one that shapes a Live TV channel's user-data
+/// keys.
+fn publish_key_policies(configuration: &ServerConfiguration) {
+    crate::item_type_lookup::set_item_id_policy(
+        configuration.enable_case_sensitive_item_ids,
+        configuration.enable_normalized_item_by_name_ids,
+    );
+    crate::user_data_keys::set_live_tv_channel_user_data_name_disabled(
+        configuration.disable_live_tv_channel_user_data_name,
+    );
+}
 
 impl std::fmt::Debug for FerrofinServerConfigurationManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -257,6 +298,15 @@ impl FerrofinServerConfigurationManager {
     /// added behavior for new content" the library scan dates new items by.
     const METADATA_FILE_NAME: &'static str = "metadata.json";
 
+    /// The on-disk NFO configuration file name (Jellyfin's named
+    /// `xbmcmetadata` configuration, `XbmcMetadataOptions`).
+    const XBMC_METADATA_FILE_NAME: &'static str = "xbmcmetadata.json";
+
+    /// The on-disk Live TV configuration file name (Jellyfin's named `livetv`
+    /// configuration): its scalar options, the tuners and listing providers
+    /// being kept in the database.
+    const LIVE_TV_FILE_NAME: &'static str = "livetv.json";
+
     /// Loads (or initializes) the configuration for the given paths.
     ///
     /// If `{configuration-directory}/system.json` exists it is parsed. If it
@@ -289,72 +339,8 @@ impl FerrofinServerConfigurationManager {
         let encoding_file = named_dir.join(Self::ENCODING_FILE_NAME);
         let metadata_file = named_dir.join(Self::METADATA_FILE_NAME);
 
-        // The named configurations live in their own files and are read on
-        // demand, so adoption has to materialize them or the imported values
-        // are never seen. Seeding runs on EVERY boot, not just the adoption
-        // one: it is a no-op once the JSON exists, and running it
-        // unconditionally is what repairs an install adopted before this import
-        // existed — whose `encoding.json` is still missing and whose hardware
-        // transcoding is therefore still off. It also runs BEFORE `system.json`
-        // is written below, since that file is the sentinel for the adoption
-        // branch and crashing between the two would lose these for good.
-        let seeded = async {
-            seed_named(
-                &config_dir.join("encoding.xml"),
-                &encoding_file,
-                EncodingOptions::default(),
-                "EncodingOptions",
-                config_import::ENCODING_XML_DENY,
-            )
-            .await?;
-            seed_named(
-                &config_dir.join("branding.xml"),
-                &branding_file,
-                BrandingOptions::default(),
-                "BrandingOptions",
-                config_import::BRANDING_XML_DENY,
-            )
-            .await?;
-            // The network policy is enforced from this file (see
-            // `ferrofin_api::ip_access`), so dropping it on adoption would
-            // quietly take down an operator's remote-IP filter and widen their
-            // `LocalNetworkSubnets` back to every private range — the server
-            // would come up more permissive than the one it replaced, and
-            // nothing would say so.
-            seed_named(
-                &config_dir.join("network.xml"),
-                &named_dir.join(Self::NETWORK_FILE_NAME),
-                ferrofin_networking::NetworkConfiguration::default(),
-                "NetworkConfiguration",
-                config_import::NETWORK_XML_DENY,
-            )
-            .await?;
-            // "Date added behavior for new content": the library scan dates
-            // every new item by it, so an operator who chose "Use date
-            // scanned into the library" keeps that choice.
-            seed_named(
-                &config_dir.join("metadata.xml"),
-                &metadata_file,
-                MetadataConfiguration::default(),
-                "MetadataConfiguration",
-                &[],
-            )
-            .await
-        };
-        if let Err(e) = seeded.await {
-            // Never fatal, on any boot. The line between refusing to start and
-            // carrying on is not "is this the adoption boot" — it is whether
-            // the next boot gets another chance. Seeding is skipped only once
-            // its JSON exists, so a failure here leaves the JSON absent and is
-            // retried forever; the cost of carrying on is hardware transcoding
-            // or a splash screen until the operator fixes the file. Refusing to
-            // start over that would be worse than the problem.
-            tracing::warn!(
-                error = %e,
-                "could not seed a named configuration from jellyfin's xml; the server is \
-                 starting on ferrofin's defaults for it, and will try again on the next boot"
-            );
-        }
+        // Before `system.json` is written below: see `seed_named_configurations`.
+        seed_named_configurations(&config_dir, &named_dir).await;
 
         // No `system.json` means this data directory has never been served by
         // Ferrofin, so it may be a Jellyfin one we are adopting. Jellyfin kept
@@ -376,7 +362,7 @@ impl FerrofinServerConfigurationManager {
                 .await
                 .map_err(|e| io_err("read configuration", &config_file, &e))?;
             let mut config = serde_json::from_slice::<ServerConfiguration>(&bytes)
-                .map_err(|e| ServiceError::Backend(format!("invalid configuration JSON: {e}")))?;
+                .map_err(|e| json_err("invalid configuration JSON", &config_file, &e))?;
             // Backfill the per-type MetadataOptions on an older config that
             // predates them (was written empty), so the library editor lists them.
             if config.metadata_options.is_empty() {
@@ -407,7 +393,12 @@ impl FerrofinServerConfigurationManager {
             }
         }
 
+        initialize_cache_path(&paths, configuration.cache_path.as_deref())?;
+        initialize_transcode_path(&paths, &encoding_file).await?;
+
+        prepare_metadata_path(&paths, &configuration.metadata_path, None)?;
         paths.set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
+        publish_key_policies(&configuration);
 
         Ok(Self {
             paths,
@@ -415,9 +406,77 @@ impl FerrofinServerConfigurationManager {
             branding_file,
             encoding_file,
             metadata_file,
+            network_file: named_dir.join(Self::NETWORK_FILE_NAME),
+            xbmc_metadata_file: named_dir.join(Self::XBMC_METADATA_FILE_NAME),
+            live_tv_file: named_dir.join(Self::LIVE_TV_FILE_NAME),
             metadata_warned: std::sync::Mutex::new(None),
-            configuration: RwLock::new(Arc::new(configuration)),
+            branding_warned: std::sync::Mutex::new(None),
+            encoding_warned: std::sync::Mutex::new(None),
+            network_warned: std::sync::Mutex::new(None),
+            xbmc_metadata_warned: std::sync::Mutex::new(None),
+            live_tv_warned: std::sync::Mutex::new(None),
+            configuration: Arc::new(RwLock::new(Arc::new(configuration))),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            listeners: Arc::new(RwLock::new(Vec::new())),
         })
+    }
+
+    /// Persists the validated startup executable for the dashboard's read-only display.
+    ///
+    /// Executable selection remains a startup operation. Failed ffmpeg validation
+    /// must not call this method; a later ffprobe failure still preserves the display.
+    /// A failed legacy XML adoption leaves JSON absent for its next-boot retry, so
+    /// the display remains unavailable until that configuration can be imported.
+    ///
+    /// # Errors
+    /// Returns an error if the encoding document cannot be serialized or saved.
+    pub async fn set_encoder_app_path_display(&self, path: &str) -> Result<(), ServiceError> {
+        let _save = self.write_lock.lock().await;
+        let legacy_encoding = self.config_file.with_file_name("encoding.xml");
+        if !self.encoding_file.exists() && legacy_encoding.exists() {
+            tracing::warn!(
+                legacy_path = %legacy_encoding.display(),
+                "resolved encoder display was not saved while legacy encoding adoption is pending; repair the XML and restart to retry"
+            );
+            return Ok(());
+        }
+        let mut options = match self.get_encoding_options().await {
+            Ok(options) => options,
+            Err(error) => {
+                tracing::warn!(%error, "loading encoding configuration failed; using defaults");
+                EncodingOptions::default()
+            }
+        };
+        options.encoder_app_path_display = Some(path.to_owned());
+        let json = serde_json::to_string_pretty(&options).map_err(|error| {
+            ServiceError::backend(format!("serialize encoding configuration: {error}"))
+        })?;
+        let file = self.encoding_file.clone();
+        let committed: Arc<str> = json.clone().into();
+        tokio::task::spawn_blocking(move || {
+            ferrofin_util::file_helper::atomic_write(&file, json.as_bytes())
+                .map_err(|error| io_err("write resolved encoder path", &file, &error))
+        })
+        .await
+        .map_err(|error| ServiceError::backend(format!("encoding writer: {error}")))??;
+        self.named_configuration_updated("encoding", committed);
+        Ok(())
+    }
+
+    /// Subscribes to successful main, branding, and named-store saves.
+    ///
+    /// The host registers listeners while constructing its services. A
+    /// listener receives the exact committed snapshot; failed saves emit none.
+    /// Keep captured service references weak if they own this manager.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the listener registry's lock is poisoned.
+    pub fn add_configuration_listener(&self, listener: Arc<ConfigurationListener>) {
+        self.listeners
+            .write()
+            .expect("configuration listener lock poisoned")
+            .push(listener);
     }
 
     /// The metadata configuration as saved now — C#
@@ -475,23 +534,52 @@ impl FerrofinServerConfigurationManager {
     /// Whether the unusable `metadata.json` as it stands now has not been
     /// warned about yet; records that it now has.
     fn first_metadata_warning(&self) -> bool {
-        let mtime = std::fs::metadata(&self.metadata_file)
-            .and_then(|m| m.modified())
-            .ok();
-        let mut warned = self
-            .metadata_warned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        warned.replace(WarnedFile(mtime)) != Some(WarnedFile(mtime))
+        first_warning(&self.metadata_warned, &self.metadata_file)
     }
 
     /// Forgets the last warning once the document reads again, so breaking
     /// it later warns anew whatever its modification time.
     fn metadata_usable(&self) {
-        self.metadata_warned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        forget_warning(&self.metadata_warned);
+    }
+
+    /// Reads a named configuration document (`branding`, `encoding`, and the
+    /// others [`ServerConfigurationManager::get_named_configuration`] serves) as C#
+    /// `BaseConfigurationManager.LoadConfiguration` does: a document never
+    /// saved is the default, and one that does not parse is the default too,
+    /// logged with its path. Upstream logs that once, because it caches the
+    /// default; Ferrofin rereads the file on every call, so it warns once per
+    /// change of the file. A read failure other than not-found is still an
+    /// error, as upstream lets an `IOException` through.
+    async fn read_named<T: serde::de::DeserializeOwned + Default>(
+        what: &'static str,
+        path: &std::path::Path,
+        warned: &std::sync::Mutex<Option<WarnedFile>>,
+    ) -> Result<T, ServiceError> {
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                forget_warning(warned);
+                return Ok(T::default());
+            }
+            Err(e) => return Err(io_err(what, path, &e)),
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(document) => {
+                forget_warning(warned);
+                Ok(document)
+            }
+            Err(e) => {
+                if first_warning(warned, path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "a saved configuration file is not valid; using its defaults until it is fixed"
+                    );
+                }
+                Ok(T::default())
+            }
+        }
     }
 
     /// A shared handle to the current configuration.
@@ -549,33 +637,31 @@ impl FerrofinServerConfigurationManager {
     pub fn concrete_paths(&self) -> Arc<FerrofinServerApplicationPaths> {
         Arc::clone(&self.paths)
     }
-
-    /// Validates a proposed metadata path, mirroring C# `ValidateMetadataPath`.
-    ///
-    /// A new, non-empty path that differs from the current one must already
-    /// exist as a directory; otherwise the update is rejected. An unchanged or
-    /// blank path is always accepted.
-    fn validate_metadata_path(&self, new_path: &str) -> Result<(), ServiceError> {
-        if new_path.trim().is_empty() {
-            return Ok(());
-        }
-        // Read through the shared handle: this only needs one field, so a deep
-        // clone of the whole document would be pure waste.
-        let current = self.snapshot_shared();
-        if new_path == current.metadata_path {
-            return Ok(());
-        }
-        if !PathBuf::from(new_path).is_dir() {
-            return Err(ServiceError::InvalidInput(format!(
-                "metadata path does not exist: {new_path}"
-            )));
-        }
-        Ok(())
-    }
 }
 
 #[async_trait]
 impl ServerConfigurationManager for FerrofinServerConfigurationManager {
+    fn named_configuration_updated(&self, key: &str, json: Arc<str>) {
+        if key.eq_ignore_ascii_case("encoding") {
+            match serde_json::from_str::<EncodingOptions>(&json) {
+                Ok(options) => self
+                    .paths
+                    .set_transcode_path(options.transcoding_temp_path.as_deref()),
+                Err(error) => {
+                    tracing::warn!(%error, "committed encoding configuration could not update transcode path");
+                }
+            }
+        }
+
+        notify_listeners(
+            &self.listeners,
+            &ConfigurationUpdate::Named {
+                key: key.to_ascii_lowercase(),
+                json,
+            },
+        );
+    }
+
     fn application_paths(&self) -> Arc<dyn ServerApplicationPaths> {
         Arc::clone(&self.paths) as Arc<dyn ServerApplicationPaths>
     }
@@ -588,61 +674,233 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
         &self,
         configuration: &ServerConfiguration,
     ) -> Result<(), ServiceError> {
-        // ReplaceConfiguration: validate, persist, then apply side effects.
-        self.validate_metadata_path(&configuration.metadata_path)?;
-        write_config(&self.config_file, configuration).await?;
-
-        // Build the replacement outside the lock, then swap the pointer: the
-        // write section is a single pointer store, and readers holding an older
-        // handle keep a consistent view of the document they took.
+        // Hold the writer through validation, persistence, publication and
+        // notification. A cancelled caller must not leave disk ahead of memory.
+        let save = Arc::clone(&self.write_lock).lock_owned().await;
+        let old_metadata = self.snapshot_shared().metadata_path.clone();
+        let old_cache = self.snapshot_shared().cache_path.clone();
         let replacement = Arc::new(configuration.clone());
-        {
-            let mut guard = self
-                .configuration
-                .write()
-                .expect("configuration lock poisoned");
-            *guard = replacement;
-        }
-
-        // OnConfigurationUpdated → UpdateMetadataPath.
-        self.paths
-            .set_internal_metadata_path(Some(configuration.metadata_path.as_str()));
-        Ok(())
+        let json = serde_json::to_vec_pretty(configuration)
+            .map_err(|e| ServiceError::backend(format!("serialize configuration: {e}")))?;
+        let path = self.config_file.clone();
+        let current = Arc::clone(&self.configuration);
+        let paths = Arc::clone(&self.paths);
+        let listeners = Arc::clone(&self.listeners);
+        tokio::task::spawn_blocking(move || {
+            let _save = save;
+            prepare_metadata_path(&paths, &replacement.metadata_path, Some(&old_metadata))?;
+            if let Some(cache) = replacement
+                .cache_path
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+            {
+                let cache_path = PathBuf::from(cache);
+                if old_cache.as_deref() != Some(cache) {
+                    if !cache_path.is_dir() {
+                        return Err(ServiceError::not_found(format!(
+                            "cache path does not exist: {cache}"
+                        )));
+                    }
+                    let probe = cache_path.join(uuid::Uuid::new_v4().to_string());
+                    std::fs::File::create_new(&probe)
+                        .and_then(|_| std::fs::remove_file(&probe))
+                        .map_err(|e| io_err("validate cache directory", &cache_path, &e))?;
+                }
+                FerrofinServerApplicationPaths::prepare_cache_path(&cache_path)
+                    .map_err(|e| io_err("prepare cache directory", &cache_path, &e))?;
+            }
+            ferrofin_util::file_helper::atomic_write(&path, &json)
+                .map_err(|e| io_err("write configuration", &path, &e))?;
+            *current.write().expect("configuration lock poisoned") = Arc::clone(&replacement);
+            publish_key_policies(&replacement);
+            paths.set_cache_path(replacement.cache_path.as_deref());
+            paths.set_internal_metadata_path(Some(&replacement.metadata_path));
+            notify_listeners(&listeners, &ConfigurationUpdate::Server(replacement));
+            Ok(())
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("configuration writer: {e}")))?
     }
 
     async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
-        if !self.branding_file.exists() {
-            return Ok(BrandingOptions::default());
-        }
-        let bytes = tokio::fs::read(&self.branding_file)
-            .await
-            .map_err(|e| io_err("read branding", &self.branding_file, &e))?;
-        serde_json::from_slice::<BrandingOptions>(&bytes)
-            .map_err(|e| ServiceError::Backend(format!("invalid branding JSON: {e}")))
+        Self::read_named("read branding", &self.branding_file, &self.branding_warned).await
     }
 
     async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError> {
-        if let Some(parent) = self.branding_file.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| io_err("create configuration directory", parent, &e))?;
-        }
-        let json = serde_json::to_vec_pretty(branding)
-            .map_err(|e| ServiceError::Backend(format!("serialize branding: {e}")))?;
-        tokio::fs::write(&self.branding_file, json)
-            .await
-            .map_err(|e| io_err("write branding", &self.branding_file, &e))
+        let save = Arc::clone(&self.write_lock).lock_owned().await;
+        let json: Arc<str> = serde_json::to_string_pretty(branding)
+            .map_err(|e| ServiceError::Backend(format!("serialize branding: {e}")))?
+            .into();
+        let path = self.branding_file.clone();
+        let listeners = Arc::clone(&self.listeners);
+        tokio::task::spawn_blocking(move || {
+            let _save = save;
+            ferrofin_util::file_helper::atomic_write(&path, json.as_bytes())
+                .map_err(|e| io_err("write branding", &path, &e))?;
+            notify_listeners(
+                &listeners,
+                &ConfigurationUpdate::Named {
+                    key: "branding".into(),
+                    json,
+                },
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("branding writer: {e}")))?
     }
 
     async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
-        if !self.encoding_file.exists() {
-            return Ok(EncodingOptions::default());
+        Self::read_named(
+            "read encoding options",
+            &self.encoding_file,
+            &self.encoding_warned,
+        )
+        .await
+    }
+
+    /// The stores Jellyfin 12.2 registers: `branding`, `encoding`, `network`,
+    /// `metadata`, `xbmcmetadata`, `livetv` and `database`. Each document is
+    /// bound to its type, so the members it omits read as their defaults and
+    /// members the type does not have are dropped. `livetv` is its scalar
+    /// options only: the Live TV manager keeps the tuners and listing
+    /// providers. `database` is the SQLite document Jellyfin writes on its
+    /// first start, the only provider Ferrofin has.
+    async fn get_named_configuration(
+        &self,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, ServiceError> {
+        let document = match key.to_ascii_lowercase().as_str() {
+            "branding" => serde_json::to_value(self.get_branding().await?),
+            "encoding" => serde_json::to_value(self.get_encoding_options().await?),
+            "network" => serde_json::to_value(
+                Self::read_named::<ferrofin_networking::NetworkConfiguration>(
+                    "read network configuration",
+                    &self.network_file,
+                    &self.network_warned,
+                )
+                .await?,
+            ),
+            "metadata" => serde_json::to_value(
+                Self::read_named::<MetadataConfiguration>(
+                    "read metadata configuration",
+                    &self.metadata_file,
+                    &self.metadata_warned,
+                )
+                .await?,
+            ),
+            "xbmcmetadata" => serde_json::to_value(
+                Self::read_named::<ferrofin_model::configuration::XbmcMetadataOptions>(
+                    "read NFO configuration",
+                    &self.xbmc_metadata_file,
+                    &self.xbmc_metadata_warned,
+                )
+                .await?,
+            ),
+            "livetv" => serde_json::to_value(
+                Self::read_named::<ferrofin_model::live_tv::LiveTvOptions>(
+                    "read Live TV configuration",
+                    &self.live_tv_file,
+                    &self.live_tv_warned,
+                )
+                .await?,
+            ),
+            "database" => serde_json::to_value(
+                ferrofin_model::configuration::DatabaseConfigurationOptions::default(),
+            ),
+            _ => return Ok(None),
+        };
+        document
+            .map(Some)
+            .map_err(|e| ServiceError::backend(format!("serialize configuration `{key}`: {e}")))
+    }
+}
+
+/// A changed dashboard directory must already exist and accept a write.
+/// Startup and unchanged paths are created if absent, as in UpdateMetadataPath.
+fn prepare_metadata_path(
+    paths: &FerrofinServerApplicationPaths,
+    proposed: &str,
+    previous: Option<&str>,
+) -> Result<(), ServiceError> {
+    let metadata = if proposed.trim().is_empty() {
+        PathBuf::from(paths.default_internal_metadata_path())
+    } else {
+        PathBuf::from(proposed)
+    };
+    if !proposed.trim().is_empty() && previous.is_some_and(|old| old != proposed) {
+        if !metadata.is_dir() {
+            return Err(ServiceError::not_found(format!(
+                "metadata path does not exist: {proposed}"
+            )));
         }
-        let bytes = tokio::fs::read(&self.encoding_file)
-            .await
-            .map_err(|e| io_err("read encoding options", &self.encoding_file, &e))?;
-        serde_json::from_slice::<EncodingOptions>(&bytes)
-            .map_err(|e| ServiceError::Backend(format!("invalid encoding options JSON: {e}")))
+        let probe = metadata.join(uuid::Uuid::new_v4().to_string());
+        std::fs::File::create_new(&probe)
+            .and_then(|_| std::fs::remove_file(&probe))
+            .map_err(|e| io_err("validate metadata directory", &metadata, &e))?;
+    }
+    std::fs::create_dir_all(&metadata)
+        .map_err(|e| io_err("prepare metadata directory", &metadata, &e))
+}
+
+fn initialize_cache_path(
+    paths: &FerrofinServerApplicationPaths,
+    configured: Option<&str>,
+) -> Result<(), ServiceError> {
+    let cache = configured
+        .filter(|p| !p.trim().is_empty())
+        .map_or_else(|| PathBuf::from(paths.cache_path()), PathBuf::from);
+    FerrofinServerApplicationPaths::prepare_cache_path(&cache)
+        .map_err(|e| io_err("prepare cache directory", &cache, &e))?;
+    paths.set_cache_path(configured);
+    Ok(())
+}
+
+/// Loads the named encoding path after cache initialization and prepares it.
+/// Read/parse failures retain defaults; filesystem preparation still fails startup.
+async fn initialize_transcode_path(
+    paths: &FerrofinServerApplicationPaths,
+    encoding_file: &std::path::Path,
+) -> Result<(), ServiceError> {
+    let encoding = match tokio::fs::read(encoding_file).await {
+        Ok(bytes) => match serde_json::from_slice::<EncodingOptions>(&bytes) {
+            Ok(options) => options,
+            Err(error) => {
+                tracing::warn!(
+                    path = %encoding_file.display(),
+                    %error,
+                    "loading encoding configuration for transcode path failed; using defaults"
+                );
+                EncodingOptions::default()
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => EncodingOptions::default(),
+        Err(error) => {
+            tracing::warn!(
+                path = %encoding_file.display(),
+                %error,
+                "reading encoding configuration for transcode path failed; using defaults"
+            );
+            EncodingOptions::default()
+        }
+    };
+    paths.set_transcode_path(encoding.transcoding_temp_path.as_deref());
+    paths.prepare_transcode_path()?;
+    Ok(())
+}
+
+fn notify_listeners(
+    listeners: &RwLock<Vec<Arc<ConfigurationListener>>>,
+    update: &ConfigurationUpdate,
+) {
+    // Release the registry lock before invoking listeners so a callback can
+    // inspect configuration or register another observer without deadlocking.
+    let callbacks = listeners
+        .read()
+        .expect("configuration listener lock poisoned")
+        .clone();
+    for callback in callbacks {
+        callback(update);
     }
 }
 
@@ -695,9 +953,127 @@ where
     Ok(imported)
 }
 
+/// Seeds every named configuration (`named/<key>.json`) from Jellyfin's XML.
+///
+/// The named configurations live in their own files and are read on
+/// demand, so adoption has to materialize them or the imported values
+/// are never seen. Seeding runs on EVERY boot, not just the adoption
+/// one: it is a no-op once the JSON exists, and running it
+/// unconditionally is what repairs an install adopted before this import
+/// existed — whose `encoding.json` is still missing and whose hardware
+/// transcoding is therefore still off. [`FerrofinServerConfigurationManager::load`]
+/// runs it BEFORE writing `system.json`, since that file is the sentinel for
+/// the adoption branch and crashing between the two would lose these for good.
+///
+/// Each document is seeded on its own, so one that cannot be imported costs
+/// only itself: a corrupt `encoding.xml` must not keep `network.xml`, whose
+/// policy the request path enforces, from being imported. A failure is logged
+/// with the file it came from, and is never fatal, on any boot. The line
+/// between refusing to start and carrying on is not "is this the adoption
+/// boot" — it is whether the next boot gets another chance. Seeding is skipped
+/// only once its JSON exists, so a failure leaves the JSON absent and is
+/// retried on every boot; the cost of carrying on is that document's settings
+/// until the operator fixes the file. Refusing to start over that would be
+/// worse than the problem.
+async fn seed_named_configurations(config_dir: &std::path::Path, named_dir: &std::path::Path) {
+    let seeds = [
+        (
+            "encoding",
+            seed_named(
+                &config_dir.join("encoding.xml"),
+                &named_dir.join(FerrofinServerConfigurationManager::ENCODING_FILE_NAME),
+                EncodingOptions::default(),
+                "EncodingOptions",
+                config_import::ENCODING_XML_DENY,
+            )
+            .await,
+        ),
+        (
+            "branding",
+            seed_named(
+                &config_dir.join("branding.xml"),
+                &named_dir.join(FerrofinServerConfigurationManager::BRANDING_FILE_NAME),
+                BrandingOptions::default(),
+                "BrandingOptions",
+                config_import::BRANDING_XML_DENY,
+            )
+            .await,
+        ),
+        // The network policy is enforced from this file (see
+        // `ferrofin_api::ip_access`), so dropping it on adoption would
+        // quietly take down an operator's remote-IP filter and widen their
+        // `LocalNetworkSubnets` back to every private range — the server
+        // would come up more permissive than the one it replaced, and
+        // nothing would say so.
+        (
+            "network",
+            seed_named(
+                &config_dir.join("network.xml"),
+                &named_dir.join(FerrofinServerConfigurationManager::NETWORK_FILE_NAME),
+                ferrofin_networking::NetworkConfiguration::default(),
+                "NetworkConfiguration",
+                config_import::NETWORK_XML_DENY,
+            )
+            .await,
+        ),
+        // "Date added behavior for new content": the library scan dates
+        // every new item by it, so an operator who chose "Use date
+        // scanned into the library" keeps that choice.
+        (
+            "metadata",
+            seed_named(
+                &config_dir.join("metadata.xml"),
+                &named_dir.join(FerrofinServerConfigurationManager::METADATA_FILE_NAME),
+                MetadataConfiguration::default(),
+                "MetadataConfiguration",
+                &[],
+            )
+            .await,
+        ),
+        // NFO settings: the user whose watched state NFO sidecars carry,
+        // the release date format and path substitution.
+        (
+            "xbmcmetadata",
+            seed_named(
+                &config_dir.join("xbmcmetadata.xml"),
+                &named_dir.join(FerrofinServerConfigurationManager::XBMC_METADATA_FILE_NAME),
+                ferrofin_model::configuration::XbmcMetadataOptions::default(),
+                "XbmcMetadataOptions",
+                &[],
+            )
+            .await,
+        ),
+        // Live TV's scalar options: guide days, recording padding,
+        // subfolders, the post-processor and NFO/image saving. Seeded here
+        // rather than by the once-only `live_tv_import`, so installs adopted
+        // before this seed existed get them on their next boot.
+        (
+            "livetv",
+            seed_named(
+                &config_dir.join("livetv.xml"),
+                &named_dir.join(FerrofinServerConfigurationManager::LIVE_TV_FILE_NAME),
+                ferrofin_model::live_tv::LiveTvOptions::default(),
+                "LiveTvOptions",
+                config_import::LIVETV_OPTIONS_XML_DENY,
+            )
+            .await,
+        ),
+    ];
+    for (key, seeded) in seeds {
+        if let Err(e) = seeded {
+            tracing::warn!(
+                configuration_key = key,
+                error = %e,
+                "could not seed a named configuration from jellyfin's xml; the server is \
+                 starting on ferrofin's defaults for it, and will try again on the next boot"
+            );
+        }
+    }
+}
+
 /// Writes `json_path` from the Jellyfin XML at `xml_path`, if that XML exists.
 ///
-/// Named configurations (`encoding`, `branding`) are read on demand and fall
+/// Named configurations (`encoding`, `branding`, `livetv`, …) are read on demand and fall
 /// back to their defaults when their file is absent, so adoption has to
 /// materialize them eagerly or the imported values would never be seen.
 ///
@@ -720,16 +1096,9 @@ where
         return Ok(());
     }
     let imported = adopt_xml(xml_path, default, root_name, deny).await?;
-    if let Some(parent) = json_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| io_err("create the named configuration directory", parent, &e))?;
-    }
     let json = serde_json::to_vec_pretty(&imported)
         .map_err(|e| ServiceError::Backend(format!("serialize the adopted configuration: {e}")))?;
-    tokio::fs::write(json_path, json)
-        .await
-        .map_err(|e| io_err("write the adopted configuration", json_path, &e))
+    write_atomically(json_path, json, "write the adopted configuration").await
 }
 
 /// Restores `IsStartupWizardCompleted` on an install adopted before the XML
@@ -737,10 +1106,14 @@ where
 /// open to anonymous callers.
 ///
 /// Only this one flag is touched, and only in the one direction: Jellyfin's XML
-/// says the wizard was completed while our JSON says it was not. Ferrofin never
-/// clears the flag, so that combination has no innocent explanation. Every
-/// other setting is left as the operator has it — a late, wholesale re-import
-/// would overwrite choices they made after adopting.
+/// says the wizard was completed while our JSON says it was not. Ferrofin itself
+/// only ever sets the flag; an administrator can clear it (`POST
+/// /System/Configuration`, or by editing `system.json` to start over after the
+/// database was lost), and on an install that still has a `system.xml` saying
+/// `true` this repair sets it again — which is why starting over means clearing
+/// it in both files, as [`startup_wizard_completed_files`] and the start-over
+/// refusal name them. Every other setting is left as the operator has it — a
+/// late, wholesale re-import would overwrite choices they made after adopting.
 async fn repair_lost_startup_flag(
     config_dir: &std::path::Path,
     config_file: &std::path::Path,
@@ -770,12 +1143,7 @@ async fn repair_lost_startup_flag(
         Ok(xml) => xml,
         Err(e) => return unverified(&e.to_string()),
     };
-    match config_import::import_over(
-        &default_server_configuration(),
-        &xml,
-        "ServerConfiguration",
-        config_import::SYSTEM_XML_DENY,
-    ) {
+    match import_system_xml(&xml) {
         Ok(jellyfin) if jellyfin.is_startup_wizard_completed => {}
         // Jellyfin agrees the wizard was never completed: nothing to repair.
         Ok(_) => return,
@@ -794,26 +1162,111 @@ async fn repair_lost_startup_flag(
     }
 }
 
+/// The configuration files under `config_dir` that record the startup wizard as
+/// completed — read before the database is opened, without writing anything.
+///
+/// An empty list means setup has not been completed. Otherwise it names every
+/// file [`FerrofinServerConfigurationManager::load`] would take the completed
+/// flag from: `system.json` when it says so, and Jellyfin's `system.xml` when
+/// it says so — the import source while `system.json` does not exist yet, and
+/// the source [`repair_lost_startup_flag`] restores the flag from when
+/// `system.json` says the wizard is incomplete. Resetting the flag means
+/// setting it to false in all of them; one left true sets it again.
+///
+/// The failure modes follow `load`: an unreadable `system.json`, or an
+/// unreadable `system.xml` that is about to be imported, is an error (the
+/// server would not start on it anyway), while an unreadable `system.xml` next
+/// to an existing `system.json` is not consulted, as the repair skips it too.
+///
+/// # Errors
+///
+/// Returns [`ServiceError`] if `system.json` exists but cannot be read or
+/// parsed, or if it is absent and `system.xml` exists but cannot be imported.
+pub fn startup_wizard_completed_files(
+    config_dir: &std::path::Path,
+) -> Result<Vec<PathBuf>, ServiceError> {
+    let json_path = config_dir.join(FerrofinServerConfigurationManager::CONFIG_FILE_NAME);
+    let xml_path = config_dir.join("system.xml");
+    let mut completed = Vec::new();
+    if json_path.exists() {
+        let bytes =
+            std::fs::read(&json_path).map_err(|e| io_err("read configuration", &json_path, &e))?;
+        let config = serde_json::from_slice::<ServerConfiguration>(&bytes)
+            .map_err(|e| json_err("invalid configuration JSON", &json_path, &e))?;
+        if config.is_startup_wizard_completed {
+            completed.push(json_path);
+        }
+        let jellyfin_completed = std::fs::read_to_string(&xml_path)
+            .ok()
+            .and_then(|xml| import_system_xml(&xml).ok())
+            .is_some_and(|jellyfin| jellyfin.is_startup_wizard_completed);
+        if jellyfin_completed {
+            completed.push(xml_path);
+        }
+    } else if xml_path.exists() {
+        let xml = std::fs::read_to_string(&xml_path)
+            .map_err(|e| io_err("read the jellyfin configuration", &xml_path, &e))?;
+        if import_system_xml(&xml)?.is_startup_wizard_completed {
+            completed.push(xml_path);
+        }
+    }
+    Ok(completed)
+}
+
+/// Imports Jellyfin's `system.xml` document over Ferrofin's defaults.
+fn import_system_xml(xml: &str) -> Result<ServerConfiguration, ServiceError> {
+    config_import::import_over(
+        &default_server_configuration(),
+        xml,
+        "ServerConfiguration",
+        config_import::SYSTEM_XML_DENY,
+    )
+}
+
 /// Serializes and writes a configuration to `path` (creating the parent dir).
 async fn write_config(
     path: &std::path::Path,
     configuration: &ServerConfiguration,
 ) -> Result<(), ServiceError> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| io_err("create configuration directory", parent, &e))?;
-    }
     let json = serde_json::to_vec_pretty(configuration)
         .map_err(|e| ServiceError::Backend(format!("serialize configuration: {e}")))?;
-    tokio::fs::write(path, json)
-        .await
-        .map_err(|e| io_err("write configuration", path, &e))
+    write_atomically(path, json, "write configuration").await
+}
+
+/// Writes a boot-time configuration file the way every runtime configuration
+/// save does.
+///
+/// [`ferrofin_util::file_helper::atomic_write`] creates the parent directory,
+/// replaces the file only once the new contents are complete, and leaves it
+/// private (`0600` on Unix). A boot killed mid-write therefore keeps the
+/// previous file, or none, instead of a truncated `system.json` that stops the
+/// next boot or a truncated named document that is never seeded again.
+async fn write_atomically(
+    path: &std::path::Path,
+    contents: Vec<u8>,
+    action: &'static str,
+) -> Result<(), ServiceError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        ferrofin_util::file_helper::atomic_write(&path, &contents)
+            .map_err(|e| io_err(action, &path, &e))
+    })
+    .await
+    .map_err(|e| ServiceError::backend(format!("boot configuration writer: {e}")))?
 }
 
 /// Wraps a filesystem error touching `path` as a [`ServiceError`].
 fn io_err(action: &str, path: &std::path::Path, err: &std::io::Error) -> ServiceError {
     ServiceError::Backend(format!("{action} ({}): {err}", path.display()))
+}
+
+/// Wraps a parse error in the JSON document at `path` as a [`ServiceError`]
+/// naming the file, as [`io_err`] does for a failed read. Upstream's
+/// `MyXmlSerializer.DeserializeFromFile` attaches the same `Filename` to any
+/// deserialization failure, so a broken configuration file can be found from
+/// the log.
+fn json_err(what: &str, path: &std::path::Path, err: &serde_json::Error) -> ServiceError {
+    ServiceError::Backend(format!("{what} ({}): {err}", path.display()))
 }
 
 #[cfg(test)]
@@ -889,6 +1342,75 @@ mod tests {
             mgr2.snapshot().server_name,
             "reload should observe the same configuration"
         );
+    }
+
+    #[tokio::test]
+    async fn cache_override_is_live_persisted_and_clear_requires_fresh_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let original = paths.cache_path();
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let mut config = mgr.snapshot();
+        for name in ["cache-one", "cache-two"] {
+            let cache = tmp.path().join(name);
+            std::fs::create_dir(&cache).expect("cache");
+            config.cache_path = Some(cache.to_string_lossy().into_owned());
+            mgr.update_configuration(&config).await.expect("save");
+            assert_eq!(paths.cache_path(), cache.to_string_lossy());
+            assert_eq!(
+                paths.image_cache_path(),
+                cache.join("images").to_string_lossy()
+            );
+            assert!(cache.join(".jellyfin-cache").is_file());
+            assert!(
+                std::fs::read_to_string(cache.join("CACHEDIR.TAG"))
+                    .expect("tag")
+                    .starts_with("Signature: 8a477f597d28d172789f06886806bc55\n")
+            );
+        }
+        let reloaded_paths = test_paths(tmp.path());
+        FerrofinServerConfigurationManager::load(Arc::clone(&reloaded_paths))
+            .await
+            .expect("reload");
+        assert_eq!(reloaded_paths.cache_path(), paths.cache_path());
+        config.cache_path = Some("  ".into());
+        mgr.update_configuration(&config).await.expect("clear");
+        assert_ne!(paths.cache_path(), original);
+        let restarted_paths = test_paths(tmp.path());
+        FerrofinServerConfigurationManager::load(Arc::clone(&restarted_paths))
+            .await
+            .expect("restart");
+        assert_eq!(restarted_paths.cache_path(), original);
+    }
+
+    #[tokio::test]
+    async fn rejected_cache_paths_preserve_saved_configuration_and_live_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let previous = std::fs::read(&mgr.config_file).expect("config");
+        let original = paths.cache_path();
+        let mut config = mgr.snapshot();
+        config.cache_path = Some(tmp.path().join("missing").to_string_lossy().into_owned());
+        assert!(matches!(
+            mgr.update_configuration(&config).await,
+            Err(ServiceError::NotFound(_))
+        ));
+        let incompatible = tmp.path().join("config-root");
+        std::fs::create_dir(&incompatible).expect("mkdir");
+        std::fs::write(incompatible.join(".jellyfin-config"), "").expect("marker");
+        config.cache_path = Some(incompatible.to_string_lossy().into_owned());
+        assert!(matches!(
+            mgr.update_configuration(&config).await,
+            Err(ServiceError::Backend(_))
+        ));
+        assert_eq!(std::fs::read(&mgr.config_file).expect("config"), previous);
+        assert_eq!(paths.cache_path(), original);
+        assert!(!incompatible.join(".jellyfin-cache").exists());
     }
 
     #[tokio::test]
@@ -990,7 +1512,7 @@ mod tests {
         ));
     }
 
-    /// `validate_metadata_path` reads the live document, so an unchanged path is
+    /// Metadata-path validation reads the live document, so an unchanged path is
     /// accepted even after the configuration has been replaced.
     #[tokio::test]
     async fn metadata_path_validation_reads_the_current_document() {
@@ -1054,6 +1576,149 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_encoder_display_preserves_options_and_persists_across_restart() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let mut options = EncodingOptions {
+            encoding_thread_count: 7,
+            encoder_app_path: Some("configured-executable".into()),
+            encoder_app_path_display: Some("old-display".into()),
+            ..EncodingOptions::default()
+        };
+        ferrofin_util::file_helper::atomic_write(
+            &mgr.encoding_file,
+            &serde_json::to_vec(&options).expect("serialize"),
+        )
+        .expect("save original");
+        mgr.set_encoder_app_path_display("/resolved/ffmpeg")
+            .await
+            .expect("display");
+        options.encoder_app_path_display = Some("/resolved/ffmpeg".into());
+        assert_eq!(mgr.get_encoding_options().await.expect("encoding"), options);
+        let restarted = FerrofinServerConfigurationManager::load(paths)
+            .await
+            .expect("restart");
+        assert_eq!(
+            restarted.get_encoding_options().await.expect("encoding"),
+            options
+        );
+        mgr.set_encoder_app_path_display("/new/ffmpeg")
+            .await
+            .expect("changed executable");
+        options.encoder_app_path_display = Some("/new/ffmpeg".into());
+        assert_eq!(mgr.get_encoding_options().await.expect("encoding"), options);
+    }
+
+    #[tokio::test]
+    async fn resolved_encoder_display_initializes_absent_or_malformed_encoding_config() {
+        for malformed in [false, true] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+                .await
+                .expect("load");
+            if malformed {
+                ferrofin_util::file_helper::atomic_write(&mgr.encoding_file, b"bad json")
+                    .expect("corrupt config");
+            }
+            mgr.set_encoder_app_path_display("/resolved/ffmpeg")
+                .await
+                .expect("display");
+            assert_eq!(
+                mgr.get_encoding_options().await.expect("encoding"),
+                EncodingOptions {
+                    encoder_app_path_display: Some("/resolved/ffmpeg".into()),
+                    ..EncodingOptions::default()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_encoder_display_reports_persistence_failure() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        std::fs::create_dir_all(&mgr.encoding_file).expect("block destination");
+        assert!(
+            mgr.set_encoder_app_path_display("/resolved/ffmpeg")
+                .await
+                .is_err()
+        );
+        assert!(mgr.encoding_file.is_dir());
+    }
+
+    #[tokio::test]
+    async fn transcode_path_loads_saved_root_and_publishes_committed_updates() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let encoding_file =
+            PathBuf::from(paths.user_configuration_directory_path()).join("named/encoding.json");
+        let first = tmp.path().join("first-transcodes");
+        let first_json = serde_json::to_string(&EncodingOptions {
+            transcoding_temp_path: Some(first.to_string_lossy().into_owned()),
+            ..EncodingOptions::default()
+        })
+        .expect("serialize");
+        ferrofin_util::file_helper::atomic_write(&encoding_file, first_json.as_bytes())
+            .expect("save startup configuration");
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        assert_eq!(PathBuf::from(paths.transcode_path()), first);
+        assert!(first.join(".jellyfin-transcode").is_file());
+        let operation = paths.transcode_path();
+        let second = tmp.path().join("second-transcodes");
+        let second_json = serde_json::to_string(&EncodingOptions {
+            transcoding_temp_path: Some(second.to_string_lossy().into_owned()),
+            ..EncodingOptions::default()
+        })
+        .expect("serialize");
+        ferrofin_util::file_helper::atomic_write(&encoding_file, second_json.as_bytes())
+            .expect("persist named update");
+        mgr.named_configuration_updated("ENCODING", second_json.into());
+        assert_eq!(PathBuf::from(paths.transcode_path()), second);
+        assert_eq!(PathBuf::from(operation), first);
+        assert!(
+            !second.exists(),
+            "save publication does not create the directory"
+        );
+        paths.prepare_transcode_path().expect("operation starts");
+        assert!(second.join(".jellyfin-transcode").is_file());
+        let restarted = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("restart");
+        assert_eq!(
+            PathBuf::from(restarted.concrete_paths().transcode_path()),
+            second
+        );
+        mgr.named_configuration_updated("encoding", Arc::from(r#"{"TranscodingTempPath":""}"#));
+        assert_eq!(
+            PathBuf::from(paths.transcode_path()),
+            PathBuf::from(paths.cache_path()).join("transcodes")
+        );
+    }
+
+    #[tokio::test]
+    async fn transcode_path_rejects_conflicting_startup_markers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let transcode = PathBuf::from(paths.cache_path()).join("transcodes");
+        let nested = transcode.join("nested");
+        std::fs::create_dir_all(&nested).expect("directory");
+        std::fs::write(nested.join(".jellyfin-data"), b"").expect("wrong owner");
+        assert!(
+            FerrofinServerConfigurationManager::load(paths)
+                .await
+                .is_err()
+        );
+        assert!(!transcode.join(".jellyfin-transcode").exists());
+    }
+
+    #[tokio::test]
     async fn encoding_options_default_then_reads_persisted_document() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let paths = test_paths(tmp.path());
@@ -1097,21 +1762,155 @@ mod tests {
         );
     }
 
+    /// C# `BaseConfigurationManager.LoadConfiguration`: a named document that
+    /// does not parse is logged with its path and read as the defaults, so
+    /// every reader (the branding routes, the transcode throttle, the segment
+    /// cleaner, trickplay) carries on. The warning comes once per change of the
+    /// file, not on every read.
     #[tokio::test]
-    async fn encoding_options_rejects_invalid_json() {
+    async fn an_invalid_named_document_reads_as_its_defaults_and_warns_once() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let paths = test_paths(tmp.path());
-        let mgr = FerrofinServerConfigurationManager::load(paths)
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
             .await
             .expect("load");
-
-        tokio::fs::create_dir_all(mgr.encoding_file.parent().expect("named dir"))
-            .await
+        std::fs::create_dir_all(mgr.branding_file.parent().expect("named dir"))
             .expect("create named dir");
-        tokio::fs::write(&mgr.encoding_file, b"not json")
+        std::fs::write(&mgr.branding_file, b"{ \"LoginDisclaimer\": \"hi\", }")
+            .expect("write bad branding");
+        std::fs::write(&mgr.encoding_file, b"not json").expect("write bad encoding");
+
+        let logs = crate::test_support::CapturedLogs::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            for _ in 0..3 {
+                assert_eq!(
+                    mgr.get_branding().await.expect("branding"),
+                    BrandingOptions::default()
+                );
+                assert_eq!(
+                    mgr.get_encoding_options().await.expect("encoding"),
+                    EncodingOptions::default()
+                );
+            }
+        }
+        let text = logs.text();
+        for file in [&mgr.branding_file, &mgr.encoding_file] {
+            let warnings: Vec<&str> = text
+                .lines()
+                .filter(|line| {
+                    line.contains(" WARN ") && line.contains(&file.display().to_string())
+                })
+                .collect();
+            assert_eq!(warnings.len(), 1, "one warning per broken file:\n{text}");
+        }
+
+        // A save overwrites the broken file, as the dashboard's would.
+        let branding = BrandingOptions {
+            login_disclaimer: Some("fixed".to_owned()),
+            ..BrandingOptions::default()
+        };
+        mgr.update_branding(&branding).await.expect("save branding");
+        assert_eq!(mgr.get_branding().await.expect("branding"), branding);
+    }
+
+    /// A hand-edited `system.json` that no longer parses stops the boot with
+    /// an error naming the file, so an operator with several data directories
+    /// does not have to guess which one broke.
+    #[tokio::test]
+    async fn a_malformed_system_json_names_the_file_at_boot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("config").join("system.json");
+        std::fs::create_dir_all(file.parent().expect("config dir")).expect("config dir");
+        std::fs::write(&file, b"{ \"EnableMetrics\": true, }").expect("system.json");
+
+        let error = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
             .await
-            .expect("write bad encoding");
-        assert!(mgr.get_encoding_options().await.is_err());
+            .expect_err("must not boot on a broken system.json");
+        assert!(
+            error.to_string().contains(&file.display().to_string()),
+            "{error}"
+        );
+    }
+
+    /// The boot-time transcode-path read falls back to the defaults for a
+    /// broken `encoding.json`, and its warning names the file.
+    #[tokio::test]
+    async fn a_malformed_encoding_json_at_boot_is_logged_with_its_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let file = tmp
+            .path()
+            .join("config")
+            .join("users")
+            .join(FerrofinServerConfigurationManager::NAMED_SUBDIR)
+            .join(FerrofinServerConfigurationManager::ENCODING_FILE_NAME);
+        std::fs::create_dir_all(file.parent().expect("named dir")).expect("named dir");
+        std::fs::write(&file, b"{ not json").expect("encoding.json");
+
+        let logs = crate::test_support::CapturedLogs::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+                .await
+                .expect("a broken encoding.json does not stop the boot");
+        }
+        let text = logs.text();
+        let warning = text
+            .lines()
+            .find(|line| line.contains("transcode path"))
+            .unwrap_or_else(|| panic!("no transcode-path warning in:\n{text}"));
+        assert!(warning.contains(" WARN "), "{warning}");
+        assert!(warning.contains(&file.display().to_string()), "{warning}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn metadata_directory_write_failure_preserves_config_and_clearing_resets_live_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths(tmp.path());
+        let mgr = FerrofinServerConfigurationManager::load(Arc::clone(&paths))
+            .await
+            .expect("load");
+        let original = paths.internal_metadata_path();
+        let valid = tmp.path().join("custom-metadata");
+        std::fs::create_dir(&valid).expect("mkdir");
+        let mut config = mgr.snapshot();
+        config.metadata_path = valid.to_string_lossy().into_owned();
+        mgr.update_configuration(&config).await.expect("save valid");
+        assert_eq!(paths.internal_metadata_path(), config.metadata_path);
+        let previous = std::fs::read(&mgr.config_file).expect("read config");
+        let blocked = tmp.path().join("readonly");
+        std::fs::create_dir(&blocked).expect("mkdir");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o555))
+            .expect("readonly");
+        config.metadata_path = blocked.to_string_lossy().into_owned();
+        let cannot_write = std::fs::File::create(blocked.join("probe")).is_err();
+        let result = mgr.update_configuration(&config).await;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+        if cannot_write {
+            assert!(matches!(result, Err(ServiceError::Backend(_))));
+            assert_eq!(
+                std::fs::read(&mgr.config_file).expect("read config"),
+                previous
+            );
+            assert_eq!(paths.internal_metadata_path(), valid.to_string_lossy());
+        }
+        config.metadata_path = String::new();
+        mgr.update_configuration(&config).await.expect("clear");
+        assert_eq!(paths.internal_metadata_path(), original);
+        assert!(std::path::Path::new(&original).is_dir());
     }
 
     #[tokio::test]
@@ -1128,7 +1927,7 @@ mod tests {
             .update_configuration(&cfg)
             .await
             .expect_err("should reject");
-        assert!(matches!(err, ServiceError::InvalidInput(_)));
+        assert!(matches!(err, ServiceError::NotFound(_)));
     }
 
     /// A fresh install is 12.0's `false`; an adopted `system.xml` carries its
@@ -1459,6 +2258,42 @@ mod tests {
             !mgr.encoding_file.exists(),
             "nothing was written, so the next boot tries again"
         );
+        mgr.set_encoder_app_path_display("/resolved/ffmpeg")
+            .await
+            .expect("pending adoption is preserved");
+        assert!(
+            !mgr.encoding_file.exists(),
+            "display update must not suppress a later XML import"
+        );
+        assert_eq!(
+            mgr.get_encoding_options().await.expect("encoding"),
+            EncodingOptions::default()
+        );
+        std::fs::write(dir.join("encoding.xml"),
+            "<EncodingOptions><EncodingThreadCount>7</EncodingThreadCount><DownMixAudioBoost>1.5</DownMixAudioBoost></EncodingOptions>")
+            .expect("repair XML");
+        let restarted = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("retry import");
+        assert_eq!(
+            restarted
+                .get_encoding_options()
+                .await
+                .expect("adopted")
+                .encoding_thread_count,
+            7
+        );
+        restarted
+            .set_encoder_app_path_display("/resolved/ffmpeg")
+            .await
+            .expect("display after import");
+        let actual = restarted.get_encoding_options().await.expect("updated");
+        assert_eq!(actual.encoding_thread_count, 7);
+        assert_eq!(actual.down_mix_audio_boost.to_bits(), 1.5_f64.to_bits());
+        assert_eq!(
+            actual.encoder_app_path_display.as_deref(),
+            Some("/resolved/ffmpeg")
+        );
     }
 
     #[tokio::test]
@@ -1517,6 +2352,90 @@ mod tests {
             ferrofin_model::entities::HardwareAccelerationType::none,
             "the operator turned it off; adoption must not turn it back on"
         );
+    }
+
+    /// One broken document costs only itself: a corrupt `encoding.xml` must not
+    /// keep `network.xml`, whose policy the request path enforces, from being
+    /// imported, and each failure is logged with the file it came from.
+    #[tokio::test]
+    async fn a_corrupt_named_xml_does_not_stop_the_documents_after_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        let dir = tmp.path().join("config");
+        let encoding_xml = dir.join("encoding.xml");
+        let livetv_xml = dir.join("livetv.xml");
+        std::fs::write(&encoding_xml, "<EncodingOptions><A></B>").expect("encoding.xml");
+        std::fs::write(&livetv_xml, "<WrongRoot />").expect("livetv.xml");
+        std::fs::write(
+            dir.join("metadata.xml"),
+            "<MetadataConfiguration><UseFileCreationTimeForDateAdded>false\
+             </UseFileCreationTimeForDateAdded></MetadataConfiguration>",
+        )
+        .expect("metadata.xml");
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let mgr = {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+                .await
+                .expect("must still boot")
+        };
+
+        let network: ferrofin_networking::NetworkConfiguration =
+            seeded_named(tmp.path(), "network");
+        assert_eq!(network.remote_ip_filter, ["203.0.113.0/24"]);
+        let branding: BrandingOptions = seeded_named(tmp.path(), "branding");
+        assert!(branding.splashscreen_enabled);
+        assert!(
+            !mgr.metadata_configuration()
+                .use_file_creation_time_for_date_added
+        );
+        assert!(!mgr.encoding_file.exists(), "retried on the next boot");
+        let named = mgr.encoding_file.parent().expect("named dir");
+        assert!(
+            !named.join("livetv.json").exists(),
+            "retried on the next boot"
+        );
+
+        let text = logs.text();
+        for xml in [&encoding_xml, &livetv_xml] {
+            let warnings = text
+                .lines()
+                .filter(|line| line.contains(" WARN ") && line.contains(&xml.display().to_string()))
+                .count();
+            assert_eq!(warnings, 1, "one warning naming {}:\n{text}", xml.display());
+        }
+    }
+
+    /// The boot writes go through the same atomic, private write as every
+    /// runtime save, so a crash mid-write cannot leave a truncated
+    /// `system.json` or named document behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_writes_are_private_like_every_other_configuration_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        let named = mgr.encoding_file.parent().expect("named dir");
+        for file in [
+            mgr.config_file.clone(),
+            mgr.encoding_file.clone(),
+            named.join("network.json"),
+        ] {
+            let mode = std::fs::metadata(&file)
+                .unwrap_or_else(|e| panic!("{}: {e}", file.display()))
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{}", file.display());
+        }
     }
 
     /// `GetMetadataConfiguration()`: the default until the dashboard saves
@@ -1630,6 +2549,166 @@ mod tests {
         assert_eq!(count(), 3, "broken again after it read: warns anew");
     }
 
+    /// Writes `body` as the named document `key`, as a save would.
+    fn write_named(mgr: &FerrofinServerConfigurationManager, key: &str, body: &[u8]) {
+        let named = mgr.encoding_file.parent().expect("named dir");
+        std::fs::create_dir_all(named).expect("named dir");
+        std::fs::write(named.join(format!("{key}.json")), body).expect("named document");
+    }
+
+    /// `GetConfiguration(key)` for each registered store, case-insensitive:
+    /// the saved document bound to its type, so members it omits read as
+    /// their defaults and members the type does not have are dropped. The
+    /// network document's older member names still bind, and come back under
+    /// the names jellyfin-web reads.
+    #[tokio::test]
+    async fn a_named_configuration_is_its_saved_document_bound_to_its_type() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        write_named(
+            &mgr,
+            "network",
+            br#"{"BaseUrl":"/jf","EnableIpv4":false,"RemoteIpFilter":["192.168.1.5"],
+                "IsRemoteIpFilterBlacklist":true,"Unrecognized":1}"#,
+        );
+        write_named(&mgr, "metadata", br#"{"Unrecognized":1}"#);
+        write_named(&mgr, "xbmcmetadata", br#"{"UserId":"user-1"}"#);
+        write_named(&mgr, "livetv", br#"{"PrePaddingSeconds":120}"#);
+        write_named(&mgr, "encoding", br#"{"EncodingThreadCount":3}"#);
+
+        let read = |key: &'static str| {
+            let mgr = &mgr;
+            async move {
+                mgr.get_named_configuration(key)
+                    .await
+                    .expect("read")
+                    .unwrap_or_else(|| panic!("{key} is registered"))
+            }
+        };
+        let network = read("NETWORK").await;
+        assert_eq!(network["BaseUrl"], "/jf");
+        assert_eq!(network["EnableIPv4"], false);
+        assert_eq!(
+            network["RemoteIPFilter"],
+            serde_json::json!(["192.168.1.5"])
+        );
+        assert_eq!(network["IsRemoteIPFilterBlacklist"], true);
+        assert_eq!(network["InternalHttpPort"], 8096);
+        for gone in ["EnableIpv4", "RemoteIpFilter", "Unrecognized"] {
+            assert!(network.get(gone).is_none(), "{gone}");
+        }
+        assert_eq!(
+            read("metadata").await,
+            serde_json::json!({"UseFileCreationTimeForDateAdded": true})
+        );
+        let nfo = read("xbmcmetadata").await;
+        assert_eq!(nfo["UserId"], "user-1");
+        assert_eq!(nfo["SaveImagePathsInNfo"], true);
+        let live_tv = read("livetv").await;
+        assert_eq!(live_tv["PrePaddingSeconds"], 120);
+        assert_eq!(live_tv["SaveRecordingNFO"], true);
+        let encoding = read("encoding").await;
+        assert_eq!(encoding["EncodingThreadCount"], 3);
+        assert_eq!(encoding["DownMixAudioBoost"], 2.0);
+        assert_eq!(
+            read("branding").await,
+            serde_json::to_value(BrandingOptions::default()).expect("branding")
+        );
+        assert_eq!(
+            read("database").await,
+            serde_json::json!({"DatabaseType": "Jellyfin-SQLite", "LockingBehavior": "NoLock"})
+        );
+    }
+
+    /// No store is registered under any other key (`ResourceNotFoundException`
+    /// upstream), whatever file a save once left behind.
+    #[tokio::test]
+    async fn an_unregistered_key_has_no_named_configuration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        write_named(&mgr, "plugin-owned", br#"{"CustomSetting":1}"#);
+        for key in ["plugin-owned", "never-saved", "", "../system", "named"] {
+            assert_eq!(
+                mgr.get_named_configuration(key).await.expect("read"),
+                None,
+                "{key}"
+            );
+        }
+    }
+
+    /// `LoadConfiguration`: a document never saved is the default, silently;
+    /// one that does not parse or bind is the default too, logged once per
+    /// change of the file and never rewritten. A read failure other than
+    /// not-found is an error; upstream serves the defaults for some of those
+    /// (see the `GET /System/Configuration/{key}` parity row).
+    #[tokio::test]
+    async fn a_broken_named_configuration_reads_as_its_defaults_and_warns_once() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        let warnings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(CountWarnings(Arc::clone(&warnings))),
+        );
+        let count = || warnings.load(std::sync::atomic::Ordering::SeqCst);
+
+        for key in ["network", "metadata", "xbmcmetadata", "livetv"] {
+            let missing = mgr.get_named_configuration(key).await.expect("missing");
+            assert!(missing.is_some_and(|value| value.is_object()), "{key}");
+        }
+        assert_eq!(count(), 0, "a document never saved is not a problem");
+
+        let broken: [(&str, &[u8]); 4] = [
+            ("network", br#"{"InternalHttpPort":"not a port"}"#),
+            (
+                "metadata",
+                br#"{"UseFileCreationTimeForDateAdded":"invalid"}"#,
+            ),
+            ("xbmcmetadata", b"{ not json"),
+            ("livetv", br#"{"SaveRecordingNFO":"invalid"}"#),
+        ];
+        for (key, body) in broken {
+            write_named(&mgr, key, body);
+            for _ in 0..3 {
+                let value = mgr
+                    .get_named_configuration(key)
+                    .await
+                    .expect("defaults")
+                    .expect("registered");
+                assert!(value.is_object(), "{key}");
+            }
+            let file = mgr
+                .encoding_file
+                .parent()
+                .expect("named dir")
+                .join(format!("{key}.json"));
+            assert_eq!(std::fs::read(file).expect("kept"), body, "{key}");
+        }
+        assert_eq!(count(), 4, "one warning per broken document");
+        let network = mgr
+            .get_named_configuration("network")
+            .await
+            .expect("defaults")
+            .expect("registered");
+        assert_eq!(network["InternalHttpPort"], 8096);
+
+        // A directory where the file belongs cannot be read at all.
+        let named = mgr.encoding_file.parent().expect("named dir");
+        std::fs::remove_file(named.join("livetv.json")).expect("remove");
+        std::fs::create_dir(named.join("livetv.json")).expect("unreadable");
+        let error = mgr
+            .get_named_configuration("livetv")
+            .await
+            .expect_err("an unreadable document is an error");
+        assert!(error.to_string().contains("livetv.json"), "{error}");
+    }
+
     /// Adoption carries Jellyfin's `metadata.xml` over, so "Use date scanned
     /// into the library" survives the move.
     #[tokio::test]
@@ -1652,5 +2731,309 @@ mod tests {
                 .use_file_creation_time_for_date_added
         );
         assert!(mgr.metadata_file.exists(), "seeded as the named JSON");
+    }
+
+    /// The named JSON document `load` wrote for `key`, parsed.
+    fn seeded_named<T: serde::de::DeserializeOwned>(root: &std::path::Path, key: &str) -> T {
+        let path = root
+            .join("config")
+            .join("users")
+            .join("named")
+            .join(format!("{key}.json"));
+        let json = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} was not seeded: {e}", path.display()));
+        serde_json::from_str(&json).expect("parses back")
+    }
+
+    /// Adoption carries Jellyfin's NFO settings (`xbmcmetadata.xml`) over, so
+    /// sidecars keep the watched state of the user the operator chose and
+    /// their date format.
+    #[tokio::test]
+    async fn adoption_imports_the_nfo_settings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        std::fs::write(
+            tmp.path().join("config").join("xbmcmetadata.xml"),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+             <XbmcMetadataOptions>\
+             <UserId>6a3c9f0e8b1d4e2fa7c5d3b9e1f0a2c4</UserId>\
+             <ReleaseDateFormat>dd.MM.yyyy</ReleaseDateFormat>\
+             <SaveImagePathsInNfo>false</SaveImagePathsInNfo>\
+             <EnablePathSubstitution>false</EnablePathSubstitution>\
+             <EnableExtraThumbsDuplication>true</EnableExtraThumbsDuplication>\
+             </XbmcMetadataOptions>",
+        )
+        .expect("xbmcmetadata.xml");
+        FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+
+        let nfo: ferrofin_model::configuration::XbmcMetadataOptions =
+            seeded_named(tmp.path(), "xbmcmetadata");
+        assert_eq!(
+            nfo,
+            ferrofin_model::configuration::XbmcMetadataOptions {
+                user_id: Some("6a3c9f0e8b1d4e2fa7c5d3b9e1f0a2c4".to_owned()),
+                release_date_format: "dd.MM.yyyy".to_owned(),
+                save_image_paths_in_nfo: false,
+                enable_path_substitution: false,
+                enable_extra_thumbs_duplication: true,
+            }
+        );
+    }
+
+    /// Adoption carries Jellyfin's scalar Live TV options over: guide days,
+    /// recording padding, subfolders, the post-processor and NFO/image saving.
+    /// The tuners and listing providers are left out: they live in the
+    /// database (`live_tv_import`). So are the recording paths, which point
+    /// into Jellyfin's filesystem.
+    #[tokio::test]
+    async fn adoption_imports_the_live_tv_options_but_not_tuners_or_recording_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        std::fs::write(
+            tmp.path().join("config").join("livetv.xml"),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+             <LiveTvOptions xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">\
+             <GuideDays>10</GuideDays>\
+             <RecordingPath>/config/recordings</RecordingPath>\
+             <MovieRecordingPath>/config/recordings/movies</MovieRecordingPath>\
+             <SeriesRecordingPath>/config/recordings/series</SeriesRecordingPath>\
+             <EnableRecordingSubfolders>true</EnableRecordingSubfolders>\
+             <EnableOriginalAudioWithEncodedRecordings>true</EnableOriginalAudioWithEncodedRecordings>\
+             <TunerHosts><TunerHostInfo><Id>4a1f2b</Id><Url>http://tuner.lan/playlist.m3u</Url>\
+             <Type>m3u</Type></TunerHostInfo></TunerHosts>\
+             <ListingProviders><ListingsProviderInfo><Id>9c8d</Id><Type>xmltv</Type>\
+             <Path>/config/guide.xml</Path></ListingsProviderInfo></ListingProviders>\
+             <PrePaddingSeconds>120</PrePaddingSeconds>\
+             <PostPaddingSeconds>300</PostPaddingSeconds>\
+             <MediaLocationsCreated><string>/media/recordings</string></MediaLocationsCreated>\
+             <RecordingPostProcessor>/usr/local/bin/comskip</RecordingPostProcessor>\
+             <RecordingPostProcessorArguments>--ini=/etc/comskip.ini \"{path}\"</RecordingPostProcessorArguments>\
+             <SaveRecordingNFO>false</SaveRecordingNFO>\
+             <SaveRecordingImages>false</SaveRecordingImages>\
+             </LiveTvOptions>",
+        )
+        .expect("livetv.xml");
+        FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+
+        let live_tv: ferrofin_model::live_tv::LiveTvOptions = seeded_named(tmp.path(), "livetv");
+        assert_eq!(
+            live_tv,
+            ferrofin_model::live_tv::LiveTvOptions {
+                guide_days: Some(10),
+                enable_recording_subfolders: true,
+                enable_original_audio_with_encoded_recordings: true,
+                pre_padding_seconds: 120,
+                post_padding_seconds: 300,
+                media_locations_created: vec!["/media/recordings".to_owned()],
+                recording_post_processor: Some("/usr/local/bin/comskip".to_owned()),
+                recording_post_processor_arguments: Some(
+                    "--ini=/etc/comskip.ini \"{path}\"".to_owned()
+                ),
+                save_recording_nfo: false,
+                save_recording_images: false,
+                ..ferrofin_model::live_tv::LiveTvOptions::default()
+            }
+        );
+    }
+    #[tokio::test]
+    async fn observers_see_committed_snapshots_and_no_failed_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+                .await
+                .unwrap(),
+        );
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&updates);
+        let weak = Arc::downgrade(&manager);
+        manager.add_configuration_listener(Arc::new(move |update| {
+            let manager = weak.upgrade().unwrap();
+            if let ConfigurationUpdate::Server(config) = update {
+                let saved: ServerConfiguration =
+                    serde_json::from_slice(&std::fs::read(&manager.config_file).unwrap()).unwrap();
+                assert_eq!(saved.server_name, config.server_name);
+                assert_eq!(manager.snapshot_shared().server_name, config.server_name);
+                assert_eq!(
+                    manager.paths.internal_metadata_path(),
+                    manager.paths.default_internal_metadata_path()
+                );
+            }
+            observed.lock().unwrap().push(update.clone());
+        }));
+        let mut jobs = tokio::task::JoinSet::new();
+        for index in 0..20 {
+            let manager = Arc::clone(&manager);
+            jobs.spawn(async move {
+                let mut config = manager.snapshot();
+                config.server_name = format!("server-{index}");
+                manager.update_configuration(&config).await.unwrap();
+            });
+        }
+        while let Some(result) = jobs.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(updates.lock().unwrap().len(), 20);
+        let previous = manager.snapshot_shared();
+        let bytes = std::fs::read(&manager.config_file).unwrap();
+        let mut invalid = (*previous).clone();
+        invalid.metadata_path = tmp.path().join("missing").to_string_lossy().into_owned();
+        assert!(manager.update_configuration(&invalid).await.is_err());
+        assert_eq!(std::fs::read(&manager.config_file).unwrap(), bytes);
+        // A persistence failure must not publish an event or swap the live Arc.
+        std::fs::remove_file(&manager.config_file).unwrap();
+        std::fs::create_dir(&manager.config_file).unwrap();
+        let mut rejected = (*previous).clone();
+        rejected.server_name = "must-not-publish".into();
+        assert!(manager.update_configuration(&rejected).await.is_err());
+        assert!(Arc::ptr_eq(&previous, &manager.snapshot_shared()));
+        assert_eq!(updates.lock().unwrap().len(), 20);
+    }
+
+    #[tokio::test]
+    async fn branding_and_named_stores_publish_the_committed_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .unwrap();
+        let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&updates);
+        manager.add_configuration_listener(Arc::new(move |update| {
+            observed.lock().unwrap().push(update.clone());
+        }));
+        let branding = BrandingOptions {
+            custom_css: Some("body { color: red; }".into()),
+            ..Default::default()
+        };
+        manager.update_branding(&branding).await.unwrap();
+        manager
+            .named_configuration_updated("NETWORK", Arc::from(r#"{"EnableRemoteAccess":false}"#));
+        {
+            let events = updates.lock().unwrap();
+            assert_eq!(events.len(), 2);
+            let ConfigurationUpdate::Named { key, json } = &events[0] else {
+                panic!("expected named update")
+            };
+            assert_eq!(key, "branding");
+            assert_eq!(
+                json.as_bytes(),
+                std::fs::read(&manager.branding_file).unwrap()
+            );
+            let ConfigurationUpdate::Named { key, json } = &events[1] else {
+                panic!("expected named update")
+            };
+            assert_eq!(key, "network");
+            assert_eq!(&**json, r#"{"EnableRemoteAccess":false}"#);
+        }
+        std::fs::remove_file(&manager.branding_file).unwrap();
+        std::fs::create_dir(&manager.branding_file).unwrap();
+        assert!(manager.update_branding(&branding).await.is_err());
+        assert_eq!(updates.lock().unwrap().len(), 2);
+    }
+
+    /// Writes a `system.json` recording `completed` into `dir`.
+    fn write_system_json(dir: &std::path::Path, completed: bool) {
+        std::fs::create_dir_all(dir).expect("config dir");
+        let mut config = default_server_configuration();
+        config.is_startup_wizard_completed = completed;
+        std::fs::write(
+            dir.join("system.json"),
+            serde_json::to_vec(&config).expect("serialize"),
+        )
+        .expect("system.json");
+    }
+
+    const INCOMPLETE_SYSTEM_XML: &str = "<ServerConfiguration>\
+         <IsStartupWizardCompleted>false</IsStartupWizardCompleted>\
+         </ServerConfiguration>";
+
+    #[test]
+    fn no_configuration_means_setup_was_never_completed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let files = startup_wizard_completed_files(&tmp.path().join("config")).expect("read");
+        assert!(files.is_empty());
+    }
+
+    #[rstest::rstest]
+    #[case::completed(true)]
+    #[case::not_completed(false)]
+    fn system_json_records_the_flag(#[case] completed: bool) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("config");
+        write_system_json(&dir, completed);
+        let files = startup_wizard_completed_files(&dir).expect("read");
+        let expected = if completed {
+            vec![dir.join("system.json")]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(files, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::completed(COMPLETED_SYSTEM_XML, true)]
+    #[case::not_completed(INCOMPLETE_SYSTEM_XML, false)]
+    fn a_jellyfin_config_not_yet_imported_records_the_flag(
+        #[case] xml: &str,
+        #[case] completed: bool,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("config");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(dir.join("system.xml"), xml).expect("system.xml");
+        let files = startup_wizard_completed_files(&dir).expect("read");
+        assert_eq!(files.is_empty(), !completed);
+        assert!(
+            !dir.join("system.json").exists(),
+            "reading the flag must not import"
+        );
+    }
+
+    /// `load`'s repair turns a `false` in `system.json` back into `true` when
+    /// Jellyfin's XML says setup was completed, so the XML counts too — and
+    /// starting over means resetting both files.
+    #[test]
+    fn jellyfin_xml_beside_system_json_counts_as_the_repair_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("config");
+        write_system_json(&dir, false);
+        std::fs::write(dir.join("system.xml"), COMPLETED_SYSTEM_XML).expect("system.xml");
+        assert_eq!(
+            startup_wizard_completed_files(&dir).expect("read"),
+            vec![dir.join("system.xml")]
+        );
+        write_system_json(&dir, true);
+        assert_eq!(
+            startup_wizard_completed_files(&dir).expect("read"),
+            vec![dir.join("system.json"), dir.join("system.xml")]
+        );
+        // An unreadable XML beside an existing system.json is skipped, as the
+        // repair skips it.
+        std::fs::write(dir.join("system.xml"), "<ServerConfiguration><A></B>").expect("xml");
+        assert_eq!(
+            startup_wizard_completed_files(&dir).expect("read"),
+            vec![dir.join("system.json")]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_configuration_is_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("config");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(dir.join("system.xml"), "<ServerConfiguration><A></B>").expect("xml");
+        assert!(startup_wizard_completed_files(&dir).is_err());
+        let json = dir.join("system.json");
+        std::fs::write(&json, b"{ not json").expect("json");
+        let error = startup_wizard_completed_files(&dir).expect_err("invalid system.json");
+        // The first boot step to read it, so its error is the one an operator
+        // sees for a hand-edited `system.json`.
+        assert!(
+            error.to_string().contains(&json.display().to_string()),
+            "{error}"
+        );
     }
 }

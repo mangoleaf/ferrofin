@@ -1,0 +1,422 @@
+[
+  {
+    "Name": "Abkhazian",
+    "Value": "ab"
+  },
+  {
+    "Name": "Afrikaans",
+    "Value": "af"
+  },
+  {
+    "Name": "azərbaycan",
+    "Value": "az"
+  },
+  {
+    "Name": "bosanski",
+    "Value": "bs"
+  },
+  {
+    "Name": "brezhoneg",
+    "Value": "br"
+  },
+  {
+    "Name": "català",
+    "Value": "ca"
+  },
+  {
+    "Name": "chiShona",
+    "Value": "sn"
+  },
+  {
+    "Name": "créole haïtien",
+    "Value": "ht"
+  },
+  {
+    "Name": "Cymraeg",
+    "Value": "cy"
+  },
+  {
+    "Name": "dansk",
+    "Value": "da"
+  },
+  {
+    "Name": "Deutsch",
+    "Value": "de"
+  },
+  {
+    "Name": "eesti",
+    "Value": "et"
+  },
+  {
+    "Name": "English",
+    "Value": "en-US"
+  },
+  {
+    "Name": "English (United Kingdom)",
+    "Value": "en-GB"
+  },
+  {
+    "Name": "español",
+    "Value": "es"
+  },
+  {
+    "Name": "español (Argentina)",
+    "Value": "es-AR"
+  },
+  {
+    "Name": "español (Latinoamérica)",
+    "Value": "es_419"
+  },
+  {
+    "Name": "español (México)",
+    "Value": "es-MX"
+  },
+  {
+    "Name": "español (República Dominicana)",
+    "Value": "es_DO"
+  },
+  {
+    "Name": "Esperanto",
+    "Value": "eo"
+  },
+  {
+    "Name": "euskara",
+    "Value": "eu"
+  },
+  {
+    "Name": "Filipino",
+    "Value": "fil"
+  },
+  {
+    "Name": "français",
+    "Value": "fr"
+  },
+  {
+    "Name": "français (Canada)",
+    "Value": "fr-CA"
+  },
+  {
+    "Name": "føroyskt",
+    "Value": "fo"
+  },
+  {
+    "Name": "Gaeilge",
+    "Value": "ga"
+  },
+  {
+    "Name": "galego",
+    "Value": "gl"
+  },
+  {
+    "Name": "hrvatski",
+    "Value": "hr"
+  },
+  {
+    "Name": "Indonesia",
+    "Value": "id"
+  },
+  {
+    "Name": "isiZulu",
+    "Value": "zu"
+  },
+  {
+    "Name": "italiano",
+    "Value": "it"
+  },
+  {
+    "Name": "kernewek",
+    "Value": "kw"
+  },
+  {
+    "Name": "Kiswahili",
+    "Value": "sw"
+  },
+  {
+    "Name": "latviešu",
+    "Value": "lv"
+  },
+  {
+    "Name": "lietuvių (Lietuva)",
+    "Value": "lt-LT"
+  },
+  {
+    "Name": "Literary Chinese",
+    "Value": "lzh"
+  },
+  {
+    "Name": "Lojban",
+    "Value": "jbo"
+  },
+  {
+    "Name": "Lëtzebuergesch",
+    "Value": "lb"
+  },
+  {
+    "Name": "magyar",
+    "Value": "hu"
+  },
+  {
+    "Name": "Malti",
+    "Value": "mt"
+  },
+  {
+    "Name": "Melayu",
+    "Value": "ms"
+  },
+  {
+    "Name": "Māori",
+    "Value": "mi"
+  },
+  {
+    "Name": "Nederlands",
+    "Value": "nl"
+  },
+  {
+    "Name": "norsk bokmål",
+    "Value": "nb"
+  },
+  {
+    "Name": "norsk nynorsk",
+    "Value": "nn"
+  },
+  {
+    "Name": "occitan",
+    "Value": "oc"
+  },
+  {
+    "Name": "o‘zbek",
+    "Value": "uz"
+  },
+  {
+    "Name": "polski",
+    "Value": "pl"
+  },
+  {
+    "Name": "português",
+    "Value": "pt"
+  },
+  {
+    "Name": "português (Brasil)",
+    "Value": "pt-BR"
+  },
+  {
+    "Name": "português (Portugal)",
+    "Value": "pt-PT"
+  },
+  {
+    "Name": "pr",
+    "Value": "pr"
+  },
+  {
+    "Name": "română",
+    "Value": "ro"
+  },
+  {
+    "Name": "Schwiizertüütsch",
+    "Value": "gsw"
+  },
+  {
+    "Name": "shqip",
+    "Value": "sq"
+  },
+  {
+    "Name": "slovenčina",
+    "Value": "sk"
+  },
+  {
+    "Name": "slovenščina (Slovenija)",
+    "Value": "sl-SI"
+  },
+  {
+    "Name": "suomi",
+    "Value": "fi"
+  },
+  {
+    "Name": "svenska",
+    "Value": "sv"
+  },
+  {
+    "Name": "Taqbaylit",
+    "Value": "kab"
+  },
+  {
+    "Name": "Tiếng Việt",
+    "Value": "vi"
+  },
+  {
+    "Name": "Türkçe",
+    "Value": "tr"
+  },
+  {
+    "Name": "íslenska",
+    "Value": "is"
+  },
+  {
+    "Name": "čeština",
+    "Value": "cs"
+  },
+  {
+    "Name": "Ελληνικά",
+    "Value": "el"
+  },
+  {
+    "Name": "беларуская",
+    "Value": "be"
+  },
+  {
+    "Name": "български (България)",
+    "Value": "bg-BG"
+  },
+  {
+    "Name": "кыргызча",
+    "Value": "ky"
+  },
+  {
+    "Name": "македонски",
+    "Value": "mk"
+  },
+  {
+    "Name": "монгол",
+    "Value": "mn"
+  },
+  {
+    "Name": "русский",
+    "Value": "ru"
+  },
+  {
+    "Name": "српски",
+    "Value": "sr"
+  },
+  {
+    "Name": "українська",
+    "Value": "uk"
+  },
+  {
+    "Name": "қазақ тілі",
+    "Value": "kk"
+  },
+  {
+    "Name": "հայերեն",
+    "Value": "hy"
+  },
+  {
+    "Name": "עברית",
+    "Value": "he"
+  },
+  {
+    "Name": "עברית (ישראל)",
+    "Value": "he_IL"
+  },
+  {
+    "Name": "ئۇيغۇرچە",
+    "Value": "ug"
+  },
+  {
+    "Name": "اردو",
+    "Value": "ur"
+  },
+  {
+    "Name": "اردو (پاکستان)",
+    "Value": "ur_PK"
+  },
+  {
+    "Name": "العربية",
+    "Value": "ar"
+  },
+  {
+    "Name": "العربية (المملكة العربية السعودية)",
+    "Value": "ar_SA"
+  },
+  {
+    "Name": "فارسی",
+    "Value": "fa"
+  },
+  {
+    "Name": "नेपाली",
+    "Value": "ne"
+  },
+  {
+    "Name": "मराठी",
+    "Value": "mr"
+  },
+  {
+    "Name": "हिन्दी",
+    "Value": "hi"
+  },
+  {
+    "Name": "অসমীয়া",
+    "Value": "as"
+  },
+  {
+    "Name": "বাংলা",
+    "Value": "bn"
+  },
+  {
+    "Name": "ਪੰਜਾਬੀ",
+    "Value": "pa"
+  },
+  {
+    "Name": "ଓଡ଼ିଆ",
+    "Value": "or"
+  },
+  {
+    "Name": "தமிழ்",
+    "Value": "ta"
+  },
+  {
+    "Name": "తెలుగు",
+    "Value": "te"
+  },
+  {
+    "Name": "ಕನ್ನಡ",
+    "Value": "kn"
+  },
+  {
+    "Name": "മലയാളം",
+    "Value": "ml"
+  },
+  {
+    "Name": "සිංහල",
+    "Value": "si"
+  },
+  {
+    "Name": "ไทย",
+    "Value": "th"
+  },
+  {
+    "Name": "မြန်မာ",
+    "Value": "my"
+  },
+  {
+    "Name": "ᏣᎳᎩ",
+    "Value": "chr"
+  },
+  {
+    "Name": "ខ្មែរ",
+    "Value": "km"
+  },
+  {
+    "Name": "ქართული",
+    "Value": "ka"
+  },
+  {
+    "Name": "中文（中国）",
+    "Value": "zh-CN"
+  },
+  {
+    "Name": "中文（中國香港特別行政區）",
+    "Value": "zh-HK"
+  },
+  {
+    "Name": "中文（台灣）",
+    "Value": "zh-TW"
+  },
+  {
+    "Name": "日本語",
+    "Value": "ja"
+  },
+  {
+    "Name": "한국어",
+    "Value": "ko"
+  }
+]

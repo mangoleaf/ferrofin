@@ -17,6 +17,7 @@
 //! Every trait is object-safe and carries a `_assert_object_safe_*` assertion.
 
 pub mod channels;
+pub mod chapters;
 pub mod hls_stream;
 pub mod library_monitor;
 pub mod live_tv;
@@ -35,5 +36,5 @@ pub use live_tv::{
     internal_timer_id, new_timer_defaults,
 };
 pub use lyrics::{LyricManager, LyricProvider, LyricResponse, RemoteLyricInfo};
-pub use sync_play::{PlaybackRequest, SyncPlayManager, SyncPlaySession};
+pub use sync_play::{PlaybackRequest, SyncPlayManager, SyncPlayNowPlaying, SyncPlaySession};
 pub use virtual_folders::DisabledVirtualFolderManager;

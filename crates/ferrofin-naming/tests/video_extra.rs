@@ -32,6 +32,7 @@ fn test_kodi_extras() {
 #[test]
 fn test_expanded_extras() {
     test("trailer.mp4", Some(ExtraType::Trailer));
+    test("trailer2.mp4", Some(ExtraType::Trailer));
     test("trailer.mp3", None);
     test("300-trailer.mp4", Some(ExtraType::Trailer));
     test("stuff trailerthings.mkv", None);
@@ -153,6 +154,8 @@ fn test_sample() {
     test("300.sample.mp4", Some(ExtraType::Sample));
     test("300_sample.mp4", Some(ExtraType::Sample));
     test("300 - sample.mp4", Some(ExtraType::Sample));
+    test("sample1.mp4", Some(ExtraType::Sample));
+    test("Sample2.mkv", Some(ExtraType::Sample));
 }
 
 #[test]

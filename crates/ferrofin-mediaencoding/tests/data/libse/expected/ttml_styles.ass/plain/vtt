@@ -1,0 +1,26 @@
+WEBVTT
+
+00:00:01.000 --> 00:00:02.000 line:50%
+Centre middle
+
+00:00:02.000 --> 00:00:03.000
+Quoted style name
+
+00:00:03.000 --> 00:00:04.000
+Raw <i>html</i> &amp; <b>bold</b>
+
+00:00:04.000 --> 00:00:05.000
+Region from the effect
+
+00:00:05.000 --> 00:00:06.000 line:20%
+Region effect with an8
+
+00:00:06.000 --> 00:00:07.000
+Effects as attributes
+
+00:00:07.000 --> 00:00:08.000 line:20%
+
+
+00:00:08.000 --> 00:00:09.000
+Lower-case style name
+Second line

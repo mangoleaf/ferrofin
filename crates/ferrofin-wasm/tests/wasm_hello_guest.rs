@@ -37,7 +37,13 @@ fn rss_kib() -> u64 {
 fn build_guest() -> Option<PathBuf> {
     let guest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/wasm-hello");
     let output = Command::new("cargo")
-        .args(["build", "--release", "--target", "wasm32-wasip2"])
+        .args([
+            "build",
+            "--locked",
+            "--release",
+            "--target",
+            "wasm32-wasip2",
+        ])
         .current_dir(&guest_dir)
         // Let the island's own rust-toolchain.toml govern — the test runner's
         // toolchain pin would otherwise leak in and miss the wasm target.
@@ -119,7 +125,10 @@ async fn real_guest_loads_runs_and_reports_rss() {
     let events = ferrofin_core::FerrofinEventManager::new();
     host.subscribe_events(&events, &manager);
     events.publish("PlaybackStart", "{}").await.unwrap();
-    events.publish("LibraryChanged", "{}").await.unwrap();
+    events
+        .publish(ferrofin_core::library_changed_notifier::ITEMS_CHANGED, "{}")
+        .await
+        .unwrap();
 
     let tasks = host.scheduled_tasks(&manager);
     let progress = ferrofin_core::TaskProgress::default();
@@ -162,14 +171,16 @@ async fn real_guest_loads_runs_and_reports_rss() {
         .expect("analyze must succeed: query-items + write-media-segments + http-fetch");
 
     // query-items → the canned movie; write-media-segments → provider-scoped
-    // replace with one Intro segment.
+    // replace with one Intro segment, under the loaded producer's Jellyfin
+    // provider id (the MD5 of its lower-cased display name).
     let expected_item: uuid::Uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeff01".parse().unwrap();
-    let expected_provider = "wasm:3f9a2f60-88f1-4f52-b3f4-6f3a1c2d9e01";
+    let expected_provider =
+        ferrofin_traits::media_segments::media_segment_provider_id("Hello Ferrofin");
     {
         let deleted = segment_store.deleted.lock().unwrap();
         assert_eq!(
             deleted.as_slice(),
-            &[(expected_item, expected_provider.to_owned())]
+            &[(expected_item, expected_provider.clone())]
         );
         let created = segment_store.created.lock().unwrap();
         assert_eq!(created.len(), 1);

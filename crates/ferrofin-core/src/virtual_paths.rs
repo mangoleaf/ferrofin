@@ -64,29 +64,29 @@ impl VirtualPathExpander {
     pub fn expand_opt(&self, path: Option<&str>) -> Option<String> {
         path.map(|p| self.expand(p))
     }
+
+    /// The write half, `ReverseVirtualPath` (`ApplicationHost.cs:299-305`):
+    /// this server's data directory, then its internal metadata directory,
+    /// replaced case-insensitively by their tokens.
+    #[must_use]
+    pub fn reverse(&self, path: &str) -> String {
+        let Some(paths) = &self.paths else {
+            return path.to_owned();
+        };
+        let data = replace_ignore_ascii_case(
+            path,
+            &paths.data_path(),
+            FerrofinServerApplicationPaths::VIRTUAL_DATA_PATH,
+        );
+        replace_ignore_ascii_case(
+            &data,
+            &paths.internal_metadata_path(),
+            FerrofinServerApplicationPaths::VIRTUAL_INTERNAL_METADATA_PATH,
+        )
+    }
 }
 
-/// Case-insensitive `String.Replace` of every occurrence of `from` with `to`.
-///
-/// Mirrors C# `string.Replace(old, new, StringComparison.OrdinalIgnoreCase)`.
-/// Empty search or replacement strings leave the input unchanged.
-pub(crate) fn replace_ignore_ascii_case(haystack: &str, from: &str, to: &str) -> String {
-    if from.is_empty() || to.is_empty() {
-        return haystack.to_owned();
-    }
-    let lower_hay = haystack.to_ascii_lowercase();
-    let lower_from = from.to_ascii_lowercase();
-    let mut out = String::with_capacity(haystack.len());
-    let mut cursor = 0;
-    while let Some(rel) = lower_hay[cursor..].find(&lower_from) {
-        let start = cursor + rel;
-        out.push_str(&haystack[cursor..start]);
-        out.push_str(to);
-        cursor = start + from.len();
-    }
-    out.push_str(&haystack[cursor..]);
-    out
-}
+pub(crate) use ferrofin_util::string_extensions::replace_ignore_ascii_case;
 
 #[cfg(test)]
 mod tests {
@@ -134,6 +134,39 @@ mod tests {
         assert_eq!(
             expander().expand("%MetadataPath%/library/ab/abcdef/poster.jpg"),
             "/var/lib/ferrofin/data/metadata/library/ab/abcdef/poster.jpg"
+        );
+    }
+
+    /// `ReverseVirtualPath` replaces the data directory first, so a metadata
+    /// directory inside it comes out under `%AppDataPath%`, as upstream's
+    /// does; a separate one gets `%MetadataPath%`; both case-insensitively.
+    #[test]
+    fn reverses_this_servers_directories_into_their_tokens() {
+        let nested = expander();
+        assert_eq!(
+            nested.reverse("/var/lib/ferrofin/data/collections"),
+            "%AppDataPath%/collections"
+        );
+        assert_eq!(
+            nested.reverse("/VAR/lib/ferrofin/Data/x"),
+            "%AppDataPath%/x"
+        );
+        assert_eq!(
+            nested.reverse("/var/lib/ferrofin/data/metadata/a"),
+            "%AppDataPath%/metadata/a"
+        );
+        assert_eq!(nested.reverse("/srv/media"), "/srv/media");
+        let paths = Arc::new(FerrofinServerApplicationPaths::new(
+            "/data", "log", "config", "cache", "web",
+        ));
+        paths.set_internal_metadata_path(Some("/meta"));
+        assert_eq!(
+            VirtualPathExpander::from_paths(paths).reverse("/meta/library/x.jpg"),
+            "%MetadataPath%/library/x.jpg"
+        );
+        assert_eq!(
+            VirtualPathExpander::identity().reverse("/data/x"),
+            "/data/x"
         );
     }
 

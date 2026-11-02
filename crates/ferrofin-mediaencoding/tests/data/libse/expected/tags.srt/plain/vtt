@@ -1,0 +1,25 @@
+WEBVTT
+
+00:00:01.000 --> 00:00:03.500
+<i>Italic line</i>
+<b>bold</b> and <u>under</u>
+
+00:00:04.000 --> 00:00:06.000
+<c.red>red hex</c> <c.red>red name</c>
+<c.blue>Red name</c> <c.magenta>eight</c>
+
+00:00:06.500 --> 00:00:08.250 line:20%
+Top centred sign
+
+00:00:09.000 --> 00:00:10.000
+Positioned &amp; "quoted" &lt;odd&gt; a&lt;b
+
+00:00:10.000 --> 00:00:10.000
+Zero length
+
+00:00:11.123 --> 00:00:12.987
+First paragraph
+second after a blank line
+
+25:01:02.345 --> 25:01:04.005
+<font face="Arial" size="20">Face and size</c> &amp; done

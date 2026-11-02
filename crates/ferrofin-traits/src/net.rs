@@ -42,12 +42,18 @@ pub struct RequestContext {
     pub headers: Vec<(String, String)>,
 
     /// The raw query string (without the leading `?`), if any. Jellyfin also
-    /// accepts the access token via the `api_key`/`ApiKey` query parameter.
+    /// accepts the access token via the `ApiKey` query parameter (`api_key`
+    /// only with `EnableLegacyAuthorization`).
     pub query_string: Option<String>,
 
     /// The remote endpoint (client IP, possibly with port) as a string, if
     /// known. Mirrors the C# `RemoteEndPoint` used for logging and LAN checks.
     pub remote_endpoint: Option<String>,
+
+    /// The scheme the request arrived with (`HttpRequest.Scheme`): `https`
+    /// over an HTTPS listener, or the scheme a known proxy forwarded. `None`
+    /// when the caller did not resolve it, which reads as `http`.
+    pub scheme: Option<String>,
 }
 
 impl RequestContext {

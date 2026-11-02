@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
+use chrono::{
+    DateTime, Datelike, Local, MappedLocalTime, NaiveDateTime, Offset as _, TimeZone, Utc,
+};
 use ferrofin_model::dto::DayOfWeek;
 use ferrofin_model::tasks::{
     TaskCompletionStatus, TaskInfo, TaskResult, TaskState, TaskTriggerInfo, TaskTriggerInfoType,
@@ -202,7 +204,9 @@ pub trait ScheduledTask: Send + Sync {
     ///
     /// Errors surface as a [`TaskCompletionStatus::Failed`] result recorded by
     /// the registry; the returned `Result` also propagates to the caller of
-    /// [`FerrofinTaskManager::run_now`].
+    /// [`FerrofinTaskManager::run_now`]. A panic in the body is recorded the
+    /// same way, as a failure whose error names the panic's message (upstream
+    /// catches every exception the body throws as `Failed`).
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError>;
 }
 
@@ -227,6 +231,10 @@ struct Registration {
     abort: Option<tokio::task::AbortHandle>,
     /// When the current run was claimed (meaningful while `Running`).
     started_at: Option<DateTime<Utc>>,
+    /// The running invocation's own time limit: the `MaxRuntimeTicks` of the
+    /// trigger that started it (`TaskOptions.MaxRuntimeTicks`), `None` for a
+    /// manual run or a trigger without one.
+    run_max_ticks: Option<i64>,
     /// Per-trigger-index last fire time, so a daily/weekly trigger fires once
     /// per scheduled occurrence and an interval trigger keeps its cadence.
     trigger_fires: HashMap<usize, DateTime<Utc>>,
@@ -255,6 +263,14 @@ struct Registration {
 impl Registration {
     /// Whether this registration's effective triggers include a
     /// `StartupTrigger`.
+    /// The time limit of the startup trigger that starts this task.
+    fn startup_max_runtime(&self) -> Option<i64> {
+        self.effective_triggers()
+            .iter()
+            .find(|t| t.type_ == TaskTriggerInfoType::StartupTrigger)
+            .and_then(|t| t.max_runtime_ticks)
+    }
+
     fn has_startup_trigger(&self) -> bool {
         self.effective_triggers()
             .iter()
@@ -294,6 +310,10 @@ impl Registration {
     }
 }
 
+/// A run requested while its task was busy: the task key, the trigger tag
+/// and the starting trigger's `MaxRuntimeTicks`.
+type QueuedRun = (String, &'static str, Option<i64>);
+
 /// The scheduled-task registry and scheduler.
 ///
 /// Register tasks up front, enumerate them as [`TaskInfo`], run one now by key,
@@ -307,6 +327,13 @@ pub struct FerrofinTaskManager {
     // a std mutex — critical sections are trivial map edits, never held across an
     // `.await`; task execution happens on a clone taken *outside* the lock.
     tasks: Arc<Mutex<HashMap<String, Registration>>>,
+    /// Runs requested while their task was busy, oldest first, as
+    /// `(task key, trigger tag, max runtime)` — upstream's `_taskQueue`, whose
+    /// entries carry their `TaskOptions`. Producers check the
+    /// task's state and push under this lock, and the completion path drains
+    /// under it after the task is `Idle`, so a request is either started
+    /// directly or seen by the drain, never lost between the two.
+    busy_queue: Arc<Mutex<std::collections::VecDeque<QueuedRun>>>,
     /// Trigger overrides loaded from / persisted to `store_path`, applied to a
     /// task when it registers.
     stored_overrides: Arc<Mutex<HashMap<String, Vec<TaskTriggerInfo>>>>,
@@ -374,12 +401,19 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 ///
 /// Callers must hold the lock guarding `value` across this call, so concurrent
 /// writers cannot lose each other's updates.
-fn write_store<T: serde::Serialize>(path: &std::path::Path, value: &T, store: &str) {
+///
+/// A failure is logged and returned, so a caller whose success depends on the
+/// file (a trigger save) can refuse to report it.
+fn write_store<T: serde::Serialize>(
+    path: &std::path::Path,
+    value: &T,
+    store: &str,
+) -> Result<(), String> {
     let bytes = match serde_json::to_vec_pretty(value) {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::warn!(store, error = %e, "failed to serialize task store");
-            return;
+            return Err(e.to_string());
         }
     };
     if let Some(parent) = path.parent() {
@@ -392,12 +426,14 @@ fn write_store<T: serde::Serialize>(path: &std::path::Path, value: &T, store: &s
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = write_synced(&tmp, &bytes) {
         tracing::warn!(store, path = %tmp.display(), error = %e, "failed to persist task store");
-        return;
+        return Err(e.to_string());
     }
     if let Err(e) = std::fs::rename(&tmp, path) {
         tracing::warn!(store, path = %path.display(), error = %e, "failed to persist task store");
         let _ = std::fs::remove_file(&tmp);
+        return Err(e.to_string());
     }
+    Ok(())
 }
 
 /// Writes `bytes` to `path` and flushes them to the device, so the rename that
@@ -407,6 +443,29 @@ fn write_synced(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
     file.write_all(bytes)?;
     file.sync_all()
+}
+
+/// Task keys Ferrofin once registered under another name: `(old, new, new
+/// name)`. A store entry under the old key is adopted by the new one, so a
+/// rename keeps a task's saved schedule and history.
+const RENAMED_TASK_KEYS: &[(&str, &str, &str)] = &[(
+    "IntroSkipper.Detect",
+    "IntroSkipperDetectSegmentsTask",
+    "Detect and Analyze Media Segments",
+)];
+
+/// Moves `map`'s entries under a renamed task's old key to its new one
+/// (unless the new one has its own); `adopt` relabels a moved value with the
+/// new key and name.
+fn adopt_renamed_keys<T>(map: &mut HashMap<String, T>, adopt: impl Fn(&mut T, &str, &str)) {
+    for (old, new, name) in RENAMED_TASK_KEYS {
+        if let Some(mut value) = map.remove(*old)
+            && !map.contains_key(*new)
+        {
+            adopt(&mut value, new, name);
+            map.insert((*new).to_owned(), value);
+        }
+    }
 }
 
 /// Reads a JSON store written by [`write_store`], returning an empty map when
@@ -461,7 +520,10 @@ impl FerrofinTaskManager {
     /// empty (first boot); an unparseable one is warned about and treated as
     /// empty, rather than silently resetting every configured schedule.
     pub fn set_trigger_store(&self, path: PathBuf) {
-        *lock(&self.stored_overrides) = read_store(&path, "task triggers");
+        let mut overrides: HashMap<String, Vec<TaskTriggerInfo>> =
+            read_store(&path, "task triggers");
+        adopt_renamed_keys(&mut overrides, |_, _, _| {});
+        *lock(&self.stored_overrides) = overrides;
         *lock(&self.store_path) = Some(path);
     }
 
@@ -470,12 +532,20 @@ impl FerrofinTaskManager {
     /// The map's lock is held across the write so two concurrent savers cannot
     /// lose each other's update (or interleave two truncating writes into
     /// invalid JSON).
-    fn persist_overrides(&self) {
-        let Some(path) = lock(&self.store_path).clone() else {
-            return;
-        };
-        let overrides = lock(&self.stored_overrides);
-        write_store(&path, &*overrides, "task triggers");
+    ///
+    /// The key's triggers join the stored map only once the write succeeds, so
+    /// a failed save leaves both the file and the in-memory overrides as they
+    /// were (`ScheduledTaskWorker.Triggers` saves before it assigns).
+    fn persist_overrides(&self, key: &str, triggers: &[TaskTriggerInfo]) -> Result<(), String> {
+        let path = lock(&self.store_path).clone();
+        let mut overrides = lock(&self.stored_overrides);
+        let mut next = overrides.clone();
+        next.insert(key.to_owned(), triggers.to_vec());
+        if let Some(path) = path {
+            write_store(&path, &next, "task triggers")?;
+        }
+        *overrides = next;
+        Ok(())
     }
 
     /// Points the registry at its run-history store, loading any previously
@@ -494,7 +564,12 @@ impl FerrofinTaskManager {
     /// task fills it in on its first Ferrofin run. Nothing is lost: Jellyfin's
     /// own files stay untouched for a swap back.
     pub fn set_result_store(&self, path: PathBuf) {
-        *lock(&self.stored_results) = read_store(&path, "task history");
+        let mut results: HashMap<String, TaskResult> = read_store(&path, "task history");
+        adopt_renamed_keys(&mut results, |result, key, name| {
+            result.key = Some(key.to_owned());
+            result.name = Some(name.to_owned());
+        });
+        *lock(&self.stored_results) = results;
         *lock(&self.result_store_path) = Some(path);
     }
 
@@ -510,7 +585,8 @@ impl FerrofinTaskManager {
         };
         let mut results = lock(&self.stored_results);
         results.insert(key.to_owned(), result.clone());
-        write_store(&path, &*results, "task history");
+        // Already logged; a history write never fails the run it describes.
+        let _ = write_store(&path, &*results, "task history");
     }
 
     /// Registers a task, replacing any existing task with the same key.
@@ -536,6 +612,7 @@ impl FerrofinTaskManager {
             progress: TaskProgress::default(),
             abort: None,
             started_at: None,
+            run_max_ticks: None,
             trigger_fires: HashMap::new(),
             triggers_since: None,
             startup_fired: false,
@@ -557,6 +634,9 @@ impl FerrofinTaskManager {
         if !fire_startup {
             return;
         }
+        let startup_max_ticks = lock(&self.tasks)
+            .get(&key)
+            .and_then(Registration::startup_max_runtime);
         // Late registration: the scheduler's one startup sweep has already run,
         // so fire this task's startup trigger now — after upstream's grace
         // period (`StartupTrigger.Start` awaits `DelayMs` first).
@@ -570,7 +650,7 @@ impl FerrofinTaskManager {
         let this = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(STARTUP_TRIGGER_DELAY).await;
-            match this.queue_with_trigger(&key, "startup") {
+            match this.queue_with_trigger(&key, "startup", startup_max_ticks) {
                 Ok(()) => {}
                 // Benign: something (an admin pressing Run) started the task
                 // inside the grace window, so the startup run is redundant.
@@ -744,26 +824,77 @@ impl FerrofinTaskManager {
             reg.last_result = Some(result);
             reg.abort = None;
             reg.started_at = None;
+            reg.run_max_ticks = None;
         }
         self.publish_snapshot(&guard);
+        drop(guard);
+        self.drain_busy_queue();
+    }
+
+    /// `TaskManager.QueueScheduledTask`: starts the task when it is idle,
+    /// otherwise remembers the request and starts it once the current run ends
+    /// (`ExecuteQueuedTasks`).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::NotFound`] when no task has that key.
+    fn queue_scheduled(
+        &self,
+        key: &str,
+        trigger: &'static str,
+        max_runtime_ticks: Option<i64>,
+    ) -> Result<(), ServiceError> {
+        let mut queue = lock(&self.busy_queue);
+        let state = lock(&self.tasks)
+            .get(key)
+            .map(|reg| reg.state)
+            .ok_or_else(|| ServiceError::not_found(format!("scheduled task {key}")))?;
+        if state == TaskState::Idle {
+            return self.queue_with_trigger(key, trigger, max_runtime_ticks);
+        }
+        queue.push_back((key.to_owned(), trigger, max_runtime_ticks));
+        Ok(())
+    }
+
+    /// `TaskManager.ExecuteQueuedTasks`, run where a run completes: takes every
+    /// remembered request, keeps the first for each task, and starts those
+    /// tasks that are idle. It runs in the completing worker's context, so a
+    /// started run inherits that worker's culture scope like upstream's.
+    fn drain_busy_queue(&self) {
+        let mut queue = lock(&self.busy_queue);
+        let mut requests: Vec<QueuedRun> = Vec::new();
+        while let Some(request) = queue.pop_front() {
+            if requests.iter().all(|(key, ..)| *key != request.0) {
+                requests.push(request);
+            }
+        }
+        for (key, trigger, max_runtime_ticks) in requests {
+            let idle = lock(&self.tasks)
+                .get(&key)
+                .is_some_and(|reg| reg.state == TaskState::Idle);
+            if idle && let Err(error) = self.queue_with_trigger(&key, trigger, max_runtime_ticks) {
+                tracing::warn!(task = key, %error, "queued task failed to start");
+            }
+        }
     }
 
     /// Runs the named task now, to completion, recording the outcome.
     ///
     /// This is the foreground `Execute` path. A failing task body is recorded
     /// as a [`TaskCompletionStatus::Failed`] result *and* propagated to the
-    /// caller.
+    /// caller; so is a body that panics, whose panic does not reach the caller.
     ///
     /// # Errors
     ///
     /// Returns [`ServiceError::NotFound`] if no task has that key,
     /// [`ServiceError::InvalidInput`] if it is already running (mirroring the C#
-    /// guard that only queues an `Idle` task), or whatever error the task body
-    /// itself returns.
+    /// guard that only queues an `Idle` task), whatever error the task body
+    /// itself returns, or [`ServiceError::Backend`] naming the panic when the
+    /// body panics.
     pub async fn run_now(&self, key: &str) -> Result<(), ServiceError> {
-        let (task, progress) = self.claim(key)?;
+        let (task, progress) = self.claim(key, None)?;
         let start = Utc::now();
-        let outcome = task.execute(&progress).await;
+        let outcome = execute_contained(task.as_ref(), &progress).await;
         self.finish(key, &task, start, &outcome, &progress);
         outcome
     }
@@ -785,7 +916,7 @@ impl FerrofinTaskManager {
     pub fn queue(&self, key: &str) -> Result<(), ServiceError> {
         // The public entry is the API/StartTask path; internal callers
         // (startup / scheduler) use `queue_with_trigger` with their own tag.
-        self.queue_with_trigger(key, "api")
+        self.queue_with_trigger(key, "api", None)
     }
 
     /// [`queue`](Self::queue) with an explicit `trigger` tag recorded on the
@@ -795,8 +926,13 @@ impl FerrofinTaskManager {
     /// background unit of work per RULES_LOGGING); `.instrument()` makes the
     /// spawned future carry it, since a span created before `spawn` does not
     /// follow the task by itself.
-    fn queue_with_trigger(&self, key: &str, trigger: &'static str) -> Result<(), ServiceError> {
-        let (task, progress) = self.claim(key)?;
+    fn queue_with_trigger(
+        &self,
+        key: &str,
+        trigger: &'static str,
+        max_runtime_ticks: Option<i64>,
+    ) -> Result<(), ServiceError> {
+        let (task, progress) = self.claim(key, max_runtime_ticks)?;
         let progress = TaskProgress {
             trigger,
             ..progress
@@ -810,11 +946,12 @@ impl FerrofinTaskManager {
             trigger,
             outcome = tracing::field::Empty,
         );
-        let handle = tokio::spawn(
+        let handle = tokio::spawn(ferrofin_util::current_culture::scope(
+            ferrofin_util::current_culture::capture(),
             async move {
                 let started = std::time::Instant::now();
                 tracing::info!("scheduled task started");
-                let outcome = task.execute(&progress).await;
+                let outcome = execute_contained(task.as_ref(), &progress).await;
                 let elapsed_ms = started.elapsed().as_millis();
                 let result = match &outcome {
                     Ok(()) if progress.was_stopped() => "cancelled",
@@ -832,7 +969,7 @@ impl FerrofinTaskManager {
                 this.finish(&key_owned, &task, start, &outcome, &progress);
             }
             .instrument(span),
-        );
+        ));
         let mut guard = lock(&self.tasks);
         if let Some(reg) = guard.get_mut(key) {
             // The spawned run may already have finished (state back to Idle);
@@ -847,7 +984,11 @@ impl FerrofinTaskManager {
     /// Validates that `key` is registered and idle, flips it to
     /// [`Running`](TaskState::Running), and returns its task handle plus a
     /// fresh progress handle.
-    fn claim(&self, key: &str) -> Result<(Arc<dyn ScheduledTask>, TaskProgress), ServiceError> {
+    fn claim(
+        &self,
+        key: &str,
+        max_runtime_ticks: Option<i64>,
+    ) -> Result<(Arc<dyn ScheduledTask>, TaskProgress), ServiceError> {
         let mut guard = lock(&self.tasks);
         let reg = guard
             .get_mut(key)
@@ -860,6 +1001,7 @@ impl FerrofinTaskManager {
         reg.state = TaskState::Running;
         reg.progress = TaskProgress::default();
         reg.started_at = Some(Utc::now());
+        reg.run_max_ticks = max_runtime_ticks;
         let claimed = (Arc::clone(&reg.task), reg.progress.clone());
         self.publish_snapshot(&guard);
         Ok(claimed)
@@ -922,6 +1064,7 @@ impl FerrofinTaskManager {
             abort.abort();
         }
         let start = reg.started_at.take().unwrap_or_else(Utc::now);
+        reg.run_max_ticks = None;
         reg.state = TaskState::Idle;
         let result = TaskResult {
             start_time_utc: start,
@@ -938,6 +1081,7 @@ impl FerrofinTaskManager {
         drop(guard);
         self.publish_task_completed(&result);
         self.persist_result(key, &result);
+        self.drain_busy_queue();
         Ok(())
     }
 
@@ -964,11 +1108,20 @@ impl FerrofinTaskManager {
                 "unrecognized task trigger type or weekday",
             ));
         }
+        if !lock(&self.tasks).contains_key(key) {
+            return Err(ServiceError::not_found(format!("scheduled task {key}")));
+        }
+        // Save first: a failed write leaves the task's triggers as they were
+        // and the caller sees the failure, as upstream's `SaveTriggers` throws
+        // before it assigns.
+        self.persist_overrides(key, triggers).map_err(|error| {
+            ServiceError::backend(format!("could not save the triggers of {key}: {error}"))
+        })?;
         {
             let mut guard = lock(&self.tasks);
-            let reg = guard
-                .get_mut(key)
-                .ok_or_else(|| ServiceError::not_found(format!("scheduled task {key}")))?;
+            let Some(reg) = guard.get_mut(key) else {
+                return Err(ServiceError::not_found(format!("scheduled task {key}")));
+            };
             reg.triggers_override = Some(triggers.to_vec());
             reg.trigger_fires.clear();
             // The new trigger set only ever arms *future* occurrences; without
@@ -976,8 +1129,6 @@ impl FerrofinTaskManager {
             // occurrence look due again on the next sweep.
             reg.triggers_since = Some(Utc::now());
         }
-        lock(&self.stored_overrides).insert(key.to_owned(), triggers.to_vec());
-        self.persist_overrides();
         Ok(())
     }
 
@@ -997,12 +1148,12 @@ impl FerrofinTaskManager {
         // fires its startup trigger from exactly one of the two paths.
         let startup_keys = {
             let mut guard = lock(&self.tasks);
-            let keys: Vec<String> = guard
+            let keys: Vec<(String, Option<i64>)> = guard
                 .iter()
                 .filter(|(_, reg)| reg.has_startup_trigger() && !reg.startup_fired)
-                .map(|(k, _)| k.clone())
+                .map(|(k, reg)| (k.clone(), reg.startup_max_runtime()))
                 .collect();
-            for key in &keys {
+            for (key, _) in &keys {
                 if let Some(reg) = guard.get_mut(key) {
                     reg.startup_fired = true;
                 }
@@ -1014,8 +1165,8 @@ impl FerrofinTaskManager {
             let scheduler_start = Utc::now();
             // Startup triggers fire once, after upstream's grace period.
             tokio::time::sleep(STARTUP_TRIGGER_DELAY).await;
-            for key in startup_keys {
-                if let Err(e) = this.queue_with_trigger(&key, "startup") {
+            for (key, max_ticks) in startup_keys {
+                if let Err(e) = this.queue_scheduled(&key, "startup", max_ticks) {
                     tracing::warn!(task = key, error = %e, "startup trigger failed to queue");
                 }
             }
@@ -1031,21 +1182,17 @@ impl FerrofinTaskManager {
     /// One scheduler pass: queue tasks whose triggers are due and abort runs
     /// past their max runtime.
     fn scheduler_sweep(&self, scheduler_start: DateTime<Utc>, now: DateTime<Utc>) {
-        let mut due: Vec<String> = Vec::new();
+        let mut due: Vec<(String, Option<i64>)> = Vec::new();
         let mut overrun: Vec<String> = Vec::new();
         {
             let mut guard = lock(&self.tasks);
             for (key, reg) in guard.iter_mut() {
                 let triggers = reg.effective_triggers();
-                if reg.state == TaskState::Running {
-                    if let (Some(started), Some(max_ticks)) = (
-                        reg.started_at,
-                        triggers.iter().filter_map(|t| t.max_runtime_ticks).min(),
-                    ) && now - started >= ticks_to_chrono(max_ticks)
-                    {
-                        overrun.push(key.clone());
-                    }
-                    continue;
+                if reg.state == TaskState::Running
+                    && let (Some(started), Some(max_ticks)) = (reg.started_at, reg.run_max_ticks)
+                    && now - started >= ticks_to_chrono(max_ticks)
+                {
+                    overrun.push(key.clone());
                 }
                 let last_run_end = reg.last_result.as_ref().map(|r| r.end_time_utc);
                 let triggers_since = reg.triggers_since;
@@ -1061,7 +1208,7 @@ impl FerrofinTaskManager {
                         triggers_since,
                     ) {
                         reg.trigger_fires.insert(idx, now);
-                        due.push(key.clone());
+                        due.push((key.clone(), trigger.max_runtime_ticks));
                         break;
                     }
                 }
@@ -1071,13 +1218,35 @@ impl FerrofinTaskManager {
             tracing::warn!(task = key, "scheduled task exceeded max runtime; aborting");
             let _ = self.stop_run(&key, TaskCompletionStatus::Aborted);
         }
-        for key in due {
+        for (key, max_ticks) in due {
             tracing::info!(task = key, "trigger fired; queueing scheduled task");
-            if let Err(e) = self.queue_with_trigger(&key, "schedule") {
+            if let Err(e) = self.queue_scheduled(&key, "schedule", max_ticks) {
                 tracing::warn!(task = key, error = %e, "trigger failed to queue task");
             }
         }
     }
+}
+
+/// Runs a claimed task's body, turning a panic in it into a failure.
+///
+/// `ScheduledTaskWorker.ExecuteInternal` catches every exception the body
+/// throws as `Failed`, so a body that panics ends like one that returns an
+/// error: [`finish`](FerrofinTaskManager::finish) records the failure, returns
+/// the task to [`Idle`](TaskState::Idle) and starts its queued triggers. The
+/// catch sits inside the run, so stopping it still aborts the spawned task.
+/// The panic hook has already logged the panic itself.
+async fn execute_contained(
+    task: &dyn ScheduledTask,
+    progress: &TaskProgress,
+) -> Result<(), ServiceError> {
+    futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(task.execute(progress)))
+        .await
+        .unwrap_or_else(|panic| {
+            Err(ServiceError::backend(format!(
+                "scheduled task panicked: {}",
+                ferrofin_util::panic::message(panic.as_ref())
+            )))
+        })
 }
 
 /// Converts trigger ticks (100 ns) to a chrono duration.
@@ -1172,40 +1341,121 @@ fn trigger_due(
             now - base >= ticks_to_chrono(interval)
         }
         TaskTriggerInfoType::DailyTrigger | TaskTriggerInfoType::WeeklyTrigger => {
-            let Some(time_of_day) = trigger.time_of_day_ticks else {
+            calendar_trigger_due(
+                &Local,
+                trigger,
+                now,
+                last_fire,
+                scheduler_start,
+                triggers_since,
+            )
+        }
+    }
+}
+
+/// [`trigger_due`] for a `DailyTrigger` or `WeeklyTrigger`, read on the wall clock
+/// of `tz`: the host's [`Local`] zone in production, a fixed zone in tests.
+///
+/// Today's occurrence is the one considered, plus yesterday's when it reads on
+/// today's date. That happens only for a time in a spring-forward gap at the end of
+/// a day (Greenland jumps from 23:00 to 00:00), which fires just after midnight.
+/// Any other occurrence of yesterday's, one missed while the host was suspended for
+/// example, is not caught up.
+fn calendar_trigger_due<Tz: TimeZone>(
+    tz: &Tz,
+    trigger: &TaskTriggerInfo,
+    now: DateTime<Utc>,
+    last_fire: Option<DateTime<Utc>>,
+    scheduler_start: DateTime<Utc>,
+    triggers_since: Option<DateTime<Utc>>,
+) -> bool {
+    let Some(time_of_day) = trigger.time_of_day_ticks else {
+        return false;
+    };
+    let weekday = if trigger.type_ == TaskTriggerInfoType::WeeklyTrigger {
+        let Some(day) = trigger.day_of_week.and_then(weekday_of) else {
+            return false;
+        };
+        Some(day)
+    } else {
+        None
+    };
+    let seconds_of_day = time_of_day / TICKS_PER_SECOND;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (h, m, s) = (
+        (seconds_of_day / 3600) as u32 % 24,
+        ((seconds_of_day / 60) % 60) as u32,
+        (seconds_of_day % 60) as u32,
+    );
+    // An occurrence that predates scheduler start — or the moment the
+    // trigger set was last saved — never fires: booting at noon must
+    // not immediately run every daily-at-3am task, and saving the
+    // schedule at 20:00 must not re-run this morning's occurrence (the
+    // C# DailyTrigger schedules the *next* occurrence in both cases).
+    let floor = triggers_since.map_or(scheduler_start, |since| since.max(scheduler_start));
+    let today = now.with_timezone(tz).date_naive();
+    [today.pred_opt(), Some(today)]
+        .into_iter()
+        .flatten()
+        .any(|date| {
+            if weekday.is_some_and(|day| date.weekday() != day) {
                 return false;
-            };
-            let local_now = now.with_timezone(&Local);
-            if trigger.type_ == TaskTriggerInfoType::WeeklyTrigger {
-                let Some(day) = trigger.day_of_week else {
-                    return false;
-                };
-                if Some(local_now.weekday()) != weekday_of(day) {
-                    return false;
-                }
             }
-            let seconds_of_day = time_of_day / TICKS_PER_SECOND;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let (h, m, s) = (
-                (seconds_of_day / 3600) as u32 % 24,
-                ((seconds_of_day / 60) % 60) as u32,
-                (seconds_of_day % 60) as u32,
-            );
-            let Some(scheduled_local) = local_now
-                .date_naive()
-                .and_hms_opt(h, m, s)
-                .and_then(|naive| Local.from_local_datetime(&naive).earliest())
-            else {
+            let Some(naive) = date.and_hms_opt(h, m, s) else {
                 return false;
             };
-            let scheduled = scheduled_local.with_timezone(&Utc);
-            // An occurrence that predates scheduler start — or the moment the
-            // trigger set was last saved — never fires: booting at noon must
-            // not immediately run every daily-at-3am task, and saving the
-            // schedule at 20:00 must not re-run this morning's occurrence (the
-            // C# DailyTrigger schedules the *next* occurrence in both cases).
-            let floor = triggers_since.map_or(scheduler_start, |since| since.max(scheduler_start));
-            now >= scheduled && scheduled >= floor && last_fire.is_none_or(|f| f < scheduled)
+            let scheduled = wall_clock_occurrence(tz, naive);
+            let reads_today = date == today || scheduled.with_timezone(tz).date_naive() == today;
+            reads_today
+                && now >= scheduled
+                && scheduled >= floor
+                && last_fire.is_none_or(|f| f < scheduled)
+        })
+}
+
+/// The instant a daily or weekly trigger fires for the wall-clock time `naive` in
+/// `tz`.
+///
+/// `DailyTrigger.Start` and `WeeklyTrigger.Start` arm a timer for `triggerDate -
+/// DateTime.Now`, a difference of local wall-clock values, which fires at the
+/// trigger time read with the offset in effect when the timer was armed. Ferrofin
+/// reads a time the way that timer does in the two cases the clock leaves open:
+/// - A time in a fall-back overlap happens twice. It fires at its first occurrence
+///   (02:30 CEST, not the second 02:30, in CET).
+/// - A time inside a spring-forward gap does not exist on that day's clock. It
+///   still fires, at that instant read with the pre-gap offset, just after the
+///   jump: 02:30 in the CET → CEST gap is 01:30 UTC, which the clock shows as 03:30.
+///
+/// Every other time fires when the clock shows it. Upstream's timer, armed before
+/// the change, also shifts the times after the change by it on that one day; that
+/// drift is not ported. Booting the scheduler, or saving the triggers, within the changed hour
+/// can differ from upstream by one fire that day: upstream compares the wall-clock
+/// time of day at that moment, Ferrofin the instants.
+fn wall_clock_occurrence<Tz: TimeZone>(tz: &Tz, naive: NaiveDateTime) -> DateTime<Utc> {
+    match tz.from_local_datetime(&naive) {
+        MappedLocalTime::Single(at) => at.with_timezone(&Utc),
+        MappedLocalTime::Ambiguous(a, b) => {
+            // chrono's `Local` lists the two instants by offset, not by time, so
+            // compare the instants. It also reports the instant the clock falls
+            // back at as ambiguous, with a candidate that never occurred (its offset
+            // is not the zone's offset at that instant), so keep only real ones.
+            let real = |at: &DateTime<Tz>| {
+                tz.offset_from_utc_datetime(&at.naive_utc()).fix() == at.offset().fix()
+            };
+            let (a_utc, b_utc) = (a.with_timezone(&Utc), b.with_timezone(&Utc));
+            match (real(&a), real(&b)) {
+                (true, false) => a_utc,
+                (false, true) => b_utc,
+                _ => a_utc.min(b_utc),
+            }
+        }
+        MappedLocalTime::None => {
+            // The offset a day earlier is the one before the gap: no zone changes
+            // its offset twice within a day.
+            let before = tz
+                .offset_from_utc_datetime(&(naive - chrono::TimeDelta::days(1)))
+                .fix();
+            (naive - chrono::TimeDelta::seconds(i64::from(before.local_minus_utc()))).and_utc()
         }
     }
 }
@@ -1341,12 +1591,15 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use ferrofin_model::tasks::{
-        TaskCompletionStatus, TaskState, TaskTriggerInfo, TaskTriggerInfoType,
+        TaskCompletionStatus, TaskResult, TaskState, TaskTriggerInfo, TaskTriggerInfoType,
     };
 
     use ferrofin_traits::error::ServiceError;
 
-    use super::{FerrofinTaskManager, ScheduledTask, TICKS_PER_SECOND, TaskProgress, trigger_due};
+    use super::{
+        FerrofinTaskManager, ScheduledTask, TICKS_PER_SECOND, TaskProgress, calendar_trigger_due,
+        trigger_due, wall_clock_occurrence,
+    };
 
     struct CountingTask {
         runs: Arc<AtomicU32>,
@@ -1657,37 +1910,39 @@ mod tests {
         assert_eq!(result["Status"], "Completed");
     }
 
+    /// An activity log that records the entries written to it.
+    #[derive(Default)]
+    struct RecordingActivity {
+        entries: std::sync::Mutex<Vec<ferrofin_traits::activity::ActivityLogCreate>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::activity::ActivityManager for RecordingActivity {
+        async fn get_paged_result(
+            &self,
+            _query: &ferrofin_traits::activity::ActivityLogQuery,
+        ) -> Result<
+            ferrofin_model::querying::QueryResult<ferrofin_model::activity::ActivityLogEntry>,
+            ServiceError,
+        > {
+            unimplemented!()
+        }
+        async fn create_entry(
+            &self,
+            entry: ferrofin_traits::activity::ActivityLogCreate,
+        ) -> Result<(), ServiceError> {
+            crate::scheduled_tasks::lock(&self.entries).push(entry);
+            Ok(())
+        }
+        async fn clean(&self, _before: chrono::DateTime<Utc>) -> Result<u64, ServiceError> {
+            Ok(0)
+        }
+    }
+
     /// A failed run must land a `TaskFailed` entry in the activity log (the
     /// dashboard's Alerts feed); a successful run must not.
     #[tokio::test(flavor = "multi_thread")]
     async fn failed_run_writes_a_task_failed_activity_entry() {
-        #[derive(Default)]
-        struct RecordingActivity {
-            entries: std::sync::Mutex<Vec<ferrofin_traits::activity::ActivityLogCreate>>,
-        }
-        #[async_trait::async_trait]
-        impl ferrofin_traits::activity::ActivityManager for RecordingActivity {
-            async fn get_paged_result(
-                &self,
-                _query: &ferrofin_traits::activity::ActivityLogQuery,
-            ) -> Result<
-                ferrofin_model::querying::QueryResult<ferrofin_model::activity::ActivityLogEntry>,
-                ServiceError,
-            > {
-                unimplemented!()
-            }
-            async fn create_entry(
-                &self,
-                entry: ferrofin_traits::activity::ActivityLogCreate,
-            ) -> Result<(), ServiceError> {
-                crate::scheduled_tasks::lock(&self.entries).push(entry);
-                Ok(())
-            }
-            async fn clean(&self, _before: chrono::DateTime<Utc>) -> Result<u64, ServiceError> {
-                Ok(0)
-            }
-        }
-
         let mgr = FerrofinTaskManager::new();
         let activity = Arc::new(RecordingActivity::default());
         mgr.set_activity_manager(activity.clone());
@@ -1729,6 +1984,202 @@ mod tests {
         }
     }
 
+    /// A task whose body panics, after waiting for its gate when it has one.
+    struct PanickingTask {
+        runs: Arc<AtomicU32>,
+        gate: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for PanickingTask {
+        fn key(&self) -> &str {
+            "panicking"
+        }
+        fn name(&self) -> &str {
+            "Panicking Task"
+        }
+        fn description(&self) -> &str {
+            "panics"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+            progress.report(10.0);
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+            }
+            panic!("kaboom");
+        }
+    }
+
+    /// How long a panicking-task test may take: a run left `Running` fails the
+    /// test instead of hanging it.
+    const PANIC_TEST_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// What a run that panicked with `kaboom` records as its error.
+    const KABOOM: &str = "backend error: scheduled task panicked: kaboom";
+
+    fn panicking(gate: Option<Arc<tokio::sync::Notify>>) -> (FerrofinTaskManager, Arc<AtomicU32>) {
+        let mgr = FerrofinTaskManager::new();
+        let runs = Arc::new(AtomicU32::new(0));
+        mgr.register(Arc::new(PanickingTask {
+            runs: runs.clone(),
+            gate,
+        }));
+        (mgr, runs)
+    }
+
+    /// Waits for the task to be idle again and returns its last result.
+    async fn idle_result(mgr: &FerrofinTaskManager, key: &str) -> TaskResult {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let info = mgr.get(key).expect("info");
+            if info.state == TaskState::Idle
+                && let Some(result) = info.last_execution_result
+            {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run never returned to Idle"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// `ScheduledTaskWorker.ExecuteInternal` catches every exception as
+    /// `Failed`: a queued run whose body panics is recorded Failed, naming the
+    /// panic, and leaves the task idle so it runs again.
+    #[tokio::test]
+    async fn a_panicking_queued_run_records_failed_and_runs_again() {
+        tokio::time::timeout(PANIC_TEST_LIMIT, async {
+            let (mgr, runs) = panicking(None);
+            mgr.queue("panicking").expect("queued");
+            let result = idle_result(&mgr, "panicking").await;
+            assert_eq!(result.status, TaskCompletionStatus::Failed);
+            assert_eq!(result.error_message.as_deref(), Some(KABOOM));
+            assert_eq!(
+                mgr.get("panicking")
+                    .expect("info")
+                    .current_progress_percentage,
+                None
+            );
+
+            mgr.queue("panicking").expect("idle again: starts");
+            wait_for_runs(&runs, 2).await;
+            let result = idle_result(&mgr, "panicking").await;
+            assert_eq!(result.status, TaskCompletionStatus::Failed);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// `ExecuteQueuedTasks` follows every outcome, a panic included: a trigger
+    /// parked behind a run that panics starts once that run is recorded.
+    #[tokio::test]
+    async fn a_trigger_queued_behind_a_panicking_run_still_starts() {
+        tokio::time::timeout(PANIC_TEST_LIMIT, async {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (mgr, runs) = panicking(Some(gate.clone()));
+            mgr.queue_scheduled("panicking", "schedule", None)
+                .expect("idle: starts");
+            wait_for_runs(&runs, 1).await;
+            mgr.queue_scheduled("panicking", "schedule", None)
+                .expect("queued");
+            assert_eq!(runs.load(Ordering::SeqCst), 1, "nothing starts while busy");
+
+            gate.notify_one();
+            wait_for_runs(&runs, 2).await;
+            assert_eq!(
+                mgr.get("panicking").expect("info").state,
+                TaskState::Running
+            );
+            gate.notify_one();
+            let result = idle_result(&mgr, "panicking").await;
+            assert_eq!(result.status, TaskCompletionStatus::Failed);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// The foreground path too: a panic is `run_now`'s error and a Failed
+    /// result, and the task is idle again.
+    #[tokio::test]
+    async fn run_now_turns_a_panic_into_a_failed_result() {
+        tokio::time::timeout(PANIC_TEST_LIMIT, async {
+            let (mgr, runs) = panicking(None);
+            let err = mgr
+                .run_now("panicking")
+                .await
+                .expect_err("a panic fails the run");
+            assert!(
+                matches!(&err, ServiceError::Backend(why) if why == "scheduled task panicked: kaboom"),
+                "{err}"
+            );
+            let info = mgr.get("panicking").expect("info");
+            assert_eq!(info.state, TaskState::Idle);
+            let result = info.last_execution_result.expect("result");
+            assert_eq!(result.status, TaskCompletionStatus::Failed);
+            assert_eq!(result.error_message.as_deref(), Some(KABOOM));
+
+            mgr.run_now("panicking")
+                .await
+                .expect_err("runs again and fails again");
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// A panicked run reaches the dashboard like any failure: a `TaskCompleted`
+    /// with `Status: Failed` (the `ScheduledTaskEnded` push) and one
+    /// `TaskFailed` activity entry naming the panic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicked_run_publishes_task_completed_and_writes_task_failed() {
+        tokio::time::timeout(PANIC_TEST_LIMIT, async {
+            let (mgr, _runs) = panicking(None);
+            let events = crate::event_manager::FerrofinEventManager::new();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            events.subscribe(
+                "TaskCompleted",
+                Arc::new(move |payload: &str| {
+                    let _ = tx.send(payload.to_owned());
+                    crate::event_manager::consumer_done()
+                }),
+            );
+            mgr.set_event_manager(Arc::new(events));
+            let activity = Arc::new(RecordingActivity::default());
+            mgr.set_activity_manager(activity.clone());
+
+            mgr.queue("panicking").expect("queued");
+            let payload = rx.recv().await.expect("TaskCompleted published");
+            let result: serde_json::Value = serde_json::from_str(&payload).expect("json");
+            assert_eq!(result["Key"], "panicking");
+            assert_eq!(result["Status"], "Failed");
+            assert_eq!(result["ErrorMessage"], KABOOM);
+
+            // The entry write is spawned; poll for it.
+            loop {
+                {
+                    let entries = crate::scheduled_tasks::lock(&activity.entries);
+                    if !entries.is_empty() {
+                        assert_eq!(entries.len(), 1);
+                        assert_eq!(entries[0].type_, "TaskFailed");
+                        assert_eq!(entries[0].name, "Panicking Task failed");
+                        assert_eq!(entries[0].overview.as_deref(), Some(KABOOM));
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("test timed out");
+    }
+
     /// A task that stays running until its gate is released.
     struct GatedTask {
         gate: Arc<tokio::sync::Notify>,
@@ -1754,6 +2205,134 @@ mod tests {
             self.gate.notified().await;
             Ok(())
         }
+    }
+
+    /// A task that counts its runs and stays running until its gate is released.
+    struct CountedGatedTask {
+        runs: Arc<AtomicU32>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for CountedGatedTask {
+        fn key(&self) -> &str {
+            "counted-gated"
+        }
+        fn name(&self) -> &str {
+            "Counted Gated Task"
+        }
+        fn description(&self) -> &str {
+            "counts runs, waits for its gate"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            self.gate.notified().await;
+            Ok(())
+        }
+    }
+
+    async fn wait_for_runs(runs: &Arc<AtomicU32>, expected: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while runs.load(Ordering::SeqCst) < expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run {expected} never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    fn counted_gated() -> (
+        FerrofinTaskManager,
+        Arc<AtomicU32>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let mgr = FerrofinTaskManager::new();
+        let runs = Arc::new(AtomicU32::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        mgr.register(Arc::new(CountedGatedTask {
+            runs: runs.clone(),
+            gate: gate.clone(),
+        }));
+        (mgr, runs, gate)
+    }
+
+    /// `TaskManager.QueueScheduledTask`: a request for a busy task is
+    /// remembered, coalesced per task, and started when the run completes.
+    #[tokio::test]
+    async fn busy_requests_coalesce_and_start_after_the_run_completes() {
+        let (mgr, runs, gate) = counted_gated();
+        mgr.queue("counted-gated").expect("started");
+        wait_for_runs(&runs, 1).await;
+        // The explicit (StartTask) path still refuses a running task.
+        assert!(matches!(
+            mgr.queue("counted-gated"),
+            Err(ServiceError::InvalidInput(_))
+        ));
+        for trigger in ["schedule", "startup", "schedule"] {
+            mgr.queue_scheduled("counted-gated", trigger, None)
+                .expect("queued");
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "nothing starts while busy");
+
+        gate.notify_one();
+        wait_for_runs(&runs, 2).await;
+        assert_eq!(mgr.get("counted-gated").unwrap().state, TaskState::Running);
+        gate.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            2,
+            "three requests coalesce into one follow-up run"
+        );
+        assert_eq!(mgr.get("counted-gated").unwrap().state, TaskState::Idle);
+        assert!(matches!(
+            mgr.queue_scheduled("nope", "schedule", None),
+            Err(ServiceError::NotFound(_))
+        ));
+    }
+
+    /// Cancelling the running task drains the queue too (`OnTaskCompleted`
+    /// follows every outcome), and an idle task starts directly.
+    #[tokio::test]
+    async fn cancelling_a_busy_task_starts_its_queued_request() {
+        let (mgr, runs, gate) = counted_gated();
+        mgr.queue_scheduled("counted-gated", "schedule", None)
+            .expect("idle: starts");
+        wait_for_runs(&runs, 1).await;
+        mgr.queue_scheduled("counted-gated", "schedule", None)
+            .expect("queued");
+        mgr.cancel("counted-gated").expect("cancel");
+        wait_for_runs(&runs, 2).await;
+        assert_eq!(mgr.get("counted-gated").unwrap().state, TaskState::Running);
+        gate.notify_one();
+    }
+
+    /// A trigger that fires while its task runs is queued rather than dropped.
+    #[tokio::test]
+    async fn a_due_trigger_on_a_running_task_queues_a_follow_up_run() {
+        let (mgr, runs, gate) = counted_gated();
+        mgr.set_triggers(
+            "counted-gated",
+            &[TaskTriggerInfo {
+                type_: TaskTriggerInfoType::IntervalTrigger,
+                interval_ticks: Some(3600 * TICKS_PER_SECOND),
+                ..TaskTriggerInfo::default()
+            }],
+        )
+        .expect("triggers");
+        mgr.queue("counted-gated").expect("started");
+        wait_for_runs(&runs, 1).await;
+        let now = Utc::now();
+        mgr.scheduler_sweep(now - chrono::Duration::hours(2), now);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        gate.notify_one();
+        wait_for_runs(&runs, 2).await;
+        gate.notify_one();
     }
 
     #[tokio::test]
@@ -1922,6 +2501,72 @@ mod tests {
         mgr.run_now("counting").await.expect("run");
         assert_eq!(first.load(Ordering::SeqCst), 0);
         assert_eq!(second.load(Ordering::SeqCst), 1);
+    }
+
+    /// `ScheduledTaskWorker.Triggers` saves the file before it assigns: a
+    /// failed write is reported to the caller and leaves the task's triggers,
+    /// and the stored overrides, as they were.
+    #[tokio::test]
+    async fn a_failed_trigger_save_is_reported_and_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A file where the store's directory should be: the write cannot land.
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"not a directory").expect("blocker");
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_trigger_store(blocker.join("triggers.json"));
+        mgr.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: false,
+            hidden: false,
+        }));
+        let triggers = vec![TaskTriggerInfo {
+            type_: TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(42),
+            ..TaskTriggerInfo::default()
+        }];
+
+        let error = mgr.set_triggers("counting", &triggers).unwrap_err();
+        assert!(
+            error.to_string().contains("could not save the triggers"),
+            "{error}"
+        );
+        assert!(mgr.get("counting").expect("info").triggers.is_empty());
+        assert!(super::lock(&mgr.stored_overrides).is_empty());
+    }
+
+    /// A renamed task keeps what was saved under its old key; an entry the
+    /// new key already has wins.
+    #[test]
+    fn a_renamed_task_adopts_its_old_entries() {
+        use super::adopt_renamed_keys;
+        use std::collections::HashMap;
+        let mut overrides: HashMap<String, Vec<u8>> =
+            HashMap::from([("IntroSkipper.Detect".to_owned(), vec![1])]);
+        adopt_renamed_keys(&mut overrides, |_, _, _| {});
+        assert_eq!(
+            overrides,
+            HashMap::from([("IntroSkipperDetectSegmentsTask".to_owned(), vec![1])])
+        );
+
+        let mut both: HashMap<String, Vec<u8>> = HashMap::from([
+            ("IntroSkipper.Detect".to_owned(), vec![1]),
+            ("IntroSkipperDetectSegmentsTask".to_owned(), vec![2]),
+        ]);
+        adopt_renamed_keys(&mut both, |_, _, _| {});
+        assert_eq!(
+            both,
+            HashMap::from([("IntroSkipperDetectSegmentsTask".to_owned(), vec![2])])
+        );
+
+        let mut results: HashMap<String, Option<String>> = HashMap::from([(
+            "IntroSkipper.Detect".to_owned(),
+            Some("IntroSkipper.Detect".to_owned()),
+        )]);
+        adopt_renamed_keys(&mut results, |key, new, _| *key = Some(new.to_owned()));
+        assert_eq!(
+            results["IntroSkipperDetectSegmentsTask"].as_deref(),
+            Some("IntroSkipperDetectSegmentsTask")
+        );
     }
 
     #[tokio::test]
@@ -2591,7 +3236,9 @@ mod tests {
             ..TaskTriggerInfo::default()
         }];
         mgr.set_triggers("gated", &cap).expect("set");
-        mgr.queue("gated").expect("queued");
+        // Started by that trigger, so its limit applies.
+        mgr.queue_scheduled("gated", "schedule", Some(1))
+            .expect("queued");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let start = Utc::now() - chrono::Duration::hours(1);
         mgr.scheduler_sweep(start, Utc::now());
@@ -2601,6 +3248,60 @@ mod tests {
             info.last_execution_result.expect("result").status,
             TaskCompletionStatus::Aborted
         );
+    }
+
+    /// `TaskOptions.MaxRuntimeTicks` belongs to the invocation the trigger
+    /// starts: a manual run, or a run started by a trigger with no limit, is
+    /// never aborted because another trigger of the task has one, and a run
+    /// queued behind a busy task keeps its own trigger's limit.
+    #[tokio::test]
+    async fn a_runs_time_limit_is_the_firing_triggers_not_the_tasks() {
+        let mgr = FerrofinTaskManager::new();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        mgr.register(Arc::new(GatedTask { gate: gate.clone() }));
+        let capped = TaskTriggerInfo {
+            type_: TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(3600 * TICKS_PER_SECOND),
+            max_runtime_ticks: Some(1), // 100 ns — instantly overrun
+            ..TaskTriggerInfo::default()
+        };
+        let uncapped = TaskTriggerInfo {
+            max_runtime_ticks: None,
+            ..capped
+        };
+        mgr.set_triggers("gated", &[capped, uncapped]).expect("set");
+        let hour_ago = Utc::now() - chrono::Duration::hours(1);
+        let settle = || tokio::time::sleep(std::time::Duration::from_millis(20));
+
+        // A manual run is unlimited.
+        mgr.queue("gated").expect("queued");
+        settle().await;
+        mgr.scheduler_sweep(hour_ago, Utc::now());
+        assert_eq!(mgr.get("gated").expect("info").state, TaskState::Running);
+
+        // A request queued while it runs, from the capped trigger, waits.
+        mgr.queue_scheduled("gated", "schedule", Some(1))
+            .expect("remembered");
+        gate.notify_one();
+        settle().await;
+        // The manual run ended; the queued one started with the capped
+        // trigger's limit and is now past it.
+        assert_eq!(mgr.get("gated").expect("info").state, TaskState::Running);
+        mgr.scheduler_sweep(hour_ago, Utc::now());
+        let info = mgr.get("gated").expect("info");
+        assert_eq!(info.state, TaskState::Idle);
+        assert_eq!(
+            info.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Aborted
+        );
+
+        // A run the unlimited trigger starts is not aborted.
+        mgr.queue_scheduled("gated", "schedule", None)
+            .expect("queued");
+        settle().await;
+        mgr.scheduler_sweep(hour_ago, Utc::now());
+        assert_eq!(mgr.get("gated").expect("info").state, TaskState::Running);
+        mgr.cancel("gated").expect("cancel");
     }
 
     #[tokio::test]
@@ -2704,5 +3405,428 @@ mod tests {
                 Err(ServiceError::NotFound(_))
             ));
         }
+    }
+
+    struct CultureTask {
+        captured: std::sync::Mutex<Vec<String>>,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        finished: tokio::sync::Notify,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for CultureTask {
+        fn key(&self) -> &str {
+            "culture"
+        }
+        fn name(&self) -> &str {
+            "Culture task"
+        }
+        fn description(&self) -> &str {
+            "Captures queued refresh context"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        async fn execute(&self, _: &TaskProgress) -> Result<(), ServiceError> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            self.started.notify_one();
+            self.release.notified().await;
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            self.finished.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn library_refresh_scheduled_task_inherits_the_starting_request_culture() {
+        let manager = FerrofinTaskManager::new();
+        let task = Arc::new(CultureTask {
+            captured: std::sync::Mutex::new(Vec::new()),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+        });
+        manager.register(task.clone());
+        ferrofin_util::current_culture::scope("sv".into(), async {
+            manager.queue("culture").unwrap();
+        })
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), task.started.notified())
+            .await
+            .unwrap();
+        assert_eq!(manager.get("culture").unwrap().state, TaskState::Running);
+        task.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task.finished.notified())
+            .await
+            .unwrap();
+        assert_eq!(*task.captured.lock().unwrap(), ["sv", "sv"]);
+    }
+
+    /// `ExecuteQueuedTasks` runs in the completing worker's context: a request
+    /// queued under another culture starts with the finishing run's, not the
+    /// producer's.
+    #[tokio::test]
+    async fn a_drained_run_inherits_the_completing_workers_culture() {
+        let manager = FerrofinTaskManager::new();
+        let task = Arc::new(CultureTask {
+            captured: std::sync::Mutex::new(Vec::new()),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+        });
+        manager.register(task.clone());
+        let wait = std::time::Duration::from_secs(2);
+        ferrofin_util::current_culture::scope("sv".into(), async {
+            manager.queue("culture").unwrap();
+        })
+        .await;
+        tokio::time::timeout(wait, task.started.notified())
+            .await
+            .unwrap();
+        ferrofin_util::current_culture::scope("de".into(), async {
+            manager
+                .queue_scheduled("culture", "schedule", None)
+                .unwrap();
+        })
+        .await;
+        task.release.notify_one();
+        tokio::time::timeout(wait, task.finished.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(wait, task.started.notified())
+            .await
+            .unwrap();
+        assert_eq!(task.captured.lock().unwrap()[2], "sv");
+        task.release.notify_one();
+    }
+
+    /// A zone with one standard and one daylight offset and a single pair of
+    /// transitions, so the DST edges are testable on any host. It maps wall-clock
+    /// times the way chrono's `Local` does on real tzdata, so the tests pin what
+    /// production sees:
+    /// - a time strictly inside the spring-forward gap is `None`;
+    /// - the gap's start reads with the standard offset;
+    /// - the whole fall-back overlap, both ends included, is `Ambiguous`, its two
+    ///   instants listed by offset, smaller first.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DstZone {
+        standard: i32,
+        daylight: i32,
+        /// The UTC instants daylight time starts and ends.
+        spring: chrono::NaiveDateTime,
+        fall: chrono::NaiveDateTime,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct DstOffset {
+        zone: DstZone,
+        seconds: i32,
+    }
+
+    impl chrono::Offset for DstOffset {
+        fn fix(&self) -> chrono::FixedOffset {
+            chrono::FixedOffset::east_opt(self.seconds).unwrap()
+        }
+    }
+
+    /// The wall-clock time `seconds` east of UTC shows at the UTC instant `utc`.
+    fn wall_at(utc: chrono::NaiveDateTime, seconds: i32) -> chrono::NaiveDateTime {
+        utc + chrono::TimeDelta::seconds(seconds.into())
+    }
+
+    impl DstZone {
+        fn offset(self, seconds: i32) -> DstOffset {
+            DstOffset {
+                zone: self,
+                seconds,
+            }
+        }
+
+        fn in_daylight(self, utc: chrono::NaiveDateTime) -> bool {
+            if self.spring < self.fall {
+                (self.spring..self.fall).contains(&utc)
+            } else {
+                // Southern hemisphere: daylight time spans the new year.
+                utc >= self.spring || utc < self.fall
+            }
+        }
+    }
+
+    impl chrono::TimeZone for DstZone {
+        type Offset = DstOffset;
+
+        fn from_offset(offset: &DstOffset) -> Self {
+            offset.zone
+        }
+
+        fn offset_from_local_date(
+            &self,
+            local: &chrono::NaiveDate,
+        ) -> chrono::MappedLocalTime<DstOffset> {
+            self.offset_from_local_datetime(&local.and_time(chrono::NaiveTime::MIN))
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &chrono::NaiveDateTime,
+        ) -> chrono::MappedLocalTime<DstOffset> {
+            let (standard, daylight) = (self.offset(self.standard), self.offset(self.daylight));
+            let gap = (
+                wall_at(self.spring, self.standard),
+                wall_at(self.spring, self.daylight),
+            );
+            let overlap = (
+                wall_at(self.fall, self.standard),
+                wall_at(self.fall, self.daylight),
+            );
+            if gap.0 < *local && *local < gap.1 {
+                chrono::MappedLocalTime::None
+            } else if overlap.0 <= *local && *local <= overlap.1 {
+                chrono::MappedLocalTime::Ambiguous(standard, daylight)
+            } else if self.in_daylight(*local - chrono::TimeDelta::seconds(self.daylight.into())) {
+                // Outside the gap and the overlap exactly one offset round-trips.
+                chrono::MappedLocalTime::Single(daylight)
+            } else {
+                chrono::MappedLocalTime::Single(standard)
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &chrono::NaiveDate) -> DstOffset {
+            self.offset_from_utc_datetime(&utc.and_time(chrono::NaiveTime::MIN))
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> DstOffset {
+            self.offset(if self.in_daylight(*utc) {
+                self.daylight
+            } else {
+                self.standard
+            })
+        }
+    }
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(y, mo, d)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap()
+    }
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> chrono::DateTime<Utc> {
+        at(y, mo, d, h, mi).and_utc()
+    }
+
+    /// Europe/Berlin in 2026: CET +1, CEST +2 from 29 March to 25 October, both at
+    /// 01:00 UTC.
+    const BERLIN: DstZone = DstZone {
+        standard: 3600,
+        daylight: 7200,
+        spring: chrono::NaiveDate::from_ymd_opt(2026, 3, 29)
+            .unwrap()
+            .and_hms_opt(1, 0, 0)
+            .unwrap(),
+        fall: chrono::NaiveDate::from_ymd_opt(2026, 10, 25)
+            .unwrap()
+            .and_hms_opt(1, 0, 0)
+            .unwrap(),
+    };
+    /// America/New_York in 2026: EST −5, EDT −4 from 8 March 07:00 UTC to 1
+    /// November 06:00 UTC.
+    const NEW_YORK: DstZone = DstZone {
+        standard: -5 * 3600,
+        daylight: -4 * 3600,
+        spring: chrono::NaiveDate::from_ymd_opt(2026, 3, 8)
+            .unwrap()
+            .and_hms_opt(7, 0, 0)
+            .unwrap(),
+        fall: chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+            .unwrap()
+            .and_hms_opt(6, 0, 0)
+            .unwrap(),
+    };
+    /// Australia/Lord_Howe in 2026: +10:30, +11 from 4 October (02:00 local, 3
+    /// October 15:30 UTC) to 5 April (02:00 local daylight, 4 April 15:00 UTC); a
+    /// 30-minute change, with daylight time spanning the new year.
+    const LORD_HOWE: DstZone = DstZone {
+        standard: 10 * 3600 + 1800,
+        daylight: 11 * 3600,
+        spring: chrono::NaiveDate::from_ymd_opt(2026, 10, 3)
+            .unwrap()
+            .and_hms_opt(15, 30, 0)
+            .unwrap(),
+        fall: chrono::NaiveDate::from_ymd_opt(2026, 4, 4)
+            .unwrap()
+            .and_hms_opt(15, 0, 0)
+            .unwrap(),
+    };
+    /// America/Nuuk in 2026: −2, −1 from 28 March 23:00 local (29 March 01:00 UTC),
+    /// a gap at the end of the local day.
+    const NUUK: DstZone = DstZone {
+        standard: -2 * 3600,
+        daylight: -3600,
+        spring: chrono::NaiveDate::from_ymd_opt(2026, 3, 29)
+            .unwrap()
+            .and_hms_opt(1, 0, 0)
+            .unwrap(),
+        fall: chrono::NaiveDate::from_ymd_opt(2026, 10, 25)
+            .unwrap()
+            .and_hms_opt(1, 0, 0)
+            .unwrap(),
+    };
+
+    fn at_time_of_day(type_: TaskTriggerInfoType, hours: i64, minutes: i64) -> TaskTriggerInfo {
+        TaskTriggerInfo {
+            type_,
+            time_of_day_ticks: Some((hours * 3600 + minutes * 60) * TICKS_PER_SECOND),
+            day_of_week: Some(ferrofin_model::dto::DayOfWeek::Sunday),
+            ..TaskTriggerInfo::default()
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::berlin_summer(BERLIN, at(2026, 7, 1, 2, 30), utc(2026, 7, 1, 0, 30))]
+    #[case::berlin_winter(BERLIN, at(2026, 1, 15, 2, 30), utc(2026, 1, 15, 1, 30))]
+    // Inside the gap: read with CET, so 01:30 UTC, which the clock shows as 03:30.
+    #[case::berlin_gap(BERLIN, at(2026, 3, 29, 2, 30), utc(2026, 3, 29, 1, 30))]
+    #[case::berlin_gap_start(BERLIN, at(2026, 3, 29, 2, 0), utc(2026, 3, 29, 1, 0))]
+    // The overlap's first occurrence, in CEST.
+    #[case::berlin_overlap(BERLIN, at(2026, 10, 25, 2, 30), utc(2026, 10, 25, 0, 30))]
+    // 03:00 is the instant the clock falls back at; its CEST reading never happened.
+    #[case::berlin_overlap_end(BERLIN, at(2026, 10, 25, 3, 0), utc(2026, 10, 25, 2, 0))]
+    #[case::new_york_gap(NEW_YORK, at(2026, 3, 8, 2, 30), utc(2026, 3, 8, 7, 30))]
+    #[case::new_york_overlap(NEW_YORK, at(2026, 11, 1, 1, 30), utc(2026, 11, 1, 5, 30))]
+    #[case::new_york_overlap_end(NEW_YORK, at(2026, 11, 1, 2, 0), utc(2026, 11, 1, 7, 0))]
+    // A 30-minute change: 02:15 sits in the 02:00–02:30 gap, read with +10:30.
+    #[case::lord_howe_gap(LORD_HOWE, at(2026, 10, 4, 2, 15), utc(2026, 10, 3, 15, 45))]
+    #[case::lord_howe_overlap(LORD_HOWE, at(2026, 4, 5, 1, 45), utc(2026, 4, 4, 14, 45))]
+    #[case::lord_howe_overlap_end(LORD_HOWE, at(2026, 4, 5, 2, 0), utc(2026, 4, 4, 15, 30))]
+    fn a_wall_clock_time_reads_as_the_clock_shows_it_or_as_upstreams_timer_reads_a_gap_or_overlap(
+        #[case] zone: DstZone,
+        #[case] wall: chrono::NaiveDateTime,
+        #[case] expected: chrono::DateTime<Utc>,
+    ) {
+        assert_eq!(wall_clock_occurrence(&zone, wall), expected);
+    }
+
+    #[test]
+    fn daily_and_weekly_triggers_in_the_spring_forward_gap_fire_just_after_the_jump() {
+        let boot = utc(2026, 3, 28, 12, 0);
+        // 29 March 2026 is a Sunday, so the weekly trigger falls on the gap day too.
+        for type_ in [
+            TaskTriggerInfoType::DailyTrigger,
+            TaskTriggerInfoType::WeeklyTrigger,
+        ] {
+            let trigger = at_time_of_day(type_, 2, 30);
+            let due = |now, last_fire| {
+                calendar_trigger_due(&BERLIN, &trigger, now, last_fire, boot, None)
+            };
+            // 03:00 CEST, just after the jump: 02:30 CET (01:30 UTC) is still ahead.
+            assert!(!due(utc(2026, 3, 29, 1, 0), None), "{type_:?}");
+            // 03:31 CEST: due, where the gap used to skip the day.
+            assert!(due(utc(2026, 3, 29, 1, 31), None), "{type_:?}");
+            // Once fired, not again that day, nor the next.
+            assert!(
+                !due(utc(2026, 3, 29, 5, 0), Some(utc(2026, 3, 29, 1, 31))),
+                "{type_:?}"
+            );
+            assert!(
+                !due(utc(2026, 3, 29, 22, 30), Some(utc(2026, 3, 29, 1, 31))),
+                "{type_:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gap_at_the_end_of_the_day_fires_just_after_midnight() {
+        // Nuuk jumps from 23:00 to 00:00, so 23:30 on Saturday 28 March reads as
+        // 00:30 on Sunday 29 March. The weekly trigger is for Saturday.
+        let boot = utc(2026, 3, 28, 12, 0);
+        for type_ in [
+            TaskTriggerInfoType::DailyTrigger,
+            TaskTriggerInfoType::WeeklyTrigger,
+        ] {
+            let trigger = TaskTriggerInfo {
+                day_of_week: Some(ferrofin_model::dto::DayOfWeek::Saturday),
+                ..at_time_of_day(type_, 23, 30)
+            };
+            let due =
+                |now, last_fire| calendar_trigger_due(&NUUK, &trigger, now, last_fire, boot, None);
+            assert!(!due(utc(2026, 3, 29, 1, 29), None), "{type_:?}");
+            assert!(due(utc(2026, 3, 29, 1, 31), None), "{type_:?}");
+            assert!(
+                !due(utc(2026, 3, 29, 2, 0), Some(utc(2026, 3, 29, 1, 31))),
+                "{type_:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_occurrence_missed_yesterday_is_not_caught_up() {
+        // The host was suspended across yesterday's 22:00 (and Sunday 03:00): on
+        // resume nothing fires until today's own occurrence.
+        let boot = utc(2026, 7, 1, 12, 0);
+        let daily = at_time_of_day(TaskTriggerInfoType::DailyTrigger, 22, 0);
+        let weekly = at_time_of_day(TaskTriggerInfoType::WeeklyTrigger, 3, 0);
+        // Suspended from Friday 3 July to Monday 6 July 07:00 UTC (09:00 CEST).
+        let last = Some(utc(2026, 7, 2, 20, 0));
+        assert!(!calendar_trigger_due(
+            &BERLIN,
+            &daily,
+            utc(2026, 7, 6, 7, 0),
+            last,
+            boot,
+            None
+        ));
+        // Monday 00:30 CEST, the day after the weekly trigger's Sunday.
+        assert!(!calendar_trigger_due(
+            &BERLIN,
+            &weekly,
+            utc(2026, 7, 5, 22, 30),
+            None,
+            boot,
+            None
+        ));
+        // Today's own occurrence still fires.
+        assert!(calendar_trigger_due(
+            &BERLIN,
+            &daily,
+            utc(2026, 7, 6, 20, 1),
+            last,
+            boot,
+            None
+        ));
+    }
+
+    #[test]
+    fn a_daily_trigger_in_the_fall_back_overlap_fires_once_at_the_first_occurrence() {
+        let boot = utc(2026, 10, 24, 12, 0);
+        let trigger = at_time_of_day(TaskTriggerInfoType::DailyTrigger, 2, 30);
+        let due =
+            |now, last_fire| calendar_trigger_due(&BERLIN, &trigger, now, last_fire, boot, None);
+        assert!(!due(utc(2026, 10, 25, 0, 29), None));
+        assert!(due(utc(2026, 10, 25, 0, 31), None));
+        // The second 02:30 (CET, 01:30 UTC) does not fire again.
+        assert!(!due(
+            utc(2026, 10, 25, 1, 31),
+            Some(utc(2026, 10, 25, 0, 31))
+        ));
+    }
+
+    #[test]
+    fn a_trigger_at_the_instant_the_clock_falls_back_keeps_its_time() {
+        // Generate Trickplay's default 03:00: on 25 October the clock reads 03:00
+        // only once, at 02:00 UTC (CET), not an hour earlier.
+        let boot = utc(2026, 10, 24, 12, 0);
+        let trigger = at_time_of_day(TaskTriggerInfoType::DailyTrigger, 3, 0);
+        let due = |now| calendar_trigger_due(&BERLIN, &trigger, now, None, boot, None);
+        assert!(!due(utc(2026, 10, 25, 1, 30)));
+        assert!(due(utc(2026, 10, 25, 2, 0)));
     }
 }

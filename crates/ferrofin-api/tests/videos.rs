@@ -22,6 +22,7 @@ use ferrofin_api::test_support::{
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::{MediaSourceInfo, MediaSourceType};
+use ferrofin_model::entities::VideoType;
 use ferrofin_model::entities_media::{MediaAttachment, MediaStream};
 use ferrofin_model::media_info::{LiveStreamRequest, MediaProtocol};
 use ferrofin_model::providers::RemoteSubtitleInfo;
@@ -39,6 +40,10 @@ use uuid::Uuid;
 
 const USER_ID: Uuid = Uuid::from_u128(0x00A1_0000);
 const ITEM_ID: Uuid = Uuid::from_u128(0x00A1_0001);
+/// A stacked movie: the first part of three.
+const STACKED_ID: Uuid = Uuid::from_u128(0x00A1_0002);
+/// [`STACKED_ID`]'s other parts.
+const PART_IDS: [Uuid; 2] = [Uuid::from_u128(0x00A1_0003), Uuid::from_u128(0x00A1_0004)];
 
 /// A minimal authenticated user for the stubs.
 fn user() -> UserEntity {
@@ -97,7 +102,12 @@ impl AuthService for OkAuth {
             user: Some(user()),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                enable_remote_access: true,
+                enable_subtitle_management: true,
+                ..Default::default()
+            })),
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -112,7 +122,12 @@ impl AuthorizationContext for OkAuth {
             user: Some(user()),
             is_api_key: self.elevated,
             is_authenticated: true,
-            ..AuthorizationInfo::default()
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                enable_remote_access: true,
+                enable_subtitle_management: true,
+                ..Default::default()
+            })),
+            ..ferrofin_api::test_support::authenticated_user_info()
         })
     }
 }
@@ -213,16 +228,56 @@ impl UserManager for OkUsers {
 }
 
 /// A [`MediaSourceManager`] that serves a static source for a temp file.
+#[derive(Default)]
 struct StreamSources {
     /// The on-disk path the static source points at.
     path: String,
+    /// A second version's path, listed under [`ALT_ID`] after the item's own.
+    alternate: Option<String>,
+    /// The path of the live stream open under [`LIVE_STREAM_ID`], if any.
+    live: Option<String>,
+    /// Whether the item's own source is a Blu-ray folder rip.
+    disc: bool,
+    /// The HTTP URL the item's own source is read from instead of its path
+    /// (an in-progress recording's `EncoderPath`), if any.
+    encoder: Option<String>,
+    /// Whether the item's own source is still being written
+    /// (`IsInfiniteStream`).
+    infinite: bool,
 }
+
+impl StreamSources {
+    /// A single-version item read from `path`, with no live stream open.
+    fn at(path: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            ..Self::default()
+        }
+    }
+}
+
+/// The id of the item's second version, when [`StreamSources`] has one.
+const ALT_ID: Uuid = Uuid::from_u128(0x00A1_00A1);
+
+/// The `User-Agent` the open live stream's tuner requires.
+const TUNER_AGENT: &str = "TunerAgent/1.0";
+
+/// The id the open live stream of [`StreamSources`] is known by.
+const LIVE_STREAM_ID: &str = "prov_service_live-1";
 
 fn static_source(path: &str) -> MediaSourceInfo {
     MediaSourceInfo {
         id: Some(ITEM_ID.to_string()),
         path: Some(path.to_owned()),
-        protocol: MediaProtocol::File,
+        // A remote target (a `.strm` shortcut's) is read over its own protocol.
+        protocol: if path.starts_with("http") {
+            MediaProtocol::Http
+        } else if path.starts_with("rtsp") {
+            MediaProtocol::Rtsp
+        } else {
+            MediaProtocol::File
+        },
+        is_remote: !path.starts_with('/'),
         type_: MediaSourceType::Default,
         supports_direct_play: true,
         supports_direct_stream: true,
@@ -248,7 +303,14 @@ impl MediaSourceManager for StreamSources {
         _allow_media_probe: bool,
         _enable_path_substitution: bool,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        Ok(vec![static_source(&self.path)])
+        let mut sources = vec![static_source(&self.path)];
+        if let Some(alternate) = &self.alternate {
+            sources.push(MediaSourceInfo {
+                id: Some(ALT_ID.to_string()),
+                ..static_source(alternate)
+            });
+        }
+        Ok(sources)
     }
     async fn get_static_media_sources(
         &self,
@@ -256,7 +318,20 @@ impl MediaSourceManager for StreamSources {
         _enable_path_substitution: bool,
         _user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        Ok(vec![static_source(&self.path)])
+        let mut sources = vec![MediaSourceInfo {
+            video_type: self.disc.then_some(VideoType::BluRay),
+            encoder_protocol: self.encoder.as_ref().map(|_| MediaProtocol::Http),
+            encoder_path: self.encoder.clone(),
+            is_infinite_stream: self.infinite,
+            ..static_source(&self.path)
+        }];
+        if let Some(alternate) = &self.alternate {
+            sources.push(MediaSourceInfo {
+                id: Some(ALT_ID.to_string()),
+                ..static_source(alternate)
+            });
+        }
+        Ok(sources)
     }
     async fn open_live_stream(
         &self,
@@ -264,8 +339,15 @@ impl MediaSourceManager for StreamSources {
     ) -> Result<MediaSourceInfo, ServiceError> {
         unimplemented!()
     }
-    async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
-        unimplemented!()
+    async fn get_live_stream(&self, id: &str) -> Result<MediaSourceInfo, ServiceError> {
+        match &self.live {
+            Some(path) if id == LIVE_STREAM_ID => Ok(MediaSourceInfo {
+                live_stream_id: Some(LIVE_STREAM_ID.to_owned()),
+                required_http_headers: [("User-Agent".to_owned(), TUNER_AGENT.to_owned())].into(),
+                ..static_source(path)
+            }),
+            _ => Err(ServiceError::NotFound(format!("live stream {id}"))),
+        }
     }
     async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!()
@@ -334,8 +416,11 @@ impl LibraryManager for StreamLibrary {
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        Ok((id == ITEM_ID || id == Uuid::from_u128(0x00A1_0002))
-            .then(|| minimal_base_item(id, "A Movie", "Movie")))
+        Ok(match id {
+            ITEM_ID => Some(minimal_base_item(ITEM_ID, "A Movie", "Movie")),
+            STACKED_ID => Some(minimal_base_item(STACKED_ID, "Heist", "Movie")),
+            _ => None,
+        })
     }
     async fn merge_versions(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
         self.merged.lock().unwrap().push(ids.to_vec());
@@ -344,6 +429,23 @@ impl LibraryManager for StreamLibrary {
     async fn remove_alternate_sources(&self, item_id: Uuid) -> Result<(), ServiceError> {
         self.removed.lock().unwrap().push(item_id);
         Ok(())
+    }
+    async fn get_additional_parts(
+        &self,
+        video: &BaseItemEntity,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        // ITEM_ID is a lone movie; STACKED_ID a stack of three parts, asked
+        // for as the requesting user.
+        assert_eq!(user.map(|u| u.username.as_str()), Some("alice"));
+        if video.id == STACKED_ID.to_string() {
+            Ok(vec![
+                minimal_base_item(PART_IDS[0], "Heist cd2", "Video"),
+                minimal_base_item(PART_IDS[1], "Heist cd3", "Video"),
+            ])
+        } else {
+            Ok(Vec::new())
+        }
     }
     async fn query_items(
         &self,
@@ -509,7 +611,12 @@ struct Harness {
 
 /// The ordinary-user harness.
 fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
-    state_with(path, subtitles, false)
+    state_with(
+        StreamSources::at(path),
+        subtitles,
+        false,
+        Arc::new(ferrofin_api::test_support::FakeDto),
+    )
 }
 
 /// The elevated harness, for the video routes that are `RequiresElevation`
@@ -517,12 +624,22 @@ fn state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
 /// `DELETE /Videos/{itemId}/AlternateSources`, and
 /// `DELETE /Videos/{itemId}/Subtitles/{index}`.
 fn elevated_state(path: &str, subtitles: Arc<dyn SubtitleManager>) -> Harness {
-    state_with(path, subtitles, true)
+    state_with(
+        StreamSources::at(path),
+        subtitles,
+        true,
+        Arc::new(ferrofin_api::test_support::FakeDto),
+    )
 }
 
-/// Builds a [`Harness`] serving `path` for streams and using `subtitles` for the
-/// subtitle routes.
-fn state_with(path: &str, subtitles: Arc<dyn SubtitleManager>, elevated: bool) -> Harness {
+/// Builds a [`Harness`] serving `sources` for streams and using `subtitles` for
+/// the subtitle routes.
+fn state_with(
+    sources: StreamSources,
+    subtitles: Arc<dyn SubtitleManager>,
+    elevated: bool,
+    dto: Arc<dyn ferrofin_traits::dto::DtoService>,
+) -> Harness {
     let merged = Arc::new(Mutex::new(Vec::new()));
     let removed = Arc::new(Mutex::new(Vec::new()));
     let bulk = Arc::new(Mutex::new(Vec::new()));
@@ -535,9 +652,7 @@ fn state_with(path: &str, subtitles: Arc<dyn SubtitleManager>, elevated: bool) -
         Arc::new(OkUsers),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
-        Arc::new(StreamSources {
-            path: path.to_owned(),
-        }),
+        Arc::new(sources),
         Arc::new(FakeSessions),
         Arc::new(FakeSystem),
         Arc::new(FakeAppHost),
@@ -546,7 +661,7 @@ fn state_with(path: &str, subtitles: Arc<dyn SubtitleManager>, elevated: bool) -
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
-        Arc::new(ferrofin_api::test_support::FakeDto),
+        dto,
         Arc::new(OkAuth { elevated }),
         Arc::new(OkAuth { elevated }),
         Arc::new(FakeQuickConnect),
@@ -654,7 +769,10 @@ async fn video_stream_serves_file() {
     let app = state(&path, no_subtitles()).app;
     let router = create_router(app);
     let resp = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
         .await
         .expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
@@ -670,7 +788,10 @@ async fn video_stream_serves_full_body() {
     let path = media.path.clone();
     let router = create_router(state(&path, no_subtitles()).app);
     let response = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -688,7 +809,7 @@ async fn video_stream_range_request_is_206_with_content_range() {
     let response = router
         .oneshot(
             Request::builder()
-                .uri(format!("/Videos/{ITEM_ID}/stream"))
+                .uri(format!("/Videos/{ITEM_ID}/stream?static=true"))
                 .header("Authorization", "Bearer token")
                 .header(header::RANGE, "bytes=2-5")
                 .body(Body::empty())
@@ -721,10 +842,418 @@ async fn video_stream_missing_file_is_404() {
     let path = path.to_string_lossy().into_owned();
     let router = create_router(state(&path, no_subtitles()).app);
     let response = router
-        .oneshot(authed("GET", &format!("/Videos/{ITEM_ID}/stream")))
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Serves `contents` over HTTP on a loopback port, with `Range` support (the
+/// remote origin a `.strm` shortcut points at), and returns its URL.
+async fn remote_origin(contents: &'static [u8]) -> String {
+    use tower_http::services::ServeFile;
+    let dir = std::env::temp_dir().join(format!("ferrofin-origin-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("movie.mkv");
+    std::fs::write(&file, contents).unwrap();
+    let app = axum::Router::new().route_service("/movie.mkv", ServeFile::new(file));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{address}/movie.mkv")
+}
+
+/// `GetStaticRemoteStreamResult`: a static stream of a source the item takes
+/// from a remote HTTP target is relayed from it — whole, and with the client's
+/// `Range` forwarded so the answer is the upstream's `206` and `Content-Range`.
+#[tokio::test]
+async fn a_static_remote_stream_is_relayed_with_its_range() {
+    let url = remote_origin(b"0123456789").await;
+    let router = create_router(state(&url, no_subtitles()).app);
+    let whole = router
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(whole.status(), StatusCode::OK);
+    assert_eq!(whole.headers()[header::ACCEPT_RANGES], "bytes");
+    assert_eq!(whole.headers()[header::CONTENT_LENGTH], "10");
+    let bytes = axum::body::to_bytes(whole.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"0123456789");
+
+    let part = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Videos/{ITEM_ID}/stream?static=true"))
+                .header("Authorization", "Bearer token")
+                .header(header::RANGE, "bytes=2-5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(part.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
+    let bytes = axum::body::to_bytes(part.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"2345");
+}
+
+/// Only an HTTP target is relayed: any other non-file protocol is
+/// `400 Input protocol … cannot be streamed statically`, and an origin that
+/// cannot be reached is a server error, not a file `404`.
+#[tokio::test]
+async fn a_static_stream_of_another_protocol_is_refused_and_a_dead_origin_fails() {
+    let rtsp = create_router(state("rtsp://camera/feed", no_subtitles()).app)
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rtsp.status(), StatusCode::BAD_REQUEST);
+
+    // Nothing listens on this port any more.
+    let dead = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/movie.mkv", listener.local_addr().unwrap())
+    };
+    let down = create_router(state(&dead, no_subtitles()).app)
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(down.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// The status and body `GET uri` answers with.
+async fn get_body(router: &axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
+    let response = router.clone().oneshot(authed("GET", uri)).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// `StreamingHelpers.GetStreamingState`: a direct-play request plays the
+/// version its `mediaSourceId` names (jellyfin-web puts it on every
+/// `stream.{container}?Static=true` URL), in either GUID spelling. The item's
+/// own id, or none, is its first version; an id naming no version is `404`,
+/// never the wrong file. Video, audio and universal audio all select alike.
+#[tokio::test]
+async fn a_static_stream_plays_the_version_its_media_source_id_names() {
+    let primary = TempMedia::new(b"primary");
+    let alternate = TempMedia::new(b"alternate");
+    let sources = StreamSources {
+        alternate: Some(alternate.path.clone()),
+        ..StreamSources::at(&primary.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let unknown = Uuid::from_u128(0xDEAD);
+    for route in [
+        format!("/Videos/{ITEM_ID}/stream?static=true"),
+        format!("/Videos/{ITEM_ID}/stream.mkv?Static=true"),
+        format!("/Audio/{ITEM_ID}/stream.mp3?static=true"),
+        format!("/Audio/{ITEM_ID}/universal?deviceId=d1"),
+    ] {
+        for (media_source_id, expected) in [
+            (ALT_ID.simple().to_string(), Some(&b"alternate"[..])),
+            (ALT_ID.to_string(), Some(&b"alternate"[..])),
+            (ITEM_ID.simple().to_string(), Some(&b"primary"[..])),
+            (String::new(), Some(&b"primary"[..])),
+            (unknown.simple().to_string(), None),
+        ] {
+            let uri = format!("{route}&mediaSourceId={media_source_id}");
+            let (status, body) = get_body(&router, &uri).await;
+            match expected {
+                Some(expected) => {
+                    assert_eq!(status, StatusCode::OK, "{uri}");
+                    assert_eq!(body, expected, "{uri}");
+                }
+                None => assert_eq!(status, StatusCode::NOT_FOUND, "{uri}"),
+            }
+        }
+    }
+}
+
+/// An origin on a loopback port that answers with the `User-Agent` it was sent
+/// (empty when none), and returns its URL: what a relay sent, and that it was
+/// this origin it read.
+async fn agent_origin() -> String {
+    let app = axum::Router::new().route(
+        "/live.ts",
+        axum::routing::get(|headers: axum::http::HeaderMap| async move {
+            headers
+                .get(header::USER_AGENT)
+                .map(|agent| agent.as_bytes().to_vec())
+                .unwrap_or_default()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{address}/live.ts")
+}
+
+/// The `User-Agent` the relay names the server with when a source requires
+/// none (`NamedClient.Default`).
+const SERVER_AGENT: &str = concat!("Ferrofin/", env!("CARGO_PKG_VERSION"));
+
+/// `GetStaticRemoteStreamResult`: a remote target that requires no
+/// `User-Agent` is relayed under the server's own, never with none at all
+/// (origins commonly refuse an agentless request).
+#[tokio::test]
+async fn a_static_remote_stream_names_the_server_when_no_agent_is_required() {
+    let url = agent_origin().await;
+    let (status, body) = get_body(
+        &create_router(state(&url, no_subtitles()).app),
+        &format!("/Videos/{ITEM_ID}/stream?static=true"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, SERVER_AGENT.as_bytes());
+}
+
+/// `EncodingHelper.AttachMediaSourceInfo`: a source naming an encoder path (an
+/// in-progress recording's `LiveRecordings` URL, which follows the file as it
+/// grows) is read from it, not from the partial file on disk.
+#[tokio::test]
+async fn a_static_stream_is_read_from_the_encoder_path_its_source_names() {
+    let partial = TempMedia::new(b"recorded so far");
+    let sources = StreamSources {
+        encoder: Some(agent_origin().await),
+        ..StreamSources::at(&partial.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let (status, body) = get_body(&router, &format!("/Videos/{ITEM_ID}/stream?static=true")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, SERVER_AGENT.as_bytes());
+}
+
+/// `VideosController.GetVideoStream`: a file source still being written
+/// (`IsInfiniteStream`) with no encoder path to relay is served as a
+/// `ProgressiveFileStream`, which keeps reading as the file grows, not as the
+/// bytes on disk when the request came in. It is typed by the output
+/// container, and no range of it is addressable.
+///
+/// Over a real connection: a response framed by the file's length at request
+/// time ends there, which an in-process call would not show. A `Range` is
+/// ignored: nothing of a growing file is addressable.
+#[tokio::test]
+async fn a_static_stream_of_a_growing_file_follows_the_file() {
+    let growing = TempMedia::new(b"written so far");
+    let sources = StreamSources {
+        infinite: true,
+        ..StreamSources::at(&growing.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let request = reqwest::Client::new()
+        .get(format!(
+            "http://{address}/Videos/{ITEM_ID}/stream.ts?static=true"
+        ))
+        .header("Authorization", "Bearer token")
+        .header("Range", "bytes=0-3")
+        .send();
+    let mut response = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+        .await
+        .expect("the response starts")
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let headers = response.headers().clone();
+
+    let mut read = Vec::new();
+    let mut appended = false;
+    let wanted = b"written so far, and then some".as_slice();
+    while read.len() < wanted.len() {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), response.chunk())
+            .await
+            .expect("the stream waits for the file to grow, it does not stall")
+            .expect("chunk");
+        let Some(chunk) = chunk else {
+            panic!(
+                "the stream ended at {:?}, before the file grew",
+                String::from_utf8_lossy(&read)
+            );
+        };
+        read.extend_from_slice(&chunk);
+        if !appended && read.len() >= b"written so far".len() {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&growing.path)
+                .and_then(|mut file| file.write_all(b", and then some"))
+                .expect("grow the file");
+            appended = true;
+        }
+    }
+    assert_eq!(read, wanted);
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    assert_eq!(header("content-type"), Some("video/mp2t"));
+    assert_eq!(header("accept-ranges"), Some("none"));
+}
+
+/// `StreamingHelpers.GetStreamingState`: a request for a file still being
+/// written that names no container is typed `ts`, whatever the file's own
+/// extension; a finished file keeps its own type. A `HEAD` answers the same
+/// headers and no body.
+#[rstest::rstest]
+#[case::growing("GET", true, "video/mp2t")]
+#[case::growing_head("HEAD", true, "video/mp2t")]
+#[case::finished("GET", false, "video/x-matroska")]
+#[tokio::test]
+async fn a_static_stream_naming_no_container_is_typed_by_its_source(
+    #[case] method: &str,
+    #[case] infinite: bool,
+    #[case] content_type: &str,
+) {
+    let file = TempMedia::new(b"some bytes");
+    let sources = StreamSources {
+        infinite,
+        ..StreamSources::at(&file.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let response = router
+        .oneshot(authed(
+            method,
+            &format!("/Videos/{ITEM_ID}/stream?static=true"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some(content_type)
+    );
+    if method == "HEAD" {
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("a HEAD body ends at once")
+        .unwrap();
+        assert!(body.is_empty(), "{body:?}");
+    }
+}
+
+/// `StreamingHelpers.GetStreamingState`: a `LiveStreamId` wins over the
+/// item's static sources, so the stream already open is what plays rather than
+/// a second dial of the channel. A pass-through stream keeps its tuner URL and
+/// is relayed with the tuner's required `User-Agent`
+/// (`GetStaticRemoteStreamResult`); a stream that is no longer open is `404`.
+#[tokio::test]
+async fn a_static_stream_with_a_live_stream_id_plays_the_open_stream() {
+    let channel = TempMedia::new(b"unopened channel");
+    let tuner = agent_origin().await;
+    let sources = StreamSources {
+        live: Some(tuner),
+        ..StreamSources::at(&channel.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let (status, body) = get_body(
+        &router,
+        &format!("/Videos/{ITEM_ID}/stream.ts?static=true&LiveStreamId={LIVE_STREAM_ID}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // The tuner's own agent came back: the open stream was read, with it.
+    assert_eq!(body, TUNER_AGENT.as_bytes());
+    let (status, _) = get_body(
+        &router,
+        &format!("/Videos/{ITEM_ID}/stream.ts?static=true&LiveStreamId=prov_service_closed"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// `VideosController.GetVideoStream`: a Blu-ray or DVD folder rip is never
+/// served as a static file; the request goes to ffmpeg, which is unavailable
+/// here (`404`). Audio has no such exclusion.
+#[tokio::test]
+async fn a_static_video_stream_of_a_disc_rip_is_transcoded() {
+    let rip = TempMedia::new(b"disc");
+    let sources = StreamSources {
+        disc: true,
+        ..StreamSources::at(&rip.path)
+    };
+    let router = create_router(
+        state_with(
+            sources,
+            no_subtitles(),
+            false,
+            Arc::new(ferrofin_api::test_support::FakeDto),
+        )
+        .app,
+    );
+    let (video, _) = get_body(&router, &format!("/Videos/{ITEM_ID}/stream?static=true")).await;
+    assert_eq!(video, StatusCode::NOT_FOUND);
+    let (audio, body) = get_body(&router, &format!("/Audio/{ITEM_ID}/stream?static=true")).await;
+    assert_eq!(audio, StatusCode::OK);
+    assert_eq!(body, b"disc");
 }
 
 // ---- Version-group management ----------------------------------------------
@@ -752,7 +1281,7 @@ async fn merge_versions_merges_two_ids() {
     let h = elevated_state(&path, no_subtitles());
     let merged = h.merged.clone();
     let router = create_router(h.app);
-    let other = Uuid::from_u128(0x00A1_0002);
+    let other = STACKED_ID;
     let resp = router
         .oneshot(authed(
             "POST",
@@ -845,6 +1374,98 @@ async fn additional_parts_empty_for_known_item() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["Items"].as_array().map(Vec::len), Some(0));
     assert_eq!(json["TotalRecordCount"].as_i64(), Some(0));
+}
+
+/// A [`DtoService`](ferrofin_traits::dto::DtoService) projecting each row to
+/// its id and name, and recording the owner it was given.
+struct PartsDto {
+    owners: Arc<Mutex<Vec<Option<Uuid>>>>,
+}
+
+#[async_trait]
+impl ferrofin_traits::dto::DtoService for PartsDto {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &ferrofin_traits::options::DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<ferrofin_model::dto::BaseItemDto, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        _options: &ferrofin_traits::options::DtoOptions,
+        _user: Option<&UserEntity>,
+        owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<ferrofin_model::dto::BaseItemDto>, ServiceError> {
+        self.owners.lock().unwrap().push(owner_id);
+        Ok(items
+            .iter()
+            .map(|i| ferrofin_model::dto::BaseItemDto {
+                id: Uuid::parse_str(&i.id).unwrap(),
+                name: i.name.clone(),
+                ..Default::default()
+            })
+            .collect())
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &ferrofin_traits::options::DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<ferrofin_model::dto::BaseItemDto, ServiceError> {
+        unimplemented!()
+    }
+}
+
+/// Port of `VideosController.GetAdditionalPart`: a stacked video's other
+/// parts, in the order the library returns them, projected with the video as
+/// their owner, counted as a `QueryResult`.
+#[tokio::test]
+async fn additional_parts_of_a_stack_are_its_other_parts() {
+    let (_dir, path) = temp_media();
+    let owners = Arc::new(Mutex::new(Vec::new()));
+    let app = state_with(
+        StreamSources::at(&path),
+        no_subtitles(),
+        false,
+        Arc::new(PartsDto {
+            owners: owners.clone(),
+        }),
+    )
+    .app;
+    let resp = create_router(app)
+        .oneshot(authed(
+            "GET",
+            &format!("/Videos/{STACKED_ID}/AdditionalParts"),
+        ))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let names: Vec<&str> = json["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Heist cd2", "Heist cd3"]);
+    assert_eq!(json["TotalRecordCount"].as_i64(), Some(2));
+    assert_eq!(json["StartIndex"].as_i64(), Some(0));
+    assert_eq!(*owners.lock().unwrap(), [Some(STACKED_ID)]);
 }
 
 #[tokio::test]

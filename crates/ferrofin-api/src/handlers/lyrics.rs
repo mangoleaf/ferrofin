@@ -11,16 +11,18 @@
 //! Five of the six carry `[Authorize(Policy = Policies.LyricManagement)]`
 //! upstream — only `GET /Audio/{itemId}/Lyrics` is a plain `[Authorize]` — so
 //! they take [`RequireLyricManagement`] rather than [`RequireAuth`]. The
-//! permission behind it (`EnableLyricManagement`) defaults to false and is not
-//! implied by administrator, so this is what stops any authenticated account
-//! overwriting or deleting another user's lyrics.
+//! permission behind it (`EnableLyricManagement`) defaults to false; only an
+//! administrator or an API key passes without it, so this is what stops any
+//! other account overwriting or deleting another user's lyrics.
 //!
-//! Every route is backed by the [`LyricManager`] (sidecar `.lrc`/`.txt` files
-//! plus the registered remote providers such as LrcLib). On a successful item
-//! resolve, upload / download also queue a metadata refresh, matching the C#
-//! flow.
+//! Every route is backed by the [`LyricManager`] (the item's `Lyric` streams,
+//! which the audio probe records from its `.lrc`/`.txt` sidecars, plus the
+//! registered remote providers such as LrcLib). After a write the track's
+//! metadata refresh re-probes its lyric streams, as the C# flow does: upload
+//! and download queue it at high priority, delete awaits it.
 
 use axum::extract::{Path, State};
+use axum::handler::Handler;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -29,8 +31,8 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAuth, RequireLyricManagement};
 use crate::error::ApiError;
-use crate::extract::Query;
-use crate::handlers::queue_high_priority_refresh;
+use crate::extract::{Query, upload_body_limit};
+use crate::handlers::{queue_high_priority_refresh, run_item_refresh};
 use crate::state::AppState;
 
 /// Ensures the item exists **and is an audio item**, returning `404` otherwise.
@@ -94,10 +96,11 @@ struct UploadLyricsQuery {
 
 /// `POST /Audio/{itemId}/Lyrics` — upload an external lyric file.
 ///
-/// Port of `LyricsController.UploadLyrics`: the request body is the raw lyric
-/// text; the format is the uploaded file's extension. `400` when the body is
-/// empty or the file name has no extension; `404` for a missing item. On success
-/// queues a high-priority metadata refresh (as the C# does).
+/// Port of `LyricsController.UploadLyrics`: the request body is the lyric
+/// file's bytes, in any encoding the manager's reader takes (a UTF-16 file
+/// is no `400`); the format is the uploaded file's extension. `400` when the
+/// body is empty or the file name has no extension; `404` for a missing item.
+/// On success queues a high-priority metadata refresh (as the C# does).
 #[utoipa::path(
     post,
     path = "/Audio/{itemId}/Lyrics",
@@ -117,17 +120,13 @@ async fn upload_lyrics(
     RequireLyricManagement(auth): RequireLyricManagement,
     Path(item_id): Path<Uuid>,
     Query(query): Query<UploadLyricsQuery>,
-    body: String,
+    body: axum::body::Bytes,
 ) -> Result<Json<LyricDto>, ApiError> {
     require_item(&state, item_id, &auth).await?;
     if body.is_empty() {
         return Err(ApiError::BadRequest("no lyrics uploaded".to_owned()));
     }
-    // The format is the file extension (matches C# `Path.GetExtension`).
-    let format = std::path::Path::new(&query.file_name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default();
+    let format = upload_format(&query.file_name);
     if format.is_empty() {
         return Err(ApiError::BadRequest(
             "extension is required on filename".to_owned(),
@@ -143,10 +142,24 @@ async fn upload_lyrics(
     }
 }
 
+/// The lyric format an uploaded file name gives:
+/// `Path.GetExtension(fileName).RightPart('.')`, the text after the last dot
+/// of the name's last `/`-separated segment (.NET's only separator on Linux,
+/// where `\` is an ordinary character). Unlike [`std::path::Path::extension`], a
+/// leading dot counts (`.lrc` is `lrc`); a trailing one gives nothing.
+fn upload_format(file_name: &str) -> &str {
+    let name = file_name.rsplit('/').next().unwrap_or(file_name);
+    name.rfind('.').map_or("", |dot| &name[dot + 1..])
+}
+
 /// `DELETE /Audio/{itemId}/Lyrics` — delete the item's stored lyrics.
 ///
 /// Port of `LyricsController.DeleteLyrics`: `204` on success, `404` for a
-/// missing item.
+/// missing item. `LyricManager.DeleteLyricsAsync` ends with an awaited
+/// `audio.RefreshMetadata`, which drops the deleted files' streams, so the
+/// refresh runs before the `204` and `HasLyrics` is false by then. A refresh
+/// that fails, or that the shutdown stops, is an error status even though
+/// the files are already deleted, as upstream's awaited refresh throws.
 #[utoipa::path(
     delete,
     path = "/Audio/{itemId}/Lyrics",
@@ -164,6 +177,7 @@ async fn delete_lyrics(
 ) -> Result<StatusCode, ApiError> {
     require_item(&state, item_id, &auth).await?;
     state.lyrics.delete_lyrics(item_id).await?;
+    run_item_refresh(&state, item_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -256,7 +270,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
             "/Audio/{itemId}/Lyrics",
-            get(get_lyrics).post(upload_lyrics).delete(delete_lyrics),
+            get(get_lyrics)
+                .post(upload_lyrics.layer(upload_body_limit()))
+                .delete(delete_lyrics),
         )
         .route(
             "/Audio/{itemId}/RemoteSearch/Lyrics",

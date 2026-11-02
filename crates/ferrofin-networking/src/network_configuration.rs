@@ -27,9 +27,10 @@
 //! configuration (CLI/environment/config.toml), not this DTO's corresponding fields.
 //! In particular, use `FERROFIN_BASE_URL` or bootstrap `base_url` for the mounted
 //! prefix; saving `BaseUrl` here does not remount routes. Bootstrap settings require
-//! a process restart to reload. The composition root currently serves HTTP and
-//! disables request-Host URL selection; these DTO fields do not enable either HTTPS
-//! listening or request-Host selection by themselves.
+//! a process restart to reload. `EnableHttps`, `RequireHttps` and the certificate
+//! fields do apply: at startup the server listens with HTTPS on its bootstrap HTTPS
+//! port when HTTPS is enabled and the certificate loads, and a new certificate path
+//! flags a restart. `EnablePublishedServerUriByRequest` is read live.
 //!
 //! `EnableUPnP` is a different case, and not a Ferrofin gap: upstream marks it
 //! `[Obsolete("No longer supported")]`

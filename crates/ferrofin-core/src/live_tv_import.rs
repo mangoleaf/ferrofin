@@ -1,9 +1,9 @@
 //! Adoption import for Jellyfin's `config/livetv.xml`.
 //!
-//! Every other Jellyfin configuration document is carried across when a data
-//! directory is adopted (see [`crate::config_import`]), but the Live TV one was
-//! not — and Ferrofin keeps tuners and listing providers in the database rather
-//! than in a config file, so nothing else would ever pick them up.
+//! The document's scalar options (guide days, padding, the post-processor) are
+//! seeded as `named/livetv.json` like every other named configuration (see
+//! [`crate::config_import`]). Ferrofin keeps the tuners and listing providers
+//! in the database rather than in that file, so this import writes them there.
 //!
 //! The cost of skipping it is not cosmetic: with no tuner configured, Live TV
 //! is *off* (C# `LiveTvManager.IsLiveTvEnabled`), so adopting a server that had
@@ -21,10 +21,6 @@ use ferrofin_traits::error::ServiceError;
 /// Once only: an operator who deletes an imported tuner means it, and a boot
 /// that re-created it would be arguing with them.
 const META_KEY: &str = "livetv_config_imported_v1";
-
-/// Fields of `livetv.xml` that must not be carried over: all three are
-/// recording paths inside the Jellyfin container's filesystem.
-const LIVETV_XML_DENY: &[&str] = &["RecordingPath", "MovieRecordingPath", "SeriesRecordingPath"];
 
 /// Imports the tuners and listing providers from `{config}/livetv.xml`, once.
 ///
@@ -68,7 +64,7 @@ async fn write_options(db: &Database, xml: &str) -> Result<usize, ServiceError> 
         &LiveTvOptions::default(),
         xml,
         "LiveTvOptions",
-        LIVETV_XML_DENY,
+        config_import::LIVETV_XML_DENY,
     ) {
         Ok(options) => options,
         Err(e) => {

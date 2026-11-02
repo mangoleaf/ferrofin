@@ -3,8 +3,9 @@
 //! The C# original delegates most lookups to an external `MimeTypes` NuGet
 //! table and overrides/augments it with two small dictionaries. Here the full
 //! extension↔mime tables are inlined (the union of the upstream override tables
-//! and the base table entries exercised by the ported oracle), preserving the
-//! same lookup order:
+//! and the base table entries exercised by the ported oracle, plus every
+//! `image/*` entry of the base table in both directions), preserving the same
+//! lookup order:
 //!
 //! `GetMimeType`: override table → base table → generic `video/<ext>` for known
 //! video extensions → default.
@@ -29,7 +30,8 @@ const VIDEO_FILE_EXTENSIONS: &[&str] = &[
 
 /// Extension → MIME type table (override table ∪ base table). Keys are lowercase
 /// with a leading dot.
-#[allow(clippy::type_complexity)]
+// A data table, one entry per line, so its length is the table's.
+#[allow(clippy::type_complexity, clippy::too_many_lines)]
 fn extension_to_mime() -> &'static [(&'static str, &'static str)] {
     &[
         // Type application
@@ -54,19 +56,112 @@ fn extension_to_mime() -> &'static [(&'static str, &'static str)] {
         (".wasm", "application/wasm"),
         (".xml", "application/xml"),
         (".zip", "application/zip"),
-        // Type image
+        // Type image: every extension the `MimeTypes` 2.5.2 base table maps to an
+        // `image/*` type, plus the override `.tbn`, so files stored under the
+        // extensions `to_extension` hands out are typed as upstream types them.
+        (".3ds", "image/x-3ds"),
+        (".apng", "image/apng"),
+        (".avci", "image/avci"),
+        (".avcs", "image/avcs"),
+        (".avif", "image/avif"),
+        (".azv", "image/vnd.airzip.accelerator.azv"),
+        (".b16", "image/vnd.pco.b16"),
         (".bmp", "image/bmp"),
+        (".btf", "image/prs.btif"),
+        (".btif", "image/prs.btif"),
+        (".cgm", "image/cgm"),
+        (".cmx", "image/x-cmx"),
+        (".dds", "image/vnd.ms-dds"),
+        (".dib", "image/bmp"),
+        (".djv", "image/vnd.djvu"),
+        (".djvu", "image/vnd.djvu"),
+        (".dpx", "image/dpx"),
+        (".drle", "image/dicom-rle"),
+        (".dwg", "image/vnd.dwg"),
+        (".dxf", "image/vnd.dxf"),
+        (".emf", "image/emf"),
+        (".exr", "image/aces"),
+        (".fbs", "image/vnd.fastbidsheet"),
+        (".fh", "image/x-freehand"),
+        (".fh4", "image/x-freehand"),
+        (".fh5", "image/x-freehand"),
+        (".fh7", "image/x-freehand"),
+        (".fhc", "image/x-freehand"),
+        (".fits", "image/fits"),
+        (".fpx", "image/vnd.fpx"),
+        (".fst", "image/vnd.fst"),
+        (".g3", "image/g3fax"),
         (".gif", "image/gif"),
+        (".heic", "image/heic"),
+        (".heics", "image/heic-sequence"),
+        (".heif", "image/heif"),
+        (".heifs", "image/heif-sequence"),
+        (".hej2", "image/hej2k"),
+        (".hsj2", "image/hsj2"),
         (".ico", "image/vnd.microsoft.icon"),
-        (".jpg", "image/jpeg"),
+        (".ief", "image/ief"),
+        (".jhc", "image/jphc"),
+        (".jls", "image/jls"),
+        (".jng", "image/x-jng"),
+        (".jp2", "image/jp2"),
+        (".jpe", "image/jpeg"),
         (".jpeg", "image/jpeg"),
+        (".jpf", "image/jpx"),
+        (".jpg", "image/jpeg"),
+        (".jpg2", "image/jp2"),
+        (".jpgm", "image/jpm"),
+        (".jph", "image/jph"),
+        (".jpm", "image/jpm"),
+        (".jpx", "image/jpx"),
+        (".jxr", "image/jxr"),
+        (".jxra", "image/jxra"),
+        (".jxrs", "image/jxrs"),
+        (".jxs", "image/jxs"),
+        (".jxsc", "image/jxsc"),
+        (".jxsi", "image/jxsi"),
+        (".jxss", "image/jxss"),
+        (".ktx", "image/ktx"),
+        (".ktx2", "image/ktx2"),
+        (".mdi", "image/vnd.ms-modi"),
+        (".mmr", "image/vnd.fujixerox.edmics-mmr"),
+        (".npx", "image/vnd.net-fpx"),
+        (".pbm", "image/x-portable-bitmap"),
+        (".pct", "image/x-pict"),
+        (".pcx", "image/vnd.zbrush.pcx"),
+        (".pgm", "image/x-portable-graymap"),
+        (".pic", "image/x-pict"),
         (".png", "image/png"),
+        (".pnm", "image/x-portable-anymap"),
+        (".ppm", "image/x-portable-pixmap"),
+        (".psd", "image/vnd.adobe.photoshop"),
+        (".pti", "image/prs.pti"),
+        (".ras", "image/x-cmu-raster"),
+        (".rgb", "image/x-rgb"),
+        (".rlc", "image/vnd.fujixerox.edmics-rlc"),
+        (".sgi", "image/sgi"),
+        (".sid", "image/x-mrsid-image"),
         (".svg", "image/svg+xml"),
         (".svgz", "image/svg+xml"),
+        (".t38", "image/t38"),
+        (".tap", "image/vnd.tencent.tap"),
         (".tbn", "image/jpeg"),
+        (".tfx", "image/tiff-fx"),
+        (".tga", "image/x-tga"),
         (".tif", "image/tiff"),
         (".tiff", "image/tiff"),
+        (".uvg", "image/vnd.dece.graphic"),
+        (".uvi", "image/vnd.dece.graphic"),
+        (".uvvg", "image/vnd.dece.graphic"),
+        (".uvvi", "image/vnd.dece.graphic"),
+        (".vtf", "image/vnd.valve.source.texture"),
+        (".wbmp", "image/vnd.wap.wbmp"),
+        (".wdp", "image/vnd.ms-photo"),
         (".webp", "image/webp"),
+        (".wmf", "image/wmf"),
+        (".xbm", "image/x-xbitmap"),
+        (".xif", "image/vnd.xiff"),
+        (".xpm", "image/x-xpixmap"),
+        (".xwd", "image/x-xwindowdump"),
         // Type font
         (".ttf", "font/ttf"),
         (".woff", "font/woff"),
@@ -123,7 +218,8 @@ fn extension_to_mime() -> &'static [(&'static str, &'static str)] {
 }
 
 /// MIME type → extension table (override table ∪ base table). Keys are lowercase.
-#[allow(clippy::type_complexity)]
+// A data table, one entry per line, so its length is the table's.
+#[allow(clippy::type_complexity, clippy::too_many_lines)]
 fn mime_to_extension() -> &'static [(&'static str, &'static str)] {
     &[
         // Type application
@@ -169,17 +265,100 @@ fn mime_to_extension() -> &'static [(&'static str, &'static str)] {
         ("font/ttf", ".ttf"),
         ("font/woff", ".woff"),
         ("font/woff2", ".woff2"),
-        // Type image
+        // Type image: every `image/*` type, so `ToExtension` knows exactly the
+        // image types Jellyfin does (the upload routes' `Content-Type` guard,
+        // `TryGetImageExtensionFromContentType`, depends on it). The override
+        // entries (`image/jpeg`, `image/jpg`, `image/tiff`, `image/x-icon`,
+        // `image/x-png`) win; every other type is the base table's
+        // `GetMimeTypeExtensions(..).FirstOrDefault()`, the first extension the
+        // `MimeTypes` 2.5.2 package lists for it.
+        ("image/aces", ".exr"),
+        ("image/apng", ".apng"),
+        ("image/avci", ".avci"),
+        ("image/avcs", ".avcs"),
+        ("image/avif", ".avif"),
         ("image/bmp", ".bmp"),
+        ("image/cgm", ".cgm"),
+        ("image/dicom-rle", ".drle"),
+        ("image/dpx", ".dpx"),
+        ("image/emf", ".emf"),
+        ("image/fits", ".fits"),
+        ("image/g3fax", ".g3"),
         ("image/gif", ".gif"),
+        ("image/heic", ".heic"),
+        ("image/heic-sequence", ".heics"),
+        ("image/heif", ".heif"),
+        ("image/heif-sequence", ".heifs"),
+        ("image/hej2k", ".hej2"),
+        ("image/hsj2", ".hsj2"),
+        ("image/ief", ".ief"),
+        ("image/jls", ".jls"),
+        ("image/jp2", ".jp2"),
         ("image/jpeg", ".jpg"),
+        ("image/jpg", ".jpg"),
+        ("image/jph", ".jph"),
+        ("image/jphc", ".jhc"),
+        ("image/jpm", ".jpgm"),
+        ("image/jpx", ".jpf"),
+        ("image/jxr", ".jxr"),
+        ("image/jxra", ".jxra"),
+        ("image/jxrs", ".jxrs"),
+        ("image/jxs", ".jxs"),
+        ("image/jxsc", ".jxsc"),
+        ("image/jxsi", ".jxsi"),
+        ("image/jxss", ".jxss"),
+        ("image/ktx", ".ktx"),
+        ("image/ktx2", ".ktx2"),
         ("image/png", ".png"),
+        ("image/prs.btif", ".btf"),
+        ("image/prs.pti", ".pti"),
+        ("image/sgi", ".sgi"),
         ("image/svg+xml", ".svg"),
+        ("image/t38", ".t38"),
         ("image/tiff", ".tiff"),
+        ("image/tiff-fx", ".tfx"),
+        ("image/vnd.adobe.photoshop", ".psd"),
+        ("image/vnd.airzip.accelerator.azv", ".azv"),
+        ("image/vnd.dece.graphic", ".uvg"),
+        ("image/vnd.djvu", ".djv"),
+        ("image/vnd.dwg", ".dwg"),
+        ("image/vnd.dxf", ".dxf"),
+        ("image/vnd.fastbidsheet", ".fbs"),
+        ("image/vnd.fpx", ".fpx"),
+        ("image/vnd.fst", ".fst"),
+        ("image/vnd.fujixerox.edmics-mmr", ".mmr"),
+        ("image/vnd.fujixerox.edmics-rlc", ".rlc"),
         ("image/vnd.microsoft.icon", ".ico"),
+        ("image/vnd.ms-dds", ".dds"),
+        ("image/vnd.ms-modi", ".mdi"),
+        ("image/vnd.ms-photo", ".wdp"),
+        ("image/vnd.net-fpx", ".npx"),
+        ("image/vnd.pco.b16", ".b16"),
+        ("image/vnd.tencent.tap", ".tap"),
+        ("image/vnd.valve.source.texture", ".vtf"),
+        ("image/vnd.wap.wbmp", ".wbmp"),
+        ("image/vnd.xiff", ".xif"),
+        ("image/vnd.zbrush.pcx", ".pcx"),
         ("image/webp", ".webp"),
+        ("image/wmf", ".wmf"),
+        ("image/x-3ds", ".3ds"),
+        ("image/x-cmu-raster", ".ras"),
+        ("image/x-cmx", ".cmx"),
+        ("image/x-freehand", ".fh"),
         ("image/x-icon", ".ico"),
+        ("image/x-jng", ".jng"),
+        ("image/x-mrsid-image", ".sid"),
+        ("image/x-pict", ".pct"),
         ("image/x-png", ".png"),
+        ("image/x-portable-anymap", ".pnm"),
+        ("image/x-portable-bitmap", ".pbm"),
+        ("image/x-portable-graymap", ".pgm"),
+        ("image/x-portable-pixmap", ".ppm"),
+        ("image/x-rgb", ".rgb"),
+        ("image/x-tga", ".tga"),
+        ("image/x-xbitmap", ".xbm"),
+        ("image/x-xpixmap", ".xpm"),
+        ("image/x-xwindowdump", ".xwd"),
         // Type text
         ("text/css", ".css"),
         ("text/csv", ".csv"),
@@ -357,6 +536,14 @@ mod tests {
     #[case(".tif", "image/tiff")]
     #[case(".tiff", "image/tiff")]
     #[case(".webp", "image/webp")]
+    // Base-table image extensions, the types uploads are now stored under.
+    #[case(".apng", "image/apng")]
+    #[case(".avif", "image/avif")]
+    #[case(".dib", "image/bmp")]
+    #[case(".heic", "image/heic")]
+    #[case(".jpe", "image/jpeg")]
+    #[case(".pct", "image/x-pict")]
+    #[case(".psd", "image/vnd.adobe.photoshop")]
     #[case(".ttf", "font/ttf")]
     #[case(".woff", "font/woff")]
     #[case(".woff2", "font/woff2")]
@@ -450,6 +637,7 @@ mod tests {
     #[case("image/bmp", ".bmp")]
     #[case("image/gif", ".gif")]
     #[case("image/jpeg", ".jpg")]
+    #[case("image/jpg", ".jpg")]
     #[case("image/png", ".png")]
     #[case("image/svg+xml", ".svg")]
     #[case("image/tiff", ".tiff")]
@@ -457,6 +645,16 @@ mod tests {
     #[case("image/webp", ".webp")]
     #[case("image/x-icon", ".ico")]
     #[case("image/x-png", ".png")]
+    // Base-table fallback (`GetMimeTypeExtensions(..).FirstOrDefault()`): the
+    // first extension the `MimeTypes` 2.5.2 table lists for the type.
+    #[case("image/apng", ".apng")]
+    #[case("image/avif", ".avif")]
+    #[case("image/heic", ".heic")]
+    #[case("image/jpm", ".jpgm")]
+    #[case("image/jpx", ".jpf")]
+    #[case("image/vnd.adobe.photoshop", ".psd")]
+    #[case("image/x-pict", ".pct")]
+    #[case("IMAGE/AVIF", ".avif")]
     #[case("text/css", ".css")]
     #[case("text/csv", ".csv")]
     #[case("text/plain", ".txt")]
@@ -497,6 +695,19 @@ mod tests {
         assert_eq!(get_mime_type("disk.iso"), "video/iso");
         // A video extension without a dedicated generic entry → video/mp4.
         assert_eq!(get_mime_type("movie.rmvb"), "video/rmvb");
+    }
+
+    /// Every extension `to_extension` hands out for an image type is typed as an
+    /// image again by `get_mime_type`, so a file stored under it is never served
+    /// as `application/octet-stream`.
+    #[test]
+    fn image_extensions_are_typed_back_as_images() {
+        for (mime_type, extension) in mime_to_extension() {
+            if is_image(mime_type) {
+                let typed = get_mime_type(extension);
+                assert!(is_image(typed), "{mime_type} -> {extension} -> {typed}");
+            }
+        }
     }
 
     #[test]

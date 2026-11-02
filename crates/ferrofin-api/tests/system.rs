@@ -611,6 +611,46 @@ async fn system_logs_list_and_fetch() {
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
 }
 
+/// Listing the log directory and reading a log file run on the blocking pool,
+/// never inline on a runtime worker: with the pool's only thread held busy
+/// neither request can finish, which an inline read would ignore. A debug
+/// server log or a long encode's ffmpeg log runs to hundreds of megabytes.
+#[test]
+fn log_listing_and_reading_go_through_the_blocking_pool() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let hog = tokio::task::spawn_blocking(move || {
+            busy_tx.send(()).ok();
+            release_rx.recv().ok();
+        });
+        busy_rx.await.unwrap();
+
+        for uri in ["/System/Logs", "/System/Logs/Log?name=ferrofin.log"] {
+            let starved = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                get(elevated_full_state(), uri),
+            )
+            .await;
+            assert!(
+                starved.is_err(),
+                "{uri} answered with the blocking pool starved, so it read inline"
+            );
+        }
+
+        release_tx.send(()).unwrap();
+        hog.await.unwrap();
+        let (status, body) = get(elevated_full_state(), "/System/Logs/Log?name=ferrofin.log").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(String::from_utf8(body).unwrap(), "log body");
+    });
+}
+
 #[tokio::test]
 async fn system_endpoint_defaults_to_non_local() {
     let (status, body) = get(full_state(), "/System/Endpoint").await;
@@ -770,6 +810,94 @@ async fn activity_log_binds_query_and_returns_entries() {
     let q = activity.last_query.lock().unwrap().clone().unwrap();
     assert_eq!(q.limit, Some(5));
     assert_eq!(q.has_user_id, Some(true));
+}
+
+/// `[FromQuery] DateTime? minDate, maxDate` bind through ASP.NET's default
+/// binder; EF's `ToUniversalTime` reads an offset-less value as server time.
+#[tokio::test]
+async fn activity_log_binds_offsetless_and_date_only_bounds_as_server_time() {
+    if ferrofin_api::test_support::rerun_in_time_zone(
+        "activity_log_binds_offsetless_and_date_only_bounds_as_server_time",
+    ) {
+        return;
+    }
+    let activity = Arc::new(StubActivity::default());
+    let app = state_with_activity(activity.clone());
+    let (status, _) = get(
+        app,
+        "/System/ActivityLog/Entries?minDate=2026-10-01&maxDate=2026-10-28T12:00:00.5Z",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let q = activity.last_query.lock().unwrap().clone().unwrap();
+    // Midnight in Asia/Kolkata (+05:30).
+    assert_eq!(
+        q.min_date,
+        Some("2026-09-30T18:30:00Z".parse().expect("date"))
+    );
+    assert_eq!(
+        q.max_date,
+        Some("2026-10-28T12:00:00.5Z".parse().expect("date"))
+    );
+}
+
+/// `[FromQuery] ActivityLogSortBy[]? sortBy, SortOrder[]? sortOrder` and
+/// `LogLevel? severity`, as Jellyfin 12.2 binds them (measured on the oracle).
+#[tokio::test]
+async fn activity_log_binds_sorts_and_severity_like_the_model_binder() {
+    use ferrofin_traits::activity::{ActivityLogSortBy as By, SortOrder as Dir};
+    let bind = |query: &'static str| async move {
+        let activity = Arc::new(StubActivity::default());
+        let app = state_with_activity(activity.clone());
+        let (status, _) = get(app, &format!("/System/ActivityLog/Entries?{query}")).await;
+        let last = activity.last_query.lock().unwrap().clone();
+        (status, last)
+    };
+    for (query, expected) in [
+        (
+            "sortBy=Type&sortBy=name",
+            vec![(By::Type, Dir::Ascending), (By::Name, Dir::Ascending)],
+        ),
+        // Numbers are the C# values (DateCreated = 5, Overiew = 1).
+        (
+            "sortBy=5&sortBy=1&sortOrder=1",
+            vec![
+                (By::DateCreated, Dir::Descending),
+                (By::Overview, Dir::Descending),
+            ],
+        ),
+        ("sortBy=OVERIEW", vec![(By::Overview, Dir::Ascending)]),
+        // `GetOrderBy` pads with the FIRST order.
+        (
+            "sortBy=Username&sortBy=LogSeverity&sortBy=Name&sortOrder=Descending&sortOrder=Ascending",
+            vec![
+                (By::Username, Dir::Descending),
+                (By::LogSeverity, Dir::Ascending),
+                (By::Name, Dir::Descending),
+            ],
+        ),
+    ] {
+        let (status, last) = bind(query).await;
+        assert_eq!(status, StatusCode::OK, "{query}");
+        assert_eq!(last.unwrap().order_by, expected, "{query}");
+    }
+    for query in [
+        "sortBy=4",
+        "sortBy=Bogus",
+        "sortBy=",
+        "sortBy=Name&sortOrder=bogus",
+        "sortBy=Name&sortOrder=2",
+    ] {
+        let (status, _) = bind(query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+    }
+    // `NullableEnumModelBinder`: an undefined number is kept, a bad name is null.
+    let (_, last) = bind("severity=99").await;
+    assert_eq!(last.unwrap().severity, Some(LogLevel::Unrecognized(99)));
+    let (_, last) = bind("severity=bogus").await;
+    assert_eq!(last.unwrap().severity, None);
+    let (_, last) = bind("severity=WARNING").await;
+    assert_eq!(last.unwrap().severity, Some(LogLevel::Warning));
 }
 
 #[tokio::test]

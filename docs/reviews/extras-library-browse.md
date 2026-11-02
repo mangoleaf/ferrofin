@@ -196,7 +196,7 @@ All seven paths passed **adoption, restart, scan, and unchanged second scan**:
 | Jellyfin 12.1 from 10.11.8 | PASS |
 | Jellyfin 12.1 through 12.0 | PASS |
 
-The unchanged `adoption/preservation.py` assertions cover metadata, artwork
+The unchanged `gates/adoption/preservation.py` assertions cover metadata, artwork
 bytes decoded as images, account settings and credentials, watch history,
 permissions, library options, subtitles, versions, extras, collections,
 playlists, resume, and next-up views. The second scan checks database writes
@@ -235,7 +235,7 @@ server's `RefreshLibrary` task log, excluding the client's polling delay.
 Raw endpoint measurements: `/tmp/ferrofin-extras-perf/results.json`; server task
 measurements: `before.log` and `after.log` in the same directory.
 
-This uses native HTTP because Docker is unavailable; the standard `bench/`
+This uses native HTTP because Docker is unavailable; the standard `gates/bench/`
 container/load suite was not run. The targeted EXPLAIN regression test separately
 guards owner-scope and path-scope pruning against table scans.
 

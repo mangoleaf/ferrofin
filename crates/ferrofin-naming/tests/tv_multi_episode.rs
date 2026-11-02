@@ -65,6 +65,20 @@ use rstest::rstest;
 #[case("Season 1/series-s09e14-720i.mkv", None)]
 #[case("Season 1/MOONLIGHTING_s01e01-e04.mkv", Some(4))]
 #[case("Season 1/MOONLIGHTING_s01e01-e04", Some(4))]
+// Hyphenated numbers in the episode title must not be read as an episode range
+#[case(
+    "Season 1/S01E01 The 6-10 to Lubbock [WEBRip-1080p][AV1 Opus].mkv",
+    None
+)]
+#[case("Season 5/S05E23 11-59 [HDTV-1080p][x265 AC3].mkv", None)]
+#[case("Season 5/S05E23 11-59 [HDTV-1080p][HEVC AC3].mkv", None)]
+#[case("Season 1/S01E01 1-23-45 [Bluray-1080p][AV1 Opus].mkv", None)]
+// Episode markers in the episode title must not be read as an episode range
+#[case(
+    "Season 03/Star Trek Enterprise (2001) - S03E21 - E2 (1080p BluRay x265).mkv",
+    None
+)]
+#[case("Season 02/Series Name (2001) - S02E10 - E5 [WEBRip-1080p].mkv", None)]
 fn test_get_ending_episode_number_from_file(
     #[case] filename: &str,
     #[case] ending_episode_number: Option<i32>,

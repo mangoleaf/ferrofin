@@ -17,6 +17,48 @@ const OPEN_AFTER_FAILURES: u32 = 6;
 const RECOVERY_SUCCESSES: u32 = 5;
 const RECOVERY_QUIET: Duration = Duration::from_mins(1);
 
+/// Test-only hooks for crates whose tests drive provider clients against a
+/// fake server. Behind the `test-util` feature, which only `[dev-dependencies]`
+/// enable.
+#[cfg(feature = "test-util")]
+pub mod test_support {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub(super) static SKIP_BACKOFF: AtomicBool = AtomicBool::new(false);
+
+    /// Stops every [`RateLimiter`](super::RateLimiter) in this process from
+    /// waiting out failure backoff and its jitter. Every retry is still sent.
+    /// Pacing intervals and server cooldowns (`Retry-After`, quota headers)
+    /// still apply. A circuit still opens, but only until the next paced send
+    /// (the caller's interval or the server's cooldown, whichever is later).
+    /// With neither, it does not hold.
+    ///
+    /// Call it at the start of a test that checks what an endpoint or a scan
+    /// does when a provider fails. Retry, backoff and circuit behaviour is
+    /// tested in this module's own suite, in virtual time.
+    ///
+    /// The switch is process-wide. nextest runs each test in its own process,
+    /// but plain `cargo test` runs a test binary's tests as threads of one
+    /// process, so the switch reaches every test in the binary of a test that
+    /// calls it. A crate whose tests call it must not assert real backoff or
+    /// circuit timing anywhere.
+    pub fn skip_backoff() {
+        SKIP_BACKOFF.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Whether a test called [`test_support::skip_backoff`].
+#[cfg(feature = "test-util")]
+fn backoff_skipped() -> bool {
+    test_support::SKIP_BACKOFF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a test called `test_support::skip_backoff`: never, without `test-util`.
+#[cfg(not(feature = "test-util"))]
+const fn backoff_skipped() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Settings {
     timeout: Duration,
@@ -111,6 +153,22 @@ impl RateLimiter {
         Self {
             metric_label: crate::metrics::provider_label(label),
             ..self.clone()
+        }
+    }
+
+    /// A fresh gate (sharing nothing with `self`) that skips failure backoff and
+    /// its jitter, for a test of what an endpoint does when its provider fails.
+    /// Unlike [`test_support::skip_backoff`] it reaches this limiter only, so
+    /// the limiter's own tests still see real backoff. Every retry is still sent.
+    #[cfg(test)]
+    pub(crate) fn without_backoff(self) -> Self {
+        let rate = RequestRate {
+            skip_backoff: true,
+            ..RequestRate::default()
+        };
+        Self {
+            state: Arc::new(Mutex::new(rate)),
+            ..self
         }
     }
 
@@ -478,9 +536,25 @@ struct RequestRate {
     successes: u32,
     last_failure: Option<Instant>,
     quota: Option<Quota>,
+    /// Set by `RateLimiter::without_backoff`: this gate skips failure backoff.
+    #[cfg(test)]
+    skip_backoff: bool,
 }
 
 impl RequestRate {
+    /// Whether failure backoff and jitter are off, for this gate or the process.
+    #[cfg(test)]
+    fn backoff_skipped(&self) -> bool {
+        self.skip_backoff || backoff_skipped()
+    }
+
+    /// Whether failure backoff and jitter are off for the process.
+    #[cfg(not(test))]
+    #[expect(clippy::unused_self, reason = "same call shape as the test build")]
+    fn backoff_skipped(&self) -> bool {
+        backoff_skipped()
+    }
+
     async fn wait_ready(
         &mut self,
         provider: &str,
@@ -520,7 +594,7 @@ impl RequestRate {
     }
 
     fn adaptive_interval(&self) -> Duration {
-        if self.failures == 0 {
+        if self.failures == 0 || self.backoff_skipped() {
             return Duration::ZERO;
         }
         Duration::from_secs(2_u64 << self.failures.min(6).saturating_sub(1)).min(BACKOFF_CAP)
@@ -600,7 +674,11 @@ impl RequestRate {
         self.last_failure = Some(Instant::now());
         let backoff = self.adaptive_interval();
         // Positive jitter avoids synchronizing clients without shortening Retry-After.
-        let jitter = Duration::from_millis(u64::from(uuid::Uuid::new_v4().as_bytes()[0]));
+        let jitter = if self.backoff_skipped() {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(u64::from(uuid::Uuid::new_v4().as_bytes()[0]))
+        };
         let delay = backoff.max(server_delay).saturating_add(jitter);
         self.postpone(delay);
         if self.failures >= OPEN_AFTER_FAILURES {
@@ -665,6 +743,8 @@ fn server_delay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// `RequestRate::failed`'s jitter is one random byte of milliseconds.
+    const MAX_JITTER: Duration = Duration::from_millis(u8::MAX as u64);
     // Real sockets need executor turns before a paused clock advances to an
     // HTTP timeout. Keep the runtime runnable and advance virtual milliseconds
     // explicitly, giving loopback I/O ample turns between ticks. No real sleeps.
@@ -1083,7 +1163,11 @@ mod tests {
         for _ in 0..20 {
             rate.failed(Duration::ZERO);
         }
-        assert!(rate.failed(Duration::ZERO) < Duration::from_secs(61));
+        let capped = rate.failed(Duration::ZERO);
+        assert!(
+            (BACKOFF_CAP..=BACKOFF_CAP + MAX_JITTER).contains(&capped),
+            "backoff grows to the cap and stops there: {capped:?}"
+        );
         headers.insert("retry-after", "120".parse().unwrap());
         assert_eq!(server_delay(&headers, now), Duration::from_mins(2));
         headers.insert(
@@ -1098,6 +1182,41 @@ mod tests {
         assert_eq!(server_delay(&headers, now), Duration::from_secs(10));
         headers.insert("x-ratelimit-remaining", "14".parse().unwrap());
         assert_eq!(server_delay(&headers, now), Duration::ZERO);
+    }
+
+    /// Jitter is under 256 ms and only ever lengthens a delay: it never
+    /// shortens the backoff or a `Retry-After`.
+    #[test]
+    fn jitter_only_lengthens_the_delay() {
+        let backoff = Duration::from_secs(2);
+        let delays: Vec<_> = (0..32)
+            .map(|_| RequestRate::default().failed(Duration::ZERO))
+            .collect();
+        assert!(
+            delays
+                .iter()
+                .all(|d| (backoff..=backoff + MAX_JITTER).contains(d)),
+            "{delays:?}"
+        );
+        assert!(delays.iter().any(|d| *d > backoff), "no jitter: {delays:?}");
+        let retry_after = Duration::from_mins(2);
+        assert!(RequestRate::default().failed(retry_after) >= retry_after);
+    }
+
+    /// `without_backoff` drops backoff and jitter for one gate only; a server
+    /// cooldown still applies, and a default gate keeps its real backoff.
+    #[test]
+    fn without_backoff_is_per_gate() {
+        let skipping = RateLimiter::new("skipping").without_backoff();
+        let mut rate = skipping.state.try_lock().expect("fresh gate");
+        assert_eq!(rate.failed(Duration::ZERO), Duration::ZERO);
+        let retry_after = Duration::from_secs(5);
+        assert_eq!(rate.failed(retry_after), retry_after);
+        drop(rate);
+
+        let default = RateLimiter::new("default");
+        let mut rate = default.state.try_lock().expect("fresh gate");
+        assert!(rate.failed(Duration::ZERO) >= Duration::from_secs(2));
     }
 
     // Real HTTP exercises the entire request/retry path, including headers and

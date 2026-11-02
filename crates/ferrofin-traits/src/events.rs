@@ -66,6 +66,34 @@ pub trait LibraryChangeAudience: Send + Sync {
         user_id: uuid::Uuid,
     ) -> Result<Vec<uuid::Uuid>, ServiceError>;
 
+    /// The `TopParentId`s the items of `libraries` (collection-folder ids)
+    /// are stored under: each library itself and the folders of its
+    /// locations (its `PhysicalFolderIds`), which is what an item's
+    /// `TopParentId` names. The default is the libraries alone.
+    async fn library_top_parents(
+        &self,
+        libraries: &[uuid::Uuid],
+    ) -> Result<Vec<uuid::Uuid>, ServiceError> {
+        Ok(libraries.to_vec())
+    }
+
+    /// Which of `ids` `user_id` may see on their own:
+    /// `TranslatePhysicalItemToUserLibrary`'s `item.IsVisibleStandalone(user)`
+    /// in `LibraryChangedNotifier`, which besides the library applies the
+    /// item's parents, the user's parental rating and tag rules, and a
+    /// playlist's owner and shares. An id with no row is not visible.
+    ///
+    /// The default admits every id; only test doubles rely on it, and the
+    /// server's audience overrides it.
+    async fn visible_item_ids(
+        &self,
+        user_id: uuid::Uuid,
+        ids: &[uuid::Uuid],
+    ) -> Result<Vec<uuid::Uuid>, ServiceError> {
+        let _ = user_id;
+        Ok(ids.to_vec())
+    }
+
     /// Pushes one user's already-filtered payload to that user's sessions.
     async fn deliver(&self, user_id: uuid::Uuid, payload: &str) -> Result<(), ServiceError>;
 }

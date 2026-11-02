@@ -21,8 +21,11 @@
 //! transliterate hand-derived expectations from the C# logic.
 
 pub mod bitstream;
+pub mod downmix;
 pub mod helper;
 pub mod hw;
+#[cfg(test)]
+pub(crate) mod test_streams;
 pub mod transcode_state;
 
 pub use helper::EncodingHelper;

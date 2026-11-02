@@ -1,0 +1,249 @@
+{
+  "server": {
+    "ServerName": "Dashboard fixture",
+    "UICulture": "fr",
+    "CachePath": "/tmp",
+    "MetadataPath": "/tmp",
+    "QuickConnectAvailable": false,
+    "LibraryScanFanoutConcurrency": 3,
+    "ParallelImageEncodingLimit": 2,
+    "PreferredMetadataLanguage": "fr",
+    "MetadataCountryCode": "FR",
+    "DummyChapterDuration": 240,
+    "ChapterImageResolution": "P480",
+    "EnableFolderView": true,
+    "DisplaySpecialsWithinSeasons": false,
+    "EnableGroupingMoviesIntoCollections": true,
+    "EnableGroupingShowsIntoCollections": true,
+    "EnableExternalContentInSuggestions": false,
+    "RemoteClientBitrateLimit": 8000000,
+    "MinResumePct": 7,
+    "MaxResumePct": 95,
+    "MinAudiobookResume": 120,
+    "MaxAudiobookResume": 180,
+    "MinResumeDurationSeconds": 360,
+    "EnableSlowResponseWarning": true,
+    "SlowResponseThresholdMs": 600,
+    "TrickplayOptions": {
+      "EnableHwAcceleration": true,
+      "EnableHwEncoding": true,
+      "EnableKeyFrameOnlyExtraction": false,
+      "ScanBehavior": "Blocking",
+      "ProcessPriority": "Idle",
+      "Interval": 6000,
+      "WidthResolutions": [
+        240,
+        320
+      ],
+      "TileWidth": 8,
+      "TileHeight": 9,
+      "Qscale": 5,
+      "JpegQuality": 85,
+      "ProcessThreads": 2
+    }
+  },
+  "branding": {
+    "LoginDisclaimer": "Fixture disclaimer",
+    "CustomCss": "body { color: red; }",
+    "SplashscreenEnabled": false
+  },
+  "metadata": {
+    "UseFileCreationTimeForDateAdded": false
+  },
+  "xbmcmetadata": {
+    "UserId": "00000000000000000000000000000001",
+    "ReleaseDateFormat": "yyyy-MM-dd",
+    "SaveImagePathsInNfo": false,
+    "EnablePathSubstitution": true,
+    "EnableExtraThumbsDuplication": true
+  },
+  "network": {
+    "BaseUrl": "/fixture",
+    "EnableHttps": false,
+    "RequireHttps": false,
+    "CertificatePath": "",
+    "CertificatePassword": "",
+    "InternalHttpPort": 8097,
+    "InternalHttpsPort": 8921,
+    "PublicHttpPort": 8098,
+    "PublicHttpsPort": 8922,
+    "AutoDiscovery": false,
+    "EnableIPv4": true,
+    "EnableIPv6": false,
+    "EnableRemoteAccess": true,
+    "LocalNetworkSubnets": [
+      "192.168.0.0/16"
+    ],
+    "LocalNetworkAddresses": [
+      "127.0.0.1"
+    ],
+    "KnownProxies": [
+      "127.0.0.1"
+    ],
+    "RemoteIPFilter": [
+      "203.0.113.0/24"
+    ],
+    "IsRemoteIPFilterBlacklist": true,
+    "PublishedServerUriBySubnet": [
+      "all=https://example.invalid/fixture"
+    ]
+  },
+  "livetv": {
+    "GuideDays": 7,
+    "RecordingPath": "/tmp",
+    "MovieRecordingPath": "/tmp/movies",
+    "SeriesRecordingPath": "/tmp/series",
+    "PrePaddingSeconds": 120,
+    "PostPaddingSeconds": 180,
+    "RecordingPostProcessor": "/bin/true",
+    "RecordingPostProcessorArguments": "{path}",
+    "SaveRecordingNFO": false,
+    "SaveRecordingImages": false
+  },
+  "encoding": {
+    "EncodingThreadCount": 3,
+    "TranscodingTempPath": "/tmp",
+    "FallbackFontPath": "/tmp/fonts",
+    "EnableFallbackFont": true,
+    "EnableAudioVbr": true,
+    "DownMixAudioBoost": 1.5,
+    "DownMixStereoAlgorithm": "NightmodeDialogue",
+    "MaxMuxingQueueSize": 1024,
+    "EnableThrottling": true,
+    "ThrottleDelaySeconds": 150,
+    "EnableSegmentDeletion": true,
+    "SegmentKeepSeconds": 180,
+    "HardwareAccelerationType": "vaapi",
+    "VaapiDevice": "/dev/dri/renderD128",
+    "QsvDevice": "0",
+    "EnableTonemapping": true,
+    "EnableVppTonemapping": true,
+    "EnableVideoToolboxTonemapping": false,
+    "TonemappingAlgorithm": "hable",
+    "TonemappingMode": "rgb",
+    "TonemappingRange": "pc",
+    "TonemappingDesat": 0.5,
+    "TonemappingPeak": 100.5,
+    "TonemappingParam": 0.25,
+    "VppTonemappingBrightness": 0.5,
+    "VppTonemappingContrast": 1.25,
+    "H264Crf": 21,
+    "H265Crf": 25,
+    "EncoderPreset": "fast",
+    "DeinterlaceDoubleRate": true,
+    "DeinterlaceMethod": "bwdif",
+    "EnableDecodingColorDepth10Hevc": true,
+    "EnableDecodingColorDepth10Vp9": true,
+    "EnableDecodingColorDepth10HevcRext": true,
+    "EnableDecodingColorDepth12HevcRext": true,
+    "EnableEnhancedNvdecDecoder": false,
+    "PreferSystemNativeHwDecoder": true,
+    "EnableIntelLowPowerH264HwEncoder": true,
+    "EnableIntelLowPowerHevcHwEncoder": true,
+    "EnableHardwareEncoding": true,
+    "AllowHevcEncoding": true,
+    "AllowAv1Encoding": true,
+    "EnableSubtitleExtraction": false,
+    "HardwareDecodingCodecs": [
+      "h264",
+      "hevc"
+    ],
+    "HlsAudioSeekStrategy": "TranscodeAudio"
+  },
+  "library": {
+    "Enabled": true,
+    "EnableArchiveMediaFiles": false,
+    "EnablePhotos": true,
+    "EnableRealtimeMonitor": false,
+    "EnableLUFSScan": true,
+    "ExtractTrickplayImagesDuringLibraryScan": true,
+    "SaveTrickplayWithMedia": true,
+    "EnableTrickplayImageExtraction": true,
+    "ExtractChapterImagesDuringLibraryScan": true,
+    "EnableChapterImageExtraction": true,
+    "EnableInternetProviders": true,
+    "SaveLocalMetadata": true,
+    "EnableAutomaticSeriesGrouping": false,
+    "PreferredMetadataLanguage": "fr",
+    "MetadataCountryCode": "FR",
+    "SeasonZeroDisplayName": "Bonus",
+    "AutomaticRefreshIntervalDays": 14,
+    "EnableEmbeddedTitles": true,
+    "EnableEmbeddedExtrasTitles": true,
+    "EnableEmbeddedEpisodeInfos": true,
+    "AllowEmbeddedSubtitles": "AllowText",
+    "SkipSubtitlesIfEmbeddedSubtitlesPresent": true,
+    "SkipSubtitlesIfAudioTrackMatches": true,
+    "SaveSubtitlesWithMedia": true,
+    "SaveLyricsWithMedia": true,
+    "RequirePerfectSubtitleMatch": false,
+    "AutomaticallyAddToCollection": true,
+    "PreferNonstandardArtistsTag": true,
+    "UseCustomTagDelimiters": true,
+    "MetadataSavers": [
+      "Nfo"
+    ],
+    "LocalMetadataReaderOrder": [
+      "Nfo"
+    ],
+    "SubtitleDownloadLanguages": [
+      "fre",
+      "eng"
+    ],
+    "CustomTagDelimiters": [
+      ";",
+      "|"
+    ],
+    "DelimiterWhitelist": [
+      "AC/DC"
+    ],
+    "DisabledSubtitleFetchers": [
+      "Open Subtitles"
+    ],
+    "SubtitleFetcherOrder": [
+      "Open Subtitles"
+    ],
+    "DisabledLyricFetchers": [
+      "LrcLib"
+    ],
+    "LyricFetcherOrder": [
+      "LrcLib"
+    ],
+    "DisabledMediaSegmentProviders": [
+      "Chapter Segments Provider"
+    ],
+    "MediaSegmentProviderOrder": [
+      "Chapter Segments Provider"
+    ],
+    "TypeOptions": [
+      {
+        "Type": "Movie",
+        "MetadataFetchers": [
+          "TheMovieDb"
+        ],
+        "MetadataFetcherOrder": [
+          "TheMovieDb"
+        ],
+        "ImageFetchers": [
+          "TheMovieDb"
+        ],
+        "ImageFetcherOrder": [
+          "TheMovieDb"
+        ],
+        "SimilarItemProviders": [
+          "TheMovieDb"
+        ],
+        "SimilarItemProviderOrder": [
+          "TheMovieDb"
+        ],
+        "ImageOptions": [
+          {
+            "Type": "Backdrop",
+            "Limit": 3,
+            "MinWidth": 1280
+          }
+        ]
+      }
+    ]
+  }
+}

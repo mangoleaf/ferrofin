@@ -4,9 +4,10 @@
 //! `IAuthorizationContext` implementation) and the trivial `IAuthService`
 //! wrapper that promotes an unauthenticated request into an error.
 //!
-//! The context parses the `MediaBrowser`/`Emby` authorization header (and the
-//! legacy `X-Emby-Token` / `X-MediaBrowser-Token` headers and `ApiKey`/`api_key`
-//! query parameters when legacy authorization is enabled), then resolves the
+//! The context parses the `MediaBrowser` authorization header and the `ApiKey`
+//! query parameter (plus the `Emby` scheme, the `X-Emby-Authorization`,
+//! `X-Emby-Token` / `X-MediaBrowser-Token` headers and the `api_key` query
+//! parameter when legacy authorization is enabled), then resolves the
 //! token against the `Devices` and `ApiKeys` tables, filling in the client /
 //! device / version fields the client omitted.
 //!
@@ -184,10 +185,11 @@ impl FerrofinAuthorizationContext {
         // The row-refresh bookkeeping below is deliberately skipped on a hit —
         // it re-runs on the next TTL expiry, the same cadence Jellyfin's
         // in-memory device map effectively gives it.
-        if let Some((device, user)) = self.auth_cache.get(token) {
+        if let Some((device, user, policy)) = self.auth_cache.get(token) {
             info.is_authenticated = true;
             fill_blank_client_fields(info, &device);
             info.user = user;
+            info.user_policy = policy;
             return Ok(true);
         }
 
@@ -249,14 +251,29 @@ impl FerrofinAuthorizationContext {
             Err(_) => None,
         };
 
+        if let Some(user) = &info.user {
+            info.user_policy = Some(Arc::new(
+                self.user_manager
+                    .get_user_dto(user, None)
+                    .await?
+                    .policy
+                    .ok_or_else(|| ServiceError::unauthorized("User policy is unavailable."))?,
+            ));
+        }
+
         if update {
             device.date_modified = Utc::now();
             self.update_device(&device).await?;
         }
         // Cache the row exactly as it now exists (post-refresh), so a hit
         // serves what a re-read would.
-        self.auth_cache
-            .put(generation, token, device, info.user.clone());
+        self.auth_cache.put(
+            generation,
+            token,
+            device,
+            info.user.clone(),
+            info.user_policy.clone(),
+        );
         Ok(true)
     }
 
@@ -357,6 +374,7 @@ impl AuthorizationContext for FerrofinAuthorizationContext {
             token: None,
             is_api_key: false,
             user: None,
+            user_policy: None,
             is_authenticated: false,
             // C# reads `HttpContext.GetNormalizedRemoteIP()` ambiently; the
             // portable seam carries it on the request context, so it rides
@@ -375,6 +393,16 @@ impl AuthorizationContext for FerrofinAuthorizationContext {
         if !self.resolve_device_token(&mut info, token.expose()).await? {
             self.resolve_api_key_token(&mut info, token.expose())
                 .await?;
+        }
+        // The HTTP middleware consumes this context directly, so the disabled
+        // check must run here as well as through AuthService. Existing device
+        // rows cannot keep a locked-out account authenticated.
+        if info
+            .user_policy
+            .as_ref()
+            .is_some_and(|policy| policy.is_disabled)
+        {
+            info.is_authenticated = false;
         }
         Ok(info)
     }
@@ -608,6 +636,7 @@ mod tests {
     use ferrofin_db::Database;
     use ferrofin_model::configuration::ServerConfiguration;
     use ferrofin_traits::net::RequestContext as HostRequestContext;
+    use ferrofin_traits::system::LocalApiAccess;
     use ferrofin_traits::system::ServerApplicationPaths;
 
     /// A minimal [`ServerConfigurationManager`] returning a fixed configuration;
@@ -672,6 +701,13 @@ mod tests {
     }
 
     #[async_trait]
+    impl LocalApiAccess for FakeHost {
+        async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+            unreachable!()
+        }
+    }
+
+    #[async_trait]
     impl ServerApplicationHost for FakeHost {
         fn core_startup_has_completed(&self) -> bool {
             true
@@ -690,6 +726,9 @@ mod tests {
         }
         fn friendly_name(&self) -> String {
             self.name.clone()
+        }
+        fn base_url(&self) -> String {
+            String::new()
         }
         async fn get_smart_api_url(
             &self,
@@ -1447,7 +1486,7 @@ mod tests {
             .unwrap();
 
         // Now the in-flight request finishes and caches what it read.
-        cache.put(generation, "dev-tok", device, None);
+        cache.put(generation, "dev-tok", device, None, None);
 
         let info = ctx.get_authorization_info(&token_request()).await.unwrap();
         assert!(
@@ -1477,6 +1516,76 @@ mod tests {
             cache.is_empty(),
             "password change dropped every cached resolution"
         );
+    }
+
+    #[tokio::test]
+    async fn saved_disable_and_lockout_reject_existing_cached_tokens() {
+        use ferrofin_model::users::UserPolicy;
+        let db = crate::test_support::test_db().await;
+        let cache = Arc::new(AuthCache::default());
+        let users = Arc::new(FerrofinUserManager::new(db.clone()).with_auth_cache(cache.clone()));
+        let user = users.create_user("policy-user").await.unwrap();
+        let uid = Uuid::parse_str(&user.id).unwrap();
+        users.change_password(uid, "password").await.unwrap();
+        seed_device(&db, uid).await;
+        let mut ctx = context(db).with_auth_cache(cache);
+        ctx.user_manager = users.clone();
+        let request = token_request();
+        let before = ctx.get_authorization_info(&request).await.unwrap();
+        let hit = ctx.get_authorization_info(&request).await.unwrap();
+        assert!(Arc::ptr_eq(
+            before.user_policy.as_ref().unwrap(),
+            hit.user_policy.as_ref().unwrap()
+        ));
+        let mut policy = UserPolicy {
+            is_disabled: true,
+            ..UserPolicy::default()
+        };
+        users.update_policy(uid, &policy).await.unwrap();
+        for _ in 0..2 {
+            assert!(
+                !ctx.get_authorization_info(&request)
+                    .await
+                    .unwrap()
+                    .is_authenticated
+            );
+            assert!(matches!(
+                AuthService::authenticate(&ctx, &request).await,
+                Err(ServiceError::Unauthorized(_))
+            ));
+        }
+        policy.is_disabled = false;
+        policy.is_hidden = true;
+        policy.login_attempts_before_lockout = 2;
+        users.update_policy(uid, &policy).await.unwrap();
+        assert!(
+            ctx.get_authorization_info(&request)
+                .await
+                .unwrap()
+                .is_authenticated
+        );
+        assert!(
+            users
+                .authenticate_user("policy-user", "password", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_some(),
+            "hidden users can log in by name"
+        );
+        for _ in 0..2 {
+            assert!(
+                users
+                    .authenticate_user("policy-user", "wrong", "127.0.0.1", true)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        for _ in 0..2 {
+            let locked = ctx.get_authorization_info(&request).await.unwrap();
+            assert!(!locked.is_authenticated);
+            assert!(locked.user_policy.unwrap().is_disabled);
+        }
     }
 
     #[tokio::test]

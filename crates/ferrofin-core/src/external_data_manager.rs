@@ -30,7 +30,7 @@ use ferrofin_traits::chapters::ChapterManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::persistence::KeyframeRepository;
-use ferrofin_traits::system::{ExternalDataManager, PathManager};
+use ferrofin_traits::system::{ExternalDataManager, MediaLocation, PathManager};
 use ferrofin_traits::trickplay::TrickplayManager;
 use uuid::Uuid;
 
@@ -127,14 +127,34 @@ impl FerrofinExternalDataManager {
 
     /// Removes every extracted-data folder for an item, logging and skipping
     /// failures (C# `DeleteExternalItemFiles`).
-    fn delete_files(&self, item_id: Uuid, media_path: &str) {
-        for path in self.path_manager.extracted_data_paths(item_id, media_path) {
-            if !self.directory_remover.exists(&path) {
-                continue;
+    ///
+    /// The checks and removals (a series' trickplay tiles, subtitle and
+    /// attachment caches and chapter images, item by item) run on the
+    /// blocking pool, never on a runtime worker.
+    async fn delete_files(&self, item_id: Uuid, media: MediaLocation<'_>) {
+        let paths = self.path_manager.extracted_data_paths(item_id, media);
+        let remover = Arc::clone(&self.directory_remover);
+        let removal = tokio::task::spawn_blocking(move || {
+            for path in paths {
+                // Never the root, an empty path or a relative one — a trickplay
+                // folder computed for a path with no folder would otherwise be
+                // `X.trickplay` against the server's working directory.
+                if !crate::item_deletion::is_deletable_path(std::path::Path::new(&path)) {
+                    if !path.is_empty() {
+                        tracing::warn!(item_id = %item_id, path, "refusing to delete extracted data at a root or relative path");
+                    }
+                    continue;
+                }
+                if !remover.exists(&path) {
+                    continue;
+                }
+                if let Err(err) = remover.remove_dir_all(&path) {
+                    tracing::warn!(%path, %err, "unable to prune external item data");
+                }
             }
-            if let Err(err) = self.directory_remover.remove_dir_all(&path) {
-                tracing::warn!(%path, %err, "unable to prune external item data");
-            }
+        });
+        if let Err(err) = removal.await {
+            tracing::warn!(item_id = %item_id, %err, "pruning external item data did not finish");
         }
     }
 }
@@ -144,10 +164,10 @@ impl ExternalDataManager for FerrofinExternalDataManager {
     async fn delete_external_item_data(
         &self,
         item_id: Uuid,
-        media_path: &str,
+        media: MediaLocation<'_>,
     ) -> Result<(), ServiceError> {
         // Filesystem first, then the four DB-side deletions (C# ordering).
-        self.delete_files(item_id, media_path);
+        self.delete_files(item_id, media).await;
         self.keyframe_repository
             .delete_keyframe_data(item_id)
             .await?;
@@ -162,9 +182,9 @@ impl ExternalDataManager for FerrofinExternalDataManager {
     async fn delete_external_item_files(
         &self,
         item_id: Uuid,
-        media_path: &str,
+        media: MediaLocation<'_>,
     ) -> Result<(), ServiceError> {
-        self.delete_files(item_id, media_path);
+        self.delete_files(item_id, media).await;
         Ok(())
     }
 }
@@ -203,7 +223,7 @@ mod tests {
         paths: Vec<String>,
     }
     impl PathManager for StubPathManager {
-        fn trickplay_directory(&self, _: Uuid, _: &str, _: bool) -> String {
+        fn trickplay_directory(&self, _: Uuid, _: MediaLocation<'_>, _: bool) -> String {
             String::new()
         }
         fn subtitle_path(&self, _: &str, _: i32, _: &str) -> Option<String> {
@@ -221,10 +241,10 @@ mod tests {
         fn chapter_image_folder_path(&self, _: Uuid, _: &str) -> String {
             String::new()
         }
-        fn chapter_image_path(&self, _: Uuid, _: &str, _: i64) -> String {
+        fn chapter_image_path(&self, _: Uuid, _: &str, _: i64, _: i64) -> String {
             String::new()
         }
-        fn extracted_data_paths(&self, _: Uuid, _: &str) -> Vec<String> {
+        fn extracted_data_paths(&self, _: Uuid, _: MediaLocation<'_>) -> Vec<String> {
             self.paths.clone()
         }
     }
@@ -413,7 +433,7 @@ mod tests {
             Arc::clone(&remover) as Arc<dyn DirectoryRemover>,
         );
 
-        mgr.delete_external_item_data(item, "/media/x.mkv")
+        mgr.delete_external_item_data(item, MediaLocation::of_file("/media/x.mkv"))
             .await
             .expect("delete");
 
@@ -447,11 +467,98 @@ mod tests {
             Arc::clone(&remover) as Arc<dyn DirectoryRemover>,
         );
 
-        mgr.delete_external_item_files(item, "/media/x.mkv")
+        mgr.delete_external_item_files(item, MediaLocation::of_file("/media/x.mkv"))
             .await
             .expect("delete files");
 
         assert_eq!(*remover.removed.lock().unwrap(), vec!["/x/a"]);
         assert!(deletes.keyframe.lock().unwrap().is_empty());
+    }
+
+    /// Removing the extracted-data folders (`is_dir`, `remove_dir_all` over a
+    /// series' trickplay tiles, caches and chapter images) runs on the
+    /// blocking pool, never inline on a runtime worker. With the pool's only
+    /// thread held busy the removal cannot happen, which an inline removal
+    /// would ignore.
+    #[test]
+    fn removing_extracted_data_goes_through_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let remover = Arc::new(RecordingRemover {
+                existing: vec!["/x/a".to_owned()],
+                ..Default::default()
+            });
+            let deletes = Arc::new(RecordingDeletes::default());
+            let mgr = Arc::new(FerrofinExternalDataManager::with_remover(
+                Arc::new(StubPathManager {
+                    paths: vec!["/x/a".to_owned()],
+                }),
+                Arc::clone(&deletes) as Arc<dyn KeyframeRepository>,
+                Arc::clone(&deletes) as Arc<dyn MediaSegmentManager>,
+                Arc::clone(&deletes) as Arc<dyn TrickplayManager>,
+                Arc::clone(&deletes) as Arc<dyn ChapterManager>,
+                Arc::clone(&remover) as Arc<dyn DirectoryRemover>,
+            ));
+
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+
+            let mut delete = tokio::spawn(async move {
+                mgr.delete_external_item_files(
+                    Uuid::new_v4(),
+                    MediaLocation::of_file("/media/x.mkv"),
+                )
+                .await
+            });
+            let starved =
+                tokio::time::timeout(std::time::Duration::from_millis(250), &mut delete).await;
+            assert!(
+                starved.is_err() && remover.removed.lock().unwrap().is_empty(),
+                "the folders were removed with the blocking pool starved, so inline on the runtime"
+            );
+
+            release_tx.send(()).unwrap();
+            hog.await.unwrap();
+            delete.await.unwrap().expect("delete files");
+            assert_eq!(*remover.removed.lock().unwrap(), vec!["/x/a"]);
+        });
+    }
+
+    /// The root guard: a root, empty or relative extracted-data path is
+    /// never removed, even when the remover says it exists — a trickplay
+    /// folder computed for a path with no folder would otherwise resolve
+    /// against the working directory.
+    #[tokio::test]
+    async fn root_empty_and_relative_paths_are_never_removed() {
+        let candidates = ["/", "", "Film.trickplay", "/x/kept"];
+        let remover = Arc::new(RecordingRemover {
+            existing: candidates.iter().map(|p| (*p).to_owned()).collect(),
+            ..Default::default()
+        });
+        let path_manager = Arc::new(StubPathManager {
+            paths: candidates.iter().map(|p| (*p).to_owned()).collect(),
+        });
+        let deletes = Arc::new(RecordingDeletes::default());
+        let mgr = FerrofinExternalDataManager::with_remover(
+            path_manager,
+            Arc::clone(&deletes) as Arc<dyn KeyframeRepository>,
+            Arc::clone(&deletes) as Arc<dyn MediaSegmentManager>,
+            Arc::clone(&deletes) as Arc<dyn TrickplayManager>,
+            Arc::clone(&deletes) as Arc<dyn ChapterManager>,
+            Arc::clone(&remover) as Arc<dyn DirectoryRemover>,
+        );
+        mgr.delete_external_item_files(Uuid::new_v4(), MediaLocation::default())
+            .await
+            .expect("delete files");
+        assert_eq!(*remover.removed.lock().unwrap(), vec!["/x/kept"]);
     }
 }

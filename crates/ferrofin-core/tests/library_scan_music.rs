@@ -110,9 +110,9 @@ impl Music {
                 } else if line.contains("/ws/2/artist?") {
                     format!(r#"{{"artists":[{{"id":"{ARTIST}","name":"Miles Davis"}}]}}"#)
                 } else if line.contains("/album-mb.php") {
-                    r#"{"album":[{"strDescriptionEN":"Album text.","strGenre":"Jazz"}]}"#.to_owned()
+                    r#"{"album":[{"strDescription":"Album text.","strGenre":"Jazz"}]}"#.to_owned()
                 } else {
-                    r#"{"artists":[{"strBiographyEN":"Artist bio.","strGenre":"Jazz"}]}"#.to_owned()
+                    r#"{"artists":[{"strBiography":"Artist bio.","strGenre":"Jazz"}]}"#.to_owned()
                 };
                 let _ = write!(
                     s,
@@ -422,11 +422,15 @@ async fn a_new_album_fetches_only_itself() {
 }
 
 /// The library monitor's scan of a new track in an existing album (the
-/// watcher, a webhook): the album is the nearest existing item, so it — and
-/// only it — refreshes, its music pass included; its artist above it is
-/// context only: no provider is asked about it and its row is not written.
+/// watcher, a webhook): the album is the nearest existing item, so it goes
+/// through the refresh decision — and is not refreshed, though its folder's
+/// mtime moved: a directory has no `DateModified` (D2), and
+/// `BaseItem.RequiresRefresh` is false for a `MinValue` one
+/// (`BaseItem.cs:1721-1731`). So its music pass asks nothing; its artist
+/// above it is context only: no provider is asked about it and its row is
+/// not written.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_track_reported_by_the_watcher_refreshes_only_its_album() {
+async fn a_new_track_reported_by_the_watcher_refreshes_neither_its_album_nor_its_artist() {
     let tmp = tempfile::tempdir().expect("tmp");
     let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
     fx.scan().await;
@@ -447,27 +451,15 @@ async fn a_new_track_reported_by_the_watcher_refreshes_only_its_album() {
         .await
         .expect("scan");
     assert_eq!(outcome.created, 1, "the track: {outcome:?}");
-    assert_eq!(outcome.updated, 1, "its album: {outcome:?}");
+    assert_eq!(outcome.updated, 0, "its album: {outcome:?}");
     let asked = fx.music.take();
-    assert!(
-        !asked.is_empty(),
-        "the album's music refresh asked its providers"
+    assert!(asked.is_empty(), "no music provider is asked: {asked:?}");
+    let album_after = fx.row(fx.album_id()).await;
+    assert_eq!(
+        album_after.date_last_refreshed, album.date_last_refreshed,
+        "the album is not refreshed"
     );
-    assert!(
-        asked
-            .iter()
-            .all(|l| !l.contains("/ws/2/artist") && !l.contains("artist-mb.php")),
-        "nothing about the artist: {asked:?}"
-    );
-    assert!(
-        searches(&asked).is_empty(),
-        "by the stored match: {asked:?}"
-    );
-    assert_ne!(
-        fx.row(fx.album_id()).await.date_last_refreshed,
-        album.date_last_refreshed,
-        "the album refreshed"
-    );
+    assert_eq!(album_after.date_modified, None, "a directory has none");
     let artist_after = fx.row(fx.artist_id()).await;
     assert_eq!(
         artist_after.date_last_saved, artist.date_last_saved,
@@ -730,6 +722,44 @@ async fn a_by_name_artist_refreshes_through_the_scanner() {
     assert_eq!(
         fx.id_of(id, "MusicBrainzArtist").await.as_deref(),
         Some(CHOSEN_ARTIST)
+    );
+}
+
+/// The server-wide options ship with TheAudioDB off for music albums and
+/// artists (`ServerConfiguration`). A music artist whose library saved no
+/// MusicArtist choices still asks it, as v12.2 `CanRefreshMetadata` lets
+/// every metadata provider through for a `MusicArtist` with no type options
+/// (jellyfin/jellyfin#16606); an album has no such exception.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_music_artist_without_type_options_asks_theaudiodb_despite_the_server_defaults() {
+    use ferrofin_model::configuration::MetadataOptions;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
+    let disabled = |kind: &str| MetadataOptions {
+        item_type: Some(kind.to_owned()),
+        disabled_metadata_fetchers: vec!["TheAudioDB".to_owned()],
+        ..MetadataOptions::default()
+    };
+    let server = vec![disabled("MusicAlbum"), disabled("MusicArtist")];
+    let fx = Fixture {
+        scanner: fx.scanner.with_metadata_options(move || server.clone()),
+        ..fx
+    };
+    fx.scan().await;
+    let asked = fx.music.take();
+    assert!(
+        asked.iter().any(|l| l.contains("/artist-mb.php")),
+        "the artist asks TheAudioDB: {asked:?}"
+    );
+    assert!(
+        !asked.iter().any(|l| l.contains("/album-mb.php")),
+        "the album follows the server-wide options: {asked:?}"
+    );
+    let artist = derive_item_id(BaseItemKind::MusicArtist, &fx.artist_dir.to_string_lossy())
+        .expect("artist id");
+    assert_eq!(
+        fx.row(artist).await.overview.as_deref(),
+        Some("Artist bio.")
     );
 }
 
@@ -1052,30 +1082,33 @@ async fn a_first_scan_searches_the_album_by_its_artists_id() {
     );
 }
 
-/// A folder change on an album left for the music pass survives a scan
-/// stopped before that pass: the walk keeps the stored `DateModified` for
-/// the music pass to write with its refresh (upstream's one `SaveInternal`,
-/// `MetadataService.cs:244-255`), so the next scan still sees the change
-/// and runs the album's providers.
+/// A refresh of an album left for the music pass survives a scan stopped
+/// before that pass: the walk leaves the album's `DateLastRefreshed` for
+/// the music pass to stamp with its refresh (upstream's one `SaveInternal`,
+/// `MetadataService.cs:244-255`), so the next scan still finds the album
+/// due and runs its providers. The album is due as never refreshed
+/// (`isFirstRefresh`); a changed folder would not make it due (a directory
+/// has no `DateModified`, D2).
 #[tokio::test(flavor = "multi_thread")]
-async fn an_album_change_survives_a_scan_cancelled_before_its_music_pass() {
+async fn an_album_refresh_survives_a_scan_cancelled_before_its_music_pass() {
     let tmp = tempfile::tempdir().expect("tmp");
     let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
     fx.scan().await;
     fx.music.take();
+    sqlx::query(r#"UPDATE "BaseItems" SET "DateLastRefreshed" = NULL WHERE "Id" = ?1"#)
+        .bind(ferrofin_db::store::guid_to_db(fx.album_id()))
+        .execute(fx.db.writer())
+        .await
+        .expect("never refreshed");
     let before = fx.row(fx.album_id()).await;
-    std::fs::File::open(&fx.album_dir)
-        .expect("open the album folder")
-        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
-        .expect("touch");
 
     let stopped = scan_cancelled_after_the_walk(&fx.scanner).await;
     assert!(stopped.stopped, "{stopped:?}");
     assert!(fx.music.take().is_empty(), "no music pass ran");
     assert_eq!(
-        fx.row(fx.album_id()).await.date_modified,
-        before.date_modified,
-        "the change is still to be refreshed"
+        fx.row(fx.album_id()).await.date_last_refreshed,
+        None,
+        "the refresh is still to be run"
     );
 
     fx.scan().await;
@@ -1087,8 +1120,11 @@ async fn an_album_change_survives_a_scan_cancelled_before_its_music_pass() {
         "the album's providers run: {asked:?}"
     );
     let after = fx.row(fx.album_id()).await;
-    assert_ne!(after.date_modified, before.date_modified, "written now");
-    assert!(after.date_last_refreshed > before.date_last_refreshed);
+    assert!(after.date_last_refreshed.is_some(), "stamped now");
+    assert!(
+        after.date_last_saved > before.date_last_saved,
+        "written now"
+    );
     fx.scan().await;
     assert!(fx.music.take().is_empty(), "then quiet");
 }
@@ -1192,6 +1228,218 @@ async fn a_by_name_artist_whose_lookup_failed_is_retried_by_a_quiet_rescan() {
 
     fx.scan().await;
     assert!(fx.music.take().is_empty(), "then never again");
+}
+
+/// `MusicAlbum.RefreshAllMetadata` ends a refresh that is not automated
+/// (`POST /Items/{id}/Refresh`) by refreshing the album's artists known only
+/// by name (`RefreshArtists`, `MusicAlbum.cs:212-236`). The same refresh run
+/// by a scan is automated and leaves them, and the album's folder-backed
+/// artist is never refreshed through it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_album_refresh_refreshes_its_artists_known_only_by_name() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
+    fx.scan().await;
+    // Gil Evans, credited on every track and so on the album, known only by
+    // name and never refreshed yet.
+    for track in ["01 - So What.mp3", "02 - Blue in Green.mp3"] {
+        let id = derive_item_id(
+            BaseItemKind::Audio,
+            &fx.album_dir.join(track).to_string_lossy(),
+        )
+        .expect("id");
+        let row = fx.row(id).await;
+        fx.persistence
+            .save_items(&[BaseItemEntity {
+                artists: Some("Gil Evans".into()),
+                ..row
+            }])
+            .await
+            .expect("credit the track");
+        fx.persistence
+            .save_item_values(id, &[(1, "Gil Evans".into())])
+            .await
+            .expect("materialize");
+    }
+    let album = fx.row(fx.album_id()).await;
+    fx.persistence
+        .save_items(&[BaseItemEntity {
+            artists: Some("Gil Evans".into()),
+            ..album
+        }])
+        .await
+        .expect("credit the album");
+    let gil = by_name_artist(&fx, "Gil Evans").await;
+    assert!(fx.row(gil).await.date_last_refreshed.is_none());
+    let miles = fx.row(fx.artist_id()).await.date_last_refreshed;
+    fx.music.take();
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    let refresh_album = |options: MetadataRefreshOptions| {
+        let scanner = &fx.scanner;
+        let target = ScanTarget::Paths(vec![fx.album_dir.to_string_lossy().into_owned()]);
+        let none = none.clone();
+        async move {
+            let cancel = ScanCancel::new();
+            scanner
+                .scan_target(
+                    &target,
+                    ScanRun::new(&options, &none, &cancel).with_passes(ScanPasses::Touched),
+                )
+                .await
+                .expect("refresh")
+        }
+    };
+
+    refresh_album(MetadataRefreshOptions::default()).await;
+    assert!(
+        fx.row(gil).await.date_last_refreshed.is_none(),
+        "an automated refresh leaves the album's artists: {:?}",
+        fx.music.take()
+    );
+
+    refresh_album(MetadataRefreshOptions::for_item_refresh(
+        MetadataRefreshMode::Default,
+        MetadataRefreshMode::Default,
+        false,
+        false,
+        false,
+    ))
+    .await;
+    let asked = fx.music.take();
+    assert!(
+        fx.row(gil).await.date_last_refreshed.is_some(),
+        "the by-name artist refreshes with the album: {asked:?}"
+    );
+    assert!(
+        searches(&asked).iter().any(|l| l.contains("Gil")),
+        "searched by its name: {asked:?}"
+    );
+    assert_eq!(
+        fx.row(fx.artist_id()).await.date_last_refreshed,
+        miles,
+        "the folder-backed artist is not refreshed through its album"
+    );
+}
+
+/// A manual refresh of a folder artist covers both of its albums: an artist
+/// known only by name that both albums credit refreshes once, and a credited
+/// name with no artist row yet gets one (`LibraryManager.GetArtist` →
+/// `CreateItemByName`), which refreshes too.
+#[tokio::test(flavor = "multi_thread")]
+// One library through its setup, a refresh and the checks of both artists.
+#[allow(clippy::too_many_lines)]
+async fn a_manual_refresh_of_two_albums_refreshes_a_shared_artist_once_and_creates_a_missing_one() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
+    let meta = tmp.path().join("metadata");
+    let store = ferrofin_core::by_name_store::ByNameStore::new(
+        fx.persistence.clone(),
+        meta.join("Genre"),
+        meta.join("MusicGenre"),
+        meta.join("Studio"),
+        meta.join("artists"),
+    );
+    let fx = Fixture {
+        scanner: fx.scanner.with_by_name_store(store),
+        ..fx
+    };
+    let sketches = fx.artist_dir.join("Sketches of Spain");
+    std::fs::create_dir_all(&sketches).expect("mkdir");
+    std::fs::write(sketches.join("01 - Concierto de Aranjuez.mp3"), b"").expect("track");
+    fx.scan().await;
+    let credit = |path: PathBuf, kind: BaseItemKind, artists: &'static str| {
+        let fx = &fx;
+        async move {
+            let id = derive_item_id(kind, &path.to_string_lossy()).expect("id");
+            let row = fx.row(id).await;
+            fx.persistence
+                .save_items(&[BaseItemEntity {
+                    artists: Some(artists.into()),
+                    ..row
+                }])
+                .await
+                .expect("credit");
+            id
+        }
+    };
+    for track in ["01 - So What.mp3", "02 - Blue in Green.mp3"] {
+        let id = credit(fx.album_dir.join(track), BaseItemKind::Audio, "Gil Evans").await;
+        fx.persistence
+            .save_item_values(id, &[(1, "Gil Evans".into())])
+            .await
+            .expect("materialize");
+    }
+    credit(fx.album_dir.clone(), BaseItemKind::MusicAlbum, "Gil Evans").await;
+    let both = "Gil Evans|Ghost Orchestra";
+    credit(
+        sketches.join("01 - Concierto de Aranjuez.mp3"),
+        BaseItemKind::Audio,
+        both,
+    )
+    .await;
+    credit(sketches.clone(), BaseItemKind::MusicAlbum, both).await;
+    let gil = by_name_artist(&fx, "Gil Evans").await;
+    let artists = |name: &'static str| {
+        let fx = &fx;
+        async move {
+            fx.items
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::MusicArtist],
+                    ..InternalItemsQuery::default()
+                })
+                .await
+                .expect("artists")
+                .into_iter()
+                .filter(|a| a.name.as_deref() == Some(name))
+                .collect::<Vec<_>>()
+        }
+    };
+    assert!(artists("Ghost Orchestra").await.is_empty(), "no row yet");
+    fx.music.take();
+
+    let options = MetadataRefreshOptions::for_item_refresh(
+        MetadataRefreshMode::Default,
+        MetadataRefreshMode::Default,
+        false,
+        false,
+        false,
+    );
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    let cancel = ScanCancel::new();
+    fx.scanner
+        .scan_target(
+            &ScanTarget::Paths(vec![fx.artist_dir.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &cancel).with_passes(ScanPasses::Touched),
+        )
+        .await
+        .expect("refresh");
+    let asked = fx.music.take();
+    let searched = |name: &str| searches(&asked).iter().filter(|l| l.contains(name)).count();
+    assert!(fx.row(gil).await.date_last_refreshed.is_some(), "{asked:?}");
+    assert_eq!(
+        searched("Gil"),
+        1,
+        "the shared artist refreshes once: {asked:?}"
+    );
+    let ghost = artists("Ghost Orchestra").await;
+    assert_eq!(ghost.len(), 1, "the missing artist is created");
+    assert!(
+        ghost[0].parent_id.as_deref().is_none_or(str::is_empty),
+        "known only by name"
+    );
+    assert!(
+        ghost[0].date_last_refreshed.is_some(),
+        "and refreshed: {asked:?}"
+    );
+    assert_eq!(searched("Ghost"), 1, "{asked:?}");
 }
 
 /// The id of the by-name `MusicArtist` row named `name`.
@@ -1872,14 +2120,18 @@ async fn a_plugin_is_never_asked_by_an_unchanged_rescan() {
 /// MusicBrainz, TheAudioDB and a plugin ranked first only fill what the NFO
 /// left: the NFO's overview and genres stand over all three; the plugin's
 /// tagline and MusicBrainz's year fill the gaps. "Replace all metadata"
-/// keeps it so — upstream's local readers still seed `temp` there unless the
-/// item has a metadata saver (`isSavingMetadata`, `:803`), and Ferrofin
-/// runs none — and the NFO's values replace the stored ones.
+/// reads neither: an existing NFO enables the Nfo saver at `MetadataEdit`
+/// (`ProviderManager.IsSaverEnabledForItem`, `:880-889`), and upstream skips
+/// the local readers of an item it is saving metadata for under "Replace all
+/// metadata" (`isSavingMetadata && ReplaceAllMetadata`, `MetadataService.cs:
+/// 803`), so the providers' values replace the NFO's.
 #[rstest::rstest]
 #[case::first_scan(false)]
 #[case::replace_all(true)]
 #[tokio::test(flavor = "multi_thread")]
-async fn the_music_nfo_stands_over_every_remote_provider(#[case] replace: bool) {
+async fn the_music_nfo_stands_over_every_remote_provider_except_under_replace_all(
+    #[case] replace: bool,
+) {
     let plugin = PluginDb::new();
     let tmp = tempfile::tempdir().expect("tmp");
     let fx = Fixture::with_plugins(tmp.path(), plugin_ranked(true), plugin.source()).await;
@@ -1898,9 +2150,24 @@ async fn the_music_nfo_stands_over_every_remote_provider(#[case] replace: bool) 
     if replace {
         fx.scan_with(&replace_all()).await;
     }
+    let (album_text, album_genre, artist_text, artist_genre) = if replace {
+        (
+            "PluginDb album text.",
+            "Cool jazz",
+            "PluginDb artist text.",
+            "Hard bop",
+        )
+    } else {
+        (
+            "NFO album text.",
+            "Bebop",
+            "NFO artist bio.",
+            "Trumpet jazz",
+        )
+    };
     let album = fx.row(fx.album_id()).await;
-    assert_eq!(album.overview.as_deref(), Some("NFO album text."));
-    assert_eq!(album.genres.as_deref(), Some("Bebop"));
+    assert_eq!(album.overview.as_deref(), Some(album_text));
+    assert_eq!(album.genres.as_deref(), Some(album_genre));
     assert_eq!(album.tagline.as_deref(), Some("PluginDb tagline."));
     assert_eq!(
         album.production_year,
@@ -1908,8 +2175,8 @@ async fn the_music_nfo_stands_over_every_remote_provider(#[case] replace: bool) 
         "MusicBrainz fills the year"
     );
     let artist = fx.row(fx.artist_id()).await;
-    assert_eq!(artist.overview.as_deref(), Some("NFO artist bio."));
-    assert_eq!(artist.genres.as_deref(), Some("Trumpet jazz"));
+    assert_eq!(artist.overview.as_deref(), Some(artist_text));
+    assert_eq!(artist.genres.as_deref(), Some(artist_genre));
     assert_eq!(artist.tagline.as_deref(), Some("PluginDb tagline."));
     assert!(
         plugin.take().iter().any(|(kind, _)| kind == "MusicAlbum"),

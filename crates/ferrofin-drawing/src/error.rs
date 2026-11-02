@@ -23,7 +23,8 @@ use thiserror::Error;
 /// touching an image file.
 ///
 /// Every variant maps to `ServiceError::BackendSource` (HTTP `500`) and keeps
-/// its underlying cause as the [`source`](std::error::Error::source).
+/// its underlying cause as the [`source`](std::error::Error::source), except
+/// [`DrawingError::WebPEncode`], whose libwebp code implements no `Error`.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DrawingError {
@@ -61,6 +62,18 @@ pub enum DrawingError {
         #[source]
         source: jpeg_encoder::EncodingError,
     },
+
+    /// libwebp (the `webp` crate) failed to write a WebP: an empty picture, or
+    /// an out-of-memory failure, say. An output over its 16383 px limit is
+    /// refused before libwebp, as invalid input.
+    #[error("{context}: libwebp {code:?}")]
+    WebPEncode {
+        /// The operation and path, e.g. `"encode /cache/a.webp"`.
+        context: String,
+        /// libwebp's error code. It implements no `Error`, so it is carried as a
+        /// value rather than as the source.
+        code: webp::WebPEncodingError,
+    },
 }
 
 impl DrawingError {
@@ -85,6 +98,15 @@ impl DrawingError {
         Self::JpegEncode {
             context: context.into(),
             source,
+        }
+    }
+
+    /// Builds a [`DrawingError::WebPEncode`] tagging libwebp's `code` with a
+    /// `context` label.
+    pub fn webp_encode(context: impl Into<String>, code: webp::WebPEncodingError) -> Self {
+        Self::WebPEncode {
+            context: context.into(),
+            code,
         }
     }
 }

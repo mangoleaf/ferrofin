@@ -38,6 +38,9 @@ use uuid::Uuid;
 const USER_ID: Uuid = Uuid::from_u128(0x1234_5678);
 const SERIES_ID: Uuid = Uuid::from_u128(0x005E_21E5);
 const SEASON_ID: Uuid = Uuid::from_u128(0x05EA_5074);
+/// A series whose season 2 holds more rows than `slice::sort_by` insertion-sorts.
+const LONG_SERIES_ID: Uuid = Uuid::from_u128(0x1005_E21E);
+const LONG_SEASON_ID: Uuid = Uuid::from_u128(0x1005_EA50);
 
 /// Builds a minimal [`UserEntity`]; every non-id field is a neutral zero value.
 fn user_entity(id: Uuid, username: &str) -> UserEntity {
@@ -155,6 +158,51 @@ fn item_entity(id: Uuid, name: &str, kind: &str) -> BaseItemEntity {
         unrated_type: None,
         width: None,
     }
+}
+
+fn season_entity(id: Uuid, number: i64) -> BaseItemEntity {
+    let mut season = item_entity(id, &format!("Season {number}"), "Season");
+    season.index_number = Some(number);
+    season.series_id = Some(Uuid::nil().to_string());
+    season.parent_id = Some(SERIES_ID.to_string());
+    season.series_presentation_unique_key = Some("key-The Series".to_owned());
+    season.path = Some(format!("/media/season{number}"));
+    season
+}
+
+/// Season 2 of [`LONG_SERIES_ID`] in `SortName` order: 22 unnumbered episodes
+/// premiered on days 20 to 11, then one undated, then days 10 to 0. The
+/// aired-episode comparer orders two dated rows by date but calls the undated
+/// one equal to both, which is no total order; `slice::sort_by` may panic on
+/// it beyond 20 rows (gl-905).
+fn long_season_rows() -> Vec<BaseItemEntity> {
+    let mut season = season_entity(LONG_SEASON_ID, 2);
+    season.parent_id = Some(LONG_SERIES_ID.to_string());
+    let days = (11..=20)
+        .rev()
+        .map(Some)
+        .chain([None])
+        .chain((0..=10).rev().map(Some));
+    let episodes = days.enumerate().map(|(row, day)| {
+        let name = day.map_or_else(
+            || format!("Row {row:02} undated"),
+            |day| format!("Row {row:02} day {day:02}"),
+        );
+        let mut item = item_entity(
+            Uuid::from_u128(0x0E00 + u128::try_from(row).expect("row")),
+            &name,
+            "Episode",
+        );
+        item.parent_index_number = Some(2);
+        item.season_id = Some(LONG_SEASON_ID.to_string());
+        item.parent_id = Some(LONG_SEASON_ID.to_string());
+        item.path = Some(format!("/media/long/row{row:02}.mkv"));
+        item.premiere_date = day.map(|day| {
+            chrono::DateTime::from_timestamp(1_600_000_000 + day * 86_400, 0).expect("date")
+        });
+        item
+    });
+    std::iter::once(season).chain(episodes).collect()
 }
 
 /// An [`AuthService`]/[`AuthorizationContext`] that authenticates as [`USER_ID`].
@@ -337,8 +385,14 @@ impl DtoService for OkDto {
 ///
 /// `get_item_by_id` resolves the series (as a `Series`) and the season (as a
 /// `Season`); `get_item_list` echoes back either seasons or episodes depending
-/// on the query's `include_item_types`.
-struct StubLibrary;
+/// on the query's `include_item_types`. With `chain`, the visibility check of the
+/// season also hands back the series it read, as the core library's does.
+#[derive(Default)]
+struct StubLibrary {
+    chain: bool,
+    /// How many times `get_item_by_id` read the series.
+    series_reads: std::sync::atomic::AtomicUsize,
+}
 
 #[async_trait]
 impl LibraryManager for StubLibrary {
@@ -357,10 +411,33 @@ impl LibraryManager for StubLibrary {
         Ok(true)
     }
 
+    async fn get_item_by_id_for_user_with_chain(
+        &self,
+        id: Uuid,
+        user: Option<&UserEntity>,
+    ) -> Result<Option<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+        let Some(item) = self.get_item_by_id_for_user(id, user).await? else {
+            return Ok(None);
+        };
+        let chain = if self.chain && id == SEASON_ID {
+            vec![item.clone(), item_entity(SERIES_ID, "The Series", "Series")]
+        } else {
+            Vec::new()
+        };
+        Ok(Some((item, chain)))
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if id == SERIES_ID {
+            self.series_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(match id {
             _ if id == SERIES_ID => Some(item_entity(SERIES_ID, "The Series", "Series")),
-            _ if id == SEASON_ID => Some(item_entity(SEASON_ID, "Season 1", "Season")),
+            _ if id == SEASON_ID => Some(season_entity(SEASON_ID, 1)),
+            _ if id == LONG_SERIES_ID => {
+                Some(item_entity(LONG_SERIES_ID, "The Long Series", "Series"))
+            }
             _ => None,
         })
     }
@@ -369,20 +446,34 @@ impl LibraryManager for StubLibrary {
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         use ferrofin_model::data::BaseItemKind;
-        if query.include_item_types.contains(&BaseItemKind::Season) {
-            Ok(vec![
-                item_entity(Uuid::from_u128(0x01), "Season 1", "Season"),
-                item_entity(Uuid::from_u128(0x02), "Season 2", "Season"),
-            ])
-        } else {
-            // Episodes (or the Upcoming episode query).
-            Ok(vec![
-                item_entity(Uuid::from_u128(0xE1), "Episode 1", "Episode"),
-                item_entity(Uuid::from_u128(0xE2), "Episode 2", "Episode"),
-                item_entity(Uuid::from_u128(0xE3), "Episode 3", "Episode"),
-            ])
+        if query.series_presentation_unique_key.as_deref() == Some("key-The Long Series") {
+            return Ok(long_season_rows());
         }
+        let mut items = Vec::new();
+        if query.include_item_types.contains(&BaseItemKind::Season) {
+            items.extend([
+                season_entity(SEASON_ID, 1),
+                season_entity(Uuid::from_u128(0x02), 2),
+            ]);
+        }
+        if query.include_item_types.contains(&BaseItemKind::Episode) {
+            items.extend((1..=3).map(|index| {
+                let mut item = item_entity(
+                    Uuid::from_u128(0xE0 + index),
+                    &format!("Episode {index}"),
+                    "Episode",
+                );
+                item.parent_index_number = Some(1);
+                item.index_number = Some(i64::try_from(index).unwrap());
+                item.season_id = Some(Uuid::nil().to_string());
+                item.parent_id = Some(SERIES_ID.to_string());
+                item.path = Some(format!("/media/episode{index}.mkv"));
+                item
+            }));
+        }
+        Ok(items)
     }
+
     async fn query_items(
         &self,
         _q: &InternalItemsQuery,
@@ -485,7 +576,8 @@ impl LibraryManager for StubLibrary {
     }
 }
 
-/// A [`TvSeriesManager`] returning a fixed one-episode next-up queue.
+/// A [`TvSeriesManager`] returning a fixed one-episode next-up queue. The
+/// episode's `PremiereDate` echoes the bound `nextUpDateCutoff`.
 struct StubTvSeries;
 
 #[async_trait]
@@ -501,6 +593,7 @@ impl TvSeriesManager for StubTvSeries {
             vec![BaseItemDto {
                 id: Uuid::from_u128(0x9E27),
                 name: Some("Next Episode".to_owned()),
+                premiere_date: query.next_up_date_cutoff,
                 ..BaseItemDto::default()
             }],
         ))
@@ -543,8 +636,13 @@ impl SimilarItemsManager for StubSimilar {
 
 /// Builds an [`AppState`] wired with the batch-8 stubs.
 fn state() -> AppState {
+    state_with(Arc::new(StubLibrary::default()))
+}
+
+/// [`state`] over the given library.
+fn state_with(library: Arc<StubLibrary>) -> AppState {
     AppState::new(
-        Arc::new(StubLibrary),
+        library,
         Arc::new(OkUsers),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
@@ -581,7 +679,12 @@ fn state() -> AppState {
 
 /// Drives one authenticated GET request through the router.
 async fn get(uri: &str) -> (StatusCode, Vec<u8>) {
-    let router = create_router(state());
+    get_with(state(), uri).await
+}
+
+/// [`get`] against the given state.
+async fn get_with(state: AppState, uri: &str) -> (StatusCode, Vec<u8>) {
+    let router = create_router(state);
     let response = router
         .oneshot(
             Request::builder()
@@ -606,6 +709,35 @@ async fn next_up_returns_queue() {
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("next up");
     assert_eq!(result.total_record_count, 1);
     assert_eq!(result.items[0].name.as_deref(), Some("Next Episode"));
+}
+
+/// `[FromQuery] DateTime? nextUpDateCutoff` binds through ASP.NET's default
+/// binder, and EF's `ToUniversalTime` reads an offset-less value as server
+/// time. jellyfin-web 12.x sends a bare date (`toIsoDateOnlyString`).
+#[tokio::test]
+async fn next_up_binds_a_date_only_cutoff_as_server_local_time() {
+    if ferrofin_api::test_support::rerun_in_time_zone(
+        "next_up_binds_a_date_only_cutoff_as_server_local_time",
+    ) {
+        return;
+    }
+    let bound = |uri: &'static str| async move {
+        let (status, body) = get(uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("next up");
+        result.items[0].premiere_date
+    };
+    // Midnight in Asia/Kolkata (+05:30).
+    assert_eq!(
+        bound("/Shows/NextUp?nextUpDateCutoff=2025-10-28").await,
+        Some("2025-10-27T18:30:00Z".parse().expect("date"))
+    );
+    assert_eq!(
+        bound("/Shows/NextUp?nextUpDateCutoff=2025-10-28T00:00:00.000Z").await,
+        Some("2025-10-28T00:00:00Z".parse().expect("date"))
+    );
+    let (status, _) = get("/Shows/NextUp?nextUpDateCutoff=yesterday").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -640,6 +772,23 @@ async fn episodes_returns_series_episodes() {
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("episodes");
     assert_eq!(result.items.len(), 3);
     assert_eq!(result.total_record_count, 3);
+}
+
+#[tokio::test]
+async fn a_long_season_the_aired_order_cannot_totally_order_lists_every_episode() {
+    let (status, body) = get(&format!("/Shows/{LONG_SERIES_ID}/Episodes?season=2")).await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("episodes");
+    assert_eq!(result.total_record_count, 22);
+    let names: Vec<_> = result.items.iter().filter_map(|i| i.name.clone()).collect();
+    assert_eq!(names.len(), 22);
+    let dated: Vec<_> = names
+        .iter()
+        .filter(|name| !name.ends_with("undated"))
+        .collect();
+    let mut by_day = dated.clone();
+    by_day.sort_by_key(|name| name.rsplit(' ').next().map(str::to_owned));
+    assert_eq!(dated, by_day, "the dated episodes keep their date order");
 }
 
 #[tokio::test]
@@ -678,6 +827,34 @@ async fn episodes_by_season_id_resolves_season() {
     assert_eq!(result.items.len(), 3);
 }
 
+/// The season's visibility check already read its series (gl-982): the episodes come from
+/// that row, the same answer as without a chain, and the series is read once less.
+#[tokio::test]
+async fn episodes_by_season_id_take_the_series_from_the_visibility_chain() {
+    let mut runs = Vec::new();
+    for chain in [true, false] {
+        let library = Arc::new(StubLibrary {
+            chain,
+            ..StubLibrary::default()
+        });
+        let (status, body) = get_with(
+            state_with(Arc::clone(&library)),
+            &format!("/Shows/{SERIES_ID}/Episodes?seasonId={SEASON_ID}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("episodes");
+        assert_eq!(result.items.len(), 3, "chain {chain}");
+        let reads = library
+            .series_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        runs.push((body, reads));
+    }
+    let [(with_chain, chain_reads), (without, plain_reads)] = <[_; 2]>::try_from(runs).unwrap();
+    assert_eq!(with_chain, without, "the same response");
+    assert_eq!(plain_reads - chain_reads, 1, "the series is not read again");
+}
+
 #[tokio::test]
 async fn episodes_bad_season_id_is_404() {
     let missing = Uuid::from_u128(0xDEAD);
@@ -698,7 +875,7 @@ async fn similar_shows_returns_items() {
 /// `DtoOptions` the controller then projects with (v12
 /// SimilarItemsManager.cs:108-112, LibraryController.cs:835-849), so every
 /// Similar row carries the field even when `fields` never named it — on the
-/// `/Shows` route and on the `LibraryController` aliases alike.
+/// `/Shows` alias and the other `LibraryController` aliases alike.
 #[tokio::test]
 async fn similar_rows_always_carry_provider_ids() {
     for path in [
@@ -713,6 +890,52 @@ async fn similar_rows_always_carry_provider_ids() {
             result.items.iter().all(|i| i.provider_ids.is_some()),
             "{path}: {body:?}",
             body = String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_season_number_has_no_episodes_and_existing_number_resolves_its_season() {
+    let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?season=99")).await;
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
+    assert!(result.items.is_empty());
+    let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?season=1")).await;
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(result.items.len(), 3);
+}
+
+#[tokio::test]
+async fn episode_adjacency_is_applied_after_start_filter_before_paging() {
+    let middle = Uuid::from_u128(0xE2);
+    let (_, body) = get(&format!(
+        "/Shows/{SERIES_ID}/Episodes?season=1&adjacentTo={middle}&startIndex=1&limit=1"
+    ))
+    .await;
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(result.total_record_count, 3);
+    assert_eq!(result.items[0].id, middle);
+    let absent = Uuid::new_v4();
+    let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?adjacentTo={absent}")).await;
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
+    assert!(result.items.is_empty());
+}
+
+#[tokio::test]
+async fn nil_episode_adjacency_is_ignored_and_empty_relation_ids_use_the_actual_parent() {
+    for suffix in [
+        format!("season=1&adjacentTo={}", Uuid::nil()),
+        format!("seasonId={SEASON_ID}&adjacentTo={}", Uuid::nil()),
+    ] {
+        let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?{suffix}")).await;
+        let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.total_record_count, 3);
+        assert_eq!(
+            result.items.iter().map(|row| row.id).collect::<Vec<_>>(),
+            [
+                Uuid::from_u128(0xE1),
+                Uuid::from_u128(0xE2),
+                Uuid::from_u128(0xE3)
+            ]
         );
     }
 }

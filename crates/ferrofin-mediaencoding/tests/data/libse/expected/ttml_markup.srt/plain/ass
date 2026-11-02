@@ -1,0 +1,32 @@
+[Script Info]
+; This is an Advanced Sub Station Alpha v4+ script.
+Title: untitled
+ScriptType: v4.00+
+PlayDepth: 0
+ScaledBorderAndShadow: Yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,1,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:02.00,0:00:03.50,Default,,0,0,0,,{\i1\b1}both{\b0\i0} after
+Dialogue: 0,0:00:04.00,0:00:05.50,Default,,0,0,0,,{\i1}line one\Nline two{\i0}
+Dialogue: 0,0:00:06.00,0:00:07.50,Default,,0,0,0,,<x>unknown</x> and <ruby-base>ruby</ruby-base> <bouten-dot>dot</bouten-dot>
+Dialogue: 0,0:00:08.00,0:00:09.50,Default,,0,0,0,,{\c&H0000ff&\fnArial}order{\c}{\fn} {\c&Hff0000&}single
+Dialogue: 0,0:00:10.00,0:00:11.50,Default,,0,0,0,,a <!-- note --> b
+Dialogue: 0,0:00:12.00,0:00:13.50,Default,,0,0,0,,odd ]]> end
+Dialogue: 0,0:00:14.00,0:00:15.50,Default,,0,0,0,,<ns:tag>undeclared</ns:tag>
+Dialogue: 0,0:00:16.00,0:00:17.50,Default,,0,0,0,,nbsp&nbsp;here &amp; amp
+Dialogue: 0,0:00:18.00,0:00:19.50,Default,,0,0,0,,{\i1}unclosed italic
+Dialogue: 0,0:00:20.00,0:00:21.50,Default,,0,0,0,,closing only{\i0}
+Dialogue: 0,0:00:22.00,0:00:23.50,Default,,0,0,0,,{\i1}Foo{\i0}\N{\i1}Bar{\i0}
+Dialogue: 0,0:00:24.00,0:00:25.50,Default,,0,0,0,,FALCONE:{\i1} I didn't think{\i0}\N{\i1}it was going to be you,{\i0}
+Dialogue: 0,0:00:26.00,0:00:27.50,Default,,0,0,0,,<I>upper</I> and < i >spaced</ i >
+Dialogue: 0,0:00:28.00,0:00:29.50,Default,,0,0,0,,{\an8}
+Dialogue: 0,0:00:30.00,0:00:31.50,Default,,0,0,0,,Tabs	and  double  spaces
+Dialogue: 0,0:00:32.00,0:00:33.50,Default,,0,0,0,,日本語のテキスト {\b1}太字{\b0}
+Dialogue: 0,0:00:34.00,0:00:35.50,Default,,0,0,0,,{\b1}x{\b0} {\i1}y{\i0} {\u1}z{\u0}
+Dialogue: 0,0:00:36.00,0:00:37.50,Default,,0,0,0,,<i/>empty italic tag
+Dialogue: 0,0:00:38.00,0:00:39.50,Default,,0,0,0,,<span>raw span</span>

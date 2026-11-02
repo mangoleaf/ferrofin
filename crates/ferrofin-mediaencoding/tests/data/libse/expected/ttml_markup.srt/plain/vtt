@@ -1,0 +1,61 @@
+WEBVTT
+
+00:00:02.000 --> 00:00:03.500
+<i><b>both</b></i> after
+
+00:00:04.000 --> 00:00:05.500
+<i>line one
+line two</i>
+
+00:00:06.000 --> 00:00:07.500
+&lt;x&gt;unknown</x> and <ruby-base>ruby</ruby-base> &lt;bouten-dot&gt;dot</bouten-dot>
+
+00:00:08.000 --> 00:00:09.500
+<font color="red" face="Arial">order</c> <font color='blue'>single</c>
+
+00:00:10.000 --> 00:00:11.500
+a &lt;!-- note --&gt; b
+
+00:00:12.000 --> 00:00:13.500
+odd ]]&gt; end
+
+00:00:14.000 --> 00:00:15.500
+&lt;ns:tag&gt;undeclared</ns:tag>
+
+00:00:16.000 --> 00:00:17.500
+nbsp&amp;nbsp;here &amp; amp
+
+00:00:18.000 --> 00:00:19.500
+<i>unclosed italic
+
+00:00:20.000 --> 00:00:21.500
+closing only</i>
+
+00:00:22.000 --> 00:00:23.500
+<i>Foo</i>
+<i>Bar</i>
+
+00:00:24.000 --> 00:00:25.500
+FALCONE:<i> I didn't think</i>
+<i>it was going to be you,</i>
+
+00:00:26.000 --> 00:00:27.500
+<I>upper</I> and &lt; i &gt;spaced</ i >
+
+00:00:28.000 --> 00:00:29.500 line:20%
+
+
+00:00:30.000 --> 00:00:31.500
+Tabs	and  double  spaces
+
+00:00:32.000 --> 00:00:33.500
+日本語のテキスト <b>太字</b>
+
+00:00:34.000 --> 00:00:35.500
+<b>x</b> <i>y</i> <u>z</u>
+
+00:00:36.000 --> 00:00:37.500
+&lt;i/&gt;empty italic tag
+
+00:00:38.000 --> 00:00:39.500
+&lt;span&gt;raw span</span>

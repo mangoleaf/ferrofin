@@ -48,6 +48,21 @@ pub fn md5_hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Lowercase hex SHA1 of raw bytes: `Convert.ToHexStringLower(SHA1.HashData(bytes))`,
+/// the password form Schedules Direct requires (`LiveTvController.AddListingProvider`'s
+/// `pw`, `SchedulesDirect.GetTokenInternal`).
+#[must_use]
+pub fn sha1_hex(bytes: &[u8]) -> String {
+    use sha1::Digest as _;
+    let digest = sha1::Sha1::digest(bytes);
+    let mut out = String::with_capacity(40);
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Computes the MD5 of `str`'s UTF-16LE bytes as a [`Uuid`].
 ///
 /// Port of `BaseExtensions.GetMD5`: MD5 over `Encoding.Unicode.GetBytes(str)`
@@ -81,6 +96,18 @@ mod md5_hex_tests {
         assert_eq!(
             super::md5_hex(b"message digest"),
             "f96b697d7cb7938d525a2f31aaf161d0"
+        );
+    }
+
+    #[test]
+    fn sha1_hex_matches_fips_180_vectors_in_lowercase() {
+        assert_eq!(
+            super::sha1_hex(b""),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+        assert_eq!(
+            super::sha1_hex(b"abc"),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
         );
     }
 }

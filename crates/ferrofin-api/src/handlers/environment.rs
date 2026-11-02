@@ -22,7 +22,7 @@ use axum::{Json, Router};
 use ferrofin_model::environment_dtos::{DefaultDirectoryBrowserInfoDto, ValidatePathDto};
 use ferrofin_model::io::FileSystemEntryInfo;
 
-use crate::auth::FirstTimeSetupOrAuth;
+use crate::auth::FirstTimeSetupOrElevated;
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
@@ -65,7 +65,7 @@ struct DirectoryContentsQuery {
 )]
 async fn get_directory_contents(
     State(state): State<AppState>,
-    _auth: FirstTimeSetupOrAuth,
+    _auth: FirstTimeSetupOrElevated,
     Query(query): Query<DirectoryContentsQuery>,
 ) -> Result<Json<Vec<FileSystemEntryInfo>>, ApiError> {
     let path = query
@@ -112,7 +112,7 @@ async fn get_directory_contents(
 )]
 async fn validate_path(
     State(state): State<AppState>,
-    _auth: FirstTimeSetupOrAuth,
+    _auth: FirstTimeSetupOrElevated,
     JsonBody(dto): JsonBody<ValidatePathDto>,
 ) -> Result<StatusCode, ApiError> {
     let path = dto.path.unwrap_or_default();
@@ -150,7 +150,7 @@ async fn validate_path(
 )]
 async fn get_drives(
     State(state): State<AppState>,
-    _auth: FirstTimeSetupOrAuth,
+    _auth: FirstTimeSetupOrElevated,
 ) -> Json<Vec<FileSystemEntryInfo>> {
     Json(state.file_system.get_drives())
 }
@@ -165,7 +165,7 @@ async fn get_drives(
     responses((status = 200, description = "Empty array returned", body = [FileSystemEntryInfo])),
     tag = "ferrofin"
 )]
-async fn get_network_shares(_auth: FirstTimeSetupOrAuth) -> Json<Vec<FileSystemEntryInfo>> {
+async fn get_network_shares(_auth: FirstTimeSetupOrElevated) -> Json<Vec<FileSystemEntryInfo>> {
     Json(Vec::new())
 }
 
@@ -190,7 +190,7 @@ struct ParentPathQuery {
     tag = "ferrofin"
 )]
 async fn get_parent_path(
-    _auth: FirstTimeSetupOrAuth,
+    _auth: FirstTimeSetupOrElevated,
     Query(query): Query<ParentPathQuery>,
 ) -> Result<Json<Option<String>>, ApiError> {
     let path = query
@@ -233,7 +233,7 @@ async fn get_parent_path(
     tag = "ferrofin"
 )]
 async fn get_default_directory_browser(
-    _auth: FirstTimeSetupOrAuth,
+    _auth: FirstTimeSetupOrElevated,
 ) -> Json<DefaultDirectoryBrowserInfoDto> {
     Json(DefaultDirectoryBrowserInfoDto::default())
 }

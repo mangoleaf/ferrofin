@@ -13,6 +13,7 @@
 
 pub mod base_parser;
 pub mod config;
+pub mod dotnet_date;
 pub mod item;
 pub mod parsers;
 pub mod saver;
@@ -56,8 +57,7 @@ pub fn fetch_movie(
 ) -> FetchResult {
     check_fetch(metadata_file)?;
     let base = BaseNfoParser::new(config, external_ids, directory_service);
-    base.fetch(&MovieNfoParser, result, xml);
-    Ok(())
+    base.fetch(&MovieNfoParser, result, xml)
 }
 
 /// Parses an `album.nfo` or `artist.nfo` document into `result`.
@@ -78,8 +78,7 @@ pub fn fetch_music(
 ) -> FetchResult {
     check_fetch(metadata_file)?;
     let base = BaseNfoParser::new(config, external_ids, directory_service);
-    base.fetch(&crate::xbmc::parsers::PlainNfoParser, result, xml);
-    Ok(())
+    base.fetch(&crate::xbmc::parsers::PlainNfoParser, result, xml)
 }
 
 /// Parses a series NFO document into `result` (`SeriesNfoParser.Fetch`).
@@ -96,8 +95,7 @@ pub fn fetch_series(
 ) -> FetchResult {
     check_fetch(metadata_file)?;
     let base = BaseNfoParser::new(config, external_ids, directory_service);
-    base.fetch(&SeriesNfoParser, result, xml);
-    Ok(())
+    base.fetch(&SeriesNfoParser, result, xml)
 }
 
 /// Parses a season NFO document into `result` (`SeasonNfoParser.Fetch`).
@@ -114,8 +112,7 @@ pub fn fetch_season(
 ) -> FetchResult {
     check_fetch(metadata_file)?;
     let base = BaseNfoParser::new(config, external_ids, directory_service);
-    base.fetch(&SeasonNfoParser, result, xml);
-    Ok(())
+    base.fetch(&SeasonNfoParser, result, xml)
 }
 
 /// Parses a series `<namedseason>` NFO into a season (`SeriesNfoSeasonParser.Fetch`).
@@ -132,8 +129,7 @@ pub fn fetch_series_season(
 ) -> FetchResult {
     check_fetch(metadata_file)?;
     let base = BaseNfoParser::new(config, external_ids, directory_service);
-    base.fetch(&SeriesNfoSeasonParser, result, xml);
-    Ok(())
+    base.fetch(&SeriesNfoSeasonParser, result, xml)
 }
 
 /// Parses an episode NFO document into `result` (`EpisodeNfoParser.Fetch`).

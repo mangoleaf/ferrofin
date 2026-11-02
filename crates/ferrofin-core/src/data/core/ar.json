@@ -100,7 +100,7 @@
     "TaskAudioNormalization": "تطبيع الصوت",
     "TaskAudioNormalizationDescription": "يفحص الملفات لجمع بيانات تطبيع الصوت.",
     "TaskDownloadMissingLyrics": "تنزيل الكلمات المفقودة",
-    "TaskDownloadMissingLyricsDescription": "ينزّل الكلمات للأغاني.",
+    "TaskDownloadMissingLyricsDescription": "تحميل كلمات الأغاني",
     "TaskExtractMediaSegments": "فحص مقاطع المحتوى",
     "TaskExtractMediaSegmentsDescription": "يستخرج أو يحصل على مقاطع المحتوى من الملحقات المفعّلة لمقاطع المحتوى (MediaSegment).",
     "TaskMoveTrickplayImages": "نقل موقع صور معاينات التنقل",

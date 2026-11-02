@@ -1,0 +1,32 @@
+[Script Info]
+; This is a Sub Station Alpha v4 script.
+Title: untitled
+ScriptType: v4.00
+Collisions: Normal
+PlayDepth: 0
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding
+Style: Default,Arial,20,16777215,65535,0,0,0,0,1,1,1,2,10,10,10,0,1
+
+[Events]
+Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: Marked=0,0:00:02.00,0:00:03.50,*Default,NTP,0000,0000,0000,,{\i1\b1}both{\b0\i0} after
+Dialogue: Marked=0,0:00:04.00,0:00:05.50,*Default,NTP,0000,0000,0000,,{\i1}line one\Nline two{\i0}
+Dialogue: Marked=0,0:00:06.00,0:00:07.50,*Default,NTP,0000,0000,0000,,<x>unknown</x> and <ruby-base>ruby</ruby-base> <bouten-dot>dot</bouten-dot>
+Dialogue: Marked=0,0:00:08.00,0:00:09.50,*Default,NTP,0000,0000,0000,,{\c&H0000ff&\fnArial}order{\c}{\fn} {\c&Hff0000&}single
+Dialogue: Marked=0,0:00:10.00,0:00:11.50,*Default,NTP,0000,0000,0000,,a <!-- note --> b
+Dialogue: Marked=0,0:00:12.00,0:00:13.50,*Default,NTP,0000,0000,0000,,odd ]]> end
+Dialogue: Marked=0,0:00:14.00,0:00:15.50,*Default,NTP,0000,0000,0000,,<ns:tag>undeclared</ns:tag>
+Dialogue: Marked=0,0:00:16.00,0:00:17.50,*Default,NTP,0000,0000,0000,,nbsp&nbsp;here &amp; amp
+Dialogue: Marked=0,0:00:18.00,0:00:19.50,*Default,NTP,0000,0000,0000,,{\i1}unclosed italic
+Dialogue: Marked=0,0:00:20.00,0:00:21.50,*Default,NTP,0000,0000,0000,,closing only{\i0}
+Dialogue: Marked=0,0:00:22.00,0:00:23.50,*Default,NTP,0000,0000,0000,,{\i1}Foo{\i0}\N{\i1}Bar{\i0}
+Dialogue: Marked=0,0:00:24.00,0:00:25.50,*Default,NTP,0000,0000,0000,,FALCONE:{\i1} I didn't think{\i0}\N{\i1}it was going to be you,{\i0}
+Dialogue: Marked=0,0:00:26.00,0:00:27.50,*Default,NTP,0000,0000,0000,,<I>upper</I> and < i >spaced</ i >
+Dialogue: Marked=0,0:00:28.00,0:00:29.50,*Default,NTP,0000,0000,0000,,{\an8}
+Dialogue: Marked=0,0:00:30.00,0:00:31.50,*Default,NTP,0000,0000,0000,,Tabs	and  double  spaces
+Dialogue: Marked=0,0:00:32.00,0:00:33.50,*Default,NTP,0000,0000,0000,,日本語のテキスト {\b1}太字{\b0}
+Dialogue: Marked=0,0:00:34.00,0:00:35.50,*Default,NTP,0000,0000,0000,,{\b1}x{\b0} {\i1}y{\i0} {\u1}z{\u0}
+Dialogue: Marked=0,0:00:36.00,0:00:37.50,*Default,NTP,0000,0000,0000,,<i/>empty italic tag
+Dialogue: Marked=0,0:00:38.00,0:00:39.50,*Default,NTP,0000,0000,0000,,<span>raw span</span>

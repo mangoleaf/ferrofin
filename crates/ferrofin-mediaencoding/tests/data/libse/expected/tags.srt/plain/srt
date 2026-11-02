@@ -1,0 +1,32 @@
+1
+00:00:01,000 --> 00:00:03,500
+<i>Italic line</i>
+<b>bold</b> and <u>under</u>
+
+2
+00:00:04,000 --> 00:00:06,000
+<font color="#ff0000">red hex</font> <font color="red">red name</font>
+<font color="Red">Red name</font> <font color="#00ff00ff">eight</font>
+
+3
+00:00:06,500 --> 00:00:08,250
+{\an8}Top centred sign
+
+4
+00:00:09,000 --> 00:00:10,000
+{\pos(100,200)}Positioned & "quoted" <odd> a<b
+
+5
+00:00:10,000 --> 00:00:10,000
+Zero length
+
+7
+00:00:11,123 --> 00:00:12,987
+First paragraph
+
+second after a blank line
+
+8
+25:01:02,345 --> 25:01:04,005
+<font face="Arial" size="20">Face and size</font> &amp; done
+

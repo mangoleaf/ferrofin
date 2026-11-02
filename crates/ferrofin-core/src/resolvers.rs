@@ -14,12 +14,17 @@
 //! - [`FileSystemWatcher`] — a small trait the [`crate::library_monitor`] uses so
 //!   tests can watch a fake instead of a real filesystem.
 //!
-//! The full metadata-driven resolution pipeline (matching a path to a concrete
-//! item kind) depends on the un-ported scanner and is out of scope for this seam;
-//! the naming-level path parsing it would call already lives in `ferrofin-naming`
-//! ([`ferrofin_naming::path`], [`ferrofin_naming::video`], …) and should be reused.
+//! - [`path_provider_ids`] — the provider ids a new item's resolver reads
+//!   from its name (`SetProviderIdsFromPath`, over
+//!   [`ferrofin_common::path_attributes::get_attribute_value`]).
+//!
+//! Matching a path to a concrete item kind is the scanner's
+//! ([`crate::library_scan`]), over the naming-level path parsing in
+//! `ferrofin-naming` ([`ferrofin_naming::path`], [`ferrofin_naming::video`], …).
 
 use async_trait::async_trait;
+use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_model::data::BaseItemKind;
 
 use ferrofin_traits::error::ServiceError;
 
@@ -46,9 +51,11 @@ const IGNORE_RULES: &[IgnoreRule] = &[
     IgnoreRule::ExtensionEquals("trickplay"),
     IgnoreRule::PathSegmentSuffix(".trickplay"),
     // Directories anywhere in the path.
+    // Files directly inside a sample folder (`**/sample/*`, `**/minta/*`):
+    // neither the folder itself nor anything deeper.
+    IgnoreRule::ParentSegmentEquals("sample"),
+    IgnoreRule::ParentSegmentEquals("minta"),
     IgnoreRule::PathSegmentEquals("metadata"),
-    IgnoreRule::PathSegmentEquals("sample"),
-    IgnoreRule::PathSegmentEquals("minta"),
     IgnoreRule::PathSegmentEquals("ps3_update"),
     IgnoreRule::PathSegmentEquals("ps3_vprm"),
     IgnoreRule::PathSegmentEquals("extrafanart"),
@@ -82,6 +89,10 @@ enum IgnoreRule {
     /// A `<stem>.<ext>` or `*.<stem>.<ext>` sample-clip pattern with a short
     /// extension (C# `**/sample.?`…`**/*.sample.?????`).
     SampleClip(&'static str),
+    /// The segment holding the last one equals this, case-insensitively: a
+    /// direct child of that directory (C# `**/<dir>/*`, whose `*` matches one
+    /// segment, so neither `<dir>` itself nor a deeper path).
+    ParentSegmentEquals(&'static str),
     /// Some path segment equals this, case-insensitively (a directory match).
     PathSegmentEquals(&'static str),
     /// Some path segment ends with this suffix, case-insensitively.
@@ -98,6 +109,9 @@ impl IgnoreRule {
                 file_name.rsplit_once('.').is_some_and(|(_, e)| e == ext)
             }
             IgnoreRule::SampleClip(stem) => is_sample_clip(file_name, stem),
+            IgnoreRule::ParentSegmentEquals(dir) => {
+                segments.len() >= 2 && segments[segments.len() - 2] == dir
+            }
             IgnoreRule::PathSegmentEquals(seg) => segments.contains(&seg),
             IgnoreRule::PathSegmentSuffix(suffix) => {
                 segments.iter().any(|s| s.ends_with(suffix)) || lower_path.ends_with(suffix)
@@ -146,6 +160,130 @@ pub fn should_ignore_path(path: &str) -> bool {
         .any(|rule| rule.matches(&lower, &segments, file_name))
 }
 
+/// The provider ids a new item's resolver reads from its own name, as
+/// `TrySetProviderId` keeps them (trimmed, valid for their provider):
+///
+/// - a movie or music video: `tmdbid` and `tvdbid` in its folder's name (its
+///   file's, in a mixed folder), else in its file name; `imdbid` anywhere in
+///   its path (`MovieResolver.SetProviderIdsFromPath`, `MovieResolver.cs:
+///   372-405`);
+/// - a series: seven ids in its folder name (`SeriesResolver.cs:190-214`);
+/// - a season: six, in its folder name (`SeasonResolver.cs:119-142`);
+/// - an episode: four, in its file name without the extension
+///   (`EpisodeResolver.cs:100-114`);
+/// - a box set: `tmdbid` in its folder name (`BoxSetResolver.cs:64-72`).
+///
+/// Any other kind reads none.
+#[must_use]
+pub fn path_provider_ids(entity: &BaseItemEntity) -> Vec<(String, String)> {
+    use ferrofin_common::path_attributes::get_attribute_value;
+    let Some(path) = entity.path.as_deref().filter(|path| !path.is_empty()) else {
+        return Vec::new();
+    };
+    let Some(kind) = crate::item_type_lookup::kind_from_type_name(&entity.type_) else {
+        return Vec::new();
+    };
+    let file_name = |path: &str| {
+        std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    // An empty name is an `ArgumentException` upstream: no id.
+    let attribute = |text: &str, name: &str| get_attribute_value(text, name).ok().flatten();
+    let named = |text: &str, ids: &[(&'static str, &str)]| -> Vec<(&'static str, Option<String>)> {
+        ids.iter()
+            .map(|&(provider, name)| (provider, attribute(text, name)))
+            .collect()
+    };
+    let found = match kind {
+        BaseItemKind::Movie | BaseItemKind::MusicVideo => {
+            let just_name = if entity.is_in_mixed_folder {
+                file_name(path)
+            } else {
+                file_name(&containing_folder_path(entity, path))
+            };
+            let file = file_name(path);
+            let mut found: Vec<(&'static str, Option<String>)> =
+                [("Tmdb", "tmdbid"), ("Tvdb", "tvdbid")]
+                    .into_iter()
+                    .map(|(provider, name)| {
+                        let id = attribute(&just_name, name).or_else(|| {
+                            (!entity.is_in_mixed_folder)
+                                .then(|| attribute(&file, name))
+                                .flatten()
+                        });
+                        (provider, id)
+                    })
+                    .collect();
+            found.push(("Imdb", attribute(path, "imdbid")));
+            found
+        }
+        BaseItemKind::Series => named(
+            &file_name(path),
+            &[
+                ("Imdb", "imdbid"),
+                ("Tvdb", "tvdbid"),
+                ("TvMaze", "tvmazeid"),
+                ("Tmdb", "tmdbid"),
+                ("AniDB", "anidbid"),
+                ("AniList", "anilistid"),
+                ("AniSearch", "anisearchid"),
+            ],
+        ),
+        BaseItemKind::Season => named(
+            &file_name(path),
+            &[
+                ("Tvdb", "tvdbid"),
+                ("TvMaze", "tvmazeid"),
+                ("Tmdb", "tmdbid"),
+                ("AniDB", "anidbid"),
+                ("AniList", "anilistid"),
+                ("AniSearch", "anisearchid"),
+            ],
+        ),
+        BaseItemKind::Episode => {
+            let stem = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default();
+            named(
+                stem,
+                &[
+                    ("Imdb", "imdbid"),
+                    ("Tvdb", "tvdbid"),
+                    ("TvMaze", "tvmazeid"),
+                    ("Tmdb", "tmdbid"),
+                ],
+            )
+        }
+        BaseItemKind::BoxSet => named(&file_name(path), &[("Tmdb", "tmdbid")]),
+        _ => Vec::new(),
+    };
+    ferrofin_providers::metadata_merge::set_provider_ids(
+        found
+            .iter()
+            .filter_map(|(provider, id)| id.as_deref().map(|id| (*provider, id))),
+    )
+}
+
+/// `Video.ContainingFolderPath`: a disc rip's own folder, a folder row
+/// itself, else the folder holding the file.
+fn containing_folder_path(entity: &BaseItemEntity, path: &str) -> String {
+    let data = crate::item_data::parse_data(entity.data.as_deref());
+    let rip = crate::item_data::read_data_string(&data, "VideoType")
+        .is_some_and(|video_type| matches!(video_type.as_str(), "Dvd" | "BluRay"));
+    if rip || entity.is_folder {
+        return path.to_owned();
+    }
+    std::path::Path::new(path)
+        .parent()
+        .and_then(|parent| parent.to_str())
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// A minimal filesystem-watch seam so the [`crate::library_monitor`] can be
 /// tested against a fake.
 ///
@@ -163,13 +301,106 @@ pub trait FileSystemWatcher: Send + Sync {
 
     /// Stops watching everything.
     async fn unwatch_all(&self) -> Result<(), ServiceError>;
+
+    /// Names every library location, watched or not, so the watcher can drop
+    /// a metadata-only change of one (its own `touch`, `chmod` or
+    /// `rsync -a`): reporting it would rescan its whole library. A location
+    /// inside a watched one is never passed to [`Self::watch`] (its parent's
+    /// recursive watch covers it, or its library has no real-time
+    /// monitoring), but it is a library root all the same. Replaces the
+    /// previous set. The default keeps nothing.
+    fn set_library_roots(&self, _roots: &[String]) {}
 }
 
 fn _assert_object_safe_file_system_watcher(_: &dyn FileSystemWatcher) {}
 
 #[cfg(test)]
 mod tests {
-    use super::should_ignore_path;
+    use super::{path_provider_ids, should_ignore_path};
+    use ferrofin_db::entities::base_items::BaseItemEntity;
+    use ferrofin_model::data::BaseItemKind;
+
+    /// The ids each kind's `SetProviderIdsFromPath` reads, kept as
+    /// `TrySetProviderId` keeps them.
+    #[rstest::rstest]
+    #[case::movie_folder(BaseItemKind::Movie, "/m/Heat (1995) [tmdbid-949]/Heat.mkv", false, None, &[("Tmdb", "949")])]
+    #[case::movie_file_when_the_folder_names_none(BaseItemKind::Movie, "/m/Heat/Heat [tmdb=949].mkv", false, None, &[("Tmdb", "949")])]
+    #[case::a_mixed_folder_reads_the_file_only(BaseItemKind::Movie, "/m/All [tmdbid-1]/Heat [tvdbid-2].mkv", true, None, &[("Tvdb", "2")])]
+    #[case::imdb_anywhere_in_the_path(BaseItemKind::Movie, "/m/tt0113277/Heat.mkv", false, None, &[("Imdb", "tt0113277")])]
+    #[case::a_disc_rip_reads_its_own_folder(BaseItemKind::Movie, "/m/Heat [tmdbid-949]", false, Some(r#"{"VideoType":"Dvd"}"#), &[("Tmdb", "949")])]
+    #[case::music_video(BaseItemKind::MusicVideo, "/mv/Song [tvdb-4]/Song.mkv", false, None, &[("Tvdb", "4")])]
+    #[case::series(BaseItemKind::Series, "/tv/Show [tvmazeid-5] [anidbid-7]", false, None, &[("TvMaze", "5"), ("AniDB", "7")])]
+    #[case::season(BaseItemKind::Season, "/tv/Show/Season 02 [anilistid-9]", false, None, &[("AniList", "9")])]
+    #[case::an_episode_reads_its_stem(BaseItemKind::Episode, "/tv/Show/S01E01 [tvdbid-3].mkv", false, None, &[("Tvdb", "3")])]
+    #[case::box_set(BaseItemKind::BoxSet, "/c/Saga [tmdbid-10] [boxset]", false, None, &[("Tmdb", "10")])]
+    #[case::an_invalid_id_is_dropped(BaseItemKind::Movie, "/m/Heat [tmdbid-abc]/Heat.mkv", false, None, &[])]
+    #[case::other_kinds_read_none(BaseItemKind::Audio, "/a/Song [tmdbid-1].flac", false, None, &[])]
+    fn path_provider_ids_read_each_kinds_name(
+        #[case] kind: BaseItemKind,
+        #[case] path: &str,
+        #[case] mixed: bool,
+        #[case] data: Option<&str>,
+        #[case] expected: &[(&str, &str)],
+    ) {
+        let entity = BaseItemEntity {
+            type_: crate::item_type_lookup::stored_type_name(kind)
+                .expect("stored type")
+                .to_owned(),
+            path: Some(path.to_owned()),
+            is_in_mixed_folder: mixed,
+            data: data.map(str::to_owned),
+            ..BaseItemEntity::default()
+        };
+        let expected: Vec<(String, String)> = expected
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        assert_eq!(path_provider_ids(&entity), expected, "{path}");
+    }
+
+    /// Upstream `IgnorePatternsTests.PathIgnored`, every `[InlineData]`.
+    #[rstest::rstest]
+    #[case("/media/small.jpg", true)]
+    #[case("/media/albumart.jpg", true)]
+    #[case("/media/movie.sample.mp4", true)]
+    #[case("/media/movie/sample.mp4", true)]
+    #[case("/media/movie/sample/movie.mp4", true)]
+    #[case("/foo/sample/bar/baz.mkv", false)]
+    #[case("/media/movies/the sample/the sample.mkv", false)]
+    #[case("/media/movies/sampler.mkv", false)]
+    #[case("/media/movies/#Recycle/test.txt", true)]
+    #[case("/media/movies/#recycle/", true)]
+    #[case("/media/movies/#recycle", true)]
+    #[case("thumbs.db", true)]
+    #[case(r"C:\media\movies\movie.avi", false)]
+    #[case("/media/.hiddendir/file.mp4", false)]
+    #[case("/media/dir/.hiddenfile.mp4", true)]
+    #[case("/media/dir/._macjunk.mp4", true)]
+    #[case("/volume1/video/Series/@eaDir", true)]
+    #[case("/volume1/video/Series/@eaDir/file.txt", true)]
+    #[case("/directory/@Recycle", true)]
+    #[case("/directory/@Recycle/file.mp3", true)]
+    #[case("/media/movies/.@__thumb", true)]
+    #[case("/media/movies/.@__thumb/foo-bar-thumbnail.png", true)]
+    #[case("/media/music/Foo B.A.R./epic.flac", false)]
+    #[case("/media/music/Foo B.A.R", false)]
+    #[case("/media/music/Foo B.A.R.", false)]
+    #[case("/movies/.zfs/snapshot/AutoM-2023-09", true)]
+    fn path_ignored(#[case] path: &str, #[case] expected: bool) {
+        assert_eq!(should_ignore_path(path), expected, "{path}");
+    }
+
+    /// `**/sample/*` takes a sample folder's direct children only: the folder
+    /// itself stays visible, so the scanner can see it as the `sample` extras
+    /// folder (PR #17964) — whatever its case.
+    #[rstest::rstest]
+    #[case("/media/Movie (2020)/Sample", false)]
+    #[case("/media/Movie (2020)/SAMPLE/clip.mkv", true)]
+    #[case("/media/Movie (2020)/minta/clip.mkv", true)]
+    #[case("/media/Movie (2020)/minta", false)]
+    fn a_sample_folder_hides_its_files_not_itself(#[case] path: &str, #[case] expected: bool) {
+        assert_eq!(should_ignore_path(path), expected, "{path}");
+    }
 
     #[test]
     fn ignores_artwork_and_sample_files() {

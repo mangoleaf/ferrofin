@@ -20,6 +20,43 @@ pub trait JsonEnum: Sized {
     fn json_default() -> Option<i32>;
 }
 
+/// Port of .NET `Enum.TryParse<TEnum>(value, ignoreCase, out result)` over a
+/// [`JsonEnum`]'s declared members, for the places upstream parses a stored or
+/// read string rather than JSON.
+///
+/// White space around the value is ignored. An integer (optional sign, then
+/// digits) is that C# value, declared or not. Anything else is a
+/// comma-separated list of member names, each matched exactly, or ignoring
+/// ASCII case with `ignore_case`, and their values are OR'ed, as C# does even
+/// for an enum without `[Flags]`. Empty input or an unknown name is `None`:
+/// C# returns `false` and leaves `default(TEnum)` in `result`, which the
+/// caller supplies with `unwrap_or`.
+#[must_use]
+pub fn try_parse<T: JsonEnum>(text: &str, ignore_case: bool) -> Option<T> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '+')
+        && let Ok(number) = trimmed.parse::<i32>()
+    {
+        return Some(T::from_discriminant(number));
+    }
+    let mut combined = 0;
+    for name in trimmed.split(',') {
+        let name = name.trim();
+        let (_, value) = T::members().iter().find(|(member, _)| {
+            if ignore_case {
+                member.eq_ignore_ascii_case(name)
+            } else {
+                *member == name
+            }
+        })?;
+        combined |= value;
+    }
+    Some(T::from_discriminant(combined))
+}
+
 /// Deserializes an enum using Jellyfin's `JsonStringEnumConverter` rules.
 ///
 /// # Errors
@@ -61,21 +98,7 @@ impl<T: JsonEnum> Visitor<'_> for EnumVisitor<T> {
         {
             return Ok(T::from_discriminant(default));
         }
-        let trimmed = text.trim();
-        if let Ok(number) = trimmed.parse::<i32>() {
-            return Ok(T::from_discriminant(number));
-        }
-        let mut combined = 0;
-        for name in trimmed.split(',') {
-            let Some((_, value)) = T::members()
-                .iter()
-                .find(|(member, _)| member.eq_ignore_ascii_case(name.trim()))
-            else {
-                return Err(E::invalid_value(de::Unexpected::Str(text), &self));
-            };
-            combined |= value;
-        }
-        Ok(T::from_discriminant(combined))
+        try_parse(text, true).ok_or_else(|| E::invalid_value(de::Unexpected::Str(text), &self))
     }
 }
 
@@ -146,6 +169,43 @@ mod tests {
         Unrecognized(i32),
     }
     wire_enum!(WithDefault, Some(1), { First => ("First", 1), Second => ("Second", 4) });
+
+    /// `Enum.TryParse<TEnum>(value, ignoreCase, out result)`: names exactly
+    /// or ignoring case, integers declared or not, comma lists OR'ed, white
+    /// space trimmed; empty, unknown or out-of-range input fails.
+    #[rstest::rstest]
+    #[case("First", false, Some(1))]
+    #[case("first", false, None)]
+    #[case("first", true, Some(1))]
+    #[case("  Second ", false, Some(4))]
+    #[case("4", false, Some(4))]
+    #[case("7", false, Some(7))]
+    #[case("-1", false, Some(-1))]
+    #[case("+4", false, Some(4))]
+    #[case("First, Second", false, Some(5))]
+    #[case("First,Nope", true, None)]
+    #[case("", true, None)]
+    #[case("   ", false, None)]
+    #[case("99999999999", false, None)]
+    // The empty-segment cases follow the .NET source (a trailing separator is
+    // rejected, an empty name matches no member); the JSON oracle has no row
+    // for them.
+    #[case("First,", false, None)]
+    #[case(",First", false, None)]
+    #[case("First,,Second", false, None)]
+    #[case("-", false, None)]
+    #[case("Second,First", false, Some(5))]
+    #[case("FIRST, second", true, Some(5))]
+    fn try_parse_follows_enum_try_parse(
+        #[case] text: &str,
+        #[case] ignore_case: bool,
+        #[case] expected: Option<i32>,
+    ) {
+        assert_eq!(
+            super::try_parse::<Sparse>(text, ignore_case).map(Sparse::json_value),
+            expected
+        );
+    }
 
     #[test]
     fn enum_binding_matches_jellyfin_oracle() {

@@ -24,16 +24,88 @@ Conventions:
 ## Per-plugin notes
 
 ### Intro Skipper
-- Ferrofin files: `crates/ferrofin-extensions/src/intro_skipper.rs`,
-  `crates/ferrofin-extensions/src/fingerprint.rs`,
-  `crates/ferrofin-api/tests/intro_skipper_handlers.rs`,
-  vendored assets `crates/ferrofin-extensions/assets/introskipper/`.
-- Phase 5 (its own API routes) deliberately deferred — see
-  the extension seam docs (`crates/ferrofin-extensions/src/lib.rs`).
+- Ferrofin files:
+  - the extension: `crates/ferrofin-extensions/src/intro_skipper.rs` (tasks,
+    config, caches, the analysis seam) and `intro_skipper/` —
+    `queue.rs` (`QueueManager`), `engine.rs` (`BaseItemAnalyzerTask`,
+    `ChromaprintAnalyzer`, `TimeAdjustmentHelper`), `chapter_analyzer.rs`,
+    `black_frame.rs` (`BlackFrameAnalyzer`, recaps), `credit_scenes.rs`
+    (`CreditsBlackFrameAnalyzer` and `Analyzers/Credits`), `automatic.rs`
+    (`Entrypoint`), `config_hash.rs` (`ConfigHasher`), test data `testdata/`;
+  - processes: `crates/ferrofin-extensions/src/ffmpeg.rs` (`FFmpegService`,
+    `FFmpegOutputParser`), `fingerprint.rs` (Chromaprint);
+  - storage: `crates/ferrofin-core/src/intro_skipper_repository.rs`, migrations
+    `0036`–`0038` (`Ferrofin*` tables), the seam
+    `crates/ferrofin-traits/src/intro_skipper.rs`;
+  - routes: `crates/ferrofin-api/src/handlers/intro_skipper.rs`, the
+    first-episode filter in `handlers/media_segments.rs`; tests
+    `crates/ferrofin-api/tests/intro_skipper_handlers.rs`;
+  - vendored assets `crates/ferrofin-extensions/assets/introskipper/`.
+- Ported: the segment store and its routes, the queue, incremental analysis
+  under `ConfigHasher`, settled-season reanalysis, every analyzer (Chromaprint,
+  chapters, black frames, credit scenes, recaps, anime previews), silence and
+  keyframe snapping, `ProbeAudioDuration`, `ProcessPriority`/`ProcessThreads`,
+  the detection cache, the Clean Intro Skipper Cache task, automatic analysis
+  (`Entrypoint`) and `AnalyzeAgain`, `MediaSegmentsFirstEpisodeFilter`, the task
+  identities and the support bundle. The upstream xUnit suites are
+  transliterated beside the code they test.
+- Accepted divergences (do NOT "fix" during sync):
+  - **Storage:** the plugin's own database is not imported (owner decision D3);
+    Ferrofin keeps its segments in `FerrofinIntroSkipperSegments` and publishes
+    them to `MediaSegments` under the plugin's MD5 provider id (D1, D2). The
+    detection cache is files beside the fingerprints (D7), not SQLite: prints
+    are keyed by window in whole seconds without a settings hash (re-keying
+    would re-fingerprint every library; a sub-second window change reuses the
+    old print), and the clean task deletes cache files no current read hits.
+    Migration `0037` seeds the segment store from the segments already
+    published, as automatic rows with an empty hash (upstream's schema upgrade
+    does the same): the first pass replaces each with what it detects, or
+    deletes it. Hand edits made before `0037`, and the plugin's own records of
+    them on an adopted database, are therefore not kept; nor are the plugin's
+    settings (`IntroSkipper.xml`). `docs/UPGRADING.md` tells operators.
+  - **Hashes:** Ferrofin's analysis hashes carry an analyzer-set token
+    (`config_hash::ANALYZERS`), bumped when an analyzer lands, so earlier
+    results are analysed again with it.
+  - **Fingerprinting:** ffmpeg's `chromaprint` muxer, falling back to `fpcalc`
+    (upstream has only the muxer); `IncompatibleFFmpegBuild` is raised only
+    when neither exists.
+  - **Upstream bugs not ported:** an anime preview is stored under the Preview
+    hash (upstream's Credits hash lets the Preview pass delete it for good);
+    Matroska `DURATION` tags parse at any fraction length (.NET's `TimeSpan`
+    stops at seven digits).
+  - **Failures:** a store write failure fails the season, retried next pass,
+    in every analyzer (upstream's black-frame analyzers log it per episode and
+    go on, the episode left analysed in memory); a failed keyframe
+    detection keeps the end; an invalid or runaway chapter pattern matches
+    nothing, reported once per pattern (upstream fails the pass); a negative
+    adjustment window is logged once, not per segment.
+  - **Concurrency:** the clean task holds the one-pass latch (upstream takes no
+    lock and can delete segments a concurrent pass just stored).
+  - **Automatic analysis:** library changes arrive through the event bus (D8),
+    debounced by `LibraryUpdateDuration` and batched, so a batch with any
+    addition waits as an addition, and image-only updates are not told apart.
+  - **Media Segment Scan** (`TaskExtractMediaSegments`) runs detection (D5),
+    then every registered segment provider — the plugin's `SegmentProvider`
+    publishing what detection stored, as upstream's scan runs it.
+  - **Support bundle:** the version line also names Ferrofin's; the ffmpeg
+    checks run when the bundle is asked for (upstream: at start); the bundle
+    names the Chromaprint backend.
+  - **Task keys:** the detection task was `IntroSkipper.Detect` before D6; the
+    task manager adopts what was saved under that key.
 
 ### File Transformation
 - Ferrofin files: `crates/ferrofin-extensions/src/file_transformation.rs`,
   vendored assets `crates/ferrofin-extensions/assets/filetransformation/`.
+- Accepted divergences:
+  - **A failing callback leaves the file as it was.** The plugin writes a callback's body over
+    the file whatever its status (`TransformationHelper.ApplyTransformation`), so an error
+    page is served as the bundle, and a timeout or transport failure is an exception that
+    fails the request. Ferrofin serves the file unchanged and logs the failure once at warn,
+    then at debug until the callback works again.
+  - **The pipeline's output is capped at 16 MiB** (`MAX_TRANSFORMED_BYTES`). The plugin reads
+    a callback's whole answer and applies every search/replace. Ferrofin reads no more than
+    16 MiB of an answer, and skips a step that would grow the file past 16 MiB, because the
+    pipeline runs on every anonymous `/web` request. jellyfin-web's bundles are a few MiB.
 
 ### Merge Versions
 - Ferrofin files: `crates/ferrofin-extensions/src/merge_versions.rs` (the whole
@@ -52,16 +124,27 @@ Conventions:
   `LocationsExcluded` config + inactive-library eligibility filters, the two
   24-hour dashboard tasks, and the vendored settings page. Routes and tasks
   self-gate on the plugin's enabled flag (disabled → routes 404, tasks no-op).
-- Accepted divergences (do NOT "fix" during sync): Ferrofin models version
-  groups solely via the `PrimaryVersionId` pointer — the C# `OwnerId` /
-  `LocalAlternateVersions` / `LinkedAlternateVersions` / linked-child-reroute
-  machinery is Jellyfin-internal representation, not API surface. No
-  `VideoType`/`Video3DFormat` columns in Ferrofin's schema, so primary selection
-  cannot demote 3D/non-file videos (width ordering only). No `IndexNumberEnd`
-  column, so that episode-key component is always empty. Upstream's
+- Divergence PENDING OWNER DECISION (D10 in
+  `brain/plans/PLAN_ITEM_FILE_DELETION.md`): the pinned plugin (`e6f58d6`,
+  `MergeVersionsManager.cs:211-233`) writes a merge as OWNED local versions —
+  each alternate gets `OwnerId` = the primary and the primary's
+  `LocalAlternateVersions` lists it, so the save writes `ChildType` 2 rows —
+  and its split (`:282-299`) unlinks local versions too. Ferrofin writes a
+  merge as a linked version (`PrimaryVersionId` plus a `ChildType` 3 row, as
+  core `VideosController.MergeVersions` does), never merges or splits an
+  owned row, and leaves `OwnerId`/type-2 rows to the scanner, which owns the
+  files it groups (`ItemPersistenceService::sync_local_versions`). An
+  adopted database's plugin merges (owned, type 2) therefore read as local
+  versions here. The linked-child reroute is not ported.
+- Accepted divergences (do NOT "fix" during sync): Upstream's
   `Parallel.ForEach` fire-and-forget async merges (error-dropping) run
-  sequentially in Ferrofin. The episode merge key is scoped to the series
-  *row* (`SeriesPresentationUniqueKey`), not the series name as upstream
+  sequentially in Ferrofin. The four bulk operations (the routes and both
+  daily tasks) also run one at a time: upstream has no lock, so a merge and a
+  split started together interleave their link writes; here a second call
+  waits for the first. The routes keep upstream's plain `[Authorize]` (any
+  signed-in user), unlike core `POST /Videos/MergeVersions`, which requires
+  elevation: owner decision 2026-10-24. The episode merge key is scoped to
+  the series *row* (`SeriesPresentationUniqueKey`), not the series name as upstream
   does: a show present in two libraries (hot/cold tiers) has two series rows
   with one name, and the name-scoped key merged episodes across them —
   hiding each alternate from its own series' list and skewing season counts.

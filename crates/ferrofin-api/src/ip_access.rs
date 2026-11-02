@@ -16,14 +16,20 @@ use ferrofin_networking::RemoteAccessPolicyResult;
 
 use crate::state::AppState;
 
+/// The address a request's connection was accepted on, which the server's
+/// accept loop records beside `ConnectInfo` (the peer). C# `IsLocal()`
+/// compares the two.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectionLocalAddr(pub std::net::SocketAddr);
+
 /// Rejects a request whose peer the network policy excludes.
 ///
 /// Upstream's shape exactly:
 ///
-/// - a request from the server's own machine is exempt (C# `IsLocal()`, which
-///   compares the local and remote addresses of the connection — here, a
-///   loopback peer, since a peer equal to the local address IS loopback for a
-///   TCP connection);
+/// - a request from the server's own machine is exempt: C# `IsLocal()`, the
+///   connection's local address equal to its remote one (the server's own
+///   ffmpeg reading a Live TV stream through a LAN address, say), and any
+///   loopback peer, which no other host can be;
 /// - otherwise `ShouldAllowServerAccess(GetNormalizedRemoteIP())` decides, and
 ///   anything but `Allow` returns **503**, not 403 — a blocked client is meant
 ///   to look like an unavailable server, not a refused one;
@@ -47,7 +53,13 @@ pub async fn ip_access_layer(
     // filter the wrong host — and let every real client through. The forwarded
     // chain is consulted only when the peer is a configured `KnownProxy`.
     let ip = state.client_address_for(peer, &crate::state::forwarded_for(request.headers()));
-    if ip.is_loopback() {
+    // Absent where the accept loop could not read the connection's local
+    // address (or a router built without it): only loopback is exempt then.
+    let local = request
+        .extensions()
+        .get::<ConnectionLocalAddr>()
+        .map(|local| crate::state::normalize_ip(local.0.ip()));
+    if ip.is_loopback() || local == Some(ip) {
         return next.run(request).await;
     }
     let result = state.remote_access_policy(ip);

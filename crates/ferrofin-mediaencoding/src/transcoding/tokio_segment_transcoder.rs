@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+use super::progress::{FfmpegProgress, parse};
 use super::segment_transcoder::{SegmentTranscoder, SpawnRequest, TranscodeChild};
 
 /// The production [`SegmentTranscoder`]: spawns ffmpeg with `tokio::process`.
@@ -63,6 +64,8 @@ impl SegmentTranscoder for TokioSegmentTranscoder {
         let _ = log.write_all(header.as_bytes()).await;
 
         let stderr = child.stderr.take();
+        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+        let progress = Arc::new(std::sync::Mutex::new(None));
 
         let exited = Arc::new(AtomicBool::new(false));
         let exit_code = Arc::new(Mutex::new(None::<i32>));
@@ -70,15 +73,33 @@ impl SegmentTranscoder for TokioSegmentTranscoder {
 
         // Pump stderr → log until EOF. Detached so it never blocks kill.
         if let Some(mut stderr) = stderr {
+            let report = Arc::clone(&progress);
             tokio::spawn(async move {
                 let mut buf = [0u8; 8192];
+                let mut line = Vec::new();
                 loop {
                     match stderr.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
+                            // Preserve the original stderr bytes in the log;
+                            // ffmpeg uses carriage returns for live statistics.
                             let _ = log.write_all(&buf[..n]).await;
+                            for byte in &buf[..n] {
+                                if *byte == b'\r' || *byte == b'\n' {
+                                    if let Some(parsed) = parse(&String::from_utf8_lossy(&line)) {
+                                        *report.lock().expect("progress lock poisoned") =
+                                            Some(parsed);
+                                    }
+                                    line.clear();
+                                } else if line.len() < 65_536 {
+                                    line.push(*byte);
+                                }
+                            }
                         }
                     }
+                }
+                if let Some(parsed) = parse(&String::from_utf8_lossy(&line)) {
+                    *report.lock().expect("progress lock poisoned") = Some(parsed);
                 }
                 let _ = log.flush().await;
             });
@@ -88,6 +109,8 @@ impl SegmentTranscoder for TokioSegmentTranscoder {
             child,
             exited,
             exit_code,
+            stdin,
+            progress,
         }))
     }
 }
@@ -97,6 +120,8 @@ struct TokioTranscodeChild {
     child: Arc<Mutex<tokio::process::Child>>,
     exited: Arc<AtomicBool>,
     exit_code: Arc<Mutex<Option<i32>>>,
+    stdin: Arc<Mutex<Option<tokio::process::ChildStdin>>>,
+    progress: Arc<std::sync::Mutex<Option<FfmpegProgress>>>,
 }
 
 #[async_trait]
@@ -120,22 +145,57 @@ impl TranscodeChild for TokioTranscodeChild {
     }
 
     async fn wait(&self) -> i32 {
-        let status = {
-            let mut child = self.child.lock().await;
-            child.wait().await
-        };
-        let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
-        self.exited.store(true, Ordering::SeqCst);
-        *self.exit_code.lock().await = Some(code);
-        code
+        // Poll/reap without holding the child mutex across a wait: teardown
+        // must be able to resume and stop a process while another task awaits it.
+        while !self.has_exited() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        self.exit_code().unwrap_or(-1)
+    }
+
+    fn progress(&self) -> Option<FfmpegProgress> {
+        *self.progress.lock().expect("progress lock poisoned")
+    }
+
+    async fn write_stdin(&self, bytes: &[u8]) -> Result<(), String> {
+        let mut stdin = self.stdin.lock().await;
+        let stdin = stdin
+            .as_mut()
+            .ok_or_else(|| "ffmpeg stdin is closed".to_owned())?;
+        stdin
+            .write_all(bytes)
+            .await
+            .map_err(|error| format!("write ffmpeg stdin: {error}"))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|error| format!("flush ffmpeg stdin: {error}"))
     }
 
     async fn kill(&self) -> Result<(), String> {
+        if self.has_exited() {
+            return Ok(());
+        }
+        // TranscodingJob.Stop resumes throttling first, then writes q and
+        // allows five seconds for a graceful exit before terminating the child.
+        let graceful = self.write_stdin(b"q\n").await.is_ok();
         let mut child = self.child.lock().await;
-        child
-            .kill()
-            .await
-            .map_err(|e| format!("failed to kill ffmpeg: {e}"))?;
+        let status = if graceful {
+            tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+                .await
+                .ok()
+                .and_then(Result::ok)
+        } else {
+            None
+        };
+        if let Some(status) = status {
+            *self.exit_code.lock().await = Some(status.code().unwrap_or(-1));
+        } else {
+            child
+                .kill()
+                .await
+                .map_err(|error| format!("failed to kill ffmpeg: {error}"))?;
+        }
         self.exited.store(true, Ordering::SeqCst);
         Ok(())
     }

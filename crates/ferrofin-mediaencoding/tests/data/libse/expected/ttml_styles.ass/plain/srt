@@ -1,0 +1,33 @@
+1
+00:00:01,000 --> 00:00:02,000
+{\an5}Centre middle
+
+2
+00:00:02,000 --> 00:00:03,000
+Quoted style name
+
+3
+00:00:03,000 --> 00:00:04,000
+Raw <i>html</i> & <b>bold</b>
+
+4
+00:00:04,000 --> 00:00:05,000
+Region from the effect
+
+5
+00:00:05,000 --> 00:00:06,000
+{\an8}Region effect with an8
+
+6
+00:00:06,000 --> 00:00:07,000
+Effects as attributes
+
+7
+00:00:07,000 --> 00:00:08,000
+{\an8}
+
+8
+00:00:08,000 --> 00:00:09,000
+Lower-case style name
+Second line
+

@@ -14,11 +14,20 @@
 //! - `create_items`/`update_items` collapse to `save_items` on the persistence
 //!   service (the row upsert is idempotent); the `parent_id` argument is accepted
 //!   for API parity but the parent linkage is already carried on each row's
-//!   `ParentId` column.
-//! - `delete_item` deletes the item's row and its children's through the
-//!   persistence service. TODO(parity, open work item): upstream deletes the
-//!   media files (`DeleteFileLocation = true`); not ported yet, it waits on
-//!   scanner parity. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
+//!   `ParentId` column. `update_items` is the edit's save, so first it does
+//!   what `UpdateItemsAsync` and the mapper do to a loaded item: it re-derives
+//!   `SortName` (a caller that must keep a key it supplies saves through the
+//!   persistence service instead), re-scores the parental rating and re-indexes
+//!   the item values.
+//! - `delete_item` honors [`DeleteOptions`] in upstream's order: a primary
+//!   video's versions first (a missing one deleted, the first remaining one
+//!   promoted in its place) or an alternate version's references moved to
+//!   its primary, then the item's (and a folder's children's) internal
+//!   metadata, then — with `delete_file_location` — its files
+//!   ([`crate::item_deletion`]; the first path's failure stops the delete
+//!   with every row in place), then the extracted data, then the rows and
+//!   everything the persistence delete takes with them (`ParentId`
+//!   descendants, the extras and stacked parts it owns).
 //! - The `IProgress` scan plumbing is dropped. A scan runs on the scan
 //!   queue's own worker task and is cancelled cooperatively, between two
 //!   items, through a [`ScanCancel`] (the `CancellationToken`'s role).
@@ -46,6 +55,7 @@ use ferrofin_traits::persistence::{
     ItemCountService, ItemPersistenceService, ItemRepository, ItemWithCounts, PeopleRepository,
 };
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+use ferrofin_util::stable_sort::stable_sort_by;
 
 use crate::library_scan::{LaneRefresh, PriorityLane, ScanCancel, ScanPasses, ScanRun};
 use ferrofin_traits::library::ScanProgressSink;
@@ -64,6 +74,11 @@ const PLACEHOLDER_ITEM_ID: Uuid = Uuid::from_u128(1);
 #[derive(Clone)]
 pub struct FerrofinLibraryManager {
     items: Arc<dyn ItemRepository>,
+    dashboard_configuration:
+        Option<Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
+    collections: Arc<
+        std::sync::OnceLock<std::sync::Weak<dyn ferrofin_traits::collections::CollectionManager>>,
+    >,
     visibility: Option<Arc<crate::item_visibility::ItemVisibility>>,
     virtual_folders: Option<Arc<dyn ferrofin_traits::library::VirtualFolderManager>>,
     counts: Arc<dyn ItemCountService>,
@@ -87,6 +102,11 @@ pub struct FerrofinLibraryManager {
     /// repository (not the `ChapterManager`) is held because the manager is
     /// built on top of this manager — taking it here would be a cycle.
     chapters: Option<Arc<dyn ferrofin_traits::persistence::ChapterRepository>>,
+    /// Playlist and collection membership, which a merge re-points from each
+    /// merged item to the primary (`RerouteLinkedChildReferencesAsync`). Set
+    /// by the composition root; `None` (unit tests) leaves membership as it
+    /// is.
+    linked_children: Option<Arc<dyn ferrofin_traits::persistence::LinkedChildrenService>>,
     /// The `UserRootFolder` provisioner (`GetUserRootFolder()`), set by the
     /// composition root. `None` (unit tests) falls back to resolving an
     /// already-persisted root row.
@@ -102,6 +122,317 @@ pub struct FerrofinLibraryManager {
     /// the composition root. `None` (unit tests) means item writes announce
     /// nothing, which is what every test that does not assert on the push wants.
     changed: Option<Arc<crate::library_changed_notifier::LibraryChangedNotifier>>,
+    /// How this database derives an item's id from its path, set by the
+    /// composition root ([`FerrofinLibraryManager::with_id_derivation`]): a
+    /// stacked video's parts are found by the ids their paths derive to
+    /// (`Video.GetAdditionalPartIds`). Unset, it is Jellyfin's derivation
+    /// with no program-data path, which is the same for every media path.
+    id_derivation: crate::item_type_lookup::IdDerivation,
+    /// The server's directories, which a delete reads twice: the internal
+    /// metadata root whose per-item folders it removes, and the
+    /// `%AppDataPath%`/`%MetadataPath%` expansion of a stored path (an
+    /// adopted collection's or playlist's folder) before its files are
+    /// deleted. A file delete is never confined to the library locations —
+    /// as upstream, whatever path the item names goes. Set by the
+    /// composition root; `None` (unit tests) removes no metadata folder and
+    /// takes stored paths as they are.
+    app_paths: Option<Arc<crate::app_paths::FerrofinServerApplicationPaths>>,
+    /// The extracted-data cleanup `DeleteItem` runs for every deleted row
+    /// (`IExternalDataManager.DeleteExternalItemFiles`). Late-bound: the
+    /// manager is built before the chapter and segment managers it needs.
+    external_data: std::sync::OnceLock<Arc<dyn ferrofin_traits::system::ExternalDataManager>>,
+}
+
+/// `Folder.QueryRecursive`'s post-filter gate (v12.2 Folder.cs:1008-1014): a
+/// user's recursive query for box sets and/or playlists only. Their per-user
+/// access (shares, open access, owner) lives in the item data, so SQL cannot
+/// decide it.
+fn post_filters_containers(query: &InternalItemsQuery) -> bool {
+    query.user.is_some()
+        && !query.include_item_types.is_empty()
+        && query
+            .include_item_types
+            .iter()
+            .all(|kind| matches!(kind, BaseItemKind::BoxSet | BaseItemKind::Playlist))
+}
+
+/// Port of Folder.CollapseBoxSetItems / AllowBoxSetCollapsing, not HasFilters:
+/// only the upstream allow-list disables this display transformation.
+fn folder_should_collapse(query: &InternalItemsQuery, movies: bool, shows: bool) -> bool {
+    if matches!(
+        query.parent_type,
+        Some(
+            BaseItemKind::BoxSet
+                | BaseItemKind::Season
+                | BaseItemKind::MusicAlbum
+                | BaseItemKind::MusicArtist
+        )
+    ) {
+        return false;
+    }
+    if !folder_allows_collapsing(query) {
+        return false;
+    }
+    if let Some(explicit) = query.collapse_box_set_items {
+        return explicit;
+    }
+    let has_movies = query.include_item_types.is_empty()
+        || query.include_item_types.contains(&BaseItemKind::Movie);
+    let has_shows = query.include_item_types.is_empty()
+        || query.include_item_types.contains(&BaseItemKind::Series);
+    if query.user.is_some() {
+        (has_movies && movies) || (has_shows && shows)
+    } else {
+        has_movies || has_shows
+    }
+}
+
+fn folder_allows_collapsing(query: &InternalItemsQuery) -> bool {
+    [
+        query.is_favorite,
+        query.is_favorite_or_liked,
+        query.is_liked,
+        query.is_played,
+        query.is_resumable,
+        query.is_folder,
+        query.has_imdb_id,
+        query.has_official_rating,
+        query.has_overview,
+        query.has_parental_rating,
+        query.has_special_feature,
+        query.has_subtitles,
+        query.has_theme_song,
+        query.has_theme_video,
+        query.has_tmdb_id,
+        query.has_trailer,
+        query.is_3d,
+        query.is_4k,
+        query.is_hd,
+        query.is_locked,
+        query.is_place_holder,
+    ]
+    .iter()
+    .all(Option::is_none)
+        && query.genres.is_empty()
+        && query.genre_ids.is_empty()
+        && query.image_types.is_empty()
+        && query.person_ids.is_empty()
+        && query.item_ids.is_empty()
+        && query.studio_ids.is_empty()
+        && query.video_types.is_empty()
+        && query.years.is_empty()
+        && query.tags.is_empty()
+        && query.official_ratings.is_empty()
+        && query
+            .person
+            .as_ref()
+            .is_none_or(|person| person.trim().is_empty())
+        && query.min_index_number.is_none()
+        && !query.order_by.iter().any(|(order, _)| {
+            matches!(
+                order,
+                ferrofin_model::live_tv::ItemSortBy::CommunityRating
+                    | ferrofin_model::live_tv::ItemSortBy::CriticRating
+                    | ferrofin_model::live_tv::ItemSortBy::Runtime
+            )
+        })
+}
+
+fn folder_name_matches(item: &BaseItemEntity, query: &InternalItemsQuery) -> bool {
+    use crate::item_repository::{folder_ordinal_compare, folder_sort_name};
+    use ferrofin_util::string_extensions::upper_invariant;
+    let sort = folder_sort_name(item);
+    query
+        .name_starts_with
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .is_none_or(|prefix| upper_invariant(&sort).starts_with(&upper_invariant(prefix)))
+        && query
+            .name_starts_with_or_greater
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .is_none_or(|bound| !folder_ordinal_compare(Some(&sort), Some(bound)).is_lt())
+        && query
+            .name_less_than
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+            .is_none_or(|bound| folder_ordinal_compare(Some(&sort), Some(bound)).is_lt())
+}
+
+fn episode_relation_id(value: Option<&str>) -> Option<Uuid> {
+    value
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .filter(|id| !id.is_nil())
+}
+
+/// A series' or season's `GetPresentationUniqueKey()`: its stored key, else
+/// its id — the key its episodes are queried under.
+pub(crate) fn episode_presentation_key(item: &BaseItemEntity) -> String {
+    item.presentation_unique_key
+        .as_ref()
+        .filter(|key| !key.is_empty())
+        .cloned()
+        .unwrap_or_else(|| item.id.clone())
+}
+
+fn episode_virtual_location(item: &BaseItemEntity) -> bool {
+    let kind = item.type_.rsplit('.').next().unwrap_or(&item.type_);
+    let channel = kind == "Channel"
+        || (!matches!(
+            kind,
+            "LiveTvChannel" | "TvChannel" | "LiveTvProgram" | "TvProgram"
+        ) && episode_relation_id(item.channel_id.as_deref()).is_some());
+    item.path.as_deref().is_none_or(str::is_empty) && !channel
+}
+
+fn episode_air_order(item: &BaseItemEntity) -> ferrofin_model::entities_media::AiredEpisodeOrder {
+    let data = item
+        .data
+        .as_deref()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok());
+    let number = |key| {
+        data.as_ref()
+            .and_then(|data| data.get(key))
+            .and_then(serde_json::Value::as_i64)
+    };
+    ferrofin_model::entities_media::AiredEpisodeOrder {
+        season: item.parent_index_number,
+        episode: item.index_number,
+        premiere: item.premiere_date,
+        airs_before_season: number("AirsBeforeSeasonNumber"),
+        airs_after_season: number("AirsAfterSeasonNumber"),
+        airs_before_episode: number("AirsBeforeEpisodeNumber"),
+    }
+}
+
+/// `Season.GetEpisodes` → `Series.GetSeasonEpisodes(parentSeason, user, options,
+/// shouldIncludeMissingEpisodes: true)`: the series' episodes (its seasons
+/// alongside, to resolve each episode's parent) narrowed to `season`'s by
+/// `FilterEpisodesBySeason` — with `include_specials`
+/// (`DisplaySpecialsWithinSeasons`), a special airing within a numbered
+/// season belongs to it — and sorted in aired order (season 0 keeps the
+/// series' `SortName` order). Empty when the season has no series.
+/// `season_id` is the season's id; `query` supplies the user and the DTO
+/// options the series query runs with.
+#[allow(clippy::too_many_lines)] // source relation resolution, then selection
+pub(crate) async fn season_episode_rows(
+    items: &dyn ItemRepository,
+    season_id: Uuid,
+    season: BaseItemEntity,
+    query: &InternalItemsQuery,
+    include_specials: bool,
+) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    let series_id = episode_relation_id(season.series_id.as_deref())
+        .or_else(|| episode_relation_id(season.parent_id.as_deref()));
+    let series = match series_id {
+        Some(id) => items.retrieve_item(id).await?,
+        None => None,
+    }
+    .filter(|row| row.type_.rsplit('.').next() == Some("Series"));
+    let Some(series) = series else {
+        return Ok(Vec::new());
+    };
+    let rows = items
+        .get_item_list(&InternalItemsQuery {
+            user: query.user.clone(),
+            series_presentation_unique_key: Some(episode_presentation_key(&series)),
+            include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
+            order_by: vec![(
+                ferrofin_model::live_tv::ItemSortBy::SortName,
+                ferrofin_model::dto::SortOrder::Ascending,
+            )],
+            dto_options: query.dto_options.clone(),
+            // Season.GetItemsInternal passes shouldIncludeMissing=true.
+            ..Default::default()
+        })
+        .await?;
+    let series_seasons: Vec<_> = rows
+        .iter()
+        .filter(|row| row.type_.rsplit('.').next() == Some("Season"))
+        .cloned()
+        .collect();
+    let mut seasons: HashMap<_, _> = series_seasons
+        .iter()
+        .filter_map(|row| episode_relation_id(Some(&row.id)).map(|id| (id, row.clone())))
+        .collect();
+    seasons.insert(season_id, season.clone());
+    let mut unknown = std::collections::HashSet::new();
+    for row in &rows {
+        if row.type_.rsplit('.').next() == Some("Episode")
+            && let Some(id) = episode_relation_id(row.season_id.as_deref())
+                .or_else(|| episode_relation_id(row.parent_id.as_deref()))
+            && !seasons.contains_key(&id)
+        {
+            unknown.insert(id);
+        }
+    }
+    if !unknown.is_empty() {
+        for row in items
+            .retrieve_items(&unknown.into_iter().collect::<Vec<_>>())
+            .await?
+        {
+            if row.type_.rsplit('.').next() == Some("Season")
+                && let Some(id) = episode_relation_id(Some(&row.id))
+            {
+                seasons.insert(id, row);
+            }
+        }
+    }
+    let key = episode_presentation_key(&season);
+    let number = season.index_number;
+    let support_specials = include_specials && number.is_some_and(|number| number != 0);
+    let mut matches = Vec::new();
+    for row in rows
+        .into_iter()
+        .filter(|row| row.type_.rsplit('.').next() == Some("Episode"))
+    {
+        let parent = episode_relation_id(row.season_id.as_deref())
+            .or_else(|| episode_relation_id(row.parent_id.as_deref()))
+            .and_then(|id| seasons.get(&id))
+            .or_else(|| {
+                (episode_relation_id(row.parent_id.as_deref()) == series_id)
+                    .then(|| {
+                        series_seasons
+                            .iter()
+                            .find(|parent| parent.index_number == row.parent_index_number)
+                    })
+                    .flatten()
+            });
+        let same_season = parent.is_some_and(|parent| {
+            ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+                &episode_presentation_key(parent),
+                &key,
+            )
+        });
+        // The disabled source query is restricted to the season's
+        // presentation ancestry, before FilterEpisodesBySeason runs.
+        if !include_specials && !same_season {
+            continue;
+        }
+        let order = episode_air_order(&row);
+        let current = if support_specials {
+            order
+                .airs_after_season
+                .or(order.airs_before_season)
+                .or(order.season)
+        } else {
+            order.season
+        };
+        let matches_number = current.is_some() && number.is_some() && current == number;
+        let matches_virtual = current.is_none()
+            && number.is_none()
+            && episode_virtual_location(&season)
+            && parent.is_none_or(episode_virtual_location);
+        if matches_number || matches_virtual || same_season {
+            matches.push((order, row));
+        }
+    }
+    if number != Some(0) {
+        // `LibraryManager.Sort`'s LINQ `OrderBy`: stable, and the aired-order
+        // comparer is not a total order, on which `sort_by` may panic.
+        stable_sort_by(&mut matches, |(left, _), (right, _)| left.compare(right));
+    }
+    Ok(matches.into_iter().map(|(_, row)| row).collect())
 }
 
 /// One scan request: what it covers, the options its items refresh with,
@@ -216,6 +547,15 @@ impl ScanRequest {
             && (whole_libraries || self.ancestors == other.ancestors)
     }
 
+    /// Whether this is a full library validation — upstream's
+    /// `ValidateMediaLibraryInternal`, the span its `IsScanRunning` covers:
+    /// every library, with the library's closing passes. A refresh of the
+    /// root folder over the API covers every library too, but it is
+    /// `ProviderManager.RefreshItem` upstream, not a validation.
+    fn is_library_validation(&self) -> bool {
+        self.scope == ScanTarget::All && self.passes == ScanPasses::Library
+    }
+
     /// Whether two requests refresh alike, so that one may cover the other.
     fn refreshes_like(&self, other: &Self) -> bool {
         self.options == other.options
@@ -284,6 +624,9 @@ struct RunningScan {
     waiters: Waiters,
     /// Stops it between two items once nobody wants it any more.
     cancel: ScanCancel,
+    /// It is a full library validation ([`ScanRequest::is_library_validation`]),
+    /// what `is_scan_running` reports.
+    validation: bool,
 }
 
 /// How a scan a caller waited for ended.
@@ -632,6 +975,7 @@ impl ScanWorker {
                     queue.running = Some(RunningScan {
                         waiters: pending.waiters,
                         cancel: cancel.clone(),
+                        validation: pending.request.is_library_validation(),
                     });
                     Some((pending.request, cancel, waited))
                 } else {
@@ -718,7 +1062,8 @@ impl ScanWorker {
         };
         let request = request.clone();
         let cancel = cancel.clone();
-        tokio::spawn(
+        tokio::spawn(ferrofin_util::current_culture::scope(
+            ferrofin_util::current_culture::capture(),
             async move {
                 let report = move |percent: f64| lock_queue(&queue).report(percent);
                 runner
@@ -732,7 +1077,7 @@ impl ScanWorker {
                     .await
             }
             .instrument(span.clone()),
-        )
+        ))
     }
 
     /// Waits for one scan's task and logs how it ended, inside `span` (only
@@ -966,6 +1311,8 @@ impl FerrofinLibraryManager {
     ) -> Self {
         Self {
             items,
+            dashboard_configuration: None,
+            collections: Arc::new(std::sync::OnceLock::new()),
             visibility: None,
             virtual_folders: None,
             counts,
@@ -976,11 +1323,435 @@ impl FerrofinLibraryManager {
             scan_progress: Arc::new(tokio::sync::watch::Sender::new(0)),
             scan_tracker: None,
             chapters: None,
+            linked_children: None,
             user_root: None,
             years: None,
+            id_derivation: crate::item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: None,
+            },
             by_name: None,
             changed: None,
+            app_paths: None,
+            external_data: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Configure live dashboard display options for controller folder browses.
+    #[must_use]
+    pub fn with_dashboard_configuration(
+        mut self,
+        config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+    ) -> Self {
+        self.dashboard_configuration = Some(config);
+        self
+    }
+
+    /// CollectionManager owns the library manager. The reverse reference is
+    /// weak so the Folder post-filter consumer cannot create an Arc cycle.
+    pub fn attach_collections(
+        &self,
+        collections: &Arc<dyn ferrofin_traits::collections::CollectionManager>,
+    ) {
+        let _ = self.collections.set(Arc::downgrade(collections));
+    }
+
+    async fn folder_display_result(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Option<QueryResult<BaseItemEntity>>, ServiceError> {
+        if !query.apply_folder_display_options || !query.item_ids.is_empty() {
+            return Ok(None);
+        }
+        let Some(config) = &self.dashboard_configuration else {
+            return Ok(None);
+        };
+        let config = config.configuration().await?;
+        let movies = config.enable_grouping_movies_into_collections;
+        let shows = config.enable_grouping_shows_into_collections;
+        // Disabled recursive queries need no parent or collection reads. Plain
+        // Folder queries still use the pinned Filter→SortAndPage contract.
+        if query.recursive
+            && query.parent_type != Some(BaseItemKind::Season)
+            && query.collapse_box_set_items.is_none()
+            && !movies
+            && !shows
+            && query.user.is_some()
+            && !post_filters_containers(query)
+        {
+            return Ok(None);
+        }
+        let mut resolved = query.clone();
+        if resolved.parent_type.is_none()
+            && !resolved.parent_id.is_nil()
+            && let Some(parent) = self.items.retrieve_item(resolved.parent_id).await?
+        {
+            resolved.parent_type = serde_json::from_value(serde_json::Value::String(
+                parent
+                    .type_
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&parent.type_)
+                    .to_owned(),
+            ))
+            .ok();
+        }
+        // Series queries use their own SQL options; Channel queries return
+        // through ChannelManager. Neither invokes Folder's automatic policy.
+        if !resolved.folder_query_recursive
+            && matches!(
+                resolved.parent_type,
+                Some(BaseItemKind::Series | BaseItemKind::Channel)
+            )
+        {
+            return Ok(None);
+        }
+        // Season.GetItemsInternal calls its live GetEpisodes consumer, then
+        // Filter/PostFilterAndSort. It never substitutes a collection.
+        if !resolved.folder_query_recursive
+            && resolved.parent_type == Some(BaseItemKind::Season)
+            && resolved.user.is_some()
+        {
+            resolved.collapse_box_set_items = None;
+            return self
+                .season_display_result(&resolved, config.display_specials_within_seasons)
+                .await
+                .map(Some);
+        }
+        // ItemsController's user-root shortcut and nonrecursive UserView
+        // builders have their own GetResult contract, outside Folder's policy.
+        if !resolved.recursive
+            && (!resolved.item_ids.is_empty()
+                || (resolved.user_root_children
+                    && (resolved.parent_id.is_nil()
+                        || resolved.parent_type == Some(BaseItemKind::UserRootFolder)))
+                || resolved.parent_type == Some(BaseItemKind::UserView))
+        {
+            return Ok(None);
+        }
+        let should_collapse = folder_should_collapse(&resolved, movies, shows);
+        // `BoxSet.GetChildren` orders the set's direct members by its
+        // `DisplayOrder` (`BoxSet.cs:116-132`) unless the request names an order
+        // of its own. A recursive listing is the repository query, which does
+        // not (measured against Jellyfin 12.2: name order whatever the set says).
+        self.apply_box_set_order(&mut resolved).await?;
+        // These domain overrides never substitute in plain Folder views.
+        // Preserve their existing browse consumers; music child-selection
+        // semantics are a separate source gap.
+        if !resolved.recursive
+            && matches!(
+                resolved.parent_type,
+                Some(BaseItemKind::BoxSet | BaseItemKind::MusicAlbum | BaseItemKind::MusicArtist)
+            )
+        {
+            return self.direct_children(resolved).await.map(Some);
+        }
+        if resolved.recursive {
+            if !resolved.force_direct && should_collapse {
+                resolved.collapse_box_set_items = Some(true);
+                resolved.collapse_box_set_item_types = if movies && shows {
+                    Vec::new()
+                } else {
+                    [(movies, BaseItemKind::Movie), (shows, BaseItemKind::Series)]
+                        .into_iter()
+                        .filter_map(|(enabled, kind)| enabled.then_some(kind))
+                        .collect()
+                };
+            }
+            // Pinned QueryRecursive does not clear an explicit true when its
+            // auto-collapse gate fails, or when ForceDirect bypasses that gate.
+            if post_filters_containers(&resolved) {
+                return self.query_with_post_filtering(&resolved).await.map(Some);
+            }
+            return self.items.get_items(&resolved).await.map(Some);
+        }
+        // Plain Folder.GetItemsInternal filters visible unpaged children even
+        // with both grouping flags disabled. D01 owns the reusable pinned
+        // UserViewBuilder.Filter seam; keep sorting/paging after substitution.
+        let children = self.visible_folder_children(&resolved).await?;
+        let children = self.items.filter_folder_children(children, query).await?;
+        let items = if should_collapse && (movies || shows) && resolved.user.is_some() {
+            self.collapse_folder_children(children, query, movies, shows)
+                .await?
+        } else {
+            children
+        };
+        self.folder_post_filter_result(items, query).await.map(Some)
+    }
+
+    /// Season.GetItemsInternal: select aired episodes before Filter and paging.
+    /// The existing LibraryManager traits query seam keeps API independent of core.
+    async fn season_display_result(
+        &self,
+        query: &InternalItemsQuery,
+        include_specials: bool,
+    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        let season = self.items.retrieve_item(query.parent_id).await?;
+        let episodes = match season {
+            Some(season) => {
+                season_episode_rows(
+                    self.items.as_ref(),
+                    query.parent_id,
+                    season,
+                    query,
+                    include_specials,
+                )
+                .await?
+            }
+            None => Vec::new(),
+        };
+        let episodes = self.items.filter_folder_children(episodes, query).await?;
+        self.folder_post_filter_result(episodes, query).await
+    }
+
+    /// Load physical and linked Folder children with the existing access checks.
+    async fn visible_folder_children(
+        &self,
+        resolved: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut child_query = InternalItemsQuery {
+            user: resolved.user.clone(),
+            parent_id: resolved.parent_id,
+            parent_type: resolved.parent_type,
+            group_by_presentation_unique_key: false,
+            ..InternalItemsQuery::default()
+        };
+        let children = if matches!(
+            resolved.parent_type,
+            Some(BaseItemKind::AggregateFolder | BaseItemKind::UserRootFolder)
+        ) {
+            // Folder.GetChildren's physical-root arm delegates to the user
+            // root, retaining its access exemptions and virtual children.
+            if let Some(root) = self.get_user_root_folder().await? {
+                child_query.parent_id = Uuid::parse_str(&root.id)
+                    .map_err(|error| ServiceError::backend(error.to_string()))?;
+                child_query.parent_type = Some(BaseItemKind::UserRootFolder);
+                child_query.user_root_children = true;
+                self.items.get_items(&child_query).await?.items
+            } else {
+                Vec::new()
+            }
+        } else {
+            let children = self.items.get_folder_children(&child_query).await?;
+            self.visible_children(children, resolved).await?
+        };
+        Ok(children)
+    }
+
+    /// The `children` of `resolved.parent_id` that `Folder.GetChildren(user)`
+    /// keeps: each child's `IsVisible(user)` and, for a box set or playlist,
+    /// `GetLinkedChildren(user)`'s owner/library check. All of them without
+    /// a user.
+    async fn visible_children(
+        &self,
+        children: Vec<ferrofin_traits::persistence::FolderChild>,
+        resolved: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let Some(user) = resolved.user.as_ref() else {
+            return Ok(children.into_iter().map(|child| child.item).collect());
+        };
+        let filter_linked = matches!(
+            resolved.parent_type,
+            Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
+        );
+        let roots = if filter_linked && children.iter().any(|child| child.linked) {
+            if let Some(root) = self.get_user_root_folder().await? {
+                let root_query = InternalItemsQuery {
+                    user: Some(user.clone()),
+                    parent_id: Uuid::parse_str(&root.id)
+                        .map_err(|error| ServiceError::backend(error.to_string()))?,
+                    user_root_children: true,
+                    group_by_presentation_unique_key: false,
+                    ..InternalItemsQuery::default()
+                };
+                self.items.get_items(&root_query).await?.items
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let visibility = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("folder visibility is not configured"))?;
+        visibility
+            .folder_children(children, user, filter_linked, &roots)
+            .await
+    }
+
+    /// A box set's, album's or artist's own listing: the repository query,
+    /// with no collection substitution, less the box-set members the user may
+    /// not see ([`Self::hidden_box_set_members`]).
+    async fn direct_children(
+        &self,
+        mut resolved: InternalItemsQuery,
+    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        resolved.collapse_box_set_items = None;
+        let hidden = self.hidden_box_set_members(&resolved).await?;
+        resolved.exclude_item_ids.extend(hidden);
+        self.items.get_items(&resolved).await
+    }
+
+    /// The members of box set `resolved.parent_id` that [`Self::visible_children`]
+    /// drops for `resolved.user` (gl-571): `BoxSet.FilterLinkedChildrenPerUser`
+    /// keeps a member only from a library the user can open
+    /// (v12.2 `Folder.cs:1736-1793`), and `GetChildren(user)` only one the
+    /// user `IsVisible` to, which the SQL's parental filter already applies. The listing excludes them by id, so its
+    /// SQL keeps the set's order and paging. None for another parent or
+    /// without a user.
+    async fn hidden_box_set_members(
+        &self,
+        resolved: &InternalItemsQuery,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        if resolved.parent_type != Some(BaseItemKind::BoxSet) || resolved.user.is_none() {
+            return Ok(Vec::new());
+        }
+        let children = self
+            .items
+            .get_folder_children(&InternalItemsQuery {
+                user: resolved.user.clone(),
+                parent_id: resolved.parent_id,
+                parent_type: resolved.parent_type,
+                group_by_presentation_unique_key: false,
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        let ids: Vec<String> = children.iter().map(|child| child.item.id.clone()).collect();
+        let visible: std::collections::HashSet<String> = self
+            .visible_children(children, resolved)
+            .await?
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        Ok(ids
+            .iter()
+            .filter(|id| !visible.contains(*id))
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
+    }
+
+    /// Orders a box set's listing by its `DisplayOrder`: `Enum.TryParse<
+    /// ItemSortBy>` of the stored text (a name, or a number — a value that is
+    /// not an `ItemSortBy` falls back to `PremiereDate`, the constructor's
+    /// default for a set that stored none), ascending; `Default` keeps the order
+    /// the members were added in.
+    async fn apply_box_set_order(
+        &self,
+        query: &mut InternalItemsQuery,
+    ) -> Result<(), ServiceError> {
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        if query.parent_type != Some(BaseItemKind::BoxSet)
+            || query.recursive
+            || !query.order_by.is_empty()
+        {
+            return Ok(());
+        }
+        let Some(set) = self.items.retrieve_item(query.parent_id).await? else {
+            return Ok(());
+        };
+        let data = crate::item_data::parse_data(set.data.as_deref());
+        let stored = data.get("DisplayOrder").and_then(serde_json::Value::as_str);
+        let sort_by = box_set_sort_by(stored);
+        if sort_by == ItemSortBy::Default {
+            query.linked_order_of = Some(query.parent_id);
+        } else {
+            query.order_by = vec![(sort_by, SortOrder::Ascending)];
+        }
+        Ok(())
+    }
+
+    /// Substitute eligible movie or series children through CollectionManager.
+    async fn collapse_folder_children(
+        &self,
+        children: Vec<BaseItemEntity>,
+        query: &InternalItemsQuery,
+        movies: bool,
+        shows: bool,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let Some(collections) = self.collections.get().and_then(std::sync::Weak::upgrade) else {
+            return Err(ServiceError::backend(
+                "collection collapsing is not configured",
+            ));
+        };
+        let (eligible, remaining): (Vec<_>, Vec<_>) = if movies && shows {
+            (children, Vec::new())
+        } else {
+            children.into_iter().partition(|item| {
+                let kind = item.type_.rsplit('.').next().unwrap_or(&item.type_);
+                (movies && kind == "Movie") || (shows && kind == "Series")
+            })
+        };
+        let mut items = collections
+            .collapse_items_within_box_sets(&eligible, query.user.as_ref())
+            .await?;
+        items.extend(remaining);
+        Ok(items)
+    }
+
+    /// `Folder.QueryWithPostFiltering` (v12.2 Folder.cs:1019-1062): the whole
+    /// unpaged list (or, with `adjacent_to`, its adjacency window, which the
+    /// SQL path trims before this filter, as `GetItemList` does upstream),
+    /// kept to what the user may open (`IsVisibleStandalone`), then counted
+    /// and paged in memory. The total is 0 when the caller did not ask for
+    /// it, as upstream.
+    async fn query_with_post_filtering(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        let unpaged = InternalItemsQuery {
+            start_index: None,
+            limit: None,
+            ..query.clone()
+        };
+        let mut items = self.items.get_item_list(&unpaged).await?;
+        if let Some(user) = &query.user {
+            let visibility = self
+                .visibility
+                .as_ref()
+                .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+            let mut visible = visibility.visible(&items, user, true).await?.into_iter();
+            items.retain(|_| visible.next().unwrap_or(false));
+        }
+        let total = if query.enable_total_record_count {
+            i32::try_from(items.len()).unwrap_or(i32::MAX)
+        } else {
+            0
+        };
+        let start_index = query.start_index.unwrap_or(0);
+        let start = usize::try_from(start_index.max(0)).unwrap_or(usize::MAX);
+        let limit = query
+            .limit
+            .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0));
+        Ok(QueryResult::new(
+            Some(start_index),
+            Some(total),
+            items.into_iter().skip(start).take(limit).collect(),
+        ))
+    }
+
+    /// Apply Folder name rechecks, stable sorting, adjacency, counts and paging.
+    async fn folder_post_filter_result(
+        &self,
+        mut items: Vec<BaseItemEntity>,
+        query: &InternalItemsQuery,
+    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        // Folder.PostFilterAndSort re-applies only these three letter filters
+        // after replacing matching members with differently named collections.
+        if query.user.is_some() {
+            items.retain(|item| folder_name_matches(item, query));
+        }
+        items = self.items.sort_folder_children(items, query).await?;
+        if let Some(adjacent) = query.adjacent_to.filter(|id| !id.is_nil()) {
+            items = crate::item_repository::adjacent_window(items, |item| {
+                Uuid::parse_str(&item.id).ok() == Some(adjacent)
+            });
+        }
+        let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
+        Ok(QueryResult::new(
+            Some(query.start_index.unwrap_or(0)),
+            Some(total),
+            crate::item_repository::page(items, query),
+        ))
     }
 
     /// Installs the standalone item-visibility evaluator.
@@ -991,6 +1762,26 @@ impl FerrofinLibraryManager {
     ) -> Self {
         self.visibility = Some(visibility);
         self
+    }
+
+    /// Attaches the server's directories, which a file-deleting delete needs
+    /// (see the `app_paths` field).
+    #[must_use]
+    pub fn with_app_paths(
+        mut self,
+        paths: Arc<crate::app_paths::FerrofinServerApplicationPaths>,
+    ) -> Self {
+        self.app_paths = Some(paths);
+        self
+    }
+
+    /// Late-binds the extracted-data cleanup every delete runs. A second call
+    /// is ignored.
+    pub fn set_external_data(
+        &self,
+        external: Arc<dyn ferrofin_traits::system::ExternalDataManager>,
+    ) {
+        let _ = self.external_data.set(external);
     }
 
     /// Attach library options for request-time series grouping decisions.
@@ -1044,6 +1835,14 @@ impl FerrofinLibraryManager {
     #[must_use]
     pub fn with_user_root(mut self, store: crate::user_root_folder::UserRootFolderStore) -> Self {
         self.user_root = Some(store);
+        self
+    }
+
+    /// Sets how this database derives an item's id from its path (the
+    /// `item_id_derivation` meta), which finds a stacked video's parts.
+    #[must_use]
+    pub fn with_id_derivation(mut self, mode: crate::item_type_lookup::IdDerivation) -> Self {
+        self.id_derivation = mode;
         self
     }
 
@@ -1188,6 +1987,17 @@ impl FerrofinLibraryManager {
         Ok(())
     }
 
+    /// Attaches the linked-children seam a merge re-points playlist and
+    /// collection entries through.
+    #[must_use]
+    pub fn with_linked_children(
+        mut self,
+        linked_children: Arc<dyn ferrofin_traits::persistence::LinkedChildrenService>,
+    ) -> Self {
+        self.linked_children = Some(linked_children);
+        self
+    }
+
     /// Attaches the chapter seam so chapter thumbnails can be served (their
     /// paths live on the chapter rows, not in the item's image rows).
     #[must_use]
@@ -1220,10 +2030,440 @@ impl FerrofinLibraryManager {
 
     /// Attaches a scan stand-in in place of the filesystem scanner.
     #[cfg(test)]
-    fn with_scan_runner(mut self, runner: Arc<dyn ScanRunner>) -> Self {
+    pub(crate) fn with_scan_runner(mut self, runner: Arc<dyn ScanRunner>) -> Self {
         self.scanner = Some(runner);
         self
     }
+}
+
+/// The file and metadata half of `LibraryManager.DeleteItem`
+/// (`LibraryManager.cs:421-625`); which paths go, and how a failure is
+/// handled, is [`crate::item_deletion`]'s.
+impl FerrofinLibraryManager {
+    /// A stored path with Jellyfin's `%AppDataPath%`/`%MetadataPath%` tokens
+    /// expanded (an adopted collection's or playlist's folder is stored that
+    /// way); Ferrofin's own rows carry resolved paths.
+    fn expand_path(&self, stored: &str) -> String {
+        self.app_paths.as_ref().map_or_else(
+            || stored.to_owned(),
+            |paths| {
+                crate::virtual_paths::VirtualPathExpander::from_paths(Arc::clone(paths))
+                    .expand(stored)
+            },
+        )
+    }
+
+    /// `GetMetadataPaths(item, children)` (`:569-580`, `:694-743`), deleted
+    /// before the item's files: each row's internal metadata folder
+    /// (`{metadata}/library/{id2}/{id}`), Ferrofin's own
+    /// `{metadata}/library/{GUID}`, and the lower-cased one older scans also
+    /// wrote art to ([`crate::item_folders::item_art_folders`]). A folder that
+    /// cannot be removed is logged and passed over, as upstream.
+    ///
+    /// Upstream's list also names a video's internal extracted data
+    /// (trickplay tiles, chapter images, subtitle and attachment caches);
+    /// those go with [`Self::delete_external_files`] after the files, which
+    /// removes every one of them, so a delete whose files cannot be removed
+    /// keeps them.
+    async fn delete_metadata_paths(&self, rows: &[&BaseItemEntity]) {
+        if let Some(paths) = &self.app_paths {
+            use ferrofin_traits::system::ServerApplicationPaths as _;
+            // Every layout: Ferrofin's `{metadata}/library/{GUID}` (and its
+            // older lower-cased spelling) and Jellyfin's
+            // `{metadata}/library/{xx}/{idN}` an adopted item has.
+            let art_root = std::path::Path::new(&paths.internal_metadata_path()).join("library");
+            let folders: Vec<std::path::PathBuf> = rows
+                .iter()
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .flat_map(|id| crate::item_folders::item_art_folders(&art_root, id))
+                .collect();
+            let removed = tokio::task::spawn_blocking(move || {
+                for folder in folders {
+                    match std::fs::remove_dir_all(&folder) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => tracing::warn!(
+                            path = %folder.display(),
+                            %err,
+                            "could not delete a deleted item's metadata folder"
+                        ),
+                    }
+                }
+            })
+            .await;
+            if let Err(err) = removed {
+                tracing::error!(%err, "deleting item metadata folders panicked");
+            }
+        }
+    }
+
+    /// `if ((options.DeleteFileLocation && item.IsFileProtocol) || …)`: the
+    /// item's `GetDeletePaths`, in order, through `DeleteItemPath`. A
+    /// channel item's media is its channel's (`options.DeleteFileLocation =
+    /// false`, `:425-440`), and an item with no path or a streamed one has
+    /// nothing to delete.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] when the item's directory cannot be listed
+    /// or its first path cannot be deleted — upstream's rethrown exception,
+    /// which leaves every row in place.
+    async fn delete_item_files(
+        &self,
+        id: Uuid,
+        row: &BaseItemEntity,
+        kind: BaseItemKind,
+    ) -> Result<(), ServiceError> {
+        let channel = row
+            .channel_id
+            .as_deref()
+            .and_then(|c| Uuid::parse_str(c).ok())
+            .filter(|c| !c.is_nil());
+        let Some(stored) = row.path.as_deref().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let path = self.expand_path(stored);
+        if channel.is_some() || !crate::media_info_resolver::is_file_protocol(&path) {
+            return Ok(());
+        }
+        let (_, protected) = self.delete_guard().await?;
+        let row = row.clone();
+        tokio::task::spawn_blocking(move || {
+            let paths = crate::item_deletion::delete_paths(&row, kind, &path)?;
+            // A delete never removes a protected folder — a video wrongly
+            // stored as not mixed at a library's root would name the
+            // library's own folder.
+            if let Some(target) = paths
+                .iter()
+                .find(|target| protected.covers(&target.path.to_string_lossy()))
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to delete {}: a library folder or a folder above one",
+                        target.path.display()
+                    ),
+                ));
+            }
+            crate::item_deletion::delete_item_paths(&paths)
+        })
+        .await
+        .map_err(|e| ServiceError::Backend(format!("deleting item {id}'s files: {e}")))?
+        .map_err(|e| ServiceError::Backend(format!("deleting item {id}'s files: {e}")))
+    }
+
+    /// `externalDataManager.DeleteExternalItemFiles` for the item and its
+    /// children (`:597-602`), before the rows: each one's extracted data,
+    /// with the trickplay folder saved beside its media.
+    async fn delete_external_files(&self, rows: &[&BaseItemEntity]) {
+        let Some(external) = self.external_data.get() else {
+            return;
+        };
+        for row in rows {
+            let Ok(id) = Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            let path = row
+                .path
+                .as_deref()
+                .map(|p| self.expand_path(p))
+                .unwrap_or_default();
+            let containing_folder = if path.is_empty() {
+                String::new()
+            } else {
+                crate::video_versions::containing_folder_path_at(row, &path)
+            };
+            let media = ferrofin_traits::system::MediaLocation {
+                path: &path,
+                containing_folder: &containing_folder,
+            };
+            if let Err(err) = external.delete_external_item_files(id, media).await {
+                tracing::warn!(item_id = %id, %err, "could not delete a deleted item's extracted data");
+            }
+        }
+    }
+}
+
+impl FerrofinLibraryManager {
+    /// The rest of `LibraryManager.DeleteItem` (`LibraryManager.cs:554-625`)
+    /// once its version handling is done: the internal metadata (the
+    /// item's and a folder's children's), then — with
+    /// `delete_file_location` — its files (the first path's failure stops
+    /// the delete with every row in place), then the extracted data, then
+    /// the rows and everything the persistence delete takes with them.
+    async fn delete_row(
+        &self,
+        id: Uuid,
+        row: &BaseItemEntity,
+        kind: BaseItemKind,
+        options: &DeleteOptions,
+    ) -> Result<(), ServiceError> {
+        // `children`: a folder's rows below it, whose metadata and extracted
+        // data go with it (the persistence delete takes owned extras too).
+        let closure = self.persistence.deletion_closure(&[id]).await?;
+        let mut affected: Vec<&BaseItemEntity> = vec![row];
+        affected.extend(recursive_children(row, &closure));
+        // `GetMetadataPaths(item, children)` goes first (errors passed over),
+        // then the files — the first path's failure stops the delete here,
+        // with every row in place — then the extracted data
+        // (`DeleteExternalItemFiles`, `:597-602`), then the rows (`:604`).
+        self.delete_metadata_paths(&affected).await;
+        if options.delete_file_location {
+            self.delete_item_files(id, row, kind).await?;
+        }
+        self.delete_external_files(&affected).await;
+        let removed = self.persistence.delete_items(&[id]).await?;
+        // `ItemRemoved` (LibraryChangedNotifier): the item, then everything
+        // the delete took with it, which have no rows left to read.
+        if let Some(changed) = &self.changed {
+            let others: Vec<Uuid> = removed.into_iter().filter(|r| *r != id).collect();
+            changed.record_removed_subtree(row, &others);
+        }
+        Ok(())
+    }
+
+    /// The libraries with their locations, and the protected folders
+    /// ([`crate::item_deletion::ProtectedPaths`]) they and the data
+    /// directory make — each folder as stored and expanded.
+    async fn delete_guard(
+        &self,
+    ) -> Result<
+        (
+            Vec<ferrofin_traits::persistence::LibraryLocations>,
+            crate::item_deletion::ProtectedPaths,
+        ),
+        ServiceError,
+    > {
+        let libraries = self.persistence.library_locations().await?;
+        let locations: Vec<String> = libraries
+            .iter()
+            .flat_map(|library| &library.locations)
+            .flat_map(|location| [self.expand_path(location), location.clone()])
+            .collect();
+        let folders = crate::item_deletion::PROTECTED_DATA_FOLDERS
+            .iter()
+            .flat_map(|folder| [self.expand_path(folder), (*folder).to_owned()]);
+        let protected = crate::item_deletion::ProtectedPaths::new(locations, folders);
+        Ok((libraries, protected))
+    }
+
+    /// Refuses a delete before anything is written — no row, no file:
+    ///
+    /// - an item whose path is a protected folder — a library location, a
+    ///   folder above one, the collections or playlists folder — is never
+    ///   deleted (`401`, as a refused `CanDelete`; a divergence from
+    ///   upstream, [`crate::item_deletion::ProtectedPaths`]);
+    /// - with `delete_file_location`, an item in a library whose last
+    ///   completed full scan was not this scanner's
+    ///   ([`crate::library_scan::LIBRARY_LAYOUT_GENERATION`]): its row may be
+    ///   one an older build stored in a shape that names more than the item
+    ///   (1.3.x kept a music library's own folder as an album), so its files
+    ///   are not deleted by it until a scan has gone over the library. The
+    ///   refusal is a [`ServiceError::Conflict`] (`409`): the request is
+    ///   sound and the user may make it, but the library must be scanned
+    ///   first. Upstream has no such state; its refusals are `401` (the user
+    ///   may not — jellyfin-web reads it as a lost session) and `403`
+    ///   (account policy), neither of which says "scan, then retry".
+    ///   Collections and playlists are the server's own containers, never
+    ///   scanned, and an item outside every library (a recording) is not
+    ///   held back.
+    async fn check_delete_allowed(
+        &self,
+        row: &BaseItemEntity,
+        kind: BaseItemKind,
+        options: &DeleteOptions,
+    ) -> Result<(), ServiceError> {
+        let Some(stored) = row.path.as_deref().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let path = self.expand_path(stored);
+        let (libraries, protected) = self.delete_guard().await?;
+        if protected.covers(stored) || protected.covers(&path) {
+            return Err(ServiceError::unauthorized("Unauthorized access"));
+        }
+        if !options.delete_file_location
+            || matches!(kind, BaseItemKind::BoxSet | BaseItemKind::Playlist)
+            || !crate::media_info_resolver::is_file_protocol(&path)
+        {
+            return Ok(());
+        }
+        let unscanned = libraries.iter().find(|library| {
+            library.scanned_by.as_deref() != Some(crate::library_scan::LIBRARY_LAYOUT_GENERATION)
+                && library.locations.iter().any(|location| {
+                    crate::library_scan::path_is_under(&path, &self.expand_path(location))
+                })
+        });
+        if let Some(library) = unscanned {
+            return Err(ServiceError::Conflict(format!(
+                "library {} has not been scanned by this version of the server yet; \
+                 scan it, then delete the item again",
+                library.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// `DeleteItem` of a primary video (no `PrimaryVersionId`, owned by
+    /// nothing; `LibraryManager.cs:461-537`): its versions — local first,
+    /// then linked by `SortName` — whose files are gone are deleted (their
+    /// rows only), and the first remaining one takes its place
+    /// ([`ItemPersistenceService::promote_version`]): the old primary's
+    /// playlist and collection entries move to it
+    /// (`RerouteLinkedChildReferencesAsync`), and the deletion that follows
+    /// no longer reaches it or the other versions through `OwnerId`. Stacked
+    /// parts and extras stay owned by the old primary and go with it.
+    ///
+    /// Promotion comes before any file is deleted, as upstream: deleting a
+    /// primary not in a mixed folder then removes its whole folder — the
+    /// promoted version's file included — and the next scan removes that
+    /// row, its file gone.
+    ///
+    /// One divergence: upstream counts a version as gone when
+    /// `FileExists(Path)` is false, which is also the case for a DVD or
+    /// Blu-ray rip (a folder), whose row it then deletes; here a version
+    /// whose path exists as a file or a folder is kept.
+    async fn promote_alternate_version(
+        &self,
+        id: Uuid,
+        primary: &BaseItemEntity,
+    ) -> Result<(), ServiceError> {
+        let links = self.persistence.version_links(id).await?;
+        if links.is_empty() {
+            return Ok(());
+        }
+        let local: std::collections::HashSet<Uuid> = links
+            .iter()
+            .filter(|(_, child_type)| *child_type == 2)
+            .map(|(child, _)| *child)
+            .collect();
+        // `GetLocalAlternateVersionIds(video)` in `SortOrder`, then
+        // `GetLinkedAlternateVersions(video)` (existing videos, by
+        // `SortName`), distinct, each `GetItemById(...).OfType<Video>()`.
+        let mut ordered: Vec<BaseItemEntity> = Vec::new();
+        let mut linked: Vec<BaseItemEntity> = Vec::new();
+        for &(child, child_type) in &links {
+            if child == id {
+                continue;
+            }
+            let Some(version) = self.items.retrieve_item(child).await? else {
+                continue;
+            };
+            let is_video = crate::item_type_lookup::kind_from_type_name(&version.type_)
+                .is_some_and(crate::kinds::is_video);
+            if !is_video {
+                continue;
+            }
+            if child_type == 2 {
+                ordered.push(version);
+            } else {
+                linked.push(version);
+            }
+        }
+        linked.sort_by(|a, b| a.sort_name.cmp(&b.sort_name));
+        for version in linked {
+            if !ordered.iter().any(|known| known.id == version.id) {
+                ordered.push(version);
+            }
+        }
+        let mut remaining: Vec<BaseItemEntity> = Vec::new();
+        for version in ordered {
+            let gone = match version.path.as_deref().filter(|p| !p.is_empty()) {
+                Some(path) => tokio::fs::metadata(self.expand_path(path)).await.is_err(),
+                None => false,
+            };
+            if gone {
+                // "Deleting missing alternate version": its row, no files.
+                let Ok(missing) = Uuid::parse_str(&version.id) else {
+                    continue;
+                };
+                tracing::info!(item_id = %missing, "deleting a missing alternate version");
+                let missing_kind = crate::item_type_lookup::kind_from_type_name(&version.type_)
+                    .unwrap_or(BaseItemKind::Video);
+                self.delete_row(missing, &version, missing_kind, &DeleteOptions::default())
+                    .await?;
+            } else {
+                remaining.push(version);
+            }
+        }
+        let Some((first, rest)) = remaining.split_first() else {
+            return Ok(());
+        };
+        let Ok(new_primary) = Uuid::parse_str(&first.id) else {
+            return Ok(());
+        };
+        let new_path = first.path.as_deref().unwrap_or_default();
+        let promotion = ferrofin_traits::persistence::VersionPromotion {
+            old_primary: id,
+            new_primary,
+            local_versions: crate::video_versions::local_alternate_versions(
+                primary.data.as_deref(),
+            )
+            .into_iter()
+            .filter(|p| !ferrofin_util::string_extensions::equals_ordinal_ignore_case(p, new_path))
+            .collect(),
+            others: rest
+                .iter()
+                .filter_map(|other| Uuid::parse_str(&other.id).ok())
+                .map(|other| (other, local.contains(&other)))
+                .collect(),
+        };
+        tracing::info!(
+            item_id = %id,
+            new_primary = %new_primary,
+            versions = rest.len() + 1,
+            "promoting an alternate version of a deleted primary"
+        );
+        self.persistence.promote_version(&promotion).await?;
+        if let Some(linked) = &self.linked_children {
+            linked.reroute_linked_children(id, new_primary).await?;
+        }
+        Ok(())
+    }
+
+    /// `DeleteItem` of an alternate version (`LibraryManager.cs:539-552`):
+    /// its playlist and collection entries move to its primary
+    /// (`RerouteLinkedChildReferencesAsync`), and the primary no longer
+    /// lists it ([`ItemPersistenceService::drop_version`]).
+    async fn detach_alternate_version(
+        &self,
+        id: Uuid,
+        version: &BaseItemEntity,
+        primary: Uuid,
+    ) -> Result<(), ServiceError> {
+        if let Some(linked) = &self.linked_children {
+            linked.reroute_linked_children(id, primary).await?;
+        }
+        self.persistence
+            .drop_version(primary, id, version.path.as_deref())
+            .await
+    }
+}
+
+/// `DeleteItem`'s `children`: `item.IsFolder ? GetRecursiveChildren(false) :
+/// []` — the rows below `item` by `ParentId`, out of its deletion `closure`
+/// (whose order puts each row after its parent).
+fn recursive_children<'a>(
+    item: &BaseItemEntity,
+    closure: &'a [BaseItemEntity],
+) -> Vec<&'a BaseItemEntity> {
+    if !item.is_folder {
+        return Vec::new();
+    }
+    let mut below: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    below.insert(item.id.as_str());
+    let mut children = Vec::new();
+    for row in closure {
+        if row.id != item.id
+            && row
+                .parent_id
+                .as_deref()
+                .is_some_and(|parent| below.contains(parent))
+        {
+            below.insert(row.id.as_str());
+            children.push(row);
+        }
+    }
+    children
 }
 
 #[async_trait]
@@ -1241,6 +2481,139 @@ impl crate::library_monitor::LibraryScanTrigger for FerrofinLibraryManager {
     }
 }
 
+/// `BaseItem.ContainingFolderPath` with its overrides:
+/// - the item's own path for a by-name item and a Live TV program (`Genre.cs`,
+///   `MusicGenre.cs`, `MusicArtist.cs`, `Person.cs`, `Studio.cs`, `Year.cs`,
+///   `LiveTvProgram.cs`);
+/// - for a playlist, the directory of a playlist file, else its own path
+///   (`Playlist.cs`: `IsPlaylistFile` is a path with an extension where no
+///   directory is);
+/// - else a folder's own path, and for a video `Video.ContainingFolderPath`'s
+///   rules ([`crate::video_versions::containing_folder_path_at`]: a disc rip's
+///   own folder, a stack's first part's directory), else the file's directory.
+///
+/// `path` is the item's path with Jellyfin's `%MetadataPath%`/`%AppDataPath%`
+/// tokens expanded, as upstream's `BaseItem.Path` is. `None` where the path
+/// has no parent directory: `/`, where .NET's `GetDirectoryName` is `null`,
+/// or a bare file name, where it is empty (a name upstream's next save drops
+/// as blank anyway).
+async fn containing_folder_path(item: &BaseItemEntity, path: &str) -> Option<String> {
+    let parent = || {
+        std::path::Path::new(path)
+            .parent()
+            .and_then(std::path::Path::to_str)
+            .filter(|folder| !folder.is_empty())
+            .map(str::to_owned)
+    };
+    match BaseItemKind::from_stored_type_name(&item.type_) {
+        Some(
+            BaseItemKind::Genre
+            | BaseItemKind::MusicGenre
+            | BaseItemKind::MusicArtist
+            | BaseItemKind::Person
+            | BaseItemKind::Studio
+            | BaseItemKind::Year
+            | BaseItemKind::TvProgram
+            | BaseItemKind::LiveTvProgram,
+        ) => return Some(path.to_owned()),
+        Some(BaseItemKind::Playlist) => {
+            // `Path.HasExtension`: a dot in the file name with something after it.
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let has_extension = name.rfind('.').is_some_and(|dot| dot + 1 < name.len());
+            let is_file = has_extension
+                && !tokio::fs::metadata(path)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_dir());
+            return if is_file {
+                parent()
+            } else {
+                Some(path.to_owned())
+            };
+        }
+        _ => {}
+    }
+    Some(crate::video_versions::containing_folder_path_at(item, path))
+        .filter(|folder| !folder.is_empty())
+}
+
+impl FerrofinLibraryManager {
+    /// [`containing_folder_path`] of `item`, its stored path expanded; `None`
+    /// for an item without a path.
+    async fn item_containing_folder(&self, item: &BaseItemEntity) -> Option<String> {
+        let path = self.expand_path(item.path.as_deref()?);
+        containing_folder_path(item, &path).await
+    }
+
+    /// `LibraryManager.GetConfiguredContentType(item, inheritConfiguredPath: false)`:
+    /// a `CollectionFolder`'s own collection type, else the override `overrides`
+    /// sets for `item`'s containing folder exactly.
+    async fn configured_content_type(
+        &self,
+        item: &BaseItemEntity,
+        overrides: &[ferrofin_model::dto::NameValuePair],
+        libraries: &[ferrofin_model::entities_media::VirtualFolderInfo],
+    ) -> Option<CollectionType> {
+        // Of upstream's `ICollectionFolder`s only a library's `CollectionFolder`
+        // can be a library item or one of its parents; the playlists folder
+        // never is.
+        if BaseItemKind::from_stored_type_name(&item.type_) == Some(BaseItemKind::CollectionFolder)
+        {
+            return libraries
+                .iter()
+                .find(|library| library.is_collection_folder(&item.id))
+                .and_then(|library| library.collection_type)
+                .and_then(crate::kinds::collection_type_of);
+        }
+        ferrofin_model::content_type_overrides::content_type_override(
+            overrides,
+            &self.item_containing_folder(item).await?,
+            false,
+        )
+    }
+
+    /// `ServerConfiguration.ContentTypes`: none without a configuration.
+    async fn content_type_overrides(
+        &self,
+    ) -> Result<Vec<ferrofin_model::dto::NameValuePair>, ServiceError> {
+        match &self.dashboard_configuration {
+            Some(config) => Ok(config.configuration().await?.content_types.clone()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The configured libraries: none without a virtual-folder manager.
+    async fn configured_libraries(
+        &self,
+    ) -> Result<Arc<[ferrofin_model::entities_media::VirtualFolderInfo]>, ServiceError> {
+        match &self.virtual_folders {
+            Some(folders) => folders.library_folders().await,
+            None => Ok(Arc::from([])),
+        }
+    }
+
+    /// `BaseItem.GetParents()`: the rows up `item`'s `ParentId` chain, its
+    /// parent first, ending where a parent is missing, or where the chain
+    /// comes back to a row already on it (a cycle in stored rows).
+    async fn parents_of(&self, item: &BaseItemEntity) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let mut parents: Vec<BaseItemEntity> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        seen.extend(Uuid::parse_str(&item.id));
+        let mut next = item.parent_id.clone();
+        while let Some(id) = next
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .filter(|id| !id.is_nil() && seen.insert(*id))
+        {
+            let Some(parent) = self.items.retrieve_item(id).await? else {
+                break;
+            };
+            next.clone_from(&parent.parent_id);
+            parents.push(parent);
+        }
+        Ok(parents)
+    }
+}
+
 #[async_trait]
 impl LibraryManager for FerrofinLibraryManager {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
@@ -1248,6 +2621,119 @@ impl LibraryManager for FerrofinLibraryManager {
             return Ok(None);
         }
         self.items.retrieve_item(id).await
+    }
+
+    /// The trait's lookup-then-check, with the item and its chain read together
+    /// ([`ItemVisibility::visible_item`]).
+    async fn get_item_by_id_for_user(
+        &self,
+        id: Uuid,
+        user: Option<&ferrofin_db::entities::users::UserEntity>,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let Some(user) = user else {
+            return self.get_item_by_id(id).await;
+        };
+        match &self.visibility {
+            Some(visibility) => visibility.visible_item(id, user).await,
+            None => match self.get_item_by_id(id).await? {
+                None => Ok(None),
+                Some(item) => self
+                    .is_item_visible_standalone(&item, user)
+                    .await
+                    .map(|visible| visible.then_some(item)),
+            },
+        }
+    }
+
+    /// [`Self::get_item_by_id_for_user`], with the chain its one read returned
+    /// ([`crate::item_visibility::ItemVisibility::visible_item_with_chain`]); without a
+    /// user or a visibility service, [`Self::get_item_by_id_for_user`]'s answer and no chain.
+    async fn get_item_by_id_for_user_with_chain(
+        &self,
+        id: Uuid,
+        user: Option<&ferrofin_db::entities::users::UserEntity>,
+    ) -> Result<Option<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+        match (user, &self.visibility) {
+            (Some(user), Some(visibility)) => visibility.visible_item_with_chain(id, user).await,
+            _ => Ok(self
+                .get_item_by_id_for_user(id, user)
+                .await?
+                .map(|item| (item, Vec::new()))),
+        }
+    }
+
+    async fn containing_folder_path(&self, item: &BaseItemEntity) -> Option<String> {
+        self.item_containing_folder(item).await
+    }
+
+    async fn get_inherited_content_type(
+        &self,
+        item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        let libraries = self.configured_libraries().await?;
+        let parents = self.parents_of(item).await?;
+        // `GetTopFolderContentType`: the library holding the top folder, the
+        // item's last parent below the `AggregateFolder` (or the item itself).
+        let top = parents
+            .iter()
+            .take_while(|parent| {
+                BaseItemKind::from_stored_type_name(&parent.type_)
+                    != Some(BaseItemKind::AggregateFolder)
+            })
+            .last()
+            .unwrap_or(item);
+        // A location matches ignoring one trailing separator: Ferrofin
+        // stores a location folder's path trimmed, where upstream's row and
+        // `PhysicalLocations` share one spelling.
+        let top_type = libraries
+            .iter()
+            .filter(|library| {
+                library.is_collection_folder(&top.id)
+                    || top.path.as_deref().is_some_and(|path| {
+                        library.locations.iter().any(|location| {
+                            ferrofin_model::content_type_overrides::paths_equal(location, path)
+                        })
+                    })
+            })
+            .find_map(|library| {
+                library
+                    .collection_type
+                    .and_then(crate::kinds::collection_type_of)
+            });
+        if top_type.is_some() {
+            return Ok(top_type);
+        }
+        // `item.GetParents().Select(GetConfiguredContentType).LastOrDefault(…)`:
+        // the parent farthest from the item that has a configured type.
+        let overrides = self.content_type_overrides().await?;
+        let mut farthest = None;
+        for parent in &parents {
+            if let Some(configured) = self
+                .configured_content_type(parent, &overrides, &libraries)
+                .await
+            {
+                farthest = Some(configured);
+            }
+        }
+        Ok(farthest)
+    }
+
+    async fn get_configured_content_type(
+        &self,
+        item: &BaseItemEntity,
+    ) -> Result<Option<CollectionType>, ServiceError> {
+        let libraries = self.configured_libraries().await?;
+        let overrides = self.content_type_overrides().await?;
+        Ok(self
+            .configured_content_type(item, &overrides, &libraries)
+            .await)
+    }
+
+    async fn build_access_filter(
+        &self,
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        self.items.build_access_filter(user).await
     }
 
     async fn is_item_visible(
@@ -1262,6 +2748,23 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(service
             .visible(std::slice::from_ref(item), user, false)
             .await?[0])
+    }
+
+    async fn filter_visible_items(
+        &self,
+        items: Vec<BaseItemEntity>,
+        user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        let visible = service.visible(&items, user, false).await?;
+        Ok(items
+            .into_iter()
+            .zip(visible)
+            .filter_map(|(item, visible)| visible.then_some(item))
+            .collect())
     }
 
     async fn is_item_visible_standalone(
@@ -1305,6 +2808,37 @@ impl LibraryManager for FerrofinLibraryManager {
             .collect())
     }
 
+    async fn get_parentally_allowed_item_ids(
+        &self,
+        ids: &[Uuid],
+        user: &ferrofin_db::entities::users::UserEntity,
+        skip_allowed_tags: bool,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let service = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        let rows = self.items.retrieve_items(ids).await?;
+        let allowed: std::collections::HashSet<Uuid> = rows
+            .iter()
+            .zip(
+                service
+                    .parentally_allowed(&rows, user, skip_allowed_tags)
+                    .await?,
+            )
+            .filter(|(_, allowed)| *allowed)
+            .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
+            .collect();
+        Ok(ids
+            .iter()
+            .copied()
+            .filter(|id| allowed.contains(id))
+            .collect())
+    }
+
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
         // Exactly `get_item_by_id(id).is_some()`, minus the row decode:
         // `get_item_by_id` rejects the nil id and `retrieve_item`'s predicate
@@ -1332,6 +2866,16 @@ impl LibraryManager for FerrofinLibraryManager {
             return Ok(Vec::new());
         }
         self.items.get_image_infos(item_id).await
+    }
+
+    async fn get_item_images_with_auto_orient(
+        &self,
+        item_id: Uuid,
+    ) -> Result<(Vec<ferrofin_traits::options::ItemImageInfo>, bool), ServiceError> {
+        if item_id.is_nil() {
+            return Ok((Vec::new(), false));
+        }
+        self.items.get_image_infos_with_auto_orient(item_id).await
     }
 
     async fn get_chapter_image(
@@ -1370,7 +2914,7 @@ impl LibraryManager for FerrofinLibraryManager {
         image_type: ImageType,
         index1: i32,
         index2: i32,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<bool, ServiceError> {
         // Only backdrops and chapters may hold multiple images and thus be
         // reordered; any other type is a bad request (C# `AllowsMultipleImages`
         // guard throwing `ArgumentException` → 400).
@@ -1379,15 +2923,27 @@ impl LibraryManager for FerrofinLibraryManager {
                 "The change index operation is only applicable to backdrops and chapters",
             ));
         }
-        self.items
+        let swapped = self
+            .items
             .swap_item_images(item_id, image_type, index1, index2)
-            .await
+            .await?;
+        // `SwapImagesAsync` saves the item (`UpdateToRepositoryAsync`), which
+        // gives a primary's local versions its reordered images.
+        if swapped {
+            self.persistence
+                .copy_metadata_to_owned_videos(&[item_id], true, false)
+                .await?;
+        }
+        Ok(swapped)
     }
 
     async fn query_items(
         &self,
         query: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        if let Some(result) = self.folder_display_result(query).await? {
+            return Ok(result);
+        }
         self.items.get_items(query).await
     }
 
@@ -1399,14 +2955,12 @@ impl LibraryManager for FerrofinLibraryManager {
         &self,
         items: &[BaseItemEntity],
     ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        // The snapshot, not `get_virtual_folders`: that rebuilds every library's
+        // full listing (its image and existence reads included) for one option.
         let folders = if items.iter().any(|item| item.type_.ends_with(".Series")) {
-            if let Some(folders) = &self.virtual_folders {
-                folders.get_virtual_folders().await?
-            } else {
-                Vec::new()
-            }
+            self.configured_libraries().await?
         } else {
-            Vec::new()
+            Arc::from([])
         };
         let grouped_series: Vec<Uuid> = items
             .iter()
@@ -1589,6 +3143,20 @@ impl LibraryManager for FerrofinLibraryManager {
         if items.is_empty() {
             return Ok(());
         }
+        let mut rated = items.to_vec();
+        // C# re-derives `SortName` on every save of a loaded item: the mapper
+        // sets `ForcedSortName` after `SortName` (`BaseItemMapper.cs:94-95`),
+        // and that setter, like `Name`'s, nulls the cached key, so the save
+        // reads the getter (`BaseItem.cs:540-561`). An edit of the name, the
+        // sort title or an episode number re-keys the row; keeping the stored
+        // key left it sorting and filtering under the old one.
+        for item in &mut rated {
+            settle_saved_sort_name(item);
+        }
+        if let Some(visibility) = &self.visibility {
+            visibility.update_rating_scores(&mut rated).await?;
+        }
+        let items = rated.as_slice();
         self.persistence.save_items(items).await?;
         // Re-index each item's genre/tag/studio/artist links: the filter
         // facets and by-name browses read `ItemValues`, not the row columns,
@@ -1601,10 +3169,33 @@ impl LibraryManager for FerrofinLibraryManager {
             let values = crate::library_scan::item_values_of(item);
             self.persistence.save_item_values(id, &values).await?;
         }
+        // `Video.UpdateToRepositoryAsync` (`Video.cs:704-726`): a saved
+        // primary's local versions take its metadata. Only a video whose
+        // `Data` lists owned videos is asked — none of the others has any.
+        let owners: Vec<Uuid> = items
+            .iter()
+            .filter(|item| crate::video_versions::owns_videos(item.data.as_deref()))
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
+            .collect();
+        if !owners.is_empty() {
+            self.persistence
+                .copy_metadata_to_owned_videos(&owners, true, false)
+                .await?;
+        }
         // No `ItemUpdated` hook here: `save_items` above is the repository save,
         // and the notifier is attached THERE so that every writer announces
         // itself, not just this one. Recording it again here would be a
         // duplicate the fold would have to drop.
+        Ok(())
+    }
+
+    async fn update_item_rating(&self, mut item: BaseItemEntity) -> Result<(), ServiceError> {
+        if let Some(visibility) = &self.visibility {
+            visibility
+                .update_rating_scores(std::slice::from_mut(&mut item))
+                .await?;
+        }
+        self.persistence.update_rating(&item).await?;
         Ok(())
     }
 
@@ -1618,7 +3209,13 @@ impl LibraryManager for FerrofinLibraryManager {
         // the rest in one transaction.
         self.persistence
             .replace_provider_ids(item_id, provider_ids)
-            .await
+            .await?;
+        // The edit's save copies the new ids to the item's local versions
+        // (`Video.UpdateToRepositoryAsync`); a non-owner has none to copy to.
+        self.persistence
+            .copy_metadata_to_owned_videos(&[item_id], true, false)
+            .await?;
+        Ok(())
     }
 
     async fn get_locked_fields_batch(
@@ -1638,7 +3235,7 @@ impl LibraryManager for FerrofinLibraryManager {
             .await
     }
 
-    async fn delete_item(&self, id: Uuid, _options: &DeleteOptions) -> Result<(), ServiceError> {
+    async fn delete_item(&self, id: Uuid, options: &DeleteOptions) -> Result<(), ServiceError> {
         if id.is_nil() {
             return Err(ServiceError::invalid_input("item id can't be empty"));
         }
@@ -1664,33 +3261,27 @@ impl LibraryManager for FerrofinLibraryManager {
         if !crate::kinds::can_delete(kind, has_parent) {
             return Err(ServiceError::unauthorized("Unauthorized access"));
         }
-        let mut ids = vec![id];
-        // C# `DeleteItem` cascades to a folder's children; gather the direct-child
-        // ids so the row deletion removes the subtree too.
-        //
-        // TODO(parity, open work item): upstream deletes the media files
-        // (`DeleteFileLocation = true`); not ported yet, it waits on scanner
-        // parity, so `options.delete_file_location` is not honoured and only
-        // rows go. See `brain/plans/PLAN_ITEM_FILE_DELETION.md`.
-        if row.is_folder {
-            // Cascade to PHYSICAL children only. A box-set/playlist is a folder whose
-            // members are LinkedChildren (references), not owned children — deleting the
-            // container must never delete the referenced media (data loss). physical_children_only
-            // suppresses the LinkedChildren merge the browse path uses.
-            let child_query = InternalItemsQuery {
-                parent_id: id,
-                physical_children_only: true,
-                ..Default::default()
-            };
-            ids.extend(self.items.get_item_ids(&child_query).await?);
+        // Before anything is written: a protected folder is never deleted,
+        // and files go only where this scanner has been over the library.
+        self.check_delete_allowed(&row, kind, options).await?;
+        if crate::kinds::is_video(kind) {
+            let version_of = row
+                .primary_version_id
+                .as_deref()
+                .and_then(|p| Uuid::parse_str(p).ok())
+                .filter(|p| !p.is_nil());
+            let owned = row
+                .owner_id
+                .as_deref()
+                .and_then(|p| Uuid::parse_str(p).ok())
+                .is_some_and(|p| !p.is_nil());
+            match version_of {
+                None if !owned => self.promote_alternate_version(id, &row).await?,
+                Some(primary) => self.detach_alternate_version(id, &row, primary).await?,
+                None => {}
+            }
         }
-        self.persistence.delete_items(&ids).await?;
-        // `ItemRemoved` (LibraryChangedNotifier). `ids[0]` is the item itself;
-        // the rest are the cascaded children, which have no rows left to read.
-        if let Some(changed) = &self.changed {
-            changed.record_removed_subtree(&row, &ids[1..]);
-        }
-        Ok(())
+        self.delete_row(id, &row, kind, options).await
     }
 
     async fn merge_versions(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
@@ -1711,16 +3302,24 @@ impl LibraryManager for FerrofinLibraryManager {
             ));
         }
 
-        // Pick the primary. C# prefers an item that already owns multiple sources
-        // and is itself not an alternate; Ferrofin does not model `MediaSourceCount`,
-        // so it falls back to C#'s secondary ordering: a plain video file outranks
-        // a special type, then the widest default video stream wins. The item's own
-        // `Width` column stands in for the default video stream width.
+        // Pick the primary (`VideosController.MergeVersions`): the first item,
+        // in id order, that already has several sources and is itself no
+        // version (`MediaSourceCount > 1 && !PrimaryVersionId.HasValue`) —
+        // a video with versions, local or merged, which here is a row that
+        // points at it — else plain files before 3D and disc videos, then the
+        // widest ([`crate::video_versions::preferred_primary_version`]).
+        let ids: Vec<Uuid> = items
+            .iter()
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
+            .collect();
+        let with_versions = self.items.get_items_by_primary_version_batch(&ids).await?;
+        let has_versions = |item: &BaseItemEntity| {
+            Uuid::parse_str(&item.id).is_ok_and(|id| with_versions.contains_key(&id))
+        };
         let primary_index = items
             .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.width.unwrap_or(0).cmp(&b.width.unwrap_or(0)))
-            .map_or(0, |(i, _)| i);
+            .position(|item| item.primary_version_id.is_none() && has_versions(item))
+            .unwrap_or_else(|| crate::video_versions::preferred_primary_version(&items));
         let primary_id = items[primary_index].id.clone();
 
         // Link every non-primary item to the primary by pointer, and ensure the
@@ -1729,6 +3328,7 @@ impl LibraryManager for FerrofinLibraryManager {
         // and a full-row save would write their other columns back stale.
         let primary_uuid = Uuid::parse_str(&primary_id)
             .map_err(|_| ServiceError::invalid_input("malformed item id"))?;
+        let merging: std::collections::HashSet<Uuid> = ids.iter().copied().collect();
         for item in &items {
             let Ok(id) = Uuid::parse_str(&item.id) else {
                 continue;
@@ -1737,13 +3337,85 @@ impl LibraryManager for FerrofinLibraryManager {
                 if item.primary_version_id.is_some() {
                     self.persistence.set_primary_version_id(id, None).await?;
                 }
-            } else if item.primary_version_id.as_deref() != Some(primary_id.as_str()) {
+                continue;
+            }
+            if item.primary_version_id.as_deref() != Some(primary_id.as_str()) {
                 self.persistence
                     .set_primary_version_id(id, Some(primary_uuid))
                     .await?;
             }
+            // Its playlist and collection entries now name the primary
+            // (`RerouteLinkedChildReferencesAsync`, `LinkedChildrenService.
+            // RerouteLinkedChildren`: a parent already listing the primary
+            // drops the entry instead).
+            if let Some(linked) = &self.linked_children {
+                linked.reroute_linked_children(id, primary_uuid).await?;
+            }
+            // Its own merged versions move to the primary
+            // (`alternateVersionsOfPrimary.Add(linkedItem)`, `:238-250`), so
+            // no version is left behind a version.
+            for version in self.items.get_merged_version_ids(id).await? {
+                if version != primary_uuid && !merging.contains(&version) {
+                    self.persistence
+                        .set_primary_version_id(version, Some(primary_uuid))
+                        .await?;
+                }
+            }
         }
         Ok(())
+    }
+
+    async fn get_additional_parts(
+        &self,
+        video: &BaseItemEntity,
+        user: Option<&ferrofin_db::entities::users::UserEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        // A method of `Video`; the controller answers `[]` for anything else.
+        if !crate::item_type_lookup::kind_from_type_name(&video.type_)
+            .is_some_and(crate::kinds::is_video)
+        {
+            return Ok(Vec::new());
+        }
+        // `GetAdditionalPartIds`: `GetNewItemId(path, typeof(Video))` per path.
+        let ids: Vec<Uuid> = crate::video_versions::additional_parts(video.data.as_deref())
+            .iter()
+            .filter_map(|path| {
+                crate::item_type_lookup::derive_item_id_with(
+                    &self.id_derivation,
+                    BaseItemKind::Video,
+                    path,
+                )
+            })
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `.Where(i => i is not null && (user is null || i.IsVisible(user)))`:
+        // the stored parts, then — for a user — `BaseItem.IsVisible` (the
+        // parent-browse rule, not the standalone one) for all of them at once.
+        let mut parts = self.items.retrieve_items(&ids).await?;
+        if let Some(user) = user
+            && !parts.is_empty()
+        {
+            let service = self
+                .visibility
+                .as_ref()
+                .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+            let visible = service.visible(&parts, user, false).await?;
+            let mut visible = visible.into_iter();
+            parts.retain(|_| visible.next().unwrap_or(false));
+        }
+        // `.OrderBy(i => i.SortName)` — a stable sort over the parts in their
+        // `AdditionalParts` order, so parts sharing a sort name keep it.
+        let position = |row: &BaseItemEntity| {
+            Uuid::parse_str(&row.id)
+                .ok()
+                .and_then(|id| ids.iter().position(|p| *p == id))
+                .unwrap_or(usize::MAX)
+        };
+        parts.sort_by_key(position);
+        parts.sort_by(|a, b| a.sort_name.cmp(&b.sort_name));
+        Ok(parts)
     }
 
     async fn remove_alternate_sources(&self, item_id: Uuid) -> Result<(), ServiceError> {
@@ -1751,22 +3423,27 @@ impl LibraryManager for FerrofinLibraryManager {
             return Err(ServiceError::not_found(format!("item {item_id}")));
         };
 
-        // Resolve the group's primary: either this item (no pointer) or the item it
-        // points at (C# hops to `PrimaryVersionId` when the item has no alternates).
-        let primary_id = match item.primary_version_id.as_deref() {
-            Some(pid) => Uuid::parse_str(pid)
-                .map_err(|_| ServiceError::invalid_input("malformed PrimaryVersionId"))?,
-            None => item_id,
-        };
+        // `VideosController.DeleteAlternateSources`: an item with no merged
+        // versions of its own that is itself a version stands for its
+        // primary's group.
+        let mut primary_id = item_id;
+        let mut merged = self.items.get_merged_version_ids(item_id).await?;
+        if merged.is_empty()
+            && let Some(pid) = item.primary_version_id.as_deref()
+        {
+            primary_id = Uuid::parse_str(pid)
+                .map_err(|_| ServiceError::invalid_input("malformed PrimaryVersionId"))?;
+            merged = self.items.get_merged_version_ids(primary_id).await?;
+        }
 
-        // Clear the pointer on every alternate that references the primary, then on
-        // the primary itself, so each becomes a standalone version again. Targeted
-        // single-column writes — a full-row save of the loaded copies would revert
-        // any column another writer changed since the load.
-        for alt in self.items.get_items_by_primary_version(primary_id).await? {
-            let Ok(id) = Uuid::parse_str(&alt.id) else {
-                continue;
-            };
+        // Clear the pointer of every merged version
+        // (`GetLinkedAlternateVersions`), then the primary's own, so each
+        // becomes a standalone version again. Only merged versions split:
+        // the files the scan grouped with the primary (its local versions)
+        // stay in the group. Targeted single-column writes — a full-row save
+        // of the loaded copies would revert any column another writer
+        // changed since the load.
+        for id in merged {
             self.persistence.set_primary_version_id(id, None).await?;
         }
         if let Some(primary) = self.items.retrieve_item(primary_id).await?
@@ -1779,11 +3456,35 @@ impl LibraryManager for FerrofinLibraryManager {
         Ok(())
     }
 
+    async fn update_people(
+        &self,
+        item: &BaseItemEntity,
+        people: &[PeopleEntity],
+    ) -> Result<(), ServiceError> {
+        // `if (!item.SupportsPeople) return;`
+        if !crate::item_type_lookup::kind_from_type_name(&item.type_)
+            .is_some_and(crate::kinds::supports_people)
+        {
+            return Ok(());
+        }
+        let Ok(item_id) = Uuid::parse_str(&item.id) else {
+            return Ok(());
+        };
+        self.people.update_people(item_id, people).await.map(|_| ())
+    }
+
     async fn get_people(
         &self,
         query: &InternalPeopleQuery,
     ) -> Result<Vec<PeopleEntity>, ServiceError> {
         Ok(self.people.get_people(query).await?.items)
+    }
+
+    async fn get_people_page(
+        &self,
+        query: &InternalPeopleQuery,
+    ) -> Result<QueryResult<PeopleEntity>, ServiceError> {
+        self.people.get_people(query).await
     }
 
     async fn get_people_batch(
@@ -1858,6 +3559,10 @@ impl LibraryManager for FerrofinLibraryManager {
         query: &InternalItemsQuery,
     ) -> Result<Vec<i32>, ServiceError> {
         self.items.get_distinct_years(query).await
+    }
+
+    async fn get_tag_names(&self, query: &InternalItemsQuery) -> Result<Vec<String>, ServiceError> {
+        self.items.get_tag_names(query).await
     }
 
     async fn get_media_stream_languages(
@@ -1955,6 +3660,13 @@ impl LibraryManager for FerrofinLibraryManager {
         // The scan runs on the queue's worker; this future only waits for it.
         self.run_scan(ScanRequest::defaults(trigger, ScanTarget::All), progress)
             .await
+    }
+
+    fn is_scan_running(&self) -> bool {
+        lock_queue(&self.scan_queue)
+            .running
+            .as_ref()
+            .is_some_and(|running| running.validation)
     }
 
     async fn shutdown_scans(&self) {
@@ -2062,7 +3774,12 @@ impl FerrofinLibraryManager {
             progress: Arc::clone(&self.scan_progress),
         };
         let span = tracing::info_span!(parent: None, "library_scan", trigger = trigger.as_str());
-        let task = tokio::spawn(worker.drain().instrument(span));
+        // Source Task.Run captures the culture of the caller that starts the
+        // draining worker; subsequent enqueued requests share that worker.
+        let task = tokio::spawn(ferrofin_util::current_culture::scope(
+            ferrofin_util::current_culture::capture(),
+            worker.drain().instrument(span),
+        ));
         #[cfg(test)]
         {
             lock_queue(&self.scan_queue).worker_task = Some(task.abort_handle());
@@ -2162,6 +3879,59 @@ impl FerrofinLibraryManager {
             && queue.serving.is_empty()
     }
 }
+
+/// `BoxSet.Sort`'s `Enum.TryParse<ItemSortBy>(DisplayOrder)`: the name or the
+/// number of an `ItemSortBy`, case-sensitively; a set that stored nothing
+/// carries the constructor's `PremiereDate`, and anything unparseable sorts by it.
+fn box_set_sort_by(stored: Option<&str>) -> ferrofin_model::live_tv::ItemSortBy {
+    use ferrofin_model::json::enums::JsonEnum as _;
+    use ferrofin_model::live_tv::ItemSortBy;
+    let Some(text) = stored else {
+        return ItemSortBy::PremiereDate;
+    };
+    let by_name = ItemSortBy::members()
+        .iter()
+        .find(|(name, _)| *name == text)
+        .map(|(_, value)| *value);
+    let by_number = text
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|value| ItemSortBy::members().iter().any(|(_, v)| v == value));
+    by_name
+        .or(by_number)
+        .map_or(ItemSortBy::PremiereDate, ItemSortBy::from_json_value)
+}
+
+/// The `SortName` the C# getter reads on a save: from `ForcedSortName` when
+/// one is set, else the per-kind `CreateSortName()`
+/// ([`ferrofin_providers::metadata_merge::settle_sort_name`]).
+///
+/// A `LiveTvChannel` without a sort title keeps its stored key: its
+/// `CreateSortName` starts with the channel number, which lives in the live TV
+/// store and not on the row, and the guide refresh re-derives that key. So
+/// clearing a channel's sort title keeps the key it gave until that refresh.
+/// TODO(parity, open work item — NOT an accepted divergence): read the number
+/// from `FerrofinLiveTvChannels` and key the row with the live TV crate's
+/// `channel_sort_name`, so an edit re-keys a channel at once as upstream's does.
+///
+/// Unlike [`crate::kinds::saved_sort_name`], this applies the per-kind
+/// `CreateSortName` overrides (episode, season, track numbers).
+fn settle_saved_sort_name(item: &mut BaseItemEntity) {
+    let forced = item
+        .forced_sort_name
+        .as_deref()
+        .is_some_and(|f| !f.is_empty());
+    if !forced
+        && BaseItemKind::from_stored_type_name(&item.type_) == Some(BaseItemKind::LiveTvChannel)
+    {
+        return;
+    }
+    ferrofin_providers::metadata_merge::settle_sort_name(item);
+}
+
+#[cfg(test)]
+mod delete_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2416,6 +4186,54 @@ mod tests {
         runner.release(2 * GatedRunner::ITEMS);
         waiter.await.expect("joined");
         assert_eq!(runner.runs().len(), 3, "the queued run scanned");
+        until_idle(&mgr).await;
+    }
+
+    /// `is_scan_running` is upstream's `IsScanRunning`: it holds for the whole
+    /// of a full library validation and for nothing that never enters
+    /// `ValidateMediaLibraryInternal` — one library's scan, the library
+    /// monitor's changed paths, a refresh of every library over the API.
+    #[tokio::test]
+    async fn only_a_full_library_validation_reports_the_scan_running() {
+        use crate::library_monitor::LibraryScanTrigger as _;
+
+        let db = test_db().await;
+        let runner = GatedRunner::new();
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        assert!(!mgr.is_scan_running(), "nothing is running");
+
+        mgr.queue_library_scan().await.expect("queued");
+        runner.started(1).await;
+        assert!(
+            mgr.is_scan_running(),
+            "a full library validation is running"
+        );
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+        assert!(!mgr.is_scan_running(), "the validation finished");
+
+        mgr.queue_library_scan_scoped(Uuid::new_v4())
+            .await
+            .expect("queued");
+        runner.started(2).await;
+        assert!(!mgr.is_scan_running(), "one library's scan");
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+
+        mgr.queue_scan_paths(vec!["/m/a.mkv".to_owned()], ScanTrigger::Watcher)
+            .await
+            .expect("queued");
+        runner.started(3).await;
+        assert!(!mgr.is_scan_running(), "the library monitor's scan");
+        runner.release(GatedRunner::ITEMS);
+        until_idle(&mgr).await;
+
+        mgr.queue_refresh_scan(ScanTarget::All, &MetadataRefreshOptions::default())
+            .await
+            .expect("queued");
+        runner.started(4).await;
+        assert!(!mgr.is_scan_running(), "a refresh of every library");
+        runner.release(GatedRunner::ITEMS);
         until_idle(&mgr).await;
     }
 
@@ -3482,6 +5300,7 @@ mod tests {
             running: Some(RunningScan {
                 waiters: Waiters { tickets, detached },
                 cancel: ScanCancel::new(),
+                validation: true,
             }),
             ..ScanQueue::default()
         };
@@ -3883,6 +5702,96 @@ mod tests {
         assert_eq!(facets.tags, vec!["4K".to_owned(), "Christmas".to_owned()]);
     }
 
+    /// C# re-derives `SortName` on every save of a loaded item: the mapper
+    /// sets `ForcedSortName` after `SortName`, and that setter (like `Name`'s)
+    /// nulls the cached key, so the save reads it back from `ForcedSortName` or
+    /// the per-kind `CreateSortName()`. A metadata edit of the name, the sort
+    /// title or an episode number therefore re-keys the row.
+    #[tokio::test]
+    async fn update_items_rederives_the_sort_name() {
+        async fn stored(db: &Database, id: Uuid) -> Option<String> {
+            crate::test_support::fetch_item(db, id).await.sort_name
+        }
+        /// Stores `key` as the row's `SortName` through the repository save,
+        /// which keeps a key the caller supplies (the scanner's path).
+        async fn keyed(db: &Database, id: Uuid, key: &str) {
+            let mut row = crate::test_support::fetch_item(db, id).await;
+            row.sort_name = Some(key.to_owned());
+            FerrofinItemPersistenceService::new(db.clone())
+                .save_items(std::slice::from_ref(&row))
+                .await
+                .expect("stored key");
+        }
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let edit = |id: Uuid, change: fn(&mut BaseItemEntity)| {
+            let mgr = &mgr;
+            async move {
+                let mut row = mgr.get_item_by_id(id).await.expect("read").expect("row");
+                change(&mut row);
+                mgr.update_items(std::slice::from_ref(&row), None)
+                    .await
+                    .expect("update");
+            }
+        };
+
+        let movie = Uuid::from_u128(0x7C);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Solaris").await;
+        keyed(&db, movie, "solaris").await;
+        edit(movie, |row| row.name = Some("The Matrix".to_owned())).await;
+        assert_eq!(stored(&db, movie).await.as_deref(), Some("matrix"));
+        edit(movie, |row| row.forced_sort_name = Some("Zed".to_owned())).await;
+        assert_eq!(stored(&db, movie).await.as_deref(), Some("zed"));
+        edit(movie, |row| row.forced_sort_name = None).await;
+        assert_eq!(stored(&db, movie).await.as_deref(), Some("matrix"));
+
+        // `Episode.CreateSortName`: the season and episode numbers lead, so a
+        // renumbered episode leaves its old position.
+        let episode = Uuid::from_u128(0x7D);
+        seed_named_item(&db, episode, BaseItemKind::Episode, "Pilot").await;
+        keyed(&db, episode, "001 - 0003 - Pilot").await;
+        edit(episode, |row| {
+            row.parent_index_number = Some(1);
+            row.index_number = Some(4);
+        })
+        .await;
+        assert_eq!(
+            stored(&db, episode).await.as_deref(),
+            Some("001 - 0004 - Pilot")
+        );
+
+        // A person sorts by the name as given, a sort title included.
+        let person = Uuid::from_u128(0x7F);
+        seed_named_item(&db, person, BaseItemKind::Person, "Alice Parity").await;
+        edit(person, |row| {
+            row.forced_sort_name = Some("Parity, Alice".to_owned());
+        })
+        .await;
+        assert_eq!(stored(&db, person).await.as_deref(), Some("Parity, Alice"));
+        edit(person, |row| row.forced_sort_name = None).await;
+        assert_eq!(stored(&db, person).await.as_deref(), Some("Alice Parity"));
+
+        // A channel's derived key needs its number, which the live TV store
+        // holds and the row does not: the stored key is kept (the guide
+        // refresh re-derives it). A sort title needs no number.
+        let channel = Uuid::from_u128(0x7E);
+        seed_named_item(&db, channel, BaseItemKind::LiveTvChannel, "One").await;
+        keyed(&db, channel, "0000000001.00000-One").await;
+        edit(channel, |row| row.name = Some("Uno".to_owned())).await;
+        assert_eq!(
+            stored(&db, channel).await.as_deref(),
+            Some("0000000001.00000-One")
+        );
+        edit(channel, |row| row.forced_sort_name = Some("Zed".to_owned())).await;
+        assert_eq!(stored(&db, channel).await.as_deref(), Some("zed"));
+        edit(channel, |row| row.forced_sort_name = None).await;
+        assert_eq!(
+            stored(&db, channel).await.as_deref(),
+            Some("zed"),
+            "kept until the guide refresh re-derives it"
+        );
+    }
+
     /// The metadata editor's external ids reach the `BaseItemProviders` table and
     /// REPLACE what was there — the write behind C# `item.ProviderIds = request.ProviderIds`.
     #[tokio::test]
@@ -3941,6 +5850,48 @@ mod tests {
         );
     }
 
+    /// The lookup with its chain: the visibility service's one read for a user, the raw row
+    /// with no chain without one, and `get_item_by_id_for_user`'s answer without the service
+    /// (gl-982).
+    #[tokio::test]
+    async fn scoped_lookup_hands_back_the_chain_its_check_read() {
+        let db = test_db().await;
+        let data = tempfile::tempdir().unwrap();
+        let [series, season] = [0x7401, 0x7402].map(Uuid::from_u128);
+        seed_named_item(&db, series, BaseItemKind::Series, "Show").await;
+        crate::test_support::seed_child_item(&db, season, BaseItemKind::Season, "S1", series).await;
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0x7403)).await;
+        let base = manager(&db);
+        let raw = base.get_item_by_id(season).await.unwrap();
+        assert_eq!(
+            base.get_item_by_id_for_user_with_chain(season, None)
+                .await
+                .unwrap(),
+            raw.clone().map(|item| (item, Vec::new()))
+        );
+        assert!(
+            base.get_item_by_id_for_user_with_chain(season, Some(&user))
+                .await
+                .is_err(),
+            "no visibility service: the lookup's own refusal"
+        );
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let library = base.with_visibility(visibility);
+        let (item, chain) = library
+            .get_item_by_id_for_user_with_chain(season, Some(&user))
+            .await
+            .unwrap()
+            .expect("visible");
+        assert_eq!(Some(item), raw);
+        let series_row = library.get_item_by_id(series).await.unwrap();
+        assert!(chain.iter().any(|row| Some(row) == series_row.as_ref()));
+    }
+
     #[tokio::test]
     async fn scoped_lookup_requires_visibility_and_keeps_raw_access() {
         let db = test_db().await;
@@ -3973,6 +5924,59 @@ mod tests {
         assert!(mgr.get_visible_item_ids(&[id], &user).await.is_err());
     }
 
+    /// The parental check over ids keeps the input order and drops what it
+    /// rejects or cannot find: a person carrying a blocked tag, an unknown id.
+    /// Without a visibility service it refuses rather than allow every id.
+    #[tokio::test]
+    async fn parentally_allowed_ids_keep_the_order_and_drop_a_blocked_person() {
+        let db = test_db().await;
+        let data = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0x7301)).await;
+        let [shown, hidden, missing] = [0x7302, 0x7303, 0x7304].map(Uuid::from_u128);
+        seed_named_item(&db, shown, BaseItemKind::Person, "Shown").await;
+        seed_named_item(&db, hidden, BaseItemKind::Person, "Hidden").await;
+        let mut row = crate::test_support::fetch_item(&db, hidden).await;
+        row.tags = Some("Private".into());
+        crate::test_support::save_item(&db, &row).await;
+        crate::user_entity_ext::set_preference(
+            &db,
+            &user.id,
+            ferrofin_db::enums::PreferenceKind::BlockedTags,
+            &["private".to_owned()],
+        )
+        .await
+        .unwrap();
+        assert!(
+            base.get_parentally_allowed_item_ids(&[shown], &user, true)
+                .await
+                .is_err(),
+            "no visibility service"
+        );
+
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let library = base.with_visibility(visibility);
+        assert_eq!(
+            library
+                .get_parentally_allowed_item_ids(&[hidden, missing, shown], &user, true)
+                .await
+                .unwrap(),
+            [shown]
+        );
+        assert!(
+            library
+                .get_parentally_allowed_item_ids(&[], &user, true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn item_exists_agrees_with_get_item_by_id() {
         // The image routes gate their 404 on `item_exists`, so it must answer
@@ -4002,7 +6006,11 @@ mod tests {
         let db = test_db().await;
         let item = Uuid::from_u128(0xA100);
         seed_named_item(&db, item, BaseItemKind::Movie, "Swappable").await;
-        for (n, path) in [(0u128, "/one.jpg"), (1, "/two.jpg")] {
+        let dir = tempfile::tempdir().unwrap();
+        let (one, two) = (dir.path().join("one.jpg"), dir.path().join("two.jpg"));
+        std::fs::write(&one, "ONE").unwrap();
+        std::fs::write(&two, "TWO").unwrap();
+        for (n, path) in [(0u128, &one), (1, &two)] {
             sqlx::query(
                 r#"INSERT INTO "BaseItemImageInfos"
                     ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
@@ -4010,7 +6018,7 @@ mod tests {
             )
             .bind(ferrofin_db::store::guid_to_db(Uuid::from_u128(0xA110 + n)))
             .bind(ferrofin_db::store::guid_to_db(item))
-            .bind(path)
+            .bind(path.to_string_lossy().as_ref())
             .execute(db.writer())
             .await
             .expect("insert backdrop");
@@ -4025,12 +6033,113 @@ mod tests {
         assert!(matches!(err, ServiceError::InvalidInput(_)));
 
         // Backdrop is reorderable and the swap goes through to the repository.
-        mgr.swap_images(item, ImageType::Backdrop, 0, 1)
+        assert!(
+            mgr.swap_images(item, ImageType::Backdrop, 0, 1)
+                .await
+                .expect("swap")
+        );
+        // The files trade contents; each slot keeps its path.
+        assert_eq!(std::fs::read_to_string(&one).unwrap(), "TWO");
+        assert_eq!(std::fs::read_to_string(&two).unwrap(), "ONE");
+        let images = mgr.get_item_images(item).await.expect("images");
+        assert_eq!(images[0].path, one.to_string_lossy());
+        assert_eq!(images[1].path, two.to_string_lossy());
+    }
+
+    /// A primary `Movie` with one local version, as the scan stores them.
+    async fn primary_with_local_version(db: &Database) -> (Uuid, Uuid) {
+        let (primary, version) = (Uuid::from_u128(0x5E_0001), Uuid::from_u128(0x5E_0002));
+        seed_named_item(db, primary, BaseItemKind::Movie, "Heat").await;
+        seed_named_item(db, version, BaseItemKind::Movie, "Heat").await;
+        let mut row = crate::test_support::fetch_item(db, primary).await;
+        row.path = Some("/m/Heat/Heat.mkv".to_owned());
+        row.data = Some(r#"{"LocalAlternateVersions":["/m/Heat/Heat - 4K.mkv"]}"#.to_owned());
+        crate::test_support::save_item(db, &row).await;
+        let mut row = crate::test_support::fetch_item(db, version).await;
+        row.path = Some("/m/Heat/Heat - 4K.mkv".to_owned());
+        row.owner_id = Some(guid_to_db(primary));
+        row.primary_version_id = Some(guid_to_db(primary));
+        crate::test_support::save_item(db, &row).await;
+        (primary, version)
+    }
+
+    /// The API edit paths are saves of the primary, so its local version
+    /// takes what changed (`Video.UpdateToRepositoryAsync`): the edited
+    /// columns, the replaced provider ids, the reordered images.
+    #[tokio::test]
+    async fn an_edit_of_a_primary_reaches_its_local_version() {
+        let db = test_db().await;
+        let (primary, version) = primary_with_local_version(&db).await;
+        let mgr = manager(&db);
+
+        let mut row = crate::test_support::fetch_item(&db, primary).await;
+        row.overview = Some("Edited.".to_owned());
+        row.genres = Some("Crime".to_owned());
+        mgr.update_items(std::slice::from_ref(&row), None)
+            .await
+            .expect("update");
+        let v = crate::test_support::fetch_item(&db, version).await;
+        assert_eq!(v.overview.as_deref(), Some("Edited."));
+        assert_eq!(v.genres.as_deref(), Some("Crime"));
+
+        mgr.update_item_provider_ids(primary, &[("Imdb".to_owned(), "tt0113277".to_owned())])
+            .await
+            .expect("ids");
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let ids = store
+            .provider_ids_for_items(&[version])
+            .await
+            .expect("version ids");
+        assert_eq!(
+            ids.get(&version).cloned().unwrap_or_default(),
+            [("Imdb".to_owned(), "tt0113277".to_owned())]
+        );
+
+        let backdrop = |path: &str| ferrofin_traits::options::ItemImageInfo {
+            path: path.to_owned(),
+            image_type: ImageType::Backdrop,
+            date_modified: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        };
+        // `SwapImagesAsync` exchanges the two files' contents; the rows keep
+        // their paths.
+        let dir = tempfile::tempdir().expect("tmp");
+        let (one, two) = (dir.path().join("one.jpg"), dir.path().join("two.jpg"));
+        std::fs::write(&one, b"ONE").expect("one");
+        std::fs::write(&two, b"TWO").expect("two");
+        let (one, two) = (
+            one.to_string_lossy().into_owned(),
+            two.to_string_lossy().into_owned(),
+        );
+        store
+            .save_item_images(primary, &[backdrop(&one), backdrop(&two)])
+            .await
+            .expect("images");
+        mgr.swap_images(primary, ImageType::Backdrop, 0, 1)
             .await
             .expect("swap");
-        let images = mgr.get_item_images(item).await.expect("images");
-        assert_eq!(images[0].path, "/two.jpg");
-        assert_eq!(images[1].path, "/one.jpg");
+        assert_eq!(std::fs::read(&one).expect("one"), b"TWO");
+        assert_eq!(std::fs::read(&two).expect("two"), b"ONE");
+        let paths = |id: Uuid| {
+            let mgr = &mgr;
+            async move {
+                mgr.get_item_images(id)
+                    .await
+                    .expect("images")
+                    .into_iter()
+                    .map(|i| i.path)
+                    .collect::<Vec<_>>()
+            }
+        };
+        let theirs = paths(primary).await;
+        assert_eq!(theirs, [one.clone(), two.clone()]);
+        assert_eq!(
+            paths(version).await,
+            theirs,
+            "the version holds the primary's images, in its order"
+        );
     }
 
     #[tokio::test]
@@ -4474,7 +6583,7 @@ mod tests {
                ("Id","Type","Name","CleanName","IsFolder","IsInMixedFolder",
                 "IsLocked","IsMovie","IsRepeat","IsSeries","IsVirtualItem")
                VALUES (?1,'MediaBrowser.Controller.Entities.Audio.MusicArtist',
-                       'Miles Davis','miles davis',1,0,0,0,0,0,0)"#,
+                       'Miles Davis','miles davis',0,0,0,0,0,0,0)"#,
         )
         .bind(&value_id)
         .execute(db.writer())
@@ -4623,6 +6732,53 @@ mod tests {
         );
     }
 
+    /// `VideosController.MergeVersions` puts 3D and disc (non-`VideoFile`)
+    /// videos after plain files before it compares widths.
+    #[tokio::test]
+    async fn merge_versions_demotes_3d_and_disc_copies_below_a_plain_file() {
+        let db = test_db().await;
+        let three_d = Uuid::from_u128(0x311);
+        let disc = Uuid::from_u128(0x312);
+        let plain = Uuid::from_u128(0x313);
+        let blob = |id| {
+            if id == three_d {
+                r#"{"Video3DFormat":"HalfSideBySide"}"#
+            } else if id == disc {
+                r#"{"VideoType":"BluRay"}"#
+            } else {
+                "{}"
+            }
+        };
+        for (id, width) in [(three_d, 3840), (disc, 1920), (plain, 1280)] {
+            crate::test_support::seed_item_with_data(&db, id, BaseItemKind::Movie, "", blob(id))
+                .await;
+            set_width(&db, id, width).await;
+        }
+        let mgr = manager(&db);
+
+        mgr.merge_versions(&[three_d, disc, plain])
+            .await
+            .expect("merge");
+
+        let pointer = |row: Option<BaseItemEntity>| {
+            row.expect("some")
+                .primary_version_id
+                .as_deref()
+                .and_then(|s| Uuid::parse_str(s).ok())
+        };
+        assert_eq!(
+            pointer(mgr.get_item_by_id(plain).await.expect("read")),
+            None
+        );
+        for id in [three_d, disc] {
+            assert_eq!(
+                pointer(mgr.get_item_by_id(id).await.expect("read")),
+                Some(plain),
+                "the wider 3D or disc copy is an alternate of the plain file"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn merge_versions_rejects_single_id() {
         let db = test_db().await;
@@ -4731,5 +6887,1691 @@ mod tests {
             .await
             .expect_err("missing");
         assert!(matches!(err, ServiceError::NotFound(_)));
+    }
+
+    struct CultureScanRunner {
+        captured: Mutex<Vec<String>>,
+        started: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl ScanRunner for CultureScanRunner {
+        async fn run(
+            &self,
+            _: &ScanTarget,
+            _: ScanRun<'_>,
+        ) -> Result<crate::library_scan::ScanOutcome, ServiceError> {
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            self.captured
+                .lock()
+                .unwrap()
+                .push(ferrofin_util::current_culture::capture());
+            Ok(crate::library_scan::ScanOutcome::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_queue_and_child_scans_inherit_the_starting_callers_culture() {
+        let db = test_db().await;
+        let runner = Arc::new(CultureScanRunner {
+            captured: Mutex::new(Vec::new()),
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let mgr = manager(&db).with_scan_runner(runner.clone());
+        ferrofin_util::current_culture::scope("sv".into(), mgr.queue_library_scan())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), runner.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        ferrofin_util::current_culture::scope("de-DE".into(), async {
+            mgr.submit(
+                ScanRequest::folder_refresh(
+                    ScanTarget::Library(Uuid::from_u128(0xC0)),
+                    replace_all(),
+                ),
+                false,
+                None,
+            );
+        })
+        .await;
+        until_queued(&mgr, 1, 0).await;
+        runner.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), runner.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        runner.release.add_permits(1);
+        until_idle(&mgr).await;
+        assert_eq!(
+            *runner.captured.lock().unwrap(),
+            ["sv", "sv", "sv", "sv"],
+            "one source Task.Run drains all queued requests under its starting culture"
+        );
+        ferrofin_util::current_culture::scope("en-US".into(), mgr.queue_library_scan())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), runner.started.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        runner.release.add_permits(1);
+        until_idle(&mgr).await;
+        assert_eq!(
+            &runner.captured.lock().unwrap()[4..],
+            ["en-US", "en-US"],
+            "a new worker captures a new caller"
+        );
+    }
+    #[derive(Default)]
+    struct CollapsingConfiguration(
+        std::sync::Mutex<ferrofin_model::configuration::ServerConfiguration>,
+    );
+    #[async_trait]
+    impl ferrofin_traits::configuration::ServerConfigurationManager for CollapsingConfiguration {
+        fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+            unreachable!("not needed")
+        }
+        async fn configuration(
+            &self,
+        ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError> {
+            Ok(Arc::new(self.0.lock().unwrap().clone()))
+        }
+        async fn update_configuration(
+            &self,
+            value: &ferrofin_model::configuration::ServerConfiguration,
+        ) -> Result<(), ServiceError> {
+            *self.0.lock().unwrap() = value.clone();
+            Ok(())
+        }
+        async fn get_branding(
+            &self,
+        ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+            Ok(ferrofin_model::branding::BrandingOptions::default())
+        }
+        async fn update_branding(
+            &self,
+            _: &ferrofin_model::branding::BrandingOptions,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// One episode row of [`long_season_episodes`]: its name (also its
+    /// `SortName` order), season and episode numbers, premiere day and
+    /// `Data` blob.
+    type LongSeasonRow = (
+        String,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<serde_json::Value>,
+    );
+
+    /// Saves a series with seasons 0 and 2 and `episodes` (all in season 2's
+    /// presentation, specials in season 0), then lists season 2 through
+    /// `season_episode_rows` (the season listing's and the scan's sort) and
+    /// returns the names in the order it gave.
+    async fn long_season_episodes(
+        episodes: Vec<LongSeasonRow>,
+        include_specials: bool,
+    ) -> Vec<String> {
+        let db = test_db().await;
+        let library = manager(&db);
+        let series = Uuid::new_v4();
+        let key = "long-series";
+        let season = |id: Uuid, number: i64| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+            name: Some(format!("Season {number}")),
+            index_number: Some(number),
+            parent_id: Some(guid_to_db(series)),
+            series_id: Some(guid_to_db(series)),
+            series_presentation_unique_key: Some(key.into()),
+            presentation_unique_key: Some(format!("long-season-{number}")),
+            is_folder: true,
+            ..Default::default()
+        };
+        let (specials, two) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut rows = vec![
+            BaseItemEntity {
+                id: guid_to_db(series),
+                type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+                name: Some("Long show".into()),
+                is_folder: true,
+                presentation_unique_key: Some(key.into()),
+                ..Default::default()
+            },
+            season(specials, 0),
+            season(two, 2),
+        ];
+        for (name, season_number, index, day, data) in episodes {
+            let season_id = if season_number == 0 { specials } else { two };
+            rows.push(BaseItemEntity {
+                id: guid_to_db(Uuid::new_v4()),
+                type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
+                sort_name: Some(name.to_lowercase()),
+                name: Some(name),
+                parent_id: Some(guid_to_db(season_id)),
+                season_id: Some(guid_to_db(season_id)),
+                series_id: Some(guid_to_db(series)),
+                series_presentation_unique_key: Some(key.into()),
+                parent_index_number: Some(season_number),
+                index_number: index,
+                premiere_date: day.map(|day| {
+                    chrono::DateTime::from_timestamp(1_600_000_000 + day * 86_400, 0).unwrap()
+                }),
+                data: data.map(|data| data.to_string()),
+                ..Default::default()
+            });
+        }
+        library.persistence.save_items(&rows).await.unwrap();
+        let season_row = library.items.retrieve_item(two).await.unwrap().unwrap();
+        season_episode_rows(
+            library.items.as_ref(),
+            two,
+            season_row,
+            &InternalItemsQuery::default(),
+            include_specials,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| row.name)
+        .collect()
+    }
+
+    /// gl-905, the undated shape: 22 unnumbered season-2 episodes in
+    /// `SortName` order, premiered on days 20 to 11, then one undated, then
+    /// days 10 to 0. The aired-order comparer calls the undated row equal to
+    /// two rows it orders apart, which `slice::sort_by` panicked on.
+    #[tokio::test]
+    async fn a_season_with_an_undated_episode_among_dated_ones_lists_them_by_date() {
+        let days = (11..=20)
+            .rev()
+            .map(Some)
+            .chain([None])
+            .chain((0..=10).rev().map(Some));
+        let rows = days
+            .enumerate()
+            .map(|(row, day)| {
+                let name = day.map_or_else(
+                    || format!("Row {row:02} undated"),
+                    |day| format!("Row {row:02} day {day:02}"),
+                );
+                (name, 2, None, day, None)
+            })
+            .collect();
+        let names = long_season_episodes(rows, false).await;
+        assert_eq!(names.len(), 22);
+        let dated: Vec<_> = names
+            .iter()
+            .filter(|name| !name.ends_with("undated"))
+            .collect();
+        let mut by_day = dated.clone();
+        by_day.sort_by_key(|name| name.rsplit(' ').next().map(str::to_owned));
+        assert_eq!(dated, by_day, "the dated episodes keep their date order");
+    }
+
+    /// gl-905, the positioned-special shape: a special that airs before
+    /// episode 20 of season 2, an unnumbered undated season-2 episode, then
+    /// episodes 20 down to 1, in that `SortName` order. The unnumbered row
+    /// comes before episode 1, episode 1 before the special, yet the comparer
+    /// calls the unnumbered row equal to the special ("Can't really compare").
+    #[tokio::test]
+    async fn a_season_with_a_special_and_an_unnumbered_episode_keeps_the_episode_order() {
+        let mut rows: Vec<LongSeasonRow> = vec![
+            (
+                "Row 00 special".into(),
+                0,
+                Some(1),
+                None,
+                Some(serde_json::json!({
+                    "AirsBeforeSeasonNumber": 2,
+                    "AirsBeforeEpisodeNumber": 20,
+                })),
+            ),
+            ("Row 01 unnumbered".into(), 2, None, None, None),
+        ];
+        rows.extend((1..=20).rev().enumerate().map(|(row, episode)| {
+            (
+                format!("Row {:02} episode {episode:02}", row + 2),
+                2,
+                Some(episode),
+                None,
+                None,
+            )
+        }));
+        let names = long_season_episodes(rows, true).await;
+        assert_eq!(names.len(), 22);
+        let episodes: Vec<_> = names
+            .iter()
+            .filter(|name| name.contains("episode"))
+            .collect();
+        let mut numbered = episodes.clone();
+        numbered.sort_by_key(|name| name.rsplit(' ').next().map(str::to_owned));
+        assert_eq!(episodes, numbered, "the numbered episodes keep their order");
+        let at = |suffix: &str| names.iter().position(|name| name.ends_with(suffix));
+        assert!(at("special") < at("episode 20"), "{names:?}");
+        assert!(at("special") > at("episode 19"), "{names:?}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn season_display_specials_is_live_and_precedes_filter_sort_count_and_page() {
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let config = Arc::new(CollapsingConfiguration::default());
+        let library = manager(&db).with_dashboard_configuration(config.clone());
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
+        let series = Uuid::new_v4();
+        let zero = Uuid::new_v4();
+        let one = Uuid::new_v4();
+        let key = "display-series";
+        let mut rows = vec![BaseItemEntity {
+            id: guid_to_db(series),
+            type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+            name: Some("Display show".into()),
+            is_folder: true,
+            presentation_unique_key: Some(key.into()),
+            path: Some(tmp.path().join("show").to_string_lossy().into_owned()),
+            ..Default::default()
+        }];
+        for (id, number) in [(zero, 0), (one, 1)] {
+            rows.push(BaseItemEntity {
+                id: guid_to_db(id),
+                type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+                name: Some(format!("Season {number}")),
+                sort_name: Some(format!("{number:04}")),
+                index_number: Some(number),
+                parent_id: Some(guid_to_db(series)),
+                // Guid.Empty must use the real Series parent.
+                series_id: Some(guid_to_db(Uuid::nil())),
+                series_presentation_unique_key: Some(key.into()),
+                presentation_unique_key: Some(format!("display-season-{number}")),
+                is_folder: true,
+                path: Some(
+                    tmp.path()
+                        .join(format!("show/season{number}"))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..Default::default()
+            });
+        }
+        // Duplicate season numbers can exist in grouped/adopted series. The
+        // direct Series child's fallback must use the first saved season order,
+        // not the iteration order of the identity lookup map.
+        rows.push(BaseItemEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+            name: Some("Replica season 1".into()),
+            sort_name: Some("9999".into()),
+            index_number: Some(1),
+            parent_id: Some(guid_to_db(series)),
+            series_id: Some(guid_to_db(series)),
+            series_presentation_unique_key: Some(key.into()),
+            presentation_unique_key: Some("other-season-key".into()),
+            is_folder: true,
+            path: Some(tmp.path().join("replica").to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        let mut episode_ids = Vec::new();
+        for (season_id, number, index, name, physical) in [
+            (one, 1, 1, "One", true),
+            (one, 1, 2, "Two", true),
+            (zero, 0, 1, "Z Special", true),
+            (one, 1, 3, "Missing", false),
+        ] {
+            let id = Uuid::new_v4();
+            episode_ids.push(id);
+            rows.push(BaseItemEntity {
+                id: guid_to_db(id),
+                type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
+                name: Some(name.into()),
+                sort_name: Some(name.to_lowercase()),
+                clean_name: Some(name.to_lowercase()),
+                parent_id: Some(guid_to_db(if name == "One" { series } else { season_id })),
+                // A direct Series child resolves its season by its number.
+                season_id: Some(guid_to_db(if name == "One" {
+                    Uuid::nil()
+                } else {
+                    season_id
+                })),
+                parent_index_number: Some(number),
+                index_number: Some(index),
+                series_id: Some(guid_to_db(series)),
+                series_presentation_unique_key: Some(key.into()),
+                media_type: Some("Video".into()),
+                is_virtual_item: !physical,
+                path: physical.then(|| {
+                    tmp.path()
+                        .join(format!("{name}.mkv"))
+                        .to_string_lossy()
+                        .into_owned()
+                }),
+                data: (number == 0).then(|| {
+                    serde_json::json!({"AirsBeforeSeasonNumber":1,"AirsBeforeEpisodeNumber":2})
+                        .to_string()
+                }),
+                ..Default::default()
+            });
+        }
+        library.persistence.save_items(&rows).await.unwrap();
+        let query = InternalItemsQuery {
+            user: Some(user),
+            parent_id: one,
+            parent_type: Some(BaseItemKind::Season),
+            apply_folder_display_options: true,
+            ..Default::default()
+        };
+        let names = |result: QueryResult<BaseItemEntity>| {
+            result
+                .items
+                .into_iter()
+                .map(|row| row.name.unwrap())
+                .collect::<Vec<_>>()
+        };
+        for enabled in [false, true, false] {
+            config.0.lock().unwrap().display_specials_within_seasons = enabled;
+            let expected = if enabled {
+                vec!["One", "Z Special", "Two", "Missing"]
+            } else {
+                vec!["One", "Two", "Missing"]
+            };
+            for recursive in [false, true] {
+                let selected = InternalItemsQuery {
+                    recursive,
+                    ..query.clone()
+                };
+                let result = library.query_items(&selected).await.unwrap();
+                assert_eq!(
+                    result.total_record_count,
+                    i32::try_from(expected.len()).unwrap()
+                );
+                assert_eq!(names(result), expected);
+                let page = library
+                    .query_items(&InternalItemsQuery {
+                        start_index: Some(1),
+                        limit: Some(1),
+                        ..selected.clone()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    page.total_record_count,
+                    i32::try_from(expected.len()).unwrap()
+                );
+                assert_eq!(names(page), [if enabled { "Z Special" } else { "Two" }]);
+            }
+            let physical = library
+                .query_items(&InternalItemsQuery {
+                    is_virtual_item: Some(false),
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                names(physical),
+                if enabled {
+                    vec!["One", "Z Special", "Two"]
+                } else {
+                    vec!["One", "Two"]
+                }
+            );
+            let prefix = library
+                .query_items(&InternalItemsQuery {
+                    name_starts_with: Some("Z".into()),
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                names(prefix),
+                if enabled { vec!["Z Special"] } else { vec![] }
+            );
+            let sorted = library
+                .query_items(&InternalItemsQuery {
+                    order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                names(sorted),
+                if enabled {
+                    vec!["Missing", "One", "Two", "Z Special"]
+                } else {
+                    vec!["Missing", "One", "Two"]
+                }
+            );
+            let descending = library
+                .query_items(&InternalItemsQuery {
+                    order_by: vec![(ItemSortBy::AiredEpisodeOrder, SortOrder::Descending)],
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                names(descending),
+                if enabled {
+                    vec!["Missing", "Two", "Z Special", "One"]
+                } else {
+                    vec!["Missing", "Two", "One"]
+                }
+            );
+            let adjacent = library
+                .query_items(&InternalItemsQuery {
+                    adjacent_to: Some(episode_ids[1]),
+                    start_index: Some(1),
+                    limit: Some(1),
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(adjacent.total_record_count, 3);
+            assert_eq!(names(adjacent), ["Two"]);
+            let zero_result = library
+                .query_items(&InternalItemsQuery {
+                    parent_id: zero,
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert_eq!(names(zero_result), ["Z Special"]);
+            let orphan = Uuid::new_v4();
+            let orphan_result = library
+                .query_items(&InternalItemsQuery {
+                    parent_id: orphan,
+                    ..query.clone()
+                })
+                .await
+                .unwrap();
+            assert!(orphan_result.items.is_empty());
+            for recursive in [false, true] {
+                let direct = library
+                    .query_items(&InternalItemsQuery {
+                        item_ids: vec![episode_ids[2]],
+                        recursive,
+                        ..query.clone()
+                    })
+                    .await
+                    .unwrap();
+                assert!(
+                    direct.items.is_empty(),
+                    "internal explicit IDs keep the supplied parent and bypass aired selection"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collection_display_guard_matches_the_pinned_allow_list_and_parent_exclusions() {
+        let mut query = InternalItemsQuery {
+            collapse_box_set_items: Some(true),
+            ..Default::default()
+        };
+        assert!(super::folder_should_collapse(&query, false, false));
+        macro_rules! boolean_guard { ($($field:ident),*) => { $(
+            query.$field = Some(false);
+            assert!(!super::folder_allows_collapsing(&query), stringify!($field));
+            query.$field = None;
+        )* }; }
+        boolean_guard!(
+            is_favorite,
+            is_favorite_or_liked,
+            is_liked,
+            is_played,
+            is_resumable,
+            is_folder,
+            has_imdb_id,
+            has_official_rating,
+            has_overview,
+            has_parental_rating,
+            has_special_feature,
+            has_subtitles,
+            has_theme_song,
+            has_theme_video,
+            has_tmdb_id,
+            has_trailer,
+            is_3d,
+            is_4k,
+            is_hd,
+            is_locked,
+            is_place_holder
+        );
+        macro_rules! list_guard { ($($field:ident => $value:expr),*) => { $(
+            query.$field.push($value);
+            assert!(!super::folder_allows_collapsing(&query), stringify!($field));
+            query.$field.clear();
+        )* }; }
+        list_guard!(genres => "Drama".into(), genre_ids => Uuid::new_v4(), image_types => ImageType::Primary,
+            person_ids => Uuid::new_v4(), item_ids => Uuid::new_v4(), studio_ids => Uuid::new_v4(),
+            video_types => ferrofin_model::entities::VideoType::VideoFile, years => 2020,
+            tags => "tag".into(), official_ratings => "PG".into());
+        query.person = Some("Person".into());
+        assert!(!super::folder_allows_collapsing(&query));
+        query.person = Some(" ".into());
+        query.min_index_number = Some(1);
+        assert!(!super::folder_allows_collapsing(&query));
+        query.min_index_number = None;
+        for order in [
+            ferrofin_model::live_tv::ItemSortBy::CommunityRating,
+            ferrofin_model::live_tv::ItemSortBy::CriticRating,
+            ferrofin_model::live_tv::ItemSortBy::Runtime,
+        ] {
+            query.order_by = vec![(order, ferrofin_model::dto::SortOrder::Ascending)];
+            assert!(!super::folder_allows_collapsing(&query));
+        }
+        query.order_by.clear();
+        // These are deliberately not part of AllowBoxSetCollapsing.
+        query.has_tvdb_id = Some(false);
+        query.min_community_rating = Some(1.0);
+        query.min_width = Some(1);
+        assert!(super::folder_allows_collapsing(&query));
+        for parent in [
+            BaseItemKind::BoxSet,
+            BaseItemKind::Season,
+            BaseItemKind::MusicAlbum,
+            BaseItemKind::MusicArtist,
+        ] {
+            query.parent_type = Some(parent);
+            assert!(!super::folder_should_collapse(&query, true, true));
+        }
+    }
+
+    #[test]
+    fn post_collapse_name_ranges_use_ordinal_comparison_and_literal_prefixes() {
+        let row = BaseItemEntity {
+            sort_name: Some("𐀀 title".into()),
+            ..Default::default()
+        };
+        assert!(
+            !super::folder_name_matches(
+                &row,
+                &InternalItemsQuery {
+                    name_less_than: Some("\u{e000}".into()),
+                    ..Default::default()
+                }
+            ),
+            "pinned Linux .NET OrdinalIgnoreCase orders the supplementary scalar after the BMP private-use codepoint"
+        );
+        let row = BaseItemEntity {
+            sort_name: Some("alpha% title".into()),
+            ..Default::default()
+        };
+        assert!(!super::folder_name_matches(
+            &row,
+            &InternalItemsQuery {
+                name_starts_with: Some("Alpha_".into()),
+                ..Default::default()
+            }
+        ));
+        assert!(super::folder_name_matches(
+            &row,
+            &InternalItemsQuery {
+                name_starts_with: Some("Alpha%".into()),
+                ..Default::default()
+            }
+        ));
+    }
+
+    /// `Folder.QueryRecursive` post-filters a user's playlist-only listing
+    /// through `Playlist.IsVisible` (v12.2 Folder.cs:1008-1062): owner, share
+    /// member or open access, and no administrator exception: Jellyfin 12.2
+    /// counts only the open playlists for an administrator who owns and
+    /// shares none (`Recursive=true&IncludeItemTypes=Playlist&Limit=0`, issue
+    /// #53).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one fixture, three readers, then paging
+    async fn a_recursive_playlist_listing_shows_only_playlists_the_user_may_open() {
+        use crate::user_entity_ext::set_permission;
+        use ferrofin_db::enums::PermissionKind;
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        let db = test_db().await;
+        let data = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let library = base
+            .with_dashboard_configuration(Arc::new(CollapsingConfiguration::default()))
+            .with_visibility(visibility);
+        let folder = Uuid::new_v4();
+        seed_named_item(&db, folder, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        let [owner, member, admin] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let mut users = Vec::new();
+        for (id, name) in [(owner, "owner"), (member, "member"), (admin, "admin")] {
+            users.push(crate::test_support::seed_named_user(&db, id, name).await);
+            crate::test_support::grant_default_permissions(&db, id).await;
+        }
+        set_permission(&db, &users[2].id, PermissionKind::IsAdministrator, true)
+            .await
+            .expect("admin");
+        let share = serde_json::json!([{"UserId": member, "CanEdit": false}]);
+        for (name, shares, open) in [
+            ("Private", serde_json::json!([]), false),
+            ("Shared", share, false),
+            ("Open", serde_json::json!([]), true),
+        ] {
+            let id = Uuid::new_v4();
+            crate::test_support::seed_child_item(&db, id, BaseItemKind::Playlist, name, folder)
+                .await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.top_parent_id.clone_from(&row.parent_id);
+            row.path = Some(
+                data.path()
+                    .join("playlists")
+                    .join(name)
+                    .display()
+                    .to_string(),
+            );
+            row.data = Some(
+                serde_json::json!({"OwnerUserId": owner, "OpenAccess": open, "Shares": shares})
+                    .to_string(),
+            );
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let listing = |user: &ferrofin_db::entities::users::UserEntity, limit| InternalItemsQuery {
+            user: Some(user.clone()),
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Playlist],
+            apply_folder_display_options: true,
+            limit,
+            ..Default::default()
+        };
+        let names = |result: QueryResult<BaseItemEntity>| {
+            let mut names: Vec<_> = result.items.into_iter().filter_map(|i| i.name).collect();
+            names.sort();
+            names
+        };
+
+        let probe = library
+            .query_items(&listing(&users[2], Some(0)))
+            .await
+            .expect("admin count");
+        assert_eq!((probe.total_record_count, probe.items.len()), (1, 0));
+        for (user, expected) in [
+            (&users[0], vec!["Open", "Private", "Shared"]),
+            (&users[1], vec!["Open", "Shared"]),
+            (&users[2], vec!["Open"]),
+        ] {
+            let result = library
+                .query_items(&listing(user, None))
+                .await
+                .expect("listing");
+            assert_eq!(
+                result.total_record_count,
+                i32::try_from(expected.len()).unwrap()
+            );
+            assert_eq!(names(result), expected);
+        }
+        let page = library
+            .query_items(&InternalItemsQuery {
+                start_index: Some(1),
+                ..listing(&users[0], Some(1))
+            })
+            .await
+            .expect("page");
+        assert_eq!(
+            (page.start_index, page.total_record_count, page.items.len()),
+            (1, 3, 1)
+        );
+        let uncounted = library
+            .query_items(&InternalItemsQuery {
+                enable_total_record_count: false,
+                ..listing(&users[0], None)
+            })
+            .await
+            .expect("uncounted");
+        assert_eq!(
+            (uncounted.total_record_count, uncounted.items.len()),
+            (0, 3),
+            "QueryWithPostFiltering reports 0 when no total was asked for"
+        );
+        // `AdjacentTo` reaches `GetItemList` with the query, so the SQL result
+        // is trimmed to the item and its neighbours BEFORE the visibility
+        // filter: by name the window around "Open" is Open and Private, which
+        // the member cannot open, so their "Shared" is not in it.
+        let by_name = vec![(ItemSortBy::SortName, SortOrder::Ascending)];
+        let open = library
+            .query_items(&InternalItemsQuery {
+                order_by: by_name.clone(),
+                ..listing(&users[0], None)
+            })
+            .await
+            .expect("listing")
+            .items
+            .into_iter()
+            .find(|item| item.name.as_deref() == Some("Open"))
+            .and_then(|item| Uuid::parse_str(&item.id).ok())
+            .expect("open playlist");
+        for (user, expected) in [
+            (&users[0], vec!["Open", "Private"]),
+            (&users[1], vec!["Open"]),
+        ] {
+            let around = library
+                .query_items(&InternalItemsQuery {
+                    adjacent_to: Some(open),
+                    order_by: by_name.clone(),
+                    ..listing(user, None)
+                })
+                .await
+                .expect("adjacent listing");
+            assert_eq!(names(around), expected);
+        }
+    }
+
+    /// The same post-filter applies to a box-set-only listing (the Collections
+    /// tab): `BoxSet.IsVisibleStandalone` hides a set whose members all sit in
+    /// libraries the user cannot open, and keeps an empty one.
+    #[tokio::test]
+    async fn a_recursive_box_set_listing_hides_sets_from_blocked_libraries() {
+        use crate::test_support::seed_child_item;
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let db = test_db().await;
+        let data = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let library = base
+            .with_dashboard_configuration(Arc::new(CollapsingConfiguration::default()))
+            .with_visibility(visibility);
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
+        let [shown_library, blocked_library, collections] =
+            [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        for (id, name) in [
+            (shown_library, "Shown"),
+            (blocked_library, "Blocked"),
+            (collections, "Collections"),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::CollectionFolder, name).await;
+        }
+        let links = crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone());
+        for (name, member_library) in [
+            ("Hidden set", Some(blocked_library)),
+            ("Shown set", Some(shown_library)),
+            ("Empty set", None),
+        ] {
+            let set = Uuid::new_v4();
+            seed_child_item(&db, set, BaseItemKind::BoxSet, name, collections).await;
+            let mut row = crate::test_support::fetch_item(&db, set).await;
+            row.top_parent_id.clone_from(&row.parent_id);
+            crate::test_support::save_item(&db, &row).await;
+            if let Some(member_library) = member_library {
+                let movie = Uuid::new_v4();
+                seed_child_item(&db, movie, BaseItemKind::Movie, name, member_library).await;
+                links
+                    .upsert_linked_child(set, movie, 0)
+                    .await
+                    .expect("link");
+            }
+        }
+        crate::user_entity_ext::set_preference(
+            &db,
+            &user.id,
+            ferrofin_db::enums::PreferenceKind::BlockedMediaFolders,
+            &[ferrofin_db::store::guid_to_db(blocked_library)],
+        )
+        .await
+        .expect("block");
+
+        let result = library
+            .query_items(&InternalItemsQuery {
+                user: Some(user),
+                recursive: true,
+                include_item_types: vec![BaseItemKind::BoxSet],
+                apply_folder_display_options: true,
+                ..Default::default()
+            })
+            .await
+            .expect("listing");
+        let mut names: Vec<_> = result.items.into_iter().filter_map(|i| i.name).collect();
+        names.sort();
+        assert_eq!(result.total_record_count, 2);
+        assert_eq!(names, ["Empty set", "Shown set"]);
+    }
+
+    /// gl-571: a box set's own listing keeps only the members in libraries
+    /// the user can open — `Folder.GetLinkedChildren(User)` with
+    /// `BoxSet.FilterLinkedChildrenPerUser` (v12.2 `Folder.cs:1736-1793`) —
+    /// in the listing and its count.
+    #[tokio::test]
+    async fn a_box_set_lists_only_members_from_libraries_the_user_can_open() {
+        let db = test_db().await;
+        let fixture = crate::test_support::seed_box_set_across_libraries(&db).await;
+        let library = crate::test_support::rooted_library_manager(
+            &db,
+            fixture.roots,
+            Arc::new(CollapsingConfiguration::default()),
+        );
+        let result = library
+            .query_items(&InternalItemsQuery {
+                user: Some(fixture.user),
+                parent_id: fixture.set,
+                parent_type: Some(BaseItemKind::BoxSet),
+                apply_folder_display_options: true,
+                enable_total_record_count: true,
+                ..Default::default()
+            })
+            .await
+            .expect("listing");
+        let names: Vec<_> = result.items.into_iter().filter_map(|i| i.name).collect();
+        assert_eq!(names, ["Shown"]);
+        assert_eq!(result.total_record_count, 1);
+    }
+
+    /// `BoxSet.GetChildren` sorts the set's direct members by its
+    /// `DisplayOrder` (default `PremiereDate`; `Default` keeps the order the
+    /// members were added in; an unparseable one is `PremiereDate`) unless the
+    /// request orders them itself — read off a Jellyfin 12.2 oracle on a set
+    /// created from Zeta (2001), Alpha (2003), Mid (1999), Beta (2002).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one set, every display order
+    async fn a_box_set_lists_its_members_by_its_display_order() {
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        use ferrofin_traits::collections::{CollectionCreationOptions, CollectionManager};
+        let db = test_db().await;
+        let temporary_paths = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            temporary_paths.path().to_string_lossy().into_owned(),
+        ));
+        let library = Arc::new(
+            base.with_dashboard_configuration(Arc::new(CollapsingConfiguration::default()))
+                .with_visibility(visibility),
+        );
+        let folder = Uuid::new_v4();
+        seed_named_item(&db, folder, BaseItemKind::CollectionFolder, "Library").await;
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
+        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> = {
+            let temp = temporary_paths.path();
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                temp.to_str().unwrap(),
+                temp.join("log").to_str().unwrap(),
+                temp.join("config").to_str().unwrap(),
+                temp.join("cache").to_str().unwrap(),
+                temp.join("web").to_str().unwrap(),
+            ))
+        };
+        let collections: Arc<dyn CollectionManager> =
+            Arc::new(crate::collection_manager::FerrofinCollectionManager::new(
+                db.clone(),
+                library.clone(),
+                Arc::new(
+                    crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone()),
+                ),
+                paths,
+            ));
+        library.attach_collections(&collections);
+        let mut members = Vec::new();
+        for (name, year) in [
+            ("Zeta", 2001),
+            ("Alpha", 2003),
+            ("Mid", 1999),
+            ("Beta", 2002),
+        ] {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.parent_id = Some(guid_to_db(folder));
+            row.top_parent_id = Some(guid_to_db(folder));
+            row.sort_name = Some(name.to_lowercase());
+            row.clean_name = Some(crate::text_util::get_clean_value(name));
+            row.premiere_date = chrono::NaiveDate::from_ymd_opt(year, 6, 1)
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|date| date.and_utc());
+            row.production_year = Some(i64::from(year));
+            library.persistence.save_items(&[row]).await.unwrap();
+            members.push(id);
+        }
+        let set = collections
+            .create_collection(&CollectionCreationOptions {
+                name: "Box".into(),
+                item_id_list: members.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let set_id = Uuid::parse_str(&set.id).unwrap();
+        let names = |result: QueryResult<BaseItemEntity>| {
+            result
+                .items
+                .into_iter()
+                .map(|item| item.name.unwrap())
+                .collect::<Vec<_>>()
+        };
+        let list = |recursive: bool, order: Vec<(ItemSortBy, SortOrder)>| {
+            let query = InternalItemsQuery {
+                user: Some(user.clone()),
+                parent_id: set_id,
+                parent_type: Some(BaseItemKind::BoxSet),
+                recursive,
+                apply_folder_display_options: true,
+                order_by: order,
+                ..Default::default()
+            };
+            let library = Arc::clone(&library);
+            async move { names(library.query_items(&query).await.unwrap()) }
+        };
+        let set_display_order = |value: Option<&'static str>| {
+            let db = db.clone();
+            async move {
+                let mut row = crate::test_support::fetch_item(&db, set_id).await;
+                let mut data = crate::item_data::parse_data(row.data.as_deref());
+                match value {
+                    Some(value) => data.insert("DisplayOrder".to_owned(), value.into()),
+                    None => data.remove("DisplayOrder"),
+                };
+                row.data = Some(serde_json::Value::Object(data).to_string());
+                crate::test_support::save_item(&db, &row).await;
+            }
+        };
+
+        // Nothing stored: the constructor's `PremiereDate`.
+        set_display_order(None).await;
+        let by_date = ["Mid", "Zeta", "Beta", "Alpha"];
+        assert_eq!(list(false, vec![]).await, by_date);
+        let by_name = ["Alpha", "Beta", "Mid", "Zeta"];
+        assert_eq!(
+            list(true, vec![]).await,
+            by_name,
+            "a recursive listing is the repository query, which ignores the set's order"
+        );
+        // An order the request names wins.
+        assert_eq!(
+            list(false, vec![(ItemSortBy::SortName, SortOrder::Ascending)]).await,
+            ["Alpha", "Beta", "Mid", "Zeta"]
+        );
+        // The set's own: a name, a number, an unparseable text.
+        set_display_order(Some("SortName")).await;
+        assert_eq!(list(false, vec![]).await, ["Alpha", "Beta", "Mid", "Zeta"]);
+        set_display_order(Some("10")).await;
+        assert_eq!(list(false, vec![]).await, ["Alpha", "Beta", "Mid", "Zeta"]);
+        for unparseable in ["premieredate", "", "Nonsense"] {
+            set_display_order(Some(unparseable)).await;
+            assert_eq!(list(false, vec![]).await, by_date, "{unparseable:?}");
+        }
+        // `Default`: the order the members were added in.
+        set_display_order(Some("Default")).await;
+        let added = ["Zeta", "Alpha", "Mid", "Beta"];
+        assert_eq!(list(false, vec![]).await, added);
+        assert_eq!(list(true, vec![]).await, by_name);
+        // `AdjacentTo` follows the set's own order: by the order added, Alpha
+        // sits between Zeta and Mid, and Beta falls outside its window.
+        let around = library
+            .query_items(&InternalItemsQuery {
+                user: Some(user.clone()),
+                parent_id: set_id,
+                parent_type: Some(BaseItemKind::BoxSet),
+                apply_folder_display_options: true,
+                adjacent_to: Some(members[1]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(names(around), ["Zeta", "Alpha", "Mid"]);
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fixture exercises live collection policy across recursive and direct Folder paths"
+    )]
+    async fn collection_display_options_are_live_scoped_and_match_recursive_and_plain_folder_paths()
+    {
+        use ferrofin_model::{dto::SortOrder, live_tv::ItemSortBy};
+        use ferrofin_traits::collections::{CollectionCreationOptions, CollectionManager};
+        let db = test_db().await;
+        let config = Arc::new(CollapsingConfiguration::default());
+        let temporary_paths = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            temporary_paths.path().to_string_lossy().into_owned(),
+        ));
+        let library = Arc::new(
+            base.with_dashboard_configuration(config.clone())
+                .with_visibility(visibility),
+        );
+        let folder = Uuid::new_v4();
+        seed_named_item(&db, folder, BaseItemKind::CollectionFolder, "Library").await;
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
+        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> = {
+            let temp = temporary_paths.path();
+            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+                temp.to_str().unwrap(),
+                temp.join("log").to_str().unwrap(),
+                temp.join("config").to_str().unwrap(),
+                temp.join("cache").to_str().unwrap(),
+                temp.join("web").to_str().unwrap(),
+            ))
+        };
+        let collections: Arc<dyn CollectionManager> =
+            Arc::new(crate::collection_manager::FerrofinCollectionManager::new(
+                db.clone(),
+                library.clone(),
+                Arc::new(
+                    crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone()),
+                ),
+                paths,
+            ));
+        library.attach_collections(&collections);
+        let mut rows = Vec::new();
+        for (kind, name) in [
+            (BaseItemKind::Movie, "Alpha movie"),
+            (BaseItemKind::Series, "Bravo series"),
+            (BaseItemKind::Video, "Charlie video"),
+        ] {
+            let id = Uuid::new_v4();
+            seed_named_item(&db, id, kind, name).await;
+            let mut item = crate::test_support::fetch_item(&db, id).await;
+            item.parent_id = Some(guid_to_db(folder));
+            item.top_parent_id = Some(guid_to_db(folder));
+            item.sort_name = Some(name.to_lowercase());
+            item.is_folder = crate::kinds::is_folder(kind);
+            item.clean_name = Some(crate::text_util::get_clean_value(name));
+            library.persistence.save_items(&[item]).await.unwrap();
+            rows.push(id);
+        }
+        let episode = Uuid::new_v4();
+        seed_named_item(&db, episode, BaseItemKind::Episode, "Unplayed episode").await;
+        let mut episode_row = crate::test_support::fetch_item(&db, episode).await;
+        episode_row.parent_id = Some(guid_to_db(rows[1]));
+        episode_row.series_id = Some(guid_to_db(rows[1]));
+        episode_row.media_type = Some("Video".into());
+        episode_row.top_parent_id = Some(guid_to_db(folder));
+        library
+            .persistence
+            .save_items(&[episode_row])
+            .await
+            .unwrap();
+        // Scanning persists the ancestry closure separately from the item row.
+        // Folder played counts use these leaf descendants, not ParentId alone.
+        library
+            .persistence
+            .set_ancestors(episode, &[rows[1], folder])
+            .await
+            .unwrap();
+        for (id, name) in rows.iter().zip([
+            "Zulu movie collection",
+            "Alpha show collection",
+            "Video collection",
+        ]) {
+            collections
+                .create_collection(&CollectionCreationOptions {
+                    name: name.into(),
+                    item_id_list: vec![*id],
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let query = InternalItemsQuery {
+            user: Some(user),
+            parent_id: folder,
+            parent_type: Some(BaseItemKind::CollectionFolder),
+            recursive: true,
+            apply_folder_display_options: true,
+            include_item_types: vec![
+                BaseItemKind::Movie,
+                BaseItemKind::Series,
+                BaseItemKind::Video,
+            ],
+            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+            ..Default::default()
+        };
+        let names = |result: QueryResult<BaseItemEntity>| {
+            result
+                .items
+                .into_iter()
+                .map(|item| item.name.unwrap())
+                .collect::<Vec<_>>()
+        };
+        for (movies, shows, expected) in [
+            (
+                false,
+                false,
+                vec!["Alpha movie", "Bravo series", "Charlie video"],
+            ),
+            (
+                true,
+                false,
+                vec!["Bravo series", "Charlie video", "Zulu movie collection"],
+            ),
+            (
+                false,
+                true,
+                vec!["Alpha movie", "Alpha show collection", "Charlie video"],
+            ),
+            (
+                true,
+                true,
+                vec![
+                    "Alpha show collection",
+                    "Video collection",
+                    "Zulu movie collection",
+                ],
+            ),
+        ] {
+            {
+                let mut settings = config.0.lock().unwrap();
+                settings.enable_grouping_movies_into_collections = movies;
+                settings.enable_grouping_shows_into_collections = shows;
+            }
+            assert_eq!(
+                names(library.query_items(&query).await.unwrap()),
+                expected,
+                "live {movies}/{shows}"
+            );
+            let plain = InternalItemsQuery {
+                recursive: false,
+                ..query.clone()
+            };
+            let expected_plain = if movies && shows {
+                vec![
+                    "Alpha show collection",
+                    "Charlie video",
+                    "Zulu movie collection",
+                ]
+            } else {
+                expected.clone()
+            };
+            assert_eq!(
+                names(library.query_items(&plain).await.unwrap()),
+                expected_plain,
+                "plain live {movies}/{shows}"
+            );
+            assert_eq!(
+                names(
+                    library
+                        .query_items(&InternalItemsQuery {
+                            is_played: Some(false),
+                            ..plain
+                        })
+                        .await
+                        .unwrap()
+                ),
+                ["Alpha movie", "Bravo series", "Charlie video"]
+            );
+        }
+        assert_eq!(
+            names(
+                library
+                    .query_items(&InternalItemsQuery {
+                        apply_folder_display_options: false,
+                        ..query.clone()
+                    })
+                    .await
+                    .unwrap()
+            ),
+            ["Alpha movie", "Bravo series", "Charlie video"],
+            "internal queries do not inherit Folder options"
+        );
+        for bypass in [
+            InternalItemsQuery {
+                collapse_box_set_items: Some(false),
+                ..query.clone()
+            },
+            InternalItemsQuery {
+                is_played: Some(false),
+                ..query.clone()
+            },
+            InternalItemsQuery {
+                force_direct: true,
+                ..query.clone()
+            },
+        ] {
+            assert_eq!(
+                names(library.query_items(&bypass).await.unwrap()),
+                ["Alpha movie", "Bravo series", "Charlie video"]
+            );
+        }
+        assert_eq!(
+            names(
+                library
+                    .query_items(&InternalItemsQuery {
+                        is_played: Some(false),
+                        collapse_box_set_items: Some(true),
+                        ..query.clone()
+                    })
+                    .await
+                    .unwrap()
+            ),
+            [
+                "Alpha show collection",
+                "Video collection",
+                "Zulu movie collection"
+            ],
+            "recursive explicit true survives a failed auto-collapse allow-list gate"
+        );
+        let plain = InternalItemsQuery {
+            recursive: false,
+            ..query.clone()
+        };
+        assert_eq!(
+            names(
+                library
+                    .query_items(&InternalItemsQuery {
+                        name_contains: Some("does not exist".into()),
+                        index_number: Some(99),
+                        parent_index_number: Some(42),
+                        source_types: vec![ferrofin_traits::options::SourceType::Channel],
+                        ..plain.clone()
+                    })
+                    .await
+                    .unwrap()
+            ),
+            [
+                "Alpha show collection",
+                "Charlie video",
+                "Zulu movie collection"
+            ],
+            "plain Filter ignores unsupported query fields and accepts null parent indices"
+        );
+        assert!(
+            library
+                .query_items(&InternalItemsQuery {
+                    name_starts_with: Some(" ".into()),
+                    ..plain.clone()
+                })
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "initial Filter treats whitespace as a real prefix"
+        );
+        let plain_items = library.query_items(&plain).await.unwrap().items;
+        let last_collection = Uuid::parse_str(&plain_items.last().unwrap().id).unwrap();
+        let adjacent = library
+            .query_items(&InternalItemsQuery {
+                adjacent_to: Some(last_collection),
+                ..plain.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(adjacent.total_record_count, 2);
+        assert_eq!(names(adjacent), ["Charlie video", "Zulu movie collection"]);
+        assert!(
+            library
+                .query_items(&InternalItemsQuery {
+                    adjacent_to: Some(Uuid::new_v4()),
+                    ..plain.clone()
+                })
+                .await
+                .unwrap()
+                .items
+                .is_empty()
+        );
+
+        assert_eq!(
+            names(library.query_items(&plain).await.unwrap()),
+            [
+                "Alpha show collection",
+                "Charlie video",
+                "Zulu movie collection"
+            ],
+            "plain path groups only Movie/Series, even with both flags true"
+        );
+        let page = library
+            .query_items(&InternalItemsQuery {
+                start_index: Some(1),
+                limit: Some(1),
+                ..plain.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total_record_count, 3);
+        assert_eq!(names(page), ["Charlie video"]);
+        let outside = library
+            .query_items(&InternalItemsQuery {
+                start_index: Some(99),
+                limit: Some(1),
+                ..plain.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outside.total_record_count, 3);
+        assert!(outside.items.is_empty());
+        assert!(
+            library
+                .query_items(&InternalItemsQuery {
+                    name_starts_with: Some("A".into()),
+                    ..plain.clone()
+                })
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "plain path filters member names before substitution and rechecks collection names afterwards"
+        );
+        assert_eq!(
+            names(
+                library
+                    .query_items(&InternalItemsQuery {
+                        name_starts_with: Some("A".into()),
+                        ..query
+                    })
+                    .await
+                    .unwrap()
+            ),
+            ["Alpha show collection"],
+            "recursive path defers letters until after substitution"
+        );
+        {
+            let mut settings = config.0.lock().unwrap();
+            settings.enable_grouping_movies_into_collections = false;
+            settings.enable_grouping_shows_into_collections = false;
+        }
+        assert_eq!(
+            names(
+                library
+                    .query_items(&InternalItemsQuery {
+                        collapse_box_set_items: Some(true),
+                        ..plain
+                    })
+                    .await
+                    .unwrap()
+            ),
+            ["Alpha movie", "Bravo series", "Charlie video"],
+            "plain explicit true does not override both disabled settings"
+        );
+    }
+
+    /// A row of `kind` at `path` (if any) hanging off `parent`.
+    fn content_row(
+        kind: BaseItemKind,
+        path: Option<&str>,
+        parent: Option<&BaseItemEntity>,
+    ) -> BaseItemEntity {
+        BaseItemEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            type_: kind.stored_type_name().expect("a stored kind").to_owned(),
+            path: path.map(str::to_owned),
+            parent_id: parent.map(|parent| parent.id.clone()),
+            is_folder: crate::kinds::is_folder(kind),
+            ..Default::default()
+        }
+    }
+
+    /// `BaseItem.ContainingFolderPath` and its overrides (`Video`, `Playlist`,
+    /// the by-name items, `LiveTvProgram`).
+    #[tokio::test]
+    async fn the_containing_folder_follows_upstreams_overrides() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let list_dir = tmp.path().join("playlists").join("Road.Trip");
+        std::fs::create_dir_all(&list_dir).expect("playlist folder");
+        let list_dir = list_dir.to_string_lossy().into_owned();
+        let disc = {
+            let mut row = content_row(BaseItemKind::Movie, Some("/m/Rip (2001)"), None);
+            row.data = Some(r#"{"VideoType":"Dvd"}"#.to_owned());
+            row
+        };
+        let cases = [
+            (
+                content_row(BaseItemKind::Folder, Some("/m/Sets"), None),
+                Some("/m/Sets"),
+            ),
+            (
+                content_row(BaseItemKind::Movie, Some("/m/Heat (1995)/Heat.mkv"), None),
+                Some("/m/Heat (1995)"),
+            ),
+            (disc, Some("/m/Rip (2001)")),
+            (
+                content_row(BaseItemKind::Genre, Some("/meta/Genre/Rock"), None),
+                Some("/meta/Genre/Rock"),
+            ),
+            (
+                content_row(BaseItemKind::Person, Some("/meta/People/A/Ada"), None),
+                Some("/meta/People/A/Ada"),
+            ),
+            (
+                content_row(BaseItemKind::Year, Some("/meta/Year/1998"), None),
+                Some("/meta/Year/1998"),
+            ),
+            (
+                content_row(BaseItemKind::Playlist, Some("/m/lists/road.m3u"), None),
+                Some("/m/lists"),
+            ),
+            (
+                content_row(BaseItemKind::Playlist, Some(&list_dir), None),
+                Some(list_dir.as_str()),
+            ),
+            (
+                content_row(BaseItemKind::Movie, Some("/x.mkv"), None),
+                Some("/"),
+            ),
+            (content_row(BaseItemKind::Movie, None, None), None),
+        ];
+        for (row, expected) in cases {
+            let folder = match row.path.as_deref() {
+                Some(path) => containing_folder_path(&row, path).await,
+                None => None,
+            };
+            assert_eq!(
+                folder.as_deref(),
+                expected,
+                "{} at {:?}",
+                row.type_,
+                row.path
+            );
+        }
+    }
+
+    /// `GetConfiguredContentType(item)`: the override naming the item's
+    /// containing folder exactly, and a library's own type for its
+    /// `CollectionFolder`.
+    #[tokio::test]
+    async fn the_configured_content_type_is_the_override_on_the_items_folder() {
+        use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+        use ferrofin_model::dto::NameValuePair;
+        use ferrofin_traits::library::VirtualFolderManager;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media = tmp.path().join("movies");
+        std::fs::create_dir_all(&media).expect("media");
+        let db = test_db().await;
+        let vf = Arc::new(crate::FerrofinVirtualFolderManager::new(
+            tmp.path().join("views"),
+        ));
+        let cf = vf
+            .add_virtual_folder(
+                "Movies",
+                Some(ferrofin_model::entities::CollectionTypeOptions::movies),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: media.to_string_lossy().into_owned(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("library")
+            .expect("its collection folder");
+        let config = Arc::new(CollapsingConfiguration::default());
+        config.0.lock().unwrap().content_types = vec![NameValuePair {
+            name: Some("/m/mixed/Blade (1998)".to_owned()),
+            value: Some("movies".to_owned()),
+        }];
+        let mgr = manager(&db)
+            .with_virtual_folders(vf)
+            .with_dashboard_configuration(config);
+        let folder = content_row(BaseItemKind::Series, Some("/m/mixed/Blade (1998)"), None);
+        let file = content_row(
+            BaseItemKind::Movie,
+            Some("/m/mixed/Blade (1998)/b.mkv"),
+            None,
+        );
+        let above = content_row(BaseItemKind::Folder, Some("/m/mixed"), None);
+        let below = content_row(BaseItemKind::Folder, Some("/m/mixed/Blade (1998)/x"), None);
+        let library = BaseItemEntity {
+            id: guid_to_db(cf),
+            ..content_row(BaseItemKind::CollectionFolder, Some("/views/Movies"), None)
+        };
+        for (row, expected) in [
+            (&folder, Some(CollectionType::movies)),
+            (&file, Some(CollectionType::movies)),
+            (&above, None),
+            (&below, None),
+            (&library, Some(CollectionType::movies)),
+        ] {
+            assert_eq!(
+                mgr.get_configured_content_type(row).await.unwrap(),
+                expected,
+                "{:?}",
+                row.path
+            );
+        }
+    }
+
+    /// `GetInheritedContentType(item)`: the type of the library holding the
+    /// item's top folder; in a mixed library, the configured type of the
+    /// parent farthest from the item, whatever the nearer ones say.
+    #[tokio::test]
+    async fn the_inherited_content_type_is_the_librarys_else_the_farthest_override() {
+        use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+        use ferrofin_model::dto::NameValuePair;
+        use ferrofin_traits::library::VirtualFolderManager;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let movies = tmp.path().join("movies");
+        let mixed = tmp.path().join("mixed");
+        std::fs::create_dir_all(&movies).expect("movies");
+        std::fs::create_dir_all(&mixed).expect("mixed");
+        let (movies, mixed) = (
+            movies.to_string_lossy().into_owned(),
+            mixed.to_string_lossy().into_owned(),
+        );
+        let db = test_db().await;
+        let vf = Arc::new(crate::FerrofinVirtualFolderManager::new(
+            tmp.path().join("views"),
+        ));
+        for (name, kind, location) in [
+            (
+                "Movies",
+                ferrofin_model::entities::CollectionTypeOptions::movies,
+                &movies,
+            ),
+            (
+                "Mixed",
+                ferrofin_model::entities::CollectionTypeOptions::mixed,
+                &mixed,
+            ),
+        ] {
+            vf.add_virtual_folder(
+                name,
+                Some(kind),
+                &LibraryOptions {
+                    path_infos: vec![MediaPathInfo {
+                        path: location.clone(),
+                    }],
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("library");
+        }
+        let config = Arc::new(CollapsingConfiguration::default());
+        let a = format!("{mixed}/A");
+        let b = format!("{a}/B");
+        config.0.lock().unwrap().content_types = [(&b, "tvshows"), (&a, "movies")]
+            .into_iter()
+            .map(|(name, value)| NameValuePair {
+                name: Some(name.clone()),
+                value: Some(value.to_owned()),
+            })
+            .collect();
+        let root = content_row(BaseItemKind::AggregateFolder, Some("/config/root"), None);
+        let movies_location = content_row(BaseItemKind::Folder, Some(&movies), Some(&root));
+        let movie = content_row(
+            BaseItemKind::Movie,
+            Some(&format!("{movies}/Heat/Heat.mkv")),
+            Some(&movies_location),
+        );
+        let mixed_location = content_row(BaseItemKind::Folder, Some(&mixed), Some(&root));
+        let folder_a = content_row(BaseItemKind::Folder, Some(&a), Some(&mixed_location));
+        let folder_b = content_row(BaseItemKind::Folder, Some(&b), Some(&folder_a));
+        let video = content_row(
+            BaseItemKind::Video,
+            Some(&format!("{b}/x.mkv")),
+            Some(&folder_b),
+        );
+        let loose = content_row(
+            BaseItemKind::Video,
+            Some(&format!("{mixed}/y.mkv")),
+            Some(&mixed_location),
+        );
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[
+                root,
+                movies_location,
+                movie.clone(),
+                mixed_location,
+                folder_a,
+                folder_b,
+                video.clone(),
+                loose.clone(),
+            ])
+            .await
+            .expect("rows");
+        let mgr = manager(&db)
+            .with_virtual_folders(vf)
+            .with_dashboard_configuration(config);
+        assert_eq!(
+            mgr.get_inherited_content_type(&movie).await.unwrap(),
+            Some(CollectionType::movies)
+        );
+        assert_eq!(
+            mgr.get_inherited_content_type(&video).await.unwrap(),
+            Some(CollectionType::movies),
+            "A, the farther overridden parent, not B"
+        );
+        assert_eq!(mgr.get_inherited_content_type(&loose).await.unwrap(), None);
+    }
+
+    /// A cycle in stored `ParentId`s ends the walk instead of looping.
+    #[tokio::test]
+    async fn a_parent_cycle_ends_the_walk() {
+        let db = test_db().await;
+        let store = FerrofinItemPersistenceService::new(db.clone());
+        let first = content_row(BaseItemKind::Folder, Some("/m/a"), None);
+        let second = content_row(BaseItemKind::Folder, Some("/m/a/b"), Some(&first));
+        store
+            .save_items(&[first.clone(), second.clone()])
+            .await
+            .expect("rows");
+        // Re-saved once its parent row exists, so the parent key holds.
+        let first = BaseItemEntity {
+            parent_id: Some(second.id.clone()),
+            ..first
+        };
+        store
+            .save_items(std::slice::from_ref(&first))
+            .await
+            .expect("the cycle");
+        let parents = manager(&db).parents_of(&first).await.unwrap();
+        assert_eq!(parents.len(), 1, "the second row, then back to the first");
     }
 }

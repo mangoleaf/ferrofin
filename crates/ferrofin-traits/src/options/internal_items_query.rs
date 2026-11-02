@@ -30,6 +30,20 @@ pub enum SourceType {
     LiveTv,
 }
 
+/// The once-resolved roots for an internal descendant query.
+///
+/// Leaf IDs stay in the database sub-select; these vectors contain only the
+/// seed and folders discovered by the pinned linked-root traversal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescendantQueryRoots {
+    /// The logical descendant criterion this snapshot resolves.
+    pub parent_id: Uuid,
+    /// Roots whose direct ancestor closure plus one seam hop contributes rows.
+    pub closure_roots: Vec<Uuid>,
+    /// Roots whose linked children contribute rows, across every child kind.
+    pub link_roots: Vec<Uuid>,
+}
+
 /// The central item query. Every field is an optional filter, a pagination/sort
 /// control, or DTO/user context; an empty query matches everything.
 ///
@@ -54,6 +68,13 @@ pub struct InternalItemsQuery {
     pub limit: Option<i32>,
     /// The user the query is scoped to.
     pub user: Option<UserEntity>,
+    /// Whether repository resolution has loaded the user content preferences.
+    pub user_preferences_loaded: bool,
+    /// Whether any library, parental rating or tag rule hides content from
+    /// [`user`](Self::user) (C# `UserHasContentRestrictions`). Like the tag and
+    /// unrated restrictions it reads preferences and permissions, so repository
+    /// resolution sets it alongside them.
+    pub user_has_content_restrictions: bool,
 
     // --- boolean tri-state filters ---
     /// Restrict to folders / non-folders.
@@ -146,7 +167,8 @@ pub struct InternalItemsQuery {
     pub is_hd: Option<bool>,
     /// Restrict to (un)locked items.
     pub is_locked: Option<bool>,
-    /// Restrict to placeholder items.
+    /// Restrict to placeholder items (an offline disc stub), or exclude them;
+    /// a folder counts as one when an item below it or linked to it is.
     pub is_place_holder: Option<bool>,
 
     // --- provider-id presence filters ---
@@ -156,7 +178,8 @@ pub struct InternalItemsQuery {
     pub has_overview: Option<bool>,
     /// Restrict to items with a TMDb id.
     pub has_tmdb_id: Option<bool>,
-    /// Restrict to items with an official rating.
+    /// Restrict to items with (or without) an official rating; a folder
+    /// counts as rated when an item below it or linked to it is.
     pub has_official_rating: Option<bool>,
     /// Restrict to items with a TVDB id.
     pub has_tvdb_id: Option<bool>,
@@ -249,7 +272,9 @@ pub struct InternalItemsQuery {
     pub index_number: Option<i32>,
     /// Minimum permitted parental rating.
     pub min_parental_rating: Option<ParentalRatingScore>,
-    /// Maximum permitted parental rating (derived from the user).
+    /// Maximum permitted parental rating. With a user, the stricter of this
+    /// and the user's own limit applies, so a value here can lower that
+    /// limit but never raise it.
     pub max_parental_rating: Option<ParentalRatingScore>,
 
     // --- structural filters ---
@@ -262,7 +287,9 @@ pub struct InternalItemsQuery {
     /// When set, a non-recursive `parent_id` browse matches only PHYSICAL children
     /// (`bi.ParentId = parent_id`) and does NOT merge the parent's `LinkedChildren`
     /// members. Used by delete-cascade so removing a box-set/playlist never deletes
-    /// the referenced items (linked children are references, not owned children).
+    /// the referenced items (linked children are references, not owned children),
+    /// and by the `/Items/Filters2` facets, whose `Parent` upstream matches as a
+    /// strict `ParentId` equality (`TranslateQuery.cs:320-322`).
     pub physical_children_only: bool,
     /// The physical folders [`Self::parent_id`] stands for, when it names a
     /// Jellyfin `CollectionFolder`.
@@ -309,8 +336,29 @@ pub struct InternalItemsQuery {
     /// the repository ignores it unless the parent really does resolve to the
     /// user root.
     pub user_root_children: bool,
+    /// Apply the Folder display policy on an ItemsController browse, and on
+    /// the internal query that lists a folder's members for a played mark
+    /// (`Folder.MarkPlayed` → `GetItemList` runs the same policy). Other
+    /// internal repository queries and latest/resume queries leave this false.
+    pub apply_folder_display_options: bool,
+    /// The source movie/TV base UserView directly calls Folder.QueryRecursive,
+    /// bypassing its parent's Series/Season/Channel GetItemsInternal override.
+    /// Derived dispatch context, never a client option.
+    pub folder_query_recursive: bool,
     /// The parent item kind, if known.
     pub parent_type: Option<BaseItemKind>,
+    /// Restrict to physical and linked descendants of this item.
+    /// Internal scope used for recursive BoxSet/Playlist reads; filters and
+    /// paging apply to the resulting rows, never to traversal intermediates.
+    pub descendant_of_id: Option<Uuid>,
+    /// Order the rows by their position in this container's linked children
+    /// (`LinkedChildren.SortOrder`) before any other ordering: a box set whose
+    /// `DisplayOrder` is `Default` lists its members as they were added.
+    /// Internal, set by the library manager, never a client option.
+    pub linked_order_of: Option<Uuid>,
+    /// Cached internal root resolution for the row and count statements.
+    /// Repositories recompute it when its parent differs from DescendantOfId.
+    pub descendant_roots: Option<DescendantQueryRoots>,
     /// Restrict to descendants of these ancestors.
     pub ancestor_ids: Vec<Uuid>,
     /// Restrict to items whose linked children descend from these ancestors.
@@ -353,7 +401,9 @@ pub struct InternalItemsQuery {
     pub force_direct: bool,
     /// Provider ids to exclude (name → value).
     pub exclude_provider_ids: Option<HashMap<String, String>>,
-    /// Whether results are grouped by metadata key.
+    /// Whether the caller de-duplicates the rows by metadata key itself: the
+    /// list queries then read 4 rows past `limit` for it to drop
+    /// (`BaseItemRepository.PrepareFilterQuery`).
     pub enable_group_by_metadata_key: bool,
     /// Restrict to items with chapter images.
     pub has_chapter_images: Option<bool>,
@@ -450,6 +500,8 @@ impl Default for InternalItemsQuery {
             start_index: None,
             limit: None,
             user: None,
+            user_preferences_loaded: false,
+            user_has_content_restrictions: false,
             is_folder: None,
             is_favorite: None,
             is_favorite_or_liked: None,
@@ -541,7 +593,12 @@ impl Default for InternalItemsQuery {
             parent_physical_folder_ids: Vec::new(),
             virtual_child_parent_id: None,
             user_root_children: false,
+            apply_folder_display_options: false,
+            folder_query_recursive: false,
             parent_type: None,
+            descendant_of_id: None,
+            linked_order_of: None,
+            descendant_roots: None,
             ancestor_ids: Vec::new(),
             linked_child_ancestor_ids: Vec::new(),
             top_parent_ids: Vec::new(),
@@ -633,6 +690,7 @@ impl InternalItemsQuery {
             || !self.subtitle_languages.is_empty()
             || !self.linked_child_ancestor_ids.is_empty()
             || !self.ancestor_ids.is_empty()
+            || self.descendant_of_id.is_some()
             || self.is_favorite.is_some()
             || self.is_favorite_or_liked.is_some()
             || self.is_liked.is_some()
@@ -657,7 +715,6 @@ impl InternalItemsQuery {
             || self.has_imdb_id.is_some()
             || self.has_tmdb_id.is_some()
             || self.has_tvdb_id.is_some()
-            || !self.any_provider_id_equals.is_empty()
             || self.has_overview.is_some()
             || self.has_official_rating.is_some()
             || self.has_parental_rating.is_some()
@@ -707,9 +764,15 @@ impl InternalItemsQuery {
     /// The C# method also derives `block_unrated_items`,
     /// `exclude_inherited_tags` and `include_inherited_tags` from the user's
     /// **preferences** (`PreferenceKind.*`). Those rows live in a separate
-    /// preferences table, not on [`UserEntity`], so the caller must populate
-    /// those three fields from a preference lookup; they are left untouched here.
+    /// preferences table, not on [`UserEntity`], so repository query resolution populates
+    /// those three fields from a preference lookup before translating SQL, along
+    /// with [`user_has_content_restrictions`](Self::user_has_content_restrictions).
     pub fn set_user(&mut self, user: UserEntity) {
+        self.user_preferences_loaded = false;
+        self.user_has_content_restrictions = false;
+        self.block_unrated_items.clear();
+        self.exclude_inherited_tags.clear();
+        self.include_inherited_tags.clear();
         if let Some(max) = user.max_parental_rating_score {
             self.max_parental_rating = Some(ParentalRatingScore::new(
                 i32::try_from(max).unwrap_or(i32::MAX),
@@ -854,6 +917,24 @@ mod tests {
             ..Default::default()
         };
         assert!(!q3.has_filters());
+
+        // Nor is a provider-id lookup: C# `HasFilters` leaves out
+        // `HasAnyProviderId`.
+        let q4 = InternalItemsQuery {
+            any_provider_id_equals: vec![("Tmdb".into(), "603".into())],
+            ..Default::default()
+        };
+        assert!(!q4.has_filters());
+    }
+
+    #[test]
+    fn descendant_of_id_is_a_filter_before_root_resolution() {
+        let query = InternalItemsQuery {
+            descendant_of_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        assert!(query.has_filters());
+        assert!(query.descendant_roots.is_none());
     }
 
     #[test]

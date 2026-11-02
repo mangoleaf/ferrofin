@@ -19,31 +19,37 @@ pub fn get_safe_leaf_file_name(file_name: Option<&str>) -> Option<String> {
         return None;
     }
 
-    let leaf = Path::new(file_name)
-        .file_name()?
-        .to_string_lossy()
-        .into_owned();
+    // `Path.GetFileName` is what follows the last separator. `Path::file_name`
+    // would normalise `sub/` and `sub/.` to `sub`, which upstream rejects.
+    let leaf = file_name
+        .rsplit(std::path::is_separator)
+        .next()
+        .unwrap_or_default();
     if leaf.is_empty() || leaf == "." || leaf == ".." {
         return None;
     }
 
-    Some(leaf)
+    Some(leaf.to_owned())
 }
 
 /// Lexically resolves a path: collapses `.` and `..` segments without consulting
 /// the filesystem (unlike `std::fs::canonicalize`, which requires existence).
-fn get_full_path(path: &str) -> PathBuf {
+#[must_use]
+pub fn get_full_path(path: &str) -> PathBuf {
     let input = Path::new(path);
     let mut resolved = PathBuf::new();
     for component in input.components() {
         match component {
             Component::CurDir => {}
-            Component::ParentDir => {
-                if !resolved.pop() {
-                    // Preserve leading `..` on relative paths.
-                    resolved.push("..");
+            // `..` cancels a name, stays put at the root, and piles up at
+            // the start of a relative path.
+            Component::ParentDir => match resolved.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    resolved.pop();
                 }
-            }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => resolved.push(".."),
+            },
             other => resolved.push(other.as_os_str()),
         }
     }
@@ -53,8 +59,9 @@ fn get_full_path(path: &str) -> PathBuf {
 /// Returns whether `candidate` resolves to a path that equals or is contained
 /// inside `root`.
 ///
-/// Both arguments are lexically resolved so `..` segments are collapsed before
-/// the comparison. The root is compared with a trailing separator to prevent
+/// Both arguments are anchored at the working directory when relative and
+/// lexically resolved, as `Path.GetFullPath` does, so `..` segments are
+/// collapsed before the comparison. The root is compared with a trailing separator to prevent
 /// prefix collisions (e.g. `/var/data` must not be accepted as a parent of
 /// `/var/dataset`).
 ///
@@ -67,8 +74,12 @@ pub fn is_contained_in(root: &str, candidate: &str) -> bool {
     assert!(!root.is_empty(), "root must not be null or empty");
     assert!(!candidate.is_empty(), "candidate must not be null or empty");
 
-    let full_root = get_full_path(root);
-    let full_candidate = get_full_path(candidate);
+    let (Ok(root), Ok(candidate)) = (std::path::absolute(root), std::path::absolute(candidate))
+    else {
+        return false;
+    };
+    let full_root = get_full_path(&root.to_string_lossy());
+    let full_candidate = get_full_path(&candidate.to_string_lossy());
 
     if full_candidate == full_root {
         return true;
@@ -83,8 +94,39 @@ pub fn is_contained_in(root: &str, candidate: &str) -> bool {
     candidate_str.starts_with(&root_with_sep)
 }
 
+/// The invalid path characters `ManagedFileSystem.GetValidFilename` replaces:
+/// `ManagedFileSystem._invalidPathCharacters`, `"` `<` `>` `|` the control
+/// characters 0–31, `:` `*` `?` `\` and `/`.
+fn is_invalid_path_character(c: char) -> bool {
+    matches!(c, '"' | '<' | '>' | '|' | ':' | '*' | '?' | '\\' | '/') || u32::from(c) <= 31
+}
+
+/// Port of `ManagedFileSystem.GetValidFilename`: every invalid path character
+/// replaced by a space, nothing trimmed. Callers trim as their upstream caller
+/// does (`AddVirtualFolder` trims first, the DVR paths after).
+#[must_use]
+pub fn get_valid_filename(filename: &str) -> String {
+    filename
+        .chars()
+        .map(|c| if is_invalid_path_character(c) { ' ' } else { c })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    /// `ManagedFileSystemTests.GetValidFilename_ReturnsValidFilename`, plus the
+    /// control characters upstream's array lists.
+    #[rstest::rstest]
+    #[case("ValidFileName", "ValidFileName")]
+    #[case("AC/DC", "AC DC")]
+    #[case("Invalid\0", "Invalid ")]
+    #[case("AC/DC\0KD/A", "AC DC KD A")]
+    #[case("a\tb\nc\u{1f}d", "a b c d")]
+    #[case("\"<>|:*?\\/", "         ")]
+    fn get_valid_filename_replaces_invalid_characters(#[case] name: &str, #[case] expected: &str) {
+        assert_eq!(super::get_valid_filename(name), expected);
+    }
+
     use super::*;
     use rstest::rstest;
     use std::env::temp_dir;
@@ -106,6 +148,11 @@ mod tests {
     #[case(Some(""))]
     #[case(Some("."))]
     #[case(Some(".."))]
+    // `Path.GetFileName` takes what follows the last separator, so a trailing
+    // separator or `.` leaves no usable leaf.
+    #[case(Some("sub/"))]
+    #[case(Some("sub/."))]
+    #[case(Some("sub/.."))]
     fn get_safe_leaf_file_name_rejects_unusable_leaf(#[case] input: Option<&str>) {
         assert_eq!(None, get_safe_leaf_file_name(input));
     }
@@ -116,6 +163,22 @@ mod tests {
             p.push(part);
         }
         p.to_string_lossy().into_owned()
+    }
+
+    #[rstest]
+    #[case("/a/../../m/x", "/m/x")]
+    #[case("/a/./b/../c", "/a/c")]
+    #[case("../a/../b", "../b")]
+    #[case("../../x", "../../x")]
+    #[case("a/../../../b", "../../b")]
+    fn get_full_path_resolves_lexically(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(get_full_path(input), PathBuf::from(expected));
+    }
+
+    #[test]
+    fn is_contained_in_anchors_relative_paths() {
+        assert!(!is_contained_in("..", "../../x"));
+        assert!(is_contained_in("a", "a/b/../c"));
     }
 
     #[test]

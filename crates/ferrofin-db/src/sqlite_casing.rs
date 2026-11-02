@@ -60,9 +60,11 @@ unsafe extern "C" fn register_on_connection(
     _err_msg: *mut *mut c_char,
     _api: *const ffi::sqlite3_api_routines,
 ) -> c_int {
-    static SORT: Mapping = ferrofin_util::sort_name::create_sort_name;
+    // Fixed on Jellyfin's default sort rules, not the configured ones: only
+    // released migrations call these, and they are registered deterministic.
+    static SORT: Mapping = ferrofin_util::sort_name::default_rules_sort_name;
     static PREVIOUS_SORT: Mapping = ferrofin_util::sort_name::previous_create_sort_name;
-    static FORCED_SORT: Mapping = ferrofin_util::sort_name::forced_sort_key;
+    static FORCED_SORT: Mapping = ferrofin_util::sort_name::default_rules_forced_sort_key;
     static PREVIOUS_FORCED_SORT: Mapping = ferrofin_util::sort_name::previous_forced_sort_key;
     static LOWER: Mapping = lower_invariant;
     static UPPER: Mapping = upper_invariant;

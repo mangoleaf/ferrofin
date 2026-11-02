@@ -1,0 +1,11 @@
+1
+00:00:01,000 --> 00:00:02,000
+<font color="yellow">yellow</font> <font color="#FFFF00">upper hex</font> <font color="#fff">short</font>
+
+2
+00:00:02,000 --> 00:00:03,000
+<font color="LightBlue">LightBlue</font> <font color=lime>bare</font> <font color="#123456">dark</font>
+
+3
+00:00:03,000 --> 00:00:04,000
+<font color="rgb(255,0,0)">rgb</font> <font color="#ffffff80">alpha</font> <font face="Times" color="#0000ff">both</font>

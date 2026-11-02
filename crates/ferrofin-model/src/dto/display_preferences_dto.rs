@@ -55,8 +55,11 @@ crate::json::enums::wire_enum! {
 }
 
 /// Display preferences for any item that supports them (usually folders).
+///
+/// A member a request body leaves out takes upstream's constructor default
+/// ([`Default`]), as System.Text.Json binds it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct DisplayPreferencesDto {
     /// Gets or sets the user id.

@@ -284,8 +284,9 @@ mod tests {
             .await
             .expect("convert");
         let text = String::from_utf8(out).expect("utf8");
+        // libse's WebVTT writer emits no BOM (Jellyfin 12 encodes with `Encoding.UTF8.GetBytes`).
         assert!(
-            text.starts_with("\u{feff}WEBVTT"),
+            text.starts_with("WEBVTT\n"),
             "expected WEBVTT header: {text}"
         );
         assert!(text.contains("Hello"));

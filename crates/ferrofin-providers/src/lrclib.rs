@@ -565,7 +565,11 @@ mod tests {
     async fn search_treats_http_error_as_no_results() {
         let (base_url, _seen) =
             spawn_stub_server("HTTP/1.1 500 Internal Server Error", "{}".to_owned());
-        let provider = LrcLibProvider::new().with_base_url(base_url);
+        let mut provider = LrcLibProvider::new().with_base_url(base_url);
+        // The test is about the endpoint, not the limiter: its backoff is
+        // covered in `rate_limit`'s own suite. Only the wait is skipped.
+        provider.limiter = provider.limiter.without_backoff();
+        let started = std::time::Instant::now();
         assert!(
             provider
                 .search(&request())
@@ -573,6 +577,8 @@ mod tests {
                 .expect("search")
                 .is_empty()
         );
+        // The limiter's first failure backoff is 2 s.
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[tokio::test]

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttp="http://www.w3.org/ns/ttml#parameter" ttp:timeBase="media" xmlns:tts="http://www.w3.org/ns/ttml#styling" xml:lang="en" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">
+  <head>
+    <metadata>
+      <ttm:title></ttm:title>
+    </metadata>
+    <styling>
+      <style xml:id="Default" tts:fontFamily="Open Sans" tts:fontWeight="normal" tts:fontStyle="normal" tts:color="#ffffff" tts:fontSize="48" />
+      <style xml:id="Sign" tts:fontFamily="Arial Black" tts:fontWeight="bold" tts:fontStyle="italic" tts:color="#ffff00" tts:fontSize="36.75" />
+    </styling>
+    <layout>
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="start" xml:id="topLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="start" xml:id="centerLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="start" xml:id="bottomLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="center" xml:id="topCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="center" xml:id="centerCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="center" xml:id="bottomCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="end" xml:id="topRight" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="end" xml:id="centerRight" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="end" xml:id="bottomRight" />
+    </layout>
+  </head>
+  <body style="s0">
+    <div>
+      <p begin="1.0s" xml:id="p0" end="3.5s" style="Default" xmlns="http://www.w3.org/ns/ttml">Plain line<br />second line</p>
+      <p begin="4.0s" xml:id="p1" end="5.55s" region="topCenter" style="Sign" xmlns="http://www.w3.org/ns/ttml">SIGN text</p>
+      <p begin="6.0s" xml:id="p2" end="7.0s" style="Default" xmlns="http://www.w3.org/ns/ttml">Italic and red end</p>
+      <p begin="8.0s" xml:id="p3" end="9.99s" xmlns="http://www.w3.org/ns/ttml">Fading, with, commas and hard space</p>
+      <p begin="10.0s" xml:id="p4" end="11.0s" style="Default" xmlns="http://www.w3.org/ns/ttml">Font and size</p>
+      <p begin="3723.04s" xml:id="p5" end="3725.06s" region="bottomLeft" style="Default" xmlns="http://www.w3.org/ns/ttml">Bottom left &amp; tag</p>
+    </div>
+  </body>
+</tt>

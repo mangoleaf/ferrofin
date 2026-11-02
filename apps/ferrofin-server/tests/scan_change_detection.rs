@@ -44,14 +44,14 @@
 //! | 3 | touch one file's mtime, rescan | exactly that item: probe + providers + save |
 //! | 4 | NFO newer than DateLastSaved + 1 min | that item's local metadata re-read only |
 //! | 5 | webhook and watcher: add one file | 1 created; parent via decision; nothing else |
-//! | 6 | webhook and watcher: delete one file | 1 removed; the watched season asks its season providers once |
+//! | 6 | webhook and watcher: delete one file | 1 removed; the watched season validated, asking nothing |
 //! | 7 | edit Overview (no LockData), rescan | edit survives; `LockData` false |
 //! | 8 | "Search for missing metadata" | empty fields filled, edited Overview kept |
 //! | 9 | "Replace all metadata", Overview unlocked | Overview replaced |
 //! | 10 | lock Overview, "Replace all metadata" | Overview kept, other fields replaced |
 //! | 11 | `LockData=true`, add `poster.png`, rescan | poster discovered; 0 provider requests |
 //! | 12 | locked item saved by a rescan | `Data` (trailers) intact |
-//! | 13 | episode with TMDB date/rating, rescans | fields intact; the season whose folder changed asks its season providers once |
+//! | 13 | episode with TMDB date/rating, rescans | fields intact; the season whose folder changed asks nothing |
 //! | 14 | pending library refresh + webhook path | no full scan queued |
 //! | 15 | movie refresh: TMDB 429 and missing ffprobe | text retained; images follow replacement flags |
 //!
@@ -69,24 +69,14 @@
 //! through the real inotify watcher on a library with real-time monitoring
 //! on, with `LibraryMonitorDelay` at 1 s.
 //!
-//! Rows 6 (watcher) and 13 refresh a season because its folder changed (a
-//! file left or joined it): upstream's `requiresRefresh`
-//! (`BaseItem.RequiresRefresh`, `Folder.RequiresRefresh`) makes
-//! `GetProviders` run every remote provider of the season
-//! (`MetadataService.cs:655-658`), and the Shows and Live libraries tick
-//! TheMovieDb alone for seasons. `TmdbSeasonProvider` then asks for the
-//! season by its series' recorded `Tmdb` id: exactly one
-//! `/tmdb/tv/{series}/season/1` request, which an episode refreshed in the
-//! same scan shares (row 5). Every other row's 0 holds: an unchanged season
-//! runs no provider.
-//!
-//! The pinned count is the request the refresh decision makes, not
-//! upstream's network count. Upstream's `TmdbClientManager` keeps each season
-//! response in memory for an hour (`season-{id}-s{n}-{lang}`,
-//! `TmdbClientManager.cs:238-262`), so it would serve rows 6 and 13 from
-//! memory a few seconds after row 1 fetched the same seasons, with 0 network
-//! requests. Ferrofin's TMDB season cache lasts one scan, so each of those
-//! rows asks once.
+//! Rows 5, 6 (watcher) and 13 change a season's folder (a file left or
+//! joined it), and the season still refreshes nothing: a directory has no
+//! `DateModified` (owner decision D2: `GetFileSystemMetadata` fills no times
+//! for a directory, stored as NULL), and `BaseItem.RequiresRefresh` is false
+//! for a `MinValue` one (`BaseItem.cs:1721-1731`), so `GetProviders` runs no
+//! remote provider of the season. The one `/tmdb/tv/{series}/season/1`
+//! request of row 5 is the new episode's: its name and still come from the
+//! season's response.
 //!
 //! One test function, one process: the metrics pipeline is process-global.
 
@@ -104,14 +94,16 @@ use std::time::{Duration, Instant};
 use ferrofin_server::config::{Config, ProviderEndpoints};
 use serde_json::{Value, json};
 
+#[path = "support/boot.rs"]
+mod boot;
+
+use boot::STARTUP_DEADLINE;
+
 const CLIENT: &str =
     r#"MediaBrowser Client="scan-matrix", Device="test", DeviceId="scan-matrix", Version="1""#;
 
 /// Ceiling for one HTTP request: a hang guard, not a latency assertion.
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
-
-/// How long the server gets to bind and boot (debug build, busy machine).
-const STARTUP_DEADLINE: Duration = Duration::from_mins(2);
 
 /// How long a scan may take before the test calls it hung. The scans here
 /// cover a dozen files; this is a hang guard, not a latency assertion.
@@ -252,9 +244,16 @@ impl Providers {
 fn subtitle_answer(target: &str, addr: std::net::SocketAddr) -> Option<String> {
     let path = target.split('?').next()?;
     Some(match path {
-        "/opensubtitles/login" => json!({"token":"test-token"}).to_string(),
+        // A JWT expiring in 2100 (`{"exp":4102444800}`): downloads reuse it.
+        "/opensubtitles/login" => {
+            json!({"token":"eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln"}).to_string()
+        }
+        "/opensubtitles/infos/user" => json!({"data":{
+            "allowed_downloads":20,"remaining_downloads":20,"reset_time_utc":"2100-01-01T00:00:00Z"
+        }})
+        .to_string(),
         "/opensubtitles/download" => {
-            json!({"link":format!("http://{addr}/subtitle-file")}).to_string()
+            json!({"link":format!("http://{addr}/subtitle-file"),"remaining":19}).to_string()
         }
         "/opensubtitles/subtitles" => {
             assert!(target.contains("moviehash="));
@@ -278,16 +277,19 @@ fn parity_answer(target: &str, addr: std::net::SocketAddr) -> Option<String> {
         "/tmdb/movie/901" => json!({"id":901,"title":"Mapped movie","original_title":"Original movie","original_language":"ja",
             "overview":"Mapped overview", "videos":{"results":[{"site":"YouTube","type":"Trailer","key":"mapped","name":"Trailer"}]}, "production_countries":[{"name":"Japan"}],"keywords":{"keywords":[{"name":"mapped keyword"}]},
             "belongs_to_collection":{"id":99,"name":"Mapped collection"},"poster_path":"/mapped-tmdb.png","credits":{"cast":[],"crew":[]}}),
+        "/tmdb/movie/901/images" => json!({"posters":[{"file_path":"/mapped-tmdb.png","width":640,"height":960}],"backdrops":[],"logos":[]}),
         "/fanart/movies/901" => json!({"movieposter":[{"url":art("mapped-fanart"),"lang":"en"}]}),
         "/tvdb/login" => json!({"data":{"token":"test"}}),
         "/tvdb/search/remoteid/tt123456" | "/tvdb/search/remoteid/777" => json!({"data":[{"series":{"id":42}}]}),
         "/tvdb/series/42/extended" => json!({"data":{"id":42,"name":"Mapped series","overview":"TVDB series overview",
+            "translations":{"nameTranslations":[{"language":"eng","name":"Mapped series"}],"overviewTranslations":[{"language":"eng","overview":"TVDB series overview"}]},
             "averageRuntime":42,"slug":"mapped-series","lists":[{"id":9,"isOfficial":true}],
             "remoteIds":[{"sourceName":"IMDB","id":"tt123456"}],
             "artworks":[{"type":2,"image":art("mapped-tvdb")}]
         }}),
         "/tvdb/series/42/episodes/official" => json!({"data":{"episodes":[{"id":43,"seasonNumber":1,"number":1}]}}),
         "/tvdb/episodes/43/extended" => json!({"data":{"id":43,"name":"Mapped episode","overview":"TVDB episode overview",
+            "translations":{"nameTranslations":[{"language":"eng","name":"Mapped episode"}],"overviewTranslations":[{"language":"eng","overview":"TVDB episode overview"}]},
             "airsBeforeEpisode":2,"airsBeforeSeason":1,"airsAfterSeason":0,
             "remoteIds":[{"sourceName":"IMDB","id":"tt123457"}],"characters":[]}}),
         "/fanart/tv/42" => json!({"tvposter":[{"url":art("mapped-series-fanart"),"lang":"en"}]}),
@@ -327,6 +329,37 @@ fn omdb_answer(target: &str) -> Option<String> {
     None
 }
 
+/// Movie detail and image-list replies are separate provider requests.
+fn movie_answer(id: &str) -> Option<String> {
+    if let Some(id) = id.strip_suffix("/images") {
+        let (title, _) = MOVIES.iter().find(|(_, m)| m.to_string() == id)?;
+        let posters = if *title == "Alpha" {
+            json!([{"file_path":"/alpha-poster.png","width":640,"height":960}])
+        } else {
+            json!([])
+        };
+        return Some(json!({"posters":posters,"backdrops":[],"logos":[]}).to_string());
+    }
+    let (title, _) = MOVIES.iter().find(|(_, m)| m.to_string() == id)?;
+    // Alpha alone has artwork and a cast member: the artwork and person
+    // requests of every row are then Alpha's (or nobody's).
+    let (poster, cast) = if *title == "Alpha" {
+        (
+            r#""poster_path": "/alpha-poster.png","#,
+            r#"[{"id": 501, "name": "Ada Actor", "character": "Lead", "order": 0,
+                     "known_for_department": "Acting", "profile_path": "/ada.png"}]"#,
+        )
+    } else {
+        ("", "[]")
+    };
+    Some(format!(
+        r#"{{"id": {id}, "title": "{title}", "overview": "About {title}.", "vote_average": 8.0,
+                "release_date": "1999-03-30", {poster} "videos": {}, "credits": {{"cast": {cast}, "crew": []}},
+                "release_dates": {{"results": []}}}}"#,
+        trailer(title)
+    ))
+}
+
 /// The stand-in's answer to `target` (path + query), `None` for a 404.
 fn answer(target: &str) -> Option<String> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -347,24 +380,7 @@ fn answer(target: &str) -> Option<String> {
         return Some(format!(r#"{{"results": [{}]}}"#, hits.join(",")));
     }
     if let Some(id) = path.strip_prefix("/tmdb/movie/") {
-        let (title, _) = MOVIES.iter().find(|(_, m)| m.to_string() == id)?;
-        // Alpha alone has artwork and a cast member: the artwork and person
-        // requests of every row are then Alpha's (or nobody's).
-        let (poster, cast) = if *title == "Alpha" {
-            (
-                r#""poster_path": "/alpha-poster.png","#,
-                r#"[{"id": 501, "name": "Ada Actor", "character": "Lead", "order": 0,
-                     "known_for_department": "Acting", "profile_path": "/ada.png"}]"#,
-            )
-        } else {
-            ("", "[]")
-        };
-        return Some(format!(
-            r#"{{"id": {id}, "title": "{title}", "overview": "About {title}.", "vote_average": 8.0,
-                "release_date": "1999-03-30", {poster} "videos": {}, "credits": {{"cast": {cast}, "crew": []}},
-                "release_dates": {{"results": []}}}}"#,
-            trailer(title)
-        ));
+        return movie_answer(id);
     }
     if path == "/tmdb/person/501" {
         return Some(
@@ -379,6 +395,9 @@ fn answer(target: &str) -> Option<String> {
         let mut parts = rest.split('/');
         let id = parts.next()?;
         let (title, _) = SHOWS.iter().find(|(_, s)| s.to_string() == id)?;
+        if rest.ends_with("/images") {
+            return Some(json!({"posters":[],"backdrops":[],"logos":[],"stills":[]}).to_string());
+        }
         let episode = |n: u32| {
             format!(
                 r#"{{"id": {n}, "episode_number": {n}, "season_number": 1, "name": "{title} episode {n}",
@@ -419,12 +438,12 @@ fn answer(target: &str) -> Option<String> {
     }
     if path == "/audiodb/album-mb.php" {
         return Some(
-            r#"{"album":[{"strDescriptionEN":"Album text.","strGenre":"Jazz"}]}"#.to_owned(),
+            r#"{"album":[{"strDescription":"Album text.","strGenre":"Jazz"}]}"#.to_owned(),
         );
     }
     if path == "/audiodb/artist-mb.php" {
         return Some(
-            r#"{"artists":[{"strBiographyEN":"Artist bio.","strGenre":"Jazz"}]}"#.to_owned(),
+            r#"{"artists":[{"strBiography":"Artist bio.","strGenre":"Jazz"}]}"#.to_owned(),
         );
     }
     None
@@ -1040,15 +1059,6 @@ const REQUEST_TABLES: [&str; 3] = ["ActivityLogs", "Devices", "Users"];
 // the server
 // ---------------------------------------------------------------------------
 
-/// A port nobody is listening on right now (a probe, not a reservation).
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
-
 /// What one row observed between [`Harness::mark`] and [`Harness::settle`].
 #[derive(Debug, Default)]
 struct Seen {
@@ -1196,12 +1206,13 @@ impl Harness {
                 tvdb: Some(format!("{}/tvdb", providers.base)),
                 fanart: Some(format!("{}/fanart", providers.base)),
                 audiodb: Some(format!("{}/audiodb", providers.base)),
+                lrclib: Some(format!("{}/lrclib", providers.base)),
             },
             // A passwordless administrator: no PBKDF2 round in a debug build.
             admin_password: String::new(),
             ..Config::test_stub(temp.path())
         };
-        let (server, base, config) = Self::spawn(&client, make_config).await;
+        let (server, base, config) = boot::spawn_server(&client, make_config).await;
         let token = Self::login(&client, &base).await;
         let writes = Writes::install(&config.database_url(), &media.root).await;
         let mut harness = Self {
@@ -1219,52 +1230,6 @@ impl Harness {
         };
         harness.configure().await;
         harness
-    }
-
-    /// Starts [`ferrofin_server::run`] on a free port (another if a
-    /// concurrent test took it first) and waits until it answers.
-    async fn spawn(
-        client: &reqwest::Client,
-        make_config: impl Fn(u16) -> Config,
-    ) -> (std::thread::JoinHandle<anyhow::Result<()>>, String, Config) {
-        for _ in 0..5 {
-            let config = make_config(free_port());
-            let base = format!("http://127.0.0.1:{}", config.port);
-            let run_config = config.clone();
-            // `run`'s future is not `Send` enough for `tokio::spawn`; the
-            // binary drives it from `main`, so give it its own runtime too.
-            let server = std::thread::spawn(move || {
-                tokio::runtime::Runtime::new()
-                    .expect("server runtime")
-                    .block_on(ferrofin_server::run(run_config))
-            });
-            let deadline = Instant::now() + STARTUP_DEADLINE;
-            while Instant::now() < deadline {
-                let name = async {
-                    let info: Value = client
-                        .get(format!("{base}/System/Info/Public"))
-                        .send()
-                        .await
-                        .ok()?
-                        .json()
-                        .await
-                        .ok()?;
-                    info["ServerName"].as_str().map(str::to_owned)
-                };
-                if name.await.as_deref() == Some(config.server_name.as_str()) {
-                    return (server, base, config);
-                }
-                if server.is_finished() {
-                    break;
-                }
-                tokio::time::sleep(POLL).await;
-            }
-            assert!(
-                server.is_finished(),
-                "server never became reachable on {base}"
-            );
-        }
-        panic!("no free port survived long enough to bind");
     }
 
     async fn login(client: &reqwest::Client, base: &str) -> String {
@@ -1691,25 +1656,6 @@ fn assert_no_provider_request(seen: &Seen, row: &str) {
     );
 }
 
-/// Asserts the row's only provider request was TheMovieDb's season lookup
-/// `season` (`/tmdb/tv/{series}/season/{n}`) — what a season refreshed for
-/// its changed folder asks for in a library that ticks only TheMovieDb for
-/// seasons (see the module docs, rows 6 and 13).
-fn assert_only_the_season_request(seen: &Seen, season: &str, row: &str) {
-    assert_eq!(
-        seen.provider_metric,
-        BTreeMap::from([("tmdb".to_owned(), 1.0)]),
-        "row {row}: provider metric {seen:?}"
-    );
-    let paths: Vec<&str> = seen
-        .requests
-        .iter()
-        .filter_map(|r| r.split_whitespace().nth(1))
-        .map(|target| target.split('?').next().unwrap_or(target))
-        .collect();
-    assert_eq!(paths, [season], "row {row}: provider requests {seen:?}");
-}
-
 /// Asserts the row wrote exactly the item tables in `tables` (every one,
 /// and none else), so a rewrite of `Peoples`, `ItemValues`,
 /// `LinkedChildren`… can't hide behind the right set of items.
@@ -1786,8 +1732,35 @@ fn assert_provider_counts_agree(seen: &Seen, row: &str) {
     );
 }
 
+/// Whether this test should run here: the server's log subscriber is
+/// process-wide (`init_tracing`'s `try_init`), so a second server booted in
+/// the same process logs into the first one's directory and never sees its
+/// own watcher start. Under `cargo test`, which runs this file's tests on
+/// threads of one process, each re-runs itself alone in a child process and
+/// reports its result; nextest already gives every test a process of its own.
+fn in_own_process(name: &str) -> bool {
+    if std::env::var_os("NEXTEST").is_some()
+        || std::env::var_os("FERROFIN_SCAN_MATRIX_CHILD").is_some()
+    {
+        return true;
+    }
+    let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env("FERROFIN_SCAN_MATRIX_CHILD", "1")
+        .status()
+        .expect("run the test in its own process");
+    assert!(
+        status.success(),
+        "{name} failed in its own process: {status}"
+    );
+    false
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_scan_reprocesses_only_what_changed() {
+    if !in_own_process("a_scan_reprocesses_only_what_changed") {
+        return;
+    }
     let h = Harness::boot().await;
     let started = Instant::now();
     rows(&h).await;
@@ -1797,6 +1770,18 @@ async fn a_scan_reprocesses_only_what_changed() {
     subtitle_probe_failure_is_quiet(&h).await;
     omdb_works_without_an_operator_key(&h).await;
     eprintln!("matrix rows took {:?}", started.elapsed());
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subtitle_downloads_survive_rescans_and_probe_failure() {
+    if !in_own_process("subtitle_downloads_survive_rescans_and_probe_failure") {
+        return;
+    }
+    let h = Harness::boot().await;
+    subtitles_are_downloaded_during_scan(&h).await;
+    std::fs::remove_file(&h.stubs.ffprobe).expect("make ffprobe unavailable");
+    subtitle_probe_failure_is_quiet(&h).await;
     h.shutdown().await;
 }
 
@@ -1810,8 +1795,9 @@ async fn rows(h: &Harness) {
     // ---- 1: the first scan creates everything and asks the providers ----
     let first = h.rescan("1").await;
     // Movies: 3. Harbor: series, season, 2 episodes. Lantern: series,
-    // season, 1 episode. Music: artist, album, 2 tracks.
-    let all_items = 14.0;
+    // season, 1 episode. Music: artist, album, 2 tracks. And each of the
+    // four library locations' `Folder` rows (owner decision D1).
+    let all_items = 18.0;
     assert_eq!(first.outcome("created"), all_items, "row 1: {first:?}");
     for outcome in ["updated", "unchanged", "removed"] {
         assert_eq!(first.outcome(outcome), 0.0, "row 1: {outcome} {first:?}");
@@ -2064,10 +2050,12 @@ async fn rows(h: &Harness) {
         BTreeMap::from([("webhook".to_owned(), 1.0)]),
         "row 5: {added:?}"
     );
-    // A movie's nearest existing item is its library: the scan validates
-    // the reported path alone, so nothing else is even counted unchanged.
+    // A movie's nearest existing item is its library location: the scan
+    // validates the reported path, with the location's folder above it as
+    // context (owner decision D1) — counted unchanged, nothing else.
     assert_eq!(added.item("webhook", "created"), 1.0, "row 5: {added:?}");
-    for outcome in ["updated", "unchanged", "removed"] {
+    assert_eq!(added.outcome("unchanged"), 1.0, "row 5: {added:?}");
+    for outcome in ["updated", "removed"] {
         assert_eq!(added.outcome(outcome), 0.0, "row 5: {outcome} {added:?}");
     }
     assert_eq!(
@@ -2118,7 +2106,9 @@ async fn rows(h: &Harness) {
         1.0,
         "row 6: {removed:?}"
     );
-    for outcome in ["created", "updated", "unchanged"] {
+    // The location's folder above the path is context (owner decision D1).
+    assert_eq!(removed.outcome("unchanged"), 1.0, "row 6: {removed:?}");
+    for outcome in ["created", "updated"] {
         assert_eq!(
             removed.outcome(outcome),
             0.0,
@@ -2139,7 +2129,6 @@ async fn rows(h: &Harness) {
     assert_tables(&removed, NEW_FILE_TABLES, "6");
 
     // ---- 5 (watcher): a new episode lands in a watched season ----
-    let lantern_season = m.key(m.lantern_e2.parent().expect("season"));
     let lantern_series = m.key(
         m.lantern_e2
             .parent()
@@ -2157,11 +2146,14 @@ async fn rows(h: &Harness) {
         "row 5: {added:?}"
     );
     // The episode is created; its season is the nearest existing item and
-    // goes through the decision (its folder's mtime moved: D3); the series
-    // and the sibling episode are context and validation only.
+    // goes through the decision, which finds nothing to do though its
+    // folder's mtime moved (a directory has no `DateModified`, D2); the
+    // sibling episode is saved, now in a mixed folder (a second episode
+    // beside it, `ResolveVideos`' count); the series and the location's
+    // folder are context only.
     assert_eq!(added.item("watcher", "created"), 1.0, "row 5: {added:?}");
     assert_eq!(added.item("watcher", "updated"), 1.0, "row 5: {added:?}");
-    assert_eq!(added.item("watcher", "unchanged"), 2.0, "row 5: {added:?}");
+    assert_eq!(added.item("watcher", "unchanged"), 3.0, "row 5: {added:?}");
     assert_eq!(added.outcome("removed"), 0.0, "row 5: {added:?}");
     assert_eq!(
         added.probes.get("ok").copied(),
@@ -2184,7 +2176,7 @@ async fn rows(h: &Harness) {
     );
     let mut expected = vec![
         lantern_series.clone(),
-        lantern_season.clone(),
+        m.key(&m.lantern_e2.with_file_name("Lantern - S01E01.mkv")),
         m.key(&m.lantern_e2),
     ];
     expected.sort_unstable();
@@ -2209,9 +2201,9 @@ async fn rows(h: &Harness) {
         1.0,
         "row 6: {removed:?}"
     );
-    // The season goes through the decision again (its folder changed):
-    // `requiresRefresh` runs its one ticked season provider, TheMovieDb's,
-    // which asks for the season once — nothing else is asked for.
+    // The season goes through the decision again, and again finds nothing
+    // to do though its folder changed (D2): nothing is asked for. The
+    // sibling, alone again, leaves its mixed folder and is saved.
     assert_eq!(
         removed.item("watcher", "updated"),
         1.0,
@@ -2219,7 +2211,7 @@ async fn rows(h: &Harness) {
     );
     assert_eq!(removed.outcome("created"), 0.0, "row 6: {removed:?}");
     assert_no_probe(&removed, "6");
-    assert_only_the_season_request(&removed, "/tmdb/tv/202/season/1", "6");
+    assert_no_provider_request(&removed, "6");
     assert_no_artwork_or_people(&removed, "6");
     assert_eq!(removed.written_items(), expected, "row 6: {removed:?}");
     assert_tables(&removed, NEW_FILE_TABLES, "6");
@@ -2239,6 +2231,9 @@ async fn rows(h: &Harness) {
     })
     .await;
     let edited = h.rescan("7").await;
+    // The movies location's own directory changed in row 6 (Delta's folder
+    // went), and its folder is still unchanged: a directory has no
+    // `DateModified` (D2).
     assert_eq!(edited.outcome("unchanged"), all_items, "row 7: {edited:?}");
     assert_no_probe(&edited, "7");
     assert_no_provider_request(&edited, "7");
@@ -2426,17 +2421,15 @@ async fn rows(h: &Harness) {
     );
     // A new sidecar re-probes the episode and saves it without asking its
     // providers (only the probe's change monitor fired): the stored date and
-    // rating must survive that save. Its season goes through the decision
-    // for its changed folder: `requiresRefresh` runs every season provider
-    // the library ticks — TheMovieDb's — which asks for the season by the
-    // series' recorded Tmdb id, once. The series and the other episode are
-    // unchanged and ask nothing.
+    // rating must survive that save. Its season, whose folder changed, is
+    // unchanged (a directory has no `DateModified`, D2), as are the series
+    // and the other episode: nothing is asked.
     put(
         &m.harbor_e1.with_file_name("Harbor - S01E01.en.srt"),
         b"1\n00:00:01,000 --> 00:00:02,000\nHi\n",
     );
     let resaved = h.rescan("13s").await;
-    assert_eq!(resaved.outcome("updated"), 2.0, "row 13: {resaved:?}");
+    assert_eq!(resaved.outcome("updated"), 1.0, "row 13: {resaved:?}");
     assert_eq!(
         resaved.probes.get("ok").copied(),
         Some(1.0),
@@ -2446,14 +2439,11 @@ async fn rows(h: &Harness) {
         resaved.probed("Harbor - S01E01.mkv"),
         "row 13: re-probed {resaved:?}"
     );
-    assert_only_the_season_request(&resaved, "/tmdb/tv/201/season/1", "13");
+    assert_no_provider_request(&resaved, "13");
     assert_no_artwork_or_people(&resaved, "13");
     assert_eq!(
         resaved.written_items(),
-        [
-            m.key(m.harbor_e1.parent().expect("season")),
-            m.key(&m.harbor_e1)
-        ],
+        [m.key(&m.harbor_e1)],
         "row 13: {resaved:?}"
     );
     assert_tables(&resaved, &["BaseItems", "MediaStreamInfos"], "13");
@@ -2508,15 +2498,19 @@ async fn rows(h: &Harness) {
     // never joined into a wider scan, then had nothing left to create.
     assert_eq!(queued.item("api", "created"), 1.0, "row 14: {queued:?}");
     assert_eq!(queued.item("webhook", "created"), 0.0, "row 14: {queued:?}");
+    // The movie, with its location's folder as context (owner decision D1).
     assert_eq!(
         queued.item("webhook", "unchanged"),
-        1.0,
+        2.0,
         "row 14: {queued:?}"
     );
-    // Shows (series, season, 2 episodes; the touched one updated) and
-    // Movies (4 with the new one): 8 items, not the 15 of every library.
+    // Shows (series, season, 2 episodes; the touched one updated; the
+    // location's folder) and Movies (4 with the new one; the location's
+    // folder, unchanged though its directory gained the new movie's: a
+    // directory has no `DateModified`, D2): 10 items, not the 19 of every
+    // library.
     assert_eq!(queued.item("api", "updated"), 1.0, "row 14: {queued:?}");
-    assert_eq!(queued.item("api", "unchanged"), 6.0, "row 14: {queued:?}");
+    assert_eq!(queued.item("api", "unchanged"), 8.0, "row 14: {queued:?}");
     assert_eq!(queued.outcome("removed"), 0.0, "row 14: {queued:?}");
     assert!(
         queued.probed("Harbor - S01E02.mkv") && queued.probed("Epsilon (1999).mkv"),
@@ -2672,12 +2666,21 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(library, "Default", false).await;
     let first = h.settle(mark, &[("api", 1.0)]).await;
+    let subtitles = of(&first.requests, "opensubtitles");
     assert_eq!(
-        of(&first.requests, "opensubtitles").len(),
-        3,
-        "search + login + download: {:?}",
+        subtitles.len(),
+        4,
+        "search + login + quota + download: {:?}",
         first.requests
     );
+    for path in ["/login", "/infos/user", "/download"] {
+        assert!(
+            subtitles
+                .iter()
+                .any(|r| r.contains(&format!("/opensubtitles{path}"))),
+            "{path} in {subtitles:?}"
+        );
+    }
     assert!(first.requests.iter().any(|r| r.contains("languages=en")));
     assert!(!first.requests.iter().any(|r| r.contains("languages=fr")));
     let english = movie.with_extension("eng.srt");
@@ -2714,7 +2717,25 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(library, "Default", false).await;
     let repaired = h.settle(mark, &[("api", 1.0)]).await;
-    assert_eq!(of(&repaired.requests, "opensubtitles").len(), 3);
+    let subtitles = of(&repaired.requests, "opensubtitles");
+    assert_eq!(
+        subtitles.len(),
+        2,
+        "search + download, on the first download's login: {:?}",
+        repaired.requests
+    );
+    assert!(
+        subtitles
+            .iter()
+            .any(|r| r.contains("/opensubtitles/download")),
+        "{subtitles:?}"
+    );
+    assert!(
+        !subtitles
+            .iter()
+            .any(|r| r.contains("/opensubtitles/login") || r.contains("/opensubtitles/infos/user")),
+        "the first download's login is reused: {subtitles:?}"
+    );
     assert_eq!(std::fs::read(&english).unwrap(), content);
 
     options["DisabledSubtitleFetchers"] = json!(["opensubtitles"]);
@@ -2780,6 +2801,7 @@ async fn subtitle_probe_failure_is_quiet(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(&id, "FullRefresh", false).await;
     let seen = h.settle(mark, &[("api", 1.0)]).await;
+    assert!(seen.probes.get("failed").copied().unwrap_or_default() > 0.0);
     assert!(of(&seen.requests, "opensubtitles").is_empty());
     assert_eq!(
         std::fs::read(movie.with_extension("eng.srt")).unwrap(),
@@ -2877,13 +2899,15 @@ async fn provider_identity_fields_and_artwork(h: &Harness) {
     assert!(
         seen.requests
             .iter()
-            .any(|r| r.contains("/image/mapped-fanart.png"))
+            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb")),
+        "{seen:?}"
     );
     assert!(
         !seen
             .requests
             .iter()
-            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb"))
+            .any(|r| r.contains("/image/mapped-fanart.png")),
+        "{seen:?}"
     );
     let id = h.id(&movie).await;
     let dto = h.item(&id).await;
@@ -2902,8 +2926,9 @@ async fn provider_identity_fields_and_artwork(h: &Harness) {
         !quiet.writes.contains_key("BaseItemImageInfos"),
         "{quiet:?}"
     );
-    // An explicit library order overrides the default on image replacement.
-    options["TypeOptions"][0]["ImageFetcherOrder"] = json!(["TheMovieDb", "FanArt"]);
+    // Movie providers default to TMDB before FanArt (pinned intrinsic order).
+    // An explicit reversed library order overrides that on replacement.
+    options["TypeOptions"][0]["ImageFetcherOrder"] = json!(["FanArt", "TheMovieDb"]);
     h.post(
         "/Library/VirtualFolders/LibraryOptions",
         Some(&json!({"Id":library,"LibraryOptions":options})),
@@ -2917,7 +2942,7 @@ async fn provider_identity_fields_and_artwork(h: &Harness) {
         reordered
             .requests
             .iter()
-            .any(|r| r.contains(" /image/") && r.contains("mapped-tmdb")),
+            .any(|r| r.contains("/image/mapped-fanart.png")),
         "{reordered:?}"
     );
 
@@ -3019,14 +3044,15 @@ fn assert_no_artwork_or_people(seen: &Seen, row: &str) {
 }
 
 /// A full pass over the Movies library: every movie re-probed, fetched by
-/// its stored TMDB id (no search) and saved; no other library touched.
+/// its stored TMDB id (no search) and saved, with the location's folder;
+/// no other library touched.
 fn assert_full_pass(seen: &Seen, movies: f64, keys: &[String], row: &str) {
     assert_eq!(
         seen.scans,
         BTreeMap::from([("api".to_owned(), 1.0)]),
         "row {row}: {seen:?}"
     );
-    assert_eq!(seen.outcome("updated"), movies, "row {row}: {seen:?}");
+    assert_eq!(seen.outcome("updated"), movies + 1.0, "row {row}: {seen:?}");
     for outcome in ["created", "unchanged", "removed"] {
         assert_eq!(seen.outcome(outcome), 0.0, "row {row}: {outcome} {seen:?}");
     }
@@ -3062,8 +3088,8 @@ fn assert_full_pass(seen: &Seen, movies: f64, keys: &[String], row: &str) {
         keys.iter().all(|k| written.contains(k))
             && written
                 .iter()
-                .all(|w| w.starts_with("movies/") || w.contains(':')),
-        "row {row}: the three movies (and their people, genres, years) {written:?}"
+                .all(|w| w == "movies" || w.starts_with("movies/") || w.contains(':')),
+        "row {row}: the three movies, the location (and their people, genres, years) {written:?}"
     );
 }
 

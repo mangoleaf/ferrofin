@@ -179,7 +179,7 @@ livenessProbe:
   timeoutSeconds: 5
   failureThreshold: 4
 
-# -- Readiness probe. Ferrofin serves GET /health/ready (runs dependency checks).
+# -- Readiness probe. Ferrofin serves GET /health/ready (503 when the database does not answer).
 readinessProbe:
   httpGet:
     path: /health/ready
@@ -189,7 +189,10 @@ readinessProbe:
   timeoutSeconds: 5
   failureThreshold: 6
 
-# -- Startup probe: give a fresh DB time to migrate + seed before liveness kicks in.
+# -- Startup probe. Ferrofin binds its port before it adopts or migrates the database
+# (a scheduled backup restore runs first), and answers while it does (/health/live 200, /health/ready 503, other
+# requests 503 with Retry-After), so this passes as soon as the process is up and a
+# long migration is never restarted by the liveness probe.
 startupProbe:
   tcpSocket:
     port: http

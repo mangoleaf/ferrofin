@@ -18,7 +18,7 @@
 //!   a real projection touches image/user-data lookups behind the trait.
 //!
 //! The trait is object-safe (`AppState` holds it behind `Arc<dyn _>`) and
-//! carries a [`_assert_object_safe_dto_service`] compile-time assertion.
+//! carries a `_assert_object_safe_dto_service` compile-time assertion.
 
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -72,6 +72,25 @@ pub trait DtoService: Send + Sync {
         skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError>;
 
+    /// Projects a playlist's or box set's members as a page, like
+    /// [`Self::get_base_item_dtos`].
+    ///
+    /// Upstream resolves these linked children with every field loaded
+    /// (`Folder.ResolveLinkedChildren` with a parameterless `DtoOptions`, or a
+    /// box set's per-member `GetLinkedChild` by id), so their provider ids are
+    /// always present, whatever fields the client asked for. That decides a
+    /// never-written member's `UserData.Key`: its provider key, as on its own
+    /// page. The default projects them as a plain list.
+    async fn get_linked_children_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.get_base_item_dtos(items, options, user, None, true)
+            .await
+    }
+
     /// Projects an item-by-name row (a genre/studio/person/…) into a
     /// [`BaseItemDto`], counting the items tagged with it.
     ///
@@ -84,6 +103,23 @@ pub trait DtoService: Send + Sync {
         tagged_item_ids: Option<&[Uuid]>,
         user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError>;
+
+    /// Whether the item itself supports downloading (`BaseItem.CanDownload()`),
+    /// before the user's permission is applied. Must agree with a userless DTO.
+    /// Implementations may answer directly without building the entire DTO.
+    async fn can_download(&self, item: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let options = DtoOptions {
+            fields: vec![ferrofin_model::querying::ItemFields::CanDownload],
+            enable_images: false,
+            enable_user_data: false,
+            ..DtoOptions::default()
+        };
+        Ok(self
+            .get_base_item_dto(item, &options, None, None)
+            .await?
+            .can_download
+            .unwrap_or(false))
+    }
 
     /// Whether `user` may delete `item` — C# `BaseItem.CanDelete(User)`, the
     /// check `LibraryController.DeleteItem`/`DeleteItems` make before deleting.

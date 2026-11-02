@@ -37,7 +37,8 @@ use ferrofin_traits::options::{
 };
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
 use ferrofin_traits::stubs::{
-    DisabledAttachmentExtractor, PlaybackRequest, SyncPlayManager, SyncPlaySession,
+    DisabledAttachmentExtractor, PlaybackRequest, SyncPlayManager, SyncPlayNowPlaying,
+    SyncPlaySession,
 };
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -111,6 +112,22 @@ fn data_dto(item_id: Uuid, played: bool) -> UserItemDataDto {
 /// ordinary clients.
 struct OkAuth {
     elevated: bool,
+    /// An API key: no user behind the token.
+    api_key: bool,
+}
+
+impl OkAuth {
+    fn info(&self) -> AuthorizationInfo {
+        if self.api_key {
+            AuthorizationInfo {
+                is_api_key: true,
+                user: None,
+                ..authed_info()
+            }
+        } else {
+            authed_info_as(self.elevated)
+        }
+    }
 }
 
 fn authed_info_as(elevated: bool) -> AuthorizationInfo {
@@ -129,6 +146,7 @@ fn authed_info() -> AuthorizationInfo {
         token: Some("token-abc".into()),
         is_api_key: false,
         user: Some(user_entity(USER_ID, "alice")),
+        user_policy: None,
         is_authenticated: true,
         remote_endpoint: Some("203.0.113.9".to_owned()),
     }
@@ -137,7 +155,7 @@ fn authed_info() -> AuthorizationInfo {
 #[async_trait]
 impl AuthService for OkAuth {
     async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(authed_info_as(self.elevated))
+        Ok(self.info())
     }
 }
 
@@ -147,7 +165,7 @@ impl AuthorizationContext for OkAuth {
         &self,
         _r: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(authed_info_as(self.elevated))
+        Ok(self.info())
     }
 }
 
@@ -490,6 +508,8 @@ struct SessionCalls {
     removed_user: Option<(String, Uuid)>,
     now_viewing: Option<(String, String)>,
     logged_out: Option<String>,
+    /// The user each `log_session_activity` call carried (`None` for none).
+    logged_users: Vec<Option<String>>,
 }
 
 /// A recording [`SessionManager`]: `log_session_activity` yields a fixed session
@@ -516,6 +536,14 @@ fn current_session_dto(with_guest: bool) -> SessionInfoDto {
 
 #[async_trait]
 impl SessionManager for RecordingSessions {
+    async fn assert_can_control(&self, controller: &str, target: &str) -> Result<(), ServiceError> {
+        assert_eq!(controller, SESSION_ID);
+        if target == "forbidden-session" {
+            return Err(ServiceError::Forbidden("control denied".to_owned()));
+        }
+        Ok(())
+    }
+
     async fn log_session_activity(
         &self,
         _app_name: &str,
@@ -523,8 +551,13 @@ impl SessionManager for RecordingSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .logged_users
+            .push(user.map(|user| user.id.clone()));
         Ok(current_session_dto(self.with_guest))
     }
     async fn on_playback_start(&self, _i: &PlaybackStartInfo) -> Result<(), ServiceError> {
@@ -635,7 +668,7 @@ impl SessionManager for RecordingSessions {
         _m: SessionMessageType,
         _d: &str,
     ) -> Result<(), ServiceError> {
-        // The played/favorite/progress handlers push `UserDataChanged` here;
+        // The user-data manager's batched `UserDataChanged` goes out here;
         // delivery is covered by the ferrofin-core session-manager tests.
         Ok(())
     }
@@ -696,6 +729,8 @@ impl SessionManager for RecordingSessions {
 #[derive(Default)]
 struct RecordingUserData {
     played: Arc<Mutex<Vec<Uuid>>>,
+    /// The `datePlayed` each `mark_played` call received.
+    dates_played: Arc<Mutex<Vec<Option<chrono::DateTime<chrono::Utc>>>>>,
     unplayed: Arc<Mutex<Vec<Uuid>>>,
 }
 
@@ -705,9 +740,10 @@ impl UserDataManager for RecordingUserData {
         &self,
         user_id: Uuid,
         item_id: Uuid,
-        _date_played: Option<chrono::DateTime<chrono::Utc>>,
+        date_played: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<UserItemDataDto, ServiceError> {
         self.played.lock().unwrap().push(user_id);
+        self.dates_played.lock().unwrap().push(date_played);
         Ok(data_dto(item_id, true))
     }
     async fn mark_unplayed(
@@ -853,6 +889,24 @@ fn state_with_users(
     elevated: bool,
     users: Arc<dyn UserManager>,
 ) -> AppState {
+    state_with_auth(
+        sessions,
+        user_data,
+        users,
+        &OkAuth {
+            elevated,
+            api_key: false,
+        },
+    )
+}
+
+/// [`state_with_users`] with the caller `auth` authenticates.
+fn state_with_auth(
+    sessions: Arc<RecordingSessions>,
+    user_data: Arc<RecordingUserData>,
+    users: Arc<dyn UserManager>,
+    auth: &OkAuth,
+) -> AppState {
     AppState::new(
         Arc::new(OkLibrary),
         users,
@@ -868,8 +922,8 @@ fn state_with_users(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
-        Arc::new(OkAuth { elevated }),
-        Arc::new(OkAuth { elevated }),
+        Arc::new(OkAuth { ..*auth }),
+        Arc::new(OkAuth { ..*auth }),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -943,6 +997,7 @@ impl SyncPlayManager for FakeSyncPlay {
         &self,
         session: &SyncPlaySession,
         group_name: &str,
+        _now_playing: Option<&SyncPlayNowPlaying>,
     ) -> Result<GroupInfoDto, ServiceError> {
         Ok(GroupInfoDto {
             group_id: GROUP_ID,
@@ -1066,14 +1121,24 @@ async fn sync_play_returns_501_when_manager_unwired() {
 
 /// Authenticates as [`USER_ID`] with a chosen stored `SyncPlayAccess` value, so
 /// the policy table can be driven from a test.
-struct PolicyAuth(i32);
+struct PolicyAuth {
+    access: i32,
+    admin: bool,
+    api_key: bool,
+}
 
 impl PolicyAuth {
     fn info(&self) -> AuthorizationInfo {
         let mut user = user_entity(USER_ID, "alice");
-        user.sync_play_access = self.0;
+        user.sync_play_access = self.access;
         AuthorizationInfo {
-            user: Some(user),
+            user: (!self.api_key).then_some(user),
+            is_api_key: self.api_key,
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                is_administrator: self.admin,
+                enable_remote_access: true,
+                ..Default::default()
+            })),
             ..authed_info()
         }
     }
@@ -1116,6 +1181,7 @@ impl SyncPlayManager for GatedSyncPlay {
         &self,
         _s: &SyncPlaySession,
         _n: &str,
+        _p: Option<&SyncPlayNowPlaying>,
     ) -> Result<GroupInfoDto, ServiceError> {
         self.touch();
         Ok(GroupInfoDto::default())
@@ -1155,9 +1221,22 @@ impl SyncPlayManager for GatedSyncPlay {
 /// A state whose caller has `access` and whose SyncPlay membership is `active`,
 /// plus the "the manager was reached" flag.
 fn policy_state(access: i32, active: bool) -> (AppState, Arc<std::sync::atomic::AtomicBool>) {
+    policy_state_as(access, active, false, false)
+}
+
+fn policy_state_as(
+    access: i32,
+    active: bool,
+    admin: bool,
+    api_key: bool,
+) -> (AppState, Arc<std::sync::atomic::AtomicBool>) {
     let (sessions, user_data) = recording();
     let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let auth = Arc::new(PolicyAuth(access));
+    let auth = Arc::new(PolicyAuth {
+        access,
+        admin,
+        api_key,
+    });
     let state = AppState::new(
         Arc::new(OkLibrary),
         Arc::new(OkUsers),
@@ -1226,6 +1305,54 @@ async fn sync_play_new_requires_create_access() {
             "a denied create must not reach the manager (access {access})"
         );
     }
+}
+
+/// `NewGroupRequestDto.GroupName` carries `[StringLength(200)]`
+/// (GHSA-v2jv-54xj-h76w): ASP.NET counts UTF-16 code units and validates the
+/// name as sent, before the controller trims it, and answers a longer one with
+/// a 400 `ValidationProblemDetails` keyed by the member, never reaching
+/// `SyncPlayManager.NewGroup`.
+#[tokio::test]
+async fn sync_play_new_caps_the_group_name_at_200_utf16_units() {
+    let non_bmp = "\u{1F3AC}"; // two UTF-16 units
+    for (name, allowed) in [
+        ("a".repeat(200), true),
+        ("a".repeat(201), false),
+        (format!("{}{non_bmp}", "a".repeat(198)), true),
+        (format!("{}{non_bmp}", "a".repeat(199)), false),
+        // Validated before the trim: trailing blanks still count.
+        (format!("{}  ", "a".repeat(199)), false),
+    ] {
+        let (state, reached) = policy_state(CREATE_AND_JOIN, false);
+        let body = serde_json::json!({ "GroupName": name }).to_string();
+        let (status, bytes) = send(state, "POST", "/SyncPlay/New", Body::from(body)).await;
+        let units = name.encode_utf16().count();
+        assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), allowed);
+        if allowed {
+            assert_eq!(status, StatusCode::OK, "{units} units");
+            continue;
+        }
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{units} units");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+                "title": "One or more validation errors occurred.",
+                "status": 400,
+                "errors": { "GroupName": ["Group name must not exceed 200 characters."] },
+            }),
+            "{units} units"
+        );
+    }
+
+    // The policy gate is an authorization filter, which runs before model
+    // validation: a caller who may not create groups is 403 whatever the name.
+    let (state, reached) = policy_state(JOIN_ONLY, false);
+    let body = serde_json::json!({ "GroupName": "a".repeat(201) }).to_string();
+    let (status, _) = send(state, "POST", "/SyncPlay/New", Body::from(body)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(!reached.load(std::sync::atomic::Ordering::SeqCst));
 }
 
 #[tokio::test]
@@ -1348,6 +1475,61 @@ async fn mark_played_returns_dto_and_hits_user_data() {
     assert_eq!(user_data.played.lock().unwrap().as_slice(), &[USER_ID]);
 }
 
+/// `datePlayed` binds through `LegacyDateTimeModelBinder`: the compact
+/// `yyyyMMddHHmmss` form as UTC, else ASP.NET's default `DateTime` binder,
+/// where EF's `ToUniversalTime` reads an offset-less value as server time.
+#[tokio::test]
+async fn mark_played_binds_legacy_and_offsetless_dates_played() {
+    if ferrofin_api::test_support::rerun_in_time_zone(
+        "mark_played_binds_legacy_and_offsetless_dates_played",
+    ) {
+        return;
+    }
+    let played = |query: &'static str| async move {
+        let (sessions, user_data) = recording();
+        let (status, body) = send(
+            state(sessions, user_data.clone()),
+            "POST",
+            &format!("/UserPlayedItems/{ITEM_ID}?{query}"),
+            Body::empty(),
+        )
+        .await;
+        let dates = user_data.dates_played.lock().unwrap().clone();
+        (status, body, dates)
+    };
+    // The offset-less forms are Asia/Kolkata (+05:30) wall time.
+    for (query, expected) in [
+        ("datePlayed=20261028123456", "2026-10-28T12:34:56Z"),
+        ("datePlayed=2026-10-28T12:34:56Z", "2026-10-28T12:34:56Z"),
+        ("datePlayed=2026-10-28T12:34:56", "2026-10-28T07:04:56Z"),
+        ("datePlayed=2026-10-28", "2026-10-27T18:30:00Z"),
+    ] {
+        let (status, body, dates) = played(query).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{query}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            dates,
+            vec![Some(expected.parse().expect("date"))],
+            "{query}"
+        );
+    }
+    // The compact form is exact: no fourteenth digit, no leap second, no
+    // padding (the default binder then cannot read the digits either).
+    for query in [
+        "datePlayed=2026102812345",
+        "datePlayed=20261028123460",
+        "datePlayed=%2020261028123456",
+    ] {
+        let (status, _, dates) = played(query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        assert!(dates.is_empty(), "{query}");
+    }
+}
+
 #[tokio::test]
 async fn mark_played_applies_to_additional_users() {
     let sessions = Arc::new(RecordingSessions {
@@ -1416,6 +1598,42 @@ async fn report_playback_start_is_204() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(sessions.calls.lock().unwrap().played_starts, 1);
+}
+
+/// `RequestHelpers.GetSession` resolves the caller's user only when it has
+/// one and logs the session with whatever it found: an API key's playback
+/// report gets a user-less session and goes on, where it used to answer 400.
+#[tokio::test]
+async fn an_api_key_reports_playback_through_a_user_less_session() {
+    let (sessions, user_data) = recording();
+    let info = PlaybackStartInfo {
+        item_id: ITEM_ID,
+        ..PlaybackStartInfo::default()
+    };
+    let (status, body) = send(
+        state_with_auth(
+            sessions.clone(),
+            user_data,
+            Arc::new(OkUsers),
+            &OkAuth {
+                elevated: false,
+                api_key: true,
+            },
+        ),
+        "POST",
+        "/Sessions/Playing",
+        Body::from(serde_json::to_vec(&info).unwrap()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let calls = sessions.calls.lock().unwrap();
+    assert_eq!(calls.played_starts, 1);
+    assert_eq!(calls.logged_users, vec![None]);
 }
 
 #[tokio::test]
@@ -1499,12 +1717,18 @@ async fn get_sessions_returns_list() {
 
 #[tokio::test]
 async fn repeated_session_scalars_forward_only_the_first_value() {
+    // An empty first value is `null` (`ConvertEmptyStringToNull`), so the
+    // filter is absent — a live Jellyfin 12.2 lists every session for
+    // `?deviceId=&deviceId=probe1`.
     for (query, expected) in [
-        ("deviceId=probe1&deviceId=nope", "probe1"),
-        ("DeviceId=nope&deviceid=probe1", "nope"),
-        ("DEVICEID=probe1&deviceId=nope&deviceid=third", "probe1"),
-        ("deviceId=a%2Cb&deviceId=c", "a,b"),
-        ("deviceId=&deviceId=probe1", ""),
+        ("deviceId=probe1&deviceId=nope", Some("probe1")),
+        ("DeviceId=nope&deviceid=probe1", Some("nope")),
+        (
+            "DEVICEID=probe1&deviceId=nope&deviceid=third",
+            Some("probe1"),
+        ),
+        ("deviceId=a%2Cb&deviceId=c", Some("a,b")),
+        ("deviceId=&deviceId=probe1", None),
     ] {
         let (sessions, user_data) = recording();
         let (status, _) = send(
@@ -1517,7 +1741,7 @@ async fn repeated_session_scalars_forward_only_the_first_value() {
         assert_eq!(status, StatusCode::OK, "{query}");
         assert_eq!(
             sessions.calls.lock().unwrap().listed,
-            Some((Some(expected.to_owned()), Some(7))),
+            Some((expected.map(str::to_owned), Some(7))),
             "{query}"
         );
     }
@@ -1638,7 +1862,7 @@ async fn send_message_defaults_header() {
 }
 
 #[tokio::test]
-async fn add_and_remove_user_are_204() {
+async fn attaching_another_user_needs_admin_but_removal_only_needs_control() {
     let (sessions, user_data) = recording();
     let app = state(sessions.clone(), user_data);
     let (status, _) = send(
@@ -1648,11 +1872,8 @@ async fn add_and_remove_user_are_204() {
         Body::empty(),
     )
     .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    assert_eq!(
-        sessions.calls.lock().unwrap().added_user,
-        Some((SESSION_ID.to_owned(), GUEST_ID))
-    );
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(sessions.calls.lock().unwrap().added_user, None);
 
     let (status, _) = send(
         app,
@@ -1965,4 +2186,84 @@ async fn get_sessions_controllable_by_self_as_non_admin_is_allowed() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn session_mutations_refuse_an_uncontrollable_target_before_writing() {
+    let (sessions, user_data) = recording();
+    let app = state(sessions.clone(), user_data);
+    for (method, uri, body) in [
+        (
+            "POST",
+            format!("/Sessions/forbidden-session/User/{USER_ID}"),
+            "",
+        ),
+        (
+            "DELETE",
+            format!("/Sessions/forbidden-session/User/{GUEST_ID}"),
+            "",
+        ),
+        (
+            "POST",
+            "/Sessions/Capabilities?id=forbidden-session".to_owned(),
+            "",
+        ),
+        (
+            "POST",
+            "/Sessions/Capabilities/Full?id=forbidden-session".to_owned(),
+            "{}",
+        ),
+        (
+            "POST",
+            format!("/Sessions/Viewing?sessionId=forbidden-session&itemId={ITEM_ID}"),
+            "",
+        ),
+    ] {
+        let (status, _) = send(app.clone(), method, &uri, Body::from(body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    let calls = sessions.calls.lock().unwrap();
+    assert!(
+        calls.added_user.is_none()
+            && calls.removed_user.is_none()
+            && calls.capabilities.is_none()
+            && calls.now_viewing.is_none()
+    );
+}
+
+#[tokio::test]
+async fn sync_play_inherits_admin_override_but_api_keys_have_no_user() {
+    for access in [CREATE_AND_JOIN, JOIN_ONLY, NO_SYNC_PLAY] {
+        for (method, uri, body, allowed) in [
+            (
+                "POST",
+                "/SyncPlay/New",
+                r#"{"GroupName":"g"}"#,
+                StatusCode::OK,
+            ),
+            (
+                "POST",
+                "/SyncPlay/Join",
+                r#"{"GroupId":"00000000-0000-0000-0000-000000000001"}"#,
+                StatusCode::NO_CONTENT,
+            ),
+            ("GET", "/SyncPlay/List", "", StatusCode::OK),
+            ("POST", "/SyncPlay/Leave", "", StatusCode::NO_CONTENT),
+        ] {
+            for api_key in [false, true] {
+                let (app, reached) = policy_state_as(access, false, !api_key, api_key);
+                let (status, _) = send(app, method, uri, Body::from(body)).await;
+                assert_eq!(
+                    status,
+                    if api_key {
+                        StatusCode::BAD_REQUEST
+                    } else {
+                        allowed
+                    },
+                    "{access} {api_key} {uri}"
+                );
+                assert_eq!(reached.load(std::sync::atomic::Ordering::SeqCst), !api_key);
+            }
+        }
+    }
 }

@@ -28,7 +28,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ferrofin_core::file_system::FerrofinFileSystem;
-use ferrofin_core::item_type_lookup::{ItemTypeLookup, derive_item_id};
+use ferrofin_core::item_type_lookup::{
+    IdDerivation, ItemTypeLookup, derive_item_id, virtual_season_id,
+};
 use ferrofin_core::{
     FerrofinChapterRepository, FerrofinItemPersistenceService, FerrofinItemRepository,
     FerrofinMediaStreamRepository, FerrofinVirtualFolderManager, LibraryScanner, ScanOutcome,
@@ -119,7 +121,14 @@ impl MediaEncoder for Probe {
         _threed_format: Option<Video3DFormat>,
         _offset_ticks: Option<i64>,
     ) -> Result<String, ServiceError> {
-        unreachable!("no frame extraction in a scan")
+        // A first scan grabs a frame for a video with no artwork (the
+        // Screen Grabber); a real ffmpeg delivers one.
+        let frame = std::env::temp_dir().join(format!(
+            "ferrofin-test-frame-{}.jpg",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&frame, b"FRAME").map_err(ServiceError::backend_source)?;
+        Ok(frame.to_string_lossy().into_owned())
     }
     fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
         input_file.to_owned()
@@ -366,37 +375,33 @@ fn id(kind: BaseItemKind, path: &Path) -> String {
     guid_to_db(derive_item_id(kind, &path.to_string_lossy()).expect("id"))
 }
 
+/// The id the scan gives season `n` of the series at `series` when the
+/// season has no folder of its own: keyed by the series, number and name
+/// (`SeriesMetadataService.CreateSeasonAsync`), under the derivation
+/// [`id`] uses.
+fn virtual_season(series: &Path, n: i32) -> String {
+    let series = derive_item_id(BaseItemKind::Series, &series.to_string_lossy()).expect("id");
+    let id = virtual_season_id(
+        &IdDerivation::LegacyLowercase,
+        series,
+        Some(n),
+        &format!("Season {n}"),
+    );
+    guid_to_db(id.expect("id"))
+}
+
 fn touch(path: &Path, file: &str) {
     std::fs::create_dir_all(path).expect("mkdir");
     std::fs::write(path.join(file), b"0123").expect("write");
 }
 
-/// Moves a directory's mtime an hour on, so the drift is unambiguous on
-/// every filesystem (some keep whole seconds only).
+/// Moves a file's or a directory's mtime an hour on, so the drift is
+/// unambiguous on every filesystem (some keep whole seconds only).
 fn move_mtime(dir: &Path) {
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
     std::fs::File::open(dir)
         .expect("dir")
         .set_modified(later)
-        .expect("set mtime");
-}
-
-/// Sets a directory's mtime back to what `rows` stored for `item`, so its
-/// refresh decision sees no change.
-fn restore_mtime(dir: &Path, stored: &Row) {
-    let at = chrono::NaiveDateTime::parse_from_str(
-        stored.5.as_deref().expect("stored DateModified"),
-        "%Y-%m-%d %H:%M:%S%.f",
-    )
-    .expect("parse")
-    .and_utc();
-    let at = std::time::UNIX_EPOCH
-        + std::time::Duration::from_nanos(
-            u64::try_from(at.timestamp_nanos_opt().expect("in range")).expect("after the epoch"),
-        );
-    std::fs::File::open(dir)
-        .expect("dir")
-        .set_modified(at)
         .expect("set mtime");
 }
 
@@ -421,17 +426,21 @@ async fn tv(tmp: &Path) -> Fixture {
 }
 
 /// A new episode in an existing season: exactly one row is created; the
-/// season — the nearest existing item, whose folder changed — refreshes
-/// through the decision; the series is context only (no provider asked for
-/// it, and of its row only the newest-media date the aggregate pass derives
-/// moves); the season's other episodes are validated and not written.
+/// season — the nearest existing item — goes through the decision and is
+/// not refreshed, its folder having moved or not: a directory has no
+/// `DateModified` (D2), and `BaseItem.RequiresRefresh` is false for a
+/// `MinValue` one (`BaseItem.cs:1721-1731`). The series is context only (no
+/// provider asked for it, and of its row only the newest-media date the
+/// aggregate pass derives moves); the season's other episodes are validated
+/// and not written.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_episode_is_created_and_only_its_season_refreshes() {
+async fn a_new_episode_is_created_and_its_season_is_not_refreshed() {
     let tmp = tempfile::tempdir().expect("tmp");
     let fx = tv(tmp.path()).await;
     let series = fx.media.join("Show");
     let season = series.join("Season 1");
     let before = fx.rows().await;
+    fx.tmdb.take();
 
     touch(&season, "Show S01E03.mkv");
     move_mtime(&season);
@@ -441,9 +450,9 @@ async fn a_new_episode_is_created_and_only_its_season_refreshes() {
         outcome,
         ScanOutcome {
             created: 1,
-            updated: 1,
-            // The series (context) and the season's two other episodes.
-            unchanged: 3,
+            // The season, the series (context) and the season's two other
+            // episodes.
+            unchanged: 4,
             ..ScanOutcome::default()
         }
     );
@@ -465,16 +474,20 @@ async fn a_new_episode_is_created_and_only_its_season_refreshes() {
         written.iter().all(|k| **k == season_id || **k == series_id),
         "only the season and the series' aggregate are written: {written:?}"
     );
-    assert_ne!(
-        after[&season_id].4, before[&season_id].4,
-        "the season refreshed (its folder changed)"
-    );
-    let (series_before, series_after) = (&before[&series_id], &after[&series_id]);
     assert_eq!(
-        (series_after.4.as_ref(), series_after.5.as_ref()),
-        (series_before.4.as_ref(), series_before.5.as_ref()),
-        "the series is not refreshed"
+        after[&season_id].3, before[&season_id].3,
+        "the season is not saved (its folder changed)"
     );
+    for (folder, what) in [(&season_id, "season"), (&series_id, "series")] {
+        let (was, is) = (&before[folder], &after[folder]);
+        assert_eq!(
+            (is.4.as_ref(), is.5.as_ref()),
+            (was.4.as_ref(), was.5.as_ref()),
+            "the {what} is not refreshed"
+        );
+    }
+    // (The new episode itself still reads its season's `/tv/{id}/season/{n}`
+    // response, for its name and still.)
     let asked = fx.tmdb.take();
     assert!(
         series_requests(&asked).is_empty(),
@@ -483,7 +496,7 @@ async fn a_new_episode_is_created_and_only_its_season_refreshes() {
 }
 
 /// A removed episode prunes exactly its rows (its streams with it); its
-/// season refreshes, its siblings stay.
+/// season is validated, its siblings stay.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_episode_prunes_exactly_its_rows() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -491,10 +504,15 @@ async fn a_removed_episode_prunes_exactly_its_rows() {
     let season = fx.media.join("Show").join("Season 1");
     let gone = season.join("Show S01E02.mkv");
     let sibling = season.join("Show S01E01.mkv");
+    // A third episode first, so removing one leaves the season's folder
+    // mixed: going down to one would flip the sibling's `IsInMixedFolder`,
+    // which upstream's `UpdateFromResolvedItem` saves.
+    let third = season.join("Show S01E03.mkv");
+    std::fs::write(&third, b"").expect("third");
+    fx.report(&[&third]).await;
     let before = fx.rows().await;
 
     std::fs::remove_file(&gone).expect("rm");
-    move_mtime(&season);
     let outcome = fx.report(&[&gone]).await;
     assert_eq!(outcome.removed, 1, "{outcome:?}");
     assert_eq!(outcome.created, 0, "{outcome:?}");
@@ -528,7 +546,6 @@ async fn a_removed_season_folder_prunes_its_subtree() {
     let before = fx.rows().await;
 
     std::fs::remove_dir_all(&season).expect("rm");
-    move_mtime(&series);
     let outcome = fx.report(&[&season]).await;
     assert_eq!(
         outcome.removed, 3,
@@ -558,9 +575,10 @@ async fn a_removed_season_folder_prunes_its_subtree() {
 
 /// A new season folder with three episodes: the season and the episodes are
 /// created. Its series is the nearest existing item, so it goes through the
-/// refresh decision — upstream's `FileRefresher` refreshes it: with its
-/// folder's mtime moved (D3) it refreshes, and with the mtime as stored it
-/// asks and writes nothing.
+/// refresh decision, as upstream's `FileRefresher` refreshes it — and asks
+/// and writes nothing, its folder's mtime moved or not: a directory has no
+/// `DateModified` (D2), and `BaseItem.RequiresRefresh` is false for a
+/// `MinValue` one (`BaseItem.cs:1721-1731`).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_season_folder_creates_the_season_and_its_episodes() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -568,8 +586,8 @@ async fn a_new_season_folder_creates_the_season_and_its_episodes() {
     let series = fx.media.join("Show");
     let series_id = id(BaseItemKind::Series, &series);
     let before = fx.rows().await;
+    fx.tmdb.take();
 
-    // The series' folder mtime as stored: the decision finds nothing to do.
     let season = series.join("Season 3");
     let episodes: Vec<PathBuf> = (1..=3)
         .map(|n| {
@@ -577,7 +595,6 @@ async fn a_new_season_folder_creates_the_season_and_its_episodes() {
             season.join(format!("Show S03E0{n}.mkv"))
         })
         .collect();
-    restore_mtime(&series, &before[&series_id]);
     let mut reported: Vec<&Path> = vec![&season];
     reported.extend(episodes.iter().map(PathBuf::as_path));
     let outcome = fx.report(&reported).await;
@@ -593,21 +610,67 @@ async fn a_new_season_folder_creates_the_season_and_its_episodes() {
             Some(id(BaseItemKind::Season, &season).as_str())
         );
     }
+    assert_eq!(after[&series_id].5, None, "a directory has no DateModified");
     assert_eq!(
         after[&series_id].4, before[&series_id].4,
-        "an unchanged series is not refreshed"
+        "the series is not refreshed"
     );
     assert!(series_requests(&fx.tmdb.take()).is_empty());
 
-    // Another new season, with the series' folder mtime moved: the decision
-    // refreshes the series (D3), as upstream's refresh of it does.
+    // Another new season, with the series' folder mtime moved: still not
+    // refreshed.
     let season = series.join("Season 4");
     touch(&season, "Show S04E01.mkv");
     move_mtime(&series);
     let outcome = fx.report(&[&season]).await;
     assert_eq!(outcome.created, 2, "{outcome:?}");
-    assert_eq!(outcome.updated, 1, "the series: {outcome:?}");
-    assert_ne!(fx.rows().await[&series_id].4, after[&series_id].4);
+    assert_eq!(outcome.updated, 0, "{outcome:?}");
+    assert_eq!(fx.rows().await[&series_id].4, after[&series_id].4);
+    assert!(series_requests(&fx.tmdb.take()).is_empty());
+}
+
+/// A provider names the series (TMDb answers "Show" for the folder "Flat"):
+/// the same scan saves its seasons and episodes with that name
+/// (`BeforeSaveInternal`: `SeriesName = FindSeriesName()`), and the next
+/// scan finds nothing to change.
+#[tokio::test(flavor = "multi_thread")]
+async fn children_carry_the_provider_series_name_and_a_rescan_changes_nothing() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("tv");
+    touch(&media.join("Flat"), "Flat S01E01.mkv");
+    touch(&media.join("Flat"), "Flat S02E01.mkv");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::tvshows)
+        .await
+        .scanned()
+        .await;
+    let names: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        r#"SELECT "Type", "Name", "SeriesName" FROM "BaseItems"
+           WHERE "TopParentId" IS NOT NULL AND "TopParentId" <> '' ORDER BY "Type""#,
+    )
+    .fetch_all(fx.db.pool())
+    .await
+    .expect("names");
+    let series = names
+        .iter()
+        .find(|(kind, ..)| kind.ends_with("TV.Series"))
+        .and_then(|(_, name, _)| name.clone())
+        .expect("series");
+    assert_eq!(series, "Show", "the provider named the series");
+    let children: Vec<_> = names
+        .iter()
+        .filter(|(kind, ..)| kind.ends_with("TV.Season") || kind.ends_with("TV.Episode"))
+        .collect();
+    assert_eq!(children.len(), 4, "{names:?}");
+    for (kind, _, series_name) in children {
+        assert_eq!(series_name.as_deref(), Some("Show"), "{kind}");
+    }
+
+    let rescan = fx.scanner.scan_all().await.expect("rescan");
+    assert_eq!(
+        (rescan.created, rescan.updated, rescan.removed),
+        (0, 0, 0),
+        "{rescan:?}"
+    );
 }
 
 /// A flat series — episodes in the series folder, no season folders. A new
@@ -652,12 +715,12 @@ async fn a_new_loose_episode_gets_the_virtual_season_a_library_scan_would() {
     assert_eq!(new_season.len(), 1);
     assert_eq!(
         after[&id(BaseItemKind::Episode, &episode)].2.as_deref(),
-        Some(new_season[0].as_str()),
-        "the episode's parent is its virtual season, stored"
+        Some(id(BaseItemKind::Series, &series).as_str()),
+        "the episode's parent is its series"
     );
     assert_eq!(
         new_season[0],
-        id(BaseItemKind::Season, &series.join("#virtual-season-2")),
+        virtual_season(&series, 2),
         "the id the library scan derives"
     );
 
@@ -678,7 +741,7 @@ async fn a_new_loose_episode_gets_the_virtual_season_a_library_scan_would() {
     assert_eq!(seasons(&rows), seasons(&after));
     assert_eq!(
         rows[&id(BaseItemKind::Episode, &second)].2.as_deref(),
-        Some(new_season[0].as_str())
+        Some(id(BaseItemKind::Series, &series).as_str()),
     );
 }
 
@@ -698,12 +761,7 @@ async fn removing_a_virtual_seasons_last_episode_prunes_the_season_too() {
         .scanned()
         .await;
     let series = media.join("Flat");
-    let season = |n: u32| {
-        id(
-            BaseItemKind::Season,
-            &series.join(format!("#virtual-season-{n}")),
-        )
-    };
+    let season = |n: i32| virtual_season(&series, n);
     let before = fx.rows().await;
     assert!(before.contains_key(&season(1)) && before.contains_key(&season(2)));
 
@@ -847,11 +905,33 @@ impl Captured {
 }
 
 /// Every item a watcher scan processed has one `debug!` line naming why:
-/// `created`, the decision's trigger (`mtime`), `unchanged` for an item only
-/// validated, `context` for a folder above the refreshed item, and
-/// `pruned` for a removed row.
+/// `created`, the decision's trigger (`mtime` for a file that changed),
+/// `unchanged` for an item only validated (a season whose folder changed
+/// among them: a directory has no `DateModified`, D2), `context` for a folder
+/// above the refreshed item, and `pruned` for a removed row.
 #[tokio::test]
 async fn every_processed_item_is_logged_with_why() {
+    // The thread-local subscriber below sees only what `tracing`'s
+    // process-wide callsite cache lets through, which a concurrently running
+    // test can switch off for these lines before it is installed. Under
+    // `cargo test` (one process, tests on threads) the test re-runs itself
+    // alone in a child process; nextest already gives it a process of its own.
+    if std::env::var_os("NEXTEST").is_none()
+        && std::env::var_os("FERROFIN_LOG_CAPTURE_CHILD").is_none()
+    {
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "every_processed_item_is_logged_with_why",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("FERROFIN_LOG_CAPTURE_CHILD", "1")
+            .status()
+            .expect("run the test in its own process");
+        assert!(status.success(), "failed in its own process: {status}");
+        return;
+    }
     let tmp = tempfile::tempdir().expect("tmp");
     let fx = tv(tmp.path()).await;
     let season = fx.media.join("Show").join("Season 1");
@@ -866,14 +946,15 @@ async fn every_processed_item_is_logged_with_why() {
 
     touch(&season, "Show S01E03.mkv");
     move_mtime(&season);
+    move_mtime(&season.join("Show S01E01.mkv"));
     fx.report(&[&season.join("Show S01E03.mkv")]).await;
     let pair = |name: &str, reason: &str| (name.to_owned(), reason.to_owned());
     assert_eq!(
         captured.reasons(),
         vec![
-            pair("Season 1", "mtime"),
+            pair("Season 1", "unchanged"),
             pair("Show", "context"),
-            pair("Show S01E01.mkv", "unchanged"),
+            pair("Show S01E01.mkv", "mtime"),
             pair("Show S01E02.mkv", "unchanged"),
             pair("Show S01E03.mkv", "created"),
         ]
@@ -1324,15 +1405,16 @@ impl Drop for Unlistable {
     }
 }
 
-/// A flat series whose second season's loose episodes sit in a non-season
-/// subfolder (`Flat/Batch2/`) that fails to list: the episodes are unknown,
-/// not gone, so their virtual season — which no listing planned — must not
-/// be removed, since the `ParentId` cascade would take the episodes, and
-/// their played state, with it. Upstream removes a virtual season only when
-/// it has no episode left (`SeriesMetadataService.cs:172-207`). Neither a
-/// library scan nor a changed-path scan loses a row.
+/// A flat series whose second season's episodes sit in an unnumbered
+/// subfolder (`Flat/Batch2/`, a season of its own, as `SeasonResolver` makes
+/// it) that then fails to list: the episodes are unknown, not gone, so the
+/// season no listing planned must not be removed, since the `ParentId`
+/// cascade would take the episodes, and their played state, with it.
+/// Upstream removes a season only when it has no episode left
+/// (`SeriesMetadataService.cs:172-207`). Neither a library scan nor a
+/// changed-path scan loses a row.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unlistable_subfolder_never_takes_its_episodes_with_their_virtual_season() {
+async fn an_unlistable_subfolder_never_takes_its_episodes_with_their_season() {
     let tmp = tempfile::tempdir().expect("tmp");
     let media = tmp.path().join("tv");
     let series = media.join("Flat");
@@ -1344,7 +1426,11 @@ async fn an_unlistable_subfolder_never_takes_its_episodes_with_their_virtual_sea
         .scanned()
         .await;
     let before = fx.rows().await;
-    assert_eq!(before.len(), 6, "the series, 2 virtual seasons, 3 episodes");
+    assert_eq!(
+        before.len(),
+        6,
+        "the series, a virtual and a folder season, 3 episodes"
+    );
     let played = id(
         BaseItemKind::Episode,
         &series.join("Batch2").join("Flat S02E01.mkv"),
@@ -1392,7 +1478,7 @@ async fn a_kept_episode_keeps_its_virtual_season_and_series() {
         .await
         .scanned()
         .await;
-    let season = id(BaseItemKind::Season, &series.join("#virtual-season-1"));
+    let season = virtual_season(&series, 1);
     let elsewhere = id(
         BaseItemKind::Episode,
         &media.join("Elsewhere").join("Flat S01E02.mkv"),
@@ -1627,11 +1713,148 @@ async fn a_missing_episode_without_a_path_survives_every_scan() {
     };
 
     touch(&season, "Show S01E03.mkv");
-    move_mtime(&season);
     let outcome = fx.report(&[&season.join("Show S01E03.mkv")]).await;
     assert_eq!((outcome.created, outcome.removed), (1, 0), "{outcome:?}");
     assert_eq!(present().await, 1, "a watcher event keeps it");
     let full = fx.scanner.scan_all().await.expect("scan");
     assert_eq!(full.removed, 0, "{full:?}");
     assert_eq!(present().await, 1, "a library scan keeps it");
+}
+
+/// A second episode beside a lone one puts both in a mixed folder, and
+/// removing it takes the survivor out again: the watcher's scan, rooted at
+/// the season, saves the sibling's flipped `IsInMixedFolder`, as upstream's
+/// `UpdateFromResolvedItem` does (`BaseItem.cs:1749-1757`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sibling_follows_its_season_in_and_out_of_a_mixed_folder() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = tv(tmp.path()).await;
+    let season = fx.media.join("Other").join("Season 1");
+    let sibling = season.join("Other S01E01.mkv");
+    let mixed = || async {
+        sqlx::query_scalar::<_, bool>(
+            r#"SELECT "IsInMixedFolder" FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(id(BaseItemKind::Episode, &sibling))
+        .fetch_one(fx.db.pool())
+        .await
+        .expect("row")
+    };
+    assert!(!mixed().await, "alone in its season");
+
+    touch(&season, "Other S01E02.mkv");
+    fx.report(&[&season.join("Other S01E02.mkv")]).await;
+    assert!(mixed().await, "beside a second episode");
+
+    std::fs::remove_file(season.join("Other S01E02.mkv")).expect("rm");
+    fx.report(&[&season.join("Other S01E02.mkv")]).await;
+    assert!(!mixed().await, "alone again");
+}
+
+/// `SeasonResolver` (v12.2): every folder directly under a series is a season,
+/// even with no season number in its name; the folder names it, its path keys
+/// it, and its episodes are its children. Two such folders keep their own
+/// episodes (the collapse Jellyfin 12.1 fixed, PR 18044); none is grouped
+/// into a virtual "Season Unknown".
+#[tokio::test(flavor = "multi_thread")]
+async fn unnumbered_subfolders_are_seasons_holding_their_own_episodes() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("tv");
+    let series = media.join("Sports");
+    let baseball = series.join("My Baseball team");
+    let football = series.join("My Football team");
+    touch(&baseball, "Opening day.mkv");
+    touch(&baseball, "Final.mkv");
+    touch(&football, "Kickoff.mkv");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::tvshows)
+        .await
+        .scanned()
+        .await;
+    let rows = fx.rows().await;
+    let series_id = id(BaseItemKind::Series, &series);
+    for season in [&baseball, &football] {
+        let row = rows
+            .get(&id(BaseItemKind::Season, season))
+            .expect("a folder season");
+        assert!(row.1.ends_with(".Season"), "{row:?}");
+        assert_eq!(
+            row.2.as_deref(),
+            Some(series_id.as_str()),
+            "under the series"
+        );
+    }
+    let parent = |path: &Path| rows[&id(BaseItemKind::Episode, path)].2.clone();
+    let baseball_id = Some(id(BaseItemKind::Season, &baseball));
+    assert_eq!(parent(&baseball.join("Opening day.mkv")), baseball_id);
+    assert_eq!(parent(&baseball.join("Final.mkv")), baseball_id);
+    assert_eq!(
+        parent(&football.join("Kickoff.mkv")),
+        Some(id(BaseItemKind::Season, &football))
+    );
+    assert_eq!(rows.len(), 6, "the series, 2 seasons, 3 episodes: {rows:?}");
+
+    // A file added later joins its folder's season on a changed-path scan,
+    // whose scoped plan emits that season row exactly as the full plan did.
+    let season_row = || async {
+        sqlx::query_as::<_, (Option<String>, Option<i64>, Option<String>, Option<String>)>(
+            r#"SELECT "Name", "IndexNumber", "SeriesId", "Path" FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(id(BaseItemKind::Season, &football))
+        .fetch_one(fx.db.pool())
+        .await
+        .expect("the football season")
+    };
+    let planned = season_row().await;
+    assert_eq!(
+        planned,
+        (
+            Some("My Football team".to_owned()),
+            None,
+            Some(series_id.clone()),
+            Some(football.to_string_lossy().into_owned())
+        )
+    );
+    touch(&football, "Halftime.mkv");
+    fx.report(&[&football.join("Halftime.mkv")]).await;
+    assert_eq!(season_row().await, planned, "the scoped plan's season row");
+    let rows = fx.rows().await;
+    assert_eq!(
+        rows[&id(BaseItemKind::Episode, &football.join("Halftime.mkv"))].2,
+        Some(id(BaseItemKind::Season, &football))
+    );
+    assert_eq!(
+        rows.len(),
+        7,
+        "one episode more, no virtual season: {rows:?}"
+    );
+}
+
+/// `SeasonResolver` declines a folder whose name reads as an episode
+/// (season and episode numbers), whose videos stay loose episodes, and one
+/// with no video anywhere below it, which plans nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_folder_named_like_an_episode_or_holding_no_video_is_no_season() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("tv");
+    let series = media.join("Show");
+    let episode_folder = series.join("Show S01E02");
+    touch(&episode_folder, "video.mkv");
+    let artwork = series.join("Artwork");
+    touch(&artwork, "poster.jpg");
+    touch(&series, "Show S01E01.mkv");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::tvshows)
+        .await
+        .scanned()
+        .await;
+    let rows = fx.rows().await;
+    assert!(!rows.contains_key(&id(BaseItemKind::Season, &episode_folder)));
+    assert!(!rows.contains_key(&id(BaseItemKind::Season, &artwork)));
+    // The declined folder's video stays a loose episode: its parent is the
+    // series (its season, a virtual one, is only its `SeasonId`).
+    assert_eq!(
+        rows[&id(BaseItemKind::Episode, &episode_folder.join("video.mkv"))].2,
+        Some(id(BaseItemKind::Series, &series))
+    );
+    let episodes = rows.values().filter(|r| r.1.ends_with(".Episode")).count();
+    assert_eq!(episodes, 2, "the artwork plans nothing: {rows:?}");
 }

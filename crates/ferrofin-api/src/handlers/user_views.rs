@@ -58,9 +58,9 @@ async fn collection_types_by_id(
 ) -> Result<HashMap<Uuid, Option<CollectionType>>, ApiError> {
     Ok(state
         .virtual_folders
-        .get_virtual_folders()
+        .library_folders()
         .await?
-        .into_iter()
+        .iter()
         .filter_map(|vf| {
             let id = vf
                 .item_id

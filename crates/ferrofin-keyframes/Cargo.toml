@@ -10,6 +10,7 @@ description = "Keyframe extraction for Ferrofin (port of Jellyfin.MediaEncoding.
 workspace = true
 
 [dependencies]
+ferrofin-util.workspace = true
 serde = { workspace = true }
 thiserror = { workspace = true }
 

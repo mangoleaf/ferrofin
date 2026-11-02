@@ -94,6 +94,9 @@ pub struct NfoBaseItem {
     pub name: Option<String>,
     /// The original-language title (`OriginalTitle`).
     pub original_title: Option<String>,
+    /// The original language (`OriginalLanguage`, Jellyfin 12.x). Saved as
+    /// `<originallanguage>`; the parser has no reader for it, as upstream.
+    pub original_language: Option<String>,
     /// The sort name (`SortName`).
     pub sort_name: Option<String>,
     /// The forced sort name (`ForcedSortName`; from `sorttitle`).

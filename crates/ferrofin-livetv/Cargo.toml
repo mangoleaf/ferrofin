@@ -4,12 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Live TV for Ferrofin — M3U tuners, XMLTV guide, DVR timers, Schedules Direct country list."
+description = "Live TV for Ferrofin — M3U and HDHomeRun tuners, XMLTV and Schedules Direct guides, DVR timers."
 
 [lints]
 workspace = true
 
 [dependencies]
+# `M3uParser.KeyValueRegex`, ported verbatim.
+regex.workspace = true
 ferrofin-util.workspace = true
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
@@ -25,6 +27,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 reqwest.workspace = true
+# Gzipped XMLTV guides (`XmlTvListingsProvider.UnzipIfNeededAndCopy`).
+flate2.workspace = true
+# XMLTV guides in the encoding they declare (`XmlReader`'s decoding).
+encoding_rs.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
 uuid = { workspace = true, features = ["v5"] }
@@ -32,5 +38,9 @@ uuid = { workspace = true, features = ["v5"] }
 [dev-dependencies]
 rstest.workspace = true
 tempfile.workspace = true
+# Paused-clock tests (the XMLTV download timeout).
+tokio = { workspace = true, features = ["test-util"] }
 # The real user manager, for the EnabledUsers test (no cycle: core does not depend on livetv).
 ferrofin-core.workspace = true
+# Captures the DVR fire path's and the stored-row readers' log lines.
+tracing-subscriber.workspace = true
