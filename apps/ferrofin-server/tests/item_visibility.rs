@@ -919,7 +919,7 @@ async fn deletion_checks_visibility_before_permission_and_stops_in_input_order()
 
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
+async fn parent_browse_and_userless_exceptions() {
     let f = fixture().await;
     let id = &f.hidden;
     let (_, folders) = call(
@@ -943,25 +943,12 @@ async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
         call(&f.router, "GET", &parent_uri, Some(&f.viewer), None)
             .await
             .0,
-        StatusCode::UNAUTHORIZED
+        StatusCode::FORBIDDEN
     );
     assert_eq!(
         call(&f.router, "GET", &parent_uri, Some(&f.admin), None)
             .await
             .0,
-        StatusCode::OK
-    );
-    // A container-only request re-roots before the parent visibility check.
-    assert_eq!(
-        call(
-            &f.router,
-            "GET",
-            &format!("{parent_uri}&includeItemTypes=BoxSet"),
-            Some(&f.viewer),
-            None
-        )
-        .await
-        .0,
         StatusCode::OK
     );
     // Divergence from upstream (gl-1090): `GetStreamingState` reads the item with
@@ -1826,6 +1813,9 @@ fn scope_routes(id: &str, viewer_id: &str) -> Vec<String> {
     .collect();
     routes.extend([
         format!("/Items?parentId={id}&recursive=true"),
+        // A library's Collections tab, and its Playlists equivalent.
+        format!("/Items?parentId={id}&includeItemTypes=BoxSet"),
+        format!("/Items?parentId={id}&includeItemTypes=Playlist"),
         format!("/Users/{viewer_id}/Items?parentId={id}"),
         format!("/Users/{viewer_id}/Items/Latest?parentId={id}"),
         format!("/Search/Hints?searchTerm=s&parentId={id}"),
@@ -1834,7 +1824,8 @@ fn scope_routes(id: &str, viewer_id: &str) -> Vec<String> {
     routes
 }
 
-// Divergence (owner decision 2026-10-31, gl-1091): see `require_scope_visible`.
+// Divergence (owner decisions 2026-10-31 and 2026-11-01, gl-1091, gl-1136): see
+// `require_scope_visible`.
 #[tokio::test]
 async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
     let f = fixture().await;
@@ -1845,7 +1836,7 @@ async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
         routes.push(format!("/Shows/NextUp?seriesId={id}"));
         for route in routes {
             let (status, _) = call(&f.router, "GET", &route, Some(&f.viewer), None).await;
-            if status != StatusCode::UNAUTHORIZED {
+            if status != StatusCode::FORBIDDEN {
                 open.push(format!("{status} {route}"));
             }
         }
@@ -1853,7 +1844,7 @@ async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
     assert!(open.is_empty(), "{open:#?}");
     let both = format!("/Items?ids={}&parentId={}", f.hidden, s.library);
     let (status, _) = call(&f.router, "GET", &both, Some(&f.viewer), None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "the scope answers first");
+    assert_eq!(status, StatusCode::FORBIDDEN, "the scope answers first");
 
     // An administrator can open them all, and an API key is not a user.
     assert_eq!(
@@ -1880,7 +1871,7 @@ async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
     assert_eq!(status, StatusCode::OK, "an API key naming a user is exempt");
     // An administrator reading as the viewer gets the viewer's answer.
     let (status, _) = call(&f.router, "GET", &for_viewer, Some(&f.admin), None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     // Opening the library opens everything inside it.
     let viewer_id = &f.viewer_id;
@@ -1942,6 +1933,27 @@ async fn a_scope_the_user_can_open_answers_on_every_route() {
             assert_eq!(status, StatusCode::OK, "{route}: {body}");
         }
     }
+    // The playlists folder belongs to no library, so a limit on libraries
+    // leaves it open.
+    let (_, media_folders) = call(
+        &f.router,
+        "GET",
+        "/Library/MediaFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let playlists = media_folders["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["Name"] == "Playlists")
+        .unwrap()["Id"]
+        .as_str()
+        .unwrap();
+    let route = format!("/Items?parentId={playlists}&includeItemTypes=Playlist");
+    let (status, body) = call(&f.router, "GET", &route, Some(&f.viewer), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]
@@ -2213,6 +2225,230 @@ async fn explicit_ids_keep_to_what_the_user_can_open() {
         item_ids(&page["Items"]),
         [uuid::Uuid::parse_str(hidden).unwrap()]
     );
+}
+
+/// A playlist's listing leaves out a member of a library its caller was not
+/// granted, and pages and counts what is left.
+#[tokio::test]
+async fn a_playlist_listing_leaves_out_members_of_hidden_libraries() {
+    let f = fixture().await;
+    let (status, created) = call(
+        &f.router,
+        "POST",
+        "/Playlists",
+        Some(&f.viewer),
+        Some(json!({
+            "Name": "mixed",
+            "Ids": [f.allowed],
+            "UserId": f.viewer_id,
+            "MediaType": "Video",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let playlist = created["Id"].as_str().expect("id").to_owned();
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!(
+            "/Playlists/{playlist}/Items?ids={}&userId={}",
+            f.hidden, f.viewer_id
+        ),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let uri = format!("/Playlists/{playlist}/Items?userId={}", f.viewer_id);
+    let (status, items) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+    assert_eq!(status, StatusCode::OK, "{items}");
+    assert_eq!(
+        item_ids(&items["Items"]),
+        [uuid::Uuid::parse_str(&f.allowed).expect("id")],
+        "{items}"
+    );
+    assert_eq!(items["TotalRecordCount"], 1, "{items}");
+}
+
+/// A playlist from two libraries, shared for editing with a viewer who can open
+/// one of them: `[Gamma (hidden), Alpha, Delta (hidden), Epsilon]`.
+struct SharedPlaylist {
+    id: String,
+    gamma: uuid::Uuid,
+    alpha: uuid::Uuid,
+    delta: uuid::Uuid,
+    epsilon: uuid::Uuid,
+}
+
+impl SharedPlaylist {
+    async fn new(f: &Fixture) -> Self {
+        let items = items_by_path(&f.router, &f.admin).await;
+        let id_of = |relative: &str| {
+            let path = f.h.path(relative).to_string_lossy().into_owned();
+            uuid::Uuid::parse_str(&items[&path]).expect("id")
+        };
+        let gamma = id_of("more/Gamma (2001)/Gamma (2001).mkv");
+        let alpha = id_of("movies/Alpha (1999)/Alpha (1999).mkv");
+        let delta = id_of("more/Delta (2002)/Delta (2002).mkv");
+        let epsilon = id_of("movies/Epsilon (2003)/Epsilon (2003).mkv");
+        let (status, created) = call(
+            &f.router,
+            "POST",
+            "/Playlists",
+            Some(&f.admin),
+            Some(json!({
+                "Name": "two libraries",
+                "Ids": [gamma, alpha, delta, epsilon],
+                "MediaType": "Video",
+                "Users": [{ "UserId": f.viewer_id, "CanEdit": true }],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        Self {
+            id: created["Id"].as_str().expect("id").to_owned(),
+            gamma,
+            alpha,
+            delta,
+            epsilon,
+        }
+    }
+
+    /// The members `token` is given by `GET /Playlists/{id}/Items`.
+    async fn listed(&self, f: &Fixture, token: &str) -> Vec<uuid::Uuid> {
+        let uri = format!("/Playlists/{}/Items", self.id);
+        let (status, page) = call(&f.router, "GET", &uri, Some(token), None).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        item_ids(&page["Items"])
+    }
+
+    /// Every stored member, in order: the administrator can open them all.
+    async fn stored(&self, f: &Fixture) -> Vec<uuid::Uuid> {
+        self.listed(f, &f.admin).await
+    }
+
+    /// `POST /Playlists/{id}/Items/{member}/Move/{index}` as the viewer.
+    async fn move_to(&self, f: &Fixture, member: uuid::Uuid, index: usize) {
+        let uri = format!(
+            "/Playlists/{}/Items/{}/Move/{index}",
+            self.id,
+            member.simple()
+        );
+        let (status, _) = call(&f.router, "POST", &uri, Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+}
+
+/// The filter comes before the paging, so a page is full and the total is what
+/// the caller can see, and `/Items?ParentId=` agrees. `ItemIds` keeps every
+/// member, and so does the playlist when reads and an add have been through it.
+#[tokio::test]
+async fn a_shared_playlist_pages_what_its_reader_can_open_and_keeps_every_member() {
+    let f = fixture().await;
+    let p = SharedPlaylist::new(&f).await;
+    let all = [p.gamma, p.alpha, p.delta, p.epsilon];
+    let open = [p.alpha, p.epsilon];
+    let page = |query: &str| format!("/Playlists/{}/Items{query}", p.id);
+
+    let (_, first) = call(&f.router, "GET", &page("?limit=1"), Some(&f.viewer), None).await;
+    assert_eq!(item_ids(&first["Items"]), [p.alpha], "{first}");
+    assert_eq!(first["TotalRecordCount"], 2, "{first}");
+    let (_, second) = call(
+        &f.router,
+        "GET",
+        &page("?startIndex=1&limit=1"),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    assert_eq!(item_ids(&second["Items"]), [p.epsilon], "{second}");
+    assert_eq!(second["TotalRecordCount"], 2, "{second}");
+    let (_, past) = call(
+        &f.router,
+        "GET",
+        &page("?startIndex=2"),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    assert!(item_ids(&past["Items"]).is_empty(), "{past}");
+    assert_eq!(past["TotalRecordCount"], 2, "{past}");
+
+    let browse = format!("/Items?ParentId={}&userId={}", p.id, f.viewer_id);
+    let (_, browsed) = call(&f.router, "GET", &browse, Some(&f.viewer), None).await;
+    assert_eq!(item_ids(&browsed["Items"]), open, "{browsed}");
+    assert_eq!(browsed["TotalRecordCount"], 2, "{browsed}");
+
+    let (_, playlist) = call(
+        &f.router,
+        "GET",
+        &format!("/Playlists/{}", p.id),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    assert_eq!(item_ids_of(&playlist["ItemIds"]), all, "{playlist}");
+    assert_eq!(p.stored(&f).await, all);
+
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!("/Playlists/{}/Items?ids={}", p.id, p.delta),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(p.listed(&f, &f.viewer).await, open, "an add hides it too");
+    assert_eq!(
+        p.stored(&f).await,
+        [p.gamma, p.alpha, p.delta, p.epsilon, p.delta],
+        "an add still stores a member its caller cannot open"
+    );
+}
+
+/// `ids` as a bare array of ids.
+fn item_ids_of(ids: &Value) -> Vec<uuid::Uuid> {
+    ids.as_array()
+        .expect("ids")
+        .iter()
+        .map(|id| uuid::Uuid::parse_str(id.as_str().expect("id")).expect("id"))
+        .collect()
+}
+
+/// A move's index counts the list its caller was given, so the member lands
+/// where they asked and the members they cannot see keep their places.
+#[tokio::test]
+async fn a_move_counts_the_members_its_caller_can_open() {
+    let f = fixture().await;
+    let p = SharedPlaylist::new(&f).await;
+    assert_eq!(p.listed(&f, &f.viewer).await, [p.alpha, p.epsilon]);
+
+    // Down: `[Alpha, Epsilon]` to `[Epsilon, Alpha]`. Counted over every
+    // member, Alpha is already at index 1 and nothing moves.
+    p.move_to(&f, p.alpha, 1).await;
+    assert_eq!(p.listed(&f, &f.viewer).await, [p.epsilon, p.alpha]);
+    assert_eq!(p.stored(&f).await, [p.gamma, p.delta, p.epsilon, p.alpha]);
+
+    // Back up: before the first member the viewer can open, not before Gamma.
+    p.move_to(&f, p.alpha, 0).await;
+    assert_eq!(p.listed(&f, &f.viewer).await, [p.alpha, p.epsilon]);
+    assert_eq!(p.stored(&f).await, [p.gamma, p.delta, p.alpha, p.epsilon]);
+
+    // Already there: stored order stays.
+    p.move_to(&f, p.alpha, 0).await;
+    assert_eq!(p.stored(&f).await, [p.gamma, p.delta, p.alpha, p.epsilon]);
+
+    // Past the viewer's list, as a client counting `ChildCount` asks: the end.
+    p.move_to(&f, p.alpha, 3).await;
+    assert_eq!(p.listed(&f, &f.viewer).await, [p.epsilon, p.alpha]);
+    assert_eq!(p.stored(&f).await, [p.gamma, p.delta, p.epsilon, p.alpha]);
+
+    // A member the viewer was not given moves only if its id is named, which
+    // `ItemIds` allows and the listing does not, and their list stays as it was.
+    p.move_to(&f, p.gamma, 1).await;
+    assert_eq!(p.listed(&f, &f.viewer).await, [p.epsilon, p.alpha]);
+    assert_eq!(p.stored(&f).await, [p.delta, p.epsilon, p.gamma, p.alpha]);
 }
 
 /// The viewer's `GET /Items/{allowed}` status.
