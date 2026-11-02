@@ -1636,21 +1636,47 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "post",
+        path: "/Users/AuthenticateByName",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "AuthenticateUserByName",
+        ferrofin: "handlers/users.rs authenticate_by_name, authenticate, login_failure, \
+               authentication_result → ferrofin-core session_manager.rs authenticate_internal \
+               (AuthenticateNewSessionInternal), admit_session → user_manager.rs \
+               authenticate_user (UserManager.AuthenticateUser); a 401 or 403 answers as \
+               ExceptionMiddleware does outside Development, the same on a live 12.4 for \
+               each refusal. Compared: user lookup and lock, provider order, the disabled, \
+               remote and schedule checks, the failure counter and lockout, the device and \
+               session limits, token rotation and session activity. The UserDto and \
+               SessionInfoDto builders are shared with other routes and not compared here",
+        date: "2026-11-01",
+        divergences: &[
+            "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+            "Every failed login writes the dashboard's AuthenticationFailed entry, where upstream \
+         publishes AuthenticationRequestEventArgs only for a wrong password: an exception from \
+         AuthenticateUser (an unknown user, a disabled account) or a device or session-limit \
+         refusal skips it, so those attempts never reach the Alerts feed. Jellyfin bug not \
+         ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
         path: "/Users/AuthenticateWithQuickConnect",
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "AuthenticateWithQuickConnect",
-        ferrofin: "handlers/users.rs authenticate_with_quick_connect, authentication_result → \
-               ferrofin-core quick_connect_manager.rs get_authorized_request (the result \
-               authorize_request stored)",
-        date: "2026-10-28",
+        ferrofin: "handlers/users.rs authenticate_with_quick_connect, login_failure, \
+               authentication_result → ferrofin-core quick_connect_manager.rs \
+               get_authorized_request (the result authorize_request stored)",
+        date: "2026-11-01",
         divergences: &[
             "The User member is built at the exchange, from the user as it is then, where \
          upstream returns the UserDto it snapshotted when the code was authorized, up to \
          10 minutes stale (a user deleted meanwhile gets the bare id/name DTO); the \
          session, token and ServerId are the stored ones on both. Jellyfin bug not \
          ported.",
-            "The 401 (Quick Connect disabled) and 404 (unknown or expired secret) bodies are \
-         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 404 (unknown or expired secret) body is Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },

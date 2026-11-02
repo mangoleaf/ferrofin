@@ -51,9 +51,9 @@ pub enum ApiError {
     #[error("conflict: {0}")]
     Conflict(String),
 
-    /// Account policy or permissions forbid the operation → `403`. Covers
-    /// disabled-account logins and the controllers' `StatusCode(403, …)` returns
-    /// (e.g. updating another user without elevation, disabling the last admin).
+    /// Account policy or permissions forbid the operation → `403`. Covers the
+    /// controllers' `StatusCode(403, …)` returns (e.g. updating another user
+    /// without elevation, disabling the last admin).
     #[error("forbidden: {0}")]
     Forbidden(String),
 

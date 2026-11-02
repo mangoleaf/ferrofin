@@ -36,10 +36,12 @@
 //! - `ServerId` is the server's system id: the user manager sets it on every
 //!   `UserDto` it builds, and the authentication result takes it from the
 //!   session.
+//! - A refused login answers as upstream's `ExceptionMiddleware` does, with no
+//!   reason in the body ([`login_failure`]).
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -64,6 +66,7 @@ use crate::auth::{
 use crate::error::ApiError;
 use crate::extract::{JsonBody, ProblemDetails, Query};
 use crate::handlers::items::user_uuid;
+use crate::panic_boundary::ERROR_BODY;
 use crate::state::AppState;
 
 /// The `AuthenticateByName` request body.
@@ -368,7 +371,7 @@ async fn authenticate_by_name(
     State(state): State<AppState>,
     parts: Parts,
     JsonBody(body): JsonBody<AuthenticateByNameRequest>,
-) -> Result<Json<AuthenticationResult>, ApiError> {
+) -> Result<Response, ApiError> {
     Box::pin(authenticate(&state, &parts, body)).await
 }
 
@@ -393,7 +396,7 @@ async fn authenticate_by_id(
     Path(user_id): Path<Uuid>,
     Query(query): Query<AuthenticateByIdQuery>,
     parts: Parts,
-) -> Result<Json<AuthenticationResult>, ApiError> {
+) -> Result<Response, ApiError> {
     // `GetUserById(Guid.Empty)` throws `ArgumentException`: a `400`.
     if user_id.is_nil() {
         return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
@@ -408,12 +411,35 @@ async fn authenticate_by_id(
     Box::pin(authenticate(&state, &parts, body)).await
 }
 
+/// Answers a failed login: a `401` or `403` as upstream's `ExceptionMiddleware`
+/// answers an `AuthenticationException` or a `SecurityException` outside
+/// Development, with the status, `text/plain` and [`ERROR_BODY`].
+///
+/// The reason stays out of the body, which would otherwise tell a caller which
+/// usernames exist and name a disabled account. jellyfin-web and the Kotlin SDK
+/// read only the status: `401` is bad credentials, `403` an account that may
+/// not sign in. The core logs each refused login at `warn` with its `reason`;
+/// the debug line here adds the text, and is the only record of Quick Connect
+/// being off.
+///
+/// Every other failure is the caller's to answer as before, so a login's `400`
+/// or `500` keeps the shared [`ApiError`] body.
+fn login_failure(error: ServiceError) -> Result<Response, ApiError> {
+    let error = ApiError::from(error);
+    let status = error.status();
+    if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
+        return Err(error);
+    }
+    tracing::debug!(%status, %error, "login refused");
+    Ok((status, [(header::CONTENT_TYPE, "text/plain")], ERROR_BODY).into_response())
+}
+
 /// `UserController.AuthenticateUserByName`'s body, shared by both login routes.
 async fn authenticate(
     state: &AppState,
     parts: &Parts,
     body: AuthenticateByNameRequest,
-) -> Result<Json<AuthenticationResult>, ApiError> {
+) -> Result<Response, ApiError> {
     let auth = auth_info(parts);
     // C# `UserController.AuthenticateUserByName` sets
     // `RemoteEndPoint = HttpContext.GetNormalizedRemoteIP().ToString()`. It ends
@@ -450,7 +476,7 @@ async fn authenticate(
                 },
             )
             .await;
-            return Err(e.into());
+            return login_failure(e);
         }
     };
     // The `AuthenticationSucceeded` entry is NOT written here: C# raises it from
@@ -459,7 +485,7 @@ async fn authenticate(
     // handler instead put it before the (spawned) SessionStarted row and showed
     // the dashboard's login pair backwards. The consumer lives beside the
     // SessionStarted one in the composition root.
-    Ok(Json(authentication_result(state, result).await))
+    Ok(Json(authentication_result(state, result).await).into_response())
 }
 
 /// `POST /Users/AuthenticateWithQuickConnect` — finish a Quick Connect login.
@@ -486,10 +512,14 @@ async fn authenticate_with_quick_connect(
                 .into_response(),
         );
     };
-    let result = state
+    let result = match state
         .quick_connect
         .get_authorized_request(secret.expose())
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return login_failure(e),
+    };
     Ok(Json(authentication_result(&state, result).await).into_response())
 }
 
@@ -1335,9 +1365,58 @@ crate::query::query_parameters! {
 #[cfg(test)]
 mod tests {
     use super::{
-        PASSWORD_RESET_PREFIX, SerializablePasswordReset, generate_reset_pin, issue_reset_pin,
-        normalize_pin, redeem_reset_pins,
+        ApiError, ERROR_BODY, PASSWORD_RESET_PREFIX, SerializablePasswordReset, ServiceError,
+        StatusCode, generate_reset_pin, header, issue_reset_pin, login_failure, normalize_pin,
+        redeem_reset_pins,
     };
+
+    /// `ExceptionMiddleware`'s answer, whatever the failure says. The server's
+    /// `login_failures` test drives the real refusals; a remote-access one needs
+    /// a client outside the local network, so its error is pinned here.
+    #[rstest::rstest]
+    #[case::bad_credentials(
+        ServiceError::unauthorized("Invalid username or password entered."),
+        StatusCode::UNAUTHORIZED
+    )]
+    #[case::remote_access(
+        ServiceError::Forbidden("remote access is not permitted for this user".to_owned()),
+        StatusCode::FORBIDDEN
+    )]
+    #[tokio::test]
+    async fn login_failure_answers_the_status_and_the_plain_body(
+        #[case] error: ServiceError,
+        #[case] status: StatusCode,
+    ) {
+        let response = login_failure(error).expect("a refusal is answered here");
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body, ERROR_BODY);
+    }
+
+    /// Only a `401` or `403` is a refused login; the rest keep the shared body.
+    #[rstest::rstest]
+    #[case::invalid_input(
+        ServiceError::invalid_input("app is required"),
+        "invalid input: app is required"
+    )]
+    #[case::not_found(
+        ServiceError::not_found("unable to find request"),
+        "not found: unable to find request"
+    )]
+    #[case::backend(ServiceError::backend("disk"), "backend error: disk")]
+    fn login_failure_leaves_other_errors_to_the_caller(
+        #[case] error: ServiceError,
+        #[case] message: &str,
+    ) {
+        let error: ApiError = login_failure(error).expect_err("not a refused login");
+        assert_eq!(error.to_string(), message);
+    }
 
     #[test]
     fn reset_pin_format_and_normalization() {

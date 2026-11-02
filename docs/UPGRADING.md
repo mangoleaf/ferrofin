@@ -83,6 +83,22 @@ database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
 
+## Unreleased — a refused login no longer says why
+
+`POST /Users/AuthenticateByName`, `POST /Users/{userId}/Authenticate` and
+`POST /Users/AuthenticateWithQuickConnect` now answer a `401` or `403` as Jellyfin does: the
+`text/plain` body `Error processing request.`, where they used to send a JSON `error` message
+that told an unknown user from a wrong password and named a disabled account. The statuses are
+unchanged: `401` for bad credentials or Quick Connect being off, `403` for an account that may
+not sign in. jellyfin-web and the Jellyfin Kotlin SDK read only the status. A script that reads
+the `error` field of a failed login needs to read the status instead.
+
+The reason is in the server log, as a `login failed` warning with a `reason` field:
+`unknown_user`, `bad_password`, `disabled`, `remote_access`, `parental_schedule`, `device` or
+`max_sessions`. A Quick Connect exchange refused because Quick Connect is off is logged at
+`debug` only. Other failures on these routes (`400`, `404`, `500`) and every other route keep
+their bodies.
+
 ## Unreleased — a progressive transcode needs a token
 
 Usually nothing to do. A `GET` on `/Videos/{id}/stream[.{container}]` or
