@@ -963,5 +963,9 @@ fn test_multi_version_episode_by_date_same_day() {
         .iter()
         .find(|r| primary_path(r).contains("2017-01-14"))
         .unwrap();
-    assert!(other.alternate_versions.is_empty());
+    assert!(
+        other.alternate_versions.is_empty(),
+        "{:?}",
+        other.alternate_versions
+    );
 }

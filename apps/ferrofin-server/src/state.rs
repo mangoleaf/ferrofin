@@ -2101,6 +2101,11 @@ pub async fn build_app_state(
         virtual_folders: Arc::clone(&virtual_folders),
         chapters: Arc::clone(&chapters),
         users: Arc::clone(&users),
+        external_identities: Arc::new(
+            ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(
+                db.clone(),
+            ),
+        ),
     };
     // The user manager was built long before the extensions: their
     // authentication and password-reset providers fill its late slots now,
@@ -2964,6 +2969,15 @@ pub async fn build_app_state(
     let plugin_routes: Arc<dyn ferrofin_traits::plugins::PluginRequestHandler> = Arc::new(
         ferrofin_wasm::WasmRequestDispatcher::new(&wasm_host, Arc::clone(&plugins)),
     );
+    // The LDAP-Auth extension's service behind the `/Ldap/*` routes. It reads
+    // the plugin's enabled flag and configuration through the plugin manager,
+    // so the routes answer 404 while the plugin is disabled or unregistered
+    // (`FERROFIN_DISABLE_EXTENSIONS`).
+    let ldap: Arc<dyn ferrofin_traits::ldap::LdapManager> =
+        Arc::new(ferrofin_extensions::ldap_auth::LdapAuthService::new(
+            Arc::clone(&plugins),
+            Arc::new(ferrofin_extensions::ldap_auth::directory::Ldap3Directory::default()),
+        ));
     let state = state
         .with_plugin_request_handler(plugin_routes)
         .with_session_bus(Arc::clone(&session_bus))
@@ -2971,6 +2985,7 @@ pub async fn build_app_state(
         .with_live_tv(live_tv)
         .with_file_transformations(Arc::clone(&file_transformations))
         .with_merge_versions(merge_versions)
+        .with_ldap(ldap)
         .with_playback_metrics(playback_metrics);
 
     Ok(WiredApp {
