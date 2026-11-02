@@ -1,7 +1,7 @@
 # Feature status
 
-**Parity: 13 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
-22 compared against v12.2 and owed a re-check, 0 subsystem rows (as of 2026-10-29; the
+**Parity: 39 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
+17 compared against v12.2 and owed a re-check, 6 subsystem rows (as of 2026-11-02; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
 Ferrofin answers the way Jellyfin does (identical, in another order, a known difference, filed, new), is in
@@ -73,10 +73,19 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     saved again; a new one goes last. Jellyfin lists them by a random id it draws again on
     every save, so its backdrop order reshuffles. An item adopted from Jellyfin can show
     its backdrops in a different order once.
+  - **Accepted divergence (a fix, not a gap):** a tuner's or guide's artwork must be an
+    `http` or `https` URL, and any other value is ignored. Jellyfin also accepts a local
+    path there. Logos set in the metadata editor, and the ones an adopted Jellyfin database
+    downloaded, keep working.
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
   `Data`-JSON shape, the same source of truth Jellyfin itself reads.
+  - **Accepted divergence:** a playlist's items listing and a reorder leave out a member from a
+    library the user was not given, where Jellyfin lists it and hides only what the member's
+    rating or tags rule out. Library access is a boundary here. What is stored stays: adding
+    still stores an item from such a library, and `GET /Playlists/{id}` still lists every
+    member in `ItemIds`.
   - **Accepted divergence (a fix, not a gap):** a reorder counts positions among the members
     the user can see, as Jellyfin's `MoveItemAsync` does, but Jellyfin anchors on the list
     before the moved entry is taken out and lands it one place short when it moves down past
@@ -150,6 +159,16 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
 
 Wired and working, with a documented limitation or lighter verification:
 
+- **Ferrofin settings page** — Ferrofin's own, with no Jellyfin counterpart, so checked in
+  jellyfin-web only. Dashboard → Plugins → **Ferrofin** → Settings, or the dashboard menu's
+  Ferrofin entry, lists every Ferrofin setting in groups with the value in use, its default, where
+  it comes from (default, `config.toml`, environment variable or flag), its variable and flag,
+  and, for each one the page may not change, why and where it is changed instead. Secrets are
+  shown to administrators, marked as secrets. The rest are edited there: Save writes the changes
+  to `config.toml`, a refused value shows the server's message next to it, Reset to default removes
+  the key, and Restart now applies them, all but the few that need a full process restart, which
+  say so ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)). Disabling the Ferrofin
+  plugin hides the page.
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote
@@ -323,8 +342,6 @@ the season's folder change asks the season providers.
   location that is missing, empty or cannot be listed (an unmounted drive or share).
 - **Artwork is downloaded only for an item that has none.** Jellyfin also downloads each
   missing image type of an item that has some, such as a backdrop beside an existing poster.
-- **Replace existing trickplay images** does nothing during a scan yet: trickplay images
-  come only from the **Generate Trickplay Images** scheduled task.
 
 ### After an upgrade or an adoption
 
@@ -337,7 +354,7 @@ the season's folder change asks the season providers.
   refreshing (no `DateLastRefreshed`), which is refreshed in full, probe and providers
   included. Later scans of an unchanged library save nothing. See the same section.
 - With metrics on (`FERROFIN_ENABLE_METRICS=true`), `ferrofin_library_scan_items_total`
-  counts each scan's items by outcome (`created`, `updated`, `unchanged`, `removed`),
+  counts each scan's items by outcome (`created`, `updated`, `unchanged`, `removed`, `skipped`),
   `ferrofin_media_probe_total` its ffprobe runs and
   `ferrofin_metadata_provider_requests_total` its provider requests; the
   [Library scans dashboard](../contrib/metrics/README.md#library-scans-dashboard) plots them.

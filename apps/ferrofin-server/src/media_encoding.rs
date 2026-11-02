@@ -23,6 +23,7 @@ use ferrofin_mediaencoding::subtitles::{
     SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
     subtitle_extraction_timeout,
 };
+use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_mediaencoding::{
     AttachmentExtractorImpl, EncodingHelper, NoopSessionReporter, TokioSegmentTranscoder,
     TranscodeManagerImpl,
@@ -68,6 +69,9 @@ pub struct MediaEncodingExtras {
     /// playlist generator has no keyframe extractor, and every playlist uses
     /// equal-length segments.
     pub keyframes: Option<Arc<dyn KeyframeRepository>>,
+    /// The caps on concurrent re-encoding jobs; see
+    /// [`crate::config::Config::max_transcodes`].
+    pub transcode_limits: TranscodeLimits,
 }
 
 /// The playlist generator's encoding options: the live configuration, as
@@ -349,7 +353,11 @@ pub fn build_media_encoding(
     if cleared > 0 {
         tracing::info!(deleted = cleared, "cleared the transcode cache");
     }
-    let manager = Arc::new(TranscodeManagerImpl::new(reporter).with_encoding_configuration(config));
+    let manager = Arc::new(
+        TranscodeManagerImpl::new(reporter)
+            .with_encoding_configuration(config)
+            .with_transcode_limits(extras.transcode_limits),
+    );
     // The idle reaper kills any transcode whose consumers vanished without a
     // stop report (a disconnected cast receiver, a killed browser tab): no
     // active segment request and no session ping within the job's ping timeout
@@ -383,6 +391,21 @@ pub fn build_media_encoding(
     (hls, attachments, subtitles)
 }
 
+/// `GET url`, its body or what went wrong, which names only the URL's host.
+async fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let source = ferrofin_util::source_url::redact_url(url);
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("GET {source}: {}", e.without_url()))?;
+    if !resp.status().is_success() {
+        return Err(format!("GET {source}: HTTP {}", resp.status()));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("GET {source} body: {}", e.without_url()))
+}
+
 /// The real ffmpeg + filesystem [`SubtitleIo`] for the subtitle encoder.
 ///
 /// Mirrors [`FfmpegAttachmentIo`]: cache paths come from the [`PathManager`],
@@ -406,16 +429,7 @@ impl SubtitleIo for FfmpegSubtitleIo {
     }
 
     async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
-        let resp = reqwest::get(url)
-            .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("GET {url}: HTTP {}", resp.status()));
-        }
-        resp.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("GET {url} body: {e}"))
+        http_get_bytes(url).await
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {
@@ -729,6 +743,18 @@ mod tests {
     use ferrofin_model::entities_media::MediaAttachment;
     use ferrofin_model::media_info::LiveStreamRequest;
 
+    /// The text ends up in a log, and the URL can carry an account.
+    #[tokio::test]
+    async fn a_failed_remote_subtitle_names_only_the_host() {
+        let error = http_get_bytes(
+            "http://acct-user:info-secret@127.0.0.1:0/path-secret/en.srt?token=query-secret",
+        )
+        .await
+        .expect_err("nothing listens there");
+
+        assert_eq!(error, "GET http://127.0.0.1:0: error sending request");
+    }
+
     /// A fake [`MediaSourceManager`] returning fixed sources + attachments.
     struct FakeSources {
         sources: Vec<MediaSourceInfo>,
@@ -1008,6 +1034,7 @@ mod tests {
                 trickplay: None,
                 sessions: None,
                 keyframes: None,
+                transcode_limits: TranscodeLimits::default(),
             },
         );
     }
@@ -1053,6 +1080,7 @@ mod tests {
                 trickplay: None,
                 sessions: None,
                 keyframes: None,
+                transcode_limits: TranscodeLimits::default(),
             },
         );
         assert!(!job.join("0123abcd0.mp4").exists());
@@ -1360,6 +1388,7 @@ mod tests {
                 trickplay: Some(Arc::new(FakeTrickplay)),
                 sessions: None,
                 keyframes: None,
+                transcode_limits: TranscodeLimits::default(),
             },
         );
 

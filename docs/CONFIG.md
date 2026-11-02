@@ -1,5 +1,10 @@
 # Configuration
 
+Every runtime setting below is listed in jellyfin-web under **Dashboard → Plugins → Ferrofin →
+Settings** ([Seeing what is set](#seeing-what-is-set)). That page edits the ones it may change and
+saves them to `config.toml` ([Editing settings from the dashboard](#editing-settings-from-the-dashboard)),
+the last of the three places below; the first two are set where the server is started.
+
 Ferrofin is configured three ways, **highest precedence first**:
 
 1. **CLI flags** — `--data-dir`, `--bind`, `--port`, `--published-url`, `--ffmpeg`, `--config`.
@@ -24,9 +29,9 @@ Each setting has exactly one key; the variable's stem is not accepted for these 
 a warning at startup that names it, and a key spelled as its variable's stem (`tvdb_pin`) is
 told the key to use (`tvdb_subscriber_pin`). A number or on/off variable whose value does not
 parse (`FERROFIN_PORT=80g`) is ignored with a warning naming it, so the file's value or the
-default applies, and a blank one counts as unset; the rows that say so (`FERROFIN_DB_POOL`, the
-cache lifetimes, the directory-cache limits, `FERROFIN_TRICKPLAY_CONCURRENCY`) stop the server
-on a bad value instead.
+default applies, and a blank one counts as unset; the rows that say so (`FERROFIN_DB_POOL`,
+`FERROFIN_DB_STATEMENT_CACHE`, the cache lifetimes, the directory-cache limits,
+`FERROFIN_TRICKPLAY_CONCURRENCY`) stop the server on a bad value instead.
 
 The file is `--config`, else `FERROFIN_CONFIG_FILE` (blank counts as unset), else `config.toml` in the data directory
 that `--data-dir`, `FERROFIN_DATA_DIR` or the default location names, in that order. A
@@ -47,11 +52,65 @@ started, or a flag or variable outranks it) is reported beside it. Each setting 
 whether the Ferrofin settings page may change it, and when it may not, why: a flag or a variable
 sets it (change those where the server is started), or it is one the web never changes (the
 directories, the ffmpeg and ffprobe executables, the first-boot seed settings,
-`disable_extensions`, `wasm_private_http_allow`), or one jellyfin-web's own Networking and
-General pages cover. Secrets (the provider keys, the TheTVDB PIN, the seed admin password) are
-reported in plain text, as Jellyfin's plugin settings are, and never logged. The route belongs
+`disable_extensions`, `wasm_private_http_allow`, `image_private_http_allow`), or one
+jellyfin-web's own Networking and General pages cover. Secrets (the provider keys, the TheTVDB
+PIN, the seed admin password) are reported in plain text, as Jellyfin's plugin settings are, and
+never logged. The route belongs
 to the **Ferrofin** plugin under Dashboard → Plugins and answers `404` while that plugin is
 disabled.
+
+That plugin's settings page shows the report: open it from the plugin's Settings link or the
+dashboard menu's **Ferrofin** entry. It lists the settings in groups (Paths, Network and
+identity, ffmpeg, Library and database, Observability, Metadata providers, Images, WASM plugins), each
+with its value, default, source, variable and flag, and the reason for any it may not change;
+secrets are marked as secrets. Disabling the plugin hides the page and the menu entry.
+
+### Editing settings from the dashboard
+
+The same page edits the settings it may change, and saves them to `config.toml`: the file it
+names at the top, chosen as [above](#configuration). When the server cannot write that file the
+page says so beside its name, and a save fails with a message naming it.
+
+Each editable setting has a control for its kind: a checkbox for on or off, a number box with the
+setting's limits, an **Auto** checkbox with a number box for a count that can be `auto`, a text
+box for text, a URL or a path, and a text box with its items separated by commas for a list (so a
+list here cannot hold a path with a comma in it). A secret is a plain text box, marked as a
+secret: administrators see these values.
+
+**Save** sends only the settings changed ([`POST /Ferrofin/Settings`](#saving-from-the-web)). The
+server checks them, not the browser, and a refused change shows the server's message next to the
+setting it names, or at the top of the page when it names none, such as a file that cannot be
+written. Nothing is saved then, and every edit stays on the page to correct. **Reset to default**
+marks a setting `config.toml` holds, and Save removes its key, so the default applies after the
+restart. Restarting with edits not yet saved asks first, since it drops them.
+
+Flags and variables outrank `config.toml`, so a setting one of them sets has no control. The page
+shows it locked, with a note naming the flag or variable and where that is changed. These have no
+control whatever sets them, each with its reason on the page:
+
+- the directories (`data_dir`, `config_dir`, `cache_dir`, `web_dir`): changing one from the web
+  could point the server at other files;
+- `ffmpeg_path` and `ffprobe_path`: the web may not choose an executable the server runs;
+- the first-boot seed settings (`library_roots`, `admin_user`, `admin_password`): they are used
+  only when the database is created;
+- `disable_extensions`: a measurement switch, set where a benchmark starts the server;
+- `wasm_private_http_allow`: it lets the plugins it names reach private addresses, so it is set by
+  hand in `config.toml` or its variable, and an admin session alone cannot grant it;
+- `image_private_http_allow`: it lets image downloads reach the private addresses it lists, so it
+  is set the same way, for the same reason;
+- the settings jellyfin-web's own pages cover: `bind_addr`, `published_url`, `port`, `https_port`
+  and `base_url` under Dashboard → Networking, `server_name` and `enable_metrics` under
+  Dashboard → General (Networking does not drive `port`, `https_port` and `base_url` yet, so their
+  notes say to set them by hand in `config.toml`, or with their variable or flag);
+- the OpenTelemetry variables, which `config.toml` has no key for.
+
+A saved change [applies at the next restart](#when-a-change-applies). After a save the page shows
+the new value beside the one in use, marked as saved, and a **Restart now** button beside the
+pending-restart notice. It runs the in-process restart, waits for the server to answer again and
+shows the values now in effect. The settings the in-process restart keeps (`log_level`,
+`log_format`, `metrics_scan_duration_buckets`) say so on their row before and after saving, and
+the notice lists any just saved: they need a full process restart, so restart the container or
+service.
 
 ### When a change applies
 
@@ -70,6 +129,36 @@ naming it. When `config.toml` no longer loads (a syntax error, an invalid value)
 restart logs an error naming the file and comes back on the configuration it was running; at a
 process start the same file stops the server. Environment variables and flags are read from the
 process, so a change to one applies only when the process restarts.
+
+### Saving from the web
+
+`POST /Ferrofin/Settings` (administrators only) saves changes to `config.toml`. The body is
+`{"Changes": {"scan_probe_concurrency": 4, "log_level": null}}`: a value sets the key, and `null`
+removes it, so the setting goes back to its default. The save is all or nothing, and it only
+touches what it names: comments, layout and every other key stay as they were. A removed key's
+line goes, with the comment at its end; the comment lines above it stay. An existing file keeps
+its mode and, where the server may set them, its owner and group; a new one is created `0600` (it
+may hold provider keys); and a linked file stays a link.
+
+Every change is checked before anything is written, and a refused one answers `400` naming the
+key: an unknown key, a setting that may not be changed here (with the reason
+[the report](#seeing-what-is-set) gives, so a value a flag or a variable sets is refused, as one
+saved underneath it would not apply), or an invalid value. The result is then loaded the way a
+start loads it, under the server's environment and flags, before it replaces `config.toml`. Rules
+that only warn at a start (`tvdb_cache_hours`, `tvdb_token_days`, `log_level`, `log_format`,
+`metrics_scan_duration_buckets`, the provider time limits) refuse the value here instead, so a
+value the server would ignore is never saved. A URL setting must be an `http` or `https` URL, or
+blank for its default, and is saved trimmed.
+
+A file or directory that cannot be written answers `409` naming the path, and nothing changes.
+That includes a read-only `config.toml` (`chmod a-w`), even where the directory would allow the
+rename: the file is yours to lock. It also includes a `config.toml` that is itself a mount (one
+file bound into a container), which cannot be renamed over: mount its directory instead. The
+answer lists the keys saved (`Changed`), whether a restart
+is needed (`RestartRequired`) and which of them need the server process itself restarted
+([above](#when-a-change-applies), `ProcessRestartRequired`), and `GET /System/Info` reports
+`HasPendingRestart: true` until the restart. The log names the keys, never their values. Like
+the report, the route answers `404` while the **Ferrofin** plugin is disabled.
 
 ## Paths
 
@@ -145,6 +234,8 @@ proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
 | `FERROFIN_FFMPEG_PATH` | auto-discovered on `$PATH` | Path to `ffmpeg`. Absent ffmpeg only disables transcode. |
 | `FERROFIN_FFPROBE_PATH` | auto-discovered on `$PATH` | Path to `ffprobe` (scan probes). |
 | `FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF` | `false` | Jellyfin's `FFmpeg:imgExtractPerfTradeoff`: trade frame quality for speed when extracting chapter images, video thumbnails and embedded pictures. On, the first attempt decodes keyframes only and takes the first one, instead of picking the most representative of 24 frames; extraction is faster, and the image may be less typical of the scene. The `config.toml` key is `ffmpeg_img_extract_perf_tradeoff`. |
+| `FERROFIN_MAX_TRANSCODES` | `0` | The most streaming jobs that re-encode the whole server runs at once, `0` to `1024` (a value outside logs a warning and is clamped). `0` means no cap. A job counts when it re-encodes any stream, video or audio, so a copied video with re-encoded audio counts and so does a music transcode; only a job copying every stream, a direct stream or remux, is free. It counts until its ffmpeg exits. Trickplay, chapter images, recordings and library analysis are other work and are not counted. Past the cap, a new job of a signed-in user first ends that user's own idle jobs (see `FERROFIN_MAX_TRANSCODES_PER_USER`). If that makes no room the request is refused with `503` and `Retry-After: 10`, before anything is started, and the stream can play once a job ends. Refusals log at `debug`. A job started with an API key counts here, and has no user whose jobs could be ended. Jellyfin has no such cap. The `config.toml` key is `max_transcodes`. |
+| `FERROFIN_MAX_TRANSCODES_PER_USER` | `0` | The most streaming jobs that re-encode one signed-in user runs at once, `0` to `1024`, counted as for `FERROFIN_MAX_TRANSCODES`. `0` means no cap. The user comes from the sign-in, never the request's `userId`, so accounts shared between devices share this cap. An API key has no user and is outside it. Past the cap, the user's idle jobs are ended first, longest idle first and no more than needed, so "next episode" works while the last episode's job waits to be reaped; if none is idle the request is refused with `503` and `Retry-After: 10`. Idle means no request is reading from the job at that moment, which is also true of an HLS player between two segment requests: with a low cap, a new stream can end one still playing on another device, and that device restarts its job at its next segment if there is room. Jellyfin has no such cap. The `config.toml` key is `max_transcodes_per_user`. |
 
 ## Library & database
 
@@ -152,6 +243,7 @@ proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
 |---|---|---|
 | `FERROFIN_LIBRARY_ROOTS` | none | Folders a fresh install starts with as libraries, separated by the OS path-list separator (`:` on Linux); in `config.toml`, `library_roots` is an array of paths. On the boot that creates the database's administrator, each folder becomes a library named after it (`/media/Movies` → `Movies`; a name already taken gets a number, `Movies2`), with no content type (mixed content) and Jellyfin's default library options (real-time monitoring off), both changeable in the dashboard; then one library scan starts in the background. A folder that does not exist, is not a directory or is already a library's location is skipped with a warning. Every later boot, and an adopted Jellyfin database, ignores the setting, so a library removed in the dashboard does not come back. |
 | `FERROFIN_DB_POOL` | `auto` | SQLite connection count, or `auto` (sizes to cores — the measured optimum). |
+| `FERROFIN_DB_STATEMENT_CACHE` | `200` | How many prepared statements each SQLite connection keeps, in the reader and writer pools alike. A statement the cache no longer holds is prepared again the next time it runs. Measured over a browse of a small library, one connection runs 120 to 190 distinct statements, more than sqlx's own default of 100, so at 100 the cache dropped statements still in use: on a repeat browse, about one execution in ten prepared again a statement the cache had dropped. Every connection keeps its own statements, so a larger cache costs memory on each connection of the pool. `100` to `1024`. The `config.toml` key is `db_statement_cache`. |
 | `FERROFIN_SCAN_PROGRESS_EVERY` | built-in | Items between scan-progress log lines. |
 | `FERROFIN_PLAYBACK_METRICS_QUEUE` | `1024` | Depth of the playback-metrics write queue, in events. Each PlaybackInfo decision and playstate start/stop is handed to this queue and written by one background task, so a SQLite WAL checkpoint can never stall a playback request. A full queue drops the event with a warning rather than blocking — raise it if `playback-metrics queue full` appears in the log under a load spike. |
 | `FERROFIN_SCAN_PROBE_CONCURRENCY` | `8` (capped at cores) | ffprobe processes a library scan keeps in flight. The probe is the bulk of scan time, so this is the scan's main throughput knob: measured ~3.7× at `4` and ~10× at `16` over serial probing on a local SSD. Keep it low on a spinning disk or a network mount, where a wide window turns sequential reads into seek thrash. |
@@ -159,7 +251,7 @@ proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
 | `FERROFIN_AUTH_CACHE_TTL_SECS` | `30` | Seconds a resolved access token (its device, user and policy) is served from memory before the database is read again. Every change made through the server applies at once; this only bounds how long a change made outside it, in the database itself, goes unseen. `5` to `300`. The `config.toml` key is `auth_cache_ttl_secs`. |
 | `FERROFIN_ROW_CACHE_TTL_SECS` | `30` | Seconds the per-user access check serves a user's permissions and preferences, and the libraries' rows and options, from memory. Queries scoped to the user's libraries, the home screen's views and every lookup of a library's physical folders read the same cached rows and options. As for the auth cache, every change made through the server applies at once, and this only bounds changes made outside it (the database, a library's `options.json`). `5` to `300`. The `config.toml` key is `row_cache_ttl_secs`. |
 | `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` | `300` | Seconds a library scan's directory listings survive unread before they are dropped. The default is Jellyfin's (`DirectoryService.IdleTimeoutMs`). Must be a positive integer; `0` is an error. The `config.toml` key is `scan_directory_cache_idle_secs`. |
-| `FERROFIN_TRICKPLAY_CONCURRENCY` | `auto` | How many trickplay images are generated at once (one item and width each: an ffmpeg frame extraction, then tile packing). A library scan generates several at once; the **Generate Trickplay Images** task goes one item at a time but shares this cap when it overlaps a scan. `auto` allows as many as the image-encoding limit: **Parallel image encoding limit** on the dashboard (`ParallelImageEncodingLimit`), else one per CPU. An integer sets a lower cap; `0`, a negative number, or a value above the auto value means `auto`. Each generation is an ffmpeg process with its own memory, and with hardware acceleration its own GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). Jellyfin generates one at a time; `1` does the same. The `config.toml` key `trickplay_concurrency` takes an integer or `"auto"`. |
+| `FERROFIN_TRICKPLAY_CONCURRENCY` | `auto` | How many trickplay images are generated at once (one item and width each: an ffmpeg frame extraction, then tile packing). A library scan generates several at once; the **Generate Trickplay Images** task goes one item at a time but shares this cap when it overlaps a scan. `auto` allows as many as the image-encoding limit: **Parallel image encoding limit** on the dashboard (`ParallelImageEncodingLimit`), else one per CPU. An integer sets a lower cap; `0`, a negative number, or a value above the auto value means `auto`. Each generation is an ffmpeg process with its own memory, and with hardware acceleration its own GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). Packing its tiles then takes server memory: about 60 MiB for a 320 tile, about 200 MiB for a 640 one. Jellyfin generates one at a time; `1` does the same. The `config.toml` key `trickplay_concurrency` takes an integer or `"auto"`. |
 
 ## Observability
 
@@ -185,6 +277,43 @@ when the server process restarts.
 
 A change applies at the next restart, the dashboard's in-process restart included.
 See [provider rate limiting](PROVIDER_RATE_LIMITING.md) for retry and cooldown policy.
+
+## Image limits
+
+What an image costs in memory depends on its dimensions, not its file size, so these bound what
+one image can cost. They cover every image Ferrofin turns into pixels: thumbnails, blur
+hashes, photos, trickplay frames, collages and the splashscreen. An image over a limit is never
+an error for a client: it gets the original file instead of a thumbnail. An image too large to
+decode also has no blur hash, and a collage or the splashscreen leaves it out. Reading an image's
+dimensions decodes nothing, so it needs no limit.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS` | `200` | The largest image Ferrofin decodes, in megapixels (width × height), clamped to `16`–`1000` (a value outside logs a warning). The file's header gives the size, so a larger image costs no memory. The `config.toml` key is `image_decode_max_megapixels`. |
+| `FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB` | `512` | The memory one decode may take, in MiB, clamped to `128`–`2048` (a value outside logs a warning). An image takes its width × height × its bytes per pixel, which is 3 for an ordinary colour photo, so the default stops those at about 178 megapixels. Each decode has its own allowance, so the most that decoded images can hold together is this times the images being worked on at once: one per CPU at most, and for thumbnails **Parallel image encoding limit** on the dashboard (`ParallelImageEncodingLimit`) when that is lower. The `config.toml` key is `image_decode_max_memory_mb`. |
+| `FERROFIN_IMAGE_RESIZE_BUDGET_MB` | `2048` | The working memory all resizes in flight share, in MiB, clamped to `256`–`16384` (a value outside logs a warning). A resize takes 16 bytes per pixel of the source's width by the output's height, whatever the file's format: a thumbnail 267 pixels tall of an image 6000 pixels wide takes about 24 MiB, and a 2160-pixel-tall view of an image 7680 pixels wide about 253 MiB. The default holds about 13000 by 10000. A resize that alone needs more serves the original file; one that fits but not beside the others waits for them. The `config.toml` key is `image_resize_budget_mb`. |
+
+Raise a limit for photos or panoramas that come back at full size. Lower them on a host with
+little memory: under a container's memory limit, keep the budget and the decode limit well below
+it, or the server can reach the limit first. At log level `debug`, a thumbnail refused names the
+image and the setting that refused it. A change applies at the next restart, the dashboard's
+in-process restart included.
+
+## Remote images
+
+Artwork that lives at a URL, such as a channel logo from an M3U playlist, is downloaded the first
+time a client asks for it. These settings bound what that can cost, and where a download may go.
+One URL is downloaded by one request at a time, and the others wait for the result.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` | `64` | The largest remote image Ferrofin downloads, in MiB, clamped to `16`–`256` (a value outside logs a warning). A response that declares more is refused unread, and a read stops at the limit whatever the response declared. The limit covers everything downloaded from a metadata provider as bytes: channel logos, scan artwork, the **Download** button in the image editor, and OMDb and OpenSubtitles responses. The scan moves on to the provider's next image, saying so at log level `debug`. Each request of a download, each redirect it follows counting as one, also has to finish within `FERROFIN_PROVIDER_TIMEOUT_SECONDS`, so raising the limit may need that raised too. The `config.toml` key is `image_download_max_mb`. |
+| `FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW` | none | The private hosts and networks image downloads may reach, comma-separated: host names (`nas.lan`), addresses (`192.168.1.20`, `fd00::5`) and networks in CIDR form (`192.168.1.0/24`). Every image download (channel and programme artwork, scan artwork, studio thumbs, the **Download** button in the image editor) refuses loopback, private, link-local (cloud metadata services among them), CGNAT and reserved addresses, on its first request and on every redirect, unless this lists the host or its address, or the host is a configured Live TV tuner's, so tvheadend's `/imagecache/` logos and an HDHomeRun's keep working without it. A tuner's host is allowed by its name, on every port and path, whatever led there and at whatever address the name resolves to: a service on the same machine as a tuner is reachable too, and so is any address a tuner whose name's DNS someone else controls (a remote IPTV playlist, say) points that name at. A host name allows that host at any address; a network allows every address in it, and `0.0.0.0/0, ::/0` every address there is. An entry that is none of these logs a warning and allows nothing. The first refused download logs a warning naming this setting, and later ones log at `debug`. A guide's (XMLTV) host is not a tuner's: list it here when its artwork is on your network. Behind an HTTP proxy (`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`), the server checks a host on its own DNS answer before the request, so it must be able to resolve it, and the proxy, which resolves the host again, is trusted to reach the same address. After a redirect, a response that names no image type is refused, where the URL's file extension names it otherwise (a tvheadend `/imagecache/` URL still counts as PNG, as without a redirect). Jellyfin checks none of this. The settings page shows it but does not change it: set it in `config.toml` or the variable. The `config.toml` key is `image_private_http_allow`. |
+| `FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS` | `3600` | How long a logo URL that gave no image is left alone before it is tried again, in seconds, clamped to `300`–`86400` (a value outside logs a warning). That is a `404` or `403`, a response that is not an image, an empty one included, one over the limit, or one on a private address image downloads may not reach (`FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW`), which stays refused until the time is up even if a tuner on that host is added meanwhile. A connection failure, a timeout, another status or a provider cooldown is not remembered, so it cannot hide a good image. Until the time is up the client gets a `404`, and Ferrofin keeps the image's row, where Jellyfin removes it. The memory is held per process and a restart clears it. The `config.toml` key is `image_negative_cache_ttl_secs`. |
+
+An image must look like one, whatever the response declares: JPEG, PNG, GIF, WebP, BMP, TIFF, ICO,
+AVIF, HEIC, JPEG XL, JPEG 2000 or uncompressed SVG. Anything else is refused and never stored. A
+change applies at the next restart, the dashboard's in-process restart included.
 
 ## Remote metadata provider keys
 
@@ -224,7 +353,7 @@ Limits for sandboxed WASM plugins loaded from `{data_dir}/plugins/*.wasm`
 | `FERROFIN_WASM_CALL_TIMEOUT_SECS` | Per-guest-call deadline in seconds (default 30). A plugin call past the deadline is interrupted; repeated failures sideline the plugin until restart. Exception: time spent inside a host media extraction (`extract-audio`/`extract-frames`) is bounded by the extraction's own 1-minute wall-clock budget instead — the deadline clock does not tick during host calls, so a call using extraction can legitimately outlive this setting by up to that budget. |
 | `FERROFIN_WASM_MEMORY_LIMIT_MB` | Per-plugin linear-memory cap in MiB (default 128). A `memory.grow` ceiling, never a reservation — small plugins use a few MiB. Also caps `http-fetch` response bodies. |
 | `FERROFIN_WASM_EVENT_QUEUE_CAPACITY` | Per-plugin event queue depth (default 256). A full queue drops events for that plugin only. Requests to a plugin's own URL space (`/Plugins/{id}/web/…`) may hold at most half of it, queued or running; past that, or when the queue is full, they get `503` at once instead of waiting. |
-| `FERROFIN_WASM_STATE_LIMIT_MB` | Per-plugin key/value state cap in MiB (default 8). Settings and cursors fit easily; raise for stats-heavy plugins (e.g. playback reporting). |
+| `FERROFIN_WASM_STATE_LIMIT_MB` | Per-plugin key/value state cap in MiB (default 8). Settings and cursors fit easily; raise for stats-heavy plugins (e.g. playback reporting). Each plugin's state is also kept parsed in memory while the server runs (roughly twice the logical bytes when values dominate, since they are hex-encoded, plus per-entry overhead), so raising the cap raises that too. |
 | `FERROFIN_WASM_IMAGE_DOWNLOAD_MB` | Cap on one plugin-artwork download in MiB (default 20). Posters/backdrops are single-digit MiB; anything larger is not artwork. |
 | `FERROFIN_WASM_IMAGE_TIMEOUT_SECS` | Wall-clock bound on one plugin-artwork download in seconds (default 30). A CDN GET, not a transfer job. |
 | `FERROFIN_WASM_WRITE_CONTENT_MB` | Cap on one plugin `write-lyrics`/`write-subtitles` payload in MiB (default 2). Settings-class writes, not media. |

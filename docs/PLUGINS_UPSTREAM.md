@@ -34,6 +34,8 @@ Conventions:
     (`Entrypoint`), `config_hash.rs` (`ConfigHasher`), test data `testdata/`;
   - processes: `crates/ferrofin-extensions/src/ffmpeg.rs` (`FFmpegService`,
     `FFmpegOutputParser`), `fingerprint.rs` (Chromaprint);
+  - paged library reads: `crates/ferrofin-extensions/src/library_pages.rs`
+    (shared with Merge Versions);
   - storage: `crates/ferrofin-core/src/intro_skipper_repository.rs`, migrations
     `0036`–`0038` (`Ferrofin*` tables), the seam
     `crates/ferrofin-traits/src/intro_skipper.rs`;
@@ -92,6 +94,14 @@ Conventions:
     names the Chromaprint backend.
   - **Task keys:** the detection task was `IntroSkipper.Detect` before D6; the
     task manager adopts what was saved under that key.
+- **Memory** (implementation only, the behaviour is the same): upstream
+  holds each library's list of episodes and movies while it queues them. The
+  queue here takes a snapshot of the ids its query matches and reads the rows
+  by id, `PAGE_SIZE` (100, upstream's `QueryPageLimit`) at a time: first to
+  place each item in its library, then library by library to queue it. The
+  items, their libraries and their order are the same, so the queue is the
+  same. Rows that tie on all four sort keys keep whatever order SQLite's plan
+  gives them; neither the snapshot nor the whole list promises one.
 
 ### File Transformation
 - Ferrofin files: `crates/ferrofin-extensions/src/file_transformation.rs`,
@@ -166,3 +176,9 @@ Conventions:
   cross-library group made by hand via `POST /Videos/MergeVersions` (which
   is itself unscoped, by design) is undone by the next nightly run whenever
   both copies carry a Tmdb id.
+- **Memory** (implementation only, the behaviour is the same): upstream
+  holds the whole list of eligible movies or episodes during a bulk
+  operation. Ferrofin reads it a page at a time (`library_pages.rs`: a
+  snapshot of the matching ids, then the rows by id, `PAGE_SIZE` at a time)
+  and keeps only the fields the grouping reads, so the groups and merges are
+  the same.

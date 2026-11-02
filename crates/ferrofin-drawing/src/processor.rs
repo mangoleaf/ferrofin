@@ -408,9 +408,9 @@ fn extension_of(path: &str) -> String {
 ///
 /// `InvalidInput` is the requested size or the file's content as the encoder
 /// sees it: a size that rounds an axis to 0, a source the decoder rejects
-/// (corrupt, truncated, a read error mid-decode, over the `image` crate's
-/// allocation limit), a JPEG output past 65535 px, or a WebP output past
-/// 16383 px. A failed encode writes no
+/// (corrupt, truncated, a read error mid-decode), one over the
+/// [`ImageLimits`](crate::ImageLimits), a resize past their budget, a JPEG
+/// output past 65535 px, or a WebP output past 16383 px. A failed encode writes no
 /// cache file, so it recurs on every request for that image and its volume
 /// grows with items × requests; LOGGING.md §1 keeps that at `debug`.
 /// Everything else (cache-dir I/O, an unreadable or removed source, codec or
@@ -502,16 +502,16 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
         self.encoder.get_image_blur_hash(x_comp, y_comp, path).await
     }
 
-    /// Port of `GetImageCacheTag(BaseItem/BaseItemDto, ItemImageInfo)`: folds onto
-    /// the path-plus-`DateModified` form. Returns `None` only when the underlying
-    /// path tag cannot be produced (never, here — the C# item overloads always
-    /// tag).
+    /// Port of `GetImageCacheTag(BaseItem/BaseItemDto, ItemImageInfo) =>
+    /// GetImageCacheTag(item.Path, image.DateModified)`: the owning item's
+    /// path (a `null` one concatenates as the empty string) with the image's
+    /// modification time. Always tags, as the C# item overloads do.
     async fn get_image_cache_tag(
         &self,
-        _item_id: Uuid,
+        item_path: Option<&str>,
         image: &ItemImageInfo,
     ) -> Result<Option<String>, ServiceError> {
-        self.get_image_cache_tag_for_path(&image.path, image.date_modified)
+        self.get_image_cache_tag_for_path(item_path.unwrap_or_default(), image.date_modified)
             .await
     }
 
@@ -856,6 +856,7 @@ mod tests {
             _quality: i32,
             _img_width: i32,
             _img_height: Option<i32>,
+            _full_chroma: bool,
         ) -> Result<i32, ServiceError> {
             Ok(0)
         }
@@ -929,26 +930,74 @@ mod tests {
         assert_ne!(base, diff_ticks);
     }
 
+    /// gl-849: `GetImageCacheTag(item, image)` hashes the OWNING item's path
+    /// with the image's `DateModified` ticks, never the image file's path.
+    /// Oracles recomputed from a Jellyfin 12.2 database and matching the tags
+    /// Jellyfin served for it: a movie (its Primary, at
+    /// `/media/movies/Burning Dance (1953)/poster.jpg`, and its Backdrop share
+    /// a date, so one tag), and the genre "Action", whose stored
+    /// `%MetadataPath%/Genre/Action` is hashed expanded, not as the token,
+    /// nor as its poster's path.
+    #[rstest::rstest]
+    #[case::movie(
+        Some("/media/movies/Burning Dance (1953)/Burning Dance (1953).mkv"),
+        "/media/movies/Burning Dance (1953)/poster.jpg",
+        1_792_815_355,
+        335_431_200,
+        "e79799f797e91bedf7e11ed8fbf41656"
+    )]
+    #[case::genre(
+        Some("/config/metadata/Genre/Action"),
+        "/config/metadata/library/ce/ce06903d834d2c3417e0889dd4049f3b/poster.png",
+        1_788_387_607,
+        559_763_800,
+        "0184e30b688e2995b166eda5317c526c"
+    )]
     #[tokio::test]
-    async fn item_cache_tag_folds_onto_path_form() {
+    async fn item_cache_tag_hashes_the_item_path(
+        #[case] item_path: Option<&str>,
+        #[case] image_path: &str,
+        #[case] secs: i64,
+        #[case] nanos: u32,
+        #[case] expected: &str,
+    ) {
+        let proc = ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), "/cache");
+        let info = ItemImageInfo {
+            path: image_path.into(),
+            date_modified: Utc.timestamp_opt(secs, nanos).single().expect("ts"),
+            ..Default::default()
+        };
+        let tag = proc
+            .get_image_cache_tag(item_path, &info)
+            .await
+            .expect("tag")
+            .expect("some");
+        assert_eq!(tag, expected);
+        let image_path_tag = proc
+            .get_image_cache_tag_for_path(image_path, info.date_modified)
+            .await
+            .expect("tag")
+            .expect("some");
+        assert_ne!(tag, image_path_tag, "the image's own path is not hashed");
+    }
+
+    /// A path-less item hashes `null + ticks`, which C# concatenates as the
+    /// ticks alone.
+    #[tokio::test]
+    async fn item_cache_tag_of_a_path_less_item_hashes_the_ticks_alone() {
         let proc = ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), "/cache");
         let dt = Utc.timestamp_opt(1_500_000_000, 0).single().expect("ts");
         let info = ItemImageInfo {
-            path: "/library/poster.jpg".into(),
+            path: "https://example.org/logo.png".into(),
             date_modified: dt,
             ..Default::default()
         };
-        let via_item = proc
-            .get_image_cache_tag(Uuid::nil(), &info)
-            .await
-            .expect("tag")
-            .expect("some");
-        let via_path = proc
-            .get_image_cache_tag_for_path("/library/poster.jpg", dt)
-            .await
-            .expect("tag")
-            .expect("some");
-        assert_eq!(via_item, via_path);
+        assert_eq!(
+            proc.get_image_cache_tag(None, &info).await.expect("tag"),
+            proc.get_image_cache_tag_for_path("", dt)
+                .await
+                .expect("tag"),
+        );
     }
 
     #[tokio::test]
@@ -1344,6 +1393,7 @@ mod tests {
                 _q: i32,
                 _w: i32,
                 _h: Option<i32>,
+                _c: bool,
             ) -> Result<i32, ServiceError> {
                 Ok(0)
             }

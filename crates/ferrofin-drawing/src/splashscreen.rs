@@ -11,11 +11,13 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
+use std::rc::Rc;
 
 use ferrofin_traits::error::ServiceError;
 use image::{Rgba, RgbaImage, imageops};
 
-use crate::image_encoder::{ImageCrateEncoder, next_valid};
+use crate::image_encoder::next_valid;
+use crate::limits::ImageMemory;
 
 /// The output frame (`FinalWidth`/`FinalHeight`).
 const FINAL_WIDTH: u32 = 1920;
@@ -42,36 +44,43 @@ const WALL_TO_FRAME: [[f64; 3]; 3] = [
 /// [`ServiceError::InvalidInput`] when either list has no decodable image
 /// (`GenerateCollage`'s "Not enough valid pictures").
 pub(crate) fn generate_splash(
+    memory: &ImageMemory,
     posters: &[String],
     backdrops: &[String],
 ) -> Result<RgbaImage, ServiceError> {
-    Ok(transform_3d(&generate_collage(posters, backdrops)?))
+    Ok(transform_3d(&generate_collage(memory, posters, backdrops)?))
 }
 
 /// Port of `GenerateCollage`.
-fn generate_collage(posters: &[String], backdrops: &[String]) -> Result<RgbaImage, ServiceError> {
+fn generate_collage(
+    memory: &ImageMemory,
+    posters: &[String],
+    backdrops: &[String],
+) -> Result<RgbaImage, ServiceError> {
     let mut wall = RgbaImage::from_pixel(WALL_WIDTH, WALL_HEIGHT, Rgba([0, 0, 0, 0xFF]));
     let row_height = WALL_HEIGHT / ROWS;
     // Each path is decoded and scaled once, where upstream decodes it for every
     // tile it fills; the wall comes out the same.
-    let mut scaled: HashMap<String, Option<RgbaImage>> = HashMap::new();
-    let mut load = |path: &str| -> Option<RgbaImage> {
+    let mut scaled: HashMap<String, Option<Rc<RgbaImage>>> = HashMap::new();
+    let mut load = |path: &str| -> Option<Rc<RgbaImage>> {
         scaled
             .entry(path.to_owned())
             .or_insert_with(|| {
-                let image = ImageCrateEncoder::decode(path).ok()?;
+                let image = memory.decode(path).ok()?;
                 let height = image.height().max(1);
                 let width = (u64::from(row_height) * u64::from(image.width()) / u64::from(height))
                     .clamp(1, u64::from(WALL_WIDTH));
-                Some(
-                    image
+                Some(Rc::new(
+                    memory
                         .resize_exact(
+                            &image,
                             u32::try_from(width).unwrap_or(WALL_WIDTH),
                             row_height,
                             imageops::FilterType::Lanczos3,
                         )
+                        .ok()?
                         .to_rgba8(),
-                )
+                ))
             })
             .clone()
     };
@@ -93,7 +102,7 @@ fn generate_collage(posters: &[String], backdrops: &[String]) -> Result<RgbaImag
                 ));
             };
             *index = next;
-            imageops::overlay(&mut wall, &image, i64::from(x), i64::from(y));
+            imageops::overlay(&mut wall, &*image, i64::from(x), i64::from(y));
             x += image.width() + SPACING;
             counter = if counter >= 4 { 0 } else { counter + 1 };
         }

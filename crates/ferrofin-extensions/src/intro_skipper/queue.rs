@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use super::IntroSkipperConfig;
 use crate::ffmpeg::{FfmpegService, ProcessOptions};
+use crate::library_pages::{self, PAGE};
 
 /// The plugin's name, as a library's `DisabledMediaSegmentProviders` lists it.
 const PLUGIN_NAME: &str = "Intro Skipper";
@@ -84,6 +85,13 @@ pub(super) type Queue = Vec<(Uuid, Vec<QueuedEpisode>)>;
 
 /// Builds the queue (`QueueManager.GetMediaItems(includeExcluded)`).
 ///
+/// Each item is queued under the first enabled library one of whose
+/// locations holds its file, the libraries in order and each in the query's
+/// order. Upstream holds each library's list whole; here the rows are read a
+/// page at a time from a snapshot of the ids ([`crate::library_pages`]), so
+/// a first pass places each id in its library and a second queues them,
+/// library by library, in that same order.
+///
 /// # Errors
 /// A library or virtual-folder read failed.
 pub(super) async fn build(
@@ -99,28 +107,21 @@ pub(super) async fn build(
             .analysis_percent
             .clamp(ANALYSIS_PERCENT.0, ANALYSIS_PERCENT.1),
     ) / 100.0;
-    let items = library
-        .get_item_list(&InternalItemsQuery {
-            include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
-            recursive: true,
-            is_virtual_item: Some(false),
-            order_by: vec![
-                (ItemSortBy::SeriesSortName, SortOrder::Ascending),
-                (ItemSortBy::ParentIndexNumber, SortOrder::Descending),
-                (ItemSortBy::IndexNumber, SortOrder::Ascending),
-            ],
-            ..InternalItemsQuery::default()
-        })
-        .await?;
-    let mut queue = QueueBuilder {
-        queue: Vec::new(),
-        positions: HashMap::new(),
-        anime: HashMap::new(),
+    let query = InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
+        recursive: true,
+        is_virtual_item: Some(false),
+        order_by: vec![
+            (ItemSortBy::SeriesSortName, SortOrder::Ascending),
+            (ItemSortBy::ParentIndexNumber, SortOrder::Descending),
+            (ItemSortBy::IndexNumber, SortOrder::Ascending),
+        ],
+        ..InternalItemsQuery::default()
     };
-    let mut seen = HashSet::new();
+    // "If libraries have been selected for analysis, ensure this library
+    // was selected."
+    let mut enabled: Vec<&VirtualFolderInfo> = Vec::new();
     for folder in folders {
-        // "If libraries have been selected for analysis, ensure this library
-        // was selected."
         if folder.library_options.as_ref().is_some_and(|o| {
             o.disabled_media_segment_providers
                 .iter()
@@ -130,31 +131,53 @@ pub(super) async fn build(
                 library = folder.name.as_deref().unwrap_or_default(),
                 "intro skipper: library disabled for analysis"
             );
-            continue;
+        } else {
+            enabled.push(folder);
         }
-        for item in items.iter().filter(|item| in_folder(item, folder)) {
-            if !seen.insert(item.id.clone()) {
-                continue;
+    }
+    if enabled.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut placed: Vec<Vec<Uuid>> = vec![Vec::new(); enabled.len()];
+    let mut seen = HashSet::new();
+    for page in library.get_item_ids(&query).await?.chunks(PAGE) {
+        for item in library_pages::rows(library, &query, page).await? {
+            if let Ok(id) = Uuid::parse_str(&item.id)
+                && let Some(index) = enabled.iter().position(|folder| in_folder(&item, folder))
+                && seen.insert(id)
+            {
+                placed[index].push(id);
             }
-            match kind(item) {
-                Some(BaseItemKind::Episode) => {
-                    queue
-                        .episode(
-                            (library, ffmpeg),
-                            item,
-                            &policy,
-                            config,
-                            analysis_percent,
-                            include_excluded,
-                        )
-                        .await;
+        }
+    }
+    let mut queue = QueueBuilder {
+        queue: Vec::new(),
+        positions: HashMap::new(),
+        anime: HashMap::new(),
+    };
+    for ids in &placed {
+        for page in ids.chunks(PAGE) {
+            for item in library_pages::rows(library, &query, page).await? {
+                match kind(&item) {
+                    Some(BaseItemKind::Episode) => {
+                        queue
+                            .episode(
+                                (library, ffmpeg),
+                                &item,
+                                &policy,
+                                config,
+                                analysis_percent,
+                                include_excluded,
+                            )
+                            .await;
+                    }
+                    Some(BaseItemKind::Movie) => {
+                        queue
+                            .movie(ffmpeg, &item, &policy, config, include_excluded)
+                            .await;
+                    }
+                    _ => {}
                 }
-                Some(BaseItemKind::Movie) => {
-                    queue
-                        .movie(ffmpeg, item, &policy, config, include_excluded)
-                        .await;
-                }
-                _ => {}
             }
         }
     }

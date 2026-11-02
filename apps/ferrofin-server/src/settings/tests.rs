@@ -13,16 +13,16 @@ use super::*;
 
 /// A fake environment backed by a map — no real `std::env` mutation.
 #[derive(Clone, Default)]
-struct FakeEnv(HashMap<String, String>);
+pub(super) struct FakeEnv(HashMap<String, String>);
 
 impl FakeEnv {
     /// An environment whose default data directory no host has, so a test
     /// reads no `config.toml` of the host's.
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::default().with("XDG_DATA_HOME", "/nonexistent/ferrofin-settings-test")
     }
 
-    fn with(mut self, key: &str, value: &str) -> Self {
+    pub(super) fn with(mut self, key: &str, value: &str) -> Self {
         self.0.insert(key.to_owned(), value.to_owned());
         self
     }
@@ -41,12 +41,12 @@ impl Env for FakeEnv {
 
 /// A temporary data directory and its `config.toml`, written from `lines`
 /// (none: no file).
-struct DataDir {
+pub(super) struct DataDir {
     dir: tempfile::TempDir,
 }
 
 impl DataDir {
-    fn new(lines: &[String]) -> Self {
+    pub(super) fn new(lines: &[String]) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         if !lines.is_empty() {
             std::fs::write(dir.path().join("config.toml"), lines.join("\n")).expect("write");
@@ -54,16 +54,16 @@ impl DataDir {
         Self { dir }
     }
 
-    fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         self.dir.path()
     }
 
-    fn config_file(&self) -> PathBuf {
+    pub(super) fn config_file(&self) -> PathBuf {
         self.path().join("config.toml")
     }
 
     /// The flags that start the server on this data directory.
-    fn cli(&self) -> Cli {
+    pub(super) fn cli(&self) -> Cli {
         Cli {
             data_dir: Some(self.path().to_path_buf()),
             ..Cli::default()
@@ -71,7 +71,7 @@ impl DataDir {
     }
 }
 
-fn spec(key: &str) -> &'static SettingSpec {
+pub(super) fn spec(key: &str) -> &'static SettingSpec {
     SETTINGS
         .iter()
         .find(|spec| spec.key == key)
@@ -80,7 +80,7 @@ fn spec(key: &str) -> &'static SettingSpec {
 
 /// A `config.toml` value for `spec`'s key that the loader takes and that is
 /// not the default.
-fn sample(spec: &SettingSpec) -> String {
+pub(super) fn sample(spec: &SettingSpec) -> String {
     match spec.key {
         "bind_addr" => "\"127.0.0.2\"".to_owned(),
         "log_level" => "\"debug\"".to_owned(),
@@ -118,7 +118,7 @@ fn entry<'a>(report: &'a ServerSettingsDto, key: &str) -> &'a ServerSettingDto {
         .unwrap_or_else(|| panic!("no setting `{key}` in the report"))
 }
 
-fn load(cli: Cli, env: &FakeEnv) -> Config {
+pub(super) fn load(cli: Cli, env: &FakeEnv) -> Config {
     Config::load_from(cli, env).expect("load")
 }
 
@@ -438,6 +438,10 @@ fn read_only_settings_carry_their_note_whatever_sets_them() {
             "wasm_private_http_allow",
             "Lets the named WASM plugins reach",
         ),
+        (
+            "image_private_http_allow",
+            "Lets image downloads reach the LAN",
+        ),
         // Owner decision D2: jellyfin-web's own pages cover these.
         (
             "bind_addr",
@@ -570,6 +574,56 @@ fn a_file_changed_since_the_start_shows_its_saved_value() {
 }
 
 #[test]
+fn auto_saved_over_a_running_count_shows_as_the_saved_value() {
+    let data = DataDir::new(&[
+        "db_pool = 8".to_owned(),
+        "trickplay_concurrency = \"auto\"".to_owned(),
+    ]);
+    let env = FakeEnv::new();
+    let running = load(data.cli(), &env);
+    std::fs::write(
+        data.config_file(),
+        "db_pool = \"auto\"\ntrickplay_concurrency = \"auto\"\n",
+    )
+    .expect("edit");
+    let shown = report(&running, &env);
+
+    // `auto` is no running value, but it is what the file holds.
+    let pool = entry(&shown, "db_pool");
+    assert_eq!(pool.value, Some(json!(8)), "the running value");
+    assert_eq!(pool.saved_value, Some(json!("auto")));
+    // Auto in the file and in use: nothing saved apart.
+    let trickplay = entry(&shown, "trickplay_concurrency");
+    assert_eq!(trickplay.value, None);
+    assert_eq!(trickplay.saved_value, None);
+
+    // A variable's count outranks it: the file's `auto` is saved underneath.
+    let env = FakeEnv::new().with("FERROFIN_DB_POOL", "16");
+    let outranked = report(&load(data.cli(), &env), &env);
+    let pool = entry(&outranked, "db_pool");
+    assert_eq!(pool.source, Source::Environment);
+    assert_eq!(pool.value, Some(json!(16)));
+    assert_eq!(pool.saved_value, Some(json!("auto")));
+}
+
+/// The page is driven by the report, so a new setting needs no page change. A
+/// key the script named would be a quoted string; a bare word may be English
+/// (`port` is in "report").
+#[test]
+fn the_settings_page_names_no_setting() {
+    use ferrofin_extensions::Extension as _;
+
+    let pages = ferrofin_extensions::ferrofin_settings::FerrofinSettingsExtension.config_pages();
+    let html = String::from_utf8_lossy(&pages[0].bytes);
+    for spec in SETTINGS {
+        for quote in ['\'', '"', '`'] {
+            let quoted = format!("{quote}{}{quote}", spec.key);
+            assert!(!html.contains(&quoted), "the page names {quoted}");
+        }
+    }
+}
+
+#[test]
 fn secrets_are_reported_in_plain_text() {
     let data = DataDir::new(&[
         "omdb_api_key = \"omdb-secret\"".to_owned(),
@@ -650,7 +704,7 @@ fn a_config_file_whose_directory_takes_no_file_is_not_writable() {
 // ---- the manager ---------------------------------------------------------------
 
 /// The Ferrofin plugin, registered as the server registers it.
-fn plugins(dir: &Path) -> Arc<dyn PluginManager> {
+pub(super) fn plugins(dir: &Path) -> Arc<dyn PluginManager> {
     Arc::new(ferrofin_core::FerrofinPluginManager::new(
         ferrofin_extensions::registered_plugins(&ferrofin_extensions::registered_extensions(true)),
         dir.to_path_buf(),
@@ -684,5 +738,15 @@ async fn the_manager_reports_the_restart_flag_and_answers_not_found_while_disabl
     assert!(
         matches!(result, Err(ServiceError::NotFound(_))),
         "{result:?}"
+    );
+}
+
+/// The statement cache row shows the default the database applies when the
+/// setting is unset.
+#[test]
+fn the_statement_cache_row_shows_the_database_default() {
+    assert_eq!(
+        spec("db_statement_cache").default,
+        ferrofin_db::DEFAULT_STATEMENT_CACHE_CAPACITY.to_string()
     );
 }

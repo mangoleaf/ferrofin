@@ -261,12 +261,20 @@ impl FerrofinSearchManager {
         ids.sort_unstable();
         ids.dedup();
         let images = self.items.get_image_infos_batch(&ids).await?;
+        // Each tag hashes its owner's `Path`: the page rows' and the
+        // ancestors', expanded as the item repository reads them.
+        let paths: std::collections::HashMap<Uuid, &str> = rows
+            .iter()
+            .map(|(id, row)| (*id, *row))
+            .chain(ancestors.iter().map(|(id, row)| (*id, row)))
+            .filter_map(|(id, row)| row.path.as_deref().map(|path| (id, path)))
+            .collect();
         for hint in hints.iter_mut() {
             let parents = rows
                 .get(&hint.id)
                 .map(|row| parent_chain(row, &ancestors))
                 .unwrap_or_default();
-            fill_artwork(processor, hint, &parents, &images).await;
+            fill_artwork(processor, hint, &parents, &images, &paths).await;
         }
         Ok(())
     }
@@ -406,18 +414,21 @@ fn first_image(
 /// aspect ratio; the Thumb of the item, else (for an Episode) its first Series
 /// with one, else its first parent with one (`SetThumbImageInfo`); the
 /// Backdrop of the item, else its first parent with one
-/// (`SetBackdropImageInfo`). An image the processor cannot tag is skipped.
+/// (`SetBackdropImageInfo`). An image the processor cannot tag is skipped;
+/// a tag hashes its owner's path from `paths` (`GetImageCacheTag(item, …)`).
 async fn fill_artwork(
     processor: &dyn ImageProcessor,
     hint: &mut SearchHint,
     parents: &[(Uuid, BaseItemKind)],
     images: &std::collections::HashMap<Uuid, Vec<ItemImageInfo>>,
+    paths: &std::collections::HashMap<Uuid, &str>,
 ) {
     let tag = |item: Uuid, image: &ItemImageInfo| {
         let image = image.clone();
+        let path = paths.get(&item).copied();
         async move {
             processor
-                .get_image_cache_tag(item, &image)
+                .get_image_cache_tag(path, &image)
                 .await
                 .ok()
                 .flatten()
@@ -829,6 +840,7 @@ mod tests {
             &BaseItemEntity {
                 is_folder: true,
                 data: Some(r#"{"Status":"Ended"}"#.to_owned()),
+                path: Some("/shows/Show".to_owned()),
                 ..row(series, "TV.Series", "Show", None)
             },
         )
@@ -841,7 +853,14 @@ mod tests {
             },
         )
         .await;
-        save_item(db, &row(episode, "TV.Episode", "Pilot", Some(season))).await;
+        save_item(
+            db,
+            &BaseItemEntity {
+                path: Some("/shows/Show/S01E01.mkv".to_owned()),
+                ..row(episode, "TV.Episode", "Pilot", Some(season))
+            },
+        )
+        .await;
         save_item(
             db,
             &BaseItemEntity {
@@ -903,7 +922,8 @@ mod tests {
         let ep = hit(episode);
         assert_eq!(
             ep.primary_image_tag.as_deref(),
-            Some("tag:/img/episode.jpg")
+            Some("tag:/img/episode.jpg@/shows/Show/S01E01.mkv"),
+            "the tag hashes its owner's path (gl-849)"
         );
         assert_eq!(
             ep.primary_image_aspect_ratio,
@@ -916,7 +936,7 @@ mod tests {
                 ep.thumb_image_item_id.as_deref()
             ),
             (
-                Some("tag:/img/series-thumb.jpg"),
+                Some("tag:/img/series-thumb.jpg@/shows/Show"),
                 Some(series.simple().to_string().as_str())
             ),
             "the Series' thumb, not the nearer Season's"
@@ -927,7 +947,7 @@ mod tests {
                 ep.backdrop_image_item_id.as_deref()
             ),
             (
-                Some("tag:/img/series-backdrop.jpg"),
+                Some("tag:/img/series-backdrop.jpg@/shows/Show"),
                 Some(series.simple().to_string().as_str())
             )
         );

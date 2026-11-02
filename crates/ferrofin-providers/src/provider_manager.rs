@@ -39,6 +39,7 @@ use ferrofin_traits::providers::{
 use uuid::Uuid;
 
 use crate::error::ProvidersError;
+use crate::image_download::ImageFetchError;
 use crate::library_options::{
     channel_fetcher_override, fetcher_names, image_fetcher_enabled, metadata_fetcher_enabled,
 };
@@ -615,7 +616,7 @@ impl RemoteSearchProvider for OmdbSearchProvider {
 }
 
 /// The shared naming options the providers' `ParseName` runs by (the OMDb
-/// Identify search, the TVDB search).
+/// Identify search, the TVDB search, the box-set refresh).
 ///
 /// [`NamingOptions::new`] compiles the whole clean-name regex table, so it is
 /// built once for the process rather than per search request.
@@ -1133,6 +1134,8 @@ pub struct LocalProviderManager {
     /// one folder per URL, named by its MD5, under the cache directory, so
     /// the "Clean Cache Directory" task expires them.
     remote_image_cache: Option<DirectoryPath>,
+    /// What those requests share, across clones of this manager.
+    remote_image_requests: Arc<RemoteImageRequests>,
     /// The TMDB client + item store used by the remote-image ("Choose Image")
     /// methods to resolve an item and list/download its TMDB artwork.
     tmdb: Option<Arc<TmdbClient>>,
@@ -1182,12 +1185,6 @@ pub struct LocalProviderManager {
     /// same chain. Read through a closure so a live config change is picked up
     /// rather than frozen at startup. `None` → the C# default, `"en"`.
     server_metadata_language: Option<Arc<dyn Fn() -> String + Send + Sync>>,
-    /// The HTTP client the artwork writer downloads a caller-supplied image URL
-    /// with. Its own, not TMDB's: `POST /Items/{itemId}/RemoteImages/Download`
-    /// is a raw GET of whatever URL the admin pasted (C#
-    /// `ProviderManager.SaveImage` uses `NamedClient.Default`), and must work
-    /// on a server with no TMDB client wired.
-    http: reqwest::Client,
     /// `ServerConfiguration.MetadataCountryCode`, the value a remote SEARCH
     /// falls back to for a blank `SearchInfo.MetadataCountryCode`
     /// (`ProviderManager.GetRemoteSearchResults`). Read through a closure for
@@ -1204,6 +1201,56 @@ pub struct LocalProviderManager {
     /// without a restart. Absent → an empty global array, i.e. no
     /// server-wide ranking.
     metadata_options: Option<Arc<dyn Fn() -> Vec<MetadataOptions> + Send + Sync>>,
+}
+
+/// What every [`ProviderManager::cached_remote_image`] shares, so that one
+/// image URL costs one download however many ask, and one that gave no image
+/// costs one per lifetime of its negative-cache entry.
+#[derive(Debug)]
+struct RemoteImageRequests {
+    /// One download per URL at a time (`ProviderManager._imageSaveLock`).
+    downloads: ferrofin_util::keyed_locks::KeyedLocks,
+    /// The URLs that answered with no image.
+    negative: crate::image_download::NegativeImageCache,
+    /// When a URL last failed with no answer. Those requests that were waiting
+    /// on that download share its failure, or each would take its turn at the
+    /// whole timeout of a source that has stopped responding; a later request
+    /// tries again, so nothing here hides an image. Its entries have no time
+    /// to live, so they stay until it is full, then all go together.
+    failed: crate::image_download::NegativeImageCache,
+}
+
+impl RemoteImageRequests {
+    fn new(negative_ttl: std::time::Duration) -> Self {
+        Self {
+            downloads: ferrofin_util::keyed_locks::KeyedLocks::new(),
+            negative: crate::image_download::NegativeImageCache::new(negative_ttl),
+            failed: crate::image_download::NegativeImageCache::new(std::time::Duration::ZERO),
+        }
+    }
+}
+
+impl Default for RemoteImageRequests {
+    fn default() -> Self {
+        Self::new(std::time::Duration::from_secs(
+            crate::DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS,
+        ))
+    }
+}
+
+/// A temporary file gone when this is dropped, however the work on it ended: a
+/// client that disconnects cancels the download with its request, and its
+/// bytes must not stay behind in the cache. Its folder goes too when that
+/// leaves it empty, as a URL with no image gets none.
+struct PartialFile(std::path::PathBuf);
+
+impl Drop for PartialFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+        if let Some(folder) = self.0.parent() {
+            let _ = std::fs::remove_dir(folder);
+        }
+    }
 }
 
 /// The file a remote image's cache folder holds, when it holds one.
@@ -1247,6 +1294,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_image_store", &self.image_store.is_some())
             .field("metadata_dir", &self.metadata_dir)
             .field("remote_image_cache", &self.remote_image_cache)
+            .field("remote_image_requests", &self.remote_image_requests)
             .field("has_tmdb", &self.tmdb.is_some())
             .field("has_items", &self.items.is_some())
             .field("has_studios", &self.studios.is_some())
@@ -1264,7 +1312,6 @@ impl std::fmt::Debug for LocalProviderManager {
                 &self.dynamic_image_providers.len(),
             )
             .field("kind_by_type_name", &self.kind_by_type_name.len())
-            .field("http", &self.http)
             .field("has_metadata_options", &self.metadata_options.is_some())
             .finish()
     }
@@ -1324,6 +1371,7 @@ impl LocalProviderManager {
             image_store: None,
             metadata_dir: None,
             remote_image_cache: None,
+            remote_image_requests: Arc::default(),
             tmdb: None,
             items: None,
             studios: None,
@@ -1337,7 +1385,6 @@ impl LocalProviderManager {
             localization: None,
             kind_by_type_name: HashMap::new(),
             virtual_folders: None,
-            http: reqwest::Client::new(),
             server_metadata_language: None,
             server_metadata_country: None,
             metadata_options: None,
@@ -1565,10 +1612,16 @@ impl LocalProviderManager {
     }
 
     /// Attaches the directory remote image rows are cached in, enabling
-    /// [`ProviderManager::cached_remote_image`].
+    /// [`ProviderManager::cached_remote_image`], and how long a URL that gave
+    /// no image is left alone (`image_negative_cache_ttl_secs`).
     #[must_use]
-    pub fn with_remote_image_cache(mut self, dir: impl Into<DirectoryPath>) -> Self {
+    pub fn with_remote_image_cache(
+        mut self,
+        dir: impl Into<DirectoryPath>,
+        negative_ttl: std::time::Duration,
+    ) -> Self {
         self.remote_image_cache = Some(dir.into());
+        self.remote_image_requests = Arc::new(RemoteImageRequests::new(negative_ttl));
         self
     }
 
@@ -1948,8 +2001,9 @@ impl LocalProviderManager {
     /// The box-set arm of the single-item refresh — port of
     /// `TmdbBoxSetProvider` + `TmdbBoxSetImageProvider`: the collection a
     /// `Tmdb` id pins (on the box set, or on the chosen Identify result),
-    /// else the top hit of a collection search by the box set's name, as a
-    /// provider result — its name and overview, its id, and its artwork.
+    /// else the top hit of a collection search by the box set's name, parsed
+    /// and cleaned as `GetMetadata` does (`TmdbBoxSetProvider.cs:105-108`), as
+    /// a provider result — its name and overview, its id, and its artwork.
     async fn fetch_box_set(
         tmdb: &TmdbClient,
         name: &str,
@@ -1960,7 +2014,8 @@ impl LocalProviderManager {
         let collection_id = if let Some(id) = collection_id {
             id
         } else {
-            tmdb.search_collection(name, language)
+            let parsed = ferrofin_naming::video::video_resolver::parse_name(name, naming_options());
+            tmdb.search_collection(&crate::tmdb::clean_name(&parsed.name), language)
                 .await
                 .into_iter()
                 .next()?
@@ -2512,6 +2567,29 @@ impl LocalProviderManager {
         // item with no file has no file change, probe or local reader to
         // monitor.
         let library = self.library_options_for(&stored).await;
+        // `ValidateImages` (`MetadataService.cs:121-143`) runs first, whatever
+        // the lock or the fetcher checkboxes: the local image providers. With
+        // "Save artwork into media folders" and "Replace existing images"
+        // upstream registers no new local file
+        // (`IsSaveLocalMetadataEnabled() && ReplaceAllImages`).
+        let saves_local_and_replaces = options.replace_all_images
+            && library
+                .as_ref()
+                .is_some_and(|library| library.save_local_metadata);
+        // A failed validation is logged and the refresh goes on without the
+        // remote image providers, unstamped (`localImagesFailed`,
+        // `MetadataService.cs:127-143,195-198`).
+        let (local_images, local_images_failed) = if saves_local_and_replaces {
+            (false, false)
+        } else {
+            match self.validate_virtual_season_images(item_id, &stored).await {
+                Ok(saved) => (saved, false),
+                Err(err) => {
+                    tracing::warn!(%item_id, %err, "could not validate the item's local images");
+                    (false, true)
+                }
+            }
+        };
         let request = RefreshRequest {
             options,
             force_save: options.force_save,
@@ -2538,7 +2616,9 @@ impl LocalProviderManager {
         let gated = self.gated_options(&stored, options).await;
         let fetch = Fetch {
             metadata: plan.remote_metadata && wants_fetch(gated.metadata_refresh_mode),
-            images: plan.remote_images != ImageFetch::None && wants_fetch(gated.image_refresh_mode),
+            images: !local_images_failed
+                && plan.remote_images != ImageFetch::None
+                && wants_fetch(gated.image_refresh_mode),
         };
         let chosen_name = options
             .search_result
@@ -2649,6 +2729,7 @@ impl LocalProviderManager {
             },
             None => (None, 0),
         };
+        failures += u32::from(local_images_failed);
         let fetched = fetched.unwrap_or_default();
         // A box set or playlist (`EnableUpdatingOfficialRatingFromChildren`)
         // scores ratings against its `GetPreferredMetadataCountryCode()`.
@@ -2811,7 +2892,11 @@ impl LocalProviderManager {
             plan,
             &request,
             PassOutcome {
-                changed: metadata_changed || ids_changed || image_saved || generated,
+                changed: metadata_changed
+                    || ids_changed
+                    || image_saved
+                    || generated
+                    || local_images,
                 failed: failures > 0,
             },
         );
@@ -2890,7 +2975,7 @@ impl LocalProviderManager {
             || request.options.replace_all_metadata
         {
             ItemUpdateType::MetadataDownload
-        } else if image_saved || generated {
+        } else if image_saved || generated || local_images {
             ItemUpdateType::ImageUpdate
         } else {
             ItemUpdateType::None
@@ -2899,6 +2984,68 @@ impl LocalProviderManager {
             self.save_metadata(item_id, update).await?;
         }
         Ok(update)
+    }
+
+    /// `ImageProvider.ValidateImages` for a season with no folder of its own:
+    /// `LocalImageProvider` reads its images from its series' folder (the
+    /// `LocationType.Virtual` branch of `Supports`,
+    /// `PopulateSeasonImagesFromSeriesFolder`). What it finds merges onto the
+    /// stored images by `MergeImages`' rule, as the library scan merges a
+    /// season's. `CanRefreshImages` enables every `ILocalImageProvider` before
+    /// the lock and the fetcher checkboxes, so neither gates it. Returns
+    /// whether the images were saved.
+    async fn validate_virtual_season_images(
+        &self,
+        item_id: Uuid,
+        row: &BaseItemEntity,
+    ) -> Result<bool, ServiceError> {
+        use crate::local_images::{
+            FsDirectoryService, ImageItem, LocalImageProvider, local_image_infos,
+            merge_local_images,
+        };
+        if BaseItemKind::from_stored_type_name(&row.type_) != Some(BaseItemKind::Season)
+            || row.path.as_deref().is_some_and(|path| !path.is_empty())
+        {
+            return Ok(false);
+        }
+        let (Some(items), Some(store)) = (&self.items, &self.image_store) else {
+            return Ok(false);
+        };
+        let Some(series_id) = row
+            .series_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            return Ok(false);
+        };
+        let series_folder = items
+            .retrieve_item(series_id)
+            .await?
+            .and_then(|series| series.path)
+            .filter(|path| !path.is_empty());
+        let season = ImageItem {
+            name: row.name.clone().unwrap_or_default(),
+            ..ImageItem::default()
+        }
+        .with_season(row.index_number, series_folder);
+        if !LocalImageProvider::supports(&season) {
+            return Ok(false);
+        }
+        let found = local_image_infos(LocalImageProvider::get_images(
+            &season,
+            &FsDirectoryService::new(),
+        ));
+        if found.is_empty() {
+            return Ok(false);
+        }
+        let Some(mut images) = self.stored_images(item_id).await else {
+            return Ok(false);
+        };
+        if !merge_local_images(&mut images, &found) {
+            return Ok(false);
+        }
+        store.save_item_images(item_id, &images).await?;
+        Ok(true)
     }
 
     /// Remote and dynamic image providers share one ordered acquisition pass.
@@ -3082,7 +3229,7 @@ impl LocalProviderManager {
             let Some(url) = candidate.url else {
                 continue;
             };
-            let download = match crate::image_download::download_artwork(&self.http, &url).await {
+            let download = match crate::image_download::download_artwork(&url).await {
                 Ok(download) => download,
                 Err(crate::ArtworkDownloadFailure::Skip) => continue,
                 Err(crate::ArtworkDownloadFailure::Stop) => {
@@ -4633,6 +4780,87 @@ impl LocalProviderManager {
     }
 }
 
+impl LocalProviderManager {
+    /// `url`'s file in the cache under `root`, downloaded unless it is there
+    /// already. `None` when the URL gave no image, now or within its
+    /// negative-cache entry.
+    async fn remote_image_file(
+        &self,
+        root: &std::path::Path,
+        url: &str,
+    ) -> Result<Option<String>, ServiceError> {
+        let requests = &self.remote_image_requests;
+        let key = ferrofin_common::extensions::get_md5(url);
+        let name = key.simple().to_string();
+        let folder = root.join(&name);
+        if let Some(file) = cached_file(&folder).await {
+            return Ok(Some(file));
+        }
+        if requests.negative.contains(key) {
+            return Ok(None);
+        }
+        let arrived = std::time::Instant::now();
+        let download = requests.downloads.get(&name);
+        let _download = download.lock().await;
+        // The download this one waited for has usually settled it.
+        if let Some(file) = cached_file(&folder).await {
+            return Ok(Some(file));
+        }
+        if requests.negative.contains(key) || requests.failed.inserted_since(key, arrived) {
+            return Ok(None);
+        }
+        let err = match Self::download_remote_image(url, &folder).await {
+            Ok(file) => return Ok(Some(file)),
+            Err(err) => err,
+        };
+        if err.is_answer() {
+            requests.negative.insert(key);
+        } else {
+            requests.failed.insert(key);
+        }
+        match err {
+            ImageFetchError::Storage(err) => Err(ServiceError::backend(format!(
+                "could not cache a remote image in {}: {err}",
+                folder.display()
+            ))),
+            ImageFetchError::TooLarge => {
+                tracing::warn!(
+                    source = %ferrofin_util::source_url::redact_url(url),
+                    "remote image is over image_download_max_mb; not cached"
+                );
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Streams `url` into `folder` and returns the file's path. Nothing is
+    /// created until the response has shown it is an image, and the file gets
+    /// its name only when it is whole, so a reader never sees half of one and
+    /// [`cached_file`] never finds a refused one.
+    async fn download_remote_image(
+        url: &str,
+        folder: &std::path::Path,
+    ) -> Result<String, ImageFetchError> {
+        let image = crate::image_download::open_image(url).await?;
+        let ext = mime_types::to_extension(image.content_type()).unwrap_or(".jpg");
+        let file = folder.join(format!("image{ext}"));
+        let partial = PartialFile(folder.join(format!(".{}.partial", Uuid::new_v4().simple())));
+        tokio::fs::create_dir_all(folder)
+            .await
+            .map_err(ImageFetchError::Storage)?;
+        let mut output = tokio::fs::File::create(&partial.0)
+            .await
+            .map_err(ImageFetchError::Storage)?;
+        image.write_to(&mut output).await?;
+        drop(output);
+        tokio::fs::rename(&partial.0, &file)
+            .await
+            .map_err(ImageFetchError::Storage)?;
+        Ok(file.to_string_lossy().into_owned())
+    }
+}
+
 #[async_trait]
 impl ProviderManager for LocalProviderManager {
     async fn queue_refresh(
@@ -4702,18 +4930,34 @@ impl ProviderManager for LocalProviderManager {
         if self.image_store.is_none() {
             return Err(Self::unwired("save_image_from_url"));
         }
-        let (bytes, mime) = crate::image_download::download_image(&self.http, url)
-            .await
-            .ok_or_else(|| {
-                ServiceError::backend(format!("could not download remote image {url}"))
-            })?;
+        // `_imageSaveLock`, shared with the requests that cache a remote image.
+        let download = self.remote_image_requests.downloads.get(
+            &ferrofin_common::extensions::get_md5(url)
+                .simple()
+                .to_string(),
+        );
+        let _download = download.lock().await;
         // `if (!contentType.StartsWith("image/")) throw` — C#
         // `ProviderManager.SaveImage`. Without this ANY URL becomes artwork:
         // pointing the endpoint at a JSON endpoint stored the document as the
         // item's image and served it back as `image/jpeg`.
-        if let Some(reason) = crate::image_download::non_image_reason(&mime) {
-            return Err(ServiceError::backend(reason));
-        }
+        let (bytes, mime) = crate::image_download::download_image(url)
+            .await
+            .map_err(|err| match err {
+                ImageFetchError::NotAnImage(reason) => ServiceError::backend(reason),
+                ImageFetchError::TooLarge => {
+                    ServiceError::backend("remote image is over the image_download_max_mb limit")
+                }
+                ImageFetchError::Refused => ServiceError::backend(format!(
+                    "remote image {} is at a private address, which image downloads may not \
+                     reach unless image_private_http_allow lists it",
+                    ferrofin_util::source_url::redact_url(url)
+                )),
+                _ => ServiceError::backend(format!(
+                    "could not download remote image {}",
+                    ferrofin_util::source_url::redact_url(url)
+                )),
+            })?;
         // Reuse the local write+persist path. The mime is the RESOLVED one, so
         // `save_image` picks the right extension and the image handler serves
         // the right `Content-Type` — the URL suffix is not consulted.
@@ -4727,43 +4971,11 @@ impl ProviderManager for LocalProviderManager {
         };
         let root = root.resolve();
         for url in path.split('|') {
-            let folder = root.join(
-                ferrofin_common::extensions::get_md5(url)
-                    .simple()
-                    .to_string(),
-            );
-            if let Some(file) = cached_file(&folder).await {
-                return Ok(file);
-            }
             // Upstream moves on to the next URL only on a 404 or 403 and
             // throws on anything else; any failed URL moves on here.
-            let Some((bytes, mime)) = crate::image_download::download_image(&self.http, url).await
-            else {
-                continue;
-            };
-            if crate::image_download::non_image_reason(&mime).is_some() {
-                continue;
+            if let Some(file) = self.remote_image_file(&root, url).await? {
+                return Ok(file);
             }
-            let ext = mime_types::to_extension(&mime).unwrap_or(".jpg");
-            let file = folder.join(format!("image{ext}"));
-            // Written beside, then renamed: two requests for one URL each
-            // write their own temporary file, and the reader never sees half
-            // a file.
-            let partial = folder.join(format!(".{}.partial", Uuid::new_v4().simple()));
-            let written = async {
-                tokio::fs::create_dir_all(&folder).await?;
-                tokio::fs::write(&partial, &bytes).await?;
-                tokio::fs::rename(&partial, &file).await
-            }
-            .await;
-            if let Err(err) = written {
-                let _ = tokio::fs::remove_file(&partial).await;
-                return Err(ServiceError::backend(format!(
-                    "could not cache a remote image in {}: {err}",
-                    folder.display()
-                )));
-            }
-            return Ok(file.to_string_lossy().into_owned());
         }
         Err(ServiceError::backend(
             "no URL of the remote image could be downloaded as an image",
@@ -5170,6 +5382,7 @@ impl ProviderManager for LocalProviderManager {
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::{
         LocalProviderManager, RemoteImageInfo, RemoteSearchProvider, language_rank,
@@ -7250,6 +7463,8 @@ mod tests {
         copied: std::sync::Mutex<Vec<(Vec<Uuid>, bool, bool)>>,
         /// Each refresh `copy_owner_metadata_to_extras` was asked for.
         extras_copied: std::sync::Mutex<Vec<OwnerExtrasRefresh>>,
+        /// Refuses every `save_item_images`, as a store that cannot write.
+        fail_image_saves: bool,
     }
 
     #[async_trait]
@@ -7259,6 +7474,9 @@ mod tests {
             item_id: Uuid,
             images: &[ItemImageInfo],
         ) -> Result<(), ServiceError> {
+            if self.fail_image_saves {
+                return Err(ServiceError::backend("the image store refuses writes"));
+            }
             let mut stored = self.images.lock().unwrap();
             stored.retain(|(id, _)| *id != item_id);
             stored.extend(images.iter().cloned().map(|image| (item_id, image)));
@@ -7780,6 +7998,37 @@ mod tests {
         assert_eq!(saved[0].name.as_deref(), Some("The Matrix Collection"));
         // The sort key is settled the way the scan settles it.
         assert_eq!(saved[0].sort_name.as_deref(), Some("matrix collection"));
+    }
+
+    /// `TmdbBoxSetProvider.GetMetadata` (`TmdbBoxSetProvider.cs:102-109`): a box
+    /// set with no Tmdb id searches by `ParseName`, then `TmdbUtils.CleanName`,
+    /// and the hit fills the box set. A name holding two years keeps the first:
+    /// `CleanDateTimes` is greedy, so only the last year comes out of it.
+    #[rstest::rstest]
+    #[case::year_suffix("Harry Potter (2001)", "Harry Potter")]
+    #[case::year_range("Harry Potter (2001-2011)", "Harry Potter 2001")]
+    #[case::release_tag("Alien 4K", "Alien")]
+    #[case::punctuation("Star Wars: Saga", "Star Wars Saga")]
+    #[case::plain("Matrix", "Matrix")]
+    #[tokio::test]
+    async fn a_box_set_with_no_id_searches_by_its_parsed_and_cleaned_name(
+        #[case] name: &str,
+        #[case] query: &str,
+    ) {
+        let (server, tmdb) = tmdb_with_decoy_search().await;
+        let store = Arc::new(RecordingStore::default());
+        let (item_id, mgr) = box_set_manager(row("Movies.BoxSet", name), tmdb, Arc::clone(&store));
+
+        mgr.refresh_full_item(item_id, &full_metadata_refresh())
+            .await
+            .expect("refresh");
+
+        assert_eq!(
+            server.query_values("/search/collection", "query"),
+            vec![query.to_owned()]
+        );
+        let saved = store.saved.lock().expect("lock");
+        assert_eq!(saved[0].overview.as_deref(), Some("Decoy."));
     }
 
     /// A refresh re-derives the by-name index from the row it just wrote.
@@ -9481,6 +9730,369 @@ mod tests {
     }
     // ── the artwork writer believes the RESPONSE, not the URL ───────────────
 
+    /// Enough of a PNG for the content check.
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    /// A manager caching remote images in `dir`, with a negative cache of `ttl`.
+    fn remote_image_manager(dir: &tempfile::TempDir, ttl: Duration) -> LocalProviderManager {
+        LocalProviderManager::default().with_remote_image_cache(dir.path().to_path_buf(), ttl)
+    }
+
+    /// `count` requests for `url` in flight together, and their answers.
+    async fn ask_at_once(
+        mgr: &LocalProviderManager,
+        url: &str,
+        count: usize,
+    ) -> Vec<Result<String, ServiceError>> {
+        let requests: Vec<_> = (0..count)
+            .map(|_| {
+                let (mgr, url) = (mgr.clone(), url.to_owned());
+                tokio::spawn(async move { mgr.cached_remote_image(&url).await })
+            })
+            .collect();
+        let mut answers = Vec::new();
+        for request in requests {
+            answers.push(request.await.expect("request"));
+        }
+        answers
+    }
+
+    /// What `dir`, a remote image cache, holds below its URL folders.
+    fn cached_files(dir: &tempfile::TempDir) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir.path())
+            .expect("cache")
+            .flat_map(|folder| std::fs::read_dir(folder.expect("folder").path()).expect("folder"))
+            .map(|file| file.expect("file").path())
+            .collect()
+    }
+
+    /// That `dir`, a remote image cache, holds nothing, not even a folder.
+    fn assert_cache_is_empty(dir: &tempfile::TempDir) {
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("cache")
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        assert_eq!(left, Vec::<std::path::PathBuf>::new());
+    }
+
+    /// `ProviderManager._imageSaveLock`: one image asked for any number of
+    /// times at once is one request to its source, and everyone gets the same
+    /// file.
+    #[tokio::test]
+    async fn one_url_is_downloaded_once_however_many_ask_at_once() {
+        use crate::mock_http::MockServer;
+        let server =
+            MockServer::start_raw(vec![MockServer::raw_ok("Content-Type: image/png\r\n", PNG)])
+                .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = remote_image_manager(&dir, Duration::from_hours(1));
+        let url = format!("{}/logo.png", server.base_url);
+
+        let answers: Vec<String> = ask_at_once(&mgr, &url, 8)
+            .await
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .expect("cached");
+
+        assert_eq!(server.requests(), 1);
+        assert!(answers.iter().all(|answer| *answer == answers[0]));
+        assert_eq!(std::fs::read(&answers[0]).expect("file"), PNG);
+    }
+
+    /// The same when the answer is no image: the requests that waited find the
+    /// refusal instead of asking again.
+    #[tokio::test]
+    async fn waiters_share_a_refusal() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start_raw(vec![MockServer::raw_status("404 Not Found")]).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = remote_image_manager(&dir, Duration::from_hours(1));
+        let url = format!("{}/logo.png", server.base_url);
+
+        let answers = ask_at_once(&mgr, &url, 8).await;
+        assert!(answers.iter().all(Result::is_err));
+        assert_eq!(server.requests(), 1);
+    }
+
+    /// A failure says nothing about the image, so it is not remembered, but
+    /// those already waiting share it instead of each taking a turn at the
+    /// timeout of a source that has stopped responding. The next one tries.
+    #[tokio::test]
+    async fn waiters_share_a_failure_and_the_next_request_tries_again() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start_raw(vec![
+            MockServer::raw_status("401 Unauthorized"),
+            MockServer::raw_ok("Content-Type: image/png\r\n", PNG),
+        ])
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = remote_image_manager(&dir, Duration::from_hours(1));
+        let url = format!("{}/logo.png", server.base_url);
+
+        let answers = ask_at_once(&mgr, &url, 8).await;
+        assert!(answers.iter().all(Result::is_err));
+        assert_eq!(server.requests(), 1);
+
+        let cached = mgr.cached_remote_image(&url).await.expect("the image");
+        assert_eq!(std::fs::read(&cached).expect("file"), PNG);
+        assert_eq!(server.requests(), 2);
+    }
+
+    /// `_imageSaveLock` is one lock: saving a URL to an item and caching the
+    /// same URL for an image request take turns.
+    #[tokio::test]
+    async fn saving_a_url_shares_the_lock_of_the_image_requests() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start_stalled(MockServer::raw_ok(
+            "Content-Type: image/png\r\nContent-Length: 1000\r\n",
+            PNG,
+        ))
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = remote_image_manager(&dir, Duration::from_hours(1)).with_image_store(
+            Arc::new(RecordingStore::default()),
+            dir.path().to_path_buf(),
+        );
+        let url = format!("{}/logo.png", server.base_url);
+
+        let save = tokio::spawn({
+            let (mgr, url) = (mgr.clone(), url.clone());
+            async move {
+                mgr.save_image_from_url(Uuid::new_v4(), &url, ImageType::Logo, None)
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while server.requests() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the save started");
+        let image_request = tokio::spawn({
+            let (mgr, url) = (mgr.clone(), url.clone());
+            async move { mgr.cached_remote_image(&url).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(server.requests(), 1, "the image request waited its turn");
+        assert!(!image_request.is_finished());
+        save.abort();
+        image_request.abort();
+    }
+
+    /// Each kind of answer that holds no image costs one request per lifetime
+    /// of its entry, and leaves nothing in the cache.
+    #[rstest::rstest]
+    #[case::not_found(crate::mock_http::MockServer::raw_status("404 Not Found"))]
+    #[case::forbidden(crate::mock_http::MockServer::raw_status("403 Forbidden"))]
+    #[case::a_page(crate::mock_http::MockServer::raw_ok(
+        "Content-Type: text/html\r\n",
+        b"<html></html>",
+    ))]
+    #[case::a_page_declared_an_image(crate::mock_http::MockServer::raw_ok(
+        "Content-Type: image/png\r\n",
+        b"<html></html>",
+    ))]
+    #[case::over_the_limit(crate::mock_http::MockServer::raw_ok(
+        "Content-Type: image/png\r\nContent-Length: 999999999999\r\n",
+        b"",
+    ))]
+    #[tokio::test]
+    async fn a_url_that_gave_no_image_is_left_alone_until_its_entry_expires(
+        #[case] answer: Vec<u8>,
+    ) {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start_raw(vec![answer]).await;
+        let url = format!("{}/logo.png", server.base_url);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = remote_image_manager(&dir, Duration::from_hours(1));
+        for _ in 0..3 {
+            assert!(mgr.cached_remote_image(&url).await.is_err());
+        }
+        assert_eq!(server.requests(), 1);
+        assert_cache_is_empty(&dir);
+
+        let mgr = remote_image_manager(&dir, Duration::ZERO);
+        assert!(mgr.cached_remote_image(&url).await.is_err());
+        assert!(mgr.cached_remote_image(&url).await.is_err());
+        assert_eq!(server.requests(), 3, "an expired entry asks again");
+    }
+
+    /// A blip must not hide a good image for the cache's lifetime: only an
+    /// answer about the image is remembered.
+    #[rstest::rstest]
+    #[case::another_status(crate::mock_http::MockServer::raw_status("401 Unauthorized"))]
+    #[case::a_body_cut_off(crate::mock_http::MockServer::raw_ok(
+        "Content-Type: image/png\r\nContent-Length: 9000\r\n",
+        PNG,
+    ))]
+    #[tokio::test]
+    async fn a_failure_that_says_nothing_about_the_image_is_tried_again(#[case] first: Vec<u8>) {
+        use crate::mock_http::MockServer;
+        let good = MockServer::raw_ok("Content-Type: image/png\r\n", PNG);
+        let server = MockServer::start_raw(vec![first, good]).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = remote_image_manager(&dir, Duration::from_hours(1));
+        let url = format!("{}/logo.png", server.base_url);
+
+        assert!(mgr.cached_remote_image(&url).await.is_err());
+        assert_cache_is_empty(&dir);
+        let cached = mgr.cached_remote_image(&url).await.expect("the image");
+        assert_eq!(std::fs::read(&cached).expect("file"), PNG);
+        assert_eq!(server.requests(), 2);
+    }
+
+    /// A provider cooldown refuses the request before it is sent, so it says
+    /// nothing about the URL.
+    #[tokio::test]
+    async fn a_cooldown_is_not_remembered() {
+        use crate::mock_http::MockServer;
+        let quota = "Content-Type: image/png\r\nX-RateLimit-Remaining: 0\r\n\
+                     X-RateLimit-Reset-In: 120\r\n";
+        let server = MockServer::start_raw(vec![MockServer::raw_ok(quota, PNG)]).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = remote_image_manager(&dir, Duration::from_hours(1));
+
+        let first = format!("{}/first.png", server.base_url);
+        mgr.cached_remote_image(&first).await.expect("cached");
+        let second = format!("{}/second.png", server.base_url);
+        assert!(mgr.cached_remote_image(&second).await.is_err());
+        assert_eq!(server.requests(), 1);
+        let key = ferrofin_common::extensions::get_md5(&second);
+        assert!(!mgr.remote_image_requests.negative.contains(key));
+    }
+
+    /// A refused URL moves on to the next one in the row, each request.
+    #[tokio::test]
+    async fn the_next_url_answers_for_a_refused_one() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start_typed(vec![
+            ("/page", "text/html", b"<html/>".to_vec()),
+            ("/logo.png", "image/png", PNG.to_vec()),
+        ])
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = remote_image_manager(&dir, Duration::from_hours(1));
+        let path = format!("{0}/page|{0}/logo.png", server.base_url);
+        for _ in 0..2 {
+            let cached = mgr.cached_remote_image(&path).await.expect("the second");
+            assert_eq!(std::fs::read(&cached).expect("file"), PNG);
+        }
+    }
+
+    /// A body that goes past the limit part way stops there and leaves no
+    /// partial file, with the URL remembered like any other refusal.
+    #[tokio::test]
+    async fn a_body_past_the_limit_is_stopped_and_leaves_nothing() {
+        use crate::mock_http::MockServer;
+        let limit = crate::rate_limit::request_limits().download_max_bytes;
+        let mut body = vec![0_u8; usize::try_from(limit).expect("limit") + 1];
+        body[..PNG.len()].copy_from_slice(PNG);
+        let server = MockServer::start_raw(vec![MockServer::raw_ok(
+            "Content-Type: image/png\r\n",
+            &body,
+        )])
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = remote_image_manager(&dir, Duration::from_hours(1));
+        let url = format!("{}/logo.png", server.base_url);
+
+        assert!(mgr.cached_remote_image(&url).await.is_err());
+        assert_cache_is_empty(&dir);
+        assert!(mgr.cached_remote_image(&url).await.is_err());
+        assert_eq!(server.requests(), 1);
+    }
+
+    /// A client that disconnects cancels the download with its request. Its
+    /// partial file goes with it, and the next request starts over.
+    #[tokio::test]
+    async fn a_cancelled_download_leaves_nothing() {
+        use crate::mock_http::MockServer;
+        let mut body = vec![0_u8; 64 * 1024];
+        body[..PNG.len()].copy_from_slice(PNG);
+        let server = MockServer::start_stalled(MockServer::raw_ok(
+            "Content-Type: image/png\r\nContent-Length: 1000000\r\n",
+            &body,
+        ))
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = remote_image_manager(&dir, Duration::from_hours(1));
+        let url = format!("{}/logo.png", server.base_url);
+
+        let download = tokio::spawn({
+            let (mgr, url) = (mgr.clone(), url.clone());
+            async move { mgr.cached_remote_image(&url).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while cached_files(&dir).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the download started");
+
+        download.abort();
+        assert!(download.await.is_err_and(|err| err.is_cancelled()));
+        assert_cache_is_empty(&dir);
+    }
+
+    /// `POST /Items/{id}/RemoteImages/Download` goes through the same limit
+    /// and content check, and says why.
+    #[tokio::test]
+    async fn saving_a_url_refuses_what_the_cache_would() {
+        use crate::mock_http::MockServer;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let item_id = Uuid::new_v4();
+        let mgr = LocalProviderManager::default().with_image_store(
+            Arc::new(RecordingStore::default()),
+            dir.path().to_path_buf(),
+        );
+        let over_limit = MockServer::start_raw(vec![MockServer::raw_ok(
+            "Content-Type: image/png\r\nContent-Length: 999999999999\r\n",
+            b"",
+        )])
+        .await;
+        let err = mgr
+            .save_image_from_url(item_id, &over_limit.base_url, ImageType::Logo, None)
+            .await
+            .expect_err("over the limit");
+        assert!(err.to_string().contains("image_download_max_mb"), "{err}");
+
+        let mislabelled = MockServer::start_raw(vec![MockServer::raw_ok(
+            "Content-Type: image/png\r\n",
+            b"<html></html>",
+        )])
+        .await;
+        let err = mgr
+            .save_image_from_url(item_id, &mislabelled.base_url, ImageType::Logo, None)
+            .await
+            .expect_err("not an image");
+        assert!(err.to_string().contains("not an image"), "{err}");
+
+        // A private address no setting allows (gl-1096): the admin is told
+        // which setting would.
+        let err = mgr
+            .save_image_from_url(
+                item_id,
+                "http://10.255.255.1/logo.png",
+                ImageType::Logo,
+                None,
+            )
+            .await
+            .expect_err("refused");
+        assert!(
+            err.to_string().contains("image_private_http_allow"),
+            "{err}"
+        );
+        assert!(
+            !dir.path()
+                .join(ferrofin_db::store::guid_to_db(item_id))
+                .exists()
+        );
+    }
+
     /// The download half of `LibraryManager.ConvertImageToLocal`: each
     /// `|`-separated URL in turn, the first image kept in a cache folder named
     /// by its URL and served from there afterwards; the row is left alone.
@@ -9488,13 +10100,14 @@ mod tests {
     async fn a_remote_image_is_cached_once_by_its_url() {
         use crate::mock_http::MockServer;
         let server = MockServer::start_typed(vec![
-            ("/logo.png", "image/png", b"png".to_vec()),
+            ("/logo.png", "image/png", PNG.to_vec()),
             ("/page", "text/html", b"<html/>".to_vec()),
         ])
         .await;
         let base = server.base_url.clone();
         let dir = tempfile::tempdir().expect("tempdir");
-        let mgr = LocalProviderManager::default().with_remote_image_cache(dir.path().to_path_buf());
+        let mgr = LocalProviderManager::default()
+            .with_remote_image_cache(dir.path().to_path_buf(), std::time::Duration::from_hours(1));
 
         // The first URL is missing (404), so the second one is kept.
         let logo = format!("{base}/logo.png");
@@ -9506,7 +10119,7 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(std::path::Path::new(&cached), folder.join("image.png"));
-        assert_eq!(std::fs::read(&cached).expect("file"), b"png");
+        assert_eq!(std::fs::read(&cached).expect("file"), PNG);
 
         // Served from the cache once the remote is gone.
         drop(server);
@@ -9594,6 +10207,50 @@ mod tests {
             "a refused download writes no artwork"
         );
     }
+
+    /// The error is logged at the handler boundary, and an image URL can carry
+    /// an account or a token (Schedules Direct's `?token=`).
+    #[tokio::test]
+    async fn a_failed_image_download_names_only_the_host() {
+        crate::destination::test_support::allow_loopback_images();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = LocalProviderManager::default().with_image_store(
+            Arc::new(RecordingStore::default()),
+            dir.path().to_path_buf(),
+        );
+
+        let err = mgr
+            .save_image_from_url(
+                Uuid::new_v4(),
+                "http://acct-user:info-secret@127.0.0.1:0/path-secret/1.jpg?token=query-secret",
+                ImageType::Primary,
+                None,
+            )
+            .await
+            .expect_err("nothing listens there");
+
+        assert_eq!(
+            err.to_string(),
+            "backend error: could not download remote image http://127.0.0.1:0"
+        );
+
+        // A refused one names only the host too.
+        let err = mgr
+            .save_image_from_url(
+                Uuid::new_v4(),
+                "http://acct-user:info-secret@10.255.255.1/path-secret/1.jpg?token=query-secret",
+                ImageType::Primary,
+                None,
+            )
+            .await
+            .expect_err("a private address");
+        assert_eq!(
+            err.to_string(),
+            "backend error: remote image http://10.255.255.1 is at a private address, which \
+             image downloads may not reach unless image_private_http_allow lists it"
+        );
+    }
+
     #[rstest::rstest]
     #[case::first(ImageType::Backdrop, 0, &[], Some(0))]
     #[case::count_collision(ImageType::Backdrop, 1, &["backdrop1.png"], Some(2))]
@@ -11068,6 +11725,224 @@ mod tests {
         assert!(season.people.written.lock().expect("lock").is_empty());
     }
 
+    /// A season with no folder of its own, under a series whose folder holds
+    /// `season01-poster.jpg`, `season01-fanart.jpg`, another season's poster
+    /// and the series' own poster, stored with a downloaded Primary, in a
+    /// library saved with `options`; refreshed before, so a Default refresh
+    /// runs no remote provider, and with its sort key settled, so a refresh
+    /// changes nothing but its images.
+    struct SeriesArtSeason {
+        show: tempfile::TempDir,
+        season_id: Uuid,
+        /// The season's stored `DateLastRefreshed`.
+        refreshed: chrono::DateTime<chrono::Utc>,
+        store: Arc<RecordingStore>,
+        mgr: LocalProviderManager,
+    }
+
+    impl SeriesArtSeason {
+        fn new(options: ferrofin_model::configuration::LibraryOptions) -> Self {
+            Self::with_store(options, RecordingStore::default())
+        }
+
+        fn with_store(
+            options: ferrofin_model::configuration::LibraryOptions,
+            store: RecordingStore,
+        ) -> Self {
+            let show = tempfile::tempdir().expect("tmp");
+            for file in [
+                "season01-poster.jpg",
+                "season01-fanart.jpg",
+                "season02-poster.jpg",
+                "poster.jpg",
+            ] {
+                std::fs::write(show.path().join(file), b"jpeg").expect("art");
+            }
+            let library_id = Uuid::new_v4();
+            let series_id = Uuid::new_v4();
+            let mut series = row("TV.Series", "Show");
+            series.id = series_id.to_string();
+            series.path = Some(show.path().to_string_lossy().into_owned());
+            let season_id = Uuid::new_v4();
+            let mut season = row("TV.Season", "Season 1");
+            season.id = season_id.to_string();
+            season.series_id = Some(series_id.to_string());
+            season.top_parent_id = Some(library_id.to_string());
+            season.index_number = Some(1);
+            let refreshed = chrono::Utc::now() - chrono::Duration::days(1);
+            season.date_last_refreshed = Some(refreshed);
+            crate::metadata_merge::settle_sort_name(&mut season);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let items = Arc::new(FakeItems {
+                rows: HashMap::from([(series_id, series), (season_id, season)]),
+                seen: tx,
+            });
+            let store = Arc::new(store);
+            store.images.lock().expect("lock").push((
+                season_id,
+                ItemImageInfo {
+                    path: "/metadata/library/ab/primary.jpg".to_owned(),
+                    image_type: ImageType::Primary,
+                    ..ItemImageInfo::default()
+                },
+            ));
+            let mgr = LocalProviderManager::default()
+                .with_remote_images(
+                    Arc::new(crate::tmdb::TmdbClient::new().with_base_url("http://127.0.0.1:9")),
+                    items,
+                )
+                .with_image_store(Arc::clone(&store) as Arc<_>, std::env::temp_dir())
+                .with_virtual_folders(Arc::new(FakeLibraries {
+                    item_id: library_id,
+                    options,
+                }));
+            Self {
+                show,
+                season_id,
+                refreshed,
+                store,
+                mgr,
+            }
+        }
+
+        /// The path of `file` in the series folder.
+        fn art(&self, file: &str) -> String {
+            self.show.path().join(file).to_string_lossy().into_owned()
+        }
+
+        /// The season's stored images.
+        fn images(&self) -> Vec<(String, ImageType)> {
+            self.store
+                .images
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(id, _)| *id == self.season_id)
+                .map(|(_, image)| (image.path.clone(), image.image_type))
+                .collect()
+        }
+    }
+
+    /// A season with no folder of its own takes its series folder's
+    /// `season01-*` files on a refresh through this route, with no remote
+    /// provider running: `ValidateImages` runs the local image providers
+    /// first, and `LocalImageProvider` supports a virtual season whose series
+    /// is on the file system. The downloaded Primary gives way to the local
+    /// poster (`MergeImages`); another season's files and the series' own
+    /// poster are not the season's. A second refresh finds nothing new.
+    #[tokio::test]
+    async fn a_virtual_seasons_refresh_takes_its_series_folder_artwork() {
+        let season = SeriesArtSeason::new(ferrofin_model::configuration::LibraryOptions::default());
+        let update = season
+            .mgr
+            .refresh_single_item(season.season_id, &Opts::default())
+            .await
+            .expect("refresh");
+        assert_eq!(update, ItemUpdateType::ImageUpdate);
+        assert_eq!(
+            season.images(),
+            [
+                (season.art("season01-poster.jpg"), ImageType::Primary),
+                (season.art("season01-fanart.jpg"), ImageType::Backdrop),
+            ]
+        );
+        assert_eq!(
+            season.store.saved.lock().expect("lock").len(),
+            1,
+            "the item is saved"
+        );
+
+        let update = season
+            .mgr
+            .refresh_single_item(season.season_id, &Opts::default())
+            .await
+            .expect("second refresh");
+        assert_eq!(update, ItemUpdateType::None);
+        assert_eq!(season.store.saved.lock().expect("lock").len(), 1);
+    }
+
+    /// A local image validation that fails (here the image store refuses the
+    /// write) does not fail the refresh: upstream logs it and goes on
+    /// without the remote image providers, and the item is saved unstamped
+    /// (`localImagesFailed`, `MetadataService.cs:127-143,195-198`). The same
+    /// forced save with a store that writes stamps the refresh.
+    #[rstest::rstest]
+    #[case::store_refuses_writes(true)]
+    #[case::store_writes(false)]
+    #[tokio::test]
+    async fn a_failed_local_image_validation_leaves_the_refresh_unstamped(
+        #[case] fail_image_saves: bool,
+    ) {
+        let season = SeriesArtSeason::with_store(
+            ferrofin_model::configuration::LibraryOptions::default(),
+            RecordingStore {
+                fail_image_saves,
+                ..RecordingStore::default()
+            },
+        );
+        let stored = season.images();
+        let forced = Opts {
+            force_save: true,
+            ..Opts::default()
+        };
+        season
+            .mgr
+            .refresh_single_item(season.season_id, &forced)
+            .await
+            .expect("the refresh goes on");
+        let saved = season
+            .store
+            .saved
+            .lock()
+            .expect("lock")
+            .last()
+            .cloned()
+            .expect("a forced save");
+        if fail_image_saves {
+            assert_eq!(season.images(), stored);
+            assert_eq!(saved.date_last_refreshed, Some(season.refreshed));
+        } else {
+            assert_ne!(season.images(), stored);
+            assert!(saved.date_last_refreshed > Some(season.refreshed));
+        }
+    }
+
+    /// "Replace existing images" in a library that saves artwork into its
+    /// media folders registers no local file: upstream only validates the
+    /// stored images then (`IsSaveLocalMetadataEnabled() &&
+    /// ReplaceAllImages`, `MetadataService.cs:121-125`). The same refresh in a
+    /// library that does not save artwork beside the media registers them.
+    #[rstest::rstest]
+    #[case::saves_artwork_beside_the_media(true, false)]
+    #[case::keeps_artwork_in_the_metadata_folder(false, true)]
+    #[tokio::test]
+    async fn replacing_all_images_registers_local_files_unless_the_library_saves_them(
+        #[case] save_local_metadata: bool,
+        #[case] registered: bool,
+    ) {
+        let season = SeriesArtSeason::new(ferrofin_model::configuration::LibraryOptions {
+            save_local_metadata,
+            ..Default::default()
+        });
+        let replace_images = Opts {
+            image_refresh_mode: Mode::FullRefresh,
+            replace_all_images: true,
+            ..Opts::default()
+        };
+        season
+            .mgr
+            .refresh_single_item(season.season_id, &replace_images)
+            .await
+            .expect("refresh");
+        let poster = (season.art("season01-poster.jpg"), ImageType::Primary);
+        assert_eq!(
+            season.images().contains(&poster),
+            registered,
+            "{:?}",
+            season.images()
+        );
+    }
+
     /// Both season providers failing under "Replace all metadata" (which
     /// re-adds no stored value, `RemoveOldMetadata`): nothing answered, so
     /// nothing is erased (`Failures > 0 && !hasRemoteMetadata`,
@@ -11729,8 +12604,8 @@ mod tests {
     ) {
         use ferrofin_model::configuration::{LibraryOptions, TypeOptions};
         let images = crate::mock_http::MockServer::start_typed(vec![
-            ("/fanart.jpg", "image/jpeg", b"fanart".to_vec()),
-            ("/tmdb.jpg", "image/jpeg", b"tmdb".to_vec()),
+            ("/fanart.jpg", "image/jpeg", b"GIF89afanart".to_vec()),
+            ("/tmdb.jpg", "image/jpeg", b"GIF89atmdb".to_vec()),
         ])
         .await;
         let origin = images.base_url.clone();
@@ -11805,9 +12680,9 @@ mod tests {
                 assert_eq!(
                     std::fs::read(&written[0].1.path).unwrap(),
                     if expected == "plugin" {
-                        b"\x89PNG\r\n\x1a\nplugin".as_slice()
+                        b"\x89PNG\r\n\x1a\nplugin".to_vec()
                     } else {
-                        expected.as_bytes()
+                        format!("GIF89a{expected}").into_bytes()
                     }
                 );
             }
@@ -11834,10 +12709,10 @@ mod tests {
     ) {
         use ferrofin_model::configuration::{ImageOption, LibraryOptions, TypeOptions};
         let images = crate::mock_http::MockServer::start_typed(vec![
-            ("/first.png", "image/png", b"first".to_vec()),
-            ("/second.png", "image/png", b"second".to_vec()),
-            ("/too-small.png", "image/png", b"small".to_vec()),
-            ("/poster.png", "image/png", b"poster".to_vec()),
+            ("/first.png", "image/png", b"GIF89afirst".to_vec()),
+            ("/second.png", "image/png", b"GIF89asecond".to_vec()),
+            ("/too-small.png", "image/png", b"GIF89asmall".to_vec()),
+            ("/poster.png", "image/png", b"GIF89aposter".to_vec()),
         ])
         .await;
         let server = crate::mock_http::MockServer::start(vec![(
@@ -11923,7 +12798,7 @@ mod tests {
                 .iter()
                 .map(|(_, image)| std::fs::read(&image.path).unwrap())
                 .collect();
-            assert_eq!(bytes, [b"first".to_vec(), b"second".to_vec()]);
+            assert_eq!(bytes, [b"GIF89afirst".to_vec(), b"GIF89asecond".to_vec()]);
             assert!(
                 !mgr.refresh_ordered_images(item_id, &movie, &ids, super::ImageFetch::MissingOnly)
                     .await

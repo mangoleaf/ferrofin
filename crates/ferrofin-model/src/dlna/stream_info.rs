@@ -5,6 +5,7 @@
 //! streaming URL and the per-subtitle [`SubtitleStreamInfo`] list.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -79,7 +80,7 @@ pub struct StreamInfo {
     /// The maximum framerate.
     pub max_framerate: Option<f32>,
     /// The device profile.
-    pub device_profile: DeviceProfile,
+    pub device_profile: Arc<DeviceProfile>,
     /// The device profile id.
     pub device_profile_id: Option<String>,
     /// The device id.
@@ -113,7 +114,7 @@ pub struct StreamInfo {
 impl StreamInfo {
     /// Creates a new `StreamInfo` bound to the given device profile.
     #[must_use]
-    pub fn new(device_profile: DeviceProfile) -> Self {
+    pub fn new(device_profile: impl Into<Arc<DeviceProfile>>) -> Self {
         Self {
             item_id: Uuid::nil(),
             play_method: PlayMethod::Transcode,
@@ -141,7 +142,7 @@ impl StreamInfo {
             max_width: None,
             max_height: None,
             max_framerate: None,
-            device_profile,
+            device_profile: device_profile.into(),
             device_profile_id: None,
             device_id: None,
             run_time_ticks: None,

@@ -592,6 +592,14 @@ kind = "value"
 issue = 220
 reason = "The bundled ListenBrainz plugin and its two settings pages are missing, so the pages shift."
 
+# Ferrofin's own plugin lists its settings page, the one in the dashboard menu, after the in-tree ones.
+[[entry]]
+request = "GetConfigurationPages"
+path = "[].EnableInMainMenu"
+kind = "value"
+issue = 540
+reason = "Ferrofin's own plugin lists its settings page, the one in the dashboard menu, after the in-tree ones."
+
 # The HLS ffmpeg arguments lack upstream's -map_metadata -1 -map_chapters -1 and -max_delay 5000000.
 [[entry]]
 request = "GetHlsAudioSegment"

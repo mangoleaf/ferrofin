@@ -108,10 +108,7 @@ impl SimilarItemsRepository {
         }
         let mut out = Vec::new();
         for chunk in values.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let placeholders = (2..=chunk.len() + 1)
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = ferrofin_db::numbered_placeholders(2..=chunk.len() + 1);
             let sql = format!(
                 // COLLATE binds to the whole comparison, so it must sit on the
                 // *operand* to apply to each `IN` element — `IN (…) COLLATE

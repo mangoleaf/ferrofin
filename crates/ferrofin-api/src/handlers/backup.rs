@@ -539,9 +539,9 @@ fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
         if path.is_dir() {
             add_dir_to_zip(zip, &path, &zip_path, options)?;
         } else {
-            let bytes = std::fs::read(&path).map_err(|e| at(&path, e))?;
+            let mut file = std::fs::File::open(&path).map_err(|e| at(&path, e))?;
             zip.start_file(zip_path, options)?;
-            zip.write_all(&bytes)?;
+            std::io::copy(&mut file, zip).map_err(|e| at(&path, e))?;
         }
     }
     Ok(())
@@ -1163,6 +1163,33 @@ mod tests {
             .finish()
             .unwrap();
         assert!(read_manifest(&bare).unwrap().is_none());
+    }
+
+    /// A file reaches the archive whole, whatever its size against the copy's
+    /// buffer, and an empty one stays an entry.
+    #[test]
+    fn archived_files_keep_every_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let large: Vec<u8> = (0..1_000_003_u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(src.join("large.bin"), &large).unwrap();
+        std::fs::write(src.join("empty.bin"), b"").unwrap();
+
+        let archive = tmp.path().join("backup.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        add_dir_to_zip(&mut zip, &src, "config", opts).unwrap();
+        zip.finish().unwrap();
+
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&archive).unwrap()).unwrap();
+        let mut read = |name: &str| {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut zip.by_name(name).unwrap(), &mut bytes).unwrap();
+            bytes
+        };
+        assert_eq!(read("config/large.bin"), large);
+        assert_eq!(read("config/empty.bin"), Vec::<u8>::new());
     }
 
     /// A restore that fails after extraction began leaves the trees partly

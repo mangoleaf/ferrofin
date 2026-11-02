@@ -8,7 +8,6 @@
 #   test    — fmt / clippy / unit tests, plus the per-crate 80% coverage gate.
 #   tag     — create-release (manual, main): cuts the release tag, gated on test.
 #   build   — the server container image, built rootless with kaniko (tags only).
-#   release — a GitLab Release object with git-cliff-generated notes.
 #   chart   — the official Helm chart, pushed as an OCI artifact.
 #
 # The git tag is the single source of truth for the version. CI never edits
@@ -19,7 +18,7 @@
 # pushes a TAG on the commit it ran on (it does NOT commit to main). No hand-made tags.
 #
 # Tag scheme (see RELEASE.md):
-#   vX.Y.Z        → image :X.Y.Z + :latest, GitLab Release, chart @ X.Y.Z
+#   vX.Y.Z        → image :X.Y.Z + :latest, chart @ X.Y.Z
 #   vX.Y.Z-rc.N   → image :X.Y.Z-rc.N only (never :latest, no release, no chart)
 #   chart-vA.B.C  → chart only @ A.B.C
 #   main commit   → dev image v{M.m.p}-{N}-{sha12} when build-relevant paths change
@@ -29,7 +28,7 @@
 #
 # Portability: release logic is intentionally plain shell so a future move to
 # GitHub Actions / Docker Hub is a matter of re-wiring triggers, not rewriting.
-stages: [test, tag, build, release, chart]
+stages: [test, tag, build, chart]
 
 # A new push to a merge request replaces its still-running test jobs: the test-stage
 # jobs and their .pre helpers set `interruptible: true` on their merge-request rule
@@ -37,7 +36,7 @@ stages: [test, tag, build, release, chart]
 # (The default, `conservative`, would cancel nothing once any non-interruptible job
 # had started, and a merge request that edits .gitlab-ci.yml or ci/*Dockerfile starts
 # ci-image, web-image and runtime-image.) Those image jobs, docker-image and the
-# release and chart jobs stay non-interruptible on purpose, so a new commit never
+# chart job stay non-interruptible on purpose, so a new commit never
 # kills an image build mid-upload. main and tag pipelines never set it, so a newer
 # commit can never cancel them.
 workflow:
@@ -388,10 +387,13 @@ shell-tests:
     # CleanValue check. The gates' scripts need findmnt (the network-filesystem refusal) and GNU
     # coreutils (realpath -m, tail --pid, truncate's size suffixes), which the Alpine image lacks;
     # GitHub's Ubuntu runner has them.
-    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow py3-yaml py3-icu findmnt coreutils
+    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow py3-yaml py3-icu findmnt coreutils py3-pip
+    # scripts/tests/git-cliff.bats runs git-cliff; the version is mise.toml's and release.yml's
+    # (Alpine's PEP 668 marker needs --break-system-packages in this throwaway container).
+    - pip install --break-system-packages git-cliff==2.14.2
   script:
     - shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh gates/lib.sh gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh
-    - shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats gates/adoption/tests/adoption.bats
+    - shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats scripts/tests/git-cliff.bats gates/adoption/tests/adoption.bats
     - bats scripts/tests gates/adoption/tests
     - scripts/ci-config-check.sh check
   rules:
@@ -558,38 +560,6 @@ docker-image:
         - Dockerfile
       when: manual
       allow_failure: true   # a non-clicked button must not leave the MR pipeline "blocked"
-
-# ---------------------------------------------------------------------------
-# release — GitLab Release with git-cliff notes (final versions only)
-# ---------------------------------------------------------------------------
-release-notes:
-  stage: release
-  image:
-    name: orhunp/git-cliff:2.14.2   # = mise.toml and release.yml
-    entrypoint: [""]
-  variables:
-    GIT_DEPTH: 0                               # git-cliff needs full history + tags
-  script:
-    - git-cliff --current --strip header -o release_notes.md
-    - cat release_notes.md
-  artifacts:
-    paths: [release_notes.md]
-    expire_in: 1 week
-  rules:
-    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
-
-release:
-  stage: release
-  image: registry.gitlab.com/gitlab-org/release-cli:v0.24.0
-  needs: [release-notes]
-  script:
-    - echo "Creating GitLab Release for $CI_COMMIT_TAG"
-  release:
-    tag_name: $CI_COMMIT_TAG
-    name: "Ferrofin $CI_COMMIT_TAG"
-    description: release_notes.md
-  rules:
-    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+$/'
 
 # ---------------------------------------------------------------------------
 # chart — official Helm chart as an OCI artifact

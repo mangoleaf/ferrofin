@@ -20,6 +20,7 @@ image.workspace = true
 kamadak-exif.workspace = true
 webp.workspace = true
 jpeg-encoder.workspace = true
+jpeg-decoder.workspace = true
 blurhash.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

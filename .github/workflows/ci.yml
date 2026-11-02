@@ -245,8 +245,9 @@ jobs:
           persist-credentials: false
           fetch-depth: 0   # version.bats reads tags
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl python3-pil python3-icu python3-yaml
+      - run: pip install git-cliff==2.14.2   # = mise.toml and release.yml; git-cliff.bats runs it
       - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh
-      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats
+      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats scripts/tests/git-cliff.bats
       - run: bats scripts/tests
       - run: make test-gates-offline   # the gates' own shellcheck, bats and Python tests: one list, in the Makefile
       - run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'

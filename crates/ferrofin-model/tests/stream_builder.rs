@@ -2130,7 +2130,7 @@ fn build_video_item_with_secondary_audio_and_external_graphical_subtitle_keeps_v
     subtitle_stream.supports_external_stream = true;
     subtitle_stream.path = None;
     let subtitle_index = subtitle_stream.index;
-    options.profile.subtitle_profiles = vec![SubtitleProfile {
+    std::sync::Arc::make_mut(&mut options.profile).subtitle_profiles = vec![SubtitleProfile {
         format: Some(subtitle_codec.to_owned()),
         container: subtitle_container.map(str::to_owned),
         method: SubtitleDeliveryMethod::External,

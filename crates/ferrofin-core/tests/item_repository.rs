@@ -1791,8 +1791,10 @@ async fn a_created_collection_survives_an_unscoped_user_query() {
         .await
         .expect("save");
 
-    // …and a collection made through the real manager.
-    let collections = collection_manager_over(&db);
+    // …and a collection made through the real manager, with a real
+    // Collections library to make.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let collections = collection_manager_over(&db, tmp.path()).await;
     collections
         .create_collection(&CollectionCreationOptions {
             name: "My Collection".to_owned(),
@@ -1839,7 +1841,7 @@ async fn a_created_collection_survives_an_unscoped_user_query() {
             .fetch_one(db.pool())
             .await
             .expect("container row");
-    assert_eq!(container.0.as_deref(), Some("Collections"));
+    assert_eq!(container.0.as_deref(), Some("collections"));
     assert!(
         container.1.is_some_and(|p| p.ends_with("/collections")),
         "the container is the folder under the data directory"
@@ -1889,29 +1891,49 @@ async fn seed_user_who_sees_everything(
 }
 
 /// The real collection manager over `db`, with throwaway application paths.
-fn collection_manager_over(db: &ferrofin_db::Database) -> ferrofin_core::FerrofinCollectionManager {
+async fn collection_manager_over(
+    db: &ferrofin_db::Database,
+    dir: &std::path::Path,
+) -> ferrofin_core::FerrofinCollectionManager {
+    let paths = Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
+        dir,
+        dir.join("log"),
+        dir.join("config"),
+        dir.join("cache"),
+        dir.join("web"),
+    ));
+    let mode = ferrofin_core::item_type_lookup::IdDerivation::from_meta(
+        None,
+        Some(dir.to_string_lossy().into_owned()),
+    );
+    ferrofin_core::AggregateFolderStore::new(
+        db.clone(),
+        mode.clone(),
+        dir.join("root"),
+        dir.join("data"),
+    )
+    .ensure()
+    .await
+    .expect("roots");
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
     ferrofin_core::FerrofinCollectionManager::new(
         db.clone(),
-        std::sync::Arc::new(ferrofin_core::FerrofinLibraryManager::new(
-            std::sync::Arc::new(ferrofin_core::FerrofinItemRepository::new(
-                db.clone(),
-                std::sync::Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new()),
-            )),
-            std::sync::Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
-            std::sync::Arc::new(FerrofinItemPersistenceService::new(db.clone())),
-            std::sync::Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+        Arc::new(ferrofin_core::FerrofinLibraryManager::new(
+            Arc::new(repo(db)),
+            Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+            persistence.clone(),
+            Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
         )),
-        std::sync::Arc::new(ferrofin_core::FerrofinLinkedChildrenService::new(
+        Arc::new(ferrofin_core::FerrofinLinkedChildrenService::new(
             db.clone(),
         )),
-        std::sync::Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
-            "/tmp/ferrofin-test",
-            "/tmp/ferrofin-test/log",
-            "/tmp/ferrofin-test/config",
-            "/tmp/ferrofin-test/cache",
-            "/tmp/ferrofin-test/web",
-        )),
+        paths,
     )
+    .with_virtual_folders(Arc::new(
+        ferrofin_core::FerrofinVirtualFolderManager::new(dir.join("root/default"))
+            .with_item_store(persistence)
+            .with_id_derivation(mode),
+    ))
 }
 
 /// v12.2 `BuildMaxParentalRatingFilter` (45d7760a14): a container is only as
@@ -2274,11 +2296,12 @@ async fn series_date_played_plan_groups_the_users_plays_once() {
 
 /// `ImageProcessor.ProcessImage`'s `autoOrient` comes back with the image
 /// rows: a photo is oriented unless its stored orientation is `TopLeft`, and
-/// nothing else is; the rows are those `get_image_infos` reads.
+/// nothing else is. So does whether the owner is a Live TV channel or
+/// programme. The rows are those `get_image_infos` reads.
 #[tokio::test]
-async fn image_infos_carry_the_photo_auto_orientation() {
+async fn image_infos_carry_what_their_owner_decides_about_serving_them() {
     use ferrofin_model::entities::ImageType;
-    use ferrofin_traits::options::ItemImageInfo;
+    use ferrofin_traits::options::{ItemImageInfo, ItemImagesToServe};
 
     let db = fresh_db().await;
     let persist = FerrofinItemPersistenceService::new(db.clone());
@@ -2286,6 +2309,8 @@ async fn image_infos_carry_the_photo_auto_orientation() {
     let upright = Uuid::new_v4();
     let unknown = Uuid::new_v4();
     let movie = Uuid::new_v4();
+    let channel = Uuid::new_v4();
+    let program = Uuid::new_v4();
     // Stored the way the image rows' foreign key reads it.
     let with_data = |id: Uuid, kind, data: Option<&str>| BaseItemEntity {
         id: id.to_string().to_uppercase(),
@@ -2310,10 +2335,12 @@ async fn image_infos_carry_the_photo_auto_orientation() {
                 BaseItemKind::Movie,
                 Some(r#"{"Orientation":"RightTop"}"#),
             ),
+            with_data(channel, BaseItemKind::LiveTvChannel, None),
+            with_data(program, BaseItemKind::LiveTvProgram, None),
         ])
         .await
         .expect("save");
-    for id in [rotated, upright, unknown, movie] {
+    for id in [rotated, upright, unknown, movie, channel, program] {
         let image = |image_type| ItemImageInfo {
             path: format!("/media/{id}.jpg"),
             image_type,
@@ -2332,26 +2359,27 @@ async fn image_infos_carry_the_photo_auto_orientation() {
         (upright, false),
         (unknown, true),
         (movie, false),
+        (channel, false),
+        (program, false),
     ] {
-        let (images, auto_orient) = repo
-            .get_image_infos_with_auto_orient(id)
-            .await
-            .expect("read");
-        assert_eq!(auto_orient, expected, "{id}");
-        assert_eq!(images, repo.get_image_infos(id).await.expect("read"));
+        let served = repo.get_image_infos_to_serve(id).await.expect("read");
+        assert_eq!(served.auto_orient, expected, "{id}");
+        assert_eq!(served.live_tv, id == channel || id == program, "{id}");
+        assert_eq!(served.images, repo.get_image_infos(id).await.expect("read"));
     }
-    let (images, auto_orient) = repo
-        .get_image_infos_with_auto_orient(Uuid::new_v4())
+    let served = repo
+        .get_image_infos_to_serve(Uuid::new_v4())
         .await
         .expect("read");
-    assert!(images.is_empty() && !auto_orient);
+    assert_eq!(served, ItemImagesToServe::default());
 
     // The owner is read by primary key beside the image rows' own index, and
     // that index already yields the order: no scan, no sort.
     let shown = plan(
         &db,
         r#"SELECT ii.*, bi."Type" = 'x' AS "IsPhoto",
-                CASE WHEN bi."Type" = 'x' THEN bi."Data" END AS "PhotoData"
+                CASE WHEN bi."Type" = 'x' THEN bi."Data" END AS "PhotoData",
+                bi."Type" IN ('a', 'b') AS "IsLiveTv"
             FROM "BaseItemImageInfos" ii
             JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
             WHERE ii."ItemId" = 'y'

@@ -74,9 +74,9 @@ impl ServerConfigurationManager for FixedConfig {
     }
 }
 
-/// A DTO service for the tests that never build a `NowPlayingItem` (no session
-/// in them is playing when its sessions are listed); [`RecordingDtoService`]
-/// serves the ones that do.
+/// A DTO service for the tests that do not look at a `NowPlayingItem`: a
+/// playback report naming a library item still builds one, which is the bare
+/// item (its id and name). [`RecordingDtoService`] serves the tests that look.
 struct UnusedDtoService;
 
 #[async_trait]
@@ -98,13 +98,20 @@ impl DtoService for UnusedDtoService {
     }
     async fn get_base_item_dtos(
         &self,
-        _items: &[BaseItemEntity],
+        items: &[BaseItemEntity],
         _options: &DtoOptions,
         _user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        unreachable!("dto service is not exercised by these tests")
+        Ok(items
+            .iter()
+            .map(|row| BaseItemDto {
+                id: Uuid::parse_str(&row.id).expect("item id"),
+                name: row.name.clone(),
+                ..BaseItemDto::default()
+            })
+            .collect())
     }
     async fn get_item_by_name_dto(
         &self,
@@ -646,6 +653,127 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
         .await
         .unwrap();
     assert_eq!(resolved.user_id, user_id);
+}
+
+/// Upstream throws one message from `UserManager.AuthenticateUser` (no such
+/// user) and `AuthenticateNewSessionInternal` (wrong password), so a caller
+/// cannot tell them apart. The two are written in different managers here.
+#[tokio::test]
+async fn unknown_user_and_wrong_password_fail_with_one_message() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "bob").await;
+    set_permission(&db, &user.id, PermissionKind::EnableRemoteAccess, true)
+        .await
+        .unwrap();
+    FerrofinUserManager::new(db.clone())
+        .change_password(user_id, "right")
+        .await
+        .unwrap();
+
+    let attempt = |username: &str| AuthenticationRequest {
+        username: Some(username.to_owned()),
+        password: Some(Secret::new("guess")),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device_name: Some("Firefox".to_owned()),
+        remote_endpoint: Some("127.0.0.1".to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    let unknown = mgr.authenticate_new_session(&attempt("nobody")).await;
+    let wrong = mgr.authenticate_new_session(&attempt("bob")).await;
+    let (Err(ServiceError::Unauthorized(unknown)), Err(ServiceError::Unauthorized(wrong))) =
+        (unknown, wrong)
+    else {
+        panic!("both must be an authentication failure");
+    };
+    assert_eq!(unknown, wrong);
+    assert_eq!(unknown, "Invalid username or password entered.");
+}
+
+/// The login routes answer every refusal with one body, so the log is the only
+/// place left that says why. These three happen once the password is settled,
+/// each logged where it is decided.
+#[tokio::test]
+async fn refused_logins_log_their_reason() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let logs = crate::test_support::CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let attempt = |username: &str, remote: &str| AuthenticationRequest {
+        username: Some(username.to_owned()),
+        password: Some(Secret::new("")),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device_name: Some("Firefox".to_owned()),
+        remote_endpoint: Some(remote.to_owned()),
+        ..AuthenticationRequest::default()
+    };
+
+    // No `EnableRemoteAccess`, from outside the local network.
+    let remote = seed_named_user(&db, Uuid::new_v4(), "remote").await;
+    set_permission(&db, &remote.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
+    let refused = mgr
+        .authenticate_new_session(&attempt("remote", "1.2.3.4"))
+        .await;
+    assert!(matches!(refused, Err(ServiceError::Forbidden(_))));
+
+    // No `EnableAllDevices`, and this device is not on the user's list.
+    let bound = seed_named_user(&db, Uuid::new_v4(), "bound").await;
+    set_permission(&db, &bound.id, PermissionKind::EnableRemoteAccess, true)
+        .await
+        .unwrap();
+    let refused = mgr
+        .authenticate_new_session(&attempt("bound", "127.0.0.1"))
+        .await;
+    assert!(matches!(refused, Err(ServiceError::Forbidden(_))));
+
+    // One session allowed, and the first login holds it.
+    let capped_id = Uuid::new_v4();
+    let capped = seed_named_user(&db, capped_id, "capped").await;
+    FerrofinUserManager::new(db.clone())
+        .update_policy(
+            capped_id,
+            &ferrofin_model::users::UserPolicy {
+                max_active_sessions: 1,
+                ..ferrofin_model::users::UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    for permission in [
+        PermissionKind::EnableRemoteAccess,
+        PermissionKind::EnableAllDevices,
+    ] {
+        set_permission(&db, &capped.id, permission, true)
+            .await
+            .unwrap();
+    }
+    let request = attempt("capped", "127.0.0.1");
+    mgr.authenticate_new_session(&request).await.unwrap();
+    let refused = mgr.authenticate_new_session(&request).await;
+    assert!(matches!(refused, Err(ServiceError::Forbidden(_))));
+
+    let log = logs.text();
+    let missing: Vec<&str> = ["remote_access", "device", "max_sessions"]
+        .into_iter()
+        .filter(|reason| {
+            !log.lines().any(|line| {
+                line.contains("login failed") && line.contains(&format!("reason=\"{reason}\""))
+            })
+        })
+        .collect();
+    assert!(missing.is_empty(), "no line for {missing:?} in: {log}");
 }
 
 #[tokio::test]
@@ -1566,8 +1694,9 @@ async fn progress_remembers_the_reported_audio_and_subtitle_tracks() {
     );
 }
 
-/// A media-source manager that records every `close_live_stream` id. Only the
-/// live-stream half of the trait is reachable from the session manager.
+/// A media-source manager that records every `close_live_stream` id. A
+/// playback report's `NowPlayingItem` build also looks up its media source,
+/// which finds none here.
 struct RecordingMediaSources {
     closed: Mutex<Vec<String>>,
 }
@@ -1601,7 +1730,7 @@ impl ferrofin_traits::library::MediaSourceManager for RecordingMediaSources {
         _enable_path_substitution: bool,
         _user_id: Option<Uuid>,
     ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
-        unreachable!("not reached from the session manager")
+        Ok(Vec::new())
     }
     async fn open_live_stream(
         &self,
@@ -1611,9 +1740,9 @@ impl ferrofin_traits::library::MediaSourceManager for RecordingMediaSources {
     }
     async fn get_live_stream(
         &self,
-        _id: &str,
+        id: &str,
     ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
-        unreachable!("not reached from the session manager")
+        Err(ServiceError::NotFound(format!("live stream {id}")))
     }
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError> {
         self.closed
@@ -4155,7 +4284,7 @@ impl DtoService for RecordingDtoService {
         &self,
         _item_id: Uuid,
     ) -> Result<Option<f64>, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
     async fn get_base_item_dto(
         &self,
@@ -4164,7 +4293,7 @@ impl DtoService for RecordingDtoService {
         _user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
     ) -> Result<BaseItemDto, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
     async fn get_base_item_dtos(
         &self,
@@ -4198,7 +4327,7 @@ impl DtoService for RecordingDtoService {
         _tagged_item_ids: Option<&[Uuid]>,
         _user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
 }
 
@@ -4217,13 +4346,13 @@ impl ferrofin_traits::library::MediaSourceManager for CannedSources {
         &self,
         _item_id: Uuid,
     ) -> Result<Vec<ferrofin_model::entities_media::MediaStream>, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
     async fn get_media_attachments(
         &self,
         _item_id: Uuid,
     ) -> Result<Vec<ferrofin_model::entities_media::MediaAttachment>, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
     async fn get_playback_media_sources(
         &self,
@@ -4232,7 +4361,7 @@ impl ferrofin_traits::library::MediaSourceManager for CannedSources {
         _allow_media_probe: bool,
         _enable_path_substitution: bool,
     ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
     async fn get_static_media_sources(
         &self,
@@ -4250,7 +4379,7 @@ impl ferrofin_traits::library::MediaSourceManager for CannedSources {
         &self,
         _request: &ferrofin_model::media_info::LiveStreamRequest,
     ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
     async fn get_live_stream(
         &self,
@@ -4486,3 +4615,7 @@ async fn the_now_playing_item_shows_the_reported_media_source(
 /// What a session request reads from its device: only the request that
 /// creates the session reads it.
 mod device_reads;
+
+/// The session's `NowPlayingItem`, built once per item on the report that
+/// names it, and the session summaries that read it.
+mod now_playing_item;

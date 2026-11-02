@@ -3,6 +3,7 @@
 //! Raw item reads remain user-less. This service loads policy and the reachable
 //! hierarchy once for a batch, without applying browse-query filters to IDs.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -14,10 +15,11 @@ use ferrofin_db::row_cache::LibrarySet;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::localization::LocalizationManager;
-use ferrofin_traits::persistence::ItemRepository;
+use ferrofin_traits::persistence::{FolderChild, ItemRepository};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::item_data::stored_physical_locations;
 use crate::item_type_lookup::kind_from_type_name;
 use crate::item_visibility_repository as repository;
 use crate::text_util::get_clean_value;
@@ -104,11 +106,12 @@ impl ItemVisibility {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        let context = self.load(items, Some(user)).await?;
+        let libraries = self.rating_libraries().await?;
+        let context = self.load(items, Some(user), &libraries.set).await?;
         items
             .iter()
             .map(|item| {
-                let item = context.rows.get(&row_id(item)).unwrap_or(item);
+                let item = context.row(item);
                 if standalone {
                     context.standalone(item)
                 } else {
@@ -136,7 +139,7 @@ impl ItemVisibility {
     }
 
     /// [`Self::visible_item`], with the rows the check read: the item's chain, item
-    /// included, as stored and without the placeholder row, as
+    /// included, without the placeholder row and with their paths expanded, as
     /// `ItemRepository::retrieve_item` returns them. A caller takes a row above the item
     /// from it instead of reading that row again (gl-982).
     ///
@@ -150,8 +153,8 @@ impl ItemVisibility {
         self.visible_item_in(id, user, true).await
     }
 
-    /// [`Self::visible_item`]'s check; `keep_chain` copies the chain before the check
-    /// takes it, for [`Self::visible_item_with_chain`].
+    /// [`Self::visible_item`]'s check; `keep_chain` hands the chain back too, for
+    /// [`Self::visible_item_with_chain`].
     async fn visible_item_in(
         &self,
         id: Uuid,
@@ -164,24 +167,39 @@ impl ItemVisibility {
         if id.is_nil() || id == placeholder {
             return Ok(None);
         }
-        let chain = repository::reachable(&self.db, &[id]).await?;
-        let Some(item) = chain.iter().find(|row| row_id(row) == id).cloned() else {
+        let mut chain = repository::reachable(&self.db, &[id]).await?;
+        let Some(index) = chain.iter().position(|row| row_id(row) == id) else {
             return Ok(None);
         };
-        let kept = if keep_chain {
-            chain
-                .iter()
-                .filter(|row| row_id(row) != placeholder)
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let libraries = self.rating_libraries().await?;
         let context = self
-            .load_known(std::slice::from_ref(&item), chain, Some(user), None)
+            .load_known(
+                std::slice::from_ref(&chain[index]),
+                &chain,
+                Some(user),
+                &libraries.set,
+            )
             .await?;
-        let row = context.rows.get(&id).unwrap_or(&item);
-        Ok(context.standalone(row)?.then_some((item, kept)))
+        let visible = context.standalone(context.row(&chain[index]))?;
+        drop(context);
+        if !visible {
+            return Ok(None);
+        }
+        // The check borrowed the chain: the item is taken out of it, and copied only when the
+        // chain is handed back too. Both are handed out as `ItemRepository::retrieve_item`
+        // hands rows out, with the path expanded (`BaseItemMapper.Map`), after the check,
+        // which reads the stored rows.
+        let (mut item, mut kept) = if keep_chain {
+            let item = chain[index].clone();
+            chain.retain(|row| row_id(row) != placeholder);
+            (item, chain)
+        } else {
+            (chain.swap_remove(index), Vec::new())
+        };
+        for row in std::iter::once(&mut item).chain(&mut kept) {
+            self.paths.expand_in_place(&mut row.path);
+        }
+        Ok(Some((item, kept)))
     }
 
     /// `BaseItem.IsParentalAllowed(user, skipAllowedTagsCheck)` for each row,
@@ -200,14 +218,36 @@ impl ItemVisibility {
         if items.is_empty() {
             return Ok(Vec::new());
         }
-        let context = self.load(items, Some(user)).await?;
+        let libraries = self.rating_libraries().await?;
+        let context = self.load(items, Some(user), &libraries.set).await?;
         items
             .iter()
             .map(|item| {
-                let item = context.rows.get(&row_id(item)).unwrap_or(item);
+                let item = context.row(item);
                 context.parental(item, skip_allowed_tags)
             })
             .collect()
+    }
+
+    /// Drops the libraries whose options disable them (`LibraryOptions.Enabled`),
+    /// for a read with no user. Any other row has no options and stays. Reads
+    /// the cached library set, as the evaluator's own `Enabled` check does.
+    ///
+    /// # Errors
+    /// Propagates repository failures.
+    pub(crate) async fn without_disabled_libraries(
+        &self,
+        mut rows: Vec<BaseItemEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let libraries = self.rating_libraries().await?;
+        rows.retain(|row| {
+            libraries
+                .set
+                .options
+                .get(&row_id(row))
+                .is_none_or(|options| options.enabled)
+        });
+        Ok(rows)
     }
 
     /// Applies Folder.GetChildren's child visibility and, for playlists and
@@ -219,7 +259,7 @@ impl ItemVisibility {
     /// Propagates repository failures and hierarchy corruption.
     pub async fn folder_children(
         &self,
-        children: Vec<ferrofin_traits::persistence::FolderChild>,
+        children: Vec<FolderChild>,
         user: &UserEntity,
         filter_linked: bool,
         roots: &[BaseItemEntity],
@@ -227,27 +267,26 @@ impl ItemVisibility {
         if children.is_empty() {
             return Ok(Vec::new());
         }
-        let rows: Vec<_> = children
-            .iter()
-            .map(|child| child.item.clone())
-            .chain(roots.iter().cloned())
-            .collect();
-        let context = self.load(&rows, Some(user)).await?;
+        let libraries = self.rating_libraries().await?;
+        let context = self
+            .load_known(
+                children.iter().map(|child| &child.item).chain(roots),
+                &[],
+                Some(user),
+                &libraries.set,
+            )
+            .await?;
         let root_ids: HashSet<_> = roots
             .iter()
             .filter(|root| crate::kinds::is_folder(kind(root)))
             .map(row_id)
             .collect();
-        let mut result = Vec::new();
-        for child in children {
-            let item = context
-                .rows
-                .get(&row_id(&child.item))
-                .unwrap_or(&child.item);
+        let keeps = |child: &FolderChild| -> Result<bool, ServiceError> {
+            let item = context.row(&child.item);
             if child.linked && filter_linked && !crate::kinds::is_item_by_name(kind(item)) {
                 // BaseItem.GetOwner is a single optional owner lookup.
                 let owner = uuid(item.owner_id.as_deref())
-                    .and_then(|id| context.rows.get(&id))
+                    .and_then(|id| context.get(&id))
                     .unwrap_or(item);
                 if owner
                     .path
@@ -260,17 +299,25 @@ impl ItemVisibility {
                         .iter()
                         .any(|id| root_ids.contains(id))
                     {
-                        continue;
+                        return Ok(false);
                     }
                 } else if !context.standalone(owner)? {
-                    continue;
+                    return Ok(false);
                 }
             }
-            if context.visible(item, false)? {
-                result.push(child.item);
-            }
-        }
-        Ok(result)
+            context.visible(item, false)
+        };
+        let kept = children
+            .iter()
+            .map(keeps)
+            .collect::<Result<Vec<bool>, ServiceError>>()?;
+        drop(context);
+        // The check borrowed the children: the kept ones are moved out, not copied.
+        Ok(children
+            .into_iter()
+            .zip(kept)
+            .filter_map(|(child, kept)| kept.then_some(child.item))
+            .collect())
     }
 
     /// `Playlist.IsVisible` for each of `playlists`, in input order, without
@@ -288,11 +335,12 @@ impl ItemVisibility {
         if playlists.is_empty() {
             return Ok(Vec::new());
         }
-        let context = self.load(playlists, Some(user)).await?;
+        let libraries = self.rating_libraries().await?;
+        let context = self.load(playlists, Some(user), &libraries.set).await?;
         playlists
             .iter()
             .map(|playlist| {
-                let row = context.rows.get(&row_id(playlist)).unwrap_or(playlist);
+                let row = context.row(playlist);
                 if context.shared_playlist(row) {
                     context.has_parental_allowed_child(row, user)
                 } else {
@@ -300,6 +348,46 @@ impl ItemVisibility {
                 }
             })
             .collect()
+    }
+
+    /// The playlists under `top_parents` (every one when none are named) that a
+    /// listing leaves out for `user`: those failing `IsVisibleStandalone`, the
+    /// check a playlist-only listing runs, so one rule answers both. A shared
+    /// playlist is its owner's, its shares' and open access's, a playlist file
+    /// takes base visibility, and each needs `HasParentalAllowedChild`.
+    ///
+    /// The listing excludes them by id, in the SQL that pages and counts it;
+    /// the cost follows the playlists, not the library. Upstream runs no such
+    /// check on a mixed query (`Folder.QueryRecursive` post-filters only a
+    /// playlist- or box-set-only one), so this is a Jellyfin bug not ported
+    /// (owner decision 2026-10-31, gl-831). An administrator keeps Jellyfin's
+    /// answer: `IsVisible` has no administrator arm, but this exclusion does.
+    ///
+    /// # Errors
+    /// Returns storage errors or an error for a cyclic hierarchy, which fails the
+    /// listing as it fails the playlist-only one and the scope's own probe.
+    pub(crate) async fn hidden_playlists(
+        &self,
+        user: &UserEntity,
+        top_parents: &[Uuid],
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        if crate::user_entity_ext::cached_permission(
+            &self.db,
+            &user.id,
+            PermissionKind::IsAdministrator,
+        )
+        .await?
+        {
+            return Ok(Vec::new());
+        }
+        let playlists = repository::playlists(&self.db, top_parents).await?;
+        let visible = self.visible(&playlists, user, true).await?;
+        Ok(playlists
+            .iter()
+            .zip(visible)
+            .filter(|(_, visible)| !visible)
+            .map(|(playlist, _)| row_id(playlist))
+            .collect())
     }
 
     /// 12.2 `UserViewManager.HasVisibleItem` (`UserViewManager.cs:161-176`):
@@ -393,8 +481,8 @@ impl ItemVisibility {
         self.update_rating_scores_with(items, Some(libraries)).await
     }
 
-    /// Reads the library rows and each library's options, which every
-    /// visibility and rating evaluation needs.
+    /// Reads the library rows, each library's options and its stored
+    /// physical locations, which every visibility and rating evaluation needs.
     ///
     /// # Errors
     /// Returns storage errors.
@@ -437,10 +525,15 @@ impl ItemVisibility {
         } else {
             repository::reachable(&self.db, &above).await?
         };
+        let physical_locations = rows
+            .iter()
+            .map(|row| (row_id(row), stored_physical_locations(row.data.as_deref())))
+            .collect();
         let set = load.store(LibrarySet {
             rows,
             ancestors,
             options,
+            physical_locations,
         });
         Ok(RatingLibraries { set })
     }
@@ -453,15 +546,27 @@ impl ItemVisibility {
         if items.is_empty() {
             return Ok(());
         }
-        let context = self.load_with(items, None, libraries).await?;
-        for item in items {
+        let read;
+        let libraries = if let Some(libraries) = libraries {
+            libraries
+        } else {
+            read = self.rating_libraries().await?;
+            &read
+        };
+        // Scored over the rows as passed in, then written: the context borrows them.
+        let scores = {
+            let context = self.load(items, None, &libraries.set).await?;
+            items
+                .iter()
+                .map(|item| context.rating_score(context.row(item)))
+                .collect::<Result<Vec<_>, ServiceError>>()?
+        };
+        for (item, score) in items.iter_mut().zip(scores) {
             item.unrated_type = Some(
                 crate::kinds::unrated_item(kind(item), uuid(item.channel_id.as_deref()).is_some())
                     .json_name()
                     .into_owned(),
             );
-            let row = context.rows.get(&row_id(item)).unwrap_or(item);
-            let score = context.rating_score(row)?;
             item.inherited_parental_rating_value = score.map(|score| i64::from(score.score));
             item.inherited_parental_rating_sub_value =
                 score.and_then(|score| score.sub_score.map(i64::from));
@@ -481,8 +586,11 @@ impl ItemVisibility {
         container: &BaseItemEntity,
     ) -> Result<Option<String>, ServiceError> {
         let ratings = repository::member_ratings(&self.db, row_id(container)).await?;
-        let context = self.load(std::slice::from_ref(container), None).await?;
-        let row = context.rows.get(&row_id(container)).unwrap_or(container);
+        let libraries = self.rating_libraries().await?;
+        let context = self
+            .load(std::slice::from_ref(container), None, &libraries.set)
+            .await?;
+        let row = context.row(container);
         let country = context.metadata_country(row)?;
         Ok(ferrofin_providers::metadata_merge::rating_to_items(
             container.official_rating.as_deref(),
@@ -496,7 +604,7 @@ impl ItemVisibility {
     /// rating-limited user's `HasParentalAllowedChild` needs.
     async fn load_hierarchy(
         &self,
-        rows: &mut HashMap<Uuid, BaseItemEntity>,
+        rows: &mut HashMap<Uuid, Cow<'_, BaseItemEntity>>,
         playlist_links: bool,
     ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
         let mut examined = HashSet::new();
@@ -547,38 +655,32 @@ impl ItemVisibility {
                 repository::reachable(&self.db, &wanted.into_iter().collect::<Vec<_>>()).await?
             {
                 // What the caller passed (an item with unsaved changes, the cached libraries) wins.
-                rows.entry(row_id(&row)).or_insert(row);
+                rows.entry(row_id(&row)).or_insert(Cow::Owned(row));
             }
         }
         Ok(links)
     }
 
+    /// The context that evaluates `items` over `libraries` (from [`Self::rating_libraries`]).
     async fn load<'a>(
         &'a self,
-        items: &[BaseItemEntity],
+        items: &'a [BaseItemEntity],
         user: Option<&'a UserEntity>,
+        libraries: &'a LibrarySet,
     ) -> Result<Context<'a>, ServiceError> {
-        self.load_with(items, user, None).await
+        self.load_known(items, &[], user, libraries).await
     }
 
-    /// [`Self::load`] over `libraries` when the caller already read them.
-    async fn load_with<'a>(
-        &'a self,
-        items: &[BaseItemEntity],
-        user: Option<&'a UserEntity>,
-        libraries: Option<&'a RatingLibraries>,
-    ) -> Result<Context<'a>, ServiceError> {
-        self.load_known(items, Vec::new(), user, libraries).await
-    }
-
-    /// [`Self::load_with`] when the caller has read some of the hierarchy too: `known` rows are
-    /// not read again.
+    /// [`Self::load`] when the caller has read some of the hierarchy too: `known` rows are
+    /// not read again. The context borrows `items`, `known` and the library set's rows; it owns
+    /// the rows [`Self::load_hierarchy`] reads, and a copy of a borrowed row only when its stored
+    /// path holds a virtual-path token to expand.
     async fn load_known<'a>(
         &'a self,
-        items: &[BaseItemEntity],
-        known: Vec<BaseItemEntity>,
+        items: impl IntoIterator<Item = &'a BaseItemEntity>,
+        known: &'a [BaseItemEntity],
         user: Option<&'a UserEntity>,
-        libraries: Option<&'a RatingLibraries>,
+        libraries: &'a LibrarySet,
     ) -> Result<Context<'a>, ServiceError> {
         let (permissions, preferences) = if let Some(user) = user {
             (
@@ -588,20 +690,14 @@ impl ItemVisibility {
         } else {
             (Vec::new(), Vec::new())
         };
-        let libraries = match libraries {
-            Some(libraries) => Arc::clone(&libraries.set),
-            None => self.rating_libraries().await?.set,
-        };
-        let library_ids: Vec<Uuid> = libraries.rows.iter().map(row_id).collect();
-        let mut rows: HashMap<Uuid, BaseItemEntity> = libraries
+        let mut rows: HashMap<Uuid, Cow<'a, BaseItemEntity>> = libraries
             .rows
             .iter()
-            .cloned()
-            .chain(items.iter().cloned())
-            .map(|row| (row_id(&row), row))
+            .chain(items)
+            .map(|row| (row_id(row), Cow::Borrowed(row)))
             .collect();
-        for row in known.into_iter().chain(libraries.ancestors.iter().cloned()) {
-            rows.entry(row_id(&row)).or_insert(row);
+        for row in known.iter().chain(&libraries.ancestors) {
+            rows.entry(row_id(row)).or_insert(Cow::Borrowed(row));
         }
         let links = self
             .load_hierarchy(
@@ -609,9 +705,38 @@ impl ItemVisibility {
                 user.is_some_and(|user| user.max_parental_rating_score.is_some()),
             )
             .await?;
+        // Every reader sees the expanded path; a borrowed row is copied only when it changes.
         for row in rows.values_mut() {
-            row.path = self.paths.expand_opt(row.path.as_deref());
+            let expanded = match row.path.as_deref().map(|path| self.paths.expand_cow(path)) {
+                Some(Cow::Owned(path)) => Some(path),
+                _ => None,
+            };
+            if let Some(path) = expanded {
+                row.to_mut().path = Some(path);
+            }
         }
+        // Each library's list, expanded once for every path match of this context. A caller's
+        // copy of a library row stands in for the set's here as in `rows`, so a list is taken
+        // from the set only for the `Data` it was parsed from.
+        let library_locations = libraries
+            .rows
+            .iter()
+            .map(|cached| {
+                let id = row_id(cached);
+                let data = &rows[&id].data;
+                let locations = match libraries.physical_locations.get(&id) {
+                    Some(stored) if *data == cached.data => stored
+                        .iter()
+                        .map(|path| self.paths.expand_cow(path))
+                        .collect(),
+                    _ => stored_physical_locations(data.as_deref())
+                        .iter()
+                        .map(|path| Cow::Owned(self.paths.expand(path)))
+                        .collect(),
+                };
+                (id, locations)
+            })
+            .collect();
         let mut playlists = HashMap::new();
         let playlist_ids: Vec<_> = rows
             .iter()
@@ -634,7 +759,7 @@ impl ItemVisibility {
             service: self,
             user,
             rows,
-            library_ids,
+            library_locations,
             links,
             libraries,
             playlists,
@@ -658,11 +783,14 @@ impl ItemVisibility {
 struct Context<'a> {
     service: &'a ItemVisibility,
     user: Option<&'a UserEntity>,
-    rows: HashMap<Uuid, BaseItemEntity>,
-    library_ids: Vec<Uuid>,
+    /// Every row the checks read, by id, its path expanded: borrowed from the caller and the
+    /// library set, owned when [`ItemVisibility::load_hierarchy`] read it or its path changed.
+    rows: HashMap<Uuid, Cow<'a, BaseItemEntity>>,
+    /// Every library's id, in the set's order, with its `PhysicalLocationsList` expanded.
+    library_locations: Vec<(Uuid, Vec<Cow<'a, str>>)>,
     links: HashMap<Uuid, Vec<Uuid>>,
     /// The library set the rows above were read with; its `options` are each library's.
-    libraries: Arc<LibrarySet>,
+    libraries: &'a LibrarySet,
     playlists: HashMap<Uuid, bool>,
     permissions: HashMap<i32, bool>,
     preferences: HashMap<i32, Vec<String>>,
@@ -703,6 +831,16 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
 }
 
 impl Context<'_> {
+    /// The row with id `id`.
+    fn get(&self, id: &Uuid) -> Option<&BaseItemEntity> {
+        self.rows.get(id).map(|row| &**row)
+    }
+
+    /// The context's row for `item`'s id, path expanded; `item` itself when it has none.
+    fn row<'r>(&'r self, item: &'r BaseItemEntity) -> &'r BaseItemEntity {
+        self.get(&row_id(item)).unwrap_or(item)
+    }
+
     fn preference(&self, kind: PreferenceKind) -> &[String] {
         self.preferences
             .get(&i32::from(kind))
@@ -760,7 +898,7 @@ impl Context<'_> {
             } else {
                 current.parent_id.as_deref()
             };
-            let Some(parent) = uuid(next).and_then(|id| self.rows.get(&id)) else {
+            let Some(parent) = uuid(next).and_then(|id| self.get(&id)) else {
                 break;
             };
             if !seen.insert(row_id(parent)) {
@@ -782,12 +920,12 @@ impl Context<'_> {
             if kind(current) == BaseItemKind::CollectionFolder {
                 return Ok(vec![row_id(current)]);
             }
-            let parent = uuid(current.parent_id.as_deref()).and_then(|id| self.rows.get(&id));
+            let parent = uuid(current.parent_id.as_deref()).and_then(|id| self.get(&id));
             if parent.is_some_and(|r| kind(r) == BaseItemKind::AggregateFolder) {
                 break;
             }
-            let next = parent
-                .or_else(|| uuid(current.owner_id.as_deref()).and_then(|id| self.rows.get(&id)));
+            let next =
+                parent.or_else(|| uuid(current.owner_id.as_deref()).and_then(|id| self.get(&id)));
             let Some(next) = next else {
                 break;
             };
@@ -797,24 +935,14 @@ impl Context<'_> {
             return Ok(Vec::new());
         };
         Ok(self
-            .library_ids
+            .library_locations
             .iter()
-            .copied()
-            .filter(|id| {
+            .filter(|(id, locations)| {
                 let row = &self.rows[id];
                 row.path
                     .as_deref()
                     .is_some_and(|p| p.eq_ignore_ascii_case(path))
-                    || data(row)
-                        .get("PhysicalLocationsList")
-                        .and_then(Value::as_array)
-                        .is_some_and(|locations| {
-                            locations.iter().any(|p| {
-                                p.as_str().is_some_and(|p| {
-                                    self.service.paths.expand(p).eq_ignore_ascii_case(path)
-                                })
-                            })
-                        })
+                    || locations.iter().any(|p| p.eq_ignore_ascii_case(path))
                     // `read_options` has already expanded these.
                     || self.libraries.options.get(id).is_some_and(|opts| {
                         opts.path_infos
@@ -822,6 +950,7 @@ impl Context<'_> {
                             .any(|p| p.path.eq_ignore_ascii_case(path))
                     })
             })
+            .map(|(id, _)| *id)
             .collect())
     }
 
@@ -914,7 +1043,7 @@ impl Context<'_> {
                     if !seen.insert(child) {
                         continue;
                     }
-                    if let Some(row) = self.rows.get(&child) {
+                    if let Some(row) = self.get(&child) {
                         if kind(row) == BaseItemKind::BoxSet {
                             queue.extend(self.links.get(&child).into_iter().flatten());
                         } else {
@@ -929,7 +1058,7 @@ impl Context<'_> {
             }
             let mut accessible = false;
             for library in library_ids {
-                if let Some(row) = self.rows.get(&library) {
+                if let Some(row) = self.get(&library) {
                     accessible |= self.visible(row, false)?;
                 }
             }
@@ -960,7 +1089,7 @@ impl Context<'_> {
             .get(&row_id(item))
             .into_iter()
             .flatten()
-            .filter_map(|id| self.rows.get(id))
+            .filter_map(|id| self.get(id))
             .peekable();
         if members.peek().is_none() {
             return Ok(true);
@@ -998,7 +1127,6 @@ impl Context<'_> {
             )
         {
             let channel = self
-                .rows
                 .get(&channel_id)
                 .ok_or_else(|| ServiceError::backend("missing item channel"))?;
             return self.visible(channel, false);
@@ -1022,7 +1150,7 @@ impl Context<'_> {
             let tags: HashSet<_> = parents
                 .iter()
                 .copied()
-                .chain(libraries.iter().filter_map(|id| self.rows.get(id)))
+                .chain(libraries.iter().filter_map(|id| self.get(id)))
                 .flat_map(|row| {
                     row.tags
                         .as_deref()
@@ -1105,7 +1233,7 @@ impl Context<'_> {
             .or_else(|| {
                 libraries
                     .iter()
-                    .filter_map(|id| self.rows.get(id))
+                    .filter_map(|id| self.get(id))
                     .find_map(|row| nonempty(row.preferred_metadata_country_code.as_deref()))
             })
             .or_else(|| {
@@ -1299,7 +1427,7 @@ mod tests {
     /// one read returned, each as `retrieve_item` reads it: a season's series among them, the
     /// placeholder row never (gl-982).
     #[tokio::test]
-    async fn visible_item_with_chain_hands_back_the_stored_chain() {
+    async fn visible_item_with_chain_hands_back_the_chain_as_retrieve_item_reads_it() {
         let f = Fixture::new().await;
         let library = f
             .item(
@@ -1354,7 +1482,11 @@ mod tests {
         assert_eq!(ids, [row_id(&library), row_id(&series), row_id(&season)]);
         for row in &chain {
             let stored = f.service.items.retrieve_item(row_id(row)).await;
-            assert_eq!(Some(row), stored.expect("read").as_ref(), "as stored");
+            assert_eq!(
+                Some(row),
+                stored.expect("read").as_ref(),
+                "as retrieve_item reads it"
+            );
         }
         set_permission(&f.db, &f.user.id, PermissionKind::EnableAllFolders, false)
             .await
@@ -1916,18 +2048,19 @@ mod tests {
                 Some(&library),
             )
             .await;
-        let mut context = f
-            .service
-            .load(std::slice::from_ref(&item), Some(&f.user))
-            .await
-            .expect("context");
-        Arc::make_mut(&mut context.libraries).options.insert(
+        let mut libraries = (*f.service.rating_libraries().await.expect("libraries").set).clone();
+        libraries.options.insert(
             row_id(&library),
             ferrofin_model::configuration::LibraryOptions {
                 enabled: false,
                 ..Default::default()
             },
         );
+        let context = f
+            .service
+            .load(std::slice::from_ref(&item), Some(&f.user), &libraries)
+            .await
+            .expect("context");
         assert!(context.visible(&item, false).expect("own policy"));
         assert!(!context.standalone(&item).expect("parent policy"));
     }
@@ -2029,6 +2162,110 @@ mod tests {
             .await
             .expect("link");
         assert!(f.visible(&owned).await, "one allowed member is enough");
+    }
+
+    /// `hidden_playlists` is the rule a playlist-only listing runs: another
+    /// user's private playlist goes, the user's own, a share and open access
+    /// stay, a playlist file takes base visibility, every arm needs
+    /// `HasParentalAllowedChild`, and an administrator loses nothing.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn hidden_playlists_follow_the_playlist_rule() {
+        let mut f = Fixture::new().await;
+        let library = f
+            .item(95, BaseItemKind::CollectionFolder, Some("/library"), None)
+            .await;
+        let mut rated = f
+            .item(96, BaseItemKind::Movie, Some("/library/96"), Some(&library))
+            .await;
+        rated.official_rating = Some("R".to_owned());
+        f.save(&rated).await;
+        let shared = |id: u128, data: serde_json::Value| {
+            let f = &f;
+            async move {
+                let mut row = f
+                    .item(
+                        id,
+                        BaseItemKind::Playlist,
+                        Some(&format!("/server/data/playlists/{id}")),
+                        None,
+                    )
+                    .await;
+                row.data = Some(data.to_string());
+                f.save(&row).await;
+                row
+            }
+        };
+        let stranger = Uuid::from_u128(999);
+        let private = shared(
+            110,
+            serde_json::json!({"OwnerUserId": stranger, "OpenAccess": false}),
+        )
+        .await;
+        let own = shared(111, serde_json::json!({"OwnerUserId": f.user.id})).await;
+        shared(
+            112,
+            serde_json::json!({"OwnerUserId": stranger, "Shares": [{"UserId": f.user.id}]}),
+        )
+        .await;
+        shared(
+            113,
+            serde_json::json!({"OwnerUserId": stranger, "OpenAccess": true}),
+        )
+        .await;
+        let file = f
+            .item(
+                114,
+                BaseItemKind::Playlist,
+                Some("/library/list.m3u"),
+                Some(&library),
+            )
+            .await;
+        let hidden = async |f: &Fixture| {
+            f.service
+                .hidden_playlists(&f.user, &[])
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<Uuid>>()
+        };
+        assert_eq!(hidden(&f).await, HashSet::from([row_id(&private)]));
+
+        // A playlist file does not take the share rule; base visibility hides it.
+        f.pref(PreferenceKind::AllowedTags, &["unmatched"]).await;
+        assert_eq!(
+            hidden(&f).await,
+            HashSet::from([row_id(&private), row_id(&file)])
+        );
+        f.pref(PreferenceKind::AllowedTags, &[]).await;
+
+        // `HasParentalAllowedChild`: the owner's own and a file both need a member.
+        for playlist in [&own, &file] {
+            crate::FerrofinLinkedChildrenService::new(f.db.clone())
+                .upsert_linked_child(row_id(playlist), row_id(&rated), 0)
+                .await
+                .expect("link");
+        }
+        f.user.max_parental_rating_score = Some(13);
+        assert_eq!(
+            hidden(&f).await,
+            HashSet::from([row_id(&private), row_id(&own), row_id(&file)])
+        );
+        f.user.max_parental_rating_score = None;
+
+        // Only the named top parents are read: nothing hangs off this one.
+        assert_eq!(
+            f.service
+                .hidden_playlists(&f.user, &[Uuid::from_u128(0x5A5A)])
+                .await
+                .unwrap(),
+            Vec::<Uuid>::new()
+        );
+
+        set_permission(&f.db, &f.user.id, PermissionKind::IsAdministrator, true)
+            .await
+            .expect("admin");
+        assert_eq!(hidden(&f).await, HashSet::new(), "Jellyfin's answer");
     }
 
     /// `playlist_policy` is `Playlist.IsVisible` minus the owner/share test,
@@ -2137,6 +2374,433 @@ mod tests {
         assert!(f.visible(&movie).await);
     }
 
+    /// gl-848: `visible_item` hands its rows out as `ItemRepository::retrieve_item`
+    /// does, with the path expanded (`BaseItemMapper.Map`); the chain rows too.
+    #[tokio::test]
+    async fn visible_item_hands_out_expanded_paths() {
+        let mut f = Fixture::new().await;
+        f.service.paths = crate::virtual_paths::VirtualPathExpander::from_paths(Arc::new(
+            crate::app_paths::FerrofinServerApplicationPaths::new(
+                "/server",
+                "/server/log",
+                "/server/config",
+                "/server/cache",
+                "/server/web",
+            ),
+        ));
+        let library = f
+            .item(
+                87,
+                BaseItemKind::CollectionFolder,
+                Some("/views/recordings"),
+                None,
+            )
+            .await;
+        let folder = f
+            .item(
+                88,
+                BaseItemKind::Folder,
+                Some("%AppDataPath%/livetv/recordings"),
+                Some(&library),
+            )
+            .await;
+        let recording = f
+            .item(
+                89,
+                BaseItemKind::Movie,
+                Some("%AppDataPath%/livetv/recordings/a.ts"),
+                Some(&folder),
+            )
+            .await;
+        let (found, chain) = f
+            .service
+            .visible_item_with_chain(row_id(&recording), &f.user)
+            .await
+            .expect("lookup")
+            .expect("visible");
+        assert_eq!(
+            found.path.as_deref(),
+            Some("/server/data/livetv/recordings/a.ts")
+        );
+        let folder_row = chain
+            .iter()
+            .find(|row| row_id(row) == row_id(&folder))
+            .expect("the folder in the chain");
+        assert_eq!(
+            folder_row.path.as_deref(),
+            Some("/server/data/livetv/recordings")
+        );
+    }
+
+    /// A layout under a server rooted at `/server` whose library row and root row store
+    /// `%AppDataPath%` paths, the token Jellyfin writes for a row under its data directory (a box
+    /// set's or a playlist's, in a real database), to give every path reader a token to expand:
+    /// the root, the user root, the library `shared` (stored `%AppDataPath%/media/shared`), the
+    /// library `other`, the physical folder `/server/data/media/shared` under the root, and a
+    /// movie in it.
+    async fn virtual_path_layout(f: &mut Fixture) -> [BaseItemEntity; 6] {
+        let paths = Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+            "/server",
+            "/server/log",
+            "/server/config",
+            "/server/cache",
+            "/server/web",
+        ));
+        f.service.paths = crate::virtual_paths::VirtualPathExpander::from_paths(paths);
+        let root = f
+            .item(
+                0xa0,
+                BaseItemKind::AggregateFolder,
+                Some("%AppDataPath%/root"),
+                None,
+            )
+            .await;
+        let user_root = f
+            .item(
+                0xa1,
+                BaseItemKind::UserRootFolder,
+                Some("/server/root/default"),
+                Some(&root),
+            )
+            .await;
+        let shared = f
+            .item(
+                0xa2,
+                BaseItemKind::CollectionFolder,
+                Some("%AppDataPath%/media/shared"),
+                Some(&user_root),
+            )
+            .await;
+        let other = f
+            .item(
+                0xa3,
+                BaseItemKind::CollectionFolder,
+                Some("/views/other"),
+                Some(&user_root),
+            )
+            .await;
+        let physical = f
+            .item(
+                0xa4,
+                BaseItemKind::Folder,
+                Some("/server/data/media/shared"),
+                Some(&root),
+            )
+            .await;
+        let movie = f
+            .item(
+                0xa5,
+                BaseItemKind::Movie,
+                Some("/server/data/media/shared/a.mkv"),
+                Some(&physical),
+            )
+            .await;
+        [root, user_root, shared, other, physical, movie]
+    }
+
+    /// A library row served from the cached library set, whose stored path holds
+    /// `%AppDataPath%`, still decides membership on its expanded path: blocking it hides the
+    /// movie, blocking the other library does not, and a linked child counts as in it
+    /// (gl-1001).
+    #[tokio::test]
+    async fn a_cached_library_with_a_virtual_path_still_decides_membership() {
+        /// How many of a box set's children `folder_children` keeps: `movie`, linked, with
+        /// `root` as the user's one root folder.
+        async fn linked(f: &Fixture, movie: &BaseItemEntity, root: &BaseItemEntity) -> usize {
+            let child = FolderChild {
+                item: movie.clone(),
+                linked: true,
+            };
+            f.service
+                .folder_children(vec![child], &f.user, true, std::slice::from_ref(root))
+                .await
+                .expect("children")
+                .len()
+        }
+        let mut f = Fixture::new().await;
+        let [root, _, shared, other, _, movie] = virtual_path_layout(&mut f).await;
+        assert!(f.visible(&movie).await);
+        // The rows handed back are expanded as `ItemRepository::retrieve_item` reads them
+        // (gl-848), after the check; the check's own expansion stays inside it, and the cached
+        // set keeps the stored path (`the_context_borrows_caller_and_cached_rows`).
+        let (item, chain) = f
+            .service
+            .visible_item_with_chain(row_id(&shared), &f.user)
+            .await
+            .expect("lookup")
+            .expect("visible");
+        assert_eq!(
+            item.path.as_deref(),
+            Some("/server/data/media/shared"),
+            "the library, expanded"
+        );
+        let above = chain.iter().find(|row| row.id == root.id).expect("root");
+        assert_eq!(
+            above.path.as_deref(),
+            Some("/server/data/root"),
+            "the root, expanded"
+        );
+        assert_eq!(linked(&f, &movie, &shared).await, 1, "in a root");
+        assert_eq!(linked(&f, &movie, &other).await, 0, "in no root");
+        f.pref(PreferenceKind::BlockedMediaFolders, &[&other.id])
+            .await;
+        assert!(f.visible(&movie).await, "another library blocked");
+        f.pref(PreferenceKind::BlockedMediaFolders, &[&shared.id])
+            .await;
+        assert!(!f.visible(&movie).await, "its library blocked");
+        let found = f.service.visible_item(row_id(&movie), &f.user).await;
+        assert!(found.expect("lookup").is_none());
+    }
+
+    /// The context holds the caller's rows and the cached library set's rows themselves, not
+    /// copies; a cached row whose stored path holds a token is the one copied, its path expanded,
+    /// and the cached set keeps the stored path (gl-1001).
+    #[tokio::test]
+    async fn the_context_borrows_caller_and_cached_rows() {
+        let mut f = Fixture::new().await;
+        let [root, user_root, shared, other, _, movie] = virtual_path_layout(&mut f).await;
+        let libraries = f.service.rating_libraries().await.expect("libraries");
+        let items = [movie];
+        let context = f
+            .service
+            .load(&items, Some(&f.user), &libraries.set)
+            .await
+            .expect("context");
+        let held = |row: &BaseItemEntity| -> &BaseItemEntity { &context.rows[&row_id(row)] };
+        let cached = |row: &BaseItemEntity| {
+            context
+                .libraries
+                .rows
+                .iter()
+                .chain(&context.libraries.ancestors)
+                .find(|cached| cached.id == row.id)
+                .expect("cached")
+        };
+        let caller = &items[0];
+        assert!(std::ptr::eq(held(caller), caller), "the caller's row");
+        assert!(
+            std::ptr::eq(held(&other), cached(&other)),
+            "a cached library"
+        );
+        assert!(
+            std::ptr::eq(held(&user_root), cached(&user_root)),
+            "a cached ancestor"
+        );
+        for (row, expanded) in [
+            (&shared, "/server/data/media/shared"),
+            (&root, "/server/data/root"),
+        ] {
+            assert!(!std::ptr::eq(held(row), cached(row)), "{expanded}: a copy");
+            assert_eq!(held(row).path.as_deref(), Some(expanded));
+            assert_eq!(cached(row).path, row.path, "the stored path stays cached");
+        }
+        assert_eq!(
+            context.libraries(&items[0]).expect("libraries"),
+            [row_id(&shared)]
+        );
+    }
+
+    /// A library only its `PhysicalLocationsList` ties to `/media/only`: its row's own path is
+    /// elsewhere and it has no options file, so no `PathInfos` either. Returned with a movie in
+    /// that location, under a location folder parented to the root folder, Jellyfin's layout.
+    async fn location_only_library(
+        f: &Fixture,
+        location: &str,
+    ) -> (BaseItemEntity, BaseItemEntity) {
+        let root = f
+            .item(0xb0, BaseItemKind::AggregateFolder, Some("/root"), None)
+            .await;
+        let physical = f
+            .item(0xb1, BaseItemKind::Folder, Some("/media/only"), Some(&root))
+            .await;
+        let mut library = f
+            .item(
+                0xb2,
+                BaseItemKind::CollectionFolder,
+                Some("/views/only"),
+                None,
+            )
+            .await;
+        library.data = Some(locations_data(&[location]));
+        f.save(&library).await;
+        let movie = f
+            .item(
+                0xb3,
+                BaseItemKind::Movie,
+                Some("/media/only/a.mkv"),
+                Some(&physical),
+            )
+            .await;
+        (library, movie)
+    }
+
+    fn locations_data(locations: &[&str]) -> String {
+        serde_json::json!({ "PhysicalLocationsList": locations }).to_string()
+    }
+
+    /// A library reached only through `PhysicalLocationsList` decides its item's access, whatever
+    /// the case of the stored path, and a save of the library's row replaces the list by the
+    /// next check: the list goes with the rows.
+    #[tokio::test]
+    async fn a_library_matched_only_through_physical_locations_decides_access() {
+        let f = Fixture::new().await;
+        let (mut library, movie) = location_only_library(&f, "/MEDIA/ONLY").await;
+        let other = f
+            .item(
+                0xb4,
+                BaseItemKind::CollectionFolder,
+                Some("/views/other"),
+                None,
+            )
+            .await;
+        let libraries = f.service.rating_libraries().await.expect("libraries");
+        assert!(
+            libraries
+                .set
+                .options
+                .values()
+                .all(|options| options.path_infos.is_empty()),
+            "nothing but the list can match"
+        );
+        let items = [movie.clone()];
+        let context = f
+            .service
+            .load(&items, Some(&f.user), &libraries.set)
+            .await
+            .expect("context");
+        assert_eq!(
+            context.libraries(&items[0]).expect("libraries"),
+            [row_id(&library)]
+        );
+        drop(context);
+
+        assert!(f.visible(&movie).await, "nothing blocked");
+        f.pref(PreferenceKind::BlockedMediaFolders, &[&other.id])
+            .await;
+        assert!(f.visible(&movie).await, "only another library blocked");
+        f.pref(PreferenceKind::BlockedMediaFolders, &[&library.id])
+            .await;
+        assert!(!f.visible(&movie).await, "its library blocked");
+
+        library.data = Some(locations_data(&["/media/elsewhere"]));
+        f.save(&library).await;
+        assert!(
+            f.visible(&movie).await,
+            "the saved list no longer reaches it, so no library holds it"
+        );
+    }
+
+    /// The load parses each library's list once. A check, which asks for the item's libraries
+    /// several times over, then parses none (gl-1060).
+    #[tokio::test]
+    async fn a_check_parses_no_library_data_once_the_set_is_loaded() {
+        let f = Fixture::new().await;
+        let (_, movie) = location_only_library(&f, "/media/only").await;
+        f.item(
+            0xb4,
+            BaseItemKind::CollectionFolder,
+            Some("/views/other"),
+            None,
+        )
+        .await;
+        let parses = crate::item_data::physical_location_parses();
+        let _ = f.service.rating_libraries().await.expect("libraries");
+        assert_eq!(
+            crate::item_data::physical_location_parses() - parses,
+            2,
+            "one parse per library"
+        );
+        let parses = crate::item_data::physical_location_parses();
+        assert!(f.visible(&movie).await);
+        assert_eq!(crate::item_data::physical_location_parses() - parses, 0);
+    }
+
+    /// A caller's copy of a library row stands in for the set's in the context, and its
+    /// `PhysicalLocationsList` with it: `folder_children` passes the roots it read as items, and
+    /// such a row can be newer than the set. Here one copy has left the path the set's row names
+    /// and the other has moved onto it.
+    #[tokio::test]
+    async fn a_callers_copy_of_a_library_row_is_matched_on_its_own_locations() {
+        let f = Fixture::new().await;
+        let (library, movie) = location_only_library(&f, "/media/only").await;
+        let other = f
+            .item(
+                0xb4,
+                BaseItemKind::CollectionFolder,
+                Some("/views/other"),
+                None,
+            )
+            .await;
+        let libraries = f.service.rating_libraries().await.expect("libraries");
+        let mut left = library.clone();
+        left.data = Some(locations_data(&["/media/moved"]));
+        let mut arrived = other.clone();
+        arrived.data = Some(locations_data(&["/media/only"]));
+        let items = [movie, left, arrived];
+        let context = f
+            .service
+            .load(&items, Some(&f.user), &libraries.set)
+            .await
+            .expect("context");
+        assert_eq!(
+            context.libraries(&items[0]).expect("libraries"),
+            [row_id(&other)]
+        );
+    }
+
+    /// The set keeps each list as stored, so a token expands with the current directories: a
+    /// changed metadata directory holds at the next check, with the same set still cached.
+    #[tokio::test]
+    async fn physical_locations_expand_with_the_current_directories() {
+        let mut f = Fixture::new().await;
+        let paths = Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+            "/server",
+            "/server/log",
+            "/server/config",
+            "/server/cache",
+            "/server/web",
+        ));
+        f.service.paths = crate::virtual_paths::VirtualPathExpander::from_paths(Arc::clone(&paths));
+        let (library, movie) = location_only_library(&f, "%MetadataPath%/only").await;
+        let libraries = f.service.rating_libraries().await.expect("libraries");
+        assert_eq!(
+            libraries.set.physical_locations[&row_id(&library)],
+            ["%MetadataPath%/only"],
+            "held as stored"
+        );
+        let cached = libraries
+            .set
+            .rows
+            .iter()
+            .find(|row| row.id == library.id)
+            .expect("cached");
+        assert_eq!(cached.data, library.data, "the stored row stays as stored");
+        let items = [movie];
+        let context = f
+            .service
+            .load(&items, Some(&f.user), &libraries.set)
+            .await
+            .expect("context");
+        let matched = context.libraries(&items[0]).expect("libraries");
+        assert!(
+            matched.is_empty(),
+            "/server/data/metadata/only is not the folder's path: {matched:?}"
+        );
+        drop(context);
+        paths.set_internal_metadata_path(Some("/media"));
+        let cached = f.service.rating_libraries().await.expect("libraries");
+        assert!(Arc::ptr_eq(&cached.set, &libraries.set), "the same set");
+        let context = f
+            .service
+            .load(&items, Some(&f.user), &cached.set)
+            .await
+            .expect("context");
+        assert_eq!(
+            context.libraries(&items[0]).expect("libraries"),
+            [row_id(&library)]
+        );
+    }
+
     #[tokio::test]
     async fn reading_adopted_library_options_does_not_write() {
         let f = Fixture::new().await;
@@ -2157,6 +2821,37 @@ mod tests {
             .await;
         assert!(!f.visible(&folder).await);
         assert!(!dir.path().join("options.json").exists());
+    }
+
+    #[tokio::test]
+    async fn only_a_library_whose_options_disable_it_is_dropped() {
+        let f = Fixture::new().await;
+        let dir = tempfile::tempdir().expect("dir");
+        tokio::fs::write(
+            dir.path().join("options.xml"),
+            "<LibraryOptions><Enabled>false</Enabled></LibraryOptions>",
+        )
+        .await
+        .expect("xml");
+        let disabled = f
+            .item(
+                88,
+                BaseItemKind::CollectionFolder,
+                dir.path().to_str(),
+                None,
+            )
+            .await;
+        let open = f
+            .item(89, BaseItemKind::CollectionFolder, Some("/open"), None)
+            .await;
+        let playlists = f.item(91, BaseItemKind::PlaylistsFolder, None, None).await;
+        let kept = f
+            .service
+            .without_disabled_libraries(vec![disabled, open.clone(), playlists.clone()])
+            .await
+            .expect("kept");
+        let kept: Vec<_> = kept.iter().map(row_id).collect();
+        assert_eq!(kept, [row_id(&open), row_id(&playlists)]);
     }
 
     #[tokio::test]

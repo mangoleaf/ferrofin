@@ -30,14 +30,21 @@ pub trait Extension: Send + Sync {
     fn id(&self) -> Uuid;                                  // also its /Plugins id
     fn descriptor(&self) -> PluginDescriptor;              // name, version, description
     fn default_config(&self) -> Vec<u8>;                   // seed config on first run
-    fn config_pages(&self) -> Vec<PluginConfigPage> { … }  // vendored settings page(s)
+    fn config_pages(&self) -> Vec<PluginConfigPage> { … }  // its settings page(s)
+    fn media_segment_providers(&self, cx: &ExtensionContext)
+        -> Vec<Arc<dyn MediaSegmentProvider>> { … }        // intro/credit producers
+    fn auth_providers(&self, cx: &ExtensionContext)
+        -> Vec<Arc<dyn AuthenticationManager>> { … }       // sign-in backends
+    fn password_reset_providers(&self, cx: &ExtensionContext)
+        -> Vec<Arc<dyn PasswordResetManager>> { … }        // forgotten-password backends
     fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>>;
 }
 ```
 
 An extension receives **only manager trait objects**, never concrete types — an
 `ExtensionContext` bundling the `LibraryManager`, `MediaSegmentManager`, `PluginManager`,
-`MergeVersionsManager`, an optional audio `Fingerprinter`, and a per-extension cache dir. It
+`MergeVersionsManager`, `UserManager`, an optional audio `Fingerprinter`, and a per-extension
+cache dir. It
 is the same dependency-injection seam the rest of the server uses (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md)), so an extension can do real work — scan the library,
 persist media segments, register background tasks — without reaching into implementation
@@ -55,6 +62,23 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
 - **Vendored settings pages.** The upstream plugin's HTML settings page is committed into
   `crates/ferrofin-extensions/assets/<name>/` at build time, so normal builds are hermetic
   (no network fetch). Refresh with `FERROFIN_REFRESH_PLUGIN_ASSETS=1 cargo build -p ferrofin-extensions`.
+  The Ferrofin extension's own page is the exception: it is authored here
+  ([below](#the-ferrofin-extension)).
+- **Authentication providers join sign-in late.** The user manager is built before the
+  extensions, so the composition root hands it every extension's `auth_providers` once
+  they are wired (`register_auth_providers`). Sign-in consults them after the built-in
+  default, and `GET /Auth/Providers` lists each enabled one by its display name and the id a
+  user's `AuthenticationProviderId` stores, which may differ. A provider reports the
+  user's administrator flag in its result rather than saving the user's policy itself
+  (which would wait forever on the login lock it is called under). The user manager applies
+  it through `UserManager::apply_external_administrator`, which sign-in paths outside the
+  password flow call too, and never demotes the last administrator.
+- **Password-reset providers join the same way.** `register_auth_providers` also hands the
+  user manager every extension's `password_reset_providers`. A forgotten-password request
+  goes to the enabled provider a user's `PasswordResetProviderId` names, and to the
+  built-in PIN-file provider otherwise. A PIN is offered to the built-in provider first, then
+  to each extension's, so a provider with no request matching it answers "no match" (never
+  an error, which would stop the redemption).
 - **The `CanUninstall=true` quirk.** jellyfin-web gates the enable/disable toggle on the
   plugin reporting `CanUninstall=true`, so compiled-in extensions report `true` to surface
   the toggle — even though the actual uninstall call is still rejected (you can't uninstall
@@ -84,10 +108,27 @@ that muxer), falling back to `fpcalc`; without either, the analyzers that need n
 
 Beside the ports, one extension is Ferrofin's own: **Ferrofin**
 (`crates/ferrofin-extensions/src/ferrofin_settings.rs`). It ports no plugin and has no tasks,
-hooks or providers; it gives the server's own settings (`GET /Ferrofin/Settings`, see
+hooks or providers; it gives the server's own settings (`GET` and `POST /Ferrofin/Settings`, see
 [`CONFIG.md`](CONFIG.md#seeing-what-is-set)) a plugin identity and an enabled flag, so the
 dashboard's Disable toggle turns them off. Its version is the server's release.
 `FERROFIN_DISABLE_EXTENSIONS` leaves it registered: it has nothing to fire inside a benchmark.
+
+Its settings page, the Settings link under Dashboard → Plugins → Ferrofin and the dashboard
+menu's **Ferrofin** entry, lists every setting that route reports, in groups: the value in use,
+the default, a badge for where the value comes from (default, `config.toml`, environment or
+flag), the environment variable and flag that set it, and, for a setting the page may not
+change, a lock with the reason and where it is changed instead. Secrets are shown to the
+administrator, marked as secrets. A setting the page may change has a control for its kind and
+**Reset to default**: Save posts the changed ones, a refused value shows the server's message next
+to it, and **Restart now** applies them ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)).
+The page holds no setting itself, since `GET /web/ConfigurationPage` is anonymous: its script reads
+them from the admin-only route and sets every string as text, never as HTML. Disabling the plugin
+removes the page and the menu entry.
+
+The extension is first-party, so it has no row or pin in
+[`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md): its page
+(`crates/ferrofin-extensions/assets/ferrofin/settings.html`) is authored in this repository,
+not vendored, and `build.rs` neither fetches nor pins it.
 
 ## Adding an extension
 
@@ -479,8 +520,9 @@ host capabilities are issues on this repository and land as additive WIT changes
 
 ## Non-goals for the WASM tier
 
-- **Authentication providers (SSO/LDAP)** — security-critical core surface; if wanted it
-  becomes a core feature, never sandbox-hosted third-party code.
+- **Authentication providers (SSO/LDAP)** — security-critical surface: they are internal
+  plugins (compiled-in extensions, through `Extension::auth_providers`) or core features,
+  never sandbox-hosted third-party code.
 - **DLNA** — needs SSDP/UDP sockets; the sandbox has no sockets by design.
 - **Item mutation/linking** (Merge-Versions-shaped) — item identity stays host-owned;
   plugins contribute metadata, they never restructure the library.

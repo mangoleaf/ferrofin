@@ -157,6 +157,13 @@ swap as two-way or round-trip in user-facing text. (Suite v3 exercises adoption 
 boots a disposable copy of a Jellyfin-scanned database and Ferrofin migrates it in place —
 but nothing checks that Jellyfin still opens the result, and nothing is expected to.)
 
+**A migration or one-shot repair runs beside the previous version.** The chart's default
+`RollingUpdate` keeps the old pod serving and writing until the new one is ready, and nothing
+serializes the two (sqlx's SQLite migration lock is a no-op), so a row saved after your statement
+ran stays in the old shape. The rules for writing one are under "Migrations and one-shot repairs"
+in `CONTRIBUTING.md`. A refusal or a process-long lock is not an answer: it would wedge a
+`maxUnavailable: 0` rollout.
+
 ### Errors
 Libraries use per-crate `thiserror` enums; the binary uses `anyhow` at the top level.
 Never `.unwrap()` on fallible paths; prefer `?` or explicit handling. `ferrofin-api` maps its
@@ -275,6 +282,17 @@ extracted into the cache whatever their `filename` tags say.
 Both of these need an ffmpeg with libx264, and `subtitle_streams_ffmpeg` also needs ffmpeg
 5.1 or later. CI does not run them (CI never sets `FERROFIN_FFMPEG_TESTS`): run them by hand
 for changes to those paths.
+
+The image limits have the same kind of gate. `image_limits_cgroup` boots the real binary in a
+`systemd-run --user --scope` with a hard memory cap and swap off, and checks that each limit holds
+there: the pixel limit, the resize budget, the memory limit on a Photo item, the budget shared
+by concurrent resizes, and remote images past the download limit. It needs a systemd user session
+and CI does not run it: run it by hand for changes to `ferrofin-drawing/src/limits.rs` or to
+`ferrofin-providers/src/image_download.rs`:
+
+```bash
+FERROFIN_CGROUP_TESTS=1 cargo test -p ferrofin-server --test image_limits_cgroup
+```
 
 Similarly, the end-to-end WASM plugin test builds the reference guest from source (needs the
 `wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root

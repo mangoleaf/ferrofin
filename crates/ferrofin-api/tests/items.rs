@@ -373,6 +373,8 @@ struct OkLibrary {
     adopted_tree: bool,
     /// The last query `query_items` received.
     last_query: Arc<std::sync::Mutex<Option<InternalItemsQuery>>>,
+    /// Every id a caller names is one they may not open.
+    no_visible_ids: bool,
     /// Every `delete_item` call: the id and whether its files were asked to go
     /// (`DeleteOptions::delete_file_location`).
     deleted: Arc<std::sync::Mutex<Vec<(Uuid, bool)>>>,
@@ -439,6 +441,17 @@ impl LibraryManager for OkLibrary {
             self.person_images.clone()
         } else {
             Vec::new()
+        })
+    }
+    async fn get_visible_item_ids(
+        &self,
+        ids: &[Uuid],
+        _user: &UserEntity,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(if self.no_visible_ids {
+            Vec::new()
+        } else {
+            ids.to_vec()
         })
     }
     async fn is_item_visible_standalone(
@@ -727,8 +740,14 @@ impl UserViewManager for OkUserViews {
     async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         Ok(vec![base_item_entity(self.item_id)])
     }
-    async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        self.get_user_views(user_id).await
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_user_views(Uuid::nil()).await
+    }
+    async fn get_user_root_children(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_media_folders().await
     }
     async fn get_latest_items(
         &self,
@@ -1656,8 +1675,14 @@ impl UserViewManager for StubUserViews {
             BaseItemKind::CollectionFolder,
         )])
     }
-    async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        self.get_user_views(user_id).await
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_user_views(Uuid::nil()).await
+    }
+    async fn get_user_root_children(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_media_folders().await
     }
     async fn get_latest_items(
         &self,
@@ -1819,6 +1844,73 @@ async fn items_adds_the_tags_field_for_a_user_with_allowed_tags() {
     )
     .await;
     assert_eq!(json["Items"][0]["Tags"], serde_json::json!([]));
+}
+
+/// The caller's policy rides on the request, so a browse reads its whitelist
+/// from there rather than rebuilding the caller's user DTO. [`OkUsers`] reports
+/// no whitelist, so `Tags` here can only have come from the request's policy.
+#[tokio::test]
+async fn items_reads_the_callers_tag_whitelist_from_the_request_policy() {
+    struct WhitelistedAuth;
+    impl WhitelistedAuth {
+        fn info() -> AuthorizationInfo {
+            AuthorizationInfo {
+                user: Some(user_entity(USER_ID, "alice")),
+                user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                    allowed_tags: vec!["kids".to_owned()],
+                    ..ferrofin_model::users::UserPolicy::default()
+                })),
+                is_authenticated: true,
+                ..AuthorizationInfo::default()
+            }
+        }
+    }
+    #[async_trait]
+    impl AuthService for WhitelistedAuth {
+        async fn authenticate(
+            &self,
+            _request: &RequestContext,
+        ) -> Result<AuthorizationInfo, ServiceError> {
+            Ok(Self::info())
+        }
+    }
+    #[async_trait]
+    impl AuthorizationContext for WhitelistedAuth {
+        async fn get_authorization_info(
+            &self,
+            _request: &RequestContext,
+        ) -> Result<AuthorizationInfo, ServiceError> {
+            Ok(Self::info())
+        }
+    }
+
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0xABCD),
+        adopted_tree: false,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
+        ..Default::default()
+    };
+    let state = ok_state_full(
+        library,
+        Arc::new(OkUsers),
+        Arc::new(OkDto),
+        (Arc::new(WhitelistedAuth), Arc::new(WhitelistedAuth)),
+    );
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/Items?recursive=true")
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    assert_eq!(json["Items"][0]["Tags"], serde_json::json!([]), "{json}");
 }
 
 #[tokio::test]
@@ -2341,6 +2433,35 @@ async fn filtered_user_root_and_typed_library_browses_run_recursively() {
     let view = query_for(&format!("parentId={TV_VIEW_ID}&includeItemTypes=Episode")).await;
     assert_eq!(view.parent_id, TV_LIBRARY_ID);
     assert!(!view.recursive);
+}
+
+/// An empty id list means no filter, so ids the user may not open must answer
+/// empty without a query, on each route that takes them.
+#[tokio::test]
+async fn ids_the_user_may_not_open_never_reach_the_query() {
+    for path in ["/Items", "/Trailers"] {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5A),
+            no_visible_ids: true,
+            ..Default::default()
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{path}?ids={}", Uuid::from_u128(0x5A)))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body = json_body(response).await;
+        assert_eq!(body["TotalRecordCount"], 0, "{path}: {body}");
+        assert_eq!(body["Items"], serde_json::json!([]), "{path}: {body}");
+        assert!(seen.lock().unwrap().is_none(), "{path}: the query ran");
+    }
 }
 
 /// Explicit ids without a `sortBy` answer in the order they were asked for:

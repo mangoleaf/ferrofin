@@ -790,6 +790,50 @@ mod tests {
         client.await.expect("client");
     }
 
+    /// The connection limits run inside TLS: the stalled peer reads its `408`,
+    /// and the connection ends with a `close_notify`.
+    #[tokio::test]
+    async fn a_stalled_request_over_tls_is_answered_408() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let certificate = test_certificate(
+            "secret",
+            p12_keystore::EncryptionAlgorithm::PbeWithHmacSha256AndAes256,
+        );
+        let path = write(&dir, "server.pfx", &certificate.pkcs12);
+        let config = load_certificate(&path, "secret").expect("certificate");
+        let listener = crate::listen::bind("127.0.0.1:0".parse().expect("address")).expect("bind");
+        let listener = TlsListener::new(listener, config).expect("listener");
+        let address = listener.local_addr();
+        let limits = crate::connection_limits::ConnectionLimits {
+            keep_alive: Duration::from_secs(10),
+            request_headers: Duration::from_millis(100),
+        };
+        let serving = crate::Serving::start_with_limits(
+            vec![crate::listen::ServedListener::Tls(listener)],
+            &axum::Router::new(),
+            limits,
+        );
+
+        let tcp = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect");
+        let name =
+            rustls::pki_types::ServerName::IpAddress(std::net::IpAddr::from([127, 0, 0, 1]).into());
+        let mut tls = trusting(&certificate.der)
+            .connect(name, tcp)
+            .await
+            .expect("handshake");
+        tls.write_all(b"GET / HTT").await.expect("write");
+        tls.flush().await.expect("flush");
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(10), tls.read_to_string(&mut response))
+            .await
+            .expect("the server closes the connection")
+            .expect("a clean close");
+        assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+        drop(serving);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_stalled_handshake_is_dropped_after_the_timeout() {
         let dir = tempfile::tempdir().expect("tempdir");

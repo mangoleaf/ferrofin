@@ -81,6 +81,7 @@ fn extraction<'a>(
         allow_hw_accel: false,
         enable_hw_encoding: false,
         keyframe_only: false,
+        full_chroma: false,
     }
 }
 
@@ -121,6 +122,10 @@ fn make_clip(path: &Path) {
             "testsrc=duration=6:size=128x72:rate=10",
             "-c:v",
             "libx264",
+            // 4:2:0, as real media is. `testsrc` is RGB, which libx264 would
+            // otherwise keep at 4:4:4.
+            "-pix_fmt",
+            "yuv420p",
         ])
         .arg(path)
         .stdout(std::process::Stdio::null())
@@ -175,6 +180,72 @@ async fn extracts_interval_frames_from_a_real_clip() {
         assert!(!bytes.is_empty(), "frame is non-empty: {frame}");
         // JPEG magic — the mjpeg encoder really wrote images.
         assert_eq!(&bytes[..2], &[0xFF, 0xD8], "JPEG SOI marker in {frame}");
+    }
+}
+
+/// The (horizontal, vertical) sampling factors of every component of a JPEG,
+/// in the order Y, Cb, Cr.
+fn sampling_factors(path: &str) -> Vec<(u8, u8)> {
+    let bytes = std::fs::read(path).expect("read frame");
+    let mut i = 2; // skip SOI
+    loop {
+        assert_eq!(bytes[i], 0xFF, "not a JPEG marker at offset {i}");
+        if bytes[i + 1] == 0xC0 {
+            // SOF0: FF C0, length, precision, height, width, count, then
+            // (id, sampling, table) per component.
+            return (0..usize::from(bytes[i + 9]))
+                .map(|component| {
+                    let sampling = bytes[i + 11 + 3 * component];
+                    (sampling >> 4, sampling & 0x0F)
+                })
+                .collect();
+        }
+        i += 2 + ((usize::from(bytes[i + 2]) << 8) | usize::from(bytes[i + 3]));
+    }
+}
+
+/// ffmpeg really writes the chroma asked for, on a 4:2:0 source. The argument
+/// tests cannot show that the mjpeg encoder takes the format filter's pixels.
+/// 4:4:4 is chroma sampled as often as luma, whatever factors a build declares
+/// for that: ffmpeg writes `(1, 2)` on every component where others write
+/// `(1, 1)`.
+#[rstest::rstest]
+#[case::full_chroma(true)]
+#[case::jellyfin_chroma(false)]
+#[tokio::test]
+async fn frames_are_written_at_the_chroma_asked_for(#[case] full_chroma: bool) {
+    if !ffmpeg_gate() {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let clip = tmp.path().join("clip.mp4");
+    make_clip(&clip);
+
+    let out_dir = tmp.path().join("frames");
+    let extractor = TrickplayFrameExtractorImpl::new(
+        Arc::new(TokioTranscoder::new()),
+        "ffmpeg",
+        probed_ffmpeg_version(),
+    );
+    let frames = extractor
+        .extract_trickplay_frames(&TrickplayExtraction {
+            full_chroma,
+            ..extraction(
+                &clip.to_string_lossy(),
+                &clip_stream(),
+                &out_dir.to_string_lossy(),
+            )
+        })
+        .await
+        .expect("frame extraction succeeds");
+
+    assert!((3..=4).contains(&frames.len()), "{frames:?}");
+    for frame in &frames {
+        let factors = sampling_factors(frame);
+        assert_eq!(factors.len(), 3, "{frame}");
+        let chroma_matches_luma = factors[1] == factors[0] && factors[2] == factors[0];
+        assert_eq!(chroma_matches_luma, full_chroma, "{frame}: {factors:?}");
     }
 }
 

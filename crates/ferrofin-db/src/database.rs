@@ -13,6 +13,10 @@ use crate::error::Result;
 ///
 /// `sqlx::migrate!()` reads the directory at **compile time**, so building
 /// this crate needs no live database or `DATABASE_URL`.
+///
+/// A migration runs while the previous version can still be writing the same
+/// database: read "Migrations and one-shot repairs" in `CONTRIBUTING.md` before
+/// adding one.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The version of the last migration in this build's chain: a database
@@ -111,17 +115,34 @@ impl Database {
         Self::connect_sized(url, None).await
     }
 
-    /// [`Database::connect`] with an explicit pool size.
-    ///
-    /// `Some(n)` pins the pool at exactly `n` connections; `None` uses the
-    /// sizing formula ([`default_pool_size`]). The composition root resolves
-    /// its config layers (`FERROFIN_DB_POOL` env / `db_pool` in `config.toml`)
-    /// into this parameter — this crate no longer reads the environment.
+    /// [`Database::connect_tuned`] with the default statement cache
+    /// ([`DEFAULT_STATEMENT_CACHE_CAPACITY`]).
     ///
     /// # Errors
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the URL is invalid or
     /// the pool cannot be opened.
     pub async fn connect_sized(url: &str, pool_size: Option<u32>) -> Result<Self> {
+        Self::connect_tuned(url, pool_size, None).await
+    }
+
+    /// [`Database::connect`] with an explicit pool size and statement cache.
+    ///
+    /// `pool_size` `Some(n)` pins the pool at exactly `n` connections; `None`
+    /// uses the sizing formula ([`default_pool_size`]). `statement_cache` is
+    /// how many prepared statements each connection keeps, reader and writer
+    /// pools alike; `None` keeps [`DEFAULT_STATEMENT_CACHE_CAPACITY`]. The
+    /// composition root resolves its config layers (`FERROFIN_DB_POOL` /
+    /// `db_pool`, `FERROFIN_DB_STATEMENT_CACHE` / `db_statement_cache`) into
+    /// these parameters — this crate does not read the environment.
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the URL is invalid or
+    /// the pool cannot be opened.
+    pub async fn connect_tuned(
+        url: &str,
+        pool_size: Option<u32>,
+        statement_cache: Option<u32>,
+    ) -> Result<Self> {
         // Readers keep the full 30s busy timeout: WAL readers normally never
         // block on the writer, but VACUUM / wal_checkpoint(TRUNCATE) take
         // EXCLUSIVE locks — a 5s reader timeout turned a long vacuum into hard
@@ -135,7 +156,14 @@ impl Database {
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(30))
             .pragma("mmap_size", MMAP_SIZE_BYTES.to_string())
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .statement_cache_capacity(
+                statement_cache.map_or(DEFAULT_STATEMENT_CACHE_CAPACITY, |n| {
+                    usize::try_from(n).unwrap_or(DEFAULT_STATEMENT_CACHE_CAPACITY)
+                }),
+            );
+        // The writer, the snapshot pool and the migration connection below
+        // inherit the read options, statement cache included.
         let write_options = read_options
             .clone()
             .busy_timeout(std::time::Duration::from_secs(30));
@@ -195,7 +223,9 @@ impl Database {
         // pool's connection would have no `ferrofin_random()` and every
         // random-ordered query would fail with "no such function".
         init_sqlite();
-        let options = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")?
+            .foreign_keys(true)
+            .statement_cache_capacity(DEFAULT_STATEMENT_CACHE_CAPACITY);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
@@ -636,10 +666,7 @@ impl Database {
     ) -> Result<Vec<(String, String, String)>> {
         let mut out = Vec::new();
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
                    WHERE "ItemId" IN ({placeholders})"#,
@@ -666,10 +693,7 @@ impl Database {
     pub async fn item_data_blobs(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Data" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "Data" IS NOT NULL"#,
@@ -697,10 +721,7 @@ impl Database {
     pub async fn item_studios(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Studios" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "Studios" IS NOT NULL AND "Studios" <> ''"#,
@@ -728,10 +749,7 @@ impl Database {
     pub async fn item_original_languages(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "OriginalLanguage" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "OriginalLanguage" IS NOT NULL"#,
@@ -763,10 +781,7 @@ impl Database {
     ) -> Result<Vec<(String, i64)>> {
         let mut out = Vec::new();
         for chunk in primary_ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             // The seeded placeholder row is excluded exactly as the full-row
             // read (`get_items_by_primary_version_batch`) excludes it.
             let sql = format!(
@@ -798,10 +813,7 @@ impl Database {
     pub async fn image_parent_rows(&self, ids: &[String]) -> Result<Vec<ImageParentRow>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Type", "ParentId", "OwnerId", "SeriesId", "SeasonId",
                           "AlbumArtists", "Path", "LUFS", "NormalizationGain"
@@ -856,10 +868,7 @@ impl Database {
     pub async fn photo_album_names(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Name" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders})
@@ -886,10 +895,7 @@ impl Database {
     pub async fn playlist_owners(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "PlaylistId", "OwnerUserId" FROM "FerrofinPlaylists"
                    WHERE "PlaylistId" IN ({placeholders}) AND "OwnerUserId" IS NOT NULL"#,
@@ -1790,10 +1796,32 @@ fn discard_snapshot(snapshot: &std::path::Path) {
 /// consistent view, log included, and waits for no other process; a warning
 /// says why. Refusing the boot instead could leave a rolling update waiting
 /// forever on a pod that never becomes ready (owner decision, 2026-10-25).
+///
+/// A finished checkpoint does not hold that process back. It can commit while
+/// the file is being copied, and its automatic checkpoint then writes into the
+/// file under the copy, which ends up with some pages from before and some from
+/// after: a corrupt database that nothing reports. Every commit puts frames in
+/// the log the checkpoint just emptied, so a log that is not empty when the copy
+/// ends means the copy cannot be trusted, and it is taken again the same way.
+/// (Only a `TRUNCATE` checkpoint of its own would empty the log again, which a
+/// running server takes at the end of its database optimization task.)
 async fn copy_database_file(
     conn: &mut sqlx::SqliteConnection,
     path: &std::path::Path,
     backup: &std::path::Path,
+) -> Result<()> {
+    copy_database_file_with(conn, path, backup, async |from, to| {
+        std::fs::copy(from, to).map(drop)
+    })
+    .await
+}
+
+/// [`copy_database_file`], with the byte-for-byte file copy passed in.
+async fn copy_database_file_with(
+    conn: &mut sqlx::SqliteConnection,
+    path: &std::path::Path,
+    backup: &std::path::Path,
+    copy_file: impl AsyncFnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
 ) -> Result<()> {
     let partial = start_snapshot(backup)?;
     let written = async {
@@ -1803,19 +1831,32 @@ async fn copy_database_file(
             sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
                 .fetch_one(&mut *conn)
                 .await?;
-        if busy == 0 && log == checkpointed {
-            std::fs::copy(path, &partial).map_err(|source| crate::DbError::Backup {
-                path: backup.display().to_string(),
-                source,
-            })?;
+        let distrusted = if busy == 0 && log == checkpointed {
+            copy_file(path, &partial)
+                .await
+                .map_err(|source| crate::DbError::Backup {
+                    path: backup.display().to_string(),
+                    source,
+                })?;
+            (!log_is_empty(path)).then_some(
+                "another process wrote to the database during the copy, which may hold half of a checkpoint",
+            )
         } else {
+            Some(
+                "another process has the database open, so its write-ahead log could not be folded in",
+            )
+        };
+        if let Some(cause) = distrusted {
             tracing::warn!(
                 database = %path.display(),
                 backup = %backup.display(),
                 log_frames = log,
                 checkpointed_frames = checkpointed,
-                "another process has the database open, so its write-ahead log could not be folded in: copying it with VACUUM INTO instead"
+                cause,
+                "copying the database with VACUUM INTO instead of the file"
             );
+            // `VACUUM INTO` refuses a file that is already there.
+            start_snapshot(backup)?;
             sqlx::query(sqlx::AssertSqlSafe(vacuum_into(&partial)))
                 .execute(&mut *conn)
                 .await?;
@@ -1824,6 +1865,18 @@ async fn copy_database_file(
     }
     .await;
     abandon_on_error(&partial, written)
+}
+
+/// Whether the write-ahead log of the database at `path` holds nothing, as a
+/// finished `wal_checkpoint(TRUNCATE)` leaves it. A log that cannot be looked at
+/// counts as holding something: the caller then takes the safe way.
+fn log_is_empty(path: &std::path::Path) -> bool {
+    let mut log = path.as_os_str().to_owned();
+    log.push("-wal");
+    match std::fs::metadata(log) {
+        Ok(metadata) => metadata.len() == 0,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// The temporary name a snapshot is written under until it is complete
@@ -2074,6 +2127,15 @@ async fn log_dangling_row_cleanup(conn: &mut sqlx::SqliteConnection) -> Result<(
         .await?;
     Ok(())
 }
+
+/// How many prepared statements each pooled connection keeps when the
+/// composition root does not say (`db_statement_cache`; owner decision,
+/// gl-1071). sqlx's own default is 100, and a browse of a small library ran 120
+/// to 190 distinct statements on one connection, largely because every size of
+/// an `IN (…)` list is its own text: at 100 the cache evicted statements still in
+/// use, and on a repeat browse about one execution in ten prepared again a
+/// statement the cache had dropped. 200 holds that working set.
+pub const DEFAULT_STATEMENT_CACHE_CAPACITY: usize = 200;
 
 /// The `auto` reader-pool size: **usable-core count** — the min of the CPU
 /// affinity mask (`available_parallelism`) and the cgroup CFS quota.
@@ -2420,6 +2482,104 @@ mod tests {
             .expect("count");
         assert_eq!(rows, 2, "the copy must hold the commit still in the WAL");
         assert!(!dir.path().join("jellyfin.db.pre-0007.partial").exists());
+    }
+
+    /// Another process that commits while the file is being copied can
+    /// checkpoint into it (its automatic checkpoint runs every 1000 pages):
+    /// the copy then holds the first half of the file from before that
+    /// checkpoint and the second half from after it. Nothing reports that, so
+    /// the log is looked at once the copy is done, and a copy it cannot vouch
+    /// for is taken again with `VACUUM INTO`.
+    #[tokio::test]
+    async fn a_copy_another_process_wrote_through_is_taken_again() {
+        use sqlx::ConnectOptions as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let mut conn = options.clone().connect().await.expect("connect");
+        sqlx::raw_sql(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+             CREATE INDEX t_v ON t (v);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+             INSERT INTO t SELECT i, printf('%0100d', i) FROM n;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed");
+        let mut other = options.connect().await.expect("the other process");
+
+        let backup = dir.path().join("jellyfin.db.pre-0044");
+        copy_database_file_with(&mut conn, &path, &backup, async |from, to| {
+            let before = std::fs::read(from)?;
+            sqlx::raw_sql(
+                "UPDATE t SET v = printf('%0100d', 9999 - id);
+                 PRAGMA wal_checkpoint(PASSIVE);",
+            )
+            .execute(&mut other)
+            .await
+            .expect("a commit and a checkpoint during the copy");
+            let after = std::fs::read(from)?;
+            let middle = before.len() / 2;
+            std::fs::write(to, [&before[..middle], &after[middle..]].concat())
+        })
+        .await
+        .expect("copy");
+
+        let mut copy = SqliteConnectOptions::new()
+            .filename(&backup)
+            .read_only(true)
+            .connect()
+            .await
+            .expect("open the copy");
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check(1)")
+            .fetch_one(&mut copy)
+            .await
+            .expect("integrity check");
+        assert_eq!(integrity, "ok", "the copy must not be torn");
+        let first: String = sqlx::query_scalar("SELECT v FROM t WHERE id = 1")
+            .fetch_one(&mut copy)
+            .await
+            .expect("read the copy");
+        assert_eq!(
+            first,
+            format!("{:0100}", 9998),
+            "the copy is taken again, so it holds the commit made during the first one"
+        );
+    }
+
+    /// With nothing else on the database the copy is the file itself, not a
+    /// `VACUUM INTO` of it: a rewritten copy is not the file the operator had.
+    #[tokio::test]
+    async fn a_copy_nothing_wrote_through_is_the_file_itself() {
+        use sqlx::ConnectOptions as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .connect()
+            .await
+            .expect("connect");
+        sqlx::raw_sql("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .execute(&mut conn)
+            .await
+            .expect("seed");
+
+        let backup = dir.path().join("jellyfin.db.pre-0044");
+        copy_database_file_with(&mut conn, &path, &backup, async |_, to| {
+            std::fs::write(to, "what the file copy wrote")
+        })
+        .await
+        .expect("copy");
+
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read the copy"),
+            "what the file copy wrote"
+        );
     }
 
     /// Seeds a database file with every migration up to `last` applied and

@@ -31,7 +31,9 @@ use ferrofin_model::session::{
     ClientCapabilities, GeneralCommand, MessageCommand, PlayRequest, PlaybackProgressInfo,
     PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest, SessionMessageType, TranscodingInfo,
 };
-use ferrofin_model::users::UserPolicy;
+use ferrofin_model::users::{
+    ForgotPasswordAction, ForgotPasswordResult, PinRedeemResult, UserPolicy,
+};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
@@ -113,7 +115,11 @@ impl AuthService for AdminAuth {
 struct MemUsers {
     /// Records the last (user_id, new_password) passed to `change_password`.
     changed_password: Mutex<Option<(Uuid, String)>>,
-    fail_password_change: std::sync::atomic::AtomicBool,
+    /// Records each (entered username, in local network) passed to
+    /// `start_forgot_password_process`.
+    forgot_requests: Mutex<Vec<(String, bool)>>,
+    /// Records each PIN passed to `redeem_password_reset_pin`.
+    redeemed_pins: Mutex<Vec<String>>,
     /// Records the last policy passed to `update_policy`.
     updated_policy: Mutex<Option<(Uuid, UserPolicy)>>,
     /// Records the last configuration passed to `update_configuration`.
@@ -124,6 +130,11 @@ struct MemUsers {
     deleted: Mutex<Option<Uuid>>,
     /// Makes `delete_user` refuse, as the last user or the last admin.
     refuse_delete: std::sync::atomic::AtomicBool,
+    /// Makes `get_user_dto` answer the policy last saved for that user, so the
+    /// device check after a policy save reads what was saved.
+    echo_saved_policy: std::sync::atomic::AtomicBool,
+    /// Listed by `get_users` before the two fixed accounts.
+    listed_first: Option<UserEntity>,
 }
 
 /// The fixed two-user table shared by [`MemUsers`] and the assertions.
@@ -137,7 +148,12 @@ fn mem_users() -> Vec<UserEntity> {
 #[async_trait]
 impl UserManager for MemUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        Ok(mem_users())
+        Ok(self
+            .listed_first
+            .iter()
+            .cloned()
+            .chain(mem_users())
+            .collect())
     }
     async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         Ok(vec![ADMIN_ID, BOB_ID])
@@ -189,14 +205,40 @@ impl UserManager for MemUsers {
         Ok(())
     }
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError> {
-        if self
-            .fail_password_change
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(ServiceError::backend("password store unavailable"));
-        }
         *self.changed_password.lock().unwrap() = Some((user_id, new_password.to_owned()));
         Ok(())
+    }
+    async fn start_forgot_password_process(
+        &self,
+        entered_username: &str,
+        is_in_network: bool,
+    ) -> Result<ForgotPasswordResult, ServiceError> {
+        self.forgot_requests
+            .lock()
+            .unwrap()
+            .push((entered_username.to_owned(), is_in_network));
+        Ok(ForgotPasswordResult {
+            action: ForgotPasswordAction::PinCode,
+            pin_file: Some("/data/passwordreset0123.json".to_owned()),
+            pin_expiration_date: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-11-02T10:30:00Z")
+                    .unwrap()
+                    .into(),
+            ),
+        })
+    }
+    async fn redeem_password_reset_pin(&self, pin: &str) -> Result<PinRedeemResult, ServiceError> {
+        self.redeemed_pins.lock().unwrap().push(pin.to_owned());
+        if pin == "A1B2C3D4" {
+            Ok(PinRedeemResult {
+                success: true,
+                users_reset: vec!["bob".to_owned()],
+            })
+        } else {
+            Err(ServiceError::not_found(
+                "no matching password reset request",
+            ))
+        }
     }
     async fn authenticate_user(
         &self,
@@ -220,16 +262,23 @@ impl UserManager for MemUsers {
     ) -> Result<UserDto, ServiceError> {
         // The admin user reports IsAdministrator; everyone else does not.
         let is_admin = user.id == ADMIN_ID.to_string();
+        let saved = self
+            .echo_saved_policy
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| self.updated_policy.lock().unwrap().clone())
+            .flatten()
+            .filter(|(id, _)| id.to_string() == user.id)
+            .map(|(_, policy)| policy);
         Ok(UserDto {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
-            policy: Some(UserPolicy {
+            policy: Some(saved.unwrap_or_else(|| UserPolicy {
                 is_administrator: is_admin,
                 // This account fixture has no device restrictions.
                 enable_all_devices: true,
                 ..UserPolicy::default()
-            }),
+            })),
             configuration: Some(UserConfiguration::default()),
             ..UserDto::default()
         })
@@ -1070,8 +1119,14 @@ impl UserViewManager for OkUserViews {
     async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         Ok(vec![base_item_entity(self.item_id)])
     }
-    async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        self.get_user_views(user_id).await
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_user_views(Uuid::nil()).await
+    }
+    async fn get_user_root_children(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_media_folders().await
     }
     async fn get_latest_items(
         &self,
@@ -1821,6 +1876,153 @@ async fn update_policy_records_and_guards_last_admin() {
     assert_eq!(recorded.1.max_active_sessions, 5);
 }
 
+/// Upstream binds the body into `new UserPolicy()`, so a member it leaves out
+/// keeps the constructor's value (`UserPolicy.cs`), not `false`/`0`. With
+/// `EnableAllDevices` kept, `DeviceAccessHost` signs no device out: the saved
+/// policy is what the device check reads here, and a check that went on to the
+/// devices would reach `FakeDevices`, which panics.
+#[tokio::test]
+async fn update_policy_partial_body_keeps_the_constructor_defaults() {
+    let users = Arc::new(MemUsers::default());
+    users
+        .echo_saved_policy
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let body = serde_json::json!({
+        "AuthenticationProviderId": "a",
+        "PasswordResetProviderId": "b",
+        "IsDisabled": false,
+    });
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users/{BOB_ID}/Policy"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (_, saved) = users.updated_policy.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        saved,
+        UserPolicy {
+            is_hidden: true,
+            enable_user_preference_access: true,
+            enable_shared_device_control: true,
+            enable_remote_access: true,
+            enable_live_tv_management: true,
+            enable_live_tv_access: true,
+            enable_media_playback: true,
+            enable_audio_playback_transcoding: true,
+            enable_video_playback_transcoding: true,
+            enable_playback_remuxing: true,
+            enable_content_downloading: true,
+            enable_sync_transcoding: true,
+            enable_media_conversion: true,
+            enable_all_devices: true,
+            enable_all_channels: true,
+            enable_all_folders: true,
+            login_attempts_before_lockout: -1,
+            enable_public_sharing: true,
+            authentication_provider_id: "a".to_owned(),
+            password_reset_provider_id: "b".to_owned(),
+            ..UserPolicy::default()
+        }
+    );
+}
+
+/// `UserManager.GetUserById(Guid.Empty)` throws `ArgumentException`, a `400`:
+/// a nil route id, a nil `?userId=`, or an API key's empty user claim when
+/// `userId` is left out (`userId ?? User.GetUserId()`).
+#[rstest::rstest]
+#[case::get("GET", "/Users/00000000-0000-0000-0000-000000000000", "", false)]
+#[case::delete("DELETE", "/Users/00000000-0000-0000-0000-000000000000", "", false)]
+#[case::policy(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000/Policy",
+    r#"{"AuthenticationProviderId":"a","PasswordResetProviderId":"b"}"#,
+    false
+)]
+#[case::update(
+    "POST",
+    "/Users?userId=00000000-0000-0000-0000-000000000000",
+    r#"{"Name":"bob","Policy":null}"#,
+    false
+)]
+#[case::update_path(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000",
+    r#"{"Name":"bob","Policy":null}"#,
+    false
+)]
+#[case::configuration(
+    "POST",
+    "/Users/Configuration?userId=00000000-0000-0000-0000-000000000000",
+    "{}",
+    false
+)]
+#[case::configuration_path(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000/Configuration",
+    "{}",
+    false
+)]
+#[case::password_path(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000/Password",
+    r#"{"ResetPassword":true}"#,
+    false
+)]
+#[case::password(
+    "POST",
+    "/Users/Password?userId=00000000-0000-0000-0000-000000000000",
+    r#"{"ResetPassword":true}"#,
+    false
+)]
+#[case::api_key_update("POST", "/Users", r#"{"Name":"bob","Policy":null}"#, true)]
+#[case::api_key_configuration("POST", "/Users/Configuration", "{}", true)]
+#[case::api_key_password("POST", "/Users/Password", r#"{"ResetPassword":true}"#, true)]
+#[tokio::test]
+async fn a_nil_user_id_is_a_bad_request(
+    #[case] method: &str,
+    #[case] uri: &str,
+    #[case] body: &str,
+    #[case] api_key: bool,
+) {
+    let users = Arc::new(MemUsers::default());
+    let auth: Arc<dyn AuthService> = if api_key {
+        Arc::new(ferrofin_api::test_support::ApiKeyAuthService)
+    } else {
+        Arc::new(AdminAuth)
+    };
+    let router = create_router(state_with_auth(
+        users.clone(),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        auth,
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(users.updated_policy.lock().unwrap().is_none());
+    assert!(users.deleted.lock().unwrap().is_none());
+    assert!(users.updated_configuration.lock().unwrap().is_none());
+}
+
 /// A policy whose two `[Required]` provider ids are set, as every client that
 /// echoes a `GET /Users/{id}` policy back sends it.
 fn complete_policy() -> UserPolicy {
@@ -1856,6 +2058,7 @@ fn complete_policy() -> UserPolicy {
     &["PasswordResetProviderId"]
 )]
 #[case::unknown_user(r"{}", Uuid::from_u128(0xDEAD), &["AuthenticationProviderId", "PasswordResetProviderId"])]
+#[case::nil_user(r"{}", Uuid::nil(), &["AuthenticationProviderId", "PasswordResetProviderId"])]
 #[tokio::test]
 async fn update_policy_requires_both_provider_ids(
     #[case] body: &str,
@@ -1894,32 +2097,34 @@ async fn update_policy_requires_both_provider_ids(
     );
 }
 
+// The flow itself (PIN files, local-only issue, one reset per PIN, expiry)
+// lives in the user manager and is tested there, in ferrofin-core
+// (`user_manager/password_reset_tests.rs`). These check the handlers' wiring.
+
 #[tokio::test]
-async fn forgot_password_unknown_user_returns_the_uniform_pin_response() {
-    // An unknown username must not disclose account existence, and touches no
-    // filesystem (the user lookup returns `None` before a pin is issued).
-    let router = create_router(state(
-        Arc::new(MemUsers::default()),
-        Arc::new(MemConfig::new(true)),
-    ));
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/Users/ForgotPassword")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "EnteredUsername": "nobody" }).to_string(),
-                ))
-                .unwrap(),
+async fn forgot_password_hands_the_name_and_network_to_the_user_manager() {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    for peer in ["203.0.113.8:4321", "127.0.0.1:4321"] {
+        let response = recovery_request(
+            &router,
+            "/Users/ForgotPassword",
+            serde_json::json!({ "EnteredUsername": "bob" }),
+            peer,
         )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_json(response).await;
-    assert_eq!(body["Action"], "PinCode");
-    assert!(body["PinExpirationDate"].is_string());
-    assert!(!std::path::Path::new(body["PinFile"].as_str().unwrap()).exists());
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["Action"], "PinCode");
+        assert_eq!(body["PinFile"], "/data/passwordreset0123.json");
+        assert!(body["PinExpirationDate"].is_string());
+    }
+    // A missing or blank EnteredUsername is not pinned here: upstream answers
+    // it 400 ([Required] required string), which gl-1156 tracks.
+    assert_eq!(
+        *users.forgot_requests.lock().unwrap(),
+        vec![("bob".to_owned(), false), ("bob".to_owned(), true)]
+    );
 }
 
 async fn recovery_request(
@@ -1946,40 +2151,22 @@ async fn recovery_request(
 }
 
 #[tokio::test]
-async fn forgot_password_local_only_preserves_failed_updates_and_consumes_once() {
-    use std::sync::atomic::Ordering;
+async fn forgot_password_pin_answers_the_redemption_and_404s_a_pin_no_provider_redeems() {
     let users = Arc::new(MemUsers::default());
     let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
-    let start = "/Users/ForgotPassword";
     let redeem = "/Users/ForgotPassword/Pin";
     let local = "127.0.0.1:4321";
     let response = recovery_request(
         &router,
-        start,
-        serde_json::json!({"EnteredUsername":"bob"}),
-        "203.0.113.8:4321",
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let remote = body_json(response).await;
-    assert_eq!(remote["Action"], "PinCode");
-    assert!(!std::path::Path::new(remote["PinFile"].as_str().unwrap()).exists());
-    let response = recovery_request(
-        &router,
-        start,
-        serde_json::json!({"EnteredUsername":"bob"}),
+        redeem,
+        serde_json::json!({"Pin":"A1B2C3D4"}),
         local,
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body["Action"], "PinCode");
-    assert_eq!(body["PinFile"], remote["PinFile"]);
-    let file = std::path::PathBuf::from(body["PinFile"].as_str().unwrap());
-    let mut record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-    record["Pin"] = serde_json::json!("A1-B2-C3-D4");
-    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert_eq!(body["Success"], true);
+    assert_eq!(body["UsersReset"], serde_json::json!(["bob"]));
     let wrong = recovery_request(
         &router,
         redeem,
@@ -1988,66 +2175,11 @@ async fn forgot_password_local_only_preserves_failed_updates_and_consumes_once()
     )
     .await;
     assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
-    assert!(file.exists());
-    users.fail_password_change.store(true, Ordering::SeqCst);
-    let failed = recovery_request(
-        &router,
-        redeem,
-        serde_json::json!({"Pin":"A1B2C3D4"}),
-        local,
-    )
-    .await;
-    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(file.exists(), "failed password update preserves recovery");
-    users.fail_password_change.store(false, Ordering::SeqCst);
-    // Two concurrent redemption attempts must produce exactly one reset.
-    let (first, second) = tokio::join!(
-        recovery_request(
-            &router,
-            redeem,
-            serde_json::json!({"Pin":"A1B2C3D4"}),
-            local
-        ),
-        recovery_request(
-            &router,
-            redeem,
-            serde_json::json!({"Pin":"A1B2C3D4"}),
-            local
-        )
-    );
-    let mut statuses = [first.status(), second.status()];
-    statuses.sort();
-    assert_eq!(statuses, [StatusCode::OK, StatusCode::NOT_FOUND]);
-    let (id, pw) = users.changed_password.lock().unwrap().clone().unwrap();
-    assert_eq!(id, BOB_ID);
     assert_eq!(
-        pw, "A1B2C3D4",
-        "the exact entered form becomes the password"
+        *users.redeemed_pins.lock().unwrap(),
+        vec!["A1B2C3D4".to_owned(), "a1-b2-c3-d4".to_owned()],
+        "the PIN reaches the user manager exactly as entered"
     );
-    assert!(!file.exists());
-    // A matched file for a deleted user also remains recoverable after failure.
-    record["UserName"] = serde_json::json!("deleted");
-    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
-    let missing = recovery_request(
-        &router,
-        redeem,
-        serde_json::json!({"Pin":"A1B2C3D4"}),
-        local,
-    )
-    .await;
-    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-    assert!(file.exists());
-    record["ExpirationDate"] = serde_json::json!("2000-01-01T00:00:00Z");
-    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
-    let expired = recovery_request(
-        &router,
-        redeem,
-        serde_json::json!({"Pin":"A1B2C3D4"}),
-        local,
-    )
-    .await;
-    assert_eq!(expired.status(), StatusCode::NOT_FOUND);
-    assert!(!file.exists());
 }
 
 #[tokio::test]
@@ -2077,7 +2209,8 @@ async fn authenticate_by_name_returns_authentication_result() {
 
 /// The obsolete `UserController.AuthenticateUser` (`POST /Users/{userId}/
 /// Authenticate?pw=`, hidden from the OpenAPI document but served): anonymous,
-/// 404 for an unknown user, `[Required] pw`, else `AuthenticateUserByName`.
+/// 400 for a nil id, 404 for an unknown user, `[Required] pw`, else
+/// `AuthenticateUserByName`.
 #[tokio::test]
 async fn authenticate_by_id_signs_in_as_that_user() {
     let post = |uri: String| async move {
@@ -2103,6 +2236,12 @@ async fn authenticate_by_id_signs_in_as_that_user() {
     ))
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = post(format!("/Users/{}/Authenticate?pw=secret", Uuid::nil())).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "GetUserById(Guid.Empty) throws"
+    );
     let response = post(format!("/Users/{USER_ID}/Authenticate")).await;
     assert_eq!(
         response.status(),
@@ -2539,4 +2678,193 @@ async fn account_updates_respect_preferences_and_api_key_elevation() {
             assert_eq!(response.status(), expected, "{path}");
         }
     }
+}
+
+/// Authenticates by the presented token, so one router serves every caller the
+/// `Policy`/`Configuration` rule tells apart. No known token is anonymous.
+struct TokenAuth;
+
+#[async_trait]
+impl AuthService for TokenAuth {
+    async fn authenticate(
+        &self,
+        request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        let token = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("X-Emby-Token"))
+            .map(|(_, value)| value.as_str());
+        let signed_in = |user: UserEntity| AuthorizationInfo {
+            user: Some(user),
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        };
+        Ok(match token {
+            Some("admin") => signed_in(user_entity(ADMIN_ID, "admin", Some("hash"))),
+            Some("bob") => signed_in(user_entity(BOB_ID, "bob", None)),
+            Some("key") => AuthorizationInfo {
+                is_authenticated: true,
+                is_api_key: true,
+                ..AuthorizationInfo::default()
+            },
+            _ => AuthorizationInfo::default(),
+        })
+    }
+}
+
+/// `GET path` as `token` (anonymous when `None`), from `peer`, on a wizard state.
+async fn get_as(
+    users: Arc<MemUsers>,
+    wizard_done: bool,
+    path: &str,
+    token: Option<&str>,
+    peer: &str,
+) -> serde_json::Value {
+    let app = state_with_auth(
+        users,
+        Arc::new(MemConfig::new(wizard_done)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(TokenAuth),
+    );
+    let mut request = Request::builder()
+        .uri(path)
+        .extension(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().unwrap(),
+        ));
+    if let Some(token) = token {
+        request = request.header("X-Emby-Token", token);
+    }
+    let response = create_router(app)
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{path}");
+    body_json(response).await
+}
+
+/// Asserts a row carries both private objects, or leaves both out of the JSON
+/// (how Jellyfin writes a null, and how the contract's optional nullable
+/// fields allow it), and that the login card's fields stay either way.
+fn assert_private_fields(row: &serde_json::Value, whole: bool) {
+    let name = &row["Name"];
+    assert!(name.is_string(), "{row}");
+    assert!(row["Id"].is_string(), "{row}");
+    for field in ["Policy", "Configuration"] {
+        match row.get(field) {
+            Some(value) => assert!(whole && value.is_object(), "{name}: {field} is {value}"),
+            None => assert!(!whole, "{name}: {field} is missing"),
+        }
+    }
+}
+
+/// Owner decision gl-1102, beyond Jellyfin: only an administrator or an API key
+/// reads another account's `Policy` and `Configuration`. A user keeps their own.
+#[rstest::rstest]
+#[case::list_non_admin("/Users", Some("bob"), &["bob"])]
+#[case::list_admin("/Users", Some("admin"), &["admin", "bob"])]
+#[case::list_api_key("/Users", Some("key"), &["admin", "bob"])]
+#[case::public_anonymous("/Users/Public", None, &[])]
+#[case::public_unknown_token("/Users/Public", Some("stale"), &[])]
+#[case::public_non_admin("/Users/Public", Some("bob"), &["bob"])]
+#[case::public_admin("/Users/Public", Some("admin"), &["admin", "bob"])]
+#[case::public_api_key("/Users/Public", Some("key"), &["admin", "bob"])]
+#[tokio::test]
+async fn user_lists_keep_private_fields_from_other_accounts(
+    #[case] path: &str,
+    #[case] token: Option<&str>,
+    #[case] whole: &[&str],
+    #[values(false, true)] wizard_done: bool,
+) {
+    let users = Arc::new(MemUsers::default());
+    let body = get_as(users, wizard_done, path, token, "127.0.0.1:9000").await;
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "no row is dropped: {body}");
+    for row in rows {
+        assert_private_fields(row, whole.contains(&row["Name"].as_str().unwrap()));
+    }
+}
+
+#[rstest::rstest]
+#[case::another_account(ADMIN_ID, "bob", false)]
+#[case::own_account(BOB_ID, "bob", true)]
+#[case::admin_reads_another(BOB_ID, "admin", true)]
+#[case::api_key_reads_any(ADMIN_ID, "key", true)]
+#[tokio::test]
+async fn get_user_by_id_keeps_private_fields_from_other_accounts(
+    #[case] target: Uuid,
+    #[case] token: &str,
+    #[case] whole: bool,
+) {
+    let users = Arc::new(MemUsers::default());
+    let path = format!("/Users/{target}");
+    let row = get_as(users, true, &path, Some(token), "127.0.0.1:9000").await;
+    assert_private_fields(&row, whole);
+}
+
+/// The remote-access filter reads `Policy`, so it must run before the strip: a
+/// remote login screen still loses the fixture's admin, which refuses remote
+/// access, and keeps bob, saved here as the one account that allows it.
+#[tokio::test]
+async fn the_remote_access_filter_reads_policy_before_it_is_stripped() {
+    let users = Arc::new(MemUsers::default());
+    users
+        .echo_saved_policy
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    *users.updated_policy.lock().unwrap() = Some((
+        BOB_ID,
+        UserPolicy {
+            enable_remote_access: true,
+            ..UserPolicy::default()
+        },
+    ));
+    let names = async |peer: &str| {
+        let body = get_as(users.clone(), true, "/Users/Public", None, peer).await;
+        let rows = body.as_array().unwrap().clone();
+        for row in &rows {
+            assert_private_fields(row, false);
+        }
+        rows.iter()
+            .map(|row| row["Name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names("127.0.0.1:9000").await, ["admin", "bob"]);
+    assert_eq!(names("203.0.113.8:9000").await, ["bob"]);
+}
+
+/// The hidden and disabled filters read `Policy` too, so a stripped row must not
+/// reach them: the login screen would list hidden and disabled accounts.
+#[rstest::rstest]
+#[case::hidden(UserPolicy { is_hidden: true, ..UserPolicy::default() })]
+#[case::disabled(UserPolicy { is_disabled: true, ..UserPolicy::default() })]
+#[tokio::test]
+async fn the_login_screen_filters_read_policy_before_it_is_stripped(#[case] policy: UserPolicy) {
+    let users = Arc::new(MemUsers::default());
+    users
+        .echo_saved_policy
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    *users.updated_policy.lock().unwrap() = Some((BOB_ID, policy));
+    let body = get_as(users, true, "/Users/Public", None, "127.0.0.1:9000").await;
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{body}");
+    assert_eq!(rows[0]["Name"], "admin");
+    assert_private_fields(&rows[0], false);
+}
+
+/// Upstream's `OrderBy(u => u.Username)` compares by culture, where case does
+/// not come first: an ordinal sort would put `Zoe` before `admin`.
+#[tokio::test]
+async fn user_lists_sort_names_by_culture() {
+    let users = Arc::new(MemUsers {
+        listed_first: Some(user_entity(Uuid::from_u128(0x0E5E), "Zoe", None)),
+        ..MemUsers::default()
+    });
+    let body = get_as(users, true, "/Users", Some("admin"), "127.0.0.1:9000").await;
+    let names: Vec<_> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["admin", "bob", "Zoe"]);
 }

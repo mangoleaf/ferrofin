@@ -31,7 +31,7 @@ use ferrofin_model::providers::{ImageProviderInfo, RemoteImageInfo, RemoteImageQ
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
-use ferrofin_traits::options::{AuthorizationInfo, ItemImageInfo};
+use ferrofin_traits::options::{AuthorizationInfo, ItemImageInfo, ItemImagesToServe};
 use ferrofin_traits::providers::{
     ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority,
 };
@@ -280,6 +280,8 @@ struct StubLibrary {
     item_reads: Mutex<usize>,
     /// Whether [`ITEM_ID`] is a photo whose images are auto-oriented.
     photo: bool,
+    /// Whether [`ITEM_ID`] is a Live TV channel.
+    live_tv: bool,
 }
 
 impl StubLibrary {
@@ -309,6 +311,13 @@ impl LibraryManager for StubLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         *self.item_reads.lock().expect("lock") += 1;
         Ok(match id {
+            _ if id == ITEM_ID && self.live_tv => Some(item_entity(
+                ITEM_ID,
+                "Channel",
+                BaseItemKind::LiveTvChannel
+                    .stored_type_name()
+                    .expect("stored name"),
+            )),
             _ if id == ITEM_ID => Some(item_entity(ITEM_ID, "Imaged Movie", "Movie")),
             _ if id == GENRE_ID => Some(item_entity(GENRE_ID, "Drama", "Genre")),
             _ => None,
@@ -322,14 +331,15 @@ impl LibraryManager for StubLibrary {
         Ok(id == ITEM_ID || id == GENRE_ID)
     }
 
-    async fn get_item_images_with_auto_orient(
+    async fn get_item_images_to_serve(
         &self,
         item_id: Uuid,
-    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
-        Ok((
-            self.get_item_images(item_id).await?,
-            self.photo && item_id == ITEM_ID,
-        ))
+    ) -> Result<ItemImagesToServe, ServiceError> {
+        Ok(ItemImagesToServe {
+            images: self.get_item_images(item_id).await?,
+            auto_orient: self.photo && item_id == ITEM_ID,
+            live_tv: self.live_tv && item_id == ITEM_ID,
+        })
     }
 
     async fn get_item_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
@@ -854,7 +864,7 @@ impl ferrofin_traits::drawing::ImageProcessor for RecordingProcessor {
     }
     async fn get_image_cache_tag(
         &self,
-        _item_id: Uuid,
+        _item_path: Option<&str>,
         _image: &ItemImageInfo,
     ) -> Result<Option<String>, ServiceError> {
         Ok(None)
@@ -899,6 +909,7 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
             swaps: Mutex::new(Vec::new()),
             item_reads: Mutex::new(0),
             photo: false,
+            live_tv: false,
         }),
         users: Arc::new(StubUsers {
             profile_path,
@@ -1076,6 +1087,7 @@ async fn a_photos_image_is_processed_with_auto_orientation() {
             swaps: Mutex::new(Vec::new()),
             item_reads: Mutex::new(0),
             photo: true,
+            live_tv: false,
         }),
         processor: Some(photo.clone()),
         ..stubs(img.path(), String::new())
@@ -1303,6 +1315,58 @@ async fn remote_image_backdrop_is_served_from_its_local_copy() {
         *asked.lock().expect("lock"),
         ["https://remote.example/backdrop.jpg"]
     );
+}
+
+/// A Live TV item's row outside the metadata directory is not served and not
+/// listed, though the file exists and another item's row may point at it; a URL
+/// is served from its copy as on any item. `FakeConfig` has no metadata
+/// directory, so here every local row is outside it.
+#[tokio::test]
+async fn a_live_tv_items_local_row_is_not_served_outside_the_metadata_directory() {
+    let img = TempImage::new(b"X");
+    let copy = TempImage::new(b"REMOTE");
+    let s = Stubs {
+        library: Arc::new(StubLibrary {
+            image_path: img.path(),
+            swaps: Mutex::new(Vec::new()),
+            item_reads: Mutex::new(0),
+            photo: false,
+            live_tv: true,
+        }),
+        providers: Arc::new(StubProviders {
+            saved: Arc::new(Mutex::new(Vec::new())),
+            deleted: Arc::new(Mutex::new(Vec::new())),
+            updates: Arc::new(Mutex::new(Vec::new())),
+            remote_copy: Some(copy.path()),
+            remote_asked: Arc::new(Mutex::new(Vec::new())),
+        }),
+        ..stubs(img.path(), String::new())
+    };
+    for method in ["GET", "HEAD"] {
+        let (status, body) = send(
+            &s,
+            method,
+            &format!("/Items/{ITEM_ID}/Images/Primary"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method}");
+        assert_ne!(body, b"X", "{method}");
+    }
+    let (status, body) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/Backdrop"),
+        None,
+    )
+    .await;
+    assert_eq!((status, body.as_slice()), (StatusCode::OK, &b"REMOTE"[..]));
+
+    let (status, body) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(listed.as_array().expect("infos").len(), 1, "{listed}");
+    assert_eq!(listed[0]["ImageType"], "Backdrop");
 }
 
 #[tokio::test]
@@ -2270,6 +2334,276 @@ async fn anonymous_profile_image_requires_a_nonempty_user_id() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+}
+
+/// `GetUserImage` passes `GetImageInternal` no sizes and a quality of 90, and the
+/// legacy forms drop what they declare, so nothing in the URL sizes an avatar.
+/// `GetImageResult` calls `ProcessImage` on every request, which re-encodes a
+/// source format the client's output formats do not list, so a plain request
+/// reaches the processor too (gl-1114).
+#[rstest::rstest]
+#[tokio::test]
+async fn user_images_reach_the_processor_with_upstreams_fixed_options(
+    #[values(
+        "/UserImage",
+        "/Users/{user}/Images/Primary",
+        "/Users/{user}/Images/Primary/0"
+    )]
+    route: &str,
+    #[values(
+        "",
+        "?width=40&height=30&maxWidth=20&maxHeight=10&fillWidth=50&fillHeight=60&blur=2&quality=60"
+    )]
+    query: &str,
+) {
+    let img = TempImage::new(b"PROFILE");
+    let processor = Arc::new(RecordingProcessor::default());
+    let mut s = stubs(String::new(), img.path());
+    s.processor = Some(processor.clone());
+    let uri = format!("{}{query}", route.replace("{user}", &USER_ID.to_string()));
+
+    let (status, body) = send(&s, "GET", &uri, None).await;
+
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::OK, &b"PROFILE"[..]),
+        "{uri}"
+    );
+    let asked = processor.asked.lock().expect("asked lock");
+    let options = asked.first().expect("the image was processed");
+    assert_eq!(options.quality, 90, "{uri}");
+    assert_eq!(
+        (
+            options.width,
+            options.height,
+            options.max_width,
+            options.max_height
+        ),
+        (None, None, None, None),
+        "{uri}"
+    );
+    assert_eq!(
+        (options.fill_width, options.fill_height, options.blur),
+        (None, None, None),
+        "{uri}"
+    );
+}
+
+/// `tag` and `format` are what all three routes pass on to `GetImageInternal`.
+#[rstest::rstest]
+#[case::user_image("/UserImage")]
+#[case::legacy("/Users/{user}/Images/Primary")]
+#[case::indexed_legacy("/Users/{user}/Images/Primary/0")]
+#[tokio::test]
+async fn user_images_keep_their_tag_and_format(#[case] route: &str) {
+    let img = TempImage::new(b"PROFILE");
+    let processor = Arc::new(RecordingProcessor::default());
+    let mut s = stubs(String::new(), img.path());
+    s.processor = Some(processor.clone());
+    let uri = format!(
+        "{}?tag=abc&format=jpg",
+        route.replace("{user}", &USER_ID.to_string())
+    );
+
+    let (status, headers, _) = send_with_headers(&s, &uri, &[]).await;
+
+    assert_eq!(status, StatusCode::OK, "{uri}");
+    assert_eq!(headers["etag"], "\"abc\"", "{uri}");
+    assert_eq!(
+        headers["cache-control"], "public, max-age=31536000, immutable",
+        "{uri}"
+    );
+    let asked = processor.asked.lock().expect("asked lock");
+    assert_eq!(
+        asked
+            .first()
+            .expect("the image was processed")
+            .supported_output_formats,
+        [ferrofin_model::drawing::ImageFormat::Jpg],
+        "{uri}"
+    );
+}
+
+/// `GetUserImage` binds `userId`, `tag` and `format` and nothing else, so a
+/// malformed size is never seen, while the legacy forms take `userId` from the
+/// route and `imageIndex` is a query member only on the form with no index in
+/// its route. `format` is a nullable enum: an unparseable one binds null, and an
+/// undefined number throws once `ProcessImage` reads it, so a user with no image
+/// is still a `404`. Each row was measured on Jellyfin 12.4 (gl-1114).
+#[rstest::rstest]
+#[case::size_is_not_bound("/UserImage?width=x", StatusCode::OK)]
+#[case::quality_is_not_bound("/UserImage?quality=x", StatusCode::OK)]
+#[case::blur_is_not_bound("/UserImage?blur=x", StatusCode::OK)]
+#[case::empty_size("/UserImage?width=", StatusCode::OK)]
+#[case::user_id_is_bound("/UserImage?userId=junk", StatusCode::BAD_REQUEST)]
+#[case::unparseable_format("/UserImage?format=bogus", StatusCode::OK)]
+#[case::undefined_format("/UserImage?format=6", StatusCode::BAD_REQUEST)]
+#[case::undefined_format_with_no_image(
+    "/UserImage?userId={missing}&format=6",
+    StatusCode::NOT_FOUND
+)]
+#[case::legacy_image_index("/Users/{user}/Images/Primary?imageIndex=x", StatusCode::BAD_REQUEST)]
+#[case::legacy_user_id_is_the_routes("/Users/{user}/Images/Primary?userId=junk", StatusCode::OK)]
+#[case::legacy_background_color_is_a_string(
+    "/Users/{user}/Images/Primary?backgroundColor=zz",
+    StatusCode::OK
+)]
+#[case::legacy_undefined_format("/Users/{user}/Images/Primary?format=6", StatusCode::BAD_REQUEST)]
+#[case::indexed_image_index_is_the_routes(
+    "/Users/{user}/Images/Primary/0?imageIndex=x",
+    StatusCode::OK
+)]
+#[case::indexed_user_id_is_the_routes("/Users/{user}/Images/Primary/0?userId=junk", StatusCode::OK)]
+#[tokio::test]
+async fn user_image_routes_bind_what_their_actions_declare(
+    #[case] route: &str,
+    #[case] expected: StatusCode,
+) {
+    let img = TempImage::new(b"PROFILE");
+    let mut s = stubs(String::new(), img.path());
+    s.processor = Some(Arc::new(RecordingProcessor::default()));
+    let uri = route
+        .replace("{user}", &USER_ID.to_string())
+        .replace("{missing}", &MISSING_ID.to_string());
+    let (status, _) = send(&s, "GET", &uri, None).await;
+    assert_eq!(status, expected, "{uri}");
+}
+
+/// The legacy forms declare these numbers and drop them, and ASP.NET binds what
+/// is declared: a malformed one is `[ApiController]`'s `400`, and an empty or a
+/// valid one has no effect. Measured on Jellyfin 12.4 (gl-1114).
+#[rstest::rstest]
+#[tokio::test]
+async fn legacy_user_image_forms_bind_every_number_they_declare(
+    #[values("/Users/{user}/Images/Primary", "/Users/{user}/Images/Primary/0")] route: &str,
+    #[values(
+        "width",
+        "height",
+        "maxWidth",
+        "maxHeight",
+        "fillWidth",
+        "fillHeight",
+        "quality",
+        "blur",
+        "percentPlayed",
+        "unplayedCount"
+    )]
+    member: &str,
+) {
+    let img = TempImage::new(b"PROFILE");
+    let s = stubs(String::new(), img.path());
+    let route = route.replace("{user}", &USER_ID.to_string());
+    for (value, expected) in [
+        ("x", StatusCode::BAD_REQUEST),
+        ("12", StatusCode::OK),
+        ("", StatusCode::OK),
+    ] {
+        let uri = format!("{route}?{member}={value}");
+        assert_eq!(send(&s, "GET", &uri, None).await.0, expected, "{uri}");
+    }
+}
+
+/// `PostUserImage` and `DeleteUserImage` bind `userId` alone, so an undeclared
+/// member is never parsed. Their legacy forms take `userId` from the route and
+/// bind no query member, except `DeleteUserImageLegacy`'s `[FromQuery] int?
+/// index`: the indexed delete takes `index` from its route, and the uploads
+/// declare none. Each row was measured on Jellyfin 12.4 (gl-1031).
+#[rstest::rstest]
+#[case::post_size("POST", "/UserImage?maxWidth=x", StatusCode::NO_CONTENT)]
+#[case::delete_size("DELETE", "/UserImage?maxWidth=x", StatusCode::NO_CONTENT)]
+#[case::post_image_index("POST", "/UserImage?imageIndex=x", StatusCode::NO_CONTENT)]
+#[case::delete_image_index("DELETE", "/UserImage?imageIndex=x", StatusCode::NO_CONTENT)]
+#[case::post_user_id("POST", "/UserImage?userId=junk", StatusCode::BAD_REQUEST)]
+#[case::delete_user_id("DELETE", "/UserImage?userId=junk", StatusCode::BAD_REQUEST)]
+#[case::post_legacy_size(
+    "POST",
+    "/Users/{user}/Images/Primary?maxWidth=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_legacy_size(
+    "DELETE",
+    "/Users/{user}/Images/Primary?maxWidth=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::post_legacy_user_id(
+    "POST",
+    "/Users/{user}/Images/Primary?userId=junk",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_legacy_user_id(
+    "DELETE",
+    "/Users/{user}/Images/Primary?userId=junk",
+    StatusCode::NO_CONTENT
+)]
+#[case::post_legacy_index("POST", "/Users/{user}/Images/Primary?index=x", StatusCode::NO_CONTENT)]
+#[case::delete_legacy_index(
+    "DELETE",
+    "/Users/{user}/Images/Primary?index=x",
+    StatusCode::BAD_REQUEST
+)]
+#[case::post_indexed_size(
+    "POST",
+    "/Users/{user}/Images/Primary/0?maxWidth=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_indexed_size(
+    "DELETE",
+    "/Users/{user}/Images/Primary/0?maxWidth=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::post_indexed_user_id(
+    "POST",
+    "/Users/{user}/Images/Primary/0?userId=junk",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_indexed_user_id(
+    "DELETE",
+    "/Users/{user}/Images/Primary/0?userId=junk",
+    StatusCode::NO_CONTENT
+)]
+#[case::post_indexed_index(
+    "POST",
+    "/Users/{user}/Images/Primary/0?index=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_indexed_index(
+    "DELETE",
+    "/Users/{user}/Images/Primary/0?index=x",
+    StatusCode::NO_CONTENT
+)]
+#[tokio::test]
+async fn user_image_writes_bind_what_their_actions_declare(
+    #[case] method: &str,
+    #[case] route: &str,
+    #[case] expected: StatusCode,
+) {
+    let s = stubs(String::new(), String::new());
+    let uri = route.replace("{user}", &USER_ID.to_string());
+    let body = (method == "POST").then_some(("image/png", "aGk="));
+    let (status, _) = send(&s, method, &uri, body).await;
+    assert_eq!(status, expected, "{method} {uri}");
+}
+
+/// No item image action declares `userId`, so a malformed one is never seen.
+/// Measured on Jellyfin 12.4 (gl-1031).
+#[rstest::rstest]
+#[case::get("GET", "/Items/{item}/Images/Primary", StatusCode::OK)]
+#[case::get_indexed("GET", "/Items/{item}/Images/Primary/0", StatusCode::OK)]
+#[case::delete("DELETE", "/Items/{item}/Images/Primary", StatusCode::NO_CONTENT)]
+#[tokio::test]
+async fn item_image_routes_ignore_a_user_id(
+    #[case] method: &str,
+    #[case] route: &str,
+    #[case] expected: StatusCode,
+) {
+    let img = TempImage::new(b"POSTER");
+    let s = elevated_stubs(img.path(), String::new());
+    let uri = format!(
+        "{}?userId=junk",
+        route.replace("{item}", &ITEM_ID.to_string())
+    );
+    let (status, _) = send(&s, method, &uri, None).await;
+    assert_eq!(status, expected, "{method} {uri}");
 }
 
 /// `GetItemImage2` takes `width`, `height`, `quality`, `fillWidth`,

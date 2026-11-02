@@ -56,16 +56,20 @@ impl LocalImageProvider {
     /// Whether this provider handles `item` (`Supports`).
     ///
     /// Port of `LocalImageProvider.Supports`: everything that supports local
-    /// metadata *except* episodes (their own provider), songs (`Audio` but not
-    /// `AudioBook`) and photos. The C# virtual-location season-from-series
-    /// branch has no analogue without a live library, so a virtual item is
-    /// unsupported here.
+    /// metadata (an item with a path of its own, `IsFileProtocol`) *except*
+    /// episodes (their own provider), songs (`Audio` but not `AudioBook`) and
+    /// photos; and of the items with no path (`LocationType.Virtual`), a
+    /// season whose series is on the file system, so that its images are
+    /// read from its series' folder.
     #[must_use]
     pub fn supports(item: &ImageItem) -> bool {
-        !matches!(
-            item.kind,
-            ImageItemKind::Episode | ImageItemKind::Audio | ImageItemKind::Photo
-        )
+        if item.path.is_some() {
+            return !matches!(
+                item.kind,
+                ImageItemKind::Episode | ImageItemKind::Audio | ImageItemKind::Photo
+            );
+        }
+        item.kind == ImageItemKind::Season && item.series_folder_path.is_some()
     }
 
     /// Discovers local images for `item` by scanning its containing folder.
@@ -476,9 +480,8 @@ impl LocalImageProvider {
     /// folder, using the season name and the `seasonNN` / `-specials` markers.
     ///
     /// Port of `PopulateSeasonImagesFromSeriesFolder`. Requires the season's
-    /// `index_number`, its `name` (used as a filename prefix) and the parent
-    /// series folder (carried on `containing_folder_path` of the standalone
-    /// [`ImageItem`] passed as the season here — see the module tests).
+    /// `index_number`, its `name` (used as a filename prefix) and its series'
+    /// folder (`series_folder_path`, `GetFiles(season.Series, false, …)`).
     fn populate_season_images_from_series_folder<D: DirectoryService>(
         season: &ImageItem,
         images: &mut Vec<LocalImageInfo>,
@@ -487,27 +490,12 @@ impl LocalImageProvider {
         let Some(season_number) = season.index_number else {
             return;
         };
-        // The parent series folder is the season's containing folder here.
-        let Some(series_folder) = season.containing_folder_path.as_deref() else {
+        let Some(series_folder) = season.series_folder_path.as_deref() else {
             return;
         };
 
         let series_listing = directory_service.file_system_entries(series_folder);
-        let series_files: Vec<&FileSystemMetadata> = {
-            let mut f: Vec<&FileSystemMetadata> = series_listing
-                .iter()
-                .filter(|i| {
-                    !i.is_directory
-                        && i.extension
-                            .as_deref()
-                            .is_some_and(is_supported_image_extension)
-                })
-                .collect();
-            f.sort_by_key(|i| {
-                supported_image_extension_index(i.extension.as_deref().unwrap_or_default())
-            });
-            f
-        };
+        let series_files = Self::get_files(&series_listing, false);
 
         // Try using the season name (spaces stripped, lower-cased).
         let prefix = season.name.replace(' ', "").to_lowercase();

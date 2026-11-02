@@ -74,7 +74,7 @@ pub struct FerrofinItemRepository {
     /// composition root (see [`FerrofinItemRepository::with_root_ids`]).
     roots: Option<RootFolderIds>,
     /// Expands the `%MetadataPath%`/`%AppDataPath%` tokens an adopted Jellyfin
-    /// database stores in image paths (see
+    /// database stores in item and image paths (see
     /// [`FerrofinItemRepository::with_virtual_paths`]).
     virtual_paths: VirtualPathExpander,
     /// The files Live TV is writing right now, bound late by the composition
@@ -283,6 +283,7 @@ impl FerrofinItemRepository {
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)
+        .map(|rows| self.mapped_rows(rows))
     }
 
     /// Creates a repository over the given database and kind-lookup tables.
@@ -311,14 +312,36 @@ impl FerrofinItemRepository {
         self
     }
 
-    /// Installs the server's [`VirtualPathExpander`], so image rows adopted
-    /// from Jellyfin (`%MetadataPath%/library/…`) come back as real paths —
-    /// the read half of `BaseItemRepository.Map`. Called once by the
-    /// composition root; without it stored tokens pass through verbatim.
+    /// Installs the server's [`VirtualPathExpander`], so item and image rows
+    /// adopted from Jellyfin (`%MetadataPath%/Genre/…`,
+    /// `%MetadataPath%/library/…`) come back as real paths — the read half of
+    /// `BaseItemRepository.Map`. Called once by the composition root; without
+    /// it stored tokens pass through verbatim.
     #[must_use]
     pub fn with_virtual_paths(mut self, virtual_paths: VirtualPathExpander) -> Self {
         self.virtual_paths = virtual_paths;
         self
+    }
+
+    /// The row as the domain reads it, its `Path` expanded
+    /// ([`VirtualPathExpander::expand_in_place`]): upstream's
+    /// `DeserializeBaseItem` maps every row through `BaseItemMapper.Map`,
+    /// whose `dto.Path = appHost.ExpandVirtualPath(entity.Path)` turns an
+    /// adopted by-name item's `%MetadataPath%/Genre/Action`, or the playlists
+    /// folder's `%AppDataPath%/playlists`, into a real path. Every row an
+    /// [`ItemRepository`] read returns goes through here; the save keeps the
+    /// stored token form (`FerrofinItemPersistenceService::upsert_item`).
+    fn mapped(&self, mut row: BaseItemEntity) -> BaseItemEntity {
+        self.virtual_paths.expand_in_place(&mut row.path);
+        row
+    }
+
+    /// [`Self::mapped`] over every row.
+    fn mapped_rows(&self, mut rows: Vec<BaseItemEntity>) -> Vec<BaseItemEntity> {
+        for row in &mut rows {
+            self.virtual_paths.expand_in_place(&mut row.path);
+        }
+        rows
     }
 
     /// Installs the slot the composition root later fills with Live TV's
@@ -936,7 +959,31 @@ impl FerrofinItemRepository {
             .await
     }
 
+    /// [`Self::resolve_scope`], less the playlists the user cannot see
+    /// ([`ItemVisibility::hidden_playlists`]), whichever statement runs next.
     async fn resolve_views_with_parent(
+        &self,
+        filter: &InternalItemsQuery,
+        parent: Option<&ViewRow>,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        let resolved = self.resolve_scope(filter, parent).await?;
+        let scoped = resolved.as_ref().unwrap_or(filter);
+        let (Some(user), Some(visibility)) = (
+            scoped.user.as_ref().filter(|_| may_list_playlists(scoped)),
+            self.visibility(),
+        ) else {
+            return Ok(resolved);
+        };
+        let hidden = Box::pin(visibility.hidden_playlists(user, &scoped.top_parent_ids)).await?;
+        if hidden.is_empty() {
+            return Ok(resolved);
+        }
+        let mut excluding = resolved.unwrap_or_else(|| filter.clone());
+        excluding.exclude_item_ids.extend(hidden);
+        Ok(Some(excluding))
+    }
+
+    async fn resolve_scope(
         &self,
         filter: &InternalItemsQuery,
         parent: Option<&ViewRow>,
@@ -1116,7 +1163,9 @@ impl FerrofinItemRepository {
             // like Live TV or Playlists, or any id on a Ferrofin database,
             // where the view IS the top parent — contributes itself. Replacing
             // the whole set whenever *one* id expanded would silently drop the
-            // scopes that did not.
+            // scopes that did not. A view that stands for libraries is not
+            // expanded here, so it matches nothing: scope one with a recursive
+            // `parent_id`, which the branch above translates.
             let by_view = library_top_parents_by_view(&self.db, &filter.top_parent_ids).await?;
             let mut expanded = Vec::with_capacity(filter.top_parent_ids.len());
             let changed = !by_view.is_empty();
@@ -1420,7 +1469,7 @@ impl FerrofinItemRepository {
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
-        Ok(rows)
+        Ok(self.mapped_rows(rows))
     }
 
     /// Runs a translated query returning only the id and clean-name columns.
@@ -1950,7 +1999,7 @@ impl FerrofinItemRepository {
                     .and_then(|name| counts_by_clean_name.get(name))
                     .copied()
                     .unwrap_or_default(),
-                item: r.item,
+                item: self.mapped(r.item),
             })
             .collect();
         Ok(QueryResult::new(Some(start_index), Some(total), items))
@@ -2798,6 +2847,22 @@ async fn scope_to_user_libraries_prepared(
     Ok(Some(resolved))
 }
 
+/// Whether `filter`'s rows can hold a playlist its user may not see, and no one
+/// else checks: a query limited to kinds or leaves that leave `Playlist` out pays
+/// nothing. Named ids stop at their own check (`retain_visible_ids`), and a plain
+/// folder's direct children at `Folder.GetChildren`'s.
+///
+/// TODO(gl-1127): box sets `BoxSet.IsVisible` hides are still listed.
+fn may_list_playlists(filter: &InternalItemsQuery) -> bool {
+    !filter.checks_playlist_visibility
+        && filter.item_ids.is_empty()
+        && filter.is_folder != Some(false)
+        && (filter.recursive || filter.parent_id.is_nil())
+        && (filter.include_item_types.is_empty()
+            || filter.include_item_types.contains(&BaseItemKind::Playlist))
+        && !filter.exclude_item_types.contains(&BaseItemKind::Playlist)
+}
+
 /// The top parents `views` stand for, in order: each library's entry in
 /// `by_view` ([`library_top_parents_by_view`]), and any other view itself.
 fn top_parents_of(
@@ -3452,7 +3517,7 @@ impl ItemRepository for FerrofinItemRepository {
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
-        Ok(row)
+        Ok(row.map(|row| self.mapped(row)))
     }
 
     async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
@@ -3468,7 +3533,7 @@ impl ItemRepository for FerrofinItemRepository {
             }
             rows.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
         }
-        Ok(rows)
+        Ok(self.mapped_rows(rows))
     }
 
     async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
@@ -3523,6 +3588,7 @@ impl ItemRepository for FerrofinItemRepository {
         let deduped = rows
             .into_iter()
             .filter(|r| seen.insert(r.id.clone()))
+            .map(|r| self.mapped(r))
             .collect();
         Ok(Some(deduped))
     }
@@ -3649,7 +3715,7 @@ impl ItemRepository for FerrofinItemRepository {
             .map(|rows| {
                 rows.into_iter()
                     .map(|row| FolderChild {
-                        item: row.item,
+                        item: self.mapped(row.item),
                         linked: row.linked,
                     })
                     .collect()
@@ -3697,7 +3763,9 @@ impl ItemRepository for FerrofinItemRepository {
             // `limit` series — see `latest_tv_repository`. A Season or Series
             // is a folder, so the caller lists it on its own; an Episode
             // groups under its series as before.
-            return crate::latest_tv_repository::latest_tv_show_items(&self.db, filter).await;
+            return crate::latest_tv_repository::latest_tv_show_items(&self.db, filter)
+                .await
+                .map(|rows| self.mapped_rows(rows));
         }
         if collection_type == CollectionType::movies {
             return self.latest_movie_items(filter).await;
@@ -3713,6 +3781,7 @@ impl ItemRepository for FerrofinItemRepository {
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)
+            .map(|rows| self.mapped_rows(rows))
     }
 
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
@@ -3749,7 +3818,7 @@ impl ItemRepository for FerrofinItemRepository {
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows)
+        Ok(self.mapped_rows(rows))
     }
 
     async fn get_merged_version_ids(&self, primary_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
@@ -3800,7 +3869,7 @@ impl ItemRepository for FerrofinItemRepository {
                     .as_deref()
                     .and_then(|s| Uuid::parse_str(s).ok())
                 {
-                    map.entry(primary).or_default().push(row);
+                    map.entry(primary).or_default().push(self.mapped(row));
                 }
             }
         }
@@ -3811,7 +3880,11 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         primary_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
-        rows_by_primary_flagged(&self.db, primary_ids).await
+        let mut map = rows_by_primary_flagged(&self.db, primary_ids).await?;
+        for (row, _) in map.values_mut().flatten() {
+            self.virtual_paths.expand_in_place(&mut row.path);
+        }
+        Ok(map)
     }
 
     async fn get_items_with_provider_id(
@@ -3856,10 +3929,7 @@ impl ItemRepository for FerrofinItemRepository {
         let mut map: std::collections::HashMap<Uuid, Vec<ItemImageInfo>> =
             std::collections::HashMap::with_capacity(item_ids.len());
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(
                 images_of_items_sql(&placeholders),
             ));
@@ -3877,11 +3947,11 @@ impl ItemRepository for FerrofinItemRepository {
         Ok(map)
     }
 
-    async fn get_image_infos_with_auto_orient(
+    async fn get_image_infos_to_serve(
         &self,
         item_id: Uuid,
-    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
-        /// An image row with its owner's photo facts.
+    ) -> Result<ferrofin_traits::options::ItemImagesToServe, ServiceError> {
+        /// An image row with its owner's facts.
         #[derive(sqlx::FromRow)]
         struct Row {
             #[sqlx(flatten)]
@@ -3890,11 +3960,14 @@ impl ItemRepository for FerrofinItemRepository {
             is_photo: bool,
             #[sqlx(rename = "PhotoData")]
             photo_data: Option<String>,
+            #[sqlx(rename = "IsLiveTv")]
+            is_live_tv: bool,
         }
         // The image read of `get_image_infos`, plus the owner by primary key.
         let rows = sqlx::query_as::<_, Row>(
             r#"SELECT ii.*, bi."Type" = ?2 AS "IsPhoto",
-                    CASE WHEN bi."Type" = ?2 THEN bi."Data" END AS "PhotoData"
+                    CASE WHEN bi."Type" = ?2 THEN bi."Data" END AS "PhotoData",
+                    bi."Type" IN (?3, ?4) AS "IsLiveTv"
                 FROM "BaseItemImageInfos" ii
                 JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
                 WHERE ii."ItemId" = ?1
@@ -3902,6 +3975,8 @@ impl ItemRepository for FerrofinItemRepository {
         )
         .bind(guid_to_db(item_id))
         .bind(BaseItemKind::Photo.stored_type_name())
+        .bind(BaseItemKind::LiveTvChannel.stored_type_name())
+        .bind(BaseItemKind::LiveTvProgram.stored_type_name())
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -3916,11 +3991,16 @@ impl ItemRepository for FerrofinItemRepository {
                     .as_deref(),
                 )
         });
+        let live_tv = rows.first().is_some_and(|row| row.is_live_tv);
         let images = rows
             .into_iter()
             .map(|row| image_info_from_row(row.image, &self.virtual_paths))
             .collect();
-        Ok((images, auto_orient))
+        Ok(ferrofin_traits::options::ItemImagesToServe {
+            images,
+            auto_orient,
+            live_tv,
+        })
     }
 
     async fn swap_item_images(
@@ -4242,7 +4322,7 @@ impl ItemRepository for FerrofinItemRepository {
             share_can_edit: first.can_edit,
         });
         Ok(PlaylistItemsWithAccess {
-            items: rows.into_iter().map(|r| r.item).collect(),
+            items: rows.into_iter().map(|r| self.mapped(r.item)).collect(),
             access,
         })
     }
@@ -4441,10 +4521,7 @@ pub(crate) async fn select_item_rows_on(
 ) -> Result<Vec<BaseItemEntity>, ServiceError> {
     let mut rows = Vec::new();
     for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-        let marks = (1..=chunk.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = ferrofin_db::numbered_placeholders(1..=chunk.len());
         let sql = format!(r#"SELECT * FROM "BaseItems" WHERE {column} IN ({marks})"#);
         let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql));
         for id in chunk {
@@ -7427,6 +7504,85 @@ mod tests {
                 ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths)
             )
         );
+    }
+
+    /// gl-848: an adopted by-name item stores its path as
+    /// `%MetadataPath%/Genre/<name>` and the playlists folder as
+    /// `%AppDataPath%/playlists`; every item read expands them, as
+    /// `BaseItemMapper.Map` does (`ExpandVirtualPath`), and leaves a media
+    /// path alone.
+    #[tokio::test]
+    async fn item_reads_expand_jellyfin_virtual_paths() {
+        let db = test_db().await;
+        let genre = Uuid::from_u128(0x9201);
+        let folder = Uuid::from_u128(0x9202);
+        let movie = Uuid::from_u128(0x9203);
+        seed_named_item(&db, genre, BaseItemKind::Genre, "Action").await;
+        seed_named_item(&db, folder, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+        for (id, path) in [
+            (genre, "%MetadataPath%/Genre/Action"),
+            (folder, "%AppDataPath%/playlists"),
+            (movie, "/media/movies/Film.mkv"),
+        ] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(path)
+                .execute(db.writer())
+                .await
+                .expect("path");
+        }
+        let raw = repo(&db).retrieve_item(genre).await.expect("read");
+        assert_eq!(
+            raw.and_then(|row| row.path).as_deref(),
+            Some("%MetadataPath%/Genre/Action"),
+            "without an expander the token passes through"
+        );
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let data = ferrofin_traits::system::ServerApplicationPaths::data_path(&*paths);
+        let repository =
+            repo(&db).with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
+        let expected = HashMap::from([
+            (genre, format!("{metadata}/Genre/Action")),
+            (folder, format!("{data}/playlists")),
+            (movie, "/media/movies/Film.mkv".to_owned()),
+        ]);
+        let path_of = |row: &BaseItemEntity| {
+            (
+                Uuid::parse_str(&row.id).expect("id"),
+                row.path.clone().expect("path"),
+            )
+        };
+
+        let one = repository
+            .retrieve_item(genre)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(one.path.as_deref(), Some(expected[&genre].as_str()));
+        let batch: HashMap<Uuid, String> = repository
+            .retrieve_items(&[genre, folder, movie])
+            .await
+            .expect("read")
+            .iter()
+            .map(path_of)
+            .collect();
+        assert_eq!(batch, expected);
+        let listed: HashMap<Uuid, String> = repository
+            .get_item_list(&InternalItemsQuery {
+                item_ids: vec![genre, folder, movie],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("query")
+            .iter()
+            .map(path_of)
+            .collect();
+        assert_eq!(listed, expected);
     }
 
     #[tokio::test]
@@ -11157,6 +11313,7 @@ mod tests {
                 rows,
                 ancestors: Vec::new(),
                 options,
+                physical_locations: HashMap::new(),
             });
         assert!(db.cached_libraries().is_some(), "the set is cached");
     }
@@ -11398,6 +11555,140 @@ mod tests {
             [1999],
             "nor its year"
         );
+    }
+
+    /// Only a listing that can hold a playlist reads them: a type-limited
+    /// browse without `Playlist`, a named id and a folder's direct children
+    /// pay nothing, and a caller that checks visibility itself is left to it.
+    #[rstest::rstest]
+    #[case::mixed(InternalItemsQuery { recursive: true, ..Default::default() }, true)]
+    #[case::unscoped(InternalItemsQuery::default(), true)]
+    #[case::mixed_types(
+        InternalItemsQuery {
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Movie, BaseItemKind::Playlist],
+            ..Default::default()
+        },
+        true
+    )]
+    #[case::playlists_only(
+        InternalItemsQuery {
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Playlist],
+            ..Default::default()
+        },
+        true
+    )]
+    #[case::movies(
+        InternalItemsQuery {
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Movie],
+            ..Default::default()
+        },
+        false
+    )]
+    #[case::excluded(
+        InternalItemsQuery {
+            recursive: true,
+            exclude_item_types: vec![BaseItemKind::Playlist],
+            ..Default::default()
+        },
+        false
+    )]
+    #[case::leaves(
+        InternalItemsQuery { recursive: true, is_folder: Some(false), ..Default::default() },
+        false
+    )]
+    #[case::named_ids(
+        InternalItemsQuery {
+            item_ids: vec![Uuid::from_u128(0x9F01)],
+            ..Default::default()
+        },
+        false
+    )]
+    #[case::folder_children(
+        InternalItemsQuery { parent_id: Uuid::from_u128(0x9F02), ..Default::default() },
+        false
+    )]
+    #[case::caller_checks(
+        InternalItemsQuery {
+            recursive: true,
+            checks_playlist_visibility: true,
+            ..Default::default()
+        },
+        false
+    )]
+    fn only_a_listing_that_can_hold_a_playlist_reads_them(
+        #[case] filter: InternalItemsQuery,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(may_list_playlists(&filter), expected);
+    }
+
+    /// A playlist the user cannot see is out of every statement a listing runs,
+    /// page, count, ids and facets, while a repository with no evaluator bound
+    /// has no rule to apply.
+    #[tokio::test]
+    async fn a_hidden_playlist_is_out_of_every_statement_of_a_listing() {
+        let db = test_db().await;
+        let slot = VisibilitySlot::default();
+        let repository = Arc::new(repo(&db).with_visibility(Arc::clone(&slot)));
+        let visibility = Arc::new(ItemVisibility::new(
+            db.clone(),
+            repository.clone(),
+            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+            "/server/data".to_owned(),
+        ));
+        slot.set(Arc::downgrade(&visibility)).unwrap();
+        let user_id = Uuid::from_u128(0xA100);
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let folder = Uuid::from_u128(0xA101);
+        seed_named_item(&db, folder, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        let (mine, theirs) = (Uuid::from_u128(0xA102), Uuid::from_u128(0xA103));
+        for (id, name, owner, year) in [
+            (mine, "Mine", user_id, 2001),
+            (theirs, "Theirs", Uuid::from_u128(0xA104), 1901),
+        ] {
+            seed_top_parented_item(&db, id, BaseItemKind::Playlist, name, folder).await;
+            let mut row = repository.retrieve_item(id).await.unwrap().unwrap();
+            row.path = Some(format!("/server/data/playlists/{name}"));
+            row.data = Some(serde_json::json!({ "OwnerUserId": owner }).to_string());
+            row.production_year = Some(year);
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let listing = InternalItemsQuery {
+            user: Some(user),
+            recursive: true,
+            top_parent_ids: vec![folder],
+            group_by_presentation_unique_key: false,
+            ..InternalItemsQuery::default()
+        };
+        let paged = InternalItemsQuery {
+            limit: Some(1),
+            ..listing.clone()
+        };
+
+        let page = repository.get_items(&paged).await.unwrap();
+        assert_eq!(page.total_record_count, 1);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].name.as_deref(), Some("Mine"));
+        assert_eq!(repository.get_item_ids(&listing).await.unwrap(), [mine]);
+        assert_eq!(
+            repository.get_distinct_years(&listing).await.unwrap(),
+            [2001]
+        );
+        assert_eq!(
+            repository
+                .get_query_filters_legacy(&listing)
+                .await
+                .unwrap()
+                .years,
+            [2001]
+        );
+
+        let mut ids = repo(&db).get_item_ids(&listing).await.unwrap();
+        ids.sort();
+        assert_eq!(ids, [mine, theirs], "no evaluator, no rule");
     }
 
     /// A `UserView` resolves through its `DisplayParentId` — C#

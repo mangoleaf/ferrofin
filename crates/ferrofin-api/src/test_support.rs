@@ -632,6 +632,13 @@ fake_library_manager!(FakeLibrary {
     ) -> Result<bool, ferrofin_traits::error::ServiceError> {
         Ok(true)
     }
+    async fn get_visible_item_ids(
+        &self,
+        ids: &[Uuid],
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(ids.to_vec())
+    }
 });
 
 /// [`FakeLibrary`] in the middle of a full library validation
@@ -1122,7 +1129,13 @@ impl UserViewManager for FakeUserViews {
     async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_media_folders(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_user_root_children(
+        &self,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
     async fn get_latest_items(

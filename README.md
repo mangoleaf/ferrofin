@@ -357,7 +357,7 @@ an 80 % per-crate line-coverage floor. Performance and memory are benchmarked be
 release.
 See [`CONTRIBUTING.md`](CONTRIBUTING.md); the deeper operating guide is [`CLAUDE.md`](CLAUDE.md).
 
-Security policy: [`SECURITY.md`](SECURITY.md). Changelog: [`CHANGELOG.md`](CHANGELOG.md).
+Security policy: [`SECURITY.md`](SECURITY.md). Release notes: [GitHub Releases](https://github.com/mangoleaf/ferrofin/releases).
 Releasing: [`RELEASE.md`](RELEASE.md).
 
 ## License

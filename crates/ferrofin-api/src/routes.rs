@@ -7,6 +7,7 @@
 //! the router builder and the contract-superset test, so they can never drift.
 
 use axum::response::IntoResponse;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
@@ -133,19 +134,34 @@ enum Seg {
     Wildcard,
 }
 
-/// The registered routes, parsed into segments once, for case-insensitive matching.
-fn canonical_routes() -> &'static Vec<Vec<Seg>> {
-    static ROUTES: OnceLock<Vec<Vec<Seg>>> = OnceLock::new();
-    ROUTES.get_or_init(|| {
+/// The registered routes, parsed into segments, for case-insensitive matching.
+///
+/// A path is looked up by its first segment and its segment count, which narrows
+/// the table to the few routes sharing both, so the lookup that runs on every
+/// request is a binary search rather than a walk of the table. The search
+/// compares case-insensitively, so the path needs no lowercased copy.
+struct RouteIndex {
+    /// Every route, in registration order. Where two routes fit a path the
+    /// earlier one wins, which makes a literal outrank a parameter at the same
+    /// position: [`axum_routes`] sorts by path, and `{` sorts after every letter.
+    routes: Vec<Vec<Seg>>,
+    /// `(first literal lowercased, segment count, index into routes)`, sorted.
+    keyed: Vec<(String, usize, usize)>,
+    /// The routes that key cannot find, as indices into `routes`: a parameter
+    /// in first position, or a catch-all, whose segment count varies.
+    unkeyed: Vec<usize>,
+}
+
+impl RouteIndex {
+    /// Indexes `paths`, given in registration order; a repeat is dropped.
+    fn new(paths: impl IntoIterator<Item = String>) -> Self {
         let mut seen = BTreeSet::new();
-        let mut out = Vec::new();
-        for (_method, path) in axum_routes() {
+        let mut routes = Vec::new();
+        for path in paths {
             if !seen.insert(path.clone()) {
                 continue;
             }
-            let segs = path
-                .split('/')
-                .filter(|s| !s.is_empty())
+            let route: Vec<Seg> = segments(&path)
                 .map(|s| {
                     if s.starts_with("{*") {
                         Seg::Wildcard
@@ -156,10 +172,124 @@ fn canonical_routes() -> &'static Vec<Vec<Seg>> {
                     }
                 })
                 .collect();
-            out.push(segs);
+            routes.push(route);
         }
-        out
+        let mut keyed = Vec::new();
+        let mut unkeyed = Vec::new();
+        for (index, route) in routes.iter().enumerate() {
+            match route.first() {
+                Some(Seg::Literal(head)) if !matches!(route.last(), Some(Seg::Wildcard)) => {
+                    keyed.push((head.to_ascii_lowercase(), route.len(), index));
+                }
+                _ => unkeyed.push(index),
+            }
+        }
+        keyed.sort_unstable();
+        Self {
+            routes,
+            keyed,
+            unkeyed,
+        }
+    }
+
+    /// The first route in registration order that `path` fits.
+    fn find(&self, path: &str) -> Option<&[Seg]> {
+        let head = segments(path).next().unwrap_or_default();
+        let count = segments(path).count();
+        let order = |(key, len, _): &(String, usize, usize)| {
+            case_insensitive_order(key, head).then(len.cmp(&count))
+        };
+        let start = self.keyed.partition_point(|key| order(key).is_lt());
+        let end = self.keyed.partition_point(|key| order(key).is_le());
+        self.keyed[start..end]
+            .iter()
+            .map(|&(_, _, index)| index)
+            .chain(self.unkeyed.iter().copied())
+            .filter(|&index| fits(&self.routes[index], path))
+            .min()
+            .map(|index| self.routes[index].as_slice())
+    }
+
+    /// [`canonicalize_path`] over this table.
+    fn canonicalize(&self, path: &str) -> Option<String> {
+        let route = self.find(path)?;
+        if spells(path, canonical_segments(route, path)) {
+            return None;
+        }
+        let mut rebuilt = String::with_capacity(path.len());
+        for segment in canonical_segments(route, path) {
+            rebuilt.push('/');
+            rebuilt.push_str(segment);
+        }
+        Some(rebuilt)
+    }
+}
+
+/// The non-empty segments of `path`.
+fn segments(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter(|s| !s.is_empty())
+}
+
+/// Orders `a` and `b` by their ASCII-lowercased bytes: `Equal` exactly when
+/// [`str::eq_ignore_ascii_case`] holds.
+fn case_insensitive_order(a: &str, b: &str) -> Ordering {
+    a.bytes()
+        .map(|byte| byte.to_ascii_lowercase())
+        .cmp(b.bytes().map(|byte| byte.to_ascii_lowercase()))
+}
+
+/// Whether `path` fits `route`: every literal in any case, one segment per
+/// parameter, and any remainder for a catch-all.
+fn fits(route: &[Seg], path: &str) -> bool {
+    let mut incoming = segments(path);
+    for seg in route {
+        match (seg, incoming.next()) {
+            (Seg::Wildcard, _) => return true,
+            (Seg::Param, Some(_)) => {}
+            (Seg::Literal(literal), Some(segment)) if segment.eq_ignore_ascii_case(literal) => {}
+            _ => return false,
+        }
+    }
+    incoming.next().is_none()
+}
+
+/// The segments of `path`, which fits `route`, with the route's literals in
+/// their registered case and everything else as sent.
+fn canonical_segments<'a>(route: &'a [Seg], path: &'a str) -> impl Iterator<Item = &'a str> {
+    let mut incoming = segments(path);
+    let mut route = route.iter();
+    let mut in_catch_all = false;
+    std::iter::from_fn(move || {
+        if in_catch_all {
+            return incoming.next();
+        }
+        match route.next()? {
+            Seg::Literal(literal) => {
+                incoming.next();
+                Some(literal.as_str())
+            }
+            Seg::Param => incoming.next(),
+            Seg::Wildcard => {
+                in_catch_all = true;
+                incoming.next()
+            }
+        }
     })
+}
+
+/// Whether `path` is exactly `/`, then `spelled` joined by `/`.
+fn spells<'a>(path: &str, spelled: impl Iterator<Item = &'a str>) -> bool {
+    let mut rest = path;
+    for segment in spelled {
+        let Some(after) = rest
+            .strip_prefix('/')
+            .and_then(|tail| tail.strip_prefix(segment))
+        else {
+            return false;
+        };
+        rest = after;
+    }
+    rest.is_empty()
 }
 
 /// Rewrites a request path so its route **literals** match the registered routes
@@ -171,55 +301,19 @@ fn canonical_routes() -> &'static Vec<Vec<Seg>> {
 /// found, or `None` when the path is already canonical or matches no API route
 /// (so `/web/*` assets, health, and unknown paths pass through untouched — their
 /// case is significant).
+///
+/// This runs on every request, so an answer of `None` allocates nothing.
 #[must_use]
 pub fn canonicalize_path(path: &str) -> Option<String> {
-    let incoming: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    for pattern in canonical_routes() {
-        let has_wildcard = matches!(pattern.last(), Some(Seg::Wildcard));
-        if has_wildcard {
-            if incoming.len() < pattern.len() - 1 {
-                continue;
-            }
-        } else if incoming.len() != pattern.len() {
-            continue;
-        }
-
-        let literals_match = pattern.iter().enumerate().all(|(i, seg)| match seg {
-            Seg::Literal(lit) => incoming[i].eq_ignore_ascii_case(lit),
-            Seg::Param | Seg::Wildcard => true,
-        });
-        if !literals_match {
-            continue;
-        }
-
-        let mut rebuilt = String::with_capacity(path.len());
-        for (i, seg) in pattern.iter().enumerate() {
-            match seg {
-                Seg::Literal(lit) => {
-                    rebuilt.push('/');
-                    rebuilt.push_str(lit);
-                }
-                Seg::Param => {
-                    rebuilt.push('/');
-                    rebuilt.push_str(incoming[i]);
-                }
-                Seg::Wildcard => {
-                    for rest in &incoming[i..] {
-                        rebuilt.push('/');
-                        rebuilt.push_str(rest);
-                    }
-                    break;
-                }
-            }
-        }
-        return (rebuilt != path).then_some(rebuilt);
-    }
-    None
+    static INDEX: OnceLock<RouteIndex> = OnceLock::new();
+    INDEX
+        .get_or_init(|| RouteIndex::new(axum_routes().into_iter().map(|(_, path)| path)))
+        .canonicalize(path)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{axum_routes, canonicalize_path, to_axum_path};
+    use super::{RouteIndex, VENDORED_ROUTES, axum_routes, canonicalize_path, to_axum_path};
     use std::collections::BTreeMap;
 
     fn one(path: &str) -> String {
@@ -256,6 +350,189 @@ mod tests {
         assert_eq!(canonicalize_path("/Localization/Cultures"), None); // already canonical
         assert_eq!(canonicalize_path("/web/index.html"), None); // static asset, not an API route
         assert_eq!(canonicalize_path("/definitely/not/a/route"), None);
+    }
+
+    /// What [`canonicalize_path`] answered when it walked the whole table, the
+    /// first matching route winning: the oracle for the indexed lookup.
+    fn table_walk(routes: &[Vec<String>], path: &str) -> Option<String> {
+        let incoming: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        for pattern in routes {
+            if incoming.len() != pattern.len() {
+                continue;
+            }
+            let literals_match = pattern
+                .iter()
+                .enumerate()
+                .all(|(i, seg)| seg.starts_with('{') || incoming[i].eq_ignore_ascii_case(seg));
+            if !literals_match {
+                continue;
+            }
+            let mut rebuilt = String::with_capacity(path.len());
+            for (i, seg) in pattern.iter().enumerate() {
+                rebuilt.push('/');
+                rebuilt.push_str(if seg.starts_with('{') {
+                    incoming[i]
+                } else {
+                    seg
+                });
+            }
+            return (rebuilt != path).then_some(rebuilt);
+        }
+        None
+    }
+
+    /// The router's patterns in registration order, split into segments.
+    fn route_table() -> Vec<Vec<String>> {
+        let mut seen = std::collections::BTreeSet::new();
+        axum_routes()
+            .into_iter()
+            .filter(|(_, path)| seen.insert(path.clone()))
+            .map(|(_, path)| {
+                path.split('/')
+                    .filter(|s| !s.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `path` with every `{placeholder}` replaced by a value.
+    fn filled(path: &str) -> String {
+        let mut out = String::with_capacity(path.len());
+        let mut rest = path;
+        while let Some((head, tail)) = rest.split_once('{') {
+            out.push_str(head);
+            out.push_str("AbC-123");
+            rest = tail.split_once('}').map_or("", |(_, after)| after);
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Every spelling a client could send for `path`, from the canonical one to
+    /// the near misses that must find no route.
+    fn spellings(path: &str) -> Vec<String> {
+        let parent = path.rsplit_once('/').map_or("", |(head, _)| head);
+        vec![
+            path.to_owned(),
+            path.to_ascii_lowercase(),
+            path.to_ascii_uppercase(),
+            format!("{path}/"),
+            format!("{path}//"),
+            format!("/{path}"),
+            path.replacen('/', "//", 2),
+            format!("{path}/extra"),
+            parent.to_owned(),
+            format!("{parent}/"),
+        ]
+    }
+
+    /// Every contract path, in every spelling, canonicalizes exactly as the
+    /// table walk did.
+    #[test]
+    fn every_contract_path_canonicalizes_as_the_table_walk_did() {
+        let routes = route_table();
+        for (_, path) in VENDORED_ROUTES {
+            for spelling in spellings(&filled(path)) {
+                assert_eq!(
+                    canonicalize_path(&spelling),
+                    table_walk(&routes, &spelling),
+                    "{spelling}"
+                );
+            }
+        }
+    }
+
+    /// Paths outside the contract: assets, whose case is significant, and what
+    /// the table has no shape for.
+    #[test]
+    fn paths_outside_the_contract_canonicalize_as_the_table_walk_did() {
+        let routes = route_table();
+        for path in [
+            "",
+            "/",
+            "//",
+            "/web",
+            "/web/",
+            "/WEB/",
+            "/web/index.html",
+            "/WEB/index.html",
+            "/web/Index.HTML",
+            "/web/assets/img/banner-light.png",
+            "/web/configurationpage",
+            "/WEB/CONFIGURATIONPAGES",
+            "/web/ConfigurationPage/extra",
+            "/health",
+            "/Health/",
+            "/health/live",
+            "/metrics",
+            "/socket",
+            "/Socket",
+            "/api-docs/openapi.json",
+            "/definitely/not/a/route",
+            "/Itéms",
+            "/ITÉMS/AbC-123",
+            "/items/é/images",
+            "/Items/%2F/Images",
+            "no-leading-slash",
+        ] {
+            assert_eq!(canonicalize_path(path), table_walk(&routes, path), "{path}");
+        }
+    }
+
+    /// Where a literal route and a parameter route both fit, the literal wins,
+    /// whatever the case: the table lists it first.
+    #[test]
+    fn a_literal_route_outranks_a_parameter_at_the_same_position() {
+        for (path, expected) in [
+            ("/items/counts", "/Items/Counts"),
+            ("/ITEMS/FILTERS2", "/Items/Filters2"),
+            ("/users/me", "/Users/Me"),
+            ("/users/public", "/Users/Public"),
+        ] {
+            assert_eq!(canonicalize_path(path).as_deref(), Some(expected), "{path}");
+        }
+    }
+
+    /// A contract path spelled canonically is left alone, and the trailing
+    /// slash a client adds to it is dropped.
+    #[test]
+    fn a_canonical_path_is_a_fixed_point_and_its_trailing_slash_is_dropped() {
+        for (_, path) in VENDORED_ROUTES {
+            let path = filled(path);
+            assert_eq!(canonicalize_path(&path), None, "{path}");
+            assert_eq!(
+                canonicalize_path(&format!("{path}/")).as_deref(),
+                Some(path.as_str()),
+            );
+        }
+    }
+
+    /// A route the key cannot describe is still found, and table order still
+    /// decides between it and a keyed one.
+    #[test]
+    fn routes_outside_the_key_are_found_in_table_order() {
+        let index = RouteIndex::new(
+            ["/Alpha/Beta", "/Alpha/{*rest}", "/{id}/Gamma", "/Zeta"].map(str::to_owned),
+        );
+        for (path, expected) in [
+            ("/alpha/beta", Some("/Alpha/Beta")),
+            ("/alpha/other/Tail", Some("/Alpha/other/Tail")),
+            ("/alpha", Some("/Alpha")),
+            ("/Value/gamma", Some("/Value/Gamma")),
+            ("/ZETA/", Some("/Zeta")),
+            ("/Alpha/Tail", None),
+            ("/Value/Gamma", None),
+            ("/nothing/here/at-all", None),
+        ] {
+            assert_eq!(index.canonicalize(path).as_deref(), expected, "{path}");
+        }
+        // Both the catch-all and `/{id}/Gamma` fit this one; the catch-all is
+        // earlier in the table, so it wins.
+        assert_eq!(
+            index.canonicalize("/alpha/gamma").as_deref(),
+            Some("/Alpha/gamma")
+        );
     }
 
     #[test]

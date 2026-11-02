@@ -117,6 +117,11 @@ pub struct ImageItem {
     /// The season's index number (`Season.IndexNumber`), for [`ImageItemKind::Season`].
     pub index_number: Option<i32>,
 
+    /// The folder of the season's series (`Season.Series.ContainingFolderPath`),
+    /// for [`ImageItemKind::Season`]: where its `seasonNN-poster`-style images
+    /// are looked for. `None` when its series is not on the file system.
+    pub series_folder_path: Option<String>,
+
     /// The physical locations of a [`ImageItemKind::CollectionFolder`]
     /// (`CollectionFolder.PhysicalLocations`).
     pub physical_locations: Vec<String>,
@@ -130,5 +135,20 @@ impl ImageItem {
             kind,
             ..Self::default()
         }
+    }
+
+    /// This item as a season: its `IndexNumber` (none when it does not fit an
+    /// `i32`) and its series' folder (`Season.Series.ContainingFolderPath`),
+    /// which `PopulateSeasonImagesFromSeriesFolder` reads.
+    #[must_use]
+    pub fn with_season(
+        mut self,
+        index_number: Option<i64>,
+        series_folder_path: Option<String>,
+    ) -> Self {
+        self.kind = ImageItemKind::Season;
+        self.index_number = index_number.and_then(|n| i32::try_from(n).ok());
+        self.series_folder_path = series_folder_path;
+        self
     }
 }

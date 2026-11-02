@@ -1,14 +1,14 @@
 //! Handler tests for the Ferrofin settings page's route
 //! (`handlers::ferrofin_settings`).
 //!
-//! Each test drives `GET /Ferrofin/Settings` through the real router against
-//! a [`FakeSettings`] manager, asserting the status, the body and whether the
-//! manager was reached at all. The caller is an API key
+//! Each test drives `GET /Ferrofin/Settings` or `POST /Ferrofin/Settings`
+//! through the real router against a [`FakeSettings`] manager, asserting the
+//! status, the body and whether the manager was reached at all. The caller is an API key
 //! (`authed_state_with_plugins`), a plain user (`user_authed_state_with_plugins`)
 //! or nobody (`fake_state`).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -19,7 +19,7 @@ use ferrofin_api::test_support::{
 };
 use ferrofin_model::server_settings::{
     ServerSettingApplies, ServerSettingDto, ServerSettingGroup, ServerSettingKind,
-    ServerSettingSource, ServerSettingsDto,
+    ServerSettingSource, ServerSettingsDto, ServerSettingsUpdateDto, ServerSettingsUpdateResultDto,
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::DisabledPluginManager;
@@ -29,17 +29,23 @@ use tower::ServiceExt;
 /// The secret the fake reports, which only an administrator may receive.
 const SECRET: &str = "omdb-key-only-admins-see";
 
-/// What [`FakeSettings::snapshot`] answers.
+/// What [`FakeSettings`] answers.
 enum Answer {
     Settings,
     Disabled,
     FileNoLongerLoads,
+    /// `update` refuses the change; `snapshot` reports the settings.
+    ChangeRefused,
+    /// `update` cannot write `config.toml`; `snapshot` reports the settings.
+    Unwritable,
 }
 
-/// A [`ServerSettingsManager`] fake that counts its calls.
+/// A [`ServerSettingsManager`] fake that counts its calls and keeps the last
+/// update it was given.
 struct FakeSettings {
     answer: Answer,
     calls: AtomicUsize,
+    update: Mutex<Option<ServerSettingsUpdateDto>>,
 }
 
 impl FakeSettings {
@@ -47,11 +53,25 @@ impl FakeSettings {
         Arc::new(Self {
             answer,
             calls: AtomicUsize::new(0),
+            update: Mutex::new(None),
         })
     }
 
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    fn last_update(&self) -> Option<ServerSettingsUpdateDto> {
+        self.update.lock().expect("update lock").clone()
+    }
+}
+
+/// What [`FakeSettings::update`] answers when it saves.
+fn saved() -> ServerSettingsUpdateResultDto {
+    ServerSettingsUpdateResultDto {
+        changed: vec!["log_level".to_owned(), "scan_probe_concurrency".to_owned()],
+        restart_required: true,
+        process_restart_required: vec!["log_level".to_owned()],
     }
 }
 
@@ -104,10 +124,32 @@ impl ServerSettingsManager for FakeSettings {
     async fn snapshot(&self) -> Result<ServerSettingsDto, ServiceError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         match self.answer {
-            Answer::Settings => Ok(settings()),
+            Answer::Settings | Answer::ChangeRefused | Answer::Unwritable => Ok(settings()),
             Answer::Disabled => Err(ServiceError::not_found("the Ferrofin plugin is disabled")),
             Answer::FileNoLongerLoads => Err(ServiceError::conflict(
                 "config file `/srv/ferrofin/config.toml` no longer loads",
+            )),
+        }
+    }
+
+    async fn update(
+        &self,
+        update: ServerSettingsUpdateDto,
+    ) -> Result<ServerSettingsUpdateResultDto, ServiceError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.update.lock().expect("update lock") = Some(update);
+        match self.answer {
+            Answer::Settings => Ok(saved()),
+            Answer::Disabled => Err(ServiceError::not_found("the Ferrofin plugin is disabled")),
+            Answer::FileNoLongerLoads => Err(ServiceError::conflict(
+                "`/srv/ferrofin/config.toml` changed since the server started and no longer loads",
+            )),
+            Answer::ChangeRefused => Err(ServiceError::invalid_input(
+                "`omdb_api_key` cannot be changed here: Set by the `FERROFIN_OMDB_KEY` \
+                 environment variable.",
+            )),
+            Answer::Unwritable => Err(ServiceError::conflict(
+                "`/srv/ferrofin/config.toml` cannot be written: Permission denied (os error 13)",
             )),
         }
     }
@@ -216,4 +258,163 @@ async fn a_config_file_that_no_longer_loads_is_a_conflict_naming_it() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
     let body = body_string(resp).await;
     assert!(body.contains("/srv/ferrofin/config.toml"), "{body}");
+}
+
+// ---- POST /Ferrofin/Settings ---------------------------------------------------
+
+fn post_settings(body: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/Ferrofin/Settings")
+        .header("Authorization", "Token abc")
+        .header("Content-Type", "application/json")
+        .body(Body::from(body.to_owned()))
+        .expect("request")
+}
+
+/// A save naming a secret, so a test can check it never comes back.
+const SAVE: &str = r#"{"Changes":{"scan_probe_concurrency":4,"log_level":null,"omdb_api_key":"omdb-key-only-admins-see"}}"#;
+
+#[tokio::test]
+async fn an_admin_saves_changes_and_gets_what_was_saved() {
+    let fake = FakeSettings::new(Answer::Settings);
+    let resp = create_router(as_admin(fake.clone()))
+        .oneshot(post_settings(SAVE))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_string(resp).await).expect("json body");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "Changed": ["log_level", "scan_probe_concurrency"],
+            "RestartRequired": true,
+            "ProcessRestartRequired": ["log_level"]
+        })
+    );
+    let update = fake.last_update().expect("the manager got the update");
+    assert_eq!(
+        update.changes.get("scan_probe_concurrency"),
+        Some(&Some(serde_json::json!(4)))
+    );
+    assert_eq!(update.changes.get("log_level"), Some(&None), "null removes");
+    assert_eq!(
+        update.changes.get("omdb_api_key"),
+        Some(&Some(serde_json::json!(SECRET)))
+    );
+    assert_eq!(fake.calls(), 1);
+}
+
+#[tokio::test]
+async fn a_plain_user_is_refused_before_anything_is_saved() {
+    let fake = FakeSettings::new(Answer::Settings);
+    let state = user_authed_state_with_plugins(Arc::new(DisabledPluginManager))
+        .with_server_settings(fake.clone());
+    let resp = create_router(state)
+        .oneshot(post_settings(SAVE))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(fake.calls(), 0, "a non-admin never reaches the manager");
+}
+
+#[tokio::test]
+async fn an_anonymous_save_is_unauthorized() {
+    let fake = FakeSettings::new(Answer::Settings);
+    let resp = create_router(fake_state().with_server_settings(fake.clone()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Ferrofin/Settings")
+                .header("Content-Type", "application/json")
+                .body(Body::from(SAVE))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(fake.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_save_while_the_plugin_is_disabled_answers_not_found() {
+    let fake = FakeSettings::new(Answer::Disabled);
+    let resp = create_router(as_admin(fake))
+        .oneshot(post_settings(SAVE))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let unwired = authed_state_with_plugins(Arc::new(DisabledPluginManager));
+    let resp = create_router(unwired)
+        .oneshot(post_settings(SAVE))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no settings manager");
+}
+
+#[tokio::test]
+async fn a_refused_change_is_a_bad_request_that_quotes_no_value() {
+    let fake = FakeSettings::new(Answer::ChangeRefused);
+    let resp = create_router(as_admin(fake))
+        .oneshot(post_settings(SAVE))
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value =
+        serde_json::from_str(&body_string(resp).await).expect("json body");
+    let error = body["error"].as_str().expect("an error message");
+    assert!(error.contains("omdb_api_key"), "{error}");
+    assert!(error.contains("FERROFIN_OMDB_KEY"), "{error}");
+    assert!(!body.to_string().contains(SECRET), "{body}");
+}
+
+#[tokio::test]
+async fn an_unwritable_config_file_is_a_conflict_naming_it() {
+    for answer in [Answer::Unwritable, Answer::FileNoLongerLoads] {
+        let fake = FakeSettings::new(answer);
+        let resp = create_router(as_admin(fake))
+            .oneshot(post_settings(SAVE))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_string(resp).await;
+        assert!(body.contains("/srv/ferrofin/config.toml"), "{body}");
+        assert!(!body.contains(SECRET), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn a_body_that_is_no_update_never_reaches_the_manager() {
+    for body in [
+        r#"{"Changes":[]}"#,
+        "[]",
+        "{",
+        r#"{"Changes":{"db_pool":4}"#,
+        "{}",
+    ] {
+        let fake = FakeSettings::new(Answer::Settings);
+        let resp = create_router(as_admin(fake.clone()))
+            .oneshot(post_settings(body))
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(fake.calls(), 0, "{body}");
+    }
+    let fake = FakeSettings::new(Answer::Settings);
+    let resp = create_router(as_admin(fake.clone()))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Ferrofin/Settings")
+                .header("Authorization", "Token abc")
+                .header("Content-Type", "text/plain")
+                .body(Body::from(SAVE))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(fake.calls(), 0);
 }

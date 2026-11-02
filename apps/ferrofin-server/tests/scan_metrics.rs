@@ -188,7 +188,11 @@ async fn scans_record_trigger_outcomes_passes_and_probes() {
     let _gauges = metrics_wiring::register_gauges(&handle);
     // A configured bucket list (`metrics_scan_duration_buckets`).
     metrics_wiring::install_subsystem_instruments(Some(&[0.01, 1.0, 100.0]));
-    let router = metrics_wiring::mount(ferrofin_api::create_router(wired.state.clone()), &handle);
+    let router = metrics_wiring::mount(
+        ferrofin_api::create_router(wired.state.clone()),
+        &handle,
+        &wired.state,
+    );
 
     // Every series exists at zero: the disabled scan (and its real ffprobe
     // run) left no trace.

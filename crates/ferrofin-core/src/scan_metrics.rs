@@ -20,7 +20,7 @@
 //! few counter adds as a one-item one.
 //!
 //! Labels are bounded (rule 5): `trigger` is [`ScanTrigger`] (5 values),
-//! `outcome` the four [`ScanOutcome`] counts, `result` 3 values, `pass` the 9
+//! `outcome` the five [`ScanOutcome`] counts, `result` 3 values, `pass` the 9
 //! closing passes.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -188,13 +188,14 @@ impl ProbeResult {
     }
 }
 
-/// The four item counts of a [`ScanOutcome`], in label order.
-fn outcome_counts(outcome: &ScanOutcome) -> [(&'static str, usize); 4] {
+/// The five item counts of a [`ScanOutcome`], in label order.
+fn outcome_counts(outcome: &ScanOutcome) -> [(&'static str, usize); 5] {
     [
         ("created", outcome.created),
         ("updated", outcome.updated),
         ("unchanged", outcome.unchanged),
         ("removed", outcome.removed),
+        ("skipped", outcome.skipped),
     ]
 }
 
@@ -245,7 +246,7 @@ impl ScanInstruments {
             .u64_counter(SCAN_ITEMS_TOTAL)
             .with_description(
                 "Items library scans processed, by trigger and outcome \
-                 (created, updated, unchanged, removed).",
+                 (created, updated, unchanged, removed, skipped).",
             )
             .build();
         let duration = meter
@@ -661,7 +662,7 @@ mod tests {
                     "{trigger} {result}"
                 );
             }
-            for outcome in ["created", "updated", "unchanged", "removed"] {
+            for outcome in ["created", "updated", "unchanged", "removed", "skipped"] {
                 assert_eq!(
                     value(
                         &points,
@@ -698,6 +699,7 @@ mod tests {
             updated: 1,
             unchanged: 40,
             removed: 2,
+            skipped: 4,
             stopped: false,
         };
         instruments.scan_finished(
@@ -717,6 +719,7 @@ mod tests {
             ("updated", 1.0),
             ("unchanged", 40.0),
             ("removed", 2.0),
+            ("skipped", 4.0),
         ] {
             assert_eq!(
                 value(&points, SCAN_ITEMS_TOTAL, &[schedule, ("outcome", outcome)]),

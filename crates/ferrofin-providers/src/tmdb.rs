@@ -2690,16 +2690,12 @@ impl TmdbClient {
         &self,
         url: &str,
     ) -> Result<crate::ArtworkDownload, crate::ArtworkDownloadFailure> {
-        crate::image_download::download_artwork(&self.http, url).await
+        crate::image_download::download_artwork(url).await
     }
 
     /// Downloads an image URL's bytes, or `None` on any failure.
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        let resp = crate::image_download::send(&self.http, url).await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        resp.counted_bytes().await.ok()
+        crate::image_download::download_bytes(url).await
     }
 }
 

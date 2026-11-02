@@ -11,16 +11,20 @@
 //!
 //! The composition root drives this: it picks the extensions to register
 //! ([`registered_extensions`]), builds [`RegisteredPlugin`]s from their
-//! descriptors ([`registered_plugins`]) and registers each extension's tasks
-//! ([`register_tasks`]).
+//! descriptors ([`registered_plugins`]), registers each extension's tasks
+//! ([`register_tasks`]) and hands their authentication providers to the user
+//! manager ([`register_auth_providers`]).
 
 use std::sync::Arc;
 
-use ferrofin_core::{FerrofinTaskManager, PluginConfigPage, RegisteredPlugin, ScheduledTask};
-use ferrofin_traits::library::LibraryManager;
+use ferrofin_core::{
+    FerrofinTaskManager, FerrofinUserManager, PluginConfigPage, RegisteredPlugin, ScheduledTask,
+};
+use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::media_segments::{MediaSegmentManager, MediaSegmentProvider};
 use ferrofin_traits::merge_versions::MergeVersionsManager;
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_traits::security::{AuthenticationManager, PasswordResetManager};
 use uuid::Uuid;
 
 use crate::fingerprint::Fingerprinter;
@@ -30,6 +34,7 @@ pub mod ffmpeg;
 pub mod file_transformation;
 pub mod fingerprint;
 pub mod intro_skipper;
+mod library_pages;
 pub mod merge_versions;
 
 /// The collaborators an extension's tasks are allowed to touch (trait objects
@@ -66,6 +71,12 @@ pub struct ExtensionContext {
     pub virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager>,
     /// Items' chapters (analysis snaps segment bounds to them).
     pub chapters: Arc<dyn ferrofin_traits::chapters::ChapterManager>,
+    /// The user accounts: an authentication provider looks up and provisions
+    /// the users it signs in through them. Such a provider is registered with
+    /// this same manager ([`register_auth_providers`]), so each holds the
+    /// other. Both live for the whole process, so the cycle is never freed,
+    /// which is harmless.
+    pub users: Arc<dyn UserManager>,
 }
 
 /// A curated, compiled-in capability that surfaces as a Jellyfin plugin.
@@ -90,6 +101,23 @@ pub trait Extension: Send + Sync {
         &self,
         _cx: &ExtensionContext,
     ) -> Vec<Arc<dyn MediaSegmentProvider>> {
+        Vec::new()
+    }
+    /// The authentication providers this extension contributes. Sign-in
+    /// consults them after the built-in default, and `GET /Auth/Providers`
+    /// lists each one its `is_enabled` admits, so a provider gates itself on
+    /// its plugin's enabled flag. Defaults to none.
+    fn auth_providers(&self, _cx: &ExtensionContext) -> Vec<Arc<dyn AuthenticationManager>> {
+        Vec::new()
+    }
+    /// The password-reset providers this extension contributes. A
+    /// forgotten-password request goes to the one a user's
+    /// `PasswordResetProviderId` names, when it is enabled, and every provider
+    /// is offered a PIN after the built-in one. Defaults to none.
+    fn password_reset_providers(
+        &self,
+        _cx: &ExtensionContext,
+    ) -> Vec<Arc<dyn PasswordResetManager>> {
         Vec::new()
     }
     /// The background tasks this extension contributes.
@@ -152,6 +180,30 @@ pub fn register_tasks(
     }
 }
 
+/// Hands every extension's authentication and password-reset providers to the
+/// user manager, in extension order. The manager is built long before the
+/// extensions, so this fills its late slots
+/// ([`FerrofinUserManager::set_extension_providers`],
+/// [`FerrofinUserManager::set_extension_reset_providers`]); call it once.
+pub fn register_auth_providers(
+    extensions: &[Arc<dyn Extension>],
+    cx: &ExtensionContext,
+    users: &FerrofinUserManager,
+) {
+    users.set_extension_providers(
+        extensions
+            .iter()
+            .flat_map(|ext| ext.auth_providers(cx))
+            .collect(),
+    );
+    users.set_extension_reset_providers(
+        extensions
+            .iter()
+            .flat_map(|ext| ext.password_reset_providers(cx))
+            .collect(),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
@@ -181,10 +233,17 @@ mod tests {
     }
 
     async fn context() -> ExtensionContext {
+        context_with_users().await.0
+    }
+
+    /// The context, and its user manager as the concrete type the composition
+    /// root registers providers with.
+    async fn context_with_users() -> (ExtensionContext, Arc<FerrofinUserManager>) {
         let db = ferrofin_db::Database::connect_in_memory()
             .await
             .expect("connect");
         db.run_migrations().await.expect("migrations");
+        let users = Arc::new(FerrofinUserManager::new(db.clone()));
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
         let library: Arc<dyn LibraryManager> =
@@ -199,7 +258,7 @@ mod tests {
                 )),
                 Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
             ));
-        ExtensionContext {
+        let cx = ExtensionContext {
             media_segments: Arc::new(ferrofin_core::FerrofinMediaSegmentManager::new(
                 db.clone(),
                 Arc::clone(&library),
@@ -220,7 +279,224 @@ mod tests {
                 ferrofin_traits::stubs::virtual_folders::DisabledVirtualFolderManager,
             ),
             chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
+            users: Arc::clone(&users) as Arc<dyn UserManager>,
+        };
+        (cx, users)
+    }
+
+    /// A test-only extension contributing one directory-style provider, whose
+    /// display name and stored id differ, as LDAP-Auth's do.
+    struct DirectoryExtension;
+
+    /// Signs anyone in with the password "directory", provisioning a
+    /// first-time user through the context's user manager.
+    struct DirectoryProvider {
+        users: Arc<dyn UserManager>,
+    }
+
+    #[async_trait]
+    impl AuthenticationManager for DirectoryProvider {
+        fn name(&self) -> &'static str {
+            "Tests Directory"
         }
+        fn id(&self) -> &'static str {
+            "Tests.Plugin.DirectoryProvider"
+        }
+        async fn is_enabled(&self) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn authenticate(
+            &self,
+            username: &str,
+            password: &str,
+            resolved_user: Option<&ferrofin_db::entities::users::UserEntity>,
+        ) -> Result<ferrofin_traits::security::ProviderAuthenticationResult, ServiceError> {
+            if password != "directory" {
+                return Err(ServiceError::unauthorized("wrong password"));
+            }
+            if resolved_user.is_none() {
+                self.users.create_user(username).await?;
+            }
+            Ok(ferrofin_traits::security::ProviderAuthenticationResult {
+                username: username.to_owned(),
+                ..Default::default()
+            })
+        }
+        async fn change_password(
+            &self,
+            _user: &ferrofin_db::entities::users::UserEntity,
+            _new_password: &str,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        fn new_user_policy(&self) -> Option<ferrofin_model::users::UserPolicy> {
+            None
+        }
+    }
+
+    impl Extension for DirectoryExtension {
+        fn id(&self) -> Uuid {
+            Uuid::from_u128(0x5eed_d1ec_7012)
+        }
+        fn descriptor(&self) -> PluginDescriptor {
+            PluginDescriptor {
+                id: self.id(),
+                name: "Tests Directory".to_owned(),
+                ..PluginDescriptor::default()
+            }
+        }
+        fn default_config(&self) -> Vec<u8> {
+            b"{}".to_vec()
+        }
+        fn auth_providers(&self, cx: &ExtensionContext) -> Vec<Arc<dyn AuthenticationManager>> {
+            vec![Arc::new(DirectoryProvider {
+                users: Arc::clone(&cx.users),
+            })]
+        }
+        fn password_reset_providers(
+            &self,
+            _cx: &ExtensionContext,
+        ) -> Vec<Arc<dyn PasswordResetManager>> {
+            vec![Arc::new(DirectoryResetPage)]
+        }
+        fn tasks(&self, _cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>> {
+            Vec::new()
+        }
+    }
+
+    /// Sends a forgotten password to the directory's own reset page, as
+    /// LDAP-Auth's reset provider does.
+    struct DirectoryResetPage;
+
+    #[async_trait]
+    impl PasswordResetManager for DirectoryResetPage {
+        fn name(&self) -> &'static str {
+            "Tests Directory"
+        }
+        fn id(&self) -> &'static str {
+            "Tests.Plugin.DirectoryProvider"
+        }
+        async fn is_enabled(&self) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn start_forgot_password_process(
+            &self,
+            _user: Option<&ferrofin_db::entities::users::UserEntity>,
+            _entered_username: &str,
+            _is_in_network: bool,
+        ) -> Result<ferrofin_model::users::ForgotPasswordResult, ServiceError> {
+            Ok(ferrofin_model::users::ForgotPasswordResult {
+                action: ferrofin_model::users::ForgotPasswordAction::ContactAdmin,
+                pin_file: Some("https://directory.example/reset".to_owned()),
+                pin_expiration_date: None,
+            })
+        }
+        async fn redeem_password_reset_pin(
+            &self,
+            _pin: &str,
+        ) -> Result<ferrofin_model::users::PinRedeemResult, ServiceError> {
+            Ok(ferrofin_model::users::PinRedeemResult::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_extensions_reset_provider_is_listed_and_answers_its_users() {
+        let (cx, users) = context_with_users().await;
+        let extensions: Vec<Arc<dyn Extension>> = vec![Arc::new(DirectoryExtension)];
+        register_auth_providers(&extensions, &cx, &users);
+
+        let ids: Vec<Option<String>> = cx
+            .users
+            .get_password_reset_providers()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|pair| pair.id)
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                Some(
+                    "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider".to_owned()
+                ),
+                Some("Tests.Plugin.DirectoryProvider".to_owned()),
+            ]
+        );
+        let user = cx.users.create_user("dana").await.expect("create");
+        let uid = Uuid::parse_str(&user.id).expect("id");
+        cx.users
+            .update_policy(
+                uid,
+                &ferrofin_model::users::UserPolicy {
+                    authentication_provider_id:
+                        "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider"
+                            .to_owned(),
+                    password_reset_provider_id: "Tests.Plugin.DirectoryProvider".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("policy");
+        let result = cx
+            .users
+            .start_forgot_password_process("dana", true)
+            .await
+            .expect("forgot password");
+        assert_eq!(
+            result.pin_file.as_deref(),
+            Some("https://directory.example/reset"),
+            "the saved reset provider answers"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_extensions_auth_provider_is_listed_and_signs_its_users_in() {
+        let (cx, users) = context_with_users().await;
+        let extensions: Vec<Arc<dyn Extension>> = vec![Arc::new(DirectoryExtension)];
+        register_auth_providers(&extensions, &cx, &users);
+
+        let pair = |name: &str, id: &str| ferrofin_model::dto::NameIdPair {
+            name: Some(name.to_owned()),
+            id: Some(id.to_owned()),
+        };
+        assert_eq!(
+            cx.users.get_authentication_providers().await.expect("list"),
+            vec![
+                pair(
+                    "Default",
+                    "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider"
+                ),
+                pair("Tests Directory", "Tests.Plugin.DirectoryProvider"),
+            ],
+            "after Default, under a name that differs from its id"
+        );
+
+        // A first sign-in provisions the user and saves the provider's id.
+        let user = cx
+            .users
+            .authenticate_user("dana", "directory", "127.0.0.1", true)
+            .await
+            .expect("sign in")
+            .expect("provisioned");
+        assert_eq!(
+            user.authentication_provider_id,
+            "Tests.Plugin.DirectoryProvider"
+        );
+        // That saved id selects the provider from then on.
+        assert!(
+            cx.users
+                .authenticate_user("dana", "wrong", "127.0.0.1", true)
+                .await
+                .expect("sign in")
+                .is_none()
+        );
+        assert!(
+            cx.users
+                .authenticate_user("dana", "directory", "127.0.0.1", true)
+                .await
+                .expect("sign in")
+                .is_some()
+        );
     }
 
     #[test]
@@ -265,6 +541,8 @@ mod tests {
         let cx = context().await;
         assert!(kept[0].tasks(&cx).is_empty());
         assert!(kept[0].media_segment_providers(&cx).is_empty());
+        assert!(kept[0].auth_providers(&cx).is_empty());
+        assert!(kept[0].password_reset_providers(&cx).is_empty());
     }
 
     #[tokio::test]

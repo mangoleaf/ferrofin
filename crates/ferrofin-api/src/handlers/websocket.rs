@@ -1043,19 +1043,38 @@ fn activity_wake(
         return None;
     }
     mark_sent(stream);
-    Some(envelope("ActivityLogEntry", &serde_json::json!([])))
+    activity_log_message()
 }
 
-/// One outbound envelope: `{MessageType, MessageId, Data}` with the required
-/// `MessageId` (strict Kotlin-SDK clients crash without it), spelled as every
-/// Jellyfin guid is (`JsonGuidConverter`: 32 hex digits).
-fn envelope(message_type: &str, data: &serde_json::Value) -> String {
-    serde_json::json!({
-        "MessageType": message_type,
-        "MessageId": uuid::Uuid::new_v4().simple().to_string(),
-        "Data": data,
+/// The `ActivityLogEntry` frame: always an empty array.
+fn activity_log_message() -> Option<String> {
+    envelope("ActivityLogEntry", &serde_json::json!([]))
+}
+
+/// One outbound envelope: `{Data, MessageId, MessageType}`, in that order as
+/// every frame has always sent it, with the required `MessageId` (strict
+/// Kotlin-SDK clients crash without it), spelled as every Jellyfin guid is
+/// (`JsonGuidConverter`: 32 hex digits). `data` is serialized where it stands,
+/// with no tree built from it, so its keys come in their declaration order, as
+/// `WebSocketConnection.SendAsync`'s `SerializeToUtf8Bytes` writes them. A
+/// frame that cannot be serialized is logged and not sent.
+fn envelope<T: serde::Serialize + ?Sized>(message_type: &str, data: &T) -> Option<String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Envelope<'a, T: ?Sized> {
+        data: &'a T,
+        message_id: uuid::fmt::Simple,
+        message_type: &'a str,
+    }
+    serde_json::to_string(&Envelope {
+        data,
+        message_id: uuid::Uuid::new_v4().simple(),
+        message_type,
     })
-    .to_string()
+    .inspect_err(|error| {
+        tracing::warn!(%error, message_type, "websocket frame could not be serialized");
+    })
+    .ok()
 }
 
 /// The `Sessions` stream payload, the port of
@@ -1084,13 +1103,12 @@ async fn sessions_message(state: &AppState, caller: &SocketCaller) -> Option<Str
     if !caller.is_admin && !caller.is_api_key {
         sessions.retain(|session| is_session_member(session, caller.user_id));
     }
-    match serde_json::to_value(sessions) {
-        Ok(data) => Some(envelope("Sessions", &data)),
-        Err(error) => {
-            tracing::warn!(%error, "websocket Sessions snapshot could not be serialized");
-            None
-        }
-    }
+    sessions_snapshot_message(&sessions)
+}
+
+/// The `Sessions` frame for `sessions`.
+fn sessions_snapshot_message(sessions: &[ferrofin_model::dto::SessionInfoDto]) -> Option<String> {
+    envelope("Sessions", sessions)
 }
 
 /// Upstream's `s.UserId.Equals(userId) || s.ContainsUser(userId)`.
@@ -1128,10 +1146,7 @@ fn task_snapshot_message(tasks: Vec<ferrofin_model::tasks::TaskInfo>) -> Option<
             );
         }
     }
-    Some(envelope(
-        "ScheduledTasksInfo",
-        &serde_json::to_value(visible_tasks(tasks)).ok()?,
-    ))
+    envelope("ScheduledTasksInfo", &visible_tasks(tasks))
 }
 
 type TaskUpdateReceiver = tokio::sync::broadcast::Receiver<Vec<ferrofin_model::tasks::TaskInfo>>;
@@ -1841,6 +1856,84 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Clean Activity Log", "Scan Media Library"]
         );
+    }
+
+    /// A frame with its random `MessageId` taken out, after checking that it is
+    /// the 32 hex digits every Jellyfin guid is written in.
+    fn without_message_id(frame: &str) -> String {
+        let (head, rest) = frame
+            .split_once(r#""MessageId":""#)
+            .expect("a frame carries a MessageId");
+        let (id, tail) = rest.split_once('"').expect("the id is a string");
+        assert_eq!(id.len(), 32, "{frame}");
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{frame}");
+        format!("{head}\"MessageId\":\"\"{tail}")
+    }
+
+    /// The exact bytes the three streams send. The DTOs' keys come in their
+    /// declaration order, as Jellyfin's `SerializeToUtf8Bytes` writes them
+    /// (owner decision on gl-1070); the envelope's own stay `Data`,
+    /// `MessageId`, `MessageType`.
+    #[test]
+    fn the_stream_frames_keep_their_bytes() {
+        let session = ferrofin_model::dto::SessionInfoDto {
+            id: Some("session-1".to_owned()),
+            user_name: Some("Zoë \"Z\"".to_owned()),
+            play_state: Some(ferrofin_model::session::PlayerStateInfo {
+                position_ticks: Some(5),
+                can_seek: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            without_message_id(&super::sessions_snapshot_message(&[session]).expect("a frame")),
+            concat!(
+                r#"{"Data":[{"PlayState":{"PositionTicks":5,"CanSeek":true,"IsPaused":false,"#,
+                r#""IsMuted":false,"RepeatMode":"RepeatNone","PlaybackOrder":"Default"},"#,
+                r#""PlayableMediaTypes":[],"Id":"session-1","#,
+                r#""UserId":"00000000000000000000000000000000","UserName":"Zoë \"Z\"","#,
+                r#""LastActivityDate":"1970-01-01T00:00:00.0000000Z","#,
+                r#""LastPlaybackCheckIn":"1970-01-01T00:00:00.0000000Z","IsActive":false,"#,
+                r#""SupportsMediaControl":false,"SupportsRemoteControl":false,"#,
+                r#""HasCustomDeviceName":false,"SupportedCommands":[]}],"#,
+                r#""MessageId":"","MessageType":"Sessions"}"#,
+            )
+        );
+
+        let task = ferrofin_model::tasks::TaskInfo {
+            name: Some("Scan Media Library".to_owned()),
+            key: Some("RefreshLibrary".to_owned()),
+            id: Some("task-1".to_owned()),
+            current_progress_percentage: Some(12.5),
+            ..Default::default()
+        };
+        assert_eq!(
+            without_message_id(&super::task_snapshot_message(vec![task]).expect("a frame")),
+            concat!(
+                r#"{"Data":[{"Name":"Scan Media Library","State":"Idle","#,
+                r#""CurrentProgressPercentage":12.5,"Id":"task-1","Triggers":[],"#,
+                r#""IsHidden":false,"Key":"RefreshLibrary"}],"#,
+                r#""MessageId":"","MessageType":"ScheduledTasksInfo"}"#,
+            )
+        );
+
+        assert_eq!(
+            without_message_id(&super::activity_log_message().expect("a frame")),
+            r#"{"Data":[],"MessageId":"","MessageType":"ActivityLogEntry"}"#
+        );
+        assert_eq!(
+            without_message_id(&super::sessions_snapshot_message(&[]).expect("a frame")),
+            r#"{"Data":[],"MessageId":"","MessageType":"Sessions"}"#
+        );
+    }
+
+    /// Data that cannot be written as JSON (here a map with non-string keys)
+    /// makes no frame, rather than half of one.
+    #[test]
+    fn a_frame_that_cannot_be_serialized_is_not_sent() {
+        let data = std::collections::BTreeMap::from([((1, 2), 3)]);
+        assert_eq!(super::envelope("Sessions", &data), None);
     }
 
     /// The watchdog's bands, against the C# factors of `WebSocketLostTimeout`.

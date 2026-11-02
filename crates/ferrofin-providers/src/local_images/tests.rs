@@ -11,6 +11,7 @@ use std::sync::Arc;
 use super::*;
 use crate::container_types::{FileSystemMetadata, LocalImageInfo};
 use ferrofin_model::entities::ImageType;
+use ferrofin_traits::options::ItemImageInfo;
 
 /// An in-memory [`DirectoryService`]: maps a directory path to its entries.
 #[derive(Debug, Default)]
@@ -89,6 +90,7 @@ fn folder_item(kind: ImageItemKind) -> ImageItem {
         file_name_without_extension: Some("The Movie".to_owned()),
         is_in_mixed_folder: false,
         index_number: None,
+        series_folder_path: None,
         physical_locations: Vec::new(),
     }
 }
@@ -105,20 +107,47 @@ fn supported_image_extension_ordering_prefers_png() {
 
 #[test]
 fn local_provider_supports_excludes_episode_song_photo() {
-    assert!(LocalImageProvider::supports(&ImageItem::new(
-        ImageItemKind::Movie
-    )));
-    assert!(LocalImageProvider::supports(&ImageItem::new(
+    let on_disk = |kind| ImageItem {
+        path: Some("/media/item".to_owned()),
+        ..ImageItem::new(kind)
+    };
+    assert!(LocalImageProvider::supports(&on_disk(ImageItemKind::Movie)));
+    assert!(LocalImageProvider::supports(&on_disk(
         ImageItemKind::AudioBook
     )));
-    assert!(!LocalImageProvider::supports(&ImageItem::new(
+    assert!(LocalImageProvider::supports(&on_disk(
+        ImageItemKind::Season
+    )));
+    assert!(!LocalImageProvider::supports(&on_disk(
         ImageItemKind::Episode
     )));
-    assert!(!LocalImageProvider::supports(&ImageItem::new(
+    assert!(!LocalImageProvider::supports(&on_disk(
         ImageItemKind::Audio
     )));
-    assert!(!LocalImageProvider::supports(&ImageItem::new(
+    assert!(!LocalImageProvider::supports(&on_disk(
         ImageItemKind::Photo
+    )));
+}
+
+/// `Supports`: an item with no path does not support local metadata, and of
+/// those (`LocationType.Virtual`) only a season whose series is on the file
+/// system is supported.
+#[test]
+fn local_provider_supports_a_path_less_season_of_a_series_on_disk_only() {
+    let series_folder = Some("/media/series".to_owned());
+    assert!(LocalImageProvider::supports(&ImageItem {
+        series_folder_path: series_folder.clone(),
+        ..ImageItem::new(ImageItemKind::Season)
+    }));
+    assert!(!LocalImageProvider::supports(&ImageItem::new(
+        ImageItemKind::Season
+    )));
+    assert!(!LocalImageProvider::supports(&ImageItem {
+        series_folder_path: series_folder,
+        ..ImageItem::new(ImageItemKind::Movie)
+    }));
+    assert!(!LocalImageProvider::supports(&ImageItem::new(
+        ImageItemKind::Series
     )));
 }
 
@@ -317,10 +346,11 @@ fn season_pulls_from_series_folder() {
         kind: ImageItemKind::Season,
         name: "Season 1".to_owned(),
         path: None,
-        containing_folder_path: Some("/media/series".to_owned()),
+        containing_folder_path: None,
         file_name_without_extension: None,
         is_in_mixed_folder: false,
         index_number: Some(1),
+        series_folder_path: Some("/media/series".to_owned()),
         physical_locations: Vec::new(),
     };
     let mut fs = FakeDirectoryService::new();
@@ -348,10 +378,11 @@ fn season_zero_uses_specials_marker() {
         kind: ImageItemKind::Season,
         name: "Specials".to_owned(),
         path: None,
-        containing_folder_path: Some("/media/series".to_owned()),
+        containing_folder_path: None,
         file_name_without_extension: None,
         is_in_mixed_folder: false,
         index_number: Some(0),
+        series_folder_path: Some("/media/series".to_owned()),
         physical_locations: Vec::new(),
     };
     let mut fs = FakeDirectoryService::new();
@@ -361,6 +392,116 @@ fn season_zero_uses_specials_marker() {
         images
             .iter()
             .any(|i| i.file_info.name == "season-specials-poster.png")
+    );
+}
+
+/// A season in its own folder, as the scan sees it: its folder is
+/// `/media/series/Season 1`, its series' folder `/media/series`.
+fn folder_season(series_folder: Option<&str>) -> ImageItem {
+    ImageItem {
+        kind: ImageItemKind::Season,
+        name: "Season 1".to_owned(),
+        path: Some("/media/series/Season 1".to_owned()),
+        containing_folder_path: Some("/media/series/Season 1".to_owned()),
+        file_name_without_extension: Some("Season 1".to_owned()),
+        index_number: Some(1),
+        series_folder_path: series_folder.map(str::to_owned),
+        ..ImageItem::new(ImageItemKind::Season)
+    }
+}
+
+/// `PopulateImages` adds a season's series-folder images before its own
+/// folder's, and `MergeImages` takes the first of each type: the series
+/// folder's `season01-*` files are the season's Primary, Banner and Thumb
+/// even with a `poster`/`banner` in its own folder, and its own folder's
+/// images still follow them.
+#[test]
+fn a_folder_season_lists_its_series_folder_images_before_its_own() {
+    let mut fs = FakeDirectoryService::new();
+    fs.file("/media/series", "season01-poster.jpg")
+        .file("/media/series", "season01-banner.jpg")
+        .file("/media/series", "season01-landscape.jpg")
+        .file("/media/series", "season02-poster.jpg")
+        .file("/media/series", "poster.jpg")
+        .file("/media/series/Season 1", "poster.jpg")
+        .file("/media/series/Season 1", "banner.jpg");
+    let images = LocalImageProvider::get_images(&folder_season(Some("/media/series")), &fs);
+    let first = |type_| {
+        images
+            .iter()
+            .find(|i| i.type_ == type_)
+            .map(|i| i.file_info.full_name.as_str())
+    };
+    assert_eq!(
+        first(ImageType::Primary),
+        Some("/media/series/season01-poster.jpg")
+    );
+    assert_eq!(
+        first(ImageType::Banner),
+        Some("/media/series/season01-banner.jpg")
+    );
+    assert_eq!(
+        first(ImageType::Thumb),
+        Some("/media/series/season01-landscape.jpg")
+    );
+    let names: Vec<_> = images
+        .iter()
+        .map(|i| i.file_info.full_name.as_str())
+        .collect();
+    assert!(
+        names.contains(&"/media/series/Season 1/poster.jpg"),
+        "{names:?}"
+    );
+    assert!(
+        !names.contains(&"/media/series/season02-poster.jpg"),
+        "another season's poster: {names:?}"
+    );
+    assert!(
+        !names.contains(&"/media/series/poster.jpg"),
+        "the series' own poster: {names:?}"
+    );
+}
+
+/// A season whose series is not on the file system reads its own folder
+/// only.
+#[test]
+fn a_season_with_no_series_folder_reads_its_own_folder_only() {
+    let mut fs = FakeDirectoryService::new();
+    fs.file("/media/series", "season01-poster.jpg")
+        .file("/media/series/Season 1", "poster.jpg");
+    let images = LocalImageProvider::get_images(&folder_season(None), &fs);
+    assert_eq!(
+        pairs(&images),
+        [("poster.jpg".to_owned(), ImageType::Primary)]
+    );
+}
+
+/// The season's name is tried before its number: `Season 1` as `season1-…`,
+/// then `season01-…`. A season named for its marker is tried once.
+#[test]
+fn a_season_is_matched_by_its_name_before_its_number() {
+    let mut fs = FakeDirectoryService::new();
+    fs.file("/media/series", "season01-poster.jpg")
+        .file("/media/series", "season1-poster.jpg");
+    let images = LocalImageProvider::get_images(&folder_season(Some("/media/series")), &fs);
+    assert_eq!(
+        pairs(&images),
+        [
+            ("season1-poster.jpg".to_owned(), ImageType::Primary),
+            ("season01-poster.jpg".to_owned(), ImageType::Primary),
+        ]
+    );
+    let named_for_marker = ImageItem {
+        name: "01".to_owned(),
+        ..folder_season(Some("/media/series"))
+    };
+    let mut fs = FakeDirectoryService::new();
+    fs.file("/media/series", "01-poster.jpg")
+        .file("/media/series", "season01-poster.jpg");
+    let images = LocalImageProvider::get_images(&named_for_marker, &fs);
+    assert_eq!(
+        pairs(&images),
+        [("01-poster.jpg".to_owned(), ImageType::Primary)]
     );
 }
 
@@ -374,6 +515,7 @@ fn episode_provider_matches_name_and_thumb() {
         file_name_without_extension: Some("S01E01".to_owned()),
         is_in_mixed_folder: true,
         index_number: None,
+        series_folder_path: None,
         physical_locations: Vec::new(),
     };
     let mut fs = FakeDirectoryService::new();
@@ -398,6 +540,7 @@ fn episode_provider_scans_metadata_subfolder() {
         file_name_without_extension: Some("S01E01".to_owned()),
         is_in_mixed_folder: true,
         index_number: None,
+        series_folder_path: None,
         physical_locations: Vec::new(),
     };
     let mut fs = FakeDirectoryService::new();
@@ -472,6 +615,7 @@ fn fs_directory_service_reads_real_temp_dir() {
         file_name_without_extension: Some("M".to_owned()),
         is_in_mixed_folder: false,
         index_number: None,
+        series_folder_path: None,
         physical_locations: Vec::new(),
     };
     let images = LocalImageProvider::get_images(&item, &FsDirectoryService::new());
@@ -565,4 +709,149 @@ fn fs_directory_service_memoizes_missing_directories() {
     );
 
     std::fs::remove_dir_all(&base).ok();
+}
+
+/// A stored or found image row of `image_type` at `path`, dated `seconds`
+/// past the epoch, with no dimensions.
+fn image_row(path: &str, image_type: ImageType, seconds: i64) -> ItemImageInfo {
+    ItemImageInfo {
+        path: path.to_owned(),
+        image_type,
+        date_modified: chrono::DateTime::from_timestamp(seconds, 0).expect("a date"),
+        width: 0,
+        height: 0,
+        blur_hash: None,
+    }
+}
+
+/// `MergeImages`: the first found image of a singular type replaces the
+/// stored one when the paths differ (a downloaded Primary gives way to the
+/// season's local poster), a type found for the first time is added, a
+/// stored type nothing found is kept, and a found backdrop is appended
+/// unless it is stored already (ignoring case).
+#[test]
+fn merging_found_images_replaces_singular_types_and_appends_new_backdrops() {
+    let mut images = vec![
+        ItemImageInfo {
+            width: 680,
+            height: 1000,
+            ..image_row("/metadata/library/ab/primary.jpg", ImageType::Primary, 0)
+        },
+        image_row("/media/Show/fanart.jpg", ImageType::Backdrop, 0),
+        image_row("/media/Show/Season 1/logo.png", ImageType::Logo, 0),
+    ];
+    let found = [
+        image_row("/media/Show/season01-poster.jpg", ImageType::Primary, 0),
+        image_row("/media/Show/Season 1/poster.jpg", ImageType::Primary, 0),
+        image_row("/media/Show/season01-banner.jpg", ImageType::Banner, 0),
+        image_row("/media/Show/FANART.jpg", ImageType::Backdrop, 0),
+        image_row("/media/Show/season01-fanart.jpg", ImageType::Backdrop, 0),
+    ];
+    assert!(merge_local_images(&mut images, &found));
+    let rows: Vec<_> = images
+        .iter()
+        .map(|i| (i.path.as_str(), i.image_type, i.width))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("/media/Show/season01-poster.jpg", ImageType::Primary, 0),
+            ("/media/Show/fanart.jpg", ImageType::Backdrop, 0),
+            ("/media/Show/Season 1/logo.png", ImageType::Logo, 0),
+            ("/media/Show/season01-banner.jpg", ImageType::Banner, 0),
+            ("/media/Show/season01-fanart.jpg", ImageType::Backdrop, 0),
+        ]
+    );
+    let again = images.clone();
+    assert!(
+        !merge_local_images(&mut images, &found),
+        "the same files again change nothing"
+    );
+    assert_eq!(images, again);
+}
+
+/// `MergeImages` takes the first found image of each singular type and every
+/// backdrop, in the order found.
+#[test]
+fn only_the_first_found_image_of_a_singular_type_is_kept() {
+    let found = vec![
+        image_row("/media/Show/season01-poster.jpg", ImageType::Primary, 0),
+        image_row("/media/Show/season01-fanart.jpg", ImageType::Backdrop, 0),
+        image_row("/media/Show/Season 1/poster.jpg", ImageType::Primary, 0),
+        image_row("/media/Show/Season 1/Season 1-logo.png", ImageType::Logo, 0),
+        image_row("/media/Show/Season 1/logo.png", ImageType::Logo, 0),
+        image_row("/media/Show/Season 1/fanart.jpg", ImageType::Backdrop, 0),
+    ];
+    let kept: Vec<_> = first_of_each_singular_type(found)
+        .into_iter()
+        .map(|i| i.path)
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            "/media/Show/season01-poster.jpg",
+            "/media/Show/season01-fanart.jpg",
+            "/media/Show/Season 1/Season 1-logo.png",
+            "/media/Show/Season 1/fanart.jpg",
+        ]
+    );
+}
+
+/// An image found again at its stored path whose file time moved by more
+/// than a second loses its stored dimensions and takes the new time; a
+/// second or less is the database's precision.
+#[test]
+fn an_image_found_again_with_a_moved_file_time_loses_its_dimensions() {
+    let stored = ItemImageInfo {
+        width: 680,
+        height: 1000,
+        ..image_row("/media/Show/season01-poster.jpg", ImageType::Primary, 10)
+    };
+    let mut images = vec![stored.clone()];
+    let within_a_second = [image_row(
+        "/media/Show/season01-poster.jpg",
+        ImageType::Primary,
+        11,
+    )];
+    assert!(!merge_local_images(&mut images, &within_a_second));
+    assert_eq!(images, [stored]);
+
+    let moved = [image_row(
+        "/media/Show/season01-poster.jpg",
+        ImageType::Primary,
+        12,
+    )];
+    assert!(merge_local_images(&mut images, &moved));
+    assert_eq!(images, moved);
+}
+
+/// Found images become rows dated by their files, with no dimensions.
+#[test]
+fn found_images_become_rows_dated_by_their_files() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let poster = dir.path().join("season01-poster.jpg");
+    std::fs::write(&poster, b"x").expect("poster");
+    let modified: chrono::DateTime<chrono::Utc> = std::fs::metadata(&poster)
+        .and_then(|m| m.modified())
+        .expect("mtime")
+        .into();
+    let found = LocalImageInfo {
+        file_info: FileSystemMetadata {
+            full_name: poster.to_string_lossy().into_owned(),
+            ..FileSystemMetadata::default()
+        },
+        type_: ImageType::Primary,
+    };
+    let rows = local_image_infos(vec![found]);
+    assert_eq!(
+        rows,
+        [ItemImageInfo {
+            path: poster.to_string_lossy().into_owned(),
+            image_type: ImageType::Primary,
+            date_modified: modified,
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        }]
+    );
 }

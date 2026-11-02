@@ -2318,6 +2318,106 @@ mod tests {
         assert!(strict.iter().all(|(k, _)| *k != id(0x55)));
     }
 
+    /// gl-1013: the queue reads the library a page at a time and keeps the
+    /// order of the whole-list walk: each item under the first enabled
+    /// library one of whose locations holds its file (a disabled library
+    /// nested in an enabled one included), libraries in order, and the
+    /// query's order within each.
+    #[tokio::test]
+    async fn the_queue_reads_the_library_a_page_at_a_time() {
+        let h = harness(&[], true, "{}", true).await;
+        let db = ferrofin_db::Database::connect_in_memory()
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrations");
+        let persistence = ferrofin_core::FerrofinItemPersistenceService::new(db.clone());
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
+            Arc::new(crate::library_pages::tests::OnePageAtATime(Arc::new(
+                ferrofin_core::FerrofinItemRepository::new(db.clone(), lookup),
+            )));
+        let library = ferrofin_core::FerrofinLibraryManager::new(
+            items,
+            Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+            Arc::new(ferrofin_core::FerrofinItemPersistenceService::new(
+                db.clone(),
+            )),
+            Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+        );
+        // More episodes than a page, one per series. The series take the
+        // three roots in turn, so the query's order interleaves the libraries.
+        let roots = ["/lib/kids", "/lib/main", "/lib/old"];
+        let count = crate::library_pages::PAGE + 37;
+        let season = |n: usize| Uuid::from_u128(0x2000 + u128::try_from(n).expect("n"));
+        let episode_type =
+            ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Episode).expect("type");
+        let mut rows: Vec<BaseItemEntity> = (0..count)
+            .map(|n| {
+                let n128 = u128::try_from(n).expect("n");
+                BaseItemEntity {
+                    id: guid_to_db(Uuid::from_u128(0x1000 + n128)),
+                    type_: episode_type.to_owned(),
+                    path: Some(format!("{}/show {n:03}/s01e01.mkv", roots[n % 3])),
+                    run_time_ticks: Some(1_800 * 10_000_000),
+                    season_id: Some(guid_to_db(season(n))),
+                    series_id: Some(guid_to_db(Uuid::from_u128(0x3000 + n128))),
+                    series_name: Some(format!("Show {n:03}")),
+                    parent_index_number: Some(1),
+                    index_number: Some(1),
+                    ..BaseItemEntity::default()
+                }
+            })
+            .collect();
+        // A file under no library's location is never queued.
+        rows.push(BaseItemEntity {
+            id: guid_to_db(Uuid::from_u128(0x1fff)),
+            type_: episode_type.to_owned(),
+            path: Some("/elsewhere/show 000/s01e01.mkv".to_owned()),
+            season_id: Some(guid_to_db(Uuid::from_u128(0x2fff))),
+            series_name: Some("Show 000".to_owned()),
+            parent_index_number: Some(1),
+            index_number: Some(1),
+            ..BaseItemEntity::default()
+        });
+        persistence.save_items(&rows).await.expect("seed");
+        let folder =
+            |location: &str, enabled: bool| ferrofin_model::entities_media::VirtualFolderInfo {
+                locations: vec![location.to_owned()],
+                library_options: (!enabled).then(|| LibraryOptions {
+                    disabled_media_segment_providers: vec!["Intro Skipper".to_owned()],
+                    ..LibraryOptions::default()
+                }),
+                ..Default::default()
+            };
+        // `/lib/old` disables the plugin but lies inside the enabled `/lib`,
+        // so its files are queued under `/lib`, after the kids' library.
+        let folders = vec![
+            folder("/lib/kids", true),
+            folder("/lib/old", false),
+            folder("/lib", true),
+        ];
+
+        let queue = queue::build(
+            &library,
+            h.task.ffmpeg.as_ref(),
+            &folders,
+            &IntroSkipperConfig::default(),
+            true,
+        )
+        .await
+        .expect("queue");
+
+        let kids = (0..count).filter(|n| n % 3 == 0);
+        let rest = (0..count).filter(|n| n % 3 != 0);
+        let expected: Vec<Uuid> = kids.chain(rest).map(season).collect();
+        let seasons: Vec<Uuid> = queue.iter().map(|(season, _)| *season).collect();
+        assert_eq!(seasons, expected);
+        // One entry per file: the kids' files, which `/lib` holds too, are
+        // queued once.
+        assert!(queue.iter().all(|(_, entries)| entries.len() == 1));
+    }
+
     /// `ClearExcludedTimestampsAsync`: the items the exclusion policy now
     /// matches lose their stored segments and cache, and are republished.
     #[tokio::test]

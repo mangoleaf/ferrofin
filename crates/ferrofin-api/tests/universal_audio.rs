@@ -129,14 +129,17 @@ impl AttachmentExtractor for NoAttachments {
     }
 }
 
-/// Authenticates as the sample user, allowed to transcode audio or not.
+/// Authenticates as the sample user, allowed to transcode audio or not, an
+/// administrator or not.
 struct AudioAuth {
     transcode: bool,
+    administrator: bool,
 }
 
-fn auth_info(transcode: bool) -> AuthorizationInfo {
+fn auth_info(transcode: bool, administrator: bool) -> AuthorizationInfo {
     AuthorizationInfo {
         user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+            is_administrator: administrator,
             enable_remote_access: true,
             enable_audio_playback_transcoding: transcode,
             enable_video_playback_transcoding: false,
@@ -153,7 +156,7 @@ impl AuthService for AudioAuth {
         &self,
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(auth_info(self.transcode))
+        Ok(auth_info(self.transcode, self.administrator))
     }
 }
 
@@ -163,7 +166,7 @@ impl AuthorizationContext for AudioAuth {
         &self,
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
-        Ok(auth_info(self.transcode))
+        Ok(auth_info(self.transcode, self.administrator))
     }
 }
 
@@ -406,7 +409,20 @@ fn router_as(
     transcode_path: &str,
     transcode: bool,
 ) -> (axum::Router, Arc<Mutex<Option<Served>>>) {
-    let auth = Arc::new(AudioAuth { transcode });
+    router_for(sources, transcode_path, transcode, false)
+}
+
+/// [`router_as`] for an administrator or not.
+fn router_for(
+    sources: Vec<MediaSourceInfo>,
+    transcode_path: &str,
+    transcode: bool,
+    administrator: bool,
+) -> (axum::Router, Arc<Mutex<Option<Served>>>) {
+    let auth = Arc::new(AudioAuth {
+        transcode,
+        administrator,
+    });
     let served = Arc::new(Mutex::new(None));
     let state = AppState::new(
         Arc::new(AudioLibrary),
@@ -677,6 +693,38 @@ async fn a_remote_source_redirects_when_remote_media_is_enabled() {
         assert_ne!(resp.status(), StatusCode::FOUND, "{query}");
         assert!(resp.headers().get(header::LOCATION).is_none(), "{query}");
     }
+}
+
+/// A redirect to a remote tuner source would hand the client the URL PlaybackInfo
+/// hides, so a caller who is not an administrator is served by the server: the
+/// source is relayed, not transcoded (this origin is unreachable, so the relay
+/// fails here). An administrator is still redirected.
+#[tokio::test]
+async fn a_tuner_url_is_redirected_to_only_for_an_administrator() {
+    let file = temp_file();
+    let tuner = || {
+        let url = "https://iptv.example.invalid/live/user/secret/a.flac";
+        let mut remote = flac_source(ITEM_ID, url, 900_000);
+        remote.protocol = MediaProtocol::Http;
+        remote.is_remote = true;
+        remote.path_is_private = true;
+        remote
+    };
+    let query = "container=flac&enableRemoteMedia=true";
+
+    let (app, served) = router_for(vec![tuner()], &file.path, true, false);
+    let resp = get(app, query).await;
+    assert_ne!(resp.status(), StatusCode::FOUND);
+    assert!(resp.headers().get(header::LOCATION).is_none());
+    assert!(served.lock().unwrap().is_none(), "relayed, not transcoded");
+
+    let (app, _) = router_for(vec![tuner()], &file.path, true, true);
+    let resp = get(app, query).await;
+    assert_eq!(resp.status(), StatusCode::FOUND);
+    assert_eq!(
+        resp.headers()[header::LOCATION],
+        "https://iptv.example.invalid/live/user/secret/a.flac"
+    );
 }
 
 /// `HEAD` answers each branch with its headers and no body: the original file

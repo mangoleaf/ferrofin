@@ -48,6 +48,7 @@ reqwest.workspace = true
 # The `Stream` impl behind the progressive Live TV response bodies.
 futures-core.workspace = true
 futures-util.workspace = true
+httpdate.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_urlencoded.workspace = true

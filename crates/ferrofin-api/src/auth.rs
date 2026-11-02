@@ -22,7 +22,7 @@
 //! Two pieces mirror the C# `MediaBrowser.Controller.Net` layer:
 //!
 //! - [`auth_context_layer`] — a middleware that builds a transport-agnostic
-//!   [`RequestContext`] from the request's headers + query, asks
+//!   [`RequestContext`] from the request's credential headers + query, asks
 //!   [`AuthorizationContext`] to parse it into an [`AuthorizationInfo`], and
 //!   stashes that as a request extension. It never rejects: an anonymous request
 //!   still gets a (default) [`AuthorizationInfo`], matching the C# behaviour
@@ -33,7 +33,7 @@
 
 use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, Request};
+use axum::http::{HeaderMap, HeaderName, Request, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use ferrofin_traits::net::RequestContext;
@@ -42,15 +42,61 @@ use ferrofin_traits::options::AuthorizationInfo;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// Builds a [`RequestContext`] from an axum request's headers and query string.
+/// The headers [`AuthorizationContext`] reads: the two authorization headers
+/// and the two bare-token ones (`GetAuthorizationDictionary` and
+/// `GetAuthorizationInfoFromDictionary` in `AuthorizationContext.cs`).
+///
+/// [`auth_request_context`] copies no others, so a header the parser starts
+/// reading has to be added here too.
+static CREDENTIAL_HEADERS: [HeaderName; 4] = [
+    header::AUTHORIZATION,
+    HeaderName::from_static("x-emby-authorization"),
+    HeaderName::from_static("x-emby-token"),
+    HeaderName::from_static("x-mediabrowser-token"),
+];
+
+/// Builds the [`RequestContext`] authentication runs on: the
+/// [`CREDENTIAL_HEADERS`], the raw query string for the `ApiKey`/`api_key`
+/// parameter, and the caller's address.
+///
+/// This runs on every request, images and segments included, so it copies only
+/// what the parser reads. A repeated header keeps its order and a non-UTF-8
+/// value is dropped, as in [`request_context`].
+pub(crate) fn auth_request_context(
+    headers: &HeaderMap,
+    query: Option<&str>,
+    remote: Option<String>,
+) -> RequestContext {
+    // Not sized up front: an anonymous request, as an image fetch usually is,
+    // then allocates nothing here.
+    let mut copied = Vec::new();
+    for name in &CREDENTIAL_HEADERS {
+        copied.extend(headers.get_all(name).iter().filter_map(|value| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_owned(), v.to_owned()))
+        }));
+    }
+    RequestContext {
+        headers: copied,
+        query_string: query.map(ToOwned::to_owned),
+        remote_endpoint: remote,
+        scheme: None,
+    }
+}
+
+/// Builds a [`RequestContext`] from an axum request's headers and query string,
+/// for what reads more of the request than authentication does: the `Host` a
+/// system address is built from.
 ///
 /// Copies every header as a `(name, value)` pair (dropping non-UTF-8 values,
 /// which Jellyfin's ASCII header grammar never uses) and carries the raw query
-/// string so the authorization logic can read the `api_key`/`ApiKey` parameter.
+/// string.
 ///
-/// The scheme is left unresolved (`None`, read as `http`): authorization does
-/// not need it. A context that builds addresses comes from
-/// `handlers::system::context_from_parts`, which resolves it.
+/// The scheme is left unresolved (`None`, read as `http`). A context that
+/// builds addresses comes from `handlers::system::context_from_parts`, which
+/// resolves it.
 pub(crate) fn request_context(
     headers: &HeaderMap,
     query: Option<&str>,
@@ -97,7 +143,7 @@ pub async fn auth_context_layer(
     // session reports an empty address and every activity-log `ShortOverview`
     // built from it is null.
     let remote = state.client_address(&parts).to_string();
-    let ctx = request_context(&parts.headers, parts.uri.query(), Some(remote));
+    let ctx = auth_request_context(&parts.headers, parts.uri.query(), Some(remote));
     let info = state
         .auth_context()
         .get_authorization_info(&ctx)
@@ -119,7 +165,7 @@ async fn authenticated_info(
     {
         return Ok(info.clone());
     }
-    let ctx = request_context(
+    let ctx = auth_request_context(
         &parts.headers,
         parts.uri.query(),
         Some(state.client_address(parts).to_string()),
@@ -158,24 +204,40 @@ pub(crate) async fn default_authorization(
     if info.is_api_key {
         return Ok(info);
     }
+    let client = state.client_address(parts);
+    let policy = user_authorization(&info, client, state, validate_schedule).await?;
+    info.user_policy = Some(policy);
+    Ok(info)
+}
+
+/// The user half of [`default_authorization`], for a caller that holds the
+/// [`AuthorizationInfo`] and has only to know the verdict: the user's policy
+/// once it allows `client`, read from `info` when the token cache supplied it.
+///
+/// A stream route answers a request this way, so that one with no credential
+/// stays anonymous while one naming a user is held to that user's account
+/// (`handlers::streaming::require_streamable_item`).
+pub(crate) async fn user_authorization(
+    info: &AuthorizationInfo,
+    client: std::net::IpAddr,
+    state: &AppState,
+    validate_schedule: bool,
+) -> Result<std::sync::Arc<ferrofin_model::users::UserPolicy>, ApiError> {
     if info.user_id().is_nil() {
         return Err(ApiError::Forbidden("user identity required".to_owned()));
     }
-    if info.user_policy.is_none()
-        && let Some(user) = &info.user
-    {
-        info.user_policy = crate::handlers::users::user_policy(state, user)
+    let policy = match (&info.user_policy, &info.user) {
+        (Some(policy), _) => Some(std::sync::Arc::clone(policy)),
+        (None, Some(user)) => crate::handlers::users::user_policy(state, user)
             .await?
-            .map(std::sync::Arc::new);
+            .map(std::sync::Arc::new),
+        (None, None) => None,
     }
-    let policy = info
-        .user_policy
-        .as_ref()
-        .ok_or_else(|| ApiError::Forbidden("user policy required".to_owned()))?;
+    .ok_or_else(|| ApiError::Forbidden("user policy required".to_owned()))?;
     if policy.is_disabled {
         return Err(ApiError::Unauthorized("account disabled".to_owned()));
     }
-    if !state.is_in_local_network(state.client_address(parts)) && !policy.enable_remote_access {
+    if !state.is_in_local_network(client) && !policy.enable_remote_access {
         return Err(ApiError::Forbidden(
             "remote access is not permitted for this user".to_owned(),
         ));
@@ -188,7 +250,7 @@ pub(crate) async fn default_authorization(
             "outside this user's access schedule".to_owned(),
         ));
     }
-    Ok(info)
+    Ok(policy)
 }
 
 /// Jellyfin's default policy: authenticated API key or user, with remote access
@@ -520,74 +582,6 @@ fn day_of_week_contains(
     }
 }
 
-/// Extractor for handlers behind Jellyfin's `LocalAccessOrRequiresElevation`
-/// policy — in the vendored contract, `POST /System/Restart` alone.
-///
-/// Port of `LocalAccessOrRequiresElevationHandler`: a caller whose peer address
-/// is on the local network is allowed regardless of role; anyone else must be an
-/// administrator. Restarting the server is the kind of thing someone standing at
-/// the machine should be able to do, and the kind of thing a stranger on the
-/// internet should not.
-///
-/// Two deliberate divergences, both in the safe direction:
-///
-/// 1. **Authentication is still required.** Upstream registers this policy as
-///    `AddPolicy(name, new LocalAccessOrRequiresElevationRequirement())` — the
-///    requirement list replaces the default policy wholesale and nothing in it
-///    demands an authenticated user, so a LAN caller with no token at all
-///    satisfies it. Ferrofin keeps [`RequireAuth`] in front, so an anonymous
-///    request is `401` whatever its source address. No authenticated client can
-///    tell the difference.
-/// 2. **An unknown peer address is treated as remote.** C# accepts a null IP
-///    ("Loopback will be on LAN, so we can accept null"), but in Ferrofin the
-///    peer address is missing only when there is no connection to ask —
-///    synthetic routing in tests, never a served request, since the composition
-///    root installs `with_connect_info`. Failing closed there costs a real
-///    caller nothing and keeps the unknown case from being the permissive one.
-///
-/// The local-network test is [`AppState::is_in_local_network`] over
-/// [`AppState::client_address`], as `GET /System/Endpoint`'s `IsInNetwork` is,
-/// so the endpoint that *reports* whether a client is in-network and the policy
-/// that *acts* on it can never disagree. With the composition root's network
-/// policy wired, that is `NetworkManager.IsInLocalNetwork` (the
-/// `LocalNetworkSubnets` intersected and the `!`-prefixed exclusions
-/// subtracted) over the client behind any `KnownProxies`, as upstream reads
-/// `GetNormalizedRemoteIP()`. Without it (unit tests) the private-range
-/// fallback in `handlers::system` applies.
-#[derive(Debug, Clone)]
-pub struct RequireLocalAccessOrAdmin(pub AuthorizationInfo);
-
-impl FromRequestParts<AppState> for RequireLocalAccessOrAdmin {
-    type Rejection = ApiError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        // Read the peer before `RequireAuth` borrows `parts` mutably.
-        // The CLIENT's address, not the transport peer: behind a proxy the peer
-        // is always the proxy, which is private, so every caller would read as
-        // local and this gate would degrade to "any authenticated account".
-        //
-        // The `is_some` is load-bearing and stays: `client_address` defaults a
-        // MISSING peer to loopback (C# `GetNormalizedRemoteIP` does), and
-        // "there was no connection to ask" must keep reading as remote here —
-        // the deliberate divergence documented on this extractor, and the only
-        // one of the two directions that is safe to be wrong in.
-        let local = parts
-            .extensions
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .is_some()
-            && state.is_in_local_network(state.client_address(parts));
-        if local {
-            let info = authenticated_info(parts, state).await?;
-            return Ok(Self(info));
-        }
-        let RequireAdmin(info) = RequireAdmin::from_request_parts(parts, state).await?;
-        Ok(Self(info))
-    }
-}
-
 /// Extractor for handlers behind Jellyfin's `FirstTimeSetupOrDefault` policy.
 ///
 /// Port of `FirstTimeSetupHandler`: while the startup wizard is **not** complete
@@ -606,7 +600,6 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let ctx = request_context(&parts.headers, parts.uri.query(), None);
         // Wizard incomplete → allow anonymous (still surface a token if one is
         // present, but never reject). Treat a config read error as "not complete"
         // so a fresh install can never lock itself out of its own setup wizard.
@@ -616,6 +609,7 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrAuth {
             .await
             .is_ok_and(|c| c.is_startup_wizard_completed);
         if !wizard_complete {
+            let ctx = auth_request_context(&parts.headers, parts.uri.query(), None);
             let info = state.auth_service().authenticate(&ctx).await.ok();
             let info = match info {
                 Some(info) if info.is_api_key || !info.user_id().is_nil() => {
@@ -656,7 +650,6 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrElevated {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let ctx = request_context(&parts.headers, parts.uri.query(), None);
         // A config read error reads as "not complete", exactly as in
         // `FirstTimeSetupOrAuth`: a fresh install must never be able to lock
         // itself out of its own setup wizard.
@@ -666,6 +659,7 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrElevated {
             .await
             .is_ok_and(|c| c.is_startup_wizard_completed);
         if !wizard_complete {
+            let ctx = auth_request_context(&parts.headers, parts.uri.query(), None);
             let info = state.auth_service().authenticate(&ctx).await.ok();
             let info = match info {
                 Some(info) if info.is_api_key || !info.user_id().is_nil() => {

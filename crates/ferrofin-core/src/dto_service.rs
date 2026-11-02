@@ -152,6 +152,10 @@ struct Prefetched {
     /// Image rows per *person* id, for the whole page's cast/crew at once, so the
     /// primary-image tag lookup does not re-query per person per item.
     person_images: HashMap<Uuid, Vec<ItemImageInfo>>,
+    /// The expanded `Path` of each credited person with a Primary image: the
+    /// person's tag hashes it (`GetTagAndFillBlurhash(dto, entity, Primary)`
+    /// → `GetImageCacheTag(entity.Path, …)`).
+    person_paths: HashMap<Uuid, String>,
     /// By-name item id per clean name, bucketed by the by-name kind (`Studio`,
     /// `Genre`, `MusicGenre`, `MusicArtist`), for every studio/genre/artist name
     /// across the page, so `attach_studios`/`_genres`/`_artists` resolve from
@@ -193,7 +197,8 @@ struct Prefetched {
     version_visible: Option<std::collections::HashSet<Uuid>>,
     /// The user's data for the page's version groups (populated only for a
     /// user, with `MediaSources` or user data, on a page holding versions),
-    /// which puts the version being resumed first.
+    /// which puts the version being resumed first: a page item's is the
+    /// page's own, and a version off the page the user never wrote is absent.
     version_user_data: HashMap<Uuid, ferrofin_model::dto::UserItemDataDto>,
     /// For each page video with versions (and user data, for a user), the
     /// version played last, whose completion its `UserData` takes
@@ -869,7 +874,9 @@ fn stored_id(value: Option<&str>) -> Option<Uuid> {
 }
 
 impl ImageParent {
-    fn from_row(row: &ferrofin_db::ImageParentRow) -> Self {
+    /// The narrow row, its path expanded as `BaseItemMapper.Map` reads it: a
+    /// parent's image tags hash it ([`FerrofinDtoService::image_tag`]).
+    fn from_row(row: &ferrofin_db::ImageParentRow, paths: &VirtualPathExpander) -> Self {
         Self {
             kind: kind_from_type_name(&row.type_).unwrap_or(BaseItemKind::Folder),
             parent_id: stored_id(row.parent_id.as_deref()),
@@ -879,13 +886,17 @@ impl ImageParent {
             album_artist: split_multi_str(row.album_artists.as_deref())
                 .next()
                 .map(str::to_owned),
-            path: row.path.clone(),
+            path: row
+                .path
+                .as_deref()
+                .map(|path| paths.expand_cow(path).into_owned()),
             lufs: row.lufs,
             normalization_gain: row.normalization_gain,
         }
     }
 
-    fn from_entity(item: &BaseItemEntity) -> Self {
+    /// [`Self::from_row`] for a page row.
+    fn from_entity(item: &BaseItemEntity, paths: &VirtualPathExpander) -> Self {
         Self {
             kind: row_kind(item),
             parent_id: stored_id(item.parent_id.as_deref()),
@@ -895,7 +906,10 @@ impl ImageParent {
             album_artist: split_multi_str(item.album_artists.as_deref())
                 .next()
                 .map(str::to_owned),
-            path: item.path.clone(),
+            path: item
+                .path
+                .as_deref()
+                .map(|path| paths.expand_cow(path).into_owned()),
             lufs: item.lufs,
             normalization_gain: item.normalization_gain,
         }
@@ -1053,6 +1067,12 @@ fn never_falls_back_to_collection_folder(kind: BaseItemKind) -> bool {
 const MAX_IMAGE_PARENT_DEPTH: usize = 16;
 
 impl ImageParentGraph {
+    /// The expanded `Path` of a row the prefetch read, the one its image tags
+    /// hash; `None` for a path-less or unread row.
+    fn path_of(&self, id: Uuid) -> Option<&str> {
+        self.rows.get(&id)?.path.as_deref()
+    }
+
     /// `LibraryManager.GetCollectionFolders(item)` (:2757-2802): walk `item`
     /// up through `GetParent()` (`GetOwner()` when there is none) until the
     /// next parent is the `AggregateFolder`, then match the user-root
@@ -1448,10 +1468,7 @@ impl FerrofinDtoService {
     ) -> Result<HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
         let mut map: HashMap<Uuid, Vec<ItemImageInfo>> = HashMap::with_capacity(item_ids.len());
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(
                 crate::item_repository::images_of_items_sql(&placeholders),
             ));
@@ -1506,7 +1523,7 @@ impl FerrofinDtoService {
                 let Ok(id) = Uuid::parse_str(&fetched_row.id) else {
                     continue;
                 };
-                let row = ImageParent::from_row(fetched_row);
+                let row = ImageParent::from_row(fetched_row, &self.virtual_paths);
                 let continues = kinds::supports_inherited_parent_images(row.kind)
                     && (walk_may_run || row.kind == BaseItemKind::Folder);
                 if continues {
@@ -1560,7 +1577,9 @@ impl FerrofinDtoService {
                 .map_err(|e| ServiceError::Backend(e.to_string()))?
             {
                 if let Ok(id) = Uuid::parse_str(&fetched_row.id) {
-                    graph.rows.insert(id, ImageParent::from_row(&fetched_row));
+                    graph
+                        .rows
+                        .insert(id, ImageParent::from_row(&fetched_row, &self.virtual_paths));
                 }
             }
         }
@@ -1572,10 +1591,11 @@ impl FerrofinDtoService {
     /// Every `CollectionFolder` with the paths `GetCollectionFoldersInternal`
     /// matches on. Read per page, and only when a walk runs out of parents
     /// (`needs_folders`) — on an adopted Jellyfin DB that is the common shape.
-    /// The rows come from the library set the visibility check caches
-    /// (`ferrofin_db::row_cache`) when one is live: the library mutation hooks
-    /// that keep it current are what a cache here needs, since a stale one
-    /// would show the wrong inherited images. With none cached they are read.
+    /// The rows and their stored locations come from the library set the
+    /// visibility check caches (`ferrofin_db::row_cache`) when one is live: the
+    /// library mutation hooks that keep it current are what a cache here needs,
+    /// since a stale one would show the wrong inherited images. With none
+    /// cached the rows are read and parsed.
     async fn collection_folder_locations(
         &self,
     ) -> Result<Vec<CollectionFolderLocations>, ServiceError> {
@@ -1585,41 +1605,40 @@ impl FerrofinDtoService {
             return Ok(Vec::new());
         };
         // The visibility check's cached library set (`ferrofin_db::row_cache`), when one is live:
-        // the same rows, kept current by the library mutation hooks.
-        let rows = match self.db.cached_libraries() {
-            Some(set) => set
+        // the same rows, kept current by the library mutation hooks, their locations parsed.
+        // `rating_libraries` gives every row an entry, an empty one for a library with no list.
+        if let Some(set) = self.db.cached_libraries() {
+            return Ok(set
                 .rows
                 .iter()
-                .map(|row| (row.id.clone(), row.path.clone(), row.data.clone()))
-                .collect(),
-            None => self
-                .db
-                .rows_of_type(type_name)
-                .await
-                .map_err(|e| ServiceError::Backend(e.to_string()))?,
-        };
+                .filter_map(|row| {
+                    let id = Uuid::parse_str(&row.id).ok()?;
+                    Some(CollectionFolderLocations {
+                        id,
+                        path: row.path.clone(),
+                        physical_locations: set
+                            .physical_locations
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect());
+        }
+        let rows = self
+            .db
+            .rows_of_type(type_name)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?;
         Ok(rows
             .into_iter()
             .filter_map(|(id, path, data)| {
-                let id = Uuid::parse_str(&id).ok()?;
-                let physical_locations = data
-                    .as_deref()
-                    .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
-                    .as_ref()
-                    .and_then(|v| v.get("PhysicalLocationsList"))
-                    .and_then(serde_json::Value::as_array)
-                    .map(|locations| {
-                        locations
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
                 Some(CollectionFolderLocations {
-                    id,
+                    id: Uuid::parse_str(&id).ok()?,
                     path,
-                    physical_locations,
+                    physical_locations: crate::item_data::stored_physical_locations(
+                        data.as_deref(),
+                    ),
                 })
             })
             .collect())
@@ -1675,7 +1694,7 @@ impl FerrofinDtoService {
         let mut audio_roots: Vec<Uuid> = Vec::new();
         for item in items {
             let id = row_id(item);
-            let row = ImageParent::from_entity(item);
+            let row = ImageParent::from_entity(item, &self.virtual_paths);
             match row.kind {
                 // The stored ids first; the parent too, for the
                 // `FindParent<Season>()`/`FindParent<Series>()` fallbacks.
@@ -1819,11 +1838,13 @@ impl FerrofinDtoService {
         primary_image_aspect_ratio(self.image_processor.as_ref(), item_id, kind, images).await
     }
 
-    /// Computes the cache tag for one image, tolerating processor failures
-    /// (logged-and-skipped in C#).
-    async fn image_tag(&self, item_id: Uuid, image: &ItemImageInfo) -> Option<String> {
+    /// Computes the cache tag of one image of the item at `item_path` (its
+    /// expanded `Path`, which the tag hashes: `GetImageCacheTag(item, image)
+    /// => GetImageCacheTag(item.Path, image.DateModified)`), tolerating
+    /// processor failures (logged-and-skipped in C#).
+    async fn image_tag(&self, item_path: Option<&str>, image: &ItemImageInfo) -> Option<String> {
         self.image_processor
-            .get_image_cache_tag(item_id, image)
+            .get_image_cache_tag(item_path, image)
             .await
             .ok()
             .flatten()
@@ -1843,10 +1864,10 @@ impl FerrofinDtoService {
     async fn tag_and_fill_blur_hash(
         &self,
         dto: &mut BaseItemDto,
-        item_id: Uuid,
+        item_path: Option<&str>,
         image: &ItemImageInfo,
     ) -> Option<String> {
-        let tag = self.image_tag(item_id, image).await?;
+        let tag = self.image_tag(item_path, image).await?;
         if let Some(hash) = image.blur_hash.as_deref().filter(|h| !h.is_empty()) {
             Self::record_blur_hash(dto, image.image_type, &tag, hash);
         }
@@ -1893,7 +1914,10 @@ impl FerrofinDtoService {
                 .get(&person_id)
                 .and_then(|images| images.iter().find(|i| i.image_type == ImageType::Primary))
             {
-                Some(primary) => self.tag_and_fill_blur_hash(dto, person_id, primary).await,
+                Some(primary) => {
+                    let person_path = prefetched.person_paths.get(&person_id).map(String::as_str);
+                    self.tag_and_fill_blur_hash(dto, person_path, primary).await
+                }
                 None => None,
             };
             // Only the blurhash of the person's own image, under every image
@@ -2034,10 +2058,11 @@ impl FerrofinDtoService {
 
     /// Applies the images (single-image tags + backdrops) to the DTO (port of
     /// the image loop in `AttachBasicFields`).
+    /// `item_path` is the item's expanded `Path`, which its tags hash.
     async fn attach_images(
         &self,
         dto: &mut BaseItemDto,
-        item_id: Uuid,
+        item_path: Option<&str>,
         images: &[ItemImageInfo],
         options: &DtoOptions,
     ) {
@@ -2053,7 +2078,7 @@ impl FerrofinDtoService {
                 .collect();
             let mut tags = Vec::with_capacity(backdrops.len());
             for image in backdrops {
-                if let Some(tag) = self.tag_and_fill_blur_hash(dto, item_id, image).await {
+                if let Some(tag) = self.tag_and_fill_blur_hash(dto, item_path, image).await {
                     tags.push(tag);
                 }
             }
@@ -2067,7 +2092,7 @@ impl FerrofinDtoService {
                 .filter(|i| !allows_multiple_images(i.image_type))
                 .filter(|i| options.image_limit(i.image_type) > 0)
             {
-                if let Some(tag) = self.tag_and_fill_blur_hash(dto, item_id, image).await {
+                if let Some(tag) = self.tag_and_fill_blur_hash(dto, item_path, image).await {
                     image_tags.insert(image.image_type, tag);
                 }
             }
@@ -2120,7 +2145,7 @@ impl FerrofinDtoService {
             }
             dto.parent_primary_image_item_id = Some(*display_parent);
             dto.parent_primary_image_tag = self
-                .tag_and_fill_blur_hash(dto, *display_parent, image)
+                .tag_and_fill_blur_hash(dto, graph.path_of(*display_parent), image)
                 .await;
         }
 
@@ -2182,8 +2207,9 @@ impl FerrofinDtoService {
                 && let Some(image) = all_images.iter().find(|i| i.image_type == ImageType::Logo)
             {
                 dto.parent_logo_item_id = Some(parent_id);
-                dto.parent_logo_image_tag =
-                    self.tag_and_fill_blur_hash(dto, parent_id, image).await;
+                dto.parent_logo_image_tag = self
+                    .tag_and_fill_blur_hash(dto, parent_row.path.as_deref(), image)
+                    .await;
             }
 
             if art_limit > 0
@@ -2192,7 +2218,9 @@ impl FerrofinDtoService {
                 && let Some(image) = all_images.iter().find(|i| i.image_type == ImageType::Art)
             {
                 dto.parent_art_item_id = Some(parent_id);
-                dto.parent_art_image_tag = self.tag_and_fill_blur_hash(dto, parent_id, image).await;
+                dto.parent_art_image_tag = self
+                    .tag_and_fill_blur_hash(dto, parent_row.path.as_deref(), image)
+                    .await;
             }
 
             // `(dto.ParentThumbItemId is null || parent is Series) && parent is
@@ -2211,8 +2239,9 @@ impl FerrofinDtoService {
                 && let Some(image) = all_images.iter().find(|i| i.image_type == ImageType::Thumb)
             {
                 dto.parent_thumb_item_id = Some(parent_id);
-                dto.parent_thumb_image_tag =
-                    self.tag_and_fill_blur_hash(dto, parent_id, image).await;
+                dto.parent_thumb_image_tag = self
+                    .tag_and_fill_blur_hash(dto, parent_row.path.as_deref(), image)
+                    .await;
             }
 
             // Backdrops only when neither the item nor an earlier parent had
@@ -2234,7 +2263,9 @@ impl FerrofinDtoService {
                 if !backdrops.is_empty() {
                     let mut tags = Vec::with_capacity(backdrops.len());
                     for image in backdrops {
-                        if let Some(tag) = self.tag_and_fill_blur_hash(dto, parent_id, image).await
+                        if let Some(tag) = self
+                            .tag_and_fill_blur_hash(dto, parent_row.path.as_deref(), image)
+                            .await
                         {
                             tags.push(tag);
                         }
@@ -2271,7 +2302,8 @@ impl FerrofinDtoService {
             .get(&parent_id)?
             .iter()
             .find(|i| i.image_type == ImageType::Primary)?;
-        self.tag_and_fill_blur_hash(dto, parent_id, image).await
+        let parent_path = prefetched.image_parents.path_of(parent_id);
+        self.tag_and_fill_blur_hash(dto, parent_path, image).await
     }
 
     /// Builds the full DTO for one item row (port of `GetBaseItemDtoInternal` +
@@ -2669,6 +2701,15 @@ impl FerrofinDtoService {
         repeated: bool,
     ) -> Result<(), ServiceError> {
         let item_id = row_id(item);
+        // The item's `Path` as `BaseItemMapper.Map` reads it (`ExpandVirtualPath`:
+        // an adopted genre's `%MetadataPath%/Genre/Action` is a real path). The
+        // item repository's rows are expanded already; this also covers the rows
+        // other readers hand the projection. `Path` maps it, and the item's image
+        // tags hash it.
+        let item_path = item
+            .path
+            .as_deref()
+            .map(|stored| self.virtual_paths.expand_cow(stored));
 
         // `if (item is IHasCollectionType hasCollectionType) dto.CollectionType =
         // hasCollectionType.CollectionType;` (DtoService.cs:1061-1064) — set for
@@ -2795,7 +2836,8 @@ impl FerrofinDtoService {
         // Images (single-type tags + backdrops), then the parents' images the
         // item borrows (C# `AddInheritedImages`, called from
         // `AttachBasicFields` right after `ParentId`).
-        self.attach_images(dto, item_id, images, options).await;
+        self.attach_images(dto, item_path.as_deref(), images, options)
+            .await;
         self.add_inherited_images(dto, item_id, kind, options, prefetched)
             .await;
 
@@ -2912,8 +2954,8 @@ impl FerrofinDtoService {
         }
         if options.contains_field(ItemFields::Path) {
             // `DtoService.GetMappedPath` (`DtoService.cs:1827`): a file-protocol
-            // path after the network substitutions.
-            dto.path = item.path.as_deref().map(|path| {
+            // path after the network substitutions, of the expanded path.
+            dto.path = item_path.as_deref().map(|path| {
                 if crate::media_info_resolver::is_file_protocol(path) {
                     path_after_network_substitution(path, &prefetched.path_substitutions)
                 } else {
@@ -3111,26 +3153,32 @@ impl FerrofinDtoService {
             let mut chapters =
                 take_or_clone(&mut prefetched.chapters, &item_id, repeated).unwrap_or_default();
             // Each extracted chapter thumbnail needs its cache tag: clients gate
-            // the chapter image request on `ImageTag` (port of
-            // `ImageProcessor.GetImageCacheTag(item, chapter)`), so without it
-            // the thumbnails never load however well the extraction ran.
+            // the chapter image request on `ImageTag`, so without it the
+            // thumbnails never load however well the extraction ran. Port of
+            // `ChapterRepository.Map(chapter, e.Item.Path)`: `GetImageCacheTag(
+            // baseItemPath, chapter.ImageDateModified)` for a chapter with an
+            // image, where the item path is the one STORED, which upstream
+            // always writes through `ReverseVirtualPath`: this server's data
+            // or metadata directory as its token (`reverse`), whichever form
+            // Ferrofin stored. Only a video under one of those directories (a
+            // recording in the default `{data}/livetv/recordings`) hashes
+            // otherwise than its own images, which hash the expanded path.
+            let stored_path = item_path
+                .as_deref()
+                .map(|path| self.virtual_paths.reverse(path));
             for chapter in &mut chapters {
-                let Some(path) = chapter.image_path.clone().filter(|p| !p.is_empty()) else {
+                if chapter.image_path.as_deref().is_none_or(str::is_empty) {
                     continue;
-                };
+                }
                 chapter.image_tag = self
-                    .image_tag(
-                        item_id,
-                        &ItemImageInfo {
-                            path,
-                            image_type: ImageType::Chapter,
-                            date_modified: chapter.image_date_modified,
-                            width: 0,
-                            height: 0,
-                            blur_hash: None,
-                        },
+                    .image_processor
+                    .get_image_cache_tag_for_path(
+                        stored_path.as_deref().unwrap_or_default(),
+                        chapter.image_date_modified,
                     )
-                    .await;
+                    .await
+                    .ok()
+                    .flatten();
             }
             dto.chapters = Some(chapters);
         }
@@ -3394,10 +3442,7 @@ impl FerrofinDtoService {
             return Ok(map);
         }
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let ph = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let ph = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
                    WHERE "ItemId" IN ({ph})"#,
@@ -3869,8 +3914,18 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         options: &DtoOptions,
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
-        _skip_visibility_check: bool,
+        skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        // `items.Where(x => x.IsVisible(user))` (`DtoService.cs:166`).
+        if let Some(user) = user.filter(|_| !skip_visibility_check) {
+            let visible = self
+                .library
+                .filter_visible_items(items.to_vec(), user)
+                .await?;
+            return self
+                .project(&visible, options, Some(user), owner_id, RowRead::List)
+                .await;
+        }
         self.project(items, options, user, owner_id, RowRead::List)
             .await
     }
@@ -4451,9 +4506,18 @@ impl FerrofinDtoService {
         };
         let groups = resume_versions.as_ref().unwrap_or(&versions);
         // `SetAlternateVersionResumeStates` and `GetResumeUserDataBatch`: the
-        // user data of every version on or reached from the page, in one
-        // read, and only when the page holds a version group. With the
-        // sources, the version the user is part-way through leads them.
+        // user data of every version on or reached from the page, and only
+        // when the page holds a version group. With the sources, the version
+        // the user is part-way through leads them.
+        //
+        // Both ask `GetUserDataBatch`, which answers the page's own items from
+        // the cache the page's batch filled moments before
+        // (`UserDataManager.cs:204-207`, filled at :216 and :256;
+        // `DtoService.cs:171-180`), so a page item's data here is the page's
+        // own; only the versions off the page are read. Both use only the
+        // play state (`VersionResumeData.ApplyTo`, `SelectMostRecentlyPlayed`),
+        // which a never-written row does not have, so the read keeps just the
+        // rows the user stored.
         let version_user_data = match user {
             Some(user)
                 if (want_sources || !resume_candidates.is_empty())
@@ -4476,13 +4540,25 @@ impl FerrofinDtoService {
                 };
                 wanted.sort_unstable();
                 wanted.dedup();
-                if wanted.is_empty() {
-                    HashMap::new()
-                } else {
-                    self.user_data
-                        .get_user_data_batch(&wanted, parse_user_id(&user.id)?)
-                        .await?
+                let mut found: HashMap<Uuid, ferrofin_model::dto::UserItemDataDto> =
+                    HashMap::with_capacity(wanted.len());
+                let mut off_page: Vec<Uuid> = Vec::new();
+                for id in wanted {
+                    match user_data.get(&id) {
+                        Some(data) => {
+                            found.insert(id, data.clone());
+                        }
+                        None => off_page.push(id),
+                    }
                 }
+                if !off_page.is_empty() {
+                    found.extend(
+                        self.user_data
+                            .get_stored_user_data_batch(&off_page, parse_user_id(&user.id)?)
+                            .await?,
+                    );
+                }
+                found
             }
             _ => HashMap::new(),
         };
@@ -4749,6 +4825,30 @@ impl FerrofinDtoService {
             .iter()
             .filter_map(|id| fetched_images.get(id).map(|rows| (*id, rows.clone())))
             .collect();
+        // A credit's `PrimaryImageTag` hashes the person's own `Path`
+        // (`%MetadataPath%/People/…`, expanded), which the id resolution above
+        // does not read: one narrow read of the credited persons that have a
+        // Primary image, and none when no credit is tagged.
+        let tagged_persons: Vec<String> = person_images
+            .iter()
+            .filter(|(_, images)| images.iter().any(|i| i.image_type == ImageType::Primary))
+            .map(|(id, _)| guid_to_db(*id))
+            .collect();
+        let person_paths: HashMap<Uuid, String> = if tagged_persons.is_empty() {
+            HashMap::new()
+        } else {
+            self.db
+                .image_parent_rows(&tagged_persons)
+                .await
+                .map_err(|e| ServiceError::Backend(e.to_string()))?
+                .into_iter()
+                .filter_map(|row| {
+                    let id = Uuid::parse_str(&row.id).ok()?;
+                    let path = row.path?;
+                    Some((id, self.virtual_paths.expand_cow(&path).into_owned()))
+                })
+                .collect()
+        };
         let parent_images: HashMap<Uuid, Vec<ItemImageInfo>> = image_parents
             .image_ids
             .iter()
@@ -5060,6 +5160,7 @@ impl FerrofinDtoService {
             locked_fields,
             people,
             person_images,
+            person_paths,
             by_name_ids,
             clean_values,
             chapters,
@@ -5866,6 +5967,43 @@ mod tests {
         assert_eq!(dto.path.as_deref(), Some("http://origin/stream"));
     }
 
+    /// gl-848: `BaseItemMapper.Map` expands the stored `Path`
+    /// (`ExpandVirtualPath`) before `GetMappedPath` substitutes it. A row a
+    /// reader outside the item repository hands over with Jellyfin's token is
+    /// served expanded, then substituted.
+    #[tokio::test]
+    async fn path_is_expanded_before_the_path_substitutions() {
+        let db = test_db().await;
+        let config_dir = tempfile::tempdir().expect("tmp");
+        let root = tempfile::tempdir().expect("tmp");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let svc = service(db.clone())
+            .with_configuration(
+                crate::test_support::configuration_with_path_substitution(
+                    config_dir.path(),
+                    &metadata,
+                    "//nas/metadata",
+                )
+                .await,
+            )
+            .with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
+        let id = Uuid::new_v4();
+        crate::test_support::seed_named_item(&db, id, BaseItemKind::Genre, "Action").await;
+        let mut genre = fetch_item(&db, id).await;
+        genre.path = Some("%MetadataPath%/Genre/Action".to_owned());
+        let options = DtoOptions {
+            fields: vec![ItemFields::Path],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&genre, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.path.as_deref(), Some("//nas/metadata/Genre/Action"));
+    }
+
     /// `Playlist.SupportsPlayedStatus => MediaType == Video` (`Playlist.cs:73`):
     /// only a video playlist carries the folder played numbers.
     #[tokio::test]
@@ -6290,6 +6428,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(anyone.media_source_count, Some(3));
+
+        // `GetBaseItemDtos`' `IsVisible` pass runs unless the caller skips it.
+        let rows = [fetch_item(&db, open).await, rated_row];
+        let names = async |skip: bool| {
+            svc.get_base_item_dtos(&rows, &count_only, Some(&user), None, skip)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|dto| dto.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(false).await, ["Cut 0"]);
+        assert_eq!(names(true).await, ["Cut 0", "Cut 1"]);
     }
 
     /// `PartCount` (DtoService.cs:1418-1421): a stacked video counts itself
@@ -6522,6 +6673,111 @@ mod tests {
         assert_eq!(listed(1), [(p, "Movie".to_owned()), (a, "4K".to_owned())]);
     }
 
+    /// A version off the page that the user is part-way through, played after
+    /// the page's video, leads that video's sources
+    /// (`SetAlternateVersionResumeStates`): its user data is read off the page,
+    /// the stored rows only. Passes on the base too, where the whole group was
+    /// read again; it guards the off-page read the version resume now makes.
+    #[tokio::test]
+    async fn an_off_page_version_in_progress_leads_the_sources() {
+        use ferrofin_traits::library::UserDataManager as _;
+        let db = test_db().await;
+        let (primary, alternate) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_named_item(&db, primary, BaseItemKind::Movie, "Movie").await;
+        seed_named_item(&db, alternate, BaseItemKind::Movie, "Movie").await;
+        let mut row = fetch_item(&db, primary).await;
+        row.path = Some("/Movies/Movie/Movie.mkv".to_owned());
+        row.media_type = Some("Video".to_owned());
+        row.run_time_ticks = Some(1_000);
+        row.data =
+            Some(r#"{"LocalAlternateVersions":["/Movies/Movie/Movie - 4K.mkv"]}"#.to_owned());
+        crate::test_support::save_item(&db, &row).await;
+        let mut row = fetch_item(&db, alternate).await;
+        row.path = Some("/Movies/Movie/Movie - 4K.mkv".to_owned());
+        row.media_type = Some("Video".to_owned());
+        row.run_time_ticks = Some(1_000);
+        row.owner_id = Some(guid_to_db(primary));
+        crate::test_support::save_item(&db, &row).await;
+        link_alternate_version(&db, alternate, primary).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let tmp = tempfile::tempdir().expect("tmp");
+        let user_data = Arc::new(crate::user_data_manager::FerrofinUserDataManager::new(
+            db.clone(),
+            crate::test_support::configuration_with_path_substitution(
+                tmp.path(),
+                "/unused",
+                "/unused",
+            )
+            .await,
+        ));
+        let svc = FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(DbBackedLibrary { db: db.clone() }),
+            user_data.clone(),
+            Arc::new(FakeCounts::default()),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources {
+                stored_alternates: Some(db.clone()),
+                ..FakeSources::default()
+            }),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        );
+        let watched = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        for (id, ticks, last_played) in [
+            (primary, 300, watched - chrono::Duration::days(1)),
+            (alternate, 700, watched),
+        ] {
+            user_data
+                .save_user_data(
+                    user_id,
+                    id,
+                    &ferrofin_model::dto::UpdateUserItemDataDto {
+                        playback_position_ticks: Some(ticks),
+                        last_played_date: Some(last_played),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let dtos = svc
+            .get_base_item_dtos(
+                &[fetch_item(&db, primary).await],
+                &DtoOptions {
+                    fields: vec![ItemFields::MediaSources],
+                    ..DtoOptions::default()
+                },
+                Some(&user),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        let ids: Vec<String> = dtos[0]
+            .media_sources
+            .iter()
+            .flatten()
+            .filter_map(|source| source.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            [alternate.simple().to_string(), primary.simple().to_string()]
+        );
+        assert_eq!(
+            dtos[0]
+                .user_data
+                .as_ref()
+                .expect("user data")
+                .last_played_date,
+            Some(watched)
+        );
+    }
+
     /// A playlist's or box set's members are resolved with every field
     /// (`Folder.ResolveLinkedChildren` with a parameterless `DtoOptions`), so a
     /// never-written member keys its user data by its provider id, as on its
@@ -6685,6 +6941,30 @@ mod tests {
             assert_eq!(own.item_id, alternate);
             assert!(own.played);
         }
+        // The primary alone on the page: its version's user data is read off
+        // the page (the stored rows only), and folds the same way.
+        let alone = [fetch_item(&db, primary).await];
+        for fields in [
+            vec![],
+            vec![ItemFields::MediaSources],
+            vec![ItemFields::MediaSourceCount],
+        ] {
+            let options = DtoOptions {
+                fields: fields.clone(),
+                ..DtoOptions::default()
+            };
+            let dtos = svc
+                .get_base_item_dtos(&alone, &options, Some(&user), None, true)
+                .await
+                .unwrap();
+            let ud = dtos[0].user_data.as_ref().expect("user data");
+            assert!(
+                ud.played,
+                "finished on the 4K version, off the page ({fields:?})"
+            );
+            assert_eq!(ud.last_played_date, Some(finished), "{fields:?}");
+            assert_eq!(ud.playback_position_ticks, 0, "{fields:?}");
+        }
         // No user data asked for: none folded, none sent.
         let dtos = svc
             .get_base_item_dtos(
@@ -6702,7 +6982,9 @@ mod tests {
         assert!(dtos[0].user_data.is_none());
     }
 
-    /// [`FakeUserData`], recording every id `get_user_data_batch` is asked for.
+    /// [`FakeUserData`], recording every id `get_user_data_batch` is asked for,
+    /// `get_stored_user_data_batch`'s included: it keeps the trait's default,
+    /// which asks `get_user_data_batch`.
     #[derive(Default)]
     struct RecordingUserData(std::sync::Mutex<Vec<Uuid>>);
 
@@ -6773,7 +7055,10 @@ mod tests {
 
     /// `GetResumeUserDataBatch` reads the user data of the page's grouped
     /// videos and their versions only: a video standing alone has no version
-    /// to resume from, so its id is not asked for again.
+    /// to resume from, so its id is not asked for again. A grouped video on the
+    /// page is not asked for again either: its data is the page's own, which
+    /// upstream's `GetUserDataBatch` answers from the cache the page's batch
+    /// filled (`UserDataManager.cs:204-207`). Only the version off the page is.
     #[tokio::test]
     async fn the_version_resume_reads_only_grouped_videos() {
         let db = test_db().await;
@@ -6807,20 +7092,110 @@ mod tests {
             Arc::new(FakeTrickplay),
         );
         let page = [fetch_item(&db, primary).await, fetch_item(&db, lone).await];
-        // No `MediaSources`, as the grid asks: with them every media row is read.
-        let options = DtoOptions {
-            fields: vec![],
-            ..DtoOptions::default()
-        };
-        svc.get_base_item_dtos(&page, &options, Some(&user), None, true)
+        // No `MediaSources`, as the grid asks, and with them: the page's media
+        // rows come from the page either way.
+        for fields in [vec![], vec![ItemFields::MediaSources]] {
+            user_data.0.lock().unwrap().clear();
+            let options = DtoOptions {
+                fields: fields.clone(),
+                ..DtoOptions::default()
+            };
+            svc.get_base_item_dtos(&page, &options, Some(&user), None, true)
+                .await
+                .unwrap();
+            let asked = user_data.0.lock().unwrap().clone();
+            assert_eq!(asked, [alternate], "{fields:?}");
+        }
+    }
+
+    /// A movie on a plain list keys its user data by its guid (no provider ids
+    /// are hydrated there), and its version resume reads that same row: the
+    /// `GetUserDataBatch` behind `GetResumeUserDataBatch` answers the page's own
+    /// item from the cache the page's batch filled (`UserDataManager.cs:
+    /// 204-207`, `DtoService.cs:171-180`). So a played row under its provider
+    /// key, which the page did not choose, does not mark it played through its
+    /// versions.
+    #[tokio::test]
+    async fn a_page_video_s_version_resume_reads_the_row_the_page_chose() {
+        let db = test_db().await;
+        let (primary, alternate) = (Uuid::new_v4(), Uuid::new_v4());
+        for (id, path) in [
+            (primary, "/Movies/Movie/Movie.mkv"),
+            (alternate, "/Movies/Movie/Movie - 4K.mkv"),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::Movie, "Movie").await;
+            let mut row = fetch_item(&db, id).await;
+            row.path = Some(path.to_owned());
+            row.media_type = Some("Video".to_owned());
+            row.run_time_ticks = Some(1_000);
+            crate::test_support::save_item(&db, &row).await;
+        }
+        link_alternate_version(&db, alternate, primary).await;
+        seed_provider_id(&db, primary, "Tmdb", "603").await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let watched = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        crate::user_data_manager::seed_keyed_user_data(
+            &db,
+            user_id,
+            primary,
+            &primary.to_string(),
+            false,
+            None,
+        )
+        .await;
+        crate::user_data_manager::seed_keyed_user_data(
+            &db,
+            user_id,
+            primary,
+            "603",
+            true,
+            Some(watched),
+        )
+        .await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let svc = FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            Arc::new(crate::user_data_manager::FerrofinUserDataManager::new(
+                db.clone(),
+                crate::test_support::configuration_with_path_substitution(
+                    tmp.path(),
+                    "/unused",
+                    "/unused",
+                )
+                .await,
+            )),
+            Arc::new(FakeCounts::default()),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources {
+                stored_alternates: Some(db.clone()),
+                ..FakeSources::default()
+            }),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        );
+        let page = [fetch_item(&db, primary).await];
+        let dtos = svc
+            .get_base_item_dtos(
+                &page,
+                &DtoOptions {
+                    fields: vec![],
+                    ..DtoOptions::default()
+                },
+                Some(&user),
+                None,
+                true,
+            )
             .await
             .unwrap();
-        let asked = user_data.0.lock().unwrap().clone();
-        assert!(
-            asked.contains(&primary) && asked.contains(&alternate),
-            "{asked:?}"
-        );
-        assert!(!asked.contains(&lone), "{asked:?}");
+        let ud = dtos[0].user_data.as_ref().expect("user data");
+        assert_eq!(ud.key, primary.to_string(), "the page chose the guid row");
+        assert!(!ud.played, "{ud:?}");
+        assert_eq!(ud.last_played_date, None, "{ud:?}");
     }
 
     /// v12 assigns `Chapters` outside the `item is Video` block
@@ -8331,6 +8706,71 @@ mod tests {
         (fetch_item(db, episode_id).await, season_id, series_id)
     }
 
+    /// gl-849: every tag hashes its OWNER's path (`GetImageCacheTag(item,
+    /// image) => GetImageCacheTag(item.Path, image.DateModified)`), never the
+    /// image file's: the episode's own Primary its path, the season's poster
+    /// the season's, the series' poster and backdrop the series' — a stored
+    /// `%MetadataPath%` expanded first.
+    #[tokio::test]
+    async fn image_tags_hash_the_owning_items_path() {
+        let db = test_db().await;
+        let (mut episode, season_id, series_id) = seed_episode_tree(&db).await;
+        for (id, path) in [
+            (season_id, "/shows/Season 01"),
+            (series_id, "%MetadataPath%/shows"),
+        ] {
+            let mut row = fetch_item(&db, id).await;
+            row.path = Some(path.to_owned());
+            save_item(&db, &row).await;
+        }
+        let episode_id = row_id(&episode);
+        seed_images(
+            &db,
+            episode_id,
+            &[image_info(
+                ImageType::Primary,
+                "/shows/Season 01/e01.jpg",
+                None,
+            )],
+        )
+        .await;
+        episode.path = Some("/shows/Season 01/e01.mkv".to_owned());
+        let root = tempfile::tempdir().expect("tmp");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let svc =
+            service(db).with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
+        let options = DtoOptions {
+            image_type_limit: 1,
+            image_types: vec![ImageType::Primary, ImageType::Backdrop, ImageType::Thumb],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&episode, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            dto.image_tags
+                .as_ref()
+                .and_then(|tags| tags.get(&ImageType::Primary))
+                .map(String::as_str),
+            Some("tag:/shows/Season 01/e01.jpg@/shows/Season 01/e01.mkv")
+        );
+        assert_eq!(
+            dto.parent_primary_image_tag.as_deref(),
+            Some("tag:/shows/Season 01/folder.jpg@/shows/Season 01")
+        );
+        assert_eq!(
+            dto.series_primary_image_tag.as_deref(),
+            Some(format!("tag:/shows/poster.jpg@{metadata}/shows").as_str())
+        );
+        assert_eq!(
+            dto.parent_backdrop_image_tags,
+            Some(vec![format!("tag:/shows/fanart.jpg@{metadata}/shows")])
+        );
+    }
+
     /// The page shape jellyfin-web asks for on the Episodes list —
     /// `EnableImageTypes=Primary,Backdrop,Thumb` (a Thumb limit, so the walk
     /// runs): the episode borrows the season's poster as its parent primary,
@@ -8907,21 +9347,44 @@ mod tests {
         let db = test_db().await;
         let id = Uuid::new_v4();
         seed_named_item(&db, id, BaseItemKind::Movie, "Chaptered").await;
-        let item = fetch_item(&db, id).await;
-        let svc = service_with_chapters(db);
+        let mut item = fetch_item(&db, id).await;
+        let root = tempfile::tempdir().expect("tmp");
+        let paths = crate::app_paths::test_paths(root.path());
+        let data = ferrofin_traits::system::ServerApplicationPaths::data_path(&*paths);
+        let svc = service_with_chapters(db)
+            .with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
 
-        let dto = svc
-            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
-            .await
-            .unwrap();
-        let chapters = dto.chapters.expect("chapters requested by default");
-        assert_eq!(chapters.len(), 2);
-        assert_eq!(
-            chapters[0].image_tag.as_deref(),
-            Some("tag:/meta/chapters/0.jpg")
-        );
-        // A chapter with no extracted image carries no tag.
-        assert_eq!(chapters[1].image_tag, None);
+        // `ChapterRepository.Map(chapter, e.Item.Path)` → `GetImageCacheTag(
+        // baseItemPath, chapter.ImageDateModified)` (gl-849): the item's path,
+        // not the thumbnail's, as upstream stores it — a recording under the
+        // data directory as `%AppDataPath%/…` (`ReverseVirtualPath`), whether
+        // the row holds the token or the resolved path.
+        for (stored, hashed) in [
+            ("/media/movies/Chaptered.mkv", "/media/movies/Chaptered.mkv"),
+            (
+                "%AppDataPath%/livetv/recordings/Chaptered.ts",
+                "%AppDataPath%/livetv/recordings/Chaptered.ts",
+            ),
+            (
+                &*format!("{data}/livetv/recordings/Chaptered.ts"),
+                "%AppDataPath%/livetv/recordings/Chaptered.ts",
+            ),
+        ] {
+            item.path = Some(stored.to_owned());
+            let dto = svc
+                .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+                .await
+                .unwrap();
+            let chapters = dto.chapters.expect("chapters requested by default");
+            assert_eq!(chapters.len(), 2);
+            assert_eq!(
+                chapters[0].image_tag.as_deref(),
+                Some(format!("path:{hashed}@0").as_str()),
+                "{stored}"
+            );
+            // A chapter with no extracted image carries no tag.
+            assert_eq!(chapters[1].image_tag, None);
+        }
     }
 
     #[tokio::test]
@@ -9709,7 +10172,7 @@ mod tests {
                 &options,
                 Some(&user),
                 None,
-                false,
+                true,
             )
             .await
             .unwrap();
@@ -9877,7 +10340,7 @@ mod tests {
                 &options,
                 Some(&user),
                 None,
-                false,
+                true,
             )
             .await
             .expect("page");
@@ -9944,7 +10407,7 @@ mod tests {
         };
 
         let page = svc
-            .get_base_item_dtos(&channels, &options, Some(&user), None, false)
+            .get_base_item_dtos(&channels, &options, Some(&user), None, true)
             .await
             .expect("page");
         let single = svc
@@ -10939,7 +11402,9 @@ mod tests {
     }
 
     /// A [`LibraryManager`] fake whose `get_item_by_id` hits the real DB — used by
-    /// the tagged-items count test, which needs each id resolved to its kind.
+    /// the tagged-items count test, which needs each id resolved to its kind,
+    /// and by `an_off_page_version_in_progress_leads_the_sources`, whose user
+    /// may open every item that exists.
     struct DbBackedLibrary {
         db: Database,
     }
@@ -10948,6 +11413,19 @@ mod tests {
     impl LibraryManager for DbBackedLibrary {
         async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
             Ok(fetch_item_opt(&self.db, id).await)
+        }
+        async fn get_visible_item_ids(
+            &self,
+            ids: &[Uuid],
+            _user: &ferrofin_db::entities::users::UserEntity,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            let mut visible = Vec::with_capacity(ids.len());
+            for &id in ids {
+                if fetch_item_opt(&self.db, id).await.is_some() {
+                    visible.push(id);
+                }
+            }
+            Ok(visible)
         }
         async fn get_item_images(
             &self,
@@ -11759,6 +12237,73 @@ mod tests {
         );
     }
 
+    /// gl-849: through the page prefetch, a credit's `PrimaryImageTag` hashes
+    /// the PERSON's path (`GetTagAndFillBlurhash(dto, entity, Primary)`), read
+    /// for the credited persons with a Primary image and expanded (an adopted
+    /// `%MetadataPath%/People/…`), and the page item's own tag its own path.
+    #[tokio::test]
+    async fn a_credit_tag_hashes_the_persons_expanded_path() {
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0xC_1235);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        seed_images(
+            &db,
+            movie,
+            &[image_info(ImageType::Primary, "/m.jpg", None)],
+        )
+        .await;
+        let person = Uuid::from_u128(0xC_5679);
+        seed_named_item(&db, person, BaseItemKind::Person, "Leonardo DiCaprio").await;
+        seed_images(
+            &db,
+            person,
+            &[image_info(ImageType::Primary, "/p.jpg", None)],
+        )
+        .await;
+        for (id, path) in [
+            (movie, "/media/M.mkv"),
+            (person, "%MetadataPath%/People/L/Leonardo DiCaprio"),
+        ] {
+            let mut row = fetch_item(&db, id).await;
+            row.path = Some(path.to_owned());
+            save_item(&db, &row).await;
+        }
+        let person_row = fetch_item(&db, person).await;
+        let item = fetch_item(&db, movie).await;
+        let library = Arc::new(FakeLibrary {
+            people: vec![PeopleEntity {
+                id: Uuid::new_v4().to_string(),
+                name: "Leonardo DiCaprio".into(),
+                person_type: Some("Actor".into()),
+                ..Default::default()
+            }],
+            named_items: vec![person_row],
+        });
+        let root = tempfile::tempdir().expect("tmp");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let svc = service_with(db, library)
+            .with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
+        let dto = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dto.image_tags
+                .as_ref()
+                .and_then(|tags| tags.get(&ImageType::Primary))
+                .map(String::as_str),
+            Some("tag:/m.jpg@/media/M.mkv")
+        );
+        let people = dto.people.as_ref().expect("people");
+        assert_eq!(
+            people[0].primary_image_tag.as_deref(),
+            Some(format!("tag:/p.jpg@{metadata}/People/L/Leonardo DiCaprio").as_str())
+        );
+    }
+
     /// Credit spellings whose *stored* form differs from every "tidy" convention
     /// a test would otherwise use: mixed case, leading/trailing and doubled
     /// internal whitespace, punctuation, accents, and non-Latin script. Paired
@@ -12040,6 +12585,9 @@ mod tests {
             .collect(),
             person_ids_by_name: [("Someone".to_owned(), person)].into_iter().collect(),
             person_images: [(person, vec![image.clone()])].into_iter().collect(),
+            person_paths: [(person, "/metadata/People/S/Someone".to_owned())]
+                .into_iter()
+                .collect(),
             ..Prefetched::default()
         };
         // Whatever the map already holds when the people are attached (in C#
@@ -12063,7 +12611,15 @@ mod tests {
             .await
             .unwrap();
 
-        let tag = svc.image_tag(person, &image).await.expect("tag");
+        // The tag hashes the PERSON's path (gl-849), not the item's.
+        let tag = svc
+            .image_tag(Some("/metadata/People/S/Someone"), &image)
+            .await
+            .expect("tag");
+        assert_eq!(
+            tag,
+            "tag:/people/someone/folder.jpg@/metadata/People/S/Someone"
+        );
         let people = dto.people.as_ref().expect("people");
         assert_eq!(people[0].primary_image_tag.as_deref(), Some(tag.as_str()));
         let person_hash: HashMap<String, String> = [(tag.clone(), "LKO2?U%2Tw=w".to_owned())]
@@ -12713,6 +13269,66 @@ mod tests {
                 let on_a_page = want || row.id == guid_to_db(playlist);
                 assert_eq!(dto.can_delete, Some(on_a_page), "{what}: page DTO");
             }
+        }
+    }
+
+    /// `collection_folder_locations` takes each library's locations from the cached set, with no
+    /// parse and in their stored form, which `protected_paths` expands itself. With none cached
+    /// it reads and parses the rows (gl-1060).
+    #[tokio::test]
+    async fn collection_folders_take_their_stored_locations_from_the_cached_set() {
+        use crate::item_data::physical_location_parses;
+        let db = test_db().await;
+        db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+        let library = Uuid::from_u128(0xC0);
+        crate::test_support::seed_item_with_data(
+            &db,
+            library,
+            BaseItemKind::CollectionFolder,
+            "Movies",
+            r#"{"PhysicalLocationsList":["%MetadataPath%/films","/media/films"]}"#,
+        )
+        .await;
+        let root = tempfile::tempdir().expect("tmp");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let svc = service(db.clone())
+            .with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
+        let stored = ["%MetadataPath%/films", "/media/films"];
+
+        let parses = physical_location_parses();
+        let read = svc.collection_folder_locations().await.expect("read");
+        assert_eq!(physical_location_parses() - parses, 1, "nothing cached");
+        assert_eq!(read[0].physical_locations, stored);
+
+        let _ = crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            crate::test_support::item_repository_over(db.clone()),
+            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+            "/data".to_owned(),
+        )
+        .rating_libraries()
+        .await
+        .expect("libraries");
+        assert!(db.cached_libraries().is_some(), "the set is cached");
+
+        let parses = physical_location_parses();
+        let cached = svc.collection_folder_locations().await.expect("cached");
+        assert_eq!(physical_location_parses() - parses, 0, "the set's lists");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].id, library);
+        assert_eq!(cached[0].path, read[0].path);
+        assert_eq!(cached[0].physical_locations, stored);
+
+        let protected = svc.protected_paths().await.expect("protected");
+        assert_eq!(physical_location_parses() - parses, 0, "the set's lists");
+        for location in [
+            "%MetadataPath%/films".to_owned(),
+            format!("{metadata}/films"),
+            "/media/films".to_owned(),
+        ] {
+            assert!(protected.covers(&location), "{location}");
         }
     }
 

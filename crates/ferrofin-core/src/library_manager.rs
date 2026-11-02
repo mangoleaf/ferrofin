@@ -128,25 +128,24 @@ pub struct FerrofinLibraryManager {
     /// (`Video.GetAdditionalPartIds`). Unset, it is Jellyfin's derivation
     /// with no program-data path, which is the same for every media path.
     id_derivation: crate::item_type_lookup::IdDerivation,
-    /// The server's directories, which a delete reads twice: the internal
-    /// metadata root whose per-item folders it removes, and the
+    /// The server's directories, which a file-deleting delete reads: the
     /// `%AppDataPath%`/`%MetadataPath%` expansion of a stored path (an
     /// adopted collection's or playlist's folder) before its files are
     /// deleted. A file delete is never confined to the library locations —
     /// as upstream, whatever path the item names goes. Set by the
-    /// composition root; `None` (unit tests) removes no metadata folder and
-    /// takes stored paths as they are.
+    /// composition root; `None` (unit tests) takes stored paths as they are.
     app_paths: Option<Arc<crate::app_paths::FerrofinServerApplicationPaths>>,
-    /// The extracted-data cleanup `DeleteItem` runs for every deleted row
-    /// (`IExternalDataManager.DeleteExternalItemFiles`). Late-bound: the
-    /// manager is built before the chapter and segment managers it needs.
-    external_data: std::sync::OnceLock<Arc<dyn ferrofin_traits::system::ExternalDataManager>>,
+    /// The metadata-folder and extracted-data cleanup `DeleteItem` runs for
+    /// every deleted row, shared with the scan's removals. Set by the
+    /// composition root; `None` (unit tests) removes neither.
+    item_data: Option<Arc<crate::item_data_cleanup::ItemDataCleanup>>,
 }
 
 /// `Folder.QueryRecursive`'s post-filter gate (v12.2 Folder.cs:1008-1014): a
 /// user's recursive query for box sets and/or playlists only. Their per-user
 /// access (shares, open access, owner) lives in the item data, so SQL cannot
-/// decide it.
+/// decide it. Any other query has the playlists the user cannot see excluded
+/// by the repository ([`crate::item_visibility::ItemVisibility::hidden_playlists`]).
 fn post_filters_containers(query: &InternalItemsQuery) -> bool {
     query.user.is_some()
         && !query.include_item_types.is_empty()
@@ -1022,8 +1021,13 @@ impl ScanWorker {
             self.progress.send_modify(|n| *n = n.wrapping_add(1));
         }
         let elapsed_ms = started.elapsed().as_millis();
-        let (created, updated, unchanged, removed) =
-            (total.created, total.updated, total.unchanged, total.removed);
+        let (created, updated, unchanged, removed, skipped) = (
+            total.created,
+            total.updated,
+            total.unchanged,
+            total.removed,
+            total.skipped,
+        );
         // A drain that included a stopped pass did not complete.
         if total.stopped {
             tracing::info!(
@@ -1031,6 +1035,7 @@ impl ScanWorker {
                 updated,
                 unchanged,
                 removed,
+                skipped,
                 elapsed_ms,
                 "library scan stopped"
             );
@@ -1040,6 +1045,7 @@ impl ScanWorker {
                 updated,
                 unchanged,
                 removed,
+                skipped,
                 elapsed_ms,
                 "library scan complete"
             );
@@ -1098,6 +1104,7 @@ impl ScanWorker {
                     updated = pass.updated,
                     unchanged = pass.unchanged,
                     removed = pass.removed,
+                    skipped = pass.skipped,
                     "library scan stopped before it finished"
                 );
                 (ScanResult::Stopped, Some(pass))
@@ -1112,6 +1119,7 @@ impl ScanWorker {
                     updated = pass.updated,
                     unchanged = pass.unchanged,
                     removed = pass.removed,
+                    skipped = pass.skipped,
                     "library scan pass complete"
                 );
                 (ScanResult::Completed, Some(pass))
@@ -1189,6 +1197,7 @@ impl PriorityLane for QueueLane {
                     updated = pass.updated,
                     unchanged = pass.unchanged,
                     removed = pass.removed,
+                    skipped = pass.skipped,
                     "item refresh served inside the running scan"
                 );
                 ScanResult::Completed
@@ -1332,7 +1341,7 @@ impl FerrofinLibraryManager {
             by_name: None,
             changed: None,
             app_paths: None,
-            external_data: std::sync::OnceLock::new(),
+            item_data: None,
         }
     }
 
@@ -1701,6 +1710,7 @@ impl FerrofinLibraryManager {
         let unpaged = InternalItemsQuery {
             start_index: None,
             limit: None,
+            checks_playlist_visibility: true,
             ..query.clone()
         };
         let mut items = self.items.get_item_list(&unpaged).await?;
@@ -1775,13 +1785,15 @@ impl FerrofinLibraryManager {
         self
     }
 
-    /// Late-binds the extracted-data cleanup every delete runs. A second call
-    /// is ignored.
-    pub fn set_external_data(
-        &self,
-        external: Arc<dyn ferrofin_traits::system::ExternalDataManager>,
-    ) {
-        let _ = self.external_data.set(external);
+    /// Attaches the metadata-folder and extracted-data cleanup every delete
+    /// runs before the rows go, the one the scanner's removals share.
+    #[must_use]
+    pub fn with_item_data_cleanup(
+        mut self,
+        cleanup: Arc<crate::item_data_cleanup::ItemDataCleanup>,
+    ) -> Self {
+        self.item_data = Some(cleanup);
+        self
     }
 
     /// Attach library options for request-time series grouping decisions.
@@ -2053,50 +2065,6 @@ impl FerrofinLibraryManager {
         )
     }
 
-    /// `GetMetadataPaths(item, children)` (`:569-580`, `:694-743`), deleted
-    /// before the item's files: each row's internal metadata folder
-    /// (`{metadata}/library/{id2}/{id}`), Ferrofin's own
-    /// `{metadata}/library/{GUID}`, and the lower-cased one older scans also
-    /// wrote art to ([`crate::item_folders::item_art_folders`]). A folder that
-    /// cannot be removed is logged and passed over, as upstream.
-    ///
-    /// Upstream's list also names a video's internal extracted data
-    /// (trickplay tiles, chapter images, subtitle and attachment caches);
-    /// those go with [`Self::delete_external_files`] after the files, which
-    /// removes every one of them, so a delete whose files cannot be removed
-    /// keeps them.
-    async fn delete_metadata_paths(&self, rows: &[&BaseItemEntity]) {
-        if let Some(paths) = &self.app_paths {
-            use ferrofin_traits::system::ServerApplicationPaths as _;
-            // Every layout: Ferrofin's `{metadata}/library/{GUID}` (and its
-            // older lower-cased spelling) and Jellyfin's
-            // `{metadata}/library/{xx}/{idN}` an adopted item has.
-            let art_root = std::path::Path::new(&paths.internal_metadata_path()).join("library");
-            let folders: Vec<std::path::PathBuf> = rows
-                .iter()
-                .filter_map(|row| Uuid::parse_str(&row.id).ok())
-                .flat_map(|id| crate::item_folders::item_art_folders(&art_root, id))
-                .collect();
-            let removed = tokio::task::spawn_blocking(move || {
-                for folder in folders {
-                    match std::fs::remove_dir_all(&folder) {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(err) => tracing::warn!(
-                            path = %folder.display(),
-                            %err,
-                            "could not delete a deleted item's metadata folder"
-                        ),
-                    }
-                }
-            })
-            .await;
-            if let Err(err) = removed {
-                tracing::error!(%err, "deleting item metadata folders panicked");
-            }
-        }
-    }
-
     /// `if ((options.DeleteFileLocation && item.IsFileProtocol) || …)`: the
     /// item's `GetDeletePaths`, in order, through `DeleteItemPath`. A
     /// channel item's media is its channel's (`options.DeleteFileLocation =
@@ -2151,37 +2119,6 @@ impl FerrofinLibraryManager {
         .map_err(|e| ServiceError::Backend(format!("deleting item {id}'s files: {e}")))?
         .map_err(|e| ServiceError::Backend(format!("deleting item {id}'s files: {e}")))
     }
-
-    /// `externalDataManager.DeleteExternalItemFiles` for the item and its
-    /// children (`:597-602`), before the rows: each one's extracted data,
-    /// with the trickplay folder saved beside its media.
-    async fn delete_external_files(&self, rows: &[&BaseItemEntity]) {
-        let Some(external) = self.external_data.get() else {
-            return;
-        };
-        for row in rows {
-            let Ok(id) = Uuid::parse_str(&row.id) else {
-                continue;
-            };
-            let path = row
-                .path
-                .as_deref()
-                .map(|p| self.expand_path(p))
-                .unwrap_or_default();
-            let containing_folder = if path.is_empty() {
-                String::new()
-            } else {
-                crate::video_versions::containing_folder_path_at(row, &path)
-            };
-            let media = ferrofin_traits::system::MediaLocation {
-                path: &path,
-                containing_folder: &containing_folder,
-            };
-            if let Err(err) = external.delete_external_item_files(id, media).await {
-                tracing::warn!(item_id = %id, %err, "could not delete a deleted item's extracted data");
-            }
-        }
-    }
 }
 
 impl FerrofinLibraryManager {
@@ -2207,11 +2144,17 @@ impl FerrofinLibraryManager {
         // then the files — the first path's failure stops the delete here,
         // with every row in place — then the extracted data
         // (`DeleteExternalItemFiles`, `:597-602`), then the rows (`:604`).
-        self.delete_metadata_paths(&affected).await;
+        if let Some(item_data) = &self.item_data {
+            item_data.delete_metadata_folders(&affected).await;
+        }
         if options.delete_file_location {
             self.delete_item_files(id, row, kind).await?;
         }
-        self.delete_external_files(&affected).await;
+        if let Some(item_data) = &self.item_data {
+            // An explicit delete takes the trickplay folder beside the media
+            // whoever else names that file, as upstream's does.
+            item_data.delete_extracted_data(&affected, &|_| false).await;
+        }
         let removed = self.persistence.delete_items(&[id]).await?;
         // `ItemRemoved` (LibraryChangedNotifier): the item, then everything
         // the delete took with it, which have no rows left to read.
@@ -2868,14 +2811,14 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items.get_image_infos(item_id).await
     }
 
-    async fn get_item_images_with_auto_orient(
+    async fn get_item_images_to_serve(
         &self,
         item_id: Uuid,
-    ) -> Result<(Vec<ferrofin_traits::options::ItemImageInfo>, bool), ServiceError> {
+    ) -> Result<ferrofin_traits::options::ItemImagesToServe, ServiceError> {
         if item_id.is_nil() {
-            return Ok((Vec::new(), false));
+            return Ok(ferrofin_traits::options::ItemImagesToServe::default());
         }
-        self.items.get_image_infos_with_auto_orient(item_id).await
+        self.items.get_image_infos_to_serve(item_id).await
     }
 
     async fn get_chapter_image(
