@@ -12,7 +12,8 @@
 //! rest of the same C# function: it runs the synthetic MJPEG job through the
 //! hardware matrix in [`crate::encoding_helper::hw`]. It is chosen per job when
 //! the request allows hardware, the configured accelerator has a ported filter
-//! chain, and a video stream is available to size it from — otherwise the
+//! chain, a video stream is available to size it from, and something runs on
+//! the GPU (a hardware decoder or a hardware MJPEG encoder) — otherwise the
 //! software path. A failed keyframe-only run retries on the path it took.
 //!
 //! The three switches come from `TrickplayOptions`, **not** from the playback
@@ -51,9 +52,14 @@
 //! - With `TrickplayExtraction::full_chroma`, the software graph holds frames
 //!   at 4:4:4 from the scale on (`format=yuvj444p`), by owner decision. With it
 //!   off the graph has no format filter, where upstream's chain ends in
-//!   `format=yuv420p`. The hardware path stays 4:2:0. So does a job on it whose
-//!   source the GPU cannot decode, which could be 4:4:4: that is open work
-//!   (gl-1132).
+//!   `format=yuv420p`. The hardware path stays 4:2:0: its frames go through a
+//!   hardware decoder, scaler or encoder.
+//! - A job with nothing on the GPU, a source it cannot decode and a software
+//!   MJPEG encoder, takes this software path even with trickplay hardware
+//!   acceleration on. Every vendor chain hands such a job to
+//!   `GetSwVidFilterChain`, which this path ports, so it keeps full chroma, the
+//!   tone-map and the conversion below. Only the filter graph differs from
+//!   the vendor chain's: neither passes such a job any device arguments.
 //! - The software scale converts the frame to the BT.601 matrix
 //!   (`out_color_matrix=bt601`), the one every JPEG decoder reads, the tile
 //!   packer's included. ffmpeg converts the range to the JPEG's full range
@@ -463,9 +469,12 @@ pub struct TrickplayJob<'a> {
 /// is switched off for trickplay, no accelerator is configured, the configured
 /// accelerator has no ported filter chain (see the `match` below), or
 /// keyframe-only extraction was asked for and this accelerator's decoder
-/// cannot do it. That last case is upstream's: decoding *every* frame on the
-/// GPU is slower than decoding keyframes on the CPU, so it drops to software
-/// rather than accept the trade.
+/// cannot do it. That case is upstream's: decoding *every* frame on the GPU is
+/// slower than decoding keyframes on the CPU, so it drops to software rather
+/// than accept the trade. It also returns `None` when nothing would run on the
+/// GPU, no hardware decoder for this source and a software MJPEG encoder: every
+/// vendor chain hands such a job to `GetSwVidFilterChain`, which
+/// [`build_trickplay_args`] ports.
 ///
 /// The environment is not decoration: the VAAPI branch sets
 /// `LIBVA_DRIVER_NAME`/`LIBVA_DRIVER_NAME_JELLYFIN` and `AMD_DEBUG`, and on a
@@ -548,6 +557,14 @@ pub fn build_accelerated_trickplay_args(
     } else {
         hw::encoder::DEFAULT_MJPEG_ENCODER.to_owned()
     };
+    let video_decoder = hw::decoder::hardware_video_decoder(&decode_ctx).unwrap_or_default();
+    // Nothing on the GPU: a source it cannot decode and a software encoder.
+    // Every vendor chain hands that job to `GetSwVidFilterChain`, which the
+    // software builder ports, with its full chroma and its conversion to the
+    // JPEG's matrix (the module's departures).
+    if video_decoder.is_empty() && video_encoder == hw::encoder::DEFAULT_MJPEG_ENCODER {
+        return None;
+    }
     let render_node = hw::device_init::RenderNode::resolve(options.vaapi_device.as_deref());
     let qsv_node = hw::device_init::RenderNode::resolve(options.qsv_device.as_deref());
     let hwaccel = hw::input_args::input_video_hwaccel_args(
@@ -557,7 +574,6 @@ pub fn build_accelerated_trickplay_args(
         qsv_node,
         true,
     );
-    let video_decoder = hw::decoder::hardware_video_decoder(&decode_ctx).unwrap_or_default();
 
     // Frame-rate deinterlacing only (see the module's departures).
     let chain_options = frame_rate_deinterlacing(options);
@@ -580,10 +596,10 @@ pub fn build_accelerated_trickplay_args(
         // `IsDeinterlaceAvailable` on a job whose `BaseRequest` asks for
         // nothing: an interlaced source forces it.
         deinterlace: stream.is_interlaced,
-        // The software chain a source the GPU cannot decode falls back to is
-        // tone-mapped upstream (`IsSwTonemapAvailable`) and not here yet: the
-        // open work of gl-1132.
-        do_sw_tonemap: false,
+        // `GetSwVidFilterChain`'s own test, for the vendor chains that fall
+        // back to it with a hardware decoder or encoder (CUDA not fully
+        // supported, no VAAPI OpenCL interop).
+        do_sw_tonemap: hw::tonemap::is_sw_tonemap_available(caps, Some(stream)),
         do_hw_tonemap: hw::input_args::is_hw_tonemap_available(&decode_ctx, &video_decoder),
         vulkan_tonemap_available: hw::tonemap::is_vulkan_hw_tonemap_available(
             options,
@@ -2778,6 +2794,42 @@ mod tests {
         assert!(!recorded[1].contains("-skip_frame"), "{}", recorded[1]);
     }
 
+    /// A source the GPU cannot decode, with a software MJPEG encoder, puts
+    /// nothing on the GPU, and every vendor chain hands such a job to
+    /// `GetSwVidFilterChain`. It takes the software builder, which keeps full
+    /// chroma (gl-1132) and tone-maps an HDR source as that chain does, with
+    /// the configured options.
+    #[tokio::test]
+    async fn a_job_with_nothing_on_the_gpu_keeps_full_chroma_and_the_tone_map() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        // VAAPI decodes only H.264 here, so this HEVC source is decoded on
+        // the CPU.
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+        let stream = hdr_stream("smpte2084");
+
+        extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                enable_hw_encoding: false,
+                full_chroma: true,
+                ..hardware_request(&stream, &out.to_string_lossy())
+            })
+            .await
+            .expect("frames");
+
+        let args = &transcoder.recorded()[0];
+        assert!(
+            args.contains(&format!(
+                "-vf \"fps=1000/10000,\
+                 setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,\
+                 tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p,\
+                 {SCALE}:out_color_matrix=bt601,format=yuvj444p\""
+            )),
+            "{args}"
+        );
+    }
+
     #[tokio::test]
     async fn hardware_decode_with_a_software_encoder_is_expressible() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -3350,6 +3402,82 @@ mod accelerated_tests {
             display_corrected_height(&stream(705, 400, Some("2:1"))),
             Some(352)
         );
+    }
+
+    /// No hardware decoder and no hardware encoder: the job takes the
+    /// software builder instead of a vendor chain's software fallback, for
+    /// every accelerator. It is the encoder chosen that counts, not the
+    /// switch: NVENC has no MJPEG encoder, and VAAPI has one only on Intel's
+    /// iHD driver. A hardware MJPEG encoder keeps the job on the hardware path.
+    #[rstest::rstest]
+    #[case::vaapi(HardwareAccelerationType::vaapi, false, true, true)]
+    #[case::qsv(HardwareAccelerationType::qsv, false, true, true)]
+    #[case::nvenc(HardwareAccelerationType::nvenc, false, true, true)]
+    #[case::nvenc_hardware_encoding_on(HardwareAccelerationType::nvenc, true, true, true)]
+    #[case::vaapi_without_ihd(HardwareAccelerationType::vaapi, true, false, true)]
+    #[case::mjpeg_vaapi(HardwareAccelerationType::vaapi, true, true, false)]
+    #[case::mjpeg_qsv(HardwareAccelerationType::qsv, true, true, false)]
+    fn a_job_with_nothing_on_the_gpu_has_no_accelerated_args(
+        #[case] accel: HardwareAccelerationType,
+        #[case] enable_hw_encoding: bool,
+        #[case] driver_ihd: bool,
+        #[case] software: bool,
+    ) {
+        let caps = caps(Platform::Linux, driver_ihd);
+        let options = EncodingOptions {
+            hardware_acceleration_type: accel,
+            prefer_system_native_hw_decoder: true,
+            enable_enhanced_nvdec_decoder: true,
+            hardware_decoding_codecs: Vec::new(),
+            ..vaapi_options()
+        };
+        let stream = stream(1920, 1080, None);
+        let job = TrickplayJob {
+            enable_hw_encoding,
+            ..job(&stream, "/tmp/o/%08d.jpg")
+        };
+        assert_eq!(
+            build_accelerated_trickplay_args(&caps, &options, &job).is_none(),
+            software
+        );
+    }
+
+    /// A vendor chain that falls back to the software chain with a hardware
+    /// decoder (here VAAPI with no OpenCL interop) tone-maps an HDR source as
+    /// `GetSwVidFilterChain` does whenever `IsSwTonemapAvailable` holds.
+    #[test]
+    fn a_software_fallback_with_a_hardware_decoder_tone_maps() {
+        let caps = FfmpegCapabilities::builder()
+            .platform(Platform::Linux)
+            .encoders(["mjpeg_vaapi", "mjpeg"])
+            .hwaccels(["vaapi"])
+            .filters(REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .vaapi_driver(false, true, false)
+            .os_version(FfmpegVersion::new(6, 1))
+            .ffmpeg_version(FfmpegVersion::with_build(7, 0, 1))
+            .build();
+        let options = EncodingOptions {
+            hardware_decoding_codecs: vec!["hevc".to_owned()],
+            enable_decoding_color_depth10_hevc: true,
+            ..vaapi_options()
+        };
+        let mut stream = stream(1920, 1080, None);
+        stream.codec = Some("hevc".to_owned());
+        stream.pixel_format = Some("yuv420p10le".to_owned());
+        stream.color_transfer = Some("smpte2084".to_owned());
+        stream.color_primaries = Some("bt2020".to_owned());
+        stream.color_space = Some("bt2020nc".to_owned());
+        let job = TrickplayJob {
+            enable_hw_encoding: false,
+            ..job(&stream, "/tmp/o/%08d.jpg")
+        };
+
+        let (args, _) = build_accelerated_trickplay_args(&caps, &options, &job)
+            .expect("a hardware decoder keeps the job on the hardware path");
+
+        assert!(args.contains("-hwaccel vaapi"), "{args}");
+        assert!(args.contains(",tonemapx=tonemap=bt2390:"), "{args}");
     }
 
     #[test]
