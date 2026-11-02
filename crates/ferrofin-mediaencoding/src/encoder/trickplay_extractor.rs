@@ -43,9 +43,11 @@
 //!   `setpts` (keyframe-only, or a stream with no frame rate), where it is
 //!   merely harmless: `fps=` thins the frames by time either way.
 //! - The software graph is assembled here (deinterlacer, scale, `setpts`,
-//!   `fps=` for an interlaced source; `setpts`, `fps=`, scale otherwise) rather
-//!   than through `sw_vid_filter_chain` and `video_processing_filter_args`, so
-//!   it keeps the `dar`-aware scale expression above. The order is upstream's.
+//!   `fps=` for an interlaced source; `setpts`, `fps=`, scale otherwise; an
+//!   HDR source's `setparams` ahead of the deinterlacer or the scale and its
+//!   `tonemapx` behind the scale) rather than through `sw_vid_filter_chain`
+//!   and `video_processing_filter_args`, so it keeps the `dar`-aware scale
+//!   expression above. The order is upstream's.
 //! - With `TrickplayExtraction::full_chroma`, the software graph holds frames
 //!   at 4:4:4 from the scale on (`format=yuvj444p`), by owner decision. With it
 //!   off the graph has no format filter, where upstream's chain ends in
@@ -64,11 +66,18 @@
 //!   BT.709 when they are HD. The conversion needs ffmpeg 5.1 or later
 //!   ([`MIN_FFMPEG_JPEG_MATRIX_CONVERSION`]); an older one gets none and
 //!   gives upstream's colours. The hardware path still writes the source's
-//!   matrix (gl-1157). Upstream also tone-maps an HDR source on this path
-//!   (`tonemapx`, when ffmpeg has it) and this graph does not: that is open
-//!   work (gl-1159), and its BT.709 output then needs this conversion too.
-//!   Until then an HDR frame gets its BT.2020 matrix converted here and
-//!   stays un-tone-mapped.
+//!   matrix (gl-1157).
+//! - The tone-map of an HDR source departs twice. `tonemapx` writes BT.709,
+//!   so the BT.601 conversion above moves out of the scale, where it would
+//!   convert the BT.2020 input, into a `scale=out_color_matrix=bt601` behind
+//!   the tone-map, under the same ffmpeg 5.1 floor. With full chroma the
+//!   tone-map goes ahead of the scale: `tonemapx` writes 4:2:0 only, so behind
+//!   the scale it would halve the chroma the scale just built. It then runs
+//!   at the source's resolution, on each sampled frame, or on each decoded
+//!   frame of an interlaced source, whose sampler comes last.
+//! - On an ffmpeg without `tonemapx`, an HDR frame is not re-tagged BT.709 as
+//!   upstream's is. The scale converts its BT.2020 matrix to BT.601, and the
+//!   frame stays un-tone-mapped, as it does upstream.
 //! - The C# creates the temp output directory itself; here the caller owns the
 //!   output directory (the trickplay manager passes a temp dir and cleans it
 //!   up), so the extractor only creates and fills it.
@@ -272,6 +281,13 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
 /// the scale on (`TrickplayOptions::full_chroma`). A 16x16 chroma block is
 /// about 5% of a 320px thumbnail wide, and frames are only the input to the
 /// tile, so subsampling them is loss the tile can never win back.
+///
+/// `tonemap` is the software tone-map of an HDR source ([`SwTonemap`]); the
+/// module's departures say where it goes in the graph.
+///
+/// `input_threads` puts `-threads {threads}` ahead of the input too, as
+/// upstream does only while trickplay may not use hardware (`!allowHwAccel`,
+/// `MediaEncoder.cs:914-917`), and ffmpeg otherwise picks the decode threads.
 #[must_use]
 #[allow(
     clippy::too_many_arguments,
@@ -291,6 +307,8 @@ pub fn build_trickplay_args(
     map_index: Option<i32>,
     deinterlace: Option<&str>,
     full_chroma: bool,
+    tonemap: Option<&SwTonemap>,
+    input_threads: bool,
 ) -> String {
     // ffmpeg qscale is 1 (best) – 31 (worst); C# clamps the configured value.
     let qscale = qscale.clamp(1, 31);
@@ -310,28 +328,86 @@ pub fn build_trickplay_args(
     let setpts = pts_frame_rate.map(pts_normalizer).unwrap_or_default();
     let map = map_argument(map_index);
     let sample = format!("{setpts}fps=1000/{interval_ms}");
-    let mut scale =
-        format!("scale=trunc(min(max(iw\\,ih*dar)\\,{max_width})/2)*2:trunc(ow/dar/2)*2");
+    let scale = format!("scale=trunc(min(max(iw\\,ih*dar)\\,{max_width})/2)*2:trunc(ow/dar/2)*2");
     // The JPEG's matrix, BT.601, read from the frame's tag (the module's
     // departures). An unprobed ffmpeg gets the older graph, as
     // `video_sync_option` gives it the older option.
-    if ffmpeg_version.is_some_and(|v| v >= MIN_FFMPEG_JPEG_MATRIX_CONVERSION) {
-        scale.push_str(":out_color_matrix=bt601");
-    }
-    if full_chroma {
-        scale.push_str(",format=yuvj444p");
-    }
+    let convert = ffmpeg_version.is_some_and(|v| v >= MIN_FFMPEG_JPEG_MATRIX_CONVERSION);
+    let to_bt601 = if convert {
+        ":out_color_matrix=bt601"
+    } else {
+        ""
+    };
+    let chroma = if full_chroma { ",format=yuvj444p" } else { "" };
+    let (tags, main) = match tonemap {
+        None => (String::new(), format!("{scale}{to_bt601}{chroma}")),
+        Some(SwTonemap {
+            input_params,
+            filter,
+        }) => {
+            let main = if full_chroma {
+                format!("{filter},{scale}{to_bt601}{chroma}")
+            } else if convert {
+                format!("{scale},{filter},scale=out_color_matrix=bt601")
+            } else {
+                format!("{scale},{filter}")
+            };
+            (format!("{input_params},"), main)
+        }
+    };
     let filters = match deinterlace {
-        Some(deinterlace) => format!("{deinterlace},{scale},{sample}"),
-        None => format!("{sample},{scale}"),
+        Some(deinterlace) => format!("{tags}{deinterlace},{main},{sample}"),
+        None => format!("{sample},{tags}{main}"),
+    };
+    let input_threads = if input_threads {
+        format!("-threads {threads} ")
+    } else {
+        String::new()
     };
     format!(
-        "-loglevel error {skip_frame}-threads {threads} -i file:{input}{map} -an -sn \
+        "-loglevel error {skip_frame}{input_threads}-i file:{input}{map} -an -sn \
          -vf \"{filters}\" \
          -threads {threads} -c:v mjpeg -qscale:v {qscale}{sync} -f image2 {output}",
         input = quote(input_path),
         output = quote(output_pattern),
     )
+}
+
+/// The software tone-map of an HDR source, for [`build_trickplay_args`]. Built
+/// by the extractor when `is_sw_tonemap_available` holds for the job.
+#[derive(Debug, Clone)]
+pub struct SwTonemap {
+    /// `GetInputHdrParam`: the `setparams` stating the source's BT.2020
+    /// primaries and PQ or HLG transfer, ahead of everything else.
+    pub input_params: String,
+    /// The `tonemapx=…` filter (`sw_tonemap_filter`).
+    pub filter: String,
+}
+
+impl SwTonemap {
+    /// The tone-map of `stream` with `options`' tone-mapping settings, or
+    /// `None` when `IsSwTonemapAvailable` does not hold for it under `caps`.
+    ///
+    /// The frame format is `yuv420p`, `GetSwVidFilterChain`'s for a software
+    /// decoder and a software MJPEG encoder.
+    #[must_use]
+    pub fn for_stream(
+        caps: &FfmpegCapabilities,
+        options: &EncodingOptions,
+        stream: Option<&MediaStream>,
+    ) -> Option<Self> {
+        use crate::encoding_helper::hw::{sw_chain, tonemap};
+
+        let stream = stream.filter(|s| tonemap::is_sw_tonemap_available(caps, Some(s)))?;
+        Some(Self {
+            input_params: tonemap::input_hdr_param(stream.color_transfer.as_deref()),
+            filter: sw_chain::sw_tonemap_filter(
+                options,
+                "yuv420p",
+                tonemap::requires_dovi_reshaping(Some(stream)),
+            ),
+        })
+    }
 }
 
 /// One trickplay extraction run, as the argument builders read it.
@@ -504,6 +580,9 @@ pub fn build_accelerated_trickplay_args(
         // `IsDeinterlaceAvailable` on a job whose `BaseRequest` asks for
         // nothing: an interlaced source forces it.
         deinterlace: stream.is_interlaced,
+        // The software chain a source the GPU cannot decode falls back to is
+        // tone-mapped upstream (`IsSwTonemapAvailable`) and not here yet: the
+        // open work of gl-1132.
         do_sw_tonemap: false,
         do_hw_tonemap: hw::input_args::is_hw_tonemap_available(&decode_ctx, &video_decoder),
         vulkan_tonemap_available: hw::tonemap::is_vulkan_hw_tonemap_available(
@@ -910,29 +989,19 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
                 hardware: true,
             };
         }
+        // Upstream's `allowHwAccel` once the keyframe-only gate has run. An
+        // extractor with no options to read (no configuration handle, or an
+        // unreadable one) counts as hardware off, as its job is.
+        let input_threads = configured.is_none();
         let options = configured.unwrap_or_default();
         let deinterlace = request
             .video_stream
             .filter(|stream| stream.is_interlaced)
             .map(|stream| trickplay_deinterlace_filter(&options, stream));
-        self.software_plan(
-            request,
-            output_pattern,
-            pts_frame_rate,
-            map_index,
-            deinterlace.as_deref(),
-        )
-    }
-
-    /// The software plan, which needs nothing probed.
-    fn software_plan(
-        &self,
-        request: &TrickplayExtraction<'_>,
-        output_pattern: &str,
-        pts_frame_rate: Option<f32>,
-        map_index: Option<i32>,
-        deinterlace: Option<&str>,
-    ) -> ExtractionPlan {
+        // A job without hardware resets `EnableTonemapping` to false, which
+        // does not switch this off: `IsSwTonemapAvailable` never reads it. The
+        // settings are `options`'.
+        let tonemap = SwTonemap::for_stream(&self.caps, &options, request.video_stream);
         ExtractionPlan {
             args: build_trickplay_args(
                 request.input_path,
@@ -945,8 +1014,10 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
                 request.keyframe_only,
                 pts_frame_rate,
                 map_index,
-                deinterlace,
+                deinterlace.as_deref(),
                 request.full_chroma,
+                tonemap.as_ref(),
+                input_threads,
             ),
             env: Vec::new(),
             hardware: false,
@@ -1193,6 +1264,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            true,
         );
         assert_eq!(
             args,
@@ -1216,7 +1289,7 @@ mod tests {
         #[case] converts: bool,
     ) {
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 4, 1, "o", version, false, None, None, None, false,
+            "/m/v.mkv", 10_000, 320, 4, 1, "o", version, false, None, None, None, false, None, true,
         );
         assert_eq!(
             args.contains("*2:out_color_matrix=bt601\" "),
@@ -1245,6 +1318,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            true,
         );
         let tokens = crate::encoder::split_args(&args).unwrap();
         let i = tokens.iter().position(|a| a == "-i").unwrap();
@@ -1259,14 +1334,14 @@ mod tests {
         // or not hardware is in play, so a job that dropped to software
         // because its accelerator cannot skip keyframes still skips them here.
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 4, 1, "o", None, true, None, None, None, false,
+            "/m/v.mkv", 10_000, 320, 4, 1, "o", None, true, None, None, None, false, None, true,
         );
         assert!(
             args.starts_with("-loglevel error -skip_frame nokey -threads 1 -i "),
             "{args}"
         );
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 4, 1, "o", None, false, None, None, None, false,
+            "/m/v.mkv", 10_000, 320, 4, 1, "o", None, false, None, None, None, false, None, true,
         );
         assert!(!args.contains("-skip_frame"), "{args}");
     }
@@ -1299,6 +1374,8 @@ mod tests {
             None,
             deinterlace,
             true,
+            None,
+            true,
         );
         assert!(args.contains(&format!("-vf \"{filters}\"")), "{args}");
     }
@@ -1320,6 +1397,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            true,
         );
         assert!(!args.contains("format="), "{args}");
     }
@@ -1352,11 +1431,11 @@ mod tests {
     #[test]
     fn qscale_is_clamped_to_ffmpeg_range() {
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 0, 0, "o", None, false, None, None, None, false,
+            "/m/v.mkv", 10_000, 320, 0, 0, "o", None, false, None, None, None, false, None, true,
         );
         assert!(args.contains("-qscale:v 1 "), "low clamp in {args}");
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 99, 0, "o", None, false, None, None, None, false,
+            "/m/v.mkv", 10_000, 320, 99, 0, "o", None, false, None, None, None, false, None, true,
         );
         assert!(args.contains("-qscale:v 31 "), "high clamp in {args}");
     }
@@ -1710,6 +1789,308 @@ mod tests {
             "{}",
             recorded[0]
         );
+    }
+
+    /// A 10-bit HEVC stream with BT.2020 primaries and `transfer`, as ffprobe
+    /// reports an HDR10 (`smpte2084`) or HLG (`arib-std-b67`) video.
+    fn hdr_stream(transfer: &str) -> MediaStream {
+        MediaStream {
+            codec: Some("hevc".to_owned()),
+            stream_type: ferrofin_model::entities::MediaStreamType::Video,
+            pixel_format: Some("yuv420p10le".to_owned()),
+            color_transfer: Some(transfer.to_owned()),
+            color_primaries: Some("bt2020".to_owned()),
+            color_space: Some("bt2020nc".to_owned()),
+            average_frame_rate: Some(24.0),
+            ..MediaStream::default()
+        }
+    }
+
+    /// An extractor on ffmpeg 7.0.1 with `filters`, whose configured encoding
+    /// options are `options`.
+    fn tonemap_extractor(
+        transcoder: Arc<RecordingTranscoder>,
+        filters: &[&str],
+        options: EncodingOptions,
+    ) -> TrickplayFrameExtractorImpl<RecordingTranscoder> {
+        let caps = crate::encoding_helper::hw::FfmpegCapabilities::builder()
+            .filters(filters.iter().copied())
+            .ffmpeg_version(FfmpegVersion::with_build(7, 0, 1))
+            .build();
+        TrickplayFrameExtractorImpl::new(transcoder, "ffmpeg", None)
+            .with_hardware(Arc::new(caps), Arc::new(FixedEncoding(options)))
+    }
+
+    /// Runs one software extraction of `stream` and returns its argument line.
+    async fn args_of(
+        extractor: &TrickplayFrameExtractorImpl<RecordingTranscoder>,
+        transcoder: &RecordingTranscoder,
+        stream: &MediaStream,
+        allow_hw_accel: bool,
+        keyframe_only: bool,
+    ) -> String {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                video_stream: Some(stream),
+                media_streams: std::slice::from_ref(stream),
+                allow_hw_accel,
+                keyframe_only,
+                ..request("/m/v.mkv", &out.to_string_lossy())
+            })
+            .await
+            .expect("frames");
+        transcoder.recorded().remove(0)
+    }
+
+    /// Runs one software extraction of `stream` and returns its `-vf` graph.
+    async fn graph_of(
+        extractor: &TrickplayFrameExtractorImpl<RecordingTranscoder>,
+        transcoder: &RecordingTranscoder,
+        stream: &MediaStream,
+        allow_hw_accel: bool,
+    ) -> String {
+        let args = args_of(extractor, transcoder, stream, allow_hw_accel, false).await;
+        let start = args.find("-vf \"").expect("a filter graph") + 5;
+        let end = start + args[start..].find('"').expect("a closed graph");
+        args[start..end].to_owned()
+    }
+
+    /// The scale every graph below shares.
+    const SCALE: &str = "scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2";
+
+    /// `GetSwVidFilterChain` with `IsSwTonemapAvailable`: the source's HDR
+    /// `setparams` first, `tonemapx` behind the scale with `new
+    /// EncodingOptions()`'s settings (trickplay may not use hardware here),
+    /// and then the conversion to the JPEG's BT.601 that `tonemapx`'s BT.709
+    /// output needs (the module's departures; gl-1159).
+    ///
+    /// Dolby Vision profile 5 (`DOVI`) is reshaped, which asks for `yuv420p`:
+    /// the format this graph has anyway.
+    #[rstest::rstest]
+    #[case::hdr10("smpte2084", None)]
+    #[case::hlg("arib-std-b67", None)]
+    #[case::dovi_profile_5("smpte2084", Some(ferrofin_model::data::VideoRangeType::Dovi))]
+    #[tokio::test]
+    async fn an_hdr_source_is_tone_mapped_the_way_upstream_does(
+        #[case] transfer: &str,
+        #[case] range_type: Option<ferrofin_model::data::VideoRangeType>,
+    ) {
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let extractor = tonemap_extractor(
+            Arc::clone(&transcoder),
+            &crate::encoder::REQUIRED_FILTERS,
+            EncodingOptions::default(),
+        );
+        let stream = match range_type {
+            Some(range_type) => {
+                crate::encoding_helper::test_streams::with_range(hdr_stream(transfer), range_type)
+            }
+            None => hdr_stream(transfer),
+        };
+        if range_type.is_some() {
+            assert!(crate::encoding_helper::hw::tonemap::requires_dovi_reshaping(Some(&stream)));
+        }
+
+        let graph = graph_of(&extractor, &transcoder, &stream, false).await;
+
+        assert_eq!(
+            graph,
+            format!(
+                "setpts=N/24.000/TB,fps=1000/10000,\
+                 setparams=color_primaries=bt2020:color_trc={transfer}:colorspace=bt2020nc,\
+                 {SCALE},\
+                 tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p,\
+                 scale=out_color_matrix=bt601"
+            )
+        );
+    }
+
+    /// The tone-map takes its settings from the options upstream builds the
+    /// job with: the server's when trickplay may use hardware (here none is
+    /// configured, so the job is still software), `new EncodingOptions()`'s
+    /// otherwise. `EnableTonemapping` off stops neither, as upstream's
+    /// `IsSwTonemapAvailable` never reads it. Keyframe-only extraction asked
+    /// of an accelerator that cannot do it starts over from `new
+    /// EncodingOptions()` too (`MediaEncoder.cs:853-866`).
+    #[rstest::rstest]
+    #[case::server_options(
+        true,
+        false,
+        "tonemapx=tonemap=hable:desat=0.5:peak=400:t=bt709:m=bt709:p=bt709:format=yuv420p:param=0.3:range=tv"
+    )]
+    #[case::new_encoding_options(
+        false,
+        false,
+        "tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p"
+    )]
+    #[case::keyframe_only_without_a_keyframe_decoder(
+        true,
+        true,
+        "tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p"
+    )]
+    #[tokio::test]
+    async fn the_tone_map_reads_the_options_upstream_does(
+        #[case] allow_hw_accel: bool,
+        #[case] keyframe_only: bool,
+        #[case] tonemapx: &str,
+    ) {
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let options = EncodingOptions {
+            hardware_acceleration_type: HardwareAccelerationType::none,
+            enable_tonemapping: false,
+            tonemapping_algorithm: ferrofin_model::entities::TonemappingAlgorithm::hable,
+            tonemapping_desat: 0.5,
+            tonemapping_peak: 400.0,
+            tonemapping_param: 0.3,
+            tonemapping_range: ferrofin_model::entities::TonemappingRange::tv,
+            ..EncodingOptions::default()
+        };
+        let extractor = tonemap_extractor(
+            Arc::clone(&transcoder),
+            &crate::encoder::REQUIRED_FILTERS,
+            options,
+        );
+
+        let args = args_of(
+            &extractor,
+            &transcoder,
+            &hdr_stream("smpte2084"),
+            allow_hw_accel,
+            keyframe_only,
+        )
+        .await;
+
+        assert!(args.contains(&format!(",{tonemapx},")), "{args}");
+    }
+
+    /// Upstream sets the decode threads only while trickplay may not use
+    /// hardware (`MediaEncoder.cs:914-917`): with the trickplay hardware switch
+    /// on and no accelerator, the job is software but ffmpeg picks its decode
+    /// threads. Keyframe-only extraction that turns hardware off sets them.
+    #[rstest::rstest]
+    #[case::hardware_off(false, false, true)]
+    #[case::hardware_on_without_an_accelerator(true, false, false)]
+    #[case::keyframe_only_turns_hardware_off(true, true, true)]
+    #[tokio::test]
+    async fn the_decode_threads_are_set_only_while_hardware_is_off(
+        #[case] allow_hw_accel: bool,
+        #[case] keyframe_only: bool,
+        #[case] input_threads: bool,
+    ) {
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let extractor = tonemap_extractor(
+            Arc::clone(&transcoder),
+            &crate::encoder::REQUIRED_FILTERS,
+            EncodingOptions {
+                hardware_acceleration_type: HardwareAccelerationType::none,
+                ..EncodingOptions::default()
+            },
+        );
+
+        let args = args_of(
+            &extractor,
+            &transcoder,
+            &hdr_stream("bt709"),
+            allow_hw_accel,
+            keyframe_only,
+        )
+        .await;
+
+        assert_eq!(args.contains("-threads 1 -i "), input_threads, "{args}");
+        assert!(args.contains(" -threads 1 -c:v mjpeg"), "{args}");
+    }
+
+    /// No tone-map without `tonemapx` (a stock ffmpeg), for an 8-bit source,
+    /// or for an SDR one. The graph is then #1129's, with the matrix
+    /// conversion in the scale.
+    #[rstest::rstest]
+    #[case::stock_ffmpeg(&["scale", "fps"], "yuv420p10le", "smpte2084")]
+    #[case::eight_bit(&crate::encoder::REQUIRED_FILTERS, "yuv420p", "smpte2084")]
+    #[case::sdr(&crate::encoder::REQUIRED_FILTERS, "yuv420p10le", "bt709")]
+    #[tokio::test]
+    async fn only_an_hdr_source_on_an_ffmpeg_with_tonemapx_is_tone_mapped(
+        #[case] filters: &[&str],
+        #[case] pixel_format: &str,
+        #[case] transfer: &str,
+    ) {
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let extractor =
+            tonemap_extractor(Arc::clone(&transcoder), filters, EncodingOptions::default());
+        let stream = MediaStream {
+            pixel_format: Some(pixel_format.to_owned()),
+            ..hdr_stream(transfer)
+        };
+
+        let graph = graph_of(&extractor, &transcoder, &stream, false).await;
+
+        assert_eq!(
+            graph,
+            format!("setpts=N/24.000/TB,fps=1000/10000,{SCALE}:out_color_matrix=bt601")
+        );
+    }
+
+    /// Where the tone-map goes in each shape of the graph. An interlaced
+    /// source keeps upstream's order (`setparams`, deinterlacer, scale,
+    /// `tonemapx`, then the sampler). Full chroma tone-maps ahead of the
+    /// scale, which then converts and builds 4:4:4 from the source's chroma:
+    /// `tonemapx` writes 4:2:0 only. Below ffmpeg 5.1 nothing converts the
+    /// matrix, as on an SDR source.
+    #[rstest::rstest]
+    #[case::interlaced(
+        Some("yadif=0:-1:0"),
+        false,
+        (7, 0),
+        "TAGS,yadif=0:-1:0,SCALE,TONEMAP,scale=out_color_matrix=bt601,fps=1000/10000"
+    )]
+    #[case::full_chroma(
+        None,
+        true,
+        (7, 0),
+        "fps=1000/10000,TAGS,TONEMAP,SCALE:out_color_matrix=bt601,format=yuvj444p"
+    )]
+    #[case::interlaced_full_chroma(
+        Some("yadif=0:-1:0"),
+        true,
+        (7, 0),
+        "TAGS,yadif=0:-1:0,TONEMAP,SCALE:out_color_matrix=bt601,format=yuvj444p,fps=1000/10000"
+    )]
+    #[case::old_ffmpeg(None, false, (5, 0), "fps=1000/10000,TAGS,SCALE,TONEMAP")]
+    #[case::old_ffmpeg_full_chroma(
+        None,
+        true,
+        (5, 0),
+        "fps=1000/10000,TAGS,TONEMAP,SCALE,format=yuvj444p"
+    )]
+    fn each_graph_shape_puts_the_tone_map_where_it_belongs(
+        #[case] deinterlace: Option<&str>,
+        #[case] full_chroma: bool,
+        #[case] (major, minor): (i32, i32),
+        #[case] shape: &str,
+    ) {
+        let tonemap = super::SwTonemap {
+            input_params: "TAGS".to_owned(),
+            filter: "TONEMAP".to_owned(),
+        };
+        let args = build_trickplay_args(
+            "/m/v.mkv",
+            10_000,
+            320,
+            4,
+            1,
+            "/tmp/out/%08d.jpg",
+            Some(FfmpegVersion::new(major, minor)),
+            true,
+            None,
+            None,
+            deinterlace,
+            full_chroma,
+            Some(&tonemap),
+            true,
+        );
+        let graph = shape.replace("SCALE", SCALE);
+        assert!(args.contains(&format!("-vf \"{graph}\"")), "{args}");
     }
 
     /// A stream with no frame rate is deinterlaced too, at frame rate, and
