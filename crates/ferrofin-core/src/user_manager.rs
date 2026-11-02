@@ -213,6 +213,10 @@ impl FerrofinUserManager {
     /// `Where(IsEnabled)` then `Where(id)`, with the same result: a provider
     /// another user's sign-in never selects is not consulted, so an extension
     /// provider whose `is_enabled` fails cannot fail a local account's sign-in.
+    ///
+    /// When nothing matches, the invalid provider stands in, and a warning
+    /// names the user and the saved id as upstream's does. That covers a sign-in
+    /// and a password change alike.
     async fn authentication_providers_for(
         &self,
         user: Option<&UserEntity>,
@@ -229,6 +233,16 @@ impl FerrofinUserManager {
             }
         }
         if candidates.is_empty() {
+            tracing::warn!(
+                username = user.map(|u| tracing::field::display(&u.username)),
+                user_id = user.map(|u| tracing::field::display(&u.id)),
+                // Saved text an administrator or an adopted database supplied:
+                // Debug escapes it (LOGGING.md, rule 6).
+                authentication_provider_id = wanted.map(tracing::field::debug),
+                "the user's saved authentication provider is missing or disabled; assigning \
+                 the invalid provider, which refuses every sign-in and ignores a password \
+                 change, until this is corrected"
+            );
             candidates.push(&self.invalid_provider);
         }
         Ok(candidates)
