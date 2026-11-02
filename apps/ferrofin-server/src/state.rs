@@ -1372,6 +1372,14 @@ pub async fn build_app_state(
             .with_users(Arc::clone(&users))
             .with_by_name_store(by_name_store.clone()),
     );
+    // What a deleted item leaves on disk besides its media — its metadata
+    // folders and extracted data — removed before its rows by the library
+    // manager's delete and by every scan removal alike
+    // (`LibraryManager.DeleteItem`). The extracted-data half is bound once
+    // its managers exist, below.
+    let item_data_cleanup = Arc::new(ferrofin_core::item_data_cleanup::ItemDataCleanup::new(
+        Arc::clone(&paths),
+    ));
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
         Arc::clone(&file_system),
@@ -1390,6 +1398,8 @@ pub async fn build_app_state(
     .with_virtual_paths(virtual_paths.clone())
     // An item moved to a new id (its kind changed) takes its folders along.
     .with_path_manager(Arc::clone(&path_manager))
+    // A row the scan removes takes its metadata folders and extracted data.
+    .with_item_data_cleanup(Arc::clone(&item_data_cleanup))
     // Each library location is the `Folder` row Jellyfin keeps for it, under
     // the aggregate root, and what it holds hangs off it (owner decision D1).
     .with_root_folder(root_folder_ids.aggregate)
@@ -1603,12 +1613,14 @@ pub async fn build_app_state(
         .with_by_name_store(by_name_store)
         // A stacked video's parts are found by the ids their paths derive to.
         .with_id_derivation(id_derivation)
-        // `DELETE /Items` removes the item's files (`DeleteFileLocation`):
-        // the internal metadata root whose per-item folders it cleans, and
-        // the `%AppDataPath%` expansion of a stored path (an adopted
+        // `DELETE /Items` removes the item's files (`DeleteFileLocation`),
+        // expanding a stored `%AppDataPath%` path first (an adopted
         // collection's or playlist's folder). Nothing confines the delete to
         // the library locations, as upstream.
-        .with_app_paths(Arc::clone(&paths)),
+        .with_app_paths(Arc::clone(&paths))
+        // Every delete removes the deleted rows' metadata folders and
+        // extracted data first.
+        .with_item_data_cleanup(Arc::clone(&item_data_cleanup)),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // Marking a series, season, box set or folder played marks the items
@@ -2180,9 +2192,10 @@ pub async fn build_app_state(
         ));
     }
     let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
-    // Every item delete removes the deleted rows' extracted data
-    // (`LibraryManager.DeleteItem` → `DeleteExternalItemFiles`); the library
-    // manager is built before the chapter and segment managers this needs.
+    // Every item delete and scan removal removes the deleted rows' extracted
+    // data (`LibraryManager.DeleteItem` → `DeleteExternalItemFiles`); the
+    // library manager and the scanner are built before the chapter and
+    // segment managers this needs.
     let external_data: Arc<dyn ferrofin_traits::system::ExternalDataManager> =
         Arc::new(FerrofinExternalDataManager::new(
             Arc::clone(&path_manager),
@@ -2191,7 +2204,7 @@ pub async fn build_app_state(
             Arc::clone(&trickplay),
             Arc::clone(&chapters),
         ));
-    library_impl.set_external_data(external_data);
+    item_data_cleanup.set_external_data(external_data);
     // Jellyfin 12.0's sweeps of a 10.11 database's items whose library or
     // file is gone delete through the library manager, so they run once it
     // removes extracted data too, and before a startup trigger can scan.
@@ -2205,6 +2218,21 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to remove items whose library or file is gone")?;
+    // Jellyfin 12.0's `CleanupOrphanedExternalData`, once per database: the
+    // extracted data and chapter images left behind for items no longer
+    // stored (every earlier Ferrofin left them when a scan removed an item).
+    // After the sweeps that delete items, and before a startup trigger can
+    // scan; under the configured metadata path.
+    ferrofin_core::adoption_repairs::run_cleanup_orphaned_external_data(
+        db,
+        &ferrofin_core::adoption_repairs::ExtractedDataRoots {
+            data: std::path::PathBuf::from(paths.data_path()),
+            trickplay: std::path::PathBuf::from(paths.trickplay_path()),
+            internal_metadata: std::path::PathBuf::from(paths.internal_metadata_path()),
+        },
+    )
+    .await
+    .context("failed to remove extracted data of items that no longer exist")?;
     // The trigger scheduler: fires startup triggers now, then evaluates
     // daily/weekly/interval triggers for the life of this host.
     background.push(task_manager.start_scheduler());

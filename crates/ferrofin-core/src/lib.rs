@@ -195,6 +195,7 @@ pub mod file_system;
 pub mod intro_skipper_repository;
 pub mod item_count_service;
 pub mod item_data;
+pub mod item_data_cleanup;
 mod item_deletion;
 pub(crate) mod item_folders;
 pub mod item_persistence_service;

@@ -91,27 +91,9 @@ impl PathManager for FerrofinPathManager {
         save_with_media: bool,
     ) -> String {
         if save_with_media {
-            // `Path.Combine(item.ContainingFolderPath,
-            //  Path.ChangeExtension(Path.GetFileName(item.Path), ".trickplay"))`
-            // (PathManager.cs:96-103): `Alien.Resurrection.mkv` →
-            // `Alien.Resurrection.trickplay` beside the file, and a folder
-            // item's (or a disc rip's) inside the folder.
-            // No folder to save beside (a path at the root, or none): no
-            // such directory, never one relative to the working directory.
-            if media.containing_folder.is_empty() {
-                return String::new();
-            }
-            let file_name = std::path::Path::new(media.path)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
+            return trickplay_folder_beside(media)
+                .map(|folder| folder.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if file_name.is_empty() {
-                return String::new();
-            }
-            return std::path::Path::new(media.containing_folder)
-                .join(change_extension(&file_name, ".trickplay"))
-                .to_string_lossy()
-                .into_owned();
         }
         let hyphenated = id_hyphenated(item_id);
         PathBuf::from(self.paths.trickplay_path())
@@ -208,6 +190,37 @@ impl PathManager for FerrofinPathManager {
     }
 }
 
+/// The trickplay folder saved beside an item's media:
+/// `Path.Combine(item.ContainingFolderPath,
+/// Path.ChangeExtension(Path.GetFileName(item.Path), ".trickplay"))`
+/// (`PathManager.cs:96-103`): `Alien.Resurrection.mkv` →
+/// `Alien.Resurrection.trickplay` beside the file, and a folder item's (or a
+/// disc rip's) inside the folder. `None` with no folder to save beside (a
+/// path at the root, or none) or no file name: never a folder relative to
+/// the working directory.
+pub(crate) fn trickplay_folder_beside(media: MediaLocation<'_>) -> Option<PathBuf> {
+    if media.containing_folder.is_empty() {
+        return None;
+    }
+    let file_name = std::path::Path::new(media.path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())?;
+    Some(
+        std::path::Path::new(media.containing_folder)
+            .join(change_extension(&file_name, ".trickplay")),
+    )
+}
+
+/// `file_name` without its extension (`Path.GetFileNameWithoutExtension`):
+/// everything before the last `.`, or the whole name when it has none — the
+/// stem [`trickplay_folder_beside`] names the folder after.
+pub(crate) fn file_stem(file_name: &str) -> &str {
+    file_name
+        .rfind('.')
+        .map_or(file_name, |dot| &file_name[..dot])
+}
+
 /// The hyphenated (`D`) form of a GUID, matching C# `Id.ToString("D")`.
 fn id_hyphenated(id: Uuid) -> String {
     id.hyphenated().to_string()
@@ -225,8 +238,7 @@ fn change_extension(name: &str, extension: &str) -> String {
     if name.is_empty() {
         return String::new();
     }
-    let stem = name.rfind('.').map_or(name, |dot| &name[..dot]);
-    format!("{stem}{extension}")
+    format!("{}{extension}", file_stem(name))
 }
 
 /// `BaseItem.GetInternalMetadataPath(basePath)` for a non-channel item:
