@@ -182,6 +182,10 @@ ferrofin:
     # made through the server apply at once; these only bound changes made outside it.
     # FERROFIN_AUTH_CACHE_TTL_SECS: "30"
     # FERROFIN_ROW_CACHE_TTL_SECS: "30"
+    # Prepared statements each SQLite connection keeps (100-1024, default 200).
+    # Each connection of the pool keeps its own, about 16 KiB a statement, so a
+    # larger value costs memory on every connection.
+    # FERROFIN_DB_STATEMENT_CACHE: "200"
     # How many trickplay images are generated at once (default: auto, up to the
     # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
     # hardware acceleration holds GPU memory; "1" matches Jellyfin.

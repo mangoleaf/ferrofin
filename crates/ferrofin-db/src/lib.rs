@@ -23,8 +23,9 @@ pub mod sqlite_random;
 pub mod store;
 
 pub use database::{
-    AdoptionState, Database, ImageParentRow, JELLYFIN_GENERATIONS, JellyfinGeneration,
-    MigrationHistory, init_sqlite, inspect_migration_history, schema_head,
+    AdoptionState, DEFAULT_STATEMENT_CACHE_CAPACITY, Database, ImageParentRow,
+    JELLYFIN_GENERATIONS, JellyfinGeneration, MigrationHistory, init_sqlite,
+    inspect_migration_history, schema_head,
 };
 
 /// How many ids one `IN (…)` query binds at a time: stays far below SQLite's
