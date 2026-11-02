@@ -1974,6 +1974,199 @@ async fn a_scope_naming_no_item_answers_as_it_did() {
     }
 }
 
+/// Saves a tuner and a guide that airs one episode of each of `titles` and a
+/// film tomorrow, then refreshes the guide.
+async fn air_series(f: &Fixture, titles: &[&str]) {
+    use std::fmt::Write as _;
+    let (playlist, guide) = (f.h.path("playlist.m3u"), f.h.path("guide.xml"));
+    let day = (chrono::Utc::now() + chrono::Duration::days(1)).format("%Y%m%d");
+    let mut programmes = String::new();
+    for (hour, title) in titles.iter().enumerate() {
+        // A channel's airing is identified by its start, so each gets its own.
+        let stop = hour + 1;
+        write!(
+            programmes,
+            "<programme start=\"{day}{hour:02}0000 +0000\" stop=\"{day}{stop:02}0000 +0000\" \
+             channel=\"one\"><title>{title}</title><sub-title>Pilot</sub-title></programme>"
+        )
+        .expect("guide");
+    }
+    let (start, stop) = (titles.len(), titles.len() + 1);
+    write!(
+        programmes,
+        "<programme start=\"{day}{start:02}0000 +0000\" stop=\"{day}{stop:02}0000 +0000\" \
+         channel=\"one\"><title>Film</title></programme>"
+    )
+    .expect("guide");
+    touch(
+        &playlist,
+        "#EXTM3U\n#EXTINF:-1 tvg-id=\"one\" tvg-chno=\"1\",one\nhttp://tuner.invalid/one\n",
+    );
+    touch(
+        &guide,
+        &format!(
+            "<tv><channel id=\"one\"><display-name>one</display-name></channel>{programmes}</tv>"
+        ),
+    );
+    let (status, body) = call(
+        &f.router,
+        "POST",
+        "/LiveTv/TunerHosts",
+        Some(&f.admin),
+        Some(json!({ "Type": "m3u", "Url": playlist.to_string_lossy() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &f.router,
+        "POST",
+        "/LiveTv/ListingProviders",
+        Some(&f.admin),
+        Some(json!({
+            "Type": "xmltv",
+            "Path": guide.to_string_lossy(),
+            "EnableAllTuners": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Each save queued a refresh, and a later refresh supersedes an earlier
+    // one's write. Once a lineup is listed they have all started, so the
+    // refresh below is the newest and has finished when it returns.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (_, channels) = call(&f.router, "GET", "/LiveTv/Channels", Some(&f.admin), None).await;
+        if channels["TotalRecordCount"].as_i64() > Some(0) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "no lineup appeared");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    f.h.wired
+        .state
+        .live_tv
+        .as_ref()
+        .expect("live tv is wired")
+        .refresh_guide()
+        .await
+        .expect("guide refresh");
+}
+
+/// The programme titles a guide request answers, sorted.
+async fn guide_titles(
+    f: &Fixture,
+    method: &str,
+    body: Option<Value>,
+    query: &str,
+    token: &str,
+) -> Vec<String> {
+    let uri = format!("/LiveTv/Programs{query}");
+    let (status, page) = call(&f.router, method, &uri, Some(token), body).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {page}");
+    let mut titles: Vec<String> = page["Items"]
+        .as_array()
+        .expect("Items")
+        .iter()
+        .map(|item| item["Name"].as_str().expect("Name").to_owned())
+        .collect();
+    titles.sort();
+    titles
+}
+
+// Divergence (owner decision 2026-10-31, gl-1091; gl-1113): see `query_programs_inner`.
+#[tokio::test]
+async fn a_series_the_user_cannot_open_names_no_guide_search() {
+    let f = fixture().await;
+    let s = hidden_scopes(&f).await;
+    air_series(&f, &["Other", "Show"]).await;
+    let series = &s.series;
+    let viewer_id = &f.viewer_id;
+    let (everything, only_show) = (["Other", "Show"], ["Show"]);
+
+    assert_eq!(
+        guide_titles(&f, "GET", None, "", &f.viewer).await,
+        ["Film", "Other", "Show"]
+    );
+
+    // The series and an id naming nothing answer alike, so the answer says
+    // nothing about the series: every series airing, and no film.
+    let closed = format!("?librarySeriesId={series}");
+    let missing = format!(
+        "?librarySeriesId={}",
+        uuid::Uuid::from_u128(0xDEAD).simple()
+    );
+    for query in [&closed, &missing] {
+        let titles = guide_titles(&f, "GET", None, query, &f.viewer).await;
+        assert_eq!(titles, everything, "{query}");
+    }
+    let page = async |query: &str| {
+        let uri = format!("/LiveTv/Programs{query}&limit=1");
+        call(&f.router, "GET", &uri, Some(&f.viewer), None).await.1
+    };
+    assert_eq!(page(&closed).await, page(&missing).await);
+    assert_eq!(page(&closed).await["TotalRecordCount"], 2);
+    let body = json!({ "LibrarySeriesId": series, "UserId": viewer_id });
+    assert_eq!(
+        guide_titles(&f, "POST", Some(body.clone()), "", &f.viewer).await,
+        everything
+    );
+    // An administrator reading as the viewer gets the viewer's answer.
+    let as_viewer = format!("{closed}&userId={viewer_id}");
+    assert_eq!(
+        guide_titles(&f, "GET", None, &as_viewer, &f.admin).await,
+        everything
+    );
+
+    // An administrator can open it.
+    assert_eq!(
+        guide_titles(&f, "GET", None, &closed, &f.admin).await,
+        only_show
+    );
+    assert_eq!(
+        guide_titles(
+            &f,
+            "POST",
+            Some(json!({ "LibrarySeriesId": series })),
+            "",
+            &f.admin
+        )
+        .await,
+        only_show
+    );
+
+    // Opening the library narrows the guide for the viewer too.
+    let (_, user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{viewer_id}"),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let mut policy = user["Policy"].clone();
+    policy["EnabledFolders"]
+        .as_array_mut()
+        .unwrap()
+        .extend(s.libraries.iter().map(|library| json!(library)));
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!("/Users/{viewer_id}/Policy"),
+        Some(&f.admin),
+        Some(policy),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        guide_titles(&f, "GET", None, &closed, &f.viewer).await,
+        only_show
+    );
+    assert_eq!(
+        guide_titles(&f, "POST", Some(body), "", &f.viewer).await,
+        only_show
+    );
+}
+
 #[tokio::test]
 async fn explicit_ids_keep_to_what_the_user_can_open() {
     let f = fixture().await;

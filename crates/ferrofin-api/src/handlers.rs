@@ -1184,7 +1184,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    listings that can hold a playlist (Folder.QueryRecursive, \
                    Folder.QueryWithPostFiltering, Playlist.IsVisible); dto_service.rs \
                    get_base_item_dtos' IsVisible pass (DtoService.GetBaseItemDtos), which of \
-                   the handlers only GET /Items/Suggestions asks for, as its controller does",
+                   the handlers only GET /Items/Suggestions asks for, as its controller does; \
+                   handlers/live_tv.rs query_programs_inner \
+                   (LiveTvController.GetLiveTvPrograms, GetPrograms)",
         date: "2026-11-01",
         divergences: &[
             "A listing with a user leaves out the playlists that fail \
@@ -1204,6 +1206,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              IsVisibleStandalone. Upstream applies IsVisible alone, on GET /Items and GET \
              /Trailers. A BoxSet or Playlist browse that re-roots to the user root skips the \
              check, as upstream. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091).",
+            "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, so \
+             a series that user cannot open (library, rating or tag rules) answers like an id \
+             that is no series: IsSeries stays forced and its title is not searched for. \
+             Upstream's GetItemById<Series> reads it with no user, and a request with no user \
+             still does here. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; \
+             gl-1113). Fix path for the rest: gl-1130.",
         ],
     },
     VerifiedSubsystem {
