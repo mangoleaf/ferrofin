@@ -91,6 +91,20 @@ database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
 
+## Unreleased — a playlist's listing leaves out what its reader cannot open
+
+`GET /Playlists/{id}/Items` no longer lists a member from a library the user was not given, and
+`TotalRecordCount` and paging count what is left. A reorder counts positions in that same list,
+so a shared playlist shows a user a shorter list than its owner's, in the same order.
+
+This changes a read, not the playlist. The member stays stored and comes back if the user is given
+the library. Adding an item from such a library still stores it, and `GET /Playlists/{id}` still
+lists every member in `ItemIds`, as Jellyfin does.
+
+A script with an editing share that saves a playlist by sending `Ids` to `POST /Playlists/{id}`
+replaces every member, so `Ids` built from this listing now drop the members it left out. Build
+them from `ItemIds` instead.
+
 ## Unreleased — stream routes hold a signed-in user to their account
 
 Usually nothing to do. A request that carries a user's token is now checked on the video and audio
