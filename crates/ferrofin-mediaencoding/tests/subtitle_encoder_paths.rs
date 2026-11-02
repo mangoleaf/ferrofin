@@ -1109,3 +1109,70 @@ async fn a_blu_ray_track_counts_the_hidden_truehd_streams_before_it() {
     assert_eq!(calls.len(), 1, "{calls:?}");
     assert!(calls[0].0.contains("-map 0:3 -an -vn"), "{}", calls[0].0);
 }
+
+// -- a remote source's account stays out of the log (gl-1121) ----------------
+
+/// What [`ACCOUNT_URL`] carries. None of it may reach a log line.
+const ACCOUNT: [&str; 4] = ["acct-user", "info-secret", "path-secret", "query-secret"];
+
+/// A `.strm` source's path is its target URL, which can carry an account in its
+/// userinfo, its path and its query.
+const ACCOUNT_URL: &str =
+    "http://acct-user:info-secret@origin.example/live/path-secret/1.ts?password=query-secret";
+
+/// The text logged through it while its subscriber is the default.
+#[derive(Clone, Default)]
+struct Logs(std::sync::Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+
+/// An extraction from a remote source logs it by its scheme and host, whether
+/// ffmpeg succeeds or fails; a local file is logged by its whole path.
+#[rstest::rstest]
+#[case::extracted(ACCOUNT_URL, "http://origin.example", false)]
+#[case::failed(ACCOUNT_URL, "http://origin.example", true)]
+#[case::local_file("/media/movie.mkv", "/media/movie.mkv", false)]
+#[tokio::test]
+async fn a_remote_source_is_logged_by_its_host(
+    #[case] path: &str,
+    #[case] shown: &str,
+    #[case] extract_fails: bool,
+) {
+    let logs = Logs::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let stream = sub_stream(2, "subrip", None, false);
+    let source = source_with("guid-remote", path, vec![stream]);
+    let io = FailableIo {
+        extract_fails,
+        ..FailableIo::default()
+    };
+    SubtitleEncoder::new(SubtitleEditParser::new(), io)
+        .extract_all_extractable_subtitles(&source)
+        .await;
+
+    let text = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+    assert!(text.contains(shown), "{text}");
+    for secret in ACCOUNT {
+        assert!(!text.contains(secret), "{secret} logged: {text}");
+    }
+}
