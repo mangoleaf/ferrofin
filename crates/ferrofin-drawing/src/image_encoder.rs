@@ -167,18 +167,26 @@ impl ImageCrateEncoder {
     /// honour `quality`; PNG is lossless, so it ignores `quality`. Port of the
     /// `SKFileWStream`/`Encode(..., quality)` tail of `EncodeImage`.
     ///
-    /// The image is encoded in memory and lands at `output_path` through a
-    /// temporary file and a rename, so the path never holds a partial image.
-    /// Upstream streams straight into the destination, and the processor
-    /// serves whatever file it finds at a cache path with an immutable
-    /// year-long cache header: a request racing an encode, or one after an
-    /// encode that failed part-way, would serve and pin the truncated file.
+    /// The image is encoded in memory and lands at `output_path` through
+    /// [`Self::write_encoded`].
     fn write(
         image: &DynamicImage,
         output_path: &str,
         format: CrateFormat,
         quality: i32,
     ) -> Result<(), ServiceError> {
+        let bytes = Self::encode(image, output_path, format, quality)?;
+        Self::write_encoded(&bytes, output_path)
+    }
+
+    /// Writes an encoded image to `output_path`, creating the parent directory
+    /// first, through a temporary file and a rename, so the path never holds a
+    /// partial image. Upstream streams straight into the destination, and the
+    /// processor serves whatever file it finds at a cache path with an
+    /// immutable year-long cache header: a request racing an encode, or one
+    /// after an encode that failed part-way, would serve and pin the truncated
+    /// file.
+    fn write_encoded(bytes: &[u8], output_path: &str) -> Result<(), ServiceError> {
         if let Some(parent) = Path::new(output_path).parent()
             && !parent.as_os_str().is_empty()
         {
@@ -186,8 +194,7 @@ impl ImageCrateEncoder {
                 .map_err(|e| DrawingError::io(format!("mkdir {}", parent.display()), e))?;
         }
 
-        let bytes = Self::encode(image, output_path, format, quality)?;
-        ferrofin_util::file_helper::atomic_write_media(Path::new(output_path), &bytes)
+        ferrofin_util::file_helper::atomic_write_media(Path::new(output_path), bytes)
             .map_err(|e| DrawingError::io(format!("write {output_path}"), e).into())
     }
 
@@ -242,25 +249,29 @@ impl ImageCrateEncoder {
     /// with **4:2:0 chroma subsampling and optimized Huffman tables**, mirroring
     /// the C# oracle's `bitmap.Encode(stream, SKEncodedImageFormat.Jpeg, quality)`.
     ///
+    /// Every JPEG goes through here except a trickplay tile written with
+    /// `TrickplayOptions::full_chroma` on, which is 4:4:4
+    /// (`create_trickplay_tile_blocking`).
+    ///
     /// This routes around the `image` crate for the same reason the WebP branch
     /// does. `image` 0.25's `JpegEncoder` hardcodes 4:4:4 (every component is
     /// declared `h: 1, v: 1` in `new_with_quality`, at every quality), whereas
     /// Skia's `SkJpegEncoder` defaults to `Downsample::k420` for all three of
     /// Jellyfin's JPEG writes (`SkiaEncoder.cs` v10.11.8 lines 628, 670 and 778 —
-    /// resized image, pixmap, and the trickplay tile grid). A 4:4:4 tile is
-    /// roughly 3x the bytes of the 4:2:0 one, and `TrickplayManager.CreateTiles`
-    /// derives `TrickplayInfo.Bandwidth` straight from the tile's file length
-    /// (`Jellyfin.Server.Implementations/Trickplay/TrickplayManager.cs`), so the
-    /// subsampling was visible to clients as a ~3.4x inflated scrub-prefetch
-    /// budget, not just as bigger files on disk.
+    /// resized image, pixmap, and the trickplay tile grid). A tile written with
+    /// `full_chroma` on departs from that on purpose:
+    /// `TrickplayManager.CreateTiles` derives `TrickplayInfo.Bandwidth` from the
+    /// tile's file length
+    /// (`Jellyfin.Server.Implementations/Trickplay/TrickplayManager.cs`), so a
+    /// 4:4:4 tile reports a larger scrub-prefetch budget than Jellyfin's, a true
+    /// one for the file it describes.
     ///
     /// `jpeg-encoder` is configured to match Skia on every knob that changes the
     /// wire format:
     ///
     /// - **4:2:0 chroma subsampling**, as above. That crate's own default is
-    ///   quality-dependent (4:4:4 at `quality >= 90`, which is exactly the
-    ///   quality trickplay tiles are written at), so it is set explicitly rather
-    ///   than inherited.
+    ///   quality-dependent (4:4:4 at `quality >= 90`), so it is set explicitly
+    ///   rather than inherited.
     /// - **Optimized Huffman tables** (libjpeg `optimize_coding = TRUE`), which
     ///   `jpeg-encoder` leaves off. Measured on the wire against Jellyfin
     ///   10.11.8: its tiles carry content-derived tables with 11/93/11/56
@@ -291,6 +302,16 @@ impl ImageCrateEncoder {
         output_path: &str,
         quality: i32,
     ) -> Result<Vec<u8>, ServiceError> {
+        Self::encode_jpeg_sampled(image, output_path, quality, SamplingFactor::F_2_2)
+    }
+
+    /// [`Self::encode_jpeg`] at the given chroma `sampling`.
+    fn encode_jpeg_sampled(
+        image: &DynamicImage,
+        output_path: &str,
+        quality: i32,
+        sampling: SamplingFactor,
+    ) -> Result<Vec<u8>, ServiceError> {
         let quality = quality.clamp(0, 100);
         // Truncation is safe: quality is clamped to 0..=100.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -311,7 +332,7 @@ impl ImageCrateEncoder {
         };
         let mut bytes = Vec::new();
         let mut encoder = JpegEncoder::new(&mut bytes, quality);
-        encoder.set_sampling_factor(SamplingFactor::F_2_2);
+        encoder.set_sampling_factor(sampling);
         encoder.set_chroma_subsampling_method(ChromaSubsamplingMethod::Average);
         encoder.set_optimized_huffman_tables(true);
         encoder
@@ -511,12 +532,19 @@ impl ImageCrateEncoder {
     /// Assumes the caller has validated the O(1) arguments (non-empty inputs,
     /// positive tile dimensions and `img_width`, and that the inputs fit the
     /// grid); the per-image dimension checks stay here with the decode.
+    ///
+    /// `full_chroma` writes the grid at 4:4:4 where Skia writes 4:2:0, when an
+    /// admin opts in (`TrickplayOptions::full_chroma`, gl-1128): a thumbnail is
+    /// small enough that chroma blocks are a large share of it. The tile's own
+    /// bytes still set `TrickplayInfo.Bandwidth`, so that stays true of the
+    /// file, and it is above Jellyfin's for the same frames.
     fn create_trickplay_tile_blocking(
         memory: &ImageMemory,
         options: &ImageCollageOptions,
         quality: i32,
         img_width: i32,
         img_height: Option<i32>,
+        full_chroma: bool,
     ) -> Result<i32, ServiceError> {
         let paths = &options.input_paths;
         let tile_width = options.width;
@@ -584,12 +612,18 @@ impl ImageCrateEncoder {
             }
         }
 
-        Self::write(
+        let sampling = if full_chroma {
+            SamplingFactor::F_1_1
+        } else {
+            SamplingFactor::F_2_2
+        };
+        let bytes = Self::encode_jpeg_sampled(
             &DynamicImage::ImageRgb8(grid),
             &options.output_path,
-            CrateFormat::Jpeg,
             quality,
+            sampling,
         )?;
+        Self::write_encoded(&bytes, &options.output_path)?;
 
         Ok(img_height)
     }
@@ -1050,6 +1084,7 @@ impl ImageEncoder for ImageCrateEncoder {
         quality: i32,
         img_width: i32,
         img_height: Option<i32>,
+        full_chroma: bool,
     ) -> Result<i32, ServiceError> {
         let paths = &options.input_paths;
         let tile_width = options.width;
@@ -1087,7 +1122,14 @@ impl ImageEncoder for ImageCrateEncoder {
         let options = options.clone();
         let memory = Arc::clone(&self.memory);
         tokio::task::spawn_blocking(move || {
-            Self::create_trickplay_tile_blocking(&memory, &options, quality, img_width, img_height)
+            Self::create_trickplay_tile_blocking(
+                &memory,
+                &options,
+                quality,
+                img_width,
+                img_height,
+                full_chroma,
+            )
         })
         .await
         .map_err(|e| ServiceError::backend(format!("trickplay tile task failed: {e}")))?
@@ -2276,14 +2318,13 @@ mod tests {
 
     /// Skia writes every JPEG with `SkJpegEncoder`'s default `Downsample::k420`
     /// — at *every* quality, and on all three of Jellyfin's JPEG writes
-    /// (`SkiaEncoder.cs` v10.11.8 lines 628, 670, 778). A 4:4:4 JPEG is ~3x the
-    /// bytes, which `TrickplayManager` turns straight into an inflated
-    /// `TrickplayInfo.Bandwidth`, so the subsampling is user-visible and is
-    /// pinned here.
+    /// (`SkiaEncoder.cs` v10.11.8 lines 628, 670, 778). Ferrofin departs from it
+    /// only for a trickplay tile written with `full_chroma` on
+    /// (`a_trickplay_tile_is_written_at_the_chroma_asked_for`); everything else
+    /// is pinned here.
     ///
     /// The high-quality case is the one that regresses silently: `jpeg-encoder`'s
-    /// own default sampling factor flips to 4:4:4 at `quality >= 90`, which is
-    /// exactly the quality trickplay tiles are written at.
+    /// own default sampling factor flips to 4:4:4 at `quality >= 90`.
     #[rstest]
     #[case(80)]
     #[case(90)]
@@ -2392,7 +2433,7 @@ mod tests {
             height: 2,
         };
         let returned_height = enc
-            .create_trickplay_tile(&options, 90, 320, None)
+            .create_trickplay_tile(&options, 90, 320, None, true)
             .await
             .expect("trickplay");
         assert_eq!(returned_height, 180);
@@ -2402,10 +2443,49 @@ mod tests {
         assert_eq!(dims, ImageDimensions::new(640, 360));
     }
 
+    /// A tile is written at the chroma asked for, at every quality. Jellyfin's
+    /// 4:2:0 stays the default (`TrickplayOptions::full_chroma` off), and
+    /// neither case moves the 4:2:0 every other JPEG is pinned to above.
+    #[rstest]
+    #[case::full_at_80(true, 80, vec![(1, 1), (1, 1), (1, 1)])]
+    #[case::full_at_90(true, 90, vec![(1, 1), (1, 1), (1, 1)])]
+    #[case::full_at_100(true, 100, vec![(1, 1), (1, 1), (1, 1)])]
+    #[case::jellyfin_at_80(false, 80, vec![(2, 2), (1, 1), (1, 1)])]
+    #[case::jellyfin_at_90(false, 90, vec![(2, 2), (1, 1), (1, 1)])]
+    #[case::jellyfin_at_100(false, 100, vec![(2, 2), (1, 1), (1, 1)])]
+    #[tokio::test]
+    async fn a_trickplay_tile_is_written_at_the_chroma_asked_for(
+        #[case] full_chroma: bool,
+        #[case] quality: i32,
+        #[case] sampling: Vec<(u8, u8)>,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let output = out_path(&dir, "tile.jpg");
+        let options = ImageCollageOptions {
+            input_paths: vec![fixture(&dir, "frame.png", 64, 36)],
+            output_path: output.clone(),
+            width: 1,
+            height: 1,
+        };
+
+        ImageCrateEncoder::new()
+            .create_trickplay_tile(&options, quality, 64, None, full_chroma)
+            .await
+            .expect("tile");
+
+        let bytes = std::fs::read(&output).expect("read tile");
+        assert_eq!(jpeg_sampling_factors(&bytes), sampling);
+    }
+
     /// A tile is its frames in reading order on black, with the bytes an RGBA
     /// canvas flattened for JPEG gives, whichever format a frame decodes to.
+    /// With `full_chroma` off they are `encode_jpeg`'s, the 4:2:0 every other
+    /// JPEG is written at, so the default tile is what it was before the option.
+    #[rstest]
+    #[case::jellyfin_chroma(false)]
+    #[case::full_chroma(true)]
     #[tokio::test]
-    async fn a_trickplay_tile_is_its_frames_on_black() {
+    async fn a_trickplay_tile_is_its_frames_on_black(#[case] full_chroma: bool) {
         let dir = TempDir::new().expect("tempdir");
         let (width, height) = (32_u32, 18_u32);
         let colour = image::RgbImage::from_fn(width, height, |x, y| {
@@ -2434,7 +2514,7 @@ mod tests {
             height: 2,
         };
         ImageCrateEncoder::new()
-            .create_trickplay_tile(&options, 90, 32, None)
+            .create_trickplay_tile(&options, 90, 32, None, full_chroma)
             .await
             .expect("trickplay");
 
@@ -2446,12 +2526,12 @@ mod tests {
             let (x, y) = (i64::from(cell.0 * width), i64::from(cell.1 * height));
             imageops::overlay(&mut canvas, &frame.to_rgba8(), x, y);
         }
-        let expected = ImageCrateEncoder::encode(
-            &DynamicImage::ImageRgba8(canvas),
-            &output,
-            CrateFormat::Jpeg,
-            90,
-        )
+        let canvas = DynamicImage::ImageRgba8(canvas);
+        let expected = if full_chroma {
+            ImageCrateEncoder::encode_jpeg_sampled(&canvas, &output, 90, SamplingFactor::F_1_1)
+        } else {
+            ImageCrateEncoder::encode_jpeg(&canvas, &output, 90)
+        }
         .expect("encodes");
         assert_eq!(std::fs::read(&output).expect("reads the tile"), expected);
     }
@@ -2466,7 +2546,7 @@ mod tests {
             height: 2,
         };
         assert!(matches!(
-            enc.create_trickplay_tile(&options, 90, 320, Some(180))
+            enc.create_trickplay_tile(&options, 90, 320, Some(180), true)
                 .await,
             Err(ServiceError::InvalidInput(_))
         ));
@@ -2487,7 +2567,7 @@ mod tests {
         };
         // 5 images do not fit a 2x2 grid.
         assert!(matches!(
-            enc.create_trickplay_tile(&options, 90, 100, Some(100))
+            enc.create_trickplay_tile(&options, 90, 100, Some(100), true)
                 .await,
             Err(ServiceError::InvalidInput(_))
         ));
@@ -2506,7 +2586,8 @@ mod tests {
         };
         // Provided img_width (999) does not match the decoded 320.
         assert!(matches!(
-            enc.create_trickplay_tile(&options, 90, 999, None).await,
+            enc.create_trickplay_tile(&options, 90, 999, None, true)
+                .await,
             Err(ServiceError::InvalidInput(_))
         ));
     }
@@ -2524,7 +2605,8 @@ mod tests {
             height: 1,
         };
         assert!(matches!(
-            enc.create_trickplay_tile(&options, 90, 16, None).await,
+            enc.create_trickplay_tile(&options, 90, 16, None, true)
+                .await,
             Err(ServiceError::InvalidInput(_))
         ));
     }
@@ -2869,7 +2951,7 @@ mod tests {
             };
             let tile = tokio::time::timeout(
                 STARVED_WAIT,
-                encoder.create_trickplay_tile(&tile_options, 90, 100, Some(100)),
+                encoder.create_trickplay_tile(&tile_options, 90, 100, Some(100), true),
             )
             .await;
             assert!(

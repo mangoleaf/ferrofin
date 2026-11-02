@@ -1221,8 +1221,8 @@ async fn refresh_item(
     // Every refresh runs with the request's options: both modes (`None`
     // when omitted, `ItemRefreshController.cs:64-65`), the replace flags,
     // `ForceSave` and `RemoveOldMetadata` as the controller sets them
-    // (`:76-89`), and `RegenerateTrickplay` (which the scan carries but does
-    // not act on yet: see the `TrickplayProvider` work item in the scanner).
+    // (`:76-89`), and `RegenerateTrickplay`, which a `FullRefresh` honours
+    // (`TrickplayProvider`).
     let options = MetadataRefreshOptions::for_item_refresh(
         metadata_refresh_mode,
         image_refresh_mode,
