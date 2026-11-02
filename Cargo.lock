@@ -1414,20 +1414,28 @@ dependencies = [
  "ferrofin-db",
  "ferrofin-health",
  "ferrofin-model",
+ "ferrofin-naming",
  "ferrofin-traits",
  "ferrofin-util",
  "futures-util",
+ "ldap3",
+ "rcgen",
  "regex",
  "reqwest",
  "rstest",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+ "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1856,6 +1864,7 @@ checksum = "a88cf1f829d945f548cf8fec32c61b1f202b6d93b45848602fc02af4b12ad218"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -2702,6 +2711,41 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
+name = "lber"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbcf559624bfd9fe8d488329a8959766335a43a9b8b2cdd6a2c379fca02909a5"
+dependencies = [
+ "bytes",
+ "nom",
+]
+
+[[package]]
+name = "ldap3"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01fe89f5e7cfb7e4701e3a38ff9f00358e026a9aee940355d88ee9d81e5c7503"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "futures-util",
+ "lber",
+ "log",
+ "nom",
+ "percent-encoding",
+ "rustls",
+ "rustls-native-certs",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-util",
+ "url",
+ "x509-parser",
+]
 
 [[package]]
 name = "leb128fmt"
@@ -3900,9 +3944,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
+checksum = "4a073f5dc7469f984c52ad2752b63b0807745133b6de880b7b64c1ac4c48aec4"
 dependencies = [
  "openssl-probe",
  "rustls-pki-types",

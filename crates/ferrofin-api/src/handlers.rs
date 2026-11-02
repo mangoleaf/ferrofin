@@ -165,6 +165,7 @@ pub mod intro_skipper;
 pub mod item_lookup;
 pub mod item_update;
 pub mod items;
+pub mod ldap;
 pub mod library;
 pub mod library_structure;
 pub mod live_tv;
@@ -786,6 +787,21 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/Intros/ScanSeason/{SeriesId}/{SeasonId}"),
     ("get", "/Intros/ScanStatus"),
     ("post", "/FileTransformation/RegisterTransformation"),
+];
+
+/// `(method, path, extension-id)` for every route a compiled-in extension
+/// registers that is **not a contract operation**: a ported plugin's own
+/// controller, which the vendored spec does not describe.
+///
+/// They are in neither [`REAL_ROUTES`] nor [`EXTENSION_ROUTES`] (contract
+/// operations only) and carry no [`VERIFIED`] row; each plugin's comparison
+/// with its upstream is recorded in `docs/PLUGINS_UPSTREAM.md`. Like every
+/// ASP.NET route they are matched ignoring case
+/// ([`canonicalize_path`](crate::routes::canonicalize_path) reads this list):
+/// a plugin's settings page calls them as it spells them.
+pub const PLUGIN_ROUTES: &[(&str, &str, &str)] = &[
+    // LDAP-Auth plugin (see handlers::ldap).
+    ("post", "/Ldap/TestServerBind", "ldap-auth"),
 ];
 
 /// `(method, path, extension-id)` for every route owned by a **compiled-in
@@ -2873,6 +2889,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     // The Ferrofin plugin's settings page — not a contract operation, so in
     // neither REAL_ROUTES nor EXTENSION_ROUTES.
     let router = ferrofin_settings::register(router);
+    // The LDAP-Auth plugin's own controller — not a contract operation, so
+    // listed in PLUGIN_ROUTES.
+    let router = ldap::register(router);
     // Live TV read surface — empty/disabled state so the web UI treats Live TV
     // as "not configured" instead of erroring on 501 (mutations stay stubbed).
     let router = live_tv::register(router);
