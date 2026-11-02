@@ -929,7 +929,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// `scan-failure-isolation` is what the library scan does about a row or a
 /// write that fails, which no operation's response shows;
 /// `progressive-transcode` is who may reach ffmpeg through the stream routes,
-/// whose operations have no row of their own yet.
+/// whose operations have no row of their own yet, and how many jobs ffmpeg may
+/// run for them and the HLS routes.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -1178,12 +1179,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    UserRootFolder.GetEligibleChildrenForRecursiveChildren); handlers/items.rs \
                    require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
                    routes that take a scope (ItemsController.GetItems, \
-                   LibraryManager.AddUserToQuery); item_repository.rs \
+                   LibraryManager.AddUserToQuery); handlers/streaming.rs \
+                   require_streamable_item at the stream, HLS, universal audio, subtitle and \
+                   attachment routes (StreamingHelpers.GetStreamingState, \
+                   SubtitleController.GetSubtitle, VideoAttachmentsController.GetAttachment); \
+                   item_repository.rs \
                    resolve_views_with_parent and item_visibility.rs hidden_playlists on \
                    listings that can hold a playlist (Folder.QueryRecursive, \
                    Folder.QueryWithPostFiltering, Playlist.IsVisible); dto_service.rs \
                    get_base_item_dtos' IsVisible pass (DtoService.GetBaseItemDtos), which of \
-                   the handlers only GET /Items/Suggestions asks for, as its controller does",
+                   the handlers only GET /Items/Suggestions asks for, as its controller does; \
+                   handlers/live_tv.rs query_programs_inner \
+                   (LiveTvController.GetLiveTvPrograms, GetPrograms)",
         date: "2026-11-01",
         divergences: &[
             "A listing with a user leaves out the playlists that fail \
@@ -1203,6 +1210,28 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              IsVisibleStandalone. Upstream applies IsVisible alone, on GET /Items and GET \
              /Trailers. A BoxSet or Playlist browse that re-roots to the user root skips the \
              check, as upstream. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091).",
+            "A request naming a user is held to that user on the stream, HLS, universal audio, \
+             subtitle Stream.{format} and attachment routes: the default policy runs (a disabled \
+             account 401, remote access and the access schedule 403), and the item, and the \
+             version a mediaSourceId names, must pass IsVisibleStandalone or the route answers \
+             404. Upstream's GetStreamingState reads the item with no user, and its stream and \
+             Stream.{format} actions are anonymous; only its attachment action already checks \
+             the item for a user, and neither the policy nor the version. A channel takes the \
+             same check, as PlaybackInfo does. A DVR recording has no row here, so it takes \
+             Live TV access, IsVisibleStandalone over its entity, the libraries holding its \
+             file and then its channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
+             now share; upstream's recording is a library item, whose library holds it. On the \
+             routes upstream leaves anonymous, no credential, a token that names nobody and an \
+             API key stay so, which binds a client that sends its token. The legacy /hls/ \
+             routes are outside this: they serve a transcode's file by its random name, and \
+             the item id selects nothing, as upstream. Deliberate divergence (owner decision \
+             2026-10-31, gl-1090).",
+            "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, so \
+             a series that user cannot open (library, rating or tag rules) answers like an id \
+             that is no series: IsSeries stays forced and its title is not searched for. \
+             Upstream's GetItemById<Series> reads it with no user, and a request with no user \
+             still does here. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; \
+             gl-1113). Fix path for the rest: gl-1130.",
         ],
     },
     VerifiedSubsystem {
@@ -1220,8 +1249,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    (FileStreamResponseHelpers.GetTranscodedFile, which answers a HEAD before \
                    ffmpeg), which the transcode branch of /Audio/{itemId}/universal also \
                    reaches (UniversalAudioController, [Authorize]); the default policy is \
-                   auth.rs RequireAuth (DefaultAuthorizationHandler)",
-        date: "2026-10-31",
+                   auth.rs RequireAuth (DefaultAuthorizationHandler). Also the admission of a \
+                   job on those routes and the HLS ones: ferrofin-mediaencoding \
+                   transcoding/manager.rs start_ffmpeg, compared with \
+                   MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs (StartFfMpeg, \
+                   PingTimer) and Emby.Server.Implementations/Session/SessionManager.cs \
+                   (MaxActiveSessions)",
+        date: "2026-11-01",
         divergences: &[
             "A GET that would start a transcode on /Videos/{itemId}/stream, \
              /Videos/{itemId}/stream.{container}, /Audio/{itemId}/stream or \
@@ -1233,6 +1267,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              upstream, and a TranscodingUrl carries ApiKey. The lowercase api_key counts only \
              with EnableLegacyAuthorization on, so it is no caller by default. Deliberate \
              divergence (owner decision 2026-10-31, gl-1089).",
+            "Jobs re-encoding any stream run under caps upstream does not have (owner decisions \
+             2026-10-31 and 2026-11-01, gl-1098), the settings max_transcodes and \
+             max_transcodes_per_user, both 0, off, by default, which leaves StartFfMpeg's \
+             behaviour as upstream's: it starts whatever it is asked to, and MaxActiveSessions \
+             applies only at login. Past a cap a start ends the same user's longest-idle job \
+             (no active request), the teardown the ping timeout would have brought, and with \
+             none idle answers 503 with Retry-After: 10 before anything is created. A job \
+             copying every stream is free. The user is the authorization's, as upstream's \
+             StartFfMpeg userId is; an API key has none, so it is outside the per-user cap \
+             and inside the server-wide one.",
         ],
     },
 ];
