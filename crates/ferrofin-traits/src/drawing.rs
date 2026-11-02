@@ -207,7 +207,7 @@ pub trait ImageEncoder: Send + Sync {
     /// thumbnail *count*, not pixels), returning the decoded height of a single
     /// thumbnail. Port of `CreateTrickplayTile(options, quality, imgWidth,
     /// imgHeight)`, plus `full_chroma`: write the tile at 4:4:4 rather than
-    /// Jellyfin's 4:2:0 (`FERROFIN_TRICKPLAY_FULL_CHROMA`).
+    /// Jellyfin's 4:2:0 (`TrickplayOptions::full_chroma`).
     async fn create_trickplay_tile(
         &self,
         options: &ImageCollageOptions,

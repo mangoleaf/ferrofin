@@ -472,12 +472,6 @@ The real remaining gaps are **by design**, not un-ported routes:
   (an `.m3u` playlist file, a playlist or box-set folder) follows the library's "Save artwork
   into media folders" (`SaveLocalMetadata`), so with it off the media folders stay
   untouched and need no write permission.
-- **Trickplay images are better than Jellyfin's by default** — an owner decision (2026-11-01).
-  `TrickplayOptions` defaults to widths `[320, 640]` and `Qscale` 2 (upstream: `[320]` and 4), and
-  frames and tiles are 4:4:4 where upstream's are 4:2:0 (`FERROFIN_TRICKPLAY_FULL_CHROMA=false`
-  restores that; hardware paths keep 4:2:0 frames). Every video gets both widths and the client
-  picks by screen. Stored settings are never rewritten, so an adopted install keeps Jellyfin's
-  values and its tiles until the operator changes them.
 - **Hardware transcoding is NVENC, VAAPI and QSV only.** AMF (AMD on Windows),
   VideoToolbox (macOS), RKMPP (Rockchip) and V4L2M2M are **not supported** — an owner
   decision (2026-08-26), not an un-ported route: their filter chains cannot be verified

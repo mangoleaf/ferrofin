@@ -320,7 +320,7 @@ pub struct TrickplayExtraction<'a> {
     /// only. Most of the speedup, and the one thing that can fail on a file
     /// with a broken keyframe index; the extractor retries without it.
     pub keyframe_only: bool,
-    /// `FERROFIN_TRICKPLAY_FULL_CHROMA`: write 4:4:4 frames on the software
+    /// `TrickplayOptions::full_chroma`: write 4:4:4 frames on the software
     /// path (`build_trickplay_args`). A job on the hardware path keeps its
     /// chain's 4:2:0. So does one whose source the GPU cannot decode, which
     /// could be 4:4:4: that is open work (gl-1132).

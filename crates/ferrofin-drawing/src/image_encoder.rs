@@ -249,17 +249,19 @@ impl ImageCrateEncoder {
     /// with **4:2:0 chroma subsampling and optimized Huffman tables**, mirroring
     /// the C# oracle's `bitmap.Encode(stream, SKEncodedImageFormat.Jpeg, quality)`.
     ///
-    /// Every JPEG goes through here except a trickplay tile, which
-    /// is 4:4:4 by default (`create_trickplay_tile_blocking`).
+    /// Every JPEG goes through here except a trickplay tile written with
+    /// `TrickplayOptions::full_chroma` on, which is 4:4:4
+    /// (`create_trickplay_tile_blocking`).
     ///
     /// This routes around the `image` crate for the same reason the WebP branch
     /// does. `image` 0.25's `JpegEncoder` hardcodes 4:4:4 (every component is
     /// declared `h: 1, v: 1` in `new_with_quality`, at every quality), whereas
     /// Skia's `SkJpegEncoder` defaults to `Downsample::k420` for all three of
     /// Jellyfin's JPEG writes (`SkiaEncoder.cs` v10.11.8 lines 628, 670 and 778 —
-    /// resized image, pixmap, and the trickplay tile grid). Ferrofin's own tile
-    /// departs from that on purpose: `TrickplayManager.CreateTiles` derives
-    /// `TrickplayInfo.Bandwidth` from the tile's file length
+    /// resized image, pixmap, and the trickplay tile grid). A tile written with
+    /// `full_chroma` on departs from that on purpose:
+    /// `TrickplayManager.CreateTiles` derives `TrickplayInfo.Bandwidth` from the
+    /// tile's file length
     /// (`Jellyfin.Server.Implementations/Trickplay/TrickplayManager.cs`), so a
     /// 4:4:4 tile reports a larger scrub-prefetch budget than Jellyfin's, a true
     /// one for the file it describes.
@@ -531,11 +533,11 @@ impl ImageCrateEncoder {
     /// positive tile dimensions and `img_width`, and that the inputs fit the
     /// grid); the per-image dimension checks stay here with the decode.
     ///
-    /// `full_chroma` writes the grid at 4:4:4 where Skia writes 4:2:0, by owner
-    /// decision (gl-1128): a thumbnail is small enough that chroma blocks are a
-    /// large share of it. The tile's own bytes still set `TrickplayInfo.Bandwidth`,
-    /// so that stays true of the file, and it is above Jellyfin's for the same
-    /// frames.
+    /// `full_chroma` writes the grid at 4:4:4 where Skia writes 4:2:0, when an
+    /// admin opts in (`TrickplayOptions::full_chroma`, gl-1128): a thumbnail is
+    /// small enough that chroma blocks are a large share of it. The tile's own
+    /// bytes still set `TrickplayInfo.Bandwidth`, so that stays true of the
+    /// file, and it is above Jellyfin's for the same frames.
     fn create_trickplay_tile_blocking(
         memory: &ImageMemory,
         options: &ImageCollageOptions,
@@ -2317,7 +2319,7 @@ mod tests {
     /// Skia writes every JPEG with `SkJpegEncoder`'s default `Downsample::k420`
     /// — at *every* quality, and on all three of Jellyfin's JPEG writes
     /// (`SkiaEncoder.cs` v10.11.8 lines 628, 670, 778). Ferrofin departs from it
-    /// only for a trickplay tile, by default
+    /// only for a trickplay tile written with `full_chroma` on
     /// (`a_trickplay_tile_is_written_at_the_chroma_asked_for`); everything else
     /// is pinned here.
     ///
@@ -2442,7 +2444,7 @@ mod tests {
     }
 
     /// A tile is written at the chroma asked for, at every quality. Jellyfin's
-    /// 4:2:0 stays available (`FERROFIN_TRICKPLAY_FULL_CHROMA=false`), and
+    /// 4:2:0 stays the default (`TrickplayOptions::full_chroma` off), and
     /// neither case moves the 4:2:0 every other JPEG is pinned to above.
     #[rstest]
     #[case::full_at_80(true, 80, vec![(1, 1), (1, 1), (1, 1)])]
@@ -2477,8 +2479,13 @@ mod tests {
 
     /// A tile is its frames in reading order on black, with the bytes an RGBA
     /// canvas flattened for JPEG gives, whichever format a frame decodes to.
+    /// With `full_chroma` off they are `encode_jpeg`'s, the 4:2:0 every other
+    /// JPEG is written at, so the default tile is what it was before the option.
+    #[rstest]
+    #[case::jellyfin_chroma(false)]
+    #[case::full_chroma(true)]
     #[tokio::test]
-    async fn a_trickplay_tile_is_its_frames_on_black() {
+    async fn a_trickplay_tile_is_its_frames_on_black(#[case] full_chroma: bool) {
         let dir = TempDir::new().expect("tempdir");
         let (width, height) = (32_u32, 18_u32);
         let colour = image::RgbImage::from_fn(width, height, |x, y| {
@@ -2507,7 +2514,7 @@ mod tests {
             height: 2,
         };
         ImageCrateEncoder::new()
-            .create_trickplay_tile(&options, 90, 32, None, true)
+            .create_trickplay_tile(&options, 90, 32, None, full_chroma)
             .await
             .expect("trickplay");
 
@@ -2519,12 +2526,12 @@ mod tests {
             let (x, y) = (i64::from(cell.0 * width), i64::from(cell.1 * height));
             imageops::overlay(&mut canvas, &frame.to_rgba8(), x, y);
         }
-        let expected = ImageCrateEncoder::encode_jpeg_sampled(
-            &DynamicImage::ImageRgba8(canvas),
-            &output,
-            90,
-            SamplingFactor::F_1_1,
-        )
+        let canvas = DynamicImage::ImageRgba8(canvas);
+        let expected = if full_chroma {
+            ImageCrateEncoder::encode_jpeg_sampled(&canvas, &output, 90, SamplingFactor::F_1_1)
+        } else {
+            ImageCrateEncoder::encode_jpeg(&canvas, &output, 90)
+        }
         .expect("encodes");
         assert_eq!(std::fs::read(&output).expect("reads the tile"), expected);
     }

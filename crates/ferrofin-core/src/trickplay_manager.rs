@@ -88,10 +88,6 @@ pub struct FerrofinTrickplayManager {
     /// then finds the first one's tiles and row and skips them, and one
     /// refresh's prune never removes a folder the other has just moved in.
     item_locks: Arc<KeyedLocks>,
-    /// `FERROFIN_TRICKPLAY_FULL_CHROMA`: tiles and software-path frames at
-    /// 4:4:4 rather than Jellyfin's 4:2:0, whose 16x16 chroma blocks are about
-    /// 5% of a 320px thumbnail wide.
-    full_chroma: bool,
 }
 
 impl std::fmt::Debug for FerrofinTrickplayManager {
@@ -205,16 +201,7 @@ impl FerrofinTrickplayManager {
                 tokio::sync::Semaphore::MAX_PERMITS,
             )),
             item_locks: Arc::new(KeyedLocks::new()),
-            full_chroma: true,
         }
-    }
-
-    /// Writes tiles and software-path frames at 4:4:4, or at Jellyfin's 4:2:0
-    /// when off. Unset, they are 4:4:4.
-    #[must_use]
-    pub fn with_full_chroma(mut self, full_chroma: bool) -> Self {
-        self.full_chroma = full_chroma;
-        self
     }
 
     /// Caps how many trickplay generations (one item width each) run at once.
@@ -492,7 +479,7 @@ impl FerrofinTrickplayManager {
                 allow_hw_accel: options.enable_hw_acceleration,
                 enable_hw_encoding: options.enable_hw_encoding,
                 keyframe_only: options.enable_key_frame_only_extraction,
-                full_chroma: self.full_chroma,
+                full_chroma: options.full_chroma,
             })
             .await?;
 
@@ -587,7 +574,7 @@ impl FerrofinTrickplayManager {
                     options.jpeg_quality,
                     info.width,
                     (info.height != 0).then_some(info.height),
-                    self.full_chroma,
+                    options.full_chroma,
                 )
                 .await?;
             if info.height == 0 {
@@ -2253,43 +2240,23 @@ mod tests {
         assert!(Path::new(&tile).is_file(), "resolved tile exists: {tile}");
     }
 
-    /// The default options give every video both widths: jellyfin-web picks
-    /// the largest one at or under 20% of the physical screen width, so 320
-    /// serves phones and 1080p screens and 640 serves 4K ones.
-    #[tokio::test]
-    async fn the_default_options_generate_both_widths() {
-        let db = test_db().await;
-        let item = Uuid::new_v4();
-        let r = rig(&db, TrickplayOptions::default(), FakeExtractor::new(1, 180));
-        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
-
-        r.mgr
-            .refresh_trickplay_data(item, false, &extraction_on())
-            .await
-            .expect("refresh");
-
-        let res = r.mgr.get_trickplay_resolutions(item).await.expect("res");
-        let mut widths: Vec<i32> = res.into_keys().collect();
-        widths.sort_unstable();
-        assert_eq!(widths, [320, 640]);
-    }
-
-    /// The chroma setting reaches both stages: 4:4:4 unless it is turned off.
+    /// `TrickplayOptions::full_chroma` reaches both stages, and is off unless
+    /// an admin turns it on.
     #[rstest::rstest]
-    #[case::by_default(None, true)]
+    #[case::by_default(None, false)]
     #[case::on(Some(true), true)]
-    #[case::off(Some(false), false)]
     #[tokio::test]
-    async fn the_chroma_setting_reaches_the_frames_and_the_tiles(
+    async fn the_chroma_option_reaches_the_frames_and_the_tiles(
         #[case] setting: Option<bool>,
         #[case] expected: bool,
     ) {
         let db = test_db().await;
         let item = Uuid::new_v4();
-        let mut r = rig(&db, options_2x2(&[320]), FakeExtractor::new(1, 180));
+        let mut options = options_2x2(&[320]);
         if let Some(setting) = setting {
-            r.mgr = r.mgr.with_full_chroma(setting);
+            options.full_chroma = setting;
         }
+        let r = rig(&db, options, FakeExtractor::new(1, 180));
         seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
 
         r.mgr

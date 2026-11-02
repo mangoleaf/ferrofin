@@ -186,9 +186,6 @@ ferrofin:
     # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
     # hardware acceleration holds GPU memory; "1" matches Jellyfin.
     # FERROFIN_TRICKPLAY_CONCURRENCY: "1"
-    # Keep full colour detail (4:4:4) in new trickplay images (default "true").
-    # "false" matches Jellyfin's 4:2:0: more colour blocks, smaller tiles.
-    # FERROFIN_TRICKPLAY_FULL_CHROMA: "false"
     # Trade frame quality for speed when extracting chapter images, video
     # thumbnails and embedded pictures: keyframes only, no 24-frame sampling
     # (default "false", Jellyfin's FFmpeg:imgExtractPerfTradeoff).

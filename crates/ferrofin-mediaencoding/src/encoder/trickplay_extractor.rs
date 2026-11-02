@@ -243,7 +243,7 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
 /// `GetVideoProcessingFilterParam` places it (PR 17058).
 ///
 /// `full_chroma` has no upstream counterpart: it holds the frame at 4:4:4 from
-/// the scale on (`FERROFIN_TRICKPLAY_FULL_CHROMA`). A 16x16 chroma block is
+/// the scale on (`TrickplayOptions::full_chroma`). A 16x16 chroma block is
 /// about 5% of a 320px thumbnail wide, and frames are only the input to the
 /// tile, so subsampling them is loss the tile can never win back.
 #[must_use]

@@ -8,35 +8,36 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
-## Trickplay images are sharper, and larger
+## Sharper trickplay images are an opt-in
 
-A new install generates scrubbing previews at two widths, 320 and 640 pixels, with `Qscale` 2
-and full colour detail. jellyfin-web picks by screen: 320 on phones and 1080p screens, 640 on 4K
-ones. Jellyfin generates one width, 320, with `Qscale` 4 and reduced colour detail.
+Nothing changes on an upgrade, an adoption or a new install: trickplay images are generated as
+before, at the stored **Width Resolutions** and **Qscale** (320 and 4 on a new install, as in
+Jellyfin), and existing images stay as they are.
 
-An upgrade changes less, and asks you to opt in to the rest:
+Ferrofin can now also write them with full colour detail (4:4:4), with far less of the blocky
+colour around edges. It is the `FullChroma` member of `TrickplayOptions` in the server
+configuration, off by default and absent from `GET /System/Configuration` while off. There is no
+dashboard control for it yet. To turn it on, `GET /System/Configuration`, set
+`"FullChroma": true` in its `TrickplayOptions`, and `POST` the whole document back: a body that
+leaves out other settings resets them, and a save without the member turns it off again. A job that
+runs on the hardware path (trickplay's **Enable hardware decoding** on, with NVENC, VAAPI or QSV
+configured) keeps reduced colour detail in its frames, even for a video the GPU cannot decode, and
+writes only the tile in full.
 
-- **Your settings stay.** An existing install, or one adopted from Jellyfin, keeps the
-  `Width Resolutions` and `Qscale` it has stored.
-- **New tiles get full colour detail**, with far less of the blocky colour around edges, at about
-  twice the size on a test clip. `FERROFIN_TRICKPLAY_FULL_CHROMA=false` keeps Jellyfin's reduced
-  colour detail ([Configuration](CONFIG.md)). With trickplay's **Enable hardware decoding** on and
-  NVENC, VAAPI or QSV configured, frames keep reduced colour detail, so only the tile is written
-  in full.
-- **Existing tiles stay as they are** until you replace them.
-
-For the full improvement, under **Dashboard > Playback > Trickplay** set **Width Resolutions** to
-`320,640` and **Qscale** to `2`. The **Generate Trickplay Images** task then adds the 640 images on
+For the sharpest images, also set **Width Resolutions** to `320,640` and **Qscale** to `2` under
+**Dashboard > Playback > Trickplay**. jellyfin-web picks the width by screen: 320 on phones and
+1080p screens, 640 on 4K ones. The **Generate Trickplay Images** task then adds the 640 images on
 its own, and the 320 ones stay as they are. To redo those too, refresh each library with **Search
 for missing metadata** and **Replace existing trickplay images** checked. The refresh leaves
 trickplay alone unless the library has **Extract trickplay images during the library scan** on, and
 a video has no scrubbing preview while its images are redone, as in Jellyfin.
 
-The cost: each width is a full pass over the file, so generation takes about twice as long. On a
-test clip a two-hour film went from about 8 MiB to about 59 MiB, and grainy film takes more. A
-640 tile is about 6 MiB, which a slow remote connection will notice when scrubbing, and takes about
-200 MiB of memory to pack, where a 320 tile takes about 60 MiB. A scan packs several at once, so
-a memory-limited install may want `FERROFIN_TRICKPLAY_CONCURRENCY` set.
+The cost: each width is a full pass over the file, so both widths take about twice as long. On a
+test clip a two-hour film took about 8 MiB as Jellyfin writes it, about 14 MiB at 320 with full
+colour detail and `Qscale` 2, and about 59 MiB at both widths with the same two settings; grainy
+film takes more. A 640 tile is about 6 MiB, which a slow remote connection will notice when
+scrubbing, and takes about 200 MiB of memory to pack, where a 320 tile takes about 60 MiB. A scan
+packs several at once, so a memory-limited install may want `FERROFIN_TRICKPLAY_CONCURRENCY` set.
 
 ## Other accounts' policy and configuration
 

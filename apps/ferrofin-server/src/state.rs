@@ -1028,7 +1028,6 @@ pub async fn build_app_state(
             Arc::clone(&image_encoder) as _,
         )
         .with_live_tv(&live_tv)
-        .with_full_chroma(config.trickplay_full_chroma)
         .with_generation_concurrency(trickplay_concurrency(
             config.trickplay_concurrency,
             image_encoding_limit,

@@ -763,6 +763,13 @@ pub struct TrickplayOptions {
 
     /// Gets or sets the number of threads to be used by ffmpeg.
     pub process_threads: i32,
+
+    /// Ferrofin only: write tiles, and the software path's frames, at 4:4:4
+    /// rather than Jellyfin's 4:2:0, whose 16x16 chroma blocks are about 5% of
+    /// a 320px thumbnail wide. Off by default, and left out of the JSON while
+    /// off, so the document stays Jellyfin's unless an admin turns it on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub full_chroma: bool,
 }
 
 impl Default for TrickplayOptions {
@@ -774,17 +781,13 @@ impl Default for TrickplayOptions {
             scan_behavior: TrickplayScanBehavior::NonBlocking,
             process_priority: ProcessPriorityClass::BelowNormal,
             interval: 10_000,
-            // Above upstream's `[320]` and `4` by owner decision (gl-1128).
-            // jellyfin-web takes the largest width at or under 20% of the
-            // physical screen width, so 320 serves phones and 1080p screens
-            // and 640 serves 4K ones. 2 is the best `Qscale` it accepts, and
-            // the best ffmpeg gives: its default `qmin` clamps 1 to 2.
-            width_resolutions: vec![320, 640],
+            width_resolutions: vec![320],
             tile_width: 10,
             tile_height: 10,
-            qscale: 2,
+            qscale: 4,
             jpeg_quality: 90,
             process_threads: 1,
+            full_chroma: false,
         }
     }
 }
@@ -1620,14 +1623,36 @@ mod tests {
     fn trickplay_options_default() {
         let opts = TrickplayOptions::default();
         assert_eq!(opts.interval, 10_000);
-        assert_eq!(opts.width_resolutions, vec![320, 640]);
+        assert_eq!(opts.width_resolutions, vec![320]);
         assert_eq!(opts.tile_width, 10);
         assert_eq!(opts.tile_height, 10);
-        assert_eq!(opts.qscale, 2);
+        assert_eq!(opts.qscale, 4);
         assert_eq!(opts.jpeg_quality, 90);
         assert_eq!(opts.process_threads, 1);
         assert_eq!(opts.scan_behavior, TrickplayScanBehavior::NonBlocking);
         assert_eq!(opts.process_priority, ProcessPriorityClass::BelowNormal);
+        assert!(!opts.full_chroma);
+    }
+
+    /// `FullChroma` is Ferrofin's own: absent from Jellyfin's document, so it
+    /// reads as off and is written only once an admin turns it on.
+    #[test]
+    fn trickplay_full_chroma_is_written_only_when_on() {
+        let off = serde_json::to_value(TrickplayOptions::default()).unwrap();
+        assert!(off.get("FullChroma").is_none(), "{off}");
+        let jellyfin: TrickplayOptions = serde_json::from_value(off).unwrap();
+        assert!(!jellyfin.full_chroma);
+
+        let on = TrickplayOptions {
+            full_chroma: true,
+            ..TrickplayOptions::default()
+        };
+        let json = serde_json::to_value(&on).unwrap();
+        assert_eq!(json["FullChroma"], true);
+        assert_eq!(
+            serde_json::from_value::<TrickplayOptions>(json).unwrap(),
+            on
+        );
     }
 
     #[test]

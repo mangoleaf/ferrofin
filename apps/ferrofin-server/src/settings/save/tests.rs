@@ -221,7 +221,7 @@ fn every_editable_setting_saves_what_a_hand_written_line_holds() {
         let value = match (spec.key, spec.kind) {
             ("log_level", _) => json!("debug"),
             ("log_format", _) => json!("text"),
-            (_, SettingKind::Bool) => json!(spec.default != "true"),
+            (_, SettingKind::Bool) => json!(true),
             (_, SettingKind::Integer { min, .. }) => json!(min + 1),
             (_, SettingKind::CountOrAuto) => json!(2),
             (_, SettingKind::Text | SettingKind::Secret) => json!("sample"),
