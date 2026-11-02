@@ -443,6 +443,256 @@ async fn frames_keep_the_colours_of_the_source(
     }
 }
 
+/// Whether the `ffmpeg` on `PATH` has jellyfin-ffmpeg's `tonemapx`, the
+/// filter software trickplay tone-maps an HDR source with.
+fn has_tonemapx() -> bool {
+    std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-filters"])
+        .output()
+        .is_ok_and(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|line| line.split_whitespace().nth(1) == Some("tonemapx"))
+        })
+}
+
+/// [`BARS`] as an HDR10 video holds them, as 10-bit limited-range BT.2020
+/// Y'CbCr: each colour linearised (BT.1886, gamma 2.4) with white at
+/// 100 cd/m², moved to BT.2020 primaries and PQ-encoded (SMPTE ST 2084).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "each value is rounded and lies in 64..=960"
+)]
+fn hdr10_ycbcr(rgb: [u8; 3]) -> [u16; 3] {
+    const BT709_TO_BT2020: [[f64; 3]; 3] = [
+        [0.6274, 0.3293, 0.0433],
+        [0.0691, 0.9195, 0.0114],
+        [0.0164, 0.0880, 0.8956],
+    ];
+    let pq = |nits: f64| {
+        let (m1, m2) = (2610.0 / 16384.0, 2523.0 / 4096.0 * 128.0);
+        let (c1, c2, c3) = (
+            3424.0 / 4096.0,
+            2413.0 / 4096.0 * 32.0,
+            2392.0 / 4096.0 * 32.0,
+        );
+        let y = (nits / 10_000.0).powf(m1);
+        ((c1 + c2 * y) / (1.0 + c3 * y)).powf(m2)
+    };
+    let linear = rgb.map(|c| (f64::from(c) / 255.0).powf(2.4) * 100.0);
+    let [r, g, b] = BT709_TO_BT2020.map(|row| pq(row.iter().zip(linear).map(|(k, c)| k * c).sum()));
+    let (kr, kb) = (0.2627, 0.0593);
+    let y = kr * r + (1.0 - kr - kb) * g + kb * b;
+    let cb = (b - y) / (2.0 * (1.0 - kb));
+    let cr = (r - y) / (2.0 * (1.0 - kr));
+    [64.0 + 876.0 * y, 512.0 + 896.0 * cb, 512.0 + 896.0 * cr].map(|v| v.round() as u16)
+}
+
+/// Writes a 4 s HDR10 clip of [`BARS`] side by side at `path`, losslessly
+/// coded (FFV1, 10-bit 4:2:0) and tagged BT.2020/PQ.
+fn make_hdr10_bars_clip(path: &Path) {
+    const WIDTH: usize = BARS_WIDTH as usize;
+    const HEIGHT: usize = BARS_HEIGHT as usize;
+    const FRAMES: usize = 4 * BARS_FPS as usize;
+    let bar_width = WIDTH / BARS.len();
+    let values = BARS.map(hdr10_ycbcr);
+    let mut frame = Vec::with_capacity(WIDTH * HEIGHT * 3);
+    for _ in 0..HEIGHT {
+        frame.extend((0..WIDTH).flat_map(|x| values[x / bar_width][0].to_le_bytes()));
+    }
+    for plane in [1, 2] {
+        for _ in 0..HEIGHT / 2 {
+            frame.extend(
+                (0..WIDTH / 2).flat_map(|x| values[2 * x / bar_width][plane].to_le_bytes()),
+            );
+        }
+    }
+    let raw = path.with_extension("yuv");
+    std::fs::write(&raw, frame.repeat(FRAMES)).expect("write raw bars");
+
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-y", "-f", "rawvideo", "-pix_fmt", "yuv420p10le"])
+        .args([
+            "-video_size",
+            &format!("{WIDTH}x{HEIGHT}"),
+            "-framerate",
+            &BARS_FPS.to_string(),
+        ])
+        .arg("-i")
+        .arg(&raw)
+        .args([
+            "-vf",
+            "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv420p10le",
+        ])
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawn ffmpeg for the HDR bars clip");
+    assert!(status.success(), "HDR bars clip generation failed");
+}
+
+/// The bars' colours at the middle of `image`, left to right.
+fn bar_colours(image: &image::RgbImage) -> Vec<[u8; 3]> {
+    let (width, height) = image.dimensions();
+    let bar_width = width / u32::try_from(BARS.len()).expect("a few bars");
+    (0..)
+        .take(BARS.len())
+        .map(|bar| {
+            image
+                .get_pixel(bar_width * bar + bar_width / 2, height / 2)
+                .0
+        })
+        .collect()
+}
+
+/// A configuration whose encoding options are the defaults. The extractor
+/// reads nothing else, and reads even those only when trickplay may use
+/// hardware.
+struct DefaultEncoding;
+
+#[async_trait::async_trait]
+impl ferrofin_traits::configuration::ServerConfigurationManager for DefaultEncoding {
+    async fn get_encoding_options(
+        &self,
+    ) -> Result<ferrofin_model::configuration::EncodingOptions, ferrofin_traits::error::ServiceError>
+    {
+        Ok(ferrofin_model::configuration::EncodingOptions::default())
+    }
+    fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+        unimplemented!("trickplay reads only the encoding options")
+    }
+    async fn configuration(
+        &self,
+    ) -> Result<
+        Arc<ferrofin_model::configuration::ServerConfiguration>,
+        ferrofin_traits::error::ServiceError,
+    > {
+        unimplemented!("trickplay reads only the encoding options")
+    }
+    async fn update_configuration(
+        &self,
+        _configuration: &ferrofin_model::configuration::ServerConfiguration,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        unimplemented!("trickplay reads only the encoding options")
+    }
+    async fn get_branding(
+        &self,
+    ) -> Result<ferrofin_model::branding::BrandingOptions, ferrofin_traits::error::ServiceError>
+    {
+        unimplemented!("trickplay reads only the encoding options")
+    }
+    async fn update_branding(
+        &self,
+        _branding: &ferrofin_model::branding::BrandingOptions,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        unimplemented!("trickplay reads only the encoding options")
+    }
+}
+
+/// Software trickplay tone-maps an HDR10 source as upstream does, and the
+/// frame then keeps `tonemapx`'s colours: they are BT.709, and a JPEG decoder
+/// reads BT.601, so the graph converts after the tone-map (gl-1159). The
+/// reference is `tonemapx`'s output read as BT.709 by ffmpeg itself. An
+/// un-tone-mapped frame misses it by about 55 and one read with the wrong
+/// matrix by about 16. Needs jellyfin-ffmpeg (for `tonemapx`), 5.1 or later.
+#[rstest::rstest]
+#[case::jellyfin_chroma(false)]
+#[case::full_chroma(true)]
+#[tokio::test]
+async fn an_hdr10_source_is_tone_mapped_to_its_sdr_colours(#[case] full_chroma: bool) {
+    if !ffmpeg_gate() {
+        return;
+    }
+    if !has_tonemapx() {
+        eprintln!("skipping: ffmpeg has no tonemapx (jellyfin-ffmpeg has it)");
+        return;
+    }
+    let version = probed_ffmpeg_version();
+    let Some(version) = version.filter(|v| *v >= MIN_FFMPEG_JPEG_MATRIX_CONVERSION) else {
+        let found = version.map_or_else(|| "unprobed".to_owned(), |v| v.to_string());
+        eprintln!(
+            "skipping: ffmpeg ({found}) is unprobed or older than \
+             {MIN_FFMPEG_JPEG_MATRIX_CONVERSION}, where trickplay converts no matrix"
+        );
+        return;
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let clip = tmp.path().join("hdr10.mkv");
+    make_hdr10_bars_clip(&clip);
+
+    // The tone-map of `EncodingOptions::default()`, which a job with trickplay
+    // hardware off reads (upstream's `new EncodingOptions()`).
+    let reference = tmp.path().join("reference.png");
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(&clip)
+        .args([
+            "-vf",
+            "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,\
+             scale=128:72,\
+             tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p,\
+             scale=in_color_matrix=bt709:in_range=tv,format=rgb24",
+            "-frames:v",
+            "1",
+        ])
+        .arg(&reference)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawn ffmpeg for the reference");
+    assert!(status.success(), "reference tone-map failed");
+    let want = bar_colours(&image::open(&reference).expect("decode reference").to_rgb8());
+
+    let caps = ferrofin_mediaencoding::FfmpegCapabilities::builder()
+        .filters(["tonemapx"])
+        .ffmpeg_version(version)
+        .build();
+    let extractor =
+        TrickplayFrameExtractorImpl::new(Arc::new(TokioTranscoder::new()), "ffmpeg", Some(version))
+            .with_hardware(Arc::new(caps), Arc::new(DefaultEncoding));
+    let stream = MediaStream {
+        codec: Some("ffv1".to_owned()),
+        pixel_format: Some("yuv420p10le".to_owned()),
+        color_transfer: Some("smpte2084".to_owned()),
+        color_primaries: Some("bt2020".to_owned()),
+        color_space: Some("bt2020nc".to_owned()),
+        ..bars_stream()
+    };
+    let out_dir = tmp.path().join("frames");
+    let frames = extractor
+        .extract_trickplay_frames(&TrickplayExtraction {
+            max_width: 128,
+            full_chroma,
+            ..extraction(&clip.to_string_lossy(), &stream, &out_dir.to_string_lossy())
+        })
+        .await
+        .expect("frame extraction succeeds");
+
+    assert!(!frames.is_empty(), "no frames");
+    for frame in &frames {
+        let image = image::open(frame).expect("decode frame").to_rgb8();
+        assert_eq!(image.dimensions(), (128, 72), "{frame}");
+        let got = bar_colours(&image);
+        let off = got
+            .iter()
+            .zip(&want)
+            .flat_map(|(g, w)| g.iter().zip(w).map(|(g, w)| g.abs_diff(*w)))
+            .max()
+            .unwrap_or_default();
+        assert!(
+            off <= COLOUR_TOLERANCE,
+            "{frame}: decoded {got:?}, tone-mapped reference {want:?} (off by {off})"
+        );
+    }
+}
+
 #[tokio::test]
 async fn missing_input_is_an_error() {
     if !ffmpeg_gate() {

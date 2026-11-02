@@ -926,6 +926,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// operation crosses several of them, so one row states their divergences once
 /// and operation rows name it in [`Verified::refs`]. `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
+/// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
+/// frames, which the tile operations serve but no response shows;
 /// `scan-failure-isolation` is what the library scan does about a row or a
 /// write that fails, which no operation's response shows;
 /// `progressive-transcode` is who may reach ffmpeg through the stream routes,
@@ -941,6 +943,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "websocket-streams",
     "scan-failure-isolation",
     "progressive-transcode",
+    "trickplay-extraction",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -1015,6 +1018,59 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              the planner's localized one, where FindSeasonName answers a literal \"Season N\" or \
              \"Season Unknown\". Fix path: port that branch to sync_season_name for a row that \
              is truly absent, leaving a row that fails to read out of it.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "trickplay-extraction",
+        upstream_file: "MediaBrowser.MediaEncoding/Encoder/MediaEncoder.cs",
+        upstream_method: "ExtractVideoImagesOnIntervalAccelerated",
+        ferrofin: "The ffmpeg run that writes a video's trickplay frames on the software path \
+                   (trickplay hardware acceleration off, no accelerator configured, or one that \
+                   cannot decode keyframes only), which the trickplay tiles are packed from: \
+                   ferrofin-mediaencoding encoder/trickplay_extractor.rs \
+                   extract_trickplay_frames, plan, build_trickplay_args, SwTonemap and run, \
+                   compared with ExtractVideoImagesOnIntervalAccelerated and \
+                   ExtractVideoImagesOnIntervalInternal and, in \
+                   MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs, \
+                   GetVideoProcessingFilterParam, GetSwVidFilterChain and IsSwTonemapAvailable. \
+                   The hardware path (build_accelerated_trickplay_args) is not part of this row",
+        date: "2026-11-02",
+        divergences: &[
+            "The fps= sampler is emitted for every stream, where upstream's GetFramerateParam \
+             emits none for a stream ffprobe read no frame rate for, or one whose rate is not \
+             above the sampling rate, and then writes a frame per keyframe or throws (12.0-rc3, \
+             PR 17304); a stream with no frame rate is sampled on its container timestamps \
+             with no setpts. A Jellyfin bug, deliberately not ported. The rate is printed as \
+             the exact 1000/interval, not upstream's float widened to double.",
+            "An interlaced source is deinterlaced at frame rate whatever \"Double the frame \
+             rate when deinterlacing\" says, because upstream's setpts would number the \
+             doubled frames at the source's rate and stretch the timeline twofold. A Jellyfin \
+             bug, deliberately not ported.",
+            "The graph is built in upstream's order but with the dar-aware software scale \
+             rather than GetSwScaleFilter, and with no setparams re-tag of an SDR frame and no \
+             closing format=yuv420p, so a 4:2:2 or 4:4:4 source keeps its chroma.",
+            "On an ffmpeg without tonemapx an HDR frame is not re-tagged BT.709 either: \
+             from ffmpeg 5.1 the scale converts its BT.2020 matrix to BT.601, and the frame \
+             stays un-tone-mapped, as upstream's does.",
+            "On ffmpeg 5.1 or later the frame is converted to the BT.601 matrix a JPEG decoder \
+             reads, in the scale, or behind tonemapx for an HDR source, whose output is \
+             BT.709. Upstream converts none, so its BT.709 previews shift colour (gl-1129): a \
+             Jellyfin bug, deliberately not ported.",
+            "With TrickplayOptions full_chroma, a Ferrofin setting that is off by default, the \
+             frame is held at 4:4:4 from the scale on, and an HDR source is tone-mapped ahead \
+             of the scale, because tonemapx writes 4:2:0 only.",
+            "A run that exits cleanly with no frames counts as failed, so a keyframe-only run \
+             that writes none retries the standard way. Upstream retries only after a non-zero \
+             exit or a hang, and its TrickplayManager then refuses the empty directory.",
+            "The caller owns the frame directory, which the extractor clears before a retry, \
+             where upstream extracts each run into a fresh temporary directory.",
+            "The argument line is logged at debug, not information, because it is logged once \
+             per video and width (docs/conventions/LOGGING.md), and a run stopped for writing \
+             no new frame logs no lines of its own: its reason is in the error the caller \
+             logs.",
+            "AMF, VideoToolbox, RKMPP and V4L2M2M have no ported filter chain, so a job \
+             configured for one takes this software path. That is the owner's hardware scope \
+             decision (CLAUDE.md, Current scope).",
         ],
     },
     VerifiedSubsystem {
