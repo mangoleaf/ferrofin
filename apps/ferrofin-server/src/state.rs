@@ -353,10 +353,12 @@ pub async fn build_app_state(
     );
     // A database whose program-data directory moved (an adopted Debian
     // `/var/lib/jellyfin`, or a relocated data_dir) keeps its ids but stores
-    // stale absolute paths for the library root and artwork.
+    // stale absolute paths for the library root and artwork. Before `ensure()`,
+    // which re-paths the aggregate root: the repair reads the old directory
+    // from the root rows.
     if let Some(rebased) = ferrofin_core::adoption_repairs::rebase_program_data_paths(
         db,
-        aggregate_store.id(),
+        &id_derivation,
         &ferrofin_core::adoption_repairs::ProgramDataDirs {
             root: paths.root_folder_path(),
             metadata: paths.internal_metadata_path(),
@@ -368,10 +370,10 @@ pub async fn build_app_state(
     .context("failed to rebase paths under the previous program-data directory")?
     {
         tracing::info!(
-            from = %rebased.from,
+            from = ?rebased.from,
             to = %paths.program_data_path(),
             rows = rebased.rows,
-            "rebased stored paths from the previous program-data directory"
+            "rewrote stored paths under a previous program-data directory"
         );
     }
     let root_folder_ids = aggregate_store
