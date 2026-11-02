@@ -39,7 +39,11 @@ pub(crate) fn remote_target(contents: &str) -> Option<String> {
     let remote = reqwest::Url::parse(&line)
         .is_ok_and(|url| REMOTE_SCHEMES.contains(&url.scheme().to_ascii_lowercase().as_str()));
     if !remote {
-        tracing::warn!(target = %line, "ignoring invalid or non-remote .strm path");
+        // A URL the line names can carry an account, like any media URL.
+        tracing::warn!(
+            target = %ferrofin_util::source_url::redact_url(&line),
+            "ignoring invalid or non-remote .strm path"
+        );
         return None;
     }
     Some(line)
@@ -123,6 +127,28 @@ mod tests {
     #[case("smb://h/a", MediaProtocol::Http)]
     fn the_protocol_follows_the_path_prefix(#[case] path: &str, #[case] expected: MediaProtocol) {
         assert_eq!(path_protocol(path), expected);
+    }
+
+    /// A target refused for its scheme is logged by its scheme and host: it can
+    /// carry an account like any URL (gl-1121).
+    #[test]
+    fn a_refused_target_is_logged_by_its_host() {
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let line =
+            "ftp://acct-user:info-secret@origin.example/path-secret/a.mkv?password=query-secret";
+        assert_eq!(remote_target(line), None);
+
+        let text = logs.text();
+        assert!(text.contains("ftp://origin.example"), "{text}");
+        for secret in ["acct-user", "info-secret", "path-secret", "query-secret"] {
+            assert!(!text.contains(secret), "{secret} logged: {text}");
+        }
     }
 
     #[test]

@@ -1468,7 +1468,12 @@ fn spawn_probe(
             }
             Err(e) => {
                 run.finish(crate::scan_metrics::ProbeResult::Failed);
-                let path = request.media_source.path.as_deref();
+                // A `.strm` item's path is its target URL, which can carry an account.
+                let path = request
+                    .media_source
+                    .path
+                    .as_deref()
+                    .map(ferrofin_util::source_url::redact_url);
                 tracing::warn!(error = %e, ?path, "media probe failed; item left unprobed");
                 return None;
             }
