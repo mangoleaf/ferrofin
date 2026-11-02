@@ -221,7 +221,8 @@ fn every_editable_setting_saves_what_a_hand_written_line_holds() {
         let value = match (spec.key, spec.kind) {
             ("log_level", _) => json!("debug"),
             ("log_format", _) => json!("text"),
-            (_, SettingKind::Bool) => json!(true),
+            // As `sample`: the value that is not the default.
+            (_, SettingKind::Bool) => json!(spec.default != "true"),
             (_, SettingKind::Integer { min, .. }) => json!(min + 1),
             (_, SettingKind::CountOrAuto) => json!(2),
             (_, SettingKind::Text | SettingKind::Secret) => json!("sample"),
@@ -924,7 +925,9 @@ async fn saves_at_once_each_land_whole() {
     let keys = SETTINGS
         .iter()
         .filter(|spec| spec.access == SettingAccess::Editable)
-        .filter(|spec| matches!(spec.kind, SettingKind::Integer { max, .. } if max > 1_000))
+        .filter(|spec| {
+            matches!(spec.kind, SettingKind::Integer { min, max } if min <= 100 && max > 1_000)
+        })
         .map(|spec| spec.key)
         .take(8);
     let mut saves = tokio::task::JoinSet::new();

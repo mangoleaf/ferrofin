@@ -1662,12 +1662,18 @@ pub const VERIFIED: &[Verified] = &[
                ExceptionMiddleware does outside Development, the same on a live 12.4 for \
                each refusal. Compared: user lookup and lock, provider order, the disabled, \
                remote and schedule checks, the failure counter and lockout, the device and \
-               session limits, token rotation and session activity. The UserDto and \
-               SessionInfoDto builders are shared with other routes and not compared here",
-        date: "2026-11-01",
+               session limits, token rotation and session activity, and that upstream has \
+               no login rate limit. The UserDto and SessionInfoDto builders are shared with \
+               other routes and not compared here",
+        date: "2026-11-02",
         divergences: &[
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "Ferrofin's login backoff (owner decisions on gl-1099; upstream has no rate limit): \
+         past login_backoff_attempts failures an account's and a client address's next \
+         attempts wait, from 1 s doubling to login_backoff_max_delay_secs. An address that \
+         would wait longer is answered as a wrong password without its password being \
+         checked; an account only waits. The backoff never disables an account.",
             "Every failed login writes the dashboard's AuthenticationFailed entry, where upstream \
          publishes AuthenticationRequestEventArgs only for a wrong password: an exception from \
          AuthenticateUser (an unknown user, a disabled account) or a device or session-limit \

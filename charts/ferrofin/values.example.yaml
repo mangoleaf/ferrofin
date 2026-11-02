@@ -182,6 +182,15 @@ ferrofin:
     # made through the server apply at once; these only bound changes made outside it.
     # FERROFIN_AUTH_CACHE_TTL_SECS: "30"
     # FERROFIN_ROW_CACHE_TTL_SECS: "30"
+    # Failed logins an account or a client address may make before its next attempts
+    # wait (1 s, doubling to the maximum; the backoff never disables an account). Add the
+    # ingress to Known proxies, or every client shares its address and one
+    # guesser can get everyone's logins refused.
+    # FERROFIN_LOGIN_BACKOFF: "true"
+    # FERROFIN_LOGIN_BACKOFF_ATTEMPTS: "5"
+    # FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS: "30"
+    # FERROFIN_LOGIN_BACKOFF_WINDOW_MINS: "15"
+    # FERROFIN_LOGIN_BACKOFF_MAX_TRACKED: "100000"
     # How many trickplay images are generated at once (default: auto, up to the
     # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
     # hardware acceleration holds GPU memory; "1" matches Jellyfin.

@@ -871,6 +871,7 @@ pub async fn build_app_state(
             // Upstream `PostUserImage`: `{UserConfigurationDirectoryPath}/{Username}/`.
             .with_profile_image_dir(paths.user_configuration_directory_path())
             .with_auth_cache(Arc::clone(&auth_cache))
+            .with_login_backoff(config.login_backoff_settings())
             // A lockout is a dashboard Alert, not just a log line.
             .with_activity(Arc::clone(&activity))
             // Resolves each user's CastReceiverId against the configured
