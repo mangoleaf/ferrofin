@@ -1581,7 +1581,8 @@ mod tests {
                 wait_for_path: (kind == PlaylistKind::Progressive).then(|| playlist.clone()),
                 segment_container: Some(self.segment_container.clone()),
                 play_session_id: Some("sess".to_owned()),
-                device_id: Some("dev".to_owned()),
+                // The request's, as the real planner carries it.
+                device_id: request.device_id.clone(),
             };
             // The real planner's event args differ; the fake tags them so the
             // live path's choice of plan is observable.
@@ -2252,10 +2253,11 @@ mod tests {
         assert_eq!(mgr.restart_failures.lock().unwrap()[key].0, 1);
     }
 
-    /// The manager learns the user from the request on every start path: a
-    /// user's idle job yields to that user and to nobody else.
+    /// The manager learns the user from the authorization and the device from
+    /// the request's `DeviceId` on every start path: a user's idle job yields
+    /// to that user on that device, and to nobody else.
     #[tokio::test]
-    async fn every_start_path_passes_the_authenticated_user_on() {
+    async fn every_start_path_passes_the_user_and_device_on() {
         let alice = Some(uuid::Uuid::from_u128(0xA11CE));
         let bob = Some(uuid::Uuid::from_u128(0xB0B));
         for path in START_PATHS {
@@ -2268,6 +2270,16 @@ mod tests {
                 ..req()
             };
             assert_refused(path, &start_through(&mgr, path, &as_bob).await);
+            let as_alice_on_another_device = HlsStreamRequest {
+                user_id: alice,
+                device_id: Some("other".to_owned()),
+                query_string: "?deviceId=other".to_owned(),
+                ..req()
+            };
+            assert_refused(
+                path,
+                &start_through(&mgr, path, &as_alice_on_another_device).await,
+            );
             let as_alice = HlsStreamRequest {
                 user_id: alice,
                 ..req()
