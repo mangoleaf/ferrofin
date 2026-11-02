@@ -57,7 +57,10 @@ use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth, RequireAuthIgnoringSchedule};
+use crate::auth::{
+    AuthenticatedIdentity, RequireAdmin, RequireAuth, RequireAuthIgnoringSchedule,
+    is_administrator_identity,
+};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, ProblemDetails, Query};
 use crate::handlers::items::user_uuid;
@@ -530,7 +533,8 @@ async fn authentication_result(
 /// `GET /Users` — list users, optionally filtered by hidden/disabled.
 ///
 /// Port of `UserController.GetUsers`: applies the hidden/disabled filters, sorts
-/// by username, and projects each to a [`UserDto`].
+/// by username, and projects each to a [`UserDto`]. [`strip_other_accounts`] goes
+/// beyond upstream.
 #[utoipa::path(
     get,
     path = "/Users",
@@ -543,10 +547,11 @@ async fn authentication_result(
 )]
 async fn get_users(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Query(query): Query<GetUsersQuery>,
 ) -> Result<Json<Vec<UserDto>>, ApiError> {
-    let dtos = filtered_user_dtos(&state, query.is_hidden, query.is_disabled, None).await?;
+    let mut dtos = filtered_user_dtos(&state, query.is_hidden, query.is_disabled, None).await?;
+    strip_other_accounts(&state, Some(&auth), &mut dtos).await?;
     Ok(Json(dtos))
 }
 
@@ -556,6 +561,8 @@ async fn get_users(
 /// are returned in both wizard states. After setup, remote callers only see
 /// accounts that allow remote access, using the shared live network policy.
 /// Authenticated callers also filter by their device after setup.
+/// [`strip_other_accounts`] goes beyond upstream. It runs after the filters that
+/// read `Policy`, and a login screen, signed out, sees neither field on any row.
 #[utoipa::path(
     get,
     path = "/Users/Public",
@@ -586,7 +593,36 @@ async fn get_public_users(
                 .is_some_and(|policy| policy.enable_remote_access)
         });
     }
+    strip_other_accounts(&state, auth.as_ref(), &mut dtos).await?;
     Ok(Json(dtos))
+}
+
+/// Clears `Policy` and `Configuration` from the rows of accounts `caller` may not
+/// read them for: every row but the caller's own, unless the caller is an
+/// administrator or an API key. A signed-out caller (`None`, `/Users/Public` on a
+/// login screen) has no own row.
+///
+/// An owner decision that goes beyond Jellyfin, which strips nothing (gl-1102).
+/// Both fields are nullable in the contract, and a cleared one is left out of the
+/// JSON, as Jellyfin writes any null.
+async fn strip_other_accounts(
+    state: &AppState,
+    caller: Option<&AuthorizationInfo>,
+    dtos: &mut [UserDto],
+) -> Result<(), ApiError> {
+    if let Some(auth) = caller
+        && is_administrator_identity(state, auth).await?
+    {
+        return Ok(());
+    }
+    let own_id = caller
+        .map(AuthorizationInfo::user_id)
+        .filter(|id| !id.is_nil());
+    for dto in dtos.iter_mut().filter(|dto| Some(dto.id) != own_id) {
+        dto.policy = None;
+        dto.configuration = None;
+    }
+    Ok(())
 }
 
 /// Lists users matching the optional hidden/disabled filters, ordered by name and
@@ -598,7 +634,7 @@ async fn filtered_user_dtos(
     device_id: Option<&str>,
 ) -> Result<Vec<UserDto>, ApiError> {
     let mut users = state.users.get_users().await?;
-    users.sort_by(|a, b| a.username.cmp(&b.username));
+    sort_by_username(&mut users);
 
     let mut dtos = Vec::with_capacity(users.len());
     for user in &users {
@@ -624,10 +660,22 @@ async fn filtered_user_dtos(
     Ok(dtos)
 }
 
+/// Upstream's `OrderBy(u => u.Username)`, which compares by the current culture.
+fn sort_by_username(users: &mut [UserEntity]) {
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture()).ok();
+    users.sort_by(|a, b| {
+        comparer.as_ref().map_or_else(
+            || a.username.cmp(&b.username),
+            |comparer| comparer.compare(&a.username, &b.username),
+        )
+    });
+}
+
 /// `GET /Users/{userId}` — a single user by id.
 ///
 /// Port of `UserController.GetUserById`: a nil id is a `400`, a missing user
-/// a `404`.
+/// a `404`. [`strip_other_accounts`] goes beyond upstream.
 #[utoipa::path(
     get,
     path = "/Users/{userId}",
@@ -641,11 +689,13 @@ async fn filtered_user_dtos(
 )]
 async fn get_user_by_id(
     State(state): State<AppState>,
-    RequireAuthIgnoringSchedule(_auth): RequireAuthIgnoringSchedule,
+    RequireAuthIgnoringSchedule(auth): RequireAuthIgnoringSchedule,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<UserDto>, ApiError> {
     let user = load_user(&state, user_id).await?;
-    Ok(Json(state.users.get_user_dto(&user, None).await?))
+    let mut dto = state.users.get_user_dto(&user, None).await?;
+    strip_other_accounts(&state, Some(&auth), std::slice::from_mut(&mut dto)).await?;
+    Ok(Json(dto))
 }
 
 /// `DELETE /Users/{userId}` — delete a user.

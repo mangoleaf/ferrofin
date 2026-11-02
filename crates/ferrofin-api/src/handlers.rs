@@ -1853,6 +1853,58 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/Users",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "GetUsers",
+        ferrofin: "handlers/users.rs get_users → filtered_user_dtos (the private Get with \
+               filterByDevice and filterByNetwork off: IsHidden and IsDisabled through the \
+               projected policy; OrderBy(u => u.Username), the current culture's comparer) → \
+               ferrofin-core user_manager.rs get_user_dto (UserManager.GetUserDto: \
+               build_user_policy, resolve_cast_receiver_id); strip_other_accounts",
+        date: "2026-11-01",
+        divergences: &[
+            USER_FIELDS_STRIPPED,
+            USER_LYRIC_MANAGEMENT,
+            "The 400 (a value the query binder cannot convert) body is Ferrofin's error shape, \
+         not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Users/Public",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "GetPublicUsers",
+        ferrofin: "handlers/users.rs get_public_users (Get(false, false, false, false) until \
+               the wizard is done, then Get(false, false, true, true): the device from the \
+               authenticated claim only, and the live network policy's remote-access filter) → \
+               filtered_user_dtos → ferrofin-core user_manager.rs get_user_dto; \
+               strip_other_accounts, after the filters that read Policy",
+        date: "2026-11-01",
+        divergences: &[USER_FIELDS_STRIPPED, USER_LYRIC_MANAGEMENT],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Users/{userId}",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "GetUserById",
+        ferrofin: "handlers/users.rs get_user_by_id (RequireAuthIgnoringSchedule: \
+               IgnoreParentalControl; load_user: GetUserById's 400 for a nil id) → ferrofin-core \
+               user_manager.rs get_user_dto; strip_other_accounts",
+        date: "2026-11-01",
+        divergences: &[
+            USER_FIELDS_STRIPPED,
+            USER_LYRIC_MANAGEMENT,
+            "A route id padded with spaces is a 400; upstream's GuidConverter trims it. Fix \
+         path: gl-1038.",
+            "The 400 (a nil or malformed user id) and 404 (unknown user) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/Users",
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
@@ -2438,6 +2490,18 @@ const SESSIONS_DIVERGENCES: &[&str] = &[
      400 (a value the query binder cannot convert) bodies are Ferrofin's error shape, not \
      upstream's. Fix path: gl-666.",
 ];
+
+/// `GET /Users`, `/Users/Public` and `/Users/{userId}` leave other accounts'
+/// private fields out (handlers/users.rs strip_other_accounts).
+const USER_FIELDS_STRIPPED: &str = "Policy and Configuration are left out of every row but the \
+     caller's own, unless the caller is an administrator or an API key, and out of every row \
+     for an anonymous caller. Upstream sends both to every caller. Owner decision (gl-1102, \
+     2026-10-31).";
+
+/// `UserManager.GetUserDto` never copies this permission into its `UserPolicy`.
+const USER_LYRIC_MANAGEMENT: &str = "Policy.EnableLyricManagement reads the stored permission. \
+     Upstream's GetUserDto leaves it out, so it always reads false, and a client saving the \
+     policy it read clears the permission. Jellyfin bug not ported.";
 
 /// What `/UserItems/Resume` — and its legacy twin `/Users/{userId}/Items/Resume`,
 /// the same handler with the user from the route, which is hidden from the
