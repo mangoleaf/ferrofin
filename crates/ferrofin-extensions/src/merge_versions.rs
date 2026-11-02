@@ -2275,6 +2275,7 @@ mod tests {
                 ferrofin_traits::stubs::virtual_folders::DisabledVirtualFolderManager,
             ),
             chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
+            users: Arc::new(ferrofin_core::FerrofinUserManager::new(db.clone())),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);

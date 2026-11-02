@@ -1464,6 +1464,19 @@ pub struct PolicySaved {
     pub newly_disabled: bool,
 }
 
+/// What [`UserManager::apply_external_administrator`] did with the
+/// administrator flag a sign-in reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminFlagOutcome {
+    /// The user already had that flag; nothing was written.
+    Unchanged,
+    /// The user was promoted or demoted.
+    Applied,
+    /// The flag would have demoted the last administrator, so the user stays
+    /// one.
+    KeptLastAdministrator,
+}
+
 /// The state of the server a policy save is checked against: the user's
 /// current policy flags and the counts `UserController.UpdateUserPolicy`
 /// takes over all users.
@@ -1655,6 +1668,64 @@ pub trait UserManager: Send + Sync {
         Ok(PolicySaved {
             newly_disabled: policy.is_disabled && !state.was_disabled,
         })
+    }
+
+    /// Sets the administrator flag an external sign-in reported for a user:
+    /// an authentication provider's
+    /// [`ProviderAuthenticationResult::administrator`](crate::security::ProviderAuthenticationResult::administrator),
+    /// or a directory or identity-provider role on a sign-in path that does
+    /// not go through [`Self::authenticate_user`].
+    ///
+    /// The last administrator is never demoted, an owner decision
+    /// (2026-11-01): the user stays one and the sign-in goes on
+    /// ([`AdminFlagOutcome::KeptLastAdministrator`], which the concrete
+    /// manager logs as a warning). Unlike [`policy_update_refusal`], this
+    /// never refuses. The caller may hold the user's login lock, so an
+    /// implementation must not take it.
+    ///
+    /// The default reads the flags through this trait and saves with
+    /// [`Self::update_policy`], so impls without a store of their own compile
+    /// unchanged. An implementation whose `update_policy` takes the user's
+    /// login lock must override it, or the password path waits on that lock
+    /// forever. The concrete manager overrides it to count the
+    /// administrators inside the transaction that writes the flag, so two
+    /// administrators demoted by concurrent sign-ins cannot both pass the
+    /// check, and to take no lock.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::NotFound`] for an unknown user, or whatever the save
+    /// surfaces.
+    async fn apply_external_administrator(
+        &self,
+        user_id: Uuid,
+        administrator: bool,
+    ) -> Result<AdminFlagOutcome, ServiceError> {
+        let user = self
+            .get_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("user {user_id}")))?;
+        let mut policy = self
+            .get_user_dto(&user, None)
+            .await?
+            .policy
+            .unwrap_or_default();
+        if policy.is_administrator == administrator {
+            return Ok(AdminFlagOutcome::Unchanged);
+        }
+        if !administrator {
+            let mut administrators = 0_usize;
+            for other in self.get_users().await? {
+                let other = self.get_user_dto(&other, None).await?.policy;
+                administrators += usize::from(other.is_some_and(|p| p.is_administrator));
+            }
+            if administrators <= 1 {
+                return Ok(AdminFlagOutcome::KeptLastAdministrator);
+            }
+        }
+        policy.is_administrator = administrator;
+        self.update_policy(user_id, &policy).await?;
+        Ok(AdminFlagOutcome::Applied)
     }
 
     /// Clears a user's profile image: deletes the stored file (a missing file is

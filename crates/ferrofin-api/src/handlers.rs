@@ -1686,16 +1686,28 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/users.rs authenticate_by_name, authenticate, login_failure, \
                authentication_result → ferrofin-core session_manager.rs authenticate_internal \
                (AuthenticateNewSessionInternal), admit_session → user_manager.rs \
-               authenticate_user (UserManager.AuthenticateUser); a 401 or 403 answers as \
-               ExceptionMiddleware does outside Development, the same on a live 12.4 for \
-               each refusal. Compared: user lookup and lock, provider order, the disabled, \
-               remote and schedule checks, the failure counter and lockout, the device and \
-               session limits, token rotation and session activity. The UserDto and \
-               SessionInfoDto builders are shared with other routes and not compared here",
-        date: "2026-11-01",
+               authenticate_user (UserManager.AuthenticateUser), authentication_providers_for \
+               (GetAuthenticationProviders(User)), authenticate_with_providers \
+               (AuthenticateLocalUser) and apply_external_administrator; a 401 or 403 \
+               answers as ExceptionMiddleware does \
+               outside Development, the same on a live 12.4 for each refusal. Compared: user \
+               lookup and lock, provider order and selection by the saved id \
+               (AuthenticationManager::id, GetType().FullName), the provider's canonical \
+               username, the new-user policy, the saved provider id, the disabled, remote and \
+               schedule checks, the failure counter and lockout, the device and session \
+               limits, token rotation and session activity. The UserDto and SessionInfoDto \
+               builders are shared with other routes and not compared here",
+        date: "2026-11-02",
         divergences: &[
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "An authentication provider reports the user's administrator flag in its result \
+         (ProviderAuthenticationResult.administrator) and the user manager applies it \
+         (UserManager::apply_external_administrator), never demoting the last administrator: \
+         that sign-in succeeds, the user stays one and a warning is logged. Upstream's LDAP \
+         plugin writes the flag itself through UpdateUserAsync, which has no such guard. No \
+         built-in provider reports a flag. \
+         Owner decision (2026-11-01).",
             "Every failed login writes the dashboard's AuthenticationFailed entry, where upstream \
          publishes AuthenticationRequestEventArgs only for a wrong password: an exception from \
          AuthenticateUser (an unknown user, a disabled account) or a device or session-limit \
@@ -2060,6 +2072,25 @@ pub const VERIFIED: &[Verified] = &[
                (AuthenticationManager.GetApiKeys) → ferrofin-model security.rs \
                AuthenticationInfo, querying QueryResult::from_items",
         date: "2026-10-28",
+        divergences: &[
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Auth/Providers",
+        upstream_file: "Jellyfin.Api/Controllers/SessionController.cs",
+        upstream_method: "GetAuthProviders",
+        ferrofin: "handlers/session.rs get_auth_providers (RequireAdmin, \
+               Policies.RequiresElevation) → ferrofin-core user_manager.rs \
+               get_authentication_providers (UserManager.GetAuthenticationProviders) over the \
+               built-in default and the providers compiled-in extensions register \
+               (set_extension_providers). Compared: the IsEnabled filter, the Default \
+               provider first and the rest by Name in the current culture, and each pair's \
+               Name and Id (the provider's GetType().FullName, AuthenticationManager::id)",
+        date: "2026-11-02",
         divergences: &[
             "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
          error shape, not upstream's. Fix path: gl-666.",
