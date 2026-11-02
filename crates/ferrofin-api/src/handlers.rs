@@ -1039,8 +1039,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    ActivityLog listener \
                    (Jellyfin.Api/WebSocketListeners/ActivityLogWebSocketListener.cs) and the \
                    ScheduledTasks listener \
-                   (Jellyfin.Api/WebSocketListeners/ScheduledTasksWebSocketListener.cs)",
-        date: "2026-10-29",
+                   (Jellyfin.Api/WebSocketListeners/ScheduledTasksWebSocketListener.cs); \
+                   envelope serializes each frame's DTOs directly, in declaration order, as \
+                   WebSocketConnection.SendAsync's SerializeToUtf8Bytes does (property order \
+                   compared with MediaBrowser.Model/Dto/SessionInfoDto.cs, \
+                   Session/PlayerStateInfo.cs and Tasks/TaskInfo.cs)",
+        date: "2026-11-02",
         divergences: &[
             "Events already queued for a socket are drained and answered with one Sessions or \
              ActivityLogEntry frame, where upstream sends one per forced event: a burst yields \
@@ -1060,6 +1064,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              once the period has passed.",
             "A session list that cannot be built is logged and skipped and the subscription stays; \
              upstream logs it and drops the connection's subscription.",
+            "A session's NowPlayingItem map members (ImageTags, ProviderIds, ImageBlurHashes, \
+             Trickplay, RequiredHttpHeaders) are written in hash order, as on every item \
+             endpoint, not upstream's insertion order.",
             "A *Start whose Data is missing, has no second field or holds a field that does not \
              parse as a whole number still subscribes, at jellyfin-web's 1500 ms when the period \
              is at fault, where upstream's Start throws and makes no subscription.",
