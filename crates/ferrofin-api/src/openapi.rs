@@ -43,6 +43,7 @@ use utoipa::OpenApi;
         crate::handlers::merge_versions::split_episodes,
         crate::handlers::ferrofin_settings::get_settings,
         crate::handlers::ferrofin_settings::update_settings,
+        crate::handlers::ldap::test_server_bind,
         crate::handlers::plugins::get_plugins,
         crate::handlers::plugins::get_plugin_configuration,
         crate::handlers::plugins::update_plugin_configuration,

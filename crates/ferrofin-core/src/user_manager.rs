@@ -1277,14 +1277,16 @@ impl UserManager for FerrofinUserManager {
             )));
         }
 
-        // The `Permissions`/`Preferences`/`AccessSchedules`/`ImageInfos` rows are
-        // removed with the user; delete them explicitly so the port does not
-        // depend on schema cascade configuration.
+        // The `Permissions`/`Preferences`/`AccessSchedules`/`ImageInfos` rows and
+        // the user's `FerrofinExternalIdentities` links are removed with the
+        // user; delete them explicitly so the port does not depend on schema
+        // cascade configuration.
         for table in [
             "Permissions",
             "Preferences",
             "AccessSchedules",
             "ImageInfos",
+            "FerrofinExternalIdentities",
         ] {
             let sql = format!(r#"DELETE FROM "{table}" WHERE "UserId" = ?1"#);
             sqlx::query(sqlx::AssertSqlSafe(sql))
