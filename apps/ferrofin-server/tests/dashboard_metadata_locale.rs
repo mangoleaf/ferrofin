@@ -331,6 +331,9 @@ async fn saved_locales_change_provider_requests_without_restarting() {
         },
         studios_repo_url: endpoint.clone(),
         musicbrainz_base_url: endpoint.clone(),
+        // The mock serves its images on loopback, which image downloads refuse
+        // unless the allow-list names it.
+        image_private_http_allow: Some("127.0.0.1".to_owned()),
         ..Config::test_stub(tmp.path())
     })
     .await;
@@ -3905,7 +3908,7 @@ async fn verify_special_episode_display(api: &Api, root: &std::path::Path) {
         .unwrap();
     // A season in a library the user cannot open is closed to them too
     // (gl-1091), unlike upstream's parent gate.
-    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
 
     // With library access restored, an inherited/own parental-policy block
     // still applies, even when the request authenticates as admin and selects
@@ -3920,7 +3923,7 @@ async fn verify_special_episode_display(api: &Api, root: &std::path::Path) {
     for (path, expected) in [
         (
             format!("/Items?parentId={season_id}&userId={hidden_id}"),
-            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
         ),
         (
             format!("/Shows/{series_id}/Episodes?seasonId={season_id}&userId={hidden_id}"),

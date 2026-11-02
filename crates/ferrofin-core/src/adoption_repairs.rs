@@ -1,7 +1,8 @@
 //! One-shot boot repairs that port Jellyfin 12.0's code migrations for the
 //! data a schema migration cannot compute — the routines under
 //! `Jellyfin.Server/Migrations/Routines/2026*` that touch linked children,
-//! extras and version groups.
+//! extras and version groups, and the one that sweeps the extracted data
+//! left on disk for items no longer stored.
 //!
 //! Each repair is keyed in `FerrofinMeta` (or on the adoption record) and runs
 //! once per database; a second boot is a no-op. They run on every path — a
@@ -14,7 +15,7 @@
 //! saved after a repair ran stays as it was, so read "Migrations and one-shot
 //! repairs" in `CONTRIBUTING.md` before adding one.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ferrofin_db::Database;
 use ferrofin_db::entities::playback::UserDataEntity;
@@ -23,7 +24,7 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_util::string_extensions::upper_invariant;
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use uuid::Uuid;
 
@@ -1906,6 +1907,352 @@ pub async fn run_sweep_missing_items(
         );
     }
     Ok(())
+}
+
+/// The folders Jellyfin 12.0's `CleanupOrphanedExternalData`
+/// (`Jellyfin.Server/Migrations/Routines/20260525010000_CleanupOrphanedExternalData.cs`)
+/// sweeps, as this server resolves them.
+#[derive(Debug, Clone)]
+pub struct ExtractedDataRoots {
+    /// `IApplicationPaths.DataPath`, whose `attachments` and `subtitles`
+    /// folders hold the extracted attachment and subtitle caches.
+    pub data: PathBuf,
+    /// `IApplicationPaths.TrickplayPath` (`{data}/trickplay`): the trickplay
+    /// tiles not saved beside the media.
+    pub trickplay: PathBuf,
+    /// `IServerApplicationPaths.InternalMetadataPath`, whose `library` folder
+    /// holds each item's chapter images.
+    pub internal_metadata: PathBuf,
+}
+
+impl ExtractedDataRoots {
+    /// Upstream's four `CleanupGuidIndexedRoot` calls, in its order: each
+    /// root's label, path, and the subfolder of an orphan's folder that goes
+    /// (the whole folder when `None`).
+    fn sweeps(&self) -> [(&'static str, PathBuf, Option<&'static str>); 4] {
+        [
+            ("attachment", self.data.join("attachments"), None),
+            ("subtitle", self.data.join("subtitles"), None),
+            ("trickplay", self.trickplay.clone(), None),
+            (
+                "chapter image",
+                self.internal_metadata.join("library"),
+                Some("chapters"),
+            ),
+        ]
+    }
+}
+
+/// The `FerrofinMeta` key of [`cleanup_orphaned_external_data`].
+const ORPHANED_EXTERNAL_DATA_KEY: &str = "orphaned_external_data_cleaned_v150";
+
+/// Upstream's `ProgressLogStep`: the sweep logs its progress every this many
+/// directories it examines under a root.
+const ORPHAN_SWEEP_PROGRESS_STEP: usize = 500;
+
+/// The one-shot port of Jellyfin 12.0's `CleanupOrphanedExternalData`: the
+/// extracted data earlier versions left behind for items that are no longer
+/// stored. Under each of its roots ([`ExtractedDataRoots`]) it walks the
+/// two-character prefix folders and their `{id}` folders, and removes each
+/// `{id}` folder — under the metadata root only its `chapters` folder —
+/// whose id no `BaseItems` row has. Nothing else is touched: a folder whose
+/// name is not two characters at the first level, or not an id at the
+/// second, stays, and so do Ferrofin's `{metadata}/library/{GUID}` art
+/// folders and every trickplay folder saved beside the media.
+///
+/// Runs once on every database, Ferrofin's own and adopted ones alike:
+/// every Ferrofin before this one left these folders behind when a library
+/// scan removed an item. A database Jellyfin 12 already swept has nothing
+/// left to find.
+///
+/// It reads the database, never the library locations or the media, so a
+/// location that is unreachable cannot make it remove anything: an item
+/// under it keeps its row, and its folders with it.
+///
+/// Unlike upstream, the stored ids are read again after a root's walk, and
+/// a folder whose item was stored in between stays: the previous version
+/// can still be scanning during a rolling update, and its new items'
+/// extracted data must not go. An id folder is read as `Guid.TryParse`
+/// reads it, in the spellings both parsers take: 32 hex digits, hyphenated
+/// or braced, in either case. And where upstream's walk throws on a folder
+/// it cannot read and fails the start, this one logs it, passes over that
+/// folder, and leaves the sweep to run again on the next start; only a root
+/// that does not exist counts as swept.
+///
+/// Returns the number of folders removed.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the stored ids cannot be read or the
+/// bookkeeping write fails; the sweep is not marked done then.
+#[tracing::instrument(skip_all, name = "cleanup_orphaned_external_data")]
+pub async fn cleanup_orphaned_external_data(
+    db: &Database,
+    roots: &ExtractedDataRoots,
+) -> Result<usize, ServiceError> {
+    if !once(db, ORPHANED_EXTERNAL_DATA_KEY).await? {
+        return Ok(0);
+    }
+    let known = std::sync::Arc::new(stored_item_ids(db).await?);
+    let mut removed = 0;
+    let mut complete = true;
+    for (label, root, subfolder) in roots.sweeps() {
+        let swept = sweep_orphaned_root(db, label, root, subfolder, &known).await?;
+        removed += swept.removed;
+        complete &= swept.complete;
+    }
+    if complete {
+        done(db, ORPHANED_EXTERNAL_DATA_KEY).await?;
+    }
+    Ok(removed)
+}
+
+/// [`cleanup_orphaned_external_data`] and its summary line, for the
+/// composition root.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the sweep fails.
+pub async fn run_cleanup_orphaned_external_data(
+    db: &Database,
+    roots: &ExtractedDataRoots,
+) -> Result<(), ServiceError> {
+    let removed = cleanup_orphaned_external_data(db, roots).await?;
+    if removed > 0 {
+        tracing::info!(
+            folders = removed,
+            "removed extracted data of items that no longer exist"
+        );
+    }
+    Ok(())
+}
+
+/// Every stored item's id (`context.BaseItems.Select(b => b.Id)`).
+async fn stored_item_ids(db: &Database) -> Result<HashSet<Uuid>, ServiceError> {
+    let ids: Vec<String> = sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems""#)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect())
+}
+
+/// What one root's sweep did.
+#[derive(Debug, Default)]
+struct RootSweep {
+    /// The orphaned folders removed.
+    removed: usize,
+    /// Whether every folder under the root could be read: a sweep with a
+    /// part it could not read runs again on the next start.
+    complete: bool,
+}
+
+/// What one root's walk found.
+#[derive(Debug, Default)]
+struct RootWalk {
+    /// How many `{id}` folders it examined.
+    scanned: usize,
+    /// Each orphan's id, with the folder to remove.
+    orphans: Vec<(Uuid, PathBuf)>,
+    /// Whether every folder under the root could be read.
+    complete: bool,
+}
+
+/// `CleanupGuidIndexedRoot` for one root: the walk on the blocking pool,
+/// then — the stored ids read again — the removals.
+async fn sweep_orphaned_root(
+    db: &Database,
+    label: &'static str,
+    root: PathBuf,
+    subfolder: Option<&'static str>,
+    known: &std::sync::Arc<HashSet<Uuid>>,
+) -> Result<RootSweep, ServiceError> {
+    // `Directory.Exists` resolves a relative root against the working
+    // directory, and so does this: every folder removed is absolute.
+    let root = match std::path::absolute(&root) {
+        Ok(root) => root,
+        Err(err) => {
+            tracing::warn!(data = label, path = %root.display(), %err, "could not resolve an extracted-data folder; it is swept on the next start");
+            return Ok(RootSweep::default());
+        }
+    };
+    let walk_known = std::sync::Arc::clone(known);
+    let walk_root = root.clone();
+    let walk = tokio::task::spawn_blocking(move || {
+        orphaned_folders(label, &walk_root, subfolder, &walk_known)
+    })
+    .await
+    .map_err(|err| ServiceError::Backend(format!("sweeping orphaned {label} data: {err}")))?;
+    let removed = if walk.orphans.is_empty() {
+        0
+    } else {
+        let stored = stored_item_ids(db).await?;
+        let orphans: Vec<PathBuf> = walk
+            .orphans
+            .into_iter()
+            .filter(|(id, _)| !stored.contains(id))
+            .map(|(_, folder)| folder)
+            .collect();
+        tokio::task::spawn_blocking(move || remove_orphaned_folders(&orphans))
+            .await
+            .map_err(|err| {
+                ServiceError::Backend(format!("removing orphaned {label} data: {err}"))
+            })?
+    };
+    tracing::info!(
+        data = label,
+        path = %root.display(),
+        scanned = walk.scanned,
+        removed,
+        complete = walk.complete,
+        "finished the orphaned extracted-data cleanup"
+    );
+    Ok(RootSweep {
+        removed,
+        complete: walk.complete,
+    })
+}
+
+/// The walk of one root (`CleanupGuidIndexedRoot`'s loops): each `{id}`
+/// folder under a two-character folder whose id is not in `known`, with the
+/// folder to remove (`{id}/{subfolder}`, only where it exists). A root that
+/// does not exist is a complete, empty walk; one that cannot be read, or a
+/// folder or entry under it that cannot be, makes it incomplete (logged),
+/// and the rest is still walked.
+fn orphaned_folders(
+    label: &str,
+    root: &Path,
+    subfolder: Option<&str>,
+    known: &HashSet<Uuid>,
+) -> RootWalk {
+    let mut walk = RootWalk {
+        complete: true,
+        ..RootWalk::default()
+    };
+    match std::fs::metadata(root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            tracing::info!(data = label, path = %root.display(), "skipping the orphaned extracted-data cleanup: not a folder");
+            return walk;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(data = label, path = %root.display(), "skipping the orphaned extracted-data cleanup: the folder does not exist");
+            return walk;
+        }
+        Err(err) => {
+            tracing::warn!(data = label, path = %root.display(), %err, "could not read an extracted-data folder; it is swept on the next start");
+            walk.complete = false;
+            return walk;
+        }
+    }
+    tracing::info!(data = label, path = %root.display(), "looking for orphaned extracted data");
+    let Some(prefixes) = list_folder(label, root, &mut walk) else {
+        return walk;
+    };
+    for prefix in prefixes {
+        // `prefixName.Length != 2`, in UTF-16 code units as .NET counts.
+        let two_characters = prefix
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().encode_utf16().count() == 2);
+        if !two_characters || !prefix.is_dir() {
+            continue;
+        }
+        let Some(folders) = list_folder(label, &prefix, &mut walk) else {
+            continue;
+        };
+        for folder in folders {
+            if !folder.is_dir() {
+                continue;
+            }
+            walk.scanned += 1;
+            if walk.scanned.is_multiple_of(ORPHAN_SWEEP_PROGRESS_STEP) {
+                tracing::info!(
+                    data = label,
+                    scanned = walk.scanned,
+                    found = walk.orphans.len(),
+                    "looking for orphaned extracted data"
+                );
+            }
+            let Some(id) = folder
+                .file_name()
+                .and_then(|name| folder_guid(&name.to_string_lossy()))
+            else {
+                continue;
+            };
+            if known.contains(&id) {
+                continue;
+            }
+            let target = match subfolder {
+                Some(sub) => folder.join(sub),
+                None => folder,
+            };
+            if subfolder.is_some() && !target.is_dir() {
+                continue;
+            }
+            walk.orphans.push((id, target));
+        }
+    }
+    walk
+}
+
+/// The entries of `folder`, or `None` when it cannot be listed; a listing,
+/// or an entry of it, that fails marks `walk` incomplete (logged).
+fn list_folder(label: &str, folder: &Path, walk: &mut RootWalk) -> Option<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(data = label, path = %folder.display(), %err, "could not list an extracted-data folder; it is swept on the next start");
+            walk.complete = false;
+            return None;
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(err) => {
+                tracing::warn!(data = label, path = %folder.display(), %err, "could not read an entry of an extracted-data folder; it is swept on the next start");
+                walk.complete = false;
+            }
+        }
+    }
+    Some(paths)
+}
+
+/// `Guid.TryParse` of a folder name, over the spellings it shares with
+/// [`Uuid::parse_str`]: 32 hex digits, hyphenated, or hyphenated in braces,
+/// in either case. A `urn:uuid:` name, which .NET does not parse, is not an
+/// id; nor is .NET's parenthesised or hex-array form, which the server never
+/// writes: such a folder stays.
+fn folder_guid(name: &str) -> Option<Uuid> {
+    if !matches!(name.len(), 32 | 36 | 38) {
+        return None;
+    }
+    Uuid::parse_str(name).ok()
+}
+
+/// `TryDelete` for each orphaned folder: a folder that cannot be removed is
+/// logged and passed over. Never a root, an empty or a relative path
+/// ([`crate::item_deletion::is_deletable_path`]). Returns how many went.
+fn remove_orphaned_folders(folders: &[PathBuf]) -> usize {
+    let mut removed = 0;
+    for folder in folders {
+        if !crate::item_deletion::is_deletable_path(folder) {
+            tracing::warn!(path = %folder.display(), "refusing to delete an orphaned folder at a root or relative path");
+            continue;
+        }
+        match std::fs::remove_dir_all(folder) {
+            Ok(()) => {
+                tracing::debug!(path = %folder.display(), "removed an orphaned folder");
+                removed += 1;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(path = %folder.display(), %err, "could not delete an orphaned folder");
+            }
+        }
+    }
+    removed
 }
 
 /// The items `CleanupItemsFromDeletedLibraries` deletes: those whose
@@ -6363,5 +6710,213 @@ mod tests {
             "outside every location, and none resolved"
         );
         assert!(exists(&f.db, unrooted).await);
+    }
+
+    /// The four roots `CleanupOrphanedExternalData` sweeps, under `dir`.
+    fn extracted_roots(dir: &Path) -> ExtractedDataRoots {
+        ExtractedDataRoots {
+            data: dir.join("data"),
+            trickplay: dir.join("data/trickplay"),
+            internal_metadata: dir.join("metadata"),
+        }
+    }
+
+    /// An item's folder under a GUID-indexed root, `{root}/{xx}/{name}`,
+    /// with a file in it.
+    fn id_folder(root: &Path, name: &str) -> PathBuf {
+        let folder = root.join(&name[..2]).join(name);
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("data"), b"x").expect("file");
+        folder
+    }
+
+    /// An orphan's attachment, subtitle and trickplay folders go whole and
+    /// its chapter images go from its metadata folder, which stays; a stored
+    /// item keeps all of them in either id spelling; folders that are not
+    /// `{xx}/{id}` stay; a second boot is a no-op.
+    #[tokio::test]
+    async fn orphaned_extracted_data_is_removed_once() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().expect("temp");
+        let roots = extracted_roots(dir.path());
+        let (live, orphan) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, live, BaseItemKind::Movie).await;
+        let spellings = |id: Uuid| {
+            [
+                id.hyphenated().to_string(),
+                id.simple().to_string().to_uppercase(),
+            ]
+        };
+        let mut kept = Vec::new();
+        let mut gone = Vec::new();
+        for root in [
+            roots.data.join("attachments"),
+            roots.data.join("subtitles"),
+            roots.trickplay.clone(),
+        ] {
+            for name in spellings(live) {
+                kept.push(id_folder(&root, &name));
+            }
+            for name in spellings(orphan) {
+                gone.push(id_folder(&root, &name));
+            }
+            // Not two characters, not an id, a `urn:uuid:` name: no item's.
+            let odd = root.join("abc").join(orphan.hyphenated().to_string());
+            std::fs::create_dir_all(&odd).expect("odd");
+            kept.push(odd);
+            kept.push(id_folder(&root, "zz-not-an-id"));
+            kept.push(id_folder(&root, &orphan.urn().to_string()));
+        }
+        // The metadata root: only an orphan's `chapters` folder goes.
+        let metadata = roots.internal_metadata.join("library");
+        let orphan_meta = id_folder(&metadata, &orphan.simple().to_string());
+        std::fs::create_dir_all(orphan_meta.join("chapters")).expect("chapters");
+        let live_meta = id_folder(&metadata, &live.simple().to_string());
+        std::fs::create_dir_all(live_meta.join("chapters")).expect("chapters");
+        // Ferrofin's own art folder is no `{xx}/{id}` folder.
+        let art = metadata.join(orphan.hyphenated().to_string().to_uppercase());
+        std::fs::create_dir_all(&art).expect("art");
+
+        let removed = cleanup_orphaned_external_data(&db, &roots)
+            .await
+            .expect("sweep");
+        assert_eq!(
+            removed,
+            gone.len() + 1,
+            "every orphan folder and the chapters"
+        );
+        for folder in &gone {
+            assert!(!folder.exists(), "{} removed", folder.display());
+        }
+        for folder in &kept {
+            assert!(folder.exists(), "{} kept", folder.display());
+        }
+        assert!(
+            !orphan_meta.join("chapters").exists(),
+            "orphan's chapters removed"
+        );
+        assert!(
+            orphan_meta.join("data").exists(),
+            "the rest of its metadata folder stays"
+        );
+        assert!(
+            live_meta.join("chapters").exists(),
+            "a stored item's chapters stay"
+        );
+        assert!(art.exists(), "an art folder is not swept");
+
+        let late = id_folder(&roots.trickplay, &Uuid::new_v4().hyphenated().to_string());
+        assert_eq!(
+            cleanup_orphaned_external_data(&db, &roots)
+                .await
+                .expect("again"),
+            0
+        );
+        assert!(late.exists(), "a second boot sweeps nothing");
+    }
+
+    /// No root on disk: nothing to do, and the sweep is still done.
+    #[tokio::test]
+    async fn missing_roots_are_skipped_and_the_sweep_is_done() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().expect("temp");
+        let roots = extracted_roots(dir.path());
+        assert_eq!(
+            cleanup_orphaned_external_data(&db, &roots)
+                .await
+                .expect("sweep"),
+            0
+        );
+        let orphan = id_folder(&roots.trickplay, &Uuid::new_v4().hyphenated().to_string());
+        cleanup_orphaned_external_data(&db, &roots)
+            .await
+            .expect("again");
+        assert!(orphan.exists(), "done on the first boot");
+    }
+
+    /// A root or a prefix folder that cannot be listed is passed over and the
+    /// sweep runs again on the next boot.
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case::root(false)]
+    #[case::prefix_folder(true)]
+    #[tokio::test]
+    async fn an_unlistable_folder_is_swept_on_the_next_boot(#[case] prefix: bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let db = test_db().await;
+        let dir = tempfile::tempdir().expect("temp");
+        let roots = extracted_roots(dir.path());
+        let orphan = id_folder(&roots.trickplay, &Uuid::new_v4().hyphenated().to_string());
+        let locked = if prefix {
+            orphan.parent().expect("prefix").to_path_buf()
+        } else {
+            roots.trickplay.clone()
+        };
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("lock");
+        let listable = std::fs::read_dir(&locked).is_ok();
+        let first = cleanup_orphaned_external_data(&db, &roots).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+        if listable {
+            // Running as root: permissions do not stop the listing, and
+            // nothing here can be checked.
+            eprintln!("skipped: the locked folder is still listable (running as root?)");
+            return;
+        }
+        assert_eq!(first.expect("sweep"), 0);
+        assert!(orphan.exists());
+        assert_eq!(
+            cleanup_orphaned_external_data(&db, &roots)
+                .await
+                .expect("again"),
+            1,
+            "swept on the next boot"
+        );
+        assert!(!orphan.exists());
+    }
+
+    /// An item stored after the ids were first read (the previous version
+    /// still scanning) keeps its folder: the ids are read again before
+    /// anything goes.
+    #[tokio::test]
+    async fn an_item_stored_during_the_walk_keeps_its_folder() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().expect("temp");
+        let roots = extracted_roots(dir.path());
+        let (stored, orphan) = (Uuid::new_v4(), Uuid::new_v4());
+        let stored_folder = id_folder(&roots.trickplay, &stored.hyphenated().to_string());
+        let orphan_folder = id_folder(&roots.trickplay, &orphan.hyphenated().to_string());
+        // The ids as the boot first read them, before `stored` was saved.
+        let before = std::sync::Arc::new(HashSet::new());
+        seed_item(&db, stored, BaseItemKind::Movie).await;
+        let removed = sweep_orphaned_root(&db, "trickplay", roots.trickplay.clone(), None, &before)
+            .await
+            .expect("sweep");
+        assert_eq!((removed.removed, removed.complete), (1, true));
+        assert!(stored_folder.exists(), "stored since: kept");
+        assert!(!orphan_folder.exists());
+    }
+
+    /// `Guid.TryParse`'s spellings that the server writes; nothing else.
+    #[test]
+    fn folder_names_parse_as_ids_in_the_spellings_both_parsers_take() {
+        let id = Uuid::new_v4();
+        for name in [
+            id.simple().to_string(),
+            id.simple().to_string().to_uppercase(),
+            id.hyphenated().to_string(),
+            id.hyphenated().to_string().to_uppercase(),
+            id.braced().to_string(),
+        ] {
+            assert_eq!(folder_guid(&name), Some(id), "{name}");
+        }
+        for name in [
+            id.urn().to_string(),
+            format!("({})", id.hyphenated()),
+            format!(" {}", id.hyphenated()),
+            "ab".to_owned(),
+            String::new(),
+        ] {
+            assert_eq!(folder_guid(&name), None, "{name}");
+        }
     }
 }

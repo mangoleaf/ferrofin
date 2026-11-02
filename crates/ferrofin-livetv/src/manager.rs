@@ -9561,6 +9561,7 @@ mod tests {
         );
         assert_eq!(opened.container.as_deref(), Some("ts"));
         assert!(opened.requires_closing);
+        assert!(opened.path_is_private, "stays set once buffered");
         let live_id = opened.live_stream_id.clone().expect("live stream id");
         assert_eq!(
             live_id,
@@ -9588,6 +9589,7 @@ mod tests {
             .expect("join");
         assert_eq!(joined.live_stream_id.as_deref(), Some(live_id.as_str()));
         assert_eq!(joined.path.as_deref(), Some(path.as_str()));
+        assert!(joined.path_is_private);
         assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // The first close only decrements; the stream stays up for the other.

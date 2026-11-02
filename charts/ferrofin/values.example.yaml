@@ -191,6 +191,10 @@ ferrofin:
     # FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS: "30"
     # FERROFIN_LOGIN_BACKOFF_WINDOW_MINS: "15"
     # FERROFIN_LOGIN_BACKOFF_MAX_TRACKED: "100000"
+    # Prepared statements each SQLite connection keeps (100-1024, default 200).
+    # Each connection of the pool keeps its own, about 16 KiB a statement, so a
+    # larger value costs memory on every connection.
+    # FERROFIN_DB_STATEMENT_CACHE: "200"
     # How many trickplay images are generated at once (default: auto, up to the
     # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
     # hardware acceleration holds GPU memory; "1" matches Jellyfin.
@@ -222,6 +226,9 @@ ferrofin:
     # (a channel logo that is gone, say) is left alone before it is tried again.
     # FERROFIN_IMAGE_DOWNLOAD_MAX_MB: "64"
     # FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS: "3600"
+    # Image downloads refuse private/LAN addresses, a Live TV tuner's host
+    # aside. List the LAN hosts or networks that serve your artwork:
+    # FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW: "nas.lan,192.168.1.0/24"
 
     # The most jobs re-encoding a stream the server runs at once, and one user
     # runs at once. Past either cap the user's idle jobs are ended first; with

@@ -94,6 +94,12 @@ async fn fixture() -> Fixture {
     ));
     let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
         Arc::new(ItemTypeLookup::new());
+    let external = Arc::new(RecordingExternalData::default());
+    let _ = external.db.set(db.clone());
+    let item_data = Arc::new(crate::item_data_cleanup::ItemDataCleanup::new(Arc::clone(
+        &paths,
+    )));
+    item_data.set_external_data(external.clone());
     let manager = FerrofinLibraryManager::new(
         Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
         Arc::new(FerrofinItemCountService::new(db.clone())),
@@ -101,12 +107,10 @@ async fn fixture() -> Fixture {
         Arc::new(FerrofinPeopleRepository::new(db.clone())),
     )
     .with_app_paths(paths)
+    .with_item_data_cleanup(item_data)
     .with_linked_children(Arc::new(
         crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone()),
     ));
-    let external = Arc::new(RecordingExternalData::default());
-    let _ = external.db.set(db.clone());
-    manager.set_external_data(external.clone());
     Fixture {
         db,
         manager,

@@ -152,6 +152,8 @@ fn answer(line: &str, answers: Answers) -> Option<&'static str> {
 
 /// Starts the stand-in; returns its base URL and its request log.
 fn spawn_providers(answers: Answers) -> (String, Arc<Mutex<Vec<String>>>) {
+    // Images are served on loopback, which downloads refuse by default.
+    ferrofin_providers::destination::test_support::allow_loopback_images();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&requests);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");

@@ -31,7 +31,7 @@
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, RwLock, Weak};
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -41,20 +41,24 @@ use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use ferrofin_model::configuration::{SubtitlePlaybackMode, UserConfiguration};
 use ferrofin_model::data::UnratedItem;
 use ferrofin_model::dto::{NameIdPair, UserDto};
-use ferrofin_model::users::{SyncPlayUserAccessType, UserPolicy};
+use ferrofin_model::users::{
+    ForgotPasswordResult, PinRedeemResult, SyncPlayUserAccessType, UserPolicy,
+};
 use ferrofin_util::string_extensions::upper_invariant;
 use sqlx::{Sqlite, SqliteExecutor};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{PolicyGuardState, PolicySaved, UserManager, policy_update_refusal};
-use ferrofin_traits::security::AuthenticationManager;
+use ferrofin_traits::library::{
+    AdminFlagOutcome, PolicyGuardState, PolicySaved, UserManager, policy_update_refusal,
+};
+use ferrofin_traits::security::{AuthenticationManager, PasswordResetManager};
 
 use crate::auth_providers::{
-    DEFAULT_AUTH_PROVIDER_ID, DefaultAuthenticationProvider, INVALID_AUTH_PROVIDER_ID,
-    InvalidAuthProvider,
+    DEFAULT_AUTH_PROVIDER_ID, DefaultAuthenticationProvider, InvalidAuthProvider,
 };
 use crate::db_error::db_err;
+use crate::password_reset::{DEFAULT_PASSWORD_RESET_PROVIDER_NAME, DefaultPasswordResetProvider};
 use crate::user_entity_ext::{
     has_permission, is_parental_schedule_allowed, seed_defaults, set_permission, set_permission_tx,
     set_preference_tx,
@@ -87,7 +91,11 @@ pub use login_backoff::LoginBackoffSettings;
 ///
 /// Holds the registered [`AuthenticationManager`] providers by shared reference
 /// so the composition root can supply LDAP/other backends alongside the
-/// built-in default; the built-in [`DefaultAuthenticationProvider`] is kept
+/// built-in default, those of compiled-in extensions joining late
+/// ([`set_extension_providers`](Self::set_extension_providers)). A provider
+/// is stored and selected by its [`id`](AuthenticationManager::id) and shown
+/// by its [`name`](AuthenticationManager::name). The built-in
+/// [`DefaultAuthenticationProvider`] is kept
 /// separately for its password-hash formatting helper (which is not on the
 /// object-safe trait).
 #[derive(Clone)]
@@ -100,6 +108,27 @@ pub struct FerrofinUserManager {
     default_provider: DefaultAuthenticationProvider,
     invalid_provider: InvalidAuthProvider,
     providers: Vec<Arc<dyn AuthenticationManager>>,
+    /// The providers compiled-in extensions contribute, consulted after
+    /// [`providers`](Self::providers). The manager is built long before the
+    /// extensions are, so the composition root fills this once they are
+    /// wired ([`set_extension_providers`](Self::set_extension_providers)).
+    /// It is behind an `Arc` so every clone of the manager sees that fill.
+    extension_providers: Arc<OnceLock<Vec<Arc<dyn AuthenticationManager>>>>,
+    /// The password-reset providers compiled-in extensions contribute,
+    /// offered after the built-in PIN-file provider. Filled once, like
+    /// [`extension_providers`](Self::extension_providers)
+    /// ([`set_extension_reset_providers`](Self::set_extension_reset_providers)).
+    extension_reset_providers: Arc<OnceLock<Vec<Arc<dyn PasswordResetManager>>>>,
+    /// Where the built-in provider writes its PIN files: upstream's
+    /// `ProgramDataPath`. Set by the composition root
+    /// ([`with_password_reset_dir`](Self::with_password_reset_dir)); `None`
+    /// fails a request to issue one.
+    password_reset_dir: Option<std::path::PathBuf>,
+    /// Serializes the built-in provider's PIN-file work (issuing a file, and
+    /// redeeming one through the password save), so two redemptions of one PIN
+    /// reset the password once. Only that provider takes it: another provider
+    /// never waits on it. Shared by every clone.
+    password_reset_lock: Arc<tokio::sync::Mutex<()>>,
     /// This server's stable id, stamped onto every [`UserDto.ServerId`] when the
     /// caller does not supply one. The web client keys its per-server api-client
     /// on it and throws (`getApiClient(null)`) if it is missing. Set by the
@@ -127,7 +156,7 @@ pub struct FerrofinUserManager {
 impl std::fmt::Debug for FerrofinUserManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FerrofinUserManager")
-            .field("provider_count", &self.providers.len())
+            .field("provider_count", &self.registered_providers().count())
             .finish_non_exhaustive()
     }
 }
@@ -172,7 +201,23 @@ impl FerrofinUserManager {
         }
     }
 
+    /// Every registered provider in the order sign-in consults them (C#
+    /// `_authenticationProviders`, the built-in types before the plugins'): the
+    /// built-in default, any [`with_providers`](Self::with_providers) extras,
+    /// then the extensions' ([`set_extension_providers`](Self::set_extension_providers)).
+    fn registered_providers(&self) -> impl Iterator<Item = &dyn AuthenticationManager> {
+        self.providers
+            .iter()
+            .chain(self.extension_providers.get().into_iter().flatten())
+            .map(Arc::as_ref)
+    }
+
     /// Enabled providers selected by the saved ID; an unknown ID fails closed.
+    ///
+    /// The id is matched before `is_enabled` is asked, the reverse of C#'s
+    /// `Where(IsEnabled)` then `Where(id)`, with the same result: a provider
+    /// another user's sign-in never selects is not consulted, so an extension
+    /// provider whose `is_enabled` fails cannot fail a local account's sign-in.
     async fn authentication_providers_for(
         &self,
         user: Option<&UserEntity>,
@@ -181,11 +226,11 @@ impl FerrofinUserManager {
             .map(|u| u.authentication_provider_id.as_str())
             .filter(|id| !id.is_empty());
         let mut candidates: Vec<&dyn AuthenticationManager> = Vec::new();
-        for provider in &self.providers {
-            if provider.is_enabled().await?
-                && wanted.is_none_or(|id| provider_id(provider.name()).eq_ignore_ascii_case(id))
+        for provider in self.registered_providers() {
+            if wanted.is_none_or(|id| provider.id().eq_ignore_ascii_case(id))
+                && provider.is_enabled().await?
             {
-                candidates.push(provider.as_ref());
+                candidates.push(provider);
             }
         }
         if candidates.is_empty() {
@@ -211,7 +256,7 @@ impl FerrofinUserManager {
                 Err(ServiceError::Unauthorized(_)) => continue,
                 Err(error) => return Err(error),
             };
-            let id = provider_id(provider.name());
+            let id = provider.id();
             let mut resolved = if let Some(user) = &user {
                 self.fetch_user(
                     Uuid::parse_str(&user.id)
@@ -240,6 +285,17 @@ impl FerrofinUserManager {
                     .map_err(db_err)?;
                 id.clone_into(&mut user.authentication_provider_id);
                 self.users_changed();
+            }
+            // After the new-user policy, so the provider's flag is the last word.
+            // As upstream's LDAP plugin sets it inside `Authenticate`, this
+            // comes before the disabled, remote-access and schedule checks.
+            if let Some(administrator) = result.administrator
+                && let Some(user) = &resolved
+            {
+                let uid = Uuid::parse_str(&user.id)
+                    .map_err(|error| ServiceError::backend(error.to_string()))?;
+                self.apply_external_administrator(uid, administrator)
+                    .await?;
             }
             return Ok((resolved, true));
         }
@@ -315,6 +371,10 @@ impl FerrofinUserManager {
             default_provider: DefaultAuthenticationProvider::new(),
             invalid_provider: InvalidAuthProvider::new(),
             providers,
+            extension_providers: Arc::default(),
+            extension_reset_providers: Arc::default(),
+            password_reset_dir: None,
+            password_reset_lock: Arc::default(),
             server_id: None,
             activity: None,
             config: None,
@@ -322,6 +382,132 @@ impl FerrofinUserManager {
             image_processor: None,
             auth_cache: Arc::new(crate::auth_cache::AuthCache::default()),
         }
+    }
+
+    /// Registers the authentication providers compiled-in extensions
+    /// contribute, consulted after the built-in default and any
+    /// [`with_providers`](Self::with_providers) extras, in the order given.
+    ///
+    /// Called once by the composition root after the extensions are wired:
+    /// the manager exists long before they do. Every clone of this manager,
+    /// earlier or later, sees the providers. A second call is a no-op and
+    /// logs a warning.
+    ///
+    /// A provider may hold the user manager it is registered with, a
+    /// reference cycle. Both live for the whole process, so it is never freed,
+    /// which is harmless.
+    pub fn set_extension_providers(&self, providers: Vec<Arc<dyn AuthenticationManager>>) {
+        if self.extension_providers.set(providers).is_err() {
+            tracing::warn!("extension authentication providers were already registered; ignoring");
+        }
+    }
+
+    /// Registers the password-reset providers compiled-in extensions
+    /// contribute, offered after the built-in PIN-file provider, in the order
+    /// given. Called once by the composition root with
+    /// [`set_extension_providers`](Self::set_extension_providers); every clone
+    /// sees them, and a second call is a no-op that logs a warning.
+    pub fn set_extension_reset_providers(&self, providers: Vec<Arc<dyn PasswordResetManager>>) {
+        if self.extension_reset_providers.set(providers).is_err() {
+            tracing::warn!("extension password-reset providers were already registered; ignoring");
+        }
+    }
+
+    /// Sets the directory the built-in password-reset provider writes its PIN
+    /// files to: upstream's `ProgramDataPath`. Called once by the composition
+    /// root.
+    #[must_use]
+    pub fn with_password_reset_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.password_reset_dir = Some(dir.into());
+        self
+    }
+
+    /// The directory the built-in password-reset provider writes its PIN
+    /// files to, once [`with_password_reset_dir`](Self::with_password_reset_dir)
+    /// set it.
+    pub(crate) fn password_reset_dir(&self) -> Option<&std::path::Path> {
+        self.password_reset_dir.as_deref()
+    }
+
+    /// The lock the built-in password-reset provider holds across its PIN-file
+    /// work.
+    pub(crate) fn password_reset_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.password_reset_lock
+    }
+
+    /// Writes the dashboard's "Password has been changed" entry (upstream's
+    /// `UserPasswordChangedLogger`, which every `ChangePassword` raises) for a
+    /// password a recovery PIN set. A failed write is not the reset's failure.
+    pub(crate) async fn log_password_changed(&self, user_id: Uuid, username: &str) {
+        if let Some(activity) = &self.activity
+            && let Err(error) = activity
+                .create_entry(ferrofin_traits::activity::ActivityLogCreate {
+                    name: format!("Password has been changed for user {username}"),
+                    type_: "UserPasswordChanged".to_owned(),
+                    user_id: Some(user_id),
+                    ..Default::default()
+                })
+                .await
+        {
+            tracing::debug!(%error, %user_id, "could not write the password-changed activity entry");
+        }
+    }
+
+    /// The password-reset providers compiled-in extensions registered, in
+    /// order. The built-in PIN-file provider comes before them and is built
+    /// per request ([`DefaultPasswordResetProvider`]).
+    fn extension_reset_providers(&self) -> impl Iterator<Item = &dyn PasswordResetManager> {
+        self.extension_reset_providers
+            .get()
+            .into_iter()
+            .flatten()
+            .map(Arc::as_ref)
+    }
+
+    /// The provider a forgotten-password request for `user` goes to (C#
+    /// `GetPasswordResetProvider(User)`): no user gets the built-in provider,
+    /// and a user gets the first enabled provider whose id their saved
+    /// `PasswordResetProviderId` names (case-insensitive), any enabled one when
+    /// it is blank, or the built-in provider when none matches.
+    async fn password_reset_provider_for<'a>(
+        &'a self,
+        user: Option<&UserEntity>,
+        default: &'a DefaultPasswordResetProvider<'a>,
+    ) -> Result<&'a dyn PasswordResetManager, ServiceError> {
+        let Some(user) = user else {
+            return Ok(default);
+        };
+        let wanted = Some(user.password_reset_provider_id.as_str()).filter(|id| !id.is_empty());
+        let providers = std::iter::once(default as &dyn PasswordResetManager)
+            .chain(self.extension_reset_providers());
+        for provider in providers {
+            if wanted.is_none_or(|id| provider.id().eq_ignore_ascii_case(id))
+                && provider.is_enabled().await?
+            {
+                return Ok(provider);
+            }
+        }
+        Ok(default)
+    }
+
+    /// Offers `pin` to each provider in turn and answers the first that
+    /// redeems it (C# `RedeemPasswordResetPin`). A provider's error stops the
+    /// redemption, as upstream's exception does. When none redeems it, the
+    /// answer is upstream's: its built-in provider throws
+    /// `ResourceNotFoundException`, a `404`.
+    async fn redeem_with(
+        providers: &[&dyn PasswordResetManager],
+        pin: &str,
+    ) -> Result<PinRedeemResult, ServiceError> {
+        for provider in providers {
+            let result = provider.redeem_password_reset_pin(pin).await?;
+            if result.success {
+                return Ok(result);
+            }
+        }
+        Err(ServiceError::not_found(
+            "no matching password reset request",
+        ))
     }
 
     /// Shares the live network policy used by HTTP authorization and trusted
@@ -822,18 +1008,6 @@ impl FerrofinUserManager {
     }
 }
 
-/// The stored provider id for a provider `name` (C# `GetType().FullName`). The
-/// two built-in providers map to their canonical `Jellyfin.*` type names so a
-/// migrated database matches; any other provider is assumed to already report
-/// its fully-qualified id as its name.
-fn provider_id(name: &str) -> &str {
-    match name {
-        "Default" => DEFAULT_AUTH_PROVIDER_ID,
-        "InvalidOrMissingAuthenticationProvider" => INVALID_AUTH_PROVIDER_ID,
-        other => other,
-    }
-}
-
 /// The C# `ValidUsernameRegex` (`^(?!\s)[\w\ \-'._@+]+(?<!\s)$`,
 /// `UserManager.cs:119`) without its lookarounds, which [`valid_username`]
 /// checks itself. .NET's `\w` is `[\p{L}\p{Mn}\p{Nd}\p{Pc}]`, narrower than
@@ -1182,7 +1356,7 @@ impl UserManager for FerrofinUserManager {
         let candidates = self.authentication_providers_for(Some(&user)).await?;
         let provider = candidates[0]; // The invalid-provider fallback guarantees a candidate.
         provider.change_password(&user, new_password).await?;
-        if provider_id(provider.name()) != DEFAULT_AUTH_PROVIDER_ID {
+        if provider.id() != DEFAULT_AUTH_PROVIDER_ID {
             self.users_changed();
             return Ok(());
         }
@@ -1322,30 +1496,108 @@ impl UserManager for FerrofinUserManager {
 
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
         let mut pairs = Vec::new();
-        for provider in &self.providers {
+        for provider in self.registered_providers() {
             if provider.is_enabled().await? {
                 pairs.push(NameIdPair {
                     name: Some(provider.name().to_owned()),
-                    id: Some(provider_id(provider.name()).to_owned()),
+                    id: Some(provider.id().to_owned()),
                 });
             }
         }
-        // Default provider first, then by name (C# ordering).
+        // C# `OrderBy(i => i is DefaultAuthenticationProvider ? 0 : 1)
+        // .ThenBy(i => i.Name)`: a stable sort, the names compared in the
+        // current culture (`Comparer<string>.Default`). A stock server lists
+        // Default alone, which needs no comparer.
+        if pairs.len() < 2 {
+            return Ok(pairs);
+        }
+        let comparer =
+            ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture())
+                .ok();
         pairs.sort_by(|a, b| {
             let rank =
                 |p: &NameIdPair| i32::from(p.id.as_deref() != Some(DEFAULT_AUTH_PROVIDER_ID));
-            rank(a).cmp(&rank(b)).then_with(|| a.name.cmp(&b.name))
+            let (a_name, b_name) = (
+                a.name.as_deref().unwrap_or_default(),
+                b.name.as_deref().unwrap_or_default(),
+            );
+            rank(a).cmp(&rank(b)).then_with(|| {
+                comparer.as_ref().map_or_else(
+                    || a_name.cmp(b_name),
+                    |comparer| comparer.compare(a_name, b_name),
+                )
+            })
         });
         Ok(pairs)
     }
 
     async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
-        // Unknown saved IDs fall back to this sole registered provider, just
-        // as UserManager.GetPasswordResetProviders does upstream.
-        Ok(vec![NameIdPair {
-            name: Some("Default Password Reset Provider".to_owned()),
-            id: Some(DEFAULT_PASSWORD_RESET_PROVIDER_ID.to_owned()),
-        }])
+        // C# `Where(IsEnabled).OrderBy(i => i is DefaultPasswordResetProvider
+        // ? 0 : 1).ThenBy(i => i.Name)`: the built-in provider is always
+        // enabled and first, the rest follow by name in the current culture.
+        let mut pairs = Vec::new();
+        for provider in self.extension_reset_providers() {
+            if provider.is_enabled().await? {
+                pairs.push(NameIdPair {
+                    name: Some(provider.name().to_owned()),
+                    id: Some(provider.id().to_owned()),
+                });
+            }
+        }
+        if pairs.len() > 1 {
+            let comparer = ferrofin_util::current_culture::comparer(
+                &ferrofin_util::current_culture::capture(),
+            )
+            .ok();
+            pairs.sort_by(|a, b| {
+                let (a, b) = (
+                    a.name.as_deref().unwrap_or_default(),
+                    b.name.as_deref().unwrap_or_default(),
+                );
+                comparer
+                    .as_ref()
+                    .map_or_else(|| a.cmp(b), |comparer| comparer.compare(a, b))
+            });
+        }
+        pairs.insert(
+            0,
+            NameIdPair {
+                name: Some(DEFAULT_PASSWORD_RESET_PROVIDER_NAME.to_owned()),
+                id: Some(DEFAULT_PASSWORD_RESET_PROVIDER_ID.to_owned()),
+            },
+        );
+        Ok(pairs)
+    }
+
+    async fn start_forgot_password_process(
+        &self,
+        entered_username: &str,
+        is_in_network: bool,
+    ) -> Result<ForgotPasswordResult, ServiceError> {
+        let user = if entered_username.trim().is_empty() {
+            None
+        } else {
+            self.get_user_by_name(entered_username).await?
+        };
+        let default = DefaultPasswordResetProvider::new(self);
+        // Upstream then saves the user unchanged (`UpdateUserAsync`) for a
+        // local request; a provider here gets the row read-only, so there is
+        // nothing of its to save.
+        self.password_reset_provider_for(user.as_ref(), &default)
+            .await?
+            .start_forgot_password_process(user.as_ref(), entered_username, is_in_network)
+            .await
+    }
+
+    async fn redeem_password_reset_pin(&self, pin: &str) -> Result<PinRedeemResult, ServiceError> {
+        let default = DefaultPasswordResetProvider::new(self);
+        // Every provider, enabled or not, in upstream's order: the built-in
+        // one first. The built-in one serializes its own file work.
+        let providers: Vec<&dyn PasswordResetManager> =
+            std::iter::once(&default as &dyn PasswordResetManager)
+                .chain(self.extension_reset_providers())
+                .collect();
+        Self::redeem_with(&providers, pin).await
     }
 
     async fn get_user_dto(
@@ -1529,6 +1781,44 @@ impl UserManager for FerrofinUserManager {
         policy: &UserPolicy,
     ) -> Result<PolicySaved, ServiceError> {
         self.save_policy(user_id, policy, true).await
+    }
+
+    /// One writer transaction reads the flag, counts the administrators and
+    /// writes, so concurrent sign-ins cannot both demote one of the last two
+    /// administrators. It takes no login lock: the password path calls it
+    /// while holding the user's, which does not nest (`save_policy` would wait
+    /// on it forever).
+    async fn apply_external_administrator(
+        &self,
+        user_id: Uuid,
+        administrator: bool,
+    ) -> Result<AdminFlagOutcome, ServiceError> {
+        let id = guid_to_db(user_id);
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let user = Self::fetch_user_on(&mut *tx, user_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("user {user_id}")))?;
+        if has_permission(&mut *tx, &id, PermissionKind::IsAdministrator).await? == administrator {
+            return Ok(AdminFlagOutcome::Unchanged);
+        }
+        if !administrator && Self::admin_count_on(&mut *tx).await? <= 1 {
+            tracing::warn!(
+                user_id = %user.id,
+                username = %user.username,
+                "sign-in would demote the last administrator; keeping them one"
+            );
+            return Ok(AdminFlagOutcome::KeptLastAdministrator);
+        }
+        set_permission_tx(&mut tx, &id, PermissionKind::IsAdministrator, administrator).await?;
+        tx.commit().await.map_err(db_err)?;
+        self.users_changed();
+        tracing::info!(
+            user_id = %user.id,
+            username = %user.username,
+            administrator,
+            "sign-in set the administrator flag"
+        );
+        Ok(AdminFlagOutcome::Applied)
     }
 
     async fn save_profile_image(
@@ -3327,3 +3617,7 @@ mod tests {
 #[cfg(test)]
 #[path = "user_manager/provider_tests.rs"]
 mod provider_tests;
+
+#[cfg(test)]
+#[path = "user_manager/password_reset_tests.rs"]
+mod password_reset_tests;

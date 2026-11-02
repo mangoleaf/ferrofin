@@ -14,6 +14,16 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 
+/// A loopback listener for a mock server. Image downloads refuse loopback
+/// unless the server's policy lets them reach it (gl-1096), so binding one
+/// lets them: a test serving images here needs nothing else. A test of the
+/// refusal itself gives its client its own policy
+/// (`image_download::ImageHttp::new`).
+async fn bind() -> TcpListener {
+    crate::destination::test_support::allow_loopback_images();
+    TcpListener::bind("127.0.0.1:0").await.expect("bind mock")
+}
+
 /// A running mock server; its [`base_url`](Self::base_url) is handed to a client.
 /// The background task is aborted on drop.
 pub struct MockServer {
@@ -42,7 +52,7 @@ impl MockServer {
     pub async fn with_headers(routes: Vec<(&'static str, String)>, headers: &'static str) -> Self {
         let routes = Arc::new(routes);
         let targets = Arc::new(Mutex::new(Vec::new()));
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let listener = bind().await;
         let port = listener.local_addr().expect("addr").port();
         let handle = tokio::spawn({
             let targets = Arc::clone(&targets);
@@ -92,7 +102,7 @@ impl MockServer {
     /// suffix. An unmatched request gets `404`.
     pub async fn start_typed(routes: Vec<(&'static str, &'static str, Vec<u8>)>) -> Self {
         let routes = Arc::new(routes);
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let listener = bind().await;
         let port = listener.local_addr().expect("addr").port();
         let handle = tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
@@ -136,7 +146,7 @@ impl MockServer {
     async fn start_raw_inner(responses: Vec<Vec<u8>>, stall: bool) -> Self {
         let responses = Arc::new(responses);
         let requests = Arc::new(AtomicUsize::new(0));
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let listener = bind().await;
         let port = listener.local_addr().expect("addr").port();
         let handle = tokio::spawn({
             let requests = Arc::clone(&requests);

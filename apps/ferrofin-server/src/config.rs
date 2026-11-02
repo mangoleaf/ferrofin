@@ -157,6 +157,7 @@ struct FileConfig {
     image_resize_budget_mb: Option<u32>,
     image_download_max_mb: Option<u32>,
     image_negative_cache_ttl_secs: Option<u64>,
+    image_private_http_allow: Option<String>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     ffmpeg_img_extract_perf_tradeoff: Option<bool>,
@@ -169,6 +170,7 @@ struct FileConfig {
     admin_user: Option<String>,
     admin_password: Option<String>,
     db_pool: Option<DbPoolFileValue>,
+    db_statement_cache: Option<u32>,
     enable_metrics: Option<bool>,
     disable_extensions: Option<bool>,
     metrics_sample_interval: Option<u32>,
@@ -482,6 +484,17 @@ pub struct Config {
     /// [`IMAGE_NEGATIVE_CACHE_TTL_SECS`] with a warning.
     pub image_negative_cache_ttl_secs: u64,
 
+    /// The private hosts and networks image downloads may reach, besides the
+    /// configured Live TV tuners' hosts: host names, addresses and CIDR
+    /// networks, comma-separated
+    /// ([`PrivateAllowList`](ferrofin_providers::destination::PrivateAllowList)).
+    /// `None` = no private address but a tuner's. Resolved
+    /// `FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW` env > `image_private_http_allow`
+    /// in `config.toml` > none; blank is unset, and an entry that is none of
+    /// those warns and allows nothing. Read with
+    /// [`image_private_allow_list`](Self::image_private_allow_list).
+    pub image_private_http_allow: Option<String>,
+
     /// Explicit `ffmpeg` executable path. `None` falls back to `system.json`
     /// then `$PATH` during discovery.
     pub ffmpeg_path: Option<PathBuf>,
@@ -540,6 +553,15 @@ pub struct Config {
     /// `config.toml` (integer or `"auto"`) > auto, matching the layering of
     /// every other knob.
     pub db_pool: Option<u32>,
+
+    /// How many prepared statements each SQLite connection keeps, reader and
+    /// writer pools alike. `None` = 200
+    /// (`ferrofin_db::DEFAULT_STATEMENT_CACHE_CAPACITY`). A browse of the
+    /// library runs more distinct statements per connection than sqlx's own
+    /// 100, so a smaller cache prepares again statements it evicted. Resolved
+    /// `FERROFIN_DB_STATEMENT_CACHE` env > `db_statement_cache` in
+    /// `config.toml` > default; must be within [`STATEMENT_CACHE_RANGE`].
+    pub db_statement_cache: Option<u32>,
 
     /// Bootstrap override for the metrics endpoint toggle. `Some(true)`/`Some(false)`
     /// force it on/off regardless of the persisted `ServerConfiguration.EnableMetrics`;
@@ -1084,6 +1106,7 @@ impl Config {
             .unwrap_or_default();
 
         let db_pool = resolve_db_pool(env, file.db_pool)?;
+        let db_statement_cache = resolve_statement_cache(env, file.db_statement_cache)?;
 
         let mut config = Self {
             data_dir,
@@ -1117,6 +1140,7 @@ impl Config {
             image_resize_budget_mb,
             image_download_max_mb,
             image_negative_cache_ttl_secs,
+            image_private_http_allow: resolve_private_allow(env, file.image_private_http_allow),
             ffmpeg_path,
             ffprobe_path,
             max_transcodes,
@@ -1134,6 +1158,7 @@ impl Config {
             admin_user,
             admin_password,
             db_pool,
+            db_statement_cache,
             enable_metrics: parse_bool_var(env, "FERROFIN_ENABLE_METRICS").or(file.enable_metrics),
             disable_extensions: parse_bool_var(env, "FERROFIN_DISABLE_EXTENSIONS")
                 .or(file.disable_extensions)
@@ -1303,6 +1328,17 @@ impl Config {
         }
     }
 
+    /// The private hosts and networks image downloads may reach
+    /// ([`image_private_http_allow`](Self::image_private_http_allow)), its
+    /// refused entries left out: the loader warned about them.
+    #[must_use]
+    pub fn image_private_allow_list(&self) -> ferrofin_providers::destination::PrivateAllowList {
+        self.image_private_http_allow
+            .as_deref()
+            .map(|raw| ferrofin_providers::destination::PrivateAllowList::parse(raw).0)
+            .unwrap_or_default()
+    }
+
     /// TheTVDB's token max age ([`tvdb_token_days`](Self::tvdb_token_days)):
     /// the configured whole days, or the plugin's 25
     /// ([`ferrofin_providers::tvdb::DEFAULT_TOKEN_MAX_AGE`]) when unset. A
@@ -1438,6 +1474,7 @@ impl Config {
             image_resize_budget_mb: ImageLimits::DEFAULT_RESIZE_BUDGET_MB,
             image_download_max_mb: RequestLimits::DEFAULT_DOWNLOAD_MAX_MB,
             image_negative_cache_ttl_secs: DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS,
+            image_private_http_allow: None,
             ffmpeg_path: None,
             ffprobe_path: None,
             ffmpeg_img_extract_perf_tradeoff: false,
@@ -1450,6 +1487,7 @@ impl Config {
             admin_user: "admin".to_owned(),
             admin_password: String::new(),
             db_pool: None,
+            db_statement_cache: None,
             enable_metrics: None,
             disable_extensions: false,
             metrics_sample_interval: None,
@@ -1541,6 +1579,24 @@ where
         ));
     }
     clamped
+}
+
+/// Resolves `image_private_http_allow`: the `FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW`
+/// env var when it is not blank, else `config.toml`'s, else none. Each entry
+/// the list refuses warns ([`Env::warn`]) and allows nothing; the rest apply.
+fn resolve_private_allow(env: &dyn Env, file: Option<String>) -> Option<String> {
+    let raw = env
+        .var("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW")
+        .filter(|raw| !raw.trim().is_empty())
+        .or(file)
+        .filter(|raw| !raw.trim().is_empty())?;
+    for (entry, reason) in ferrofin_providers::destination::PrivateAllowList::parse(&raw).1 {
+        env.warn(format!(
+            "FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW / image_private_http_allow: `{entry}` {reason}; \
+             it is ignored"
+        ));
+    }
+    Some(raw)
 }
 
 /// Resolves the stdout log format: the `FERROFIN_LOG_FORMAT` env var when it
@@ -1698,6 +1754,33 @@ fn resolve_cache_ttl(
         );
     }
     Ok(secs)
+}
+
+/// The prepared statements each SQLite connection may keep
+/// (`db_statement_cache`; owner decision, gl-1071): from 100, sqlx's own
+/// default, which one browse of the library outgrows, to 1024. Every
+/// connection keeps its own statements, so the memory a larger cache holds is
+/// multiplied by the pool size.
+pub const STATEMENT_CACHE_RANGE: std::ops::RangeInclusive<u32> = 100..=1024;
+
+/// Resolves the per-connection statement cache: `FERROFIN_DB_STATEMENT_CACHE`
+/// env > `db_statement_cache` in `config.toml` > `None` (the default). A value
+/// outside [`STATEMENT_CACHE_RANGE`], or one that is not an integer, is an
+/// error, so a typo stops the server instead of silently changing how much
+/// it prepares.
+fn resolve_statement_cache(env: &dyn Env, file: Option<u32>) -> anyhow::Result<Option<u32>> {
+    const ENV_KEY: &str = "FERROFIN_DB_STATEMENT_CACHE";
+    const FILE_KEY: &str = "db_statement_cache";
+    let statements = resolve_positive(env, ENV_KEY, FILE_KEY, file)?;
+    if let Some(n) = statements {
+        anyhow::ensure!(
+            STATEMENT_CACHE_RANGE.contains(&n),
+            "invalid {ENV_KEY} / {FILE_KEY} `{n}`: expected {} to {} statements",
+            STATEMENT_CACHE_RANGE.start(),
+            STATEMENT_CACHE_RANGE.end()
+        );
+    }
+    Ok(statements)
 }
 
 /// Resolves the trickplay concurrency: `FERROFIN_TRICKPLAY_CONCURRENCY` env
@@ -2800,6 +2883,69 @@ mod tests {
         assert_eq!(settings(&cfg), (64, 3600));
     }
 
+    /// The image downloads' private allow-list (gl-1096): the variable, then
+    /// `config.toml`, then none; a blank value is unset, and an entry that is
+    /// not a host, an address or a network warns and allows nothing.
+    #[test]
+    fn the_image_private_allow_list_resolves_and_warns_about_bad_entries() {
+        use ferrofin_providers::destination::PrivateAllowList;
+        let lan: std::net::IpAddr = "192.168.1.20".parse().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "image_private_http_allow = \"nas.lan\"\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.image_private_http_allow, None, "nothing by default");
+        assert!(cfg.image_private_allow_list().is_empty());
+
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert!(cfg.image_private_allow_list().allows("nas.lan", lan));
+
+        let env = FakeEnv::new().with("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW", "192.168.1.0/24");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert_eq!(
+            cfg.image_private_http_allow.as_deref(),
+            Some("192.168.1.0/24"),
+            "the variable beats the file"
+        );
+        assert!(cfg.image_private_allow_list().allows("printer.lan", lan));
+        assert!(
+            !cfg.image_private_allow_list()
+                .allows("nas.lan", "10.0.0.1".parse().unwrap())
+        );
+
+        let env = FakeEnv::new().with("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW", "  ");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(
+            cfg.image_private_http_allow.as_deref(),
+            Some("nas.lan"),
+            "a blank variable is unset"
+        );
+
+        let env = FakeEnv::new().with(
+            "FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW",
+            "nas.lan:8080, 10.0.0.0/8",
+        );
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.load_warnings.len(), 1, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("`nas.lan:8080`")
+                && cfg.load_warnings[0].contains("image_private_http_allow"),
+            "{}",
+            cfg.load_warnings[0]
+        );
+        assert_eq!(
+            cfg.image_private_allow_list(),
+            PrivateAllowList::parse("10.0.0.0/8").0,
+            "the rest applies"
+        );
+    }
+
     /// The config file is TOML: a file named for another format is refused,
     /// not read in a format the docs never describe, and so is one with no
     /// extension, as before.
@@ -3238,6 +3384,59 @@ mod tests {
         let env = FakeEnv::new().with("FERROFIN_DB_POOL", "many");
         let err = Config::load_from(Cli::default(), &env).unwrap_err();
         assert!(err.to_string().contains("invalid FERROFIN_DB_POOL"));
+    }
+
+    #[test]
+    fn db_statement_cache_resolves_and_rejects_values_out_of_range() {
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.db_statement_cache, None, "unset ⇒ the default");
+        for value in ["100", "1024"] {
+            let env = FakeEnv::new().with("FERROFIN_DB_STATEMENT_CACHE", value);
+            let cfg = Config::load_from(Cli::default(), &env).unwrap();
+            assert_eq!(cfg.db_statement_cache, Some(value.parse().unwrap()));
+        }
+        for value in ["0", "99", "1025", "lots"] {
+            let env = FakeEnv::new().with("FERROFIN_DB_STATEMENT_CACHE", value);
+            let err = Config::load_from(Cli::default(), &env)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("FERROFIN_DB_STATEMENT_CACHE"),
+                "{value}: {err}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "db_statement_cache = 300\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert_eq!(
+            Config::load_from(cli(), &FakeEnv::new())
+                .unwrap()
+                .db_statement_cache,
+            Some(300)
+        );
+        let env = FakeEnv::new().with("FERROFIN_DB_STATEMENT_CACHE", " 150 ");
+        assert_eq!(
+            Config::load_from(cli(), &env).unwrap().db_statement_cache,
+            Some(150),
+            "the variable beats the file"
+        );
+        let env = FakeEnv::new().with("FERROFIN_DB_STATEMENT_CACHE", "  ");
+        assert_eq!(
+            Config::load_from(cli(), &env).unwrap().db_statement_cache,
+            Some(300),
+            "a blank variable is unset"
+        );
+        for value in ["0", "99", "2048"] {
+            std::fs::write(&toml, format!("db_statement_cache = {value}\n")).unwrap();
+            let err = Config::load_from(cli(), &FakeEnv::new())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("db_statement_cache"), "{value}: {err}");
+        }
     }
 
     #[test]

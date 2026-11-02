@@ -1039,8 +1039,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    ActivityLog listener \
                    (Jellyfin.Api/WebSocketListeners/ActivityLogWebSocketListener.cs) and the \
                    ScheduledTasks listener \
-                   (Jellyfin.Api/WebSocketListeners/ScheduledTasksWebSocketListener.cs)",
-        date: "2026-10-29",
+                   (Jellyfin.Api/WebSocketListeners/ScheduledTasksWebSocketListener.cs); \
+                   envelope serializes each frame's DTOs directly, in declaration order, as \
+                   WebSocketConnection.SendAsync's SerializeToUtf8Bytes does (property order \
+                   compared with MediaBrowser.Model/Dto/SessionInfoDto.cs, \
+                   Session/PlayerStateInfo.cs and Tasks/TaskInfo.cs)",
+        date: "2026-11-02",
         divergences: &[
             "Events already queued for a socket are drained and answered with one Sessions or \
              ActivityLogEntry frame, where upstream sends one per forced event: a burst yields \
@@ -1060,6 +1064,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              once the period has passed.",
             "A session list that cannot be built is logged and skipped and the subscription stays; \
              upstream logs it and drops the connection's subscription.",
+            "A session's NowPlayingItem map members (ImageTags, ProviderIds, ImageBlurHashes, \
+             Trickplay, RequiredHttpHeaders) are written in hash order, as on every item \
+             endpoint, not upstream's insertion order.",
             "A *Start whose Data is missing, has no second field or holds a field that does not \
              parse as a whole number still subscribes, at jellyfin-web's 1500 ms when the period \
              is at fault, where upstream's Start throws and makes no subscription.",
@@ -1098,8 +1105,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/BaseItemExtensions.cs (SetImagePath) and \
                    Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto). Also the \
                    download of a remote image: ferrofin-providers image_download.rs \
-                   open_image, provider_manager.rs cached_remote_image, compared with \
-                   MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage) and \
+                   open_image (ImageHttp::send, which follows and vets each redirect; \
+                   destination.rs ImageDestinations), provider_manager.rs \
+                   cached_remote_image, compared with \
+                   MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
+                   Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs (ConvertImageToLocal)",
         date: "2026-10-31",
         divergences: &[
@@ -1122,6 +1132,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              first file stored for a URL or an item stays there. The formats are listed in \
              image_download.rs is_image, with SVG and tvheadend's untyped /imagecache/ URLs \
              allowed.",
+            "A remote image download refuses loopback, private, link-local, CGNAT and reserved \
+             addresses, on its first request and on every redirect it follows (owner decision \
+             2026-10-31, gl-1096), unless image_private_http_allow lists the host, its address \
+             or its network, or the host is a configured Live TV tuner's; upstream's \
+             NamedClient.Default (Startup.cs) has no destination policy and follows redirects \
+             anywhere. A refusal counts as an answer, as a 404 does. A download follows at \
+             most 10 redirects, reqwest's default, where .NET's handler follows 50. After a \
+             redirect, SaveImage's fallback to the URL's suffix is not taken: a response with no \
+             type, or application/octet-stream, is refused, but for the tvheadend \
+             /imagecache/ workaround, which still names PNG.",
             "A row whose URLs all gave no image stays, and each URL is left alone for \
              image_negative_cache_ttl_secs (owner decision 2026-10-31, gl-1095), where \
              LibraryManager.ConvertImageToLocal's removeOnFailure removes the row, for the same \
@@ -1142,7 +1162,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         key: "user-data",
         upstream_file: "Emby.Server.Implementations/Library/UserDataManager.cs",
         upstream_method: "SaveUserData",
-        ferrofin: "The write path only. ferrofin-core user_data_manager.rs mutate_row \
+        ferrofin: "The write path, plus the read path only where a page's version groups get \
+                   their user data. ferrofin-core user_data_manager.rs mutate_row \
                    (SaveUserData with its retired-key update, GetUserData, ResolveUserDataRow), \
                    save_user_data_with_reason (the UpdateUserItemDataDto SaveUserData), \
                    save_play_state and apply_play_report (UpdatePlayState), \
@@ -1154,8 +1175,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
                    MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
                    Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
-                   UpdateUserItemRatingInternal)",
-        date: "2026-10-30",
+                   UpdateUserItemRatingInternal). The version groups: dto_service.rs prefetch's \
+                   version user data (a page item's from the page's own read, a version off \
+                   the page from user_data_manager.rs get_stored_user_data_batch), compared \
+                   with Emby.Server.Implementations/Library/UserDataManager.cs \
+                   (GetUserDataBatch, whose cache answers the page's items, and \
+                   GetResumeUserDataBatch), Emby.Server.Implementations/Dto/DtoService.cs \
+                   (GetBaseItemDtos) and Emby.Server.Implementations/Library/\
+                   MediaSourceManager.cs (SetAlternateVersionResumeStates)",
+        date: "2026-11-02",
         divergences: &[
             "Each change reads the row inside its write transaction, so two overlapping saves of \
              one item both land; upstream's GetUserData hands each caller a copy and SaveUserData \
@@ -1179,12 +1207,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    UserRootFolder.GetEligibleChildrenForRecursiveChildren); handlers/items.rs \
                    require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
                    routes that take a scope (ItemsController.GetItems, \
-                   LibraryManager.AddUserToQuery); item_repository.rs \
+                   LibraryManager.AddUserToQuery); handlers/streaming.rs \
+                   require_streamable_item at the stream, HLS, universal audio, subtitle and \
+                   attachment routes (StreamingHelpers.GetStreamingState, \
+                   SubtitleController.GetSubtitle, VideoAttachmentsController.GetAttachment); \
+                   item_repository.rs \
                    resolve_views_with_parent and item_visibility.rs hidden_playlists on \
                    listings that can hold a playlist (Folder.QueryRecursive, \
                    Folder.QueryWithPostFiltering, Playlist.IsVisible); dto_service.rs \
                    get_base_item_dtos' IsVisible pass (DtoService.GetBaseItemDtos), which of \
-                   the handlers only GET /Items/Suggestions asks for, as its controller does",
+                   the handlers only GET /Items/Suggestions asks for, as its controller does; \
+                   handlers/live_tv.rs query_programs_inner \
+                   (LiveTvController.GetLiveTvPrograms, GetPrograms)",
         date: "2026-11-01",
         divergences: &[
             "A listing with a user leaves out the playlists that fail \
@@ -1200,10 +1234,35 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A request naming an item as its scope (parentId, ids, seriesId, appearsInItemId) \
              stops at the libraries the user may open, on every route that takes one: a \
              library or view must pass IsVisible and anything else IsVisibleStandalone, or \
-             the request answers 401, and ids are reduced to those that pass \
-             IsVisibleStandalone. Upstream applies IsVisible alone, on GET /Items and GET \
-             /Trailers. A BoxSet or Playlist browse that re-roots to the user root skips the \
-             check, as upstream. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091).",
+             the request answers 403, a BoxSet or Playlist browse included, and ids are \
+             reduced to those that pass IsVisibleStandalone. Upstream applies IsVisible \
+             alone, on GET /Items and GET /Trailers, and answers 401. Jellyfin bug not ported \
+             (owner decisions 2026-10-31 and 2026-11-01, gl-1091, gl-1136).",
+            "A request naming a user is held to that user on the stream, HLS, universal audio, \
+             subtitle Stream.{format} and attachment routes: the default policy runs (a disabled \
+             account 401, remote access and the access schedule 403), and the item, and the \
+             version a mediaSourceId names, must pass IsVisibleStandalone or the route answers \
+             404. Upstream's GetStreamingState reads the item with no user, and its stream and \
+             Stream.{format} actions are anonymous; only its attachment action already checks \
+             the item for a user, and neither the policy nor the version. A channel takes the \
+             same check, as PlaybackInfo does. A DVR recording has no row here, so it takes \
+             Live TV access, IsVisibleStandalone over its entity, the libraries holding its \
+             file and then its channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
+             now share; upstream's recording is a library item, whose library holds it. On the \
+             routes upstream leaves anonymous, no credential, a token that names nobody and an \
+             API key stay so, which binds a client that sends its token. The legacy /hls/ \
+             routes are outside this: they serve a transcode's file by its random name, and \
+             the item id selects nothing, as upstream. Deliberate divergence (owner decision \
+             2026-10-31, gl-1090).",
+            "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, or \
+             as the signed-in caller when a POST body names no user, so a series that user \
+             cannot open (library, rating or tag rules) answers like an id that is no series: \
+             IsSeries stays forced and its title is not searched for. Upstream's \
+             GetItemById<Series> reads it with no user. A POST body naming no user keeps the \
+             query without one, as upstream, so its DTOs carry no user data; only a request \
+             with no user at all (an API key naming none) still reads the row as upstream \
+             does. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; gl-1113, \
+             gl-1130).",
         ],
     },
     VerifiedSubsystem {
@@ -1658,13 +1717,18 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/users.rs authenticate_by_name, authenticate, login_failure, \
                authentication_result → ferrofin-core session_manager.rs authenticate_internal \
                (AuthenticateNewSessionInternal), admit_session → user_manager.rs \
-               authenticate_user (UserManager.AuthenticateUser); a 401 or 403 answers as \
-               ExceptionMiddleware does outside Development, the same on a live 12.4 for \
-               each refusal. Compared: user lookup and lock, provider order, the disabled, \
-               remote and schedule checks, the failure counter and lockout, the device and \
-               session limits, token rotation and session activity, and that upstream has \
-               no login rate limit. The UserDto and SessionInfoDto builders are shared with \
-               other routes and not compared here",
+               authenticate_user (UserManager.AuthenticateUser), authentication_providers_for \
+               (GetAuthenticationProviders(User)), authenticate_with_providers \
+               (AuthenticateLocalUser) and apply_external_administrator; a 401 or 403 \
+               answers as ExceptionMiddleware does \
+               outside Development, the same on a live 12.4 for each refusal. Compared: user \
+               lookup and lock, provider order and selection by the saved id \
+               (AuthenticationManager::id, GetType().FullName), the provider's canonical \
+               username, the new-user policy, the saved provider id, the disabled, remote and \
+               schedule checks, the failure counter and lockout, the device and session \
+               limits, token rotation and session activity, and that upstream has no login rate \
+               limit. The UserDto and SessionInfoDto \
+               builders are shared with other routes and not compared here",
         date: "2026-11-02",
         divergences: &[
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
@@ -1674,6 +1738,13 @@ pub const VERIFIED: &[Verified] = &[
          attempts wait, from 1 s doubling to login_backoff_max_delay_secs. An address that \
          would wait longer is answered as a wrong password without its password being \
          checked; an account only waits. The backoff never disables an account.",
+            "An authentication provider reports the user's administrator flag in its result \
+         (ProviderAuthenticationResult.administrator) and the user manager applies it \
+         (UserManager::apply_external_administrator), never demoting the last administrator: \
+         that sign-in succeeds, the user stays one and a warning is logged. Upstream's LDAP \
+         plugin writes the flag itself through UpdateUserAsync, which has no such guard. No \
+         built-in provider reports a flag. \
+         Owner decision (2026-11-01).",
             "Every failed login writes the dashboard's AuthenticationFailed entry, where upstream \
          publishes AuthenticationRequestEventArgs only for a wrong password: an exception from \
          AuthenticateUser (an unknown user, a disabled account) or a device or session-limit \
@@ -2045,6 +2116,45 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/Auth/Providers",
+        upstream_file: "Jellyfin.Api/Controllers/SessionController.cs",
+        upstream_method: "GetAuthProviders",
+        ferrofin: "handlers/session.rs get_auth_providers (RequireAdmin, \
+               Policies.RequiresElevation) → ferrofin-core user_manager.rs \
+               get_authentication_providers (UserManager.GetAuthenticationProviders) over the \
+               built-in default and the providers compiled-in extensions register \
+               (set_extension_providers). Compared: the IsEnabled filter, the Default \
+               provider first and the rest by Name in the current culture, and each pair's \
+               Name and Id (the provider's GetType().FullName, AuthenticationManager::id)",
+        date: "2026-11-02",
+        divergences: &[
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Auth/PasswordResetProviders",
+        upstream_file: "Jellyfin.Api/Controllers/SessionController.cs",
+        upstream_method: "GetPasswordResetProviders",
+        ferrofin: "handlers/session.rs get_password_reset_providers (RequireAdmin, \
+               Policies.RequiresElevation) → ferrofin-core user_manager.rs \
+               get_password_reset_providers (UserManager.GetPasswordResetProviders) over the \
+               built-in password_reset.rs DefaultPasswordResetProvider and the providers \
+               compiled-in extensions register (set_extension_reset_providers). Compared: the \
+               IsEnabled filter, the default provider first and the rest by Name in the \
+               current culture, and each pair's Name and Id (GetType().FullName, \
+               PasswordResetManager::id)",
+        date: "2026-11-02",
+        divergences: &[
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/Collections",
         upstream_file: "Jellyfin.Api/Controllers/CollectionController.cs",
@@ -2281,6 +2391,69 @@ pub const VERIFIED: &[Verified] = &[
          empty Forbid). Fix path: gl-666.",
         ],
         refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Playlists/{itemId}/Items",
+        upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
+        upstream_method: "GetPlaylistItems",
+        ferrofin: "handlers/playlists.rs get_playlist_items (effective_user_id: \
+               RequestHelpers.GetUserId) → ferrofin-core collection_manager.rs \
+               FerrofinPlaylistManager::get_playlist_items (GetPlaylistForUser and \
+               GetManageableItems: manual links, in order, missing items out), then \
+               LibraryManager::get_visible_item_ids before the paging, as upstream filters \
+               before Skip and Take, and tv_shows::build_dto_options + get_linked_children_dtos \
+               + the PlaylistItemId tag",
+        date: "2026-11-01",
+        divergences: &[
+            "A member the caller may not open is left out with the standalone check, which also \
+         walks its library, where upstream's IsVisible reads only its rating and tags and \
+         lists a member from a library the caller was not granted. An accepted divergence \
+         (owner decision 2026-10-31, gl-1092): only this read and Move's index change, so \
+         the stored members, Add, Create and ItemIds stay as upstream has them. It is the \
+         check GET /Items?ids= uses. GET /Items?ParentId=<playlist> takes \
+         Folder.GetLinkedChildren(user)'s rule (item_visibility.rs folder_children), which \
+         agrees on a member of a library the caller was or was not granted and differs at \
+         the edges: a member of a disabled library or a file in no library is kept here and \
+         dropped there, and a member whose parent fails the caller's rating limit is dropped \
+         here and kept there. This list answers as GET /Items/{id} does.",
+            "A negative limit is ignored and the rest of the list comes back; upstream's \
+         Take(limit) answers an empty page. Fix path: gl-1137.",
+            "The 404 (no playlist the caller can see) and 403 (another user's id without the \
+         administrator role) bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
+        method: "post",
+        path: "/Playlists/{itemId}/Items/{itemId}/Move/{newIndex}",
+        upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
+        upstream_method: "MoveItem",
+        ferrofin: "handlers/playlists.rs move_item (get_playlist_access + require_edit: \
+               GetPlaylistForUser and the owner-or-editing-share check) → ferrofin-core \
+               collection_manager.rs FerrofinPlaylistManager::move_item \
+               (PlaylistManager.MoveItemAsync: the first occurrence moves, the index counts \
+               the caller's list, no write when it is already there) and visible_entries",
+        date: "2026-11-01",
+        divergences: &[
+            "The index counts the members GET /Playlists/{id}/Items gave the caller, so the \
+         standalone check, library included, where upstream's accessibleChildren take \
+         IsVisible alone. An accepted divergence (owner decision 2026-10-31, gl-1092). A \
+         hidden member named by its id still moves, as upstream: its id comes from ItemIds, \
+         not the listing.",
+            "Moving down past a member hidden from the caller lands at the index asked for; \
+         upstream anchors on the list before the entry is taken out \
+         (DetermineAdjustedIndex) and lands one place short. Jellyfin bug not ported.",
+            "An index beyond the length of the caller's list goes to the end; upstream's \
+         accessibleChildren[newPriorItemIndex] throws (500), as it does at any index when \
+         the caller's list is empty. Jellyfin bug not ported.",
+            "A malformed playlist id is a 400; upstream's Guid.Parse throws FormatException, \
+         which ExceptionMiddleware answers with a 500. Jellyfin bug not ported.",
+            "The 400 (a malformed index), 403 (no editing share) and 404 (no playlist the \
+         caller can see) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
     },
     Verified {
         method: "get",

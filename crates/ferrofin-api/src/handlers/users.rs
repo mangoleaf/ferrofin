@@ -50,9 +50,7 @@ use ferrofin_model::configuration::UserConfiguration;
 use ferrofin_model::dto::UserDto;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::AuthenticationResult;
-use ferrofin_model::users::{
-    ForgotPasswordAction, ForgotPasswordResult, PinRedeemResult, UserPolicy,
-};
+use ferrofin_model::users::{ForgotPasswordResult, PinRedeemResult, UserPolicy};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData};
@@ -137,124 +135,6 @@ struct ForgotPasswordPinDto {
     /// The entered pin.
     #[serde(default)]
     pin: String,
-}
-
-/// Filename prefix for a pending password-reset record under the data dir
-/// (`passwordreset-<userId>.json`). Port of C#
-/// `DefaultPasswordResetProvider._passwordResetFileBase`.
-const PASSWORD_RESET_PREFIX: &str = "passwordreset";
-
-/// How long an issued forgot-password pin stays valid. Port of C#
-/// `DefaultPasswordResetProvider` (30 minutes).
-const PIN_TTL_MINUTES: i64 = 30;
-
-/// The on-disk record of an in-progress forgot-password reset.
-///
-/// Port of C# `DefaultPasswordResetProvider.SerializablePasswordReset`, written
-/// to the program-data directory when a pin is issued and consumed by
-/// the `/Pin` redemption.
-#[derive(Debug, serde::Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct SerializablePasswordReset {
-    /// When the pin expires.
-    expiration_date: chrono::DateTime<chrono::Utc>,
-    /// The issued pin (dash-grouped uppercase hex, e.g. `1A-2B-3C-4D`).
-    pin: String,
-    /// The absolute path of this record (echoed to the client as `PinFile`).
-    pin_file: String,
-    /// The username this reset belongs to.
-    user_name: String,
-}
-
-/// Generates a fresh reset pin from 4 random bytes, formatted like C#'s
-/// `BitConverter.ToString` (`1A-2B-3C-4D`).
-///
-/// ponytail: seeds from a v4 UUID's random bytes instead of pulling in a
-/// dedicated RNG crate — 32 bits of entropy over a 30-minute window is ample for
-/// a single-use, admin-visible reset pin.
-fn generate_reset_pin() -> String {
-    let b = Uuid::new_v4().into_bytes();
-    format!("{:02X}-{:02X}-{:02X}-{:02X}", b[0], b[1], b[2], b[3])
-}
-
-/// Comparison ignores grouping dashes, but preserves case (C# Ordinal).
-fn normalize_pin(pin: &str) -> String {
-    pin.replace('-', "")
-}
-
-/// Every username receives the same response shape. Only a known local user
-/// gets a recovery file; the path uses the entered name's invariant-uppercase
-/// UTF-16 MD5, matching Jellyfin's built-in provider.
-fn issue_reset_pin(
-    data_dir: &std::path::Path,
-    entered_username: &str,
-    user_name: Option<&str>,
-) -> Result<ForgotPasswordResult, ServiceError> {
-    let expiration = chrono::Utc::now() + chrono::Duration::minutes(PIN_TTL_MINUTES);
-    let hash = ferrofin_common::extensions::get_md5(
-        &ferrofin_util::string_extensions::upper_invariant(entered_username),
-    );
-    let path = data_dir.join(format!("{PASSWORD_RESET_PREFIX}{}.json", hash.simple()));
-    let pin_file = path.to_string_lossy().into_owned();
-    if let Some(user_name) = user_name {
-        let record = SerializablePasswordReset {
-            expiration_date: expiration,
-            pin: generate_reset_pin(),
-            pin_file: pin_file.clone(),
-            user_name: user_name.to_owned(),
-        };
-        std::fs::create_dir_all(data_dir)
-            .map_err(|e| ServiceError::backend(format!("create reset directory: {e}")))?;
-        let bytes = serde_json::to_vec(&record)
-            .map_err(|e| ServiceError::backend(format!("serialize reset record: {e}")))?;
-        ferrofin_util::file_helper::atomic_write(&path, &bytes)
-            .map_err(|e| ServiceError::backend(format!("write reset record: {e}")))?;
-    }
-    Ok(ForgotPasswordResult {
-        action: ForgotPasswordAction::PinCode,
-        pin_file: Some(pin_file),
-        pin_expiration_date: Some(expiration),
-    })
-}
-
-/// Find matches and purge expired records. Matching files remain until their
-/// password update succeeds, so a failed update does not consume recovery.
-fn redeem_reset_pins(
-    data_dir: &std::path::Path,
-    entered_pin: &str,
-) -> Result<Vec<(String, std::path::PathBuf)>, ServiceError> {
-    let entered = normalize_pin(entered_pin);
-    let mut matches = Vec::new();
-    let entries = match std::fs::read_dir(data_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(matches),
-        Err(e) => return Err(ServiceError::backend(format!("read reset directory: {e}"))),
-    };
-    for entry in entries {
-        let path = entry
-            .map_err(|e| ServiceError::backend(format!("read reset entry: {e}")))?
-            .path();
-        if !path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(PASSWORD_RESET_PREFIX))
-            || !path.is_file()
-        {
-            continue;
-        }
-        let bytes = std::fs::read(&path)
-            .map_err(|e| ServiceError::backend(format!("read reset record: {e}")))?;
-        let record = serde_json::from_slice::<Option<SerializablePasswordReset>>(&bytes)
-            .map_err(|e| ServiceError::backend(format!("parse reset record: {e}")))?
-            .ok_or_else(|| ServiceError::not_found("invalid reset record"))?;
-        if record.expiration_date < chrono::Utc::now() {
-            std::fs::remove_file(&path)
-                .map_err(|e| ServiceError::backend(format!("remove expired reset: {e}")))?;
-        } else if normalize_pin(&record.pin) == entered {
-            matches.push((record.user_name, path));
-        }
-    }
-    Ok(matches)
 }
 
 /// Query parameters carrying an optional `userId` (the update, password and
@@ -1160,11 +1040,12 @@ async fn log_password_changed(state: &AppState, user_id: Uuid, username: &str) {
     .await;
 }
 
-/// `POST /Users/ForgotPassword` — begin built-in password recovery.
-/// Known users on the local network get a PIN file in ProgramDataPath. All
-/// callers receive PinCode and the computed path, without disclosing account
-/// existence. Unknown reset-provider IDs fall back to this built-in provider,
-/// which is the only currently registered choice, matching Jellyfin.
+/// `POST /Users/ForgotPassword` — begin password recovery.
+///
+/// Port of `UserController.ForgotPassword`: the user manager hands the request
+/// to the account's saved password-reset provider
+/// (`UserManager.StartForgotPasswordProcess`), the built-in PIN file for most.
+/// Every caller gets the same answer, whether the name exists or not.
 #[utoipa::path(
     post,
     path = "/Users/ForgotPassword",
@@ -1176,28 +1057,22 @@ async fn forgot_password(
     parts: Parts,
     JsonBody(body): JsonBody<ForgotPasswordDto>,
 ) -> Result<Json<ForgotPasswordResult>, ApiError> {
-    let _guard = state.password_reset_lock.lock().await;
-    let user = if body.entered_username.trim().is_empty() {
-        None
-    } else {
-        state.users.get_user_by_name(&body.entered_username).await?
-    };
     let local = state.is_in_local_network(state.client_address(&parts));
-    let username = user
-        .as_ref()
-        .filter(|_| local)
-        .map(|user| user.username.as_str());
-    let dir = std::path::PathBuf::from(state.config.application_paths().program_data_path());
-    Ok(Json(issue_reset_pin(
-        &dir,
-        &body.entered_username,
-        username,
-    )?))
+    Ok(Json(
+        state
+            .users
+            .start_forgot_password_process(&body.entered_username, local)
+            .await?,
+    ))
 }
 
-/// `POST /Users/ForgotPassword/Pin` — redeem a case-sensitive recovery PIN.
-/// Dashes are ignored for comparison. The password becomes the exact entered
-/// PIN, and the file is consumed only after a successful password update.
+/// `POST /Users/ForgotPassword/Pin` — redeem a recovery PIN.
+///
+/// Port of `UserController.ForgotPasswordPin`: each password-reset provider is
+/// offered the PIN in turn (`UserManager.RedeemPasswordResetPin`). With the
+/// built-in provider the PIN is case-sensitive with its dashes ignored, the
+/// password becomes the PIN as entered, and the file is consumed only once the
+/// password is saved. No provider redeeming it is a `404`.
 #[utoipa::path(
     post,
     path = "/Users/ForgotPassword/Pin",
@@ -1208,29 +1083,9 @@ async fn forgot_password_pin(
     State(state): State<AppState>,
     JsonBody(body): JsonBody<ForgotPasswordPinDto>,
 ) -> Result<Json<PinRedeemResult>, ApiError> {
-    let _guard = state.password_reset_lock.lock().await;
-    let dir = std::path::PathBuf::from(state.config.application_paths().program_data_path());
-    let mut users_reset = Vec::new();
-    for (user_name, path) in redeem_reset_pins(&dir, &body.pin)? {
-        let user = state
-            .users
-            .get_user_by_name(&user_name)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("user for recovery record"))?;
-        let user_id = user_uuid(&user)?;
-        state.users.change_password(user_id, &body.pin).await?;
-        log_password_changed(&state, user_id, &user.username).await;
-        users_reset.push(user.username);
-        std::fs::remove_file(path)
-            .map_err(|e| ServiceError::backend(format!("remove consumed reset: {e}")))?;
-    }
-    if users_reset.is_empty() {
-        return Err(ServiceError::not_found("no matching password reset request").into());
-    }
-    Ok(Json(PinRedeemResult {
-        success: true,
-        users_reset,
-    }))
+    Ok(Json(
+        state.users.redeem_password_reset_pin(&body.pin).await?,
+    ))
 }
 
 /// `GET /Users/Me` — the authenticated caller's user record.
@@ -1364,11 +1219,7 @@ crate::query::query_parameters! {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ApiError, ERROR_BODY, PASSWORD_RESET_PREFIX, SerializablePasswordReset, ServiceError,
-        StatusCode, generate_reset_pin, header, issue_reset_pin, login_failure, normalize_pin,
-        redeem_reset_pins,
-    };
+    use super::{ApiError, ERROR_BODY, ServiceError, StatusCode, header, login_failure};
 
     /// `ExceptionMiddleware`'s answer, whatever the failure says. The server's
     /// `login_failures` test drives the real refusals; a remote-access one needs
@@ -1416,87 +1267,5 @@ mod tests {
     ) {
         let error: ApiError = login_failure(error).expect_err("not a refused login");
         assert_eq!(error.to_string(), message);
-    }
-
-    #[test]
-    fn reset_pin_format_and_normalization() {
-        let pin = generate_reset_pin();
-        // `XX-XX-XX-XX`: 8 hex digits in four dash-separated pairs.
-        let parts: Vec<&str> = pin.split('-').collect();
-        assert_eq!(parts.len(), 4);
-        assert!(
-            parts
-                .iter()
-                .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
-        );
-        assert_eq!(normalize_pin("1a-2b"), "1a2b");
-        assert_ne!(normalize_pin("AA-BB"), normalize_pin("aa-bb"));
-    }
-
-    #[test]
-    fn issue_then_redeem_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = issue_reset_pin(dir.path(), "aLiCe", Some("alice")).unwrap();
-        assert_eq!(result.action, super::ForgotPasswordAction::PinCode);
-        assert!(result.pin_expiration_date.is_some());
-        let file = std::path::PathBuf::from(result.pin_file.unwrap());
-        let expected = dir.path().join(format!(
-            "{PASSWORD_RESET_PREFIX}{}.json",
-            ferrofin_common::extensions::get_md5("ALICE").simple()
-        ));
-        assert_eq!(file, expected);
-        let record: SerializablePasswordReset =
-            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        let found = redeem_reset_pins(dir.path(), "wrong").unwrap();
-        assert!(found.is_empty(), "{found:?}");
-        let found = redeem_reset_pins(dir.path(), "").unwrap();
-        assert!(found.is_empty(), "{found:?}");
-        assert_eq!(
-            redeem_reset_pins(dir.path(), &record.pin.replace('-', "")).unwrap(),
-            vec![("alice".to_owned(), file.clone())]
-        );
-        assert!(
-            file.exists(),
-            "only the handler consumes a successfully applied reset"
-        );
-        let absent = issue_reset_pin(dir.path(), "unknown", None).unwrap();
-        assert_eq!(absent.action, super::ForgotPasswordAction::PinCode);
-        assert!(!std::path::Path::new(&absent.pin_file.unwrap()).exists());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-    }
-
-    #[test]
-    fn expired_record_is_deleted_and_never_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        let record = SerializablePasswordReset {
-            expiration_date: chrono::Utc::now() - chrono::Duration::minutes(1),
-            pin: "AA-BB-CC-DD".to_owned(),
-            pin_file: String::new(),
-            user_name: "bob".to_owned(),
-        };
-        let file = dir
-            .path()
-            .join(format!("{PASSWORD_RESET_PREFIX}user-2.json"));
-        std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
-
-        // Even with the correct pin, an expired record yields no match and is purged.
-        let found = redeem_reset_pins(dir.path(), "AA-BB-CC-DD").unwrap();
-        assert!(found.is_empty(), "{found:?}");
-        assert!(!file.exists());
-    }
-
-    #[test]
-    fn redeem_on_missing_dir_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("does-not-exist");
-        let found = redeem_reset_pins(&missing, "AA-BB-CC-DD").unwrap();
-        assert!(found.is_empty(), "{found:?}");
     }
 }
