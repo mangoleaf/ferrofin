@@ -76,6 +76,10 @@ fn clone_err(e: &ServiceError) -> ServiceError {
     match e {
         ServiceError::NotFound(m) => ServiceError::NotFound(m.clone()),
         ServiceError::InvalidInput(m) => ServiceError::InvalidInput(m.clone()),
+        ServiceError::Busy {
+            message,
+            retry_after_secs,
+        } => ServiceError::busy(message.clone(), *retry_after_secs),
         other => ServiceError::NotFound(format!("{other:?}")),
     }
 }
@@ -793,6 +797,106 @@ async fn every_planning_route_carries_trusted_playback_permissions() {
             }),
             "{uri}"
         );
+    }
+}
+
+/// The routes that start a transcode, each with its `[Required]` members.
+fn starting_routes() -> [String; 5] {
+    [
+        "Videos/ITEM/live.m3u8?x=1",
+        "Videos/ITEM/hls1/main/0.ts?RuntimeTicks=0&ActualSegmentLengthTicks=0",
+        "Audio/ITEM/hls1/main/0.ts?RuntimeTicks=0&ActualSegmentLengthTicks=0",
+        "Videos/ITEM/stream.ts?x=1",
+        "Audio/ITEM/stream.aac?x=1",
+    ]
+    .map(|route| format!("/{}", route.replace("ITEM", &ITEM_ID.to_string())))
+}
+
+/// An API key: authenticated, with no user behind it.
+struct UserlessApiKeyAuth;
+
+impl UserlessApiKeyAuth {
+    fn info() -> AuthorizationInfo {
+        AuthorizationInfo {
+            token: Some(ferrofin_model::secret::Secret::new("key")),
+            is_api_key: true,
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        }
+    }
+}
+
+#[async_trait]
+impl AuthorizationContext for UserlessApiKeyAuth {
+    async fn get_authorization_info(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::info())
+    }
+}
+
+#[async_trait]
+impl AuthService for UserlessApiKeyAuth {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::info())
+    }
+}
+
+/// The transcode caps count the user the authorization names, through every
+/// way a request is built. A `UserId` in the query is the client's own word
+/// and must not move a job onto another account's count.
+#[rstest]
+#[case::signed_in(false)]
+#[case::api_key(true)]
+#[tokio::test]
+async fn a_transcode_is_the_authorizations_user_never_the_querys(#[case] api_key: bool) {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let rec = Arc::new(Recorded::default());
+    let hls = ok_hls(temp.path().to_str().unwrap(), rec.clone());
+    let (router, expected) = if api_key {
+        (
+            router_no_static_with_auth(hls, Arc::new(UserlessApiKeyAuth)),
+            None,
+        )
+    } else {
+        (router_no_static(hls), Some(ok_auth_info().user_id()))
+    };
+    let claimed = Uuid::from_u128(0xB0B);
+    for route in starting_routes() {
+        *rec.last.lock().unwrap() = None;
+        let uri = format!("{route}&UserId={claimed}");
+        let response = router.clone().oneshot(authed("GET", &uri)).await.unwrap();
+        let status = response.status();
+        let request = rec.last.lock().unwrap().clone();
+        let request = request.unwrap_or_else(|| panic!("{uri} reached no manager: {status}"));
+        assert_eq!(request.user_id, expected, "{uri}");
+    }
+}
+
+/// A refused transcode reaches the client as 503 with its wait, on every
+/// route that starts one, and a client can read why.
+#[tokio::test]
+async fn a_refused_transcode_answers_503_with_retry_after() {
+    let hls = Arc::new(FakeHls {
+        served_path: "/unused".to_owned(),
+        rec: Arc::new(Recorded::default()),
+        fail: Some(ServiceError::busy("at the limit", 10)),
+    });
+    let router = router_no_static(hls);
+    for route in starting_routes() {
+        let response = router.clone().oneshot(authed("GET", &route)).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{route}"
+        );
+        assert_eq!(response.headers()["retry-after"], "10", "{route}");
+        let body = body_string(response).await;
+        assert_eq!(body, r#"{"error":"at the limit"}"#, "{route}");
     }
 }
 

@@ -2685,6 +2685,12 @@ impl FerrofinSessionManager {
             sessions.values().filter(|s| s.user_id == user_uuid).count()
         };
         if i64::try_from(active).unwrap_or(i64::MAX) >= user.max_active_sessions {
+            tracing::warn!(
+                username = %user.username,
+                user_id = %user.id,
+                reason = "max_sessions",
+                "login failed"
+            );
             return Err(ServiceError::Forbidden(
                 "user is at their maximum number of sessions".to_owned(),
             ));
@@ -2724,14 +2730,22 @@ impl FerrofinSessionManager {
                 )
                 .await?;
         }
-        let user =
-            user.ok_or_else(|| ServiceError::unauthorized("invalid username or password entered"))?;
+        let user = user.ok_or_else(|| {
+            ServiceError::unauthorized(crate::user_manager::INVALID_CREDENTIALS_MESSAGE)
+        })?;
 
         if !self
             .device_manager
             .can_access_device(&user, device_id)
             .await?
         {
+            tracing::warn!(
+                username = %user.username,
+                user_id = %user.id,
+                device_id,
+                reason = "device",
+                "login failed"
+            );
             return Err(ServiceError::Forbidden(
                 "user is not allowed access from this device".to_owned(),
             ));
