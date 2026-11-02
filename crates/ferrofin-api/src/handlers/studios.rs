@@ -40,7 +40,7 @@ async fn get_studios(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
-    query.parent(&state, &auth, user.as_ref()).await?;
+    query.parent(&state, &auth, user.as_deref()).await?;
     let internal = query.base_query(user.clone())?;
     let result = state.library.get_studios(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
@@ -49,7 +49,7 @@ async fn get_studios(
         result,
         &options,
         query.should_include_item_types(),
-        user.as_ref(),
+        user.as_deref(),
     )
     .await?;
     Ok(Json(projected))
@@ -94,7 +94,7 @@ async fn get_studio(
     let options = DtoOptions::default();
     let dto = state
         .dto
-        .get_base_item_dto(&item, &options, user.as_ref(), None)
+        .get_base_item_dto(&item, &options, user.as_deref(), None)
         .await?;
     Ok(Json(dto))
 }

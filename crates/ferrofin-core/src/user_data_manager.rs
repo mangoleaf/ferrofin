@@ -1025,7 +1025,7 @@ impl FerrofinUserDataManager {
         // `new InternalItemsQuery(user)`: `set_user` also carries the user's
         // parental-rating cap.
         let mut query = ferrofin_traits::options::InternalItemsQuery::default();
-        query.set_user(user.clone());
+        query.set_user(Arc::new(user.clone()));
         if counts
             .get_linked_children_count_batch(&[id])
             .await?
@@ -1484,7 +1484,7 @@ fn member_query(
     played: bool,
 ) -> ferrofin_traits::options::InternalItemsQuery {
     use ferrofin_traits::options::InternalItemsQuery;
-    let user_entity = Some(user.clone());
+    let user_entity = Some(Arc::new(user.clone()));
     match kind_from_type_name(&folder.type_) {
         // `BoxSet.GetLinkedChildren(user)`: the parent query merges the
         // manual links (a legacy set's children are its rows on disk), and
@@ -2940,7 +2940,7 @@ mod tests {
         let resume = || async {
             repository
                 .get_item_list(&InternalItemsQuery {
-                    user: Some(user.clone()),
+                    user: Some(Arc::new(user.clone())),
                     is_resumable: Some(true),
                     ..InternalItemsQuery::default()
                 })

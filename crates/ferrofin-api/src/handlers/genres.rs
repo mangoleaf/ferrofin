@@ -47,7 +47,7 @@ async fn get_genres(
     Query(query): Query<ByNameListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
-    let parent = query.parent(&state, &auth, user.as_ref()).await?;
+    let parent = query.parent(&state, &auth, user.as_deref()).await?;
     let internal = query.base_query(user.clone())?;
     let result = if is_music_collection_folder(parent.as_ref()) {
         state.library.get_music_genres(&internal).await?
@@ -64,7 +64,7 @@ async fn get_genres(
         result,
         &options,
         query.should_include_item_types(),
-        user.as_ref(),
+        user.as_deref(),
     )
     .await?;
     Ok(Json(projected))
@@ -131,7 +131,7 @@ async fn get_genre(
     let options = DtoOptions::default();
     let dto = state
         .dto
-        .get_base_item_dto(&item, &options, user.as_ref(), None)
+        .get_base_item_dto(&item, &options, user.as_deref(), None)
         .await?;
     Ok(Json(dto))
 }

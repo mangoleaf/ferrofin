@@ -96,7 +96,7 @@ async fn similar_items(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(state, auth, query.user_id).await?;
     if !item_id.is_nil() {
-        require_visible_item(state, item_id, user.as_ref()).await?;
+        require_visible_item(state, item_id, user.as_deref()).await?;
     }
     let user_id = user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok());
     let exclude_artist_ids = parse_csv_uuids(query.exclude_artist_ids.as_deref())?;
@@ -130,7 +130,7 @@ async fn similar_items(
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
     let dtos = state
         .dto
-        .get_base_item_dtos(&items, &options, user.as_ref(), None, true)
+        .get_base_item_dtos(&items, &options, user.as_deref(), None, true)
         .await?;
     Ok(Json(QueryResult::new(Some(0), Some(total), dtos)))
 }

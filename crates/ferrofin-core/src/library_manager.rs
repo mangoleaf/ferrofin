@@ -1691,7 +1691,7 @@ impl FerrofinLibraryManager {
             })
         };
         let mut items = collections
-            .collapse_items_within_box_sets(&eligible, query.user.as_ref())
+            .collapse_items_within_box_sets(&eligible, query.user.as_deref())
             .await?;
         items.extend(remaining);
         Ok(items)
@@ -7206,7 +7206,7 @@ mod tests {
         }
         library.persistence.save_items(&rows).await.unwrap();
         let query = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             parent_id: one,
             parent_type: Some(BaseItemKind::Season),
             apply_folder_display_options: true,
@@ -7523,7 +7523,7 @@ mod tests {
             crate::test_support::save_item(&db, &row).await;
         }
         let listing = |user: &ferrofin_db::entities::users::UserEntity, limit| InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             recursive: true,
             include_item_types: vec![BaseItemKind::Playlist],
             apply_folder_display_options: true,
@@ -7672,7 +7672,7 @@ mod tests {
 
         let result = library
             .query_items(&InternalItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 recursive: true,
                 include_item_types: vec![BaseItemKind::BoxSet],
                 apply_folder_display_options: true,
@@ -7701,7 +7701,7 @@ mod tests {
         );
         let result = library
             .query_items(&InternalItemsQuery {
-                user: Some(fixture.user),
+                user: Some(Arc::new(fixture.user)),
                 parent_id: fixture.set,
                 parent_type: Some(BaseItemKind::BoxSet),
                 apply_folder_display_options: true,
@@ -7800,7 +7800,7 @@ mod tests {
         };
         let list = |recursive: bool, order: Vec<(ItemSortBy, SortOrder)>| {
             let query = InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 parent_id: set_id,
                 parent_type: Some(BaseItemKind::BoxSet),
                 recursive,
@@ -7858,7 +7858,7 @@ mod tests {
         // sits between Zeta and Mid, and Beta falls outside its window.
         let around = library
             .query_items(&InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 parent_id: set_id,
                 parent_type: Some(BaseItemKind::BoxSet),
                 apply_folder_display_options: true,
@@ -7967,7 +7967,7 @@ mod tests {
                 .unwrap();
         }
         let query = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             parent_id: folder,
             parent_type: Some(BaseItemKind::CollectionFolder),
             recursive: true,

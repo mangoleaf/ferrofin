@@ -10,6 +10,8 @@
 //! `QueryResult<BaseItemDto>`); identity args are [`uuid::Uuid`]; `Task<T>` →
 //! `async fn -> Result<T, ServiceError>`.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -39,7 +41,7 @@ pub struct LiveTvChannelQuery {
     /// Restrict to one channel type (TV or Radio).
     pub channel_type: Option<ChannelType>,
     /// The requesting user, if any.
-    pub user: Option<UserEntity>,
+    pub user: Option<Arc<UserEntity>>,
     /// The index of the first record to return.
     pub start_index: Option<i32>,
     /// The maximum number of records to return.

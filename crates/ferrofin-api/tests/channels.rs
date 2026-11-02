@@ -68,7 +68,7 @@ struct UserAuth(Uuid);
 impl AuthService for UserAuth {
     async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(fake_user_entity(self.0, "caller")),
+            user: Some(Arc::new(fake_user_entity(self.0, "caller"))),
             is_authenticated: true,
             ..ferrofin_api::test_support::authenticated_user_info()
         })
@@ -82,7 +82,7 @@ impl AuthorizationContext for UserAuth {
         _r: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(fake_user_entity(self.0, "caller")),
+            user: Some(Arc::new(fake_user_entity(self.0, "caller"))),
             is_authenticated: true,
             ..ferrofin_api::test_support::authenticated_user_info()
         })

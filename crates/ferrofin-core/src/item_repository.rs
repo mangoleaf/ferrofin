@@ -1091,7 +1091,7 @@ impl FerrofinItemRepository {
             && let Some(mut folders) = Self::top_parent_ids_for_query(
                 &self.db,
                 filter.parent_id,
-                filter.user.as_ref(),
+                filter.user.as_deref(),
                 0,
                 parent.cloned(),
             )
@@ -3490,7 +3490,7 @@ impl ItemRepository for FerrofinItemRepository {
             include_owned_items: true,
             ..InternalItemsQuery::default()
         };
-        filter.set_user(user.clone());
+        filter.set_user(Arc::new(user.clone()));
         // Restrictions first: they decide whether the views lookup is needed.
         let filter = crate::query_restrictions::resolve(&self.db, &filter)
             .await?
@@ -4277,7 +4277,7 @@ impl ItemRepository for FerrofinItemRepository {
         // library manager's job; here the direct-children form is honored and the
         // recursive flag widens to the ancestor closure where present.
         let mut filter = InternalItemsQuery::default();
-        filter.set_user(user.clone());
+        filter.set_user(Arc::new(user.clone()));
         let filter = crate::query_restrictions::resolve(&self.db, &filter)
             .await?
             .unwrap_or(filter);
@@ -4760,7 +4760,7 @@ mod tests {
         }
         let query = InternalItemsQuery {
             parent_id: folder,
-            user: Some(seed_user_with_defaults(&db, Uuid::new_v4()).await),
+            user: Some(Arc::new(seed_user_with_defaults(&db, Uuid::new_v4()).await)),
             limit: Some(1),
             start_index: Some(99),
             include_item_types: vec![BaseItemKind::Audio],
@@ -5017,7 +5017,7 @@ mod tests {
         )
         .await;
         let filter = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             item_ids: vec![tagged, plain],
             group_by_presentation_unique_key: false,
             ..Default::default()
@@ -5106,7 +5106,7 @@ mod tests {
         let db = test_db().await;
         let user = seed_user(&db, Uuid::from_u128(0xA0F0)).await;
         let filter = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             is_resumable: Some(true),
             ..Default::default()
         };
@@ -5222,7 +5222,7 @@ mod tests {
                 .bind(score).bind(channel.then(|| guid_to_db(Uuid::new_v4()))).bind(guid_to_db(id)).execute(db.writer()).await.unwrap();
         }
         let query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             item_ids: vec![unrated, rated],
             group_by_presentation_unique_key: false,
             ..Default::default()
@@ -5289,7 +5289,7 @@ mod tests {
         }
         seed_library_over(&db, &movies).await;
         let query = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             ..Default::default()
         };
         let genres = repository.get_genres(&query).await.unwrap();
@@ -5335,7 +5335,7 @@ mod tests {
         for (limit, count) in [(Some(12), 0), (Some(18), 1), (None, 1)] {
             user.max_parental_rating_score = limit;
             let query = InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 include_item_types: vec![BaseItemKind::Series],
                 is_resumable: Some(true),
                 ..Default::default()
@@ -5447,7 +5447,7 @@ mod tests {
         }
         seed_library_over(&db, &ids).await;
         let query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             include_item_types: vec![BaseItemKind::Movie],
             ..Default::default()
         };
@@ -5479,7 +5479,7 @@ mod tests {
             .await
             .unwrap();
         let query = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             include_item_types: vec![BaseItemKind::BoxSet],
             ..Default::default()
         };
@@ -5549,7 +5549,7 @@ mod tests {
 
         let listed = repository
             .get_item_list(&InternalItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 item_ids: vec![container],
                 ..Default::default()
             })
@@ -5882,7 +5882,7 @@ mod tests {
         .await
         .unwrap();
         let grouped = InternalItemsQuery {
-            user: Some(seed_user_with_defaults(&db, Uuid::new_v4()).await),
+            user: Some(Arc::new(seed_user_with_defaults(&db, Uuid::new_v4()).await)),
             group_by_presentation_unique_key: true,
             ..query.clone()
         };
@@ -6292,7 +6292,7 @@ mod tests {
         .unwrap();
         set_folder_preference(&db, user_id, PreferenceKind::EnabledFolders, &[allowed]).await;
         let query = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             include_item_types: vec![BaseItemKind::Movie],
             is_virtual_item: Some(false),
             is_played: Some(false),
@@ -6695,7 +6695,7 @@ mod tests {
             })
             .get_items(&InternalItemsQuery {
                 user_root_children: true,
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 ..InternalItemsQuery::default()
             })
             .await
@@ -6753,7 +6753,7 @@ mod tests {
             .get_item_list(&InternalItemsQuery {
                 parent_id: aggregate,
                 recursive: true,
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 ..InternalItemsQuery::default()
             })
             .await
@@ -6809,7 +6809,7 @@ mod tests {
             .expect("keyless person");
         }
         let query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             item_ids: people.iter().map(|(id, _)| *id).collect(),
             ..InternalItemsQuery::default()
         };
@@ -7914,7 +7914,7 @@ mod tests {
                 .collect()
         };
         let query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             ..Default::default()
         };
 
@@ -8705,7 +8705,7 @@ mod tests {
         .await;
 
         let liked = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             is_liked: Some(true),
             include_item_types: vec![BaseItemKind::Movie],
             order_by: vec![(
@@ -8781,7 +8781,7 @@ mod tests {
 
         // isFavorite=true keeps only the favorited genre…
         let fav = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             is_favorite: Some(true),
             ..Default::default()
         };
@@ -8795,7 +8795,7 @@ mod tests {
 
         // …and isFavorite=false keeps only the un-favorited one (NOT EXISTS).
         let not_fav = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             is_favorite: Some(false),
             ..Default::default()
         };
@@ -9054,7 +9054,7 @@ mod tests {
             include_owned_items,
             ..InternalItemsQuery::default()
         };
-        query.set_user(user);
+        query.set_user(Arc::new(user));
         query
     }
 
@@ -9155,7 +9155,7 @@ mod tests {
         .expect("link the set's member");
 
         let under = |parent: Uuid, kind: BaseItemKind| InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             include_item_types: vec![kind],
             parent_id: parent,
             physical_children_only: true,
@@ -9237,7 +9237,7 @@ mod tests {
 
         let tags = repository
             .get_tag_names(&InternalItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 include_item_types: vec![BaseItemKind::Movie],
                 ..InternalItemsQuery::default()
             })
@@ -9311,7 +9311,7 @@ mod tests {
         set_folder_preference(&db, user_id, PreferenceKind::EnabledFolders, &[library]).await;
 
         let base = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             include_item_types: vec![BaseItemKind::Movie],
             ..InternalItemsQuery::default()
         };
@@ -10395,7 +10395,7 @@ mod tests {
         // no TopParentId. C# AddUserToQuery must not replace it with libraries.
         let user = seed_user_with_defaults(&db, Uuid::from_u128(0xE003)).await;
         let scoped = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             ..query.clone()
         };
         let res = repository
@@ -10437,7 +10437,7 @@ mod tests {
             .expect("set position");
 
         let query = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             is_resumable: Some(true),
             ..InternalItemsQuery::default()
         };
@@ -10530,13 +10530,14 @@ mod tests {
     /// A query asking for exactly `ItemCounts` (the by-name controllers add
     /// it whenever `includeItemTypes` is set).
     fn with_item_counts(mut query: InternalItemsQuery) -> InternalItemsQuery {
-        query.dto_options.fields = vec![ferrofin_model::querying::ItemFields::ItemCounts];
+        Arc::make_mut(&mut query.dto_options).fields =
+            vec![ferrofin_model::querying::ItemFields::ItemCounts];
         query
     }
 
     /// A query with an explicit empty field set (`/Items/Filters2`'s shape).
     fn without_fields(mut query: InternalItemsQuery) -> InternalItemsQuery {
-        query.dto_options.fields = Vec::new();
+        Arc::make_mut(&mut query.dto_options).fields = Vec::new();
         query
     }
 
@@ -10682,7 +10683,7 @@ mod tests {
         // `IsMovie` with a Program-only kind filter reaches the content row;
         // with no kind filter v12 skips the predicate (`include_all_movie_types`).
         let programs = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             include_item_types: vec![BaseItemKind::LiveTvProgram],
             is_movie: Some(true),
             ..Default::default()
@@ -10692,7 +10693,7 @@ mod tests {
             vec!["News"]
         );
         let unfiltered = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             is_movie: Some(true),
             ..Default::default()
         };
@@ -10708,7 +10709,7 @@ mod tests {
 
         // `IsPlayed` scopes the COUNTS (`scopeQuery`, `:310`), not the list.
         let played = with_item_counts(InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             is_played: Some(false),
             ..Default::default()
         });
@@ -11039,7 +11040,7 @@ mod tests {
     async fn unscoped_names(repository: &FerrofinItemRepository, user: &UserEntity) -> Vec<String> {
         let mut names: Vec<String> = repository
             .get_item_list(&InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 recursive: true,
                 include_item_types: vec![BaseItemKind::Movie],
                 ..InternalItemsQuery::default()
@@ -11447,7 +11448,7 @@ mod tests {
         seed_item_genre(&db, Uuid::from_u128(0x9804), "Mystery").await;
 
         let query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             ..InternalItemsQuery::default()
         };
         let names = |result: QueryResult<ItemWithCounts>| {
@@ -11520,7 +11521,7 @@ mod tests {
         set_production_year(&db, Uuid::from_u128(0x9804), 2018).await;
 
         let query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             ..InternalItemsQuery::default()
         };
         let filters = repository
@@ -11657,7 +11658,7 @@ mod tests {
             crate::test_support::save_item(&db, &row).await;
         }
         let listing = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             recursive: true,
             top_parent_ids: vec![folder],
             group_by_presentation_unique_key: false,
@@ -11865,7 +11866,7 @@ mod tests {
                     .get_item_list(&InternalItemsQuery {
                         parent_id: parent,
                         recursive: true,
-                        user: Some(user),
+                        user: Some(Arc::new(user)),
                         include_item_types: vec![BaseItemKind::Movie],
                         ..InternalItemsQuery::default()
                     })
@@ -11925,7 +11926,7 @@ mod tests {
                     .get_item_list(&InternalItemsQuery {
                         parent_id: parent,
                         recursive: true,
-                        user: Some(user),
+                        user: Some(Arc::new(user)),
                         include_item_types: vec![BaseItemKind::Movie],
                         ..InternalItemsQuery::default()
                     })
@@ -12284,7 +12285,7 @@ mod tests {
         let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9C05)).await;
 
         let filter = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             recursive: true,
             include_item_types: vec![BaseItemKind::Movie],
             ..InternalItemsQuery::default()
@@ -12378,7 +12379,7 @@ mod tests {
 
         let mut found: Vec<String> = repository
             .get_item_list(&InternalItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 recursive: true,
                 include_item_types: vec![BaseItemKind::Movie],
                 ..InternalItemsQuery::default()
@@ -12473,7 +12474,7 @@ mod tests {
         date_progress(alternate_id, "2026-01-02 00:00:00.0000000").await;
 
         let query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             recursive: true,
             is_resumable: Some(true),
             ..InternalItemsQuery::default()
@@ -12576,7 +12577,7 @@ mod tests {
             async move {
                 repository
                     .get_item_list(&InternalItemsQuery {
-                        user: Some(user),
+                        user: Some(Arc::new(user)),
                         recursive: true,
                         include_item_types: vec![BaseItemKind::Movie],
                         order_by: vec![(sort, SortOrder::Descending)],
@@ -12728,7 +12729,7 @@ mod tests {
         }
 
         let query = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             recursive: true,
             is_resumable: Some(true),
             ..InternalItemsQuery::default()
@@ -12809,7 +12810,7 @@ mod tests {
         }
         let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9D05)).await;
         let grouped = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             recursive: true,
             include_item_types: vec![BaseItemKind::Movie],
             ..InternalItemsQuery::default()
@@ -13465,7 +13466,7 @@ mod tests {
         };
         let played = repository
             .get_item_list(&InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 include_item_types: vec![BaseItemKind::Movie],
                 is_played: Some(true),
                 ..Default::default()
@@ -13479,7 +13480,7 @@ mod tests {
         );
         let unplayed = repository
             .get_item_list(&InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 include_item_types: vec![BaseItemKind::Movie],
                 is_played: Some(false),
                 ..Default::default()
@@ -13497,7 +13498,7 @@ mod tests {
         let options = tempfile::tempdir().unwrap();
         crate::test_support::set_item_path(&db, second, options.path().to_str().unwrap()).await;
         let query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             recursive: true,
             include_item_types: vec![BaseItemKind::Movie],
             ..Default::default()
@@ -13576,7 +13577,7 @@ mod tests {
         let repository = repo(&db).with_root_ids(roots);
         let query = InternalItemsQuery {
             user_root_children: true,
-            user: Some(user),
+            user: Some(Arc::new(user)),
             ..Default::default()
         };
         let page = repository.get_items(&query).await.unwrap();
@@ -13658,7 +13659,7 @@ mod tests {
         let repository = repo(&db).with_root_ids(roots);
         let query = InternalItemsQuery {
             parent_id: view,
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             recursive: true,
             order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
             ..Default::default()
@@ -13986,7 +13987,7 @@ mod tests {
             .get_item_list(&InternalItemsQuery {
                 parent_id: view,
                 recursive: true,
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 include_item_types: vec![BaseItemKind::Movie],
                 ..InternalItemsQuery::default()
             })
@@ -14207,7 +14208,7 @@ mod folder_get_result_tests {
             (
                 InternalItemsQuery {
                     is_liked: Some(true),
-                    user: Some(user.clone()),
+                    user: Some(Arc::new(user.clone())),
                     ..Default::default()
                 },
                 vec![liked],
@@ -14215,7 +14216,7 @@ mod folder_get_result_tests {
             (
                 InternalItemsQuery {
                     is_liked: Some(false),
-                    user: Some(user.clone()),
+                    user: Some(Arc::new(user.clone())),
                     ..Default::default()
                 },
                 vec![disliked],
@@ -14223,7 +14224,7 @@ mod folder_get_result_tests {
             (
                 InternalItemsQuery {
                     is_favorite_or_liked: Some(true),
-                    user: Some(user.clone()),
+                    user: Some(Arc::new(user.clone())),
                     ..Default::default()
                 },
                 vec![liked, favorite],
@@ -14231,7 +14232,7 @@ mod folder_get_result_tests {
             (
                 InternalItemsQuery {
                     is_favorite_or_liked: Some(false),
-                    user: Some(user.clone()),
+                    user: Some(Arc::new(user.clone())),
                     ..Default::default()
                 },
                 vec![unrated, disliked],
@@ -14239,7 +14240,7 @@ mod folder_get_result_tests {
             (
                 InternalItemsQuery {
                     is_favorite: Some(true),
-                    user: Some(user.clone()),
+                    user: Some(Arc::new(user.clone())),
                     ..Default::default()
                 },
                 vec![favorite],
@@ -14273,22 +14274,22 @@ mod folder_get_result_tests {
         for query in [
             InternalItemsQuery {
                 is_favorite: Some(true),
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 ..Default::default()
             },
             InternalItemsQuery {
                 is_resumable: Some(true),
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 ..Default::default()
             },
             InternalItemsQuery {
                 is_played: Some(true),
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 ..Default::default()
             },
             InternalItemsQuery {
                 is_liked: Some(true),
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 ..Default::default()
             },
         ] {
@@ -14304,7 +14305,7 @@ mod folder_get_result_tests {
                     rows,
                     &InternalItemsQuery {
                         is_liked: Some(false),
-                        user: Some(user),
+                        user: Some(Arc::new(user)),
                         ..Default::default()
                     }
                 )
@@ -14353,7 +14354,7 @@ mod folder_get_result_tests {
                     rows,
                     &InternalItemsQuery {
                         is_favorite: Some(true),
-                        user: Some(user.clone()),
+                        user: Some(Arc::new(user.clone())),
                         ..Default::default()
                     },
                 )
@@ -14400,7 +14401,7 @@ mod folder_get_result_tests {
                     rows,
                     &InternalItemsQuery {
                         is_favorite: Some(true),
-                        user: Some(user),
+                        user: Some(Arc::new(user)),
                         ..Default::default()
                     }
                 )
@@ -14480,7 +14481,7 @@ mod folder_get_result_tests {
             .filter_folder_children(
                 rows.clone(),
                 &InternalItemsQuery {
-                    user: Some(user),
+                    user: Some(Arc::new(user)),
                     is_favorite: Some(true),
                     ..Default::default()
                 },
@@ -14498,7 +14499,7 @@ mod folder_get_result_tests {
             repo.filter_folder_children(
                 rows,
                 &InternalItemsQuery {
-                    user: Some(other),
+                    user: Some(Arc::new(other)),
                     is_favorite: Some(true),
                     ..Default::default()
                 }
@@ -14528,7 +14529,7 @@ mod folder_get_result_tests {
                     rows.clone(),
                     &InternalItemsQuery {
                         is_played: Some(true),
-                        user: Some(user.clone()),
+                        user: Some(Arc::new(user.clone())),
                         ..Default::default()
                     }
                 )
@@ -14542,7 +14543,7 @@ mod folder_get_result_tests {
                     rows.clone(),
                     &InternalItemsQuery {
                         is_played: Some(false),
-                        user: Some(user.clone()),
+                        user: Some(Arc::new(user.clone())),
                         ..Default::default()
                     }
                 )
@@ -14557,7 +14558,7 @@ mod folder_get_result_tests {
                     rows,
                     &InternalItemsQuery {
                         is_resumable: Some(true),
-                        user: Some(user),
+                        user: Some(Arc::new(user)),
                         ..Default::default()
                     }
                 )
@@ -15058,7 +15059,7 @@ mod folder_get_result_tests {
         .unwrap();
         let repository = repository(&db).with_root_ids(roots);
         let result = Box::pin(repository.user_root_children(&InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             parent_id: roots.user_root,
             user_root_children: true,
             ..Default::default()

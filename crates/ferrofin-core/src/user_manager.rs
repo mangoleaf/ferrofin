@@ -1650,6 +1650,20 @@ impl UserManager for FerrofinUserManager {
         Ok(dto)
     }
 
+    async fn latest_items_excludes(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
+        // A hit copies the one list instead of the whole DTO; a miss builds the
+        // DTO (and caches it) exactly as `get_user_dto` would.
+        if let Some(excludes) = self.auth_cache.latest_items_excludes(user) {
+            return Ok(excludes);
+        }
+        Ok(self
+            .get_user_dto(user, None)
+            .await?
+            .configuration
+            .map(|c| c.latest_items_excludes)
+            .unwrap_or_default())
+    }
+
     async fn update_configuration(
         &self,
         user_id: Uuid,
@@ -2900,6 +2914,11 @@ mod tests {
         // First build populates the cache; a repeat with the same entity hits it.
         let first = mgr.get_user_dto(&user, None).await.expect("dto");
         assert_eq!(mgr.auth_cache.get_user_dto(&user), Some(first.clone()));
+        assert_eq!(
+            mgr.auth_cache.latest_items_excludes(&user),
+            Some(Vec::new()),
+            "the list read hits the same cached DTO"
+        );
         let second = mgr.get_user_dto(&user, None).await.expect("dto again");
         assert_eq!(second, first);
 
@@ -2935,8 +2954,62 @@ mod tests {
         let mut renamed = user.clone();
         renamed.username = "erin2".to_owned();
         assert!(mgr.auth_cache.get_user_dto(&renamed).is_none());
+        assert!(
+            mgr.auth_cache.latest_items_excludes(&renamed).is_none(),
+            "the list read checks the entity the DTO was built from too"
+        );
         let fresh = mgr.get_user_dto(&renamed, None).await.expect("dto renamed");
         assert_eq!(fresh.name.as_deref(), Some("erin2"));
+    }
+
+    /// `/Items/Latest` and `/UserItems/Resume` read one list off the user's
+    /// configuration. The read answers what `get_user_dto` would, from a cold
+    /// cache and from a warm one, and follows a configuration change.
+    #[tokio::test]
+    async fn latest_items_excludes_reads_the_configuration_get_user_dto_builds() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let user = mgr.create_user("fern").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        let excluded = vec![Uuid::from_u128(0xa1), Uuid::from_u128(0xa2)];
+        let config = UserConfiguration {
+            latest_items_excludes: excluded.clone(),
+            ..mgr
+                .get_user_dto(&user, None)
+                .await
+                .expect("dto")
+                .configuration
+                .expect("configuration")
+        };
+        mgr.update_configuration(id, &config).await.expect("update");
+
+        // Cold: the update cleared the cache, so this read builds and caches.
+        assert!(mgr.auth_cache.get_user_dto(&user).is_none());
+        assert_eq!(
+            mgr.latest_items_excludes(&user).await.expect("cold read"),
+            excluded
+        );
+        assert!(
+            mgr.auth_cache.get_user_dto(&user).is_some(),
+            "a cold read leaves the DTO cached for the next request"
+        );
+        // Warm: the same answer from the cached DTO.
+        assert_eq!(
+            mgr.latest_items_excludes(&user).await.expect("warm read"),
+            excluded
+        );
+
+        let cleared = UserConfiguration {
+            latest_items_excludes: Vec::new(),
+            ..config
+        };
+        mgr.update_configuration(id, &cleared).await.expect("clear");
+        assert_eq!(
+            mgr.latest_items_excludes(&user)
+                .await
+                .expect("after change"),
+            Vec::<Uuid>::new()
+        );
     }
 
     #[rstest::rstest]
@@ -3265,7 +3338,13 @@ mod tests {
                     is_active: true,
                     user_id: user.id.clone(),
                 };
-                cache.put(generation, token, device, Some(user.clone()), None);
+                cache.put(
+                    generation,
+                    token,
+                    device,
+                    Some(Arc::new(user.clone())),
+                    None,
+                );
                 cache.put_user_dto(generation, user, UserDto::default());
             }
         };

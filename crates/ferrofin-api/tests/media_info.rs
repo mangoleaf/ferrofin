@@ -82,7 +82,7 @@ impl AuthService for OkAuthService {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -99,7 +99,7 @@ impl AuthorizationContext for OkAuthContext {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             client: Some("Wolphin".to_owned()),
             version: Some("1.0".to_owned()),
             device_id: Some("dev-1".to_owned()),
@@ -2065,7 +2065,7 @@ struct TranscodingAuth;
 impl TranscodingAuth {
     fn info() -> AuthorizationInfo {
         AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
                 enable_audio_playback_transcoding: true,
                 enable_video_playback_transcoding: true,
