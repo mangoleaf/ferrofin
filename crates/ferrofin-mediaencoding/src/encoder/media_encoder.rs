@@ -2535,6 +2535,7 @@ mod tests {
                     allow_hw_accel: false,
                     enable_hw_encoding: false,
                     keyframe_only: false,
+                    full_chroma: false,
                 })
                 .await
         });

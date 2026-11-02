@@ -1192,12 +1192,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    UserRootFolder.GetEligibleChildrenForRecursiveChildren); handlers/items.rs \
                    require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
                    routes that take a scope (ItemsController.GetItems, \
-                   LibraryManager.AddUserToQuery); item_repository.rs \
+                   LibraryManager.AddUserToQuery); handlers/streaming.rs \
+                   require_streamable_item at the stream, HLS, universal audio, subtitle and \
+                   attachment routes (StreamingHelpers.GetStreamingState, \
+                   SubtitleController.GetSubtitle, VideoAttachmentsController.GetAttachment); \
+                   item_repository.rs \
                    resolve_views_with_parent and item_visibility.rs hidden_playlists on \
                    listings that can hold a playlist (Folder.QueryRecursive, \
                    Folder.QueryWithPostFiltering, Playlist.IsVisible); dto_service.rs \
                    get_base_item_dtos' IsVisible pass (DtoService.GetBaseItemDtos), which of \
-                   the handlers only GET /Items/Suggestions asks for, as its controller does",
+                   the handlers only GET /Items/Suggestions asks for, as its controller does; \
+                   handlers/live_tv.rs query_programs_inner \
+                   (LiveTvController.GetLiveTvPrograms, GetPrograms)",
         date: "2026-11-01",
         divergences: &[
             "A listing with a user leaves out the playlists that fail \
@@ -1213,10 +1219,32 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A request naming an item as its scope (parentId, ids, seriesId, appearsInItemId) \
              stops at the libraries the user may open, on every route that takes one: a \
              library or view must pass IsVisible and anything else IsVisibleStandalone, or \
-             the request answers 401, and ids are reduced to those that pass \
-             IsVisibleStandalone. Upstream applies IsVisible alone, on GET /Items and GET \
-             /Trailers. A BoxSet or Playlist browse that re-roots to the user root skips the \
-             check, as upstream. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091).",
+             the request answers 403, a BoxSet or Playlist browse included, and ids are \
+             reduced to those that pass IsVisibleStandalone. Upstream applies IsVisible \
+             alone, on GET /Items and GET /Trailers, and answers 401. Jellyfin bug not ported \
+             (owner decisions 2026-10-31 and 2026-11-01, gl-1091, gl-1136).",
+            "A request naming a user is held to that user on the stream, HLS, universal audio, \
+             subtitle Stream.{format} and attachment routes: the default policy runs (a disabled \
+             account 401, remote access and the access schedule 403), and the item, and the \
+             version a mediaSourceId names, must pass IsVisibleStandalone or the route answers \
+             404. Upstream's GetStreamingState reads the item with no user, and its stream and \
+             Stream.{format} actions are anonymous; only its attachment action already checks \
+             the item for a user, and neither the policy nor the version. A channel takes the \
+             same check, as PlaybackInfo does. A DVR recording has no row here, so it takes \
+             Live TV access, IsVisibleStandalone over its entity, the libraries holding its \
+             file and then its channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
+             now share; upstream's recording is a library item, whose library holds it. On the \
+             routes upstream leaves anonymous, no credential, a token that names nobody and an \
+             API key stay so, which binds a client that sends its token. The legacy /hls/ \
+             routes are outside this: they serve a transcode's file by its random name, and \
+             the item id selects nothing, as upstream. Deliberate divergence (owner decision \
+             2026-10-31, gl-1090).",
+            "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, so \
+             a series that user cannot open (library, rating or tag rules) answers like an id \
+             that is no series: IsSeries stays forced and its title is not searched for. \
+             Upstream's GetItemById<Series> reads it with no user, and a request with no user \
+             still does here. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; \
+             gl-1113). Fix path for the rest: gl-1130.",
         ],
     },
     VerifiedSubsystem {
@@ -2288,6 +2316,69 @@ pub const VERIFIED: &[Verified] = &[
          empty Forbid). Fix path: gl-666.",
         ],
         refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Playlists/{itemId}/Items",
+        upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
+        upstream_method: "GetPlaylistItems",
+        ferrofin: "handlers/playlists.rs get_playlist_items (effective_user_id: \
+               RequestHelpers.GetUserId) → ferrofin-core collection_manager.rs \
+               FerrofinPlaylistManager::get_playlist_items (GetPlaylistForUser and \
+               GetManageableItems: manual links, in order, missing items out), then \
+               LibraryManager::get_visible_item_ids before the paging, as upstream filters \
+               before Skip and Take, and tv_shows::build_dto_options + get_linked_children_dtos \
+               + the PlaylistItemId tag",
+        date: "2026-11-01",
+        divergences: &[
+            "A member the caller may not open is left out with the standalone check, which also \
+         walks its library, where upstream's IsVisible reads only its rating and tags and \
+         lists a member from a library the caller was not granted. An accepted divergence \
+         (owner decision 2026-10-31, gl-1092): only this read and Move's index change, so \
+         the stored members, Add, Create and ItemIds stay as upstream has them. It is the \
+         check GET /Items?ids= uses. GET /Items?ParentId=<playlist> takes \
+         Folder.GetLinkedChildren(user)'s rule (item_visibility.rs folder_children), which \
+         agrees on a member of a library the caller was or was not granted and differs at \
+         the edges: a member of a disabled library or a file in no library is kept here and \
+         dropped there, and a member whose parent fails the caller's rating limit is dropped \
+         here and kept there. This list answers as GET /Items/{id} does.",
+            "A negative limit is ignored and the rest of the list comes back; upstream's \
+         Take(limit) answers an empty page. Fix path: gl-1137.",
+            "The 404 (no playlist the caller can see) and 403 (another user's id without the \
+         administrator role) bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
+        method: "post",
+        path: "/Playlists/{itemId}/Items/{itemId}/Move/{newIndex}",
+        upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
+        upstream_method: "MoveItem",
+        ferrofin: "handlers/playlists.rs move_item (get_playlist_access + require_edit: \
+               GetPlaylistForUser and the owner-or-editing-share check) → ferrofin-core \
+               collection_manager.rs FerrofinPlaylistManager::move_item \
+               (PlaylistManager.MoveItemAsync: the first occurrence moves, the index counts \
+               the caller's list, no write when it is already there) and visible_entries",
+        date: "2026-11-01",
+        divergences: &[
+            "The index counts the members GET /Playlists/{id}/Items gave the caller, so the \
+         standalone check, library included, where upstream's accessibleChildren take \
+         IsVisible alone. An accepted divergence (owner decision 2026-10-31, gl-1092). A \
+         hidden member named by its id still moves, as upstream: its id comes from ItemIds, \
+         not the listing.",
+            "Moving down past a member hidden from the caller lands at the index asked for; \
+         upstream anchors on the list before the entry is taken out \
+         (DetermineAdjustedIndex) and lands one place short. Jellyfin bug not ported.",
+            "An index beyond the length of the caller's list goes to the end; upstream's \
+         accessibleChildren[newPriorItemIndex] throws (500), as it does at any index when \
+         the caller's list is empty. Jellyfin bug not ported.",
+            "A malformed playlist id is a 400; upstream's Guid.Parse throws FormatException, \
+         which ExceptionMiddleware answers with a 500. Jellyfin bug not ported.",
+            "The 400 (a malformed index), 403 (no editing share) and 404 (no playlist the \
+         caller can see) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
     },
     Verified {
         method: "get",

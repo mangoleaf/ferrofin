@@ -3,6 +3,8 @@
 ## What
 <!-- The change, user-visible behaviour first. -->
 
+**Upgrade note:** <!-- What an operator must do, or plan for, when upgrading to a release with this change, or `none`. See CONTRIBUTING.md, "Upgrade notes". Do not edit docs/UPGRADING.md. -->
+
 ## Why
 <!-- The problem and its impact. Link any issue; cite the upstream Jellyfin code for parity fixes. -->
 

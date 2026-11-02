@@ -291,10 +291,22 @@ async fn get_playlist_items(
         .get_playlist_items(playlist_id, calling_user_id)
         .await?;
     // `GetManageableItems().Where(i => i.Item2.IsVisible(user))`: a member
-    // the caller may not see (its rating or tags) is out of the page and the
-    // count.
+    // the caller may not see is out of the page and the count. Divergence
+    // (gl-1092): the standalone check, which also walks the member's
+    // library, where upstream's `IsVisible` reads only its rating and tags,
+    // so a member from a library the caller was not granted is dropped too.
     if let Some(user) = &user {
-        items = state.library.filter_visible_items(items, user).await?;
+        let ids: Vec<Uuid> = items
+            .iter()
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
+            .collect();
+        let visible: std::collections::HashSet<Uuid> = state
+            .library
+            .get_visible_item_ids(&ids, user)
+            .await?
+            .into_iter()
+            .collect();
+        items.retain(|item| Uuid::parse_str(&item.id).is_ok_and(|id| visible.contains(&id)));
     }
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
 

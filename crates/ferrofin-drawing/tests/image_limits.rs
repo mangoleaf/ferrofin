@@ -452,6 +452,7 @@ async fn a_trickplay_frame_over_a_limit_is_refused() {
                 90,
                 200,
                 None,
+                true,
             )
             .await,
         "image_decode_max_megapixels",
