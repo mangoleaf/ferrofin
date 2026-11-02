@@ -62,7 +62,8 @@ pub(crate) fn provider_label(name: &str) -> &'static str {
 /// How one logical provider request ended — the `result` label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestResult {
-    /// A success status.
+    /// A success status, or a redirect handed back to be followed
+    /// (`rate_limit::is_redirect_to_follow`).
     Ok,
     /// A 404: the provider answered "nothing here".
     NotFound,

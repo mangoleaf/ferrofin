@@ -244,7 +244,7 @@ impl StudiosClient {
     /// Downloads `url`, returning its bytes; `None` on any failure
     /// (best-effort, like the metadata clients' image downloads).
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        crate::image_download::download_bytes(&self.http, url).await
+        crate::image_download::download_bytes(url).await
     }
 
     /// The thumb URL for `studio_name`, or `None` when the repository has no

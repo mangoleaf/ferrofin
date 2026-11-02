@@ -13,6 +13,9 @@ use uuid::Uuid;
 
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
+use ferrofin_providers::destination::{
+    DestinationRefused, PublicOnlyResolver, environment_proxy, is_private_address,
+};
 use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::InternalItemsQuery;
@@ -109,66 +112,6 @@ impl EgressPolicy {
     }
 }
 
-/// Whether an address is in a range the private-HTTP policy denies by
-/// default: loopback, link-local (incl. cloud metadata services), RFC1918,
-/// CGNAT (`100.64.0.0/10` — Tailscale's default range), IPv6 ULA, and the
-/// reserved/multicast blocks a public HTTP fetch should never target.
-/// An IPv6 address that carries an IPv4 one reaches that IPv4 host, so it
-/// takes the IPv4 rule: IPv4-mapped (`::ffff:0:0/96`), IPv4-compatible
-/// (`::/96`, RFC 4291), NAT64 (`64:ff9b::/96`, RFC 6052) and 6to4
-/// (`2002::/16`, RFC 3056). The local-use NAT64 prefix `64:ff9b:1::/48`
-/// (RFC 8215) is not globally reachable, so it is private whatever it embeds.
-///
-/// The CGNAT and reserved-block checks are open-coded because
-/// `Ipv4Addr::is_shared`/`is_reserved` are still nightly-only and we pin
-/// stable.
-#[must_use]
-pub fn is_private_address(addr: std::net::IpAddr) -> bool {
-    match addr {
-        std::net::IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
-            v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_private()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()               // 224.0.0.0/4
-                // CGNAT 100.64.0.0/10 (Tailscale, carrier NAT).
-                || (a == 100 && (64..128).contains(&b))
-                // Benchmarking 198.18.0.0/15.
-                || (a == 198 && (b == 18 || b == 19))
-                // IETF protocol assignments 192.0.0.0/24.
-                || (a == 192 && b == 0 && v4.octets()[2] == 0)
-                // Reserved for future use 240.0.0.0/4 (excl. broadcast, above).
-                || a >= 240
-        }
-        std::net::IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
-                return true;
-            }
-            let segments = v6.segments();
-            let from_segments =
-                |hi: u16, lo: u16| std::net::Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
-            // `to_ipv4` is the mapped and the compatible form; `::1` and `::`
-            // are caught above, since the compatible form reads them as
-            // `0.0.0.1` and `0.0.0.0`.
-            let embedded = v6.to_ipv4().or_else(|| match segments {
-                [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] | [0x2002, hi, lo, ..] => {
-                    Some(from_segments(hi, lo))
-                }
-                _ => None,
-            });
-            if let Some(v4) = embedded {
-                return is_private_address(std::net::IpAddr::V4(v4));
-            }
-            v6.is_multicast()
-                || v6.is_unicast_link_local()
-                || v6.is_unique_local()
-                || matches!(segments, [0x64, 0xff9b, 1, ..])
-        }
-    }
-}
-
 /// The guest HTTP clients, built once per plugin host and shared by every
 /// plugin and every call, so connections are pooled and no call spawns a
 /// client runtime of its own.
@@ -179,12 +122,13 @@ pub fn is_private_address(addr: std::net::IpAddr) -> bool {
 /// - `open` resolves as the system does and honours an environment proxy.
 ///   It serves plugins the admin granted private-network access
 ///   (`FERROFIN_WASM_PRIVATE_HTTP_ALLOW`).
-/// - `vetted` resolves through [`PublicOnlyResolver`], which refuses a name
-///   with any private or loopback address, and never uses a proxy. The
-///   resolver vets every resolution the client makes, new pooled connections
-///   included, and the client connects only to the addresses it returned, so
-///   a short-TTL record that alternates public and private cannot win a
-///   re-resolve race (the DNS-rebinding TOCTOU).
+/// - `vetted` resolves through [`PublicOnlyResolver`] (the guard the image
+///   downloads share), which refuses a name with any private or loopback
+///   address, and never uses a proxy. The resolver vets every resolution the
+///   client makes, new pooled connections included, and the client connects
+///   only to the addresses it returned, so a short-TTL record that alternates
+///   public and private cannot win a re-resolve race (the DNS-rebinding
+///   TOCTOU).
 ///
 /// A proxy resolves the destination itself, out of the resolver's sight. So
 /// when the environment configures one (`environment_proxy`), a hostname
@@ -236,30 +180,11 @@ impl GuestHttp {
             vetted: build(
                 reqwest::blocking::Client::builder()
                     .no_proxy()
-                    .dns_resolver(Arc::new(PublicOnlyResolver { refused })),
+                    .dns_resolver(Arc::new(PublicOnlyResolver::new(Arc::new(refused)))),
             )?,
             environment_proxy,
         })
     }
-}
-
-/// Whether the environment configures an outbound proxy reqwest would use:
-/// a non-empty `ALL_PROXY`, `HTTP_PROXY` or `HTTPS_PROXY`, in either case.
-///
-/// Over-reporting only sends fetches down the proxied path, which vets them
-/// too. A proxy this misses cannot bypass the check either: the vetted
-/// client never uses a proxy, so the fetch connects directly.
-fn environment_proxy(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
-    [
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-    ]
-    .iter()
-    .any(|name| var(name).is_some_and(|value| !value.is_empty()))
 }
 
 /// Enforces the private-destination policy for one hostname before a
@@ -296,74 +221,6 @@ fn pinned_client(
         .resolve(host, std::net::SocketAddr::new(vetted, 0))
         .build()
         .map_err(|e| format!("building pinned http client: {e}"))
-}
-
-/// Why [`PublicOnlyResolver`] refused a hostname. Carried through reqwest's
-/// error chain so [`http_fetch`] can tell the guest exactly that.
-#[derive(Debug)]
-enum DestinationRefused {
-    /// The name resolves to an address the policy denies.
-    Private {
-        host: String,
-        address: std::net::IpAddr,
-    },
-    /// The name does not resolve.
-    Unresolvable { host: String, error: std::io::Error },
-    /// The name resolves to nothing.
-    Empty { host: String },
-}
-
-impl std::fmt::Display for DestinationRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Private { host, address } => {
-                write!(f, "`{host}` resolves to the private address {address}")
-            }
-            Self::Unresolvable { host, error } => write!(f, "could not resolve `{host}`: {error}"),
-            Self::Empty { host } => write!(f, "`{host}` resolved to no addresses"),
-        }
-    }
-}
-
-impl std::error::Error for DestinationRefused {}
-
-/// The vetted client's DNS resolver: the system lookup, refused when ANY
-/// address of the name is one the private-destination policy denies.
-struct PublicOnlyResolver {
-    refused: fn(std::net::IpAddr) -> bool,
-}
-
-impl reqwest::dns::Resolve for PublicOnlyResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_owned();
-        let refused = self.refused;
-        Box::pin(async move {
-            // The system lookup blocks, as reqwest's own resolver does.
-            let lookup = host.clone();
-            let resolved = tokio::task::spawn_blocking(move || {
-                std::net::ToSocketAddrs::to_socket_addrs(&(lookup.as_str(), 0))
-                    .map(Iterator::collect::<Vec<_>>)
-            })
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            let addrs = resolved.map_err(|error| {
-                Box::new(DestinationRefused::Unresolvable {
-                    host: host.clone(),
-                    error,
-                }) as Box<dyn std::error::Error + Send + Sync>
-            })?;
-            if addrs.is_empty() {
-                return Err(Box::new(DestinationRefused::Empty { host }) as _);
-            }
-            if let Some(private) = addrs.iter().find(|a| refused(a.ip())) {
-                return Err(Box::new(DestinationRefused::Private {
-                    host,
-                    address: private.ip(),
-                }) as _);
-            }
-            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
 }
 
 /// The guest-visible refusal of a private destination: the address class
@@ -1584,31 +1441,5 @@ mod tests {
             matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
             "nothing was sent"
         );
-    }
-
-    #[test]
-    fn an_environment_proxy_is_any_non_empty_proxy_variable() {
-        let env = |set: &'static [(&'static str, &'static str)]| {
-            move |name: &str| {
-                set.iter()
-                    .find(|(key, _)| *key == name)
-                    .map(|(_, value)| std::ffi::OsString::from(*value))
-            }
-        };
-        assert!(!super::environment_proxy(env(&[])));
-        assert!(!super::environment_proxy(env(&[("HTTP_PROXY", "")])));
-        assert!(!super::environment_proxy(env(&[("NO_PROXY", "*")])));
-        for name in [
-            "ALL_PROXY",
-            "all_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-        ] {
-            let set: &'static [(&'static str, &'static str)] =
-                Box::leak(vec![(name, "http://proxy:3128")].into_boxed_slice());
-            assert!(super::environment_proxy(env(set)), "{name}");
-        }
     }
 }

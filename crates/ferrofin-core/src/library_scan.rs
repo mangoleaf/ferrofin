@@ -24734,6 +24734,8 @@ mod tests {
         routes: Vec<(&'static str, &'static str)>,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = Arc::clone(&requests);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -27179,6 +27181,8 @@ mod tests {
     /// else — enough HTTP for the studios client (blocking, own thread).
     fn spawn_art_server(manifest: &'static str, image: &'static [u8]) -> String {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -27846,6 +27850,8 @@ mod tests {
         use ferrofin_db::entities::base_items::BaseItemEntity;
         use ferrofin_model::data::BaseItemKind;
         use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
 
         let db = test_db().await;
         let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
@@ -28450,6 +28456,8 @@ mod tests {
     /// Returns its base URL and the requests it answered.
     fn spawn_music_stub() -> (String, Arc<MusicHits>) {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let hits = Arc::new(MusicHits::default());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -29661,6 +29669,8 @@ mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         // Every request, not just season fetches: a series lookup never asks
         // for a season, so a season-only counter cannot prove TMDB stayed out.
@@ -33378,6 +33388,8 @@ mod tests {
     /// the provider fold could be deleted with the whole suite green.
     fn spawn_tvdb_server(search: Option<&'static str>, details: Option<&'static str>) -> String {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -34329,6 +34341,8 @@ mod tests {
         vote_tenths: Arc<std::sync::atomic::AtomicU32>,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = Arc::clone(&requests);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -34814,6 +34828,8 @@ mod tests {
     /// Returns the base URL and every request line.
     fn spawn_artwork_server(still: bool) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = Arc::clone(&requests);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -35324,6 +35340,8 @@ mod tests {
 
     fn spawn_music_artwork_stub() -> String {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
