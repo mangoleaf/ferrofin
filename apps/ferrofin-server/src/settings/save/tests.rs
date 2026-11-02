@@ -571,6 +571,22 @@ fn an_invalid_value_leaves_the_file_byte_identical() {
     }
 }
 
+/// The transcode caps take 0, which is off, to 1024, and saving refuses the
+/// rest, where the loader would clamp them.
+#[test]
+fn a_transcode_cap_outside_its_range_is_refused() {
+    let data = DataDir::new(&[]);
+    let env = FakeEnv::new();
+    for (key, value) in [
+        ("max_transcodes", json!(1025)),
+        ("max_transcodes_per_user", json!(-1)),
+    ] {
+        let err = saved(&data, &env, &[(key, value)]).expect_err("refused");
+        let message = refused(err);
+        assert!(message.contains("from 0 to 1024"), "{message}");
+    }
+}
+
 /// A message from the loader names `config.toml`, not the staged file it read.
 #[test]
 fn a_loader_message_names_config_toml() {

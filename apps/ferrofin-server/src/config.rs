@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use ferrofin_drawing::ImageLimits;
+use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_providers::rate_limit::RequestLimits;
 use ferrofin_providers::{DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS, IMAGE_NEGATIVE_CACHE_TTL_SECS};
 use serde::Deserialize;
@@ -158,6 +159,8 @@ struct FileConfig {
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     ffmpeg_img_extract_perf_tradeoff: Option<bool>,
+    max_transcodes: Option<u32>,
+    max_transcodes_per_user: Option<u32>,
     library_roots: Option<Vec<PathBuf>>,
     server_name: Option<String>,
     log_level: Option<String>,
@@ -490,6 +493,20 @@ pub struct Config {
     /// `ffmpeg_img_extract_perf_tradeoff` in `config.toml` > `false`,
     /// Jellyfin's default.
     pub ffmpeg_img_extract_perf_tradeoff: bool,
+
+    /// Re-encoding jobs the whole server may run at once; `0` is no cap. Past
+    /// it a signed-in user's idle jobs are ended first, and a start that still
+    /// has no room is answered `503` with `Retry-After`. Resolved
+    /// `FERROFIN_MAX_TRANSCODES` env > `max_transcodes` in `config.toml` > `0`,
+    /// clamped to [`TranscodeLimits::RANGE`].
+    pub max_transcodes: u32,
+
+    /// Re-encoding jobs one signed-in user may run at once; `0` is no cap. An
+    /// API key has no user, so only [`Self::max_transcodes`] applies to it.
+    /// Resolved `FERROFIN_MAX_TRANSCODES_PER_USER` env >
+    /// `max_transcodes_per_user` in `config.toml` > `0`, clamped to
+    /// [`TranscodeLimits::RANGE`].
+    pub max_transcodes_per_user: u32,
 
     /// Initial media library roots used to seed a fresh install.
     pub library_roots: Vec<PathBuf>,
@@ -969,6 +986,24 @@ impl Config {
             RequestLimits::DOWNLOAD_MAX_MB,
             "MiB",
         );
+        let max_transcodes = resolve_clamped(
+            env,
+            "FERROFIN_MAX_TRANSCODES",
+            "max_transcodes",
+            file.max_transcodes,
+            0,
+            TranscodeLimits::RANGE,
+            "transcodes",
+        );
+        let max_transcodes_per_user = resolve_clamped(
+            env,
+            "FERROFIN_MAX_TRANSCODES_PER_USER",
+            "max_transcodes_per_user",
+            file.max_transcodes_per_user,
+            0,
+            TranscodeLimits::RANGE,
+            "transcodes",
+        );
         let image_negative_cache_ttl_secs = resolve_clamped(
             env,
             "FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS",
@@ -1053,6 +1088,8 @@ impl Config {
             image_negative_cache_ttl_secs,
             ffmpeg_path,
             ffprobe_path,
+            max_transcodes,
+            max_transcodes_per_user,
             ffmpeg_img_extract_perf_tradeoff: parse_bool_var(
                 env,
                 "FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF",
@@ -1341,6 +1378,8 @@ impl Config {
             ffmpeg_path: None,
             ffprobe_path: None,
             ffmpeg_img_extract_perf_tradeoff: false,
+            max_transcodes: 0,
+            max_transcodes_per_user: 0,
             library_roots: Vec::new(),
             server_name: "ferrofin-test".to_owned(),
             log_level: "info".to_owned(),
@@ -2970,6 +3009,39 @@ mod tests {
         // Empty env value is "unset", not an error (compose passes `${VAR:-}`).
         let env = FakeEnv::new().with("FERROFIN_DB_POOL", "");
         assert_eq!(Config::load_from(cli(), &env).unwrap().db_pool, Some(8));
+    }
+
+    /// Both caps default off, the variable beats the file, and a value past
+    /// the range is clamped with a warning rather than stopping the boot.
+    #[test]
+    fn transcode_caps_default_off_env_beats_file_and_clamp() {
+        let caps = |cfg: &Config| (cfg.max_transcodes, cfg.max_transcodes_per_user);
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(caps(&unset), (0, 0));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "max_transcodes = 16\nmax_transcodes_per_user = 4\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(caps(&cfg), (16, 4));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_MAX_TRANSCODES", "0")
+            .with("FERROFIN_MAX_TRANSCODES_PER_USER", "2");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert_eq!(caps(&cfg), (0, 2));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_MAX_TRANSCODES", "1025")
+            .with("FERROFIN_MAX_TRANSCODES_PER_USER", "99999");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(caps(&cfg), (1024, 1024));
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
     }
 
     #[test]

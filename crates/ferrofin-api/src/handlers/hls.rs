@@ -325,6 +325,8 @@ struct HlsRequestContext {
     api_key: Option<String>,
     /// Trusted policy snapshot from authorization, including on segment requests.
     playback_permissions: Option<ferrofin_traits::library::PlaybackPermissions>,
+    /// The authenticated user, for the transcode manager's per-user cap.
+    user_id: Option<Uuid>,
     /// Whether the client is on the local network: `GetNormalizedRemoteIP()`
     /// (the client behind any known proxy) judged by
     /// `INetworkManager.IsInLocalNetwork` (the configured LAN subnets). A
@@ -376,6 +378,7 @@ impl HlsRequestContext {
         Self {
             api_key: auth.token.as_ref().map(|t| t.expose().to_owned()),
             playback_permissions: auth.user_policy.as_deref().map(Into::into),
+            user_id: auth_user_id(auth),
             // The peer is inserted by the server's `with_connect_info`; it is
             // absent only in tests.
             is_in_local_network: extensions
@@ -386,6 +389,11 @@ impl HlsRequestContext {
             user_agent: None,
         }
     }
+}
+
+/// The authenticated caller's user id; `None` for a userless API key.
+fn auth_user_id(auth: &ferrofin_traits::options::AuthorizationInfo) -> Option<Uuid> {
+    Some(auth.user_id()).filter(|id| !id.is_nil())
 }
 
 /// Builds an [`HlsStreamRequest`] for `item_id` from the parsed query, the raw
@@ -463,6 +471,7 @@ fn build_request(
         enable_trickplay: query.enable_trickplay.unwrap_or(true),
         api_key: ctx.api_key,
         playback_permissions: ctx.playback_permissions,
+        user_id: ctx.user_id,
         is_in_local_network: ctx.is_in_local_network,
         query_string,
         // Fields this route does not read keep their DTO defaults.
@@ -584,6 +593,7 @@ pub(crate) fn request_from_query(
         raw_query,
         HlsRequestContext {
             playback_permissions: auth.user_policy.as_deref().map(Into::into),
+            user_id: auth_user_id(auth),
             ..HlsRequestContext::default()
         },
     )
@@ -1298,6 +1308,7 @@ mod tests {
         let ctx = HlsRequestContext {
             api_key: Some("tok".to_owned()),
             playback_permissions: None,
+            user_id: None,
             is_in_local_network: true,
             subtitles_in_manifest_default: false,
             user_agent: Some("AppleCoreMedia/1.0 (iPhone)".to_owned()),
@@ -1331,6 +1342,7 @@ mod tests {
         let ctx = HlsRequestContext {
             api_key: None,
             playback_permissions: None,
+            user_id: None,
             is_in_local_network: false,
             subtitles_in_manifest_default: true,
             user_agent: None,
