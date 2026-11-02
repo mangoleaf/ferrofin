@@ -52,9 +52,10 @@ started, or a flag or variable outranks it) is reported beside it. Each setting 
 whether the Ferrofin settings page may change it, and when it may not, why: a flag or a variable
 sets it (change those where the server is started), or it is one the web never changes (the
 directories, the ffmpeg and ffprobe executables, the first-boot seed settings,
-`disable_extensions`, `wasm_private_http_allow`), or one jellyfin-web's own Networking and
-General pages cover. Secrets (the provider keys, the TheTVDB PIN, the seed admin password) are
-reported in plain text, as Jellyfin's plugin settings are, and never logged. The route belongs
+`disable_extensions`, `wasm_private_http_allow`, `image_private_http_allow`), or one
+jellyfin-web's own Networking and General pages cover. Secrets (the provider keys, the TheTVDB
+PIN, the seed admin password) are reported in plain text, as Jellyfin's plugin settings are, and
+never logged. The route belongs
 to the **Ferrofin** plugin under Dashboard → Plugins and answers `404` while that plugin is
 disabled.
 
@@ -95,6 +96,8 @@ control whatever sets them, each with its reason on the page:
 - `disable_extensions`: a measurement switch, set where a benchmark starts the server;
 - `wasm_private_http_allow`: it lets the plugins it names reach private addresses, so it is set by
   hand in `config.toml` or its variable, and an admin session alone cannot grant it;
+- `image_private_http_allow`: it lets image downloads reach the private addresses it lists, so it
+  is set the same way, for the same reason;
 - the settings jellyfin-web's own pages cover: `bind_addr`, `published_url`, `port`, `https_port`
   and `base_url` under Dashboard → Networking, `server_name` and `enable_metrics` under
   Dashboard → General (Networking does not drive `port`, `https_port` and `base_url` yet, so their
@@ -299,13 +302,14 @@ in-process restart included.
 ## Remote images
 
 Artwork that lives at a URL, such as a channel logo from an M3U playlist, is downloaded the first
-time a client asks for it. These settings bound what that can cost. One URL is downloaded by one
-request at a time, and the others wait for the result.
+time a client asks for it. These settings bound what that can cost, and where a download may go.
+One URL is downloaded by one request at a time, and the others wait for the result.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` | `64` | The largest remote image Ferrofin downloads, in MiB, clamped to `16`–`256` (a value outside logs a warning). A response that declares more is refused unread, and a read stops at the limit whatever the response declared. The limit covers everything downloaded from a metadata provider as bytes: channel logos, scan artwork, the **Download** button in the image editor, and OMDb and OpenSubtitles responses. The scan moves on to the provider's next image, saying so at log level `debug`. A download also has to finish within `FERROFIN_PROVIDER_TIMEOUT_SECONDS`, so raising the limit may need that raised too. The `config.toml` key is `image_download_max_mb`. |
-| `FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS` | `3600` | How long a logo URL that gave no image is left alone before it is tried again, in seconds, clamped to `300`–`86400` (a value outside logs a warning). That is a `404` or `403`, a response that is not an image, an empty one included, or one over the limit. A connection failure, a timeout, another status or a provider cooldown is not remembered, so it cannot hide a good image. Until the time is up the client gets a `404`, and Ferrofin keeps the image's row, where Jellyfin removes it. The memory is held per process and a restart clears it. The `config.toml` key is `image_negative_cache_ttl_secs`. |
+| `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` | `64` | The largest remote image Ferrofin downloads, in MiB, clamped to `16`–`256` (a value outside logs a warning). A response that declares more is refused unread, and a read stops at the limit whatever the response declared. The limit covers everything downloaded from a metadata provider as bytes: channel logos, scan artwork, the **Download** button in the image editor, and OMDb and OpenSubtitles responses. The scan moves on to the provider's next image, saying so at log level `debug`. Each request of a download, each redirect it follows counting as one, also has to finish within `FERROFIN_PROVIDER_TIMEOUT_SECONDS`, so raising the limit may need that raised too. The `config.toml` key is `image_download_max_mb`. |
+| `FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW` | none | The private hosts and networks image downloads may reach, comma-separated: host names (`nas.lan`), addresses (`192.168.1.20`, `fd00::5`) and networks in CIDR form (`192.168.1.0/24`). Every image download (channel and programme artwork, scan artwork, studio thumbs, the **Download** button in the image editor) refuses loopback, private, link-local (cloud metadata services among them), CGNAT and reserved addresses, on its first request and on every redirect, unless this lists the host or its address, or the host is a configured Live TV tuner's, so tvheadend's `/imagecache/` logos and an HDHomeRun's keep working without it. A tuner's host is allowed by its name, on every port and path, whatever led there and at whatever address the name resolves to: a service on the same machine as a tuner is reachable too, and so is any address a tuner whose name's DNS someone else controls (a remote IPTV playlist, say) points that name at. A host name allows that host at any address; a network allows every address in it, and `0.0.0.0/0, ::/0` every address there is. An entry that is none of these logs a warning and allows nothing. The first refused download logs a warning naming this setting, and later ones log at `debug`. A guide's (XMLTV) host is not a tuner's: list it here when its artwork is on your network. Behind an HTTP proxy (`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`), the server checks a host on its own DNS answer before the request, so it must be able to resolve it, and the proxy, which resolves the host again, is trusted to reach the same address. After a redirect, a response that names no image type is refused, where the URL's file extension names it otherwise (a tvheadend `/imagecache/` URL still counts as PNG, as without a redirect). Jellyfin checks none of this. The settings page shows it but does not change it: set it in `config.toml` or the variable. The `config.toml` key is `image_private_http_allow`. |
+| `FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS` | `3600` | How long a logo URL that gave no image is left alone before it is tried again, in seconds, clamped to `300`–`86400` (a value outside logs a warning). That is a `404` or `403`, a response that is not an image, an empty one included, one over the limit, or one on a private address image downloads may not reach (`FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW`), which stays refused until the time is up even if a tuner on that host is added meanwhile. A connection failure, a timeout, another status or a provider cooldown is not remembered, so it cannot hide a good image. Until the time is up the client gets a `404`, and Ferrofin keeps the image's row, where Jellyfin removes it. The memory is held per process and a restart clears it. The `config.toml` key is `image_negative_cache_ttl_secs`. |
 
 An image must look like one, whatever the response declares: JPEG, PNG, GIF, WebP, BMP, TIFF, ICO,
 AVIF, HEIC, JPEG XL, JPEG 2000 or uncompressed SVG. Anything else is refused and never stored. A

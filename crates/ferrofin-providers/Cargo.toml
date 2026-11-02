@@ -23,8 +23,9 @@ workspace = true
 default = ["opensubtitles", "lrclib"]
 opensubtitles = []
 lrclib = []
-# Test-only hooks for other crates' tests (`rate_limit::test_support`). Enable it
-# from `[dev-dependencies]` only: no production build may contain it.
+# Test-only hooks for other crates' tests (`rate_limit::test_support`,
+# `destination::test_support`). Enable it from `[dev-dependencies]` only: no
+# production build may contain it.
 test-util = []
 
 [dependencies]
@@ -34,6 +35,9 @@ ferrofin-naming.workspace = true
 ferrofin-util = { workspace = true, features = ["tokio"] }
 ferrofin-common.workspace = true
 ferrofin-db.workspace = true
+# The CIDR parsing and matching of the image downloads' private allow-list
+# (`destination::PrivateAllowList`).
+ferrofin-networking.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true

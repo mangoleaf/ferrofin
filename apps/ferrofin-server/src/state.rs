@@ -976,6 +976,33 @@ pub async fn build_app_state(
         }),
     );
     let live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager> = live_tv_impl.clone();
+    // What image downloads may reach beyond the public internet (gl-1096):
+    // the configuration's allow-list, and the configured tuners' hosts, read
+    // when a private address needs them so that a tuner added later counts at
+    // once. Weak, so this lifetime's manager goes on an in-process restart.
+    ferrofin_providers::destination::set_image_destinations(
+        ferrofin_providers::destination::ImageDestinations::new(
+            config.image_private_allow_list(),
+        )
+        .with_tuner_hosts({
+            let live_tv = Arc::downgrade(&live_tv);
+            Arc::new(move || {
+                let live_tv = live_tv.upgrade();
+                Box::pin(async move {
+                    let Some(live_tv) = live_tv else {
+                        return Vec::new();
+                    };
+                    match live_tv.get_tuner_hosts().await {
+                        Ok(tuners) => tuners.iter().filter_map(tuner_host).collect(),
+                        Err(error) => {
+                            tracing::debug!(%error, "tuner hosts unreadable; no tuner's host exempts an image download");
+                            Vec::new()
+                        }
+                    }
+                })
+            })
+        }),
+    );
     let recording_source = Arc::downgrade(&live_tv);
     active_recordings
         .set(Arc::new(move || {
@@ -3127,6 +3154,22 @@ fn sort_rules(
     }
 }
 
+/// The host a tuner's images may come from: its URL's, with the scheme an
+/// HDHomeRun's leaves out (`HdHomerunHost.GetApiUrl`). `None` for an M3U
+/// tuner read from a file.
+fn tuner_host(info: &ferrofin_model::live_tv::TunerHostInfo) -> Option<String> {
+    let url = if info
+        .type_
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("hdhomerun"))
+    {
+        ferrofin_livetv::hdhomerun::host::get_api_url(info).ok()?
+    } else {
+        info.url.clone()?
+    };
+    ferrofin_providers::destination::url_host(&url)
+}
+
 /// The server's stable id (`ApplicationHost.SystemId`), persisted across
 /// restarts. Jellyfin persists its SystemId and the web client keys stored
 /// sessions by it, so regenerating it on every boot breaks reconnect:
@@ -3219,6 +3262,37 @@ async fn load_server_id(
 
 #[cfg(test)]
 mod tests {
+    /// The hosts that exempt a tuner's own artwork from the image downloads'
+    /// private-address refusal (gl-1096).
+    #[test]
+    fn a_tuner_host_is_its_urls() {
+        let tuner = |kind: &str, url: &str| ferrofin_model::live_tv::TunerHostInfo {
+            type_: Some(kind.to_owned()),
+            url: Some(url.to_owned()),
+            ..Default::default()
+        };
+        for (kind, url, host) in [
+            ("hdhomerun", "192.168.1.50", Some("192.168.1.50")),
+            ("hdhomerun", "http://HDHR.lan:80", Some("hdhr.lan")),
+            (
+                "m3u",
+                "http://tvh.lan:9981/playlist/channels",
+                Some("tvh.lan"),
+            ),
+            ("m3u", "/config/channels.m3u", None),
+        ] {
+            assert_eq!(
+                super::tuner_host(&tuner(kind, url)).as_deref(),
+                host,
+                "{kind} {url}"
+            );
+        }
+        assert_eq!(
+            super::tuner_host(&ferrofin_model::live_tv::TunerHostInfo::default()),
+            None
+        );
+    }
+
     /// The server id on first boot over an adopted Jellyfin install is
     /// Jellyfin's own (`DeviceId`: `{DataPath}/device.txt`), so clients keep
     /// recognising the server; Ferrofin's `system_id`, once written, wins; and

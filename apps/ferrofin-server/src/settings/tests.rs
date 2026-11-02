@@ -438,6 +438,10 @@ fn read_only_settings_carry_their_note_whatever_sets_them() {
             "wasm_private_http_allow",
             "Lets the named WASM plugins reach",
         ),
+        (
+            "image_private_http_allow",
+            "Lets image downloads reach the LAN",
+        ),
         // Owner decision D2: jellyfin-web's own pages cover these.
         (
             "bind_addr",

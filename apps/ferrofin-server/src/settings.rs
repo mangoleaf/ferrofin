@@ -899,6 +899,25 @@ pub static SETTINGS: &[SettingSpec] = &[
         running: |c| json!(c.image_negative_cache_ttl_secs),
         ..ROW
     },
+    SettingSpec {
+        key: "image_private_http_allow",
+        env: Some("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW"),
+        env_read: EnvRead::NonBlank,
+        group: Group::Images,
+        // As wasm_private_http_allow (owner decision D5): letting the server
+        // reach private addresses takes host access, not just an admin
+        // session.
+        access: SettingAccess::ReadOnly(
+            "Lets image downloads reach the LAN, loopback and cloud-metadata addresses it lists. \
+             Set it by hand in config.toml (image_private_http_allow) or \
+             FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW, so an admin session alone cannot grant it.",
+        ),
+        default: "no private address but a Live TV tuner's host",
+        description: "Private hosts, addresses and CIDR networks image downloads may reach, \
+                      comma-separated; Live TV tuners' hosts are always allowed.",
+        running: |c| json!(c.image_private_http_allow),
+        ..ROW
+    },
     // ---- WASM plugins -----------------------------------------------------
     SettingSpec {
         key: "wasm_call_timeout_secs",
