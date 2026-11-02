@@ -43,8 +43,9 @@ pub trait Extension: Send + Sync {
 
 An extension receives **only manager trait objects**, never concrete types — an
 `ExtensionContext` bundling the `LibraryManager`, `MediaSegmentManager`, `PluginManager`,
-`MergeVersionsManager`, `UserManager`, an optional audio `Fingerprinter`, and a per-extension
-cache dir. It
+`MergeVersionsManager`, `UserManager`, the `ExternalIdentityStore` (which outside identity,
+such as an LDAP uid, belongs to which user), an optional audio `Fingerprinter`, and a
+per-extension cache dir. It
 is the same dependency-injection seam the rest of the server uses (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md)), so an extension can do real work — scan the library,
 persist media segments, register background tasks — without reaching into implementation

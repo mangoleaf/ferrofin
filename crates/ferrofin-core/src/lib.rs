@@ -190,6 +190,7 @@ pub mod dynamic_images;
 mod embedded_lyrics;
 pub mod event_manager;
 pub mod external_data_manager;
+pub mod external_identity_repository;
 mod extra_owners_repository;
 pub mod file_system;
 pub mod intro_skipper_repository;
