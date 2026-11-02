@@ -62,7 +62,7 @@ use crate::auth::{
     is_administrator_identity,
 };
 use crate::error::ApiError;
-use crate::extract::{JsonBody, ProblemDetails, Query};
+use crate::extract::{JsonBody, ProblemDetails, Query, RequiredString};
 use crate::handlers::items::user_uuid;
 use crate::panic_boundary::ERROR_BODY;
 use crate::state::AppState;
@@ -123,18 +123,19 @@ struct UpdateUserPassword {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ForgotPasswordDto {
-    /// The username whose password should be reset.
+    /// The username whose password should be reset (upstream's
+    /// `[Required] public required string`).
     #[serde(default)]
-    entered_username: String,
+    entered_username: RequiredString,
 }
 
 /// The `POST /Users/ForgotPassword/Pin` request body.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ForgotPasswordPinDto {
-    /// The entered pin.
+    /// The entered pin (upstream's `[Required] public required string`).
     #[serde(default)]
-    pin: String,
+    pin: RequiredString,
 }
 
 /// Query parameters carrying an optional `userId` (the update, password and
@@ -1046,24 +1047,50 @@ async fn log_password_changed(state: &AppState, user_id: Uuid, username: &str) {
 /// to the account's saved password-reset provider
 /// (`UserManager.StartForgotPasswordProcess`), the built-in PIN file for most.
 /// Every caller gets the same answer, whether the name exists or not.
+///
+/// A missing or blank `EnteredUsername` is a `400` before anything else runs.
+/// The request is local when its connection was accepted on the client's own
+/// address (`HttpContext.IsLocal()`) or the client is on the local network.
+/// A request from elsewhere is logged at warn with the client's address.
 #[utoipa::path(
     post,
     path = "/Users/ForgotPassword",
-    responses((status = 200, description = "Forgot-password process started", body = ForgotPasswordResult)),
+    responses(
+        (status = 200, description = "Forgot-password process started", body = ForgotPasswordResult),
+        (status = 400, description = "A missing or blank EnteredUsername")
+    ),
     tag = "ferrofin"
 )]
 async fn forgot_password(
     State(state): State<AppState>,
     parts: Parts,
     JsonBody(body): JsonBody<ForgotPasswordDto>,
-) -> Result<Json<ForgotPasswordResult>, ApiError> {
-    let local = state.is_in_local_network(state.client_address(&parts));
+) -> Result<Response, ApiError> {
+    let entered_username = match body.entered_username.require(
+        "Jellyfin.Api.Models.UserDtos.ForgotPasswordDto",
+        "EnteredUsername",
+    ) {
+        Ok(name) => name,
+        Err(problem) => return Ok(problem.into_response()),
+    };
+    let ip = state.client_address(&parts);
+    let local = crate::ip_access::is_local_connection(&parts.extensions, ip)
+        || state.is_in_local_network(ip);
+    if !local {
+        // One line per remote request with no volume guard, as upstream's, and
+        // as the IP gate logs each request it refuses.
+        tracing::warn!(
+            remote_ip = %ip,
+            "password reset process initiated from outside the local network"
+        );
+    }
     Ok(Json(
         state
             .users
-            .start_forgot_password_process(&body.entered_username, local)
+            .start_forgot_password_process(&entered_username, local)
             .await?,
-    ))
+    )
+    .into_response())
 }
 
 /// `POST /Users/ForgotPassword/Pin` — redeem a recovery PIN.
@@ -1072,20 +1099,30 @@ async fn forgot_password(
 /// offered the PIN in turn (`UserManager.RedeemPasswordResetPin`). With the
 /// built-in provider the PIN is case-sensitive with its dashes ignored, the
 /// password becomes the PIN as entered, and the file is consumed only once the
-/// password is saved. No provider redeeming it is a `404`.
+/// password is saved. No provider redeeming it is a `404`, and a missing or
+/// blank `Pin` is a `400` before any provider is asked.
 #[utoipa::path(
     post,
     path = "/Users/ForgotPassword/Pin",
-    responses((status = 200, description = "Pin redemption result", body = PinRedeemResult)),
+    responses(
+        (status = 200, description = "Pin redemption result", body = PinRedeemResult),
+        (status = 400, description = "A missing or blank Pin"),
+        (status = 404, description = "No provider redeemed the PIN")
+    ),
     tag = "ferrofin"
 )]
 async fn forgot_password_pin(
     State(state): State<AppState>,
     JsonBody(body): JsonBody<ForgotPasswordPinDto>,
-) -> Result<Json<PinRedeemResult>, ApiError> {
-    Ok(Json(
-        state.users.redeem_password_reset_pin(&body.pin).await?,
-    ))
+) -> Result<Response, ApiError> {
+    let pin = match body
+        .pin
+        .require("Jellyfin.Api.Models.UserDtos.ForgotPasswordPinDto", "Pin")
+    {
+        Ok(pin) => pin,
+        Err(problem) => return Ok(problem.into_response()),
+    };
+    Ok(Json(state.users.redeem_password_reset_pin(&pin).await?).into_response())
 }
 
 /// `GET /Users/Me` — the authenticated caller's user record.
