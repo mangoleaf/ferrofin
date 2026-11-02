@@ -667,7 +667,7 @@ impl FerrofinSimilarItemsManager {
             }
             query.top_parent_ids = scope;
         }
-        query.set_user(user);
+        query.set_user(Arc::new(user));
         Ok(true)
     }
 
@@ -1232,7 +1232,7 @@ impl FerrofinSimilarItemsManager {
                 enable_group_by_metadata_key: true,
                 ..Default::default()
             };
-            query.set_user(user.clone());
+            query.set_user(Arc::new(user.clone()));
             let items = self.items.get_item_list(&query).await?;
             let ids: Vec<Uuid> = items
                 .iter()
@@ -1460,7 +1460,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
         }
 
         let mut recent_played_q = recently_played_query(parent_id);
-        recent_played_q.set_user(user.clone());
+        recent_played_q.set_user(Arc::new(user.clone()));
         let recently_played = self.items.get_item_list(&recent_played_q).await?;
 
         // Liked/favorited movies (C#: IsFavoriteOrLiked, Limit 10,
@@ -1471,7 +1471,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             .collect();
         let movie_kinds = self.movie_candidate_kinds().await;
         let mut liked_q = liked_query(parent_id, movie_kinds.clone(), played_ids.clone());
-        liked_q.set_user(user.clone());
+        liked_q.set_user(Arc::new(user.clone()));
         let liked = self.items.get_item_list(&liked_q).await?;
 
         // Directors / actors of the six most-recently-played (C# GetPeopleNames).

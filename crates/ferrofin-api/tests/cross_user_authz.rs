@@ -63,7 +63,7 @@ impl UserAuth {
     fn info(&self) -> AuthorizationInfo {
         AuthorizationInfo {
             token: Some("tok".into()),
-            user: Some(fake_user_entity(self.0, "caller")),
+            user: Some(Arc::new(fake_user_entity(self.0, "caller"))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         }

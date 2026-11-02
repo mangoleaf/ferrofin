@@ -209,7 +209,7 @@ fn folder_items_query(
         ..InternalItemsQuery::default()
     };
     if let Some(user) = user {
-        query.set_user(user);
+        query.set_user(Arc::new(user));
     }
     if kind == BaseItemKind::Series {
         query.series_presentation_unique_key =
@@ -889,7 +889,7 @@ impl CollectionManager for FerrofinCollectionManager {
         use std::collections::HashSet;
         let collections = if let Some(folder) = self.get_collections_folder(false).await? {
             let query = InternalItemsQuery {
-                user: user.cloned(),
+                user: user.cloned().map(Arc::new),
                 parent_id: Uuid::parse_str(&folder.id)
                     .map_err(|error| ServiceError::backend(error.to_string()))?,
                 include_item_types: vec![BaseItemKind::BoxSet],
@@ -1191,7 +1191,7 @@ impl FerrofinPlaylistManager {
                         ..InternalItemsQuery::default()
                     };
                     if let Some(user) = user.clone() {
-                        query.set_user(user);
+                        query.set_user(Arc::new(user));
                     }
                     if kind == BaseItemKind::MusicGenre {
                         query.genre_ids = vec![id];

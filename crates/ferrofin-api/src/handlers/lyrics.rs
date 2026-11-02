@@ -58,7 +58,7 @@ async fn require_item(
 ) -> Result<(), ApiError> {
     let is_audio = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .is_some_and(|item| {
             let short = item.type_.rsplit('.').next().unwrap_or(&item.type_);

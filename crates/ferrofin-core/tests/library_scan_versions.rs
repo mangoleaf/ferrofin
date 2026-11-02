@@ -2157,7 +2157,7 @@ async fn next_up_of(
     let top = Uuid::parse_str(episode.top_parent_id.as_deref().unwrap()).unwrap();
     let service = ferrofin_core::FerrofinNextUpService::new(f.db.clone());
     let filter = ferrofin_traits::options::InternalItemsQuery {
-        user: Some(user_row(f, user).await),
+        user: Some(Arc::new(user_row(f, user).await)),
         top_parent_ids: vec![top],
         ..Default::default()
     };
@@ -2452,7 +2452,7 @@ async fn every_version_a_user_may_open_passes_the_source_filter() {
     let user = user_row_of(&f, user).await;
     let visible = |grouped: bool| {
         let mut q = query(grouped);
-        q.user = Some(user.clone());
+        q.user = Some(Arc::new(user.clone()));
         q
     };
     assert_eq!(repo.get_item_ids(&visible(false)).await.unwrap().len(), 3);

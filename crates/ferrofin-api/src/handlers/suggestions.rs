@@ -88,7 +88,7 @@ async fn get_suggestions(
     // the page goes through `IsVisible`.
     let dtos = state
         .dto
-        .get_base_item_dtos(&result.items, &options, user.as_ref(), None, false)
+        .get_base_item_dtos(&result.items, &options, user.as_deref(), None, false)
         .await?;
     Ok(Json(QueryResult::new(
         query.start_index,

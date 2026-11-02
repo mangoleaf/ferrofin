@@ -3691,7 +3691,7 @@ fn related_item_kinds(kind: BaseItemKind) -> Option<&'static [BaseItemKind]> {
 /// one is present.
 fn access_filter_for(user: Option<&UserEntity>) -> ferrofin_traits::options::InternalItemsQuery {
     ferrofin_traits::options::InternalItemsQuery {
-        user: user.cloned(),
+        user: user.cloned().map(Arc::new),
         ..Default::default()
     }
 }
@@ -4126,7 +4126,7 @@ impl FerrofinDtoService {
         user: &UserEntity,
     ) -> Result<i32, ServiceError> {
         let mut query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             limit: Some(0),
             enable_total_record_count: true,
             ..InternalItemsQuery::default()
@@ -5012,7 +5012,7 @@ impl FerrofinDtoService {
                         .get_linked_children_count_batch(&unbatched)
                         .await?;
                     let mut query = ferrofin_traits::options::InternalItemsQuery::default();
-                    query.set_user(user.clone());
+                    query.set_user(Arc::new(user.clone()));
                     // Resolved once for every folder below.
                     let query = crate::query_restrictions::resolve(&self.db, &query)
                         .await?

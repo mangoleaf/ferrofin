@@ -10,6 +10,7 @@ use ferrofin_model::entities_media::ParentalRatingScore;
 use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::querying::ItemFilter;
 use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 use uuid::Uuid;
 
 use super::DtoOptions;
@@ -44,6 +45,11 @@ pub struct DescendantQueryRoots {
     pub link_roots: Vec<Uuid>,
 }
 
+/// The options [`InternalItemsQuery::default`] starts from, built once: every
+/// default query shares them instead of building the all-fields list again.
+static DEFAULT_DTO_OPTIONS: LazyLock<Arc<DtoOptions>> =
+    LazyLock::new(|| Arc::new(DtoOptions::default()));
+
 /// The central item query. Every field is an optional filter, a pagination/sort
 /// control, or DTO/user context; an empty query matches everything.
 ///
@@ -67,7 +73,11 @@ pub struct InternalItemsQuery {
     /// The maximum number of results to return.
     pub limit: Option<i32>,
     /// The user the query is scoped to.
-    pub user: Option<UserEntity>,
+    ///
+    /// Shared, not owned: the resolve chain copies the query two to three
+    /// times per browse, and each copy takes a refcount instead of a copy of
+    /// every column.
+    pub user: Option<Arc<UserEntity>>,
     /// Whether repository resolution has loaded the user content preferences.
     pub user_preferences_loaded: bool,
     /// Whether any library, parental rating or tag rule hides content from
@@ -423,7 +433,10 @@ pub struct InternalItemsQuery {
     pub min_date_last_saved_for_user: Option<DateTime<Utc>>,
 
     /// The DTO field/image toggles used when materializing results.
-    pub dto_options: DtoOptions,
+    ///
+    /// Shared like [`user`](Self::user). A caller that changes one copy's
+    /// options goes through [`Arc::make_mut`], which leaves the others alone.
+    pub dto_options: Arc<DtoOptions>,
 
     // --- audio/subtitle language absence filters ---
     /// Exclude items that have an audio track with this language.
@@ -629,7 +642,7 @@ impl Default for InternalItemsQuery {
             min_date_created: None,
             min_date_last_saved: None,
             min_date_last_saved_for_user: None,
-            dto_options: DtoOptions::default(),
+            dto_options: Arc::clone(&DEFAULT_DTO_OPTIONS),
             has_no_audio_track_with_language: None,
             has_no_internal_subtitle_track_with_language: None,
             has_no_external_subtitle_track_with_language: None,
@@ -772,7 +785,7 @@ impl InternalItemsQuery {
     /// preferences table, not on [`UserEntity`], so repository query resolution populates
     /// those three fields from a preference lookup before translating SQL, along
     /// with [`user_has_content_restrictions`](Self::user_has_content_restrictions).
-    pub fn set_user(&mut self, user: UserEntity) {
+    pub fn set_user(&mut self, user: Arc<UserEntity>) {
         self.user_preferences_loaded = false;
         self.user_has_content_restrictions = false;
         self.block_unrated_items.clear();
@@ -880,7 +893,10 @@ pub struct ConflictingFilters;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{ConflictingFilters, InternalItemsQuery, SourceType};
+    use crate::options::authorization_info::tests::user_with_id;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::querying::ItemFilter;
     use uuid::Uuid;
@@ -901,6 +917,22 @@ mod tests {
         );
         // A fresh query has no narrowing filters.
         assert!(!q.has_filters());
+    }
+
+    /// The resolve chain clones the query two to three times per browse: the
+    /// user row and the DTO options must come along as shared handles, not as
+    /// deep copies of every `String` column and both option lists.
+    #[test]
+    fn a_query_copy_shares_the_user_and_the_dto_options() {
+        let mut q = InternalItemsQuery::default();
+        q.set_user(Arc::new(user_with_id(&Uuid::from_u128(7).to_string())));
+        let copy = q.clone();
+        assert!(Arc::ptr_eq(
+            q.user.as_ref().expect("user"),
+            copy.user.as_ref().expect("user")
+        ));
+        assert!(Arc::ptr_eq(&q.dto_options, &copy.dto_options));
+        assert_eq!(copy.user_id(), Some(Uuid::from_u128(7)));
     }
 
     #[test]

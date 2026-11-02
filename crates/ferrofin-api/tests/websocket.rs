@@ -210,7 +210,7 @@ impl AuthService for TokenAuth {
         Ok(AuthorizationInfo {
             is_authenticated: true,
             token: Some("socket-token".into()),
-            user: Some(ferrofin_api::test_support::sample_user()),
+            user: Some(Arc::new(ferrofin_api::test_support::sample_user())),
             user_policy: Some(Arc::new(UserPolicy {
                 is_administrator: self.admin,
                 enable_remote_access: true,

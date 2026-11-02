@@ -66,7 +66,7 @@ async fn get_item_segments(
 ) -> Result<Json<QueryResult<MediaSegmentDto>>, ApiError> {
     let Some(item) = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
     else {
         return Err(ApiError::NotFound(format!("item {item_id}")));

@@ -145,7 +145,7 @@ fn authed_info() -> AuthorizationInfo {
         version: Some("1.0".to_owned()),
         token: Some("token-abc".into()),
         is_api_key: false,
-        user: Some(user_entity(USER_ID, "alice")),
+        user: Some(Arc::new(user_entity(USER_ID, "alice"))),
         user_policy: None,
         is_authenticated: true,
         remote_endpoint: Some("203.0.113.9".to_owned()),
@@ -1132,7 +1132,7 @@ impl PolicyAuth {
         let mut user = user_entity(USER_ID, "alice");
         user.sync_play_access = self.access;
         AuthorizationInfo {
-            user: (!self.api_key).then_some(user),
+            user: (!self.api_key).then_some(Arc::new(user)),
             is_api_key: self.api_key,
             user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
                 is_administrator: self.admin,

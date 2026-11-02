@@ -13,6 +13,7 @@
 //! does, through `get_played_and_total_count` or its linked sibling.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -1019,7 +1020,7 @@ impl ItemCountService for FerrofinItemCountService {
         let total_q =
             sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(total_sql)).bind(page.as_str());
         let mut access_filter = InternalItemsQuery::default();
-        access_filter.set_user(user.clone());
+        access_filter.set_user(Arc::new(user.clone()));
         let preferences = crate::query_restrictions::resolve(&self.db, &access_filter).await?;
         let access_filter = preferences.unwrap_or(access_filter);
         let mut total_q = restrict_count_query(total_q, &access_filter, Some(r#"a."ItemId""#))?;
@@ -1132,7 +1133,7 @@ impl ItemCountService for FerrofinItemCountService {
         }
         let mut access_filter = InternalItemsQuery::default();
         if let Some(user) = user {
-            access_filter.set_user(user.clone());
+            access_filter.set_user(Arc::new(user.clone()));
         }
         let has_user = access_filter.user.is_some();
         // `includeVirtual`: missing episodes count for no user, or for one
@@ -1402,7 +1403,7 @@ impl FerrofinItemCountService {
         roots: RootFolderIds,
     ) -> Result<PlayedAndTotal, ServiceError> {
         let mut filter = InternalItemsQuery::default();
-        filter.set_user(user.clone());
+        filter.set_user(Arc::new(user.clone()));
         let preferences = crate::query_restrictions::resolve(&self.db, &filter).await?;
         let filter = preferences.unwrap_or(filter);
         let (aggregate, user_root) = (guid_to_db(roots.aggregate), guid_to_db(roots.user_root));
@@ -2086,7 +2087,7 @@ mod tests {
             seed_item_genre(&db, id, "Shared").await;
         }
         let mut filter = InternalItemsQuery::default();
-        filter.set_user(user.clone());
+        filter.set_user(Arc::new(user.clone()));
         let batch = service
             .get_played_and_total_count_batch(&[folder], &user)
             .await
@@ -2178,7 +2179,7 @@ mod tests {
 
         let filter = InternalItemsQuery {
             recursive: true,
-            user: Some(user),
+            user: Some(Arc::new(user)),
             ..Default::default()
         };
 
@@ -2255,7 +2256,7 @@ mod tests {
             seed_user_data(&db, user_id, episode, series == first, None).await;
         }
         let mut filter = InternalItemsQuery::default();
-        filter.set_user(user.clone());
+        filter.set_user(Arc::new(user.clone()));
         let service = svc(&db);
         // The page's batch sums each group too (v12.2
         // `GetPlayedAndTotalCountBatch`), one statement for the groups.
@@ -2344,7 +2345,7 @@ mod tests {
         let service = svc(&db);
         for (viewer, played) in [(user, 4), (stranger, 0)] {
             let mut filter = InternalItemsQuery::default();
-            filter.set_user(viewer);
+            filter.set_user(Arc::new(viewer));
             let counts = service
                 .get_played_and_total_count(&filter, series)
                 .await
@@ -3074,7 +3075,7 @@ mod tests {
         seed_user_data(&db, user, played, true, None).await;
 
         let filter = InternalItemsQuery {
-            user: Some(user_entity),
+            user: Some(Arc::new(user_entity)),
             ..Default::default()
         };
         let res = service
@@ -3145,7 +3146,7 @@ mod tests {
         let res = service
             .get_played_and_total_count_from_linked_children(
                 &InternalItemsQuery {
-                    user: Some(user_entity),
+                    user: Some(Arc::new(user_entity)),
                     ..Default::default()
                 },
                 boxset,
@@ -3972,7 +3973,7 @@ mod tests {
         let mut user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
         user.max_parental_rating_score = Some(12);
         let filter = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             ..Default::default()
         };
         let counts = service
@@ -4073,13 +4074,13 @@ mod tests {
         .await
         .expect("enable the first library only");
         let viewer = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             ..InternalItemsQuery::default()
         };
         let no_library = InternalItemsQuery {
-            user: Some(
+            user: Some(Arc::new(
                 crate::test_support::seed_named_user(&db, Uuid::from_u128(0x7906), "none").await,
-            ),
+            )),
             ..InternalItemsQuery::default()
         };
         let artist = Uuid::from_u128(0x7907);
@@ -4177,10 +4178,10 @@ mod tests {
         set_column(&db, trailer, "ExtraType", Some("2".to_owned())).await;
         let filter = if as_user {
             InternalItemsQuery {
-                user: Some(
+                user: Some(Arc::new(
                     crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0x7929))
                         .await,
-                ),
+                )),
                 ..InternalItemsQuery::default()
             }
         } else {
@@ -4422,7 +4423,7 @@ mod tests {
         .await
         .expect("enable the open library only");
         let viewer = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             ..InternalItemsQuery::default()
         };
         let related = [BaseItemKind::Episode, BaseItemKind::Series];
@@ -4897,7 +4898,7 @@ mod tests {
     /// resolves them for a user.
     async fn per_item_leaves(db: &Database) -> InternalItemsQuery {
         let mut filter = InternalItemsQuery::default();
-        filter.set_user(seed_user(db, Uuid::from_u128(0xD0F0)).await);
+        filter.set_user(Arc::new(seed_user(db, Uuid::from_u128(0xD0F0)).await));
         svc(db)
             .countable_leaves_query(&filter, Uuid::from_u128(0xD0F1))
             .await
@@ -5499,7 +5500,7 @@ mod tests {
         );
         // Read by id, the aggregate counts the same whole server.
         let mut filter = InternalItemsQuery::default();
-        filter.set_user(user);
+        filter.set_user(Arc::new(user));
         let by_id = svc(&db)
             .with_root_ids(roots)
             .get_played_and_total_count(&filter, roots.aggregate)

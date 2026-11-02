@@ -454,7 +454,7 @@ impl AuthService for AuthedAuthService {
 pub fn authenticated_user_info() -> AuthorizationInfo {
     AuthorizationInfo {
         is_authenticated: true,
-        user: Some(sample_user()),
+        user: Some(Arc::new(sample_user())),
         user_policy: Some(Arc::new(UserPolicy {
             enable_remote_access: true,
             ..UserPolicy::default()
@@ -744,7 +744,7 @@ impl AuthService for AuthedUserService {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             is_authenticated: true,
-            user: Some(sample_user()),
+            user: Some(Arc::new(sample_user())),
             ..AuthorizationInfo::default()
         })
     }
