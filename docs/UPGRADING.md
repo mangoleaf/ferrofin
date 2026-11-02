@@ -8,36 +8,13 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
-## Sharper trickplay images are an opt-in
+## A user's library access holds on every route
 
-Nothing changes on an upgrade, an adoption or a new install: trickplay images are generated as
-before, at the stored **Width Resolutions** and **Qscale** (320 and 4 on a new install, as in
-Jellyfin), and existing images stay as they are.
-
-Ferrofin can now also write them with full colour detail (4:4:4), with far less of the blocky
-colour around edges. It is the `FullChroma` member of `TrickplayOptions` in the server
-configuration, off by default and absent from `GET /System/Configuration` while off. There is no
-dashboard control for it yet. To turn it on, `GET /System/Configuration`, set
-`"FullChroma": true` in its `TrickplayOptions`, and `POST` the whole document back: a body that
-leaves out other settings resets them, and a save without the member turns it off again. A job that
-runs on the hardware path (trickplay's **Enable hardware decoding** on, with NVENC, VAAPI or QSV
-configured) keeps reduced colour detail in its frames, even for a video the GPU cannot decode, and
-writes only the tile in full.
-
-For the sharpest images, also set **Width Resolutions** to `320,640` and **Qscale** to `2` under
-**Dashboard > Playback > Trickplay**. jellyfin-web picks the width by screen: 320 on phones and
-1080p screens, 640 on 4K ones. The **Generate Trickplay Images** task then adds the 640 images on
-its own, and the 320 ones stay as they are. To redo those too, refresh each library with **Search
-for missing metadata** and **Replace existing trickplay images** checked. The refresh leaves
-trickplay alone unless the library has **Extract trickplay images during the library scan** on, and
-a video has no scrubbing preview while its images are redone, as in Jellyfin.
-
-The cost: each width is a full pass over the file, so both widths take about twice as long. On a
-test clip a two-hour film took about 8 MiB as Jellyfin writes it, about 14 MiB at 320 with full
-colour detail and `Qscale` 2, and about 59 MiB at both widths with the same two settings; grainy
-film takes more. A 640 tile is about 6 MiB, which a slow remote connection will notice when
-scrubbing, and takes about 200 MiB of memory to pack, where a 320 tile takes about 60 MiB. A scan
-packs several at once, so a memory-limited install may want `FERROFIN_TRICKPLAY_CONCURRENCY` set.
+A request that names a folder or an item as its scope (`parentId`, `seriesId`, `ids`) now stops
+at the libraries the user may open. A scope outside them answers `403`, on `GET /Items` as well,
+which used to answer `401` for a library, and `ids` leave out what the user may not open. A user
+who can open the library sees no change, and an API key is exempt. So a script or a client that
+kept an id from a library the user has since lost now gets that `403`.
 
 ## Other accounts' policy and configuration
 
@@ -113,6 +90,45 @@ is marked failed while the migration goes on running. Do not use `--atomic` or
 database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
+
+## Unreleased — a playlist's listing leaves out what its reader cannot open
+
+`GET /Playlists/{id}/Items` no longer lists a member from a library the user was not given, and
+`TotalRecordCount` and paging count what is left. A reorder counts positions in that same list,
+so a shared playlist shows a user a shorter list than its owner's, in the same order.
+
+This changes a read, not the playlist. The member stays stored and comes back if the user is given
+the library. Adding an item from such a library still stores it, and `GET /Playlists/{id}` still
+lists every member in `ItemIds`, as Jellyfin does.
+
+A script with an editing share that saves a playlist by sending `Ids` to `POST /Playlists/{id}`
+replaces every member, so `Ids` built from this listing now drop the members it left out. Build
+them from `ItemIds` instead.
+
+## Unreleased — stream routes hold a signed-in user to their account
+
+Usually nothing to do. A request that carries a user's token is now checked on the video and audio
+stream, HLS, universal audio, subtitle `Stream.{format}` and attachment routes, as it already was
+on `/Items/{id}` and `PlaybackInfo`. This differs from Jellyfin on purpose, where the stream and
+HLS routes read an item by id alone.
+
+- An item, or a version named by `mediaSourceId`, in a library the user may not open answers `404`.
+  That includes an item in a disabled library, for an administrator too, as on `PlaybackInfo`.
+- A user outside their access schedule (administrators are not held to one), or remote with remote access
+  off, gets `403`. A locked-out account's token gets `401`.
+- A channel answers as its `PlaybackInfo` does. A DVR recording needs "Allow Live TV access" unless
+  the user is an administrator, or it answers `404`.
+- A recording whose file lies in a library the user may not open, or on a channel hidden from them,
+  is `404`. That also applies to `GET` and `DELETE /LiveTv/Recordings/{id}`.
+
+**What this does not do:** it binds a client that sends its token, not someone who leaves it off.
+
+- A request with no credential stays anonymous, and so does a token the server does not recognise,
+  such as a revoked one: disabling an account from the dashboard revokes its tokens. A static read
+  or an anonymous subtitle read still works for such a request. Starting a transcode does not.
+- An API key is not limited to any library.
+- The lowercase `api_key=` counts only with `EnableLegacyAuthorization` on, which is off by default.
+  Without it a URL carrying only that reads as no credential.
 
 ## Unreleased — a refused login no longer says why
 
