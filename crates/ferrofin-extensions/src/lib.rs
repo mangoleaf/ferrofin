@@ -77,6 +77,10 @@ pub struct ExtensionContext {
     /// other. Both live for the whole process, so the cycle is never freed,
     /// which is harmless.
     pub users: Arc<dyn UserManager>,
+    /// Links from outside identities (an LDAP uid, later an OIDC subject) to
+    /// users: an authentication provider finds and records through it who
+    /// signs in with which identity.
+    pub external_identities: Arc<dyn ferrofin_traits::external_identities::ExternalIdentityStore>,
 }
 
 /// A curated, compiled-in capability that surfaces as a Jellyfin plugin.
@@ -280,6 +284,11 @@ mod tests {
             ),
             chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
             users: Arc::clone(&users) as Arc<dyn UserManager>,
+            external_identities: Arc::new(
+                ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(
+                    db.clone(),
+                ),
+            ),
         };
         (cx, users)
     }

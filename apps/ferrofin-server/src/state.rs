@@ -2080,6 +2080,11 @@ pub async fn build_app_state(
         virtual_folders: Arc::clone(&virtual_folders),
         chapters: Arc::clone(&chapters),
         users: Arc::clone(&users),
+        external_identities: Arc::new(
+            ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(
+                db.clone(),
+            ),
+        ),
     };
     // The user manager was built long before the extensions: their
     // authentication and password-reset providers fill its late slots now,

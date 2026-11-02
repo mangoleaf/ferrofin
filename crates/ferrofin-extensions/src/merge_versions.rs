@@ -2483,6 +2483,11 @@ mod tests {
             ),
             chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
             users: Arc::new(ferrofin_core::FerrofinUserManager::new(db.clone())),
+            external_identities: Arc::new(
+                ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(
+                    db.clone(),
+                ),
+            ),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);

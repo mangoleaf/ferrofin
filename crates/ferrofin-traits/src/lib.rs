@@ -26,6 +26,7 @@ pub mod drawing;
 pub mod dto;
 pub mod error;
 pub mod events;
+pub mod external_identities;
 pub mod filesystem;
 pub mod intro_skipper;
 pub mod library;
