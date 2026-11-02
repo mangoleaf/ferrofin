@@ -135,6 +135,10 @@ impl AuthenticationManager for DefaultAuthenticationProvider {
         "Default"
     }
 
+    fn id(&self) -> &str {
+        DEFAULT_AUTH_PROVIDER_ID
+    }
+
     async fn is_enabled(&self) -> Result<bool, ServiceError> {
         Ok(true)
     }
@@ -154,7 +158,7 @@ impl AuthenticationManager for DefaultAuthenticationProvider {
         if stored.is_empty() && password.is_empty() {
             return Ok(ProviderAuthenticationResult {
                 username: username.to_owned(),
-                display_name: None,
+                ..ProviderAuthenticationResult::default()
             });
         }
 
@@ -180,7 +184,7 @@ impl AuthenticationManager for DefaultAuthenticationProvider {
 
         Ok(ProviderAuthenticationResult {
             username: username.to_owned(),
-            display_name: None,
+            ..ProviderAuthenticationResult::default()
         })
     }
 
@@ -221,6 +225,10 @@ impl AuthenticationManager for InvalidAuthProvider {
     #[allow(clippy::unnecessary_literal_bound)]
     fn name(&self) -> &str {
         "InvalidOrMissingAuthenticationProvider"
+    }
+
+    fn id(&self) -> &str {
+        INVALID_AUTH_PROVIDER_ID
     }
 
     async fn is_enabled(&self) -> Result<bool, ServiceError> {

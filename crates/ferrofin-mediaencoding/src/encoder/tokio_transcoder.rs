@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use ferrofin_model::configuration::ProcessPriorityClass;
 use ferrofin_util::process_priority::{ProcessPriority, set_process_priority};
+use ferrofin_util::source_url::redact_urls_in;
 use tokio::io::AsyncWriteExt as _;
 
 use super::encoding_utils::split_args;
@@ -127,9 +128,12 @@ impl TokioTranscoder {
             // ffmpeg running to completion).
             .kill_on_drop(true);
 
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("failed to spawn `{path} {arguments}`: {e}"))?;
+        let mut child = command.spawn().map_err(|e| {
+            format!(
+                "failed to spawn `{path} {}`: {e}",
+                redact_urls_in(arguments)
+            )
+        })?;
         lower_priority(&child, path);
         if let Some(priority) = priority {
             set_configured_priority(&child, priority, path);
@@ -147,7 +151,7 @@ impl TokioTranscoder {
         let output = child
             .wait_with_output()
             .await
-            .map_err(|e| format!("failed to run `{path} {arguments}`: {e}"))?;
+            .map_err(|e| format!("failed to run `{path} {}`: {e}", redact_urls_in(arguments)))?;
 
         let bytes = if read_stderr {
             &output.stderr
@@ -454,5 +458,23 @@ mod tests {
                 .get_process_exit_code("sh", r#"-c true ""#)
                 .await
         );
+    }
+
+    /// A probe of a `.strm` target that cannot start names the URL in its
+    /// arguments by its scheme and host: the error reaches the scan's log, and
+    /// the URL can carry an account (gl-1121).
+    #[tokio::test]
+    async fn a_failed_start_names_a_url_argument_by_its_host() {
+        use crate::encoder::Transcoder as _;
+
+        let arguments = r#"-i "http://acct-user:info-secret@origin.example/live/path-secret/1.ts?password=query-secret" -f null -"#;
+        let err = super::TokioTranscoder
+            .get_process_output("/nonexistent/ffprobe", arguments, false, None, &[])
+            .await
+            .expect_err("no such program");
+        assert!(err.contains("http://origin.example"), "{err}");
+        for secret in ["acct-user", "info-secret", "path-secret", "query-secret"] {
+            assert!(!err.contains(secret), "{secret} shown in: {err}");
+        }
     }
 }

@@ -1095,8 +1095,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    ActivityLog listener \
                    (Jellyfin.Api/WebSocketListeners/ActivityLogWebSocketListener.cs) and the \
                    ScheduledTasks listener \
-                   (Jellyfin.Api/WebSocketListeners/ScheduledTasksWebSocketListener.cs)",
-        date: "2026-10-29",
+                   (Jellyfin.Api/WebSocketListeners/ScheduledTasksWebSocketListener.cs); \
+                   envelope serializes each frame's DTOs directly, in declaration order, as \
+                   WebSocketConnection.SendAsync's SerializeToUtf8Bytes does (property order \
+                   compared with MediaBrowser.Model/Dto/SessionInfoDto.cs, \
+                   Session/PlayerStateInfo.cs and Tasks/TaskInfo.cs)",
+        date: "2026-11-02",
         divergences: &[
             "Events already queued for a socket are drained and answered with one Sessions or \
              ActivityLogEntry frame, where upstream sends one per forced event: a burst yields \
@@ -1116,6 +1120,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              once the period has passed.",
             "A session list that cannot be built is logged and skipped and the subscription stays; \
              upstream logs it and drops the connection's subscription.",
+            "A session's NowPlayingItem map members (ImageTags, ProviderIds, ImageBlurHashes, \
+             Trickplay, RequiredHttpHeaders) are written in hash order, as on every item \
+             endpoint, not upstream's insertion order.",
             "A *Start whose Data is missing, has no second field or holds a field that does not \
              parse as a whole number still subscribes, at jellyfin-web's 1500 ms when the period \
              is at fault, where upstream's Start throws and makes no subscription.",
@@ -1154,8 +1161,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/BaseItemExtensions.cs (SetImagePath) and \
                    Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto). Also the \
                    download of a remote image: ferrofin-providers image_download.rs \
-                   open_image, provider_manager.rs cached_remote_image, compared with \
-                   MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage) and \
+                   open_image (ImageHttp::send, which follows and vets each redirect; \
+                   destination.rs ImageDestinations), provider_manager.rs \
+                   cached_remote_image, compared with \
+                   MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
+                   Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs (ConvertImageToLocal)",
         date: "2026-10-31",
         divergences: &[
@@ -1178,6 +1188,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              first file stored for a URL or an item stays there. The formats are listed in \
              image_download.rs is_image, with SVG and tvheadend's untyped /imagecache/ URLs \
              allowed.",
+            "A remote image download refuses loopback, private, link-local, CGNAT and reserved \
+             addresses, on its first request and on every redirect it follows (owner decision \
+             2026-10-31, gl-1096), unless image_private_http_allow lists the host, its address \
+             or its network, or the host is a configured Live TV tuner's; upstream's \
+             NamedClient.Default (Startup.cs) has no destination policy and follows redirects \
+             anywhere. A refusal counts as an answer, as a 404 does. A download follows at \
+             most 10 redirects, reqwest's default, where .NET's handler follows 50. After a \
+             redirect, SaveImage's fallback to the URL's suffix is not taken: a response with no \
+             type, or application/octet-stream, is refused, but for the tvheadend \
+             /imagecache/ workaround, which still names PNG.",
             "A row whose URLs all gave no image stays, and each URL is left alone for \
              image_negative_cache_ttl_secs (owner decision 2026-10-31, gl-1095), where \
              LibraryManager.ConvertImageToLocal's removeOnFailure removes the row, for the same \
@@ -1198,7 +1218,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         key: "user-data",
         upstream_file: "Emby.Server.Implementations/Library/UserDataManager.cs",
         upstream_method: "SaveUserData",
-        ferrofin: "The write path only. ferrofin-core user_data_manager.rs mutate_row \
+        ferrofin: "The write path, plus the read path only where a page's version groups get \
+                   their user data. ferrofin-core user_data_manager.rs mutate_row \
                    (SaveUserData with its retired-key update, GetUserData, ResolveUserDataRow), \
                    save_user_data_with_reason (the UpdateUserItemDataDto SaveUserData), \
                    save_play_state and apply_play_report (UpdatePlayState), \
@@ -1210,8 +1231,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
                    MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
                    Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
-                   UpdateUserItemRatingInternal)",
-        date: "2026-10-30",
+                   UpdateUserItemRatingInternal). The version groups: dto_service.rs prefetch's \
+                   version user data (a page item's from the page's own read, a version off \
+                   the page from user_data_manager.rs get_stored_user_data_batch), compared \
+                   with Emby.Server.Implementations/Library/UserDataManager.cs \
+                   (GetUserDataBatch, whose cache answers the page's items, and \
+                   GetResumeUserDataBatch), Emby.Server.Implementations/Dto/DtoService.cs \
+                   (GetBaseItemDtos) and Emby.Server.Implementations/Library/\
+                   MediaSourceManager.cs (SetAlternateVersionResumeStates)",
+        date: "2026-11-02",
         divergences: &[
             "Each change reads the row inside its write transaction, so two overlapping saves of \
              one item both land; upstream's GetUserData hands each caller a copy and SaveUserData \
@@ -1282,12 +1310,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              routes are outside this: they serve a transcode's file by its random name, and \
              the item id selects nothing, as upstream. Deliberate divergence (owner decision \
              2026-10-31, gl-1090).",
-            "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, so \
-             a series that user cannot open (library, rating or tag rules) answers like an id \
-             that is no series: IsSeries stays forced and its title is not searched for. \
-             Upstream's GetItemById<Series> reads it with no user, and a request with no user \
-             still does here. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; \
-             gl-1113). Fix path for the rest: gl-1130.",
+            "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, or \
+             as the signed-in caller when a POST body names no user, so a series that user \
+             cannot open (library, rating or tag rules) answers like an id that is no series: \
+             IsSeries stays forced and its title is not searched for. Upstream's \
+             GetItemById<Series> reads it with no user. A POST body naming no user keeps the \
+             query without one, as upstream, so its DTOs carry no user data; only a request \
+             with no user at all (an API key naming none) still reads the row as upstream \
+             does. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; gl-1113, \
+             gl-1130).",
         ],
     },
     VerifiedSubsystem {
@@ -1742,16 +1773,28 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/users.rs authenticate_by_name, authenticate, login_failure, \
                authentication_result → ferrofin-core session_manager.rs authenticate_internal \
                (AuthenticateNewSessionInternal), admit_session → user_manager.rs \
-               authenticate_user (UserManager.AuthenticateUser); a 401 or 403 answers as \
-               ExceptionMiddleware does outside Development, the same on a live 12.4 for \
-               each refusal. Compared: user lookup and lock, provider order, the disabled, \
-               remote and schedule checks, the failure counter and lockout, the device and \
-               session limits, token rotation and session activity. The UserDto and \
-               SessionInfoDto builders are shared with other routes and not compared here",
-        date: "2026-11-01",
+               authenticate_user (UserManager.AuthenticateUser), authentication_providers_for \
+               (GetAuthenticationProviders(User)), authenticate_with_providers \
+               (AuthenticateLocalUser) and apply_external_administrator; a 401 or 403 \
+               answers as ExceptionMiddleware does \
+               outside Development, the same on a live 12.4 for each refusal. Compared: user \
+               lookup and lock, provider order and selection by the saved id \
+               (AuthenticationManager::id, GetType().FullName), the provider's canonical \
+               username, the new-user policy, the saved provider id, the disabled, remote and \
+               schedule checks, the failure counter and lockout, the device and session \
+               limits, token rotation and session activity. The UserDto and SessionInfoDto \
+               builders are shared with other routes and not compared here",
+        date: "2026-11-02",
         divergences: &[
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "An authentication provider reports the user's administrator flag in its result \
+         (ProviderAuthenticationResult.administrator) and the user manager applies it \
+         (UserManager::apply_external_administrator), never demoting the last administrator: \
+         that sign-in succeeds, the user stays one and a warning is logged. Upstream's LDAP \
+         plugin writes the flag itself through UpdateUserAsync, which has no such guard. No \
+         built-in provider reports a flag. \
+         Owner decision (2026-11-01).",
             "Every failed login writes the dashboard's AuthenticationFailed entry, where upstream \
          publishes AuthenticationRequestEventArgs only for a wrong password: an exception from \
          AuthenticateUser (an unknown user, a disabled account) or a device or session-limit \
@@ -2116,6 +2159,45 @@ pub const VERIFIED: &[Verified] = &[
                (AuthenticationManager.GetApiKeys) → ferrofin-model security.rs \
                AuthenticationInfo, querying QueryResult::from_items",
         date: "2026-10-28",
+        divergences: &[
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Auth/Providers",
+        upstream_file: "Jellyfin.Api/Controllers/SessionController.cs",
+        upstream_method: "GetAuthProviders",
+        ferrofin: "handlers/session.rs get_auth_providers (RequireAdmin, \
+               Policies.RequiresElevation) → ferrofin-core user_manager.rs \
+               get_authentication_providers (UserManager.GetAuthenticationProviders) over the \
+               built-in default and the providers compiled-in extensions register \
+               (set_extension_providers). Compared: the IsEnabled filter, the Default \
+               provider first and the rest by Name in the current culture, and each pair's \
+               Name and Id (the provider's GetType().FullName, AuthenticationManager::id)",
+        date: "2026-11-02",
+        divergences: &[
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Auth/PasswordResetProviders",
+        upstream_file: "Jellyfin.Api/Controllers/SessionController.cs",
+        upstream_method: "GetPasswordResetProviders",
+        ferrofin: "handlers/session.rs get_password_reset_providers (RequireAdmin, \
+               Policies.RequiresElevation) → ferrofin-core user_manager.rs \
+               get_password_reset_providers (UserManager.GetPasswordResetProviders) over the \
+               built-in password_reset.rs DefaultPasswordResetProvider and the providers \
+               compiled-in extensions register (set_extension_reset_providers). Compared: the \
+               IsEnabled filter, the default provider first and the rest by Name in the \
+               current culture, and each pair's Name and Id (GetType().FullName, \
+               PasswordResetManager::id)",
+        date: "2026-11-02",
         divergences: &[
             "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
          error shape, not upstream's. Fix path: gl-666.",

@@ -511,7 +511,7 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     })?;
 
     let url = config.database_url();
-    let db = Database::connect_sized(&url, config.db_pool)
+    let db = Database::connect_tuned(&url, config.db_pool, config.db_statement_cache)
         .await
         .with_context(|| format!("failed to open database `{url}`"))?;
     db.run_migrations()

@@ -115,17 +115,34 @@ impl Database {
         Self::connect_sized(url, None).await
     }
 
-    /// [`Database::connect`] with an explicit pool size.
-    ///
-    /// `Some(n)` pins the pool at exactly `n` connections; `None` uses the
-    /// sizing formula ([`default_pool_size`]). The composition root resolves
-    /// its config layers (`FERROFIN_DB_POOL` env / `db_pool` in `config.toml`)
-    /// into this parameter — this crate no longer reads the environment.
+    /// [`Database::connect_tuned`] with the default statement cache
+    /// ([`DEFAULT_STATEMENT_CACHE_CAPACITY`]).
     ///
     /// # Errors
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the URL is invalid or
     /// the pool cannot be opened.
     pub async fn connect_sized(url: &str, pool_size: Option<u32>) -> Result<Self> {
+        Self::connect_tuned(url, pool_size, None).await
+    }
+
+    /// [`Database::connect`] with an explicit pool size and statement cache.
+    ///
+    /// `pool_size` `Some(n)` pins the pool at exactly `n` connections; `None`
+    /// uses the sizing formula ([`default_pool_size`]). `statement_cache` is
+    /// how many prepared statements each connection keeps, reader and writer
+    /// pools alike; `None` keeps [`DEFAULT_STATEMENT_CACHE_CAPACITY`]. The
+    /// composition root resolves its config layers (`FERROFIN_DB_POOL` /
+    /// `db_pool`, `FERROFIN_DB_STATEMENT_CACHE` / `db_statement_cache`) into
+    /// these parameters — this crate does not read the environment.
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the URL is invalid or
+    /// the pool cannot be opened.
+    pub async fn connect_tuned(
+        url: &str,
+        pool_size: Option<u32>,
+        statement_cache: Option<u32>,
+    ) -> Result<Self> {
         // Readers keep the full 30s busy timeout: WAL readers normally never
         // block on the writer, but VACUUM / wal_checkpoint(TRUNCATE) take
         // EXCLUSIVE locks — a 5s reader timeout turned a long vacuum into hard
@@ -139,7 +156,14 @@ impl Database {
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(30))
             .pragma("mmap_size", MMAP_SIZE_BYTES.to_string())
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .statement_cache_capacity(
+                statement_cache.map_or(DEFAULT_STATEMENT_CACHE_CAPACITY, |n| {
+                    usize::try_from(n).unwrap_or(DEFAULT_STATEMENT_CACHE_CAPACITY)
+                }),
+            );
+        // The writer, the snapshot pool and the migration connection below
+        // inherit the read options, statement cache included.
         let write_options = read_options
             .clone()
             .busy_timeout(std::time::Duration::from_secs(30));
@@ -199,7 +223,9 @@ impl Database {
         // pool's connection would have no `ferrofin_random()` and every
         // random-ordered query would fail with "no such function".
         init_sqlite();
-        let options = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")?
+            .foreign_keys(true)
+            .statement_cache_capacity(DEFAULT_STATEMENT_CACHE_CAPACITY);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
@@ -2101,6 +2127,15 @@ async fn log_dangling_row_cleanup(conn: &mut sqlx::SqliteConnection) -> Result<(
         .await?;
     Ok(())
 }
+
+/// How many prepared statements each pooled connection keeps when the
+/// composition root does not say (`db_statement_cache`; owner decision,
+/// gl-1071). sqlx's own default is 100, and a browse of a small library ran 120
+/// to 190 distinct statements on one connection, largely because every size of
+/// an `IN (…)` list is its own text: at 100 the cache evicted statements still in
+/// use, and on a repeat browse about one execution in ten prepared again a
+/// statement the cache had dropped. 200 holds that working set.
+pub const DEFAULT_STATEMENT_CACHE_CAPACITY: usize = 200;
 
 /// The `auto` reader-pool size: **usable-core count** — the min of the CPU
 /// affinity mask (`available_parallelism`) and the cgroup CFS quota.

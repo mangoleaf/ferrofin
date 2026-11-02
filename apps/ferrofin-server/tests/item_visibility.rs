@@ -2067,6 +2067,18 @@ async fn air_series(f: &Fixture, titles: &[&str]) {
         .expect("guide refresh");
 }
 
+/// Mints the fixture's only API key and returns it.
+async fn only_api_key(f: &Fixture) -> String {
+    let uri = "/Auth/Keys?app=guide-fixture";
+    let (status, _) = call(&f.router, "POST", uri, Some(&f.admin), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, keys) = call(&f.router, "GET", "/Auth/Keys", Some(&f.admin), None).await;
+    keys["Items"][0]["AccessToken"]
+        .as_str()
+        .expect("AccessToken")
+        .to_owned()
+}
+
 /// The programme titles a guide request answers, sorted.
 async fn guide_titles(
     f: &Fixture,
@@ -2088,7 +2100,8 @@ async fn guide_titles(
     titles
 }
 
-// Divergence (owner decision 2026-10-31, gl-1091; gl-1113): see `query_programs_inner`.
+// Divergence (owner decision 2026-10-31, gl-1091; gl-1113, gl-1130): see
+// `query_programs_inner`.
 #[tokio::test]
 async fn a_series_the_user_cannot_open_names_no_guide_search() {
     let f = fixture().await;
@@ -2125,6 +2138,12 @@ async fn a_series_the_user_cannot_open_names_no_guide_search() {
         guide_titles(&f, "POST", Some(body.clone()), "", &f.viewer).await,
         everything
     );
+    // A body naming no user still reads the series as the signed-in caller.
+    let no_user = json!({ "LibrarySeriesId": series });
+    assert_eq!(
+        guide_titles(&f, "POST", Some(no_user.clone()), "", &f.viewer).await,
+        everything
+    );
     // An administrator reading as the viewer gets the viewer's answer.
     let as_viewer = format!("{closed}&userId={viewer_id}");
     assert_eq!(
@@ -2146,6 +2165,12 @@ async fn a_series_the_user_cannot_open_names_no_guide_search() {
             &f.admin
         )
         .await,
+        only_show
+    );
+    // An API key has no user, so it reads the series as upstream does.
+    let key = only_api_key(&f).await;
+    assert_eq!(
+        guide_titles(&f, "POST", Some(no_user.clone()), "", &key).await,
         only_show
     );
 
@@ -2178,6 +2203,10 @@ async fn a_series_the_user_cannot_open_names_no_guide_search() {
     );
     assert_eq!(
         guide_titles(&f, "POST", Some(body), "", &f.viewer).await,
+        only_show
+    );
+    assert_eq!(
+        guide_titles(&f, "POST", Some(no_user), "", &f.viewer).await,
         only_show
     );
 }
@@ -2414,6 +2443,61 @@ fn item_ids_of(ids: &Value) -> Vec<uuid::Uuid> {
         .iter()
         .map(|id| uuid::Uuid::parse_str(id.as_str().expect("id")).expect("id"))
         .collect()
+}
+
+/// The disabled-library edge the `GET /Playlists/{itemId}/Items` row records: a
+/// member of a disabled library stays in the playlist's listing, which takes the
+/// check `/Items?ids=` uses, and leaves `/Items?ParentId=`, which takes
+/// `Folder.GetLinkedChildren(user)`'s rule, for the administrator and the viewer
+/// alike.
+#[tokio::test]
+async fn members_of_a_disabled_library_stay_listed_and_leave_the_browse() {
+    /// The members `token` is given by `/Items?ParentId=<playlist>`.
+    async fn browsed(f: &Fixture, p: &SharedPlaylist, token: &str) -> Vec<uuid::Uuid> {
+        let uri = format!("/Items?ParentId={}", p.id);
+        let (status, page) = call(&f.router, "GET", &uri, Some(token), None).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        item_ids(&page["Items"])
+    }
+    let f = fixture().await;
+    let p = SharedPlaylist::new(&f).await;
+    let all = [p.gamma, p.alpha, p.delta, p.epsilon];
+    // "Allowed" holds Alpha and Epsilon; "Hidden" Gamma and Delta.
+    let in_allowed = [p.alpha, p.epsilon];
+    assert_eq!(browsed(&f, &p, &f.admin).await, all, "enabled");
+    assert_eq!(browsed(&f, &p, &f.viewer).await, in_allowed, "enabled");
+
+    let (_, folders) = call(
+        &f.router,
+        "GET",
+        "/Library/VirtualFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let allowed = folders
+        .as_array()
+        .expect("folders")
+        .iter()
+        .find(|folder| folder["Name"] == "Allowed")
+        .expect("Allowed")
+        .clone();
+    let mut options = allowed["LibraryOptions"].clone();
+    options["Enabled"] = json!(false);
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        "/Library/VirtualFolders/LibraryOptions",
+        Some(&f.admin),
+        Some(json!({"Id": allowed["ItemId"], "LibraryOptions": options})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    assert_eq!(p.stored(&f).await, all);
+    assert_eq!(browsed(&f, &p, &f.admin).await, [p.gamma, p.delta]);
+    assert_eq!(p.listed(&f, &f.viewer).await, in_allowed);
+    assert_eq!(browsed(&f, &p, &f.viewer).await, Vec::<uuid::Uuid>::new());
 }
 
 /// A move's index counts the list its caller was given, so the member lands

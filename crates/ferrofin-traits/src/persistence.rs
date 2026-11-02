@@ -761,6 +761,22 @@ pub trait ItemPersistenceService: Send + Sync {
     /// [`ServiceError::Backend`] on a storage failure.
     async fn deletion_closure(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// The ids of [`Self::deletion_closure`]'s rows, in the same order,
+    /// without reading the rows: a caller that cleans a large deletion (a
+    /// removed library) reads the rows a batch at a time.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn deletion_closure_ids(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(self
+            .deletion_closure(ids)
+            .await?
+            .iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect())
+    }
+
     /// Persists (inserts or updates) the given item rows.
     ///
     /// An update stamps `DateLastSaved` with the save time

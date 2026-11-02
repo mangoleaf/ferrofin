@@ -193,6 +193,12 @@ const CACHE_TTL: SettingKind = SettingKind::Integer {
     max: *config::CACHE_TTL_RANGE_SECS.end() as i64,
 };
 
+/// The statement cache's bounds ([`config::STATEMENT_CACHE_RANGE`]).
+const STATEMENT_CACHE: SettingKind = SettingKind::Integer {
+    min: *config::STATEMENT_CACHE_RANGE.start() as i64,
+    max: *config::STATEMENT_CACHE_RANGE.end() as i64,
+};
+
 /// The transcode caps' bounds ([`TranscodeLimits::RANGE`]).
 const TRANSCODE_CAP: SettingKind = SettingKind::Integer {
     min: *TranscodeLimits::RANGE.start() as i64,
@@ -486,6 +492,16 @@ pub static SETTINGS: &[SettingSpec] = &[
         default: "auto",
         description: "SQLite connection count, or auto to size it to the cores.",
         running: |c| json!(c.db_pool),
+        ..ROW
+    },
+    SettingSpec {
+        key: "db_statement_cache",
+        env: Some("FERROFIN_DB_STATEMENT_CACHE"),
+        env_read: EnvRead::NonBlank,
+        kind: STATEMENT_CACHE,
+        default: "200",
+        description: "Prepared statements each SQLite connection keeps.",
+        running: |c| json!(c.db_statement_cache),
         ..ROW
     },
     SettingSpec {
@@ -881,6 +897,25 @@ pub static SETTINGS: &[SettingSpec] = &[
         description: "Seconds a remote image URL that gave no image is left alone before it is \
                       tried again.",
         running: |c| json!(c.image_negative_cache_ttl_secs),
+        ..ROW
+    },
+    SettingSpec {
+        key: "image_private_http_allow",
+        env: Some("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW"),
+        env_read: EnvRead::NonBlank,
+        group: Group::Images,
+        // As wasm_private_http_allow (owner decision D5): letting the server
+        // reach private addresses takes host access, not just an admin
+        // session.
+        access: SettingAccess::ReadOnly(
+            "Lets image downloads reach the LAN, loopback and cloud-metadata addresses it lists. \
+             Set it by hand in config.toml (image_private_http_allow) or \
+             FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW, so an admin session alone cannot grant it.",
+        ),
+        default: "no private address but a Live TV tuner's host",
+        description: "Private hosts, addresses and CIDR networks image downloads may reach, \
+                      comma-separated; Live TV tuners' hosts are always allowed.",
+        running: |c| json!(c.image_private_http_allow),
         ..ROW
     },
     // ---- WASM plugins -----------------------------------------------------

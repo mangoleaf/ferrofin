@@ -101,7 +101,10 @@ take it off with `without_url()`. ffmpeg needs the real URL, and it prints that 
 every segment URL itself, so a job reading one has its `FFmpeg.*.log`, its debug argument
 line and the stderr tail in its errors filtered (`transcoding::ffmpeg_log`). The
 `-user_agent` and `-referer` values go too. An ordinary file transcode's log stays byte
-for byte.
+for byte. A `.strm` item's media path is its target URL, so whatever names that path does
+the same: subtitle extraction, a failed probe and the `.strm` reader log it through
+`redact_url`, and an error that quotes the input or ffmpeg's arguments (attachment
+extraction, a failed spawn) passes them through `redact_urls_in`.
 
 ## 6. The sinks are fixed
 

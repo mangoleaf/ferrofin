@@ -17,14 +17,25 @@
 //! cannot decide how much memory a download takes, and the first bytes must be
 //! an image whatever the response declared, because the first file stored for
 //! a URL or an item stays there.
+//!
+//! A third (owner decision 2026-10-31, gl-1096): a download never reaches a
+//! private address, on its first request or on any redirect, unless the
+//! server's [`ImageDestinations`](crate::destination::ImageDestinations) let
+//! it, and the URL's suffix names the type only when no redirect happened.
+//! Upstream's client follows redirects anywhere, so a playlist's logo URL
+//! could read an internal service through the server.
 
+use crate::destination::{
+    self, ConfiguredImageDestinations, DestinationPolicy, DestinationRefused, PublicOnlyResolver,
+};
 use crate::rate_limit::{
-    BodyError, CappedBody, CountedBody as _, LimitedRequest as _, RateLimiter, RequestError,
-    request_limits,
+    BodyError, CappedBody, CountedBody as _, LimitedRequest as _, RateLimiter, request_limits,
 };
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::ops::RangeInclusive;
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
@@ -51,13 +62,245 @@ pub(crate) fn limiter_for(url: &str, label: &'static str) -> RateLimiter {
         .counted_as(label)
 }
 
-pub(crate) async fn send(
-    http: &reqwest::Client,
-    url: &str,
-) -> Result<reqwest::Response, RequestError> {
-    http.get(url)
-        .send_limited(&limiter_for(url, crate::metrics::IMAGE))
-        .await
+/// Most redirects one download follows: reqwest's default policy
+/// (`redirect::Policy::default()`), which downloads went by until they followed
+/// redirects themselves, to vet each hop.
+const MAX_REDIRECTS: usize = 10;
+
+/// Why [`ImageHttp::send`] has no response.
+#[derive(Debug)]
+pub(crate) enum SendError {
+    /// A destination the policy refuses: a private address nothing exempts.
+    Refused,
+    /// The request through the origin's limiter failed
+    /// ([`RequestError`](crate::rate_limit::RequestError): a transport
+    /// failure or a cooldown).
+    Request,
+    /// No request could be made: a URL that does not parse, a redirect to
+    /// another scheme or past [`MAX_REDIRECTS`], a name a proxy would resolve
+    /// that the server cannot, or a client that could not be built.
+    Failed,
+}
+
+/// A response, and whether a redirect led to it.
+pub(crate) struct Fetched {
+    response: reqwest::Response,
+    redirected: bool,
+}
+
+/// The clients image downloads go through, and the destinations they refuse
+/// ([`DestinationPolicy`]). Each request and each redirect hop is vetted
+/// before it is sent; redirects are followed here, not by the client, so that
+/// none goes unvetted.
+pub(crate) struct ImageHttp {
+    /// Direct connections, with no proxy: every name it resolves goes through
+    /// [`PublicOnlyResolver`], so the address it connects to is one the policy
+    /// was asked about, even if the name's answer changed since the check (DNS
+    /// rebinding). `None` when it could not be built: every download then
+    /// fails, rather than going out unguarded.
+    vetted: Option<reqwest::Client>,
+    /// Set when the environment configures a proxy
+    /// ([`destination::environment_proxy`]): the client that goes through it.
+    /// The proxy resolves names itself, out of the resolver's sight, so a name
+    /// is checked on the server's own answer before each request and pinned
+    /// to it for the hosts the proxy settings exclude.
+    proxied: Option<reqwest::Client>,
+    policy: Arc<dyn DestinationPolicy>,
+}
+
+impl ImageHttp {
+    /// The process's: the server's
+    /// [`set_image_destinations`](destination::set_image_destinations), read
+    /// at each check, and the environment's proxy.
+    pub(crate) fn shared() -> &'static Self {
+        static SHARED: OnceLock<ImageHttp> = OnceLock::new();
+        SHARED.get_or_init(|| {
+            Self::new(
+                Arc::new(ConfiguredImageDestinations),
+                destination::environment_proxy(|name| std::env::var_os(name)),
+            )
+        })
+    }
+
+    /// Clients refusing what `policy` refuses, through the environment's
+    /// proxy when `proxy`.
+    fn new(policy: Arc<dyn DestinationPolicy>, proxy: bool) -> Self {
+        let vetted = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::new(PublicOnlyResolver::new(Arc::clone(&policy))))
+            .build()
+            .ok();
+        let proxied = proxy.then(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .ok()
+        });
+        Self {
+            vetted,
+            proxied: proxied.flatten(),
+            policy,
+        }
+    }
+
+    /// GETs `url` through its origin's limiter, following redirects up to
+    /// [`MAX_REDIRECTS`] and vetting the destination of each.
+    pub(crate) async fn send(&self, url: &str) -> Result<Fetched, SendError> {
+        let limiter = limiter_for(url, crate::metrics::IMAGE);
+        let mut current = reqwest::Url::parse(url).map_err(|_| SendError::Failed)?;
+        let mut redirects = 0;
+        loop {
+            let client = self.client_for(&current).await?;
+            let response = client
+                .get(current.clone())
+                .send_limited(&limiter)
+                .await
+                .map_err(|_| SendError::Request)?;
+            let Some(next) = redirect_target(&response, &current) else {
+                if crate::rate_limit::is_redirect_to_follow(&response) {
+                    // The limiter took it for a hop to follow.
+                    return Err(unsent("a redirect whose Location cannot be followed"));
+                }
+                return Ok(Fetched {
+                    response,
+                    redirected: redirects > 0,
+                });
+            };
+            if redirects == MAX_REDIRECTS {
+                return Err(unsent("too many redirects"));
+            }
+            redirects += 1;
+            current = next;
+        }
+    }
+
+    /// The client to send a request for `url` with, once its destination
+    /// passed the policy.
+    async fn client_for(&self, url: &reqwest::Url) -> Result<reqwest::Client, SendError> {
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(unsent("a URL with a scheme other than http or https"));
+        }
+        let host = url.host_str().ok_or_else(|| unsent("a URL with no host"))?;
+        // An address literal reaches no resolver, so it is vetted here.
+        if let Ok(address) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+            if self.policy.refuses(host, address).await {
+                refused(host, address);
+                return Err(SendError::Refused);
+            }
+            return self
+                .proxied
+                .as_ref()
+                .or(self.vetted.as_ref())
+                .cloned()
+                .ok_or_else(|| unsent("the HTTP client could not be built"));
+        }
+        // A name is vetted here too, so that a refusal is told apart from a
+        // connection failure; the vetted client's resolver vets it again when
+        // it connects. One that does not resolve, or not within the request
+        // timeout, goes on to fail the way it always did, as a connection
+        // failure, unless a proxy would resolve it.
+        let port = url.port_or_known_default().unwrap_or_default();
+        let lookup = destination::resolve_vetted(self.policy.as_ref(), host, port);
+        let vetted = match tokio::time::timeout(request_limits().timeout, lookup).await {
+            Ok(Ok(addresses)) => Some(addresses),
+            Ok(Err(DestinationRefused::Private { host, address })) => {
+                refused(&host, address);
+                return Err(SendError::Refused);
+            }
+            Ok(Err(_)) | Err(_) => None,
+        };
+        if self.proxied.is_none() {
+            return self
+                .vetted
+                .clone()
+                .ok_or_else(|| unsent("the HTTP client could not be built"));
+        }
+        // Through the proxy, or straight to the vetted addresses for a host
+        // the proxy settings exclude.
+        let Some(addresses) = vetted else {
+            unresolvable_behind_a_proxy(host);
+            return Err(unsent("a host the server cannot resolve, behind a proxy"));
+        };
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(host, &addresses)
+            .build()
+            .map_err(|_| unsent("the HTTP client could not be built"))
+    }
+}
+
+#[cfg(test)]
+impl ImageHttp {
+    /// Clients that refuse nothing, for a test serving its images on
+    /// loopback.
+    fn open() -> Self {
+        let nothing: fn(IpAddr) -> bool = |_| false;
+        Self::new(Arc::new(nothing), false)
+    }
+}
+
+/// Where a redirect response sends the request next: the statuses reqwest's
+/// own policy follows (301, 302, 303, 307, 308), with a `Location` that
+/// resolves against `current`. `None` for any other response, which is the
+/// answer.
+fn redirect_target(response: &reqwest::Response, current: &reqwest::Url) -> Option<reqwest::Url> {
+    if !crate::rate_limit::REDIRECT_STATUSES.contains(&response.status()) {
+        return None;
+    }
+    let location = response.headers().get(reqwest::header::LOCATION)?;
+    // UTF-8, not just visible ASCII, as reqwest's own policy reads it.
+    current
+        .join(std::str::from_utf8(location.as_bytes()).ok()?)
+        .ok()
+}
+
+/// A request that could not be sent, or a redirect that could not be
+/// followed: a failure of the provider, counted as the limiter counts one
+/// (reqwest's own redirect errors used to come back through it), and logged
+/// at `debug`, since a library can hold any number.
+fn unsent(reason: &'static str) -> SendError {
+    crate::rate_limit::note_request_failure();
+    tracing::debug!(reason, "remote image not downloaded");
+    SendError::Failed
+}
+
+/// Logs, once per process at `warn`, that behind a proxy a host the server
+/// cannot resolve is not sent: it could not be checked.
+fn unresolvable_behind_a_proxy(host: &str) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            %host,
+            "remote image not downloaded: behind an HTTP proxy, image downloads go only to \
+             hosts the server can resolve itself, to check their address; further ones are \
+             logged at debug"
+        );
+    }
+}
+
+/// Logs a refused destination: the first of the process at `warn`, naming the
+/// setting that allows it, the rest at `debug`, since a playlist or a library
+/// can hold any number of them.
+fn refused(host: &str, address: IpAddr) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        tracing::debug!(%host, %address, "remote image refused: private address");
+    } else {
+        tracing::warn!(
+            %host,
+            %address,
+            "remote image refused: the host is at a private address, which image downloads \
+             may not reach unless image_private_http_allow (FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW) \
+             lists it or it is a Live TV tuner's host; further refusals are logged at debug"
+        );
+    }
+}
+
+/// GETs `url` for an image download: [`ImageHttp::send`] on the process's
+/// clients.
+pub(crate) async fn send(url: &str) -> Result<Fetched, SendError> {
+    ImageHttp::shared().send(url).await
 }
 
 use ferrofin_model::net::mime_types;
@@ -76,6 +319,10 @@ pub(crate) enum ImageFetchError {
     NotAnImage(String),
     /// The body is over the download limit.
     TooLarge,
+    /// The URL, or a redirect from it, is at a private address the server's
+    /// [`ImageDestinations`](crate::destination::ImageDestinations) do not
+    /// let downloads reach.
+    Refused,
     /// No answer to go on: a transport failure, a timeout, a provider
     /// cooldown, or a status that says nothing about the image.
     Unavailable,
@@ -86,9 +333,22 @@ pub(crate) enum ImageFetchError {
 impl ImageFetchError {
     /// Whether the source answered and asking again would get the same
     /// answer. Anything else may be gone in a moment, so a good image must not
-    /// be hidden because of it.
+    /// be hidden because of it. A refusal is the same until the server
+    /// restarts with another allow-list, or a tuner on that host is added.
     pub(crate) fn is_answer(&self) -> bool {
-        matches!(self, Self::Missing | Self::NotAnImage(_) | Self::TooLarge)
+        matches!(
+            self,
+            Self::Missing | Self::NotAnImage(_) | Self::TooLarge | Self::Refused
+        )
+    }
+}
+
+impl From<SendError> for ImageFetchError {
+    fn from(error: SendError) -> Self {
+        match error {
+            SendError::Refused => Self::Refused,
+            SendError::Request | SendError::Failed => Self::Unavailable,
+        }
     }
 }
 
@@ -149,21 +409,24 @@ impl RemoteImage {
 /// GETs `url` and checks everything that can be checked before the body:
 /// the status, the media type resolved the way the C# does
 /// ([`resolve_content_type`]), the declared length, and then the first bytes.
-pub(crate) async fn open_image(
-    http: &reqwest::Client,
-    url: &str,
-) -> Result<RemoteImage, ImageFetchError> {
-    open_image_capped(http, url, request_limits().download_max_bytes).await
+pub(crate) async fn open_image(url: &str) -> Result<RemoteImage, ImageFetchError> {
+    open_image_capped(
+        ImageHttp::shared(),
+        url,
+        request_limits().download_max_bytes,
+    )
+    .await
 }
 
 async fn open_image_capped(
-    http: &reqwest::Client,
+    http: &ImageHttp,
     url: &str,
     limit: u64,
 ) -> Result<RemoteImage, ImageFetchError> {
-    let response = send(http, url)
-        .await
-        .map_err(|_| ImageFetchError::Unavailable)?;
+    let Fetched {
+        response,
+        redirected,
+    } = http.send(url).await?;
     match response.status() {
         reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::FORBIDDEN => {
             return Err(ImageFetchError::Missing);
@@ -177,7 +440,7 @@ async fn open_image_capped(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty());
-    let content_type = resolve_content_type(declared.as_deref(), url);
+    let content_type = resolve_content_type(declared.as_deref(), url, redirected);
     if let Some(reason) = non_image_reason(&content_type) {
         return Err(ImageFetchError::NotAnImage(reason));
     }
@@ -199,19 +462,16 @@ async fn open_image_capped(
 }
 
 /// GETs `url` and returns its bytes plus their media type.
-pub(crate) async fn download_image(
-    http: &reqwest::Client,
-    url: &str,
-) -> Result<(Vec<u8>, String), ImageFetchError> {
-    let image = open_image(http, url).await?;
+pub(crate) async fn download_image(url: &str) -> Result<(Vec<u8>, String), ImageFetchError> {
+    let image = open_image(url).await?;
     let content_type = image.content_type.clone();
     Ok((image.into_bytes().await?, content_type))
 }
 
 /// GETs `url` for a caller that names the file itself, so it needs no media
 /// type and only the bytes have to be an image. `None` on any failure.
-pub(crate) async fn download_bytes(http: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
-    let response = send(http, url).await.ok()?;
+pub(crate) async fn download_bytes(url: &str) -> Option<Vec<u8>> {
+    let response = send(url).await.ok()?.response;
     if !response.status().is_success() {
         return None;
     }
@@ -219,15 +479,25 @@ pub(crate) async fn download_bytes(http: &reqwest::Client, url: &str) -> Option<
     is_image(&bytes).then_some(bytes)
 }
 
-/// The media-type resolution above, without the I/O.
-pub(crate) fn resolve_content_type(declared: Option<&str>, url: &str) -> String {
+/// The media-type resolution above, without the I/O. `redirected` is
+/// whether a redirect led from `url` to the response.
+pub(crate) fn resolve_content_type(declared: Option<&str>, url: &str, redirected: bool) -> String {
     // Workaround for tvheadend channel icons, which report no type at all.
+    // It names PNG whatever redirect led to the answer, as upstream's does:
+    // it is the URL's shape, not its suffix, and the bytes must be an image
+    // anyway (`is_image`), so a tvheadend behind an http-to-https redirect
+    // keeps its logos.
     if declared.is_none() && url.to_ascii_lowercase().contains("/imagecache/") {
         return "image/png".to_owned();
     }
     // Some providers do not report a usable media type; fall back to the one
-    // implied by the URL path with its query string stripped.
+    // implied by the URL path with its query string stripped. Only when the
+    // URL itself answered (gl-1096): a redirect may lead anywhere, so the name
+    // of the URL asked for says nothing about what answered.
     if declared.is_none_or(|t| t == "application/octet-stream") {
+        if redirected {
+            return declared.unwrap_or("application/octet-stream").to_owned();
+        }
         let path = url.split(['?', '#']).next().unwrap_or(url);
         return mime_types::get_mime_type(path).to_ascii_lowercase();
     }
@@ -262,23 +532,40 @@ mod tests {
 
     #[rstest]
     // The response's own type wins, parameters stripped by the caller.
-    #[case(Some("image/png"), "https://x/poster.jpg", "image/png")]
+    #[case(Some("image/png"), "https://x/poster.jpg", false, "image/png")]
+    #[case(Some("image/png"), "https://x/poster.jpg", true, "image/png")]
     // No type + an `/imagecache/` URL: the ported tvheadend workaround.
-    #[case(None, "http://tvh/imagecache/42", "image/png")]
+    #[case(None, "http://tvh/imagecache/42", false, "image/png")]
+    #[case(None, "http://tvh/imagecache/42", true, "image/png")]
     // No type elsewhere: the URL PATH decides, query string stripped.
-    #[case(None, "https://x/poster.png?size=big", "image/png")]
-    #[case(None, "https://x/poster.jpg?v=2", "image/jpeg")]
+    #[case(None, "https://x/poster.png?size=big", false, "image/png")]
+    #[case(None, "https://x/poster.jpg?v=2", false, "image/jpeg")]
     // `application/octet-stream` is treated as "not reported".
-    #[case(Some("application/octet-stream"), "https://x/a.webp", "image/webp")]
+    #[case(
+        Some("application/octet-stream"),
+        "https://x/a.webp",
+        false,
+        "image/webp"
+    )]
     // An extensionless URL with no usable type falls to the default, which is
     // NOT an image — so the caller refuses it rather than guessing jpeg.
-    #[case(None, "https://x/image", "application/octet-stream")]
+    #[case(None, "https://x/image", false, "application/octet-stream")]
+    // After a redirect the URL asked for names nothing (gl-1096): whatever
+    // answered was not it.
+    #[case(None, "https://x/poster.png", true, "application/octet-stream")]
+    #[case(
+        Some("application/octet-stream"),
+        "https://x/a.webp",
+        true,
+        "application/octet-stream"
+    )]
     fn content_type_resolution(
         #[case] declared: Option<&str>,
         #[case] url: &str,
+        #[case] redirected: bool,
         #[case] expected: &str,
     ) {
-        assert_eq!(resolve_content_type(declared, url), expected);
+        assert_eq!(resolve_content_type(declared, url, redirected), expected);
     }
 
     #[test]
@@ -321,7 +608,7 @@ mod body_tests {
     async fn fetch(response: Vec<u8>, path: &str) -> Result<Vec<u8>, ImageFetchError> {
         let server = MockServer::start_raw(vec![response]).await;
         let url = format!("{}{path}", server.base_url);
-        open_image_capped(&reqwest::Client::new(), &url, LIMIT as u64)
+        open_image_capped(&ImageHttp::open(), &url, LIMIT as u64)
             .await?
             .into_bytes()
             .await
@@ -399,9 +686,7 @@ mod body_tests {
     async fn a_tvheadend_icon_with_no_type_is_kept(#[case] body: &[u8]) {
         let server = MockServer::start_raw(vec![MockServer::raw_ok("", body)]).await;
         let url = format!("{}/imagecache/42", server.base_url);
-        let (bytes, content_type) = download_image(&reqwest::Client::new(), &url)
-            .await
-            .expect("an image");
+        let (bytes, content_type) = download_image(&url).await.expect("an image");
         assert_eq!(bytes, body);
         assert_eq!(content_type, "image/png");
     }
@@ -414,9 +699,7 @@ mod body_tests {
             body,
         )])
         .await;
-        let (bytes, content_type) = download_image(&reqwest::Client::new(), &server.base_url)
-            .await
-            .expect("an image");
+        let (bytes, content_type) = download_image(&server.base_url).await.expect("an image");
         assert_eq!(bytes, body);
         assert_eq!(content_type, "image/svg+xml");
     }
@@ -459,7 +742,7 @@ mod body_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("image.png");
         let mut file = tokio::fs::File::create(&path).await.expect("file");
-        open_image(&reqwest::Client::new(), &server.base_url)
+        open_image(&server.base_url)
             .await
             .expect("an image")
             .write_to(&mut file)
@@ -474,9 +757,7 @@ mod body_tests {
         let body = png_of(40 * 1024 * 1024);
         let headers = format!("{PNG_TYPE}Content-Length: {}\r\n", body.len());
         let server = MockServer::start_raw(vec![MockServer::raw_ok(&headers, &body)]).await;
-        let download = download_artwork(&reqwest::Client::new(), &server.base_url)
-            .await
-            .expect("artwork");
+        let download = download_artwork(&server.base_url).await.expect("artwork");
         assert_eq!(download.bytes.len(), body.len());
         assert_eq!(download.content_length, Some(body.len() as u64));
         assert_eq!(download.content_type, "image/png");
@@ -490,21 +771,15 @@ mod body_tests {
         let declared = crate::rate_limit::request_limits().download_max_bytes + 1;
         let headers = format!("{PNG_TYPE}Content-Length: {declared}\r\n");
         let server = MockServer::start_raw(vec![MockServer::raw_ok(&headers, b"")]).await;
-        let (outcome, failures) = crate::rate_limit::count_request_failures(download_artwork(
-            &reqwest::Client::new(),
-            &server.base_url,
-        ))
-        .await;
+        let (outcome, failures) =
+            crate::rate_limit::count_request_failures(download_artwork(&server.base_url)).await;
         assert!(matches!(outcome, Err(ArtworkDownloadFailure::Skip)));
         assert_eq!(failures, 0);
 
         let server =
             MockServer::start_raw(vec![MockServer::raw_ok(PNG_TYPE, b"<html></html>")]).await;
-        let (outcome, failures) = crate::rate_limit::count_request_failures(download_artwork(
-            &reqwest::Client::new(),
-            &server.base_url,
-        ))
-        .await;
+        let (outcome, failures) =
+            crate::rate_limit::count_request_failures(download_artwork(&server.base_url)).await;
         assert!(matches!(outcome, Err(ArtworkDownloadFailure::Stop)));
         assert_eq!(failures, 1);
     }
@@ -513,17 +788,12 @@ mod body_tests {
     /// no failure counted, so a studio's thumb is not asked for forever.
     #[tokio::test]
     async fn a_direct_download_keeps_only_an_image() {
-        let http = reqwest::Client::new();
         let server = MockServer::start_raw(vec![MockServer::raw_ok("", &png_of(16))]).await;
-        assert_eq!(
-            download_bytes(&http, &server.base_url).await,
-            Some(png_of(16))
-        );
+        assert_eq!(download_bytes(&server.base_url).await, Some(png_of(16)));
 
         let server = MockServer::start_raw(vec![MockServer::raw_ok("", b"<html></html>")]).await;
         let (bytes, failures) =
-            crate::rate_limit::count_request_failures(download_bytes(&http, &server.base_url))
-                .await;
+            crate::rate_limit::count_request_failures(download_bytes(&server.base_url)).await;
         assert_eq!(bytes, None);
         assert_eq!(failures, 0);
     }
@@ -660,13 +930,272 @@ mod quota_tests {
         )
         .await;
         let other = MockServer::always("image").await;
-        let http = reqwest::Client::new();
-        assert!(send(&http, &blocked.base_url).await.is_ok());
+        let http = ImageHttp::open();
+        assert!(http.send(&blocked.base_url).await.is_ok());
         assert!(matches!(
-            send(&http, &format!("{}/another-cover", blocked.base_url)).await,
-            Err(RequestError::Cooldown)
+            http.send(&format!("{}/another-cover?probe=1", blocked.base_url))
+                .await,
+            Err(SendError::Request)
         ));
-        assert!(send(&http, &other.base_url).await.is_ok());
+        assert!(
+            blocked.query_values("/another-cover", "probe").is_empty(),
+            "the cooldown kept it unsent"
+        );
+        assert!(http.send(&other.base_url).await.is_ok());
+    }
+}
+
+/// gl-1096: a download refuses a private destination on its first request and
+/// on every redirect hop, unless the policy lets it through.
+#[cfg(test)]
+mod destination_tests {
+    use super::*;
+    use crate::mock_http::MockServer;
+    use rstest::rstest;
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n rest of a png";
+    const PNG_HEADER: &str = "Content-Type: image/png\r\n";
+
+    /// Refuses every private address but at the one host it names.
+    struct PrivateBut(&'static str);
+
+    #[async_trait::async_trait]
+    impl DestinationPolicy for PrivateBut {
+        async fn refuses(&self, host: &str, address: IpAddr) -> bool {
+            destination::is_private_address(address) && host != self.0
+        }
+    }
+
+    fn guarded(allowed_host: &'static str) -> ImageHttp {
+        ImageHttp::new(Arc::new(PrivateBut(allowed_host)), false)
+    }
+
+    fn redirect(location: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn port(server: &MockServer) -> &str {
+        server.base_url.rsplit(':').next().expect("port")
+    }
+
+    /// The server's own default: before the server sets anything, every
+    /// private address is refused, and nothing is sent to it.
+    #[tokio::test]
+    async fn a_private_address_is_refused_unsent() {
+        let server = MockServer::start_raw(vec![MockServer::raw_ok(PNG_HEADER, PNG)]).await;
+        let http = ImageHttp::new(Arc::new(destination::ImageDestinations::default()), false);
+        let err = open_image_capped(&http, &format!("{}/a.png", server.base_url), 1024)
+            .await
+            .err()
+            .expect("refused");
+        assert!(matches!(err, ImageFetchError::Refused), "{err:?}");
+        assert!(err.is_answer());
+        assert_eq!(server.requests(), 0);
+    }
+
+    /// The finding: a URL on an allowed host answers with a redirect to an
+    /// internal service. Whether the hop names the service's host or its
+    /// address, it is refused, and nothing reaches the service.
+    #[rstest]
+    #[case::to_a_name("127.0.0.1", "localhost")]
+    #[case::to_an_address("localhost", "127.0.0.1")]
+    #[tokio::test]
+    async fn a_redirect_to_a_private_address_is_refused(
+        #[case] allowed: &'static str,
+        #[case] internal: &'static str,
+    ) {
+        let service = MockServer::start_raw(vec![MockServer::raw_ok(PNG_HEADER, PNG)]).await;
+        let target = format!("http://{internal}:{}/secret", port(&service));
+        let source = MockServer::start_raw(vec![redirect(&target)]).await;
+        let first = format!("http://{allowed}:{}/a.png", port(&source));
+        let err = open_image_capped(&guarded(allowed), &first, 1024)
+            .await
+            .err()
+            .expect("refused");
+        assert!(matches!(err, ImageFetchError::Refused), "{err:?}");
+        assert_eq!(source.requests(), 1);
+        assert_eq!(service.requests(), 0, "the hop was never sent");
+    }
+
+    /// A redirect the policy allows is followed, but then the URL asked for
+    /// no longer names the type: an internal answer typed
+    /// `application/octet-stream` is not stored as the `.png` it was asked as.
+    #[tokio::test]
+    async fn after_a_redirect_the_url_names_no_type() {
+        let untyped = MockServer::raw_ok("Content-Type: application/octet-stream\r\n", PNG);
+        let direct = MockServer::start_raw(vec![untyped.clone()]).await;
+        let image = open_image_capped(
+            &ImageHttp::open(),
+            &format!("{}/a.png", direct.base_url),
+            1024,
+        )
+        .await
+        .expect("typed by its URL");
+        assert_eq!(image.content_type(), "image/png");
+
+        let server = MockServer::start_raw(vec![redirect("/blob"), untyped]).await;
+        let err = open_image_capped(
+            &ImageHttp::open(),
+            &format!("{}/a.png", server.base_url),
+            1024,
+        )
+        .await
+        .err()
+        .expect("untyped");
+        assert!(
+            matches!(&err, ImageFetchError::NotAnImage(reason)
+                if reason == "Request returned 'application/octet-stream' instead of an image type"),
+            "{err:?}"
+        );
+        assert_eq!(server.requests(), 2, "the redirect was followed");
+    }
+
+    /// A redirect with the response's own image type is kept.
+    #[tokio::test]
+    async fn an_allowed_redirect_is_followed() {
+        let server = MockServer::start_raw(vec![
+            redirect("/elsewhere.jpg"),
+            MockServer::raw_ok(PNG_HEADER, PNG),
+        ])
+        .await;
+        let image = open_image_capped(&ImageHttp::open(), &server.base_url, 1024)
+            .await
+            .expect("an image");
+        assert_eq!(image.content_type(), "image/png");
+        assert_eq!(image.into_bytes().await.expect("bytes"), PNG);
+    }
+
+    /// A `Location` in raw UTF-8 is followed, as reqwest's own policy does.
+    #[tokio::test]
+    async fn a_utf8_location_is_followed() {
+        let mut moved = b"HTTP/1.1 302 Found\r\nLocation: /caf\xc3\xa9.png\r\n".to_vec();
+        moved.extend_from_slice(b"Content-Length: 0\r\nConnection: close\r\n\r\n");
+        let server = MockServer::start_raw(vec![moved, MockServer::raw_ok(PNG_HEADER, PNG)]).await;
+        let image = open_image_capped(&ImageHttp::open(), &server.base_url, 1024)
+            .await
+            .expect("followed");
+        assert_eq!(image.content_type(), "image/png");
+        assert_eq!(server.requests(), 2);
+    }
+
+    /// Past reqwest's own limit, or to a scheme a download does not speak, a
+    /// redirect is no answer, and a failure of the provider.
+    #[rstest]
+    #[case::endless("/again", MAX_REDIRECTS + 1)]
+    #[case::another_scheme("ftp://127.0.0.1/a.png", 1)]
+    #[tokio::test]
+    async fn a_redirect_that_cannot_be_followed_is_unavailable(
+        #[case] location: &str,
+        #[case] sent: usize,
+    ) {
+        let server = MockServer::start_raw(vec![redirect(location)]).await;
+        let (outcome, failures) = crate::rate_limit::count_request_failures(open_image_capped(
+            &ImageHttp::open(),
+            &server.base_url,
+            1024,
+        ))
+        .await;
+        let err = outcome.err().expect("no image");
+        assert!(matches!(err, ImageFetchError::Unavailable), "{err:?}");
+        assert!(!err.is_answer());
+        assert_eq!(failures, 1);
+        assert_eq!(server.requests(), sent);
+    }
+
+    /// With a proxy configured, which would resolve a name out of the
+    /// resolver's sight, a name is checked on the server's own answer before
+    /// anything is sent, then reached at the addresses checked (the hosts the
+    /// proxy settings exclude go there directly; this test sets no proxy, so
+    /// all do). An address literal is checked as it is, and a name the server
+    /// cannot resolve is not sent to the proxy unchecked.
+    #[tokio::test]
+    async fn through_a_proxy_a_destination_is_checked_before_it_is_sent() {
+        let server = MockServer::start_raw(vec![MockServer::raw_ok(PNG_HEADER, PNG)]).await;
+        let at = |host: &str| format!("http://{host}:{}/a.png", port(&server));
+        let proxied = |allowed| ImageHttp::new(Arc::new(PrivateBut(allowed)), true);
+
+        let image = open_image_capped(&proxied("localhost"), &at("localhost"), 1024)
+            .await
+            .expect("an allowed name");
+        assert_eq!(image.content_type(), "image/png");
+        assert!(
+            open_image_capped(&proxied("127.0.0.1"), &at("127.0.0.1"), 1024)
+                .await
+                .is_ok(),
+            "an allowed address"
+        );
+        assert_eq!(server.requests(), 2);
+
+        for (allowed, host) in [("127.0.0.1", "localhost"), ("localhost", "127.0.0.1")] {
+            let err = open_image_capped(&proxied(allowed), &at(host), 1024)
+                .await
+                .err()
+                .expect("refused");
+            assert!(matches!(err, ImageFetchError::Refused), "{host}: {err:?}");
+        }
+        let err = open_image_capped(&proxied("x"), "http://name.invalid/a.png", 1024)
+            .await
+            .err()
+            .expect("unresolvable");
+        assert!(matches!(err, ImageFetchError::Unavailable), "{err:?}");
+        assert_eq!(server.requests(), 2, "nothing refused was sent");
+    }
+
+    /// A refused candidate is skipped like a missing one, and is not a
+    /// failure of the refresh; a direct download of one has no bytes. (The
+    /// process's policy refuses every private address but loopback, where
+    /// tests serve.)
+    #[tokio::test]
+    async fn the_scan_skips_a_refused_candidate() {
+        destination::test_support::allow_loopback_images();
+        let private = "http://10.255.255.1/a.png";
+        let (outcome, failures) =
+            crate::rate_limit::count_request_failures(download_artwork(private)).await;
+        assert!(matches!(outcome, Err(ArtworkDownloadFailure::Skip)));
+        assert_eq!(failures, 0);
+        assert_eq!(download_bytes(private).await, None);
+    }
+
+    /// The resolver refuses at connect time too: a name whose answer turns
+    /// private after the check before sending (DNS rebinding) never reaches
+    /// that address.
+    #[tokio::test]
+    async fn a_name_that_turns_private_after_the_check_is_refused_at_connect() {
+        /// Allows the first lookup's addresses, then refuses every private one.
+        struct Rebinding {
+            allowed: usize,
+            checks: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl DestinationPolicy for Rebinding {
+            async fn refuses(&self, _host: &str, address: IpAddr) -> bool {
+                let check = self.checks.fetch_add(1, Ordering::SeqCst);
+                check >= self.allowed && destination::is_private_address(address)
+            }
+        }
+        let server = MockServer::start_raw(vec![MockServer::raw_ok(PNG_HEADER, PNG)]).await;
+        let allowed = destination::lookup("localhost", 80)
+            .await
+            .expect("localhost")
+            .len();
+        let http = ImageHttp::new(
+            Arc::new(Rebinding {
+                allowed,
+                checks: std::sync::atomic::AtomicUsize::new(0),
+            }),
+            false,
+        );
+        let url = format!("http://localhost:{}/a.png", port(&server));
+        let err = open_image_capped(&http, &url, 1024)
+            .await
+            .err()
+            .expect("refused at connect");
+        assert!(matches!(err, ImageFetchError::Unavailable), "{err:?}");
+        assert_eq!(server.requests(), 0, "nothing reached the address");
     }
 }
 
@@ -877,11 +1406,8 @@ pub enum ArtworkDownloadFailure {
     Stop,
 }
 
-pub(crate) async fn download_artwork(
-    http: &reqwest::Client,
-    url: &str,
-) -> Result<ArtworkDownload, ArtworkDownloadFailure> {
-    let image = open_image(http, url).await.map_err(artwork_failure)?;
+pub(crate) async fn download_artwork(url: &str) -> Result<ArtworkDownload, ArtworkDownloadFailure> {
+    let image = open_image(url).await.map_err(artwork_failure)?;
     let content_type = image.content_type.clone();
     let content_length = image.content_length;
     let bytes = image.into_bytes().await.map_err(artwork_failure)?;
@@ -895,10 +1421,11 @@ pub(crate) async fn download_artwork(
 /// What automatic acquisition does about a failed candidate. One over the
 /// limit is like a missing one: the same provider's next candidate may fit,
 /// and a failure would keep the item from being marked as refreshed, for a
-/// body that will not change.
+/// body that will not change. So is a refused one, which was logged when it
+/// was refused.
 fn artwork_failure(error: ImageFetchError) -> ArtworkDownloadFailure {
     match error {
-        ImageFetchError::Missing => ArtworkDownloadFailure::Skip,
+        ImageFetchError::Missing | ImageFetchError::Refused => ArtworkDownloadFailure::Skip,
         ImageFetchError::TooLarge => {
             tracing::debug!("artwork is over image_download_max_mb; trying the next candidate");
             ArtworkDownloadFailure::Skip
