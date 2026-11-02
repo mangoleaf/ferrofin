@@ -8,25 +8,26 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
-## Unreleased — recording folders become libraries
+## A user's library access holds on every route
 
-Nothing to do unless you record Live TV. A recording folder whose directory exists now becomes a
-library, as on Jellyfin: `Recordings`, and `Recorded Movies` and `Recorded Shows` for the custom
-movie and series paths. It is scanned like any other library, so recordings appear in search and
-on the home screen of every user who may see all libraries. A folder a library already holds is
-left to that library.
+A request that names a folder or an item as its scope (`parentId`, `seriesId`, `ids`) now stops
+at the libraries the user may open. A scope outside them answers `403`, on `GET /Items` as well,
+which used to answer `401` for a library, and `ids` leave out what the user may not open. A user
+who can open the library sees no change, and an API key is exempt. So a script or a client that
+kept an id from a library the user has since lost now gets that `403`.
 
-If you change a recording path, or its directory goes missing (a share not mounted when the server
-starts counts), the library Ferrofin made for it is removed, as on Jellyfin. A library you made
-yourself, or one adopted from Jellyfin whose path is not a recording folder here, stays.
+## Other accounts' policy and configuration
 
-On a database adopted from Jellyfin, the first start of this version drops every location that is
-not a recording folder here from Jellyfin's list of the locations it made libraries for, once, so
-the libraries over those locations stay. During a rolling update the old pod can write the old list
-back if the Live TV settings are saved on it, and the new pod would then remove those libraries the
-next time a restart, a Live TV settings save or a guide refresh checks the recording folders. Do not
-save those settings until the old pod has gone, or
-[stop it first](#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
+`GET /Users`, `GET /Users/Public` and `GET /Users/{userId}` now leave `Policy` and
+`Configuration` out of a user's row unless the caller is that user, an administrator or an
+API key. Signed out, every row on `GET /Users/Public` lacks them. Jellyfin sends both to
+everyone, so this is a deliberate difference.
+
+jellyfin-web, Android TV and Wholphin need no change. A script that reads another account's
+`Policy` with a regular user's token has to use an administrator's token or an API key.
+
+The same lists, the login screen's included, now sort names as Jellyfin does: `Zoe` comes after
+`admin`, where capitals used to sort first.
 
 ## Restarting the server needs an administrator
 
@@ -89,6 +90,61 @@ is marked failed while the migration goes on running. Do not use `--atomic` or
 database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
+
+## Unreleased — a playlist's listing leaves out what its reader cannot open
+
+`GET /Playlists/{id}/Items` no longer lists a member from a library the user was not given, and
+`TotalRecordCount` and paging count what is left. A reorder counts positions in that same list,
+so a shared playlist shows a user a shorter list than its owner's, in the same order.
+
+This changes a read, not the playlist. The member stays stored and comes back if the user is given
+the library. Adding an item from such a library still stores it, and `GET /Playlists/{id}` still
+lists every member in `ItemIds`, as Jellyfin does.
+
+A script with an editing share that saves a playlist by sending `Ids` to `POST /Playlists/{id}`
+replaces every member, so `Ids` built from this listing now drop the members it left out. Build
+them from `ItemIds` instead.
+
+## Unreleased — stream routes hold a signed-in user to their account
+
+Usually nothing to do. A request that carries a user's token is now checked on the video and audio
+stream, HLS, universal audio, subtitle `Stream.{format}` and attachment routes, as it already was
+on `/Items/{id}` and `PlaybackInfo`. This differs from Jellyfin on purpose, where the stream and
+HLS routes read an item by id alone.
+
+- An item, or a version named by `mediaSourceId`, in a library the user may not open answers `404`.
+  That includes an item in a disabled library, for an administrator too, as on `PlaybackInfo`.
+- A user outside their access schedule (administrators are not held to one), or remote with remote access
+  off, gets `403`. A locked-out account's token gets `401`.
+- A channel answers as its `PlaybackInfo` does. A DVR recording needs "Allow Live TV access" unless
+  the user is an administrator, or it answers `404`.
+- A recording whose file lies in a library the user may not open, or on a channel hidden from them,
+  is `404`. That also applies to `GET` and `DELETE /LiveTv/Recordings/{id}`.
+
+**What this does not do:** it binds a client that sends its token, not someone who leaves it off.
+
+- A request with no credential stays anonymous, and so does a token the server does not recognise,
+  such as a revoked one: disabling an account from the dashboard revokes its tokens. A static read
+  or an anonymous subtitle read still works for such a request. Starting a transcode does not.
+- An API key is not limited to any library.
+- The lowercase `api_key=` counts only with `EnableLegacyAuthorization` on, which is off by default.
+  Without it a URL carrying only that reads as no credential.
+
+## Unreleased — a refused login no longer says why
+
+`POST /Users/AuthenticateByName`, `POST /Users/{userId}/Authenticate` and
+`POST /Users/AuthenticateWithQuickConnect` now answer a `401` or `403` as Jellyfin does: the
+`text/plain` body `Error processing request.`, where they used to send a JSON `error` message
+that told an unknown user from a wrong password and named a disabled account. The statuses are
+unchanged: `401` for bad credentials or Quick Connect being off, `403` for an account that may
+not sign in. jellyfin-web and the Jellyfin Kotlin SDK read only the status. A script that reads
+the `error` field of a failed login needs to read the status instead.
+
+The reason is in the server log, as a `login failed` warning with a `reason` field:
+`unknown_user`, `bad_password`, `disabled`, `remote_access`, `parental_schedule`, `device` or
+`max_sessions`. A Quick Connect exchange refused because Quick Connect is off is logged at
+`debug` only. Other failures on these routes (`400`, `404`, `500`) and every other route keep
+their bodies.
 
 ## Unreleased — a progressive transcode needs a token
 

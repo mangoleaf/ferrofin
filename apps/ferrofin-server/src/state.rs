@@ -40,6 +40,7 @@ use ferrofin_core::{
 use ferrofin_db::Database;
 use ferrofin_drawing::{ImageCrateEncoder, ImageProcessor};
 use ferrofin_livetv::FerrofinLiveTvManager;
+use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_mediaencoding::{
     MediaEncoderConfig, MediaEncoderImpl, TokioTranscoder, TrickplayFrameExtractorImpl,
 };
@@ -2708,6 +2709,10 @@ pub async fn build_app_state(
             sessions: Some(me_sessions),
             // Remux playlists are cut on the stored or extracted keyframes.
             keyframes: Some(Arc::clone(&keyframe_repository)),
+            transcode_limits: TranscodeLimits {
+                server: config.max_transcodes,
+                per_user: config.max_transcodes_per_user,
+            },
         },
     );
     let state = state

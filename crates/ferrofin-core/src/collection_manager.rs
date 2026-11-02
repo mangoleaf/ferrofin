@@ -1296,8 +1296,10 @@ impl FerrofinPlaylistManager {
 
     /// Which of `entries` are in the caller's member list: a manual link
     /// (`GET /Playlists/{id}/Items` lists only those) to an existing member
-    /// the caller sees (`IsVisible(user)`). Every manual entry without the
-    /// evaluator.
+    /// the caller can open. That is the listing's check, the standalone one
+    /// that also walks the member's library, where upstream's `MoveItemAsync`
+    /// reads `IsVisible(user)` (gl-1092): a move's index counts the list the
+    /// caller was given. Every manual entry without the evaluator.
     async fn visible_entries(
         &self,
         entries: &[Entry],
@@ -1312,7 +1314,7 @@ impl FerrofinPlaylistManager {
             .filter_map(|(child, _)| Uuid::parse_str(child).ok())
             .collect();
         let rows = self.items.retrieve_items(&ids).await?;
-        let visible = visibility.visible(&rows, &user, false).await?;
+        let visible = visibility.visible(&rows, &user, true).await?;
         let by_id: std::collections::HashMap<Uuid, bool> = rows
             .iter()
             .zip(visible)
