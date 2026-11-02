@@ -350,6 +350,46 @@ impl ItemVisibility {
             .collect()
     }
 
+    /// The playlists under `top_parents` (every one when none are named) that a
+    /// listing leaves out for `user`: those failing `IsVisibleStandalone`, the
+    /// check a playlist-only listing runs, so one rule answers both. A shared
+    /// playlist is its owner's, its shares' and open access's, a playlist file
+    /// takes base visibility, and each needs `HasParentalAllowedChild`.
+    ///
+    /// The listing excludes them by id, in the SQL that pages and counts it;
+    /// the cost follows the playlists, not the library. Upstream runs no such
+    /// check on a mixed query (`Folder.QueryRecursive` post-filters only a
+    /// playlist- or box-set-only one), so this is a Jellyfin bug not ported
+    /// (owner decision 2026-10-31, gl-831). An administrator keeps Jellyfin's
+    /// answer: `IsVisible` has no administrator arm, but this exclusion does.
+    ///
+    /// # Errors
+    /// Returns storage errors or an error for a cyclic hierarchy, which fails the
+    /// listing as it fails the playlist-only one and the scope's own probe.
+    pub(crate) async fn hidden_playlists(
+        &self,
+        user: &UserEntity,
+        top_parents: &[Uuid],
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        if crate::user_entity_ext::cached_permission(
+            &self.db,
+            &user.id,
+            PermissionKind::IsAdministrator,
+        )
+        .await?
+        {
+            return Ok(Vec::new());
+        }
+        let playlists = repository::playlists(&self.db, top_parents).await?;
+        let visible = self.visible(&playlists, user, true).await?;
+        Ok(playlists
+            .iter()
+            .zip(visible)
+            .filter(|(_, visible)| !visible)
+            .map(|(playlist, _)| row_id(playlist))
+            .collect())
+    }
+
     /// 12.2 `UserViewManager.HasVisibleItem` (`UserViewManager.cs:161-176`):
     /// whether `user` can see at least one `kind` item (`Playlist` or
     /// `BoxSet`) whose `TopParentId` is one of `top_parent_ids`, wherever
@@ -2122,6 +2162,110 @@ mod tests {
             .await
             .expect("link");
         assert!(f.visible(&owned).await, "one allowed member is enough");
+    }
+
+    /// `hidden_playlists` is the rule a playlist-only listing runs: another
+    /// user's private playlist goes, the user's own, a share and open access
+    /// stay, a playlist file takes base visibility, every arm needs
+    /// `HasParentalAllowedChild`, and an administrator loses nothing.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn hidden_playlists_follow_the_playlist_rule() {
+        let mut f = Fixture::new().await;
+        let library = f
+            .item(95, BaseItemKind::CollectionFolder, Some("/library"), None)
+            .await;
+        let mut rated = f
+            .item(96, BaseItemKind::Movie, Some("/library/96"), Some(&library))
+            .await;
+        rated.official_rating = Some("R".to_owned());
+        f.save(&rated).await;
+        let shared = |id: u128, data: serde_json::Value| {
+            let f = &f;
+            async move {
+                let mut row = f
+                    .item(
+                        id,
+                        BaseItemKind::Playlist,
+                        Some(&format!("/server/data/playlists/{id}")),
+                        None,
+                    )
+                    .await;
+                row.data = Some(data.to_string());
+                f.save(&row).await;
+                row
+            }
+        };
+        let stranger = Uuid::from_u128(999);
+        let private = shared(
+            110,
+            serde_json::json!({"OwnerUserId": stranger, "OpenAccess": false}),
+        )
+        .await;
+        let own = shared(111, serde_json::json!({"OwnerUserId": f.user.id})).await;
+        shared(
+            112,
+            serde_json::json!({"OwnerUserId": stranger, "Shares": [{"UserId": f.user.id}]}),
+        )
+        .await;
+        shared(
+            113,
+            serde_json::json!({"OwnerUserId": stranger, "OpenAccess": true}),
+        )
+        .await;
+        let file = f
+            .item(
+                114,
+                BaseItemKind::Playlist,
+                Some("/library/list.m3u"),
+                Some(&library),
+            )
+            .await;
+        let hidden = async |f: &Fixture| {
+            f.service
+                .hidden_playlists(&f.user, &[])
+                .await
+                .unwrap()
+                .into_iter()
+                .collect::<HashSet<Uuid>>()
+        };
+        assert_eq!(hidden(&f).await, HashSet::from([row_id(&private)]));
+
+        // A playlist file does not take the share rule; base visibility hides it.
+        f.pref(PreferenceKind::AllowedTags, &["unmatched"]).await;
+        assert_eq!(
+            hidden(&f).await,
+            HashSet::from([row_id(&private), row_id(&file)])
+        );
+        f.pref(PreferenceKind::AllowedTags, &[]).await;
+
+        // `HasParentalAllowedChild`: the owner's own and a file both need a member.
+        for playlist in [&own, &file] {
+            crate::FerrofinLinkedChildrenService::new(f.db.clone())
+                .upsert_linked_child(row_id(playlist), row_id(&rated), 0)
+                .await
+                .expect("link");
+        }
+        f.user.max_parental_rating_score = Some(13);
+        assert_eq!(
+            hidden(&f).await,
+            HashSet::from([row_id(&private), row_id(&own), row_id(&file)])
+        );
+        f.user.max_parental_rating_score = None;
+
+        // Only the named top parents are read: nothing hangs off this one.
+        assert_eq!(
+            f.service
+                .hidden_playlists(&f.user, &[Uuid::from_u128(0x5A5A)])
+                .await
+                .unwrap(),
+            Vec::<Uuid>::new()
+        );
+
+        set_permission(&f.db, &f.user.id, PermissionKind::IsAdministrator, true)
+            .await
+            .expect("admin");
+        assert_eq!(hidden(&f).await, HashSet::new(), "Jellyfin's answer");
     }
 
     /// `playlist_policy` is `Playlist.IsVisible` minus the owner/share test,
