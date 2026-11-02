@@ -331,3 +331,46 @@ async fn close_is_idempotent_and_observable() {
         .expect("reopen after close");
     assert!(!reopened.is_closed());
 }
+
+/// Runs `n` statements of distinct text on `conn`, then returns how many its
+/// statement cache holds, which is at most the cache's capacity.
+async fn statements_cached_after(conn: &mut sqlx::SqliteConnection, n: usize) -> usize {
+    for i in 0..n {
+        sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {i}")))
+            .execute(&mut *conn)
+            .await
+            .expect("select");
+    }
+    sqlx::Connection::cached_statements_size(conn)
+}
+
+/// Each pooled connection, reader and writer, keeps 200 prepared statements
+/// by default: sqlx's own 100 is fewer than one browse of the library
+/// prepares on a connection, so it re-prepared statements it had evicted.
+#[tokio::test]
+async fn pooled_connections_keep_200_statements_by_default() {
+    assert_eq!(ferrofin_db::DEFAULT_STATEMENT_CACHE_CAPACITY, 200);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url = format!("sqlite://{}", dir.path().join("cache.db").display());
+    let db = Database::connect_sized(&url, Some(1))
+        .await
+        .expect("file connect");
+    let mut reader = db.pool().acquire().await.expect("reader");
+    assert_eq!(statements_cached_after(&mut reader, 300).await, 200);
+    let mut writer = db.writer().acquire().await.expect("writer");
+    assert_eq!(statements_cached_after(&mut writer, 300).await, 200);
+}
+
+/// A configured statement cache reaches the reader and the writer pools.
+#[tokio::test]
+async fn pooled_connections_keep_the_configured_statement_cache() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url = format!("sqlite://{}", dir.path().join("cache.db").display());
+    let db = Database::connect_tuned(&url, Some(1), Some(150))
+        .await
+        .expect("file connect");
+    let mut reader = db.pool().acquire().await.expect("reader");
+    assert_eq!(statements_cached_after(&mut reader, 300).await, 150);
+    let mut writer = db.writer().acquire().await.expect("writer");
+    assert_eq!(statements_cached_after(&mut writer, 300).await, 150);
+}

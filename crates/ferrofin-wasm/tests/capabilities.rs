@@ -14,8 +14,7 @@ use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_wasm::bindings::types::{HttpRequest, ItemQuery, MediaSegment};
 use ferrofin_wasm::capabilities::{
-    Collaborators, MAX_QUERY_ROWS, http_fetch, is_private_address, query_items,
-    write_media_segments,
+    Collaborators, MAX_QUERY_ROWS, http_fetch, query_items, write_media_segments,
 };
 
 mod common;
@@ -307,61 +306,8 @@ async fn write_media_segments_validates_types_and_ranges() {
 
 #[test]
 fn http_fetch_denies_private_destinations_unless_allowlisted() {
-    // Loopback, link-local (cloud metadata), RFC1918, and v4-mapped v6 are
-    // all private; public addresses are not.
-    for private in [
-        "127.0.0.1",
-        "169.254.169.254", // cloud metadata / link-local
-        "10.1.2.3",        // RFC1918
-        "172.16.0.1",
-        "192.168.1.1",
-        "100.64.0.1",      // CGNAT (Tailscale)
-        "100.100.100.100", // CGNAT interior
-        "198.18.0.5",      // benchmarking
-        "192.0.0.1",       // IETF protocol assignments
-        "240.0.0.1",       // reserved
-        "224.0.0.1",       // multicast
-        "::1",
-        "fe80::1",
-        "fd00::1",
-        "ff02::1",           // v6 multicast
-        "::ffff:10.0.0.1",   // v4-mapped RFC1918
-        "::ffff:100.64.0.1", // v4-mapped CGNAT
-        // IPv6 forms that carry a private IPv4 reach it through a NAT64
-        // gateway, a 6to4 relay or IPv4-compatible routing.
-        "64:ff9b::a9fe:a9fe", // NAT64 → cloud metadata
-        "64:ff9b::7f00:1",    // NAT64 → loopback
-        "64:ff9b:1::1",       // local-use NAT64 prefix (not globally reachable)
-        "2002:7f00:1::",      // 6to4 → loopback
-        "2002:c0a8:101::1",   // 6to4 → 192.168.1.1
-        "2002:a00:1::",       // 6to4 → 10.0.0.1
-        "::127.0.0.1",        // IPv4-compatible loopback
-        "::10.0.0.1",         // IPv4-compatible RFC1918
-    ] {
-        assert!(
-            is_private_address(private.parse().unwrap()),
-            "{private} must be private"
-        );
-    }
-    for public in [
-        "1.1.1.1",
-        "8.8.8.8",
-        "93.184.216.34",
-        "100.63.255.255", // just below CGNAT
-        "100.128.0.0",    // just above CGNAT
-        "2606:4700:4700::1111",
-        "64:ff9b::808:808", // NAT64 → 8.8.8.8
-        "2002:808:808::1",  // 6to4 → 8.8.8.8
-        "::8.8.8.8",        // IPv4-compatible public
-        "64:ff9b:2::1",     // just past the local-use NAT64 prefix
-        "64:ff9b:0:0:1::1", // not the NAT64 /96: a non-zero middle
-    ] {
-        assert!(
-            !is_private_address(public.parse().unwrap()),
-            "{public} must be public"
-        );
-    }
-
+    // Which addresses are private is `ferrofin_providers::destination`'s
+    // (`is_private_address`, tested there); this is the host applying it.
     // A non-allowlisted plugin cannot reach the loopback listener; the
     // denial names the address class and the knob that grants access.
     let (url, _server) = one_shot_http("200 OK", b"nope");

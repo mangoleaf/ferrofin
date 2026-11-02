@@ -895,21 +895,12 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     ("delete", "/Audio/{itemId}/Lyrics", "v12.2"),
     ("get", "/Audio/{itemId}/RemoteSearch/Lyrics", "v12.2"),
     ("post", "/Items/{itemId}/ContentType", "v12.2"),
-    // gl-1027: a padded lyric extension is trimmed and saved.
-    ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
-    // gl-1028: a whitespace-only route id is not the validation 400.
     (
         "post",
         "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
         "v12.2",
     ),
-    ("get", "/Providers/Lyrics/{lyricId}", "v12.2"),
-    ("get", "/DisplayPreferences/{displayPreferencesId}", "v12.2"),
-    (
-        "post",
-        "/DisplayPreferences/{displayPreferencesId}",
-        "v12.2",
-    ),
+    ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
     // gl-1059: "EnabledTuners": null or "ChannelMappings": null is a 400, not
     // bound.
     ("post", "/LiveTv/ListingProviders", "v12.2"),
@@ -1105,8 +1096,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/BaseItemExtensions.cs (SetImagePath) and \
                    Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto). Also the \
                    download of a remote image: ferrofin-providers image_download.rs \
-                   open_image, provider_manager.rs cached_remote_image, compared with \
-                   MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage) and \
+                   open_image (ImageHttp::send, which follows and vets each redirect; \
+                   destination.rs ImageDestinations), provider_manager.rs \
+                   cached_remote_image, compared with \
+                   MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
+                   Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
                    Emby.Server.Implementations/Library/LibraryManager.cs (ConvertImageToLocal)",
         date: "2026-10-31",
         divergences: &[
@@ -1129,6 +1123,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              first file stored for a URL or an item stays there. The formats are listed in \
              image_download.rs is_image, with SVG and tvheadend's untyped /imagecache/ URLs \
              allowed.",
+            "A remote image download refuses loopback, private, link-local, CGNAT and reserved \
+             addresses, on its first request and on every redirect it follows (owner decision \
+             2026-10-31, gl-1096), unless image_private_http_allow lists the host, its address \
+             or its network, or the host is a configured Live TV tuner's; upstream's \
+             NamedClient.Default (Startup.cs) has no destination policy and follows redirects \
+             anywhere. A refusal counts as an answer, as a 404 does. A download follows at \
+             most 10 redirects, reqwest's default, where .NET's handler follows 50. After a \
+             redirect, SaveImage's fallback to the URL's suffix is not taken: a response with no \
+             type, or application/octet-stream, is refused, but for the tvheadend \
+             /imagecache/ workaround, which still names PNG.",
             "A row whose URLs all gave no image stays, and each URL is left alone for \
              image_negative_cache_ttl_secs (owner decision 2026-10-31, gl-1095), where \
              LibraryManager.ConvertImageToLocal's removeOnFailure removes the row, for the same \
@@ -1149,7 +1153,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         key: "user-data",
         upstream_file: "Emby.Server.Implementations/Library/UserDataManager.cs",
         upstream_method: "SaveUserData",
-        ferrofin: "The write path only. ferrofin-core user_data_manager.rs mutate_row \
+        ferrofin: "The write path, plus the read path only where a page's version groups get \
+                   their user data. ferrofin-core user_data_manager.rs mutate_row \
                    (SaveUserData with its retired-key update, GetUserData, ResolveUserDataRow), \
                    save_user_data_with_reason (the UpdateUserItemDataDto SaveUserData), \
                    save_play_state and apply_play_report (UpdatePlayState), \
@@ -1161,8 +1166,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
                    MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
                    Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
-                   UpdateUserItemRatingInternal)",
-        date: "2026-10-30",
+                   UpdateUserItemRatingInternal). The version groups: dto_service.rs prefetch's \
+                   version user data (a page item's from the page's own read, a version off \
+                   the page from user_data_manager.rs get_stored_user_data_batch), compared \
+                   with Emby.Server.Implementations/Library/UserDataManager.cs \
+                   (GetUserDataBatch, whose cache answers the page's items, and \
+                   GetResumeUserDataBatch), Emby.Server.Implementations/Dto/DtoService.cs \
+                   (GetBaseItemDtos) and Emby.Server.Implementations/Library/\
+                   MediaSourceManager.cs (SetAlternateVersionResumeStates)",
+        date: "2026-11-02",
         divergences: &[
             "Each change reads the row inside its write transaction, so two overlapping saves of \
              one item both land; upstream's GetUserData hands each caller a copy and SaveUserData \
@@ -1233,12 +1245,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              routes are outside this: they serve a transcode's file by its random name, and \
              the item id selects nothing, as upstream. Deliberate divergence (owner decision \
              2026-10-31, gl-1090).",
-            "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, so \
-             a series that user cannot open (library, rating or tag rules) answers like an id \
-             that is no series: IsSeries stays forced and its title is not searched for. \
-             Upstream's GetItemById<Series> reads it with no user, and a request with no user \
-             still does here. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; \
-             gl-1113). Fix path for the rest: gl-1130.",
+            "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, or \
+             as the signed-in caller when a POST body names no user, so a series that user \
+             cannot open (library, rating or tag rules) answers like an id that is no series: \
+             IsSeries stays forced and its title is not searched for. Upstream's \
+             GetItemById<Series> reads it with no user. A POST body naming no user keeps the \
+             query without one, as upstream, so its DTOs carry no user data; only a request \
+             with no user at all (an API key naming none) still reads the row as upstream \
+             does. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; gl-1113, \
+             gl-1130).",
         ],
     },
     VerifiedSubsystem {
@@ -1260,9 +1275,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    job on those routes and the HLS ones: ferrofin-mediaencoding \
                    transcoding/manager.rs start_ffmpeg, compared with \
                    MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs (StartFfMpeg, \
-                   PingTimer) and Emby.Server.Implementations/Session/SessionManager.cs \
-                   (MaxActiveSessions)",
-        date: "2026-11-01",
+                   PingTimer, KillTranscodingJobs) and \
+                   Emby.Server.Implementations/Session/SessionManager.cs (MaxActiveSessions)",
+        date: "2026-11-02",
         divergences: &[
             "A GET that would start a transcode on /Videos/{itemId}/stream, \
              /Videos/{itemId}/stream.{container}, /Audio/{itemId}/stream or \
@@ -1278,12 +1293,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              2026-10-31 and 2026-11-01, gl-1098), the settings max_transcodes and \
              max_transcodes_per_user, both 0, off, by default, which leaves StartFfMpeg's \
              behaviour as upstream's: it starts whatever it is asked to, and MaxActiveSessions \
-             applies only at login. Past a cap a start ends the same user's longest-idle job \
-             (no active request), the teardown the ping timeout would have brought, and with \
-             none idle answers 503 with Retry-After: 10 before anything is created. A job \
-             copying every stream is free. The user is the authorization's, as upstream's \
-             StartFfMpeg userId is; an API key has none, so it is outside the per-user cap \
-             and inside the server-wide one.",
+             applies only at login. Past a cap a start ends the longest-idle job (no active \
+             request) of the same user on the same device, the teardown the ping timeout \
+             would have brought, and with none idle answers 503 with Retry-After: 10 before \
+             anything is created. The device is the request's DeviceId, compared ignoring \
+             ASCII case (KillTranscodingJobs uses OrdinalIgnoreCase), and a start without one \
+             ends nothing: an HLS player between two segment requests is idle too, so \
+             another device's job is never ended (gl-1140). A job copying every stream is \
+             free. The user is the authorization's, as upstream's StartFfMpeg userId is; an \
+             API key has none, so it is outside the per-user cap and inside the server-wide \
+             one.",
         ],
     },
 ];
@@ -1572,18 +1591,24 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "UploadLyrics",
-        ferrofin: "handlers/lyrics.rs upload_lyrics (upload_format, queue_high_priority_refresh) \
-               → ferrofin-core lyric_manager.rs save_lyric (decode_stream_text, save_targets, \
-               try_save_to_files)",
+        ferrofin: "handlers/lyrics.rs upload_lyrics (require_item, an empty body by its \
+               size hint, upload_format, then the Bytes read under upload_body_limit; \
+               queue_high_priority_refresh) → ferrofin-core lyric_manager.rs save_lyric \
+               (decode_stream_text, parse_by_format on the format as given, save_targets \
+               with save_extension, try_save_to_files)",
         date: "2026-10-24",
         divergences: &[
             "An upload with no Content-Length (a chunked body) is read and saved; upstream \
          tests Request.ContentLength and answers every chunked upload 400 \"No lyrics \
          uploaded\". Jellyfin bug not ported.",
             "A body past Kestrel's 30,000,000-byte default (MAX_UPLOAD_BODY_BYTES, the same \
-         cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
-         Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
-         Jellyfin bug not ported.",
+         cap) is a 413 once the item, the empty-body and the extension checks pass, where \
+         upstream reads it too; upstream's ExceptionMiddleware maps no \
+         BadHttpRequestException, so Kestrel's \"request body too large\" reaches the \
+         client as a plain-text 500. Jellyfin bug not ported.",
+            "The 400 (an empty body, a file name without an extension, a format no parser \
+         reads, a missing or blank fileName) and 404 (no such item, or one the caller may \
+         not see) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1620,13 +1645,14 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "DownloadRemoteLyrics",
-        ferrofin: "handlers/lyrics.rs download_remote_lyrics (queue_high_priority_refresh) → \
+        ferrofin: "handlers/lyrics.rs download_remote_lyrics (RequiredRouteString lyricId: \
+               ConvertEmptyStringToNull, then [Required]; queue_high_priority_refresh) → \
                ferrofin-core lyric_manager.rs download_lyrics (fetch_remote, save_targets, \
                try_save_to_files)",
         date: "2026-10-19",
         divergences: &[
-            "A lyricId of only whitespace is a 404 (no provider owns it); upstream's \
-         ArgumentException.ThrowIfNullOrWhiteSpace makes it a 500. Jellyfin bug not ported.",
+            "The 404 (no such item, one the caller may not see, or no lyric for the id) body \
+         is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1635,10 +1661,14 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Providers/Lyrics/{lyricId}",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "GetRemoteLyrics",
-        ferrofin: "handlers/lyrics.rs get_remote_lyrics → ferrofin-core lyric_manager.rs \
+        ferrofin: "handlers/lyrics.rs get_remote_lyrics (RequiredRouteString lyricId: \
+               ConvertEmptyStringToNull, then [Required]) → ferrofin-core lyric_manager.rs \
                get_remote_lyrics (fetch_remote, parse_by_format)",
-        date: "2026-10-19",
-        divergences: &[],
+        date: "2026-10-30",
+        divergences: &[
+            "The 404 (no provider owns the id, or it has no such lyric) body is Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
         refs: &[],
     },
     Verified {
@@ -1699,10 +1729,12 @@ pub const VERIFIED: &[Verified] = &[
                answers as ExceptionMiddleware does \
                outside Development, the same on a live 12.4 for each refusal. Compared: user \
                lookup and lock, provider order and selection by the saved id \
-               (AuthenticationManager::id, GetType().FullName), the provider's canonical \
-               username, the new-user policy, the saved provider id, the disabled, remote and \
-               schedule checks, the failure counter and lockout, the device and session \
-               limits, token rotation and session activity. The UserDto and SessionInfoDto \
+               (AuthenticationManager::id, GetType().FullName), the warning naming the user \
+               and the saved id when no enabled provider has it (InvalidAuthProvider then \
+               refuses the sign-in), the provider's canonical username, the new-user \
+               policy, the saved provider id, the disabled, remote and schedule checks, \
+               the failure counter and lockout, the device and session limits, token \
+               rotation and session activity. The UserDto and SessionInfoDto \
                builders are shared with other routes and not compared here",
         date: "2026-11-02",
         divergences: &[
@@ -2163,6 +2195,26 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/Auth/PasswordResetProviders",
+        upstream_file: "Jellyfin.Api/Controllers/SessionController.cs",
+        upstream_method: "GetPasswordResetProviders",
+        ferrofin: "handlers/session.rs get_password_reset_providers (RequireAdmin, \
+               Policies.RequiresElevation) → ferrofin-core user_manager.rs \
+               get_password_reset_providers (UserManager.GetPasswordResetProviders) over the \
+               built-in password_reset.rs DefaultPasswordResetProvider and the providers \
+               compiled-in extensions register (set_extension_reset_providers). Compared: the \
+               IsEnabled filter, the default provider first and the rest by Name in the \
+               current culture, and each pair's Name and Id (GetType().FullName, \
+               PasswordResetManager::id)",
+        date: "2026-11-02",
+        divergences: &[
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/Collections",
         upstream_file: "Jellyfin.Api/Controllers/CollectionController.cs",
@@ -2236,8 +2288,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/DisplayPreferences/{displayPreferencesId}",
         upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
         upstream_method: "GetDisplayPreferences",
-        ferrofin: "handlers/display_preferences.rs get_display_preferences (Query: \
-               ConvertEmptyStringToNull, then [Required] client from query/required.json; \
+        ferrofin: "handlers/display_preferences.rs get_display_preferences \
+               (RequiredRouteString displayPreferencesId and Query: ConvertEmptyStringToNull, \
+               then [Required], client from query/required.json; \
                effective_user_id: RequestHelpers.GetUserId; resolve_item_id: Guid.TryParse \
                else GetMD5; index_by_name, chromecast_name, home_section_name) → ferrofin-core \
                display_preferences_manager.rs (get_display_preferences, \
@@ -2245,7 +2298,7 @@ pub const VERIFIED: &[Verified] = &[
                list_home_sections) → ferrofin-db database.rs home_sections (Order, then Id: \
                the Include(HomeSections) load order); ferrofin-model \
                dto/display_preferences_dto.rs",
-        date: "2026-10-25",
+        date: "2026-10-30",
         divergences: &[
             "CustomPrefs members are written in hash order, not upstream's insertion order \
          (the home sections, the scalar keys, then the stored preferences); the members and \
@@ -2261,8 +2314,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/DisplayPreferences/{displayPreferencesId}",
         upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
         upstream_method: "UpdateDisplayPreferences",
-        ferrofin: "handlers/display_preferences.rs update_display_preferences (Query: \
-               ConvertEmptyStringToNull, then [Required] client from query/required.json; \
+        ferrofin: "handlers/display_preferences.rs update_display_preferences \
+               (RequiredRouteString displayPreferencesId and Query: ConvertEmptyStringToNull, \
+               then [Required], client from query/required.json; \
                JsonBody DisplayPreferencesDto, resolve_item_id: Guid.TryParse else GetMD5, \
                take_pref/take_nullable_pref, enum_try_parse for Enum.TryParse/Enum.Parse, \
                parse_dotnet_int/parse_dotnet_bool for int.Parse/bool.Parse) → ferrofin-core \
@@ -2271,7 +2325,7 @@ pub const VERIFIED: &[Verified] = &[
                update_item_display_preferences, update_display_preferences, \
                set_home_sections) → ferrofin-db database.rs replace_home_sections; \
                ferrofin-model dto/display_preferences_dto.rs",
-        date: "2026-10-25",
+        date: "2026-10-30",
         divergences: &[
             "A missing or empty skipBackLength/skipForwardLength stores 10000/30000 ms; \
          upstream's controller stores 15000 for both. Fix path: gl-410.",

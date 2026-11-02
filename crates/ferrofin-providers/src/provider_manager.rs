@@ -1185,12 +1185,6 @@ pub struct LocalProviderManager {
     /// same chain. Read through a closure so a live config change is picked up
     /// rather than frozen at startup. `None` → the C# default, `"en"`.
     server_metadata_language: Option<Arc<dyn Fn() -> String + Send + Sync>>,
-    /// The HTTP client the artwork writer downloads a caller-supplied image URL
-    /// with. Its own, not TMDB's: `POST /Items/{itemId}/RemoteImages/Download`
-    /// is a raw GET of whatever URL the admin pasted (C#
-    /// `ProviderManager.SaveImage` uses `NamedClient.Default`), and must work
-    /// on a server with no TMDB client wired.
-    http: reqwest::Client,
     /// `ServerConfiguration.MetadataCountryCode`, the value a remote SEARCH
     /// falls back to for a blank `SearchInfo.MetadataCountryCode`
     /// (`ProviderManager.GetRemoteSearchResults`). Read through a closure for
@@ -1318,7 +1312,6 @@ impl std::fmt::Debug for LocalProviderManager {
                 &self.dynamic_image_providers.len(),
             )
             .field("kind_by_type_name", &self.kind_by_type_name.len())
-            .field("http", &self.http)
             .field("has_metadata_options", &self.metadata_options.is_some())
             .finish()
     }
@@ -1392,7 +1385,6 @@ impl LocalProviderManager {
             localization: None,
             kind_by_type_name: HashMap::new(),
             virtual_folders: None,
-            http: reqwest::Client::new(),
             server_metadata_language: None,
             server_metadata_country: None,
             metadata_options: None,
@@ -3237,7 +3229,7 @@ impl LocalProviderManager {
             let Some(url) = candidate.url else {
                 continue;
             };
-            let download = match crate::image_download::download_artwork(&self.http, &url).await {
+            let download = match crate::image_download::download_artwork(&url).await {
                 Ok(download) => download,
                 Err(crate::ArtworkDownloadFailure::Skip) => continue,
                 Err(crate::ArtworkDownloadFailure::Stop) => {
@@ -4817,7 +4809,7 @@ impl LocalProviderManager {
         if requests.negative.contains(key) || requests.failed.inserted_since(key, arrived) {
             return Ok(None);
         }
-        let err = match Self::download_remote_image(&self.http, url, &folder).await {
+        let err = match Self::download_remote_image(url, &folder).await {
             Ok(file) => return Ok(Some(file)),
             Err(err) => err,
         };
@@ -4847,11 +4839,10 @@ impl LocalProviderManager {
     /// its name only when it is whole, so a reader never sees half of one and
     /// [`cached_file`] never finds a refused one.
     async fn download_remote_image(
-        http: &reqwest::Client,
         url: &str,
         folder: &std::path::Path,
     ) -> Result<String, ImageFetchError> {
-        let image = crate::image_download::open_image(http, url).await?;
+        let image = crate::image_download::open_image(url).await?;
         let ext = mime_types::to_extension(image.content_type()).unwrap_or(".jpg");
         let file = folder.join(format!("image{ext}"));
         let partial = PartialFile(folder.join(format!(".{}.partial", Uuid::new_v4().simple())));
@@ -4950,13 +4941,18 @@ impl ProviderManager for LocalProviderManager {
         // `ProviderManager.SaveImage`. Without this ANY URL becomes artwork:
         // pointing the endpoint at a JSON endpoint stored the document as the
         // item's image and served it back as `image/jpeg`.
-        let (bytes, mime) = crate::image_download::download_image(&self.http, url)
+        let (bytes, mime) = crate::image_download::download_image(url)
             .await
             .map_err(|err| match err {
                 ImageFetchError::NotAnImage(reason) => ServiceError::backend(reason),
                 ImageFetchError::TooLarge => {
                     ServiceError::backend("remote image is over the image_download_max_mb limit")
                 }
+                ImageFetchError::Refused => ServiceError::backend(format!(
+                    "remote image {} is at a private address, which image downloads may not \
+                     reach unless image_private_http_allow lists it",
+                    ferrofin_util::source_url::redact_url(url)
+                )),
                 _ => ServiceError::backend(format!(
                     "could not download remote image {}",
                     ferrofin_util::source_url::redact_url(url)
@@ -10074,6 +10070,22 @@ mod tests {
             .await
             .expect_err("not an image");
         assert!(err.to_string().contains("not an image"), "{err}");
+
+        // A private address no setting allows (gl-1096): the admin is told
+        // which setting would.
+        let err = mgr
+            .save_image_from_url(
+                item_id,
+                "http://10.255.255.1/logo.png",
+                ImageType::Logo,
+                None,
+            )
+            .await
+            .expect_err("refused");
+        assert!(
+            err.to_string().contains("image_private_http_allow"),
+            "{err}"
+        );
         assert!(
             !dir.path()
                 .join(ferrofin_db::store::guid_to_db(item_id))
@@ -10200,6 +10212,7 @@ mod tests {
     /// an account or a token (Schedules Direct's `?token=`).
     #[tokio::test]
     async fn a_failed_image_download_names_only_the_host() {
+        crate::destination::test_support::allow_loopback_images();
         let dir = tempfile::tempdir().expect("tempdir");
         let mgr = LocalProviderManager::default().with_image_store(
             Arc::new(RecordingStore::default()),
@@ -10219,6 +10232,22 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "backend error: could not download remote image http://127.0.0.1:0"
+        );
+
+        // A refused one names only the host too.
+        let err = mgr
+            .save_image_from_url(
+                Uuid::new_v4(),
+                "http://acct-user:info-secret@10.255.255.1/path-secret/1.jpg?token=query-secret",
+                ImageType::Primary,
+                None,
+            )
+            .await
+            .expect_err("a private address");
+        assert_eq!(
+            err.to_string(),
+            "backend error: remote image http://10.255.255.1 is at a private address, which \
+             image downloads may not reach unless image_private_http_allow lists it"
         );
     }
 

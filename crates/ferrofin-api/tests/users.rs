@@ -31,7 +31,9 @@ use ferrofin_model::session::{
     ClientCapabilities, GeneralCommand, MessageCommand, PlayRequest, PlaybackProgressInfo,
     PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest, SessionMessageType, TranscodingInfo,
 };
-use ferrofin_model::users::UserPolicy;
+use ferrofin_model::users::{
+    ForgotPasswordAction, ForgotPasswordResult, PinRedeemResult, UserPolicy,
+};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
@@ -113,7 +115,11 @@ impl AuthService for AdminAuth {
 struct MemUsers {
     /// Records the last (user_id, new_password) passed to `change_password`.
     changed_password: Mutex<Option<(Uuid, String)>>,
-    fail_password_change: std::sync::atomic::AtomicBool,
+    /// Records each (entered username, in local network) passed to
+    /// `start_forgot_password_process`.
+    forgot_requests: Mutex<Vec<(String, bool)>>,
+    /// Records each PIN passed to `redeem_password_reset_pin`.
+    redeemed_pins: Mutex<Vec<String>>,
     /// Records the last policy passed to `update_policy`.
     updated_policy: Mutex<Option<(Uuid, UserPolicy)>>,
     /// Records the last configuration passed to `update_configuration`.
@@ -199,14 +205,40 @@ impl UserManager for MemUsers {
         Ok(())
     }
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError> {
-        if self
-            .fail_password_change
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(ServiceError::backend("password store unavailable"));
-        }
         *self.changed_password.lock().unwrap() = Some((user_id, new_password.to_owned()));
         Ok(())
+    }
+    async fn start_forgot_password_process(
+        &self,
+        entered_username: &str,
+        is_in_network: bool,
+    ) -> Result<ForgotPasswordResult, ServiceError> {
+        self.forgot_requests
+            .lock()
+            .unwrap()
+            .push((entered_username.to_owned(), is_in_network));
+        Ok(ForgotPasswordResult {
+            action: ForgotPasswordAction::PinCode,
+            pin_file: Some("/data/passwordreset0123.json".to_owned()),
+            pin_expiration_date: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-11-02T10:30:00Z")
+                    .unwrap()
+                    .into(),
+            ),
+        })
+    }
+    async fn redeem_password_reset_pin(&self, pin: &str) -> Result<PinRedeemResult, ServiceError> {
+        self.redeemed_pins.lock().unwrap().push(pin.to_owned());
+        if pin == "A1B2C3D4" {
+            Ok(PinRedeemResult {
+                success: true,
+                users_reset: vec!["bob".to_owned()],
+            })
+        } else {
+            Err(ServiceError::not_found(
+                "no matching password reset request",
+            ))
+        }
     }
     async fn authenticate_user(
         &self,
@@ -2065,32 +2097,34 @@ async fn update_policy_requires_both_provider_ids(
     );
 }
 
+// The flow itself (PIN files, local-only issue, one reset per PIN, expiry)
+// lives in the user manager and is tested there, in ferrofin-core
+// (`user_manager/password_reset_tests.rs`). These check the handlers' wiring.
+
 #[tokio::test]
-async fn forgot_password_unknown_user_returns_the_uniform_pin_response() {
-    // An unknown username must not disclose account existence, and touches no
-    // filesystem (the user lookup returns `None` before a pin is issued).
-    let router = create_router(state(
-        Arc::new(MemUsers::default()),
-        Arc::new(MemConfig::new(true)),
-    ));
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/Users/ForgotPassword")
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::json!({ "EnteredUsername": "nobody" }).to_string(),
-                ))
-                .unwrap(),
+async fn forgot_password_hands_the_name_and_network_to_the_user_manager() {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    for peer in ["203.0.113.8:4321", "127.0.0.1:4321"] {
+        let response = recovery_request(
+            &router,
+            "/Users/ForgotPassword",
+            serde_json::json!({ "EnteredUsername": "bob" }),
+            peer,
         )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = body_json(response).await;
-    assert_eq!(body["Action"], "PinCode");
-    assert!(body["PinExpirationDate"].is_string());
-    assert!(!std::path::Path::new(body["PinFile"].as_str().unwrap()).exists());
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["Action"], "PinCode");
+        assert_eq!(body["PinFile"], "/data/passwordreset0123.json");
+        assert!(body["PinExpirationDate"].is_string());
+    }
+    // A missing or blank EnteredUsername is not pinned here: upstream answers
+    // it 400 ([Required] required string), which gl-1156 tracks.
+    assert_eq!(
+        *users.forgot_requests.lock().unwrap(),
+        vec![("bob".to_owned(), false), ("bob".to_owned(), true)]
+    );
 }
 
 async fn recovery_request(
@@ -2117,40 +2151,22 @@ async fn recovery_request(
 }
 
 #[tokio::test]
-async fn forgot_password_local_only_preserves_failed_updates_and_consumes_once() {
-    use std::sync::atomic::Ordering;
+async fn forgot_password_pin_answers_the_redemption_and_404s_a_pin_no_provider_redeems() {
     let users = Arc::new(MemUsers::default());
     let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
-    let start = "/Users/ForgotPassword";
     let redeem = "/Users/ForgotPassword/Pin";
     let local = "127.0.0.1:4321";
     let response = recovery_request(
         &router,
-        start,
-        serde_json::json!({"EnteredUsername":"bob"}),
-        "203.0.113.8:4321",
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let remote = body_json(response).await;
-    assert_eq!(remote["Action"], "PinCode");
-    assert!(!std::path::Path::new(remote["PinFile"].as_str().unwrap()).exists());
-    let response = recovery_request(
-        &router,
-        start,
-        serde_json::json!({"EnteredUsername":"bob"}),
+        redeem,
+        serde_json::json!({"Pin":"A1B2C3D4"}),
         local,
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_json(response).await;
-    assert_eq!(body["Action"], "PinCode");
-    assert_eq!(body["PinFile"], remote["PinFile"]);
-    let file = std::path::PathBuf::from(body["PinFile"].as_str().unwrap());
-    let mut record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-    record["Pin"] = serde_json::json!("A1-B2-C3-D4");
-    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert_eq!(body["Success"], true);
+    assert_eq!(body["UsersReset"], serde_json::json!(["bob"]));
     let wrong = recovery_request(
         &router,
         redeem,
@@ -2159,66 +2175,11 @@ async fn forgot_password_local_only_preserves_failed_updates_and_consumes_once()
     )
     .await;
     assert_eq!(wrong.status(), StatusCode::NOT_FOUND);
-    assert!(file.exists());
-    users.fail_password_change.store(true, Ordering::SeqCst);
-    let failed = recovery_request(
-        &router,
-        redeem,
-        serde_json::json!({"Pin":"A1B2C3D4"}),
-        local,
-    )
-    .await;
-    assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    assert!(file.exists(), "failed password update preserves recovery");
-    users.fail_password_change.store(false, Ordering::SeqCst);
-    // Two concurrent redemption attempts must produce exactly one reset.
-    let (first, second) = tokio::join!(
-        recovery_request(
-            &router,
-            redeem,
-            serde_json::json!({"Pin":"A1B2C3D4"}),
-            local
-        ),
-        recovery_request(
-            &router,
-            redeem,
-            serde_json::json!({"Pin":"A1B2C3D4"}),
-            local
-        )
-    );
-    let mut statuses = [first.status(), second.status()];
-    statuses.sort();
-    assert_eq!(statuses, [StatusCode::OK, StatusCode::NOT_FOUND]);
-    let (id, pw) = users.changed_password.lock().unwrap().clone().unwrap();
-    assert_eq!(id, BOB_ID);
     assert_eq!(
-        pw, "A1B2C3D4",
-        "the exact entered form becomes the password"
+        *users.redeemed_pins.lock().unwrap(),
+        vec!["A1B2C3D4".to_owned(), "a1-b2-c3-d4".to_owned()],
+        "the PIN reaches the user manager exactly as entered"
     );
-    assert!(!file.exists());
-    // A matched file for a deleted user also remains recoverable after failure.
-    record["UserName"] = serde_json::json!("deleted");
-    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
-    let missing = recovery_request(
-        &router,
-        redeem,
-        serde_json::json!({"Pin":"A1B2C3D4"}),
-        local,
-    )
-    .await;
-    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-    assert!(file.exists());
-    record["ExpirationDate"] = serde_json::json!("2000-01-01T00:00:00Z");
-    std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
-    let expired = recovery_request(
-        &router,
-        redeem,
-        serde_json::json!({"Pin":"A1B2C3D4"}),
-        local,
-    )
-    .await;
-    assert_eq!(expired.status(), StatusCode::NOT_FOUND);
-    assert!(!file.exists());
 }
 
 #[tokio::test]

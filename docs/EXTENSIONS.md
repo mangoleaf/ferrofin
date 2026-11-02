@@ -35,6 +35,8 @@ pub trait Extension: Send + Sync {
         -> Vec<Arc<dyn MediaSegmentProvider>> { … }        // intro/credit producers
     fn auth_providers(&self, cx: &ExtensionContext)
         -> Vec<Arc<dyn AuthenticationManager>> { … }       // sign-in backends
+    fn password_reset_providers(&self, cx: &ExtensionContext)
+        -> Vec<Arc<dyn PasswordResetManager>> { … }        // forgotten-password backends
     fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>>;
 }
 ```
@@ -71,6 +73,12 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
   (which would wait forever on the login lock it is called under). The user manager applies
   it through `UserManager::apply_external_administrator`, which sign-in paths outside the
   password flow call too, and never demotes the last administrator.
+- **Password-reset providers join the same way.** `register_auth_providers` also hands the
+  user manager every extension's `password_reset_providers`. A forgotten-password request
+  goes to the enabled provider a user's `PasswordResetProviderId` names, and to the
+  built-in PIN-file provider otherwise. A PIN is offered to the built-in provider first, then
+  to each extension's, so a provider with no request matching it answers "no match" (never
+  an error, which would stop the redemption).
 - **The `CanUninstall=true` quirk.** jellyfin-web gates the enable/disable toggle on the
   plugin reporting `CanUninstall=true`, so compiled-in extensions report `true` to surface
   the toggle — even though the actual uninstall call is still rejected (you can't uninstall

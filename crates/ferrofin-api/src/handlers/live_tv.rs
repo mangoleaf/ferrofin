@@ -21,7 +21,8 @@
 //! handlers: `GET /LiveTv/Channels` cannot page (its seam method takes no
 //! query), `Programs/Recommended` does not apply upstream's per-user
 //! recommendation *score* re-ordering (it needs channel user-data the seam does
-//! not expose), and `librarySeriesId` reads the series as the request's user.
+//! not expose), and `librarySeriesId` reads the series as the request's user,
+//! else the signed-in caller.
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -683,7 +684,10 @@ async fn get_programs(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let (filters, options) = query.into_parts()?;
-    Ok(Json(query_programs(&state, user, filters, &options).await?))
+    let caller = auth.user.as_ref();
+    Ok(Json(
+        query_programs(&state, user, caller, filters, &options).await?,
+    ))
 }
 
 /// `POST /LiveTv/Programs` — EPG programs (request-body form).
@@ -691,7 +695,9 @@ async fn get_programs(
 /// Port of `LiveTvController.GetPrograms`. The `GetProgramsDto` body carries the
 /// same filter set as the query-string form and is honoured field for field;
 /// the one deliberate difference is `UserId`, which upstream does **not** fall
-/// back to the authenticated caller here.
+/// back to the authenticated caller here. The caller still reads
+/// `librarySeriesId`'s row when the body names no user (gl-1130), so the
+/// series check holds while the DTOs stay upstream's.
 async fn post_programs(
     State(state): State<AppState>,
     RequireLiveTvAccess(auth): RequireLiveTvAccess,
@@ -702,7 +708,10 @@ async fn post_programs(
         None => None,
     };
     let (filters, options) = body.into_parts();
-    Ok(Json(query_programs(&state, user, filters, &options).await?))
+    let caller = auth.user.as_ref();
+    Ok(Json(
+        query_programs(&state, user, caller, filters, &options).await?,
+    ))
 }
 
 /// `GET /LiveTv/Programs/Recommended` — "On Now" / recommended programs.
@@ -719,8 +728,9 @@ async fn get_recommended_programs(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let (filters, options) = query.into_parts()?;
+    // Recommended takes no `librarySeriesId`, so it has no series to read.
     Ok(Json(
-        query_programs_inner(&state, user, filters, &options, true).await?,
+        query_programs_inner(&state, user, None, filters, &options, true).await?,
     ))
 }
 
@@ -754,10 +764,11 @@ async fn get_program(
 async fn query_programs(
     state: &AppState,
     user: Option<UserEntity>,
+    caller: Option<&UserEntity>,
     filters: ProgramFilters,
     options: &DtoOptions,
 ) -> Result<QueryResult<BaseItemDto>, ApiError> {
-    query_programs_inner(state, user, filters, options, false).await
+    query_programs_inner(state, user, caller, filters, options, false).await
 }
 
 /// The shared body of `GET/POST /LiveTv/Programs` and
@@ -766,9 +777,12 @@ async fn query_programs(
 /// `recommended` picks which manager entry point the assembled query goes to:
 /// upstream's two controller actions build the identical `InternalItemsQuery`
 /// and differ only in calling `GetProgramsAsync` vs `GetRecommendedProgramsAsync`.
+/// `caller` is the signed-in user, who reads `librarySeriesId`'s row when the
+/// request names no user.
 async fn query_programs_inner(
     state: &AppState,
     user: Option<UserEntity>,
+    caller: Option<&UserEntity>,
     filters: ProgramFilters,
     options: &DtoOptions,
     recommended: bool,
@@ -811,12 +825,15 @@ async fn query_programs_inner(
     // Divergence (owner decision 2026-10-31, gl-1091): the row is read as the
     // request's user, where upstream reads it with none, so a series that user
     // cannot open answers like an id that is no series and its title never
-    // reaches the query. A request with no user reads it as upstream does.
+    // reaches the query. A POST whose body names no user reads it as the
+    // signed-in caller (gl-1130), while the query keeps no user, so the DTOs
+    // stay upstream's. Only an API key, which has no user, reads it as
+    // upstream does.
     if let Some(series_id) = library_series_id.filter(|id| !id.is_nil()) {
         query.is_series = Some(true);
         if let Some(series) = state
             .library
-            .get_item_by_id_for_user(series_id, query.user.as_ref())
+            .get_item_by_id_for_user(series_id, query.user.as_ref().or(caller))
             .await?
             && series.type_.ends_with("Series")
         {

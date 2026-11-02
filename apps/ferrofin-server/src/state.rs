@@ -351,6 +351,29 @@ pub async fn build_app_state(
         paths.root_folder_path(),
         paths.data_path(),
     );
+    // A database whose program-data directory moved (an adopted Debian
+    // `/var/lib/jellyfin`, or a relocated data_dir) keeps its ids but stores
+    // stale absolute paths for the library root and artwork.
+    if let Some(rebased) = ferrofin_core::adoption_repairs::rebase_program_data_paths(
+        db,
+        aggregate_store.id(),
+        &ferrofin_core::adoption_repairs::ProgramDataDirs {
+            root: paths.root_folder_path(),
+            metadata: paths.internal_metadata_path(),
+            data: paths.data_path(),
+            config: paths.configuration_directory_path(),
+        },
+    )
+    .await
+    .context("failed to rebase paths under the previous program-data directory")?
+    {
+        tracing::info!(
+            from = %rebased.from,
+            to = %paths.program_data_path(),
+            rows = rebased.rows,
+            "rebased stored paths from the previous program-data directory"
+        );
+    }
     let root_folder_ids = aggregate_store
         .ensure()
         .await
@@ -870,6 +893,8 @@ pub async fn build_app_state(
             .with_server_id(server_id.clone())
             // Upstream `PostUserImage`: `{UserConfigurationDirectoryPath}/{Username}/`.
             .with_profile_image_dir(paths.user_configuration_directory_path())
+            // Upstream `DefaultPasswordResetProvider`: PIN files in `ProgramDataPath`.
+            .with_password_reset_dir(paths.program_data_path())
             .with_auth_cache(Arc::clone(&auth_cache))
             // A lockout is a dashboard Alert, not just a log line.
             .with_activity(Arc::clone(&activity))
@@ -976,6 +1001,33 @@ pub async fn build_app_state(
         }),
     );
     let live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager> = live_tv_impl.clone();
+    // What image downloads may reach beyond the public internet (gl-1096):
+    // the configuration's allow-list, and the configured tuners' hosts, read
+    // when a private address needs them so that a tuner added later counts at
+    // once. Weak, so this lifetime's manager goes on an in-process restart.
+    ferrofin_providers::destination::set_image_destinations(
+        ferrofin_providers::destination::ImageDestinations::new(
+            config.image_private_allow_list(),
+        )
+        .with_tuner_hosts({
+            let live_tv = Arc::downgrade(&live_tv);
+            Arc::new(move || {
+                let live_tv = live_tv.upgrade();
+                Box::pin(async move {
+                    let Some(live_tv) = live_tv else {
+                        return Vec::new();
+                    };
+                    match live_tv.get_tuner_hosts().await {
+                        Ok(tuners) => tuners.iter().filter_map(tuner_host).collect(),
+                        Err(error) => {
+                            tracing::debug!(%error, "tuner hosts unreadable; no tuner's host exempts an image download");
+                            Vec::new()
+                        }
+                    }
+                })
+            })
+        }),
+    );
     let recording_source = Arc::downgrade(&live_tv);
     active_recordings
         .set(Arc::new(move || {
@@ -1374,6 +1426,14 @@ pub async fn build_app_state(
             .with_users(Arc::clone(&users))
             .with_by_name_store(by_name_store.clone()),
     );
+    // What a deleted item leaves on disk besides its media — its metadata
+    // folders and extracted data — removed before its rows by the library
+    // manager's delete and by every scan removal alike
+    // (`LibraryManager.DeleteItem`). The extracted-data half is bound once
+    // its managers exist, below.
+    let item_data_cleanup = Arc::new(ferrofin_core::item_data_cleanup::ItemDataCleanup::new(
+        Arc::clone(&paths),
+    ));
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
         Arc::clone(&file_system),
@@ -1402,6 +1462,8 @@ pub async fn build_app_state(
     .with_virtual_paths(virtual_paths.clone())
     // An item moved to a new id (its kind changed) takes its folders along.
     .with_path_manager(Arc::clone(&path_manager))
+    // A row the scan removes takes its metadata folders and extracted data.
+    .with_item_data_cleanup(Arc::clone(&item_data_cleanup))
     // Each library location is the `Folder` row Jellyfin keeps for it, under
     // the aggregate root, and what it holds hangs off it (owner decision D1).
     .with_root_folder(root_folder_ids.aggregate)
@@ -1615,12 +1677,14 @@ pub async fn build_app_state(
         .with_by_name_store(by_name_store)
         // A stacked video's parts are found by the ids their paths derive to.
         .with_id_derivation(id_derivation)
-        // `DELETE /Items` removes the item's files (`DeleteFileLocation`):
-        // the internal metadata root whose per-item folders it cleans, and
-        // the `%AppDataPath%` expansion of a stored path (an adopted
+        // `DELETE /Items` removes the item's files (`DeleteFileLocation`),
+        // expanding a stored `%AppDataPath%` path first (an adopted
         // collection's or playlist's folder). Nothing confines the delete to
         // the library locations, as upstream.
-        .with_app_paths(Arc::clone(&paths)),
+        .with_app_paths(Arc::clone(&paths))
+        // Every delete removes the deleted rows' metadata folders and
+        // extracted data first.
+        .with_item_data_cleanup(Arc::clone(&item_data_cleanup)),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // Marking a series, season, box set or folder played marks the items
@@ -2039,8 +2103,8 @@ pub async fn build_app_state(
         users: Arc::clone(&users),
     };
     // The user manager was built long before the extensions: their
-    // authentication providers fill its one late slot now, before the server
-    // takes a request. Every clone of the manager shares that slot.
+    // authentication and password-reset providers fill its late slots now,
+    // before the server takes a request. Every clone of the manager shares them.
     ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, &users_impl);
     let intro_skipper_analysis = ferrofin_extensions::intro_skipper::analysis(&extension_cx);
     subscribe_intro_skipper(&event_bus, &intro_skipper_analysis);
@@ -2208,9 +2272,10 @@ pub async fn build_app_state(
         ));
     }
     let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
-    // Every item delete removes the deleted rows' extracted data
-    // (`LibraryManager.DeleteItem` → `DeleteExternalItemFiles`); the library
-    // manager is built before the chapter and segment managers this needs.
+    // Every item delete and scan removal removes the deleted rows' extracted
+    // data (`LibraryManager.DeleteItem` → `DeleteExternalItemFiles`); the
+    // library manager and the scanner are built before the chapter and
+    // segment managers this needs.
     let external_data: Arc<dyn ferrofin_traits::system::ExternalDataManager> =
         Arc::new(FerrofinExternalDataManager::new(
             Arc::clone(&path_manager),
@@ -2219,7 +2284,7 @@ pub async fn build_app_state(
             Arc::clone(&trickplay),
             Arc::clone(&chapters),
         ));
-    library_impl.set_external_data(external_data);
+    item_data_cleanup.set_external_data(external_data);
     // Jellyfin 12.0's sweeps of a 10.11 database's items whose library or
     // file is gone delete through the library manager, so they run once it
     // removes extracted data too, and before a startup trigger can scan.
@@ -2233,6 +2298,21 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to remove items whose library or file is gone")?;
+    // Jellyfin 12.0's `CleanupOrphanedExternalData`, once per database: the
+    // extracted data and chapter images left behind for items no longer
+    // stored (every earlier Ferrofin left them when a scan removed an item).
+    // After the sweeps that delete items, and before a startup trigger can
+    // scan; under the configured metadata path.
+    ferrofin_core::adoption_repairs::run_cleanup_orphaned_external_data(
+        db,
+        &ferrofin_core::adoption_repairs::ExtractedDataRoots {
+            data: std::path::PathBuf::from(paths.data_path()),
+            trickplay: std::path::PathBuf::from(paths.trickplay_path()),
+            internal_metadata: std::path::PathBuf::from(paths.internal_metadata_path()),
+        },
+    )
+    .await
+    .context("failed to remove extracted data of items that no longer exist")?;
     // The trigger scheduler: fires startup triggers now, then evaluates
     // daily/weekly/interval triggers for the life of this host.
     background.push(task_manager.start_scheduler());
@@ -3128,6 +3208,22 @@ fn sort_rules(
     }
 }
 
+/// The host a tuner's images may come from: its URL's, with the scheme an
+/// HDHomeRun's leaves out (`HdHomerunHost.GetApiUrl`). `None` for an M3U
+/// tuner read from a file.
+fn tuner_host(info: &ferrofin_model::live_tv::TunerHostInfo) -> Option<String> {
+    let url = if info
+        .type_
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("hdhomerun"))
+    {
+        ferrofin_livetv::hdhomerun::host::get_api_url(info).ok()?
+    } else {
+        info.url.clone()?
+    };
+    ferrofin_providers::destination::url_host(&url)
+}
+
 /// The server's stable id (`ApplicationHost.SystemId`), persisted across
 /// restarts. Jellyfin persists its SystemId and the web client keys stored
 /// sessions by it, so regenerating it on every boot breaks reconnect:
@@ -3220,6 +3316,37 @@ async fn load_server_id(
 
 #[cfg(test)]
 mod tests {
+    /// The hosts that exempt a tuner's own artwork from the image downloads'
+    /// private-address refusal (gl-1096).
+    #[test]
+    fn a_tuner_host_is_its_urls() {
+        let tuner = |kind: &str, url: &str| ferrofin_model::live_tv::TunerHostInfo {
+            type_: Some(kind.to_owned()),
+            url: Some(url.to_owned()),
+            ..Default::default()
+        };
+        for (kind, url, host) in [
+            ("hdhomerun", "192.168.1.50", Some("192.168.1.50")),
+            ("hdhomerun", "http://HDHR.lan:80", Some("hdhr.lan")),
+            (
+                "m3u",
+                "http://tvh.lan:9981/playlist/channels",
+                Some("tvh.lan"),
+            ),
+            ("m3u", "/config/channels.m3u", None),
+        ] {
+            assert_eq!(
+                super::tuner_host(&tuner(kind, url)).as_deref(),
+                host,
+                "{kind} {url}"
+            );
+        }
+        assert_eq!(
+            super::tuner_host(&ferrofin_model::live_tv::TunerHostInfo::default()),
+            None
+        );
+    }
+
     /// The server id on first boot over an adopted Jellyfin install is
     /// Jellyfin's own (`DeviceId`: `{DataPath}/device.txt`), so clients keep
     /// recognising the server; Ferrofin's `system_id`, once written, wins; and

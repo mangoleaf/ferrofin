@@ -172,6 +172,8 @@ mod tests {
 
     fn server() -> (String, Arc<Mutex<Vec<String>>>) {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));

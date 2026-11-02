@@ -2340,6 +2340,23 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(closure.iter().filter_map(|id| rows.remove(id)).collect())
     }
 
+    async fn deletion_closure_ids(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        let given: Vec<String> = ids
+            .iter()
+            .map(|id| guid_to_db(*id))
+            .filter(|id| id != PLACEHOLDER_ID)
+            .collect();
+        if given.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+        Ok(deletion_closure_rows(&mut conn, &given)
+            .await?
+            .iter()
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
+    }
+
     async fn save_items(&self, items: &[BaseItemEntity]) -> Result<(), ServiceError> {
         for item in items {
             self.upsert_item(item, UPSERT_SQL, false).await?;
@@ -13965,12 +13982,17 @@ mod tests {
             .deletion_closure(&[season, Uuid::new_v4()])
             .await
             .expect("closure");
+        let closure_ids = svc
+            .deletion_closure_ids(&[season, Uuid::new_v4()])
+            .await
+            .expect("closure ids");
         assert_eq!(rows_and_links(&db).await, before, "nothing deleted");
         assert_eq!(closure[0].id, guid_to_db(season), "the item first");
         let mut ids: Vec<Uuid> = closure
             .iter()
             .filter_map(|row| Uuid::parse_str(&row.id).ok())
             .collect();
+        assert_eq!(closure_ids, ids, "the same rows' ids, in the same order");
         ids.sort_unstable();
         let mut deleted = svc.delete_items(&[season]).await.expect("delete");
         deleted.sort_unstable();
@@ -13985,6 +14007,8 @@ mod tests {
         );
         let deletion_closure = svc.deletion_closure(&[]).await.expect("empty");
         assert!(deletion_closure.is_empty(), "{deletion_closure:?}");
+        let deletion_closure_ids = svc.deletion_closure_ids(&[]).await.expect("empty");
+        assert!(deletion_closure_ids.is_empty(), "{deletion_closure_ids:?}");
         assert!(
             crate::test_support::fetch_item_opt(&db, series)
                 .await

@@ -292,7 +292,9 @@ impl RateLimiter {
         crate::metrics::request_finished(self.metric_label, request_result(&result, sent));
         let failed = match &result {
             Err(_) => true,
-            Ok(response) => is_failure_status(response.status()),
+            Ok(response) => {
+                is_failure_status(response.status()) && !is_redirect_to_follow(response)
+            }
         };
         if failed {
             note_request_failure();
@@ -418,10 +420,10 @@ impl RateLimiter {
                 // as an empty result, not an authentication or service failure.
                 tracing::debug!(provider = %self.provider, %context, %status,
                     "Metadata provider lookup returned no result");
-            } else if !status.is_success() {
+            } else if !status.is_success() && !is_redirect_to_follow(response) {
                 tracing::warn!(provider = %self.provider, %context, %status,
                     "Metadata provider request rejected");
-            } else if rate.succeeded() {
+            } else if status.is_success() && rate.succeeded() {
                 tracing::info!(provider = %self.provider, "Metadata provider requests recovered");
             }
             rate.postpone(interval.max(server_delay).max(rate.adaptive_interval()));
@@ -451,7 +453,9 @@ impl RateLimiter {
 /// The `result` label of one logical request ([`crate::metrics`]): `skipped`
 /// only when nothing was ever sent (an open circuit or a cooldown longer than
 /// the caller may wait). A request that went out and then gave up — say a
-/// 429 whose `Retry-After` outlasts the wait for the retry — `failed`.
+/// 429 whose `Retry-After` outlasts the wait for the retry — `failed`. A
+/// redirect handed back to be followed ([`is_redirect_to_follow`]) is `ok`:
+/// each hop an image download follows is a request of its own.
 fn request_result(
     result: &Result<reqwest::Response, RequestError>,
     sent: u32,
@@ -459,7 +463,9 @@ fn request_result(
     use crate::metrics::RequestResult;
     match result {
         Err(RequestError::Cooldown) if sent == 0 => RequestResult::Skipped,
-        Ok(response) if response.status().is_success() => RequestResult::Ok,
+        Ok(response) if response.status().is_success() || is_redirect_to_follow(response) => {
+            RequestResult::Ok
+        }
         Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
             RequestResult::NotFound
         }
@@ -477,9 +483,30 @@ tokio::task_local! {
 /// answered. A 404 is an answer ("nothing here"): the provider clients
 /// report it as a miss, the way `TMDbLib` returns `null` for it instead of
 /// throwing. Every other non-success status (a 5xx or 429 that outlived
-/// its retries, an auth failure, a rejected request) is a failure.
+/// its retries, an auth failure, a rejected request) is a failure. A redirect
+/// handed back to be followed ([`is_redirect_to_follow`]) is not a final
+/// response, and its caller leaves it out.
 fn is_failure_status(status: reqwest::StatusCode) -> bool {
     !status.is_success() && status != reqwest::StatusCode::NOT_FOUND
+}
+
+/// The statuses reqwest's own redirect policy follows.
+pub(crate) const REDIRECT_STATUSES: [reqwest::StatusCode; 5] = [
+    reqwest::StatusCode::MOVED_PERMANENTLY,
+    reqwest::StatusCode::FOUND,
+    reqwest::StatusCode::SEE_OTHER,
+    reqwest::StatusCode::TEMPORARY_REDIRECT,
+    reqwest::StatusCode::PERMANENT_REDIRECT,
+];
+
+/// Whether `response` is a redirect handed back for its caller to follow: one
+/// of [`REDIRECT_STATUSES`], with a `Location`. A client that follows
+/// redirects never hands one back, so only the image downloads, which follow
+/// them themselves to vet each hop, see one: an answer, not a failure. Any
+/// other 3xx is what it always was.
+pub(crate) fn is_redirect_to_follow(response: &reqwest::Response) -> bool {
+    REDIRECT_STATUSES.contains(&response.status())
+        && response.headers().contains_key(reqwest::header::LOCATION)
 }
 
 /// Counts one failed provider call into the enclosing
@@ -1435,6 +1462,47 @@ mod tests {
         assert_eq!(statuses, vec![200, 404, 401, 400]);
         assert_eq!(failures, 2, "401 and 400 failed; 200 and 404 answered");
         assert_eq!(task.await.unwrap().len(), 4);
+    }
+
+    /// A redirect handed back to be followed (the image downloads' client
+    /// follows none itself) is an answer, counted `ok`; a 3xx that cannot be
+    /// followed is still a failure.
+    #[tokio::test]
+    async fn a_redirect_to_follow_is_an_answer_and_another_3xx_a_failure() {
+        use crate::mock_http::MockServer;
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let client = RateLimiter::new("redirects");
+        for (raw, status, answered) in [
+            (
+                b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                302,
+                true,
+            ),
+            (MockServer::raw_status("302 Found"), 302, false),
+            (MockServer::raw_status("300 Multiple Choices"), 300, false),
+        ] {
+            let server = MockServer::start_raw(vec![raw]).await;
+            let (response, failures) = count_request_failures(
+                client.send_request(http.get(&server.base_url), Duration::ZERO),
+            )
+            .await;
+            let response = response.unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(
+                failures,
+                u32::from(!answered),
+                "{status}, Location: {answered}"
+            );
+            let expected = if answered {
+                crate::metrics::RequestResult::Ok
+            } else {
+                crate::metrics::RequestResult::Failed
+            };
+            assert_eq!(request_result(&Ok(response), 1), expected);
+        }
     }
 
     #[tokio::test(start_paused = true)]

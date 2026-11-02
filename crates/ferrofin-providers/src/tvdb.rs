@@ -1277,7 +1277,7 @@ impl TvdbClient {
 
     /// Downloads an image by absolute URL, returning its bytes.
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        crate::image_download::download_bytes(&self.http, url).await
+        crate::image_download::download_bytes(url).await
     }
 }
 

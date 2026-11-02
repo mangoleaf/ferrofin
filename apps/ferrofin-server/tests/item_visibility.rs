@@ -2067,6 +2067,18 @@ async fn air_series(f: &Fixture, titles: &[&str]) {
         .expect("guide refresh");
 }
 
+/// Mints the fixture's only API key and returns it.
+async fn only_api_key(f: &Fixture) -> String {
+    let uri = "/Auth/Keys?app=guide-fixture";
+    let (status, _) = call(&f.router, "POST", uri, Some(&f.admin), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, keys) = call(&f.router, "GET", "/Auth/Keys", Some(&f.admin), None).await;
+    keys["Items"][0]["AccessToken"]
+        .as_str()
+        .expect("AccessToken")
+        .to_owned()
+}
+
 /// The programme titles a guide request answers, sorted.
 async fn guide_titles(
     f: &Fixture,
@@ -2088,7 +2100,8 @@ async fn guide_titles(
     titles
 }
 
-// Divergence (owner decision 2026-10-31, gl-1091; gl-1113): see `query_programs_inner`.
+// Divergence (owner decision 2026-10-31, gl-1091; gl-1113, gl-1130): see
+// `query_programs_inner`.
 #[tokio::test]
 async fn a_series_the_user_cannot_open_names_no_guide_search() {
     let f = fixture().await;
@@ -2125,6 +2138,12 @@ async fn a_series_the_user_cannot_open_names_no_guide_search() {
         guide_titles(&f, "POST", Some(body.clone()), "", &f.viewer).await,
         everything
     );
+    // A body naming no user still reads the series as the signed-in caller.
+    let no_user = json!({ "LibrarySeriesId": series });
+    assert_eq!(
+        guide_titles(&f, "POST", Some(no_user.clone()), "", &f.viewer).await,
+        everything
+    );
     // An administrator reading as the viewer gets the viewer's answer.
     let as_viewer = format!("{closed}&userId={viewer_id}");
     assert_eq!(
@@ -2146,6 +2165,12 @@ async fn a_series_the_user_cannot_open_names_no_guide_search() {
             &f.admin
         )
         .await,
+        only_show
+    );
+    // An API key has no user, so it reads the series as upstream does.
+    let key = only_api_key(&f).await;
+    assert_eq!(
+        guide_titles(&f, "POST", Some(no_user.clone()), "", &key).await,
         only_show
     );
 
@@ -2178,6 +2203,10 @@ async fn a_series_the_user_cannot_open_names_no_guide_search() {
     );
     assert_eq!(
         guide_titles(&f, "POST", Some(body), "", &f.viewer).await,
+        only_show
+    );
+    assert_eq!(
+        guide_titles(&f, "POST", Some(no_user), "", &f.viewer).await,
         only_show
     );
 }

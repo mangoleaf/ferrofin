@@ -369,15 +369,16 @@ fn provider_id(name: &str) -> String {
         .to_string()
 }
 
-/// A lyric format string (`"lrc"`, `".LRC"`, …) reduced to a bare lowercase
-/// extension. Mirrors `format.ReplaceLineEndings("").ToLowerInvariant()` plus
-/// the leading-dot tolerance `Path.GetExtension` gives the controller.
-fn normalise_format(format: &str) -> String {
-    format
-        .trim()
-        .trim_start_matches('.')
-        .replace(['\r', '\n'], "")
-        .to_ascii_lowercase()
+/// The characters .NET's `string.ReplaceLineEndings` treats as line endings:
+/// CR and LF (so CRLF too), NEL, FF, LS and PS.
+const LINE_ENDINGS: [char; 6] = ['\r', '\n', '\u{0085}', '\u{000C}', '\u{2028}', '\u{2029}'];
+
+/// The extension `TrySaveLyric` saves a lyric of `format` under:
+/// `format.ReplaceLineEndings(string.Empty).ToLowerInvariant()`, and nothing
+/// more. It does not trim and keeps any dots, so `.lrc` saves as `song..lrc`
+/// there too.
+fn save_extension(format: &str) -> String {
+    ferrofin_util::string_extensions::lower_invariant(&format.replace(LINE_ENDINGS, ""))
 }
 
 /// `{media base name}.{ext}` — the sidecar file name Jellyfin saves and resolves
@@ -394,7 +395,7 @@ fn sidecar_file_name(media_path: &Path, ext: &str) -> std::ffi::OsString {
 /// The save-path list for a lyric of `media_path`, in `TrySaveLyric` order:
 /// the media folder only when the library opts in (`SaveLyricsWithMedia`),
 /// then always the item's internal metadata folder. The file name is the
-/// media base name plus the lowercased lyric format. A target that leaves its
+/// media base name plus [`save_extension`]. A target that leaves its
 /// folder is dropped (`PathHelper.IsContainedIn`, `LyricManager.cs:407,416`).
 pub(crate) fn save_targets(
     media_path: &Path,
@@ -402,7 +403,7 @@ pub(crate) fn save_targets(
     metadata_dir: Option<&Path>,
     format: &str,
 ) -> Vec<PathBuf> {
-    let name = sidecar_file_name(media_path, &normalise_format(format));
+    let name = sidecar_file_name(media_path, &save_extension(format));
     let media_folder = media_path.parent().filter(|_| save_with_media);
     [media_folder, metadata_dir]
         .into_iter()
@@ -480,9 +481,11 @@ fn parse_by_name(name: &str, content: &str) -> Option<LyricDto> {
     None
 }
 
-/// The parser chain for a bare format string — `new LyricFile($"lyric.{format}")`.
+/// The parser chain for a bare format string — `new LyricFile($"lyric.{format}")`,
+/// the format as given. Neither parser trims the extension it compares, so a
+/// padded `"lrc "` or a `"lrc\n"` matches none (gl-1027).
 fn parse_by_format(format: &str, text: &str) -> Option<LyricDto> {
-    parse_by_name(&format!("lyric.{}", normalise_format(format)), text)
+    parse_by_name(&format!("lyric.{format}"), text)
 }
 
 /// Builds the provider search request from the resolved item — the fields
@@ -1988,6 +1991,61 @@ mod tests {
         let saved = metadata_sidecar(meta.path(), item_id, "song", "txt");
         record_lyric_streams(&db, item_id, &[&saved]).await;
         assert_eq!(mgr.get_lyrics(item_id).await.expect("get"), Some(dto));
+    }
+
+    /// gl-1027: `SaveLyricAsync` parses `new LyricFile($"lyric.{format}")` with
+    /// the format as the controller passed it, and both parsers compare
+    /// `Path.GetExtension` of that name with `.lrc`/`.elrc`/`.txt` untrimmed,
+    /// so a padded format, or one with a line break, matches neither: null,
+    /// the controller's `400`, and nothing written. A format that differs only
+    /// in case is read (`OrdinalIgnoreCase`) and saved under `TrySaveLyric`'s
+    /// `format.ReplaceLineEndings("").ToLowerInvariant()`, which keeps a
+    /// leading dot (`song..lrc`).
+    #[rstest::rstest]
+    #[case::trailing_space("lrc ", None)]
+    #[case::leading_space(" lrc", None)]
+    #[case::trailing_tab("txt\t", None)]
+    #[case::trailing_line_feed("lrc\n", None)]
+    #[case::trailing_crlf("lrc\r\n", None)]
+    #[case::trailing_next_line("lrc\u{0085}", None)]
+    #[case::upper_case("LRC", Some("lrc"))]
+    #[case::mixed_case_txt("TxT", Some("txt"))]
+    #[case::leading_dot(".lrc", Some(".lrc"))]
+    #[tokio::test]
+    async fn save_lyric_reads_the_format_as_given(
+        #[case] format: &str,
+        #[case] saved_as: Option<&str>,
+    ) {
+        let db = test_support::test_db().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let meta = tempfile::tempdir().expect("tempdir");
+        let media = dir.path().join("song.flac");
+        std::fs::write(&media, b"flac").expect("write media");
+        let item_id = seed_audio(&db, &media.to_string_lossy()).await;
+        let mgr = manager_over(&db, Vec::new()).with_metadata_path(meta.path());
+
+        let parsed = mgr
+            .save_lyric(item_id, format, b"[00:01.00]hi")
+            .await
+            .expect("runs");
+        assert_eq!(parsed.is_some(), saved_as.is_some(), "{format:?}");
+        let folder = metadata_sidecar(meta.path(), item_id, "song", "lrc")
+            .parent()
+            .expect("folder")
+            .to_path_buf();
+        let mut written: Vec<String> = std::fs::read_dir(&folder)
+            .map(|entries| {
+                entries
+                    .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        written.sort();
+        let expected: Vec<String> = saved_as
+            .map(|ext| format!("song.{ext}"))
+            .into_iter()
+            .collect();
+        assert_eq!(written, expected, "{format:?}");
     }
 
     /// `SaveLyricAsync(Audio, string, Stream)`: the parse reads the upload

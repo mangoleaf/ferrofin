@@ -438,6 +438,10 @@ fn read_only_settings_carry_their_note_whatever_sets_them() {
             "wasm_private_http_allow",
             "Lets the named WASM plugins reach",
         ),
+        (
+            "image_private_http_allow",
+            "Lets image downloads reach the LAN",
+        ),
         // Owner decision D2: jellyfin-web's own pages cover these.
         (
             "bind_addr",
@@ -734,5 +738,15 @@ async fn the_manager_reports_the_restart_flag_and_answers_not_found_while_disabl
     assert!(
         matches!(result, Err(ServiceError::NotFound(_))),
         "{result:?}"
+    );
+}
+
+/// The statement cache row shows the default the database applies when the
+/// setting is unset.
+#[test]
+fn the_statement_cache_row_shows_the_database_default() {
+    assert_eq!(
+        spec("db_statement_cache").default,
+        ferrofin_db::DEFAULT_STATEMENT_CACHE_CAPACITY.to_string()
     );
 }

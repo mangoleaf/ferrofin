@@ -107,8 +107,6 @@ pub struct Inner {
     /// Serializes named saves through validation, persistence and live updates,
     /// and with the Live TV manager's own write of `livetv`.
     pub configuration_write_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Serializes issuing and consuming recovery files through password updates.
-    pub password_reset_lock: tokio::sync::Mutex<()>,
     /// Store validators registered by the composition root, keyed case-insensitively.
     pub configuration_validators: std::collections::HashMap<
         String,
@@ -437,7 +435,6 @@ impl AppState {
     ) -> Self {
         Self::from_inner(Inner {
             configuration_write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            password_reset_lock: tokio::sync::Mutex::new(()),
             configuration_validators: std::collections::HashMap::new(),
             committed_configuration_checks: Vec::new(),
             // Wired by the composition root via `with_network`.
