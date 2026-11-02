@@ -209,6 +209,17 @@ ferrofin:
     # FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB: "512"
     # FERROFIN_IMAGE_RESIZE_BUDGET_MB: "2048"
 
+    # The largest remote image downloaded, and how long a URL that gave no image
+    # (a channel logo that is gone, say) is left alone before it is tried again.
+    # FERROFIN_IMAGE_DOWNLOAD_MAX_MB: "64"
+    # FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS: "3600"
+
+    # The most jobs re-encoding a stream the server runs at once, and one user
+    # runs at once. Past either cap the user's idle jobs are ended first; with
+    # none to end, the client gets 503 with Retry-After. 0 means no cap.
+    # FERROFIN_MAX_TRANSCODES: "0"
+    # FERROFIN_MAX_TRANSCODES_PER_USER: "0"
+
     # WASM plugins (sandboxed, runtime-installed): install from a plugin
     # repository in the dashboard (Plugins → Repositories → Catalog), or place
     # .wasm components at {data_dir}/plugins/ — under the DATA volume above —

@@ -350,6 +350,25 @@ impl EncodingJobInfo {
         codec.is_some_and(|c| c.eq_ignore_ascii_case("copy"))
     }
 
+    /// Whether this job re-encodes any stream, video or audio: what the
+    /// [`TranscodeLimits`](crate::transcoding::TranscodeLimits) caps count.
+    ///
+    /// Only a job copying every stream is free, so a copied video with
+    /// re-encoded audio counts and so does a music transcode. A stream the job
+    /// does not carry takes no part: the audio routes leave
+    /// [`video_stream`](Self::video_stream) empty, and
+    /// [`output_audio_codec`](Self::output_audio_codec) names a codec even for
+    /// a source with no audio. With neither stream known, ffmpeg picks the
+    /// streams and their encoders itself, so the job cannot be called a copy.
+    #[must_use]
+    pub fn encodes_any_stream(&self) -> bool {
+        let video = self.video_stream.is_some();
+        let audio = self.audio_stream.is_some();
+        !(video || audio)
+            || (video && !Self::is_copy_codec(self.output_video_codec.as_deref()))
+            || (audio && !Self::is_copy_codec(self.output_audio_codec.as_deref()))
+    }
+
     /// The effective output video codec: the source codec when the output is a
     /// stream copy, else the requested output codec. Port of
     /// `ActualOutputVideoCodec`.

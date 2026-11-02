@@ -31,7 +31,7 @@ test-util = []
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-naming.workspace = true
-ferrofin-util.workspace = true
+ferrofin-util = { workspace = true, features = ["tokio"] }
 ferrofin-common.workspace = true
 ferrofin-db.workspace = true
 async-trait.workspace = true

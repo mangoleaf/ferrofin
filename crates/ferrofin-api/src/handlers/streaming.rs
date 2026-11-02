@@ -12,18 +12,23 @@ use std::io::Read as _;
 
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{Extensions, HeaderMap, StatusCode, header};
 use axum::response::Response;
 use chrono::{DateTime, Utc};
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::entities::VideoType;
+use ferrofin_model::users::UserPolicy;
 use ferrofin_traits::filesystem::OpenedFile;
 use ferrofin_traits::media_encoding::HlsStreamRequest;
+use ferrofin_traits::options::AuthorizationInfo;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
 
+use crate::auth::user_authorization;
 use crate::error::ApiError;
 use crate::handlers::hls::transcode_stream_fallback;
+use crate::handlers::live_tv::recording_visible;
 use crate::state::AppState;
 
 /// What a static (direct-play) request is served from: the requested media
@@ -46,6 +51,125 @@ pub(crate) struct StaticSource {
     /// The `User-Agent` the source requires (an IPTV tuner's), sent when a
     /// remote target is relayed.
     pub user_agent: Option<String>,
+}
+
+/// Holds a request that names a user to that user's account and libraries,
+/// before a stream, HLS, subtitle or attachment route resolves a source or
+/// starts a transcode: the account rules of [`user_authorization`] (a disabled
+/// account `401`; remote access and the access schedule `403`), then `404`
+/// unless the user may see `item_id` and the version `media_source_id` names,
+/// the library access check `/Items/{id}`, `/Download` and `/PlaybackInfo`
+/// already apply.
+///
+/// Divergence from upstream (gl-1090): `StreamingHelpers.GetStreamingState`
+/// reads the item with no user, so a restricted account could stream, and
+/// download through `static=true`, any item of a library it was not granted.
+///
+/// **With no user there is nothing to check, and nothing is read.** A request
+/// with no credential, or with a token that names nobody (the middleware
+/// resolves those alike), and an API key, stay as anonymous as upstream's. A
+/// disabled account's token does name its user, though it does not authenticate
+/// ([`AuthorizationInfo::is_authenticated`] is false), so this asks only whether
+/// there is one. This runs on every HLS segment and `Range` request: a user pays
+/// the one [`get_item_by_id_for_user`] `PlaybackInfo` pays, and a second read
+/// only for an id that is not their item's. A route behind `RequireAuth` has run
+/// the account rules already: running them again reads nothing, and keeps this
+/// the one check every route calls.
+///
+/// An id with no `BaseItems` row is no item of a library. A DVR recording's id
+/// has none (a scan gives its file a library item with another id) and answers
+/// to [`recording_refused`]. Anything else is left for the route, which finds an
+/// unmirrored channel's tuner or answers as it always has. An open live stream
+/// is not checked: its id is a capability, as on `PlaybackInfo`, which reads it
+/// by id once the item passes.
+///
+/// [`get_item_by_id_for_user`]: ferrofin_traits::library::LibraryManager::get_item_by_id_for_user
+pub(crate) async fn require_streamable_item(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    extensions: &Extensions,
+    headers: &HeaderMap,
+    item_id: Uuid,
+    media_source_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(user) = auth.user.as_ref().filter(|_| !auth.is_api_key) else {
+        return Ok(());
+    };
+    let client = state.client_address_of(extensions, headers);
+    let policy = user_authorization(auth, client, state, true).await?;
+    let refused = match row_access(state, item_id, user).await? {
+        RowAccess::Visible => false,
+        RowAccess::Hidden => true,
+        RowAccess::Absent => recording_refused(state, &policy, item_id, user).await?,
+    };
+    if refused {
+        return Err(ApiError::NotFound(format!("item {item_id}")));
+    }
+    // `GetStaticMediaSources(item, …, user)` keeps a hidden version out of
+    // `PlaybackInfo`; the stream routes pick by id from the userless list. An id
+    // that is no row's (a tuner source, a capture's timer) is no version.
+    if let Some(version) = media_source_id
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .filter(|version| *version != item_id)
+        && matches!(row_access(state, version, user).await?, RowAccess::Hidden)
+    {
+        return Err(ApiError::NotFound(format!("media source {version}")));
+    }
+    Ok(())
+}
+
+/// Where a row stands with a user.
+enum RowAccess {
+    /// The row exists and the user may see it.
+    Visible,
+    /// The row exists and the user may not see it.
+    Hidden,
+    /// There is no row.
+    Absent,
+}
+
+/// [`RowAccess`] of `id` for `user`. The row a user may see costs one lookup;
+/// only an id that lookup misses is read again, to tell the other two apart.
+async fn row_access(state: &AppState, id: Uuid, user: &UserEntity) -> Result<RowAccess, ApiError> {
+    if state
+        .library
+        .get_item_by_id_for_user(id, Some(user))
+        .await?
+        .is_some()
+    {
+        return Ok(RowAccess::Visible);
+    }
+    Ok(if state.library.get_item_by_id(id).await?.is_some() {
+        RowAccess::Hidden
+    } else {
+        RowAccess::Absent
+    })
+}
+
+/// Whether `user` is refused the DVR recording `id`, `false` when it is none.
+///
+/// `PlaybackInfo` finds no item for a recording's id, for any caller, so the
+/// rule is that of the one route that reads it, `GET /LiveTv/Recordings/{id}`:
+/// "Live TV access" ([`RequireLiveTvAccess`](crate::auth::RequireLiveTvAccess)),
+/// which is what shuts an account out of the DVR, and then the recording's own
+/// visibility ([`recording_visible`]), which holds a file inside a library to
+/// that library.
+async fn recording_refused(
+    state: &AppState,
+    policy: &UserPolicy,
+    id: Uuid,
+    user: &UserEntity,
+) -> Result<bool, ApiError> {
+    let Some(live_tv) = state.live_tv.as_ref() else {
+        return Ok(false);
+    };
+    let Some(recording) = live_tv.get_recording_item(id).await? else {
+        return Ok(false);
+    };
+    if !policy.is_administrator && !policy.enable_live_tv_access {
+        return Ok(true);
+    }
+    Ok(!recording_visible(state, recording, user).await?)
 }
 
 /// Resolves the direct-play source a stream request names.
@@ -92,10 +216,23 @@ pub(crate) async fn static_source(
     })
 }
 
+/// The container a `stream.{container}` route segment names, or `None` when the
+/// segment is not that route.
+///
+/// The route registers as one capture (`routes::to_axum_path`), so the literal
+/// is checked here, in any case, as ASP.NET matches a route's literals. The
+/// container keeps the case it was sent in.
+pub(crate) fn stream_route_container(segment: &str) -> Option<&str> {
+    const LITERAL: &str = "stream.";
+    let (literal, container) = segment.split_at_checked(LITERAL.len())?;
+    (literal.eq_ignore_ascii_case(LITERAL) && !container.is_empty()).then_some(container)
+}
+
 /// The shared body of `VideosController.GetVideoStream` and
 /// `AudioHelper.GetAudioStream`: a `Static=true` request is served from the
 /// source it names; anything else, and a static video request for a disc
-/// folder (which only ffmpeg reads), is transcoded.
+/// folder (which only ffmpeg reads), is transcoded, which needs a caller
+/// ([`transcode_stream_fallback`]).
 pub(crate) async fn static_or_transcode(
     state: &AppState,
     item_id: Uuid,

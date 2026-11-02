@@ -164,6 +164,12 @@ mod tests {
     use ferrofin_model::configuration::{ImageOption, LibraryOptions, TypeOptions};
     use std::sync::{Arc, Mutex};
 
+    /// The body served for `path`: enough of an image to be kept, and which
+    /// one it is.
+    fn image(path: &str) -> Vec<u8> {
+        format!("GIF89a{path}").into_bytes()
+    }
+
     fn server() -> (String, Arc<Mutex<Vec<String>>>) {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -185,16 +191,16 @@ mod tests {
                     _ => "200 OK",
                 };
                 let body = if path == "/duplicate" {
-                    b"/first".as_slice()
+                    image("/first")
                 } else {
-                    path.as_bytes()
+                    image(&path)
                 };
                 let _ = write!(
                     stream,
                     "HTTP/1.1 {status}\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                let _ = stream.write_all(body);
+                let _ = stream.write_all(&body);
             }
         });
         (format!("http://{address}"), requests)
@@ -276,8 +282,11 @@ mod tests {
             *requests.lock().unwrap(),
             ["/first", "/duplicate", "/unknown-width"]
         );
-        assert_eq!(std::fs::read(&images[0].path).unwrap(), b"/first");
-        assert_eq!(std::fs::read(&images[1].path).unwrap(), b"/unknown-width");
+        assert_eq!(std::fs::read(&images[0].path).unwrap(), image("/first"));
+        assert_eq!(
+            std::fs::read(&images[1].path).unwrap(),
+            image("/unknown-width")
+        );
         let more = acquire_images(
             &TmdbClient::new(),
             tmp.path(),
@@ -314,11 +323,11 @@ mod tests {
         assert_eq!(*requests.lock().unwrap(), ["/poster", "/disc"]);
         assert_eq!(
             std::fs::read(tmp.path().join("primary.png")).unwrap(),
-            b"/poster"
+            image("/poster")
         );
         assert_eq!(
             std::fs::read(tmp.path().join("disc.png")).unwrap(),
-            b"/disc"
+            image("/disc")
         );
     }
 
@@ -362,7 +371,7 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(std::fs::read(&next[0].path).unwrap(), b"/fallback");
+        assert_eq!(std::fs::read(&next[0].path).unwrap(), image("/fallback"));
     }
 
     #[tokio::test]
@@ -409,7 +418,7 @@ mod tests {
         prune_old_backdrops_in(std::slice::from_ref(&dir), &current);
         assert!(!old.exists());
         assert_eq!(std::fs::read(local).unwrap(), b"sidecar");
-        assert_eq!(std::fs::read(&current[1].path).unwrap(), b"/new");
+        assert_eq!(std::fs::read(&current[1].path).unwrap(), image("/new"));
     }
 
     /// An item's folders are pruned together: once the own folder keeps a new

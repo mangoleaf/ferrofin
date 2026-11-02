@@ -2141,9 +2141,11 @@ pub trait UserViewManager: Send + Sync {
     /// Gets the user-root children `user` may open.
     ///
     /// Port of `GetUserRootFolder().GetChildren(user, true)`: the rows of
-    /// [`get_media_folders`](Self::get_media_folders) that pass `IsVisible`.
-    /// Unlike [`get_user_views`](Self::get_user_views), the user's home-screen
-    /// choice (`MyMediaExcludes`) does not narrow it.
+    /// [`get_media_folders`](Self::get_media_folders) that pass `IsVisible`,
+    /// with the libraries first and the playlists folder after them, where
+    /// `get_media_folders` sorts it among them. Unlike
+    /// [`get_user_views`](Self::get_user_views), the user's home-screen choice
+    /// (`MyMediaExcludes`) does not narrow it.
     ///
     /// # Errors
     /// Returns a backend error when the implementation has no visibility

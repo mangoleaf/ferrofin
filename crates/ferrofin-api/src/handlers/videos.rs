@@ -17,7 +17,9 @@ use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::parse_csv_uuids;
-use crate::handlers::streaming::{serve_static_file, static_or_transcode};
+use crate::handlers::streaming::{
+    require_streamable_item, serve_static_file, static_or_transcode, stream_route_container,
+};
 use crate::state::AppState;
 
 /// `GET`/`HEAD /Videos/{itemId}/stream` — stream the requested video source.
@@ -35,6 +37,15 @@ async fn get_video_stream(
 ) -> Result<Response, ApiError> {
     let raw = request.uri().query().map(ToOwned::to_owned);
     let req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
+    require_streamable_item(
+        &state,
+        &auth,
+        request.extensions(),
+        request.headers(),
+        item_id,
+        req.media_source_id.as_deref(),
+    )
+    .await?;
     crate::handlers::hls::validate_stream_request(&req)?;
     static_or_transcode(&state, item_id, false, req, request).await
 }
@@ -50,12 +61,19 @@ async fn get_video_stream_by_container(
     let raw = request.uri().query().map(ToOwned::to_owned);
     let mut req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
     req.output_container = Some(
-        container
-            .strip_prefix("stream.")
-            .filter(|value| !value.is_empty())
+        stream_route_container(&container)
             .ok_or_else(|| ApiError::NotFound("stream route".to_owned()))?
             .to_owned(),
     );
+    require_streamable_item(
+        &state,
+        &auth,
+        request.extensions(),
+        request.headers(),
+        item_id,
+        req.media_source_id.as_deref(),
+    )
+    .await?;
     crate::handlers::hls::validate_stream_request(&req)?;
     static_or_transcode(&state, item_id, false, req, request).await
 }

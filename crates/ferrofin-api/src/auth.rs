@@ -204,24 +204,40 @@ pub(crate) async fn default_authorization(
     if info.is_api_key {
         return Ok(info);
     }
+    let client = state.client_address(parts);
+    let policy = user_authorization(&info, client, state, validate_schedule).await?;
+    info.user_policy = Some(policy);
+    Ok(info)
+}
+
+/// The user half of [`default_authorization`], for a caller that holds the
+/// [`AuthorizationInfo`] and has only to know the verdict: the user's policy
+/// once it allows `client`, read from `info` when the token cache supplied it.
+///
+/// A stream route answers a request this way, so that one with no credential
+/// stays anonymous while one naming a user is held to that user's account
+/// (`handlers::streaming::require_streamable_item`).
+pub(crate) async fn user_authorization(
+    info: &AuthorizationInfo,
+    client: std::net::IpAddr,
+    state: &AppState,
+    validate_schedule: bool,
+) -> Result<std::sync::Arc<ferrofin_model::users::UserPolicy>, ApiError> {
     if info.user_id().is_nil() {
         return Err(ApiError::Forbidden("user identity required".to_owned()));
     }
-    if info.user_policy.is_none()
-        && let Some(user) = &info.user
-    {
-        info.user_policy = crate::handlers::users::user_policy(state, user)
+    let policy = match (&info.user_policy, &info.user) {
+        (Some(policy), _) => Some(std::sync::Arc::clone(policy)),
+        (None, Some(user)) => crate::handlers::users::user_policy(state, user)
             .await?
-            .map(std::sync::Arc::new);
+            .map(std::sync::Arc::new),
+        (None, None) => None,
     }
-    let policy = info
-        .user_policy
-        .as_ref()
-        .ok_or_else(|| ApiError::Forbidden("user policy required".to_owned()))?;
+    .ok_or_else(|| ApiError::Forbidden("user policy required".to_owned()))?;
     if policy.is_disabled {
         return Err(ApiError::Unauthorized("account disabled".to_owned()));
     }
-    if !state.is_in_local_network(state.client_address(parts)) && !policy.enable_remote_access {
+    if !state.is_in_local_network(client) && !policy.enable_remote_access {
         return Err(ApiError::Forbidden(
             "remote access is not permitted for this user".to_owned(),
         ));
@@ -234,7 +250,7 @@ pub(crate) async fn default_authorization(
             "outside this user's access schedule".to_owned(),
         ));
     }
-    Ok(info)
+    Ok(policy)
 }
 
 /// Jellyfin's default policy: authenticated API key or user, with remote access
@@ -563,74 +579,6 @@ fn day_of_week_contains(
         D::Friday => weekday == Weekday::Fri,
         D::Saturday => weekday == Weekday::Sat,
         D::Unrecognized(_) => false,
-    }
-}
-
-/// Extractor for handlers behind Jellyfin's `LocalAccessOrRequiresElevation`
-/// policy — in the vendored contract, `POST /System/Restart` alone.
-///
-/// Port of `LocalAccessOrRequiresElevationHandler`: a caller whose peer address
-/// is on the local network is allowed regardless of role; anyone else must be an
-/// administrator. Restarting the server is the kind of thing someone standing at
-/// the machine should be able to do, and the kind of thing a stranger on the
-/// internet should not.
-///
-/// Two deliberate divergences, both in the safe direction:
-///
-/// 1. **Authentication is still required.** Upstream registers this policy as
-///    `AddPolicy(name, new LocalAccessOrRequiresElevationRequirement())` — the
-///    requirement list replaces the default policy wholesale and nothing in it
-///    demands an authenticated user, so a LAN caller with no token at all
-///    satisfies it. Ferrofin keeps [`RequireAuth`] in front, so an anonymous
-///    request is `401` whatever its source address. No authenticated client can
-///    tell the difference.
-/// 2. **An unknown peer address is treated as remote.** C# accepts a null IP
-///    ("Loopback will be on LAN, so we can accept null"), but in Ferrofin the
-///    peer address is missing only when there is no connection to ask —
-///    synthetic routing in tests, never a served request, since the composition
-///    root installs `with_connect_info`. Failing closed there costs a real
-///    caller nothing and keeps the unknown case from being the permissive one.
-///
-/// The local-network test is [`AppState::is_in_local_network`] over
-/// [`AppState::client_address`], as `GET /System/Endpoint`'s `IsInNetwork` is,
-/// so the endpoint that *reports* whether a client is in-network and the policy
-/// that *acts* on it can never disagree. With the composition root's network
-/// policy wired, that is `NetworkManager.IsInLocalNetwork` (the
-/// `LocalNetworkSubnets` intersected and the `!`-prefixed exclusions
-/// subtracted) over the client behind any `KnownProxies`, as upstream reads
-/// `GetNormalizedRemoteIP()`. Without it (unit tests) the private-range
-/// fallback in `handlers::system` applies.
-#[derive(Debug, Clone)]
-pub struct RequireLocalAccessOrAdmin(pub AuthorizationInfo);
-
-impl FromRequestParts<AppState> for RequireLocalAccessOrAdmin {
-    type Rejection = ApiError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        // Read the peer before `RequireAuth` borrows `parts` mutably.
-        // The CLIENT's address, not the transport peer: behind a proxy the peer
-        // is always the proxy, which is private, so every caller would read as
-        // local and this gate would degrade to "any authenticated account".
-        //
-        // The `is_some` is load-bearing and stays: `client_address` defaults a
-        // MISSING peer to loopback (C# `GetNormalizedRemoteIP` does), and
-        // "there was no connection to ask" must keep reading as remote here —
-        // the deliberate divergence documented on this extractor, and the only
-        // one of the two directions that is safe to be wrong in.
-        let local = parts
-            .extensions
-            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-            .is_some()
-            && state.is_in_local_network(state.client_address(parts));
-        if local {
-            let info = authenticated_info(parts, state).await?;
-            return Ok(Self(info));
-        }
-        let RequireAdmin(info) = RequireAdmin::from_request_parts(parts, state).await?;
-        Ok(Self(info))
     }
 }
 
