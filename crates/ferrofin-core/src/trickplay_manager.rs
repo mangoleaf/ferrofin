@@ -479,6 +479,7 @@ impl FerrofinTrickplayManager {
                 allow_hw_accel: options.enable_hw_acceleration,
                 enable_hw_encoding: options.enable_hw_encoding,
                 keyframe_only: options.enable_key_frame_only_extraction,
+                full_chroma: options.full_chroma,
             })
             .await?;
 
@@ -573,6 +574,7 @@ impl FerrofinTrickplayManager {
                     options.jpeg_quality,
                     info.width,
                     (info.height != 0).then_some(info.height),
+                    options.full_chroma,
                 )
                 .await?;
             if info.height == 0 {
@@ -1615,6 +1617,8 @@ mod tests {
     struct RecordingEncoder {
         inner: ImageCrateEncoder,
         tiles: Mutex<Vec<String>>,
+        /// The `full_chroma` of the last tile.
+        last_full_chroma: Mutex<Option<bool>>,
     }
 
     #[async_trait]
@@ -1692,13 +1696,15 @@ mod tests {
             quality: i32,
             img_width: i32,
             img_height: Option<i32>,
+            full_chroma: bool,
         ) -> Result<i32, ServiceError> {
             self.tiles
                 .lock()
                 .expect("lock")
                 .push(options.output_path.clone());
+            *self.last_full_chroma.lock().expect("lock") = Some(full_chroma);
             self.inner
-                .create_trickplay_tile(options, quality, img_width, img_height)
+                .create_trickplay_tile(options, quality, img_width, img_height, full_chroma)
                 .await
         }
     }
@@ -1714,6 +1720,8 @@ mod tests {
         last_request: Mutex<Option<(i32, i32)>>,
         /// The priority the last request carried.
         last_priority: Mutex<Option<ferrofin_model::configuration::ProcessPriorityClass>>,
+        /// The `full_chroma` the last request carried.
+        last_full_chroma: Mutex<Option<bool>>,
         /// The video stream the last request carried, which is what decides
         /// whether the extractor can take the hardware path at all.
         last_stream: Mutex<Option<MediaStream>>,
@@ -1731,6 +1739,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 last_request: Mutex::new(None),
                 last_priority: Mutex::new(None),
+                last_full_chroma: Mutex::new(None),
                 last_stream: Mutex::new(None),
                 last_streams: Mutex::new(Vec::new()),
                 last_output: Mutex::new(None),
@@ -1763,6 +1772,7 @@ mod tests {
             *self.last_request.lock().expect("lock") =
                 Some((request.interval_ms, request.max_width));
             *self.last_priority.lock().expect("lock") = Some(request.priority);
+            *self.last_full_chroma.lock().expect("lock") = Some(request.full_chroma);
             *self.last_stream.lock().expect("lock") = request.video_stream.cloned();
             *self.last_streams.lock().expect("lock") = request.media_streams.to_vec();
             let output_dir = request.output_dir;
@@ -1810,6 +1820,7 @@ mod tests {
         let encoder = Arc::new(RecordingEncoder {
             inner: ImageCrateEncoder::new(),
             tiles: Mutex::new(Vec::new()),
+            last_full_chroma: Mutex::new(None),
         });
         let extractor = Arc::new(extractor);
         let items = Arc::new(FerrofinItemRepository::new(
@@ -2227,6 +2238,40 @@ mod tests {
             .expect("tile")
             .expect("some path");
         assert!(Path::new(&tile).is_file(), "resolved tile exists: {tile}");
+    }
+
+    /// `TrickplayOptions::full_chroma` reaches both stages, and is off unless
+    /// an admin turns it on.
+    #[rstest::rstest]
+    #[case::by_default(None, false)]
+    #[case::on(Some(true), true)]
+    #[tokio::test]
+    async fn the_chroma_option_reaches_the_frames_and_the_tiles(
+        #[case] setting: Option<bool>,
+        #[case] expected: bool,
+    ) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let mut options = options_2x2(&[320]);
+        if let Some(setting) = setting {
+            options.full_chroma = setting;
+        }
+        let r = rig(&db, options, FakeExtractor::new(1, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        assert_eq!(
+            *r.extractor.last_full_chroma.lock().expect("lock"),
+            Some(expected)
+        );
+        assert_eq!(
+            *r.encoder.last_full_chroma.lock().expect("lock"),
+            Some(expected)
+        );
     }
 
     #[tokio::test]

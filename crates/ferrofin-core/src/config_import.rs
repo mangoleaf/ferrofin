@@ -665,6 +665,8 @@ mod tests {
             cfg.trickplay_options.qscale,
             default.trickplay_options.qscale
         );
+        // Ferrofin's own opt-in: Jellyfin's XML never has it, so it is off.
+        assert!(!cfg.trickplay_options.full_chroma);
     }
 
     #[test]
