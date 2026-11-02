@@ -870,6 +870,8 @@ pub async fn build_app_state(
             .with_server_id(server_id.clone())
             // Upstream `PostUserImage`: `{UserConfigurationDirectoryPath}/{Username}/`.
             .with_profile_image_dir(paths.user_configuration_directory_path())
+            // Upstream `DefaultPasswordResetProvider`: PIN files in `ProgramDataPath`.
+            .with_password_reset_dir(paths.program_data_path())
             .with_auth_cache(Arc::clone(&auth_cache))
             // A lockout is a dashboard Alert, not just a log line.
             .with_activity(Arc::clone(&activity))
@@ -2057,8 +2059,8 @@ pub async fn build_app_state(
         users: Arc::clone(&users),
     };
     // The user manager was built long before the extensions: their
-    // authentication providers fill its one late slot now, before the server
-    // takes a request. Every clone of the manager shares that slot.
+    // authentication and password-reset providers fill its late slots now,
+    // before the server takes a request. Every clone of the manager shares them.
     ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, &users_impl);
     let intro_skipper_analysis = ferrofin_extensions::intro_skipper::analysis(&extension_cx);
     subscribe_intro_skipper(&event_bus, &intro_skipper_analysis);

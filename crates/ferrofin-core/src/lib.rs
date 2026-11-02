@@ -226,6 +226,7 @@ pub mod mount_table;
 pub mod music_manager;
 pub mod next_up_service;
 pub mod notify_watcher;
+pub mod password_reset;
 pub mod path_manager;
 pub mod people_repository;
 pub mod playback_activity;

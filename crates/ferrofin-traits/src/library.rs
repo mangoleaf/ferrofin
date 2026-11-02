@@ -39,7 +39,7 @@ use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::media_info::LiveStreamRequest;
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use ferrofin_model::search::{SearchHint, SearchQuery};
-use ferrofin_model::users::UserPolicy;
+use ferrofin_model::users::{ForgotPasswordResult, PinRedeemResult, UserPolicy};
 use uuid::Uuid;
 
 use crate::error::ServiceError;
@@ -1590,8 +1590,54 @@ pub trait UserManager: Send + Sync {
     /// Lists the available authentication providers.
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError>;
 
-    /// Lists the available password-reset providers.
+    /// Lists the enabled password-reset providers, the default first, then by
+    /// name (`UserManager.GetPasswordResetProviders`).
     async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError>;
+
+    /// Starts a forgotten-password request (`POST /Users/ForgotPassword`,
+    /// `UserManager.StartForgotPasswordProcess`).
+    ///
+    /// The account `entered_username` names, if any, picks the provider by its
+    /// saved `PasswordResetProviderId`. An unknown name, a blank one, or a
+    /// saved id naming no enabled provider goes to the built-in PIN-file
+    /// provider. `is_in_network` is whether the request came from the local
+    /// network.
+    ///
+    /// The default fails, so impls without a reset store compile unchanged;
+    /// the concrete manager overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the chosen provider surfaces (the PIN file cannot be written).
+    async fn start_forgot_password_process(
+        &self,
+        entered_username: &str,
+        is_in_network: bool,
+    ) -> Result<ForgotPasswordResult, ServiceError> {
+        let _ = (entered_username, is_in_network);
+        Err(ServiceError::backend(
+            "start_forgot_password_process is not wired on this UserManager",
+        ))
+    }
+
+    /// Redeems a forgotten-password PIN (`POST /Users/ForgotPassword/Pin`,
+    /// `UserManager.RedeemPasswordResetPin`): every provider is offered it in
+    /// turn, and the first that redeems it answers.
+    ///
+    /// The default fails, so impls without a reset store compile unchanged;
+    /// the concrete manager overrides it.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::NotFound`] when no provider redeems the PIN (upstream's
+    /// built-in provider throws `ResourceNotFoundException`), or whatever a
+    /// provider surfaces (a password that cannot be saved).
+    async fn redeem_password_reset_pin(&self, pin: &str) -> Result<PinRedeemResult, ServiceError> {
+        let _ = pin;
+        Err(ServiceError::backend(
+            "redeem_password_reset_pin is not wired on this UserManager",
+        ))
+    }
 
     /// Projects a user row into the full public [`UserDto`].
     ///

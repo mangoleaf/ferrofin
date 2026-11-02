@@ -24,7 +24,7 @@ use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::media_segments::{MediaSegmentManager, MediaSegmentProvider};
 use ferrofin_traits::merge_versions::MergeVersionsManager;
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
-use ferrofin_traits::security::AuthenticationManager;
+use ferrofin_traits::security::{AuthenticationManager, PasswordResetManager};
 use uuid::Uuid;
 
 use crate::fingerprint::Fingerprinter;
@@ -110,6 +110,16 @@ pub trait Extension: Send + Sync {
     fn auth_providers(&self, _cx: &ExtensionContext) -> Vec<Arc<dyn AuthenticationManager>> {
         Vec::new()
     }
+    /// The password-reset providers this extension contributes. A
+    /// forgotten-password request goes to the one a user's
+    /// `PasswordResetProviderId` names, when it is enabled, and every provider
+    /// is offered a PIN after the built-in one. Defaults to none.
+    fn password_reset_providers(
+        &self,
+        _cx: &ExtensionContext,
+    ) -> Vec<Arc<dyn PasswordResetManager>> {
+        Vec::new()
+    }
     /// The background tasks this extension contributes.
     fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>>;
 }
@@ -170,10 +180,11 @@ pub fn register_tasks(
     }
 }
 
-/// Hands every extension's authentication providers to the user manager, in
-/// extension order. The manager is built long before the extensions, so this
-/// fills its one late slot
-/// ([`FerrofinUserManager::set_extension_providers`]); call it once.
+/// Hands every extension's authentication and password-reset providers to the
+/// user manager, in extension order. The manager is built long before the
+/// extensions, so this fills its late slots
+/// ([`FerrofinUserManager::set_extension_providers`],
+/// [`FerrofinUserManager::set_extension_reset_providers`]); call it once.
 pub fn register_auth_providers(
     extensions: &[Arc<dyn Extension>],
     cx: &ExtensionContext,
@@ -183,6 +194,12 @@ pub fn register_auth_providers(
         extensions
             .iter()
             .flat_map(|ext| ext.auth_providers(cx))
+            .collect(),
+    );
+    users.set_extension_reset_providers(
+        extensions
+            .iter()
+            .flat_map(|ext| ext.password_reset_providers(cx))
             .collect(),
     );
 }
@@ -336,9 +353,100 @@ mod tests {
                 users: Arc::clone(&cx.users),
             })]
         }
+        fn password_reset_providers(
+            &self,
+            _cx: &ExtensionContext,
+        ) -> Vec<Arc<dyn PasswordResetManager>> {
+            vec![Arc::new(DirectoryResetPage)]
+        }
         fn tasks(&self, _cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>> {
             Vec::new()
         }
+    }
+
+    /// Sends a forgotten password to the directory's own reset page, as
+    /// LDAP-Auth's reset provider does.
+    struct DirectoryResetPage;
+
+    #[async_trait]
+    impl PasswordResetManager for DirectoryResetPage {
+        fn name(&self) -> &'static str {
+            "Tests Directory"
+        }
+        fn id(&self) -> &'static str {
+            "Tests.Plugin.DirectoryProvider"
+        }
+        async fn is_enabled(&self) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn start_forgot_password_process(
+            &self,
+            _user: Option<&ferrofin_db::entities::users::UserEntity>,
+            _entered_username: &str,
+            _is_in_network: bool,
+        ) -> Result<ferrofin_model::users::ForgotPasswordResult, ServiceError> {
+            Ok(ferrofin_model::users::ForgotPasswordResult {
+                action: ferrofin_model::users::ForgotPasswordAction::ContactAdmin,
+                pin_file: Some("https://directory.example/reset".to_owned()),
+                pin_expiration_date: None,
+            })
+        }
+        async fn redeem_password_reset_pin(
+            &self,
+            _pin: &str,
+        ) -> Result<ferrofin_model::users::PinRedeemResult, ServiceError> {
+            Ok(ferrofin_model::users::PinRedeemResult::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_extensions_reset_provider_is_listed_and_answers_its_users() {
+        let (cx, users) = context_with_users().await;
+        let extensions: Vec<Arc<dyn Extension>> = vec![Arc::new(DirectoryExtension)];
+        register_auth_providers(&extensions, &cx, &users);
+
+        let ids: Vec<Option<String>> = cx
+            .users
+            .get_password_reset_providers()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|pair| pair.id)
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                Some(
+                    "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider".to_owned()
+                ),
+                Some("Tests.Plugin.DirectoryProvider".to_owned()),
+            ]
+        );
+        let user = cx.users.create_user("dana").await.expect("create");
+        let uid = Uuid::parse_str(&user.id).expect("id");
+        cx.users
+            .update_policy(
+                uid,
+                &ferrofin_model::users::UserPolicy {
+                    authentication_provider_id:
+                        "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider"
+                            .to_owned(),
+                    password_reset_provider_id: "Tests.Plugin.DirectoryProvider".to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("policy");
+        let result = cx
+            .users
+            .start_forgot_password_process("dana", true)
+            .await
+            .expect("forgot password");
+        assert_eq!(
+            result.pin_file.as_deref(),
+            Some("https://directory.example/reset"),
+            "the saved reset provider answers"
+        );
     }
 
     #[tokio::test]
@@ -434,6 +542,7 @@ mod tests {
         assert!(kept[0].tasks(&cx).is_empty());
         assert!(kept[0].media_segment_providers(&cx).is_empty());
         assert!(kept[0].auth_providers(&cx).is_empty());
+        assert!(kept[0].password_reset_providers(&cx).is_empty());
     }
 
     #[tokio::test]

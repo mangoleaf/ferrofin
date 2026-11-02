@@ -1,7 +1,10 @@
-//! Security-layer traits — pluggable authentication and Quick Connect.
+//! Security-layer traits — pluggable authentication, password reset and Quick
+//! Connect.
 //!
 //! Port of `MediaBrowser.Controller.Authentication.IAuthenticationProvider`
-//! (surfaced here as [`AuthenticationManager`]) and
+//! (surfaced here as [`AuthenticationManager`]),
+//! `MediaBrowser.Controller.Authentication.IPasswordResetProvider`
+//! ([`PasswordResetManager`]) and
 //! `MediaBrowser.Controller.QuickConnect.IQuickConnect` ([`QuickConnect`]).
 //!
 //! Port rules applied throughout:
@@ -21,13 +24,13 @@
 //! - `Task<T>` → `async fn -> Result<T, ServiceError>`; the `IsEnabled` property
 //!   becomes an `async fn` so implementations may consult live configuration.
 //!
-//! Both traits are object-safe and carry `_assert_object_safe_*` assertions.
+//! Every trait is object-safe and carries an `_assert_object_safe_*` assertion.
 
 use async_trait::async_trait;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::quick_connect::QuickConnectResult;
 use ferrofin_model::security::AuthenticationInfo;
-use ferrofin_model::users::UserPolicy;
+use ferrofin_model::users::{ForgotPasswordResult, PinRedeemResult, UserPolicy};
 use uuid::Uuid;
 
 use crate::error::ServiceError;
@@ -112,6 +115,52 @@ pub trait AuthenticationManager: Send + Sync {
 }
 
 fn _assert_object_safe_authentication_manager(_: &dyn AuthenticationManager) {}
+
+/// A pluggable password-reset backend: the built-in PIN file, or a
+/// directory's reset page (LDAP-Auth).
+///
+/// Port of `IPasswordResetProvider`. A user's `PasswordResetProviderId`
+/// stores the [`id`](Self::id) that selects it for their forgotten-password
+/// requests (`UserManager.GetPasswordResetProviders(User)`), and every provider
+/// is offered a PIN in turn until one redeems it
+/// (`UserManager.RedeemPasswordResetPin`).
+#[async_trait]
+pub trait PasswordResetManager: Send + Sync {
+    /// The provider's display name, the `Name` `GET /Auth/PasswordResetProviders`
+    /// lists.
+    fn name(&self) -> &str;
+
+    /// The id a user's `PasswordResetProviderId` stores to select this
+    /// provider, the `Id` `GET /Auth/PasswordResetProviders` lists (C#
+    /// `GetType().FullName`). Defaults to [`name`](Self::name).
+    fn id(&self) -> &str {
+        self.name()
+    }
+
+    /// Whether the provider is currently enabled.
+    async fn is_enabled(&self) -> Result<bool, ServiceError>;
+
+    /// Starts a forgotten-password request for `entered_username`: `user` is
+    /// the account it names, or `None` when it names none, and
+    /// `is_in_network` whether the request came from the local network.
+    async fn start_forgot_password_process(
+        &self,
+        user: Option<&UserEntity>,
+        entered_username: &str,
+        is_in_network: bool,
+    ) -> Result<ForgotPasswordResult, ServiceError>;
+
+    /// Redeems a PIN this provider issued.
+    ///
+    /// A provider with no request matching `pin`, or one that issues no PINs,
+    /// answers a [`PinRedeemResult`] with `success` false, never an error: an
+    /// error stops the redemption, so it would keep a later provider from
+    /// redeeming its own PIN. (Upstream's LDAP provider throws
+    /// `NotImplementedException` here.)
+    async fn redeem_password_reset_pin(&self, pin: &str) -> Result<PinRedeemResult, ServiceError>;
+}
+
+fn _assert_object_safe_password_reset_manager(_: &dyn PasswordResetManager) {}
 
 /// Drives the Quick Connect pairing flow.
 ///
