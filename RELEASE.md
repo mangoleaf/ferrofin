@@ -56,6 +56,13 @@ from.
    area, the scale, and the upgrade notes. The `github-release-overview` skill collects the
    commits and PRs and drafts it.
 
+   **Upgrade notes.** Before the freeze, every release, patch releases included, gets its
+   `## X.Y.Z` section in [`docs/UPGRADING.md`](docs/UPGRADING.md), written from the **Upgrade
+   note** lines of the pull requests it contains: what an operator must do or plan for, grouped
+   by who has to act or when, a line or two each, or "Nothing to do." when no pull request has
+   one. It lands through a pull request into the branch you release from. The
+   `github-release-overview` skill drafts it, for a patch release too, which has no overview.
+
    **Freeze.** From here until the tag exists, nothing merges into the release branch. If its
    head moves anyway, start again from step 1: the workflow tags the head at the time it
    runs.

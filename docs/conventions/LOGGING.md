@@ -97,7 +97,11 @@ in its userinfo, its query or its path, and no rule tells a credential in a path
 ordinary one, so log the id of what it belongs to and only its scheme and host
 (`ferrofin_util::source_url::redact_url`). The same goes for error text, which ends up in
 a log or a `4xx` body: `reqwest::Error` prints the URL in its `Display` and `Debug`, so
-take it off with `without_url()`.
+take it off with `without_url()`. ffmpeg needs the real URL, and it prints that URL and
+every segment URL itself, so a job reading one has its `FFmpeg.*.log`, its debug argument
+line and the stderr tail in its errors filtered (`transcoding::ffmpeg_log`). The
+`-user_agent` and `-referer` values go too. An ordinary file transcode's log stays byte
+for byte.
 
 ## 6. The sinks are fixed
 
