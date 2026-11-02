@@ -1729,10 +1729,12 @@ pub const VERIFIED: &[Verified] = &[
                answers as ExceptionMiddleware does \
                outside Development, the same on a live 12.4 for each refusal. Compared: user \
                lookup and lock, provider order and selection by the saved id \
-               (AuthenticationManager::id, GetType().FullName), the provider's canonical \
-               username, the new-user policy, the saved provider id, the disabled, remote and \
-               schedule checks, the failure counter and lockout, the device and session \
-               limits, token rotation and session activity. The UserDto and SessionInfoDto \
+               (AuthenticationManager::id, GetType().FullName), the warning naming the user \
+               and the saved id when no enabled provider has it (InvalidAuthProvider then \
+               refuses the sign-in), the provider's canonical username, the new-user \
+               policy, the saved provider id, the disabled, remote and schedule checks, \
+               the failure counter and lockout, the device and session limits, token \
+               rotation and session activity. The UserDto and SessionInfoDto \
                builders are shared with other routes and not compared here",
         date: "2026-11-02",
         divergences: &[
