@@ -207,6 +207,7 @@ fn start_req<'a>(
     StartFfMpegRequest {
         env: Vec::new(),
         hardware_acceleration_type: ferrofin_model::entities::HardwareAccelerationType::none,
+        user_id: None,
         program: "ffmpeg",
         state,
         output_path,
@@ -461,7 +462,7 @@ async fn manager_start_ffmpeg_surfaces_nonzero_exit_as_error() {
         .await
         .expect_err("bogus input should fail");
     assert!(
-        err.contains("exited with code") || err.contains("timed out"),
+        err.to_string().contains("exited with code") || err.to_string().contains("timed out"),
         "unexpected error: {err}"
     );
     // The failed job left nothing registered (OnTranscodeFailedToStart).
@@ -534,7 +535,8 @@ async fn a_remote_source_reaches_ffmpeg_but_not_its_log_or_error() {
     let err = manager
         .start_ffmpeg(&transcoder, start_req(&st, &playlist, args))
         .await
-        .expect_err("a 500 source should fail");
+        .expect_err("a 500 source should fail")
+        .to_string();
     assert!(err.contains("exited with code"), "{err}");
     assert!(!err.contains("SECRET"), "{err}");
 

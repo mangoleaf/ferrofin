@@ -518,6 +518,12 @@ fn an_invalid_value_leaves_the_file_byte_identical() {
             "from 128 to 2048",
         ),
         ("image_resize_budget_mb", json!(0), "from 256 to 16384"),
+        ("image_download_max_mb", json!(15), "from 16 to 256"),
+        (
+            "image_negative_cache_ttl_secs",
+            json!(299),
+            "from 300 to 86400",
+        ),
         (
             "ffmpeg_img_extract_perf_tradeoff",
             json!("yes"),
@@ -562,6 +568,22 @@ fn an_invalid_value_leaves_the_file_byte_identical() {
             "{key} = {value}: {:?}",
             leftovers(data.path())
         );
+    }
+}
+
+/// The transcode caps take 0, which is off, to 1024, and saving refuses the
+/// rest, where the loader would clamp them.
+#[test]
+fn a_transcode_cap_outside_its_range_is_refused() {
+    let data = DataDir::new(&[]);
+    let env = FakeEnv::new();
+    for (key, value) in [
+        ("max_transcodes", json!(1025)),
+        ("max_transcodes_per_user", json!(-1)),
+    ] {
+        let err = saved(&data, &env, &[(key, value)]).expect_err("refused");
+        let message = refused(err);
+        assert!(message.contains("from 0 to 1024"), "{message}");
     }
 }
 

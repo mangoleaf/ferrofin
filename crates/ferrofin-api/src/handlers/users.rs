@@ -36,10 +36,12 @@
 //! - `ServerId` is the server's system id: the user manager sets it on every
 //!   `UserDto` it builds, and the authentication result takes it from the
 //!   session.
+//! - A refused login answers as upstream's `ExceptionMiddleware` does, with no
+//!   reason in the body ([`login_failure`]).
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -57,10 +59,14 @@ use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth, RequireAuthIgnoringSchedule};
+use crate::auth::{
+    AuthenticatedIdentity, RequireAdmin, RequireAuth, RequireAuthIgnoringSchedule,
+    is_administrator_identity,
+};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, ProblemDetails, Query};
 use crate::handlers::items::user_uuid;
+use crate::panic_boundary::ERROR_BODY;
 use crate::state::AppState;
 
 /// The `AuthenticateByName` request body.
@@ -251,16 +257,17 @@ fn redeem_reset_pins(
     Ok(matches)
 }
 
-/// Query parameters carrying an optional `userId` (the update/password routes).
+/// Query parameters carrying an optional `userId` (the update, password and
+/// user-image write routes).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UserIdQuery {
+pub(crate) struct UserIdQuery {
     /// The target user; defaults to the authenticated caller when absent.
     #[serde(
         default,
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
-    user_id: Option<Uuid>,
+    pub(crate) user_id: Option<Uuid>,
 }
 
 /// Query parameters for `GET /Users` (hidden/disabled filters).
@@ -364,7 +371,7 @@ async fn authenticate_by_name(
     State(state): State<AppState>,
     parts: Parts,
     JsonBody(body): JsonBody<AuthenticateByNameRequest>,
-) -> Result<Json<AuthenticationResult>, ApiError> {
+) -> Result<Response, ApiError> {
     Box::pin(authenticate(&state, &parts, body)).await
 }
 
@@ -389,7 +396,7 @@ async fn authenticate_by_id(
     Path(user_id): Path<Uuid>,
     Query(query): Query<AuthenticateByIdQuery>,
     parts: Parts,
-) -> Result<Json<AuthenticationResult>, ApiError> {
+) -> Result<Response, ApiError> {
     // `GetUserById(Guid.Empty)` throws `ArgumentException`: a `400`.
     if user_id.is_nil() {
         return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
@@ -404,12 +411,35 @@ async fn authenticate_by_id(
     Box::pin(authenticate(&state, &parts, body)).await
 }
 
+/// Answers a failed login: a `401` or `403` as upstream's `ExceptionMiddleware`
+/// answers an `AuthenticationException` or a `SecurityException` outside
+/// Development, with the status, `text/plain` and [`ERROR_BODY`].
+///
+/// The reason stays out of the body, which would otherwise tell a caller which
+/// usernames exist and name a disabled account. jellyfin-web and the Kotlin SDK
+/// read only the status: `401` is bad credentials, `403` an account that may
+/// not sign in. The core logs each refused login at `warn` with its `reason`;
+/// the debug line here adds the text, and is the only record of Quick Connect
+/// being off.
+///
+/// Every other failure is the caller's to answer as before, so a login's `400`
+/// or `500` keeps the shared [`ApiError`] body.
+fn login_failure(error: ServiceError) -> Result<Response, ApiError> {
+    let error = ApiError::from(error);
+    let status = error.status();
+    if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
+        return Err(error);
+    }
+    tracing::debug!(%status, %error, "login refused");
+    Ok((status, [(header::CONTENT_TYPE, "text/plain")], ERROR_BODY).into_response())
+}
+
 /// `UserController.AuthenticateUserByName`'s body, shared by both login routes.
 async fn authenticate(
     state: &AppState,
     parts: &Parts,
     body: AuthenticateByNameRequest,
-) -> Result<Json<AuthenticationResult>, ApiError> {
+) -> Result<Response, ApiError> {
     let auth = auth_info(parts);
     // C# `UserController.AuthenticateUserByName` sets
     // `RemoteEndPoint = HttpContext.GetNormalizedRemoteIP().ToString()`. It ends
@@ -446,7 +476,7 @@ async fn authenticate(
                 },
             )
             .await;
-            return Err(e.into());
+            return login_failure(e);
         }
     };
     // The `AuthenticationSucceeded` entry is NOT written here: C# raises it from
@@ -455,7 +485,7 @@ async fn authenticate(
     // handler instead put it before the (spawned) SessionStarted row and showed
     // the dashboard's login pair backwards. The consumer lives beside the
     // SessionStarted one in the composition root.
-    Ok(Json(authentication_result(state, result).await))
+    Ok(Json(authentication_result(state, result).await).into_response())
 }
 
 /// `POST /Users/AuthenticateWithQuickConnect` — finish a Quick Connect login.
@@ -482,10 +512,14 @@ async fn authenticate_with_quick_connect(
                 .into_response(),
         );
     };
-    let result = state
+    let result = match state
         .quick_connect
         .get_authorized_request(secret.expose())
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return login_failure(e),
+    };
     Ok(Json(authentication_result(&state, result).await).into_response())
 }
 
@@ -529,7 +563,8 @@ async fn authentication_result(
 /// `GET /Users` — list users, optionally filtered by hidden/disabled.
 ///
 /// Port of `UserController.GetUsers`: applies the hidden/disabled filters, sorts
-/// by username, and projects each to a [`UserDto`].
+/// by username, and projects each to a [`UserDto`]. [`strip_other_accounts`] goes
+/// beyond upstream.
 #[utoipa::path(
     get,
     path = "/Users",
@@ -542,10 +577,11 @@ async fn authentication_result(
 )]
 async fn get_users(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Query(query): Query<GetUsersQuery>,
 ) -> Result<Json<Vec<UserDto>>, ApiError> {
-    let dtos = filtered_user_dtos(&state, query.is_hidden, query.is_disabled, None).await?;
+    let mut dtos = filtered_user_dtos(&state, query.is_hidden, query.is_disabled, None).await?;
+    strip_other_accounts(&state, Some(&auth), &mut dtos).await?;
     Ok(Json(dtos))
 }
 
@@ -555,6 +591,8 @@ async fn get_users(
 /// are returned in both wizard states. After setup, remote callers only see
 /// accounts that allow remote access, using the shared live network policy.
 /// Authenticated callers also filter by their device after setup.
+/// [`strip_other_accounts`] goes beyond upstream. It runs after the filters that
+/// read `Policy`, and a login screen, signed out, sees neither field on any row.
 #[utoipa::path(
     get,
     path = "/Users/Public",
@@ -585,7 +623,36 @@ async fn get_public_users(
                 .is_some_and(|policy| policy.enable_remote_access)
         });
     }
+    strip_other_accounts(&state, auth.as_ref(), &mut dtos).await?;
     Ok(Json(dtos))
+}
+
+/// Clears `Policy` and `Configuration` from the rows of accounts `caller` may not
+/// read them for: every row but the caller's own, unless the caller is an
+/// administrator or an API key. A signed-out caller (`None`, `/Users/Public` on a
+/// login screen) has no own row.
+///
+/// An owner decision that goes beyond Jellyfin, which strips nothing (gl-1102).
+/// Both fields are nullable in the contract, and a cleared one is left out of the
+/// JSON, as Jellyfin writes any null.
+async fn strip_other_accounts(
+    state: &AppState,
+    caller: Option<&AuthorizationInfo>,
+    dtos: &mut [UserDto],
+) -> Result<(), ApiError> {
+    if let Some(auth) = caller
+        && is_administrator_identity(state, auth).await?
+    {
+        return Ok(());
+    }
+    let own_id = caller
+        .map(AuthorizationInfo::user_id)
+        .filter(|id| !id.is_nil());
+    for dto in dtos.iter_mut().filter(|dto| Some(dto.id) != own_id) {
+        dto.policy = None;
+        dto.configuration = None;
+    }
+    Ok(())
 }
 
 /// Lists users matching the optional hidden/disabled filters, ordered by name and
@@ -597,7 +664,7 @@ async fn filtered_user_dtos(
     device_id: Option<&str>,
 ) -> Result<Vec<UserDto>, ApiError> {
     let mut users = state.users.get_users().await?;
-    users.sort_by(|a, b| a.username.cmp(&b.username));
+    sort_by_username(&mut users);
 
     let mut dtos = Vec::with_capacity(users.len());
     for user in &users {
@@ -623,10 +690,22 @@ async fn filtered_user_dtos(
     Ok(dtos)
 }
 
+/// Upstream's `OrderBy(u => u.Username)`, which compares by the current culture.
+fn sort_by_username(users: &mut [UserEntity]) {
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture()).ok();
+    users.sort_by(|a, b| {
+        comparer.as_ref().map_or_else(
+            || a.username.cmp(&b.username),
+            |comparer| comparer.compare(&a.username, &b.username),
+        )
+    });
+}
+
 /// `GET /Users/{userId}` — a single user by id.
 ///
 /// Port of `UserController.GetUserById`: a nil id is a `400`, a missing user
-/// a `404`.
+/// a `404`. [`strip_other_accounts`] goes beyond upstream.
 #[utoipa::path(
     get,
     path = "/Users/{userId}",
@@ -640,11 +719,13 @@ async fn filtered_user_dtos(
 )]
 async fn get_user_by_id(
     State(state): State<AppState>,
-    RequireAuthIgnoringSchedule(_auth): RequireAuthIgnoringSchedule,
+    RequireAuthIgnoringSchedule(auth): RequireAuthIgnoringSchedule,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<UserDto>, ApiError> {
     let user = load_user(&state, user_id).await?;
-    Ok(Json(state.users.get_user_dto(&user, None).await?))
+    let mut dto = state.users.get_user_dto(&user, None).await?;
+    strip_other_accounts(&state, Some(&auth), std::slice::from_mut(&mut dto)).await?;
+    Ok(Json(dto))
 }
 
 /// `DELETE /Users/{userId}` — delete a user.
@@ -1276,7 +1357,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 }
 
 crate::query::query_parameters! {
-    UserIdQuery {} => [("post", "/Users"), ("post", "/Users/Configuration"), ("post", "/Users/Password")];
+    UserIdQuery {} => [("post", "/Users"), ("post", "/Users/Configuration"), ("post", "/Users/Password"), ("post", "/UserImage"), ("delete", "/UserImage")];
     GetUsersQuery {} => [("get", "/Users")];
     AuthenticateByIdQuery {} => [];
 }
@@ -1284,9 +1365,58 @@ crate::query::query_parameters! {
 #[cfg(test)]
 mod tests {
     use super::{
-        PASSWORD_RESET_PREFIX, SerializablePasswordReset, generate_reset_pin, issue_reset_pin,
-        normalize_pin, redeem_reset_pins,
+        ApiError, ERROR_BODY, PASSWORD_RESET_PREFIX, SerializablePasswordReset, ServiceError,
+        StatusCode, generate_reset_pin, header, issue_reset_pin, login_failure, normalize_pin,
+        redeem_reset_pins,
     };
+
+    /// `ExceptionMiddleware`'s answer, whatever the failure says. The server's
+    /// `login_failures` test drives the real refusals; a remote-access one needs
+    /// a client outside the local network, so its error is pinned here.
+    #[rstest::rstest]
+    #[case::bad_credentials(
+        ServiceError::unauthorized("Invalid username or password entered."),
+        StatusCode::UNAUTHORIZED
+    )]
+    #[case::remote_access(
+        ServiceError::Forbidden("remote access is not permitted for this user".to_owned()),
+        StatusCode::FORBIDDEN
+    )]
+    #[tokio::test]
+    async fn login_failure_answers_the_status_and_the_plain_body(
+        #[case] error: ServiceError,
+        #[case] status: StatusCode,
+    ) {
+        let response = login_failure(error).expect("a refusal is answered here");
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body, ERROR_BODY);
+    }
+
+    /// Only a `401` or `403` is a refused login; the rest keep the shared body.
+    #[rstest::rstest]
+    #[case::invalid_input(
+        ServiceError::invalid_input("app is required"),
+        "invalid input: app is required"
+    )]
+    #[case::not_found(
+        ServiceError::not_found("unable to find request"),
+        "not found: unable to find request"
+    )]
+    #[case::backend(ServiceError::backend("disk"), "backend error: disk")]
+    fn login_failure_leaves_other_errors_to_the_caller(
+        #[case] error: ServiceError,
+        #[case] message: &str,
+    ) {
+        let error: ApiError = login_failure(error).expect_err("not a refused login");
+        assert_eq!(error.to_string(), message);
+    }
 
     #[test]
     fn reset_pin_format_and_normalization() {

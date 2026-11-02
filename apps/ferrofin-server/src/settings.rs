@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrofin_core::system_manager::LifecycleController;
 use ferrofin_drawing::ImageLimits;
+use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_model::server_settings::{
     ServerSettingApplies as Applies, ServerSettingDto, ServerSettingGroup as Group,
     ServerSettingKind, ServerSettingSource as Source, ServerSettingsDto, ServerSettingsUpdateDto,
@@ -190,6 +191,12 @@ const PORT: SettingKind = SettingKind::Integer {
 const CACHE_TTL: SettingKind = SettingKind::Integer {
     min: *config::CACHE_TTL_RANGE_SECS.start() as i64,
     max: *config::CACHE_TTL_RANGE_SECS.end() as i64,
+};
+
+/// The transcode caps' bounds ([`TranscodeLimits::RANGE`]).
+const TRANSCODE_CAP: SettingKind = SettingKind::Integer {
+    min: *TranscodeLimits::RANGE.start() as i64,
+    max: *TranscodeLimits::RANGE.end() as i64,
 };
 
 /// [`EnvRead::Parsed`] for a variable the loader reads as a `u32`.
@@ -413,6 +420,32 @@ pub static SETTINGS: &[SettingSpec] = &[
         description: "Extract chapter images and thumbnails from keyframes only: faster, and \
                       the image may be less typical of the scene.",
         running: |c| json!(c.ffmpeg_img_extract_perf_tradeoff),
+        ..ROW
+    },
+    SettingSpec {
+        key: "max_transcodes",
+        env: Some("FERROFIN_MAX_TRANSCODES"),
+        env_read: PARSED_U32,
+        group: Group::Ffmpeg,
+        kind: TRANSCODE_CAP,
+        default: "0",
+        description: "Most jobs re-encoding a stream the server runs at once; past it a user's \
+                      idle jobs are ended, and a new one is refused if that makes no room. 0 \
+                      means no cap.",
+        running: |c| json!(c.max_transcodes),
+        ..ROW
+    },
+    SettingSpec {
+        key: "max_transcodes_per_user",
+        env: Some("FERROFIN_MAX_TRANSCODES_PER_USER"),
+        env_read: PARSED_U32,
+        group: Group::Ffmpeg,
+        kind: TRANSCODE_CAP,
+        default: "0",
+        description: "Most jobs re-encoding a stream one user runs at once; past it their \
+                      idle jobs are ended, and a new one is refused if none is idle. 0 means \
+                      no cap.",
+        running: |c| json!(c.max_transcodes_per_user),
         ..ROW
     },
     // ---- Library and database ---------------------------------------------
@@ -826,6 +859,30 @@ pub static SETTINGS: &[SettingSpec] = &[
         running: |c| json!(c.image_resize_budget_mb),
         ..ROW
     },
+    SettingSpec {
+        key: "image_download_max_mb",
+        env: Some("FERROFIN_IMAGE_DOWNLOAD_MAX_MB"),
+        env_read: PARSED_U32,
+        group: Group::Images,
+        kind: image_limit(ferrofin_providers::rate_limit::RequestLimits::DOWNLOAD_MAX_MB),
+        default: "64",
+        description: "Largest remote image downloaded, in MiB; a larger one is refused and the \
+                      read stops there.",
+        running: |c| json!(c.image_download_max_mb),
+        ..ROW
+    },
+    SettingSpec {
+        key: "image_negative_cache_ttl_secs",
+        env: Some("FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS"),
+        env_read: EnvRead::Parsed(parses::<u64>),
+        group: Group::Images,
+        kind: provider_seconds(ferrofin_providers::IMAGE_NEGATIVE_CACHE_TTL_SECS),
+        default: "3600",
+        description: "Seconds a remote image URL that gave no image is left alone before it is \
+                      tried again.",
+        running: |c| json!(c.image_negative_cache_ttl_secs),
+        ..ROW
+    },
     // ---- WASM plugins -----------------------------------------------------
     SettingSpec {
         key: "wasm_call_timeout_secs",
@@ -968,7 +1025,8 @@ const fn provider_seconds(range: std::ops::RangeInclusive<u64>) -> SettingKind {
     }
 }
 
-/// An image limit's bounds, from `ferrofin_drawing::ImageLimits`.
+/// An image limit's bounds, from `ferrofin_drawing::ImageLimits` or the
+/// download limit in `RequestLimits`.
 const fn image_limit(range: std::ops::RangeInclusive<u32>) -> SettingKind {
     SettingKind::Integer {
         min: *range.start() as i64,

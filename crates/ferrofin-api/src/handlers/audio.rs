@@ -22,7 +22,9 @@ use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::hls::nullable_enum_value;
 use crate::handlers::media_info::universal_audio_source;
-use crate::handlers::streaming::{serve_static_source, static_or_transcode, static_source};
+use crate::handlers::streaming::{
+    serve_static_source, static_or_transcode, static_source, stream_route_container,
+};
 use crate::state::AppState;
 
 /// `GET`/`HEAD /Audio/{itemId}/stream` — stream the requested audio source.
@@ -55,9 +57,7 @@ async fn get_audio_stream_by_container(
     let raw = request.uri().query().map(ToOwned::to_owned);
     let mut req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
     req.output_container = Some(
-        container
-            .strip_prefix("stream.")
-            .filter(|value| !value.is_empty())
+        stream_route_container(&container)
             .ok_or_else(|| ApiError::NotFound("stream route".to_owned()))?
             .to_owned(),
     );

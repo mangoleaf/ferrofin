@@ -2,6 +2,7 @@
 
 mod ffmpeg_log;
 pub mod fs_wait;
+pub mod limits;
 pub mod manager;
 pub mod progress;
 pub mod segment_cleaner;
@@ -10,6 +11,7 @@ pub mod throttler;
 pub mod tokio_segment_transcoder;
 
 pub use fs_wait::FsWaiter;
+pub use limits::{StartFfmpegError, TRANSCODE_RETRY_AFTER_SECS, TranscodeLimits, TranscodeRefused};
 pub use manager::{
     FileCleaner, FsFileCleaner, HLS_PING_TIMEOUT_MS, NoopSessionReporter,
     PROGRESSIVE_PING_TIMEOUT_MS, SEGMENT_READY_POLL_INTERVAL_MS, SessionReporter,

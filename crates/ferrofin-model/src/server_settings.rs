@@ -147,7 +147,7 @@ pub enum ServerSettingGroup {
     Observability,
     /// The remote metadata providers: keys, mirrors and request limits.
     Providers,
-    /// The memory limits of image decoding and resizing.
+    /// The limits of image decoding, resizing and downloading.
     Images,
     /// The limits of sandboxed WASM plugins.
     Wasm,

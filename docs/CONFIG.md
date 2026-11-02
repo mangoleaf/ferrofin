@@ -231,6 +231,8 @@ proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
 | `FERROFIN_FFMPEG_PATH` | auto-discovered on `$PATH` | Path to `ffmpeg`. Absent ffmpeg only disables transcode. |
 | `FERROFIN_FFPROBE_PATH` | auto-discovered on `$PATH` | Path to `ffprobe` (scan probes). |
 | `FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF` | `false` | Jellyfin's `FFmpeg:imgExtractPerfTradeoff`: trade frame quality for speed when extracting chapter images, video thumbnails and embedded pictures. On, the first attempt decodes keyframes only and takes the first one, instead of picking the most representative of 24 frames; extraction is faster, and the image may be less typical of the scene. The `config.toml` key is `ffmpeg_img_extract_perf_tradeoff`. |
+| `FERROFIN_MAX_TRANSCODES` | `0` | The most streaming jobs that re-encode the whole server runs at once, `0` to `1024` (a value outside logs a warning and is clamped). `0` means no cap. A job counts when it re-encodes any stream, video or audio, so a copied video with re-encoded audio counts and so does a music transcode; only a job copying every stream, a direct stream or remux, is free. It counts until its ffmpeg exits. Trickplay, chapter images, recordings and library analysis are other work and are not counted. Past the cap, a new job of a signed-in user first ends that user's own idle jobs (see `FERROFIN_MAX_TRANSCODES_PER_USER`). If that makes no room the request is refused with `503` and `Retry-After: 10`, before anything is started, and the stream can play once a job ends. Refusals log at `debug`. A job started with an API key counts here, and has no user whose jobs could be ended. Jellyfin has no such cap. The `config.toml` key is `max_transcodes`. |
+| `FERROFIN_MAX_TRANSCODES_PER_USER` | `0` | The most streaming jobs that re-encode one signed-in user runs at once, `0` to `1024`, counted as for `FERROFIN_MAX_TRANSCODES`. `0` means no cap. The user comes from the sign-in, never the request's `userId`, so accounts shared between devices share this cap. An API key has no user and is outside it. Past the cap, the user's idle jobs are ended first, longest idle first and no more than needed, so "next episode" works while the last episode's job waits to be reaped; if none is idle the request is refused with `503` and `Retry-After: 10`. Idle means no request is reading from the job at that moment, which is also true of an HLS player between two segment requests: with a low cap, a new stream can end one still playing on another device, and that device restarts its job at its next segment if there is room. Jellyfin has no such cap. The `config.toml` key is `max_transcodes_per_user`. |
 
 ## Library & database
 
@@ -292,6 +294,21 @@ little memory: under a container's memory limit, keep the budget and the decode 
 it, or the server can reach the limit first. At log level `debug`, a thumbnail refused names the
 image and the setting that refused it. A change applies at the next restart, the dashboard's
 in-process restart included.
+
+## Remote images
+
+Artwork that lives at a URL, such as a channel logo from an M3U playlist, is downloaded the first
+time a client asks for it. These settings bound what that can cost. One URL is downloaded by one
+request at a time, and the others wait for the result.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` | `64` | The largest remote image Ferrofin downloads, in MiB, clamped to `16`–`256` (a value outside logs a warning). A response that declares more is refused unread, and a read stops at the limit whatever the response declared. The limit covers everything downloaded from a metadata provider as bytes: channel logos, scan artwork, the **Download** button in the image editor, and OMDb and OpenSubtitles responses. The scan moves on to the provider's next image, saying so at log level `debug`. A download also has to finish within `FERROFIN_PROVIDER_TIMEOUT_SECONDS`, so raising the limit may need that raised too. The `config.toml` key is `image_download_max_mb`. |
+| `FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS` | `3600` | How long a logo URL that gave no image is left alone before it is tried again, in seconds, clamped to `300`–`86400` (a value outside logs a warning). That is a `404` or `403`, a response that is not an image, an empty one included, or one over the limit. A connection failure, a timeout, another status or a provider cooldown is not remembered, so it cannot hide a good image. Until the time is up the client gets a `404`, and Ferrofin keeps the image's row, where Jellyfin removes it. The memory is held per process and a restart clears it. The `config.toml` key is `image_negative_cache_ttl_secs`. |
+
+An image must look like one, whatever the response declares: JPEG, PNG, GIF, WebP, BMP, TIFF, ICO,
+AVIF, HEIC, JPEG XL, JPEG 2000 or uncompressed SVG. Anything else is refused and never stored. A
+change applies at the next restart, the dashboard's in-process restart included.
 
 ## Remote metadata provider keys
 

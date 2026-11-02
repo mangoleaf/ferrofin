@@ -285,9 +285,10 @@ for changes to those paths.
 
 The image limits have the same kind of gate. `image_limits_cgroup` boots the real binary in a
 `systemd-run --user --scope` with a hard memory cap and swap off, and checks that each limit holds
-there: the pixel limit, the resize budget, the memory limit on a Photo item, and the budget shared
-by concurrent resizes. It needs a systemd user session and CI does not run it: run it by hand for
-changes to `ferrofin-drawing/src/limits.rs`:
+there: the pixel limit, the resize budget, the memory limit on a Photo item, the budget shared
+by concurrent resizes, and remote images past the download limit. It needs a systemd user session
+and CI does not run it: run it by hand for changes to `ferrofin-drawing/src/limits.rs` or to
+`ferrofin-providers/src/image_download.rs`:
 
 ```bash
 FERROFIN_CGROUP_TESTS=1 cargo test -p ferrofin-server --test image_limits_cgroup
