@@ -56,10 +56,14 @@
 pub use crate::query::{Query, QueryParameters, QueryRejection};
 
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, FromRequest, OptionalFromRequest, Request};
+use axum::extract::{
+    DefaultBodyLimit, FromRequest, FromRequestParts, OptionalFromRequest, RawPathParams, Request,
+};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
@@ -509,6 +513,59 @@ where
     }
 }
 
+/// Names one `[FromRoute, Required] string` route parameter for
+/// [`RequiredRouteString`]. Each such parameter gets a marker type that
+/// implements this.
+pub trait RouteParameter {
+    /// The parameter's name in the route template (`{lyricId}` is
+    /// `"lyricId"`), which is also the key ASP.NET files its error under.
+    const NAME: &'static str;
+}
+
+/// A `[FromRoute, Required] string` route parameter, bound the way ASP.NET
+/// binds one. [`Query`] applies the same rule to query values.
+///
+/// `SimpleTypeModelBinder` reads a value of nothing but white space
+/// (`string.IsNullOrWhiteSpace`) as null (`ConvertEmptyStringToNull`), then
+/// `[Required]` fails, and `[ApiController]`'s model-state filter answers
+/// `400` "The {name} field is required." before the action runs.
+/// `axum::extract::Path<String>` takes such a value as it is. Any other value
+/// is kept exactly as sent, padding included, because the string binder does
+/// not trim.
+///
+/// Authorization runs before model binding upstream, so a handler lists its
+/// auth extractor ahead of this one.
+#[derive(Debug, Clone)]
+pub struct RequiredRouteString<P>(pub String, pub PhantomData<P>);
+
+impl<P, S> FromRequestParts<S> for RequiredRouteString<P>
+where
+    P: RouteParameter,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let params = RawPathParams::from_request_parts(parts, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let Some((_, value)) = params.iter().find(|(name, _)| *name == P::NAME) else {
+            // The handler names a parameter its route does not have. That is
+            // a bug in the route table, not a bad request.
+            tracing::error!(parameter = P::NAME, "route has no such parameter");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        };
+        if value.trim().is_empty() {
+            return Err(ProblemDetails::member_validation(
+                P::NAME,
+                format!("The {} field is required.", P::NAME),
+            )
+            .into_response());
+        }
+        Ok(Self(value.to_owned(), PhantomData))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,5 +744,79 @@ mod tests {
         let media = serde_json::to_value(ProblemDetails::unsupported_media_type()).expect("json");
         assert_eq!(media["status"], 415);
         assert!(media.get("errors").is_none());
+    }
+
+    /// `{name}` for the [`RequiredRouteString`] tests.
+    struct Name;
+
+    impl RouteParameter for Name {
+        const NAME: &'static str = "name";
+    }
+
+    /// `(status, body)` for `GET uri` on a router whose two routes bind
+    /// [`RequiredRouteString<Name>`]: `/named/{name}` has the parameter, and
+    /// `/other/{other}` does not.
+    async fn bind_route_string(uri: &str) -> (StatusCode, String) {
+        use tower::ServiceExt as _;
+        async fn echo(RequiredRouteString(value, _): RequiredRouteString<Name>) -> String {
+            format!("[{value}]")
+        }
+        let app = axum::Router::new()
+            .route("/named/{name}", axum::routing::get(echo))
+            .route("/other/{other}", axum::routing::get(echo));
+        let response = app
+            .oneshot(
+                Request::get(uri)
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    #[rstest::rstest]
+    #[case::plain("/named/abc", "[abc]")]
+    #[case::padded_is_kept("/named/%20abc%20", "[ abc ]")]
+    #[case::decoded("/named/a%2Fb", "[a/b]")]
+    #[tokio::test]
+    async fn a_required_route_string_keeps_any_value_with_text(
+        #[case] uri: &str,
+        #[case] bound: &str,
+    ) {
+        assert_eq!(
+            bind_route_string(uri).await,
+            (StatusCode::OK, bound.to_owned())
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::space("/named/%20")]
+    #[case::tab_and_line_feed("/named/%09%0A")]
+    #[case::no_break_space("/named/%C2%A0")]
+    #[case::ideographic_space("/named/%E3%80%80")]
+    #[tokio::test]
+    async fn a_blank_required_route_string_is_the_validation_400(#[case] uri: &str) {
+        let (status, body) = bind_route_string(uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("json"),
+            serde_json::json!({
+                "type": VALIDATION_TYPE,
+                "title": VALIDATION_TITLE,
+                "status": 400,
+                "errors": { "name": ["The name field is required."] },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_required_route_string_its_route_lacks_is_a_500() {
+        let (status, _) = bind_route_string("/other/abc").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

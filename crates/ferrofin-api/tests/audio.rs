@@ -873,6 +873,10 @@ async fn post_body(app: AppState, uri: &str, body: Vec<u8>) -> StatusCode {
 #[case::plain("s.lrc", b"[00:01.00]hi".to_vec(), "lrc")]
 #[case::dot_only_name(".lrc", b"[00:01.00]hi".to_vec(), "lrc")]
 #[case::folder_in_name("a.b/song.TXT", b"hi".to_vec(), "TXT")]
+// gl-1027: neither `GetExtension` nor `RightPart` trims, so the padding
+// reaches `SaveLyricAsync`, whose parsers then refuse it.
+#[case::padded_extension("s.lrc%20", b"[00:01.00]hi".to_vec(), "lrc ")]
+#[case::line_break_in_extension("s.lrc%0A", b"[00:01.00]hi".to_vec(), "lrc\n")]
 #[case::utf16(
     "s.lrc",
     [&[0xFF, 0xFE][..], &[b'h', 0, b'i', 0]].concat(),
@@ -964,6 +968,198 @@ async fn lyrics_upload_without_an_extension_is_400(#[case] file_name: &str) {
         StatusCode::BAD_REQUEST
     );
     assert!(saved.lock().unwrap().is_none());
+}
+
+/// gl-1027: `UploadLyrics` checks the item, then an empty `Content-Length`,
+/// then the extension, and only then copies `Request.Body`, the read on which
+/// Kestrel enforces its 30,000,000-byte limit. So an oversize upload for a
+/// missing or non-audio item is the `404`, one whose name has no extension is
+/// the `400`, and only one that gets as far as the read is the `413` (a
+/// plain-text `500` upstream, recorded on the row). Ferrofin read the body
+/// before the handler ran and answered all of them `413`.
+#[rstest::rstest]
+#[case::missing_item(Uuid::from_u128(0x00A1_0FFF), "s.lrc", StatusCode::NOT_FOUND)]
+#[case::non_audio_item(MOVIE_ID, "s.lrc", StatusCode::NOT_FOUND)]
+#[case::no_extension(ITEM_ID, "song", StatusCode::BAD_REQUEST)]
+#[case::read(ITEM_ID, "s.lrc", StatusCode::PAYLOAD_TOO_LARGE)]
+#[tokio::test]
+async fn lyrics_upload_reads_the_body_after_the_item_and_name_checks(
+    #[case] item_id: Uuid,
+    #[case] file_name: &str,
+    #[case] expected: StatusCode,
+) {
+    let (_dir, path) = temp_media();
+    let saved = Arc::new(Mutex::new(None));
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: Some(LyricDto::default()),
+            remote: None,
+            deleted: Arc::default(),
+            saved: Arc::clone(&saved),
+        }),
+    );
+    let uri = format!("/Audio/{item_id}/Lyrics?fileName={file_name}");
+    assert_eq!(post_body(app, &uri, vec![b'a'; 30_000_001]).await, expected);
+    assert!(saved.lock().unwrap().is_none());
+}
+
+/// `Request.ContentLength.GetValueOrDefault(0) == 0` is the action's
+/// `400 "No lyrics uploaded"`, checked after the item and before the file
+/// name, and nothing is saved.
+#[rstest::rstest]
+#[case::empty(ITEM_ID, "s.lrc", StatusCode::BAD_REQUEST)]
+#[case::empty_without_an_extension(ITEM_ID, "song", StatusCode::BAD_REQUEST)]
+#[case::empty_for_a_missing_item(Uuid::from_u128(0x00A1_0FFF), "s.lrc", StatusCode::NOT_FOUND)]
+#[tokio::test]
+async fn lyrics_upload_with_an_empty_body_is_400_after_the_item_check(
+    #[case] item_id: Uuid,
+    #[case] file_name: &str,
+    #[case] expected: StatusCode,
+) {
+    let (_dir, path) = temp_media();
+    let saved = Arc::new(Mutex::new(None));
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: Some(LyricDto::default()),
+            remote: None,
+            deleted: Arc::default(),
+            saved: Arc::clone(&saved),
+        }),
+    );
+    let uri = format!("/Audio/{item_id}/Lyrics?fileName={file_name}");
+    let (status, body) = call(app, "POST", &uri).await;
+    assert_eq!(status, expected);
+    if expected == StatusCode::BAD_REQUEST {
+        assert!(
+            String::from_utf8_lossy(&body).contains("no lyrics uploaded"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    assert!(saved.lock().unwrap().is_none());
+}
+
+/// A chunked upload carries no `Content-Length`, so it is read (the row's
+/// recorded divergence) and an empty one is the same `400` after the read.
+#[tokio::test]
+async fn lyrics_upload_with_an_empty_chunked_body_is_400() {
+    let (_dir, path) = temp_media();
+    let saved = Arc::new(Mutex::new(None));
+    let app = state(
+        &path,
+        Arc::new(CannedLyrics {
+            stored: Some(LyricDto::default()),
+            remote: None,
+            deleted: Arc::default(),
+            saved: Arc::clone(&saved),
+        }),
+    );
+    let chunks = futures_util::stream::empty::<Result<axum::body::Bytes, std::io::Error>>();
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/Audio/{ITEM_ID}/Lyrics?fileName=s.lrc"))
+        .header("Authorization", "Bearer token")
+        .header("Content-Type", "text/plain")
+        .body(Body::from_stream(chunks))
+        .expect("request");
+    let response = create_router(app).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&body).contains("no lyrics uploaded"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(saved.lock().unwrap().is_none());
+}
+
+/// `[FromQuery, Required] string fileName` is bound before the action runs:
+/// a missing, empty or blank one is a `400` even for a missing item (the
+/// `Query` extractor, `query/required.json` and `query/non_nullable.json`).
+#[rstest::rstest]
+#[case::missing("")]
+#[case::empty("?fileName=")]
+#[case::blank("?fileName=%20")]
+#[tokio::test]
+async fn lyrics_upload_refuses_a_blank_file_name_before_the_item_check(#[case] query: &str) {
+    let (_dir, path) = temp_media();
+    let app = state(&path, no_lyrics());
+    let uri = format!("/Audio/{}/Lyrics{query}", Uuid::from_u128(0x00A1_0FFF));
+    assert_eq!(
+        post_body(app, &uri, b"[00:01.00]hi".to_vec()).await,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+/// gl-1028: `DownloadRemoteLyrics` and `GetRemoteLyrics` bind
+/// `[FromRoute, Required] string lyricId`. ASP.NET's `SimpleTypeModelBinder`
+/// reads a route value of nothing but white space as null
+/// (`ConvertEmptyStringToNull`), `[Required]` fails, and `[ApiController]`
+/// answers a `400` `ValidationProblemDetails` keyed `lyricId` before the
+/// action runs: before the item check, but after the `LyricManagement`
+/// policy. Ferrofin looked the blank id up and answered `404`.
+#[rstest::rstest]
+#[case::download_space("POST", "/Audio/ITEM/RemoteSearch/Lyrics/%20")]
+#[case::download_tab("POST", "/Audio/ITEM/RemoteSearch/Lyrics/%09")]
+#[case::download_no_break_space("POST", "/Audio/ITEM/RemoteSearch/Lyrics/%C2%A0")]
+#[case::download_for_a_non_audio_item("POST", "/Audio/MOVIE/RemoteSearch/Lyrics/%20")]
+#[case::remote_space("GET", "/Providers/Lyrics/%20")]
+#[case::remote_spaces("GET", "/Providers/Lyrics/%20%20%20")]
+#[case::remote_line_feed("GET", "/Providers/Lyrics/%0A")]
+#[tokio::test]
+async fn remote_lyric_routes_refuse_a_blank_lyric_id(#[case] method: &str, #[case] path: &str) {
+    let canned = || CannedLyrics {
+        stored: None,
+        remote: None,
+        deleted: Arc::default(),
+        saved: Arc::default(),
+    };
+    let path = path
+        .replace("ITEM", &ITEM_ID.to_string())
+        .replace("MOVIE", &MOVIE_ID.to_string());
+
+    let (_dir, media) = temp_media();
+    let (status, body) = call(state(&media, Arc::new(canned())), method, &path).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}");
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        problem,
+        serde_json::json!({
+            "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+            "title": "One or more validation errors occurred.",
+            "status": 400,
+            "errors": { "lyricId": ["The lyricId field is required."] },
+        }),
+        "{method} {path}"
+    );
+
+    // The policy runs first: without the permission it is still the `403`.
+    let (_dir, media) = temp_media();
+    let app = state_as(&media, Arc::new(canned()), false, false);
+    let (status, _) = call(app, method, &path).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+}
+
+/// The binder drops only a value that is all white space: a padded id is
+/// looked up as sent (the string binder does not trim).
+#[tokio::test]
+async fn remote_lyrics_look_a_padded_id_up_as_sent() {
+    let (_dir, media) = temp_media();
+    let app = state(
+        &media,
+        Arc::new(CannedLyrics {
+            stored: None,
+            remote: Some((" abc_1".to_owned(), LyricDto::default())),
+            deleted: Arc::default(),
+            saved: Arc::default(),
+        }),
+    );
+    let (status, _) = call(app, "GET", "/Providers/Lyrics/%20abc_1").await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
