@@ -59,7 +59,10 @@
 //!   acceleration on. Every vendor chain hands such a job to
 //!   `GetSwVidFilterChain`, which this path ports, so it keeps full chroma, the
 //!   tone-map and the conversion below. Only the filter graph differs from
-//!   the vendor chain's: neither passes such a job any device arguments.
+//!   the vendor chain's. Neither initialises a device for such a job, except
+//!   upstream with VAAPI or QSV when the server's hardware encoding is on, its
+//!   MJPEG encoder is available (iHD for VAAPI) and trickplay's switch is off,
+//!   which starts a device nothing uses.
 //! - The software scale converts the frame to the BT.601 matrix
 //!   (`out_color_matrix=bt601`), the one every JPEG decoder reads, the tile
 //!   packer's included. ffmpeg converts the range to the JPEG's full range
@@ -71,8 +74,15 @@
 //!   converted, and neither are untagged ones, which players often show as
 //!   BT.709 when they are HD. The conversion needs ffmpeg 5.1 or later
 //!   ([`MIN_FFMPEG_JPEG_MATRIX_CONVERSION`]); an older one gets none and
-//!   gives upstream's colours. The hardware path still writes the source's
-//!   matrix (gl-1157).
+//!   gives upstream's colours. On the hardware path, frames a hardware decoder
+//!   hands the software MJPEG encoder get the same conversion at the end of
+//!   the graph, from the matrix they really hold (BT.709 when tone-mapped,
+//!   else the probed colour space), not from the BT.709 the chain's
+//!   `setparams` re-tags every SDR frame with. That was measured on NVENC;
+//!   the VAAPI and QSV downloads (`nv12`, limited or full range) were measured
+//!   with CPU scalers in their formats, not on Intel or AMD hardware. Frames
+//!   for a hardware MJPEG encoder (VAAPI, QSV) keep the source's matrix, as
+//!   upstream's do: open work (gl-1169), which needs that hardware to verify.
 //! - The tone-map of an HDR source departs twice. `tonemapx` writes BT.709,
 //!   so the BT.601 conversion above moves out of the scale, where it would
 //!   convert the BT.2020 input, into a `scale=out_color_matrix=bt601` behind
@@ -673,6 +683,23 @@ pub fn build_accelerated_trickplay_args(
         graph.insert_str(at?, &pts_normalizer(rate));
     }
 
+    // Frames a hardware decoder hands the software MJPEG encoder are still in
+    // the source's matrix; convert them to the JPEG's BT.601, as the software
+    // path does (the module's departures). A hardware MJPEG encoder keeps them
+    // on the GPU, where nothing converts them yet (gl-1169).
+    if video_encoder == hw::encoder::DEFAULT_MJPEG_ENCODER
+        && caps
+            .ffmpeg_version()
+            .is_some_and(|v| v >= MIN_FFMPEG_JPEG_MATRIX_CONVERSION)
+        && let Some(matrix) = frame_matrix(stream, &graph)
+    {
+        use std::fmt::Write as _;
+        let _ = write!(
+            graph,
+            ",scale=in_color_matrix={matrix}:out_color_matrix=bt601"
+        );
+    }
+
     let (quality_option, quality) = mjpeg_quality(&video_encoder, qscale);
     let hwaccel_args = hwaccel.args.trim();
     let separator = if hwaccel_args.is_empty() { "" } else { " " };
@@ -704,6 +731,33 @@ pub fn build_accelerated_trickplay_args(
         output = quote(output_pattern),
     );
     Some((args, hwaccel.env))
+}
+
+/// The Y'CbCr matrix of the frames a hardware chain hands the encoder, by
+/// swscale's name, or `None` when they are BT.601 already or the source does
+/// not say (read as BT.601, as the software path reads an untagged frame).
+///
+/// A tone-mapped frame is BT.709: every tone-mapper the chains use writes it
+/// (`tonemap_cuda`, `tonemap_opencl`, `tonemap_vaapi`, `vpp_qsv`'s `tonemap=1`,
+/// libplacebo's `tonemapping=`, `tonemapx`). Otherwise the frame keeps the
+/// source's matrix whatever the chain's `setparams` re-tag says: an SD source
+/// re-tagged BT.709 still holds BT.601 values. A tone-map the driver ignores
+/// (`vpp_qsv`'s `tonemap=1` on an MSDK runtime, which upstream notes)
+/// is not detected: that frame is converted as BT.709 though it is BT.2020,
+/// and it is un-tone-mapped anyway.
+fn frame_matrix(stream: &MediaStream, graph: &str) -> Option<&'static str> {
+    // ponytail: read off the graph just built, as each name above holds
+    // `tonemap`; a flag from every vendor chain would repeat their gates.
+    if graph.contains("tonemap") {
+        return Some("bt709");
+    }
+    match stream.color_space.as_deref()? {
+        "bt709" => Some("bt709"),
+        "bt2020nc" | "bt2020c" => Some("bt2020"),
+        "smpte240m" => Some("smpte240m"),
+        "fcc" => Some("fcc"),
+        _ => None,
+    }
 }
 
 /// The MJPEG quality option name and value for `video_encoder`.
@@ -3376,6 +3430,12 @@ mod accelerated_tests {
             display_corrected_height(&stream(720, 576, Some("16:9"))),
             Some(405)
         );
+        // 1:0 would make it 0, which upstream hands its fixed-size scale: the
+        // stored height is kept.
+        assert_eq!(
+            display_corrected_height(&stream(720, 576, Some("1:0"))),
+            Some(576)
+        );
         // Already square: left alone.
         assert_eq!(
             display_corrected_height(&stream(1920, 1080, Some("16:9"))),
@@ -3402,6 +3462,99 @@ mod accelerated_tests {
             display_corrected_height(&stream(705, 400, Some("2:1"))),
             Some(352)
         );
+    }
+
+    /// NVENC decoding H.264 and HEVC (10-bit too) on the GPU, with the
+    /// keyframe-only decoder.
+    fn nvenc_options() -> EncodingOptions {
+        EncodingOptions {
+            hardware_acceleration_type: HardwareAccelerationType::nvenc,
+            enable_enhanced_nvdec_decoder: true,
+            hardware_decoding_codecs: vec!["h264".to_owned(), "hevc".to_owned()],
+            enable_decoding_color_depth10_hevc: true,
+            ..vaapi_options()
+        }
+    }
+
+    /// Frames a hardware decoder hands the software MJPEG encoder are still in
+    /// the source's matrix, whatever the chain's `setparams` re-tag says, and
+    /// a JPEG decoder reads BT.601: they are converted to it at the end of the
+    /// graph (gl-1157). A tone-mapped frame is BT.709. A BT.601 or untagged
+    /// source needs nothing, and below ffmpeg 5.1 nothing is converted, as on
+    /// the software path.
+    #[rstest::rstest]
+    #[case::bt709("h264", Some("bt709"), false, (7, 0), Some("bt709"))]
+    #[case::bt2020_sdr("h264", Some("bt2020nc"), false, (7, 0), Some("bt2020"))]
+    #[case::sd_bt601("h264", Some("smpte170m"), false, (7, 0), None)]
+    #[case::untagged("h264", None, false, (7, 0), None)]
+    #[case::old_ffmpeg("h264", Some("bt709"), false, (5, 0), None)]
+    #[case::tone_mapped_on_the_gpu("hevc", Some("bt2020nc"), true, (7, 0), Some("bt709"))]
+    fn frames_downloaded_for_the_software_encoder_are_converted_to_bt601(
+        #[case] codec: &str,
+        #[case] color_space: Option<&str>,
+        #[case] hdr: bool,
+        #[case] (major, minor): (i32, i32),
+        #[case] matrix: Option<&str>,
+    ) {
+        let caps = FfmpegCapabilities::builder()
+            .platform(Platform::Linux)
+            .encoders(["mjpeg"])
+            .hwaccels(["cuda"])
+            .filters(REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .ffmpeg_version(FfmpegVersion::new(major, minor))
+            .build();
+        let options = EncodingOptions {
+            enable_tonemapping: hdr,
+            ..nvenc_options()
+        };
+        let mut stream = stream(1920, 1080, None);
+        stream.codec = Some(codec.to_owned());
+        stream.color_space = color_space.map(str::to_owned);
+        if hdr {
+            stream.pixel_format = Some("yuv420p10le".to_owned());
+            stream.color_transfer = Some("smpte2084".to_owned());
+            stream.color_primaries = Some("bt2020".to_owned());
+        }
+
+        let (args, _) =
+            build_accelerated_trickplay_args(&caps, &options, &job(&stream, "/tmp/o/%08d.jpg"))
+                .expect("NVENC has a ported chain");
+
+        assert!(args.contains("-hwaccel cuda"), "decoded on the GPU: {args}");
+        assert!(args.contains("-c:v mjpeg "), "encoded on the CPU: {args}");
+        if hdr {
+            assert!(
+                args.contains("tonemap_cuda"),
+                "tone-mapped on the GPU: {args}"
+            );
+        }
+        match matrix {
+            Some(matrix) => assert!(
+                args.contains(&format!(
+                    ",scale=in_color_matrix={matrix}:out_color_matrix=bt601\" "
+                )),
+                "{args}"
+            ),
+            None => assert!(!args.contains("out_color_matrix"), "{args}"),
+        }
+    }
+
+    /// A hardware MJPEG encoder keeps the frames on the GPU, where nothing
+    /// converts the matrix yet (gl-1169): the graph is the vendor chain's.
+    #[test]
+    fn frames_for_a_hardware_mjpeg_encoder_are_not_converted() {
+        let caps = caps(Platform::Linux, true);
+        let mut stream = stream(1920, 1080, None);
+        stream.color_space = Some("bt709".to_owned());
+        let (args, _) = build_accelerated_trickplay_args(
+            &caps,
+            &vaapi_options(),
+            &job(&stream, "/tmp/o/%08d.jpg"),
+        )
+        .expect("VAAPI has a ported chain");
+        assert!(args.contains("-c:v mjpeg_vaapi"), "{args}");
+        assert!(!args.contains("out_color_matrix"), "{args}");
     }
 
     /// No hardware decoder and no hardware encoder: the job takes the
@@ -3478,6 +3631,84 @@ mod accelerated_tests {
 
         assert!(args.contains("-hwaccel vaapi"), "{args}");
         assert!(args.contains(",tonemapx=tonemap=bt2390:"), "{args}");
+        // `tonemapx` writes BT.709, which the JPEG's BT.601 is converted from.
+        assert!(
+            args.contains(",scale=in_color_matrix=bt709:out_color_matrix=bt601\" "),
+            "{args}"
+        );
+    }
+
+    /// The VAAPI and QSV copy-back chains (a hardware decoder, the software
+    /// encoder) download the frames too, and they are converted like NVENC's.
+    /// An interlaced source keeps its sampler last, and the conversion follows
+    /// it, so only sampled frames are converted.
+    #[rstest::rstest]
+    #[case::progressive(HardwareAccelerationType::vaapi, false, "fps=0.10000000149011612,")]
+    #[case::interlaced(
+        HardwareAccelerationType::vaapi,
+        true,
+        "fps=0.10000000149011612,scale=in_color_matrix"
+    )]
+    #[case::qsv(HardwareAccelerationType::qsv, false, "fps=0.10000000149011612,")]
+    fn copy_back_frames_are_converted_to_bt601(
+        #[case] accel: HardwareAccelerationType,
+        #[case] interlaced: bool,
+        #[case] marker: &str,
+    ) {
+        let caps = caps(Platform::Linux, true);
+        let options = EncodingOptions {
+            hardware_acceleration_type: accel,
+            prefer_system_native_hw_decoder: true,
+            ..vaapi_options()
+        };
+        let mut stream = stream(1920, 1080, None);
+        stream.color_space = Some("bt709".to_owned());
+        stream.is_interlaced = interlaced;
+        let job = TrickplayJob {
+            enable_hw_encoding: false,
+            ..job(&stream, "/tmp/o/%08d.jpg")
+        };
+        let (args, _) = build_accelerated_trickplay_args(&caps, &options, &job)
+            .expect("VAAPI and QSV have a ported chain");
+        // QSV on Linux with the native decoder preferred decodes through VAAPI.
+        assert!(args.contains("-hwaccel vaapi"), "{args}");
+        assert!(args.contains("-c:v mjpeg "), "{args}");
+        // `hwmap=mode=read` brings the frames to system memory on iHD.
+        assert!(args.contains("hwmap=mode=read,format=nv12,"), "{args}");
+        assert!(
+            args.contains(",scale=in_color_matrix=bt709:out_color_matrix=bt601\" "),
+            "{args}"
+        );
+        assert!(args.contains(marker), "{args}");
+    }
+
+    /// The matrix the frames hold, by swscale's name: BT.709 after any
+    /// tone-mapper, otherwise the probed colour space; `None` for BT.601 and
+    /// for a source that says nothing.
+    #[rstest::rstest]
+    #[case::bt709(Some("bt709"), "scale_cuda=w=320", Some("bt709"))]
+    #[case::bt2020nc(Some("bt2020nc"), "scale_cuda=w=320", Some("bt2020"))]
+    #[case::bt2020c(Some("bt2020c"), "scale_cuda=w=320", Some("bt2020"))]
+    #[case::smpte240m(Some("smpte240m"), "scale_cuda=w=320", Some("smpte240m"))]
+    #[case::fcc(Some("fcc"), "scale_cuda=w=320", Some("fcc"))]
+    #[case::smpte170m(Some("smpte170m"), "scale_cuda=w=320", None)]
+    #[case::bt470bg(Some("bt470bg"), "scale_cuda=w=320", None)]
+    #[case::unknown(Some("unknown"), "scale_cuda=w=320", None)]
+    #[case::untagged(None, "scale_cuda=w=320", None)]
+    #[case::tonemap_cuda(Some("bt2020nc"), "tonemap_cuda=format=yuv420p", Some("bt709"))]
+    #[case::tonemap_opencl(Some("bt2020nc"), "tonemap_opencl=format=nv12", Some("bt709"))]
+    #[case::tonemap_vaapi(Some("bt2020nc"), "tonemap_vaapi=format=nv12", Some("bt709"))]
+    #[case::vpp_qsv(Some("bt2020nc"), "vpp_qsv=tonemap=1", Some("bt709"))]
+    #[case::libplacebo(Some("bt2020nc"), "libplacebo=tonemapping=bt.2390", Some("bt709"))]
+    #[case::tonemapx(Some("bt2020nc"), "tonemapx=tonemap=bt2390", Some("bt709"))]
+    fn the_frame_matrix_is_what_the_frames_hold(
+        #[case] color_space: Option<&str>,
+        #[case] graph: &str,
+        #[case] matrix: Option<&str>,
+    ) {
+        let mut stream = stream(1920, 1080, None);
+        stream.color_space = color_space.map(str::to_owned);
+        assert_eq!(frame_matrix(&stream, graph), matrix);
     }
 
     #[test]
