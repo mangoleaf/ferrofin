@@ -52,6 +52,23 @@
 //!   `format=yuv420p`. The hardware path stays 4:2:0. So does a job on it whose
 //!   source the GPU cannot decode, which could be 4:4:4: that is open work
 //!   (gl-1132).
+//! - The software scale converts the frame to the BT.601 matrix
+//!   (`out_color_matrix=bt601`), the one every JPEG decoder reads, the tile
+//!   packer's included. ffmpeg converts the range to the JPEG's full range
+//!   itself. Upstream's chain re-tags an SDR frame BT.709 (`setparams`) and
+//!   converts no matrix, so a BT.709 source, which means most HD and 4K
+//!   video, comes out with shifted reds and greens: a Jellyfin bug not
+//!   ported (gl-1129). The scale takes the source's matrix from the frame's
+//!   tag and reads an untagged frame as BT.601, so BT.601 sources are not
+//!   converted, and neither are untagged ones, which players often show as
+//!   BT.709 when they are HD. The conversion needs ffmpeg 5.1 or later
+//!   ([`MIN_FFMPEG_JPEG_MATRIX_CONVERSION`]); an older one gets none and
+//!   gives upstream's colours. The hardware path still writes the source's
+//!   matrix (gl-1157). Upstream also tone-maps an HDR source on this path
+//!   (`tonemapx`, when ffmpeg has it) and this graph does not: that is open
+//!   work (gl-1159), and its BT.709 output then needs this conversion too.
+//!   Until then an HDR frame gets its BT.2020 matrix converted here and
+//!   stays un-tone-mapped.
 //! - The C# creates the temp output directory itself; here the caller owns the
 //!   output directory (the trickplay manager passes a temp dir and cleans it
 //!   up), so the extractor only creates and fills it.
@@ -85,6 +102,14 @@ fn pts_frame_rate(stream: Option<&MediaStream>) -> Option<f32> {
         .and_then(MediaStream::reference_frame_rate)
         .filter(|rate| *rate > 0.0)
 }
+
+/// The oldest ffmpeg line measured to convert a 4:2:0 frame to the BT.601
+/// matrix correctly while the JPEG encoder takes it to full range. On flat
+/// colour bars, 5.1.9, 6.1.1, 7.1.3 and later bring a BT.709 source within 2
+/// levels of its colours, while 4.4.2 lands up to 15 off. Below this the
+/// software graph converts no matrix and gives upstream's colours (see the
+/// module's departures).
+pub const MIN_FFMPEG_JPEG_MATRIX_CONVERSION: FfmpegVersion = FfmpegVersion::new(5, 1);
 
 /// `setpts=N/{rate:F3}/TB,`, the filter upstream splices in front of the
 /// `fps=` sampler (`MediaEncoder.cs:948`). Numbering frames from the decode
@@ -229,7 +254,8 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
 /// exact rational `1000/interval_ms`; the `scale` expression is Jellyfin's
 /// width-bounded software scaler (`trunc(min(max(iw,ih*dar),W)/2)*2` by
 /// `trunc(ow/dar/2)*2`), which keeps both dimensions even and honours
-/// anamorphic sources.
+/// anamorphic sources. Unlike Jellyfin's, it also converts the frame to the
+/// JPEG's BT.601 matrix on ffmpeg 5.1 and later (the module's departures).
 ///
 /// `pts_frame_rate` is `Some` when the timestamps are rebuilt in front of the
 /// sampler (keyframe-only extraction configured off; see [`pts_normalizer`]).
@@ -286,6 +312,12 @@ pub fn build_trickplay_args(
     let sample = format!("{setpts}fps=1000/{interval_ms}");
     let mut scale =
         format!("scale=trunc(min(max(iw\\,ih*dar)\\,{max_width})/2)*2:trunc(ow/dar/2)*2");
+    // The JPEG's matrix, BT.601, read from the frame's tag (the module's
+    // departures). An unprobed ffmpeg gets the older graph, as
+    // `video_sync_option` gives it the older option.
+    if ffmpeg_version.is_some_and(|v| v >= MIN_FFMPEG_JPEG_MATRIX_CONVERSION) {
+        scale.push_str(":out_color_matrix=bt601");
+    }
     if full_chroma {
         scale.push_str(",format=yuvj444p");
     }
@@ -1144,6 +1176,8 @@ mod tests {
         }
     }
 
+    /// Upstream's format string, except that the scale also converts to a
+    /// JPEG's Y'CbCr (the module's departures; gl-1129).
     #[test]
     fn args_mirror_the_upstream_format_string() {
         let args = build_trickplay_args(
@@ -1163,8 +1197,31 @@ mod tests {
         assert_eq!(
             args,
             "-loglevel error -threads 1 -i file:\"/m/v.mkv\" -an -sn \
-             -vf \"fps=1000/10000,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2\" \
+             -vf \"fps=1000/10000,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2:out_color_matrix=bt601\" \
              -threads 1 -c:v mjpeg -qscale:v 4 -fps_mode passthrough -f image2 \"/tmp/out/%08d.jpg\""
+        );
+    }
+
+    /// The JPEG matrix conversion needs ffmpeg 5.1: an older or unprobed
+    /// ffmpeg keeps upstream's graph (the module's departures).
+    #[rstest::rstest]
+    #[case::unprobed(None, false)]
+    #[case::ffmpeg_4_4(Some(FfmpegVersion::with_build(4, 4, 2)), false)]
+    #[case::ffmpeg_5_0(Some(FfmpegVersion::with_build(5, 0, 3)), false)]
+    #[case::ffmpeg_5_1(Some(FfmpegVersion::new(5, 1)), true)]
+    #[case::ffmpeg_5_1_9(Some(FfmpegVersion::with_build(5, 1, 9)), true)]
+    #[case::ffmpeg_8_1(Some(FfmpegVersion::with_build(8, 1, 3)), true)]
+    fn the_jpeg_matrix_conversion_needs_ffmpeg_5_1(
+        #[case] version: Option<FfmpegVersion>,
+        #[case] converts: bool,
+    ) {
+        let args = build_trickplay_args(
+            "/m/v.mkv", 10_000, 320, 4, 1, "o", version, false, None, None, None, false,
+        );
+        assert_eq!(
+            args.contains("*2:out_color_matrix=bt601\" "),
+            converts,
+            "{args}"
         );
     }
 
@@ -1219,11 +1276,11 @@ mod tests {
     #[rstest::rstest]
     #[case::progressive(
         None,
-        "fps=1000/10000,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2,format=yuvj444p"
+        "fps=1000/10000,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2:out_color_matrix=bt601,format=yuvj444p"
     )]
     #[case::interlaced(
         Some("yadif=0:-1:0"),
-        "yadif=0:-1:0,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2,format=yuvj444p,fps=1000/10000"
+        "yadif=0:-1:0,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2:out_color_matrix=bt601,format=yuvj444p,fps=1000/10000"
     )]
     fn full_chroma_asks_for_444_right_after_the_scale(
         #[case] deinterlace: Option<&str>,

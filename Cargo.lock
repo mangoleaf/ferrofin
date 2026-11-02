@@ -1523,6 +1523,7 @@ dependencies = [
  "ferrofin-model",
  "ferrofin-traits",
  "ferrofin-util",
+ "image",
  "notify",
  "quick-xml",
  "regex",
