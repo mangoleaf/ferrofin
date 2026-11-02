@@ -289,6 +289,12 @@ pub struct Inner {
     /// the plugin unavailable (`404`, like a Jellyfin server without the
     /// plugin's controller).
     pub merge_versions: Option<Arc<dyn ferrofin_traits::merge_versions::MergeVersionsManager>>,
+
+    /// The LDAP-Auth extension's service backing the `/Ldap/*` routes. `None`
+    /// until the composition root wires it via [`AppState::with_ldap`]; while
+    /// unset those routes report the plugin unavailable (`404`, like a
+    /// Jellyfin server without the plugin's controller).
+    pub ldap: Option<Arc<dyn ferrofin_traits::ldap::LdapManager>>,
 }
 
 /// How many [`FileSystem`] calls handlers may have on the blocking pool at once
@@ -456,6 +462,7 @@ impl AppState {
             plugin_routes: None,
             playback_metrics: None,
             merge_versions: None,
+            ldap: None,
             music,
             similar_items,
             search,
@@ -1048,6 +1055,23 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_merge_versions must be called before the state is shared");
         inner.merge_versions = Some(merge_versions);
+        self
+    }
+
+    /// Wires the LDAP-Auth extension's service behind the `/Ldap/*` routes.
+    ///
+    /// [`new`](Self::new) leaves it unset (the routes report the plugin
+    /// unavailable); the composition root calls this with the
+    /// `ferrofin-extensions` implementation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_ldap(mut self, ldap: Arc<dyn ferrofin_traits::ldap::LdapManager>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_ldap must be called before the state is shared");
+        inner.ldap = Some(ldap);
         self
     }
 

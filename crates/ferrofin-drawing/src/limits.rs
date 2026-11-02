@@ -483,7 +483,8 @@ mod tests {
 
     /// Resizes take the budget in the order they came: a small one that would
     /// fit now waits behind a large one that does not, so a stream of small
-    /// resizes can never starve it.
+    /// resizes can never starve it. The two do not fit together either, so the
+    /// small one records itself only after the large one gives its bytes back.
     #[test]
     fn a_large_resize_is_not_passed_over_by_a_small_one() {
         let memory = memory_with_budget(100);
@@ -497,20 +498,20 @@ mod tests {
             })
         };
 
-        let large = resize(60);
+        let large = resize(70);
         wait_for_turns(&memory, 2);
-        let small = resize(10);
+        let small = resize(40);
         wait_for_turns(&memory, 3);
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             order.lock().unwrap().is_empty(),
-            "10 would fit, but came second"
+            "40 would fit, but came second"
         );
 
         drop(held);
         large.join().expect("the large resize ends");
         small.join().expect("the small resize ends");
-        assert_eq!(*order.lock().unwrap(), [60, 10]);
+        assert_eq!(*order.lock().unwrap(), [70, 40]);
     }
 
     /// Two resizes that fit together run together: the turn order costs no
