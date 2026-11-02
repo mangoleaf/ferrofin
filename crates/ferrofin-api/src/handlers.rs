@@ -1278,9 +1278,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    job on those routes and the HLS ones: ferrofin-mediaencoding \
                    transcoding/manager.rs start_ffmpeg, compared with \
                    MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs (StartFfMpeg, \
-                   PingTimer) and Emby.Server.Implementations/Session/SessionManager.cs \
-                   (MaxActiveSessions)",
-        date: "2026-11-01",
+                   PingTimer, KillTranscodingJobs) and \
+                   Emby.Server.Implementations/Session/SessionManager.cs (MaxActiveSessions)",
+        date: "2026-11-02",
         divergences: &[
             "A GET that would start a transcode on /Videos/{itemId}/stream, \
              /Videos/{itemId}/stream.{container}, /Audio/{itemId}/stream or \
@@ -1296,12 +1296,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              2026-10-31 and 2026-11-01, gl-1098), the settings max_transcodes and \
              max_transcodes_per_user, both 0, off, by default, which leaves StartFfMpeg's \
              behaviour as upstream's: it starts whatever it is asked to, and MaxActiveSessions \
-             applies only at login. Past a cap a start ends the same user's longest-idle job \
-             (no active request), the teardown the ping timeout would have brought, and with \
-             none idle answers 503 with Retry-After: 10 before anything is created. A job \
-             copying every stream is free. The user is the authorization's, as upstream's \
-             StartFfMpeg userId is; an API key has none, so it is outside the per-user cap \
-             and inside the server-wide one.",
+             applies only at login. Past a cap a start ends the longest-idle job (no active \
+             request) of the same user on the same device, the teardown the ping timeout \
+             would have brought, and with none idle answers 503 with Retry-After: 10 before \
+             anything is created. The device is the request's DeviceId, compared ignoring \
+             ASCII case (KillTranscodingJobs uses OrdinalIgnoreCase), and a start without one \
+             ends nothing: an HLS player between two segment requests is idle too, so \
+             another device's job is never ended (gl-1140). A job copying every stream is \
+             free. The user is the authorization's, as upstream's StartFfMpeg userId is; an \
+             API key has none, so it is outside the per-user cap and inside the server-wide \
+             one.",
         ],
     },
     VerifiedSubsystem {
@@ -1772,10 +1776,12 @@ pub const VERIFIED: &[Verified] = &[
                answers as ExceptionMiddleware does \
                outside Development, the same on a live 12.4 for each refusal. Compared: user \
                lookup and lock, provider order and selection by the saved id \
-               (AuthenticationManager::id, GetType().FullName), the provider's canonical \
-               username, the new-user policy, the saved provider id, the disabled, remote and \
-               schedule checks, the failure counter and lockout, the device and session \
-               limits, token rotation and session activity. The UserDto and SessionInfoDto \
+               (AuthenticationManager::id, GetType().FullName), the warning naming the user \
+               and the saved id when no enabled provider has it (InvalidAuthProvider then \
+               refuses the sign-in), the provider's canonical username, the new-user \
+               policy, the saved provider id, the disabled, remote and schedule checks, \
+               the failure counter and lockout, the device and session limits, token \
+               rotation and session activity. The UserDto and SessionInfoDto \
                builders are shared with other routes and not compared here",
         date: "2026-11-02",
         divergences: &[

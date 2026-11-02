@@ -8527,6 +8527,37 @@ mod tests {
         );
     }
 
+    /// Every kind of job carries the request's `DeviceId`: past a transcode cap
+    /// only a job of the same device gives up its slot, so a plan that dropped
+    /// it would leave "next episode" refused.
+    #[tokio::test]
+    async fn every_plan_carries_the_requests_device() {
+        let root = tempfile::tempdir().unwrap();
+        let (planner, _) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![video_stream("hevc"), audio_stream("aac")],
+            )],
+            root.path(),
+        )
+        .await;
+        let mut request = request("abc");
+        request.device_id = Some("living-room-tv".to_owned());
+        request.output_container = Some("mp4".to_owned());
+        for (segment, kind) in [
+            (Some(0), PlaylistKind::Vod),
+            (Some(0), PlaylistKind::Event),
+            (None, PlaylistKind::Progressive),
+        ] {
+            let plan = planner.plan(&request, false, segment, kind).await.unwrap();
+            assert_eq!(
+                plan.state.device_id.as_deref(),
+                Some("living-room-tv"),
+                "{kind:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn progressive_video_uses_single_file_seek_and_native_muxing() {
         let root = tempfile::tempdir().unwrap();
