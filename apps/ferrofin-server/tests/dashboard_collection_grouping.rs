@@ -654,7 +654,7 @@ async fn live_collection_flags_and_request_overrides_reach_real_folder_queries()
     .await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
         "direct-ID dispatch retains the actual explicit-parent access gate"
     );
     for task in wired.background {

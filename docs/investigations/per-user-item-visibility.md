@@ -32,7 +32,8 @@ identified this gap but needs two corrections:
   passed as `/Items?parentId=...` returns **401**. An explicit `/Items?ids=...`
   query returns the hidden movie on **both servers**. Preserve these distinctions.
   **Superseded 2026-10-31 (gl-1091):** Ferrofin no longer keeps this. A named
-  scope or id stops at the library boundary; the `access-filtering` row of
+  scope or id stops at the library boundary, and a refused scope answers `403`
+  (gl-1136); the `access-filtering` row of
   `handlers::VERIFIED_SUBSYSTEMS` states the rule.
 
 ## Baseline evidence
@@ -210,7 +211,8 @@ Exceptions to blanket switching:
 - `Items?ids=` is a query filter; the live reference returns the hidden item.
   Do not use it as the implementation of standalone authorization.
   **Superseded 2026-10-31 (gl-1091):** Ferrofin no longer keeps this. A named
-  scope or id stops at the library boundary; the `access-filtering` row of
+  scope or id stops at the library boundary, and a refused scope answers `403`
+  (gl-1136); the `access-filtering` row of
   `handlers::VERIFIED_SUBSYSTEMS` states the rule.
 - General audio/video/HLS streaming uses unscoped `StreamingHelpers` resolution;
   UniversalAudio is explicitly scoped. Subtitle file delivery's helper and

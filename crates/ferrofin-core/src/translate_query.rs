@@ -3839,6 +3839,53 @@ mod tests {
         }
     }
 
+    /// A mixed listing excludes the playlists its user cannot see by id
+    /// ([`crate::item_visibility::ItemVisibility::hidden_playlists`]). That is a
+    /// residual check on rows the statement already reached: every step of the
+    /// plan, page and count, stays the one the listing has without it, and only
+    /// the listings holding such a playlist carry the predicate.
+    #[rstest::rstest]
+    #[case::page(QueryShape::FullRows)]
+    #[case::count(QueryShape::GroupedCount)]
+    #[tokio::test]
+    async fn excluding_hidden_playlists_keeps_the_listing_plan(#[case] shape: QueryShape) {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let user =
+            crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5511)).await;
+        let plan = async |exclude_item_ids: Vec<uuid::Uuid>| {
+            let filter = InternalItemsQuery {
+                user: Some(user.clone()),
+                recursive: true,
+                top_parent_ids: vec![uuid::Uuid::from_u128(0x5512), uuid::Uuid::from_u128(0x5513)],
+                exclude_item_ids,
+                order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+                limit: Some(50),
+                ..InternalItemsQuery::default()
+            };
+            let mut builder = build_query(&filter, shape);
+            let mut query = builder.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<String>>()
+        };
+        let plain = plan(Vec::new()).await;
+        assert_eq!(
+            plan((0x6000..0x6000 + 500).map(uuid::Uuid::from_u128).collect()).await,
+            plain
+        );
+        assert!(
+            plain.iter().any(|step| step.contains("TopParentId=?")),
+            "the listing seeks its libraries: {plain:?}"
+        );
+    }
+
     /// The folder arm of `push_is_played`, as a Series / BoxSet browse
     /// filters and sorts on it: the page keeps the unfiltered browse's
     /// `(Type, TopParentId)` seek, and each of the three descendant arms seeks

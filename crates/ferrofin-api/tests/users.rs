@@ -127,6 +127,8 @@ struct MemUsers {
     /// Makes `get_user_dto` answer the policy last saved for that user, so the
     /// device check after a policy save reads what was saved.
     echo_saved_policy: std::sync::atomic::AtomicBool,
+    /// Listed by `get_users` before the two fixed accounts.
+    listed_first: Option<UserEntity>,
 }
 
 /// The fixed two-user table shared by [`MemUsers`] and the assertions.
@@ -140,7 +142,12 @@ fn mem_users() -> Vec<UserEntity> {
 #[async_trait]
 impl UserManager for MemUsers {
     async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
-        Ok(mem_users())
+        Ok(self
+            .listed_first
+            .iter()
+            .cloned()
+            .chain(mem_users())
+            .collect())
     }
     async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
         Ok(vec![ADMIN_ID, BOB_ID])
@@ -2710,4 +2717,193 @@ async fn account_updates_respect_preferences_and_api_key_elevation() {
             assert_eq!(response.status(), expected, "{path}");
         }
     }
+}
+
+/// Authenticates by the presented token, so one router serves every caller the
+/// `Policy`/`Configuration` rule tells apart. No known token is anonymous.
+struct TokenAuth;
+
+#[async_trait]
+impl AuthService for TokenAuth {
+    async fn authenticate(
+        &self,
+        request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        let token = request
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("X-Emby-Token"))
+            .map(|(_, value)| value.as_str());
+        let signed_in = |user: UserEntity| AuthorizationInfo {
+            user: Some(user),
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        };
+        Ok(match token {
+            Some("admin") => signed_in(user_entity(ADMIN_ID, "admin", Some("hash"))),
+            Some("bob") => signed_in(user_entity(BOB_ID, "bob", None)),
+            Some("key") => AuthorizationInfo {
+                is_authenticated: true,
+                is_api_key: true,
+                ..AuthorizationInfo::default()
+            },
+            _ => AuthorizationInfo::default(),
+        })
+    }
+}
+
+/// `GET path` as `token` (anonymous when `None`), from `peer`, on a wizard state.
+async fn get_as(
+    users: Arc<MemUsers>,
+    wizard_done: bool,
+    path: &str,
+    token: Option<&str>,
+    peer: &str,
+) -> serde_json::Value {
+    let app = state_with_auth(
+        users,
+        Arc::new(MemConfig::new(wizard_done)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(TokenAuth),
+    );
+    let mut request = Request::builder()
+        .uri(path)
+        .extension(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().unwrap(),
+        ));
+    if let Some(token) = token {
+        request = request.header("X-Emby-Token", token);
+    }
+    let response = create_router(app)
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{path}");
+    body_json(response).await
+}
+
+/// Asserts a row carries both private objects, or leaves both out of the JSON
+/// (how Jellyfin writes a null, and how the contract's optional nullable
+/// fields allow it), and that the login card's fields stay either way.
+fn assert_private_fields(row: &serde_json::Value, whole: bool) {
+    let name = &row["Name"];
+    assert!(name.is_string(), "{row}");
+    assert!(row["Id"].is_string(), "{row}");
+    for field in ["Policy", "Configuration"] {
+        match row.get(field) {
+            Some(value) => assert!(whole && value.is_object(), "{name}: {field} is {value}"),
+            None => assert!(!whole, "{name}: {field} is missing"),
+        }
+    }
+}
+
+/// Owner decision gl-1102, beyond Jellyfin: only an administrator or an API key
+/// reads another account's `Policy` and `Configuration`. A user keeps their own.
+#[rstest::rstest]
+#[case::list_non_admin("/Users", Some("bob"), &["bob"])]
+#[case::list_admin("/Users", Some("admin"), &["admin", "bob"])]
+#[case::list_api_key("/Users", Some("key"), &["admin", "bob"])]
+#[case::public_anonymous("/Users/Public", None, &[])]
+#[case::public_unknown_token("/Users/Public", Some("stale"), &[])]
+#[case::public_non_admin("/Users/Public", Some("bob"), &["bob"])]
+#[case::public_admin("/Users/Public", Some("admin"), &["admin", "bob"])]
+#[case::public_api_key("/Users/Public", Some("key"), &["admin", "bob"])]
+#[tokio::test]
+async fn user_lists_keep_private_fields_from_other_accounts(
+    #[case] path: &str,
+    #[case] token: Option<&str>,
+    #[case] whole: &[&str],
+    #[values(false, true)] wizard_done: bool,
+) {
+    let users = Arc::new(MemUsers::default());
+    let body = get_as(users, wizard_done, path, token, "127.0.0.1:9000").await;
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "no row is dropped: {body}");
+    for row in rows {
+        assert_private_fields(row, whole.contains(&row["Name"].as_str().unwrap()));
+    }
+}
+
+#[rstest::rstest]
+#[case::another_account(ADMIN_ID, "bob", false)]
+#[case::own_account(BOB_ID, "bob", true)]
+#[case::admin_reads_another(BOB_ID, "admin", true)]
+#[case::api_key_reads_any(ADMIN_ID, "key", true)]
+#[tokio::test]
+async fn get_user_by_id_keeps_private_fields_from_other_accounts(
+    #[case] target: Uuid,
+    #[case] token: &str,
+    #[case] whole: bool,
+) {
+    let users = Arc::new(MemUsers::default());
+    let path = format!("/Users/{target}");
+    let row = get_as(users, true, &path, Some(token), "127.0.0.1:9000").await;
+    assert_private_fields(&row, whole);
+}
+
+/// The remote-access filter reads `Policy`, so it must run before the strip: a
+/// remote login screen still loses the fixture's admin, which refuses remote
+/// access, and keeps bob, saved here as the one account that allows it.
+#[tokio::test]
+async fn the_remote_access_filter_reads_policy_before_it_is_stripped() {
+    let users = Arc::new(MemUsers::default());
+    users
+        .echo_saved_policy
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    *users.updated_policy.lock().unwrap() = Some((
+        BOB_ID,
+        UserPolicy {
+            enable_remote_access: true,
+            ..UserPolicy::default()
+        },
+    ));
+    let names = async |peer: &str| {
+        let body = get_as(users.clone(), true, "/Users/Public", None, peer).await;
+        let rows = body.as_array().unwrap().clone();
+        for row in &rows {
+            assert_private_fields(row, false);
+        }
+        rows.iter()
+            .map(|row| row["Name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names("127.0.0.1:9000").await, ["admin", "bob"]);
+    assert_eq!(names("203.0.113.8:9000").await, ["bob"]);
+}
+
+/// The hidden and disabled filters read `Policy` too, so a stripped row must not
+/// reach them: the login screen would list hidden and disabled accounts.
+#[rstest::rstest]
+#[case::hidden(UserPolicy { is_hidden: true, ..UserPolicy::default() })]
+#[case::disabled(UserPolicy { is_disabled: true, ..UserPolicy::default() })]
+#[tokio::test]
+async fn the_login_screen_filters_read_policy_before_it_is_stripped(#[case] policy: UserPolicy) {
+    let users = Arc::new(MemUsers::default());
+    users
+        .echo_saved_policy
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    *users.updated_policy.lock().unwrap() = Some((BOB_ID, policy));
+    let body = get_as(users, true, "/Users/Public", None, "127.0.0.1:9000").await;
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{body}");
+    assert_eq!(rows[0]["Name"], "admin");
+    assert_private_fields(&rows[0], false);
+}
+
+/// Upstream's `OrderBy(u => u.Username)` compares by culture, where case does
+/// not come first: an ordinal sort would put `Zoe` before `admin`.
+#[tokio::test]
+async fn user_lists_sort_names_by_culture() {
+    let users = Arc::new(MemUsers {
+        listed_first: Some(user_entity(Uuid::from_u128(0x0E5E), "Zoe", None)),
+        ..MemUsers::default()
+    });
+    let body = get_as(users, true, "/Users", Some("admin"), "127.0.0.1:9000").await;
+    let names: Vec<_> = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["admin", "bob", "Zoe"]);
 }
