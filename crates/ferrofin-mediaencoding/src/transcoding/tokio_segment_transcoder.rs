@@ -19,7 +19,8 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use super::progress::{FfmpegProgress, parse};
+use super::ffmpeg_log::{StderrPump, shown_arguments};
+use super::progress::FfmpegProgress;
 use super::segment_transcoder::{SegmentTranscoder, SpawnRequest, TranscodeChild};
 
 /// The production [`SegmentTranscoder`]: spawns ffmpeg with `tokio::process`.
@@ -57,10 +58,15 @@ impl SegmentTranscoder for TokioSegmentTranscoder {
 
         // Open the stderr log, prefixed with the command line (mirrors the C#
         // JobLogger header) so a failed transcode is diagnosable from the log.
+        // Only the spawn above gets a remote source's real URL.
         let mut log = tokio::fs::File::create(&req.log_path)
             .await
             .map_err(|e| format!("failed to create log {}: {e}", req.log_path.display()))?;
-        let header = format!("{} {}\n\n", req.program, req.arguments.join(" "));
+        let header = format!(
+            "{} {}\n\n",
+            req.program,
+            shown_arguments(&req.arguments).join(" ")
+        );
         let _ = log.write_all(header.as_bytes()).await;
 
         let stderr = child.stderr.take();
@@ -74,31 +80,22 @@ impl SegmentTranscoder for TokioSegmentTranscoder {
         // Pump stderr → log until EOF. Detached so it never blocks kill.
         if let Some(mut stderr) = stderr {
             let report = Arc::clone(&progress);
+            let mut pump = StderrPump::new(&req.arguments);
             tokio::spawn(async move {
                 let mut buf = [0u8; 8192];
-                let mut line = Vec::new();
                 loop {
                     match stderr.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            // Preserve the original stderr bytes in the log;
-                            // ffmpeg uses carriage returns for live statistics.
-                            let _ = log.write_all(&buf[..n]).await;
-                            for byte in &buf[..n] {
-                                if *byte == b'\r' || *byte == b'\n' {
-                                    if let Some(parsed) = parse(&String::from_utf8_lossy(&line)) {
-                                        *report.lock().expect("progress lock poisoned") =
-                                            Some(parsed);
-                                    }
-                                    line.clear();
-                                } else if line.len() < 65_536 {
-                                    line.push(*byte);
-                                }
+                            let _ = log.write_all(&pump.feed(&buf[..n])).await;
+                            if let Some(parsed) = pump.take_progress() {
+                                *report.lock().expect("progress lock poisoned") = Some(parsed);
                             }
                         }
                     }
                 }
-                if let Some(parsed) = parse(&String::from_utf8_lossy(&line)) {
+                let _ = log.write_all(&pump.finish()).await;
+                if let Some(parsed) = pump.take_progress() {
                     *report.lock().expect("progress lock poisoned") = Some(parsed);
                 }
                 let _ = log.flush().await;
@@ -245,5 +242,43 @@ mod tests {
             "child never saw the variable; log: {:?}",
             std::fs::read_to_string(&log)
         );
+    }
+
+    /// The log of a job reading a URL: the header and stderr lose the
+    /// credentials, even split across two reads, and the live statistics keep
+    /// their carriage returns. The child still receives the real URL.
+    #[tokio::test]
+    async fn a_remote_source_never_reaches_the_log() {
+        const SOURCE: &str = "http://USER:SECRET@127.0.0.1:9/live/USER/SECRET/1.m3u8";
+        const SCRIPT: &str = "url=$0; printf 'Input from %s\\n' \"$url\" >&2; \
+             printf 'frame=  1\\rframe=  2\\r' >&2; \
+             printf 'Opening http://USER:SEC' >&2; sleep 0.2; printf 'RET@cdn.example/s.ts\\n' >&2";
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("t.log");
+        let req = SpawnRequest {
+            program: "sh".to_owned(),
+            arguments: vec!["-c".to_owned(), SCRIPT.to_owned(), SOURCE.to_owned()],
+            working_dir: None,
+            output_dir: dir.path().to_path_buf(),
+            log_path: log.clone(),
+            env: Vec::new(),
+        };
+        let child = TokioSegmentTranscoder::new()
+            .start_transcode(&req)
+            .await
+            .unwrap();
+        assert_eq!(child.wait().await, 0);
+
+        let wanted = "Input from http://127.0.0.1:9\nframe=  1\rframe=  2\r\
+                      Opening http://cdn.example\n";
+        for _ in 0..50 {
+            if std::fs::read_to_string(&log).is_ok_and(|s| s.ends_with(wanted)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let written = std::fs::read_to_string(&log).unwrap();
+        assert!(written.ends_with(wanted), "{written:?}");
+        assert!(!written.contains("SECRET"), "{written:?}");
     }
 }
