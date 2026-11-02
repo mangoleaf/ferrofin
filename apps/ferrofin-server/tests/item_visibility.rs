@@ -919,7 +919,7 @@ async fn deletion_checks_visibility_before_permission_and_stops_in_input_order()
 
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
+async fn parent_browse_and_userless_exceptions() {
     let f = fixture().await;
     let id = &f.hidden;
     let (_, folders) = call(
@@ -943,7 +943,7 @@ async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
         call(&f.router, "GET", &parent_uri, Some(&f.viewer), None)
             .await
             .0,
-        StatusCode::UNAUTHORIZED
+        StatusCode::FORBIDDEN
     );
     assert_eq!(
         call(&f.router, "GET", &parent_uri, Some(&f.admin), None)
@@ -951,19 +951,9 @@ async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
             .0,
         StatusCode::OK
     );
-    // A container-only request re-roots before the parent visibility check.
-    assert_eq!(
-        call(
-            &f.router,
-            "GET",
-            &format!("{parent_uri}&includeItemTypes=BoxSet"),
-            Some(&f.viewer),
-            None
-        )
-        .await
-        .0,
-        StatusCode::OK
-    );
+    // Divergence from upstream (gl-1090): `GetStreamingState` reads the item with
+    // no user, so Jellyfin streams it. Here a known user gets the same library
+    // check as on `/Download`.
     assert_eq!(
         call(
             &f.router,
@@ -974,7 +964,7 @@ async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
         )
         .await
         .0,
-        StatusCode::OK
+        StatusCode::NOT_FOUND
     );
     assert_eq!(
         call(
@@ -1823,6 +1813,9 @@ fn scope_routes(id: &str, viewer_id: &str) -> Vec<String> {
     .collect();
     routes.extend([
         format!("/Items?parentId={id}&recursive=true"),
+        // A library's Collections tab, and its Playlists equivalent.
+        format!("/Items?parentId={id}&includeItemTypes=BoxSet"),
+        format!("/Items?parentId={id}&includeItemTypes=Playlist"),
         format!("/Users/{viewer_id}/Items?parentId={id}"),
         format!("/Users/{viewer_id}/Items/Latest?parentId={id}"),
         format!("/Search/Hints?searchTerm=s&parentId={id}"),
@@ -1831,7 +1824,8 @@ fn scope_routes(id: &str, viewer_id: &str) -> Vec<String> {
     routes
 }
 
-// Divergence (owner decision 2026-10-31, gl-1091): see `require_scope_visible`.
+// Divergence (owner decisions 2026-10-31 and 2026-11-01, gl-1091, gl-1136): see
+// `require_scope_visible`.
 #[tokio::test]
 async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
     let f = fixture().await;
@@ -1842,7 +1836,7 @@ async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
         routes.push(format!("/Shows/NextUp?seriesId={id}"));
         for route in routes {
             let (status, _) = call(&f.router, "GET", &route, Some(&f.viewer), None).await;
-            if status != StatusCode::UNAUTHORIZED {
+            if status != StatusCode::FORBIDDEN {
                 open.push(format!("{status} {route}"));
             }
         }
@@ -1850,7 +1844,7 @@ async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
     assert!(open.is_empty(), "{open:#?}");
     let both = format!("/Items?ids={}&parentId={}", f.hidden, s.library);
     let (status, _) = call(&f.router, "GET", &both, Some(&f.viewer), None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "the scope answers first");
+    assert_eq!(status, StatusCode::FORBIDDEN, "the scope answers first");
 
     // An administrator can open them all, and an API key is not a user.
     assert_eq!(
@@ -1877,7 +1871,7 @@ async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
     assert_eq!(status, StatusCode::OK, "an API key naming a user is exempt");
     // An administrator reading as the viewer gets the viewer's answer.
     let (status, _) = call(&f.router, "GET", &for_viewer, Some(&f.admin), None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     // Opening the library opens everything inside it.
     let viewer_id = &f.viewer_id;
@@ -1939,6 +1933,27 @@ async fn a_scope_the_user_can_open_answers_on_every_route() {
             assert_eq!(status, StatusCode::OK, "{route}: {body}");
         }
     }
+    // The playlists folder belongs to no library, so a limit on libraries
+    // leaves it open.
+    let (_, media_folders) = call(
+        &f.router,
+        "GET",
+        "/Library/MediaFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let playlists = media_folders["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["Name"] == "Playlists")
+        .unwrap()["Id"]
+        .as_str()
+        .unwrap();
+    let route = format!("/Items?parentId={playlists}&includeItemTypes=Playlist");
+    let (status, body) = call(&f.router, "GET", &route, Some(&f.viewer), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]
@@ -1972,6 +1987,199 @@ async fn a_scope_naming_no_item_answers_as_it_did() {
             assert_eq!(status, expected, "{route}: {body}");
         }
     }
+}
+
+/// Saves a tuner and a guide that airs one episode of each of `titles` and a
+/// film tomorrow, then refreshes the guide.
+async fn air_series(f: &Fixture, titles: &[&str]) {
+    use std::fmt::Write as _;
+    let (playlist, guide) = (f.h.path("playlist.m3u"), f.h.path("guide.xml"));
+    let day = (chrono::Utc::now() + chrono::Duration::days(1)).format("%Y%m%d");
+    let mut programmes = String::new();
+    for (hour, title) in titles.iter().enumerate() {
+        // A channel's airing is identified by its start, so each gets its own.
+        let stop = hour + 1;
+        write!(
+            programmes,
+            "<programme start=\"{day}{hour:02}0000 +0000\" stop=\"{day}{stop:02}0000 +0000\" \
+             channel=\"one\"><title>{title}</title><sub-title>Pilot</sub-title></programme>"
+        )
+        .expect("guide");
+    }
+    let (start, stop) = (titles.len(), titles.len() + 1);
+    write!(
+        programmes,
+        "<programme start=\"{day}{start:02}0000 +0000\" stop=\"{day}{stop:02}0000 +0000\" \
+         channel=\"one\"><title>Film</title></programme>"
+    )
+    .expect("guide");
+    touch(
+        &playlist,
+        "#EXTM3U\n#EXTINF:-1 tvg-id=\"one\" tvg-chno=\"1\",one\nhttp://tuner.invalid/one\n",
+    );
+    touch(
+        &guide,
+        &format!(
+            "<tv><channel id=\"one\"><display-name>one</display-name></channel>{programmes}</tv>"
+        ),
+    );
+    let (status, body) = call(
+        &f.router,
+        "POST",
+        "/LiveTv/TunerHosts",
+        Some(&f.admin),
+        Some(json!({ "Type": "m3u", "Url": playlist.to_string_lossy() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &f.router,
+        "POST",
+        "/LiveTv/ListingProviders",
+        Some(&f.admin),
+        Some(json!({
+            "Type": "xmltv",
+            "Path": guide.to_string_lossy(),
+            "EnableAllTuners": true,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Each save queued a refresh, and a later refresh supersedes an earlier
+    // one's write. Once a lineup is listed they have all started, so the
+    // refresh below is the newest and has finished when it returns.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (_, channels) = call(&f.router, "GET", "/LiveTv/Channels", Some(&f.admin), None).await;
+        if channels["TotalRecordCount"].as_i64() > Some(0) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "no lineup appeared");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    f.h.wired
+        .state
+        .live_tv
+        .as_ref()
+        .expect("live tv is wired")
+        .refresh_guide()
+        .await
+        .expect("guide refresh");
+}
+
+/// The programme titles a guide request answers, sorted.
+async fn guide_titles(
+    f: &Fixture,
+    method: &str,
+    body: Option<Value>,
+    query: &str,
+    token: &str,
+) -> Vec<String> {
+    let uri = format!("/LiveTv/Programs{query}");
+    let (status, page) = call(&f.router, method, &uri, Some(token), body).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {page}");
+    let mut titles: Vec<String> = page["Items"]
+        .as_array()
+        .expect("Items")
+        .iter()
+        .map(|item| item["Name"].as_str().expect("Name").to_owned())
+        .collect();
+    titles.sort();
+    titles
+}
+
+// Divergence (owner decision 2026-10-31, gl-1091; gl-1113): see `query_programs_inner`.
+#[tokio::test]
+async fn a_series_the_user_cannot_open_names_no_guide_search() {
+    let f = fixture().await;
+    let s = hidden_scopes(&f).await;
+    air_series(&f, &["Other", "Show"]).await;
+    let series = &s.series;
+    let viewer_id = &f.viewer_id;
+    let (everything, only_show) = (["Other", "Show"], ["Show"]);
+
+    assert_eq!(
+        guide_titles(&f, "GET", None, "", &f.viewer).await,
+        ["Film", "Other", "Show"]
+    );
+
+    // The series and an id naming nothing answer alike, so the answer says
+    // nothing about the series: every series airing, and no film.
+    let closed = format!("?librarySeriesId={series}");
+    let missing = format!(
+        "?librarySeriesId={}",
+        uuid::Uuid::from_u128(0xDEAD).simple()
+    );
+    for query in [&closed, &missing] {
+        let titles = guide_titles(&f, "GET", None, query, &f.viewer).await;
+        assert_eq!(titles, everything, "{query}");
+    }
+    let page = async |query: &str| {
+        let uri = format!("/LiveTv/Programs{query}&limit=1");
+        call(&f.router, "GET", &uri, Some(&f.viewer), None).await.1
+    };
+    assert_eq!(page(&closed).await, page(&missing).await);
+    assert_eq!(page(&closed).await["TotalRecordCount"], 2);
+    let body = json!({ "LibrarySeriesId": series, "UserId": viewer_id });
+    assert_eq!(
+        guide_titles(&f, "POST", Some(body.clone()), "", &f.viewer).await,
+        everything
+    );
+    // An administrator reading as the viewer gets the viewer's answer.
+    let as_viewer = format!("{closed}&userId={viewer_id}");
+    assert_eq!(
+        guide_titles(&f, "GET", None, &as_viewer, &f.admin).await,
+        everything
+    );
+
+    // An administrator can open it.
+    assert_eq!(
+        guide_titles(&f, "GET", None, &closed, &f.admin).await,
+        only_show
+    );
+    assert_eq!(
+        guide_titles(
+            &f,
+            "POST",
+            Some(json!({ "LibrarySeriesId": series })),
+            "",
+            &f.admin
+        )
+        .await,
+        only_show
+    );
+
+    // Opening the library narrows the guide for the viewer too.
+    let (_, user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{viewer_id}"),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let mut policy = user["Policy"].clone();
+    policy["EnabledFolders"]
+        .as_array_mut()
+        .unwrap()
+        .extend(s.libraries.iter().map(|library| json!(library)));
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!("/Users/{viewer_id}/Policy"),
+        Some(&f.admin),
+        Some(policy),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        guide_titles(&f, "GET", None, &closed, &f.viewer).await,
+        only_show
+    );
+    assert_eq!(
+        guide_titles(&f, "POST", Some(body), "", &f.viewer).await,
+        only_show
+    );
 }
 
 #[tokio::test]
@@ -2017,6 +2225,230 @@ async fn explicit_ids_keep_to_what_the_user_can_open() {
         item_ids(&page["Items"]),
         [uuid::Uuid::parse_str(hidden).unwrap()]
     );
+}
+
+/// A playlist's listing leaves out a member of a library its caller was not
+/// granted, and pages and counts what is left.
+#[tokio::test]
+async fn a_playlist_listing_leaves_out_members_of_hidden_libraries() {
+    let f = fixture().await;
+    let (status, created) = call(
+        &f.router,
+        "POST",
+        "/Playlists",
+        Some(&f.viewer),
+        Some(json!({
+            "Name": "mixed",
+            "Ids": [f.allowed],
+            "UserId": f.viewer_id,
+            "MediaType": "Video",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let playlist = created["Id"].as_str().expect("id").to_owned();
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!(
+            "/Playlists/{playlist}/Items?ids={}&userId={}",
+            f.hidden, f.viewer_id
+        ),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let uri = format!("/Playlists/{playlist}/Items?userId={}", f.viewer_id);
+    let (status, items) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+    assert_eq!(status, StatusCode::OK, "{items}");
+    assert_eq!(
+        item_ids(&items["Items"]),
+        [uuid::Uuid::parse_str(&f.allowed).expect("id")],
+        "{items}"
+    );
+    assert_eq!(items["TotalRecordCount"], 1, "{items}");
+}
+
+/// A playlist from two libraries, shared for editing with a viewer who can open
+/// one of them: `[Gamma (hidden), Alpha, Delta (hidden), Epsilon]`.
+struct SharedPlaylist {
+    id: String,
+    gamma: uuid::Uuid,
+    alpha: uuid::Uuid,
+    delta: uuid::Uuid,
+    epsilon: uuid::Uuid,
+}
+
+impl SharedPlaylist {
+    async fn new(f: &Fixture) -> Self {
+        let items = items_by_path(&f.router, &f.admin).await;
+        let id_of = |relative: &str| {
+            let path = f.h.path(relative).to_string_lossy().into_owned();
+            uuid::Uuid::parse_str(&items[&path]).expect("id")
+        };
+        let gamma = id_of("more/Gamma (2001)/Gamma (2001).mkv");
+        let alpha = id_of("movies/Alpha (1999)/Alpha (1999).mkv");
+        let delta = id_of("more/Delta (2002)/Delta (2002).mkv");
+        let epsilon = id_of("movies/Epsilon (2003)/Epsilon (2003).mkv");
+        let (status, created) = call(
+            &f.router,
+            "POST",
+            "/Playlists",
+            Some(&f.admin),
+            Some(json!({
+                "Name": "two libraries",
+                "Ids": [gamma, alpha, delta, epsilon],
+                "MediaType": "Video",
+                "Users": [{ "UserId": f.viewer_id, "CanEdit": true }],
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        Self {
+            id: created["Id"].as_str().expect("id").to_owned(),
+            gamma,
+            alpha,
+            delta,
+            epsilon,
+        }
+    }
+
+    /// The members `token` is given by `GET /Playlists/{id}/Items`.
+    async fn listed(&self, f: &Fixture, token: &str) -> Vec<uuid::Uuid> {
+        let uri = format!("/Playlists/{}/Items", self.id);
+        let (status, page) = call(&f.router, "GET", &uri, Some(token), None).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        item_ids(&page["Items"])
+    }
+
+    /// Every stored member, in order: the administrator can open them all.
+    async fn stored(&self, f: &Fixture) -> Vec<uuid::Uuid> {
+        self.listed(f, &f.admin).await
+    }
+
+    /// `POST /Playlists/{id}/Items/{member}/Move/{index}` as the viewer.
+    async fn move_to(&self, f: &Fixture, member: uuid::Uuid, index: usize) {
+        let uri = format!(
+            "/Playlists/{}/Items/{}/Move/{index}",
+            self.id,
+            member.simple()
+        );
+        let (status, _) = call(&f.router, "POST", &uri, Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+}
+
+/// The filter comes before the paging, so a page is full and the total is what
+/// the caller can see, and `/Items?ParentId=` agrees. `ItemIds` keeps every
+/// member, and so does the playlist when reads and an add have been through it.
+#[tokio::test]
+async fn a_shared_playlist_pages_what_its_reader_can_open_and_keeps_every_member() {
+    let f = fixture().await;
+    let p = SharedPlaylist::new(&f).await;
+    let all = [p.gamma, p.alpha, p.delta, p.epsilon];
+    let open = [p.alpha, p.epsilon];
+    let page = |query: &str| format!("/Playlists/{}/Items{query}", p.id);
+
+    let (_, first) = call(&f.router, "GET", &page("?limit=1"), Some(&f.viewer), None).await;
+    assert_eq!(item_ids(&first["Items"]), [p.alpha], "{first}");
+    assert_eq!(first["TotalRecordCount"], 2, "{first}");
+    let (_, second) = call(
+        &f.router,
+        "GET",
+        &page("?startIndex=1&limit=1"),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    assert_eq!(item_ids(&second["Items"]), [p.epsilon], "{second}");
+    assert_eq!(second["TotalRecordCount"], 2, "{second}");
+    let (_, past) = call(
+        &f.router,
+        "GET",
+        &page("?startIndex=2"),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    assert!(item_ids(&past["Items"]).is_empty(), "{past}");
+    assert_eq!(past["TotalRecordCount"], 2, "{past}");
+
+    let browse = format!("/Items?ParentId={}&userId={}", p.id, f.viewer_id);
+    let (_, browsed) = call(&f.router, "GET", &browse, Some(&f.viewer), None).await;
+    assert_eq!(item_ids(&browsed["Items"]), open, "{browsed}");
+    assert_eq!(browsed["TotalRecordCount"], 2, "{browsed}");
+
+    let (_, playlist) = call(
+        &f.router,
+        "GET",
+        &format!("/Playlists/{}", p.id),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    assert_eq!(item_ids_of(&playlist["ItemIds"]), all, "{playlist}");
+    assert_eq!(p.stored(&f).await, all);
+
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!("/Playlists/{}/Items?ids={}", p.id, p.delta),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(p.listed(&f, &f.viewer).await, open, "an add hides it too");
+    assert_eq!(
+        p.stored(&f).await,
+        [p.gamma, p.alpha, p.delta, p.epsilon, p.delta],
+        "an add still stores a member its caller cannot open"
+    );
+}
+
+/// `ids` as a bare array of ids.
+fn item_ids_of(ids: &Value) -> Vec<uuid::Uuid> {
+    ids.as_array()
+        .expect("ids")
+        .iter()
+        .map(|id| uuid::Uuid::parse_str(id.as_str().expect("id")).expect("id"))
+        .collect()
+}
+
+/// A move's index counts the list its caller was given, so the member lands
+/// where they asked and the members they cannot see keep their places.
+#[tokio::test]
+async fn a_move_counts_the_members_its_caller_can_open() {
+    let f = fixture().await;
+    let p = SharedPlaylist::new(&f).await;
+    assert_eq!(p.listed(&f, &f.viewer).await, [p.alpha, p.epsilon]);
+
+    // Down: `[Alpha, Epsilon]` to `[Epsilon, Alpha]`. Counted over every
+    // member, Alpha is already at index 1 and nothing moves.
+    p.move_to(&f, p.alpha, 1).await;
+    assert_eq!(p.listed(&f, &f.viewer).await, [p.epsilon, p.alpha]);
+    assert_eq!(p.stored(&f).await, [p.gamma, p.delta, p.epsilon, p.alpha]);
+
+    // Back up: before the first member the viewer can open, not before Gamma.
+    p.move_to(&f, p.alpha, 0).await;
+    assert_eq!(p.listed(&f, &f.viewer).await, [p.alpha, p.epsilon]);
+    assert_eq!(p.stored(&f).await, [p.gamma, p.delta, p.alpha, p.epsilon]);
+
+    // Already there: stored order stays.
+    p.move_to(&f, p.alpha, 0).await;
+    assert_eq!(p.stored(&f).await, [p.gamma, p.delta, p.alpha, p.epsilon]);
+
+    // Past the viewer's list, as a client counting `ChildCount` asks: the end.
+    p.move_to(&f, p.alpha, 3).await;
+    assert_eq!(p.listed(&f, &f.viewer).await, [p.epsilon, p.alpha]);
+    assert_eq!(p.stored(&f).await, [p.gamma, p.delta, p.epsilon, p.alpha]);
+
+    // A member the viewer was not given moves only if its id is named, which
+    // `ItemIds` allows and the listing does not, and their list stays as it was.
+    p.move_to(&f, p.gamma, 1).await;
+    assert_eq!(p.listed(&f, &f.viewer).await, [p.epsilon, p.alpha]);
+    assert_eq!(p.stored(&f).await, [p.delta, p.epsilon, p.gamma, p.alpha]);
 }
 
 /// The viewer's `GET /Items/{allowed}` status.
@@ -2136,4 +2568,766 @@ async fn library_option_and_library_row_edits_reach_the_next_request() {
         StatusCode::NOT_FOUND,
         "the library's tag is blocked"
     );
+}
+
+/// The names of a listing's `Playlist` rows, sorted.
+fn playlist_names(listing: &Value) -> Vec<String> {
+    let mut names: Vec<String> = listing["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items: {listing}"))
+        .iter()
+        .filter(|item| item["Type"] == "Playlist")
+        .map(|item| item["Name"].as_str().unwrap().to_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A playlist of the fixture's visible movie, private unless `public`, as `token`.
+async fn create_playlist(f: &Fixture, token: &str, name: &str, public: bool) -> String {
+    let (status, created) = call(
+        &f.router,
+        "POST",
+        "/Playlists",
+        Some(token),
+        Some(json!({"Name": name, "Ids": [f.allowed], "IsPublic": public})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{name}: {created}");
+    created["Id"].as_str().unwrap().to_owned()
+}
+
+/// gl-831: a listing that is not limited to playlists hides the ones a user
+/// cannot see, in the SQL that pages and counts it, whichever rule shows them
+/// the others: their own, a share, open access. An administrator's mixed
+/// listing keeps Jellyfin's answer, and `/Items/Suggestions` takes Jellyfin's
+/// `IsVisible` for everyone.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn listings_hide_the_playlists_a_user_cannot_see() {
+    let f = fixture().await;
+    let private = create_playlist(&f, &f.admin, "Admin private", false).await;
+    let shared = create_playlist(&f, &f.admin, "Admin shared", false).await;
+    create_playlist(&f, &f.admin, "Admin open", true).await;
+    create_playlist(&f, &f.viewer, "Viewer own", false).await;
+    let (status, body) = call(
+        &f.router,
+        "POST",
+        &format!("/Playlists/{shared}/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        Some(json!({"CanEdit": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let visible = ["Admin open", "Admin shared", "Viewer own"];
+    let viewer = format!("userId={}", f.viewer_id);
+
+    // A mixed listing, and the playlist-only one that always hid them.
+    for filter in [
+        "",
+        "&includeItemTypes=Playlist,Movie",
+        "&includeItemTypes=Playlist",
+    ] {
+        let uri = format!("/Items?{viewer}&recursive=true{filter}");
+        let (status, listing) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {listing}");
+        assert_eq!(playlist_names(&listing), visible, "{uri}");
+    }
+
+    // The count and the pages agree with the listing: two movies, three playlists.
+    let mut paged = Vec::new();
+    for start in [0, 2, 4] {
+        let uri = format!(
+            "/Items?{viewer}&recursive=true&includeItemTypes=Playlist,Movie\
+             &sortBy=SortName&limit=2&startIndex={start}&enableTotalRecordCount=true"
+        );
+        let (_, page) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+        assert_eq!(page["TotalRecordCount"], 5, "{uri}: {page}");
+        paged.extend(playlist_names(&page));
+    }
+    paged.sort();
+    assert_eq!(paged, visible);
+
+    // Library-wide search reads the same rows.
+    let uri = format!("/Search/Hints?{viewer}&searchTerm=Admin");
+    let (_, hints) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+    let mut names: Vec<&str> = hints["SearchHints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|hint| hint["Name"].as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["Admin open", "Admin shared"], "{hints}");
+
+    // Suggestions: `SuggestionsController` passes no skip, and the total stays
+    // right because the rows never reach the page.
+    for filter in ["", "&type=Playlist"] {
+        let uri = format!("/Items/Suggestions?{viewer}&enableTotalRecordCount=true{filter}");
+        let (status, listing) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {listing}");
+        assert_eq!(playlist_names(&listing), visible, "{uri}");
+    }
+    let uri =
+        format!("/Items/Suggestions?{viewer}&type=Playlist&limit=2&enableTotalRecordCount=true");
+    let (_, page) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+    assert_eq!(page["TotalRecordCount"], 3, "{page}");
+    assert_eq!(page["Items"].as_array().unwrap().len(), 2, "{page}");
+
+    // By id, the item stays out of reach.
+    let uri = format!("/Items?{viewer}&ids={private}");
+    let (status, listing) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {listing}");
+    assert_eq!(playlist_names(&listing), Vec::<String>::new(), "{uri}");
+
+    // An administrator's mixed listing (`userId` defaults to the caller) is
+    // Jellyfin's: nothing is taken out of it…
+    let (_, listing) = call(
+        &f.router,
+        "GET",
+        "/Items?recursive=true",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(
+        playlist_names(&listing),
+        ["Admin open", "Admin private", "Admin shared", "Viewer own"]
+    );
+    // …while `IsVisible` has no administrator arm, so Suggestions and the
+    // playlist-only listing leave out another user's private playlist.
+    for uri in [
+        "/Items/Suggestions",
+        "/Items?recursive=true&includeItemTypes=Playlist",
+    ] {
+        let (_, me) = call(&f.router, "GET", "/Users/Me", Some(&f.admin), None).await;
+        let separator = if uri.contains('?') { '&' } else { '?' };
+        let uri = format!("{uri}{separator}userId={}", me["Id"].as_str().unwrap());
+        let (_, listing) = call(&f.router, "GET", &uri, Some(&f.admin), None).await;
+        assert_eq!(
+            playlist_names(&listing),
+            ["Admin open", "Admin private", "Admin shared"],
+            "{uri}"
+        );
+    }
+
+    // A user no playlist names sees what is open to everyone.
+    create_user(&f.router, &f.admin, "plain", "plain-pw").await;
+    let (plain, plain_id) = login(&f.router, "plain", "plain-pw").await;
+    let uri = format!("/Items?userId={plain_id}&recursive=true");
+    let (_, listing) = call(&f.router, "GET", &uri, Some(&plain), None).await;
+    assert_eq!(playlist_names(&listing), ["Admin open"], "{uri}: {listing}");
+}
+
+/// Sends `GET uri` with exactly the given headers (no default
+/// `Authorization`), for the credential forms a stream URL can carry.
+async fn status_with(router: &axum::Router, uri: &str, headers: &[(&str, String)]) -> StatusCode {
+    let mut req = Request::builder().method("GET").uri(uri);
+    for (name, value) in headers {
+        req = req.header(*name, value);
+    }
+    router
+        .clone()
+        .oneshot(req.body(Body::empty()).expect("request"))
+        .await
+        .expect("response")
+        .status()
+}
+
+/// Applies `change` to `user_id`'s policy through the route the dashboard uses.
+async fn set_policy(f: &Fixture, user_id: &str, change: impl FnOnce(&mut Value)) {
+    let (_, user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{user_id}"),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let mut policy = user["Policy"].clone();
+    change(&mut policy);
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!("/Users/{user_id}/Policy"),
+        Some(&f.admin),
+        Some(policy),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// The parameters a segment URL must bind.
+const SEGMENT_QUERY: &str = "runtimeTicks=0&actualSegmentLengthTicks=0";
+
+/// The two static reads, which answer `200` from a file with no ffmpeg, so a
+/// refusal cannot be mistaken for a missing track or a failed probe.
+fn static_routes(id: &str) -> Vec<String> {
+    vec![
+        format!("/Videos/{id}/stream?static=true"),
+        format!("/Videos/{id}/stream.mkv?static=true"),
+        format!("/Audio/{id}/stream?static=true"),
+        format!("/Audio/{id}/stream.mkv?static=true"),
+    ]
+}
+
+/// Every route that reads an item's bytes for a caller, static reads included:
+/// the stream, HLS, universal audio, subtitle and attachment families.
+fn stream_routes(id: &str) -> Vec<String> {
+    let mut routes = static_routes(id);
+    routes.extend([
+        format!("/Videos/{id}/stream?static=false&VideoCodec=h264&PlaySessionId=x"),
+        format!("/Audio/{id}/stream?static=false&AudioCodec=mp3&PlaySessionId=x"),
+        format!("/Audio/{id}/universal"),
+        format!("/Videos/{id}/master.m3u8?MediaSourceId={id}"),
+        format!("/Videos/{id}/main.m3u8?MediaSourceId={id}"),
+        format!("/Videos/{id}/live.m3u8?MediaSourceId={id}"),
+        format!("/Audio/{id}/master.m3u8?MediaSourceId={id}"),
+        format!("/Audio/{id}/main.m3u8?MediaSourceId={id}"),
+        format!("/Videos/{id}/hls1/main/0.ts?MediaSourceId={id}&{SEGMENT_QUERY}"),
+        format!("/Audio/{id}/hls1/main/0.ts?MediaSourceId={id}&{SEGMENT_QUERY}"),
+        format!("/Videos/{id}/{id}/Subtitles/0/Stream.srt"),
+        format!("/Videos/{id}/{id}/Subtitles/0/0/Stream.srt"),
+        format!("/Videos/{id}/{id}/Subtitles/0/subtitles.m3u8?segmentLength=30"),
+        format!("/Videos/{id}/{id}/Attachments/0"),
+    ]);
+    routes
+}
+
+/// The routes a request with no credential may use, whose answer must not
+/// depend on a user.
+fn anonymous_routes(id: &str) -> Vec<String> {
+    let mut routes = static_routes(id);
+    routes.extend([
+        format!("/Videos/{id}/{id}/Subtitles/0/Stream.srt"),
+        format!("/Videos/{id}/{id}/Subtitles/0/0/Stream.srt"),
+        format!("/Videos/{id}/{id}/Attachments/0"),
+    ]);
+    routes
+}
+
+/// Gives `id` an external subtitle as a scan stores one, whether or not this
+/// host has an ffprobe to read the scanned file with.
+async fn store_sidecar(f: &Fixture, id: &str) {
+    use ferrofin_traits::persistence::MediaStreamRepository as _;
+    let path = f.h.path(&format!("subtitles/{id}.srt"));
+    touch(&path, "1\n00:00:00,500 --> 00:00:02,000\nA line\n");
+    let item: uuid::Uuid = id.parse().unwrap();
+    let row = ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+        item_id: ferrofin_db::store::guid_to_db(item),
+        stream_index: 0,
+        stream_type: i32::from(ferrofin_db::enums::MediaStreamTypeEntity::Subtitle),
+        codec: Some("subrip".to_owned()),
+        path: Some(path.to_string_lossy().into_owned()),
+        is_external: true,
+        ..ferrofin_db::entities::base_items::MediaStreamInfoEntity::default()
+    };
+    ferrofin_core::media_stream_repository::FerrofinMediaStreamRepository::new(f.h.db.clone())
+        .save_media_streams(item, &[row])
+        .await
+        .unwrap();
+}
+
+/// A signed-in user is held to the libraries it may open on every route that
+/// reads bytes (gl-1090). Upstream's `GetStreamingState` reads the item with no
+/// user, so Jellyfin streams it.
+#[tokio::test]
+async fn a_known_user_is_refused_what_it_cannot_open_on_every_stream_route() {
+    let f = fixture().await;
+    for uri in stream_routes(&f.hidden) {
+        let (status, body) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+    // What the user may open answers as it does for the administrator, whose
+    // reads of the hidden item are the same again.
+    for (allowed, hidden) in stream_routes(&f.allowed)
+        .into_iter()
+        .zip(stream_routes(&f.hidden))
+    {
+        let viewer = call(&f.router, "GET", &allowed, Some(&f.viewer), None)
+            .await
+            .0;
+        let admin = call(&f.router, "GET", &allowed, Some(&f.admin), None)
+            .await
+            .0;
+        assert_eq!(viewer, admin, "{allowed}");
+        let admin_hidden = call(&f.router, "GET", &hidden, Some(&f.admin), None)
+            .await
+            .0;
+        assert_eq!(admin_hidden, admin, "{hidden}");
+    }
+    for uri in static_routes(&f.allowed) {
+        assert_eq!(
+            call(&f.router, "GET", &uri, Some(&f.viewer), None).await.0,
+            StatusCode::OK,
+            "{uri}"
+        );
+    }
+}
+
+/// The owner's boundary stops at a known user: no credential, an API key, and a
+/// token that names nobody read these routes as they did (gl-1090). A token in
+/// a form the server does not read names nobody either: `api_key` counts only
+/// with `EnableLegacyAuthorization` on.
+#[tokio::test]
+async fn no_user_on_a_stream_route_means_no_user_check() {
+    let f = fixture().await;
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        "/Auth/Keys?app=stream-access",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, keys) = call(&f.router, "GET", "/Auth/Keys", Some(&f.admin), None).await;
+    let key = keys["Items"][0]["AccessToken"].as_str().unwrap();
+    for uri in static_routes(&f.hidden) {
+        let sep = if uri.contains('?') { '&' } else { '?' };
+        for (label, request, headers) in [
+            ("no credential", uri.clone(), vec![]),
+            ("API key", format!("{uri}{sep}ApiKey={key}"), vec![]),
+            (
+                "unknown token",
+                format!("{uri}{sep}ApiKey=not-a-token"),
+                vec![],
+            ),
+            (
+                "unread form",
+                format!("{uri}{sep}api_key={}", f.viewer),
+                vec![],
+            ),
+            (
+                "unread header",
+                uri.clone(),
+                vec![("X-Emby-Token", f.viewer.clone())],
+            ),
+        ] {
+            assert_eq!(
+                status_with(&f.router, &request, &headers).await,
+                StatusCode::OK,
+                "{label}: {request}"
+            );
+        }
+    }
+    // A subtitle read answers from the sidecar, whichever library it is in.
+    for id in [&f.allowed, &f.hidden] {
+        store_sidecar(&f, id).await;
+        for uri in [
+            format!("/Videos/{id}/{id}/Subtitles/0/Stream.srt"),
+            format!("/Videos/{id}/{id}/Subtitles/0/0/Stream.srt"),
+        ] {
+            assert_eq!(
+                status_with(&f.router, &uri, &[]).await,
+                StatusCode::OK,
+                "{uri}"
+            );
+        }
+    }
+}
+
+/// A token outside its access schedule and a locked-out account's token are
+/// refused on the routes that take no credential, as on the HLS routes, and
+/// dropping the token still reads what any anonymous request reads (gl-1090).
+/// The dashboard's own "disable" revokes the account's tokens, so such a token
+/// names nobody and reads as no credential does: lockout is what leaves a
+/// disabled account's token standing.
+#[tokio::test]
+async fn account_state_binds_a_known_user_on_the_stream_routes() {
+    let f = fixture().await;
+    let routes = anonymous_routes(&f.allowed);
+    set_policy(&f, &f.viewer_id, |policy| {
+        // A window of one instant, midnight.
+        policy["AccessSchedules"] = json!([{
+            "Id": 0, "UserId": f.viewer_id, "DayOfWeek": "Everyday",
+            "StartHour": 0.0, "EndHour": 0.0,
+        }]);
+    })
+    .await;
+    for uri in &routes {
+        assert_eq!(
+            call(&f.router, "GET", uri, Some(&f.viewer), None).await.0,
+            StatusCode::FORBIDDEN,
+            "outside the schedule: {uri}"
+        );
+    }
+    set_policy(&f, &f.viewer_id, |policy| {
+        policy["AccessSchedules"] = json!([]);
+        policy["LoginAttemptsBeforeLockout"] = json!(1);
+    })
+    .await;
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        "/Users/AuthenticateByName",
+        None,
+        Some(json!({"Username": "viewer", "Pw": "not-the-password"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (_, user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(user["Policy"]["IsDisabled"], json!(true), "{user}");
+    for uri in &routes {
+        assert_eq!(
+            call(&f.router, "GET", uri, Some(&f.viewer), None).await.0,
+            StatusCode::UNAUTHORIZED,
+            "locked out: {uri}"
+        );
+    }
+    // The account is reached only on a route: a segment that is not
+    // `stream.{container}` is no route for anyone.
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("/Videos/{}/streams.mkv", f.allowed),
+            Some(&f.viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    for uri in static_routes(&f.allowed) {
+        assert_eq!(
+            status_with(&f.router, &uri, &[]).await,
+            StatusCode::OK,
+            "no credential: {uri}"
+        );
+    }
+    // Reopen the account, sign in again, and disable it from the dashboard.
+    set_policy(&f, &f.viewer_id, |policy| {
+        policy["IsDisabled"] = json!(false);
+        policy["LoginAttemptsBeforeLockout"] = json!(-1);
+    })
+    .await;
+    let (viewer, _) = login(&f.router, "viewer", "viewer-pw").await;
+    set_policy(&f, &f.viewer_id, |policy| {
+        policy["IsDisabled"] = json!(true);
+    })
+    .await;
+    for uri in static_routes(&f.allowed) {
+        assert_eq!(
+            call(&f.router, "GET", &uri, Some(&viewer), None).await.0,
+            StatusCode::OK,
+            "revoked: {uri}"
+        );
+    }
+}
+
+/// A version in a library the user cannot open is no source for them: a visible
+/// item does not lend it out through `mediaSourceId` (gl-1090), as
+/// `GetStaticMediaSources` keeps it out of `PlaybackInfo`.
+#[tokio::test]
+async fn a_visible_item_does_not_lend_out_a_hidden_version() {
+    let f = fixture().await;
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!("/Videos/MergeVersions?ids={},{}", f.allowed, f.hidden),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (allowed, hidden) = (&f.allowed, &f.hidden);
+    let (_, info) = call(
+        &f.router,
+        "GET",
+        &format!("/Items/{allowed}/PlaybackInfo"),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    let sources = info["MediaSources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1, "{info}");
+    for uri in [
+        format!("/Videos/{allowed}/stream?static=true&mediaSourceId={hidden}"),
+        format!("/Audio/{allowed}/stream?static=true&mediaSourceId={hidden}"),
+        format!("/Videos/{allowed}/stream.mkv?static=true&MediaSourceId={hidden}"),
+        format!("/Videos/{allowed}/master.m3u8?MediaSourceId={hidden}"),
+        format!("/Videos/{allowed}/main.m3u8?MediaSourceId={hidden}"),
+        format!("/Videos/{allowed}/hls1/main/0.ts?MediaSourceId={hidden}&{SEGMENT_QUERY}"),
+        format!("/Audio/{allowed}/universal?mediaSourceId={hidden}"),
+        format!("/Videos/{allowed}/{hidden}/Subtitles/0/Stream.srt"),
+        format!("/Videos/{allowed}/{hidden}/Subtitles/0/0/Stream.srt"),
+        format!("/Videos/{allowed}/{hidden}/Subtitles/0/subtitles.m3u8?segmentLength=30"),
+        format!("/Videos/{allowed}/{hidden}/Attachments/0"),
+    ] {
+        let (status, body) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+    let simple = hidden.replace('-', "");
+    let uri = format!("/Videos/{allowed}/stream?static=true&mediaSourceId={simple}");
+    assert_eq!(
+        call(&f.router, "GET", &uri, Some(&f.viewer), None).await.0,
+        StatusCode::NOT_FOUND,
+        "either spelling of the guid"
+    );
+    // Not a version: what the route answers, as for anyone.
+    for (id, expected) in [("", StatusCode::OK), ("not-a-guid", StatusCode::NOT_FOUND)] {
+        let uri = format!("/Videos/{allowed}/stream?static=true&mediaSourceId={id}");
+        for token in [Some(&f.viewer), None] {
+            assert_eq!(
+                call(&f.router, "GET", &uri, token.map(String::as_str), None)
+                    .await
+                    .0,
+                expected,
+                "{uri}"
+            );
+        }
+    }
+    for (token, id) in [
+        (&f.viewer, allowed),
+        (&f.admin, allowed),
+        (&f.admin, hidden),
+    ] {
+        let uri = format!("/Videos/{allowed}/stream?static=true&mediaSourceId={id}");
+        assert_eq!(
+            call(&f.router, "GET", &uri, Some(token), None).await.0,
+            StatusCode::OK,
+            "{uri}"
+        );
+    }
+}
+
+/// A DVR recording's row, whose id no `BaseItems` row carries, on a file of its
+/// own at `folder`. `channel` is the channel it was captured from.
+async fn stored_recording(f: &Fixture, folder: &str, name: &str, channel: uuid::Uuid) -> String {
+    let path = f.h.path(&format!("{folder}/{name}.ts"));
+    touch(&path, "captured");
+    let id = uuid::Uuid::new_v4();
+    let timer = ferrofin_livetv::dvr::TimerRecordingInfo {
+        id: format!("timer-{name}"),
+        name: name.to_owned(),
+        channel_id: channel,
+        ..ferrofin_livetv::dvr::TimerRecordingInfo::default()
+    };
+    ferrofin_livetv::dvr_repository::insert_recording(
+        &f.h.db,
+        id,
+        &timer,
+        &path,
+        chrono::Utc::now(),
+    )
+    .await
+    .unwrap();
+    id.simple().to_string()
+}
+
+/// An M3U tuner with one channel whose stream is a local origin, listed through
+/// the routes the dashboard uses. Returns the channel's id.
+async fn stored_channel(f: &Fixture) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = listener.local_addr().unwrap();
+    let tuner = axum::Router::new().fallback(|| async { "live bytes" });
+    tokio::spawn(async move { axum::serve(listener, tuner).await });
+    let playlist = f.h.path("playlist.m3u");
+    let guide = f.h.path("guide.xml");
+    touch(
+        &playlist,
+        &format!("#EXTM3U\n#EXTINF:-1 tvg-id=\"one\" tvg-chno=\"1\",One\nhttp://{origin}/one.ts\n"),
+    );
+    touch(
+        &guide,
+        "<tv><channel id=\"one\"><display-name>One</display-name></channel></tv>",
+    );
+    for (uri, body) in [
+        (
+            "/LiveTv/TunerHosts",
+            json!({"Type": "m3u", "Url": playlist.to_string_lossy()}),
+        ),
+        (
+            "/LiveTv/ListingProviders",
+            json!({"Type": "xmltv", "Path": guide.to_string_lossy(), "EnableAllTuners": true}),
+        ),
+    ] {
+        let (status, response) = call(&f.router, "POST", uri, Some(&f.admin), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {response}");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (_, page) = call(&f.router, "GET", "/LiveTv/Channels", Some(&f.admin), None).await;
+        if let Some(id) = page["Items"][0]["Id"].as_str() {
+            f.h.wired
+                .state
+                .live_tv
+                .as_ref()
+                .unwrap()
+                .refresh_guide()
+                .await
+                .unwrap();
+            return id.to_owned();
+        }
+        assert!(std::time::Instant::now() < deadline, "no lineup appeared");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// A recording's id names no `BaseItems` row, and it must still play for every
+/// caller who may reach it. Its rule is `GET /LiveTv/Recordings/{id}`'s, the one
+/// route that reads it, since `PlaybackInfo` finds no item for anyone: "Live TV
+/// access", its own visibility, the library holding its file, and its channel.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one recording, through every rule that reaches it"
+)]
+#[tokio::test]
+async fn a_recording_plays_for_whoever_may_read_it() {
+    let f = fixture().await;
+    let channel = stored_channel(&f).await;
+    let channel = channel.parse().unwrap();
+    let id = stored_recording(&f, "recordings", "show", channel).await;
+    let uri = format!("/Videos/{id}/stream?static=true");
+    let audio = format!("/Audio/{id}/stream?static=true");
+    assert_eq!(status_with(&f.router, &uri, &[]).await, StatusCode::OK);
+    for token in [&f.viewer, &f.admin] {
+        assert_eq!(
+            call(
+                &f.router,
+                "GET",
+                &format!("/LiveTv/Recordings/{id}"),
+                Some(token),
+                None
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        for uri in [&uri, &audio] {
+            assert_eq!(
+                call(&f.router, "GET", uri, Some(token), None).await.0,
+                StatusCode::OK,
+                "{uri}"
+            );
+        }
+    }
+    let hidden = stored_recording(&f, "more", "kept-out", channel).await;
+    let uri_hidden = format!("/Videos/{hidden}/stream?static=true");
+    assert_eq!(
+        call(&f.router, "GET", &uri_hidden, Some(&f.viewer), None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND,
+        "a file inside a library the user cannot open"
+    );
+    assert_eq!(
+        call(&f.router, "GET", &uri_hidden, Some(&f.admin), None)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let lost = stored_recording(&f, "recordings", "gone", uuid::Uuid::from_u128(0xdead)).await;
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("/Videos/{lost}/stream?static=true"),
+            Some(&f.viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK,
+        "a channel gone from the lineup leaves its recordings playable"
+    );
+    assert_eq!(
+        call(
+            &f.router,
+            "GET",
+            &format!("/LiveTv/Recordings/{lost}"),
+            Some(&f.viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    // Its channel hidden from the user, and then the recording itself: what the
+    // user may not see of it, on the stream and on its own route.
+    for kind in ["LiveTvChannel", "Other"] {
+        set_policy(&f, &f.viewer_id, |policy| {
+            policy["BlockUnratedItems"] = json!([kind]);
+        })
+        .await;
+        for route in [uri.clone(), format!("/LiveTv/Recordings/{id}")] {
+            assert_eq!(
+                call(&f.router, "GET", &route, Some(&f.viewer), None)
+                    .await
+                    .0,
+                StatusCode::NOT_FOUND,
+                "{kind} unrated blocked: {route}"
+            );
+        }
+    }
+    set_policy(&f, &f.viewer_id, |policy| {
+        policy["BlockUnratedItems"] = json!([]);
+        policy["EnableLiveTvAccess"] = json!(false);
+    })
+    .await;
+    for uri in [&uri, &audio] {
+        assert_eq!(
+            call(&f.router, "GET", uri, Some(&f.viewer), None).await.0,
+            StatusCode::NOT_FOUND,
+            "no Live TV access: {uri}"
+        );
+    }
+    assert_eq!(status_with(&f.router, &uri, &[]).await, StatusCode::OK);
+    assert_eq!(
+        call(&f.router, "GET", &uri, Some(&f.admin), None).await.0,
+        StatusCode::OK
+    );
+}
+
+/// A channel is a row with no path, so the library list does not reach it. Its
+/// rule is `PlaybackInfo`'s, whose answer the stream route repeats: rating and
+/// tag rules hide it, and "Live TV access" does not, there or here.
+#[tokio::test]
+async fn a_channel_answers_as_its_playback_info_does() {
+    let f = fixture().await;
+    let id = stored_channel(&f).await;
+    let stream = format!("/Videos/{id}/stream?static=true");
+    let info = format!("/Items/{id}/PlaybackInfo");
+    assert_eq!(status_with(&f.router, &stream, &[]).await, StatusCode::OK);
+    for token in [&f.viewer, &f.admin] {
+        assert_eq!(
+            call(&f.router, "GET", &info, Some(token), None).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(&f.router, "GET", &stream, Some(token), None).await.0,
+            StatusCode::OK
+        );
+    }
+    set_policy(&f, &f.viewer_id, |policy| {
+        policy["EnableLiveTvAccess"] = json!(false);
+    })
+    .await;
+    for uri in [&info, &stream] {
+        assert_eq!(
+            call(&f.router, "GET", uri, Some(&f.viewer), None).await.0,
+            StatusCode::OK,
+            "{uri}"
+        );
+    }
+    set_policy(&f, &f.viewer_id, |policy| {
+        policy["BlockUnratedItems"] = json!(["LiveTvChannel"]);
+    })
+    .await;
+    for uri in [&info, &stream] {
+        assert_eq!(
+            call(&f.router, "GET", uri, Some(&f.viewer), None).await.0,
+            StatusCode::NOT_FOUND,
+            "{uri}"
+        );
+    }
+    assert_eq!(status_with(&f.router, &stream, &[]).await, StatusCode::OK);
 }

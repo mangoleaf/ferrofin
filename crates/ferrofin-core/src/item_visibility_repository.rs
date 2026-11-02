@@ -68,6 +68,34 @@ pub(crate) async fn libraries(db: &Database) -> Result<Vec<BaseItemEntity>, Serv
         .map_err(db_err)
 }
 
+/// The `Playlist` rows under `top_parents`, or every one when none are named:
+/// the rows a listing's SQL can reach, from the `(Type, TopParentId)` index.
+pub(crate) async fn playlists(
+    db: &Database,
+    top_parents: &[Uuid],
+) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    playlists_statement(top_parents)
+        .build_query_as()
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// [`playlists`]' statement.
+fn playlists_statement(top_parents: &[Uuid]) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+    let mut query = sqlx::QueryBuilder::new(r#"SELECT * FROM "BaseItems" WHERE "Type" = "#);
+    query.push_bind(stored_type_name(BaseItemKind::Playlist).unwrap_or_default());
+    if !top_parents.is_empty() {
+        query.push(r#" AND "TopParentId" IN ("#);
+        let mut separated = query.separated(",");
+        for id in top_parents {
+            separated.push_bind(guid_to_db(*id));
+        }
+        separated.push_unseparated(")");
+    }
+    query
+}
+
 pub(crate) async fn linked_children(
     db: &Database,
     parent_ids: &[Uuid],
@@ -144,6 +172,42 @@ pub(crate) async fn playlist_access(
 mod tests {
     use super::*;
     use crate::test_support::{seed_child_item, seed_item, test_db};
+
+    /// The playlists a listing can reach come from a `(Type, TopParentId)` seek, or a
+    /// `Type` seek without a scope: this read runs on mixed listings, and its cost must
+    /// follow the playlists, never the library.
+    #[tokio::test]
+    async fn the_playlist_candidates_seek_their_type() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        for top_parents in [vec![Uuid::from_u128(0x201), Uuid::from_u128(0x202)], vec![]] {
+            let mut builder = playlists_statement(&top_parents);
+            let mut query = builder.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            let wanted = if top_parents.is_empty() {
+                "(Type=?)"
+            } else {
+                "(Type=? AND TopParentId=?)"
+            };
+            assert!(
+                plan.iter()
+                    .any(|step| step.starts_with("SEARCH") && step.contains(wanted)),
+                "{plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.starts_with("SCAN")),
+                "{plan:?}"
+            );
+        }
+    }
 
     /// One read returns the whole chain above an item, and reaches every row through the
     /// primary key: no scan of `BaseItems` (`EXPLAIN QUERY PLAN`).

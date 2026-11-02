@@ -1,7 +1,7 @@
 # Feature status
 
-**Parity: 29 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
-19 compared against v12.2 and owed a re-check, 6 subsystem rows (as of 2026-11-01; the
+**Parity: 37 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
+17 compared against v12.2 and owed a re-check, 6 subsystem rows (as of 2026-11-01; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
 Ferrofin answers the way Jellyfin does (identical, in another order, a known difference, filed, new), is in
@@ -81,6 +81,11 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
   `Data`-JSON shape, the same source of truth Jellyfin itself reads.
+  - **Accepted divergence:** a playlist's items listing and a reorder leave out a member from a
+    library the user was not given, where Jellyfin lists it and hides only what the member's
+    rating or tags rule out. Library access is a boundary here. What is stored stays: adding
+    still stores an item from such a library, and `GET /Playlists/{id}` still lists every
+    member in `ItemIds`.
   - **Accepted divergence (a fix, not a gap):** a reorder counts positions among the members
     the user can see, as Jellyfin's `MoveItemAsync` does, but Jellyfin anchors on the list
     before the moved entry is taken out and lands it one place short when it moves down past

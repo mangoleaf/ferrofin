@@ -616,7 +616,7 @@ impl RemoteSearchProvider for OmdbSearchProvider {
 }
 
 /// The shared naming options the providers' `ParseName` runs by (the OMDb
-/// Identify search, the TVDB search).
+/// Identify search, the TVDB search, the box-set refresh).
 ///
 /// [`NamingOptions::new`] compiles the whole clean-name regex table, so it is
 /// built once for the process rather than per search request.
@@ -2009,8 +2009,9 @@ impl LocalProviderManager {
     /// The box-set arm of the single-item refresh — port of
     /// `TmdbBoxSetProvider` + `TmdbBoxSetImageProvider`: the collection a
     /// `Tmdb` id pins (on the box set, or on the chosen Identify result),
-    /// else the top hit of a collection search by the box set's name, as a
-    /// provider result — its name and overview, its id, and its artwork.
+    /// else the top hit of a collection search by the box set's name, parsed
+    /// and cleaned as `GetMetadata` does (`TmdbBoxSetProvider.cs:105-108`), as
+    /// a provider result — its name and overview, its id, and its artwork.
     async fn fetch_box_set(
         tmdb: &TmdbClient,
         name: &str,
@@ -2021,7 +2022,8 @@ impl LocalProviderManager {
         let collection_id = if let Some(id) = collection_id {
             id
         } else {
-            tmdb.search_collection(name, language)
+            let parsed = ferrofin_naming::video::video_resolver::parse_name(name, naming_options());
+            tmdb.search_collection(&crate::tmdb::clean_name(&parsed.name), language)
                 .await
                 .into_iter()
                 .next()?
@@ -8000,6 +8002,37 @@ mod tests {
         assert_eq!(saved[0].name.as_deref(), Some("The Matrix Collection"));
         // The sort key is settled the way the scan settles it.
         assert_eq!(saved[0].sort_name.as_deref(), Some("matrix collection"));
+    }
+
+    /// `TmdbBoxSetProvider.GetMetadata` (`TmdbBoxSetProvider.cs:102-109`): a box
+    /// set with no Tmdb id searches by `ParseName`, then `TmdbUtils.CleanName`,
+    /// and the hit fills the box set. A name holding two years keeps the first:
+    /// `CleanDateTimes` is greedy, so only the last year comes out of it.
+    #[rstest::rstest]
+    #[case::year_suffix("Harry Potter (2001)", "Harry Potter")]
+    #[case::year_range("Harry Potter (2001-2011)", "Harry Potter 2001")]
+    #[case::release_tag("Alien 4K", "Alien")]
+    #[case::punctuation("Star Wars: Saga", "Star Wars Saga")]
+    #[case::plain("Matrix", "Matrix")]
+    #[tokio::test]
+    async fn a_box_set_with_no_id_searches_by_its_parsed_and_cleaned_name(
+        #[case] name: &str,
+        #[case] query: &str,
+    ) {
+        let (server, tmdb) = tmdb_with_decoy_search().await;
+        let store = Arc::new(RecordingStore::default());
+        let (item_id, mgr) = box_set_manager(row("Movies.BoxSet", name), tmdb, Arc::clone(&store));
+
+        mgr.refresh_full_item(item_id, &full_metadata_refresh())
+            .await
+            .expect("refresh");
+
+        assert_eq!(
+            server.query_values("/search/collection", "query"),
+            vec![query.to_owned()]
+        );
+        let saved = store.saved.lock().expect("lock");
+        assert_eq!(saved[0].overview.as_deref(), Some("Decoy."));
     }
 
     /// A refresh re-derives the by-name index from the row it just wrote.

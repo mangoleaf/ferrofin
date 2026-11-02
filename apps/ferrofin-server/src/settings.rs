@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrofin_core::system_manager::LifecycleController;
 use ferrofin_drawing::ImageLimits;
+use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_model::server_settings::{
     ServerSettingApplies as Applies, ServerSettingDto, ServerSettingGroup as Group,
     ServerSettingKind, ServerSettingSource as Source, ServerSettingsDto, ServerSettingsUpdateDto,
@@ -190,6 +191,12 @@ const PORT: SettingKind = SettingKind::Integer {
 const CACHE_TTL: SettingKind = SettingKind::Integer {
     min: *config::CACHE_TTL_RANGE_SECS.start() as i64,
     max: *config::CACHE_TTL_RANGE_SECS.end() as i64,
+};
+
+/// The transcode caps' bounds ([`TranscodeLimits::RANGE`]).
+const TRANSCODE_CAP: SettingKind = SettingKind::Integer {
+    min: *TranscodeLimits::RANGE.start() as i64,
+    max: *TranscodeLimits::RANGE.end() as i64,
 };
 
 /// [`EnvRead::Parsed`] for a variable the loader reads as a `u32`.
@@ -413,6 +420,32 @@ pub static SETTINGS: &[SettingSpec] = &[
         description: "Extract chapter images and thumbnails from keyframes only: faster, and \
                       the image may be less typical of the scene.",
         running: |c| json!(c.ffmpeg_img_extract_perf_tradeoff),
+        ..ROW
+    },
+    SettingSpec {
+        key: "max_transcodes",
+        env: Some("FERROFIN_MAX_TRANSCODES"),
+        env_read: PARSED_U32,
+        group: Group::Ffmpeg,
+        kind: TRANSCODE_CAP,
+        default: "0",
+        description: "Most jobs re-encoding a stream the server runs at once; past it a user's \
+                      idle jobs are ended, and a new one is refused if that makes no room. 0 \
+                      means no cap.",
+        running: |c| json!(c.max_transcodes),
+        ..ROW
+    },
+    SettingSpec {
+        key: "max_transcodes_per_user",
+        env: Some("FERROFIN_MAX_TRANSCODES_PER_USER"),
+        env_read: PARSED_U32,
+        group: Group::Ffmpeg,
+        kind: TRANSCODE_CAP,
+        default: "0",
+        description: "Most jobs re-encoding a stream one user runs at once; past it their \
+                      idle jobs are ended, and a new one is refused if none is idle. 0 means \
+                      no cap.",
+        running: |c| json!(c.max_transcodes_per_user),
         ..ROW
     },
     // ---- Library and database ---------------------------------------------
