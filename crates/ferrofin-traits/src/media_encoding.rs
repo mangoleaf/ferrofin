@@ -659,6 +659,10 @@ pub struct HlsStreamRequest {
     /// copying a stream when its transcoding permission is disabled, matching
     /// `EncodingHelper.TryStreamCopy`; remuxing controls playback negotiation.
     pub playback_permissions: Option<crate::library::PlaybackPermissions>,
+    /// The authenticated user the stream is for, never populated from query
+    /// parameters; `None` for a userless API key. The transcode manager counts
+    /// a user's running transcodes against its per-user cap by it.
+    pub user_id: Option<Uuid>,
     /// Whether the request came from the local network
     /// (`INetworkManager.IsInLocalNetwork(remoteIp)`): disables the adaptive
     /// bitrate variants, which "within the local network will likely do more
@@ -691,6 +695,7 @@ impl Default for HlsStreamRequest {
     fn default() -> Self {
         Self {
             item_id: Uuid::nil(),
+            user_id: None,
             media_source_id: None,
             live_stream_id: None,
             play_session_id: None,

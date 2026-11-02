@@ -23,6 +23,7 @@ use ferrofin_mediaencoding::subtitles::{
     SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
     subtitle_extraction_timeout,
 };
+use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_mediaencoding::{
     AttachmentExtractorImpl, EncodingHelper, NoopSessionReporter, TokioSegmentTranscoder,
     TranscodeManagerImpl,
@@ -68,6 +69,9 @@ pub struct MediaEncodingExtras {
     /// playlist generator has no keyframe extractor, and every playlist uses
     /// equal-length segments.
     pub keyframes: Option<Arc<dyn KeyframeRepository>>,
+    /// The caps on concurrent re-encoding jobs; see
+    /// [`crate::config::Config::max_transcodes`].
+    pub transcode_limits: TranscodeLimits,
 }
 
 /// The playlist generator's encoding options: the live configuration, as
@@ -349,7 +353,11 @@ pub fn build_media_encoding(
     if cleared > 0 {
         tracing::info!(deleted = cleared, "cleared the transcode cache");
     }
-    let manager = Arc::new(TranscodeManagerImpl::new(reporter).with_encoding_configuration(config));
+    let manager = Arc::new(
+        TranscodeManagerImpl::new(reporter)
+            .with_encoding_configuration(config)
+            .with_transcode_limits(extras.transcode_limits),
+    );
     // The idle reaper kills any transcode whose consumers vanished without a
     // stop report (a disconnected cast receiver, a killed browser tab): no
     // active segment request and no session ping within the job's ping timeout
@@ -1026,6 +1034,7 @@ mod tests {
                 trickplay: None,
                 sessions: None,
                 keyframes: None,
+                transcode_limits: TranscodeLimits::default(),
             },
         );
     }
@@ -1071,6 +1080,7 @@ mod tests {
                 trickplay: None,
                 sessions: None,
                 keyframes: None,
+                transcode_limits: TranscodeLimits::default(),
             },
         );
         assert!(!job.join("0123abcd0.mp4").exists());
@@ -1378,6 +1388,7 @@ mod tests {
                 trickplay: Some(Arc::new(FakeTrickplay)),
                 sessions: None,
                 keyframes: None,
+                transcode_limits: TranscodeLimits::default(),
             },
         );
 

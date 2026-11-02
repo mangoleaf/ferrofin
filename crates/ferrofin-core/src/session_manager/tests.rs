@@ -655,6 +655,127 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
     assert_eq!(resolved.user_id, user_id);
 }
 
+/// Upstream throws one message from `UserManager.AuthenticateUser` (no such
+/// user) and `AuthenticateNewSessionInternal` (wrong password), so a caller
+/// cannot tell them apart. The two are written in different managers here.
+#[tokio::test]
+async fn unknown_user_and_wrong_password_fail_with_one_message() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "bob").await;
+    set_permission(&db, &user.id, PermissionKind::EnableRemoteAccess, true)
+        .await
+        .unwrap();
+    FerrofinUserManager::new(db.clone())
+        .change_password(user_id, "right")
+        .await
+        .unwrap();
+
+    let attempt = |username: &str| AuthenticationRequest {
+        username: Some(username.to_owned()),
+        password: Some(Secret::new("guess")),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device_name: Some("Firefox".to_owned()),
+        remote_endpoint: Some("127.0.0.1".to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    let unknown = mgr.authenticate_new_session(&attempt("nobody")).await;
+    let wrong = mgr.authenticate_new_session(&attempt("bob")).await;
+    let (Err(ServiceError::Unauthorized(unknown)), Err(ServiceError::Unauthorized(wrong))) =
+        (unknown, wrong)
+    else {
+        panic!("both must be an authentication failure");
+    };
+    assert_eq!(unknown, wrong);
+    assert_eq!(unknown, "Invalid username or password entered.");
+}
+
+/// The login routes answer every refusal with one body, so the log is the only
+/// place left that says why. These three happen once the password is settled,
+/// each logged where it is decided.
+#[tokio::test]
+async fn refused_logins_log_their_reason() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let logs = crate::test_support::CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let attempt = |username: &str, remote: &str| AuthenticationRequest {
+        username: Some(username.to_owned()),
+        password: Some(Secret::new("")),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device_name: Some("Firefox".to_owned()),
+        remote_endpoint: Some(remote.to_owned()),
+        ..AuthenticationRequest::default()
+    };
+
+    // No `EnableRemoteAccess`, from outside the local network.
+    let remote = seed_named_user(&db, Uuid::new_v4(), "remote").await;
+    set_permission(&db, &remote.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
+    let refused = mgr
+        .authenticate_new_session(&attempt("remote", "1.2.3.4"))
+        .await;
+    assert!(matches!(refused, Err(ServiceError::Forbidden(_))));
+
+    // No `EnableAllDevices`, and this device is not on the user's list.
+    let bound = seed_named_user(&db, Uuid::new_v4(), "bound").await;
+    set_permission(&db, &bound.id, PermissionKind::EnableRemoteAccess, true)
+        .await
+        .unwrap();
+    let refused = mgr
+        .authenticate_new_session(&attempt("bound", "127.0.0.1"))
+        .await;
+    assert!(matches!(refused, Err(ServiceError::Forbidden(_))));
+
+    // One session allowed, and the first login holds it.
+    let capped_id = Uuid::new_v4();
+    let capped = seed_named_user(&db, capped_id, "capped").await;
+    FerrofinUserManager::new(db.clone())
+        .update_policy(
+            capped_id,
+            &ferrofin_model::users::UserPolicy {
+                max_active_sessions: 1,
+                ..ferrofin_model::users::UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    for permission in [
+        PermissionKind::EnableRemoteAccess,
+        PermissionKind::EnableAllDevices,
+    ] {
+        set_permission(&db, &capped.id, permission, true)
+            .await
+            .unwrap();
+    }
+    let request = attempt("capped", "127.0.0.1");
+    mgr.authenticate_new_session(&request).await.unwrap();
+    let refused = mgr.authenticate_new_session(&request).await;
+    assert!(matches!(refused, Err(ServiceError::Forbidden(_))));
+
+    let log = logs.text();
+    let missing: Vec<&str> = ["remote_access", "device", "max_sessions"]
+        .into_iter()
+        .filter(|reason| {
+            !log.lines().any(|line| {
+                line.contains("login failed") && line.contains(&format!("reason=\"{reason}\""))
+            })
+        })
+        .collect();
+    assert!(missing.is_empty(), "no line for {missing:?} in: {log}");
+}
+
 #[tokio::test]
 async fn authenticate_new_session_enforces_password_and_returns_the_token() {
     // The interactive path (`authenticate_new_session`) runs the password check
