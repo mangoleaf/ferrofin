@@ -48,7 +48,9 @@ use crate::extract::{JsonBody, Query, upload_body_limit};
 use crate::handlers::image_upload::decode_base64;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::queue_high_priority_refresh;
-use crate::handlers::streaming::{opened_file_response, physical_file_precondition};
+use crate::handlers::streaming::{
+    opened_file_response, physical_file_precondition, require_streamable_item,
+};
 use crate::state::AppState;
 
 /// The MIME type Jellyfin serves an HLS subtitle playlist with
@@ -504,10 +506,20 @@ async fn serve_graphical_subtitle(
 )]
 async fn get_subtitle(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
     Path((item_id, media_source_id, index, route_format)): Path<(Uuid, String, i32, String)>,
     Query(query): Query<SubtitleStreamQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    require_streamable_item(
+        &state,
+        &auth,
+        request.extensions(),
+        request.headers(),
+        item_id,
+        Some(&media_source_id),
+    )
+    .await?;
     let format = parse_subtitle_format(&route_format);
     if let Some(response) =
         serve_graphical_subtitle(&state, item_id, &media_source_id, index, &format, request).await?
@@ -541,6 +553,7 @@ async fn get_subtitle(
 )]
 async fn get_subtitle_with_ticks(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
     Path((item_id, media_source_id, index, start_position_ticks, route_format)): Path<(
         Uuid,
         String,
@@ -551,6 +564,15 @@ async fn get_subtitle_with_ticks(
     Query(mut query): Query<SubtitleStreamQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    require_streamable_item(
+        &state,
+        &auth,
+        request.extensions(),
+        request.headers(),
+        item_id,
+        Some(&media_source_id),
+    )
+    .await?;
     // The route-supplied start position applies unless the query names one
     // (the C# `startPositionTicks ?? routeStartPositionTicks`).
     query
@@ -605,7 +627,17 @@ async fn get_subtitle_playlist(
     // suppresses the same unused parameter (CA1801).
     Path((item_id, media_source_id, _index)): Path<(Uuid, String, i32)>,
     Query(query): Query<SubtitlePlaylistQuery>,
+    parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    require_streamable_item(
+        &state,
+        &auth,
+        &parts.extensions,
+        &parts.headers,
+        item_id,
+        Some(&media_source_id),
+    )
+    .await?;
     require_video(&state, item_id, &auth).await?;
 
     let user = resolve_user_opt(&state, &auth, None).await?;

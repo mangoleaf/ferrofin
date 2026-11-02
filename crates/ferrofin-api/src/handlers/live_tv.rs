@@ -31,6 +31,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::{BaseItemDto, NameIdPair, SortOrder};
 use ferrofin_model::entities::ImageType;
@@ -1129,14 +1130,84 @@ async fn require_visible_recording(
             .ok_or_else(|| ApiError::NotFound("recording".into()))?,
     };
     if let Some(user) = user
-        && !state
-            .library
-            .is_item_visible_standalone(&item, user)
-            .await?
+        && !recording_visible(state, item, user).await?
     {
         return Err(ApiError::NotFound("recording".into()));
     }
     Ok(())
+}
+
+/// Whether `user` may see a recording: `IsVisibleStandalone` over its entity,
+/// the libraries holding its file, then the channel it was captured from.
+///
+/// The check cannot see the last two by itself. An entity with no row has no
+/// parent to reach a library through, so its file's folder is matched here. And
+/// a recording's `ChannelId` names a tuner channel, as on a programme, where the
+/// check reads a plugin channel's: that answer would end it, and a channel gone
+/// from the lineup, which leaves no row while its recordings stay, would read as
+/// a corrupt reference.
+pub(crate) async fn recording_visible(
+    state: &AppState,
+    mut recording: BaseItemEntity,
+    user: &UserEntity,
+) -> Result<bool, ApiError> {
+    let channel = recording
+        .channel_id
+        .take()
+        .and_then(|id| Uuid::parse_str(&id).ok());
+    if !state
+        .library
+        .is_item_visible_standalone(&recording, user)
+        .await?
+    {
+        return Ok(false);
+    }
+    if let Some(path) = recording.path.as_deref()
+        && !recording_library_allows(state, path, user).await?
+    {
+        return Ok(false);
+    }
+    let Some(channel) = channel else {
+        return Ok(true);
+    };
+    match state.library.get_item_by_id(channel).await? {
+        Some(channel) => Ok(state.library.is_item_visible(&channel, user).await?),
+        None => Ok(true),
+    }
+}
+
+/// Whether the libraries holding the file at `path` leave it to `user`: no
+/// library does, or the user may open one that does. A recording folder is a
+/// library of its own, which a restricted user may not have been granted.
+async fn recording_library_allows(
+    state: &AppState,
+    path: &str,
+    user: &UserEntity,
+) -> Result<bool, ApiError> {
+    let holders: Vec<Uuid> = state
+        .virtual_folders
+        .get_virtual_folders()
+        .await?
+        .iter()
+        .filter(|folder| {
+            folder
+                .locations
+                .iter()
+                .any(|location| std::path::Path::new(path).starts_with(location))
+        })
+        .filter_map(|folder| Uuid::parse_str(folder.item_id.as_deref()?).ok())
+        .collect();
+    if holders.is_empty() {
+        return Ok(true);
+    }
+    for holder in holders {
+        if let Some(library) = state.library.get_item_by_id(holder).await?
+            && state.library.is_item_visible(&library, user).await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `DELETE /LiveTv/Recordings/{recordingId}` — delete a recording + its file.
