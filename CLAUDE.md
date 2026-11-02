@@ -294,6 +294,18 @@ and CI does not run it: run it by hand for changes to `ferrofin-drawing/src/limi
 FERROFIN_CGROUP_TESTS=1 cargo test -p ferrofin-server --test image_limits_cgroup
 ```
 
+The LDAP-Auth extension's directory client has one too. `ldap_directory` starts two OpenLDAP
+containers (built from `alpine:3.22` on the first run, certificates generated per run) and runs
+the settings page's connection test over plain LDAP, LDAPS and StartTLS: a custom root CA, a
+client certificate, skip-verify, a certificate for the wrong name refused, a wrong bind
+password, and an unroutable address failing within the 5-second connect timeout; then search,
+modify, the password-modify operation and the root DSE. It needs `docker`, and CI does not run
+it: run it by hand for changes to `crates/ferrofin-extensions/src/ldap_auth/`:
+
+```bash
+FERROFIN_LDAP_TESTS=1 cargo test -p ferrofin-extensions --test ldap_directory -- --nocapture
+```
+
 Similarly, the end-to-end WASM plugin test builds the reference guest from source (needs the
 `wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root
 toolchain stays server-only). It skips with a message when the target is absent; CI always

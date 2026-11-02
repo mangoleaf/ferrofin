@@ -20,6 +20,7 @@ Conventions:
 | Intro Skipper | https://github.com/intro-skipper/intro-skipper | `db09359` | 10.11/prerelease | ported |
 | File Transformation | https://github.com/IAmParadox27/jellyfin-plugin-file-transformation | `f4f01c3` | 2.5.10.0 | ported |
 | Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
+| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page and `TestServerBind` (milestone "LDAP-Auth plugin port") |
 
 ## Per-plugin notes
 
@@ -160,13 +161,21 @@ Conventions:
   hiding each alternate from its own series' list and skewing season counts.
   The bulk episode task self-heals links whose key no longer matches their
   primary's (unlink + regroup within the series). The key's title fallback (no
-  provider id, no episode number) also carries the episode's air date
-  (`PremiereDate`): upstream's `title:{SeriesName}:{SeasonName}:{Name}:{ProductionYear}`
+  provider id, no episode number) also carries the core resolver's version
+  key read from the episode's file name (`GetEpisodeVersionKey`: `D{yyyyMMdd}`
+  for a name by air date, `S{n}E{n}` for one with both numbers): upstream's
+  `title:{SeriesName}:{SeasonName}:{Name}:{ProductionYear}`
   is the same for every airing of a show whose files are named by date —
   `IsByDate` clears the number, the name is the series', the year the
   series' — so the task merged a whole season of airings into one episode.
-  Two copies of one airing still merge, as the core resolver's `D{date}`
-  version key groups them. For the same reason movie
+  Two copies of one airing still merge, as the core resolver groups them. The
+  stored `PremiereDate` is not used: an NFO, or a row adopted from Jellyfin
+  (server-local midnight), can store an airing's date on another day. A file
+  name with no such key keeps upstream's key. The self-heal also undoes a
+  group made by hand through `POST /Videos/MergeVersions` of two airings, or
+  of two copies only one of whose file names carries the key; the playlist
+  and collection entries that merge rerouted to the primary stay on it.
+  For the same two-libraries reason as the series-row scoping, movie
   grouping is keyed by (owning library `TopParentId`, `Tmdb` id) rather than
   the `Tmdb` id alone: the same film held in a cold (NAS) and a hot (local)
   library is two intentional entries, and merging them hid one behind the
@@ -189,3 +198,78 @@ Conventions:
   snapshot of the matching ids, then the rows by id, `PAGE_SIZE` at a time)
   and keeps only the fields the grouping reads, so the groups and merges are
   the same.
+
+### LDAP-Auth
+- Ferrofin files: `crates/ferrofin-extensions/src/ldap_auth.rs` (the extension, the
+  configuration, the `LdapDirectory` seam, `TestServerBind` and its service) and
+  `ldap_auth/directory.rs` (the `ldap3` client and its rustls configuration), vendored
+  assets `crates/ferrofin-extensions/assets/ldapauth/`, the trait seam
+  `crates/ferrofin-traits/src/ldap.rs`, the wire types `crates/ferrofin-model/src/ldap.rs`,
+  and the thin HTTP handler `crates/ferrofin-api/src/handlers/ldap.rs`. The live directory
+  test is `crates/ferrofin-extensions/tests/ldap_directory.rs` (`FERROFIN_LDAP_TESTS=1`,
+  OpenLDAP in docker; CI does not run it).
+- Ported so far (v24, `d11c86a`): `LdapPlugin` (GUID, name `LDAP-Auth`, version 24,
+  `ConfigurationFileName` `LDAP-Auth.xml`, the settings page under its name),
+  `PluginConfiguration` with upstream's defaults, `GetConnectionOptions` and its certificate
+  callbacks, and `LdapController.TestServerBind` with
+  `LdapAuthenticationProviderPlugin.TestServerBind`: the body is saved into the
+  configuration first, then connect, StartTLS, bind (`Anonymous` for an empty password, as
+  Novell's client binds) and a subtree count of the base DN with Novell's filter for an empty
+  one, `(objectclass=*)`, each step `Testing...` until it passes and `Error` naming the
+  failure. The route is administrators only (`RequiresElevation`), answers `404` while the
+  plugin is disabled, and refuses a body without `LdapServer` or `LdapBaseDn`
+  (`[Required]`) with ASP.NET's validation problem. With both `UseSsl` and `UseStartTls`
+  set, StartTLS is still sent over the LDAPS connection, as Novell's client sends it, and
+  the server's refusal is the StartTLS step's error (`ldap3` alone would skip it). A server
+  given as an IPv6 address works over TLS too: the certificate is checked against the
+  address. For a host name, a certificate with no DNS name among its subject alternative
+  names is matched by its subject common name, OpenSSL's fallback, which .NET uses on
+  Linux. Sign-in, the filter and user-search tests, password changes, profile images,
+  referrals and the `LDAP-Auth.xml` import are later phases of the milestone.
+- `POST /Ldap/TestServerBind` is the plugin's own controller, not a contract operation, so it
+  is in `handlers::PLUGIN_ROUTES` (matched ignoring case, as the page calls
+  `ldap/TestServerBind`) and has no `handlers::VERIFIED` row; this section is its record.
+- Accepted divergences (do NOT "fix" during sync):
+  - **Off by default** (owner decision D3): the plugin is disabled in `/Plugins` until an
+    administrator enables it, and `LdapServer` seeds empty instead of
+    `ldap-server.contoso.com`. Upstream's provider is always enabled and would try the
+    placeholder host on every sign-in of an unknown name.
+  - **No `LdapUsers` in the configuration** (D12): which LDAP uid belongs to which user lives in
+    Ferrofin's external-identity table, so `GET /Plugins/{id}/Configuration` does not return
+    it, and a `LdapUsers` member posted to it is dropped. Upstream's settings page never reads
+    or writes it.
+  - **Timeouts** (D6): opening a connection (the TCP connect and an LDAPS handshake) gives up
+    after 5 seconds, and each operation, StartTLS included, after 10 seconds without an
+    answer (a search's timer restarts with each entry). Upstream sets none.
+  - **A custom root CA is the only trust anchor**: the server's certificate must chain to a
+    certificate in that file, or be one of the file's certificates itself (a self-signed
+    server certificate given as the root CA, which webpki alone refuses when it is marked as a
+    CA, as `openssl req -x509` marks it), and it must be valid for the server's name and
+    within its validity period. Upstream also rejects a name mismatch, but its chain policy
+    sets `AllowUnknownCertificateAuthority`, with which .NET accepts a chain ending at a root
+    that is not in the file. A root CA file with a certificate rustls cannot use as a root
+    skips it, and fails only when none is usable.
+  - **Unreadable certificate files** fail the test's Connect step with the reason. Upstream
+    reads the client certificate before its `try`, so the request fails with a `500`; a client
+    certificate is read here only for a TLS connection, where it is used.
+  - **Error wording**: `Error` is the RFC 4511 result name (spelled as Novell's client does,
+    `Invalid Credentials`) with the server's diagnostic, or the transport's own message
+    (rustls' certificate errors, `could not connect to host:port within 5 seconds`, `the
+    directory closed the connection: …`). Upstream reports the Novell exception's message.
+  - **The base search asks for no attributes** (`1.1`): the count it reports is the same,
+    without the directory sending every entry's attributes. A search reference fails the step
+    with Novell's `Search result reference received, and referral following is off`, as
+    upstream's iterator throws on one.
+  - **Certificate checks are webpki's** beyond the name and the trust anchor: X.509 v3
+    certificates only, no SHA-1 signatures in a chain, the `serverAuth` extended key usage
+    when the certificate lists any, and no revocation check (.NET checks revocation online,
+    ignoring an unknown status).
+  - **The common-name fallback is Ferrofin's own, and narrower**: an exact match ignoring
+    case, with no wildcard, for a host name only (never for an IP address), and off
+    whenever any root in the root CA file or the system store, or any intermediate the
+    server presents, carries name constraints, since webpki checks those against
+    alternative names only. A legacy certificate naming its host only as a wildcard or an
+    address in the common name may connect upstream and is refused here; both fail closed.
+  - **A stored `LdapProfileImageFormat` that names no format** reads as `Default`, so one bad
+    value cannot make the configuration unreadable. .NET's deserializer fails the whole
+    configuration and the plugin starts from its defaults.

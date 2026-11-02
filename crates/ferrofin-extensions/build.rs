@@ -46,6 +46,13 @@ const MERGE_VERSIONS_REV: &str = "e6f58d63eb600ba57a4b578e2a29cd745d7c6834";
 /// Its dashboard assets — one static page, no web build step.
 const MERGE_VERSIONS_ASSETS: &[&str] = &["configurationpage.html"];
 
+/// The LDAP-Auth plugin repository.
+const LDAP_AUTH_REPO: &str = "https://github.com/jellyfin/jellyfin-plugin-ldapauth.git";
+/// The pinned revision its vendored settings page is copied from (tag v24).
+const LDAP_AUTH_REV: &str = "d11c86a47d51a0e3372bbff20e508302ad78f7bd";
+/// Its dashboard assets — one static page, no web build step.
+const LDAP_AUTH_ASSETS: &[&str] = &["configPage.html"];
+
 fn main() {
     println!("cargo:rerun-if-env-changed=FERROFIN_REFRESH_PLUGIN_ASSETS");
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -75,6 +82,14 @@ fn main() {
         "mergeversions",
         MERGE_VERSIONS_ASSETS,
         build_merge_versions_assets,
+    );
+    vendor_plugin_assets(
+        &manifest,
+        &out_dir,
+        refresh,
+        "ldapauth",
+        LDAP_AUTH_ASSETS,
+        build_ldap_auth_assets,
     );
 }
 
@@ -225,6 +240,36 @@ fn build_merge_versions_assets(out_dir: &Path, staged: &Path, vendored: &Path) {
         .join("Configuration");
     fs::create_dir_all(vendored).expect("create vendored asset dir");
     for asset in MERGE_VERSIONS_ASSETS {
+        let src = built.join(asset);
+        assert!(src.is_file(), "plugin repo is missing {}", src.display());
+        fs::copy(&src, staged.join(asset))
+            .unwrap_or_else(|e| panic!("stage plugin asset {asset}: {e}"));
+        fs::copy(&src, vendored.join(asset))
+            .unwrap_or_else(|e| panic!("vendor plugin asset {asset}: {e}"));
+    }
+}
+
+/// Clones the LDAP-Auth repo at the pinned rev and installs its static
+/// settings page into the staged (`OUT_DIR`) and vendored (`assets/`) dirs — a
+/// fetch + copy, since the page has no web build step.
+fn build_ldap_auth_assets(out_dir: &Path, staged: &Path, vendored: &Path) {
+    let clone = out_dir.join("ldap-auth-src");
+    if clone.exists() {
+        fs::remove_dir_all(&clone).expect("clear stale plugin clone");
+    }
+    fs::create_dir_all(&clone).expect("create plugin clone dir");
+
+    run("git", &["init", "-q"], &clone);
+    run(
+        "git",
+        &["fetch", "-q", "--depth", "1", LDAP_AUTH_REPO, LDAP_AUTH_REV],
+        &clone,
+    );
+    run("git", &["checkout", "-q", "FETCH_HEAD"], &clone);
+
+    let built = clone.join("LDAP-Auth").join("Config");
+    fs::create_dir_all(vendored).expect("create vendored asset dir");
+    for asset in LDAP_AUTH_ASSETS {
         let src = built.join(asset);
         assert!(src.is_file(), "plugin repo is missing {}", src.display());
         fs::copy(&src, staged.join(asset))
