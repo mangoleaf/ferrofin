@@ -1226,12 +1226,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              routes are outside this: they serve a transcode's file by its random name, and \
              the item id selects nothing, as upstream. Deliberate divergence (owner decision \
              2026-10-31, gl-1090).",
-            "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, so \
-             a series that user cannot open (library, rating or tag rules) answers like an id \
-             that is no series: IsSeries stays forced and its title is not searched for. \
-             Upstream's GetItemById<Series> reads it with no user, and a request with no user \
-             still does here. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; \
-             gl-1113). Fix path for the rest: gl-1130.",
+            "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, or \
+             as the signed-in caller when a POST body names no user, so a series that user \
+             cannot open (library, rating or tag rules) answers like an id that is no series: \
+             IsSeries stays forced and its title is not searched for. Upstream's \
+             GetItemById<Series> reads it with no user. A POST body naming no user keeps the \
+             query without one, as upstream, so its DTOs carry no user data; only a request \
+             with no user at all (an API key naming none) still reads the row as upstream \
+             does. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; gl-1113, \
+             gl-1130).",
         ],
     },
     VerifiedSubsystem {
