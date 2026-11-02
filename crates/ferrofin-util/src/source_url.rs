@@ -1,6 +1,8 @@
 //! Tuner, guide and stream sources: whether one is remote, and what a log line
 //! or an error may say about it.
 
+use std::borrow::Cow;
+
 use url::Url;
 
 /// What [`redact_url`] shows of a URL it cannot split.
@@ -52,11 +54,103 @@ pub fn redact_url(source: &str) -> String {
     }
 }
 
+/// Whether `value`, as a whole, is a URL naming something remote: it starts
+/// with `<scheme>://`, a `file` URL aside, or with `http:` or `https:`, which
+/// ffmpeg and [`redact_url`] both read without the slashes.
+#[must_use]
+pub fn is_remote_url(value: &str) -> bool {
+    value
+        .find(':')
+        .is_some_and(|colon| scheme_start(value, 0, colon) == Some(0) && names_url(value, 0, colon))
+}
+
+/// `text` with each URL in it passed through [`redact_url`], for text Ferrofin
+/// did not write, such as a line of ffmpeg's stderr. Borrowed when `text` holds
+/// no URL.
+///
+/// A URL right after a quote runs to the last such quote in `text`, or to the
+/// end when there is none: ffmpeg prints a URL unescaped, so a password can
+/// hold anything. Any other URL runs to the next white space, less the
+/// punctuation that closes a sentence around it.
+#[must_use]
+pub fn redact_urls_in(text: &str) -> Cow<'_, str> {
+    let mut redacted = String::new();
+    let mut copied = 0;
+    let mut cursor = 0;
+    while let Some(start) = next_url(text, cursor) {
+        let end = url_end(text, start);
+        let url = text[start..end].trim_end_matches(['.', ',', ';', ':', ')']);
+        redacted.push_str(&text[copied..start]);
+        redacted.push_str(&redact_url(url));
+        copied = start + url.len();
+        cursor = end;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(text);
+    }
+    redacted.push_str(&text[copied..]);
+    Cow::Owned(redacted)
+}
+
+/// Where the first URL at or after `from` in `text` starts.
+fn next_url(text: &str, from: usize) -> Option<usize> {
+    let mut search = from;
+    while let Some(found) = text[search..].find(':') {
+        let colon = search + found;
+        if let Some(start) = scheme_start(text, from, colon)
+            && names_url(text, start, colon)
+        {
+            return Some(start);
+        }
+        search = colon + 1;
+    }
+    None
+}
+
+/// Where the scheme ending at `colon` starts, no earlier than `from`.
+fn scheme_start(text: &str, from: usize, colon: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let run = bytes[from..colon]
+        .iter()
+        .rposition(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')))
+        .map_or(from, |before| from + before + 1);
+    (run..colon).find(|&at| bytes[at].is_ascii_alphabetic())
+}
+
+/// Whether the scheme `text[start..colon]` begins a remote URL.
+fn names_url(text: &str, start: usize, colon: usize) -> bool {
+    let scheme = &text[start..colon];
+    let rest = &text[colon + 1..];
+    if rest.starts_with("//") {
+        return !scheme.eq_ignore_ascii_case("file");
+    }
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        && rest
+            .chars()
+            .next()
+            .is_some_and(|next| !next.is_whitespace() && !matches!(next, '\'' | '"'))
+}
+
+/// Where the URL starting at `start` in `text` ends; see [`redact_urls_in`].
+fn url_end(text: &str, start: usize) -> usize {
+    match text[..start].chars().next_back() {
+        Some(quote @ ('\'' | '"')) => text
+            .rfind(quote)
+            .filter(|&end| end >= start)
+            .unwrap_or(text.len()),
+        _ => text[start..]
+            .find(char::is_whitespace)
+            .map_or(text.len(), |end| start + end),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use rstest::rstest;
 
-    use super::{is_http, redact_url};
+    use super::{is_http, is_remote_url, redact_url, redact_urls_in};
 
     /// `StartsWith("http", StringComparison.OrdinalIgnoreCase)`: the scheme in
     /// any case is remote; a path, `file://` and anything shorter are not.
@@ -111,5 +205,97 @@ mod tests {
     #[case::no_host("http://", crate::source_url::UNREADABLE_URL)]
     fn a_source_is_shown_by_its_scheme_and_host(#[case] source: &str, #[case] shown: &str) {
         assert_eq!(redact_url(source), shown, "{source}");
+    }
+
+    /// A value is a remote URL as a whole, by its scheme; what only holds a
+    /// URL, an ffmpeg option and a local path or `file` URL are not.
+    #[rstest]
+    #[case("http://tuner.example/1.m3u8", true)]
+    #[case("HTTPS://tuner.example", true)]
+    #[case("http:user:secret@tuner.example/1.m3u8", true)]
+    #[case("rtsp://cam.example/s", true)]
+    #[case("udp://@239.0.0.1:1234", true)]
+    #[case("crypto+http://tuner.example/s.ts", true)]
+    #[case("file:/media/a.mkv", false)]
+    #[case("file:///media/a.mkv", false)]
+    #[case("FILE:///media/a.mkv", false)]
+    #[case("/media/http://a.mkv", false)]
+    #[case("title=http://a.example/", false)]
+    #[case("http,https,tcp", false)]
+    #[case("http", false)]
+    #[case("http:", false)]
+    #[case("pipe:0", false)]
+    #[case("0://x", false)]
+    #[case("", false)]
+    fn a_remote_url_is_told_by_its_scheme(#[case] value: &str, #[case] remote: bool) {
+        assert_eq!(is_remote_url(value), remote, "{value}");
+    }
+
+    /// Every URL in a line goes, however ffmpeg framed it, and what surrounds
+    /// it stays; a line with none comes back as it is.
+    #[rstest]
+    #[case::bare_sentence(
+        "Error opening input file http://u:secret@tuner.example/1.m3u8.",
+        "Error opening input file http://tuner.example."
+    )]
+    #[case::single_quotes(
+        "Input #0, hls, from 'http://u:secret@tuner.example:81/a?k=secret':",
+        "Input #0, hls, from 'http://tuner.example:81':"
+    )]
+    #[case::double_quotes(
+        "got \"https://tuner.example/secret\" now",
+        "got \"https://tuner.example\" now"
+    )]
+    #[case::a_space_inside_quotes(
+        "Opening 'http://tuner.example/my secret/1.ts' for reading",
+        "Opening 'http://tuner.example' for reading"
+    )]
+    #[case::a_quote_in_the_password(
+        "Opening 'http://u:se'cret@tuner.example/1.ts' for reading",
+        "Opening 'http://tuner.example' for reading"
+    )]
+    #[case::no_closing_quote(
+        "Opening 'http://tuner.example/secret and more secret",
+        "Opening 'http://tuner.example"
+    )]
+    #[case::two_urls(
+        "from http://a.example/secret to https://b.example/secret",
+        "from http://a.example to https://b.example"
+    )]
+    #[case::an_inner_scheme(
+        "crypto+http://u:secret@a.example/k and hls+https://b.example/secret",
+        "crypto+http://a.example and hls+https://b.example"
+    )]
+    #[case::a_prefixed_protocol("crypto:http://a.example/secret", "crypto:http://a.example")]
+    #[case::no_slashes(
+        "file http:user:secret@tuner.example/x failed",
+        "file http://tuner.example failed"
+    )]
+    #[case::port_only(
+        "Connection to tcp://127.0.0.1:9 failed: Connection refused",
+        "Connection to tcp://127.0.0.1:9 failed: Connection refused"
+    )]
+    #[case::multibyte(
+        "caf\u{e9}: http://a.example/s\u{e9}cret \u{e9}",
+        "caf\u{e9}: http://a.example \u{e9}"
+    )]
+    #[case::a_file_url(
+        "Opening 'file:///tmp/a.ts' for reading",
+        "Opening 'file:///tmp/a.ts' for reading"
+    )]
+    fn urls_in_a_line_are_redacted(#[case] text: &str, #[case] shown: &str) {
+        assert_eq!(redact_urls_in(text), shown, "{text}");
+    }
+
+    /// ffmpeg's ordinary lines hold plenty of colons and no URL.
+    #[rstest]
+    #[case("Stream #0:0: Video: h264 (High), yuv420p, 1920x1080")]
+    #[case("  Duration: 00:01:40.00, start: 1.400000, bitrate: N/A")]
+    #[case("frame=  100 fps=25 q=-1.0 time=00:00:04.00 speed=1.0x")]
+    #[case("Protocol 'http' not on whitelist 'file,crypto,data'!")]
+    #[case("http: the connection broke")]
+    #[case("")]
+    fn a_line_without_a_url_is_left_alone(#[case] text: &str) {
+        assert!(matches!(redact_urls_in(text), Cow::Borrowed(_)), "{text}");
     }
 }

@@ -270,7 +270,7 @@ impl ByNameListQuery {
     ///
     /// # Errors
     ///
-    /// `400` for an id naming no item, `401` for one the user may not open.
+    /// `400` for an id naming no item, `403` for one the user may not open.
     pub(crate) async fn parent(
         &self,
         state: &AppState,
@@ -343,7 +343,7 @@ impl ByNameListQuery {
 ///
 /// # Errors
 ///
-/// `400` for an id naming no item, the zero id included, and `401` for one the
+/// `400` for an id naming no item, the zero id included, and `403` for one the
 /// user may not open ([`require_scope_visible`]).
 pub(crate) async fn resolve_parent(
     state: &AppState,
