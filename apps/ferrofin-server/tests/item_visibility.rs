@@ -2468,7 +2468,7 @@ async fn members_of_a_disabled_library_stay_listed_and_leave_the_browse() {
     assert_eq!(p.stored(&f).await, all);
     assert_eq!(browsed(&f, &p, &f.admin).await, [p.gamma, p.delta]);
     assert_eq!(p.listed(&f, &f.viewer).await, in_allowed);
-    assert!(browsed(&f, &p, &f.viewer).await.is_empty());
+    assert_eq!(browsed(&f, &p, &f.viewer).await, Vec::<uuid::Uuid>::new());
 }
 
 /// A move's index counts the list its caller was given, so the member lands
