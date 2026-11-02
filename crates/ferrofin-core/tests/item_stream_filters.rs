@@ -1153,7 +1153,7 @@ async fn seed_user(db: &Database, id: Uuid) -> UserEntity {
 /// The movie-browse `GET /Items` shape: user, `Movie`, recursive, sorted, paged.
 fn movie_browse(user: UserEntity) -> InternalItemsQuery {
     InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         include_item_types: vec![BaseItemKind::Movie],
         recursive: true,
         limit: Some(100),

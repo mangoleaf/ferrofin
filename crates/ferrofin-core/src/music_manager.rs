@@ -128,7 +128,7 @@ impl FerrofinMusicManager {
     async fn mix_from_genre_ids(
         &self,
         genre_ids: &[Uuid],
-        user: Option<UserEntity>,
+        user: Option<Arc<UserEntity>>,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Audio],
@@ -197,7 +197,7 @@ impl FerrofinMusicManager {
     async fn mix_from_row_genres(
         &self,
         seed: &BaseItemEntity,
-        user: Option<UserEntity>,
+        user: Option<Arc<UserEntity>>,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         let genre_ids = self.music_genre_ids(&row_genres(seed)).await?;
         self.mix_from_genre_ids(&genre_ids, user).await
@@ -209,7 +209,7 @@ impl FerrofinMusicManager {
         &self,
         seed: &BaseItemEntity,
         seed_id: Uuid,
-        user: Option<UserEntity>,
+        user: Option<Arc<UserEntity>>,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         let children = self
             .items
@@ -243,7 +243,7 @@ impl MusicManager for FerrofinMusicManager {
         let Some(seed) = self.items.retrieve_item(item_id).await? else {
             return Ok(Vec::new());
         };
-        let user = self.user_row(user_id).await?;
+        let user = self.user_row(user_id).await?.map(Arc::new);
         match kind_from_type_name(&seed.type_) {
             // A genre item stands for itself: filter on its own id.
             Some(BaseItemKind::MusicGenre) => self.mix_from_genre_ids(&[item_id], user).await,
@@ -287,7 +287,7 @@ impl MusicManager for FerrofinMusicManager {
         user_id: Option<Uuid>,
         _dto_options: &DtoOptions,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let user = self.user_row(user_id).await?;
+        let user = self.user_row(user_id).await?.map(Arc::new);
         let genre_ids = self.music_genre_ids(genres).await?;
         self.mix_from_genre_ids(&genre_ids, user).await
     }

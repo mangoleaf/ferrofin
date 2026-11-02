@@ -165,6 +165,7 @@ pub mod intro_skipper;
 pub mod item_lookup;
 pub mod item_update;
 pub mod items;
+pub mod ldap;
 pub mod library;
 pub mod library_structure;
 pub mod live_tv;
@@ -788,6 +789,21 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/FileTransformation/RegisterTransformation"),
 ];
 
+/// `(method, path, extension-id)` for every route a compiled-in extension
+/// registers that is **not a contract operation**: a ported plugin's own
+/// controller, which the vendored spec does not describe.
+///
+/// They are in neither [`REAL_ROUTES`] nor [`EXTENSION_ROUTES`] (contract
+/// operations only) and carry no [`VERIFIED`] row; each plugin's comparison
+/// with its upstream is recorded in `docs/PLUGINS_UPSTREAM.md`. Like every
+/// ASP.NET route they are matched ignoring case
+/// ([`canonicalize_path`](crate::routes::canonicalize_path) reads this list):
+/// a plugin's settings page calls them as it spells them.
+pub const PLUGIN_ROUTES: &[(&str, &str, &str)] = &[
+    // LDAP-Auth plugin (see handlers::ldap).
+    ("post", "/Ldap/TestServerBind", "ldap-auth"),
+];
+
 /// `(method, path, extension-id)` for every route owned by a **compiled-in
 /// extension** (`ferrofin-extensions`); core routes are everything in
 /// [`REAL_ROUTES`] not listed here.
@@ -895,21 +911,12 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     ("delete", "/Audio/{itemId}/Lyrics", "v12.2"),
     ("get", "/Audio/{itemId}/RemoteSearch/Lyrics", "v12.2"),
     ("post", "/Items/{itemId}/ContentType", "v12.2"),
-    // gl-1027: a padded lyric extension is trimmed and saved.
-    ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
-    // gl-1028: a whitespace-only route id is not the validation 400.
     (
         "post",
         "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
         "v12.2",
     ),
-    ("get", "/Providers/Lyrics/{lyricId}", "v12.2"),
-    ("get", "/DisplayPreferences/{displayPreferencesId}", "v12.2"),
-    (
-        "post",
-        "/DisplayPreferences/{displayPreferencesId}",
-        "v12.2",
-    ),
+    ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
     // gl-1059: "EnabledTuners": null or "ChannelMappings": null is a 400, not
     // bound.
     ("post", "/LiveTv/ListingProviders", "v12.2"),
@@ -1284,9 +1291,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    job on those routes and the HLS ones: ferrofin-mediaencoding \
                    transcoding/manager.rs start_ffmpeg, compared with \
                    MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs (StartFfMpeg, \
-                   PingTimer) and Emby.Server.Implementations/Session/SessionManager.cs \
-                   (MaxActiveSessions)",
-        date: "2026-11-01",
+                   PingTimer, KillTranscodingJobs) and \
+                   Emby.Server.Implementations/Session/SessionManager.cs (MaxActiveSessions)",
+        date: "2026-11-02",
         divergences: &[
             "A GET that would start a transcode on /Videos/{itemId}/stream, \
              /Videos/{itemId}/stream.{container}, /Audio/{itemId}/stream or \
@@ -1302,12 +1309,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              2026-10-31 and 2026-11-01, gl-1098), the settings max_transcodes and \
              max_transcodes_per_user, both 0, off, by default, which leaves StartFfMpeg's \
              behaviour as upstream's: it starts whatever it is asked to, and MaxActiveSessions \
-             applies only at login. Past a cap a start ends the same user's longest-idle job \
-             (no active request), the teardown the ping timeout would have brought, and with \
-             none idle answers 503 with Retry-After: 10 before anything is created. A job \
-             copying every stream is free. The user is the authorization's, as upstream's \
-             StartFfMpeg userId is; an API key has none, so it is outside the per-user cap \
-             and inside the server-wide one.",
+             applies only at login. Past a cap a start ends the longest-idle job (no active \
+             request) of the same user on the same device, the teardown the ping timeout \
+             would have brought, and with none idle answers 503 with Retry-After: 10 before \
+             anything is created. The device is the request's DeviceId, compared ignoring \
+             ASCII case (KillTranscodingJobs uses OrdinalIgnoreCase), and a start without one \
+             ends nothing: an HLS player between two segment requests is idle too, so \
+             another device's job is never ended (gl-1140). A job copying every stream is \
+             free. The user is the authorization's, as upstream's StartFfMpeg userId is; an \
+             API key has none, so it is outside the per-user cap and inside the server-wide \
+             one.",
         ],
     },
 ];
@@ -1596,18 +1607,24 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "UploadLyrics",
-        ferrofin: "handlers/lyrics.rs upload_lyrics (upload_format, queue_high_priority_refresh) \
-               → ferrofin-core lyric_manager.rs save_lyric (decode_stream_text, save_targets, \
-               try_save_to_files)",
+        ferrofin: "handlers/lyrics.rs upload_lyrics (require_item, an empty body by its \
+               size hint, upload_format, then the Bytes read under upload_body_limit; \
+               queue_high_priority_refresh) → ferrofin-core lyric_manager.rs save_lyric \
+               (decode_stream_text, parse_by_format on the format as given, save_targets \
+               with save_extension, try_save_to_files)",
         date: "2026-10-24",
         divergences: &[
             "An upload with no Content-Length (a chunked body) is read and saved; upstream \
          tests Request.ContentLength and answers every chunked upload 400 \"No lyrics \
          uploaded\". Jellyfin bug not ported.",
             "A body past Kestrel's 30,000,000-byte default (MAX_UPLOAD_BODY_BYTES, the same \
-         cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
-         Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
-         Jellyfin bug not ported.",
+         cap) is a 413 once the item, the empty-body and the extension checks pass, where \
+         upstream reads it too; upstream's ExceptionMiddleware maps no \
+         BadHttpRequestException, so Kestrel's \"request body too large\" reaches the \
+         client as a plain-text 500. Jellyfin bug not ported.",
+            "The 400 (an empty body, a file name without an extension, a format no parser \
+         reads, a missing or blank fileName) and 404 (no such item, or one the caller may \
+         not see) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1644,13 +1661,14 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "DownloadRemoteLyrics",
-        ferrofin: "handlers/lyrics.rs download_remote_lyrics (queue_high_priority_refresh) → \
+        ferrofin: "handlers/lyrics.rs download_remote_lyrics (RequiredRouteString lyricId: \
+               ConvertEmptyStringToNull, then [Required]; queue_high_priority_refresh) → \
                ferrofin-core lyric_manager.rs download_lyrics (fetch_remote, save_targets, \
                try_save_to_files)",
         date: "2026-10-19",
         divergences: &[
-            "A lyricId of only whitespace is a 404 (no provider owns it); upstream's \
-         ArgumentException.ThrowIfNullOrWhiteSpace makes it a 500. Jellyfin bug not ported.",
+            "The 404 (no such item, one the caller may not see, or no lyric for the id) body \
+         is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1659,10 +1677,14 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Providers/Lyrics/{lyricId}",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "GetRemoteLyrics",
-        ferrofin: "handlers/lyrics.rs get_remote_lyrics → ferrofin-core lyric_manager.rs \
+        ferrofin: "handlers/lyrics.rs get_remote_lyrics (RequiredRouteString lyricId: \
+               ConvertEmptyStringToNull, then [Required]) → ferrofin-core lyric_manager.rs \
                get_remote_lyrics (fetch_remote, parse_by_format)",
-        date: "2026-10-19",
-        divergences: &[],
+        date: "2026-10-30",
+        divergences: &[
+            "The 404 (no provider owns the id, or it has no such lyric) body is Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
         refs: &[],
     },
     Verified {
@@ -1723,11 +1745,13 @@ pub const VERIFIED: &[Verified] = &[
                answers as ExceptionMiddleware does \
                outside Development, the same on a live 12.4 for each refusal. Compared: user \
                lookup and lock, provider order and selection by the saved id \
-               (AuthenticationManager::id, GetType().FullName), the provider's canonical \
-               username, the new-user policy, the saved provider id, the disabled, remote and \
-               schedule checks, the failure counter and lockout, the device and session \
-               limits, token rotation and session activity, and that upstream has no login rate \
-               limit. The UserDto and SessionInfoDto \
+               (AuthenticationManager::id, GetType().FullName), the warning naming the user \
+               and the saved id when no enabled provider has it (InvalidAuthProvider then \
+               refuses the sign-in), the provider's canonical username, the new-user \
+               policy, the saved provider id, the disabled, remote and schedule checks, \
+               the failure counter and lockout, the device and session limits, token \
+               rotation and session activity, and that upstream has no login rate limit. \
+               The UserDto and SessionInfoDto \
                builders are shared with other routes and not compared here",
         date: "2026-11-02",
         divergences: &[
@@ -2228,8 +2252,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/DisplayPreferences/{displayPreferencesId}",
         upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
         upstream_method: "GetDisplayPreferences",
-        ferrofin: "handlers/display_preferences.rs get_display_preferences (Query: \
-               ConvertEmptyStringToNull, then [Required] client from query/required.json; \
+        ferrofin: "handlers/display_preferences.rs get_display_preferences \
+               (RequiredRouteString displayPreferencesId and Query: ConvertEmptyStringToNull, \
+               then [Required], client from query/required.json; \
                effective_user_id: RequestHelpers.GetUserId; resolve_item_id: Guid.TryParse \
                else GetMD5; index_by_name, chromecast_name, home_section_name) → ferrofin-core \
                display_preferences_manager.rs (get_display_preferences, \
@@ -2237,7 +2262,7 @@ pub const VERIFIED: &[Verified] = &[
                list_home_sections) → ferrofin-db database.rs home_sections (Order, then Id: \
                the Include(HomeSections) load order); ferrofin-model \
                dto/display_preferences_dto.rs",
-        date: "2026-10-25",
+        date: "2026-10-30",
         divergences: &[
             "CustomPrefs members are written in hash order, not upstream's insertion order \
          (the home sections, the scalar keys, then the stored preferences); the members and \
@@ -2253,8 +2278,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/DisplayPreferences/{displayPreferencesId}",
         upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
         upstream_method: "UpdateDisplayPreferences",
-        ferrofin: "handlers/display_preferences.rs update_display_preferences (Query: \
-               ConvertEmptyStringToNull, then [Required] client from query/required.json; \
+        ferrofin: "handlers/display_preferences.rs update_display_preferences \
+               (RequiredRouteString displayPreferencesId and Query: ConvertEmptyStringToNull, \
+               then [Required], client from query/required.json; \
                JsonBody DisplayPreferencesDto, resolve_item_id: Guid.TryParse else GetMD5, \
                take_pref/take_nullable_pref, enum_try_parse for Enum.TryParse/Enum.Parse, \
                parse_dotnet_int/parse_dotnet_bool for int.Parse/bool.Parse) → ferrofin-core \
@@ -2263,7 +2289,7 @@ pub const VERIFIED: &[Verified] = &[
                update_item_display_preferences, update_display_preferences, \
                set_home_sections) → ferrofin-db database.rs replace_home_sections; \
                ferrofin-model dto/display_preferences_dto.rs",
-        date: "2026-10-25",
+        date: "2026-10-30",
         divergences: &[
             "A missing or empty skipBackLength/skipForwardLength stores 10000/30000 ms; \
          upstream's controller stores 15000 for both. Fix path: gl-410.",
@@ -2869,6 +2895,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     // The Ferrofin plugin's settings page — not a contract operation, so in
     // neither REAL_ROUTES nor EXTENSION_ROUTES.
     let router = ferrofin_settings::register(router);
+    // The LDAP-Auth plugin's own controller — not a contract operation, so
+    // listed in PLUGIN_ROUTES.
+    let router = ldap::register(router);
     // Live TV read surface — empty/disabled state so the web UI treats Live TV
     // as "not configured" instead of erroring on 501 (mutations stay stubbed).
     let router = live_tv::register(router);

@@ -567,7 +567,7 @@ struct OkAuth;
 impl AuthService for OkAuth {
     async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID)),
+            user: Some(Arc::new(user_entity(USER_ID))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -581,7 +581,7 @@ impl AuthorizationContext for OkAuth {
         _r: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID)),
+            user: Some(Arc::new(user_entity(USER_ID))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })

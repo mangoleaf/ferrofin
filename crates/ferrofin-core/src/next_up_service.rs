@@ -937,7 +937,7 @@ mod tests {
 
     fn query_for(user: UserEntity, top_parent: Uuid) -> InternalItemsQuery {
         InternalItemsQuery {
-            user: Some(user),
+            user: Some(std::sync::Arc::new(user)),
             top_parent_ids: vec![top_parent],
             ..Default::default()
         }

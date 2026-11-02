@@ -765,3 +765,71 @@ async fn a_failing_providers_is_enabled_never_reaches_a_local_sign_in() {
             .is_some()
     );
 }
+
+/// What `f` logs under a scoped `fmt` subscriber.
+async fn logged<F: std::future::Future>(f: F) -> (F::Output, String) {
+    let logs = crate::test_support::CapturedLogs::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let output = f.await;
+    (output, logs.text())
+}
+
+/// Upstream's `GetAuthenticationProviders(User)` warns, naming the user and
+/// the saved provider id, before it falls back to `InvalidAuthProvider`. A
+/// sign-in and a password change both go through it, so an administrator can
+/// tell a missing or disabled provider from a wrong password.
+#[rstest::rstest]
+#[case::not_registered("Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin", true)]
+#[case::disabled("Tests.External", false)]
+#[tokio::test]
+async fn a_saved_provider_that_is_missing_or_disabled_is_named_in_a_warning(
+    #[case] saved: &str,
+    #[case] enabled: bool,
+) {
+    let (mgr, provider) = manager(enabled, false).await;
+    let uid = saved_with_provider(&mgr, "directory-user", saved).await;
+    // The fields are checked on the warning's own line: the sign-in's
+    // `login failed` line names the user too.
+    let named = |text: &str| {
+        text.lines().any(|line| {
+            line.contains("WARN")
+                && line.contains("authentication provider is missing or disabled")
+                && line.contains("username=directory-user")
+                && line.contains(&format!("user_id={}", guid_to_db(uid)))
+                && line.contains(&format!("authentication_provider_id={saved:?}"))
+        })
+    };
+
+    let (signed_in, text) =
+        logged(mgr.authenticate_user("directory-user", "external", "127.0.0.1", true)).await;
+    assert!(signed_in.unwrap().is_none(), "the sign-in fails closed");
+    assert!(named(&text), "{text}");
+
+    let (changed, text) = logged(mgr.change_password(uid, "new-password")).await;
+    changed.unwrap();
+    assert!(named(&text), "{text}");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert!(provider.passwords.lock().unwrap().is_empty());
+}
+
+/// A provider the saved id selects, and the built-in one, log no such warning.
+#[rstest::rstest]
+#[case::selected("Tests.External")]
+#[case::built_in(DEFAULT_AUTH_PROVIDER_ID)]
+#[case::unsaved("")]
+#[tokio::test]
+async fn a_saved_provider_that_is_enabled_logs_no_warning(#[case] saved: &str) {
+    let (mgr, _) = manager(true, false).await;
+    saved_with_provider(&mgr, "directory-user", saved).await;
+    let (_, text) =
+        logged(mgr.authenticate_user("directory-user", "external", "127.0.0.1", true)).await;
+    assert!(
+        !text.contains("authentication provider is missing or disabled"),
+        "{text}"
+    );
+}

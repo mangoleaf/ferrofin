@@ -1658,6 +1658,22 @@ pub trait UserManager: Send + Sync {
         server_id: Option<String>,
     ) -> Result<UserDto, ServiceError>;
 
+    /// The libraries `user` hides from Latest
+    /// (`UserConfiguration.LatestItemsExcludes`), as [`Self::get_user_dto`]
+    /// reports them.
+    ///
+    /// `/Items/Latest` and `/UserItems/Resume` need only this list. The default
+    /// body builds the whole DTO; a manager that caches the DTO answers from
+    /// the cache without copying it.
+    async fn latest_items_excludes(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(self
+            .get_user_dto(user, None)
+            .await?
+            .configuration
+            .map(|c| c.latest_items_excludes)
+            .unwrap_or_default())
+    }
+
     /// Updates a user's configuration (stopgap; prefer [`Self::update_user`]).
     async fn update_configuration(
         &self,

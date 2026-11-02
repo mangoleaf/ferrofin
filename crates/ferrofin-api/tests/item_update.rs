@@ -180,7 +180,7 @@ impl AuthService for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             is_api_key: true,
             is_authenticated: true,
             ..AuthorizationInfo::default()
@@ -195,7 +195,7 @@ impl AuthorizationContext for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             is_api_key: true,
             is_authenticated: true,
             ..AuthorizationInfo::default()

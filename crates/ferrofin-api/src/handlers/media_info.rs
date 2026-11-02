@@ -370,7 +370,7 @@ async fn playback_info(
     request: PlaybackRequest,
 ) -> Result<PlaybackInfoResponse, ApiError> {
     let user = resolve_user_opt(state, auth, request.user_id).await?;
-    let item = require_visible_item(state, item_id, user.as_ref()).await?;
+    let item = require_visible_item(state, item_id, user.as_deref()).await?;
     let resolved_user_id = match &user {
         Some(user) => user_uuid(user)?,
         None => effective_user_id(state, auth, request.user_id).await?,
@@ -378,7 +378,7 @@ async fn playback_info(
     let mut media_sources = resolve_playback_media_sources(
         state,
         &item,
-        user.as_ref(),
+        user.as_deref(),
         resolved_user_id,
         request.media_source_id.as_deref(),
         request.live_stream_id.as_deref(),
@@ -425,7 +425,7 @@ async fn playback_info(
         let decisions = set_device_specific_data(
             state,
             auth,
-            user.as_ref(),
+            user.as_deref(),
             resolved_user_id,
             item_id,
             item.media_type.as_deref(),
@@ -568,7 +568,7 @@ async fn open_media_source(
         set_device_specific_data(
             state,
             auth,
-            user.as_ref(),
+            user.as_deref(),
             request.user_id,
             request.item_id,
             item.media_type.as_deref(),
@@ -698,7 +698,7 @@ pub(crate) async fn universal_audio_source(
     transcoding_protocol: Option<MediaStreamProtocol>,
 ) -> Result<Option<UniversalAudioSource>, ApiError> {
     let user = resolve_user_opt(state, auth, user_id).await?;
-    let item = require_visible_item(state, item_id, user.as_ref()).await?;
+    let item = require_visible_item(state, item_id, user.as_deref()).await?;
     let resolved_user_id = match &user {
         Some(user) => user_uuid(user)?,
         None => effective_user_id(state, auth, user_id).await?,
@@ -706,7 +706,7 @@ pub(crate) async fn universal_audio_source(
     // Every version (the universal route takes no live stream id), narrowed
     // below rather than by the helper's exact match.
     let mut media_sources =
-        resolve_playback_media_sources(state, &item, user.as_ref(), resolved_user_id, None, None)
+        resolve_playback_media_sources(state, &item, user.as_deref(), resolved_user_id, None, None)
             .await?;
     // The version is matched in either GUID spelling, as the static stream
     // routes match it (`MediaSourceInfo::id_matches`): the universal URL's
@@ -738,7 +738,7 @@ pub(crate) async fn universal_audio_source(
     set_device_specific_data(
         state,
         auth,
-        user.as_ref(),
+        user.as_deref(),
         resolved_user_id,
         item_id,
         item.media_type.as_deref(),

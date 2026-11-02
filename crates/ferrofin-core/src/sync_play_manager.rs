@@ -5353,7 +5353,7 @@ mod tests {
             library
                 .get_item_ids(&InternalItemsQuery {
                     item_ids: vec![movie_id],
-                    user: Some(guest_user.clone()),
+                    user: Some(Arc::new(guest_user.clone())),
                     ..InternalItemsQuery::default()
                 })
                 .await

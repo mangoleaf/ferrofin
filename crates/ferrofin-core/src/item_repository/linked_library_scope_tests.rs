@@ -6,6 +6,8 @@
 //! playlists folder's own `TopParentId` is its id, so without the gate a user
 //! with no playlist got the folder in every unscoped recursive `/Items`.
 
+use std::sync::Arc;
+
 use super::*;
 use crate::item_count_service::FerrofinItemCountService;
 use crate::item_type_lookup::ItemTypeLookup;
@@ -69,7 +71,7 @@ impl Wired {
             .expect("user")
             .expect("seeded");
         let query = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             recursive: true,
             include_item_types: kinds.to_vec(),
             ..InternalItemsQuery::default()
@@ -305,7 +307,7 @@ async fn without_an_evaluator_the_scope_keeps_the_playlists_folder() {
     let listed: Vec<String> =
         FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
             .get_item_list(&InternalItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 recursive: true,
                 include_item_types: vec![BaseItemKind::PlaylistsFolder],
                 ..InternalItemsQuery::default()

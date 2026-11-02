@@ -126,7 +126,7 @@ async fn theme_media(
     } else {
         state
             .library
-            .get_item_by_id_for_user(item_id, user.as_ref())
+            .get_item_by_id_for_user(item_id, user.as_deref())
             .await?
             .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?
     };
@@ -181,7 +181,7 @@ async fn theme_media(
         .get_base_item_dtos(
             &items,
             &DtoOptions::default(),
-            user.as_ref(),
+            user.as_deref(),
             Some(owner_id),
             true,
         )
@@ -423,7 +423,7 @@ async fn get_file(
 ) -> Result<Response, ApiError> {
     let item = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let path = item

@@ -522,8 +522,8 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: TRANSCODE_CAP,
         default: "0",
         description: "Most jobs re-encoding a stream the server runs at once; past it a user's \
-                      idle jobs are ended, and a new one is refused if that makes no room. 0 \
-                      means no cap.",
+                      idle job on the same device is ended, and a new one is refused if that \
+                      makes no room. 0 means no cap.",
         running: |c| json!(c.max_transcodes),
         ..ROW
     },
@@ -535,8 +535,8 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: TRANSCODE_CAP,
         default: "0",
         description: "Most jobs re-encoding a stream one user runs at once; past it their \
-                      idle jobs are ended, and a new one is refused if none is idle. 0 means \
-                      no cap.",
+                      idle job on the same device is ended, and a new one is refused if none \
+                      is idle. 0 means no cap.",
         running: |c| json!(c.max_transcodes_per_user),
         ..ROW
     },

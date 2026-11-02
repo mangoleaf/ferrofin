@@ -513,8 +513,8 @@ pub struct Config {
     pub ffmpeg_img_extract_perf_tradeoff: bool,
 
     /// Re-encoding jobs the whole server may run at once; `0` is no cap. Past
-    /// it a signed-in user's idle jobs are ended first, and a start that still
-    /// has no room is answered `503` with `Retry-After`. Resolved
+    /// it a signed-in user's idle job on the same device is ended first, and a
+    /// start that still has no room is answered `503` with `Retry-After`. Resolved
     /// `FERROFIN_MAX_TRANSCODES` env > `max_transcodes` in `config.toml` > `0`,
     /// clamped to [`TranscodeLimits::RANGE`].
     pub max_transcodes: u32,
@@ -574,7 +574,7 @@ pub struct Config {
     pub enable_metrics: Option<bool>,
 
     /// Suppress the compiled-in extensions (intro skipper, file
-    /// transformation, merge versions) — `true` registers none of them but
+    /// transformation, merge versions, LDAP-Auth) — `true` registers none of them but
     /// the Ferrofin settings extension, the server's own settings page
     /// (`ferrofin_extensions::registered_extensions`).
     ///

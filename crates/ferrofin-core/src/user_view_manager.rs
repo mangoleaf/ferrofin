@@ -1176,7 +1176,7 @@ pub(crate) fn visible_item_query(
 ) -> InternalItemsQuery {
     InternalItemsQuery {
         include_item_types: vec![kind],
-        user: Some(user.clone()),
+        user: Some(Arc::new(user.clone())),
         top_parent_ids,
         group_by_presentation_unique_key: false,
         checks_playlist_visibility: true,
@@ -1575,7 +1575,9 @@ impl FerrofinUserViewManager {
             is_virtual_item: Some(false),
             limit: Some(limit.saturating_mul(LATEST_OVER_FETCH_FACTOR)),
             is_played,
-            dto_options: options.clone(),
+            // The trait hands in `&DtoOptions`: one copy here, as before; the
+            // query's own clones then share it.
+            dto_options: Arc::new(options.clone()),
             media_types,
             ..InternalItemsQuery::default()
         };
@@ -3249,7 +3251,7 @@ mod tests {
             let unplayed = latest(
                 &mgr,
                 LatestItemsQuery {
-                    user: Some(user.clone()),
+                    user: Some(Arc::new(user.clone())),
                     is_played: Some(false),
                     group_items,
                     limit: Some(1),
@@ -3275,7 +3277,7 @@ mod tests {
         let music = latest(
             &mgr,
             LatestItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 parent_id: Some(MUSIC),
                 is_played: Some(false),
                 group_items: false,
@@ -3479,7 +3481,7 @@ mod tests {
             .with_database(db.clone())
             .with_visibility(visibility(&db));
         let mut query = LatestItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             ..Default::default()
         };
         let expected = vec![(None, vec![movie])];
@@ -3614,7 +3616,7 @@ mod tests {
         let groups = latest(
             &mgr,
             LatestItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 limit: Some(2),
                 ..LatestItemsQuery::default()
             },
@@ -3701,7 +3703,7 @@ mod tests {
         let groups = latest(
             &manager(&db),
             LatestItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 parent_id: Some(view),
                 limit: Some(20),
                 group_items,
@@ -3751,7 +3753,7 @@ mod tests {
         .await;
         let mgr = manager(&db);
         let query = |group_items| LatestItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             parent_id: Some(view),
             limit: Some(20),
             group_items,
@@ -3818,7 +3820,7 @@ mod tests {
         seed(&db, &rows).await;
         let mgr = manager(&db);
         let query = |limit, group_items| LatestItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             parent_id: Some(view),
             limit: Some(limit),
             group_items,
@@ -3871,7 +3873,7 @@ mod tests {
         let groups = latest(
             &manager(&db),
             LatestItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 parent_id: Some(view),
                 limit: Some(20),
                 ..LatestItemsQuery::default()
@@ -3908,7 +3910,7 @@ mod tests {
         let groups = latest(
             &manager(&db),
             LatestItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 parent_id: Some(view),
                 limit: Some(20),
                 ..LatestItemsQuery::default()
@@ -3961,7 +3963,7 @@ mod tests {
         let groups = latest(
             &manager(&db),
             LatestItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 parent_id: Some(view),
                 limit: Some(20),
                 ..LatestItemsQuery::default()
@@ -4006,7 +4008,7 @@ mod tests {
         let groups = latest(
             &manager(&db),
             LatestItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 parent_id: Some(view),
                 limit: Some(20),
                 ..LatestItemsQuery::default()
@@ -4046,7 +4048,7 @@ mod tests {
         let groups = latest(
             &manager(&db),
             LatestItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 parent_id: Some(view),
                 limit: Some(20),
                 ..LatestItemsQuery::default()
@@ -4090,7 +4092,7 @@ mod tests {
         let groups = latest(
             &manager(&db),
             LatestItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 parent_id: Some(view),
                 limit: Some(20),
                 ..LatestItemsQuery::default()
@@ -4154,7 +4156,7 @@ mod tests {
         let groups = latest(
             &FerrofinUserViewManager::new(Arc::new(repository)),
             LatestItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 parent_id: Some(view),
                 include_item_types,
                 limit: Some(20),

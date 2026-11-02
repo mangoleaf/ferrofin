@@ -231,8 +231,9 @@ ferrofin:
     # FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW: "nas.lan,192.168.1.0/24"
 
     # The most jobs re-encoding a stream the server runs at once, and one user
-    # runs at once. Past either cap the user's idle jobs are ended first; with
-    # none to end, the client gets 503 with Retry-After. 0 means no cap.
+    # runs at once. Past either cap the user's idle job on the same device is
+    # ended first; with none to end, the client gets 503 with Retry-After. 0
+    # means no cap.
     # FERROFIN_MAX_TRANSCODES: "0"
     # FERROFIN_MAX_TRANSCODES_PER_USER: "0"
 
