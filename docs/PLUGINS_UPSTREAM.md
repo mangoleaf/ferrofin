@@ -159,7 +159,14 @@ Conventions:
   with one name, and the name-scoped key merged episodes across them —
   hiding each alternate from its own series' list and skewing season counts.
   The bulk episode task self-heals links whose key no longer matches their
-  primary's (unlink + regroup within the series). For the same reason movie
+  primary's (unlink + regroup within the series). The key's title fallback (no
+  provider id, no episode number) also carries the episode's air date
+  (`PremiereDate`): upstream's `title:{SeriesName}:{SeasonName}:{Name}:{ProductionYear}`
+  is the same for every airing of a show whose files are named by date —
+  `IsByDate` clears the number, the name is the series', the year the
+  series' — so the task merged a whole season of airings into one episode.
+  Two copies of one airing still merge, as the core resolver's `D{date}`
+  version key groups them. For the same reason movie
   grouping is keyed by (owning library `TopParentId`, `Tmdb` id) rather than
   the `Tmdb` id alone: the same film held in a cold (NAS) and a hot (local)
   library is two intentional entries, and merging them hid one behind the
