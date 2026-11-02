@@ -41,6 +41,11 @@
 //!   alternate from its own series' episode list and skewing season counts.
 //!   The bulk episode task also self-heals: links whose key no longer matches
 //!   their primary's are unlinked and regrouped within their own series.
+//! - The episode key's title fallback (no provider id, no episode number)
+//!   also carries the air date: upstream's (season, name, year) is the same
+//!   for every airing of a show whose files are named by date, so the task
+//!   merged a whole season of daily or weekly airings into one episode. The
+//!   self-heal above releases those links on the next run.
 //! - Ferrofin models a version group solely by the `PrimaryVersionId` pointer;
 //!   the upstream `OwnerId`/`LocalAlternateVersions`/`LinkedAlternateVersions`
 //!   columns and the linked-child reroute are Jellyfin-internal representation
@@ -807,7 +812,8 @@ fn percent(index: usize, total: usize) -> f64 {
 
 /// The upstream 12.0 `GetEpisodeMergeKey`: the first non-blank provider id
 /// (`Tvdb` → `Tmdb` → `Imdb`), else season/episode numbers, else title
-/// fields. The caller lowercases the key (`StringComparer.OrdinalIgnoreCase`).
+/// fields and — unlike upstream — the air date. The caller lowercases the key
+/// (`StringComparer.OrdinalIgnoreCase`).
 fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<String>) -> String {
     // Every branch is scoped to the series *identity* (presentation key), not
     // the series name — a deliberate divergence from upstream, which groups by
@@ -842,12 +848,27 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
         .unwrap_or_default();
         return format!("{series}|number:{parent}:{index}:{end}");
     }
+    // The title fallback also carries the air date — a second deliberate
+    // divergence. Upstream keys it on (series, season, name, year) alone, and
+    // for an episode named by air date (`Show - 2023-12-16 - Guest.ts`) none
+    // of those tell two airings apart: Jellyfin clears its `IndexNumber`
+    // (`LibraryManager.FillMissingEpisodeNumbersFromPath`, `IsByDate`), its
+    // name is the series' and its year the series' or the season's, so every
+    // airing in a season shares one key and the bulk task hid all but one
+    // behind it as "versions". The core resolver groups such files only when
+    // their dates match (`VideoListResolver.GetEpisodeVersionKey`, `D{date}`);
+    // with the date in the key two copies of one airing still merge, two
+    // airings no longer do. An episode with no air date keeps the upstream key
+    // plus an empty component.
     format!(
-        "{series}|title:{}:{}:{}",
+        "{series}|title:{}:{}:{}:{}",
         ep.season_name.as_deref().unwrap_or_default(),
         ep.name.as_deref().unwrap_or_default(),
         ep.production_year
             .map(|y| y.to_string())
+            .unwrap_or_default(),
+        ep.premiere_date
+            .map(|date| date.format("%Y-%m-%d").to_string())
             .unwrap_or_default()
     )
 }
@@ -1269,7 +1290,37 @@ mod tests {
         let ep = episode("Show", "Season 1", "Pilot", None);
         assert_eq!(
             episode_merge_key(&ep, |_| None),
-            "Show|title:Season 1:Pilot:2020"
+            "Show|title:Season 1:Pilot:2020:"
+        );
+    }
+
+    /// An episode named by air date has no number (`IsByDate` clears it) and
+    /// the series' name, so only its air date tells two airings apart in the
+    /// title fallback; two copies of one airing share the key.
+    #[test]
+    fn episode_merge_key_tells_airings_apart_by_date() {
+        let aired = |date: &str| BaseItemEntity {
+            premiere_date: Some(format!("{date}T06:00:00Z").parse().expect("date")),
+            ..episode("Show", "Season 49", "Show", None)
+        };
+        let (dec16, dec09) = (aired("2023-12-16"), aired("2023-12-09"));
+        assert_eq!(
+            episode_merge_key(&dec16, |_| None),
+            "Show|title:Season 49:Show:2020:2023-12-16"
+        );
+        assert_ne!(
+            episode_merge_key(&dec16, |_| None),
+            episode_merge_key(&dec09, |_| None)
+        );
+        assert_eq!(
+            episode_merge_key(&dec16, |_| None),
+            episode_merge_key(&aired("2023-12-16"), |_| None)
+        );
+        // A provider id or a number still outranks the date.
+        let tvdb = |p: &str| (p == "Tvdb").then(|| "6008035".to_owned());
+        assert_eq!(
+            episode_merge_key(&dec16, tvdb),
+            episode_merge_key(&dec09, tvdb)
         );
     }
 
@@ -1890,6 +1941,69 @@ mod tests {
             "one of a/b is the primary, the other the alternate"
         );
         assert_eq!(primary_of(&db, &svc, other).await, None);
+    }
+
+    /// Sets an episode's air date (read-modify-write, as `set_episode_fields`).
+    async fn set_premiere_date(db: &Database, id: Uuid, date: &str) {
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+        let mut item = FerrofinItemRepository::new(db.clone(), lookup)
+            .retrieve_item(id)
+            .await
+            .expect("read")
+            .expect("row");
+        item.premiere_date = Some(format!("{date}T06:00:00Z").parse().expect("date"));
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[item])
+            .await
+            .expect("set premiere date");
+    }
+
+    // A season of episodes named by air date (`Show - 2023-12-16 - Guest.ts`):
+    // no number, no provider id, the series' name and one production year.
+    // The airings stay separate episodes, a link an earlier run made between
+    // two airings is released, and two copies of one airing still merge.
+    #[tokio::test]
+    async fn merge_episodes_keeps_by_date_airings_apart() {
+        let db = test_db().await;
+        let (dec02, dec09, dec16) = (
+            Uuid::from_u128(0x481),
+            Uuid::from_u128(0x482),
+            Uuid::from_u128(0x483),
+        );
+        let (copy_a, copy_b) = (Uuid::from_u128(0x484), Uuid::from_u128(0x485));
+        for (id, width, date) in [
+            (dec02, 1920, "2023-12-02"),
+            (dec09, 1920, "2023-12-09"),
+            (dec16, 1920, "2023-12-16"),
+            (copy_a, 1920, "2023-11-18"),
+            (copy_b, 640, "2023-11-18"),
+        ] {
+            seed(&db, id, BaseItemKind::Episode, None, width).await;
+            set_episode_fields(&db, id, "Show", "Season 49", "Show", None, 1975).await;
+            set_premiere_date(&db, id, date).await;
+        }
+        // What the date-blind key left behind: two airings hidden behind a third.
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        for id in [dec02, dec16] {
+            persistence
+                .set_primary_version_id(id, Some(dec09))
+                .await
+                .expect("seed stale link");
+        }
+
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+        svc.merge_episodes(None).await.expect("merge episodes");
+
+        for id in [dec02, dec09, dec16] {
+            assert_eq!(primary_of(&db, &svc, id).await, None, "airing {id}");
+        }
+        assert_eq!(
+            primary_of(&db, &svc, copy_b).await,
+            Some(copy_a.to_string()),
+            "two copies of one airing are one episode"
+        );
+        assert_eq!(primary_of(&db, &svc, copy_a).await, None);
     }
 
     /// Sets the series-row identity the scoped merge key reads.

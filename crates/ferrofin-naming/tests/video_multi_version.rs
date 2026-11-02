@@ -898,3 +898,38 @@ fn test_multi_version_episode_absolute_numbering_dont_collapse() {
     assert_eq!(result.len(), 3);
     assert!(result.iter().all(|r| r.alternate_versions.is_empty()));
 }
+
+// Not ported — upstream has no by-date case here. Files named by air date
+// (a DVR's `Show (Year) - YYYY-MM-DD hh mm ss - Title.ts`) key on the date
+// (`GetEpisodeVersionKey`'s `D{yyyyMMdd}`): two airings in one season folder
+// are two episodes, two recordings of one airing are versions of one.
+#[test]
+fn test_multi_version_episode_by_date_dont_collapse() {
+    let result = resolve_tv(&[
+        "/TV/Show (1975)/Season 49/Show (1975) - 2023-12-16 06 00 00 - Guest A; Band A.ts",
+        "/TV/Show (1975)/Season 49/Show (1975) - 2023-12-09 06 00 00 - Guest B; Band B.ts",
+        "/TV/Show (1975)/Season 49/Show (1975) - 2023-12-02 06 00 00 - Guest C; Band C.ts",
+    ]);
+    assert_eq!(result.len(), 3);
+    assert!(result.iter().all(|r| r.alternate_versions.is_empty()));
+}
+
+#[test]
+fn test_multi_version_episode_by_date_same_day() {
+    let result = resolve_tv(&[
+        "/TV/Show (1975)/Season 2017/Show (1975) - 2017-10-28 00 00 00 - Episode 10-28.ts",
+        "/TV/Show (1975)/Season 2017/Show (1975) - 2017-10-28 00 00 00 - Halloween Special.ts",
+        "/TV/Show (1975)/Season 2017/Show (1975) - 2017-01-14 00 00 00 - Guest D; Band D.ts",
+    ]);
+    assert_eq!(result.len(), 2);
+    let same_day = result
+        .iter()
+        .find(|r| primary_path(r).contains("2017-10-28"))
+        .unwrap();
+    assert_eq!(same_day.alternate_versions.len(), 1);
+    let other = result
+        .iter()
+        .find(|r| primary_path(r).contains("2017-01-14"))
+        .unwrap();
+    assert!(other.alternate_versions.is_empty());
+}
