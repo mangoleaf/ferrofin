@@ -14,7 +14,9 @@
 //! Run with:
 //! `FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-mediaencoding --test segment_transcode_ffmpeg`
 
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrofin_mediaencoding::transcoding::manager::StartFfMpegRequest;
@@ -465,6 +467,156 @@ async fn manager_start_ffmpeg_surfaces_nonzero_exit_as_error() {
     );
     // The failed job left nothing registered (OnTranscodeFailedToStart).
     assert_eq!(manager.active_job_count(), 0);
+}
+
+/// A loopback source that answers `500` to everything, and the request heads it
+/// saw. The listener thread lives until the test binary exits.
+fn failing_source() -> (u16, Arc<Mutex<String>>) {
+    use std::io::{Read as _, Write as _};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(String::new()));
+    let record = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut head = [0u8; 4096];
+            let n = stream.read(&mut head).unwrap_or(0);
+            record
+                .lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&head[..n]));
+            let _ = stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+        }
+    });
+    (port, seen)
+}
+
+/// The one `FFmpeg.*.log` a job left in `dir`.
+fn ffmpeg_log(dir: &Path) -> PathBuf {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.to_string_lossy().contains("FFmpeg."))
+        .expect("the ffmpeg log")
+}
+
+/// A pass-through source's credentials reach ffmpeg, which sends them, and
+/// nothing written about the job: its log (command line and ffmpeg's own
+/// stderr) and the startup error, whose tail is read back out of that log.
+#[tokio::test]
+async fn a_remote_source_reaches_ffmpeg_but_not_its_log_or_error() {
+    if !ffmpeg_gate() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let out_dir = tmp.path().join("job");
+    let playlist = out_dir.join("out.m3u8");
+    let first_segment = out_dir.join("out0.ts");
+    let (port, seen) = failing_source();
+    let source =
+        format!("http://INVENTED:SECRET@127.0.0.1:{port}/live/INVENTED/SECRET/1.m3u8?t=SECRET");
+    let args = vec![
+        "-y".into(),
+        "-user_agent".into(),
+        "Box/1.0 SECRET".into(),
+        "-i".into(),
+        source,
+        "-f".into(),
+        "hls".into(),
+        playlist.to_string_lossy().into_owned(),
+    ];
+    let transcoder = TokioSegmentTranscoder::new();
+    let manager = TranscodeManagerImpl::new(NoopSessionReporter);
+    let st = state(&playlist, &first_segment, "ts");
+
+    let err = manager
+        .start_ffmpeg(&transcoder, start_req(&st, &playlist, args))
+        .await
+        .expect_err("a 500 source should fail")
+        .to_string();
+    assert!(err.contains("exited with code"), "{err}");
+    assert!(!err.contains("SECRET"), "{err}");
+
+    let log_path = ffmpeg_log(&out_dir);
+    let finished = |text: &str| text.contains("Error opening input");
+    wait_until(Duration::from_secs(5), || {
+        finished(&std::fs::read_to_string(&log_path).unwrap_or_default())
+    })
+    .await;
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(finished(&log), "{log}");
+    assert!(!log.contains("SECRET"), "{log}");
+    let host = format!("http://127.0.0.1:{port}");
+    assert!(log.contains(&format!("-i {host} ")), "{log}");
+    assert!(log.contains(&format!("{host}.")), "{log}");
+
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.contains("GET /live/INVENTED/SECRET/1.m3u8?t=SECRET HTTP/1.1"),
+        "{seen}"
+    );
+    assert!(seen.contains("User-Agent: Box/1.0 SECRET"), "{seen}");
+}
+
+/// A file transcode's log is not filtered at all: a URL ffmpeg prints from the
+/// file's own tags, and the command line, stay exactly as they were.
+#[tokio::test]
+async fn an_ordinary_file_log_keeps_every_byte() {
+    const TAG: &str = "https://someone:public@example.org/about?a=1";
+    if !ffmpeg_gate() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let clip = tmp.path().join("clip.mp4");
+    make_clip(&clip);
+    let tagged = tmp.path().join("tagged.mkv");
+    let status = std::process::Command::new("ffmpeg")
+        .arg("-i")
+        .arg(&clip)
+        .args(["-c", "copy", "-metadata"])
+        .arg(format!("comment={TAG}"))
+        .arg(&tagged)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let log_path = tmp.path().join("job.log");
+    let arguments = vec![
+        "-i".to_owned(),
+        format!("file:{}", tagged.display()),
+        "-c".to_owned(),
+        "copy".to_owned(),
+        "-f".to_owned(),
+        "null".to_owned(),
+        "-".to_owned(),
+    ];
+    let header = format!("ffmpeg {}\n\n", arguments.join(" "));
+    let req = SpawnRequest {
+        program: "ffmpeg".to_owned(),
+        arguments,
+        working_dir: None,
+        output_dir: tmp.path().to_path_buf(),
+        log_path: log_path.clone(),
+        env: Vec::new(),
+    };
+    let child = TokioSegmentTranscoder::new()
+        .start_transcode(&req)
+        .await
+        .unwrap();
+    assert_eq!(child.wait().await, 0);
+
+    wait_until(Duration::from_secs(5), || {
+        std::fs::read_to_string(&log_path).is_ok_and(|log| log.contains("Output #0"))
+    })
+    .await;
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(log.starts_with(&header), "{log}");
+    assert!(log.contains(TAG), "{log}");
 }
 
 /// The concrete transcoder alone (no manager): a real mpegts HLS VOD transcode
