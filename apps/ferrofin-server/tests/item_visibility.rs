@@ -2416,6 +2416,61 @@ fn item_ids_of(ids: &Value) -> Vec<uuid::Uuid> {
         .collect()
 }
 
+/// The disabled-library edge the `GET /Playlists/{itemId}/Items` row records: a
+/// member of a disabled library stays in the playlist's listing, which takes the
+/// check `/Items?ids=` uses, and leaves `/Items?ParentId=`, which takes
+/// `Folder.GetLinkedChildren(user)`'s rule, for the administrator and the viewer
+/// alike.
+#[tokio::test]
+async fn members_of_a_disabled_library_stay_listed_and_leave_the_browse() {
+    /// The members `token` is given by `/Items?ParentId=<playlist>`.
+    async fn browsed(f: &Fixture, p: &SharedPlaylist, token: &str) -> Vec<uuid::Uuid> {
+        let uri = format!("/Items?ParentId={}", p.id);
+        let (status, page) = call(&f.router, "GET", &uri, Some(token), None).await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        item_ids(&page["Items"])
+    }
+    let f = fixture().await;
+    let p = SharedPlaylist::new(&f).await;
+    let all = [p.gamma, p.alpha, p.delta, p.epsilon];
+    // "Allowed" holds Alpha and Epsilon; "Hidden" Gamma and Delta.
+    let in_allowed = [p.alpha, p.epsilon];
+    assert_eq!(browsed(&f, &p, &f.admin).await, all, "enabled");
+    assert_eq!(browsed(&f, &p, &f.viewer).await, in_allowed, "enabled");
+
+    let (_, folders) = call(
+        &f.router,
+        "GET",
+        "/Library/VirtualFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let allowed = folders
+        .as_array()
+        .expect("folders")
+        .iter()
+        .find(|folder| folder["Name"] == "Allowed")
+        .expect("Allowed")
+        .clone();
+    let mut options = allowed["LibraryOptions"].clone();
+    options["Enabled"] = json!(false);
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        "/Library/VirtualFolders/LibraryOptions",
+        Some(&f.admin),
+        Some(json!({"Id": allowed["ItemId"], "LibraryOptions": options})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    assert_eq!(p.stored(&f).await, all);
+    assert_eq!(browsed(&f, &p, &f.admin).await, [p.gamma, p.delta]);
+    assert_eq!(p.listed(&f, &f.viewer).await, in_allowed);
+    assert_eq!(browsed(&f, &p, &f.viewer).await, Vec::<uuid::Uuid>::new());
+}
+
 /// A move's index counts the list its caller was given, so the member lands
 /// where they asked and the members they cannot see keep their places.
 #[tokio::test]
