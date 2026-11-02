@@ -1206,10 +1206,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A request naming an item as its scope (parentId, ids, seriesId, appearsInItemId) \
              stops at the libraries the user may open, on every route that takes one: a \
              library or view must pass IsVisible and anything else IsVisibleStandalone, or \
-             the request answers 401, and ids are reduced to those that pass \
-             IsVisibleStandalone. Upstream applies IsVisible alone, on GET /Items and GET \
-             /Trailers. A BoxSet or Playlist browse that re-roots to the user root skips the \
-             check, as upstream. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091).",
+             the request answers 403, a BoxSet or Playlist browse included, and ids are \
+             reduced to those that pass IsVisibleStandalone. Upstream applies IsVisible \
+             alone, on GET /Items and GET /Trailers, and answers 401. Jellyfin bug not ported \
+             (owner decisions 2026-10-31 and 2026-11-01, gl-1091, gl-1136).",
             "A request naming a user is held to that user on the stream, HLS, universal audio, \
              subtitle Stream.{format} and attachment routes: the default policy runs (a disabled \
              account 401, remote access and the access schedule 403), and the item, and the \

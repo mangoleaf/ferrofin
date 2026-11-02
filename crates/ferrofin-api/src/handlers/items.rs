@@ -58,13 +58,14 @@ pub(crate) async fn require_visible_item(
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))
 }
 
-/// Refuses a scope the user may not open, as `ItemsController` refuses a
-/// library: a `401`, before the query runs.
+/// Refuses a scope the user may not open: a `403`, before the query runs.
 ///
-/// Divergence (owner decision 2026-10-31, gl-1091): library access is a hard
-/// boundary on every route that takes a scope, where upstream applies
-/// `IsVisible` on `GET /Items` alone. A library or a view keeps `IsVisible`, so
-/// the hottest browse pays nothing more; anything else takes
+/// Divergence (owner decisions 2026-10-31 and 2026-11-01, gl-1091, gl-1136):
+/// library access is a hard boundary on every route that takes a scope, where
+/// upstream applies `IsVisible` on `GET /Items` alone and answers `401`. The
+/// user is authorized and policy forbids the scope, and a client can read a
+/// `401` as a dead session and sign them out. A library or a view keeps
+/// `IsVisible`, so the hottest browse pays nothing more; anything else takes
 /// `IsVisibleStandalone`, which walks up to the library. An API key is exempt,
 /// as upstream ("api keys can always access all folders"), and with no user
 /// there is nobody to refuse.
@@ -91,7 +92,9 @@ pub(crate) async fn require_scope_visible(
     if visible {
         Ok(())
     } else {
-        Err(ApiError::Unauthorized("Unauthorized access".into()))
+        Err(ApiError::Forbidden(
+            "Access to this item is not permitted".into(),
+        ))
     }
 }
 
@@ -2018,10 +2021,9 @@ fn is_direct_children_browse(short_type_name: &str) -> bool {
     )
 }
 
-/// ItemsController refuses an explicit parent the user may not open with a 401,
-/// and API keys bypass this gate; see [`require_scope_visible`], which is
-/// stricter than upstream's `IsVisible`. Container-only browses re-root to
-/// UserRootFolder before the check.
+/// An explicit parent the user may not open is refused, and API keys bypass this
+/// gate: see [`require_scope_visible`], which is stricter than upstream's
+/// `IsVisible`. A container-only browse is held to the parent it names too.
 /// Whether the parent is itself a library, and a `boxsets` one, is left in
 /// `library` for the library browse defaults ([`apply_library_browse_defaults`]).
 async fn check_parent_visibility(
@@ -2041,11 +2043,7 @@ async fn check_parent_visibility(
         .await?
         .ok_or_else(|| ApiError::BadRequest(format!("Invalid parent id: {}", query.parent_id)))?;
     let kind = parent.type_.rsplit('.').next().unwrap_or(&parent.type_);
-    let rerooted = matches!(
-        query.include_item_types.as_slice(),
-        [BaseItemKind::BoxSet | BaseItemKind::Playlist]
-    ) && !matches!(kind, "BoxSet" | "Playlist");
-    if kind != "UserRootFolder" && !rerooted {
+    if kind != "UserRootFolder" {
         require_scope_visible(state, auth, &parent, query.user.as_ref()).await?;
     }
     let kind_from = |row: &ferrofin_db::entities::base_items::BaseItemEntity| {

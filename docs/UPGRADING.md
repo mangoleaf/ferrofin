@@ -8,6 +8,14 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## A user's library access holds on every route
+
+A request that names a folder or an item as its scope (`parentId`, `seriesId`, `ids`) now stops
+at the libraries the user may open. A scope outside them answers `403`, on `GET /Items` as well,
+which used to answer `401` for a library, and `ids` leave out what the user may not open. A user
+who can open the library sees no change, and an API key is exempt. So a script or a client that
+kept an id from a library the user has since lost now gets that `403`.
+
 ## Other accounts' policy and configuration
 
 `GET /Users`, `GET /Users/Public` and `GET /Users/{userId}` now leave `Policy` and

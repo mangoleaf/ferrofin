@@ -919,7 +919,7 @@ async fn deletion_checks_visibility_before_permission_and_stops_in_input_order()
 
 #[allow(clippy::too_many_lines)]
 #[tokio::test]
-async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
+async fn parent_browse_and_userless_exceptions() {
     let f = fixture().await;
     let id = &f.hidden;
     let (_, folders) = call(
@@ -943,25 +943,12 @@ async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
         call(&f.router, "GET", &parent_uri, Some(&f.viewer), None)
             .await
             .0,
-        StatusCode::UNAUTHORIZED
+        StatusCode::FORBIDDEN
     );
     assert_eq!(
         call(&f.router, "GET", &parent_uri, Some(&f.admin), None)
             .await
             .0,
-        StatusCode::OK
-    );
-    // A container-only request re-roots before the parent visibility check.
-    assert_eq!(
-        call(
-            &f.router,
-            "GET",
-            &format!("{parent_uri}&includeItemTypes=BoxSet"),
-            Some(&f.viewer),
-            None
-        )
-        .await
-        .0,
         StatusCode::OK
     );
     // Divergence from upstream (gl-1090): `GetStreamingState` reads the item with
@@ -1826,6 +1813,9 @@ fn scope_routes(id: &str, viewer_id: &str) -> Vec<String> {
     .collect();
     routes.extend([
         format!("/Items?parentId={id}&recursive=true"),
+        // A library's Collections tab, and its Playlists equivalent.
+        format!("/Items?parentId={id}&includeItemTypes=BoxSet"),
+        format!("/Items?parentId={id}&includeItemTypes=Playlist"),
         format!("/Users/{viewer_id}/Items?parentId={id}"),
         format!("/Users/{viewer_id}/Items/Latest?parentId={id}"),
         format!("/Search/Hints?searchTerm=s&parentId={id}"),
@@ -1834,7 +1824,8 @@ fn scope_routes(id: &str, viewer_id: &str) -> Vec<String> {
     routes
 }
 
-// Divergence (owner decision 2026-10-31, gl-1091): see `require_scope_visible`.
+// Divergence (owner decisions 2026-10-31 and 2026-11-01, gl-1091, gl-1136): see
+// `require_scope_visible`.
 #[tokio::test]
 async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
     let f = fixture().await;
@@ -1845,7 +1836,7 @@ async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
         routes.push(format!("/Shows/NextUp?seriesId={id}"));
         for route in routes {
             let (status, _) = call(&f.router, "GET", &route, Some(&f.viewer), None).await;
-            if status != StatusCode::UNAUTHORIZED {
+            if status != StatusCode::FORBIDDEN {
                 open.push(format!("{status} {route}"));
             }
         }
@@ -1853,7 +1844,7 @@ async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
     assert!(open.is_empty(), "{open:#?}");
     let both = format!("/Items?ids={}&parentId={}", f.hidden, s.library);
     let (status, _) = call(&f.router, "GET", &both, Some(&f.viewer), None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "the scope answers first");
+    assert_eq!(status, StatusCode::FORBIDDEN, "the scope answers first");
 
     // An administrator can open them all, and an API key is not a user.
     assert_eq!(
@@ -1880,7 +1871,7 @@ async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
     assert_eq!(status, StatusCode::OK, "an API key naming a user is exempt");
     // An administrator reading as the viewer gets the viewer's answer.
     let (status, _) = call(&f.router, "GET", &for_viewer, Some(&f.admin), None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     // Opening the library opens everything inside it.
     let viewer_id = &f.viewer_id;
@@ -1942,6 +1933,27 @@ async fn a_scope_the_user_can_open_answers_on_every_route() {
             assert_eq!(status, StatusCode::OK, "{route}: {body}");
         }
     }
+    // The playlists folder belongs to no library, so a limit on libraries
+    // leaves it open.
+    let (_, media_folders) = call(
+        &f.router,
+        "GET",
+        "/Library/MediaFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let playlists = media_folders["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["Name"] == "Playlists")
+        .unwrap()["Id"]
+        .as_str()
+        .unwrap();
+    let route = format!("/Items?parentId={playlists}&includeItemTypes=Playlist");
+    let (status, body) = call(&f.router, "GET", &route, Some(&f.viewer), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]
