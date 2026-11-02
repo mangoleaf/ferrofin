@@ -2021,6 +2021,26 @@ pub trait UserDataManager: Send + Sync {
         user_id: Uuid,
     ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError>;
 
+    /// [`Self::get_user_data_batch`] for a caller that reads only what the
+    /// user played: the item's play state, position and last-played date.
+    /// Each item the user stored a row for is answered as there.
+    ///
+    /// An item the user never wrote may be absent. The empty row
+    /// [`Self::get_user_data_batch`] answers for it is keyed by the item's
+    /// first user-data key, which has to be derived from the item's metadata,
+    /// yet it is never played and holds no position, so such a caller answers
+    /// alike without it. The concrete manager leaves those items out and
+    /// derives keys only for the items with a stored row, to choose between
+    /// their rows. The default answers with [`Self::get_user_data_batch`],
+    /// so fakes and other impls compile unchanged.
+    async fn get_stored_user_data_batch(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        self.get_user_data_batch(item_ids, user_id).await
+    }
+
     /// Updates play state from a reported position, returning whether the item
     /// is now considered played to completion.
     async fn update_play_state(
