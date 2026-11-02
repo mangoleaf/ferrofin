@@ -234,7 +234,7 @@ impl AuthService for OkAuth {
             return Err(ServiceError::unauthorized("no credentials"));
         }
         Ok(AuthorizationInfo {
-            user: self.caller(),
+            user: self.caller().map(Arc::new),
             is_api_key: self.elevated || self.userless,
             is_authenticated: true,
             ..ferrofin_api::test_support::authenticated_user_info()
@@ -256,7 +256,7 @@ impl AuthorizationContext for OkAuth {
             return Err(ServiceError::unauthorized("no credentials"));
         }
         Ok(AuthorizationInfo {
-            user: self.caller(),
+            user: self.caller().map(Arc::new),
             is_api_key: self.elevated || self.userless,
             is_authenticated: true,
             ..ferrofin_api::test_support::authenticated_user_info()

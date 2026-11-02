@@ -247,7 +247,7 @@ impl FerrofinAuthorizationContext {
         }
 
         info.user = match Uuid::parse_str(&device.user_id) {
-            Ok(id) => self.user_manager.get_user_by_id(id).await?,
+            Ok(id) => self.user_manager.get_user_by_id(id).await?.map(Arc::new),
             Err(_) => None,
         };
 

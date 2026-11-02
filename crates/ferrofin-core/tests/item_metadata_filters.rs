@@ -349,7 +349,7 @@ async fn has_parental_rating_false_yields_to_the_users_limit_and_unrated_block()
         ..stored_user(&db).await
     };
     let by_policy = InternalItemsQuery {
-        user: Some(limited),
+        user: Some(Arc::new(limited)),
         has_parental_rating: Some(false),
         ..InternalItemsQuery::default()
     };
@@ -394,7 +394,7 @@ async fn the_stricter_limit_breaks_a_score_tie_on_the_sub_score() {
         ..stored_user(&db).await
     };
     let policy_only = InternalItemsQuery {
-        user: Some(user.clone()),
+        user: Some(Arc::new(user.clone())),
         ..InternalItemsQuery::default()
     };
     assert!(translated_all(&db, &policy_only).await.contains(&tie));
@@ -416,7 +416,7 @@ async fn maximum_rating_never_exceeds_the_users_limit() {
         ..stored_user(&db).await
     };
     let capped = |score: Option<i32>| InternalItemsQuery {
-        user: Some(user.clone()),
+        user: Some(Arc::new(user.clone())),
         max_parental_rating: score.map(|score| ParentalRatingScore::new(score, None)),
         ..InternalItemsQuery::default()
     };

@@ -39,7 +39,7 @@ pub(crate) async fn current_session(
             caller.device_id,
             caller.device,
             caller.remote_endpoint,
-            user.as_ref(),
+            user.as_deref(),
         )
         .await?;
     Ok(session)
@@ -62,7 +62,7 @@ pub(crate) async fn current_session_id(
             caller.device_id,
             caller.device,
             caller.remote_endpoint,
-            user.as_ref(),
+            user.as_deref(),
         )
         .await?
         .ok_or_else(|| ApiError::NotFound("Session not found.".to_owned()))

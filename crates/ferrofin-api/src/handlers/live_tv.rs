@@ -24,6 +24,8 @@
 //! not expose), and `librarySeriesId` reads the series as the request's user,
 //! else the signed-in caller.
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
@@ -227,8 +229,8 @@ async fn get_channel(
         return Err(ApiError::NotFound("channel".into()));
     };
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
-    require_visible_item(&state, channel_id, user.as_ref()).await?;
-    m.get_channel(channel_id, user.as_ref(), &DtoOptions::default())
+    require_visible_item(&state, channel_id, user.as_deref()).await?;
+    m.get_channel(channel_id, user.as_deref(), &DtoOptions::default())
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::NotFound("channel".into()))
@@ -684,7 +686,7 @@ async fn get_programs(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let (filters, options) = query.into_parts()?;
-    let caller = auth.user.as_ref();
+    let caller = auth.user.as_deref();
     Ok(Json(
         query_programs(&state, user, caller, filters, &options).await?,
     ))
@@ -708,7 +710,7 @@ async fn post_programs(
         None => None,
     };
     let (filters, options) = body.into_parts();
-    let caller = auth.user.as_ref();
+    let caller = auth.user.as_deref();
     Ok(Json(
         query_programs(&state, user, caller, filters, &options).await?,
     ))
@@ -749,7 +751,7 @@ async fn get_program(
         return Err(ApiError::NotFound("program".into()));
     };
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
-    m.get_program(program_id, user.as_ref(), &DtoOptions::default())
+    m.get_program(program_id, user.as_deref(), &DtoOptions::default())
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::NotFound("program".into()))
@@ -763,7 +765,7 @@ async fn get_program(
 /// start date to take advantage of a specialized index").
 async fn query_programs(
     state: &AppState,
-    user: Option<UserEntity>,
+    user: Option<Arc<UserEntity>>,
     caller: Option<&UserEntity>,
     filters: ProgramFilters,
     options: &DtoOptions,
@@ -781,7 +783,7 @@ async fn query_programs(
 /// request names no user.
 async fn query_programs_inner(
     state: &AppState,
-    user: Option<UserEntity>,
+    user: Option<Arc<UserEntity>>,
     caller: Option<&UserEntity>,
     filters: ProgramFilters,
     options: &DtoOptions,
@@ -833,7 +835,7 @@ async fn query_programs_inner(
         query.is_series = Some(true);
         if let Some(series) = state
             .library
-            .get_item_by_id_for_user(series_id, query.user.as_ref().or(caller))
+            .get_item_by_id_for_user(series_id, query.user.as_deref().or(caller))
             .await?
             && series.type_.ends_with("Series")
         {
@@ -1092,7 +1094,7 @@ async fn get_recordings(
     };
     Ok(Json(
         manager
-            .get_recordings_matching(&recording_query, user.as_ref(), &options)
+            .get_recordings_matching(&recording_query, user.as_deref(), &options)
             .await?,
     ))
 }
@@ -1123,7 +1125,7 @@ async fn get_recording(
     Query(query): Query<LiveTvUserQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
-    require_visible_recording(&state, recording_id, user.as_ref()).await?;
+    require_visible_recording(&state, recording_id, user.as_deref()).await?;
     live_tv(&state)?
         .get_recording(recording_id)
         .await?
@@ -1233,7 +1235,7 @@ async fn delete_recording(
     RequireLiveTvManagement(auth): RequireLiveTvManagement,
     Path(recording_id): Path<Uuid>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    require_visible_recording(&state, recording_id, auth.user.as_ref()).await?;
+    require_visible_recording(&state, recording_id, auth.user.as_deref()).await?;
     live_tv(&state)?.delete_recording(recording_id).await?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

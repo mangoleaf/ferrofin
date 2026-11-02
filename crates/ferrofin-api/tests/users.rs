@@ -101,7 +101,7 @@ impl AuthService for AdminAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(ADMIN_ID, "admin", Some("hash"))),
+            user: Some(Arc::new(user_entity(ADMIN_ID, "admin", Some("hash")))),
             token: Some("current-session".into()),
             is_authenticated: true,
             ..AuthorizationInfo::default()
@@ -751,7 +751,7 @@ impl AuthService for OkAuthService {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(hsp_user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(hsp_user_entity(USER_ID, "alice"))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -770,7 +770,7 @@ impl AuthorizationContext for OkAuthContext {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(hsp_user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(hsp_user_entity(USER_ID, "alice"))),
             client: Some("Wolphin".to_owned()),
             version: Some("1.0".to_owned()),
             device_id: Some("dev-1".to_owned()),
@@ -2634,7 +2634,7 @@ async fn account_updates_respect_preferences_and_api_key_elevation() {
             _: &RequestContext,
         ) -> Result<AuthorizationInfo, ServiceError> {
             Ok(AuthorizationInfo {
-                user: Some(user_entity(BOB_ID, "bob", None)),
+                user: Some(Arc::new(user_entity(BOB_ID, "bob", None))),
                 is_authenticated: true,
                 ..Default::default()
             })
@@ -2696,7 +2696,7 @@ impl AuthService for TokenAuth {
             .find(|(name, _)| name.eq_ignore_ascii_case("X-Emby-Token"))
             .map(|(_, value)| value.as_str());
         let signed_in = |user: UserEntity| AuthorizationInfo {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         };

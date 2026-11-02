@@ -22,6 +22,7 @@ use crate::test_support::{
 use ferrofin_model::dto::SortOrder;
 use ferrofin_model::live_tv::ItemSortBy;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// A second library, for versions whose primary lives elsewhere.
 const OTHER_LIBRARY: Uuid = Uuid::from_u128(0x0022_B000_02B0);
@@ -125,7 +126,7 @@ async fn library() -> (Database, Arc<dyn ItemRepository>, UserEntity, Uuid) {
 
 fn query(user: &UserEntity, kind: BaseItemKind) -> InternalItemsQuery {
     InternalItemsQuery {
-        user: Some(user.clone()),
+        user: Some(Arc::new(user.clone())),
         include_item_types: vec![kind],
         ..Default::default()
     }
@@ -464,7 +465,7 @@ async fn is_resumable_drops_a_series_whose_last_episode_was_played_through_an_al
     let resumable: HashSet<Uuid> = ids(
         &lib.repository,
         &InternalItemsQuery {
-            user: Some(lib.user.clone()),
+            user: Some(Arc::new(lib.user.clone())),
             is_resumable: Some(true),
             ..Default::default()
         },
@@ -490,7 +491,7 @@ async fn is_resumable_counts_an_episode_played_only_through_its_alternate() {
     let resumable = ids(
         &repository,
         &InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             is_resumable: Some(true),
             ..Default::default()
         },
@@ -678,11 +679,12 @@ async fn by_name_counts_roll_a_series_up_from_its_episodes() {
     }
     seed.write(&db, user_id).await;
     let mut filter = InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         is_played: Some(false),
         ..Default::default()
     };
-    filter.dto_options.fields = vec![ferrofin_model::querying::ItemFields::ItemCounts];
+    Arc::make_mut(&mut filter.dto_options).fields =
+        vec![ferrofin_model::querying::ItemFields::ItemCounts];
     let genres = repository.get_genres(&filter).await.expect("genres");
     let drama = genres
         .items
@@ -711,7 +713,7 @@ async fn a_by_name_artist_reads_its_own_played_state() {
     .await;
     let artists = async |played: bool| -> Vec<String> {
         let filter = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             is_played: Some(played),
             ..Default::default()
         };

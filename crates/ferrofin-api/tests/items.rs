@@ -197,7 +197,7 @@ impl AuthService for OkAuthService {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -214,7 +214,7 @@ impl AuthorizationContext for OkAuthContext {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             client: Some("Wolphin".to_owned()),
             version: Some("1.0".to_owned()),
             device_id: Some("dev-1".to_owned()),
@@ -986,7 +986,7 @@ impl AuthService for StubAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -1000,7 +1000,7 @@ impl AuthorizationContext for StubAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -1855,7 +1855,7 @@ async fn items_reads_the_callers_tag_whitelist_from_the_request_policy() {
     impl WhitelistedAuth {
         fn info() -> AuthorizationInfo {
             AuthorizationInfo {
-                user: Some(user_entity(USER_ID, "alice")),
+                user: Some(Arc::new(user_entity(USER_ID, "alice"))),
                 user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
                     allowed_tags: vec!["kids".to_owned()],
                     ..ferrofin_model::users::UserPolicy::default()

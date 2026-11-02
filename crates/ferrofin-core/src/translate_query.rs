@@ -3855,7 +3855,7 @@ mod tests {
             crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5511)).await;
         let plan = async |exclude_item_ids: Vec<uuid::Uuid>| {
             let filter = InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(std::sync::Arc::new(user.clone())),
                 recursive: true,
                 top_parent_ids: vec![uuid::Uuid::from_u128(0x5512), uuid::Uuid::from_u128(0x5513)],
                 exclude_item_ids,
@@ -3902,7 +3902,7 @@ mod tests {
         let user =
             crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5511)).await;
         let browse = InternalItemsQuery {
-            user: Some(user),
+            user: Some(std::sync::Arc::new(user)),
             recursive: true,
             include_item_types: vec![BaseItemKind::Series, BaseItemKind::BoxSet],
             top_parent_ids: vec![uuid::Uuid::from_u128(0x5512)],
@@ -3993,7 +3993,7 @@ mod tests {
         let user =
             crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5521)).await;
         let browse = InternalItemsQuery {
-            user: Some(user),
+            user: Some(std::sync::Arc::new(user)),
             recursive: true,
             include_item_types: vec![
                 BaseItemKind::Movie,
@@ -4054,7 +4054,7 @@ mod tests {
         let user =
             crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5531)).await;
         let browse = InternalItemsQuery {
-            user: Some(user),
+            user: Some(std::sync::Arc::new(user)),
             recursive: true,
             include_item_types: vec![
                 BaseItemKind::Movie,

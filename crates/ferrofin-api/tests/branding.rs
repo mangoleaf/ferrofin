@@ -193,14 +193,14 @@ impl AuthService for Caller {
         Ok(match self {
             Self::Key => AuthorizationInfo {
                 token: Some("tok".into()),
-                user: Some(user()),
+                user: Some(Arc::new(user())),
                 is_api_key: true,
                 is_authenticated: true,
                 ..Default::default()
             },
             Self::Regular => AuthorizationInfo {
                 token: Some("tok".into()),
-                user: Some(user()),
+                user: Some(Arc::new(user())),
                 user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy::default())),
                 is_authenticated: true,
                 ..Default::default()

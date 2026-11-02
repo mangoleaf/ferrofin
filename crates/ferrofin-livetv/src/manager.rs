@@ -3143,7 +3143,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // same channel, which is the whole point of putting it there.
         let dtos = self
             .dto_service()?
-            .get_base_item_dtos(&entities, &list_options, query.user.as_ref(), None, true)
+            .get_base_item_dtos(&entities, &list_options, query.user.as_deref(), None, true)
             .await?;
         Ok(QueryResult::new(Some(start_index), Some(total), dtos))
     }
@@ -3216,7 +3216,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let mut list_options = options.clone();
         remove_fields(&mut list_options);
         let items = self
-            .program_dtos(&rows, &list_options, query.user.as_ref())
+            .program_dtos(&rows, &list_options, query.user.as_deref())
             .await?;
 
         // Same rule as the item repository: the count is only bought when
@@ -3307,7 +3307,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let mut list_options = options.clone();
         remove_fields(&mut list_options);
         let items = self
-            .program_dtos(&rows, &list_options, query.user.as_ref())
+            .program_dtos(&rows, &list_options, query.user.as_deref())
             .await?;
         Ok(QueryResult::new(query.start_index, Some(total), items))
     }
@@ -3640,7 +3640,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             min_end_date: Some(now),
             limit: i32::try_from(channel_ids.len()).ok(),
             order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
-            user: user.cloned(),
+            user: user.cloned().map(Arc::new),
             ..InternalItemsQuery::default()
         };
         let program_rows = self.query_program_rows(&query, now).await?;
@@ -11826,7 +11826,7 @@ mod tests {
         let favorites = mgr
             .get_channels(
                 &LiveTvChannelQuery {
-                    user: Some(user.clone()),
+                    user: Some(Arc::new(user.clone())),
                     is_favorite: Some(true),
                     ..LiveTvChannelQuery::default()
                 },
@@ -11840,7 +11840,7 @@ mod tests {
         let sorted = mgr
             .get_channels(
                 &LiveTvChannelQuery {
-                    user: Some(user.clone()),
+                    user: Some(Arc::new(user.clone())),
                     enable_favorite_sorting: true,
                     ..LiveTvChannelQuery::default()
                 },

@@ -443,6 +443,71 @@ async fn frames_keep_the_colours_of_the_source(
     }
 }
 
+/// The tail the hardware builder appends to frames a GPU decoder hands the
+/// software MJPEG encoder: a conversion at the frame's own size, from the
+/// matrix the frames hold to the JPEG's BT.601 (gl-1157). Downloaded frames are
+/// `yuv420p` from CUDA and `nv12` from VAAPI and QSV, full range when the VPP
+/// scaler was told the encoder is MJPEG, and a same-size scale must convert
+/// each, which needs no GPU to show.
+#[rstest::rstest]
+#[case::cuda_download("scale=128:72,format=yuv420p")]
+#[case::vaapi_qsv_download("scale=128:72,format=nv12")]
+#[case::vaapi_qsv_full_range_download("scale=128:72:out_range=pc,format=nv12")]
+#[tokio::test]
+async fn a_downloaded_frame_is_converted_to_bt601_at_its_own_size(#[case] download: &str) {
+    if !ffmpeg_gate() {
+        return;
+    }
+    let version = probed_ffmpeg_version();
+    if version.is_none_or(|v| v < MIN_FFMPEG_JPEG_MATRIX_CONVERSION) {
+        eprintln!("skipping: ffmpeg is unprobed or older than {MIN_FFMPEG_JPEG_MATRIX_CONVERSION}");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let clip = tmp.path().join("bars.mkv");
+    make_bars_clip(
+        &clip,
+        Matrix::Bt709,
+        Some("colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv"),
+    );
+    let frame = tmp.path().join("frame.jpg");
+    // A hardware scaler's fixed-size output in the download's format, then
+    // the builder's tail as `build_accelerated_trickplay_args` writes it: keep
+    // the two in step.
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(&clip)
+        .args([
+            "-vf",
+            &format!("{download},scale=in_color_matrix=bt709:out_color_matrix=bt601"),
+            "-frames:v",
+            "1",
+            "-c:v",
+            "mjpeg",
+            "-qscale:v",
+            "4",
+        ])
+        .arg(&frame)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "ffmpeg failed");
+
+    let got = bar_colours(&image::open(&frame).expect("decode frame").to_rgb8());
+    let off = got
+        .iter()
+        .zip(&BARS)
+        .flat_map(|(g, w)| g.iter().zip(w).map(|(g, w)| g.abs_diff(*w)))
+        .max()
+        .unwrap_or_default();
+    assert!(
+        off <= COLOUR_TOLERANCE,
+        "{download}: decoded {got:?}, source {BARS:?} (off by {off})"
+    );
+}
+
 /// Whether the `ffmpeg` on `PATH` has jellyfin-ffmpeg's `tonemapx`, the
 /// filter software trickplay tone-maps an HDR source with.
 fn has_tonemapx() -> bool {
