@@ -1,20 +1,25 @@
-//! The statements `GET /Users/{id}/Views` runs, end to end (gl-981).
+//! The statements a request runs, end to end.
 //!
-//! The home screen's view row asks three questions about the libraries'
-//! physical folders: the scope of 12.2's `HasVisibleItem` probe for the
-//! playlists folder, that probe's own query, and the views' `ChildCount`
-//! (`GetChildCountSourceIds`). All three read `CollectionFolder` rows, which
-//! the library set the visibility check caches already holds, `Data`
-//! included. The probe's scope also looks for the Live TV view among the
-//! `UserView` rows it has just read. So a warm request reads neither again.
-//!
-//! Boots the real composition root over a temp data dir with one scanned
-//! movies library and the playlists folder every server provisions, and
-//! records, through a global subscriber, the `sqlx::query` events emitted
+//! Each test boots the real composition root over a temp data dir with a
+//! scanned movies library (and the playlists folder every server provisions),
+//! and records, through a global subscriber, the `sqlx::query` events emitted
 //! inside one request's span (the SQLite worker enters the caller's span).
-//! Then, the set still warm, it toggles the library's `Enabled` option through
-//! the dashboard's endpoint and checks the user's scope follows on the next
-//! request.
+//!
+//! - `GET /Users/{id}/Views` (gl-981). The home screen's view row asks three
+//!   questions about the libraries' physical folders: the scope of 12.2's
+//!   `HasVisibleItem` probe for the playlists folder, that probe's own query,
+//!   and the views' `ChildCount` (`GetChildCountSourceIds`). All three read
+//!   `CollectionFolder` rows, which the library set the visibility check caches
+//!   already holds, `Data` included. The probe's scope also looks for the Live
+//!   TV view among the `UserView` rows it has just read. So a warm request reads
+//!   neither again. Then, the set still warm, it toggles the library's
+//!   `Enabled` option through the dashboard's endpoint and checks the user's
+//!   scope follows on the next request.
+//! - A library browse whose page holds a movie with versions (gl-1083). Its
+//!   version resume (`GetResumeUserDataBatch`) takes the page's own items' user
+//!   data from the page, as upstream's cache answers them, and reads only what
+//!   the user stored on the versions off the page: none here, so no user-data
+//!   key is derived.
 
 use std::sync::Mutex;
 
@@ -30,17 +35,22 @@ use tracing_subscriber::layer::{Context, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;
 
 const ADMIN_USER: &str = "admin";
-const ADMIN_PASSWORD: &str = "user-views-statements-pw";
+const ADMIN_PASSWORD: &str = "request-statements-pw";
 
-const CLIENT_AUTH: &str = r#"MediaBrowser Client="Views Statements", Device="Test Rig", DeviceId="rig-vs", Version="1.0.0""#;
+const CLIENT_AUTH: &str = r#"MediaBrowser Client="Request Statements", Device="Test Rig", DeviceId="rig-rs", Version="1.0.0""#;
 
-/// The span the recorded request runs in.
-const REQUEST_SPAN: &str = "gl981_views_request";
+/// The span the recorded views request runs in.
+const VIEWS_SPAN: &str = "gl981_views_request";
 
-/// The statements recorded inside [`REQUEST_SPAN`], in order.
-static STATEMENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// The span the recorded browse with a version group runs in.
+const VERSIONS_SPAN: &str = "gl1083_version_resume_request";
 
-/// Records the text of every `sqlx::query` event emitted inside [`REQUEST_SPAN`].
+/// The statements recorded inside each test's span, in order, tagged with the
+/// span: `cargo test` runs a binary's tests on threads of one process.
+static STATEMENTS: Mutex<Vec<(&'static str, String)>> = Mutex::new(Vec::new());
+
+/// Records the text of every `sqlx::query` event emitted inside one of the
+/// recorded spans.
 struct Statements;
 
 impl<S> tracing_subscriber::Layer<S> for Statements
@@ -51,19 +61,44 @@ where
         if event.metadata().target() != "sqlx::query" {
             return;
         }
-        let in_request = ctx
-            .event_scope(event)
-            .is_some_and(|mut scope| scope.any(|span| span.name() == REQUEST_SPAN));
-        if !in_request {
+        let Some(span) = ctx.event_scope(event).and_then(|mut scope| {
+            scope.find_map(|span| {
+                [VIEWS_SPAN, VERSIONS_SPAN]
+                    .into_iter()
+                    .find(|name| span.name() == *name)
+            })
+        }) else {
             return;
-        }
+        };
         let mut text = StatementText(String::new());
         event.record(&mut text);
         STATEMENTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(text.0.split_whitespace().collect::<Vec<_>>().join(" "));
+            .push((
+                span,
+                text.0.split_whitespace().collect::<Vec<_>>().join(" "),
+            ));
     }
+}
+
+/// Forgets what was recorded inside `span`.
+fn clear_statements(span: &str) {
+    STATEMENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(recorded, _)| *recorded != span);
+}
+
+/// The statements recorded inside `span`, in order.
+fn statements_in(span: &str) -> Vec<String> {
+    STATEMENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(recorded, _)| *recorded == span)
+        .map(|(_, statement)| statement.clone())
+        .collect()
 }
 
 /// sqlx's `summary` (the statement's start) and `db.statement` (the whole
@@ -96,21 +131,22 @@ struct Harness {
     _temp: tempfile::TempDir,
 }
 
-/// Boots the composition root over a temp DB and seeds the admin.
-async fn boot() -> Harness {
+/// Boots the composition root over a temp DB and seeds the admin, with a
+/// movies directory holding `files` (paths under it).
+async fn boot(files: &[&str]) -> Harness {
     let temp = tempfile::tempdir().expect("temp dir");
     std::fs::create_dir_all(temp.path().join("config")).expect("config dir");
     let config = Config {
-        server_name: "ferrofin-user-views-statements".to_owned(),
+        server_name: "ferrofin-request-statements".to_owned(),
         admin_user: ADMIN_USER.to_owned(),
         admin_password: ADMIN_PASSWORD.to_owned(),
         ..Config::test_stub(temp.path())
     };
     let movies_dir = temp.path().join("movies");
-    for title in ["Film Alpha (1999)", "Film Beta (2004)"] {
-        let dir = movies_dir.join(title);
-        std::fs::create_dir_all(&dir).expect("movie dir");
-        std::fs::write(dir.join(format!("{title}.mkv")), [0u8; 1024]).expect("movie file");
+    for file in files {
+        let path = movies_dir.join(file);
+        std::fs::create_dir_all(path.parent().expect("movie dir")).expect("movie dir");
+        std::fs::write(path, [0u8; 1024]).expect("movie file");
     }
     std::fs::create_dir_all(&config.data_dir).expect("data dir");
     let db = Database::connect(&config.database_url())
@@ -202,13 +238,11 @@ fn record_statements() {
     });
 }
 
-#[tokio::test]
-async fn a_warm_views_request_reads_no_library_row_again() {
-    record_statements();
-    let harness = boot().await;
-    let router = ferrofin_api::create_router(harness.wired.state.clone());
+/// Signs the admin in, adds the movies library with no remote fetchers and
+/// scans it; returns the admin's authorization header and user id.
+async fn sign_in_and_scan(harness: &Harness, router: &axum::Router) -> (String, String) {
     let (status, auth) = send(
-        &router,
+        router,
         CLIENT_AUTH,
         "POST",
         "/Users/AuthenticateByName",
@@ -219,12 +253,12 @@ async fn a_warm_views_request_reads_no_library_row_again() {
     let token = auth["AccessToken"].as_str().expect("token");
     let user_id = auth["User"]["Id"].as_str().expect("user id").to_owned();
     let auth_header = format!(
-        r#"MediaBrowser Client="Views Statements", Device="Test Rig", DeviceId="rig-vs", Version="1.0.0", Token="{token}""#
+        r#"MediaBrowser Client="Request Statements", Device="Test Rig", DeviceId="rig-rs", Version="1.0.0", Token="{token}""#
     );
 
     // No remote metadata or image fetchers: a scan that asks TMDb waits on it.
     let (status, body) = send(
-        &router,
+        router,
         &auth_header,
         "POST",
         &format!(
@@ -249,6 +283,19 @@ async fn a_warm_views_request_reads_no_library_row_again() {
             .expect("scan"),
         "the scan ran"
     );
+    (auth_header, user_id)
+}
+
+#[tokio::test]
+async fn a_warm_views_request_reads_no_library_row_again() {
+    record_statements();
+    let harness = boot(&[
+        "Film Alpha (1999)/Film Alpha (1999).mkv",
+        "Film Beta (2004)/Film Beta (2004).mkv",
+    ])
+    .await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
     let views_uri = format!("/Users/{user_id}/Views");
     let movies_count = |views: &serde_json::Value| {
         views["Items"].as_array().and_then(|items| {
@@ -266,20 +313,14 @@ async fn a_warm_views_request_reads_no_library_row_again() {
         harness.db.cached_libraries().is_some(),
         "a views request leaves the library set cached"
     );
-    STATEMENTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
+    clear_statements(VIEWS_SPAN);
     let (status, views) = send(&router, &auth_header, "GET", &views_uri, None)
-        .instrument(tracing::info_span!(REQUEST_SPAN))
+        .instrument(tracing::info_span!(VIEWS_SPAN))
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(views, warm, "the recorded request answers as the warm one");
     assert_eq!(movies_count(&views), Some(2), "{views}");
-    let statements = STATEMENTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let statements = statements_in(VIEWS_SPAN);
     let listing = statements.join("\n");
     // The recording sees the request: its child count is there.
     assert!(
@@ -306,6 +347,81 @@ async fn a_warm_views_request_reads_no_library_row_again() {
     );
 
     a_dashboard_toggle_reaches_the_next_request(&harness, &router, &auth_header, &user_id).await;
+}
+
+/// A movie with two versions on a library browse, the runtime-sorted edge
+/// request of the release gate: the page's version resume
+/// (`GetResumeUserDataBatch`, `DtoService.cs:171-180`) takes the primary's
+/// user data from the page, as upstream's `GetUserDataBatch` answers it from
+/// the cache the page's batch filled, and reads only what the user stored on
+/// the version off the page. Nothing is stored, so no user-data key is
+/// derived: the key read (`identity_ids`) exists to choose among stored rows
+/// and to key a never-written row, which nothing here shows.
+#[tokio::test]
+async fn a_version_group_s_resume_derives_no_key_for_unwritten_versions() {
+    record_statements();
+    let harness = boot(&[
+        "Film Alpha (1999)/Film Alpha (1999).mkv",
+        "Film Gamma (2010)/Film Gamma (2010) - 1080p.mkv",
+        "Film Gamma (2010)/Film Gamma (2010) - 2160p.mkv",
+    ])
+    .await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let (status, views) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!("/Users/{user_id}/Views"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "views: {views}");
+    let movies = views["Items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["Name"] == "Movies"))
+        .and_then(|item| item["Id"].as_str())
+        .expect("the Movies view")
+        .to_owned();
+    let browse = format!(
+        "/Items?userId={user_id}&parentId={movies}&includeItemTypes=Movie&recursive=true\
+         &sortBy=Runtime,SortName&sortOrder=Ascending&limit=50"
+    );
+    let (status, warm) = send(&router, &auth_header, "GET", &browse, None).await;
+    assert_eq!(status, StatusCode::OK, "browse: {warm}");
+    let gammas = warm["Items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|item| item["Name"] == "Film Gamma (2010)")
+        .count();
+    assert_eq!(gammas, 1, "the versions list once: {warm}");
+
+    clear_statements(VERSIONS_SPAN);
+    let (status, page) = send(&router, &auth_header, "GET", &browse, None)
+        .instrument(tracing::info_span!(VERSIONS_SPAN))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page, warm, "the recorded request answers as the warm one");
+    let statements = statements_in(VERSIONS_SPAN);
+    let listing = statements.join("\n");
+    // The page's version group is read, so the resume had a group to fold,
+    // and then the user data of the one version off the page, alone: the
+    // grouped movie on the page answers with the page's own.
+    let versions_read = statements
+        .iter()
+        .position(|s| s.contains(r#"AS "HasVersions""#))
+        .unwrap_or_else(|| panic!("the page's versions are read:\n{listing}"));
+    assert!(
+        statements[versions_read..]
+            .iter()
+            .any(|s| s.contains(r#"FROM "UserData""#) && s.contains(r#""ItemId" IN (?2)"#)),
+        "the version off the page is read, alone:\n{listing}"
+    );
+    assert!(
+        !statements.iter().any(|s| s.contains("identity_ids")),
+        "no user-data key is derived for a version nobody played:\n{listing}"
+    );
 }
 
 /// With the library set warm, a library disabled from the dashboard leaves

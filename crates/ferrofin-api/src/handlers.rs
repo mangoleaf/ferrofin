@@ -1142,7 +1142,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         key: "user-data",
         upstream_file: "Emby.Server.Implementations/Library/UserDataManager.cs",
         upstream_method: "SaveUserData",
-        ferrofin: "The write path only. ferrofin-core user_data_manager.rs mutate_row \
+        ferrofin: "The write path, plus the read path only where a page's version groups get \
+                   their user data. ferrofin-core user_data_manager.rs mutate_row \
                    (SaveUserData with its retired-key update, GetUserData, ResolveUserDataRow), \
                    save_user_data_with_reason (the UpdateUserItemDataDto SaveUserData), \
                    save_play_state and apply_play_report (UpdatePlayState), \
@@ -1154,8 +1155,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
                    MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
                    Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
-                   UpdateUserItemRatingInternal)",
-        date: "2026-10-30",
+                   UpdateUserItemRatingInternal). The version groups: dto_service.rs prefetch's \
+                   version user data (a page item's from the page's own read, a version off \
+                   the page from user_data_manager.rs get_stored_user_data_batch), compared \
+                   with Emby.Server.Implementations/Library/UserDataManager.cs \
+                   (GetUserDataBatch, whose cache answers the page's items, and \
+                   GetResumeUserDataBatch), Emby.Server.Implementations/Dto/DtoService.cs \
+                   (GetBaseItemDtos) and Emby.Server.Implementations/Library/\
+                   MediaSourceManager.cs (SetAlternateVersionResumeStates)",
+        date: "2026-11-02",
         divergences: &[
             "Each change reads the row inside its write transaction, so two overlapping saves of \
              one item both land; upstream's GetUserData hands each caller a copy and SaveUserData \
