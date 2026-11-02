@@ -568,7 +568,7 @@ pub struct Config {
     pub enable_metrics: Option<bool>,
 
     /// Suppress the compiled-in extensions (intro skipper, file
-    /// transformation, merge versions) — `true` registers none of them but
+    /// transformation, merge versions, LDAP-Auth) — `true` registers none of them but
     /// the Ferrofin settings extension, the server's own settings page
     /// (`ferrofin_extensions::registered_extensions`).
     ///

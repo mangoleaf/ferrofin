@@ -341,7 +341,7 @@ not replace the account needed for subtitle downloads.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FERROFIN_DISABLE_EXTENSIONS` | `false` | Register none of the compiled-in extensions (Intro Skipper, File Transformation, Merge Versions): their plugins, scheduled tasks and event hooks are gone. Meant for measurement, so a benchmark compares Ferrofin with a Jellyfin that has no plugins installed. The **Ferrofin** plugin stays: it is the server's own settings, with no task or hook. Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`. |
+| `FERROFIN_DISABLE_EXTENSIONS` | `false` | Register none of the compiled-in extensions (Intro Skipper, File Transformation, Merge Versions, LDAP-Auth): their plugins, scheduled tasks and event hooks are gone. Meant for measurement, so a benchmark compares Ferrofin with a Jellyfin that has no plugins installed. The **Ferrofin** plugin stays: it is the server's own settings, with no task or hook. Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`. |
 
 ## WASM plugins (Tier 1b)
 
@@ -374,5 +374,7 @@ Not runtime config, listed for completeness:
   `FERROFIN_SCAN_BENCH_PROBE=1` turns on the real ffprobe, and
   `FERROFIN_SCAN_BENCH_{MEDIA,POSTER}` point it at real sample files.
 - `FERROFIN_FFMPEG_TESTS=1` — run the env-gated real-ffmpeg integration tests.
+- `FERROFIN_LDAP_TESTS=1` — run the LDAP-Auth directory test against OpenLDAP in
+  containers (`crates/ferrofin-extensions/tests/ldap_directory.rs`; needs docker).
 - `FERROFIN_WASM_GUEST_TESTS=1` — build `examples/wasm-hello` from source (needs the
   wasm32-wasip2 target) and run the end-to-end WASM plugin tests.

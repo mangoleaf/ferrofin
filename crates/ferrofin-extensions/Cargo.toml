@@ -26,6 +26,12 @@ ferrofin-health.workspace = true
 async-trait.workspace = true
 regex.workspace = true
 reqwest.workspace = true
+# The LDAP-Auth extension's directory client, its TLS configuration and errors.
+ldap3.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+thiserror.workspace = true
+x509-parser.workspace = true
 tokio = { workspace = true }
 uuid.workspace = true
 serde.workspace = true
@@ -36,3 +42,6 @@ tempfile.workspace = true
 [dev-dependencies]
 rstest.workspace = true
 tracing-subscriber.workspace = true
+# Certificates and in-process TLS servers for the LDAP-Auth connection tests.
+rcgen.workspace = true
+tokio-rustls.workspace = true

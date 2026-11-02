@@ -29,6 +29,7 @@ pub mod events;
 pub mod external_identities;
 pub mod filesystem;
 pub mod intro_skipper;
+pub mod ldap;
 pub mod library;
 pub mod localization;
 pub mod media_analysis;
