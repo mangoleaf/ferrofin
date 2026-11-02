@@ -29,9 +29,9 @@ Each setting has exactly one key; the variable's stem is not accepted for these 
 a warning at startup that names it, and a key spelled as its variable's stem (`tvdb_pin`) is
 told the key to use (`tvdb_subscriber_pin`). A number or on/off variable whose value does not
 parse (`FERROFIN_PORT=80g`) is ignored with a warning naming it, so the file's value or the
-default applies, and a blank one counts as unset; the rows that say so (`FERROFIN_DB_POOL`, the
-cache lifetimes, the directory-cache limits, `FERROFIN_TRICKPLAY_CONCURRENCY`) stop the server
-on a bad value instead.
+default applies, and a blank one counts as unset; the rows that say so (`FERROFIN_DB_POOL`,
+`FERROFIN_DB_STATEMENT_CACHE`, the cache lifetimes, the directory-cache limits,
+`FERROFIN_TRICKPLAY_CONCURRENCY`) stop the server on a bad value instead.
 
 The file is `--config`, else `FERROFIN_CONFIG_FILE` (blank counts as unset), else `config.toml` in the data directory
 that `--data-dir`, `FERROFIN_DATA_DIR` or the default location names, in that order. A
@@ -240,6 +240,7 @@ proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
 |---|---|---|
 | `FERROFIN_LIBRARY_ROOTS` | none | Folders a fresh install starts with as libraries, separated by the OS path-list separator (`:` on Linux); in `config.toml`, `library_roots` is an array of paths. On the boot that creates the database's administrator, each folder becomes a library named after it (`/media/Movies` → `Movies`; a name already taken gets a number, `Movies2`), with no content type (mixed content) and Jellyfin's default library options (real-time monitoring off), both changeable in the dashboard; then one library scan starts in the background. A folder that does not exist, is not a directory or is already a library's location is skipped with a warning. Every later boot, and an adopted Jellyfin database, ignores the setting, so a library removed in the dashboard does not come back. |
 | `FERROFIN_DB_POOL` | `auto` | SQLite connection count, or `auto` (sizes to cores — the measured optimum). |
+| `FERROFIN_DB_STATEMENT_CACHE` | `200` | How many prepared statements each SQLite connection keeps, in the reader and writer pools alike. A statement the cache no longer holds is prepared again the next time it runs. Measured over a browse of a small library, one connection runs 120 to 190 distinct statements, more than sqlx's own default of 100, so at 100 the cache dropped statements still in use: on a repeat browse, about one execution in ten prepared again a statement the cache had dropped. Every connection keeps its own statements, so a larger cache costs memory on each connection of the pool. `100` to `1024`. The `config.toml` key is `db_statement_cache`. |
 | `FERROFIN_SCAN_PROGRESS_EVERY` | built-in | Items between scan-progress log lines. |
 | `FERROFIN_PLAYBACK_METRICS_QUEUE` | `1024` | Depth of the playback-metrics write queue, in events. Each PlaybackInfo decision and playstate start/stop is handed to this queue and written by one background task, so a SQLite WAL checkpoint can never stall a playback request. A full queue drops the event with a warning rather than blocking — raise it if `playback-metrics queue full` appears in the log under a load spike. |
 | `FERROFIN_SCAN_PROBE_CONCURRENCY` | `8` (capped at cores) | ffprobe processes a library scan keeps in flight. The probe is the bulk of scan time, so this is the scan's main throughput knob: measured ~3.7× at `4` and ~10× at `16` over serial probing on a local SSD. Keep it low on a spinning disk or a network mount, where a wide window turns sequential reads into seek thrash. |

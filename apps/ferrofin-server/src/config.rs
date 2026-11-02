@@ -168,6 +168,7 @@ struct FileConfig {
     admin_user: Option<String>,
     admin_password: Option<String>,
     db_pool: Option<DbPoolFileValue>,
+    db_statement_cache: Option<u32>,
     enable_metrics: Option<bool>,
     disable_extensions: Option<bool>,
     metrics_sample_interval: Option<u32>,
@@ -534,6 +535,15 @@ pub struct Config {
     /// `config.toml` (integer or `"auto"`) > auto, matching the layering of
     /// every other knob.
     pub db_pool: Option<u32>,
+
+    /// How many prepared statements each SQLite connection keeps, reader and
+    /// writer pools alike. `None` = 200
+    /// (`ferrofin_db::DEFAULT_STATEMENT_CACHE_CAPACITY`). A browse of the
+    /// library runs more distinct statements per connection than sqlx's own
+    /// 100, so a smaller cache prepares again statements it evicted. Resolved
+    /// `FERROFIN_DB_STATEMENT_CACHE` env > `db_statement_cache` in
+    /// `config.toml` > default; must be within [`STATEMENT_CACHE_RANGE`].
+    pub db_statement_cache: Option<u32>,
 
     /// Bootstrap override for the metrics endpoint toggle. `Some(true)`/`Some(false)`
     /// force it on/off regardless of the persisted `ServerConfiguration.EnableMetrics`;
@@ -1045,6 +1055,7 @@ impl Config {
             .unwrap_or_default();
 
         let db_pool = resolve_db_pool(env, file.db_pool)?;
+        let db_statement_cache = resolve_statement_cache(env, file.db_statement_cache)?;
 
         let mut config = Self {
             data_dir,
@@ -1095,6 +1106,7 @@ impl Config {
             admin_user,
             admin_password,
             db_pool,
+            db_statement_cache,
             enable_metrics: parse_bool_var(env, "FERROFIN_ENABLE_METRICS").or(file.enable_metrics),
             disable_extensions: parse_bool_var(env, "FERROFIN_DISABLE_EXTENSIONS")
                 .or(file.disable_extensions)
@@ -1376,6 +1388,7 @@ impl Config {
             admin_user: "admin".to_owned(),
             admin_password: String::new(),
             db_pool: None,
+            db_statement_cache: None,
             enable_metrics: None,
             disable_extensions: false,
             metrics_sample_interval: None,
@@ -1574,6 +1587,33 @@ fn resolve_cache_ttl(
         );
     }
     Ok(secs)
+}
+
+/// The prepared statements each SQLite connection may keep
+/// (`db_statement_cache`; owner decision, gl-1071): from 100, sqlx's own
+/// default, which one browse of the library outgrows, to 1024. Every
+/// connection keeps its own statements, so the memory a larger cache holds is
+/// multiplied by the pool size.
+pub const STATEMENT_CACHE_RANGE: std::ops::RangeInclusive<u32> = 100..=1024;
+
+/// Resolves the per-connection statement cache: `FERROFIN_DB_STATEMENT_CACHE`
+/// env > `db_statement_cache` in `config.toml` > `None` (the default). A value
+/// outside [`STATEMENT_CACHE_RANGE`], or one that is not an integer, is an
+/// error, so a typo stops the server instead of silently changing how much
+/// it prepares.
+fn resolve_statement_cache(env: &dyn Env, file: Option<u32>) -> anyhow::Result<Option<u32>> {
+    const ENV_KEY: &str = "FERROFIN_DB_STATEMENT_CACHE";
+    const FILE_KEY: &str = "db_statement_cache";
+    let statements = resolve_positive(env, ENV_KEY, FILE_KEY, file)?;
+    if let Some(n) = statements {
+        anyhow::ensure!(
+            STATEMENT_CACHE_RANGE.contains(&n),
+            "invalid {ENV_KEY} / {FILE_KEY} `{n}`: expected {} to {} statements",
+            STATEMENT_CACHE_RANGE.start(),
+            STATEMENT_CACHE_RANGE.end()
+        );
+    }
+    Ok(statements)
 }
 
 /// Resolves the trickplay concurrency: `FERROFIN_TRICKPLAY_CONCURRENCY` env
@@ -3114,6 +3154,59 @@ mod tests {
         let env = FakeEnv::new().with("FERROFIN_DB_POOL", "many");
         let err = Config::load_from(Cli::default(), &env).unwrap_err();
         assert!(err.to_string().contains("invalid FERROFIN_DB_POOL"));
+    }
+
+    #[test]
+    fn db_statement_cache_resolves_and_rejects_values_out_of_range() {
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.db_statement_cache, None, "unset ⇒ the default");
+        for value in ["100", "1024"] {
+            let env = FakeEnv::new().with("FERROFIN_DB_STATEMENT_CACHE", value);
+            let cfg = Config::load_from(Cli::default(), &env).unwrap();
+            assert_eq!(cfg.db_statement_cache, Some(value.parse().unwrap()));
+        }
+        for value in ["0", "99", "1025", "lots"] {
+            let env = FakeEnv::new().with("FERROFIN_DB_STATEMENT_CACHE", value);
+            let err = Config::load_from(Cli::default(), &env)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("FERROFIN_DB_STATEMENT_CACHE"),
+                "{value}: {err}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "db_statement_cache = 300\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert_eq!(
+            Config::load_from(cli(), &FakeEnv::new())
+                .unwrap()
+                .db_statement_cache,
+            Some(300)
+        );
+        let env = FakeEnv::new().with("FERROFIN_DB_STATEMENT_CACHE", " 150 ");
+        assert_eq!(
+            Config::load_from(cli(), &env).unwrap().db_statement_cache,
+            Some(150),
+            "the variable beats the file"
+        );
+        let env = FakeEnv::new().with("FERROFIN_DB_STATEMENT_CACHE", "  ");
+        assert_eq!(
+            Config::load_from(cli(), &env).unwrap().db_statement_cache,
+            Some(300),
+            "a blank variable is unset"
+        );
+        for value in ["0", "99", "2048"] {
+            std::fs::write(&toml, format!("db_statement_cache = {value}\n")).unwrap();
+            let err = Config::load_from(cli(), &FakeEnv::new())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("db_statement_cache"), "{value}: {err}");
+        }
     }
 
     #[test]
