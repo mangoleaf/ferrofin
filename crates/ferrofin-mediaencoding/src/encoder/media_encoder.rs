@@ -30,6 +30,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
 use super::encoding_utils::{get_input_argument, quote};
+use super::trickplay_extractor::MIN_FFMPEG_JPEG_MATRIX_CONVERSION;
 use super::{FfmpegVersion, ProcessOutput, Transcoder};
 use crate::encoding_helper::hw::FfmpegCapabilities;
 use crate::probing::dtos::InternalMediaInfoResult;
@@ -136,8 +137,11 @@ pub struct MediaEncoderConfig {
     /// mounts, so extraction output can never go next to the input file.
     pub temp_dir: ferrofin_util::directory_path::DirectoryPath,
     /// The probed ffmpeg version, which decides `-fps_mode` versus the
-    /// deprecated `-vsync` (`GetVideoSyncOption`). `None` means "unprobed" and
-    /// takes `-vsync`, which every supported build still understands.
+    /// deprecated `-vsync` (`GetVideoSyncOption`) and whether an extracted
+    /// image is converted to the JPEG's BT.601 matrix
+    /// ([`MIN_FFMPEG_JPEG_MATRIX_CONVERSION`]). `None` means "unprobed": it
+    /// takes `-vsync`, which every supported build still understands, and
+    /// converts no matrix.
     pub ffmpeg_version: Option<FfmpegVersion>,
     /// `FFmpeg:imgExtractPerfTradeoff` (`GetFFmpegImgExtractPerfTradeoff`,
     /// default `false`): a frame extraction's I-frame attempt decodes
@@ -149,7 +153,8 @@ pub struct MediaEncoderConfig {
 /// request: the probed ffmpeg, the thread count and the startup options.
 #[derive(Debug, Clone, Copy, Default)]
 struct ExtractionSettings {
-    /// Decides `-fps_mode` versus `-vsync`.
+    /// Decides `-fps_mode` versus `-vsync`, and whether the kept frame is
+    /// converted to BT.601 ([`MIN_FFMPEG_JPEG_MATRIX_CONVERSION`]).
     ffmpeg_version: Option<FfmpegVersion>,
     /// The `-threads` count.
     threads: i32,
@@ -423,8 +428,10 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     /// offset.
     ///
     /// An HDR video stream is tone-mapped after the sampling
-    /// ([`Self::hdr_tone_map`]). The dashboard's image resolution applies
-    /// after the video filter chain.
+    /// ([`Self::hdr_tone_map`]). The kept frame is then converted to the
+    /// JPEG's BT.601 matrix, a step upstream's chain lacks; audio cover art
+    /// and embedded image streams, which share this line, get it too. The
+    /// dashboard's image resolution applies after the video filter chain.
     #[allow(clippy::too_many_arguments)]
     fn extract_image_arguments(
         input_path: &str,
@@ -480,6 +487,23 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         // after the sampling, on one frame.
         if let Some(tone_map) = Self::hdr_tone_map(video_stream, settings) {
             filters.push(tone_map);
+        }
+        // A JPEG decoder reads Y'CbCr as BT.601, so the frame is converted to
+        // that matrix last, on the one frame kept, as trickplay's are
+        // (gl-1129). The scale reads the matrix from the frame's tag, which
+        // this graph never re-tags: the source's, or BT.709 after a
+        // tone-map. An untagged frame reads as BT.601 and passes unchanged.
+        // An HDR frame no filter here can tone-map is converted from its
+        // BT.2020 matrix and stays un-tone-mapped, as upstream's does.
+        // Upstream converts nothing, so BT.709 video (most HD and 4K) and
+        // every tone-mapped HDR frame shift colour: a Jellyfin bug, not
+        // ported. ffmpeg converts the range for the JPEG encoder itself.
+        // Older ffmpeg lines convert a 4:2:0 frame wrongly, hence the gate.
+        if settings
+            .ffmpeg_version
+            .is_some_and(|v| v >= MIN_FFMPEG_JPEG_MATRIX_CONVERSION)
+        {
+            filters.push("scale=out_color_matrix=bt601".to_owned());
         }
 
         let vf = filters.join(",");
@@ -989,7 +1013,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FfmpegVersion, ProcessOutput};
+    use super::{FfmpegVersion, MIN_FFMPEG_JPEG_MATRIX_CONVERSION, ProcessOutput};
     use ferrofin_model::entities::Video3DFormat;
     use rstest::rstest;
 
@@ -2169,6 +2193,69 @@ mod tests {
                 None => assert!(graph.ends_with(before), "{graph}"),
             }
             assert_eq!(graph.contains("thumbnail"), use_iframe, "{graph}");
+        }
+    }
+
+    /// The kept frame is converted to the JPEG's BT.601 matrix last, behind
+    /// the sampling, a 3D scaler and the tone-map (gl-1158), on an ffmpeg that
+    /// converts a 4:2:0 frame correctly. An older or unprobed one gets
+    /// upstream's graph.
+    #[rstest]
+    #[case::unprobed(None, false)]
+    #[case::ffmpeg_5_0(Some(FfmpegVersion::new(5, 0)), false)]
+    #[case::ffmpeg_5_1(Some(MIN_FFMPEG_JPEG_MATRIX_CONVERSION), true)]
+    #[case::ffmpeg_8_1(Some(FfmpegVersion::with_build(8, 1, 3)), true)]
+    fn the_kept_frame_is_converted_to_the_jpeg_matrix(
+        #[case] ffmpeg_version: Option<FfmpegVersion>,
+        #[case] converted: bool,
+    ) {
+        let hdr = graded_stream(Some("smpte2084"), None);
+        for (stream, threed_format, use_iframe, tonemapx, last) in [
+            (None, None, true, true, "thumbnail=n=24"),
+            (None, None, false, true, "round(ih/2)*2"),
+            (
+                None,
+                Some(Video3DFormat::HalfSideBySide),
+                true,
+                true,
+                "thumbnail=n=24",
+            ),
+            (Some(&hdr), None, true, true, TONEMAPX_100),
+            (Some(&hdr), None, false, true, TONEMAPX_100),
+            (Some(&hdr), None, true, false, ZSCALE),
+        ] {
+            let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+                "file:\"/media/movie.mkv\"",
+                "matroska",
+                stream,
+                None,
+                threed_format,
+                None,
+                use_iframe,
+                "/tmp/out.jpg",
+                ExtractionSettings {
+                    ffmpeg_version,
+                    tonemapx,
+                    zscale: true,
+                    ..ExtractionSettings::default()
+                },
+                ImageResolution::P720,
+            );
+            let tokens = crate::encoder::split_args(&args).unwrap();
+            let graph = &tokens[tokens.iter().position(|a| a == "-vf").unwrap() + 1];
+            let want = if converted {
+                format!("{last},scale=out_color_matrix=bt601")
+            } else {
+                last.to_owned()
+            };
+            assert!(graph.ends_with(&want), "{graph}");
+            assert_eq!(
+                graph.matches("out_color_matrix").count(),
+                usize::from(converted)
+            );
+            // The dashboard's resolution follows the graph, behind the
+            // conversion; its scaler sets no matrix, so it converts nothing.
+            assert!(args.contains("\" -s 1280x720 "), "{args}");
         }
     }
 
