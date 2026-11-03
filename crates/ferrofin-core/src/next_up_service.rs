@@ -32,16 +32,19 @@
 //!   played, unplayed and played-non-virtual pools, the rewatching "last played
 //!   by date" pick, the per-episode user-data facts and the
 //!   [`NextUpEpisode`]s the batch result names are all derived;
-//! * 1 query for the specials' full rows, only when specials were requested;
-//! * 1 query for the full rows of the episodes on the page the manager settled
-//!   on ([`get_next_up_episode_rows`]), none when no episode is on it.
+//! * 1 query for the specials' numbers, premiere dates and `Data` blobs, only
+//!   when specials were requested ([`next_up_specials_sql`]);
+//! * 1 query for the full rows of the episodes, specials included, on the page
+//!   the manager settled on ([`get_next_up_episode_rows`]), none when no
+//!   episode is on it.
 //!
 //! So 4 round-trips in the default configuration, one more when the scope holds
 //! a parent other than a library with physical folders (the playlists folder
 //! the default scope lists, a view), and one more with specials on. Unlike
-//! C#, the batch loads no full row but the specials': its picks and last watched
-//! episodes come from the projection, so an episode picked outside the requested
-//! page never has its row read, and a last watched row is never read.
+//! C#, the batch loads no full row: its picks and last watched episodes come
+//! from the projection and its specials from their own narrow statement, so an
+//! episode or special picked outside the requested page never has its row
+//! read, and a last watched row is never read.
 //!
 //! [`get_next_up_episode_rows`]: NextUpService::get_next_up_episode_rows
 //! [`get_next_up_series_keys`]: NextUpService::get_next_up_series_keys
@@ -70,6 +73,7 @@ use crate::db_error::db_err;
 use crate::item_repository::{library_top_parents_by_view, view_top_parent_ids};
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{PLACEHOLDER_ID, TopParentTerm, push_access_filter};
+use crate::tv_series_manager::airs_numbers;
 
 /// The concrete next-up service.
 #[derive(Clone)]
@@ -206,13 +210,15 @@ impl EpisodePos {
         Some((self.season?, self.episode?))
     }
 
-    /// The episode as the batch result names it.
+    /// The episode as the batch result names it. It comes from a pool, so it
+    /// is no special and carries no `Airs*` numbers.
     fn to_episode(self) -> NextUpEpisode {
         NextUpEpisode {
             id: guid_to_db(self.id),
             parent_index_number: self.season,
             index_number: self.episode,
             premiere_date: self.premiere,
+            ..NextUpEpisode::default()
         }
     }
 }
@@ -449,32 +455,41 @@ impl NextUpService for FerrofinNextUpService {
 }
 
 impl FerrofinNextUpService {
-    /// The non-virtual special (season 0) episode rows per series key, as
-    /// `ApplyAccessFiltering` leaves them (`NextUpService.cs:176`). They are
-    /// full rows, though the merge reads few of their columns and shows only a
-    /// picked one: gl-1065 narrows them.
+    /// The non-virtual specials (season 0) per series key, as
+    /// `ApplyAccessFiltering` leaves them (`NextUpService.cs:167-190`), each
+    /// with what `DetermineNextEpisode` reads of it: its numbers, its premiere
+    /// date and the `Airs*` members of its `Data` blob. C# reads them in full;
+    /// here a special's row is read only when it is a pick on the requested
+    /// page ([`NextUpService::get_next_up_episode_rows`]).
+    ///
+    /// Each series' specials keep the statement's row order, which a tie in
+    /// the aired-order sort keeps too.
     async fn fetch_specials(
         &self,
         episode_type: &'static str,
         series_keys: &[String],
         access: &Access<'_>,
-    ) -> Result<HashMap<String, Vec<BaseItemEntity>>, ServiceError> {
-        let mut qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new(r#"SELECT bi.* FROM "BaseItems" bi WHERE bi."Type" = "#);
-        qb.push_bind(episode_type)
-            .push(r#" AND bi."ParentIndexNumber" = 0 AND bi."IsVirtualItem" = 0"#);
-        push_series_keys(&mut qb, series_keys);
-        push_access(&mut qb, access);
-        let rows: Vec<BaseItemEntity> = qb
+    ) -> Result<HashMap<String, Vec<NextUpEpisode>>, ServiceError> {
+        let rows: Vec<SpecialRow> = specials_query(episode_type, series_keys, access)
             .build_query_as()
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
-        let mut out: HashMap<String, Vec<BaseItemEntity>> = HashMap::new();
-        for row in rows {
-            if let Some(key) = row.series_presentation_unique_key.clone() {
-                out.entry(key).or_default().push(row);
-            }
+        let mut out: HashMap<String, Vec<NextUpEpisode>> = HashMap::new();
+        for (key, id, season, episode, premiere, data) in rows {
+            let Some(key) = key else {
+                continue;
+            };
+            let [before_season, after_season, before_episode] = airs_numbers(data.as_deref());
+            out.entry(key).or_default().push(NextUpEpisode {
+                id,
+                parent_index_number: season,
+                index_number: episode,
+                premiere_date: premiere,
+                airs_before_season_number: before_season,
+                airs_after_season_number: after_season,
+                airs_before_episode_number: before_episode,
+            });
         }
         Ok(out)
     }
@@ -704,6 +719,62 @@ pub fn next_up_projection_sql(
         .to_owned()
 }
 
+/// A row of the specials statement: `(series key, id, season, episode,
+/// premiere date, Data)`.
+type SpecialRow = (
+    Option<String>,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<DateTime<Utc>>,
+    Option<String>,
+);
+
+/// The specials statement of [`FerrofinNextUpService`]'s batch (see
+/// `fetch_specials`): C#'s `specialsQuery` filter, selecting only the columns
+/// the specials merge reads. It reads `Data` whole, not its three `Airs*`
+/// members through `json_extract`: `serde_json`'s read, which `aired_order`
+/// makes, and SQLite's JSON functions disagree on some blobs (a repeated
+/// member, `-0`, `true`, an integer past `i64`, a blob `serde_json` rejects
+/// elsewhere), and a blob that is no JSON at all would fail the statement.
+fn specials_query(
+    episode_type: &'static str,
+    series_keys: &[String],
+    access: &Access<'_>,
+) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT bi."SeriesPresentationUniqueKey", bi."Id",
+                  bi."ParentIndexNumber", bi."IndexNumber", bi."PremiereDate",
+                  bi."Data"
+           FROM "BaseItems" bi WHERE bi."Type" = "#,
+    );
+    qb.push_bind(episode_type)
+        .push(r#" AND bi."ParentIndexNumber" = 0 AND bi."IsVirtualItem" = 0"#);
+    push_series_keys(&mut qb, series_keys);
+    push_access(&mut qb, access);
+    qb
+}
+
+/// The specials statement the next-up batch sends for `series_keys` keys,
+/// confined to `top_parents` and restricted as `filter` says — the SQL text
+/// only, for the plan pin in `tests/`.
+#[must_use]
+pub fn next_up_specials_sql(
+    filter: &InternalItemsQuery,
+    top_parents: &[Uuid],
+    series_keys: usize,
+) -> String {
+    let keys: Vec<String> = (0..series_keys).map(|n| n.to_string()).collect();
+    let access = Access {
+        filter,
+        top_parents,
+    };
+    specials_query("Episode", &keys, &access)
+        .sql()
+        .as_str()
+        .to_owned()
+}
+
 /// The access scope of one batch: the resolved query and the libraries its
 /// pools are confined to.
 struct Access<'a> {
@@ -835,8 +906,8 @@ fn attach_user_data(
     ]
     .into_iter()
     .flatten()
-    .map(|episode| &episode.id)
-    .chain(batch.specials.iter().map(|row| &row.id));
+    .chain(&batch.specials)
+    .map(|episode| &episode.id);
     for id in ids {
         if let Some(facts) = Uuid::parse_str(id).ok().and_then(|id| user_data.get(&id)) {
             batch.user_data.insert(id.clone(), *facts);
@@ -958,7 +1029,10 @@ mod tests {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_traits::options::InternalItemsQuery;
     use ferrofin_traits::persistence::{NextUpEpisode, NextUpService};
+    use rstest::rstest;
     use uuid::Uuid;
+
+    use crate::tv_series_manager::aired_order;
 
     /// Parses an RFC3339 timestamp into a UTC datetime for seeding user-data.
     fn ts(s: &str) -> DateTime<Utc> {
@@ -2000,15 +2074,17 @@ mod tests {
     }
 
     /// gl-1006: the batch names its episodes from the projection and reads
-    /// none of their full rows. A column only the full row carries
-    /// (`DateLastSaved`) is corrupted on every episode of the series, so on
-    /// every row the batch names (the last watched, the next up and both
-    /// rewatching picks), and the batch still answers, specials and
-    /// rewatching on.
+    /// none of their full rows; gl-1065: nor its specials'. A column only the
+    /// full row carries (`DateLastSaved`) is corrupted on every episode of the
+    /// series, so on every row the batch names (the last watched, the next up,
+    /// both rewatching picks and the special), and the batch still answers,
+    /// specials and rewatching on.
     #[tokio::test]
     async fn the_batch_reads_no_full_episode_row() {
         let db = test_db().await;
         let (user, top, e1, e2) = seed_rewatched_series(&db).await;
+        let special = Uuid::new_v4();
+        seed_episode(&db, special, "series-a", 0, 1, false, Some(top)).await;
         exec(
             &db,
             r#"UPDATE "BaseItems" SET "DateLastSaved" = 'not-a-timestamp'
@@ -2047,8 +2123,127 @@ mod tests {
                 .map(|e| e.id.clone()),
             Some(guid_to_db(e2))
         );
+        assert_eq!(
+            series
+                .specials
+                .iter()
+                .map(|e| e.id.clone())
+                .collect::<Vec<_>>(),
+            vec![guid_to_db(special)]
+        );
         // The corruption bites where a row really is read.
         assert!(svc.get_next_up_episode_rows(&[e2]).await.is_err());
+        assert!(svc.get_next_up_episode_rows(&[special]).await.is_err());
+    }
+
+    /// gl-1065: the batch's specials carry what the specials merge reads of
+    /// them, off a narrow statement: the numbers, the premiere date, and the
+    /// three `Airs*` members of `Data` exactly as `aired_order` reads them off
+    /// the full row. A member that is missing, is no integer in `i64` range, or
+    /// sits in a blob `serde_json` rejects is `None`; a repeated member is its
+    /// last occurrence.
+    #[rstest]
+    #[case::integers(
+        Some(r#"{"AirsBeforeSeasonNumber":2,"AirsAfterSeasonNumber":1,"AirsBeforeEpisodeNumber":3}"#),
+        [Some(2), Some(1), Some(3)]
+    )]
+    #[case::among_others(
+        Some(r#"{"Overview":"x","AirsAfterSeasonNumber":-1,"Tags":["a"]}"#),
+        [None, Some(-1), None]
+    )]
+    #[case::missing(Some("{}"), [None, None, None])]
+    #[case::string(
+        Some(r#"{"AirsBeforeSeasonNumber":"2","AirsAfterSeasonNumber":1}"#),
+        [None, Some(1), None]
+    )]
+    #[case::boolean(Some(r#"{"AirsBeforeSeasonNumber":true}"#), [None, None, None])]
+    #[case::null(Some(r#"{"AirsBeforeSeasonNumber":null}"#), [None, None, None])]
+    #[case::float(Some(r#"{"AirsBeforeSeasonNumber":2.0}"#), [None, None, None])]
+    #[case::negative_zero(Some(r#"{"AirsBeforeSeasonNumber":-0}"#), [None, None, None])]
+    #[case::too_large(
+        Some(r#"{"AirsBeforeSeasonNumber":9223372036854775808}"#),
+        [None, None, None]
+    )]
+    #[case::other_case(Some(r#"{"airsBeforeSeasonNumber":2}"#), [None, None, None])]
+    #[case::duplicate(
+        Some(r#"{"AirsBeforeSeasonNumber":5,"AirsBeforeSeasonNumber":2}"#),
+        [Some(2), None, None]
+    )]
+    #[case::rejected_elsewhere(
+        Some(r#"{"Overview":"\ud800","AirsBeforeSeasonNumber":1}"#),
+        [None, None, None]
+    )]
+    #[case::not_json(Some("broken"), [None, None, None])]
+    #[case::no_blob(None, [None, None, None])]
+    #[tokio::test]
+    async fn specials_carry_what_aired_order_reads_off_their_rows(
+        #[case] data: Option<&str>,
+        #[case] airs: [Option<i64>; 3],
+    ) {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let e1 = Uuid::new_v4();
+        let special = Uuid::new_v4();
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, special, "series-a", 0, 4, false, Some(top)).await;
+        seed_user_data(&db, user_id, e1, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+        let premiere = ts("2020-03-04T05:06:07Z");
+        exec(
+            &db,
+            r#"UPDATE "BaseItems" SET "PremiereDate" = ?1 WHERE "Id" = ?2"#,
+            &[&datetime_to_db(premiere), &guid_to_db(special)],
+        )
+        .await;
+        if let Some(data) = data {
+            exec(
+                &db,
+                r#"UPDATE "BaseItems" SET "Data" = ?1 WHERE "Id" = ?2"#,
+                &[data, &guid_to_db(special)],
+            )
+            .await;
+        }
+
+        let svc = FerrofinNextUpService::new(db);
+        let batch = svc
+            .get_next_up_episodes_batch(
+                &query_for(user, top),
+                &["series-a".to_owned()],
+                true,
+                false,
+            )
+            .await
+            .expect("batch");
+        let series = batch.get("series-a").expect("series present");
+        let [before_season, after_season, before_episode] = airs;
+        assert_eq!(
+            series.specials,
+            vec![NextUpEpisode {
+                id: guid_to_db(special),
+                parent_index_number: Some(0),
+                index_number: Some(4),
+                premiere_date: Some(premiere),
+                airs_before_season_number: before_season,
+                airs_after_season_number: after_season,
+                airs_before_episode_number: before_episode,
+            }]
+        );
+
+        let rows = svc
+            .get_next_up_episode_rows(&[special])
+            .await
+            .expect("rows");
+        let order = aired_order(&rows[&special]);
+        assert_eq!(
+            [
+                order.airs_before_season,
+                order.airs_after_season,
+                order.airs_before_episode,
+            ],
+            airs,
+            "the full row reads the same numbers"
+        );
     }
 
     /// The batch's episodes carry what the aired-order sort reads, off the
@@ -2089,6 +2284,7 @@ mod tests {
                 parent_index_number: Some(1),
                 index_number: Some(2),
                 premiere_date: Some(premiere),
+                ..NextUpEpisode::default()
             })
         );
         assert_eq!(
@@ -2097,7 +2293,7 @@ mod tests {
                 id: guid_to_db(e1),
                 parent_index_number: Some(1),
                 index_number: Some(1),
-                premiere_date: None,
+                ..NextUpEpisode::default()
             })
         );
     }

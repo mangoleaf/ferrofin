@@ -148,13 +148,14 @@ pub struct NextUpEpisodeUserData {
 ///
 /// C# hands back whole `BaseItem`s, but the manager only compares these
 /// episodes and dates them: a series' last watched episode is never shown, and
-/// its pick is shown only when it lands on the requested page. So the batch
-/// carries this much, and the manager reads the full rows of the page's picks
-/// afterwards with [`NextUpService::get_next_up_episode_rows`].
+/// its pick, a special included, is shown only when it lands on the requested
+/// page. So the batch carries this much, and the manager reads the full rows of
+/// the page's picks afterwards with [`NextUpService::get_next_up_episode_rows`].
 ///
-/// Never a special: the pools leave season 0 out, so the `Airs*` numbers
-/// `AiredEpisodeOrder` reads off a special's `Data` blob do not apply.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A special (season 0) also carries the three `Airs*` members of its `Data`
+/// blob, which place it among the regular episodes in `AiredEpisodeOrder`. The
+/// other episodes come from pools that leave season 0 out, and carry none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NextUpEpisode {
     /// The stored id, as [`BaseItemEntity::id`].
     pub id: String,
@@ -164,15 +165,22 @@ pub struct NextUpEpisode {
     pub index_number: Option<i64>,
     /// `PremiereDate`: breaks a tie between two episodes in aired order.
     pub premiere_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// `Episode.AirsBeforeSeasonNumber`, a special's: the season it airs
+    /// before. `None` for any other episode.
+    pub airs_before_season_number: Option<i64>,
+    /// `Episode.AirsAfterSeasonNumber`, a special's: the season it airs after.
+    /// `None` for any other episode.
+    pub airs_after_season_number: Option<i64>,
+    /// `Episode.AirsBeforeEpisodeNumber`, a special's: the episode it airs
+    /// before. `None` for any other episode.
+    pub airs_before_episode_number: Option<i64>,
 }
 
 /// Result of a batched next-up query for a single series.
 ///
 /// Port of `MediaBrowser.Controller.Persistence.NextUpEpisodeBatchResult`. Each
-/// `BaseItem?` field becomes an `Option<NextUpEpisode>` (see [`NextUpEpisode`]
-/// for why it is not the row), and the specials list becomes
-/// `Vec<BaseItemEntity>`: `DetermineNextEpisode` needs a special's `Data` blob,
-/// so specials arrive as full rows.
+/// `BaseItem?` field becomes an `Option<NextUpEpisode>`, and the specials list
+/// a `Vec<NextUpEpisode>` (see [`NextUpEpisode`] for why neither is the row).
 #[derive(Debug, Clone, Default)]
 pub struct NextUpEpisodeBatchResult {
     /// The highest played season/episode.
@@ -180,15 +188,14 @@ pub struct NextUpEpisodeBatchResult {
     /// The next unwatched episode after the last watched position.
     pub next_up: Option<NextUpEpisode>,
     /// Specials that may air between episodes (only when specials were requested).
-    pub specials: Vec<BaseItemEntity>,
+    pub specials: Vec<NextUpEpisode>,
     /// The most recently played episode, for rewatching mode.
     pub last_watched_for_rewatching: Option<NextUpEpisode>,
     /// The next played episode, for rewatching mode.
     pub next_played_for_rewatching: Option<NextUpEpisode>,
     /// The user-data facts for every episode this result names, keyed by its
-    /// stored id ([`NextUpEpisode::id`], [`BaseItemEntity::id`]). Not a C#
-    /// field: it stands in for the `IUserDataManager` reads the C# manager
-    /// makes per episode.
+    /// stored id ([`NextUpEpisode::id`]). Not a C# field: it stands in for the
+    /// `IUserDataManager` reads the C# manager makes per episode.
     pub user_data: HashMap<String, NextUpEpisodeUserData>,
 }
 
@@ -2811,8 +2818,8 @@ pub trait NextUpService: Send + Sync {
     ) -> Result<HashMap<String, NextUpEpisodeBatchResult>, ServiceError>;
 
     /// Reads the full rows of the given episodes, keyed by id: the picks of
-    /// the requested page, once the batch has decided and ordered them. An id
-    /// with no row has no entry.
+    /// the requested page, specials included, once the batch has decided and
+    /// ordered them. An id with no row has no entry.
     async fn get_next_up_episode_rows(
         &self,
         ids: &[Uuid],
