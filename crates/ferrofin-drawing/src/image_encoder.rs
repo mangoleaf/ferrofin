@@ -2385,8 +2385,8 @@ mod tests {
     async fn default_options_spit_out_original() {
         let dir = TempDir::new().expect("tempdir");
         // High quality, matching format, and fill bounds covering the source →
-        // HasDefaultOptions holds (the C# guard rejects a source larger than the
-        // unset-zero FillWidth/Height, so the fill bounds must cover it).
+        // HasDefaultOptions holds (an unset fill would pass too: the C# fill
+        // fields are `int?`).
         let input = fixture(&dir, "orig.jpg", 640, 480);
         let output = out_path(&dir, "should_not_exist.jpg");
         let enc = ImageCrateEncoder::new();
@@ -2412,6 +2412,37 @@ mod tests {
             .await
             .expect("encode");
         // Original path returned untouched; output never written.
+        assert_eq!(written, input);
+        assert!(!Path::new(&output).exists());
+    }
+
+    #[tokio::test]
+    async fn bounds_the_source_meets_with_no_fill_spit_out_original() {
+        // EncodeImage's own HasDefaultOptions check, which decides for an image
+        // whose stored size was unknown to the processor: a `maxWidth` above
+        // the source and no fill leave it as it is (gl-1117).
+        let dir = TempDir::new().expect("tempdir");
+        let input = fixture(&dir, "orig.jpg", 640, 480);
+        let output = out_path(&dir, "should_not_exist.jpg");
+        let options = ImageProcessingOptions {
+            quality: 95,
+            supported_output_formats: vec![ImageFormat::Jpg],
+            max_width: Some(2000),
+            ..Default::default()
+        };
+        let written = ImageCrateEncoder::new()
+            .encode_image(
+                &input,
+                Utc::now(),
+                &output,
+                false,
+                None,
+                95,
+                &options,
+                ImageFormat::Jpg,
+            )
+            .await
+            .expect("encode");
         assert_eq!(written, input);
         assert!(!Path::new(&output).exists());
     }
