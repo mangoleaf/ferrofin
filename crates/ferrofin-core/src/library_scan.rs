@@ -2974,12 +2974,9 @@ enum ItemSaved {
 }
 
 /// The refresh facts of a row the walk does not plan: nothing on disk feeds
-/// its decision.
-///
-/// TODO(parity, open work item — NOT an accepted divergence; gl-337): a
-/// library's own `CollectionFolder.RequiresRefresh` (its folder's write time
-/// and its changed physical locations) does not fire yet; that issue ports
-/// it into `item_requires_refresh`.
+/// its decision. A directory has no `DateModified` (D2), so a library's or the
+/// root's `BaseItem.RequiresRefresh` never fires; a library's locations are
+/// the one fact [`unwalked_refresh_plan`] adds.
 const UNWALKED_FACTS: FileFacts = FileFacts {
     mtime: None,
     probe: ProbeKind::None,
@@ -2990,6 +2987,8 @@ const UNWALKED_FACTS: FileFacts = FileFacts {
     is_shortcut: false,
     is_file_protocol: true,
     is_placeholder: false,
+    path_rebased: false,
+    locations_changed: false,
 };
 
 /// The refresh plan of `row`, a row a library or root refresh reaches
@@ -2998,18 +2997,25 @@ const UNWALKED_FACTS: FileFacts = FileFacts {
 /// `run_all_providers` forces the row's dynamic image as
 /// `MetadataService.GetProviders` does: "Replace all metadata", a full
 /// refresh, or at `Default` or above the row's own first refresh or its
-/// library's elapsed `AutomaticRefreshIntervalDays`.
+/// library's elapsed `AutomaticRefreshIntervalDays`, or its required refresh:
+/// `locations_changed` is `CollectionFolder.RequiresRefresh`'s own arms (the
+/// library's recorded locations changed,
+/// [`VirtualFolderManager::take_library_requires_refresh`]).
 /// [`decide_save`](crate::refresh_plan::decide_save) over it says whether the
 /// pass stamps the row's `DateLastRefreshed`.
 pub(crate) fn unwalked_refresh_plan(
     row: Option<&BaseItemEntity>,
     options: &MetadataRefreshOptions,
     library: Option<&LibraryOptionsModel>,
+    locations_changed: bool,
 ) -> ItemRefreshPlan {
     let stored = row.map(music::stored_state);
     crate::refresh_plan::plan_item_refresh(
         stored.as_ref(),
-        &UNWALKED_FACTS,
+        &FileFacts {
+            locations_changed,
+            ..UNWALKED_FACTS
+        },
         &RefreshRequest {
             options,
             force_save: false,
@@ -10573,6 +10579,11 @@ impl LibraryScanner {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false)
             }),
+            // The walk plans neither an artist known only by name nor a
+            // library: their overrides' facts are fed where they are planned
+            // (`by_name_artist_facts`, `unwalked_refresh_plan`).
+            path_rebased: false,
+            locations_changed: false,
         }
     }
 
@@ -13571,8 +13582,23 @@ impl LibraryScanner {
                     continue;
                 }
             };
-            let plan =
-                unwalked_refresh_plan(row.as_ref(), options, folder.library_options.as_ref());
+            // `RefreshMetadata` asks `RequiresRefresh` in every mode but
+            // `None`, and `BeforeMetadataRefresh` then clears the flag.
+            let locations_changed = options.metadata_refresh_mode != MetadataRefreshMode::None
+                && self.virtual_folders.take_library_requires_refresh(cf);
+            let plan = unwalked_refresh_plan(
+                row.as_ref(),
+                options,
+                folder.library_options.as_ref(),
+                locations_changed,
+            );
+            if locations_changed {
+                tracing::debug!(
+                    library = %cf,
+                    reason = plan.reason.as_str(),
+                    "the library's locations changed; refreshing it"
+                );
+            }
             let pass = match self
                 .refresh_library_image(
                     items,
@@ -23750,7 +23776,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            super::unwalked_refresh_plan(Some(&row), &options, Some(&library)).run_all_providers,
+            super::unwalked_refresh_plan(Some(&row), &options, Some(&library), false)
+                .run_all_providers,
             want
         );
     }

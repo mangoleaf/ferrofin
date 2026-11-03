@@ -9,8 +9,11 @@
 //! (`MediaInfo/ProbeProvider.cs:127-201`), `BaseNfoProvider.HasChanged`
 //! (`XbmcMetadata/Providers/BaseNfoProvider.cs:67-80`) and
 //! `BaseXmlProvider.HasChanged` (`LocalMetadata/BaseXmlProvider.cs:97-107`).
-//! `BaseItem.RequiresRefresh` (`Entities/BaseItem.cs:1721-1731`) and its
-//! `Folder` override (`Entities/Folder.cs:213-223`) decide `requiresRefresh`.
+//! `BaseItem.RequiresRefresh` (`Entities/BaseItem.cs:1754-1764`) and its
+//! `Folder` (`Entities/Folder.cs:213-223`), `CollectionFolder`
+//! (`Entities/CollectionFolder.cs:206-230`) and `MusicArtist`
+//! (`Entities/Audio/MusicArtist.cs:186-198`) overrides decide
+//! `requiresRefresh`.
 //!
 //! Everything here is pure: the scan gathers the stored row's dates, the
 //! filesystem facts and the options, and acts on the answer. It lives here,
@@ -138,6 +141,14 @@ pub struct FileFacts {
     pub is_file_protocol: bool,
     /// `Video.IsPlaceHolder`: a disc stub standing in for offline media.
     pub is_placeholder: bool,
+    /// `MusicArtist.RequiresRefresh`'s own arm: an artist known only by name
+    /// whose `Path` is not its rebased path (`GetRebasedPath`: the artists
+    /// directory joined with the path's file name).
+    pub path_rebased: bool,
+    /// `CollectionFolder.RequiresRefresh`'s own arms: the library's
+    /// `_requiresRefresh` flag is set, or its stored `PhysicalLocations` or
+    /// `PhysicalFolderIds` differ from the ones resolved now.
+    pub locations_changed: bool,
 }
 
 /// Which remote image providers run.
@@ -161,7 +172,8 @@ pub struct ItemRefreshPlan {
     /// `isFirstRefresh`: the item has never been refreshed.
     pub is_first_refresh: bool,
     /// `requiresRefresh`: the refresh interval elapsed, the file changed,
-    /// or a cumulative-runtime folder has no runtime.
+    /// a cumulative-runtime folder has no runtime, an artist known only by
+    /// name is not at its rebased path, or a library's locations changed.
     pub requires_refresh: bool,
     /// Run the probe (`ProbeProvider`).
     pub probe: bool,
@@ -224,6 +236,10 @@ pub enum RefreshReason {
     Modified,
     /// A cumulative-runtime folder has no runtime.
     NoRuntime,
+    /// An artist known only by name is not at its rebased path.
+    PathRebased,
+    /// A library's locations changed.
+    Locations,
     /// The NFO/XML sidecar is newer than the last save.
     LocalMetadata,
     /// The external subtitle/audio files beside the video changed.
@@ -250,6 +266,8 @@ impl RefreshReason {
             Self::Interval => "interval",
             Self::Modified => "mtime",
             Self::NoRuntime => "runtime",
+            Self::PathRebased => "path",
+            Self::Locations => "locations",
             Self::LocalMetadata => "nfo",
             Self::Sidecars => "sidecar",
             Self::Lyrics => "lyrics",
@@ -294,28 +312,26 @@ pub fn file_changed(stored: Option<DateTime<Utc>>, mtime: DateTime<Utc>) -> bool
     stored.is_none_or(|stored| drifted(stored, mtime, FILE_CHANGE_TOLERANCE_MS))
 }
 
-/// TODO(parity, open work item — NOT an accepted divergence): two more
-/// upstream overrides are not ported. `CollectionFolder.RequiresRefresh`
-/// (`CollectionFolder.cs:206-230`) also fires when the library's physical
-/// locations changed, and `MusicArtist.RequiresRefresh` (`MusicArtist.cs:
-/// 186-198`) when an accessed-by-name artist's rebased path moved. The scan
-/// plans neither kind today (collection folders and by-name artists are
-/// written outside the per-item walk); porting them means feeding those two
-/// facts in `FileFacts` when those items go through this decision.
-///
-/// `BaseItem.RequiresRefresh` + the `Folder` override: the file changed
-/// (never for a path-less item or an unset `DateModified`), or a folder that
-/// sums its children's runtime has none. `None` when neither holds, else the
-/// one that does (the file first).
+/// `BaseItem.RequiresRefresh` with the overrides of the kinds a scan plans:
+/// the file changed (never for a path-less item or an unset `DateModified`),
+/// or a folder that sums its children's runtime has none (`Folder`). An
+/// artist known only by name asks first whether its path moved
+/// (`MusicArtist`), and a library asks last whether its locations changed
+/// (`CollectionFolder`, after `base.RequiresRefresh()`, the `Folder` one).
+/// `None` when nothing holds, else the first that does, in that order.
 fn item_requires_refresh(stored: &StoredState, fs: &FileFacts) -> Option<RefreshReason> {
     let changed = matches!(
         (stored.date_modified, fs.mtime),
         (Some(saved), Some(now)) if drifted(saved, now, FILE_CHANGE_TOLERANCE_MS)
     );
-    if changed {
+    if fs.path_rebased {
+        Some(RefreshReason::PathRebased)
+    } else if changed {
         Some(RefreshReason::Modified)
     } else if fs.supports_cumulative_run_time && stored.run_time_ticks.is_none() {
         Some(RefreshReason::NoRuntime)
+    } else if fs.locations_changed {
+        Some(RefreshReason::Locations)
     } else {
         None
     }

@@ -242,6 +242,15 @@ pub struct FerrofinVirtualFolderManager {
     /// every listing, which is a hot read path; once a row is known to be
     /// parented the two extra probes (root exists, parent set) are skipped.
     parented: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    /// The libraries whose recorded locations changed since their refresh last
+    /// began: `CollectionFolder._requiresRefresh`, which `CreateResolveArgs`
+    /// sets when the resolved `PhysicalLocations` differ from the stored ones
+    /// and `BeforeMetadataRefresh` clears. Here
+    /// [`sync_physical_folders`](Self::sync_physical_folders) sets it, as it is
+    /// what records new locations on the row, and the library's next refresh
+    /// takes it ([`VirtualFolderManager::take_library_requires_refresh`]). Held
+    /// in memory as upstream's field is.
+    requires_refresh: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
     /// `{data}/playlists` — the `PlaylistsFolder` `LibraryManager.CreateRootFolder`
     /// adds to the root as a virtual child, set by the composition root. It is a
     /// root child like any library, so its location is part of
@@ -315,6 +324,7 @@ impl FerrofinVirtualFolderManager {
             items: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             parented: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            requires_refresh: Arc::default(),
             playlists_path: None,
             user_root: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
@@ -710,7 +720,7 @@ impl FerrofinVirtualFolderManager {
             if let Some(marker) = collection_type {
                 persistence.set_collection_type(id, marker).await?;
             }
-            self.sync_physical_folders(folder_path, id).await?;
+            self.sync_physical_folders(folder_path, id, true).await?;
             if let Ok(mut set) = self.parented.lock() {
                 set.insert(id);
             }
@@ -735,7 +745,8 @@ impl FerrofinVirtualFolderManager {
             .save_items(std::slice::from_ref(&entity))
             .await?;
         persistence.set_ancestors(id, &[root_id]).await?;
-        self.sync_physical_folders(folder_path, id).await?;
+        // A new row is refreshed for the first time, which runs everything.
+        self.sync_physical_folders(folder_path, id, false).await?;
         if let Ok(mut set) = self.parented.lock() {
             set.insert(id);
         }
@@ -748,10 +759,16 @@ impl FerrofinVirtualFolderManager {
     /// the id of the `Folder` row the scan keeps for each location (owner
     /// decision D1) — what every library read resolves a library's items
     /// through.
+    ///
+    /// With `track`, a row whose recorded locations or folder ids differ from
+    /// these (compared in order, as `SequenceEqual`, the stored ones expanded)
+    /// is marked as requiring its refresh
+    /// ([`requires_refresh`](Self::requires_refresh)).
     async fn sync_physical_folders(
         &self,
         folder_path: &Path,
         id: uuid::Uuid,
+        track: bool,
     ) -> Result<(), ServiceError> {
         let Some(persistence) = &self.persistence else {
             return Ok(());
@@ -780,6 +797,7 @@ impl FerrofinVirtualFolderManager {
             })
             .map(|folder| serde_json::Value::String(folder.simple().to_string()))
             .collect();
+        let changed = track && self.recorded_locations_differ(id, &paths, &ids).await;
         let mut fields = serde_json::Map::new();
         fields.insert(
             "PhysicalLocationsList".to_owned(),
@@ -789,7 +807,66 @@ impl FerrofinVirtualFolderManager {
             "PhysicalFolderIds".to_owned(),
             serde_json::Value::Array(ids),
         );
-        persistence.merge_data_fields(id, &fields).await
+        persistence.merge_data_fields(id, &fields).await?;
+        if changed {
+            tracing::debug!(
+                library = %id,
+                path = %folder_path.display(),
+                "the library's locations changed; its next refresh is required"
+            );
+            if let Ok(mut set) = self.requires_refresh.lock() {
+                set.insert(id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether library row `id` records other locations or folder ids than
+    /// `paths` and `ids`: `CollectionFolder.RequiresRefresh`'s two
+    /// `SequenceEqual` arms. The stored locations are compared expanded, as
+    /// upstream reads a row's paths. A row that cannot be read, or no item
+    /// reader, reads as unchanged.
+    async fn recorded_locations_differ(
+        &self,
+        id: uuid::Uuid,
+        paths: &[serde_json::Value],
+        ids: &[serde_json::Value],
+    ) -> bool {
+        let Some(items) = &self.items else {
+            return false;
+        };
+        let row = match items.retrieve_item(id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return false,
+            Err(err) => {
+                tracing::warn!(%err, library = %id, "failed to read the library's recorded locations");
+                return false;
+            }
+        };
+        let stored_paths: Vec<String> =
+            crate::item_data::stored_physical_locations(row.data.as_deref())
+                .iter()
+                .map(|path| self.virtual_paths.expand(path))
+                .collect();
+        // `PhysicalFolderIds` is a `Guid[]`: compared as ids, whatever their
+        // spelling in the stored JSON.
+        let as_ids = |values: &[serde_json::Value]| -> Vec<Option<uuid::Uuid>> {
+            values
+                .iter()
+                .map(|value| value.as_str().and_then(|id| uuid::Uuid::parse_str(id).ok()))
+                .collect()
+        };
+        let data = crate::item_data::parse_data(row.data.as_deref());
+        let stored_ids = data
+            .get("PhysicalFolderIds")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| as_ids(values))
+            .unwrap_or_default();
+        !stored_paths
+            .iter()
+            .map(String::as_str)
+            .eq(paths.iter().filter_map(serde_json::Value::as_str))
+            || stored_ids != as_ids(ids)
     }
 
     /// Points the row a rename keeps at the renamed directory `folder_path`:
@@ -816,7 +893,7 @@ impl FerrofinVirtualFolderManager {
         row.name = Some(name);
         row.path = Some(folder_path.to_string_lossy().into_owned());
         persistence.save_items(std::slice::from_ref(&row)).await?;
-        self.sync_physical_folders(folder_path, id).await
+        self.sync_physical_folders(folder_path, id, true).await
     }
 
     /// Forgets that the library at `folder_path` was set up this boot, so the
@@ -1684,6 +1761,12 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // `ValidateTopLibraryFolders` runs after every structural change.
         self.prune_orphan_collection_folders().await?;
         Ok(())
+    }
+
+    fn take_library_requires_refresh(&self, library: uuid::Uuid) -> bool {
+        self.requires_refresh
+            .lock()
+            .is_ok_and(|mut set| set.remove(&library))
     }
 
     async fn prune_orphan_collection_folders(&self) -> Result<usize, ServiceError> {
@@ -3459,6 +3542,142 @@ mod tests {
             Some(super::guid_to_db(root_id).as_str()),
             "re-parented in place"
         );
+    }
+
+    /// What a test does to a library row's recorded locations before the
+    /// manager records them again.
+    #[derive(Debug, Clone, Copy)]
+    enum Recorded {
+        /// Nothing: they are as resolved.
+        Unchanged,
+        /// The location in `%AppDataPath%` form, as an adopted row stores it.
+        TokenForm,
+        /// The folder ids upper-case and hyphenated.
+        IdSpelling,
+        /// One location more than the library has.
+        ExtraLocation,
+        /// Another folder id.
+        OtherId,
+    }
+
+    /// gl-337: `CollectionFolder.RequiresRefresh`'s `SequenceEqual` arms. A
+    /// library whose row records other locations or folder ids than the ones
+    /// resolved now requires its next refresh, once; a stored token or a GUID
+    /// spelled another way is the same location or id.
+    #[rstest::rstest]
+    #[case::unchanged(Recorded::Unchanged, false)]
+    #[case::token_form(Recorded::TokenForm, false)]
+    #[case::id_spelling(Recorded::IdSpelling, false)]
+    #[case::extra_location(Recorded::ExtraLocation, true)]
+    #[case::other_id(Recorded::OtherId, true)]
+    #[tokio::test]
+    async fn changed_recorded_locations_require_the_librarys_refresh_once(
+        #[case] recorded: Recorded,
+        #[case] required: bool,
+    ) {
+        use ferrofin_traits::persistence::{ItemPersistenceService as _, ItemRepository as _};
+        let (tmp, db, mgr) = manager_with_store().await;
+        let paths = Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+            tmp.path().join("srv").to_str().expect("utf-8"),
+            "log",
+            "config",
+            "cache",
+            "web",
+        ));
+        let mgr = mgr.with_virtual_paths(crate::virtual_paths::VirtualPathExpander::from_paths(
+            Arc::clone(&paths),
+        ));
+        let data = ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref());
+        let media = format!("{data}/movies");
+        std::fs::create_dir_all(&media).expect("media");
+        mgr.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &opts_with_paths(std::slice::from_ref(&media)),
+        )
+        .await
+        .expect("add");
+        mgr.get_virtual_folders().await.expect("list");
+        let folder = tmp.path().join("default").join("Movies");
+        let id = mgr.collection_folder_id(&folder).expect("id");
+        assert!(
+            !mgr.take_library_requires_refresh(id),
+            "a new library is refreshed for the first time"
+        );
+
+        let items = crate::item_repository::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let row = items.retrieve_item(id).await.expect("read").expect("row");
+        let stored = crate::item_data::parse_data(row.data.as_deref());
+        let mut locations = stored["PhysicalLocationsList"]
+            .as_array()
+            .expect("locations")
+            .clone();
+        let mut ids = stored["PhysicalFolderIds"].as_array().expect("ids").clone();
+        match recorded {
+            Recorded::Unchanged => {}
+            Recorded::TokenForm => {
+                let last = locations.last_mut().expect("a location");
+                assert_eq!(last.as_str(), Some(media.as_str()));
+                *last = serde_json::Value::String("%AppDataPath%/movies".to_owned());
+            }
+            Recorded::IdSpelling => {
+                for id in &mut ids {
+                    let parsed = uuid::Uuid::parse_str(id.as_str().expect("id")).expect("uuid");
+                    *id = serde_json::Value::String(parsed.hyphenated().to_string().to_uppercase());
+                }
+            }
+            Recorded::ExtraLocation => {
+                locations.push(serde_json::Value::String("/media/gone".to_owned()));
+            }
+            Recorded::OtherId => {
+                ids[0] = serde_json::Value::String(uuid::Uuid::new_v4().simple().to_string());
+            }
+        }
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "PhysicalLocationsList".to_owned(),
+            serde_json::Value::Array(locations),
+        );
+        fields.insert(
+            "PhysicalFolderIds".to_owned(),
+            serde_json::Value::Array(ids),
+        );
+        FerrofinItemPersistenceService::new(db)
+            .merge_data_fields(id, &fields)
+            .await
+            .expect("record");
+
+        // The next listing after a structural change records them again.
+        mgr.forget_setup(&folder);
+        mgr.get_virtual_folders().await.expect("list");
+        assert_eq!(mgr.take_library_requires_refresh(id), required);
+        assert!(!mgr.take_library_requires_refresh(id), "taken once");
+    }
+
+    /// A manager with no item reader cannot read the recorded locations, so
+    /// it never requires a library's refresh.
+    #[tokio::test]
+    async fn without_an_item_reader_no_refresh_is_required() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = Database::connect_in_memory().await.expect("db");
+        db.run_migrations().await.expect("migrate");
+        let mgr = FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db)));
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder("Movies", None, &opts_with_paths(&[media]))
+            .await
+            .expect("add");
+        let folder = tmp.path().join("default").join("Movies");
+        let other = media_dir(&tmp, "more");
+        mgr.add_media_path("Movies", &MediaPathInfo { path: other })
+            .await
+            .expect("add a location");
+        mgr.get_virtual_folders().await.expect("list");
+        let id = mgr.collection_folder_id(&folder).expect("id");
+        assert!(!mgr.take_library_requires_refresh(id));
     }
 
     /// Creates a real on-disk media directory under `tmp` and returns its path.
