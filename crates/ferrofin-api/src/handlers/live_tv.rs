@@ -24,6 +24,7 @@
 //! not expose), and `librarySeriesId` reads the series as the request's user,
 //! else the signed-in caller.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -38,6 +39,7 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::{BaseItemDto, NameIdPair, SortOrder};
 use ferrofin_model::entities::ImageType;
+use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::live_tv::{
     ChannelMappingOptionsDto, GuideInfo, ItemSortBy, ListingsProviderInfo, LiveTvInfo,
     SeriesTimerInfoDto, TimerInfoDto, TunerChannelMapping, TunerHostInfo,
@@ -45,7 +47,8 @@ use ferrofin_model::live_tv::{
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 
-use ferrofin_traits::stubs::LiveTvChannelQuery;
+use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::stubs::{LiveTvChannelQuery, RecordingVisibility};
 
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
@@ -1057,6 +1060,12 @@ struct RecordingsQuery {
 /// projection runs through the same service every other item uses, and each
 /// recording carries its timer link, status and (while it is being captured)
 /// how far through it is.
+///
+/// With a user, only the recordings `GET /LiveTv/Recordings/{recordingId}`
+/// lets that user open are listed, and paging and `TotalRecordCount` run over
+/// those: upstream lists library items with `InternalItemsQuery(user)` under
+/// the recording folders the user may see. With no user (an API key naming
+/// none), every recording is listed, as the by-id route passes it.
 async fn get_recordings(
     State(state): State<AppState>,
     RequireLiveTvAccess(auth): RequireLiveTvAccess,
@@ -1092,11 +1101,75 @@ async fn get_recordings(
         is_library_item: query.is_library_item,
         ..ferrofin_model::live_tv::RecordingQuery::default()
     };
+    let visibility = match user.as_deref() {
+        Some(user) => Some(ListedRecordingVisibility {
+            state: &state,
+            user,
+            folders: state.virtual_folders.get_virtual_folders().await?,
+            answers: std::sync::Mutex::default(),
+        }),
+        None => None,
+    };
     Ok(Json(
         manager
-            .get_recordings_matching(&recording_query, user.as_deref(), &options)
+            .get_recordings_matching(
+                &recording_query,
+                user.as_deref(),
+                &options,
+                visibility
+                    .as_ref()
+                    .map(|visibility| visibility as &dyn RecordingVisibility),
+            )
             .await?,
     ))
+}
+
+/// [`recording_visible`] over a listing, with the virtual folders read once
+/// and each answer kept per channel and set of libraries holding the file.
+///
+/// Nothing else of a DVR entity reaches the rule: it has no parent, owner,
+/// rating or tags, it is always a `Video`, its channel is taken out before
+/// the standalone check, and its id (a new v4 uuid) names no `BaseItems` row.
+struct ListedRecordingVisibility<'a> {
+    state: &'a AppState,
+    user: &'a UserEntity,
+    folders: Vec<VirtualFolderInfo>,
+    answers: std::sync::Mutex<HashMap<RecordingVisibilityKey, bool>>,
+}
+
+/// What a DVR entity's visibility depends on besides the user: the channel it
+/// was captured from and the libraries holding its file.
+type RecordingVisibilityKey = (Option<Uuid>, Vec<Uuid>);
+
+#[async_trait::async_trait]
+impl RecordingVisibility for ListedRecordingVisibility<'_> {
+    async fn is_visible(&self, recording: &BaseItemEntity) -> Result<bool, ServiceError> {
+        let channel = recording
+            .channel_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok());
+        let holders = recording
+            .path
+            .as_deref()
+            .map(|path| holding_libraries(&self.folders, path))
+            .unwrap_or_default();
+        let key = (channel, holders);
+        if let Some(&known) = self
+            .answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
+            return Ok(known);
+        }
+        let visible =
+            recording_visible_given(self.state, recording.clone(), &key.1, self.user).await?;
+        self.answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, visible);
+        Ok(visible)
+    }
 }
 
 /// The lone `userId` query parameter shared by the recording routes that take
@@ -1167,9 +1240,24 @@ async fn require_visible_recording(
 /// a corrupt reference.
 pub(crate) async fn recording_visible(
     state: &AppState,
-    mut recording: BaseItemEntity,
+    recording: BaseItemEntity,
     user: &UserEntity,
 ) -> Result<bool, ApiError> {
+    let holders = match recording.path.as_deref() {
+        Some(path) => holding_libraries(&state.virtual_folders.get_virtual_folders().await?, path),
+        None => Vec::new(),
+    };
+    Ok(recording_visible_given(state, recording, &holders, user).await?)
+}
+
+/// [`recording_visible`], with `holders` the libraries holding the
+/// recording's file.
+async fn recording_visible_given(
+    state: &AppState,
+    mut recording: BaseItemEntity,
+    holders: &[Uuid],
+    user: &UserEntity,
+) -> Result<bool, ServiceError> {
     let channel = recording
         .channel_id
         .take()
@@ -1181,32 +1269,22 @@ pub(crate) async fn recording_visible(
     {
         return Ok(false);
     }
-    if let Some(path) = recording.path.as_deref()
-        && !recording_library_allows(state, path, user).await?
-    {
+    if !libraries_allow(state, holders, user).await? {
         return Ok(false);
     }
     let Some(channel) = channel else {
         return Ok(true);
     };
     match state.library.get_item_by_id(channel).await? {
-        Some(channel) => Ok(state.library.is_item_visible(&channel, user).await?),
+        Some(channel) => state.library.is_item_visible(&channel, user).await,
         None => Ok(true),
     }
 }
 
-/// Whether the libraries holding the file at `path` leave it to `user`: no
-/// library does, or the user may open one that does. A recording folder is a
-/// library of its own, which a restricted user may not have been granted.
-async fn recording_library_allows(
-    state: &AppState,
-    path: &str,
-    user: &UserEntity,
-) -> Result<bool, ApiError> {
-    let holders: Vec<Uuid> = state
-        .virtual_folders
-        .get_virtual_folders()
-        .await?
+/// The libraries among `folders` whose locations hold the file at `path`,
+/// sorted and once each.
+fn holding_libraries(folders: &[VirtualFolderInfo], path: &str) -> Vec<Uuid> {
+    let mut holders: Vec<Uuid> = folders
         .iter()
         .filter(|folder| {
             folder
@@ -1216,10 +1294,23 @@ async fn recording_library_allows(
         })
         .filter_map(|folder| Uuid::parse_str(folder.item_id.as_deref()?).ok())
         .collect();
+    holders.sort_unstable();
+    holders.dedup();
+    holders
+}
+
+/// Whether the libraries `holders` holding a file leave it to `user`: none
+/// does, or the user may open one that does. A recording folder is a library
+/// of its own, which a restricted user may not have been granted.
+async fn libraries_allow(
+    state: &AppState,
+    holders: &[Uuid],
+    user: &UserEntity,
+) -> Result<bool, ServiceError> {
     if holders.is_empty() {
         return Ok(true);
     }
-    for holder in holders {
+    for &holder in holders {
         if let Some(library) = state.library.get_item_by_id(holder).await?
             && state.library.is_item_visible(&library, user).await?
         {
@@ -2147,6 +2238,54 @@ mod tests {
     /// `apps/ferrofin-server/tests/elevation.rs`.
     fn admin_auth() -> RequireAdmin {
         RequireAdmin(AuthorizationInfo::default())
+    }
+
+    /// A listing runs the recording rule once per channel and set of libraries
+    /// holding the file, not once per recording: nothing else of a DVR entity
+    /// reaches the rule.
+    #[tokio::test]
+    async fn a_listing_asks_once_per_channel_and_holding_libraries() {
+        let library = Arc::new(crate::test_support::CountingRefusals::default());
+        let state = crate::test_support::authed_state_with_library_and_monitor(
+            library.clone(),
+            Arc::new(ferrofin_traits::stubs::NoopLibraryMonitor),
+        );
+        let folder = |location: &str| VirtualFolderInfo {
+            locations: vec![location.to_owned()],
+            item_id: Some(Uuid::new_v4().simple().to_string()),
+            ..VirtualFolderInfo::default()
+        };
+        let user = crate::test_support::sample_user();
+        let listing = ListedRecordingVisibility {
+            state: &state,
+            user: &user,
+            folders: vec![folder("/rec"), folder("/movies"), folder("/rec/show")],
+            answers: std::sync::Mutex::default(),
+        };
+        let (one, other) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+        for (channel, path) in [
+            (&one, "/rec/a.ts"),
+            (&one, "/rec/b.ts"),
+            (&other, "/rec/c.ts"),
+            (&one, "/movies/d.ts"),
+            (&one, "/rec/show/e.ts"),
+            (&one, "/elsewhere/f.ts"),
+            (&one, "/elsewhere/g.ts"),
+            (&one, "/rec/show/h.ts"),
+        ] {
+            let recording = BaseItemEntity {
+                channel_id: Some(channel.clone()),
+                path: Some(path.to_owned()),
+                ..crate::test_support::minimal_base_item(
+                    Uuid::new_v4(),
+                    path,
+                    "MediaBrowser.Controller.Entities.Video",
+                )
+            };
+            assert!(!listing.is_visible(&recording).await.unwrap(), "{path}");
+        }
+        // One rec, other rec, movies, rec + rec/show, and no library.
+        assert_eq!(library.0.load(std::sync::atomic::Ordering::SeqCst), 5);
     }
 
     #[tokio::test]

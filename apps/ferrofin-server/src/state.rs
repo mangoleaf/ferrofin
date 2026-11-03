@@ -1091,6 +1091,12 @@ pub async fn build_app_state(
         )),
     );
     let trickplay: Arc<dyn ferrofin_traits::trickplay::TrickplayManager> = trickplay_impl.clone();
+    // The first boot after upgrading records the trickplay settings the images
+    // on disk are taken to match, so only a later change makes the Generate
+    // Trickplay Images task check them.
+    if let Err(err) = trickplay_impl.record_trickplay_settings_once().await {
+        tracing::warn!(%err, "cannot read the trickplay settings of the last pass; the next Generate Trickplay Images run records them");
+    }
 
     // ---- library + media-sources (consume repositories/services) ----------
     // The virtual-folder manager (shared with `with_virtual_folders` below) and
@@ -1598,7 +1604,8 @@ pub async fn build_app_state(
         scanner = scanner.with_probe_concurrency(concurrency as usize);
     }
     // The bounds of each scan's directory listings (bootstrap knobs, both
-    // validated positive); unset keeps upstream's `DirectoryService` values.
+    // clamped to positive ranges); unset keeps upstream's `DirectoryService`
+    // values.
     {
         let mut limits = ferrofin_core::library_scan::DirectoryCacheLimits::default();
         if let Some(records) = config
