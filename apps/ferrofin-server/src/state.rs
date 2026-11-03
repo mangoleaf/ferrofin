@@ -1604,7 +1604,8 @@ pub async fn build_app_state(
         scanner = scanner.with_probe_concurrency(concurrency as usize);
     }
     // The bounds of each scan's directory listings (bootstrap knobs, both
-    // validated positive); unset keeps upstream's `DirectoryService` values.
+    // clamped to positive ranges); unset keeps upstream's `DirectoryService`
+    // values.
     {
         let mut limits = ferrofin_core::library_scan::DirectoryCacheLimits::default();
         if let Some(records) = config

@@ -1340,9 +1340,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              same check, as PlaybackInfo does. A DVR recording has no row here, so it takes \
              Live TV access, IsVisibleStandalone over its entity, the libraries holding its \
              file and then its channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
-             now share; upstream's recording is a library item, whose library holds it. On the \
-             routes upstream leaves anonymous, no credential, a token that names nobody and an \
-             API key stay so, which binds a client that sends its token. The legacy /hls/ \
+             now share and GET /LiveTv/Recordings lists by; upstream's recording is a library \
+             item, whose library holds it. On the routes upstream leaves anonymous, no \
+             credential, a token that names nobody and an API key stay so, which binds a \
+             client that sends its token. The legacy /hls/ \
              routes are outside this: they serve a transcode's file by its random name, and \
              the item id selects nothing, as upstream. Deliberate divergence (owner decision \
              2026-10-31, gl-1090).",
@@ -1437,11 +1438,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              Images run that finished (recorded in FerrofinMeta, and on the first boot after \
              upgrading), the next run checks every video: a set whose first tile's chroma \
              differs from the setting is regenerated and swapped in the same way, and a width \
-             an earlier run selected and the current one does not is removed once the selected \
-             widths exist. The run is recorded only when every video's sets match, so an \
-             interrupted run, or one that could not replace a set, checks again. Upstream \
-             never replaces images unasked. Deliberate divergence (owner decisions \
-             2026-11-01, D3 and D5, gl-1138).",
+             Ferrofin made sets at and the current settings do not select is removed once the \
+             selected widths exist: one an earlier run selected, or one a library scan or an \
+             item refresh made under settings other than those recorded (recorded before it is \
+             made, which also checks again after a change back). A user-placed grid stays. The \
+             run is recorded only when every video's sets match, so an interrupted run, or one \
+             that could not replace a set, checks again. A run with no width selected is no \
+             checking pass and records nothing (in a library with extraction on it makes and \
+             removes nothing), so the next change still removes the \
+             widths recorded before it. Upstream never replaces images unasked. Deliberate \
+             divergence (owner decisions 2026-11-01, D3 and D5, gl-1138; gl-1178).",
             "Importing a width's folder that has no row counts only its .jpg tiles; upstream \
              counts every file in it, so a stray file there makes the import fail on its image \
              size. Jellyfin bug not ported.",
@@ -2031,6 +2037,49 @@ pub const VERIFIED: &[Verified] = &[
          there) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/Recordings",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetRecordings",
+        ferrofin: "handlers/live_tv.rs get_recordings (items.rs resolve_user_opt, \
+               program_dto_options; ListedRecordingVisibility → recording_visible_given, \
+               holding_libraries, libraries_allow) → ferrofin-livetv manager.rs \
+               get_recordings_matching (dvr_repository.rs recording_rows, \
+               visible_recording_rows, remove_fields, recording_dtos, \
+               add_info_to_recording_dtos) (RequestHelpers.GetUserId, \
+               LiveTvManager.GetRecordingsAsync, GetEmbyRecordingsAsync, \
+               GetRecordingFoldersAsync, RemoveFields)",
+        date: "2026-11-02",
+        divergences: &[
+            "Recordings are the rows of Ferrofin's DVR table, not library items under the \
+         recording folders, so the list differs wherever the two models do: an id is the \
+         row's, not the library item's; a recording file with no row (one from an adopted \
+         Jellyfin database, or a partial file) is not listed; channelId, status, seriesTimerId \
+         and isNews filter the rows, where upstream ignores them; isMovie, isSeries, isKids \
+         and isSports match the programme's flags, either way, where upstream matches the \
+         Movie and Episode kinds and, for true only, the Sports, Kids, Children and Family \
+         genres; isInProgress=false filters the rows, where upstream ignores it, and \
+         isInProgress=true keeps limit and counts every capture in progress, where upstream \
+         drops limit and counts the page; the order is the capture's creation time, newest \
+         first, then the name; enableTotalRecordCount=false still counts every recording, \
+         where upstream reports the page's length; the parental rating, blocked and allowed \
+         tag and unrated rules see a Video with no rating or tags, where upstream applies \
+         them to the library item, its library's tags included; and a recording no library \
+         holds is listed, where upstream lists only under the recording folders the user may \
+         see, and answers an empty page when there is none. Fix path: gl-1077.",
+            "A request with no user (an API key naming none, or an administrator naming an \
+         account that does not exist) lists every recording, as GET \
+         /LiveTv/Recordings/{recordingId} answers the same request for each, while GET \
+         /LiveTv/Recordings/Folders answers it an empty list; upstream's \
+         GetEmbyRecordingsAsync answers an empty page for a null user. Deliberate: API keys \
+         are exempt from the library rule gl-1091 made a hard boundary.",
+            "The 400 (a value the query binder cannot convert) and 403 (another user's id \
+         without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
+         Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
     },
     Verified {
         method: "delete",

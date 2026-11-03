@@ -57,17 +57,16 @@ impl ImageLimits {
     /// `image_decode_max_megapixels`'s default.
     pub const DEFAULT_DECODE_MEGAPIXELS: u32 = 200;
     /// The values `image_decode_max_megapixels` takes.
-    pub const DECODE_MEGAPIXELS: RangeInclusive<u32> = 16..=1000;
+    pub const DECODE_MEGAPIXELS: RangeInclusive<u32> = 50..=1000;
     /// `image_decode_max_memory_mb`'s default, the `image` crate's `max_alloc`
     /// default.
     pub const DEFAULT_DECODE_MEMORY_MB: u32 = 512;
     /// The values `image_decode_max_memory_mb` takes.
-    pub const DECODE_MEMORY_MB: RangeInclusive<u32> = 128..=2048;
+    pub const DECODE_MEMORY_MB: RangeInclusive<u32> = 256..=2048;
     /// `image_resize_budget_mb`'s default.
     pub const DEFAULT_RESIZE_BUDGET_MB: u32 = 2048;
-    /// The values `image_resize_budget_mb` takes. The ceiling is what one
-    /// resize of a 1000 MP image can need.
-    pub const RESIZE_BUDGET_MB: RangeInclusive<u32> = 256..=16_384;
+    /// The values `image_resize_budget_mb` takes.
+    pub const RESIZE_BUDGET_MB: RangeInclusive<u32> = 512..=8192;
 
     /// The limits from the settings' units: megapixels and MiB.
     #[must_use]
