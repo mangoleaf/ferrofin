@@ -5128,6 +5128,68 @@ mod tests {
         assert!(args.join(" ").contains("-map 1:0 "), "{args:?}");
     }
 
+    /// A progressive stream that starts mid-file reads its embedded bitmap
+    /// sidecar from the sidecar's start, on every ffmpeg (gl-1200): synced to
+    /// the movie's clock where `-isync` exists (5.1), on its own timestamps
+    /// moved back by the seek where it does not (gl-929). Only the movie is
+    /// seeked. Seeked as well, the sidecar's seek landed past the start by its
+    /// first cue's time and inside a display set, which lost that subtitle.
+    #[rstest::rstest]
+    #[case::from_5_1(Some((5, 1)), &["-isync", "0"])]
+    #[case::release(Some((8, 1)), &["-isync", "0"])]
+    #[case::on_5_0(Some((5, 0)), &["-seek_timestamp", "1", "-itsoffset", "-90000000"])]
+    #[case::unknown_version(None, &["-seek_timestamp", "1", "-itsoffset", "-90000000"])]
+    #[tokio::test]
+    async fn a_seeked_embedded_bitmap_sidecar_is_read_from_its_start(
+        #[case] version: Option<(i32, i32)>,
+        #[case] timing: &[&str],
+    ) {
+        let mut capabilities = FfmpegCapabilities::builder();
+        if let Some((major, minor)) = version {
+            capabilities = capabilities.ffmpeg_version(FfmpegVersion::new(major, minor));
+        }
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![
+                        video_stream("h264"),
+                        audio_stream("aac"),
+                        sidecar("PGSSUB", 2, "/media/movie.en.sup"),
+                    ],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            capabilities.build(),
+            EncodingOptions::default(),
+        );
+        let mut req = request("abc");
+        req.output_container = Some("mkv".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Embed".to_owned());
+        req.start_time_ticks = Some(9 * TICKS_PER_SECOND);
+
+        let plan = p
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        let expected: Vec<&str> = ["-analyzeduration", "200M", "-probesize", "1G"]
+            .into_iter()
+            .chain(timing.iter().copied())
+            .chain(["-i", "file:/media/movie.en.sup"])
+            .collect();
+        assert_eq!(inputs_after_the_media(args), expected, "{args:?}");
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "-ss").count(),
+            1,
+            "only the movie seeks: {args:?}"
+        );
+    }
+
     /// The embedded-sidecar trim from ffmpeg 5.1: elapsed cues dropped, the
     /// one on screen at the start started there.
     const FILTER_EVENTS: &[&str] = &[

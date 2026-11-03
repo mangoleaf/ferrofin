@@ -285,26 +285,53 @@ fn a_burned_external_bitmap_is_read_from_its_start_on_the_media_files_clock() {
     );
 }
 
-/// The embedded half of that pair: an embedded bitmap sidecar keeps the
-/// media file's seek where `-isync` exists (ffmpeg 5.1; before it, it is read
-/// from its start and gl-930's output trim cuts it, see gl-1200) and is
-/// synced, with no canvas; with no seek it is synced all the same.
+/// The embedded half of that pair: where `-isync` exists, an embedded bitmap
+/// sidecar is read from its start on the media file's clock too, with no
+/// canvas, whether the media file seeks or not (gl-1200). Seeked like the
+/// media file, its seek landed past the start by its first cue's time and
+/// inside a display set: an embed from 1, 3 or 9 s kept only the end segment
+/// of the first display set after the start, so that subtitle never showed.
+/// The cues before the start are cut on the output side (gl-930).
 #[rstest]
-#[case::seeked(Some("10"), &["-ss", "10", "-isync", "0"])]
-#[case::from_the_start(None, &["-isync", "0"])]
-fn an_embedded_external_bitmap_keeps_the_seek_and_is_synced(
-    #[case] seek: Option<&str>,
-    #[case] timing: &[&str],
-) {
+#[case::seeked(Some("10"))]
+#[case::from_the_start(None)]
+#[case::seek_clamped_to_the_start(Some("00:00:00.000"))]
+fn an_embedded_external_bitmap_is_read_from_its_start_and_synced(#[case] seek: Option<&str>) {
     let sub = external_subtitle(2, "PGSSUB", "/media/movie.en.sup");
     let state = build_state(Some(sub), Some(SubtitleDeliveryMethod::Embed), None);
-    let mut expected = vec!["-analyzeduration", "200M", "-probesize", "1G"];
-    expected.extend(timing);
-    expected.extend(["-i", "file:/media/movie.en.sup"]);
     assert_eq!(
         external_stream_input_arguments(&state, seek, Some(FfmpegVersion::new(7, 0))),
-        expected
+        [
+            "-analyzeduration",
+            "200M",
+            "-probesize",
+            "1G",
+            "-isync",
+            "0",
+            "-i",
+            "file:/media/movie.en.sup",
+        ]
     );
+}
+
+/// A VobSub sidecar is a bitmap too: embedded where `-isync` exists, it is
+/// read through its `.idx` from its start, on the media file's clock.
+#[test]
+fn an_embedded_vob_sub_is_read_from_its_start_and_synced() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub_file = dir.path().join("movie.sub");
+    std::fs::write(&sub_file, "dummy").unwrap();
+    std::fs::write(dir.path().join("movie.idx"), "dummy").unwrap();
+    let sub = external_subtitle(2, "dvdsub", &sub_file.to_string_lossy());
+    let state = build_state(Some(sub), Some(SubtitleDeliveryMethod::Embed), None);
+    let input_args =
+        external_stream_input_arguments(&state, Some("10"), Some(FfmpegVersion::new(5, 1)));
+    assert_eq!(
+        input_args[4..6],
+        ["-isync", "0"],
+        "no seek before the sync: {input_args:?}"
+    );
+    assert!(input_args.last().unwrap().ends_with("movie.idx"));
 }
 
 /// An embedded external track is input 1 too, with no canvas: it is copied
@@ -345,14 +372,15 @@ fn other_external_subtitles_add_no_input(
 
 /// Without `-copyts` every input's timeline starts at its own first packet,
 /// so each external subtitle input is put on the media file's clock by the
-/// `-isync` ffmpeg 5.1 brought. On an older or unknown ffmpeg a bitmap sidecar,
-/// whose start time is its first cue, is read from its start on its own
-/// timestamps (`-seek_timestamp`) and moved back by the seek (gl-929); a text
-/// sidecar has no start time and keeps upstream's seeked form.
+/// `-isync` ffmpeg 5.1 brought; a bitmap sidecar, whose start time is its
+/// first cue, is not seeked there (gl-1200). On an older or unknown ffmpeg a
+/// bitmap sidecar is read from its start on its own timestamps
+/// (`-seek_timestamp`) and moved back by the seek (gl-929); a text sidecar has
+/// no start time and keeps upstream's seeked form.
 #[rstest]
 #[case::with_isync(Some(FfmpegVersion::new(5, 1)), "srt", &["-ss", "10", "-isync", "0"])]
 #[case::newer(Some(FfmpegVersion::with_build(7, 0, 1)), "srt", &["-ss", "10", "-isync", "0"])]
-#[case::bitmap_with_isync(Some(FfmpegVersion::new(5, 1)), "PGSSUB", &["-ss", "10", "-isync", "0"])]
+#[case::bitmap_with_isync(Some(FfmpegVersion::new(5, 1)), "PGSSUB", &["-isync", "0"])]
 #[case::text_before_isync(Some(FfmpegVersion::new(5, 0)), "srt", &["-ss", "10"])]
 #[case::text_unknown(None, "srt", &["-ss", "10"])]
 #[case::bitmap_before_isync(

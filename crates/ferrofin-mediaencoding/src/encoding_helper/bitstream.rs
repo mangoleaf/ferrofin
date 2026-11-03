@@ -498,12 +498,14 @@ const MIN_FFMPEG_SETTS_DURATION: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// convert the sidecar with the server's subtitle encoder from the start
 /// position (`FilterEvents`) and add that file unseeked.
 ///
-/// TODO(gl-1200): a bitmap sidecar's packets carry no duration, so every one
-/// before the start is dropped and a bitmap on screen at the start shows only
-/// from the next display set; from ffmpeg 5.1 an embedded one is also still
-/// seeked, past the start by its first cue's time and inside a display set.
-/// Fix path: read every bitmap sidecar unseeked on the movie's clock, and
-/// start the last display set before the start at 0 instead of dropping it.
+/// A bitmap sidecar is read from its start on every ffmpeg (gl-1200), so every
+/// display set before the start reaches these options. TODO(gl-1215): its
+/// packets carry no duration, so every one before the start is dropped and a
+/// bitmap on screen at the start shows only from the next display set, often
+/// its own clear. Fix path: find the last display set at or before the start
+/// in the sidecar's own timing (the `.sup` segment headers, the `.idx`
+/// timestamps) and start it at 0 instead of dropping it; its time on the
+/// output clock follows the clock gl-1214 decides.
 ///
 /// A job that copies timestamps (`-copyts -avoid_negative_ts disabled`) keeps
 /// the source's clock, on which nothing before the seek is negative and no
