@@ -172,7 +172,8 @@ support for every 10.11.x or 12.x release.
 >    separately, for example in `/etc/jellyfin` on Debian. Include any external state
 >    directories too.
 > 3. Copy Jellyfin's `data/jellyfin.db`, `data/playlists/`, `data/collections/`,
->    `root/default/` and `metadata/` to the same relative paths under Ferrofin's data
+>    `root/default/`, `metadata/` and, if Jellyfin used LDAP-Auth,
+>    `plugins/configurations/LDAP-Auth.xml` to the same relative paths under Ferrofin's data
 >    directory, and its XML configuration into Ferrofin's config directory, **before
 >    Ferrofin's first startup**. [`scripts/migrate-jellyfin.sh`](scripts/migrate-jellyfin.sh)
 >    does this for the Debian layout. Keep the originals and backup intact. An existing

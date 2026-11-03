@@ -202,8 +202,9 @@ Conventions:
 ### LDAP-Auth
 - Ferrofin files: `crates/ferrofin-extensions/src/ldap_auth.rs` (the extension, the
   configuration, the `LdapDirectory` seam, the settings page's three tests and their service),
-  `ldap_auth/directory.rs` (the `ldap3` client and its rustls configuration) and
-  `ldap_auth/provider.rs` (the sign-in provider), vendored
+  `ldap_auth/directory.rs` (the `ldap3` client and its rustls configuration),
+  `ldap_auth/provider.rs` (the sign-in provider) and `ldap_auth/adoption.rs` (the
+  `LDAP-Auth.xml` import), vendored
   assets `crates/ferrofin-extensions/assets/ldapauth/`, the trait seam
   `crates/ferrofin-traits/src/ldap.rs`, the wire types `crates/ferrofin-model/src/ldap.rs`,
   and the thin HTTP handler `crates/ferrofin-api/src/handlers/ldap.rs`. The live directory
@@ -247,7 +248,19 @@ Conventions:
   server (D3);
   upstream's `IsEnabled` is always `true`. `ChangePassword` with `AllowPassChange` off is
   upstream's `NotImplementedException`, a `500`. Password changes and resets, profile
-  images, referrals and the `LDAP-Auth.xml` import are later phases of the milestone.
+  images and referrals are later phases of the milestone.
+- Adoption (v24, `d11c86a`; owner decision D7): on a boot where LDAP-Auth has no `config.json`
+  yet, an adopted Jellyfin's `{program data}/plugins/configurations/LDAP-Auth.xml`
+  (`BasePlugin<T>.ConfigurationFilePath`, written by .NET's `XmlSerializer`) is read with the
+  server configuration's importer. Every setting comes across, the bind password included
+  (never logged). Each `LdapUsers` entry whose user still exists becomes an external-identity
+  link (`LdapUid` as the subject, `ProfileImageHash` as the avatar hash); an entry for a
+  deleted user is skipped. The plugin is then enabled when any user's
+  `AuthenticationProviderId` is LDAP-Auth's (ignoring case), and otherwise stays off. The file
+  is only read. A missing file is silent; one that cannot be read or parsed, or a write that
+  fails, is a warning, and the next boot tries again (`config.json` is written last, so its
+  presence means the import finished). `scripts/migrate-jellyfin.sh` copies this one file of
+  Jellyfin's `plugins/`.
 - Admin filter (v24, `d11c86a`): the admin block of `Authenticate`. While `LdapAdminFilter` is
   neither empty nor `_disabled_` (ordinal), after the password is checked the bind DN searches,
   on a connection of its own, the subtree of `LdapAdminBaseDn` (the base DN when that is empty)
@@ -348,11 +361,19 @@ Conventions:
   - **Off by default** (owner decision D3): the plugin is disabled in `/Plugins` until an
     administrator enables it, and `LdapServer` seeds empty instead of
     `ldap-server.contoso.com`. Upstream's provider is always enabled and would try the
-    placeholder host on every sign-in of an unknown name.
+    placeholder host on every sign-in of an unknown name. An adopted `LDAP-Auth.xml` whose
+    `LdapServer` is still that placeholder is imported with the server empty, and a warning
+    names `LdapServer`: the plugin is on for its LDAP users but inactive until an
+    administrator sets a server.
   - **No `LdapUsers` in the configuration** (D12): which LDAP uid belongs to which user lives in
     Ferrofin's external-identity table, so `GET /Plugins/{id}/Configuration` does not return
     it, and a `LdapUsers` member posted to it is dropped. Upstream's settings page never reads
     or writes it.
+  - **An adopted `LDAP-Auth.xml` is imported once and never written back.** Upstream reads and
+    writes that file as the plugin's live store; Ferrofin keeps `config.json` and the links
+    table from the import on, so a change made in Ferrofin never reaches the file, which stays
+    as Jellyfin last wrote it. The importer trims each value, as it does `system.xml`'s, so a
+    setting with leading or trailing spaces (a bind password, say) comes across without them.
   - **Timeouts** (D6): opening a connection (the TCP connect and an LDAPS handshake) gives up
     after 5 seconds, and each operation, StartTLS included, after 10 seconds without an
     answer (a search's timer restarts with each entry). Upstream sets none.
