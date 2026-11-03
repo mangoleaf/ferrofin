@@ -11,18 +11,18 @@
 //! Every image request runs through the wired
 //! [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor) (the real
 //! `image`-crate encoder at the composition root): the `maxWidth`/`maxHeight`/
-//! `width`/`height`/`fillWidth`/`fillHeight`/`format`/`blur`/`backgroundColor`/
-//! `foregroundLayer` parameters resize, composite and format-convert the
-//! bytes, and the positional-parameter URL lifts its `format`/`maxWidth`/
-//! `maxHeight` path segments into the same transform. A plain
-//! request (or an unwired processor) serves the **stored original** untouched,
-//! except on the user-image routes, which reach the processor on every request
-//! as `GetImageResult` does (gl-1118 is the other routes). When the request
-//! names no `format`, the output format is negotiated from the client's `Accept`
-//! header exactly as C# `GetClientSupportedFormats` does.
+//! `width`/`height`/`fillWidth`/`fillHeight`/`format`/`quality`/`blur`/
+//! `backgroundColor`/`foregroundLayer` parameters resize, composite and
+//! format-convert the bytes, and the positional-parameter URL lifts its
+//! `format`/`maxWidth`/`maxHeight` path segments into the same transform. Every
+//! request reaches the processor, as `GetImageResult` calls `ProcessImage` on
+//! every request; the processor serves the **stored original** when nothing
+//! needs changing (`HasDefaultOptions`), and only an unwired processor skips it.
+//! When the request names no `format`, the output format is negotiated from the
+//! client's `Accept` header exactly as C# `GetClientSupportedFormats` does.
 //!
-//! TODO(overlays): the `percentPlayed`/`unplayedCount` parameters bind and are
-//! validated, but their overlays are not drawn — see the TODO on
+//! TODO(overlays, gl-806): the `percentPlayed`/`unplayedCount` parameters bind
+//! and are validated, but their overlays are not drawn — see the TODO on
 //! [`get_item_image_parametrized`] for the port path.
 //!
 //! A missing item (or by-name item, or user), or an item with no image of the
@@ -113,14 +113,15 @@ fn dotnet_enum_parse(text: &str, member: impl Fn(&str) -> Option<i32>) -> Option
 /// The query parameters accepted by the item and by-name image routes.
 ///
 /// Every field is optional and mirrors Jellyfin's `GetImage*` signature; the
-/// size/format/blur fields drive the [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor)
-/// transform.
+/// size, format, quality and compositing fields drive the
+/// [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor) transform.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ImageQuery {
-    /// Optional explicit image index (query-string form of the route segment).
+    /// Optional explicit image index (query-string form of the route segment),
+    /// read by [`Self::query_image_index`] on the routes that declare it.
     #[serde(default)]
-    image_index: Option<i32>,
+    image_index: Option<String>,
     /// The requested output format (`jpg`/`png`/`webp`/…); the original's format
     /// is kept when omitted.
     #[serde(default)]
@@ -152,15 +153,24 @@ pub(crate) struct ImageQuery {
     /// A black layer drawn over the image, its opacity `1 - value`.
     #[serde(default)]
     foreground_layer: Option<String>,
+    /// Bound as `GetItemImage` declares it, so a malformed value is a `400`; the
+    /// overlay is not drawn (gl-806), so a valid one has no effect.
+    #[serde(default)]
+    #[allow(dead_code)]
+    percent_played: Option<f64>,
+    /// Bound and dropped like `percent_played` (gl-806).
+    #[serde(default)]
+    #[allow(dead_code)]
+    unplayed_count: Option<i32>,
     /// The image's cache tag (`md5(path+dateModified)`): purely a cache key —
     /// when present the URL is content-addressed, so the response is served
     /// with Jellyfin's immutable caching contract (`Cache-Control`/`ETag`).
     #[serde(default)]
     tag: Option<String>,
-    /// Set by the user-image routes, never bound: the request reaches the
-    /// processor even when it names no transform.
+    /// Set by the splashscreen route, never bound: `GetSplashscreen` passes
+    /// `GetImageResult` no response headers, so it sends no DLNA headers.
     #[serde(skip)]
-    always_process: bool,
+    without_dlna_headers: bool,
 }
 
 impl ImageQuery {
@@ -176,22 +186,29 @@ impl ImageQuery {
         }
     }
 
-    /// Whether the request goes through the processor: one that asks for a
-    /// transform (resize/format/blur/compositing), and every user-image request. Any other
-    /// plain request serves the stored original untouched, where upstream
-    /// reaches `ProcessImage` too (gl-1118).
-    fn wants_transform(&self) -> bool {
-        self.always_process
-            || self.format.is_some()
-            || self.max_width.is_some()
-            || self.max_height.is_some()
-            || self.width.is_some()
-            || self.height.is_some()
-            || self.fill_width.is_some()
-            || self.fill_height.is_some()
-            || self.blur.is_some()
-            || self.background_color.is_some()
-            || self.foreground_layer.is_some()
+    /// `[FromQuery] int? imageIndex`, which only the actions with no index in
+    /// their route declare: `0` when absent or blank, a `400` when malformed.
+    /// The indexed routes never read it, as their actions do not bind it.
+    /// It binds as the query binder binds an `int?` (blank is absent, hex
+    /// forms are read), only later.
+    fn query_image_index(&self) -> Result<i32, ApiError> {
+        let Some(raw) = self.image_index.as_deref() else {
+            return Ok(0);
+        };
+        <Option<i32> as serde::Deserialize>::deserialize(crate::query::value::Value::nullable(raw))
+            .map(|index| index.unwrap_or(0))
+            .map_err(|_| {
+                ApiError::BadRequest(format!("The value '{raw}' is not valid for imageIndex."))
+            })
+    }
+
+    /// The splashscreen's query: [`tagged`](Self::tagged), without the DLNA
+    /// headers `GetImageInternal` adds to every other image route.
+    pub(crate) fn splashscreen(tag: Option<String>, format: Option<String>) -> Self {
+        Self {
+            without_dlna_headers: true,
+            ..Self::tagged(tag, format)
+        }
     }
 }
 
@@ -425,10 +442,12 @@ fn select_image(
     image_type: ImageType,
     index: i32,
 ) -> Option<&ItemImageInfo> {
+    // `GetImages(type).ElementAtOrDefault(index)`: a negative index is no image.
+    let index = usize::try_from(index).ok()?;
     images
         .iter()
         .filter(|i| i.image_type == image_type)
-        .nth(usize::try_from(index).unwrap_or(0))
+        .nth(index)
 }
 
 /// Whether a Live TV channel's or programme's `image` may be served: a URL, or
@@ -478,8 +497,8 @@ async fn local_image<'a>(
 /// downloaded is a `404` (upstream's exception is a `500`).
 ///
 /// `auto_orient` is `ImageProcessor.ProcessImage`'s photo flag: the image is
-/// turned upright from its EXIF orientation, so it goes through the processor
-/// even when nothing else is asked for, as upstream re-encodes it.
+/// turned upright from its EXIF orientation, so a photo is re-encoded even when
+/// nothing else is asked for, as upstream re-encodes it.
 ///
 /// [`ProviderManager::cached_remote_image`]: ferrofin_traits::providers::ProviderManager::cached_remote_image
 pub(crate) async fn serve_image_file(
@@ -500,15 +519,13 @@ pub(crate) async fn serve_image_file(
     let local = local_image(state, image).await?;
     let image: &ItemImageInfo = &local;
 
-    // Run the image through the processor for the requested resize/format. It
-    // short-circuits to the original file when nothing is asked for (or the source
-    // already matches), so a plain request still serves the untouched original.
+    // `GetImageResult` runs every request through `ProcessImage`, which serves
+    // the original file when nothing needs changing (`HasDefaultOptions`) and
+    // re-encodes a quality under 90 or a format the client cannot take.
     let mut serve_path = image.path.clone();
     let mut content_type: Option<String> = None;
-    if let (true, Some(processor)) = (
-        query.wants_transform() || auto_orient,
-        state.image_processor.as_ref(),
-    ) {
+    let mut date_modified = image.date_modified;
+    if let Some(processor) = state.image_processor.as_ref() {
         let options = ImageProcessingOptions {
             item_id,
             image: image.clone(),
@@ -541,7 +558,12 @@ pub(crate) async fn serve_image_file(
         let processed = processor.process_image(&options).await?;
         serve_path = processed.path;
         content_type = processed.mime_type;
+        date_modified = processed.date_modified;
     }
+    let headers = ImageHeaders {
+        dlna: !query.without_dlna_headers,
+        date_modified,
+    };
 
     // ── Jellyfin's image caching contract (C# `GetImageResult`) ─────────────
     // Posters are requested with `?tag=md5(path+dateModified)` — a content
@@ -550,36 +572,38 @@ pub(crate) async fn serve_image_file(
     // lets clients (Android TV image loaders especially) paint a library grid
     // from their local disk cache with zero network. Without these headers
     // every library visit re-fetches every poster — visible slow pop-in.
+    // `Request.Headers[CacheControl].Contains("no-cache")`: one header value
+    // that is exactly `no-cache` (`no-cache, max-age=0` is not, measured on 12.4).
     let no_cache = request
         .headers()
-        .get(axum::http::header::CACHE_CONTROL)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("no-cache"));
+        .get_all(axum::http::header::CACHE_CONTROL)
+        .iter()
+        .any(|v| v == "no-cache");
     let tag = query.tag.as_deref().filter(|t| !t.is_empty());
 
-    // ETag validation first (C# prefers If-None-Match over If-Modified-Since):
-    // a matching tag short-circuits to an empty 304 before any file I/O.
-    if !no_cache
-        && let Some(tag) = tag
-        && let Some(if_none_match) = request
-            .headers()
-            .get(axum::http::header::IF_NONE_MATCH)
-            .and_then(|v| v.to_str().ok())
-        && (if_none_match == format!("\"{tag}\"") || if_none_match == tag)
-    {
-        let mut response = Response::new(Body::empty());
-        *response.status_mut() = axum::http::StatusCode::NOT_MODIFIED;
-        append_image_cache_headers(response.headers_mut(), no_cache, Some(tag), image);
-        return Ok(response);
+    // `GetImageResult`'s own validation, after `ProcessImage` as upstream's,
+    // and skipped under `no-cache`.
+    if !no_cache && is_fresh(request.headers(), tag, headers.date_modified) {
+        return Ok(not_modified(content_type.as_deref(), tag, &headers));
     }
 
     // Image validators belong to the tag-based contract above. ServeFile's
     // metadata ETag is a different identity and must not decide these requests.
+    // `GetImageResult` answers with `PhysicalFile`, whose range processing is
+    // off: a `Range` is ignored and no `Accept-Ranges` is sent. It also
+    // ignores an `If-Modified-Since` in the future (measured on 12.4).
     let mut request = request;
-    request.headers_mut().remove(axum::http::header::IF_MATCH);
-    request
-        .headers_mut()
-        .remove(axum::http::header::IF_NONE_MATCH);
+    let request_headers = request.headers_mut();
+    request_headers.remove(axum::http::header::IF_MATCH);
+    request_headers.remove(axum::http::header::IF_NONE_MATCH);
+    request_headers.remove(axum::http::header::RANGE);
+    if request_headers
+        .get(axum::http::header::IF_MODIFIED_SINCE)
+        .and_then(|v| httpdate::parse_http_date(v.to_str().ok()?).ok())
+        .is_some_and(|since| since > std::time::SystemTime::now())
+    {
+        request_headers.remove(axum::http::header::IF_MODIFIED_SINCE);
+    }
     let mut response = ServeFile::new(&serve_path)
         .oneshot(request)
         .await
@@ -595,37 +619,134 @@ pub(crate) async fn serve_image_file(
             .insert(axum::http::header::CONTENT_TYPE, value);
     }
     response.headers_mut().remove(axum::http::header::ETAG);
-    append_image_cache_headers(response.headers_mut(), no_cache, tag, image);
+    response
+        .headers_mut()
+        .remove(axum::http::header::ACCEPT_RANGES);
+    served_file_last_modified(response.headers_mut(), &serve_path).await;
+    append_image_cache_headers(response.headers_mut(), no_cache, tag, &headers);
     Ok(response)
+}
+
+/// `GetImageResult`'s two `304` checks: an `If-None-Match` naming the tag,
+/// quoted or not, then an `If-Modified-Since` at or after `ProcessImage`'s
+/// date. Upstream reads the header as local time (`DateTime.TryParse`); it is
+/// compared in UTC here.
+fn is_fresh(
+    request: &axum::http::HeaderMap,
+    tag: Option<&str>,
+    date_modified: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let header = |name| {
+        request
+            .get(name)
+            .and_then(|v: &axum::http::HeaderValue| v.to_str().ok())
+    };
+    if let Some(tag) = tag
+        && let Some(if_none_match) = header(axum::http::header::IF_NONE_MATCH)
+        && (if_none_match == format!("\"{tag}\"") || if_none_match == tag)
+    {
+        return true;
+    }
+    header(axum::http::header::IF_MODIFIED_SINCE)
+        .and_then(|since| httpdate::parse_http_date(since).ok())
+        .is_some_and(|since| date_modified <= chrono::DateTime::<chrono::Utc>::from(since))
+}
+
+/// The empty `304` [`is_fresh`] allows. `GetImageResult` sets the content type
+/// and `Last-Modified` before it answers, so the `304` carries them beside the
+/// caching headers.
+fn not_modified(content_type: Option<&str>, tag: Option<&str>, headers: &ImageHeaders) -> Response {
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = axum::http::StatusCode::NOT_MODIFIED;
+    if let Some(value) = content_type.and_then(|mime| axum::http::HeaderValue::from_str(mime).ok())
+    {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    append_image_cache_headers(response.headers_mut(), false, tag, headers);
+    response
+}
+
+/// `PhysicalFile`'s `Last-Modified`, the served file's, on a `ServeFile` answer
+/// that has none (its `412`).
+async fn served_file_last_modified(headers: &mut axum::http::HeaderMap, path: &str) {
+    if headers.contains_key(axum::http::header::LAST_MODIFIED) {
+        return;
+    }
+    if let Ok(modified) = tokio::fs::metadata(path)
+        .await
+        .and_then(|meta| meta.modified())
+        && let Ok(value) = axum::http::HeaderValue::from_str(&httpdate::fmt_http_date(modified))
+    {
+        headers.insert(axum::http::header::LAST_MODIFIED, value);
+    }
+}
+
+/// What [`append_image_cache_headers`] needs beyond the request.
+struct ImageHeaders {
+    /// Whether to send `GetImageInternal`'s two DLNA headers.
+    dlna: bool,
+    /// `ProcessImage`'s date: the original's, or the cached encode's write time.
+    date_modified: chrono::DateTime<chrono::Utc>,
 }
 
 /// Appends the caching/metadata headers of C# `GetImageResult` to an image
 /// response: `Cache-Control` (immutable year-long for tagged, content-addressed
 /// URLs; `public` otherwise; `no-cache` mirrored back when the client sent it),
-/// `ETag` from the tag, plus `Age` and `Vary: Accept`. `Last-Modified` /
-/// `If-Modified-Since` are handled by `ServeFile` itself.
+/// `ETag` from the tag, plus `Age`, `Vary: Accept` and, when nothing set one
+/// yet (the `304` of [`not_modified`]), `ProcessImage`'s date as `Last-Modified`.
 fn append_image_cache_headers(
     headers: &mut axum::http::HeaderMap,
     no_cache: bool,
     tag: Option<&str>,
-    image: &ItemImageInfo,
+    meta: &ImageHeaders,
 ) {
     use axum::http::HeaderValue;
     use axum::http::header;
 
     // C# `GetImageInternal` builds these two into `responseHeaders` and
     // `GetImageResult` appends them before the caching branch, so they are on
-    // every image response — cached, uncached and `304` alike. HTTP header names
-    // are case-insensitive; Jellyfin spells them `transferMode.dlna.org` /
+    // every image response — cached, uncached and `304` alike, except the
+    // splashscreen's, which passes none. HTTP header names are
+    // case-insensitive; Jellyfin spells them `transferMode.dlna.org` /
     // `realTimeInfo.dlna.org`.
+    if meta.dlna {
+        headers.insert(
+            axum::http::HeaderName::from_static("transfermode.dlna.org"),
+            HeaderValue::from_static("Interactive"),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_static("realtimeinfo.dlna.org"),
+            HeaderValue::from_static("DLNA.ORG_TLAG=*"),
+        );
+    }
+
+    // `Age`, `Vary` and the disposition come before the caching branch, so
+    // `no-cache` answers carry them too (measured on 12.4).
+    let age_secs = (chrono::Utc::now() - meta.date_modified)
+        .num_seconds()
+        .max(0);
+    if let Ok(value) = HeaderValue::from_str(&age_secs.to_string()) {
+        headers.insert(header::AGE, value);
+    }
+    headers.insert(header::VARY, HeaderValue::from_static("Accept"));
+    // C# sends `attachment` on image responses; harmless to image loaders
+    // (they ignore disposition) and kept for header parity.
     headers.insert(
-        axum::http::HeaderName::from_static("transfermode.dlna.org"),
-        HeaderValue::from_static("Interactive"),
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment"),
     );
-    headers.insert(
-        axum::http::HeaderName::from_static("realtimeinfo.dlna.org"),
-        HeaderValue::from_static("DLNA.ORG_TLAG=*"),
-    );
+    if !headers.contains_key(header::LAST_MODIFIED)
+        && let Ok(value) = HeaderValue::from_str(
+            &meta
+                .date_modified
+                .format("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string(),
+        )
+    {
+        headers.insert(header::LAST_MODIFIED, value);
+    }
 
     if no_cache {
         headers.insert(
@@ -654,19 +775,6 @@ fn append_image_cache_headers(
     {
         headers.insert(header::ETAG, value);
     }
-    let age_secs = (chrono::Utc::now() - image.date_modified)
-        .num_seconds()
-        .max(0);
-    if let Ok(value) = HeaderValue::from_str(&age_secs.to_string()) {
-        headers.insert(header::AGE, value);
-    }
-    headers.insert(header::VARY, HeaderValue::from_static("Accept"));
-    // C# sends `attachment` on image responses; harmless to image loaders
-    // (they ignore disposition) and kept for header parity.
-    headers.insert(
-        header::CONTENT_DISPOSITION,
-        HeaderValue::from_static("attachment"),
-    );
 }
 
 /// Whether the caller has already proved the item exists.
@@ -780,7 +888,7 @@ async fn get_item_image(
     request: Request,
 ) -> Result<Response, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    let index = query.image_index.unwrap_or(0);
+    let index = query.query_image_index()?;
     let resolved = authorize_image_item(&state, item_id, auth).await?;
     serve_item_image(
         &state, item_id, image_type, index, &query, request, resolved,
@@ -790,8 +898,8 @@ async fn get_item_image(
 
 /// `GET`/`HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}` — indexed variant.
 ///
-/// Port of `ImageController.GetItemImageByIndex` (and the long parametrized
-/// alias, whose extra path segments are decorative under original-file serving).
+/// Port of `ImageController.GetItemImageByIndex`: the index is the route's, and
+/// the query's `imageIndex` is not read.
 #[utoipa::path(
     get,
     path = "/Items/{itemId}/Images/{imageType}/{imageIndex}",
@@ -1119,7 +1227,7 @@ macro_rules! by_name_image_handlers {
             request: Request,
         ) -> Result<Response, ApiError> {
             let image_type = parse_image_type(&image_type)?;
-            let index = query.image_index.unwrap_or(0);
+            let index = query.query_image_index()?;
             serve_named_image(&state, $kind, &name, image_type, index, &query, request).await
         }
 
@@ -1287,10 +1395,7 @@ async fn get_user_image(
         .get_profile_image(user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("user {user_id} has no profile image")))?;
-    let query = ImageQuery {
-        always_process: true,
-        ..ImageQuery::tagged(query.tag, query.format)
-    };
+    let query = ImageQuery::tagged(query.tag, query.format);
     serve_image_file(&state, user_id, &image, 0, false, &query, request).await
 }
 
@@ -1599,8 +1704,9 @@ async fn delete_item_image(
     Query(query): Query<ImageQuery>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
+    // Bound before the item is read, as the binder's `400` comes first upstream.
+    let index = query.query_image_index()?;
     require_item(&state, item_id, auth.user.as_deref()).await?;
-    let index = query.image_index.unwrap_or(0);
     state
         .providers
         .delete_image(item_id, image_type, Some(index))
