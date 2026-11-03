@@ -1183,8 +1183,9 @@ pub trait ItemPersistenceService: Send + Sync {
     /// whose stored `DateModified` still matches the file's mtime is *not*
     /// refreshed, so upstream never re-decodes an unchanged poster. Ferrofin
     /// holds its image rows in the database rather than on an in-memory
-    /// `BaseItem`, so the scan reads them back — once for the whole run, in the
-    /// same shape as the other scan prereads, never once per item.
+    /// `BaseItem`, so the scan reads them back in batches — one stored-row
+    /// window of its plan at a time, and its albums' once for their covers —
+    /// never once per item.
     ///
     /// The default returns nothing (stub/fake services), which is safe: a
     /// caller that finds no stored metadata simply recomputes.
@@ -1909,7 +1910,8 @@ pub trait ItemPersistenceService: Send + Sync {
 
     /// The external ids already recorded for each of `item_ids`, keyed by item.
     ///
-    /// A scanner reads these once up front so a re-scan resolves each item by
+    /// A scanner reads these in batches ahead of its walk (one stored-row
+    /// window of its plan at a time) so a re-scan resolves each item by
     /// the id a previous pass matched — C# `info.GetProviderId` — instead of
     /// searching by title again. The default is an empty map, for stub
     /// services with no store behind them.
