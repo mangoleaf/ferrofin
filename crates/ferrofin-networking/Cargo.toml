@@ -18,10 +18,16 @@ thiserror.workspace = true
 fancy-regex.workspace = true
 percent-encoding.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
+# Paused-clock tests of the network-change wait (tokio::time::pause).
+tokio = { workspace = true, features = ["test-util"] }
 rstest.workspace = true
 serde_json.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

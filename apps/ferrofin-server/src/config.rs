@@ -174,6 +174,7 @@ struct FileConfig {
     db_statement_cache: Option<u32>,
     enable_metrics: Option<bool>,
     disable_extensions: Option<bool>,
+    detect_network_change: Option<bool>,
     metrics_sample_interval: Option<u32>,
     metrics_scan_duration_buckets: Option<Vec<f64>>,
     shutdown_timeout_secs: Option<u32>,
@@ -592,6 +593,13 @@ pub struct Config {
     /// `ServerConfiguration`, so `/System/Configuration` stays byte-identical
     /// to Jellyfin.
     pub disable_extensions: bool,
+
+    /// Whether the server listens for the operating system's network changes
+    /// and reads its network interfaces again after each one (Jellyfin's
+    /// `DetectNetworkChange` startup key, `True` by default; `--nonetchange`
+    /// turns it off). Resolved `FERROFIN_DETECT_NETWORK_CHANGE` env >
+    /// `detect_network_change` in `config.toml` > `true`.
+    pub detect_network_change: bool,
 
     /// Metrics gauge-sampler interval, in seconds. `None` = the 15 s default
     /// (aligned with the Prometheus scrape interval). Resolved
@@ -1183,6 +1191,9 @@ impl Config {
             disable_extensions: parse_bool_var(env, "FERROFIN_DISABLE_EXTENSIONS")
                 .or(file.disable_extensions)
                 .unwrap_or(false),
+            detect_network_change: parse_bool_var(env, "FERROFIN_DETECT_NETWORK_CHANGE")
+                .or(file.detect_network_change)
+                .unwrap_or(true),
             metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
             metrics_scan_duration_buckets: env
                 .var("FERROFIN_METRICS_SCAN_DURATION_BUCKETS")
@@ -1630,6 +1641,7 @@ impl Config {
             db_statement_cache: None,
             enable_metrics: None,
             disable_extensions: false,
+            detect_network_change: true,
             metrics_sample_interval: None,
             metrics_scan_duration_buckets: None,
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
@@ -3258,6 +3270,31 @@ mod tests {
     fn db_pool_defaults_to_auto() {
         let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
         assert_eq!(cfg.db_pool, None, "no knob set ⇒ auto sizing");
+    }
+
+    /// Network-change detection resolves env > `config.toml` > on, as
+    /// Jellyfin's `DetectNetworkChange` defaults to `True`.
+    #[test]
+    fn detect_network_change_defaults_on_and_env_beats_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "detect_network_change = false\n").unwrap();
+        let load =
+            |cli: Cli, env: &FakeEnv| Config::load_from(cli, env).unwrap().detect_network_change;
+        let from_file = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert!(load(Cli::default(), &FakeEnv::new()));
+        assert!(!load(
+            Cli::default(),
+            &FakeEnv::new().with("FERROFIN_DETECT_NETWORK_CHANGE", "off")
+        ));
+        assert!(!load(from_file(), &FakeEnv::new()));
+        assert!(load(
+            from_file(),
+            &FakeEnv::new().with("FERROFIN_DETECT_NETWORK_CHANGE", "1")
+        ));
     }
 
     /// The extension kill-switch resolves env > file > off, and accepts the
