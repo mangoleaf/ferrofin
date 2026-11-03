@@ -12194,15 +12194,15 @@ impl LibraryScanner {
     }
 
     /// The stored row and `LockedFields` of every credited person whose
-    /// biography is about to be fetched (one read each); a person the store
-    /// cannot answer for is absent.
+    /// biography is about to be fetched ([`fetches_biography`]; one read
+    /// each); a person the store cannot answer for is absent.
     async fn person_locks(
         &self,
         written: &[ferrofin_traits::persistence::WrittenPerson],
     ) -> Option<HashMap<Uuid, PersonLock>> {
         let ids: Vec<Uuid> = written
             .iter()
-            .filter(|p| p.needs_details)
+            .filter(|p| fetches_biography(p))
             .map(|p| p.id)
             .collect();
         let Some(repo) = &self.item_repository else {
@@ -12310,8 +12310,11 @@ impl LibraryScanner {
         let stored = self.stored_person_image_metadata(&written).await;
         let person_locks = self.person_locks(&written).await;
         let server_locale = self.server_metadata_locale();
-        let folders = if written.iter().any(|person| person.needs_details) {
-            match self.virtual_folders.get_virtual_folders().await {
+        // Read only for a biography fetch, which most credits never make (a
+        // person with no TMDB id, or one already described), and from the
+        // libraries' snapshot: the full listing re-heals every library.
+        let folders = if written.iter().any(fetches_biography) {
+            match self.virtual_folders.library_folders().await {
                 Ok(folders) => Some(folders),
                 Err(error) => {
                     tracing::warn!(%error, "could not read credited people's library locale");
@@ -12319,7 +12322,7 @@ impl LibraryScanner {
                 }
             }
         } else {
-            Some(Vec::new())
+            Some(Arc::from([]))
         };
         let mut locale_cache = ArtworkCache::default();
         for person in written {
@@ -18721,6 +18724,14 @@ fn photo_exif_fields(
             exif.iso_speed_rating.map(serde_json::Value::from),
         ),
     ]
+}
+
+/// Whether [`LibraryScanner::enrich_people`] fetches `person`'s biography: it
+/// has none yet, and a TMDB id to look one up by. Only these need the stored
+/// row, its locks and the libraries; a credit from an NFO without ids never
+/// does, however often it is written.
+fn fetches_biography(person: &ferrofin_traits::persistence::WrittenPerson) -> bool {
+    person.needs_details && person.provider_id.is_some()
 }
 
 /// A credited person's stored row and `LockedFields`.
@@ -27661,6 +27672,307 @@ mod tests {
         assert_eq!(f.production_locations.as_deref(), Some("Leeds"));
         let o = row(open).await;
         assert_eq!(o.overview.as_deref(), Some("TMDB bio."));
+    }
+
+    /// A [`VirtualFolderManager`](ferrofin_traits::library::VirtualFolderManager)
+    /// with no library, counting the full listings and the snapshot reads it
+    /// answers: a per-item lookup reads the snapshot (gl-1084).
+    #[derive(Default)]
+    struct CountingFolders {
+        listings: std::sync::atomic::AtomicUsize,
+        snapshots: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingFolders {
+        /// `(full listings, snapshot reads)` so far.
+        fn counts(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (self.listings.load(SeqCst), self.snapshots.load(SeqCst))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::library::VirtualFolderManager for CountingFolders {
+        async fn get_virtual_folders(
+            &self,
+        ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, super::ServiceError>
+        {
+            self.listings
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        async fn library_folders(
+            &self,
+        ) -> Result<
+            std::sync::Arc<[ferrofin_model::entities_media::VirtualFolderInfo]>,
+            super::ServiceError,
+        > {
+            self.snapshots
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(std::sync::Arc::from([]))
+        }
+        async fn add_virtual_folder(
+            &self,
+            _name: &str,
+            _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
+            _options: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<Option<uuid::Uuid>, super::ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn remove_virtual_folder(&self, _name: &str) -> Result<(), super::ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn rename_virtual_folder(
+            &self,
+            _name: &str,
+            _new_name: &str,
+        ) -> Result<(), super::ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn add_media_path(
+            &self,
+            _name: &str,
+            _path: &ferrofin_model::configuration::MediaPathInfo,
+        ) -> Result<(), super::ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn update_media_path(
+            &self,
+            _name: &str,
+            _path: &ferrofin_model::configuration::MediaPathInfo,
+        ) -> Result<(), super::ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn remove_media_path(
+            &self,
+            _name: &str,
+            _path: &str,
+        ) -> Result<(), super::ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn update_library_options(
+            &self,
+            _name: &str,
+            _options: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<(), super::ServiceError> {
+            unimplemented!("fake")
+        }
+    }
+
+    /// The server configuration over `root`, as the savers read it.
+    async fn saver_configuration(
+        root: &std::path::Path,
+    ) -> std::sync::Arc<crate::FerrofinServerConfigurationManager> {
+        let paths = std::sync::Arc::new(crate::FerrofinServerApplicationPaths::new(
+            root,
+            root.join("log"),
+            root.join("server-config"),
+            root.join("cache"),
+            root.join("web"),
+        ));
+        std::sync::Arc::new(
+            crate::FerrofinServerConfigurationManager::load(paths)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// gl-1084: the people pass reads the libraries only for a biography it
+    /// fetches, which takes a TMDB id: credits from an NFO without ids (most
+    /// of a scan's) read nothing, however often they are written. And then
+    /// from the libraries' snapshot, not the full listing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enrich_people_reads_the_libraries_only_for_a_biography_it_fetches() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::people_repository::FerrofinPeopleRepository;
+        use crate::test_support::test_db;
+        use ferrofin_traits::persistence::{ItemRepository, WrittenPerson};
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = r#"{"id": 1, "name": "P", "biography": "TMDB bio."}"#;
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let db = test_db().await;
+        let persistence = std::sync::Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: std::sync::Arc<dyn ItemRepository> = std::sync::Arc::new(
+            FerrofinItemRepository::new(db.clone(), std::sync::Arc::new(ItemTypeLookup::new())),
+        );
+        let person = super::Uuid::new_v4();
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(person),
+                type_: stored_type_name(BaseItemKind::Person).unwrap().to_owned(),
+                name: Some("P".into()),
+                ..Default::default()
+            }])
+            .await
+            .expect("seed");
+        let tmp = tempfile::tempdir().unwrap();
+        let folders = std::sync::Arc::new(CountingFolders::default());
+        let scanner = LibraryScanner::new(
+            folders.clone(),
+            std::sync::Arc::new(FerrofinFileSystem::new()),
+            persistence.clone(),
+        )
+        .with_items(std::sync::Arc::clone(&items))
+        .with_metadata(
+            std::sync::Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&base)),
+            tmp.path().join("People"),
+        );
+        let people = FerrofinPeopleRepository::new(db.clone());
+        let credit = |provider_id| WrittenPerson {
+            id: person,
+            needs_details: true,
+            image_url: None,
+            provider_id,
+        };
+
+        scanner.enrich_people(&people, vec![credit(None)]).await;
+        assert_eq!(folders.counts(), (0, 0), "no TMDB id, no library read");
+
+        scanner.enrich_people(&people, vec![credit(Some(1))]).await;
+        assert_eq!(folders.counts(), (0, 1), "the snapshot, once");
+        let row = items.retrieve_item(person).await.unwrap().unwrap();
+        assert_eq!(row.overview.as_deref(), Some("TMDB bio."), "fetched");
+    }
+
+    /// gl-1084: the artwork destination saver runs for every item a scan saves,
+    /// and reads where artwork goes only when an image was acquired this pass,
+    /// from the libraries' snapshot. An item whose images are local or already
+    /// saved reads no setting, and so cannot fail on one.
+    #[tokio::test]
+    async fn saving_artwork_reads_destinations_only_for_an_acquired_image() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::test_support::test_db;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let items = std::sync::Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            std::sync::Arc::new(ItemTypeLookup::new()),
+        ));
+        let folders = std::sync::Arc::new(CountingFolders::default());
+        let meta = tmp.path().join("metadata");
+        let saver = ferrofin_providers::image_save::ImageFileSaver::new(
+            items,
+            folders.clone(),
+            saver_configuration(tmp.path()).await,
+            meta.clone().into(),
+        );
+        let movie_dir = tmp.path().join("movies").join("Heat (1995)");
+        let movie = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(super::Uuid::new_v4()),
+            type_: stored_type_name(BaseItemKind::Movie).unwrap().to_owned(),
+            path: Some(
+                movie_dir
+                    .join("Heat (1995).mkv")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..Default::default()
+        };
+        let image = |path: std::path::PathBuf, image_type| ItemImageInfo {
+            path: path.to_string_lossy().into_owned(),
+            image_type,
+            date_modified: chrono::DateTime::UNIX_EPOCH,
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        };
+        let local = image(movie_dir.join("poster.jpg"), ImageType::Primary);
+        let published = image(meta.join("heat").join("backdrop.jpg"), ImageType::Backdrop);
+        saver
+            .save_all(&movie, &mut [local, published.clone()], &[published])
+            .await
+            .expect("nothing to publish");
+        assert_eq!(folders.counts(), (0, 0), "no destination asked for");
+
+        let fetched = image(meta.join("heat").join("logo.png"), ImageType::Logo);
+        saver
+            .save_all(&movie, &mut [fetched], &[])
+            .await
+            .expect("no library saves beside the media");
+        assert_eq!(folders.counts(), (0, 1), "the snapshot, once");
+    }
+
+    /// gl-1084: the NFO saver refuses a scan's `MetadataImport` of an episode
+    /// before reading any option, as `IsSaverEnabledForItem` asks the saver
+    /// first, and reads the library's options from the snapshot when the
+    /// update could save.
+    #[tokio::test]
+    async fn the_nfo_saver_reads_library_options_only_for_an_update_it_can_save() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::media_stream_repository::FerrofinMediaStreamRepository;
+        use crate::people_repository::FerrofinPeopleRepository;
+        use crate::test_support::test_db;
+        use ferrofin_traits::providers::ItemUpdateType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let persistence = std::sync::Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let episode = super::Uuid::new_v4();
+        let season = tmp.path().join("Show").join("Season 01");
+        std::fs::create_dir_all(&season).unwrap();
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(episode),
+                type_: stored_type_name(BaseItemKind::Episode).unwrap().to_owned(),
+                name: Some("Pilot".into()),
+                path: Some(
+                    season
+                        .join("Show - S01E01.mkv")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..Default::default()
+            }])
+            .await
+            .expect("seed");
+        let folders = std::sync::Arc::new(CountingFolders::default());
+        let saver = ferrofin_providers::nfo_save::NfoSaver::new(
+            std::sync::Arc::new(FerrofinItemRepository::new(
+                db.clone(),
+                std::sync::Arc::new(ItemTypeLookup::new()),
+            )),
+            persistence,
+            std::sync::Arc::new(FerrofinPeopleRepository::new(db.clone())),
+            std::sync::Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
+            folders.clone(),
+            saver_configuration(tmp.path()).await,
+        );
+
+        saver
+            .save(episode, ItemUpdateType::MetadataImport)
+            .await
+            .expect("refused");
+        assert_eq!(folders.counts(), (0, 0), "refused before the options");
+
+        saver
+            .save(episode, ItemUpdateType::MetadataEdit)
+            .await
+            .expect("no library saves it");
+        assert_eq!(folders.counts(), (0, 1), "the snapshot, once");
+        assert!(
+            !season.join("Show - S01E01.nfo").exists(),
+            "local saving is off"
+        );
     }
 
     /// A person's downloaded profile art must be persisted with its real pixel

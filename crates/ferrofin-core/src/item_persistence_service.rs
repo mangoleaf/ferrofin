@@ -2945,6 +2945,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_id: Uuid,
         ancestor_ids: &[Uuid],
     ) -> Result<(), ServiceError> {
+        use std::fmt::Write as _;
         let id = guid_to_db(item_id);
         // One transaction so the clear+rewrite is atomic on a single connection —
         // otherwise the DELETE and INSERTs land on different pool connections and
@@ -2956,15 +2957,25 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        for ancestor in ancestor_ids {
-            sqlx::query(
-                r#"INSERT OR IGNORE INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#,
-            )
-            .bind(&id)
-            .bind(guid_to_db(*ancestor))
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
+        // The whole closure in one statement (gl-1084): the scan writes every
+        // item's ancestors, one awaited statement per ancestor otherwise.
+        for chunk in ancestor_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let mut sql = String::from(
+                r#"INSERT OR IGNORE INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES "#,
+            );
+            // `?1` is the item, each ancestor the next number.
+            for bind in 2..chunk.len() + 2 {
+                if bind > 2 {
+                    sql.push_str(", ");
+                }
+                // Writing to a String cannot fail.
+                let _ = write!(sql, "(?1, ?{bind})");
+            }
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&id);
+            for ancestor in chunk {
+                query = query.bind(guid_to_db(*ancestor));
+            }
+            query.execute(&mut *tx).await.map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)
     }
@@ -10174,6 +10185,44 @@ mod tests {
         svc.save_item_images(item, &images).await.unwrap();
         paths.push("/e.jpg");
         assert_eq!(listed().await, paths);
+    }
+
+    /// `set_ancestors` replaces the closure with the ancestors given, written
+    /// in one statement (gl-1084): none clears it, a repeated ancestor is
+    /// stored once, and a rewrite drops the ancestors no longer given.
+    #[rstest::rstest]
+    #[case::none(&[], &[])]
+    #[case::one(&[0], &[0])]
+    #[case::several(&[0, 1, 2], &[0, 1, 2])]
+    #[case::repeated(&[1, 0, 1], &[0, 1])]
+    #[tokio::test]
+    async fn set_ancestors_writes_the_closure_it_is_given(
+        #[case] given: &[usize],
+        #[case] stored: &[usize],
+    ) {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let item = Uuid::new_v4();
+        let parents: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for id in std::iter::once(item).chain(parents.iter().copied()) {
+            seed_item(&db, id, BaseItemKind::Folder).await;
+        }
+        // A closure from an earlier save, which the rewrite replaces.
+        svc.set_ancestors(item, &parents[2..])
+            .await
+            .expect("earlier closure");
+        let given: Vec<Uuid> = given.iter().map(|&i| parents[i]).collect();
+        svc.set_ancestors(item, &given).await.expect("ancestors");
+        let mut read: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "ParentItemId" FROM "AncestorIds" WHERE "ItemId" = ?1"#)
+                .bind(guid_to_db(item))
+                .fetch_all(db.pool())
+                .await
+                .expect("closure");
+        read.sort();
+        let mut want: Vec<String> = stored.iter().map(|&i| guid_to_db(parents[i])).collect();
+        want.sort();
+        assert_eq!(read, want);
     }
 
     #[tokio::test]
