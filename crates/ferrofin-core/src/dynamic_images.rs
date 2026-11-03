@@ -402,7 +402,7 @@ impl DynamicImageProviders {
         for row in rows {
             between().await;
             // No library: `GetLibraryOptions` gives the root the defaults.
-            let plan = crate::library_scan::unwalked_refresh_plan(Some(&row), options, None);
+            let plan = crate::library_scan::unwalked_refresh_plan(Some(&row), options, None, false);
             let pass = self
                 .refresh_tallied(&row, plan.run_all_providers, &mut report)
                 .await;

@@ -3546,6 +3546,8 @@ const NO_FILE: FileFacts = FileFacts {
     is_shortcut: false,
     is_file_protocol: false,
     is_placeholder: false,
+    path_rebased: false,
+    locations_changed: false,
 };
 
 /// What a provider arm of the single-item refresh returned: upstream's
