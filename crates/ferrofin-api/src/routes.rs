@@ -356,6 +356,15 @@ mod tests {
             Some("/Ldap/TestServerBind")
         );
         assert_eq!(canonicalize_path("/Ldap/TestServerBind"), None);
+        // And the filter test and user search, which it calls the same way.
+        assert_eq!(
+            canonicalize_path("/ldap/TestLdapFilters").as_deref(),
+            Some("/Ldap/TestLdapFilters")
+        );
+        assert_eq!(
+            canonicalize_path("/ldap/LdapUserSearch").as_deref(),
+            Some("/Ldap/LdapUserSearch")
+        );
     }
 
     #[test]

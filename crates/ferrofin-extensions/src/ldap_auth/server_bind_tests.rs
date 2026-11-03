@@ -3,6 +3,7 @@
 //! and the service behind `POST /Ldap/TestServerBind` over the real plugin
 //! manager.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ferrofin_core::FerrofinPluginManager;
@@ -17,6 +18,8 @@ struct Script {
     connect: Result<(), LdapError>,
     bind: Result<(), LdapError>,
     search: Result<SearchOutcome, LdapError>,
+    /// What a search with one of these filters answers instead of `search`.
+    by_filter: HashMap<String, Result<SearchOutcome, LdapError>>,
 }
 
 impl Default for Script {
@@ -25,6 +28,7 @@ impl Default for Script {
             connect: Ok(()),
             bind: Ok(()),
             search: Ok(SearchOutcome::default()),
+            by_filter: HashMap::new(),
         }
     }
 }
@@ -98,7 +102,11 @@ impl LdapConnection for FakeDirectory {
             filter.to_owned(),
             attributes.iter().map(|a| (*a).to_owned()).collect(),
         ));
-        self.script.search.clone()
+        self.script
+            .by_filter
+            .get(filter)
+            .unwrap_or(&self.script.search)
+            .clone()
     }
 
     async fn modify_replace(
@@ -654,3 +662,5 @@ async fn an_unreadable_configuration_is_an_error_without_its_values() {
         other => panic!("expected a backend error, got {other:?}"),
     }
 }
+
+mod filter_and_user_search_tests;

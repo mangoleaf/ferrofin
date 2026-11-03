@@ -1,13 +1,13 @@
-//! The LDAP-Auth plugin's wire types: the body and the answer of
-//! `POST /Ldap/TestServerBind`, which the plugin's settings page sends when the
-//! administrator presses the connection test.
+//! The LDAP-Auth plugin's wire types: the bodies and answers of the
+//! `POST /Ldap/*` routes the plugin's settings page calls when the
+//! administrator presses one of its test buttons (the connection test, the
+//! filter test and the user search).
 //!
 //! Ported from `jellyfin-plugin-ldapauth` v24 (`d11c86a`),
-//! `LDAP-Auth/Api/Models/ServerConnectionInfo.cs` and `ServerTestResponse.cs`.
-//! Not Jellyfin contract types: the route is the plugin's own controller. Their
-//! JSON is PascalCase, as the plugin's is.
+//! `LDAP-Auth/Api/Models/*.cs`. Not Jellyfin contract types: the routes are the
+//! plugin's own controller. Their JSON is PascalCase, as the plugin's is.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 
 use crate::secret::Secret;
@@ -126,6 +126,93 @@ pub struct ServerTestResponse {
     pub error: Option<String>,
 }
 
+/// The filters the settings page's filter test saves and tries, a subset of
+/// the plugin configuration (upstream `UserFilterInfo`).
+///
+/// A missing or `null` filter reads as `None`, as `System.Text.Json` leaves a
+/// C# string it does not see.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct UserFilterInfo {
+    /// The filter a directory entry must match to sign in.
+    pub ldap_search_filter: Option<String>,
+    /// The filter that makes a user an administrator; empty or `_disabled_`
+    /// turns it off. The settings page sends `_disabled_` for an empty box.
+    pub ldap_admin_filter: Option<String>,
+    /// Whether any entry the admin filter finds makes the user an
+    /// administrator (a `memberUid` filter), not only the user's own entry.
+    ///
+    /// `None` when the body leaves it out, which keeps the saved value.
+    /// Upstream saves a missing member as `false`, and its own settings page
+    /// never sends it, so pressing the filter test there turns member-uid
+    /// mode off until the page is saved again: a Jellyfin bug not ported. A
+    /// `null` does not bind, as a C# `bool` refuses it.
+    #[serde(
+        deserialize_with = "present_bool",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(nullable = false)]
+    pub enable_ldap_admin_filter_member_uid: Option<bool>,
+}
+
+/// A member that binds only as a boolean, so that `null` is refused like a C#
+/// `bool` refuses it; with `#[serde(default)]`, an absent member is `None`.
+fn present_bool<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
+}
+
+/// What the filter test found (upstream `LdapFilterResponse`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct LdapFilterResponse {
+    /// How many distinct entries the user filter finds.
+    pub users: usize,
+    /// How many distinct entries the admin filter finds; `0` while it is off.
+    pub admins: usize,
+    /// Whether every entry the admin filter finds is one the user filter finds.
+    pub is_subset: bool,
+}
+
+/// Why a settings-page test could not run, the body of its `400` or `401`
+/// (upstream `LdapTestErrorResponse`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct LdapTestErrorResponse {
+    /// What went wrong, as the settings page shows it after `Failure: `.
+    pub message: String,
+}
+
+impl LdapTestErrorResponse {
+    /// An answer carrying `message`.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// The search attributes the settings page's user search saves, and the name
+/// to look up with them (upstream `UserSearchAttributes`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct UserSearchAttributes {
+    /// The comma-separated attributes a sign-in name is looked up by.
+    pub ldap_search_attributes: Option<String>,
+    /// The name to look up; when empty or absent, the attributes are only
+    /// saved.
+    pub test_search_username: Option<String>,
+}
+
+/// What the user search found (upstream `UserSearchResponse`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct UserSearchResponse {
+    /// The DN of the entry the name found; absent when no name was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub located_dn: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +277,83 @@ mod tests {
             ..ServerConnectionInfo::default()
         };
         assert_eq!(empty_base.missing_required().len(), 1);
+    }
+
+    #[test]
+    fn the_filter_test_body_keeps_member_uid_mode_unless_it_is_sent() {
+        // What upstream's settings page sends: no member-uid flag.
+        let page: UserFilterInfo = serde_json::from_str(
+            r#"{"LdapSearchFilter":"(objectClass=person)","LdapAdminFilter":"_disabled_"}"#,
+        )
+        .expect("binds");
+        assert_eq!(
+            page.ldap_search_filter.as_deref(),
+            Some("(objectClass=person)")
+        );
+        assert_eq!(page.ldap_admin_filter.as_deref(), Some("_disabled_"));
+        assert_eq!(page.enable_ldap_admin_filter_member_uid, None);
+
+        let sent: UserFilterInfo = serde_json::from_str(
+            r#"{"LdapSearchFilter":null,"EnableLdapAdminFilterMemberUid":true}"#,
+        )
+        .expect("binds");
+        assert_eq!(sent.ldap_search_filter, None);
+        assert_eq!(sent.enable_ldap_admin_filter_member_uid, Some(true));
+
+        assert!(
+            serde_json::from_str::<UserFilterInfo>(r#"{"EnableLdapAdminFilterMemberUid":null}"#)
+                .is_err(),
+            "a C# bool refuses null"
+        );
+    }
+
+    #[test]
+    fn the_member_uid_flag_is_documented_and_sent_as_a_plain_boolean() {
+        use utoipa::PartialSchema;
+        let schema = serde_json::to_value(UserFilterInfo::schema()).expect("schema");
+        assert_eq!(
+            schema["properties"]["EnableLdapAdminFilterMemberUid"]["type"], "boolean",
+            "not nullable: {schema}"
+        );
+        assert_eq!(
+            serde_json::to_value(UserFilterInfo::default()).expect("json"),
+            serde_json::json!({"LdapSearchFilter": null, "LdapAdminFilter": null})
+        );
+    }
+
+    #[test]
+    fn the_filter_and_search_answers_are_upstreams_shapes() {
+        let found = LdapFilterResponse {
+            users: 2,
+            admins: 1,
+            is_subset: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&found).expect("json"),
+            serde_json::json!({"Users": 2, "Admins": 1, "IsSubset": true})
+        );
+        assert_eq!(
+            serde_json::to_value(LdapTestErrorResponse::new(
+                "Failed to Connect or Bind to server."
+            ))
+            .expect("json"),
+            serde_json::json!({"Message": "Failed to Connect or Bind to server."})
+        );
+        assert_eq!(
+            serde_json::to_value(UserSearchResponse::default()).expect("json"),
+            serde_json::json!({}),
+            "no LocatedDn without a name, which the page reads as undefined"
+        );
+        assert_eq!(
+            serde_json::to_value(UserSearchResponse {
+                located_dn: Some("uid=ada,dc=example,dc=org".to_owned()),
+            })
+            .expect("json"),
+            serde_json::json!({"LocatedDn": "uid=ada,dc=example,dc=org"})
+        );
+        let search: UserSearchAttributes =
+            serde_json::from_str(r#"{"LdapSearchAttributes":"uid, mail"}"#).expect("binds");
+        assert_eq!(search.ldap_search_attributes.as_deref(), Some("uid, mail"));
+        assert_eq!(search.test_search_username, None);
     }
 }

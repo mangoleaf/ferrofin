@@ -6,9 +6,28 @@
 //! there; `ferrofin-api` handlers reach it only through this object-safe trait.
 
 use async_trait::async_trait;
-use ferrofin_model::ldap::{ServerConnectionInfo, ServerTestResponse};
+use ferrofin_model::ldap::{
+    LdapFilterResponse, LdapTestErrorResponse, ServerConnectionInfo, ServerTestResponse,
+    UserFilterInfo, UserSearchAttributes, UserSearchResponse,
+};
 
 use crate::error::ServiceError;
+
+/// How a settings-page directory test ended: its result, or one of the
+/// plugin's own error answers, which carry an [`LdapTestErrorResponse`] where
+/// Ferrofin's errors carry their own body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LdapTestAnswer<T> {
+    /// `200` with the result.
+    Ok(T),
+    /// `400`: the directory refused the search (`LdapController` catching an
+    /// `LdapException`).
+    BadRequest(LdapTestErrorResponse),
+    /// `401`: the directory could not be reached or refused the configured
+    /// bind DN, or the user search failed or found no one (`LdapController`
+    /// catching an `AuthenticationException`).
+    Unauthorized(LdapTestErrorResponse),
+}
 
 /// The LDAP-Auth plugin's settings-page operations.
 ///
@@ -33,6 +52,32 @@ pub trait LdapManager: Send + Sync {
         &self,
         connection: ServerConnectionInfo,
     ) -> Result<ServerTestResponse, ServiceError>;
+
+    /// Saves `filters` into the plugin configuration, then counts the entries
+    /// the user filter and (while it is on) the admin filter find under the
+    /// base DN.
+    ///
+    /// Port of `LdapController.TestLdapFilters` and
+    /// `LdapAuthenticationProviderPlugin.GetFilteredUsers`. The result is `Err`
+    /// only when the plugin is disabled or its configuration cannot be read or
+    /// saved; a directory that fails is one of the [`LdapTestAnswer`] errors.
+    async fn test_ldap_filters(
+        &self,
+        filters: UserFilterInfo,
+    ) -> Result<LdapTestAnswer<LdapFilterResponse>, ServiceError>;
+
+    /// Saves the search attributes into the plugin configuration, then, when a
+    /// name is given, finds the entry it signs in as.
+    ///
+    /// Port of `LdapController.LdapUserSearch` and
+    /// `LdapAuthenticationProviderPlugin.LocateLdapUser`. The result is `Err`
+    /// only when the plugin is disabled or its configuration cannot be read or
+    /// saved; a directory that fails, or finds no entry, is
+    /// [`LdapTestAnswer::Unauthorized`].
+    async fn ldap_user_search(
+        &self,
+        search: UserSearchAttributes,
+    ) -> Result<LdapTestAnswer<UserSearchResponse>, ServiceError>;
 }
 
 fn _assert_object_safe_ldap_manager(_: &dyn LdapManager) {}

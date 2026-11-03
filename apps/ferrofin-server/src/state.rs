@@ -938,6 +938,8 @@ pub async fn build_app_state(
             .with_login_backoff(config.login_backoff_settings())
             // A lockout is a dashboard Alert, not just a log line.
             .with_activity(Arc::clone(&activity))
+            // A rename or policy save is announced (`UserUpdated`).
+            .with_events(Arc::clone(&event_manager))
             // Resolves each user's CastReceiverId against the configured
             // receivers — jellyfin-web shows no cast devices without one.
             .with_configuration(Arc::clone(&config_trait)),
@@ -2489,6 +2491,17 @@ pub async fn build_app_state(
         persistence: Arc::clone(&item_persistence_service),
         visibility: Arc::clone(&item_visibility),
     }));
+
+    // Every rename and policy save the user manager announces, whoever made
+    // it, reaches the user's sessions and then the device check (upstream's
+    // `UserUpdatedNotifier` and `DeviceAccessHost`). Attachable only now that
+    // the session manager exists.
+    ferrofin_core::user_updated::subscribe(
+        &event_bus,
+        Arc::clone(&users),
+        Arc::clone(&sessions),
+        Arc::clone(&devices),
+    );
 
     // Forward domain events to client sessions over the WebSocket — the Rust
     // shape of Jellyfin's notifier entry points (`LibraryChangedNotifier`,
