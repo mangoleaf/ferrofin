@@ -10,6 +10,13 @@
 //!
 //! A file rewritten with its mtime put back is what tells those apart without
 //! counting decodes: the row only moves if something measured the file.
+//!
+//! A photo whose provider does not run (a locked one, or any plain rescan)
+//! keeps its stored row, and upstream still compares that row with the file:
+//! `Folder.ValidateChildrenInternal` runs `UpdateImagesAsync` over every
+//! unchanged current child (a saved one reaches it through
+//! `RunMetadataSavers`), which measures each image `ImageNeedsRefresh` finds
+//! more than a second from its file's last write time.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,10 +33,15 @@ use ferrofin_drawing::{ImageCrateEncoder, ImageProcessor};
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::{CollectionTypeOptions, ImageType};
+use ferrofin_traits::drawing::ImageProcessor as _;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::ItemImageInfo;
-use ferrofin_traits::persistence::ItemRepository;
+use ferrofin_traits::persistence::{ItemPersistenceService as _, ItemRepository};
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+use uuid::Uuid;
+
+mod counting_images;
+use counting_images::CountingImages;
 
 /// The red-dominant look of the first version of the photo.
 const RED: [u8; 3] = [200, 30, 30];
@@ -48,7 +60,9 @@ fn first_write() -> DateTime<Utc> {
 struct Library {
     _tmp: tempfile::TempDir,
     items: Arc<dyn ItemRepository>,
+    persistence: Arc<FerrofinItemPersistenceService>,
     scanner: LibraryScanner,
+    processor: Arc<CountingImages>,
     photo: PathBuf,
 }
 
@@ -84,26 +98,73 @@ impl Library {
             db.clone(),
             Arc::new(ItemTypeLookup::new()),
         ));
-        let processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
-            ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), tmp.path().join("cache")),
-        );
-        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
-            .with_items(Arc::clone(&items))
-            .with_image_processor(processor)
-            .with_progress_every(0);
+        let processor = Arc::new(CountingImages::new(ImageProcessor::new(
+            Arc::new(ImageCrateEncoder::new()),
+            tmp.path().join("cache"),
+        )));
+        let scanner = LibraryScanner::new(
+            vf,
+            Arc::new(FerrofinFileSystem::new()),
+            Arc::clone(&persistence) as _,
+        )
+        .with_items(Arc::clone(&items))
+        .with_image_processor(Arc::clone(&processor) as _)
+        .with_progress_every(0);
         Self {
             _tmp: tmp,
             items,
+            persistence,
             scanner,
+            processor,
             photo,
         }
     }
 
+    /// The photo's id.
+    fn id(&self) -> Uuid {
+        derive_item_id(BaseItemKind::Photo, &self.photo.to_string_lossy()).expect("id")
+    }
+
+    /// Locks the photo's metadata, as the metadata editor's lock does.
+    async fn lock(&self) {
+        let mut row = self
+            .items
+            .retrieve_item(self.id())
+            .await
+            .expect("read the photo")
+            .expect("the photo's row");
+        row.is_locked = true;
+        self.persistence
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .expect("lock");
+    }
+
+    /// Stores `image` as the photo's only image row.
+    async fn store(&self, image: &ItemImageInfo) {
+        self.persistence
+            .save_item_images(self.id(), std::slice::from_ref(image))
+            .await
+            .expect("store the image row");
+    }
+
+    /// How many measurements (a size or a blurhash) the scans asked for.
+    fn measured(&self) -> usize {
+        self.processor.measured()
+    }
+
+    /// The cache tag clients key the photo's `image` by.
+    async fn tag(&self, image: &ItemImageInfo) -> Option<String> {
+        self.processor
+            .get_image_cache_tag(Some(&self.photo.to_string_lossy()), image)
+            .await
+            .expect("tag")
+    }
+
     /// The stored Primary image row of the photo.
     async fn primary(&self) -> ItemImageInfo {
-        let id = derive_item_id(BaseItemKind::Photo, &self.photo.to_string_lossy()).expect("id");
         self.items
-            .get_image_infos(id)
+            .get_image_infos(self.id())
             .await
             .expect("image rows")
             .into_iter()
@@ -242,4 +303,93 @@ async fn a_full_refresh_measures_a_photo_whose_mtime_did_not_move() {
     assert_eq!((image.width, image.height), (90, 30));
     assert_ne!(image.blur_hash, first.blur_hash);
     assert_eq!(image.date_modified, first.date_modified);
+}
+
+/// gl-1126: a locked photo's provider does not run, so its row is the one
+/// stored, and the file it was measured from has changed since. Upstream's
+/// `UpdateImagesAsync` over the current child finds the row more than a
+/// second from the file (`ImageNeedsRefresh`) and measures it, so its size,
+/// blurhash and date (and the tag that hashes the date) follow the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_photo_is_measured_again_when_its_file_changes() {
+    let library = Library::new().await;
+    library.scanner.scan_all().await.expect("scan");
+    let first = library.primary().await;
+    library.lock().await;
+
+    write_photo(&library.photo, 90, 30, BLUE);
+    let moved = library.touch();
+    library.scanner.scan_all().await.expect("rescan");
+
+    let image = library.primary().await;
+    assert_eq!((image.width, image.height), (90, 30));
+    assert_eq!(image.date_modified, moved);
+    assert_ne!(image.blur_hash, first.blur_hash);
+    assert_ne!(library.tag(&image).await, library.tag(&first).await);
+}
+
+/// gl-1126: a row stored before gl-1057 dates the photo 1970. A plain rescan
+/// does not run the photo's provider, so only the comparison with the file
+/// can put it right; it measures the photo once and stores the file's date.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plain_rescan_measures_a_photo_row_dated_before_its_file() {
+    let library = Library::new().await;
+    library.scanner.scan_all().await.expect("scan");
+    let first = library.primary().await;
+    library
+        .store(&ItemImageInfo {
+            date_modified: DateTime::<Utc>::UNIX_EPOCH,
+            ..first.clone()
+        })
+        .await;
+
+    library.edit_keeping_mtime();
+    library.scanner.scan_all().await.expect("rescan");
+
+    let image = library.primary().await;
+    assert_eq!((image.width, image.height), (90, 30));
+    assert_ne!(image.blur_hash, first.blur_hash);
+    assert_eq!(image.date_modified, first_write());
+}
+
+/// Once the rows agree with their files, a plain rescan measures nothing.
+/// The photo's row is first dated 1970 and settled by a rescan, then the
+/// photo is locked and edited and settled by another.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rescan_of_settled_photos_measures_nothing() {
+    let library = Library::new().await;
+    library.scanner.scan_all().await.expect("scan");
+    let first = library.primary().await;
+    library
+        .store(&ItemImageInfo {
+            date_modified: DateTime::<Utc>::UNIX_EPOCH,
+            ..first
+        })
+        .await;
+    library
+        .scanner
+        .scan_all()
+        .await
+        .expect("the rescan that settles the 1970 row");
+    library.lock().await;
+    write_photo(&library.photo, 90, 30, BLUE);
+    library.touch();
+    library
+        .scanner
+        .scan_all()
+        .await
+        .expect("the rescan that settles the locked edit");
+    let settled = library.primary().await;
+    assert_eq!((settled.width, settled.height), (90, 30));
+
+    let before = library.measured();
+    library.scanner.scan_all().await.expect("rescan");
+    library.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(
+        library.measured(),
+        before,
+        "a settled photo is not measured"
+    );
+    assert_eq!(library.primary().await, settled);
 }
