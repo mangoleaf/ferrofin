@@ -57,7 +57,11 @@ impl XmltvChannel {
 }
 
 /// A single programme (an airing on a channel over a time range).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// Serializable so a guide write can set a provider's airings aside on disk
+/// as it reads them, rather than hold them all, and take them back for the
+/// write (the round trip is exact, the start's offset included).
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::struct_excessive_bools)] // one field per XMLTV flag element
 pub struct XmltvProgramme {
     /// The `channel` attribute — matches an [`XmltvChannel::id`].
@@ -1952,6 +1956,35 @@ mod programme_child_tests {
             "<tv><programme start=\"20260725060000 +0000\" channel=\"x\"><title>T</title>{children}</programme></tv>"
         ));
         guide.programmes.into_iter().next().expect("one programme")
+    }
+
+    /// A guide write sets a provider's airings aside as JSON and reads them
+    /// back: every field comes back as it was read, the start's own offset
+    /// included, since the programme id is built from it.
+    #[test]
+    fn a_programme_comes_back_from_json_unchanged() {
+        let guide = parse_xmltv(
+            "<tv><programme start=\"20260725060000 +0100\" stop=\"20260725073000 +0100\" \
+             channel=\"c.tv\"><title>T</title><sub-title>S</sub-title>\
+             <desc>Line one\nline \"two\" \u{2014} \u{00e9}</desc><category>News</category>\
+             <category>Kids</category><icon src=\"http://img/p.jpg\"/>\
+             <image type=\"still\">http://img/s.jpg</image>\
+             <image type=\"backdrop\">http://img/b.jpg</image><date>2019</date>\
+             <episode-num system=\"xmltv_ns\">0.5.</episode-num><new/><premiere/><live/>\
+             <previously-shown start=\"20200101000000 +0000\"/>\
+             <rating><value>TV-PG</value></rating></programme></tv>",
+        );
+        let read = &guide.programmes[0];
+        assert!(read.sub_title.is_some() && read.still_image.is_some() && read.year.is_some());
+
+        let json = serde_json::to_string(read).expect("serialize");
+        let back: XmltvProgramme = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(&back, read);
+        assert_eq!(
+            back.start.map(|start| start.offset().to_string()),
+            Some("+01:00".to_owned())
+        );
+        assert!(!json.contains('\n'), "one programme is one line: {json}");
     }
 
     #[test]

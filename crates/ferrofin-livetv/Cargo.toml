@@ -34,10 +34,11 @@ encoding_rs.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
 uuid = { workspace = true, features = ["v5"] }
+# A guide write sets the airings it reads aside in an anonymous file.
+tempfile.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
-tempfile.workspace = true
 # Paused-clock tests (the XMLTV download timeout).
 tokio = { workspace = true, features = ["test-util"] }
 # The real user manager, for the EnabledUsers test (no cycle: core does not depend on livetv).
