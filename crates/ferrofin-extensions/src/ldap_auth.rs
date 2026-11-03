@@ -12,10 +12,11 @@
 //!   `ldap3` by [`directory::Ldap3Directory`];
 //! - [`LdapAuthService`] — `POST /Ldap/TestServerBind`
 //!   (`LdapController.TestServerBind`), which stays in `ferrofin-api` as a thin
-//!   handler over the [`LdapManager`] trait.
-//!
-//! Sign-in is not part of this yet: the extension contributes no
-//! authentication provider, so `GET /Auth/Providers` does not list it.
+//!   handler over the [`LdapManager`] trait;
+//! - [`provider::LdapAuthProvider`] — sign-in
+//!   (`LdapAuthenticationProviderPlugin.Authenticate`), the authentication
+//!   provider the extension contributes, listed by `GET /Auth/Providers` while
+//!   the plugin is enabled and names a server.
 //!
 //! Accepted divergences from the C# (see `docs/PLUGINS_UPSTREAM.md`):
 //! - The plugin is **disabled by default**, and `LdapServer` seeds empty
@@ -46,6 +47,7 @@
 //!   count is the same, without every entry's attributes on the wire.
 
 pub mod directory;
+pub mod provider;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -58,6 +60,7 @@ use ferrofin_model::secret::Secret;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::ldap::LdapManager;
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_traits::security::AuthenticationManager;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
@@ -622,6 +625,38 @@ async fn run_server_test(
     outcome
 }
 
+/// Why stored bytes are not a configuration, without the value that failed:
+/// a type mismatch's message quotes the value (``invalid type: integer
+/// `12345` ``), which for `LdapBindPassword` is the bind password (LOGGING.md,
+/// rule 5). Only the kind of error is kept, with its position in the
+/// configuration as the plugin manager serves it (compact JSON, so not the
+/// file's own lines).
+pub(crate) fn config_error(error: &serde_json::Error) -> String {
+    format!(
+        "{:?} error at line {} column {}",
+        error.classify(),
+        error.line(),
+        error.column()
+    )
+}
+
+/// A bind as Novell's `LdapConnection.Bind(dn, password)` sends it: the DN
+/// trimmed, and an empty password an anonymous bind with an empty DN, after
+/// which Novell reports `Bound` false.
+pub(crate) async fn novell_bind(
+    connection: &mut dyn LdapConnection,
+    dn: &str,
+    password: &str,
+) -> Result<(), LdapError> {
+    if password.is_empty() {
+        connection.simple_bind("", "").await
+    } else {
+        let dn = dn.trim();
+        tracing::debug!(bind_dn = ?dn, "LDAP bind");
+        connection.simple_bind(dn, password).await
+    }
+}
+
 /// The bind and base-search steps of the connection test.
 async fn bind_and_count(
     connection: &mut dyn LdapConnection,
@@ -629,18 +664,16 @@ async fn bind_and_count(
     response: &mut ServerTestResponse,
 ) -> Result<(), LdapError> {
     response.bind = Some(TESTING.to_owned());
-    // Novell's `Bind` trims the DN, and an empty password makes the bind
-    // anonymous, with an empty DN; `Bound` is then false.
     let password = config.ldap_bind_password.expose();
-    if password.is_empty() {
-        connection.simple_bind("", "").await?;
-        response.bind = Some(ANONYMOUS.to_owned());
-    } else {
-        let dn = config.ldap_bind_user.trim();
-        tracing::debug!(bind_dn = ?dn, "testing the LDAP bind");
-        connection.simple_bind(dn, password).await?;
-        response.bind = Some(SUCCESS.to_owned());
-    }
+    novell_bind(connection, &config.ldap_bind_user, password).await?;
+    response.bind = Some(
+        if password.is_empty() {
+            ANONYMOUS
+        } else {
+            SUCCESS
+        }
+        .to_owned(),
+    );
 
     response.base_search = Some(TESTING.to_owned());
     let found = connection
@@ -691,8 +724,12 @@ impl LdapAuthService {
     /// configuration.
     pub async fn config(&self) -> Result<LdapConfig, ServiceError> {
         let bytes = self.plugins.get_plugin_configuration(EXTENSION_ID).await?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| ServiceError::backend(format!("read the LDAP-Auth configuration: {e}")))
+        serde_json::from_slice(&bytes).map_err(|e| {
+            ServiceError::backend(format!(
+                "read the LDAP-Auth configuration: {}",
+                config_error(&e)
+            ))
+        })
     }
 
     /// Saves `config` as the plugin's configuration.
@@ -770,6 +807,18 @@ impl Extension for LdapAuthExtension {
             bytes: include_bytes!(concat!(env!("OUT_DIR"), "/ldapauth/configPage.html")).to_vec(),
             enable_in_main_menu: false,
         }]
+    }
+
+    /// The sign-in provider, over the context's plugin manager, users and
+    /// identity links and a real directory client. It gates itself on the
+    /// plugin's enabled flag and a configured server.
+    fn auth_providers(&self, cx: &ExtensionContext) -> Vec<Arc<dyn AuthenticationManager>> {
+        vec![Arc::new(provider::LdapAuthProvider::new(
+            Arc::clone(&cx.plugins),
+            Arc::clone(&cx.users),
+            Arc::clone(&cx.external_identities),
+            Arc::new(directory::Ldap3Directory::default()),
+        ))]
     }
 
     fn tasks(&self, _cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>> {
