@@ -3087,36 +3087,42 @@ mod tests {
     /// structure change, while the next one may already be running.
     #[tokio::test]
     async fn a_listing_during_a_structure_change_leaves_the_library_row_to_it() {
+        use ferrofin_traits::persistence::ItemRepository as _;
         let (tmp, db, mgr) = manager_with_store().await;
-        let rows = || async {
-            sqlx::query_scalar::<_, i64>(
-                r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Type" LIKE '%CollectionFolder'"#,
-            )
-            .fetch_one(db.pool())
-            .await
-            .expect("count")
-        };
+        let items = crate::item_repository::FerrofinItemRepository::new(
+            db,
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
         let change = mgr.structure_change.write().await;
-        std::fs::create_dir_all(tmp.path().join("default").join("Movies")).expect("folder");
+        let folder = tmp.path().join("default").join("Movies");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let id = mgr.collection_folder_id(&folder).expect("id");
+        let row = || async { items.retrieve_item(id).await.expect("read").is_some() };
 
         let listed = mgr.get_virtual_folders().await.expect("list");
         assert_eq!(listed.len(), 1, "the folder is listed");
-        assert_eq!(rows().await, 0, "no row written mid-change");
+        assert!(!row().await, "no row written mid-change");
 
         drop(change);
         // Another listing's heal under way does not hold this one back.
         let _other_listing = mgr.structure_change.read().await;
         mgr.get_virtual_folders().await.expect("list");
-        assert_eq!(rows().await, 1, "the next listing heals the row");
+        assert!(row().await, "the next listing heals the row");
     }
 
     /// A media-path change records the library's locations on its row before
-    /// it returns, with no listing in between: access checks and views read
-    /// them from the row, and nothing else lists the libraries right after a
-    /// change now that the library monitor restarts on its own task.
+    /// it returns, with no listing in between, and marks the library's refresh
+    /// required, as the listing's heal did: access checks and views read the
+    /// locations from the row, and nothing else lists the libraries right
+    /// after a change now that the library monitor restarts on its own task.
     #[tokio::test]
     async fn a_media_path_change_records_the_rows_locations_before_it_returns() {
+        use ferrofin_traits::persistence::ItemRepository as _;
         let (tmp, db, mgr) = manager_with_store().await;
+        let items = crate::item_repository::FerrofinItemRepository::new(
+            db,
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
         let (first, second) = (media_dir(&tmp, "first"), media_dir(&tmp, "second"));
         mgr.add_virtual_folder(
             "Movies",
@@ -3125,23 +3131,24 @@ mod tests {
         )
         .await
         .expect("add");
+        let id = mgr
+            .collection_folder_id(&tmp.path().join("default").join("Movies"))
+            .expect("id");
         let recorded = || async {
-            let data: String = sqlx::query_scalar(
-                r#"SELECT "Data" FROM "BaseItems" WHERE "Type" LIKE '%CollectionFolder'"#,
-            )
-            .fetch_one(db.pool())
-            .await
-            .expect("row");
-            let data: serde_json::Value = serde_json::from_str(&data).expect("json");
-            data["PhysicalLocationsList"]
-                .as_array()
-                .expect("locations")
-                .iter()
-                .filter_map(|location| location.as_str().map(str::to_owned))
-                .filter(|location| *location == first || *location == second)
-                .collect::<Vec<_>>()
+            let row = items.retrieve_item(id).await.expect("read").expect("row");
+            let mut locations: Vec<String> =
+                crate::item_data::stored_physical_locations(row.data.as_deref())
+                    .into_iter()
+                    .filter(|location| *location == first || *location == second)
+                    .collect();
+            locations.sort();
+            locations
         };
-        assert_eq!(recorded().await, [first.clone()]);
+        assert_eq!(recorded().await, std::slice::from_ref(&first));
+        assert!(
+            !mgr.take_library_requires_refresh(id),
+            "a new library is refreshed for the first time"
+        );
 
         mgr.add_media_path(
             "Movies",
@@ -3151,19 +3158,25 @@ mod tests {
         )
         .await
         .expect("add path");
-        let mut both = recorded().await;
-        both.sort();
         let mut want = vec![first.clone(), second.clone()];
         want.sort();
-        assert_eq!(both, want, "the added path is recorded");
+        assert_eq!(recorded().await, want, "the added path is recorded");
+        assert!(
+            mgr.take_library_requires_refresh(id),
+            "the change requires the library's refresh"
+        );
 
         mgr.remove_media_path("Movies", &first)
             .await
             .expect("remove path");
         assert_eq!(
             recorded().await,
-            [second.clone()],
+            std::slice::from_ref(&second),
             "the removed path is gone"
+        );
+        assert!(
+            mgr.take_library_requires_refresh(id),
+            "the removal requires the library's refresh too"
         );
     }
 
@@ -3784,7 +3797,9 @@ mod tests {
             .await
             .expect("record");
 
-        // The next listing after a structural change records them again.
+        // A row recorded another way (a hand edit, an earlier version) is
+        // recorded again by the first listing after a restart (here, once its
+        // setup is forgotten).
         mgr.forget_setup(&folder);
         mgr.get_virtual_folders().await.expect("list");
         assert_eq!(mgr.take_library_requires_refresh(id), required);
