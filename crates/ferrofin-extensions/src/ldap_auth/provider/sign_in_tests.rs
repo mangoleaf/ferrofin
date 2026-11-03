@@ -43,6 +43,17 @@ struct State {
     bind: HashMap<String, LdapError>,
     /// Failures for a search with one of these filters.
     failing_filters: HashMap<String, LdapError>,
+    /// The root DSE's `supportedExtension` values, or the failure reading it
+    /// answers with.
+    extensions: Vec<String>,
+    root_dse: Option<LdapError>,
+    /// Connections past this many are refused.
+    refuse_connections_after: Option<usize>,
+    /// The failure a password write answers with instead.
+    write: Option<LdapError>,
+    /// Every password written, as `(dn, how, value)`: `how` is
+    /// `passwordModify` or the attribute replaced.
+    writes: Vec<(String, String, String)>,
     // The calls.
     connects: usize,
     binds: Vec<(String, String)>,
@@ -66,13 +77,31 @@ impl FakeDirectory {
         state.binds.clear();
         state.searches.clear();
         state.unbinds = 0;
+        state.writes.clear();
     }
 
     /// Whether anything reached the directory since the last
     /// [`clear_calls`](Self::clear_calls).
     fn untouched(&self) -> bool {
         let state = self.state();
-        state.connects == 0 && state.binds.is_empty() && state.searches.is_empty()
+        state.connects == 0
+            && state.binds.is_empty()
+            && state.searches.is_empty()
+            && state.writes.is_empty()
+    }
+
+    /// Records a password write and, unless it is scripted to fail, makes the
+    /// directory take the new password for `dn`.
+    fn write(&self, dn: &str, how: &str, value: &str) -> Result<(), LdapError> {
+        let mut state = self.state();
+        state
+            .writes
+            .push((dn.to_owned(), how.to_owned(), value.to_owned()));
+        if let Some(error) = &state.write {
+            return Err(error.clone());
+        }
+        state.accounts.insert(dn.to_owned(), value.to_owned());
+        Ok(())
     }
 }
 
@@ -86,6 +115,12 @@ impl LdapDirectory for FakeDirectory {
         state.connects += 1;
         if let Some(error) = &state.connect {
             return Err(error.clone());
+        }
+        if state
+            .refuse_connections_after
+            .is_some_and(|allowed| state.connects > allowed)
+        {
+            return Err(LdapError::Connect("connection refused".to_owned()));
         }
         Ok(Box::new(self.clone()))
     }
@@ -143,23 +178,28 @@ impl LdapConnection for FakeDirectory {
 
     async fn modify_replace(
         &mut self,
-        _dn: &str,
-        _attribute: &str,
-        _values: &[&str],
+        dn: &str,
+        attribute: &str,
+        values: &[&str],
     ) -> Result<(), LdapError> {
-        Err(LdapError::Connection("not scripted".to_owned()))
+        assert_eq!(values.len(), 1, "a password write sets one value");
+        self.write(dn, attribute, values[0])
     }
 
     async fn password_modify(
         &mut self,
-        _user_dn: &str,
-        _new_password: &str,
+        user_dn: &str,
+        new_password: &str,
     ) -> Result<(), LdapError> {
-        Err(LdapError::Connection("not scripted".to_owned()))
+        self.write(user_dn, "passwordModify", new_password)
     }
 
     async fn supported_extensions(&mut self) -> Result<Vec<String>, LdapError> {
-        Err(LdapError::Connection("not scripted".to_owned()))
+        let state = self.state();
+        match &state.root_dse {
+            Some(error) => Err(error.clone()),
+            None => Ok(state.extensions.clone()),
+        }
     }
 
     async fn unbind(&mut self) {
@@ -1177,3 +1217,4 @@ fn the_user_search_filter_is_built_as_upstream_builds_it(
 }
 
 mod admin_filter_tests;
+mod password_tests;
