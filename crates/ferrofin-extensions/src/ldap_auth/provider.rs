@@ -6,8 +6,11 @@
 //! A sign-in finds the user's directory entry as the bind DN, finds or
 //! relinks the Ferrofin user it belongs to (by LDAP uid through the
 //! external-identity store, then by name for a user LDAP-Auth already owns),
-//! checks the password by binding as the entry, then creates the user or
-//! follows a directory rename.
+//! checks the password by binding as the entry, asks the admin filter whether
+//! the user is an administrator, then creates the user or follows a directory
+//! rename. The administrator flag goes back to the user manager in
+//! [`ProviderAuthenticationResult::administrator`], which applies it and never
+//! demotes the last administrator (D5).
 //!
 //! Accepted divergences from the C# (see `docs/PLUGINS_UPSTREAM.md`):
 //! - **An empty password is refused before any connection.** Novell's client
@@ -21,9 +24,17 @@
 //!   not). The bind counts as refused only for the result codes that refuse
 //!   credentials ([`REFUSED_BIND`]). A directory that cannot be reached,
 //!   times out, fails the bind with another code, refuses the configured bind
-//!   DN, fails the search or refers it elsewhere is a server error, which the
-//!   user manager does not count toward lockout. Upstream answers each with
-//!   an `AuthenticationException`.
+//!   DN, fails the user search or the admin filter's, or refers the user
+//!   search elsewhere is a server error, which the user manager does not
+//!   count toward lockout. Upstream answers each with an
+//!   `AuthenticationException`.
+//! - **The last administrator is never demoted by the admin filter** (D5):
+//!   the user manager keeps them one and logs a warning, and the sign-in
+//!   succeeds. Upstream demotes them.
+//! - **An entry without the username attribute fails with a `400` whenever
+//!   the name is needed**: to apply the admin filter, or to create or rename
+//!   the user. Upstream's `SanitizeFilter` throws on the null name, a `500`,
+//!   while the admin filter is on.
 //! - **A name that finds another account's entry is refused.** When the name
 //!   signed in with is a Ferrofin user's, the entry must belong to that user.
 //!   Upstream signs in the user the name named whichever entry the search
@@ -60,8 +71,8 @@ use ferrofin_util::string_extensions::replace_ignore_ascii_case;
 use uuid::Uuid;
 
 use super::{
-    ConnectionOptions, EXTENSION_ID, LdapConfig, LdapConnection, LdapDirectory, LdapEntry,
-    LdapError, SearchScope, config_error, novell_bind,
+    BoundSearchError, ConnectionOptions, EXTENSION_ID, LdapConfig, LdapDirectory, LdapEntry,
+    LdapError, NO_ATTRIBUTES, config_error, novell_bind, search_as_bind_dn,
 };
 
 /// The id LDAP-Auth's users store as their `AuthenticationProviderId` and
@@ -79,7 +90,7 @@ const USERNAME_PLACEHOLDER: &str = "{username}";
 const INVALID_LOGIN: &str = "Error completing LDAP login. Invalid username or password.";
 
 /// Upstream's message when the search finds no entry.
-const NO_MATCH: &str = "Found no LDAP users matching provided username.";
+pub(crate) const NO_MATCH: &str = "Found no LDAP users matching provided username.";
 
 /// The RFC 4511 result codes with which a directory refuses a bind's
 /// credentials, rather than failing to serve it: `constraintViolation` (19, a
@@ -126,6 +137,64 @@ pub fn user_search_filter(config: &LdapConfig, username: &str) -> String {
     built
 }
 
+/// The filter the admin filter searches with at sign-in for the entry whose
+/// username attribute is `ldap_username`: `LdapAdminFilter` with every
+/// `{username}` replaced (ignoring case) by the name escaped with
+/// [`sanitize_filter`], as upstream's `Authenticate` builds it.
+#[must_use]
+pub fn admin_search_filter(config: &LdapConfig, ldap_username: &str) -> String {
+    replace_ignore_ascii_case(
+        &config.ldap_admin_filter,
+        USERNAME_PLACEHOLDER,
+        &sanitize_filter(ldap_username),
+    )
+}
+
+/// `LocateLdapUser`: searches the base DN's subtree as the configured bind DN
+/// with [`user_search_filter`] for `[LdapUsernameAttribute, LdapUidAttribute]`
+/// and returns the first entry, warning when there are more, or `None` when
+/// none matches. A search that found no entry but referred elsewhere is a
+/// failed search: the references are not followed yet (TODO(gl-1148)).
+pub(crate) async fn locate_ldap_user(
+    directory: &dyn LdapDirectory,
+    config: &LdapConfig,
+    username: &str,
+) -> Result<Option<LdapEntry>, BoundSearchError> {
+    let filter = user_search_filter(config, username);
+    tracing::debug!(base_dn = ?config.ldap_base_dn, filter = ?filter, "LDAP user search");
+    let mut found = search_as_bind_dn(
+        directory,
+        config,
+        &config.ldap_base_dn,
+        &filter,
+        &[
+            config.ldap_username_attribute.as_str(),
+            config.ldap_uid_attribute.as_str(),
+        ],
+    )
+    .await?;
+    if found.entries.is_empty() {
+        if !found.references.is_empty() {
+            // TODO(gl-1148): follow referrals with the bind credentials, as
+            // upstream's `LdapAuthHandler` does.
+            return Err(BoundSearchError::Search(LdapError::Referral(
+                found.references,
+            )));
+        }
+        tracing::debug!(username = ?username, "no LDAP entry matches the sign-in name");
+        return Ok(None);
+    }
+    if found.entries.len() > 1 {
+        tracing::warn!(
+            username = ?username,
+            "more than one LDAP result matched; using first result only"
+        );
+    }
+    let entry = found.entries.swap_remove(0);
+    tracing::debug!(username = ?username, dn = ?entry.dn, "found the LDAP entry");
+    Ok(Some(entry))
+}
+
 /// The first value of `entry`'s attribute `name` as text (Novell's
 /// `LdapAttribute.StringValue`), or `None` with upstream's warning when the
 /// entry lacks it.
@@ -144,6 +213,16 @@ fn attribute_text(entry: &LdapEntry, name: &str) -> Option<String> {
 /// the user's lockout (D4).
 fn outage(step: &str, error: &LdapError) -> ServiceError {
     ServiceError::backend(format!("LDAP sign-in could not {step}: {error}"))
+}
+
+/// The [`outage`] for a search as the configured bind DN that failed at the
+/// connection, the bind, or the search the sign-in calls `search_step`.
+fn search_outage(search_step: &str, error: &BoundSearchError) -> ServiceError {
+    match error {
+        BoundSearchError::Connect(error) => outage("connect", error),
+        BoundSearchError::Bind(error) => outage("bind as the configured bind DN", error),
+        BoundSearchError::Search(error) => outage(search_step, error),
+    }
 }
 
 /// The LDAP-Auth authentication provider. Reads the plugin's enabled flag
@@ -234,44 +313,69 @@ impl LdapAuthProvider {
         }
     }
 
-    /// `ConnectToLdap()` then `LocateLdapUser`: binds as the configured bind
-    /// DN, searches the base DN's subtree with [`user_search_filter`] and
-    /// returns the first entry, warning when there are more.
+    /// `LocateLdapUser` ([`locate_ldap_user`]) at sign-in: no matching entry
+    /// is upstream's `401`, and a directory that fails is a server error.
     async fn locate_user(
         &self,
         config: &LdapConfig,
         username: &str,
     ) -> Result<LdapEntry, ServiceError> {
-        let options = ConnectionOptions::from_config(config);
-        let mut connection = self
-            .directory
-            .connect(&options)
+        locate_ldap_user(self.directory.as_ref(), config, username)
             .await
-            .map_err(|error| outage("connect", &error))?;
-        let found = search_user(connection.as_mut(), config, username).await;
-        connection.unbind().await;
-        let mut found = found?;
-        if found.entries.is_empty() {
-            if !found.references.is_empty() {
-                // TODO(gl-1148): follow referrals with the bind credentials,
-                // as upstream's `LdapAuthHandler` does.
-                return Err(outage(
-                    "search the directory",
-                    &LdapError::Referral(found.references),
-                ));
-            }
-            tracing::debug!(username = ?username, "no LDAP entry matches the sign-in name");
-            return Err(ServiceError::unauthorized(NO_MATCH));
+            .map_err(|error| search_outage("search the directory", &error))?
+            .ok_or_else(|| ServiceError::unauthorized(NO_MATCH))
+    }
+
+    /// Whether the admin filter makes the user whose entry is `entry` an
+    /// administrator: upstream's admin block in `Authenticate`, or `None`
+    /// while the filter is off (see [`LdapConfig::admin_filter_enabled`]).
+    ///
+    /// It searches as the configured bind DN, on a connection of its own,
+    /// [`LdapConfig::admin_base_dn`]'s subtree with [`admin_search_filter`].
+    /// With `EnableLdapAdminFilterMemberUid` any entry found makes the user an
+    /// administrator; otherwise one of them must be the user's own entry (the
+    /// DNs compared ordinally).
+    async fn administrator(
+        &self,
+        config: &LdapConfig,
+        entry: &LdapEntry,
+        ldap_username: Option<&str>,
+    ) -> Result<Option<bool>, ServiceError> {
+        if !config.admin_filter_enabled() {
+            return Ok(None);
         }
-        if found.entries.len() > 1 {
-            tracing::warn!(
-                username = ?username,
-                "more than one LDAP result matched; using first result only"
+        // Upstream's `SanitizeFilter` throws on a null name: see the module's
+        // divergences.
+        let name = ldap_username.ok_or_else(|| no_username(config))?;
+        let filter = admin_search_filter(config, name);
+        tracing::debug!(base_dn = ?config.admin_base_dn(), filter = ?filter, "LDAP admin filter search");
+        let found = search_as_bind_dn(
+            self.directory.as_ref(),
+            config,
+            config.admin_base_dn(),
+            &filter,
+            &[NO_ATTRIBUTES],
+        )
+        .await
+        .map_err(|error| search_outage("apply the admin filter", &error))?;
+        if !found.references.is_empty() {
+            // TODO(gl-1148): follow them with the bind credentials, as
+            // upstream's referral handler does. Until then the entries sent
+            // decide: failing instead would refuse every user who is not an
+            // administrator wherever a search returns references, as Active
+            // Directory's do at a domain root.
+            tracing::debug!(
+                references = ?found.references,
+                "the admin filter's search referred elsewhere; the references are not followed"
             );
         }
-        let entry = found.entries.swap_remove(0);
-        tracing::debug!(username = ?username, dn = ?entry.dn, "found the LDAP entry");
-        Ok(entry)
+        let administrator = if config.enable_ldap_admin_filter_member_uid {
+            !found.entries.is_empty()
+        } else {
+            found.entries.iter().any(|admin| admin.dn == entry.dn)
+        };
+        tracing::debug!(dn = ?entry.dn, administrator, "applied the LDAP admin filter");
+        Ok(Some(administrator))
     }
 
     /// `ConnectToLdap(userDn, password)`: a connection of its own, bound as
@@ -357,35 +461,6 @@ impl LdapAuthProvider {
     }
 }
 
-/// Binds as the configured bind DN and runs the user search on `connection`.
-async fn search_user(
-    connection: &mut dyn LdapConnection,
-    config: &LdapConfig,
-    username: &str,
-) -> Result<super::SearchOutcome, ServiceError> {
-    novell_bind(
-        connection,
-        &config.ldap_bind_user,
-        config.ldap_bind_password.expose(),
-    )
-    .await
-    .map_err(|error| outage("bind as the configured bind DN", &error))?;
-    let filter = user_search_filter(config, username);
-    tracing::debug!(base_dn = ?config.ldap_base_dn, filter = ?filter, "LDAP user search");
-    connection
-        .search(
-            &config.ldap_base_dn,
-            SearchScope::Subtree,
-            &filter,
-            &[
-                config.ldap_username_attribute.as_str(),
-                config.ldap_uid_attribute.as_str(),
-            ],
-        )
-        .await
-        .map_err(|error| outage("search the directory", &error))
-}
-
 /// The error for a directory entry without the username attribute: upstream
 /// creates or renames the user with a null name, which throws an
 /// `ArgumentException`, a `400`.
@@ -447,6 +522,9 @@ impl AuthenticationManager for LdapAuthProvider {
         }
 
         self.bind_as_user(&config, &entry.dn, password).await?;
+        let administrator = self
+            .administrator(&config, &entry, ldap_username.as_deref())
+            .await?;
 
         let Some(FoundUser { user, needs_link }) = found else {
             if !config.create_users_from_ldap {
@@ -477,6 +555,9 @@ impl AuthenticationManager for LdapAuthProvider {
             self.link(&created.id, &uid).await?;
             return Ok(ProviderAuthenticationResult {
                 username: name,
+                // Upstream sets the flag on every user it creates, `false`
+                // while the filter is off.
+                administrator: Some(administrator.unwrap_or(false)),
                 ..ProviderAuthenticationResult::default()
             });
         };
@@ -500,6 +581,9 @@ impl AuthenticationManager for LdapAuthProvider {
         }
         Ok(ProviderAuthenticationResult {
             username: name,
+            // The manager applies it: a provider saving the policy here would
+            // wait forever on the login lock the manager holds.
+            administrator,
             ..ProviderAuthenticationResult::default()
         })
     }

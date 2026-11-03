@@ -20,7 +20,7 @@ Conventions:
 | Intro Skipper | https://github.com/intro-skipper/intro-skipper | `db09359` | 10.11/prerelease | ported |
 | File Transformation | https://github.com/IAmParadox27/jellyfin-plugin-file-transformation | `f4f01c3` | 2.5.10.0 | ported |
 | Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
-| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, `TestServerBind` and sign-in (milestone "LDAP-Auth plugin port") |
+| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, its three test routes, sign-in and the admin filter (milestone "LDAP-Auth plugin port") |
 
 ## Per-plugin notes
 
@@ -201,7 +201,7 @@ Conventions:
 
 ### LDAP-Auth
 - Ferrofin files: `crates/ferrofin-extensions/src/ldap_auth.rs` (the extension, the
-  configuration, the `LdapDirectory` seam, `TestServerBind` and its service),
+  configuration, the `LdapDirectory` seam, the settings page's three tests and their service),
   `ldap_auth/directory.rs` (the `ldap3` client and its rustls configuration) and
   `ldap_auth/provider.rs` (the sign-in provider), vendored
   assets `crates/ferrofin-extensions/assets/ldapauth/`, the trait seam
@@ -246,12 +246,41 @@ Conventions:
   null name throws an `ArgumentException`. The provider is enabled only with the plugin and a
   server (D3);
   upstream's `IsEnabled` is always `true`. `ChangePassword` with `AllowPassChange` off is
-  upstream's `NotImplementedException`, a `500`. The admin filter, password changes and
-  resets, profile images, referrals and the `LDAP-Auth.xml` import are later phases of the
-  milestone.
-- `POST /Ldap/TestServerBind` is the plugin's own controller, not a contract operation, so it
-  is in `handlers::PLUGIN_ROUTES` (matched ignoring case, as the page calls
-  `ldap/TestServerBind`) and has no `handlers::VERIFIED` row; this section is its record.
+  upstream's `NotImplementedException`, a `500`. Password changes and resets, profile
+  images, referrals and the `LDAP-Auth.xml` import are later phases of the milestone.
+- Admin filter (v24, `d11c86a`): the admin block of `Authenticate`. While `LdapAdminFilter` is
+  neither empty nor `_disabled_` (ordinal), after the password is checked the bind DN searches,
+  on a connection of its own, the subtree of `LdapAdminBaseDn` (the base DN when that is empty)
+  with the filter's `{username}` replaced, ignoring case, by the entry's username attribute
+  escaped as `SanitizeFilter` does. With `EnableLdapAdminFilterMemberUid` any entry found makes
+  the user an administrator; otherwise one of them must be the user's entry (DNs compared
+  ordinally). A new user gets the flag at creation (`false` while the filter is off, as upstream
+  sets it); a returning user's flag follows it at each sign-in, and is left alone while the
+  filter is off. The provider reports the flag in `ProviderAuthenticationResult.administrator`
+  and the user manager applies it, because the login lock it holds does not nest.
+- `LdapController.TestLdapFilters` with `GetFilteredUsers` (v24, `d11c86a`): the body
+  (`UserFilterInfo`) is saved into the configuration first, then the bind DN counts the distinct
+  DNs `LdapSearchFilter` finds in the base DN's subtree and, while the admin filter is on, those
+  `LdapAdminFilter` finds, answering `LdapFilterResponse` (`Users`, `Admins`, `IsSubset`). As
+  upstream, both filters are used as written (no `{username}` replaced) and both search the base
+  DN, not `LdapAdminBaseDn`; an empty filter is Novell's `(objectclass=*)`. A directory that
+  cannot be reached or refuses the bind DN is a `401` with `Failed to Connect or Bind to
+  server.`; a search it fails, a filter that does not parse included, is a `400` with `User
+  Filter: ` or `Admin Filter: ` before the reason, each as `LdapTestErrorResponse`
+  (`{"Message": …}`).
+- `LdapController.LdapUserSearch` with `LocateLdapUser` (v24, `d11c86a`): the body
+  (`UserSearchAttributes`) saves `LdapSearchAttributes`, then, for a `TestSearchUsername` that
+  is not empty, answers `UserSearchResponse` with the `LocatedDn` of the entry the name signs in
+  as (the sign-in's own search); with no name, `{}`. A directory that cannot be reached or
+  refuses the bind DN, a search it fails, and no matching entry are each a `401` with upstream's
+  message (`Failed to Connect or Bind to server.`, `Error completing LDAP login while applying
+  user filter.`, `Found no LDAP users matching provided username.`).
+- `POST /Ldap/TestServerBind`, `/Ldap/TestLdapFilters` and `/Ldap/LdapUserSearch` are the
+  plugin's own controller, not contract operations, so they are in `handlers::PLUGIN_ROUTES`
+  (matched ignoring case, as the page calls `ldap/TestServerBind` and the others so) and have no
+  `handlers::VERIFIED` row; this section is their record. All three are administrators only
+  (`RequiresElevation`), answer `404` while the plugin is disabled, and refuse a body that does
+  not bind with ASP.NET's validation problem.
 - Accepted divergences (do NOT "fix" during sync):
   - **An empty password is refused before any connection.** Novell's client turns it into an
     anonymous bind, which upstream then refuses as not `Bound` (kept too, at the user's bind);
@@ -266,10 +295,35 @@ Conventions:
     `inappropriateAuthentication` (48), `invalidCredentials` (49), `insufficientAccessRights`
     (50) and `unwillingToPerform` (53). A directory that cannot be reached, does not answer
     within the D6 timeouts, fails the user's bind with any other code (`busy`, `unavailable`,
-    `other`, …), refuses the configured bind DN, fails the search, or refers it elsewhere with
-    no entry, is a `500` that is not counted, and other users' sign-ins go on. Upstream answers
-    each with an `AuthenticationException`, a counted `401`. Ferrofin's login backoff still
-    counts such an attempt for pacing, as it counts every attempt that does not succeed.
+    `other`, …), refuses the configured bind DN, fails the user search or the admin filter's
+    search, or refers the user search elsewhere with no entry, is a `500` that is not counted,
+    and other users' sign-ins go on. Upstream answers each with an `AuthenticationException`, a
+    counted `401` (`Error completing LDAP login while applying admin filter.` for the admin
+    filter's search). Ferrofin's login backoff still counts such an attempt for pacing, as it
+    counts every attempt that does not succeed.
+  - **The admin filter never demotes the last administrator** (owner decision D5): removed
+    from the directory's administrators while no other administrator exists, the user signs in,
+    stays one, and the server logs a warning. With two or more the filter demotes as upstream
+    does. The user manager reads the count in the transaction that writes the flag.
+  - **An entry without the username attribute is a `400` while the admin filter is on**, as it
+    is when the user is created or renamed. Upstream's `SanitizeFilter` throws a
+    `NullReferenceException` on the null name first, a `500`.
+  - **The filter test keeps the saved `EnableLdapAdminFilterMemberUid` when the body leaves it
+    out** (a Jellyfin bug not ported). Upstream saves the missing member as `false`, and its own
+    settings page never sends it, so pressing "Test filters" there turns member-uid mode off
+    until the page is saved again, and the admin filter then demotes the administrators it found
+    through a group. A body that sends it still sets it, and a `null` does not bind, as a C#
+    `bool` refuses it.
+  - **A filter the directory client cannot parse** is reported as `User Filter: Filter Error`
+    (or `Admin Filter: …`): `ldap3` gives no reason. Upstream pulls Novell's parser message out of
+    the exception text with a regex.
+  - **Search references are not followed yet** by the filter test or the admin filter's search,
+    which read only the entries the directory sent: TODO(gl-1148). Upstream follows them with
+    the bind credentials (`LdapAuthHandler`). Until then an administrator whose entry (or group)
+    only a referred server holds is not found, and the filter demotes them unless they are the
+    last one; failing the sign-in instead would refuse every other user wherever a search returns
+    references, as Active Directory's do at a domain root. A user search that found no entry but
+    a reference is a failed search, as at sign-in.
   - **A name that finds another account's entry is refused** (a counted `401`). When the name
     signed in with is a Ferrofin user's, the entry the search found must be that user's (by
     its uid link, or by name). Upstream signs in the user the name named with whichever entry
@@ -317,10 +371,11 @@ Conventions:
     `Invalid Credentials`) with the server's diagnostic, or the transport's own message
     (rustls' certificate errors, `could not connect to host:port within 5 seconds`, `the
     directory closed the connection: …`). Upstream reports the Novell exception's message.
-  - **The base search asks for no attributes** (`1.1`): the count it reports is the same,
-    without the directory sending every entry's attributes. A search reference fails the step
-    with Novell's `Search result reference received, and referral following is off`, as
-    upstream's iterator throws on one.
+  - **The base search asks for no attributes** (`1.1`), and neither do the filter test's
+    searches or the admin filter's at sign-in: they read only DNs, the same either way, without
+    the directory sending every entry's attributes. A search reference fails the connection
+    test's base search with Novell's `Search result reference received, and referral following
+    is off`, as upstream's iterator throws on one there.
   - **Certificate checks are webpki's** beyond the name and the trust anchor: X.509 v3
     certificates only, no SHA-1 signatures in a chain, the `serverAuth` extended key usage
     when the certificate lists any, and no revocation check (.NET checks revocation online,

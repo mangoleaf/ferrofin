@@ -14,7 +14,7 @@ use ferrofin_model::secret::Secret;
 use ferrofin_traits::external_identities::ExternalIdentity;
 use rstest::rstest;
 
-use super::super::{LdapAttribute, LdapAuthExtension, SearchOutcome};
+use super::super::{LdapAttribute, LdapAuthExtension, LdapConnection, SearchOutcome, SearchScope};
 use super::*;
 use crate::{Extension, registered_plugins};
 
@@ -35,10 +35,14 @@ struct State {
     /// What every search answers.
     entries: Vec<LdapEntry>,
     references: Vec<String>,
+    /// What a search with one of these filters answers instead.
+    by_filter: HashMap<String, SearchOutcome>,
     /// Failures to answer with instead.
     connect: Option<LdapError>,
     search: Option<LdapError>,
     bind: HashMap<String, LdapError>,
+    /// Failures for a search with one of these filters.
+    failing_filters: HashMap<String, LdapError>,
     // The calls.
     connects: usize,
     binds: Vec<(String, String)>,
@@ -121,8 +125,15 @@ impl LdapConnection for FakeDirectory {
             filter.to_owned(),
             attributes.iter().map(|a| (*a).to_owned()).collect(),
         ));
-        if let Some(error) = &state.search {
+        if let Some(error) = state
+            .search
+            .as_ref()
+            .or_else(|| state.failing_filters.get(filter))
+        {
             return Err(error.clone());
+        }
+        if let Some(outcome) = state.by_filter.get(filter) {
+            return Ok(outcome.clone());
         }
         Ok(SearchOutcome {
             entries: state.entries.clone(),
@@ -199,9 +210,11 @@ fn bob() -> LdapEntry {
     )
 }
 
-/// A configured plain-LDAP directory whose users are named by their uid.
+/// A configured plain-LDAP directory whose users are named by their uid, with
+/// the admin filter (on in upstream's defaults) off.
 fn config() -> LdapConfig {
     LdapConfig {
+        ldap_admin_filter: String::new(),
         ldap_server: "ldap.example".to_owned(),
         ldap_port: 389,
         use_ssl: false,
@@ -1162,3 +1175,5 @@ fn the_user_search_filter_is_built_as_upstream_builds_it(
     };
     assert_eq!(user_search_filter(&config, username), expected);
 }
+
+mod admin_filter_tests;

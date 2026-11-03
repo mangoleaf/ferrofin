@@ -802,6 +802,8 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
 pub const PLUGIN_ROUTES: &[(&str, &str, &str)] = &[
     // LDAP-Auth plugin (see handlers::ldap).
     ("post", "/Ldap/TestServerBind", "ldap-auth"),
+    ("post", "/Ldap/TestLdapFilters", "ldap-auth"),
+    ("post", "/Ldap/LdapUserSearch", "ldap-auth"),
 ];
 
 /// `(method, path, extension-id)` for every route owned by a **compiled-in
