@@ -31,12 +31,11 @@
 //! **Divergence (owner decision 2026-10-31, gl-737).** A Dolby Vision profile
 //! 8.1 AV1 title copied to jellyfin-web with its RPU did not render, although
 //! the browser plays the HDR10 base layer under it. So once a client has
-//! declared its range types,
-//! Ferrofin strips the RPU from every Dolby Vision stream it copies to a client
-//! that listed neither `DOVI` nor the stream's own range type
-//! ([`strips_dovi_for_a_client_without_dovi`]), where upstream plans no
-//! removal. The copy decision transcodes such a stream when this ffmpeg cannot
-//! strip it, or when the job's output takes no bitstream filter
+//! declared its range types, Ferrofin strips the RPU from every Dolby Vision
+//! stream it copies to a client that listed neither `DOVI` nor the stream's
+//! own range type ([`strips_dovi_for_a_client_without_dovi`]), where upstream
+//! plans no removal. The copy decision transcodes such a stream when this
+//! ffmpeg cannot strip it, or when the job's output takes no bitstream filter
 //! ([`video_bit_stream_filters_apply`]).
 
 use ferrofin_model::data::{VideoRange, VideoRangeType};
