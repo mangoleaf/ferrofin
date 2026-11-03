@@ -1,12 +1,14 @@
 //! Subtitles through a real ffmpeg, over HTTP: an embedded PGS track kept as
 //! PGS in a progressive transcode, an external `.sup` sidecar embedded, and
-//! burned into a seeked HLS segment, on the movie's clock; an ASS track
-//! burned in with the fonts its file ships, extracted into the cache; and an
-//! `.srt` sidecar embedded into a progressive stream that starts mid-file.
+//! burned into a seeked HLS segment, on the movie's clock, also on an ffmpeg
+//! the server knows no `-isync` for; an ASS track burned in with the fonts its
+//! file ships, extracted into the cache; and an `.srt` sidecar embedded into a
+//! progressive stream that starts mid-file.
 //!
 //! ffmpeg has no PGS encoder, so the subtitle is written here: display sets
 //! drawing a white box in the middle of a black picture ([`SHOWINGS`]).
-//! Needs `ffmpeg` 5.1 or later (with libx264) and `ffprobe` on `PATH`:
+//! Needs `ffmpeg` 5.1 or later (with libx264) and `ffprobe` on `PATH`; the
+//! older-ffmpeg case hides the version from the server instead:
 //!
 //! ```bash
 //! FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server --test subtitle_streams_ffmpeg
@@ -51,6 +53,31 @@ fn wrapper(root: &Path, name: &str, real: &Path) -> PathBuf {
         "#!/bin/sh\nprintf '%s %s\\n' '{name}' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
         log.display(),
         real.display()
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// Like [`wrapper`] for ffmpeg, but its `-version` banner is one the server
+/// cannot read (`ffmpeg version N-…`, as static and git builds print), so the
+/// server takes it for the oldest supported ffmpeg, without `-isync`.
+fn unread_version_wrapper(root: &Path, real: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = root.join("bin").join("ffmpeg");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let log = root.join("calls.log");
+    let real = real.display();
+    let script = format!(
+        "#!/bin/sh\nprintf '%s %s\\n' 'ffmpeg' \"$*\" >> '{}'\n\
+         for arg in \"$@\"; do\n\
+         if [ \"$arg\" = -version ]; then\n\
+         '{real}' -version | sed '1s/^ffmpeg version [^ ]*/ffmpeg version N-117000-g0123abcd/'\n\
+         exit 0\n\
+         fi\n\
+         done\n\
+         exec '{real}' \"$@\"\n",
+        log.display(),
     );
     std::fs::write(&path, script).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -815,4 +842,89 @@ async fn a_seeked_embed_of_a_text_sidecar_starts_every_stream_on_time() {
             assert!((duration - length).abs() < 0.05, "{case}: {cues:?}");
         }
     }
+}
+
+/// On an ffmpeg the server knows no `-isync` for (an unreadable version
+/// banner counts as the oldest supported), the `.sup` sidecar is read from its
+/// start on its own timestamps and moved back by the seek (gl-929). Embedded
+/// from 1 s, before its first cue, and from 9 s, its cues keep their times on
+/// the movie's clock; burned into the segment from 2 to 4 s the box shows from
+/// 3.5 s. Seeked instead, the sidecar lost its first display set there, and
+/// unsynced its cues came 3.5 s early.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_isync_a_bitmap_sidecar_stays_on_the_movies_clock() {
+    let Some((real_ffmpeg, real_ffprobe)) = tools() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let movies = root.join("media").join("movies");
+    generate_movie(&real_ffmpeg, &movies.join("Movie (2020)"));
+    let ffmpeg = unread_version_wrapper(root, &real_ffmpeg);
+    let ffprobe = wrapper(root, "ffprobe", &real_ffprobe);
+
+    let server = Server::boot(root, &ffmpeg, &ffprobe).await;
+    let movie = &server.the_only_movie_in(&movies).await;
+    let item = movie["Id"].as_str().expect("the movie was scanned");
+    let source = &movie["MediaSources"][0];
+    let source_id = source["Id"].as_str().unwrap();
+    let sidecar = source["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["Type"] == "Subtitle" && s["IsExternal"] == true)
+        .unwrap_or_else(|| panic!("the .sup sidecar in {source}"))["Index"]
+        .as_i64()
+        .unwrap();
+
+    // The width cap re-encodes the video, which then starts exactly at the
+    // seek; the first box shows at 3.5 s, the second at 10.5 s.
+    for (start, first_cue) in [(1, 2.5), (9, 1.5)] {
+        let body = server
+            .download(&format!(
+                "/Videos/{item}/stream.mkv?mediaSourceId={source_id}&static=false\
+                 &videoCodec=h264&audioCodec=aac&maxWidth=160&startTimeTicks={start}0000000\
+                 &playSessionId=old-embed-{start}&subtitleStreamIndex={sidecar}\
+                 &subtitleMethod=Embed"
+            ))
+            .await;
+        let output = root.join(format!("old-embed-{start}.mkv"));
+        std::fs::write(&output, body).unwrap();
+        let video = packets(&real_ffprobe, &output, "v")[0].0;
+        let first = first_subtitle_time(&real_ffprobe, &output);
+        assert!(video.abs() < 0.2, "from {start} s: video at {video}");
+        assert!(
+            (first - first_cue).abs() < 0.05,
+            "from {start} s: first cue at {first}"
+        );
+    }
+
+    let body = server
+        .download(&format!(
+            "/Videos/{item}/hls1/main/1.ts?mediaSourceId={source_id}\
+             &videoCodec=h264&audioCodec=aac&segmentContainer=ts&segmentLength=2\
+             &runtimeTicks=20000000&actualSegmentLengthTicks=20000000\
+             &playSessionId=old-burn&subtitleStreamIndex={sidecar}&subtitleMethod=Encode"
+        ))
+        .await;
+    let segment = root.join("old-burn-1.ts");
+    std::fs::write(&segment, body).unwrap();
+    let calls = std::fs::read_to_string(root.join("calls.log")).unwrap();
+    let burn = calls
+        .lines()
+        .find(|line| {
+            line.starts_with("ffmpeg ") && line.contains(".en.sup") && line.contains(" -f hls ")
+        })
+        .expect("the burn-in ran ffmpeg with the sidecar");
+    assert!(!burn.contains("-isync"), "{burn}");
+    assert!(
+        burn.contains("-seek_timestamp 1 -itsoffset -00:00:02.000 -i file:"),
+        "{burn}"
+    );
+    let before = brightness_in_the_box(&real_ffmpeg, &segment, "0.5");
+    let during = brightness_in_the_box(&real_ffmpeg, &segment, "1.8");
+    assert!(
+        before < 64.0 && during > 128.0,
+        "the box is burned in from 3.5 s (means {before} at 2.5 s, {during} at 3.8 s)"
+    );
 }

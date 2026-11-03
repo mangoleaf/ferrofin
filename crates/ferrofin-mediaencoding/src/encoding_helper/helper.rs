@@ -1775,8 +1775,9 @@ const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// tail of `GetInputArgument`, which [`EncodingHelper::map_args`] and the
 /// overlay pads count on.
 ///
-/// `fast_seek` is the media file's own `-ss` value, if it seeks: every input
-/// is seeked alike, so the tracks stay in step with the video. A subtitle
+/// `fast_seek` is the media file's own `-ss` value, if it seeks: the inputs
+/// are seeked alike, so the tracks stay in step with the video, except the
+/// bitmap sidecars the divergences below read from their start. A subtitle
 /// input reads with the media file's `-analyzeduration` and `-probesize`, and
 /// a burned-in graphical one with its canvas size. A VobSub `.sub` is read
 /// through its `.idx` when one lies beside it, since the `.idx` names the
@@ -1798,10 +1799,36 @@ const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// measured) decodes the bitmaps but never draws them. A subtitle on screen
 /// at the seek point is then drawn too, which a seek would skip.
 ///
-/// TODO(gl-929): an ffmpeg older than 5.1, or one whose version cannot be
-/// read (it counts as the oldest supported, as for every version gate), gets
-/// upstream's unsynced form, so a bitmap sidecar there is still early by its
-/// first cue's time. Fix path: offset it by its probed start time.
+/// Third divergence (gl-929): an ffmpeg older than 5.1 has no `-isync`, and
+/// one whose version cannot be read counts as the oldest supported, as for
+/// every version gate (static and git builds print `ffmpeg version N-…`).
+/// Upstream's unsynced form, which Ferrofin kept there until then, moved a
+/// bitmap sidecar earlier by its first cue's time and seeked it that much too
+/// far: embedded, its cues came 3.5 s early; burned into a segment seeked to
+/// 9 s, the box was never drawn (a `.sup` with cues at 3.5-8 s and 10.5-14 s).
+/// A bitmap sidecar there, embedded or burned in, is read from its start with
+/// `-seek_timestamp 1`, which keeps ffmpeg from offsetting its timeline by its
+/// start time, and moved back by the media file's seek (`-itsoffset -<ss>`),
+/// which puts it on the media file's clock for a movie that starts at 0. It is
+/// not seeked: a seek before its first cue fails and loses that display set
+/// (a box from 3.5 s, seeked to 1 or 3 s, was never drawn) and one after can
+/// land inside a display set. Measured on ffmpeg 4.4.2 and 9.0.2 from 1, 3
+/// and 9 s, embedded and burned in; embedded, the cues before the start are
+/// cut on the output side
+/// ([`embedded_sidecar_trim_arguments`](super::bitstream::embedded_sidecar_trim_arguments)).
+/// A text sidecar reports no start time and keeps upstream's seeked form, and
+/// so does an external audio track.
+///
+/// TODO(gl-1200): `-isync` and `-seek_timestamp` differ for a movie whose own
+/// timeline does not start at 0 (an MPEG-TS): `-isync` puts the sidecar on the
+/// movie's absolute clock, `-seek_timestamp` on its time since the start. And
+/// from 5.1 an embedded bitmap sidecar is still seeked, past the start by its
+/// first cue's time, so cues starting in between are lost. Fix path: read
+/// every bitmap sidecar unseeked on every version, once the clock a TS movie's
+/// sidecar follows is decided. Under `-copyts -start_at_zero`, which no
+/// stream route binds yet (gl-1040), the pre-5.1 form is wrong as well:
+/// `-seek_timestamp` no longer cancels the sidecar's start time there (with or
+/// without the `-itsoffset`), where `-isync` still does.
 ///
 /// A seeked sidecar can still bring a cue from before the seek; the embed
 /// drops it on the output side
@@ -1852,8 +1879,12 @@ pub fn external_stream_input_arguments(
             "-probesize".to_owned(),
             crate::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
         ]);
-        let burned_in = should_encode_subtitle(state) && !sub.is_text_subtitle_stream();
-        if !(burned_in && can_sync) {
+        let bitmap = !sub.is_text_subtitle_stream();
+        let burned_in = should_encode_subtitle(state) && bitmap;
+        // Read from its start (see the divergences): a burned-in bitmap where
+        // `-isync` exists, and any bitmap where it does not.
+        let unseeked = if can_sync { burned_in } else { bitmap };
+        if !unseeked {
             seek(&mut args);
         }
         if burned_in {
@@ -1863,7 +1894,15 @@ pub fn external_stream_input_arguments(
                     .map(str::to_owned),
             );
         }
-        sync(&mut args);
+        if bitmap && !can_sync {
+            // Its own timestamps, moved back by the media file's seek.
+            args.extend(["-seek_timestamp".to_owned(), "1".to_owned()]);
+            if let Some(time) = fast_seek {
+                args.extend(["-itsoffset".to_owned(), format!("-{time}")]);
+            }
+        } else {
+            sync(&mut args);
+        }
         args.extend(["-i".to_owned(), format!("file:{path}")]);
     }
     if let Some(audio) = state

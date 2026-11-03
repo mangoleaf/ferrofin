@@ -398,15 +398,17 @@ const MIN_FFMPEG_SETTS_DURATION: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// TODO(gl-1199): before ffmpeg 5.1 a cue on screen at the start is dropped
 /// rather than started at 0, and before 5.0 a track converted to another codec
 /// (`subtitleCodec`) is still shifted, since `-copypriorss` only reaches stream
-/// copy. Fix path: convert the sidecar with the server's subtitle encoder from
-/// the start position (`FilterEvents`) and add that file unseeked.
+/// copy. A converted bitmap sidecar, which such an ffmpeg reads from its
+/// start, shifts it by the start position less its first cue's time. Fix path:
+/// convert the sidecar with the server's subtitle encoder from the start
+/// position (`FilterEvents`) and add that file unseeked.
 ///
 /// TODO(gl-1200): a bitmap sidecar's packets carry no duration, so every one
 /// before the start is dropped and a bitmap on screen at the start shows only
-/// from the next display set; its seek also lands past the start by the
-/// sidecar's first cue time, and inside a display set. Fix path: read the
-/// sidecar unseeked on the movie's clock, and start the last display set
-/// before the start at 0 instead of dropping it.
+/// from the next display set; from ffmpeg 5.1 an embedded one is also still
+/// seeked, past the start by its first cue's time and inside a display set.
+/// Fix path: read every bitmap sidecar unseeked on the movie's clock, and
+/// start the last display set before the start at 0 instead of dropping it.
 ///
 /// A job that copies timestamps (`-copyts -avoid_negative_ts disabled`) keeps
 /// the source's clock, on which nothing before the seek is negative and no
