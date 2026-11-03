@@ -15,9 +15,11 @@
 //! load-bearing rather than incidental — a guard evaluated on the *read* pool
 //! and acted on through the *writer* pool is a check-then-act, and the
 //! last-user / last-admin / duplicate-name guards below are all written in the
-//! transaction that acts on them for exactly that reason. The `.NET` event manager
-//! (`UserCreated`/`UserUpdated`/…) is out of scope (event wiring lands
-//! separately).
+//! transaction that acts on them for exactly that reason. A committed rename
+//! or policy save publishes `UserUpdated` on the event bus
+//! ([`with_events`](FerrofinUserManager::with_events)), as upstream's
+//! `RenameUser` and `UpdatePolicyAsync` publish `UserUpdatedEventArgs`; its
+//! consumers are in [`crate::user_updated`].
 //!
 //! Faithful port simplifications, each flagged:
 //! - `authenticate_user` shares the configured network policy with HTTP auth,
@@ -139,6 +141,10 @@ pub struct FerrofinUserManager {
     /// Optional activity-log seam: a lockout is recorded as a dashboard Alert
     /// (port of upstream's `UserLockedOutLogger`). `None` in tests.
     activity: Option<Arc<dyn ferrofin_traits::activity::ActivityManager>>,
+    /// Where a rename or a policy save is announced
+    /// ([`USER_UPDATED_EVENT`](crate::user_updated::USER_UPDATED_EVENT)).
+    /// `None` in tests, which then announce nothing.
+    events: Option<Arc<dyn ferrofin_traits::events::EventManager>>,
     /// Server configuration, read to resolve a user's cast receiver against
     /// the configured applications (upstream does this at DTO time). `None`
     /// in tests, which then echo the stored value.
@@ -392,6 +398,7 @@ impl FerrofinUserManager {
             password_reset_lock: Arc::default(),
             server_id: None,
             activity: None,
+            events: None,
             config: None,
             profile_image_dir: None,
             image_processor: None,
@@ -663,6 +670,35 @@ impl FerrofinUserManager {
         self
     }
 
+    /// Attaches the event bus a committed rename or policy save is announced
+    /// on, so its consumers ([`crate::user_updated::subscribe`]) run whoever
+    /// called the manager.
+    #[must_use]
+    pub fn with_events(mut self, events: Arc<dyn ferrofin_traits::events::EventManager>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// Publishes [`USER_UPDATED_EVENT`](crate::user_updated::USER_UPDATED_EVENT)
+    /// for `user_id`, after a committed rename or policy save: upstream's
+    /// `PublishAsync(new UserUpdatedEventArgs(user))` and `OnUserUpdated`.
+    /// The bus logs a failing consumer and goes on, so this never fails the
+    /// save it follows. A save calls it after releasing its own login lock,
+    /// as upstream raises the event once `_userLock` is released; the
+    /// consumers take no login lock, so the sign-in path may hold its own.
+    async fn announce_user_updated(&self, user_id: Uuid) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        if let Ok(payload) = serde_json::to_string(&user_id)
+            && let Err(error) = events
+                .publish(crate::user_updated::USER_UPDATED_EVENT, &payload)
+                .await
+        {
+            tracing::debug!(user_id = %user_id, %error, "could not announce the user update");
+        }
+    }
+
     /// Installs the shared [`crate::auth_cache::AuthCache`] (composition root
     /// only) — must be the instance the authorization context reads through.
     #[must_use]
@@ -846,7 +882,7 @@ impl FerrofinUserManager {
     ) -> Result<PolicySaved, ServiceError> {
         let id = guid_to_db(user_id);
         let login_lock = self.login_lock(&id);
-        let _login_guard = login_lock.lock().await;
+        let login_guard = login_lock.lock().await;
         self.require_user(user_id).await?;
 
         // "The default number of login attempts is 3, but for some god forsaken
@@ -939,6 +975,8 @@ impl FerrofinUserManager {
         // One `SaveChangesAsync`: all or nothing.
         tx.commit().await.map_err(db_err)?;
         self.users_changed();
+        drop(login_guard);
+        self.announce_user_updated(user_id).await;
         Ok(PolicySaved {
             newly_disabled: policy.is_disabled && !was_disabled,
         })
@@ -1189,6 +1227,7 @@ impl UserManager for FerrofinUserManager {
             return Err(db_err(e));
         }
         self.users_changed();
+        self.announce_user_updated(user_id).await;
         Ok(())
     }
 
@@ -1883,6 +1922,11 @@ impl UserManager for FerrofinUserManager {
     /// administrators. It takes no login lock: the password path calls it
     /// while holding the user's, which does not nest (`save_policy` would wait
     /// on it forever).
+    ///
+    /// It announces nothing, unlike a policy save: upstream's LDAP plugin
+    /// writes the flag with `UpdateUserAsync` (jellyfin-plugin-ldapauth v24,
+    /// `LdapAuthenticationProviderPlugin.Authenticate`), which publishes no
+    /// `UserUpdatedEventArgs`.
     async fn apply_external_administrator(
         &self,
         user_id: Uuid,

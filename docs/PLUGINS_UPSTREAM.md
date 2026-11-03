@@ -291,10 +291,6 @@ Conventions:
     passwordless user first and sets the provider ids after, a moment in which the built-in
     provider signs that user in with an empty password. The "User … has been created"
     activity entry is recorded as `CreateUserAsync` records it.
-  - **A rename at sign-in sends no `UserUpdated` message** to the user's other sessions:
-    Ferrofin pushes it from the `POST /Users` handler, which a provider does not go through,
-    where upstream's `RenameUser` publishes it whoever calls it. TODO(gl-1179): raise it
-    from the user manager, for every caller.
   - **Off by default** (owner decision D3): the plugin is disabled in `/Plugins` until an
     administrator enables it, and `LdapServer` seeds empty instead of
     `ldap-server.contoso.com`. Upstream's provider is always enabled and would try the

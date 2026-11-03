@@ -39,8 +39,6 @@
 //!   null `LdapUid`, which no lookup finds, and in doing so drops the user's
 //!   earlier link and every other null-uid link. Such a user is found by name
 //!   each time, and keeps the link of the uid they had.
-//! - **A rename at sign-in sends no `UserUpdated` message** to the user's
-//!   other sessions, which upstream's `RenameUser` publishes (TODO(gl-1179)).
 //! - **A new user is created with its provider ids in one transaction**
 //!   ([`UserManager::create_external_user`]). Upstream saves them after
 //!   creating the user, a moment in which the account has no password and
@@ -492,9 +490,10 @@ impl AuthenticationManager for LdapAuthProvider {
             let user_id = Uuid::parse_str(&user.id)
                 .map_err(|error| ServiceError::backend(error.to_string()))?;
             // Takes no login lock, so it is safe under the one the manager
-            // holds for this sign-in. TODO(gl-1179): upstream's `RenameUser`
-            // also pushes `UserUpdated` to the user's other sessions, which
-            // Ferrofin sends from the `POST /Users` handler alone.
+            // holds for this sign-in, and neither does what it announces
+            // (`UserUpdated` to the user's sessions, then the device check):
+            // the lock does not nest. Upstream's plugin renames here too,
+            // under `AuthenticateUser`'s lock, which nests there.
             self.users
                 .rename_user(user_id, &user.username, &name)
                 .await?;
