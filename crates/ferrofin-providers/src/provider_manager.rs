@@ -5098,7 +5098,9 @@ impl ProviderManager for LocalProviderManager {
             if live_tv && !self.in_metadata_directory(&path).await {
                 tracing::warn!(
                     item_id = %item_id,
-                    path,
+                    // A source's value: a URL other than http keeps only its
+                    // scheme and host (LOGGING.md §5).
+                    path = %ferrofin_util::source_url::redact_url(&path),
                     "left the file of a Live TV image row outside the metadata directory"
                 );
                 continue;

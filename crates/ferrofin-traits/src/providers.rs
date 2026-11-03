@@ -320,7 +320,9 @@ pub trait ProviderManager: Send + Sync {
     ///
     /// Port of `BaseItem.DeleteImageAsync(imageType, index)` (the fan-in target of
     /// `ImageController.DeleteItemImage`/`DeleteItemImageByIndex`): removes the
-    /// on-disk file and the stored image row. The default implementation (for
+    /// stored image row and, for a local row, its on-disk file (best-effort).
+    /// Shared album artwork and a Live TV channel's or programme's file
+    /// outside the internal metadata directory stay. The default implementation (for
     /// stub/test managers with no image store) reports the operation as unwired;
     /// the concrete provider manager overrides it.
     ///
