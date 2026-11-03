@@ -2017,7 +2017,8 @@ pub const VERIFIED: &[Verified] = &[
          see, and answers an empty page when there is none. Fix path: gl-1077.",
             "A request with no user (an API key naming none, or an administrator naming an \
          account that does not exist) lists every recording, as GET \
-         /LiveTv/Recordings/{recordingId} answers the same request for each; upstream's \
+         /LiveTv/Recordings/{recordingId} answers the same request for each, while GET \
+         /LiveTv/Recordings/Folders answers it an empty list; upstream's \
          GetEmbyRecordingsAsync answers an empty page for a null user. Deliberate: API keys \
          are exempt from the library rule gl-1091 made a hard boundary.",
             "The 400 (a value the query binder cannot convert) and 403 (another user's id \

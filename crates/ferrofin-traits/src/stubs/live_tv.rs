@@ -692,10 +692,11 @@ pub trait LiveTvManager: Send + Sync {
     /// Lists the recordings a query selects, projected for `user`.
     ///
     /// Port of `LiveTvManager.GetRecordingsAsync`: the in-progress/status/
-    /// channel/series-timer filters, then `visible` (when given) before paging
-    /// so `TotalRecordCount` counts only what it keeps, then the DTO
-    /// projection with the list-path `RemoveFields` strip and the recording
-    /// post-pass.
+    /// channel/series-timer filters, then the drop of a finished recording
+    /// whose file has gone (a library item upstream), then `visible` (when
+    /// given) before paging so `TotalRecordCount` counts only what it keeps,
+    /// then the DTO projection with the list-path `RemoveFields` strip and the
+    /// recording post-pass.
     ///
     /// The default ignores the query — the "nothing recorded" state.
     async fn get_recordings_matching(
