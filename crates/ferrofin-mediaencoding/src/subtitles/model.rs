@@ -111,6 +111,19 @@ impl TimeCode {
         i32::try_from(self.ticks() / TICKS_PER_MILLISECOND % 1000).unwrap_or(0)
     }
 
+    /// The `TimeCode.Milliseconds` setter: the time rebuilt from the `TimeSpan`'s
+    /// days, hours, minutes and seconds with `milliseconds` in place of its own
+    /// (`new TimeSpan(ts.Days, ts.Hours, ts.Minutes, ts.Seconds, value)`), so the
+    /// sub-millisecond part goes and a negative time keeps its sign on every part.
+    pub fn set_milliseconds(&mut self, milliseconds: i32) {
+        // The components truncate toward zero together, so they add back up to the
+        // `TimeSpan`'s whole seconds.
+        let whole_seconds = self.ticks() / (TICKS_PER_MILLISECOND * 1000);
+        #[allow(clippy::cast_precision_loss)] // whole milliseconds within ±99:59:59
+        let total = (whole_seconds * 1000 + i64::from(milliseconds)) as f64;
+        self.total_milliseconds = total;
+    }
+
     /// `TimeCode.ToString()`: `hh:mm:ss,fff`, hours not wrapped, and one leading `-`
     /// for a negative time (`PrefixSign`).
     #[must_use]
@@ -193,6 +206,16 @@ impl Paragraph {
             end_time,
             ..Self::default()
         }
+    }
+
+    /// `Paragraph.IsDefault`: both times within libse's 0.01 ms of zero and no text,
+    /// as a `new Paragraph()` is.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        const ZERO_TOLERANCE_MS: f64 = 0.01;
+        self.start_time.total_milliseconds().abs() < ZERO_TOLERANCE_MS
+            && self.end_time.total_milliseconds().abs() < ZERO_TOLERANCE_MS
+            && self.text.is_empty()
     }
 }
 

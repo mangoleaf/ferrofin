@@ -147,9 +147,9 @@ impl SubtitleParser for SubtitleEditParser {
                 clean = Some(subtitle);
                 break;
             }
-            // Upstream logs this at error. Debug here: the SubRip loader does
-            // not count errors as libse's does (gl-757), so a file libse
-            // loads cleanly could report some on every request.
+            // Upstream logs this at error, with libse's messages. Debug here:
+            // it repeats on every request for the same file, so its volume
+            // follows the request rate (LOGGING.md, "Levels mean things").
             tracing::debug!(
                 errors,
                 file_extension,

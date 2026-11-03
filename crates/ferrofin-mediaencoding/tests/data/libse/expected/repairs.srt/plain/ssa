@@ -1,0 +1,23 @@
+[Script Info]
+; This is a Sub Station Alpha v4 script.
+Title: untitled
+ScriptType: v4.00
+Collisions: Normal
+PlayDepth: 0
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding
+Style: Default,Arial,20,16777215,65535,0,0,0,0,1,1,1,2,10,10,10,0,1
+
+[Events]
+Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: Marked=0,0:00:00.10,0:00:00.90,*Default,NTP,0000,0000,0000,,well-formed, so ffprobe opens the file
+Dialogue: Marked=0,0:00:01.00,0:00:02.00,*Default,NTP,0000,0000,0000,,single-dash arrow
+Dialogue: Marked=0,0:00:03.00,0:00:04.00,*Default,NTP,0000,0000,0000,,em-dash arrow
+Dialogue: Marked=0,0:00:05.00,0:00:05.50,*Default,NTP,0000,0000,0000,,no hours
+Dialogue: Marked=0,0:00:06.00,0:00:07.50,*Default,NTP,0000,0000,0000,,dots between the fields
+Dialogue: Marked=0,0:00:00.00,0:00:08.00,*Default,NTP,0000,0000,0000,,negative start
+Dialogue: Marked=0,0:00:09.00,0:00:10.00,*Default,NTP,0000,0000,0000,,DVD-rip position info
+Dialogue: Marked=0,0:00:11.00,0:00:12.00,*Default,NTP,0000,0000,0000,,nul char
+Dialogue: Marked=0,0:00:13.00,0:00:14.00,*Default,NTP,0000,0000,0000,,Hello\Nworld
+Dialogue: Marked=0,0:00:15.00,0:00:16.00,*Default,NTP,0000,0000,0000,,nbsp\Ndeleted
