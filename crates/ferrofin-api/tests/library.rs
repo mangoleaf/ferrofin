@@ -294,6 +294,7 @@ impl LibraryMonitor for RecordingMonitor {
     async fn stop(&self) -> Result<(), ServiceError> {
         Ok(())
     }
+    fn restart(&self) {}
     async fn report_file_system_change_beginning(&self, _path: &str) -> Result<(), ServiceError> {
         Ok(())
     }

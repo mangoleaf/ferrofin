@@ -910,11 +910,13 @@ struct CountingMonitor(AtomicUsize);
 #[async_trait::async_trait]
 impl ferrofin_traits::library::LibraryMonitor for CountingMonitor {
     async fn start(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
-        self.0.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     async fn stop(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
         Ok(())
+    }
+    fn restart(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
     }
     async fn report_file_system_change_beginning(
         &self,
@@ -1056,4 +1058,136 @@ async fn a_structure_change_refused_up_front_neither_restarts_nor_refreshes(
     let (status, restarts, scans) = structure_request(vf, method, uri, None).await;
     assert_eq!(status, expected);
     assert_eq!((restarts, scans), (0, 0));
+}
+
+/// A [`LibraryMonitor`](ferrofin_traits::library::LibraryMonitor) whose watch
+/// walk never ends: `start` is a recursive watch of a library on a mount that
+/// stopped answering. It counts the restarts it is asked for.
+#[derive(Default)]
+struct StuckWalkMonitor {
+    restarts: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ferrofin_traits::library::LibraryMonitor for StuckWalkMonitor {
+    async fn start(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
+        std::future::pending().await
+    }
+    async fn stop(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+    /// A real monitor's restart runs this walk on its own task.
+    fn restart(&self) {
+        self.restarts.fetch_add(1, Ordering::SeqCst);
+    }
+    async fn report_file_system_change_beginning(
+        &self,
+        _path: &str,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+    async fn report_file_system_change_complete(
+        &self,
+        _path: &str,
+        _refresh_path: bool,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+    async fn report_file_system_changed(
+        &self,
+        _path: &str,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+}
+
+/// Upstream's `LibraryMonitor.Start` creates each watcher on a thread-pool
+/// task (`StartWatchingPath`'s `Task.Run`), and the path and rename actions
+/// call it from a `Task.Run` of their own, so no structure request waits for a
+/// watch to exist. Every structure change answers while the monitor's walk is
+/// still running, and asks for exactly one restart, but `Paths/Update`, which
+/// changes no location and, as upstream's, restarts nothing.
+#[rstest::rstest]
+#[case::add_library("POST", "/Library/VirtualFolders?name=Films", None, 1)]
+#[case::remove_library("DELETE", "/Library/VirtualFolders?name=Movies", None, 1)]
+#[case::rename_library(
+    "POST",
+    "/Library/VirtualFolders/Name?name=Movies&newName=Films",
+    None,
+    1
+)]
+#[case::add_media_path(
+    "POST",
+    "/Library/VirtualFolders/Paths",
+    Some(r#"{"Name":"Movies","Path":"/media/films"}"#),
+    1
+)]
+#[case::update_media_path(
+    "POST",
+    "/Library/VirtualFolders/Paths/Update",
+    Some(r#"{"Name":"Movies","PathInfo":{"Path":"/media/movies"}}"#),
+    0
+)]
+#[case::remove_media_path(
+    "DELETE",
+    "/Library/VirtualFolders/Paths?name=Movies&path=/media/movies",
+    None,
+    1
+)]
+#[case::library_options(
+    "POST",
+    "/Library/VirtualFolders/LibraryOptions",
+    Some(r#"{"Name":"Movies","LibraryOptions":{"EnableRealtimeMonitor":true}}"#),
+    1
+)]
+#[tokio::test(start_paused = true)]
+async fn a_structure_change_answers_before_the_monitor_has_watched_anything(
+    #[case] method: &str,
+    #[case] uri: &str,
+    #[case] body: Option<&str>,
+    #[case] restarts: usize,
+) {
+    let vf = FakeVirtualFolders::working();
+    ferrofin_traits::library::VirtualFolderManager::add_virtual_folder(
+        &vf,
+        "Movies",
+        None,
+        &ferrofin_model::configuration::LibraryOptions {
+            path_infos: vec![ferrofin_model::configuration::MediaPathInfo {
+                path: "/media/movies".to_owned(),
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let monitor = Arc::new(StuckWalkMonitor::default());
+    let state =
+        authed_state_with_library_and_monitor(Arc::new(CountingScans::default()), monitor.clone())
+            .with_virtual_folders(Arc::new(vf));
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("X-Emby-Token", TOKEN);
+    if body.is_some() {
+        request = request.header(header::CONTENT_TYPE, "application/json");
+    }
+    let request = request
+        .body(body.map_or_else(Body::empty, |b| Body::from(b.to_owned())))
+        .unwrap();
+    // Paused time: the deadline lapses as soon as the request has nothing
+    // left to do but wait, so its length only has to be non-zero.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        create_router(state).oneshot(request),
+    )
+    .await
+    .expect("the structure request waited for the monitor's watch walk")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        monitor.restarts.load(Ordering::SeqCst),
+        restarts,
+        "restarts asked"
+    );
 }

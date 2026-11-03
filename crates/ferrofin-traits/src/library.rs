@@ -2795,11 +2795,24 @@ fn _assert_object_safe_music_manager(_: &dyn MusicManager) {}
 /// surface failures uniformly.
 #[async_trait]
 pub trait LibraryMonitor: Send + Sync {
-    /// Starts monitoring.
+    /// Starts monitoring: watches the libraries' roots as they are now. A
+    /// library-structure change asks for [`restart`](Self::restart) instead,
+    /// which does not wait for the watches.
     async fn start(&self) -> Result<(), ServiceError>;
 
     /// Stops monitoring.
     async fn stop(&self) -> Result<(), ServiceError>;
+
+    /// Asks for the watches to be rebuilt for the library structure as it is
+    /// now, a [`stop`](Self::stop) and then a [`start`](Self::start): what
+    /// every library-structure change ends with (`LibraryStructureController`,
+    /// `LibraryManager.AddVirtualFolder`). Returns before any watch exists, as
+    /// upstream's `Start` does (it creates each watcher on a thread-pool task):
+    /// a recursive watch walks the library's whole tree, and the change that
+    /// asked has already been made. Overlapping requests are served one
+    /// restart at a time, each reading the structure when it runs, so the
+    /// watches end up matching the latest one.
+    fn restart(&self);
 
     /// Signals that a change at `path` is beginning (suppress self-triggering).
     async fn report_file_system_change_beginning(&self, path: &str) -> Result<(), ServiceError>;

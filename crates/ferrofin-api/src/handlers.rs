@@ -2704,7 +2704,9 @@ pub const VERIFIED: &[Verified] = &[
          revalidated. Ferrofin has no in-memory tree, and the row keeps the library's id \
          resolvable and a scan clear of the foreign key (owner decision 2026-10-24).",
             "A failed write of that CollectionFolder row is logged at warn and the library \
-         is listed with its projected ItemId; the next listing retries the write.",
+         is listed with its projected ItemId; the next listing retries the write. No row is \
+         written while a library-structure change is under way: the change records its own \
+         library's locations, and a later listing writes any other row.",
             "An empty .mblink is dropped; upstream filters only nulls, so it lists an empty \
          location, which names no folder. Jellyfin bug not ported.",
             "An options.json that does not parse serves the defaults without a log entry; \
@@ -2712,6 +2714,204 @@ pub const VERIFIED: &[Verified] = &[
          path: gl-271.",
             "The 401 and 403 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/Library/VirtualFolders",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryStructureController.cs",
+        upstream_method: "RemoveVirtualFolder",
+        ferrofin: "handlers/library_structure.rs remove_virtual_folder → finish_structure_change \
+               (after_structure_change: LibraryMonitor::restart, then queue_library_scan when \
+               refreshLibrary) → ferrofin-core virtual_folder_manager.rs remove_virtual_folder \
+               (LibraryManager.RemoveVirtualFolder: child_path and require_folder for \
+               GetChildPath and Directory.Exists, preserve_legacy_children, the CollectionFolder \
+               row deleted, remove_dir_all, prune_orphan_collection_folders for \
+               ValidateTopLibraryFolders' tail) → library_monitor.rs restart and run \
+               (LibraryMonitor.Stop and Start, StartWatchingPath)",
+        date: "2026-11-03",
+        divergences: &[
+            "Without refreshLibrary, upstream waits 1000 ms (Task.Delay) inside the request before \
+         LibraryMonitor.Start, so its directory watchers miss the removal; Ferrofin answers at \
+         once and the monitor restarts on its own task without the wait. The removal writes \
+         only under the libraries root, which is not a library location, so no watcher sees it \
+         either way.",
+            "The monitor keeps watching while the folder is removed and restarts after; upstream \
+         stops it first. For the reason above, no event of the removal reaches it.",
+            "The library's CollectionFolder row is deleted and the rows of libraries whose folder \
+         is gone are pruned whatever refreshLibrary says; upstream runs \
+         ValidateTopLibraryFolders(removeRoot: true) only with refreshLibrary, so without it the \
+         removed library's row and view stay until the next scan. Jellyfin bug not ported.",
+            "With refreshLibrary the monitor is restarted too, and the full scan is queued behind a \
+         running one; upstream leaves the restart to the scan's ValidateMediaLibraryInternal \
+         (Ferrofin's scan does not restart the monitor) and drops the scan when one is running \
+         (StartScanInBackground), which misses the removal when that scan listed the libraries \
+         before it. Jellyfin bug not ported.",
+            "A change the monitor was still settling when the restart came is refreshed after it; \
+         upstream's Stop disposes its FileRefreshers, so that change waits for the next scan. \
+         Jellyfin bug not ported.",
+            "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Library/VirtualFolders/Name",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryStructureController.cs",
+        upstream_method: "RenameVirtualFolder",
+        ferrofin: "handlers/library_structure.rs rename_virtual_folder (the name and newName 400s) \
+               → library_id_by_name for the scan's scope → finish_structure_change \
+               (after_structure_change: LibraryMonitor::restart, then queue_library_scan_scoped \
+               when refreshLibrary) → ferrofin-core virtual_folder_manager.rs \
+               rename_virtual_folder (child_path for GetChildPath, the 404 and 409 checks, \
+               case_hop for the case-only temp hop, the preference remap for \
+               ReplaceLibraryIdInUserPreferencesAsync over library_preference_repository.rs, \
+               repath_collection_folder and prune_orphan_collection_folders) → \
+               library_monitor.rs restart and run (LibraryMonitor.Stop and Start)",
+        date: "2026-11-03",
+        divergences: &[
+            "The monitor keeps watching while the folder moves and restarts after; upstream stops \
+         it first. The move happens under the libraries root, which is not a library location, \
+         so no event of it reaches the monitor.",
+            "Without refreshLibrary the restart runs at once on the monitor's own task; upstream's \
+         RefreshAfterRenameAsync waits 1000 ms (Task.Delay) first, which for the reason above \
+         has nothing to let settle here.",
+            "With refreshLibrary a scan scoped to the renamed library is queued and the monitor is \
+         restarted; upstream refreshes the library's physical folders directly on a background \
+         task, beside any running scan, and never calls Start, so real-time monitoring stays off \
+         until the next full scan. Jellyfin bug not ported (the missing restart).",
+            "Without refreshLibrary the old library's row is repathed or deleted and orphan rows \
+         pruned at once, and the listing writes the new row; upstream validates the top folders \
+         only with refreshLibrary, so the old row stays while users' preferences already name the \
+         new id. Jellyfin bug not ported.",
+            "A case-only rename onto another library's spelling on a case-sensitive filesystem is a \
+         409, and a failed second hop moves the folder back; upstream skips the conflict check \
+         for a case-only rename, answers 500 from the second move and leaves the folder under its \
+         temporary name. Jellyfin bug not ported.",
+            "A newName that names a regular file in the libraries root is a 409; upstream's \
+         Directory.Exists misses the file and the move fails with 500.",
+            "When the preference remap fails after the move, the requested scan is a full one, \
+         since no settled id scopes it; upstream still refreshes the renamed library.",
+            "A change the monitor was still settling when the restart came is refreshed after it; \
+         upstream's Stop disposes its FileRefreshers. Jellyfin bug not ported.",
+            "The 400, 404 and 409 bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Library/VirtualFolders/Paths",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryStructureController.cs",
+        upstream_method: "AddMediaPath",
+        ferrofin: "handlers/library_structure.rs add_media_path (the Name and PathInfo/Path 400s, \
+               PathInfo preferred over Path) → finish_structure_change (after_structure_change: \
+               LibraryMonitor::restart, then queue_library_scan when refreshLibrary) → \
+               ferrofin-core virtual_folder_manager.rs add_media_path \
+               (LibraryManager.AddMediaPath and AddMediaPathInternal: the path's existence, \
+               require_folder, create_shortcut for CreateShortcut, \
+               remove_content_type_overrides, sync_options_to_locations for \
+               SyncLibraryOptionsToLocations, save_options, record_changed_locations) → \
+               library_monitor.rs restart and run (LibraryMonitor.Stop and Start)",
+        date: "2026-11-03",
+        divergences: &[
+            "A request refused for its arguments or for a missing library or path (400, 404) \
+         restarts nothing and queues no scan; upstream makes those checks inside its try, so its \
+         finally still queues the requested full scan, or restarts the monitor, for a library it \
+         did not change.",
+            "The monitor keeps watching while the shortcut is written and restarts after it, at \
+         once; upstream stops it first and starts it again after 1000 ms (Task.Delay). The \
+         shortcut is written under the libraries root, which is not a library location, so no \
+         event of it reaches the monitor and there is nothing for the wait to let settle.",
+            "With refreshLibrary the monitor is restarted as well as the full scan queued; upstream \
+         leaves the restart to the scan's ValidateMediaLibraryInternal, and Ferrofin's scan does \
+         not restart the monitor.",
+            "A change the monitor was still settling when the restart came is refreshed after it; \
+         upstream's Stop disposes its FileRefreshers. Jellyfin bug not ported.",
+            "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Library/VirtualFolders/Paths/Update",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryStructureController.cs",
+        upstream_method: "UpdateMediaPath",
+        ferrofin: "handlers/library_structure.rs update_media_path (the Name and PathInfo 400s; \
+               no monitor restart, as upstream's) → ferrofin-core virtual_folder_manager.rs \
+               update_media_path (LibraryManager.UpdateMediaPath: require_folder, load_options, \
+               sync_options_to_locations for SyncLibraryOptionsToLocations, save_options, \
+               record_changed_locations; the posted PathInfo is not applied, as upstream's is not)",
+        date: "2026-11-03",
+        divergences: &[
+            "\"PathInfo\": {} is a 400, since MediaPathInfo binds Path without a default; upstream's \
+         MediaPathInfo() defaults Path to \"\" and the request answers 204. Fix path: gl-1206.",
+            "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/Library/VirtualFolders/Paths",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryStructureController.cs",
+        upstream_method: "RemoveMediaPath",
+        ferrofin: "handlers/library_structure.rs remove_media_path (the name and path 400s) → \
+               finish_structure_change (after_structure_change: LibraryMonitor::restart, then \
+               queue_library_scan when refreshLibrary) → ferrofin-core virtual_folder_manager.rs \
+               remove_media_path (LibraryManager.RemoveMediaPath: require_folder, \
+               delete_shortcut_for over resolve_shortcut and the virtual-path expansion, the \
+               ordinal PathInfos filter, save_options, record_changed_locations) → library_monitor.rs \
+               restart and run (LibraryMonitor.Stop and Start)",
+        date: "2026-11-03",
+        divergences: &[
+            "A path with a trailing separator deletes the location's shortcut but keeps its \
+         PathInfos entry; upstream matches neither and changes nothing. Fix path: gl-1205.",
+            "A request for a library that does not exist (404) restarts nothing and queues no \
+         scan; upstream throws inside its try, so its finally still queues the requested full \
+         scan, or restarts the monitor, for an unchanged library.",
+            "Shortcuts are looked for in the library folder itself; upstream also searches its \
+         subfolders (GetFilePaths with recursion), where neither server writes one.",
+            "The monitor keeps watching while the shortcut is deleted and restarts after it, at \
+         once; upstream stops it first and starts it again after 1000 ms (Task.Delay). The \
+         shortcut lives under the libraries root, which is not a library location, so no event \
+         of it reaches the monitor and there is nothing for the wait to let settle.",
+            "With refreshLibrary the monitor is restarted as well as the full scan queued; upstream \
+         leaves the restart to the scan's ValidateMediaLibraryInternal, and Ferrofin's scan does \
+         not restart the monitor.",
+            "A change the monitor was still settling when the restart came is refreshed after it; \
+         upstream's Stop disposes its FileRefreshers. Jellyfin bug not ported.",
+            "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Library/VirtualFolders/LibraryOptions",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryStructureController.cs",
+        upstream_method: "UpdateLibraryOptions",
+        ferrofin: "handlers/library_structure.rs update_library_options (Name, else Id resolved \
+               against the listing's parsed ItemId; 404 for neither) → after_structure_change \
+               (LibraryMonitor::restart) → ferrofin-core virtual_folder_manager.rs \
+               update_library_options (CollectionFolder.UpdateLibraryOptions: create_shortcut and \
+               remove_content_type_overrides for each path not already in PathInfos, then \
+               save_options of the posted options, record_changed_locations) → \
+               library_monitor.rs restart and run",
+        date: "2026-11-03",
+        divergences: &[
+            "The library monitor is asked to restart after the save, so an EnableRealtimeMonitor \
+         toggle or a new location is watched at once; upstream's UpdateLibraryOptions does not \
+         touch the monitor, so the dashboard's real-time monitoring checkbox applies only at the \
+         next library scan. Jellyfin bug not ported.",
+            "A body without LibraryOptions (or with null) saves the default options and answers \
+         204; upstream dereferences request.LibraryOptions and answers 500 having written \
+         nothing. Fix path: gl-1204.",
+            "A body with no Id and no Name is a 404; upstream's GetItemById(Guid.Empty) throws \
+         ArgumentException, a 400. A new PathInfo with an empty Path writes an empty shortcut \
+         and answers 204; upstream's CreateShortcut throws before anything is saved, a 400. Fix \
+         path: gl-1206.",
+            "A Name in the body is accepted and wins over Id; UpdateLibraryOptionsDto has no Name.",
+            "The 404 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
