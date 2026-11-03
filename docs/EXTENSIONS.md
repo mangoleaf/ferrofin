@@ -120,14 +120,16 @@ dashboard's Disable toggle turns them off. Its version is the server's release.
 `FERROFIN_DISABLE_EXTENSIONS` leaves it registered: it has nothing to fire inside a benchmark.
 
 Its settings page, the Settings link under Dashboard → Plugins → Ferrofin and the dashboard
-menu's **Ferrofin** entry, lists every setting that route reports, in a tab per group: a readable
-name with the `config.toml` key and environment variable below it, the value in use in its unit,
-the default, a badge for where the value comes from (default, `config.toml`, environment or
-flag), the flag that sets it, and, for a setting the page may not
-change, a lock with the reason and where it is changed instead. Secrets are shown to the
-administrator, marked as secrets. A setting the page may change has a control for its kind and
-**Reset to default**: Save posts the changed ones, a refused value shows the server's message next
-to it, and **Restart now** applies them ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)).
+menu's **Ferrofin** entry, lists every setting that route reports, in a tab per group, with a
+search box and filters (changed, needs restart, hide read-only) above the tabs. Each setting has a
+readable name with the `config.toml` key, environment variable, flag and default below it, a badge
+for what sets it (`config.toml`, environment or flag) when anything does, and, for a setting the
+page may not change, its value as text with a lock, the reason and where it is changed instead.
+Secrets are shown to the administrator, marked as secrets. A setting the page may change is edited
+on one line: a field for its kind showing the default, muted, when nothing sets it, its unit and
+**Reset to default**. Each tab counts its unsaved edits; Save posts the changed ones of every tab,
+a refused value shows the server's message next to it, and **Restart now** applies them
+([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)).
 The page holds no setting itself, since `GET /web/ConfigurationPage` is anonymous: its script reads
 them from the admin-only route and sets every string as text, never as HTML. Disabling the plugin
 removes the page and the menu entry.
