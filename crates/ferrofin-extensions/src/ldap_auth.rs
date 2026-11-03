@@ -21,6 +21,11 @@
 //!   provider the extension contributes, listed by `GET /Auth/Providers` and
 //!   `GET /Auth/PasswordResetProviders` while the plugin is enabled and names a
 //!   server;
+//! - `provider::profile_image` — users' pictures from the directory
+//!   (`LdapProfileImageFormat`'s binary, Base64 or URL values): a new user's
+//!   at their first sign-in, and the `LdapProfileImageSync` task
+//!   (`LdapProfileImageSyncTask`) that keeps every LDAP user's current, a URL
+//!   fetched through the server's image download limits;
 //! - [`adoption`] — the one-time import of an adopted Jellyfin's
 //!   `LDAP-Auth.xml`, its uid map included, which turns the plugin on when a
 //!   user's saved authentication provider is LDAP-Auth's (B7, D7);
@@ -1128,14 +1133,15 @@ impl LdapManager for LdapAuthService {
 pub struct LdapAuthExtension;
 
 impl LdapAuthExtension {
-    /// The provider over the context's plugin manager, users and identity
-    /// links and a real directory client.
+    /// The provider over the context's plugin manager, users, identity links
+    /// and image fetcher, and a real directory client.
     fn provider(cx: &ExtensionContext) -> provider::LdapAuthProvider {
         provider::LdapAuthProvider::new(
             Arc::clone(&cx.plugins),
             Arc::clone(&cx.users),
             Arc::clone(&cx.external_identities),
             Arc::new(directory::Ldap3Directory::default()),
+            Arc::clone(&cx.remote_images),
         )
     }
 }
@@ -1193,8 +1199,12 @@ impl Extension for LdapAuthExtension {
         vec![Arc::new(Self::provider(cx))]
     }
 
-    fn tasks(&self, _cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>> {
-        Vec::new()
+    /// `LdapProfileImageSyncTask`, gated like the provider and on
+    /// `EnableLdapProfileImageSync`.
+    fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>> {
+        vec![Arc::new(
+            provider::profile_image::ProfileImageSyncTask::new(Arc::new(Self::provider(cx))),
+        )]
     }
 }
 

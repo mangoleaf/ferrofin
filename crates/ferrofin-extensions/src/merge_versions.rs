@@ -2488,6 +2488,9 @@ mod tests {
                     db.clone(),
                 ),
             ),
+            remote_images: Arc::new(
+                crate::ldap_auth::provider::profile_image::FakeImages::default(),
+            ),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);

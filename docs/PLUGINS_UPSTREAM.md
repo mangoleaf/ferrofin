@@ -20,7 +20,7 @@ Conventions:
 | Intro Skipper | https://github.com/intro-skipper/intro-skipper | `db09359` | 10.11/prerelease | ported |
 | File Transformation | https://github.com/IAmParadox27/jellyfin-plugin-file-transformation | `f4f01c3` | 2.5.10.0 | ported |
 | Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
-| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, its three test routes, sign-in, the admin filter, password changes and resets, referrals, and the adopted settings' import (milestone "LDAP-Auth plugin port") |
+| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, its three test routes, sign-in, the admin filter, password changes and resets, referrals, the adopted settings' import, and profile images with their sync task (milestone "LDAP-Auth plugin port") |
 
 ## Per-plugin notes
 
@@ -204,9 +204,12 @@ Conventions:
   configuration, the `LdapDirectory` seam, the settings page's three tests and their service),
   `ldap_auth/directory.rs` (the `ldap3` client and its rustls configuration),
   `ldap_auth/provider.rs` (the sign-in, password-change and password-reset provider),
+  `ldap_auth/provider/profile_image.rs` (profile images and their sync task),
   `ldap_auth/referrals.rs` (referral following) and `ldap_auth/adoption.rs` (the
   `LDAP-Auth.xml` import), vendored assets `crates/ferrofin-extensions/assets/ldapauth/`, the
-  trait seam `crates/ferrofin-traits/src/ldap.rs`, the wire types
+  trait seam `crates/ferrofin-traits/src/ldap.rs`, the image download seam
+  `crates/ferrofin-traits/src/remote_images.rs` (implemented in
+  `crates/ferrofin-providers/src/remote_images.rs`), the wire types
   `crates/ferrofin-model/src/ldap.rs`, and the thin HTTP handler
   `crates/ferrofin-api/src/handlers/ldap.rs`. The live directory test is
   `crates/ferrofin-extensions/tests/ldap_directory.rs` (`FERROFIN_LDAP_TESTS=1`, OpenLDAP in
@@ -247,7 +250,8 @@ Conventions:
   An entry without the username attribute is a `400`, as upstream's create or rename with a
   null name throws an `ArgumentException`. The provider is enabled only with the plugin and a
   server (D3);
-  upstream's `IsEnabled` is always `true`. Profile images are a later phase of the milestone.
+  upstream's `IsEnabled` is always `true`. A new user's picture is taken from the entry (see
+  Profile images).
 - Password change (v24, `d11c86a`): `ChangePassword`, which the user manager calls for a user
   whose `AuthenticationProviderId` is LDAP-Auth's (`POST /Users/{userId}/Password`). With
   `AllowPassChange` off it is upstream's `NotImplementedException`, a `500`. Otherwise the user's
@@ -280,6 +284,28 @@ Conventions:
   fails, is a warning, and the next boot tries again (`config.json` is written last, so its
   presence means the import finished). `scripts/migrate-jellyfin.sh` copies this one file of
   Jellyfin's `plugins/`.
+- Profile images (v24, `d11c86a`): the profile-image block of `Authenticate`,
+  `LdapUtils.TryDetermineAttributeFormat`, `ProfileImageUpdater.SetProfileImage` and
+  `LdapProfileImageSyncTask`. While `EnableLdapProfileImageSync` is on, `LocateLdapUser` also
+  asks for `LdapProfileImageAttribute`, and a user the sign-in creates gets the first value of
+  that attribute as their picture, stored as `profile.jpg` (`image/jpeg`, whatever the format,
+  as upstream), its link recording the Base64 of the picture's MD5 as the avatar hash
+  (`ProfileImageHash`). `LdapProfileImageFormat` reads the value: `Binary` as the bytes,
+  `Base64` with `Convert.FromBase64String`'s rules (whitespace skipped, padding required, the
+  unused bits of the last character ignored), `Url` by fetching it, and `Default` detects it on
+  the value read as UTF-8: a control character other than tab, CR and LF, or DEL, is binary;
+  else text `Base64.IsValid` accepts (which refuses non-zero unused bits before padding) is
+  Base64; else an absolute `http` or `https` URL is a URL; anything else is upstream's
+  `InvalidFormatException` message, not a guess. A returning user's sign-in leaves the picture
+  alone, as upstream. The task (key `LdapProfileImageSync`, name `LDAP - Synchronize profile
+  images`, description `Synchronizes user profile images from LDAP.`, category Application,
+  every 24 hours, task id from `Jellyfin.Plugin.LDAP_Auth.LdapProfileImageSyncTask`) does
+  nothing while the plugin is off, names no server, or has sync off. Otherwise, for each LDAP
+  link it finds the entry by the link's uid through the user search filter (`LocateLdapUser`
+  with the uid as the name); a user it does not find is a warning. With a picture there, an
+  unchanged one (same hash, a picture stored) is skipped, and otherwise the old picture is
+  cleared and the new one stored with its hash. Without one, `RemoveImagesNotInLdap` clears
+  the user's picture and the hash.
 - Admin filter (v24, `d11c86a`): the admin block of `Authenticate`. While `LdapAdminFilter` is
   neither empty nor `_disabled_` (ordinal), after the password is checked the bind DN searches,
   on a connection of its own, the subtree of `LdapAdminBaseDn` (the base DN when that is empty)
@@ -478,3 +504,43 @@ Conventions:
   - **A stored `LdapProfileImageFormat` that names no format** reads as `Default`, so one bad
     value cannot make the configuration unreadable. .NET's deserializer fails the whole
     configuration and the plugin starts from its defaults.
+  - **A picture given as a URL is fetched under the server's image download limits**, through
+    the `RemoteImageFetcher` seam over the providers' download path: a private address is
+    refused, on the request and on every redirect, unless `image_private_http_allow` lists it
+    (gl-1096); the body is read under `image_download_max_mb` (gl-1095); and it must start
+    like an image. Upstream fetches it with the default `HttpClient`, so a directory entry
+    could make the server read an internal service. A refused or failed fetch is a warning.
+  - **A picture that cannot be read is a warning for that user, never a failure.** Detection
+    that fails, Base64 that does not decode or a download that fails leaves a new user without
+    a picture (the sign-in succeeds; at sign-in a picture or hash that cannot be stored is a
+    warning too) and leaves the task's user as they were while it goes on to the next.
+    Upstream's exceptions fail the sign-in of the user it has just created, before it links
+    them, or stop the whole task. A search the directory fails for one user is a warning and
+    the next user is synced, as upstream catches that `AuthenticationException`; a user's
+    picture or link that cannot be stored fails the task, as upstream's.
+  - **A new user is linked before their picture is read**, and the picture's hash is recorded
+    once it is stored, so a concurrent sign-in finds the account by its uid while a URL picture
+    downloads. Upstream links after the picture. The download still runs inside the sign-in, as
+    upstream's does, bounded by the image download limits (the provider timeout and the origin's
+    pacing); a slow picture host therefore delays the first sign-ins that wait on the same
+    login lock.
+  - **The task fails when the directory cannot be reached or refuses the bind DN**, naming the
+    step, at the first user. Upstream catches that `AuthenticationException` for each user and
+    goes on, so every user would wait out the connect timeout (D6) in turn and the run would
+    report completed with nothing synced.
+  - **An entry without the picture attribute is logged at debug**: most users have none, and
+    the task would warn about each of them every day. Upstream's `GetAttribute` warns.
+  - **The task skips a link whose user is gone and a link with an empty uid.** Links go with
+    their user, so only a deletion racing the task leaves the first; upstream's
+    `NullReferenceException` stops the task there. An empty uid finds nothing, so it is not
+    searched for; upstream searches and warns, as the task does here.
+  - **The sync asks for the picture attribute only when it is named**: an empty
+    `LdapProfileImageAttribute` is not sent in the search's attribute list, since no entry has
+    an attribute without a name. Upstream sends the empty name.
+  - **An error's value is redacted**: a detection error names a URL by its scheme and host
+    (`redact_url`, which leaves a `file:` URL whole) and any other value by its length only,
+    and so does a failed fetch (the `Url` format set for an attribute that holds no URL
+    included), so a web URL's path and credentials, or an attribute that is not the picture (a
+    password hash, a whole encoded image), stay out of the log. A detection error still names
+    the scheme of a value that has one, as upstream's does. Upstream's message quotes the
+    value whole.

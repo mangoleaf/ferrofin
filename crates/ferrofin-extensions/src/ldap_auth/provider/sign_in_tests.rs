@@ -15,6 +15,7 @@ use ferrofin_traits::external_identities::ExternalIdentity;
 use rstest::rstest;
 
 use super::super::{LdapAttribute, LdapAuthExtension, LdapConnection, SearchOutcome, SearchScope};
+use super::profile_image::FakeImages;
 use super::*;
 use crate::{Extension, registered_plugins};
 
@@ -297,7 +298,11 @@ struct Harness {
     identities: Arc<FerrofinExternalIdentityStore>,
     plugins: Arc<FerrofinPluginManager>,
     directory: FakeDirectory,
+    /// What a picture URL answers.
+    images: FakeImages,
     plugins_dir: tempfile::TempDir,
+    /// Where `users` keeps profile images.
+    _profile_dir: tempfile::TempDir,
 }
 
 impl Harness {
@@ -320,8 +325,12 @@ impl Harness {
             .expect("connect");
         db.run_migrations().await.expect("migrations");
         let events = FerrofinEventManager::new();
-        let users =
-            Arc::new(FerrofinUserManager::new(db.clone()).with_events(Arc::new(events.clone())));
+        let profile_dir = tempfile::tempdir().expect("tempdir");
+        let users = Arc::new(
+            FerrofinUserManager::new(db.clone())
+                .with_events(Arc::new(events.clone()))
+                .with_profile_image_dir(profile_dir.path().to_path_buf()),
+        );
         let identities = Arc::new(FerrofinExternalIdentityStore::new(db));
         let plugins_dir = tempfile::tempdir().expect("tempdir");
         let extensions: Vec<Arc<dyn Extension>> = vec![Arc::new(LdapAuthExtension)];
@@ -339,11 +348,13 @@ impl Harness {
             ]);
             state.entries = vec![ada()];
         }
+        let images = FakeImages::default();
         users.set_extension_providers(vec![Arc::new(LdapAuthProvider::new(
             Arc::clone(&plugins) as Arc<dyn PluginManager>,
             Arc::clone(&users) as Arc<dyn UserManager>,
             Arc::clone(&identities) as Arc<dyn ExternalIdentityStore>,
             Arc::new(directory.clone()),
+            Arc::new(images.clone()),
         ))]);
         Self {
             users,
@@ -351,8 +362,21 @@ impl Harness {
             identities,
             plugins,
             directory,
+            images,
             plugins_dir,
+            _profile_dir: profile_dir,
         }
+    }
+
+    /// A provider over this harness, as the extension builds one.
+    fn provider(&self) -> LdapAuthProvider {
+        LdapAuthProvider::new(
+            Arc::clone(&self.plugins) as Arc<dyn PluginManager>,
+            Arc::clone(&self.users) as Arc<dyn UserManager>,
+            Arc::clone(&self.identities) as Arc<dyn ExternalIdentityStore>,
+            Arc::new(self.directory.clone()),
+            Arc::new(self.images.clone()),
+        )
     }
 
     async fn configure(&self, config: &LdapConfig) {
@@ -547,12 +571,7 @@ async fn an_empty_password_never_reaches_the_directory() {
 #[tokio::test]
 async fn the_users_bind_refuses_an_empty_password_itself() {
     let harness = Harness::new(&config()).await;
-    let provider = LdapAuthProvider::new(
-        Arc::clone(&harness.plugins) as Arc<dyn PluginManager>,
-        Arc::clone(&harness.users) as Arc<dyn UserManager>,
-        Arc::clone(&harness.identities) as Arc<dyn ExternalIdentityStore>,
-        Arc::new(harness.directory.clone()),
-    );
+    let provider = harness.provider();
     assert!(matches!(
         provider.bind_as_user(&config(), ADA_DN, "").await,
         Err(ServiceError::Unauthorized(_))
@@ -1286,3 +1305,4 @@ fn the_user_search_filter_is_built_as_upstream_builds_it(
 mod admin_filter_tests;
 mod adoption_tests;
 mod password_tests;
+mod profile_image_tests;
