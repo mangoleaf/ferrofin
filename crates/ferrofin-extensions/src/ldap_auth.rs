@@ -71,10 +71,11 @@
 //!   filter that does not parse (`Filter Error`). Upstream pulls Novell's
 //!   parser message out of the exception's text.
 //! - A followed referral keeps the configured TLS, its chain stops after
-//!   [`REFERRAL_HOP_LIMIT`] referrals, one that leads to no server is skipped
-//!   with a warning wherever it arrives, and its URL is read as RFC 4516
-//!   writes it: see `referrals`. Upstream's Novell client connects to a
-//!   referred server in plain LDAP, never stops a referral loop, and drops a
+//!   [`REFERRAL_HOP_LIMIT`] referrals, a search chases at most
+//!   [`REFERRAL_BUDGET`] in all, one that leads to no server is skipped with a
+//!   warning wherever it arrives, and its URL is read as RFC 4516 writes it:
+//!   see `referrals`. Upstream's Novell client connects to a referred server
+//!   in plain LDAP, never stops a referral loop, sets no total, and drops a
 //!   referral it cannot follow when it comes after the last entry or is a
 //!   `referral` result.
 
@@ -122,6 +123,16 @@ pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 /// default `HopLimit`): a referred server that refers the search on once more
 /// fails it, which is what stops a referral loop.
 pub const REFERRAL_HOP_LIMIT: usize = 10;
+
+/// The most referrals one search chases in all, followed or skipped (owner
+/// decision, gl-1208, 2026-11-03): the one past it fails the search. Each
+/// referral costs the D6 timeouts again ([`CONNECT_TIMEOUT`] and
+/// [`OPERATION_TIMEOUT`], for each of its URLs), and the hop limit bounds
+/// only a chain, not how many referrals each answer carries, so this bounds
+/// how many referrals one search chases, and with them most of the time it
+/// can take (a referral's URLs are not counted). Novell's client sets no
+/// total.
+pub const REFERRAL_BUDGET: usize = 10;
 
 /// The `referral` result code (RFC 4511 section 4.1.9): the server holds
 /// none of the operation's target and names where to send it.
@@ -594,6 +605,16 @@ pub enum LdapError {
     )]
     ReferralHopLimit {
         /// The server that sent the referral past the limit, `host:port`.
+        server: String,
+    },
+    /// A search met more than [`REFERRAL_BUDGET`] referrals in all.
+    #[error(
+        "the search was referred more than {} times in all, the last time by {server}: no \
+         search follows more referrals than that",
+        REFERRAL_BUDGET
+    )]
+    ReferralBudget {
+        /// The server that sent the referral past the budget, `host:port`.
         server: String,
     },
     /// The connection failed during an operation.
