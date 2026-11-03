@@ -471,3 +471,65 @@ async fn a_never_linked_user_ldap_auth_owns_changes_their_password_and_gains_no_
         "a password change links nothing"
     );
 }
+
+/// A user whose entry only a referred server lists is found there, as sign-in
+/// finds them, and the bind DN then writes the password at the configured
+/// server, as upstream's `ChangePassword` does (`ConnectToLdap()` follows no
+/// referral).
+#[tokio::test]
+async fn a_user_found_behind_a_referral_has_the_password_written_at_the_configured_server() {
+    const GRACE_DN: &str = "uid=grace,ou=partners,dc=example,dc=org";
+    let harness = Harness::new(&changes_allowed()).await;
+    {
+        let mut state = harness.directory.state();
+        state.extensions = vec![PASSWORD_MODIFY_OID.to_owned()];
+        state.entries.clear();
+        state.references = vec![vec![
+            "ldap://partners.example/ou=partners,dc=example,dc=org??sub".to_owned(),
+        ]];
+        state.by_server.insert(
+            "partners.example".to_owned(),
+            SearchOutcome {
+                entries: vec![entry(
+                    GRACE_DN,
+                    &[("uid", "grace"), ("mail", "grace@example.org")],
+                )],
+                references: Vec::new(),
+            },
+        );
+        state
+            .accounts
+            .insert(GRACE_DN.to_owned(), "grace-secret".to_owned());
+    }
+    let grace = harness
+        .sign_in("grace", "grace-secret")
+        .await
+        .expect("sign in")
+        .expect("created");
+    harness.directory.clear_calls();
+
+    harness
+        .users
+        .change_password(id_of(&grace), "grace-new-secret")
+        .await
+        .expect("changed");
+
+    let state = harness.directory.state();
+    assert_eq!(
+        state.writes,
+        [(
+            GRACE_DN.to_owned(),
+            "passwordModify".to_owned(),
+            "grace-new-secret".to_owned()
+        )]
+    );
+    assert_eq!(
+        state.binds_at,
+        [
+            ("ldap.example".to_owned(), READER_DN.to_owned()),
+            ("partners.example".to_owned(), READER_DN.to_owned()),
+            ("ldap.example".to_owned(), READER_DN.to_owned()),
+        ],
+        "searched through the referral, written at the configured server"
+    );
+}

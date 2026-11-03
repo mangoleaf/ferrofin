@@ -15,12 +15,15 @@ pub const LATEST_ITEMS_FALLBACK_LIMIT: i32 = 10;
 /// Port of C# `MediaBrowser.Model.Querying.LatestItemsQuery` — the request
 /// behind `GET /Items/Latest`.
 ///
-/// The manager runs **one** query across every parent (the root folders the
-/// user may open, or the `parent_id` folder), over-fetching `limit * 5` rows ordered
-/// `DateCreated DESC, SortName DESC, ProductionYear DESC`, and then groups the
-/// rows by their index container (episode → series, track → album, photo →
-/// photo album) until `limit` groups exist. `is_played` is pushed into the SQL
-/// (it needs `user`), exactly as upstream's `InternalItemsQuery.IsPlayed`.
+/// The manager reads the rows across every parent (the root folders the user
+/// may open, or the `parent_id` folder) — the plain query over-fetches
+/// `limit * 5` rows ordered `DateCreated DESC, SortName DESC, ProductionYear
+/// DESC`; a grouped request with a tvshows, music or movies first typed parent,
+/// or with no typed parent at all, takes that arm of v12's `GetLatestItemList`
+/// instead — and then groups the rows by their index container (episode →
+/// series, track → album, photo → photo album) until `limit` groups exist.
+/// `is_played` is pushed into the SQL (it needs `user`), exactly as upstream's
+/// `InternalItemsQuery.IsPlayed`.
 #[derive(Debug, Clone)]
 pub struct LatestItemsQuery {
     /// The requesting user (C# `User`). Scopes the played predicate and the
@@ -39,7 +42,8 @@ pub struct LatestItemsQuery {
     /// The number of **groups** to return (C# `Limit`); the plain query
     /// over-fetches `limit * 5` rows (a grouped request whose first typed
     /// library is tvshows, music or movies takes that type's query instead,
-    /// which `limit` caps directly). `None` falls back to [`LATEST_ITEMS_FALLBACK_LIMIT`]
+    /// and one with no typed parent the `unknown` arm, which `limit` caps
+    /// directly). `None` falls back to [`LATEST_ITEMS_FALLBACK_LIMIT`]
     /// for the over-fetch and never stops the grouping early (C#'s
     /// `list.Count >= null` is always false).
     pub limit: Option<i32>,

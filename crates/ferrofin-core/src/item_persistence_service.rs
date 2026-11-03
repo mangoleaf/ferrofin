@@ -3045,9 +3045,9 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         if item_ids.is_empty() {
             return Ok(out);
         }
-        // Chunked to stay under SQLite's bound-parameter ceiling, the same
-        // 500-wide shape every other batched id lookup here uses.
-        for chunk in item_ids.chunks(500) {
+        // Chunked to stay under SQLite's bound-parameter ceiling, in the
+        // shape every other batched id lookup here uses.
+        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Path", "Width", "Height", "Blurhash", "DateModified"

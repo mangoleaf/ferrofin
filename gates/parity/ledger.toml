@@ -382,21 +382,6 @@ kind = "value"
 issue = 848
 reason = "Paths of by-name items are answered with %MetadataPath% unexpanded."
 
-# Grouped Latest lacks v12's movies and mixed-library branches.
-[[entry]]
-request = "GetLatestMedia*"
-path = "$"
-kind = "length"
-issue = 383
-reason = "Grouped Latest lacks v12's movies and mixed-library branches."
-
-[[entry]]
-request = "GetLatestMedia*"
-path = "[].ChildCount"
-kind = "value"
-issue = 383
-reason = "Grouped Latest lacks v12's movies and mixed-library branches."
-
 # The latest-episode container is loaded without its provider ids.
 [[entry]]
 request = "GetLatestMedia.includeItemTypes.episode"

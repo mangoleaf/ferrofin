@@ -61,6 +61,14 @@ pub trait EncoderCapabilities: Send + Sync {
     fn is_vaapi_device_intel_ihd(&self) -> bool {
         false
     }
+
+    /// Whether a bitstream filter accepts `option`, the Dolby Vision and HDR10+
+    /// removals the stream-copy decision depends on. Port of
+    /// `IMediaEncoder.SupportsBitStreamFilterWithOption`; `false` (the default)
+    /// when nothing was probed, so such a copy transcodes.
+    fn supports_bsf_with_option(&self, _option: super::hw::capabilities::BsfOption) -> bool {
+        false
+    }
 }
 
 /// [`EncoderCapabilities`] that reports no optional encoders available.
@@ -348,6 +356,16 @@ impl EncodingJobInfo {
     #[must_use]
     pub fn is_copy_codec(codec: Option<&str>) -> bool {
         codec.is_some_and(|c| c.eq_ignore_ascii_case("copy"))
+    }
+
+    /// Whether a progressive job keeps the source's timestamps (`-copyts`):
+    /// the client asked for it (`CopyTimestamps`) and the runtime is known, as
+    /// upstream's progressive command requires (`state.RunTimeTicks.HasValue &&
+    /// state.BaseRequest.CopyTimestamps`). Not the HLS rule: upstream's HLS
+    /// command copies timestamps whatever the request says.
+    #[must_use]
+    pub fn copies_timestamps(&self) -> bool {
+        self.base_request.copy_timestamps && self.run_time_ticks.is_some()
     }
 
     /// Whether this job re-encodes any stream, video or audio: what the

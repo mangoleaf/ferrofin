@@ -34,7 +34,7 @@ use tracing::Instrument;
 use super::{
     CONNECT_TIMEOUT, CertificateVerification, ClientCertificate, ConnectionOptions, FILTER_ERROR,
     LdapAttribute, LdapConnection, LdapDirectory, LdapEntry, LdapError, OPERATION_TIMEOUT,
-    SearchOutcome, SearchScope,
+    REFERRAL, SearchOutcome, SearchScope,
 };
 
 /// The OID of the StartTLS extended operation (RFC 4511 section 4.14).
@@ -679,15 +679,27 @@ impl LdapConnection for Ldap3Connection {
             SearchScope::OneLevel => Scope::OneLevel,
             SearchScope::Subtree => Scope::Subtree,
         };
-        let ldap3::SearchResult(entries, result) = match self
-            .ldap
-            .with_timeout(self.timeout)
-            .search(base, scope, filter, attributes.to_vec())
-            .await
+        let (entries, references, result) = match stream_search(
+            &mut self.ldap,
+            self.timeout,
+            base,
+            scope,
+            filter,
+            attributes,
+        )
+        .await
         {
             Ok(found) => found,
             Err(e) => return Err(self.failure(e).await),
         };
+        // A `referral` result refers the whole search: an LDAPv3 server sends
+        // no entries with it, so none are kept.
+        if result.rc == REFERRAL && !result.refs.is_empty() {
+            return Err(LdapError::Referred {
+                urls: result.refs,
+                message: result.text,
+            });
+        }
         if result.rc != 0 {
             return Err(LdapError::Result {
                 code: result.rc,
@@ -699,7 +711,10 @@ impl LdapConnection for Ldap3Connection {
                 .into_iter()
                 .map(ldap_entry)
                 .collect::<Result<_, _>>()?,
-            references: result.refs,
+            references: references
+                .into_iter()
+                .map(reference_urls)
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -766,6 +781,63 @@ impl LdapConnection for Ldap3Connection {
             tracing::debug!(error = ?e.to_string(), "LDAP unbind failed");
         }
     }
+}
+
+/// A search's entries, its search references and its result, as `ldap3`'s
+/// `search` collects them but with each reference kept apart: `search` (its
+/// `EntriesOnly` adapter) runs every reference's URLs and the result's own
+/// referral into one list, losing which URLs are alternatives of each other.
+/// Intermediate responses are dropped, as `search` drops them.
+async fn stream_search(
+    ldap: &mut ldap3::Ldap,
+    timeout: Duration,
+    base: &str,
+    scope: Scope,
+    filter: &str,
+    attributes: &[&str],
+) -> Result<
+    (
+        Vec<ldap3::ResultEntry>,
+        Vec<ldap3::ResultEntry>,
+        ldap3::LdapResult,
+    ),
+    ldap3::LdapError,
+> {
+    let mut stream = ldap
+        .with_timeout(timeout)
+        .streaming_search(base, scope, filter, attributes.to_vec())
+        .await?;
+    let mut entries = Vec::new();
+    let mut references = Vec::new();
+    while let Some(entry) = stream.next().await? {
+        if entry.is_ref() {
+            references.push(entry);
+        } else if !entry.is_intermediate() {
+            entries.push(entry);
+        }
+    }
+    Ok((entries, references, stream.finish().await))
+}
+
+/// The URLs of a search reference. `ldap3::parse_refs` panics on one it
+/// cannot read, which here fails the search instead.
+fn reference_urls(reference: ldap3::ResultEntry) -> Result<Vec<String>, LdapError> {
+    reference
+        .0
+        .expect_constructed()
+        .and_then(|urls| {
+            urls.into_iter()
+                .map(|url| {
+                    url.expect_primitive()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                })
+                .collect()
+        })
+        .ok_or_else(|| {
+            LdapError::Connection(
+                "the directory sent a search reference that cannot be read".to_owned(),
+            )
+        })
 }
 
 /// An `ldap3` entry as a [`LdapEntry`], its text and binary attributes alike.

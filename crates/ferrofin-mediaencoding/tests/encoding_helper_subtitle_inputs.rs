@@ -223,10 +223,12 @@ fn an_upper_case_vob_sub_is_read_through_its_idx() {
 }
 
 /// The subtitle input reads like the media file (`-analyzeduration`,
-/// `-probesize`), seeks with it, and a burned-in bitmap is decoded onto the
-/// canvas it was authored for; the `-i` names it as a `file:` URL.
+/// `-probesize`), and a burned-in bitmap is decoded onto the canvas it was
+/// authored for; the `-i` names it as a `file:` URL. With no `-isync` known it
+/// is read from its start on its own timestamps, moved back by the media
+/// file's seek (gl-929).
 #[test]
-fn a_burned_external_bitmap_is_input_1_seeked_and_on_its_canvas() {
+fn a_burned_external_bitmap_is_input_1_on_its_canvas() {
     let mut sub = external_subtitle(2, "PGSSUB", "/media/movie en.sup");
     sub.width = Some(1920);
     sub.height = Some(1080);
@@ -239,10 +241,12 @@ fn a_burned_external_bitmap_is_input_1_seeked_and_on_its_canvas() {
             "3000000",
             "-probesize",
             "1G",
-            "-ss",
-            "00:01:02.500",
             "-canvas_size",
             "1920x1080",
+            "-seek_timestamp",
+            "1",
+            "-itsoffset",
+            "-00:01:02.500",
             "-i",
             "file:/media/movie en.sup",
         ]
@@ -282,9 +286,9 @@ fn a_burned_external_bitmap_is_read_from_its_start_on_the_media_files_clock() {
 }
 
 /// The embedded half of that pair: an embedded bitmap sidecar keeps the
-/// media file's seek (its packets are copied, and an unseeked one would
-/// carry negative timestamps into the muxer) and is synced, with no canvas;
-/// with no seek it is synced all the same.
+/// media file's seek where `-isync` exists (ffmpeg 5.1; before it, it is read
+/// from its start and gl-930's output trim cuts it, see gl-1200) and is
+/// synced, with no canvas; with no seek it is synced all the same.
 #[rstest]
 #[case::seeked(Some("10"), &["-ss", "10", "-isync", "0"])]
 #[case::from_the_start(None, &["-isync", "0"])]
@@ -340,27 +344,114 @@ fn other_external_subtitles_add_no_input(
 }
 
 /// Without `-copyts` every input's timeline starts at its own first packet,
-/// so each external input is put on the media file's clock, by the `-isync`
-/// ffmpeg 5.1 brought; an older or unknown ffmpeg gets no option it would
-/// refuse.
+/// so each external subtitle input is put on the media file's clock by the
+/// `-isync` ffmpeg 5.1 brought. On an older or unknown ffmpeg a bitmap sidecar,
+/// whose start time is its first cue, is read from its start on its own
+/// timestamps (`-seek_timestamp`) and moved back by the seek (gl-929); a text
+/// sidecar has no start time and keeps upstream's seeked form.
 #[rstest]
-#[case::with_isync(Some(FfmpegVersion::new(5, 1)), true)]
-#[case::newer(Some(FfmpegVersion::with_build(7, 0, 1)), true)]
-#[case::before_isync(Some(FfmpegVersion::new(5, 0)), false)]
-#[case::unknown(None, false)]
+#[case::with_isync(Some(FfmpegVersion::new(5, 1)), "srt", &["-ss", "10", "-isync", "0"])]
+#[case::newer(Some(FfmpegVersion::with_build(7, 0, 1)), "srt", &["-ss", "10", "-isync", "0"])]
+#[case::bitmap_with_isync(Some(FfmpegVersion::new(5, 1)), "PGSSUB", &["-ss", "10", "-isync", "0"])]
+#[case::text_before_isync(Some(FfmpegVersion::new(5, 0)), "srt", &["-ss", "10"])]
+#[case::text_unknown(None, "srt", &["-ss", "10"])]
+#[case::bitmap_before_isync(
+    Some(FfmpegVersion::new(5, 0)),
+    "PGSSUB",
+    &["-seek_timestamp", "1", "-itsoffset", "-10"]
+)]
+#[case::bitmap_oldest(
+    Some(FfmpegVersion::new(4, 4)),
+    "PGSSUB",
+    &["-seek_timestamp", "1", "-itsoffset", "-10"]
+)]
+#[case::bitmap_unknown(None, "PGSSUB", &["-seek_timestamp", "1", "-itsoffset", "-10"])]
 fn external_inputs_are_synced_to_the_media_files_clock(
     #[case] version: Option<FfmpegVersion>,
-    #[case] synced: bool,
+    #[case] codec: &str,
+    #[case] timing: &[&str],
 ) {
-    let sub = external_subtitle(2, "srt", "/media/movie.en.srt");
+    let path = if codec == "srt" {
+        "/media/movie.en.srt"
+    } else {
+        "/media/movie.en.sup"
+    };
+    let sub = external_subtitle(2, codec, path);
     let state = build_state(Some(sub), Some(SubtitleDeliveryMethod::Embed), None);
     let inputs = external_stream_input_arguments(&state, Some("10"), version);
-    let mut expected = vec!["-analyzeduration", "200M", "-probesize", "1G", "-ss", "10"];
-    if synced {
-        expected.extend(["-isync", "0"]);
-    }
-    expected.extend(["-i", "file:/media/movie.en.srt"]);
+    let mut expected = vec!["-analyzeduration", "200M", "-probesize", "1G"];
+    expected.extend(timing);
+    let input = format!("file:{path}");
+    expected.extend(["-i", input.as_str()]);
     assert_eq!(inputs, expected);
+}
+
+/// A seek clamped to the very start still names its time, which offsets a
+/// bitmap read from its start by nothing.
+#[test]
+fn a_seek_clamped_to_the_start_offsets_a_bitmap_by_nothing() {
+    let sub = external_subtitle(2, "PGSSUB", "/media/movie.en.sup");
+    let state = build_state(Some(sub), Some(SubtitleDeliveryMethod::Embed), None);
+    assert_eq!(
+        external_stream_input_arguments(&state, Some("00:00:00.000"), None),
+        [
+            "-analyzeduration",
+            "200M",
+            "-probesize",
+            "1G",
+            "-seek_timestamp",
+            "1",
+            "-itsoffset",
+            "-00:00:00.000",
+            "-i",
+            "file:/media/movie.en.sup",
+        ]
+    );
+}
+
+/// Without `-isync`, a burned-in bitmap sidecar is read from its start too,
+/// after its canvas: a seek before its first cue would lose that display set.
+/// With no seek it takes `-seek_timestamp` alone, so its timeline is not moved
+/// by its first cue (gl-929).
+#[rstest]
+#[case::seeked(Some("10"), &["-canvas_size", "1920x1080", "-seek_timestamp", "1", "-itsoffset", "-10"])]
+#[case::from_the_start(None, &["-canvas_size", "1920x1080", "-seek_timestamp", "1"])]
+fn without_isync_a_burned_bitmap_is_read_from_its_start(
+    #[case] seek: Option<&str>,
+    #[case] timing: &[&str],
+) {
+    let mut sub = external_subtitle(2, "PGSSUB", "/media/movie.en.sup");
+    sub.width = Some(1920);
+    sub.height = Some(1080);
+    let state = build_state(Some(sub), Some(SubtitleDeliveryMethod::Encode), None);
+    let mut expected = vec!["-analyzeduration", "200M", "-probesize", "1G"];
+    expected.extend(timing);
+    expected.extend(["-i", "file:/media/movie.en.sup"]);
+    assert_eq!(
+        external_stream_input_arguments(&state, seek, Some(FfmpegVersion::new(5, 0))),
+        expected
+    );
+}
+
+/// Without `-isync`, an external audio track keeps upstream's form: seeked,
+/// with no option for its clock.
+#[rstest]
+#[case::before_isync(Some(FfmpegVersion::new(5, 0)))]
+#[case::unknown(None)]
+fn without_isync_an_external_audio_track_is_seeked_as_upstream(
+    #[case] version: Option<FfmpegVersion>,
+) {
+    let audio = MediaStream {
+        is_external: true,
+        path: Some("/media/movie.commentary.mka".to_owned()),
+        ..stream(3, MediaStreamType::Audio, "aac")
+    };
+    let mut state = build_state(None, None, Some(vec![audio.clone()]));
+    state.audio_stream = Some(audio);
+    assert_eq!(
+        external_stream_input_arguments(&state, Some("10"), version),
+        ["-ss", "10", "-i", "/media/movie.commentary.mka"]
+    );
 }
 
 /// An external audio track follows the subtitle input, seeked alike, so the

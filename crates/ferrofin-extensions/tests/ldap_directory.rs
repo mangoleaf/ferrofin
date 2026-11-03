@@ -10,13 +10,15 @@
 //! It needs `docker`. The first run builds a small image from `alpine:3.22`
 //! with Alpine's OpenLDAP packages; certificates are generated per run under
 //! the target directory. Two servers start: one that takes any client, and one
-//! that demands a client certificate. Without `FERROFIN_LDAP_TESTS=1` the test
-//! says so and passes. Later phases of the LDAP-Auth port add their cases here.
+//! that demands a client certificate; the referral case starts two more, one
+//! referring to the other and to a name that does not resolve. Without
+//! `FERROFIN_LDAP_TESTS=1` the test says so and passes. Later phases of the
+//! LDAP-Auth port add their cases here.
 
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore;
@@ -399,6 +401,7 @@ async fn the_directory_client_against_openldap() {
     filter_test_and_user_search(&plain).await;
     password_change(&plain).await;
     directory_operations(&plain).await;
+    referrals(&files, &conf, scratch.path()).await;
 }
 
 /// Plain LDAP: every step, an anonymous bind, a wrong bind password and a
@@ -1362,4 +1365,352 @@ async fn password_change(plain: &LdapConfig) {
         .expect("restored");
     assert!(signs_in(&users, ADA_PASSWORD).await);
     println!("password change: ok");
+}
+
+/// Grace, whom only the referred server's directory lists.
+const GRACE_DN: &str = "uid=grace,ou=partners,dc=example,dc=org";
+const GRACE_PASSWORD: &str = "grace-secret";
+/// The referring server's referral object, which names the referred server.
+const PARTNERS_REFERRAL_DN: &str = "ou=partners-referral,dc=example,dc=org";
+/// The referring server's referral object naming a server whose name does not
+/// resolve ([`GONE_HOST`]), as Active Directory's references to
+/// `ForestDnsZones.<domain>` are to a server outside the domain's DNS.
+const GONE_REFERRAL_DN: &str = "ou=gone-referral,dc=example,dc=org";
+/// A name that never resolves (`.invalid`, RFC 2606).
+const GONE_HOST: &str = "ferrofin-referral-test.invalid";
+
+/// The referred server's directory: the same suffix, with the reader (the bind
+/// DN binds there too) and the partners only it lists.
+const REFERRED_SEED: &str = "dn: dc=example,dc=org
+objectClass: top
+objectClass: dcObject
+objectClass: organization
+o: Example
+dc: example
+
+dn: ou=people,dc=example,dc=org
+objectClass: organizationalUnit
+ou: people
+
+dn: uid=reader,ou=people,dc=example,dc=org
+objectClass: inetOrgPerson
+uid: reader
+cn: reader
+sn: reader
+userPassword: reader-secret
+
+dn: ou=partners,dc=example,dc=org
+objectClass: organizationalUnit
+ou: partners
+
+dn: uid=grace,ou=partners,dc=example,dc=org
+objectClass: inetOrgPerson
+uid: grace
+cn: Grace Hopper
+sn: Hopper
+mail: grace@example.org
+userPassword: grace-secret
+";
+
+/// What the referring server adds to [`SEED`]: a referral object naming the
+/// referred server's partners, by plain LDAP and by LDAPS (alternatives, in
+/// that order), one naming [`GONE_HOST`], and Grace's credentials. Sign-in
+/// checks the user's password at the configured server, as upstream does,
+/// which in Active Directory can authenticate a user of another domain in its
+/// forest; OpenLDAP cannot, so it keeps her password in an `account` entry,
+/// which the user filter (`inetOrgPerson`) does not find.
+fn referring_seed(referred: &Directory) -> String {
+    format!(
+        "{SEED}
+dn: ou=partners,dc=example,dc=org
+objectClass: organizationalUnit
+ou: partners
+
+dn: {GRACE_DN}
+objectClass: account
+objectClass: simpleSecurityObject
+uid: grace
+userPassword: {GRACE_PASSWORD}
+
+dn: {PARTNERS_REFERRAL_DN}
+objectClass: referral
+objectClass: extensibleObject
+ou: partners-referral
+ref: ldap://localhost:{}/ou=partners,dc=example,dc=org
+ref: ldaps://localhost:{}/ou=partners,dc=example,dc=org
+
+dn: {GONE_REFERRAL_DN}
+objectClass: referral
+objectClass: extensibleObject
+ou: gone-referral
+ref: ldap://{GONE_HOST}/ou=gone,dc=example,dc=org
+",
+        referred.ldap_port, referred.ldaps_port
+    )
+}
+
+/// Writes a server's configuration into `dir`, with the seed `seed` and the
+/// certificates `conf` holds, adding `global` to slapd.conf's global section.
+fn prepare_server(dir: &Path, conf: &Path, seed: &str, global: &str) {
+    std::fs::create_dir_all(dir).expect("server dir");
+    write(
+        dir,
+        "slapd.conf",
+        &slapd_conf("never").replace("database mdb", &format!("{global}database mdb")),
+    );
+    write(dir, "seed.ldif", seed);
+    write(dir, "start.sh", START);
+    for file in ["server.pem", "server.key", "client-ca.pem"] {
+        std::fs::copy(conf.join(file), dir.join(file)).expect("certificate");
+    }
+}
+
+/// The real directory client, recording where it connects.
+#[derive(Default)]
+struct Recording {
+    connects: Mutex<Vec<ConnectionOptions>>,
+}
+
+impl Recording {
+    /// The connections asked for since the last call.
+    fn take(&self) -> Vec<ConnectionOptions> {
+        std::mem::take(&mut *self.connects.lock().expect("connects"))
+    }
+}
+
+#[async_trait::async_trait]
+impl LdapDirectory for Recording {
+    async fn connect(
+        &self,
+        options: &ConnectionOptions,
+    ) -> Result<Box<dyn LdapConnection>, LdapError> {
+        self.connects
+            .lock()
+            .expect("connects")
+            .push(options.clone());
+        Ldap3Directory::default().connect(options).await
+    }
+}
+
+/// `(use_ssl, use_start_tls, port)` of each connection to the referred
+/// server among `connects`.
+fn referred_connections(
+    connects: &[ConnectionOptions],
+    referred: &Directory,
+) -> Vec<(bool, bool, i32)> {
+    let ports = [
+        i32::from(referred.ldap_port),
+        i32::from(referred.ldaps_port),
+    ];
+    connects
+        .iter()
+        .filter(|options| ports.contains(&options.port))
+        .map(|options| (options.use_ssl, options.use_start_tls, options.port))
+        .collect()
+}
+
+/// Referrals (`GetSearchConstraints` with `LdapAuthHandler`): the referring
+/// server lists Grace's part of the tree as a referral to the referred one,
+/// which refuses a simple bind without TLS. A user only the referred server
+/// lists is found by the user search and the filter test and signs in, over
+/// plain LDAP, LDAPS and StartTLS, the referred connection never in clear,
+/// while the reference to a name that does not resolve is skipped (gl-1207);
+/// a search whose base is the referral object follows the `referral` result;
+/// the connection test's base search does not follow, as upstream's.
+async fn referrals(files: &Files, conf: &Path, scratch: &Path) {
+    let referred_conf = scratch.join("referred");
+    prepare_server(
+        &referred_conf,
+        conf,
+        REFERRED_SEED,
+        "security simple_bind=1\n",
+    );
+    let referred = Directory::start(&referred_conf);
+    let referring_conf = scratch.join("referring");
+    prepare_server(&referring_conf, conf, &referring_seed(&referred), "");
+    let referring = Directory::start(&referring_conf);
+    wait_until_up(referred.ldap_port).await;
+    wait_until_up(referring.ldap_port).await;
+
+    // The referred server refuses the bind password in clear.
+    let mut clear = Ldap3Directory::default()
+        .connect(&ConnectionOptions::from_config(&plain_config(
+            referred.ldap_port,
+        )))
+        .await
+        .expect("connect");
+    let refused = clear.simple_bind(READER_DN, READER_PASSWORD).await;
+    clear.unbind().await;
+    println!("referred server, a bind in clear: {refused:?}");
+    assert!(
+        matches!(refused, Err(LdapError::Result { code: 13, .. })),
+        "{refused:?}"
+    );
+
+    // The warnings for the skipped referrals, printed.
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_env_filter("ferrofin_extensions::ldap_auth::referrals=warn")
+            .with_ansi(false)
+            .with_test_writer()
+            .finish(),
+    );
+    referral_configurations(files, &referring, &referred).await;
+    println!("referrals: ok");
+}
+
+/// How many of `connects` went to `host`.
+fn connections_to(connects: &[ConnectionOptions], host: &str) -> usize {
+    connects
+        .iter()
+        .filter(|options| options.server == host)
+        .count()
+}
+
+/// Over plain LDAP, LDAPS and StartTLS to the referring server: the user
+/// search finds Grace and the filter test counts her, the referred connection
+/// never in clear, and she signs in, each search skipping the reference to
+/// [`GONE_HOST`]; then searches based at the referral objects, and the
+/// connection test.
+async fn referral_configurations(files: &Files, referring: &Directory, referred: &Directory) {
+    let plain = LdapConfig {
+        ldap_search_filter: "(objectClass=inetOrgPerson)".to_owned(),
+        ldap_search_attributes: "uid, cn, mail".to_owned(),
+        ldap_uid_attribute: "uid".to_owned(),
+        ldap_username_attribute: "cn".to_owned(),
+        ldap_admin_filter: "_disabled_".to_owned(),
+        ldap_root_ca_path: files.root_ca.clone(),
+        enable_all_folders: true,
+        ..plain_config(referring.ldap_port)
+    };
+    let ldaps = LdapConfig {
+        ldap_port: i32::from(referring.ldaps_port),
+        use_ssl: true,
+        ..plain.clone()
+    };
+    let start_tls = LdapConfig {
+        use_start_tls: true,
+        ..plain.clone()
+    };
+    let ldap = i32::from(referred.ldap_port);
+    let ldaps_port = i32::from(referred.ldaps_port);
+    // Each configuration and how it reaches the referred server: the plain
+    // URL first, over the configured TLS; plain LDAP is refused there, and an
+    // LDAPS connection to the plain port fails, so both go on to the LDAPS URL.
+    let cases = [
+        (
+            "plain",
+            &plain,
+            vec![(false, false, ldap), (true, false, ldaps_port)],
+        ),
+        (
+            "ldaps",
+            &ldaps,
+            vec![(true, false, ldap), (true, false, ldaps_port)],
+        ),
+        ("starttls", &start_tls, vec![(false, true, ldap)]),
+    ];
+    let directory = Recording::default();
+    for (case, config, path) in cases {
+        let answer = ldap_user_search(&directory, config, "grace").await;
+        println!("referral, {case}: user search {answer:?}");
+        assert_eq!(
+            answer,
+            LdapTestAnswer::Ok(UserSearchResponse {
+                located_dn: Some(GRACE_DN.to_owned()),
+            }),
+            "{case}"
+        );
+        let connects = directory.take();
+        assert_eq!(
+            referred_connections(&connects, referred),
+            path,
+            "{case}: the referred connections"
+        );
+        // The reference to a name that does not resolve: met, and skipped.
+        assert_eq!(connections_to(&connects, GONE_HOST), 1, "{case}");
+
+        // The reader and Ada here, Grace there.
+        assert_eq!(
+            test_ldap_filters(&directory, config).await,
+            LdapTestAnswer::Ok(LdapFilterResponse {
+                users: 3,
+                admins: 0,
+                is_subset: true,
+            }),
+            "{case}"
+        );
+        directory.take();
+
+        let users = SignIn::new(config).await;
+        let grace = users
+            .sign_in("grace", GRACE_PASSWORD)
+            .await
+            .expect("sign in")
+            .expect("created");
+        assert_eq!(grace.username, "Grace Hopper", "{case}");
+        assert_eq!(
+            users
+                .sign_in("Grace Hopper", "wrong")
+                .await
+                .expect("sign in"),
+            None,
+            "{case}: a wrong password, checked at the configured server"
+        );
+    }
+
+    // A search whose base is the referral object gets a `referral` result,
+    // followed to the DN it names.
+    let at_the_referral = LdapConfig {
+        ldap_base_dn: PARTNERS_REFERRAL_DN.to_owned(),
+        ..start_tls.clone()
+    };
+    assert_eq!(
+        ldap_user_search(&directory, &at_the_referral, "grace").await,
+        LdapTestAnswer::Ok(UserSearchResponse {
+            located_dn: Some(GRACE_DN.to_owned()),
+        }),
+        "a referral result"
+    );
+    referral_result_to_no_server(&directory, &start_tls).await;
+
+    // The connection test's base search does not follow, as upstream's.
+    let response = run("referral, connection test", &plain).await;
+    assert_eq!(response.base_search, testing());
+    assert_eq!(
+        response.error.as_deref(),
+        Some("Search result reference received, and referral following is off")
+    );
+}
+
+/// A search whose base is the referral object naming [`GONE_HOST`] gets a
+/// `referral` result that leads to no server: it is skipped, so the search
+/// finds nothing, as Novell's search results end empty (gl-1207).
+async fn referral_result_to_no_server(directory: &Recording, config: &LdapConfig) {
+    directory.take();
+    let at_the_gone_referral = LdapConfig {
+        ldap_base_dn: GONE_REFERRAL_DN.to_owned(),
+        ..config.clone()
+    };
+    assert_eq!(
+        ldap_user_search(directory, &at_the_gone_referral, "grace").await,
+        LdapTestAnswer::Unauthorized(LdapTestErrorResponse::new(
+            "Found no LDAP users matching provided username."
+        )),
+        "a referral result that leads to no server"
+    );
+    assert_eq!(
+        test_ldap_filters(directory, &at_the_gone_referral).await,
+        LdapTestAnswer::Ok(LdapFilterResponse {
+            users: 0,
+            admins: 0,
+            is_subset: true,
+        }),
+    );
+    assert_eq!(
+        connections_to(&directory.take(), GONE_HOST),
+        2,
+        "each search followed the referral result to the name that does not resolve"
+    );
+    println!("referral to a name that does not resolve: skipped");
 }

@@ -1793,6 +1793,8 @@ pub async fn build_app_state(
     );
     // From here the writers' bracketed writes reach the monitor.
     self_writes.set(library_monitor_impl.clone());
+    // Its watch lifecycle, spawned below.
+    let monitor_lifecycle = (*library_monitor_impl).clone();
     let library_monitor: Arc<dyn ferrofin_traits::library::LibraryMonitor> = library_monitor_impl;
     // Close the Live TV <-> library cycle: the recording folders become
     // libraries through this, on the lock a `livetv` save over the API holds.
@@ -1818,30 +1820,6 @@ pub async fn build_app_state(
             }
         }));
     }
-    // Establishing the watches is a FILESYSTEM WALK, not a registration: an
-    // inotify recursive watch adds one kernel watch per directory under every
-    // library root, so its cost scales with the library's directory count and
-    // with how slow that filesystem is (measured on warm tmpfs: 10 ms at 1,000
-    // directories, 21 ms at 5,000, 60 ms at 20,000 — a cold network mount is
-    // far worse). Awaiting it here put that walk *before* the listener binds,
-    // where every millisecond is a client getting connection-refused rather
-    // than a slow response.
-    //
-    // Nothing needs the watches to exist before the server serves: they only
-    // feed realtime change detection, which is already blind for the whole of
-    // boot, and a change arriving during the walk is picked up by the next
-    // scheduled scan exactly as one arriving a moment earlier would be. So it
-    // is spawned and boot continues. It is a background task like the event
-    // pump, so an in-process restart's teardown stops the walk rather than
-    // letting the old lifetime keep adding watches (upstream's
-    // `ApplicationStopping` disposes the monitor). Nothing calls `start`
-    // after teardown: the requests have drained and the pump is stopped.
-    let monitor_start = Arc::clone(&library_monitor);
-    background.push(tokio::spawn(async move {
-        if let Err(err) = monitor_start.start().await {
-            tracing::warn!(%err, "failed to start library monitor");
-        }
-    }));
     // Scheduled tasks: the registry + trigger scheduler behind the dashboard's
     // "Scheduled Tasks" page. Trigger overrides persist across restarts; the
     // full Library/Maintenance task set is registered below once its backing
@@ -2044,25 +2022,25 @@ pub async fn build_app_state(
             db.clone(),
         ),
     );
+    // Where the plugin manager keeps each plugin's state and `config.json`; the
+    // LDAP-Auth import below checks the same directory.
+    let plugin_state_dir = config.config_dir.join("plugins");
     let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> = Arc::new(
-        ferrofin_core::FerrofinPluginManager::new(
-            registered_plugins,
-            config.config_dir.join("plugins"),
-        )
-        .with_offered_items(Arc::clone(&plugin_offered_items))
-        .with_installer(
-            config.data_dir.join("plugins"),
-            Arc::clone(&wasm_validator),
-            Arc::clone(&lifecycle),
-        )
-        .with_download_cap_mb(config.max_plugin_download_mb)
-        // The package repositories live in the server configuration — the single
-        // store upstream keeps them in — so `/Repositories`, `/Packages` and
-        // `/System/Configuration` can never disagree.
-        .with_configuration(Arc::clone(&config_trait))
-        .with_application_version(JELLYFIN_API_VERSION)
-        // A saved configuration is announced in-process (`ConfigurationChanged`).
-        .with_events(Arc::clone(&event_manager)),
+        ferrofin_core::FerrofinPluginManager::new(registered_plugins, plugin_state_dir.clone())
+            .with_offered_items(Arc::clone(&plugin_offered_items))
+            .with_installer(
+                config.data_dir.join("plugins"),
+                Arc::clone(&wasm_validator),
+                Arc::clone(&lifecycle),
+            )
+            .with_download_cap_mb(config.max_plugin_download_mb)
+            // The package repositories live in the server configuration — the single
+            // store upstream keeps them in — so `/Repositories`, `/Packages` and
+            // `/System/Configuration` can never disagree.
+            .with_configuration(Arc::clone(&config_trait))
+            .with_application_version(JELLYFIN_API_VERSION)
+            // A saved configuration is announced in-process (`ConfigurationChanged`).
+            .with_events(Arc::clone(&event_manager)),
     );
     // Jellyfin's five in-tree provider plugins read their settings through
     // `Plugin.Instance.Configuration` at call time, so an admin's save on a
@@ -2174,6 +2152,19 @@ pub async fn build_app_state(
     // authentication and password-reset providers fill its late slots now,
     // before the server takes a request. Every clone of the manager shares them.
     ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, &users_impl);
+    // One-shot, before the server takes a request: an adopted Jellyfin's
+    // LDAP-Auth settings and uid map come across from the plugin's XML, so its
+    // directory users sign in with no admin action (B7).
+    ferrofin_extensions::ldap_auth::adoption::import_adopted_config(
+        &std::path::Path::new(&paths.plugins_path())
+            .join("configurations")
+            .join(ferrofin_extensions::ldap_auth::adoption::CONFIGURATION_FILE_NAME),
+        &plugin_state_dir,
+        plugins.as_ref(),
+        users.as_ref(),
+        extension_cx.external_identities.as_ref(),
+    )
+    .await;
     let intro_skipper_analysis = ferrofin_extensions::intro_skipper::analysis(&extension_cx);
     subscribe_intro_skipper(&event_bus, &intro_skipper_analysis);
     // Register actual loaded producers before the core "Media Segment Scan"
@@ -2423,8 +2414,9 @@ pub async fn build_app_state(
     if let Err(err) = live_tv.start_dvr().await {
         tracing::warn!(%err, "could not restart the Live TV recording timers");
     }
-    // `RecordingsHost.StartAsync`'s other half. A folder it adds restarts the
-    // library monitor, which is a filesystem walk, so boot does not wait on it.
+    // `RecordingsHost.StartAsync`'s other half. A folder it adds becomes a
+    // library (written to disk, the library monitor's restart asked for, a
+    // scan queued), none of which boot waits for.
     let recordings = Arc::clone(&live_tv);
     background.push(tokio::spawn(tracing::Instrument::instrument(
         async move { recordings.create_recording_folders().await },
@@ -3065,6 +3057,32 @@ pub async fn build_app_state(
         .with_ldap(ldap)
         .with_playback_metrics(playback_metrics);
 
+    // Establishing the watches is a FILESYSTEM WALK, not a registration: an
+    // inotify recursive watch adds one kernel watch per directory under every
+    // library root, so its cost scales with the library's directory count and
+    // with how slow that filesystem is (measured on warm tmpfs: 10 ms at 1,000
+    // directories, 21 ms at 5,000, 60 ms at 20,000 — a cold network mount is
+    // far worse). Awaiting it here put that walk *before* the listener binds,
+    // where every millisecond is a client getting connection-refused rather
+    // than a slow response.
+    //
+    // Nothing needs the watches to exist before the server serves: they only
+    // feed realtime change detection, which is already blind for the whole of
+    // boot, and a change arriving during the walk is picked up by the next
+    // scheduled scan exactly as one arriving a moment earlier would be. So it
+    // is spawned and boot continues. The same holds after a library-structure
+    // change, so the restart it asks for runs on this task too, and the
+    // request answers first. It is a background task like the event pump, so
+    // an in-process restart's teardown stops the walk rather than letting the
+    // old lifetime keep adding watches (upstream's `ApplicationStopping`
+    // disposes the monitor). Started last, as the network-change monitor
+    // below is: it never ends on its own, and a restart asked for before it
+    // runs waits for it.
+    background.push(tokio::spawn(tracing::Instrument::instrument(
+        monitor_lifecycle.run(),
+        // The first start and each restart have spans of their own.
+        tracing::info_span!(parent: None, "library_monitor", task = "library_monitor"),
+    )));
     // `DetectNetworkChange`: the OS's network changes refresh the shared
     // network manager for this lifetime (upstream subscribes in the
     // `NetworkManager` constructor and unsubscribes in `Dispose`). Started

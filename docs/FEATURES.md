@@ -1,7 +1,7 @@
 # Feature status
 
-**Parity: 44 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
-14 compared against v12.2 and owed a re-check, 8 subsystem rows (as of 2026-11-02; the
+**Parity: 60 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
+14 compared against v12.2 and owed a re-check, 9 subsystem rows (as of 2026-11-03; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
 Ferrofin answers the way Jellyfin does (identical, in another order, a known difference, filed, new), is in

@@ -1999,20 +1999,16 @@ impl FerrofinStreamStatePlanner {
         // lets a Dolby Vision file copy through to a client that cannot play it
         // — the alternative is re-encoding a 4K HDR source.
         //
-        // The `NalLengthSize == "0"` gate is upstream's and it suppresses the
+        // The gates are upstream's, and the copy decision reads the same ones
+        // (`video_bit_stream_filters_apply`). A progressive job takes `-bsf:v`
+        // only into MPEG-TS, and the `NalLengthSize == "0"` gate suppresses the
         // metadata removal as well as the `mp4toannexb` conversion: a source
         // already in Annex B form gets no `-bsf:v` at all, so its Dolby Vision
-        // RPU survives even when the client asked for it gone.
+        // RPU survives even when a Dolby Vision player asked for it gone. For a
+        // client that did not list DOVI the copy decision transcodes such a
+        // stream instead of shipping its RPU.
         if copying_video
-            && (!progressive
-                || state
-                    .output_container
-                    .as_deref()
-                    .is_some_and(|container| container.eq_ignore_ascii_case("ts")))
-            && state
-                .video_stream
-                .as_ref()
-                .is_some_and(|v| v.nal_length_size.as_deref() != Some("0"))
+            && bitstream::video_bit_stream_filters_apply(state)
             && let Some(bsf) = ferrofin_mediaencoding::encoding_helper::bitstream::bit_stream_args(
                 caps,
                 state,
@@ -2108,7 +2104,7 @@ impl FerrofinStreamStatePlanner {
             if copying_video && state.run_time_ticks.is_none() {
                 push_split(&mut args, "-fflags +genpts");
             }
-            if state.base_request.copy_timestamps && state.run_time_ticks.is_some() {
+            if state.copies_timestamps() {
                 push_split(
                     &mut args,
                     "-copyts -avoid_negative_ts disabled -start_at_zero",
@@ -2327,6 +2323,17 @@ impl FerrofinStreamStatePlanner {
                         state,
                     ),
                 );
+                // An embedded sidecar seeked with the movie can bring a cue
+                // from before the start, which would start every stream late.
+                if let Some(trim) =
+                    ferrofin_mediaencoding::encoding_helper::bitstream::embedded_sidecar_trim_arguments(
+                        state,
+                        input_seek_ticks.is_some_and(|ticks| ticks > 0),
+                        caps.ffmpeg_version(),
+                    )
+                {
+                    push_split(&mut args, trim);
+                }
                 if playlist_path
                     .extension()
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
@@ -5017,7 +5024,8 @@ mod tests {
     }
 
     /// `GetInputArgument` adds a burned-in external bitmap as ffmpeg input 1,
-    /// seeked like the media file and decoded onto its own canvas, and the
+    /// read from its start on the media file's clock (upstream seeks it like
+    /// the media file) and decoded onto its own canvas, and the
     /// overlay reads its first stream there. Without the input, ffmpeg refused
     /// the overlay's `[1:0]` and the playback never started.
     #[rstest::rstest]
@@ -5049,11 +5057,19 @@ mod tests {
         let args = &plan.arguments;
         // The NVENC probe reports ffmpeg 7.0.1, which takes `-isync`: the
         // sidecar is then read from its start on the movie's clock. The plain
-        // probe reports no version, which keeps upstream's seeked input.
+        // probe reports no version, so no `-isync`: the bitmap is read from its
+        // start on its own timestamps, moved back by the seek (gl-929).
         let timing: &[&str] = if hardware {
             &["-canvas_size", "1920x1080", "-isync", "0"]
         } else {
-            &["-ss", "90000000", "-canvas_size", "1920x1080"]
+            &[
+                "-canvas_size",
+                "1920x1080",
+                "-seek_timestamp",
+                "1",
+                "-itsoffset",
+                "-90000000",
+            ]
         };
         let expected: Vec<&str> = ["-analyzeduration", "200M", "-probesize", "1G"]
             .into_iter()
@@ -5069,11 +5085,18 @@ mod tests {
     /// An external track embedded into a progressive MKV is input 1, mapped
     /// as `1:0`, text or bitmap alike (upstream PR 16448's StreamBuilder and
     /// map halves were ported; this is the input half).
+    ///
+    /// With no version probed (no `-isync`), a bitmap one is read on its own
+    /// timestamps (gl-929); a text one, which has no start time, as upstream.
     #[rstest::rstest]
-    #[case::srt("srt", "/media/movie.en.srt")]
-    #[case::pgs("PGSSUB", "/media/movie.en.sup")]
+    #[case::srt("srt", "/media/movie.en.srt", &[])]
+    #[case::pgs("PGSSUB", "/media/movie.en.sup", &["-seek_timestamp", "1"])]
     #[tokio::test]
-    async fn an_embedded_external_track_is_input_1(#[case] codec: &str, #[case] path: &str) {
+    async fn an_embedded_external_track_is_input_1(
+        #[case] codec: &str,
+        #[case] path: &str,
+        #[case] timing: &[&str],
+    ) {
         let src = source(
             "abc",
             vec![
@@ -5095,19 +5118,98 @@ mod tests {
             .unwrap();
 
         let args = &plan.arguments;
-        assert_eq!(
-            inputs_after_the_media(args),
-            [
-                "-analyzeduration",
-                "200M",
-                "-probesize",
-                "1G",
-                "-i",
-                &format!("file:{path}"),
-            ],
-            "{args:?}"
-        );
+        let input = format!("file:{path}");
+        let expected: Vec<&str> = ["-analyzeduration", "200M", "-probesize", "1G"]
+            .into_iter()
+            .chain(timing.iter().copied())
+            .chain(["-i", input.as_str()])
+            .collect();
+        assert_eq!(inputs_after_the_media(args), expected, "{args:?}");
         assert!(args.join(" ").contains("-map 1:0 "), "{args:?}");
+    }
+
+    /// The embedded-sidecar trim from ffmpeg 5.1: elapsed cues dropped, the
+    /// one on screen at the start started there.
+    const FILTER_EVENTS: &[&str] = &[
+        "-bsf:s:0",
+        "noise=drop='lt(pts\\,0)*lte(pts+duration\\,0)',setts=pts='max(PTS\\,0)':dts='max(DTS\\,0)':duration='DURATION+min(PTS\\,0)'",
+    ];
+    /// The embedded-sidecar trim on ffmpeg 5.0.
+    const NOISE_DROP: &[&str] = &["-bsf:s:0", "noise=drop='lt(pts\\,0)'"];
+    /// The embedded-sidecar trim before ffmpeg 5.0.
+    const COPY_PRIOR: &[&str] = &["-copypriorss:s:0", "0"];
+
+    /// A progressive stream that starts mid-file drops the cues its embedded
+    /// sidecar brings from before the start (gl-930): the sidecar's seek can
+    /// keep a cue already over, whose negative timestamp made the muxer start
+    /// every stream late. From ffmpeg 5.1 the cues are trimmed as upstream's
+    /// `FilterEvents` trims them, for a copied or a converted track; 5.0 drops
+    /// every cue before the start with the `noise` filter; an older or unread
+    /// version gets `-copypriorss`, for a copied one. The options follow the
+    /// embed arguments, ahead of the output. Nothing without a seek, and nothing
+    /// for a track inside the media file, whose seek keeps no such cue.
+    #[rstest::rstest]
+    #[case::from_5_1(Some((5, 1)), Some(9), true, None, FILTER_EVENTS)]
+    #[case::converted(Some((8, 1)), Some(9), true, Some("ass"), FILTER_EVENTS)]
+    #[case::on_5_0(Some((5, 0)), Some(9), true, None, NOISE_DROP)]
+    #[case::before_5_0(Some((4, 4)), Some(9), true, None, COPY_PRIOR)]
+    #[case::unknown_version(None, Some(9), true, None, COPY_PRIOR)]
+    #[case::no_seek(Some((8, 1)), None, true, None, &[])]
+    #[case::internal_track(Some((8, 1)), Some(9), false, None, &[])]
+    #[tokio::test]
+    async fn a_seeked_progressive_embed_drops_the_sidecar_cues_before_the_start(
+        #[case] version: Option<(i32, i32)>,
+        #[case] start_secs: Option<i64>,
+        #[case] external: bool,
+        #[case] subtitle_codec: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        let sub = if external {
+            sidecar("subrip", 2, "/media/movie.en.srt")
+        } else {
+            subtitle_stream("subrip", 2)
+        };
+        let mut capabilities = FfmpegCapabilities::builder();
+        if let Some((major, minor)) = version {
+            capabilities = capabilities.ffmpeg_version(FfmpegVersion::new(major, minor));
+        }
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![video_stream("hevc"), audio_stream("aac"), sub],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            capabilities.build(),
+            EncodingOptions::default(),
+        );
+        let mut req = request("abc");
+        req.output_container = Some("mkv".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Embed".to_owned());
+        req.subtitle_codec = subtitle_codec.map(str::to_owned);
+        req.start_time_ticks = start_secs.map(|secs| secs * TICKS_PER_SECOND);
+
+        let plan = p
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        let disposition = args
+            .windows(2)
+            .position(|w| w == ["-disposition:s:0", "default"])
+            .unwrap_or_else(|| panic!("embedded: {args:?}"));
+        // Between the embed arguments and `-y <output>`.
+        assert_eq!(&args[disposition + 2..args.len() - 2], expected, "{args:?}");
+        let trims = args
+            .iter()
+            .filter(|arg| arg.starts_with("-bsf:s") || arg.starts_with("-copypriorss"))
+            .count();
+        assert_eq!(trims, expected.len() / 2, "{args:?}");
     }
 
     /// An external audio track selected for a transcode is the next input.
@@ -7550,6 +7652,142 @@ mod tests {
         req.query_string = "hevc-rangetype=DOVI".to_owned();
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert!(!plan.arguments.join(" ").contains("-bsf:v"));
+    }
+
+    /// A Dolby Vision profile 8.1 video on an HDR10 base layer
+    /// (`DOVIWithHDR10`), in MP4 framing.
+    fn dovi_p8_1(codec: &str) -> MediaStream {
+        let video = MediaStream {
+            color_transfer: Some("smpte2084".to_owned()),
+            color_primaries: Some("bt2020".to_owned()),
+            color_space: Some("bt2020nc".to_owned()),
+            dv_profile: Some(8),
+            dv_level: Some(6),
+            dv_bl_signal_compatibility_id: Some(1),
+            rpu_present_flag: Some(1),
+            bl_present_flag: Some(1),
+            nal_length_size: (codec == "hevc").then(|| "4".to_owned()),
+            ..video_stream(codec)
+        };
+        assert_eq!(
+            video.video_range_type(),
+            ferrofin_model::data::VideoRangeType::DoviWithHdr10
+        );
+        video
+    }
+
+    /// The plan for [`dovi_p8_1`] from a client playing `codec` or H.264 with
+    /// the range types `ranges`, on an ffmpeg with or without the Dolby Vision
+    /// strip filters.
+    async fn dovi_fallback_plan(
+        codec: &str,
+        ranges: &str,
+        strip: bool,
+        kind: PlaylistKind,
+        container: Option<&str>,
+    ) -> TranscodePlan {
+        use ferrofin_mediaencoding::BsfOption;
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![dovi_p8_1(codec), audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            FfmpegCapabilities::builder()
+                .bsf_option(BsfOption::HevcMetadataRemoveDovi, strip)
+                .bsf_option(BsfOption::Av1MetadataRemoveDovi, strip)
+                .bsf_option(BsfOption::DoviRpuStrip, strip)
+                .build(),
+            EncodingOptions::default(),
+        );
+        let mut req = request("abc");
+        req.segment_container = Some("mp4".to_owned());
+        req.video_codec = Some(format!("{codec},h264"));
+        req.output_container = container.map(str::to_owned);
+        req.query_string = format!("{codec}-rangetype={ranges}");
+        p.plan(&req, false, None, kind).await.unwrap()
+    }
+
+    /// Owner decision 2026-10-31 (gl-737): a Dolby Vision profile 8.1 stream
+    /// copies to a client that plays HDR10 but did not list DOVI, as jellyfin-web
+    /// on an HDR display declares it, with its RPU stripped in the copy's own
+    /// `-bsf:v` chain. The plan records the strip, so the master playlist
+    /// advertises no Dolby Vision, and fMP4 takes the plain HEVC tag, not the
+    /// Dolby Vision branch (`-strict -2`). Upstream copies this stream with its
+    /// RPU.
+    #[tokio::test]
+    async fn a_dolby_vision_fallback_copy_strips_the_rpu_for_a_client_without_dovi() {
+        let hdr10 = "SDR,HDR10,HDR10Plus,HLG";
+        for (codec, strip) in [
+            (
+                "hevc",
+                "-bsf:v hevc_mp4toannexb,hevc_metadata=remove_dovi=1",
+            ),
+            ("av1", "-bsf:v av1_metadata=remove_dovi=1"),
+        ] {
+            let plan = dovi_fallback_plan(codec, hdr10, true, PlaylistKind::Vod, None).await;
+            let args = plan.arguments.join(" ");
+            assert!(args.contains("-c:v copy"), "{codec}: {args}");
+            assert!(args.contains(strip), "{codec}: {args}");
+            assert_eq!(args.matches("-bsf:v").count(), 1, "{codec}: {args}");
+            assert!(plan.is_dovi_removed, "{codec}");
+            assert!(!args.contains("-strict -2"), "{codec}: {args}");
+            assert!(!args.contains("-tag:v:0 dav1"), "{codec}: {args}");
+            if codec == "hevc" {
+                assert!(args.contains("-tag:v:0 hvc1"), "{args}");
+            }
+        }
+    }
+
+    /// Where the RPU cannot be stripped the stream transcodes instead of going
+    /// out with it: an ffmpeg without the filters, and a progressive copy into
+    /// a container that takes no bitstream filter. A progressive MPEG-TS copy
+    /// takes the strip.
+    #[tokio::test]
+    async fn a_dolby_vision_fallback_transcodes_where_the_rpu_cannot_be_stripped() {
+        let hdr10 = "SDR,HDR10,HLG";
+        let plan = dovi_fallback_plan("hevc", hdr10, false, PlaylistKind::Vod, None).await;
+        let args = plan.arguments.join(" ");
+        assert!(!args.contains("-c:v copy"), "{args}");
+        assert!(!plan.is_dovi_removed);
+
+        let plan =
+            dovi_fallback_plan("hevc", hdr10, true, PlaylistKind::Progressive, Some("mkv")).await;
+        let args = plan.arguments.join(" ");
+        assert!(!args.contains("-c:v copy"), "{args}");
+
+        let plan =
+            dovi_fallback_plan("hevc", hdr10, true, PlaylistKind::Progressive, Some("ts")).await;
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:v copy"), "{args}");
+        assert!(
+            args.contains("-bsf:v hevc_mp4toannexb,hevc_metadata=remove_dovi=1"),
+            "{args}"
+        );
+    }
+
+    /// A Dolby Vision player copies the same stream with its RPU, on any
+    /// ffmpeg, as upstream: nothing is stripped, and fMP4 takes the Dolby
+    /// Vision branch (profile 8 keeps the `hvc1` tag, with `-strict -2`).
+    #[tokio::test]
+    async fn a_dolby_vision_player_copies_the_fallback_untouched() {
+        for ranges in ["SDR,HDR10,DOVI", "SDR,HDR10,DOVIWithHDR10"] {
+            let plan = dovi_fallback_plan("hevc", ranges, false, PlaylistKind::Vod, None).await;
+            let args = plan.arguments.join(" ");
+            assert!(args.contains("-c:v copy"), "{ranges}: {args}");
+            assert!(
+                args.contains("-bsf:v hevc_mp4toannexb "),
+                "{ranges}: {args}"
+            );
+            assert!(!args.contains("remove_dovi"), "{ranges}: {args}");
+            assert!(!args.contains("dovi_rpu"), "{ranges}: {args}");
+            assert!(!plan.is_dovi_removed, "{ranges}");
+        }
+        // The fMP4 Dolby Vision branch follows upstream's `DOVI` check.
+        let plan =
+            dovi_fallback_plan("hevc", "SDR,HDR10,DOVI", true, PlaylistKind::Vod, None).await;
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-tag:v:0 hvc1 -strict -2"), "{args}");
     }
 
     #[tokio::test]

@@ -242,6 +242,14 @@ pub struct FerrofinVirtualFolderManager {
     /// every listing, which is a hot read path; once a row is known to be
     /// parented the two extra probes (root exists, parent set) are skipped.
     parented: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    /// Written by each library-structure change for its whole run, and tried
+    /// for reading by the listing's self-heal, which skips a listing's heals
+    /// while a change is under way or waiting: the change writes its
+    /// library's row itself, and a heal from a folder it is still building
+    /// would record no locations and mark the row set up, so the change's own
+    /// write would be skipped. Listings share it, so their heals never skip
+    /// each other's.
+    structure_change: Arc<tokio::sync::RwLock<()>>,
     /// The libraries whose recorded locations changed since their refresh last
     /// began: `CollectionFolder._requiresRefresh`, which `CreateResolveArgs`
     /// sets when the resolved `PhysicalLocations` differ from the stored ones
@@ -324,6 +332,7 @@ impl FerrofinVirtualFolderManager {
             items: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             parented: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            structure_change: Arc::default(),
             requires_refresh: Arc::default(),
             playlists_path: None,
             user_root: None,
@@ -904,6 +913,29 @@ impl FerrofinVirtualFolderManager {
             (self.collection_folder_id(folder_path), self.parented.lock())
         {
             set.remove(&id);
+        }
+    }
+
+    /// Records the changed locations of the library at `folder_path` on its
+    /// `CollectionFolder` row now ([`forget_setup`](Self::forget_setup), then
+    /// [`ensure_collection_folder`](Self::ensure_collection_folder)), so the
+    /// row's physical locations and folder ids, which access checks and views
+    /// read, are current when the change returns. A failed write is logged,
+    /// as the listing's self-heal logs it, and the next listing retries it:
+    /// the change itself has been saved.
+    async fn record_changed_locations(&self, folder_path: &Path) {
+        self.forget_setup(folder_path);
+        let Some(name) = folder_path.file_name().and_then(|name| name.to_str()) else {
+            return;
+        };
+        if let Err(error) = self.ensure_collection_folder(folder_path, name).await {
+            tracing::warn!(
+                library = name,
+                path = %folder_path.display(),
+                %error,
+                "could not record the library's changed locations on its CollectionFolder row; \
+                 the next listing retries"
+            );
         }
     }
 
@@ -1509,8 +1541,12 @@ impl FerrofinVirtualFolderManager {
             // doesn't hit a FOREIGN KEY failure and its ItemId always resolves.
             // Upstream's listing writes nothing, so a failed write must not fail
             // it: the library is listed with its projected id, and the next
-            // listing retries the write (the id is not marked parented).
+            // listing retries the write (the id is not marked parented). Not
+            // while a structure change is under way (it may be building this
+            // folder, and writes its row itself): a later listing heals what
+            // this one skips.
             if let Some(name) = name.as_deref()
+                && let Ok(_no_change) = self.structure_change.try_read()
                 && let Err(error) = self.ensure_collection_folder(&path, name).await
             {
                 tracing::warn!(
@@ -1672,6 +1708,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         collection_type: Option<CollectionTypeOptions>,
         options: &LibraryOptions,
     ) -> Result<Option<uuid::Uuid>, ServiceError> {
+        let _change = self.structure_change.write().await;
         let _snapshot = self.invalidate_on_drop();
         let name = Self::valid_filename(name);
         if name.is_empty() {
@@ -1731,7 +1768,10 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
 
         // Create the library's CollectionFolder item so it appears in /UserViews
         // and its ItemId resolves (jellyfin-web's library editor rejects a null
-        // ItemId). Its children are populated by the library scan.
+        // ItemId). Its children are populated by the library scan. Its setup is
+        // forgotten first, so the row records this folder's locations and
+        // collection type whatever was written for the folder before.
+        self.forget_setup(&folder_path);
         self.ensure_collection_folder(&folder_path, &dedup_name)
             .await?;
 
@@ -1739,6 +1779,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     }
 
     async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError> {
+        let _change = self.structure_change.write().await;
         let _snapshot = self.invalidate_on_drop();
         if name.trim().is_empty() {
             return Err(ServiceError::invalid_input("name must not be empty"));
@@ -1774,6 +1815,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     }
 
     async fn rename_virtual_folder(&self, name: &str, new_name: &str) -> Result<(), ServiceError> {
+        let _change = self.structure_change.write().await;
         let _snapshot = self.invalidate_on_drop();
         if name.trim().is_empty() {
             return Err(ServiceError::invalid_input("name must not be empty"));
@@ -1878,6 +1920,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         virtual_folder_name: &str,
         path_info: &MediaPathInfo,
     ) -> Result<(), ServiceError> {
+        let _change = self.structure_change.write().await;
         let _snapshot = self.invalidate_on_drop();
         if path_info.path.trim().is_empty() {
             return Err(ServiceError::invalid_input("path must not be empty"));
@@ -1898,7 +1941,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         self.sync_options_to_locations(&folder_path, &mut options)
             .await?;
         Self::save_options(&folder_path, &options).await?;
-        self.forget_setup(&folder_path);
+        self.record_changed_locations(&folder_path).await;
         Ok(())
     }
 
@@ -1907,6 +1950,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         virtual_folder_name: &str,
         _path_info: &MediaPathInfo,
     ) -> Result<(), ServiceError> {
+        let _change = self.structure_change.write().await;
         let _snapshot = self.invalidate_on_drop();
         let folder_path = self.require_folder(virtual_folder_name).await?;
         let mut options = self.load_options(&folder_path).await;
@@ -1915,7 +1959,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         self.sync_options_to_locations(&folder_path, &mut options)
             .await?;
         Self::save_options(&folder_path, &options).await?;
-        self.forget_setup(&folder_path);
+        self.record_changed_locations(&folder_path).await;
         Ok(())
     }
 
@@ -1924,6 +1968,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         virtual_folder_name: &str,
         path: &str,
     ) -> Result<(), ServiceError> {
+        let _change = self.structure_change.write().await;
         let _snapshot = self.invalidate_on_drop();
         if path.trim().is_empty() {
             return Err(ServiceError::invalid_input("path must not be empty"));
@@ -1935,7 +1980,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         let mut options = self.load_options(&folder_path).await;
         options.path_infos.retain(|i| i.path != path);
         Self::save_options(&folder_path, &options).await?;
-        self.forget_setup(&folder_path);
+        self.record_changed_locations(&folder_path).await;
         Ok(())
     }
 
@@ -1944,6 +1989,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         virtual_folder_name: &str,
         options: &LibraryOptions,
     ) -> Result<(), ServiceError> {
+        let _change = self.structure_change.write().await;
         let _snapshot = self.invalidate_on_drop();
         let folder_path = self.require_folder(virtual_folder_name).await?;
         let existing = self.load_options(&folder_path).await;
@@ -1959,7 +2005,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         }
 
         Self::save_options(&folder_path, options).await?;
-        self.forget_setup(&folder_path);
+        self.record_changed_locations(&folder_path).await;
         Ok(())
     }
 }
@@ -3033,6 +3079,107 @@ mod tests {
         assert_eq!(exists, 1, "the CollectionFolder row was re-created");
     }
 
+    /// A listing that meets a library mid-change (its folder made, its
+    /// shortcuts and collection marker not yet) leaves the row to the change.
+    /// Healing it then would record no locations and mark the row set up, so
+    /// the change's own write would be skipped and its media never scanned:
+    /// the library monitor's restart lists the libraries right after each
+    /// structure change, while the next one may already be running.
+    #[tokio::test]
+    async fn a_listing_during_a_structure_change_leaves_the_library_row_to_it() {
+        use ferrofin_traits::persistence::ItemRepository as _;
+        let (tmp, db, mgr) = manager_with_store().await;
+        let items = crate::item_repository::FerrofinItemRepository::new(
+            db,
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let change = mgr.structure_change.write().await;
+        let folder = tmp.path().join("default").join("Movies");
+        std::fs::create_dir_all(&folder).expect("folder");
+        let id = mgr.collection_folder_id(&folder).expect("id");
+        let row = || async { items.retrieve_item(id).await.expect("read").is_some() };
+
+        let listed = mgr.get_virtual_folders().await.expect("list");
+        assert_eq!(listed.len(), 1, "the folder is listed");
+        assert!(!row().await, "no row written mid-change");
+
+        drop(change);
+        // Another listing's heal under way does not hold this one back.
+        let _other_listing = mgr.structure_change.read().await;
+        mgr.get_virtual_folders().await.expect("list");
+        assert!(row().await, "the next listing heals the row");
+    }
+
+    /// A media-path change records the library's locations on its row before
+    /// it returns, with no listing in between, and marks the library's refresh
+    /// required, as the listing's heal did: access checks and views read the
+    /// locations from the row, and nothing else lists the libraries right
+    /// after a change now that the library monitor restarts on its own task.
+    #[tokio::test]
+    async fn a_media_path_change_records_the_rows_locations_before_it_returns() {
+        use ferrofin_traits::persistence::ItemRepository as _;
+        let (tmp, db, mgr) = manager_with_store().await;
+        let items = crate::item_repository::FerrofinItemRepository::new(
+            db,
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let (first, second) = (media_dir(&tmp, "first"), media_dir(&tmp, "second"));
+        mgr.add_virtual_folder(
+            "Movies",
+            None,
+            &opts_with_paths(std::slice::from_ref(&first)),
+        )
+        .await
+        .expect("add");
+        let id = mgr
+            .collection_folder_id(&tmp.path().join("default").join("Movies"))
+            .expect("id");
+        let recorded = || async {
+            let row = items.retrieve_item(id).await.expect("read").expect("row");
+            let mut locations: Vec<String> =
+                crate::item_data::stored_physical_locations(row.data.as_deref())
+                    .into_iter()
+                    .filter(|location| *location == first || *location == second)
+                    .collect();
+            locations.sort();
+            locations
+        };
+        assert_eq!(recorded().await, std::slice::from_ref(&first));
+        assert!(
+            !mgr.take_library_requires_refresh(id),
+            "a new library is refreshed for the first time"
+        );
+
+        mgr.add_media_path(
+            "Movies",
+            &MediaPathInfo {
+                path: second.clone(),
+            },
+        )
+        .await
+        .expect("add path");
+        let mut want = vec![first.clone(), second.clone()];
+        want.sort();
+        assert_eq!(recorded().await, want, "the added path is recorded");
+        assert!(
+            mgr.take_library_requires_refresh(id),
+            "the change requires the library's refresh"
+        );
+
+        mgr.remove_media_path("Movies", &first)
+            .await
+            .expect("remove path");
+        assert_eq!(
+            recorded().await,
+            std::slice::from_ref(&second),
+            "the removed path is gone"
+        );
+        assert!(
+            mgr.take_library_requires_refresh(id),
+            "the removal requires the library's refresh too"
+        );
+    }
+
     /// An item store whose writes fail while `failing` is set, as a busy, full
     /// or read-only database's would; otherwise it records the rows saved.
     #[derive(Default)]
@@ -3650,7 +3797,9 @@ mod tests {
             .await
             .expect("record");
 
-        // The next listing after a structural change records them again.
+        // A row recorded another way (a hand edit, an earlier version) is
+        // recorded again by the first listing after a restart (here, once its
+        // setup is forgotten).
         mgr.forget_setup(&folder);
         mgr.get_virtual_folders().await.expect("list");
         assert_eq!(mgr.take_library_requires_refresh(id), required);
