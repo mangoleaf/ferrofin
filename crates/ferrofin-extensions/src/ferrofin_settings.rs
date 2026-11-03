@@ -180,7 +180,14 @@ mod tests {
         assert!(html.contains("{ Changes: "), "{html}");
         assert!(html.contains("ApiClient.restartServer()"), "{html}");
         // A control for each kind that is not plain text.
-        for kind in ["Bool", "Integer", "CountOrAuto", "PathList", "NumberList"] {
+        for kind in [
+            "Bool",
+            "Integer",
+            "CountOrAuto",
+            "PathList",
+            "NumberList",
+            "Choice",
+        ] {
             assert!(
                 html.contains(&format!("case '{kind}':")),
                 "no control for {kind}"
@@ -188,9 +195,34 @@ mod tests {
         }
         // jellyfin-web upgrades these once they are in the document, and
         // `emby-input` needs its parent by then.
-        for element in ["emby-input", "emby-checkbox", "emby-button"] {
+        for element in ["emby-input", "emby-checkbox", "emby-button", "emby-select"] {
             assert!(html.contains(&format!("'is', '{element}'")), "{element}");
         }
+        assert!(
+            html.contains(r#"data-require="emby-input,emby-button,emby-checkbox,emby-select""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_settings_page_offers_choices_notes_and_settings_that_apply_at_once() {
+        let html = settings_html();
+        // A choice is a select of its options, the picked one's note below
+        // it, and a Custom entry for a stored value that fits none.
+        assert!(html.contains("setting.Options"), "{html}");
+        assert!(html.contains("option.Note"), "{html}");
+        assert!(html.contains("setting.Custom"), "{html}");
+        // A row's longer note shows under its description.
+        assert!(html.contains("setting.Note"), "{html}");
+        assert!(html.contains("ferrofinSettingNote"), "{html}");
+        // A row stored in the server configuration applies at once: no
+        // restart note, and a save of it alone points to no restart.
+        assert!(
+            html.contains("setting.Store === 'ServerConfiguration'"),
+            "{html}"
+        );
+        assert!(html.contains("setting.Applies === 'Immediately'"), "{html}");
+        assert!(html.contains("result.RestartRequired"), "{html}");
     }
 
     #[test]

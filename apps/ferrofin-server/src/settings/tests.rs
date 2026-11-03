@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{CommandFactory, Parser};
+use ferrofin_model::configuration::ImageSavingConvention;
 use ferrofin_traits::plugins::PluginManager;
 
 use super::*;
@@ -71,6 +72,144 @@ impl DataDir {
     }
 }
 
+/// A server configuration manager holding one configuration in memory, as
+/// the real one serves it to `GET /System/Configuration`: the JSON it would
+/// answer is [`json`](Self::json), and every read and update is counted. One
+/// built [`failing`](Self::failing) refuses its updates.
+pub(super) struct FakeConfiguration {
+    current: std::sync::Mutex<Arc<ServerConfiguration>>,
+    reads: std::sync::atomic::AtomicUsize,
+    updates: std::sync::atomic::AtomicUsize,
+    fail: bool,
+    paths: Arc<ferrofin_core::FerrofinServerApplicationPaths>,
+}
+
+impl FakeConfiguration {
+    pub(super) fn new(configuration: ServerConfiguration) -> Arc<Self> {
+        Arc::new(Self {
+            current: std::sync::Mutex::new(Arc::new(configuration)),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            updates: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+            paths: Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
+                "/nonexistent/data",
+                "/nonexistent/log",
+                "/nonexistent/config",
+                "/nonexistent/cache",
+                "/nonexistent/web",
+            )),
+        })
+    }
+
+    pub(super) fn failing(configuration: ServerConfiguration) -> Arc<Self> {
+        let mut fake = Arc::into_inner(Self::new(configuration)).expect("one owner");
+        fake.fail = true;
+        Arc::new(fake)
+    }
+
+    /// `GET /System/Configuration`'s body: the configuration as it serializes.
+    pub(super) fn json(&self) -> String {
+        serde_json::to_string(&**self.current.lock().expect("lock")).expect("serialize")
+    }
+
+    pub(super) fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(super) fn updates(&self) -> usize {
+        self.updates.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl ServerConfigurationManager for FakeConfiguration {
+    fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+        Arc::clone(&self.paths) as Arc<_>
+    }
+
+    async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Arc::clone(&self.current.lock().expect("lock")))
+    }
+
+    async fn update_configuration(
+        &self,
+        configuration: &ServerConfiguration,
+    ) -> Result<(), ServiceError> {
+        if self.fail {
+            return Err(ServiceError::backend("the configuration cannot be saved"));
+        }
+        self.updates
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.current.lock().expect("lock") = Arc::new(configuration.clone());
+        Ok(())
+    }
+
+    async fn get_branding(
+        &self,
+    ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+        Ok(ferrofin_model::branding::BrandingOptions::default())
+    }
+
+    async fn update_branding(
+        &self,
+        _branding: &ferrofin_model::branding::BrandingOptions,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+/// A row stored in the server configuration, registered only in tests until
+/// the first real one (gl-1139): the image naming convention, a choice with
+/// a note, whose unnamed values ([`ImageSavingConvention::Unrecognized`]) are
+/// Custom.
+pub(super) const STORED_ROW: SettingSpec = SettingSpec {
+    key: "image_saving_convention",
+    label: "Image naming",
+    group: Group::Images,
+    kind: SettingKind::Choice,
+    applies: Applies::Immediately,
+    default: "Legacy",
+    description: "How images saved beside the media are named.",
+    note: "A row the tests register, stored in the server configuration.",
+    options: &[
+        SettingOption {
+            value: "Legacy",
+            label: "Legacy",
+            note: "Jellyfin's own names.",
+        },
+        SettingOption {
+            value: "Compatible",
+            label: "Compatible",
+            note: "",
+        },
+    ],
+    store: SettingStore::ServerConfiguration(ConfigurationField {
+        read: |configuration| match configuration.image_saving_convention {
+            ImageSavingConvention::Legacy => json!("Legacy"),
+            ImageSavingConvention::Compatible => json!("Compatible"),
+            ImageSavingConvention::Unrecognized(n) => json!(n.to_string()),
+        },
+        write: |configuration, value| {
+            configuration.image_saving_convention = match value.as_str() {
+                Some("Compatible") => ImageSavingConvention::Compatible,
+                _ => ImageSavingConvention::Legacy,
+            };
+        },
+    }),
+    ..ROW
+};
+
+/// [`SETTINGS`] and [`STORED_ROW`].
+pub(super) fn rows_with_a_stored_one() -> &'static [SettingSpec] {
+    static ROWS: std::sync::LazyLock<&'static [SettingSpec]> = std::sync::LazyLock::new(|| {
+        let mut rows = SETTINGS.to_vec();
+        rows.push(STORED_ROW);
+        Box::leak(rows.into_boxed_slice())
+    });
+    *ROWS
+}
+
 pub(super) fn spec(key: &str) -> &'static SettingSpec {
     SETTINGS
         .iter()
@@ -84,7 +223,6 @@ pub(super) fn sample(spec: &SettingSpec) -> String {
     match spec.key {
         "bind_addr" => "\"127.0.0.2\"".to_owned(),
         "log_level" => "\"debug\"".to_owned(),
-        "log_format" => "\"text\"".to_owned(),
         "wasm_private_http_allow" => "\"*\"".to_owned(),
         _ => match spec.kind {
             // The value that is not the default, so setting it changes something.
@@ -100,6 +238,15 @@ pub(super) fn sample(spec: &SettingSpec) -> String {
             SettingKind::Path => "\"/sample\"".to_owned(),
             SettingKind::PathList => "[\"/sample\"]".to_owned(),
             SettingKind::NumberList => "[0.5, 1.0]".to_owned(),
+            // An option other than the default.
+            SettingKind::Choice => spec
+                .options
+                .iter()
+                .find(|option| option.value != spec.default)
+                .map_or_else(
+                    || panic!("`{}` offers nothing but its default", spec.key),
+                    |option| format!("\"{}\"", option.value),
+                ),
         },
     }
 }
@@ -112,7 +259,14 @@ fn file_rows() -> impl Iterator<Item = &'static SettingSpec> {
 
 /// The report `config` gives under `env`, the way the route runs it.
 fn report(config: &Config, env: &FakeEnv) -> ServerSettingsDto {
-    snapshot(config, env, false).expect("snapshot")
+    snapshot(
+        SETTINGS,
+        config,
+        env,
+        &ServerConfiguration::default(),
+        false,
+    )
+    .expect("snapshot")
 }
 
 fn entry<'a>(report: &'a ServerSettingsDto, key: &str) -> &'a ServerSettingDto {
@@ -945,7 +1099,14 @@ fn a_config_file_that_no_longer_loads_is_a_conflict_naming_it() {
     let env = FakeEnv::new();
     let running = load(data.cli(), &env);
     std::fs::write(data.config_file(), "db_pool = 0\n").expect("edit");
-    let err = snapshot(&running, &env, false).expect_err("refused");
+    let err = snapshot(
+        SETTINGS,
+        &running,
+        &env,
+        &ServerConfiguration::default(),
+        false,
+    )
+    .expect_err("refused");
     let ServiceError::Conflict(message) = err else {
         panic!("{err:?}");
     };
@@ -975,7 +1136,14 @@ fn a_config_file_that_no_longer_loads_quotes_no_secret() {
         let env = FakeEnv::new();
         let running = load(data.cli(), &env);
         std::fs::write(data.config_file(), contents).expect("edit");
-        let err = snapshot(&running, &env, false).expect_err("refused");
+        let err = snapshot(
+            SETTINGS,
+            &running,
+            &env,
+            &ServerConfiguration::default(),
+            false,
+        )
+        .expect_err("refused");
         let ServiceError::Conflict(message) = err else {
             panic!("{contents}: {err:?}");
         };
@@ -1015,6 +1183,7 @@ async fn the_manager_reports_the_restart_flag_and_answers_not_found_while_disabl
         load(data.cli(), &env),
         lifecycle.clone(),
         Arc::clone(&plugins),
+        FakeConfiguration::new(ServerConfiguration::default()),
     )
     .with_env(env);
 
@@ -1042,4 +1211,173 @@ fn the_statement_cache_row_shows_the_database_default() {
         spec("db_statement_cache").default,
         ferrofin_db::DEFAULT_STATEMENT_CACHE_CAPACITY.to_string()
     );
+}
+
+// ---- choices, notes and the server configuration (gl-1174) -----------------
+
+/// B10: `log_format` is a choice between JSON and Text, each with its note,
+/// reported by the value of the option in use.
+#[test]
+fn log_format_is_a_choice_with_a_note_per_option() {
+    let data = DataDir::new(&[]);
+    let env = FakeEnv::new();
+    let report = report(&load(data.cli(), &env), &env);
+    let row = entry(&report, "log_format");
+
+    assert_eq!(row.kind, ServerSettingKind::Choice);
+    assert_eq!(row.store, ServerSettingStore::ConfigFile);
+    assert_eq!(row.value, Some(json!("json")));
+    assert!(!row.custom);
+    let options: Vec<(&str, &str, Option<&str>)> = row
+        .options
+        .iter()
+        .map(|option| {
+            (
+                option.value.as_str(),
+                option.label.as_str(),
+                option.note.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        options,
+        [
+            (
+                "json",
+                "JSON",
+                Some("One JSON object per line, for log collectors")
+            ),
+            ("text", "Text", Some("Plain lines, for reading by hand")),
+        ]
+    );
+}
+
+/// B10: a `config.toml` value that fits no option is reported as written, as
+/// Custom, with no saved value beside it; one that fits in another case or
+/// with spaces is the option's. A variable that fits none is not the file's
+/// to keep: it locks the row.
+#[test]
+fn a_choice_in_config_toml_that_fits_no_option_is_custom() {
+    for (written, value, custom) in [
+        ("xml", "xml", true),
+        (" TEXT ", "text", false),
+        ("json", "json", false),
+    ] {
+        let data = DataDir::new(&[format!("log_format = \"{written}\"")]);
+        let env = FakeEnv::new();
+        let report = report(&load(data.cli(), &env), &env);
+        let row = entry(&report, "log_format");
+        assert_eq!(row.value, Some(json!(value)), "{written}");
+        assert_eq!(row.custom, custom, "{written}");
+        assert_eq!(row.saved_value, None, "{written}");
+        assert!(row.editable, "{written}");
+    }
+
+    let data = DataDir::new(&[]);
+    let env = FakeEnv::new().with("FERROFIN_LOG_FORMAT", "xml");
+    let report = report(&load(data.cli(), &env), &env);
+    let row = entry(&report, "log_format");
+    assert!(!row.custom);
+    assert!(!row.editable);
+}
+
+/// Every choice offers its default among named options of its own, every
+/// other row has none, and every row stored in the server configuration
+/// applies at once, is set by nothing else, and has a new server's value as
+/// its default.
+#[test]
+fn every_choice_offers_its_default_and_every_stored_row_applies_at_once() {
+    for spec in rows_with_a_stored_one() {
+        if spec.kind == SettingKind::Choice {
+            let values: BTreeSet<&str> = spec.options.iter().map(|option| option.value).collect();
+            assert!(spec.options.len() >= 2, "{}: no choice", spec.key);
+            assert_eq!(
+                values.len(),
+                spec.options.len(),
+                "{}: an option twice",
+                spec.key
+            );
+            assert!(
+                values.contains(spec.default),
+                "{}: the default is no option",
+                spec.key
+            );
+            assert!(
+                spec.options.iter().all(|option| !option.label.is_empty()),
+                "{}: an option with no name",
+                spec.key
+            );
+        } else {
+            assert!(
+                spec.options.is_empty(),
+                "{}: options on a {:?}",
+                spec.key,
+                spec.kind
+            );
+        }
+        if let SettingStore::ServerConfiguration(field) = spec.store {
+            assert_eq!(spec.applies, Applies::Immediately, "{}", spec.key);
+            assert!(spec.env.is_none() && spec.flag.is_none(), "{}", spec.key);
+            assert_eq!(spec.access, SettingAccess::Editable, "{}", spec.key);
+            assert_eq!(
+                (field.read)(&ServerConfiguration::default()),
+                json!(spec.default),
+                "{}: the default is not a new server's value",
+                spec.key
+            );
+        } else {
+            assert_ne!(spec.applies, Applies::Immediately, "{}", spec.key);
+        }
+    }
+}
+
+/// B11, B12: a row stored in the server configuration is read from it, with
+/// its note: a new server's value as the default, another as set there, an
+/// unnamed one as Custom. It applies at once and nothing locks it.
+#[test]
+fn a_row_stored_in_the_server_configuration_is_read_from_it() {
+    let data = DataDir::new(&[]);
+    let env = FakeEnv::new();
+    let running = load(data.cli(), &env);
+    let stored = |convention| {
+        let configuration = ServerConfiguration {
+            image_saving_convention: convention,
+            ..ServerConfiguration::default()
+        };
+        let report = snapshot(
+            rows_with_a_stored_one(),
+            &running,
+            &env,
+            &configuration,
+            false,
+        )
+        .expect("report");
+        entry(&report, STORED_ROW.key).clone()
+    };
+
+    let row = stored(ImageSavingConvention::Legacy);
+    assert_eq!(row.note.as_deref(), Some(STORED_ROW.note));
+    assert_eq!(row.store, ServerSettingStore::ServerConfiguration);
+    assert_eq!(row.applies, Applies::Immediately);
+    assert_eq!(row.source, Source::Default);
+    assert_eq!(row.value, Some(json!("Legacy")));
+    assert!(row.editable, "{row:?}");
+    assert_eq!(row.locked_reason, None);
+    assert_eq!(row.env_var, None);
+    assert!(!row.custom);
+    assert_eq!(
+        row.options[0].note.as_deref(),
+        Some("Jellyfin's own names.")
+    );
+    assert_eq!(row.options[1].note, None);
+
+    let row = stored(ImageSavingConvention::Compatible);
+    assert_eq!(row.source, Source::ServerConfiguration);
+    assert_eq!(row.value, Some(json!("Compatible")));
+    assert!(!row.custom);
+
+    let row = stored(ImageSavingConvention::Unrecognized(7));
+    assert_eq!(row.source, Source::ServerConfiguration);
+    assert_eq!(row.value, Some(json!("7")));
+    assert!(row.custom);
 }

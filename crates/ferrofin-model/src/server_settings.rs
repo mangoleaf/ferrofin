@@ -1,7 +1,7 @@
 //! The Ferrofin settings page's wire types: what `GET /Ferrofin/Settings`
-//! reports about each bootstrap setting (CLI flags, `FERROFIN_*` environment
-//! variables, `config.toml`), and what `POST /Ferrofin/Settings` saves to
-//! `config.toml`.
+//! reports about each setting (CLI flags, `FERROFIN_*` environment variables,
+//! `config.toml`, and the server configuration the Dashboard edits), and what
+//! `POST /Ferrofin/Settings` saves.
 //!
 //! Not a Jellyfin contract type: the route is Ferrofin's own, read by the
 //! Ferrofin plugin's settings page. Its JSON is PascalCase, like the rest of
@@ -62,6 +62,11 @@ pub struct ServerSettingDto {
     /// What the setting does, in one line.
     pub description: String,
 
+    /// What the setting does, at more length than its description, which the
+    /// page shows under it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+
     /// The environment variable that sets it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env_var: Option<String>,
@@ -107,6 +112,46 @@ pub struct ServerSettingDto {
     /// The largest value an [`ServerSettingKind::Integer`] setting takes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<i64>,
+
+    /// The options of a [`ServerSettingKind::Choice`] setting, in the order
+    /// the page offers them. Empty, and left out, for any other kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<ServerSettingOptionDto>,
+
+    /// Where a save writes it.
+    pub store: ServerSettingStore,
+
+    /// Whether the stored value of a [`ServerSettingKind::Choice`] setting
+    /// fits none of its options: [`value`](Self::value) is then the stored
+    /// value as text, which a save keeps until it names the setting. Left out
+    /// when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub custom: bool,
+}
+
+/// One option of a [`ServerSettingKind::Choice`] setting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct ServerSettingOptionDto {
+    /// The value a save sends and the report gives when it is picked.
+    pub value: String,
+
+    /// Its readable name.
+    pub label: String,
+
+    /// What picking it does, which the page shows while it is picked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Where a setting is stored, which decides when a change to it applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+pub enum ServerSettingStore {
+    /// `config.toml`, read when the server starts.
+    ConfigFile,
+    /// The server configuration that the Dashboard edits
+    /// (`GET /System/Configuration`), which applies at once.
+    ServerConfiguration,
 }
 
 impl std::fmt::Debug for ServerSettingDto {
@@ -128,6 +173,7 @@ impl std::fmt::Debug for ServerSettingDto {
             .field("kind", &self.kind)
             .field("unit", &self.unit)
             .field("description", &self.description)
+            .field("note", &self.note)
             .field("env_var", &self.env_var)
             .field("flag", &self.flag)
             .field("default", &self.default)
@@ -139,6 +185,9 @@ impl std::fmt::Debug for ServerSettingDto {
             .field("applies", &self.applies)
             .field("min", &self.min)
             .field("max", &self.max)
+            .field("options", &self.options)
+            .field("store", &self.store)
+            .field("custom", &self.custom)
             .finish()
     }
 }
@@ -218,6 +267,8 @@ pub enum ServerSettingKind {
     NumberList,
     /// A key, a PIN or a password: shown to admins, never logged.
     Secret,
+    /// One of the setting's `Options`, by its `Value`.
+    Choice,
 }
 
 /// Where a setting's value in use comes from, highest precedence first.
@@ -229,6 +280,10 @@ pub enum ServerSettingSource {
     Environment,
     /// `config.toml`.
     ConfigFile,
+    /// The server configuration, for a setting stored there
+    /// ([`ServerSettingStore::ServerConfiguration`]), when it holds another
+    /// value than a new server's. Nothing outranks it.
+    ServerConfiguration,
     /// Nothing sets it: the default applies.
     Default,
 }
@@ -241,17 +296,22 @@ pub enum ServerSettingApplies {
     /// A restart of the server process: the in-process restart keeps the
     /// value it was started with.
     ProcessRestart,
+    /// Nothing: a setting stored in the server configuration applies as it is
+    /// saved.
+    Immediately,
 }
 
-/// The changes `POST /Ferrofin/Settings` saves to `config.toml`.
+/// The changes `POST /Ferrofin/Settings` saves: to `config.toml`, and to the
+/// server configuration for a setting stored there.
 ///
 /// `Debug` lists the keys only: a value may be a key or a password.
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct ServerSettingsUpdateDto {
-    /// The settings to change, by `config.toml` key ([`ServerSettingDto::key`]).
-    /// A value sets the key; `null` removes it from `config.toml`, so the
-    /// setting goes back to its default.
+    /// The settings to change, by key ([`ServerSettingDto::key`]). A value
+    /// sets the key; `null` removes it from `config.toml`, so the setting goes
+    /// back to its default, and puts a setting stored in the server
+    /// configuration back to a new server's value.
     pub changes: BTreeMap<String, Option<serde_json::Value>>,
 }
 
@@ -272,7 +332,7 @@ pub struct ServerSettingsUpdateResultDto {
     pub changed: Vec<String>,
 
     /// Whether a restart is needed before the saved values apply: whenever a
-    /// key changed. The server then reports a pending restart
+    /// `config.toml` key changed. The server then reports a pending restart
     /// (`GET /System/Info`'s `HasPendingRestart`).
     pub restart_required: bool,
 
@@ -280,6 +340,10 @@ pub struct ServerSettingsUpdateResultDto {
     /// ([`ServerSettingApplies::ProcessRestart`]): the in-process restart keeps
     /// their running value.
     pub process_restart_required: Vec<String>,
+
+    /// The keys stored in the server configuration that the save changed, in
+    /// key order: they applied at once, with no restart.
+    pub applied_now: Vec<String>,
 }
 
 #[cfg(test)]
@@ -294,6 +358,7 @@ mod tests {
             kind,
             unit: None,
             description: "OMDb API key".to_owned(),
+            note: None,
             env_var: Some("FERROFIN_OMDB_KEY".to_owned()),
             flag: None,
             default: None,
@@ -305,6 +370,9 @@ mod tests {
             applies: ServerSettingApplies::Restart,
             min: None,
             max: None,
+            options: Vec::new(),
+            store: ServerSettingStore::ConfigFile,
+            custom: false,
         }
     }
 
@@ -331,7 +399,18 @@ mod tests {
         assert_eq!(json["Applies"], "Restart");
         assert_eq!(json["Value"], "hunter2-running");
         assert_eq!(json["SavedValue"], "hunter2-saved");
-        for absent in ["Unit", "Flag", "Default", "LockedReason", "Min", "Max"] {
+        assert_eq!(json["Store"], "ConfigFile");
+        for absent in [
+            "Unit",
+            "Flag",
+            "Default",
+            "LockedReason",
+            "Min",
+            "Max",
+            "Note",
+            "Options",
+            "Custom",
+        ] {
             assert!(json.get(absent).is_none(), "{absent} in {json}");
         }
 
@@ -348,6 +427,62 @@ mod tests {
         assert_eq!(json["Settings"][0]["Key"], "omdb_api_key");
         let back: ServerSettingsDto = serde_json::from_value(json).expect("round trip");
         assert_eq!(back, all);
+    }
+
+    #[test]
+    fn a_choice_serializes_its_options_note_store_and_custom_flag() {
+        let choice = ServerSettingDto {
+            key: "image_saving_convention".to_owned(),
+            kind: ServerSettingKind::Choice,
+            note: Some("A longer note.".to_owned()),
+            value: Some(serde_json::json!("7")),
+            saved_value: None,
+            source: ServerSettingSource::ServerConfiguration,
+            applies: ServerSettingApplies::Immediately,
+            options: vec![
+                ServerSettingOptionDto {
+                    value: "Legacy".to_owned(),
+                    label: "Legacy".to_owned(),
+                    note: Some("Jellyfin's own names.".to_owned()),
+                },
+                ServerSettingOptionDto {
+                    value: "Compatible".to_owned(),
+                    label: "Compatible".to_owned(),
+                    note: None,
+                },
+            ],
+            store: ServerSettingStore::ServerConfiguration,
+            custom: true,
+            ..setting(ServerSettingKind::Text)
+        };
+        let json = serde_json::to_value(&choice).expect("serialize");
+        assert_eq!(json["Kind"], "Choice");
+        assert_eq!(json["Note"], "A longer note.");
+        assert_eq!(json["Source"], "ServerConfiguration");
+        assert_eq!(json["Applies"], "Immediately");
+        assert_eq!(json["Store"], "ServerConfiguration");
+        assert_eq!(json["Custom"], true);
+        assert_eq!(json["Value"], "7");
+        assert_eq!(
+            json["Options"],
+            serde_json::json!([
+                { "Value": "Legacy", "Label": "Legacy", "Note": "Jellyfin's own names." },
+                { "Value": "Compatible", "Label": "Compatible" }
+            ])
+        );
+        let back: ServerSettingDto = serde_json::from_value(json).expect("round trip");
+        assert_eq!(back, choice);
+
+        let result = ServerSettingsUpdateResultDto {
+            applied_now: vec!["image_saving_convention".to_owned()],
+            ..ServerSettingsUpdateResultDto::default()
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(
+            json["AppliedNow"],
+            serde_json::json!(["image_saving_convention"])
+        );
+        assert_eq!(json["RestartRequired"], false);
     }
 
     #[test]
@@ -405,6 +540,7 @@ mod tests {
             changed: vec!["log_level".to_owned(), "scan_probe_concurrency".to_owned()],
             restart_required: true,
             process_restart_required: vec!["log_level".to_owned()],
+            applied_now: Vec::new(),
         };
         let json = serde_json::to_value(&result).expect("serialize");
         assert_eq!(
@@ -412,7 +548,8 @@ mod tests {
             serde_json::json!({
                 "Changed": ["log_level", "scan_probe_concurrency"],
                 "RestartRequired": true,
-                "ProcessRestartRequired": ["log_level"]
+                "ProcessRestartRequired": ["log_level"],
+                "AppliedNow": []
             })
         );
         let back: ServerSettingsUpdateResultDto = serde_json::from_value(json).expect("round trip");

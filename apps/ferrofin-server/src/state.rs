@@ -2827,7 +2827,7 @@ pub async fn build_app_state(
         sessions,
         system,
         app_host_trait,
-        config_trait,
+        Arc::clone(&config_trait),
         providers,
         music,
         similar_items,
@@ -2960,12 +2960,14 @@ pub async fn build_app_state(
 
     // ---- Ferrofin settings -----------------------------------------------
     // `GET /Ferrofin/Settings`: the bootstrap configuration this lifetime runs
-    // with and where each value comes from, while the Ferrofin plugin is
-    // enabled in the plugin manager.
+    // with and where each value comes from, and the settings stored in the
+    // server configuration, while the Ferrofin plugin is enabled in the plugin
+    // manager.
     let state = state.with_server_settings(Arc::new(crate::settings::FerrofinServerSettings::new(
         config.clone(),
         Arc::clone(&lifecycle),
         Arc::clone(&plugins),
+        Arc::clone(&config_trait),
     )));
 
     // ---- SyncPlay ---------------------------------------------------------

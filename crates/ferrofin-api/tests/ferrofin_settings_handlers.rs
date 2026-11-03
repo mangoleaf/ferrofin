@@ -19,8 +19,8 @@ use ferrofin_api::test_support::{
 };
 use ferrofin_model::server_settings::{
     ServerSettingApplies, ServerSettingDto, ServerSettingGroup, ServerSettingKind,
-    ServerSettingSource, ServerSettingUnit, ServerSettingsDto, ServerSettingsUpdateDto,
-    ServerSettingsUpdateResultDto,
+    ServerSettingOptionDto, ServerSettingSource, ServerSettingStore, ServerSettingUnit,
+    ServerSettingsDto, ServerSettingsUpdateDto, ServerSettingsUpdateResultDto,
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::DisabledPluginManager;
@@ -73,6 +73,7 @@ fn saved() -> ServerSettingsUpdateResultDto {
         changed: vec!["log_level".to_owned(), "scan_probe_concurrency".to_owned()],
         restart_required: true,
         process_restart_required: vec!["log_level".to_owned()],
+        applied_now: vec!["image_saving_convention".to_owned()],
     }
 }
 
@@ -89,6 +90,7 @@ fn settings() -> ServerSettingsDto {
                 kind: ServerSettingKind::Secret,
                 unit: None,
                 description: "OMDb API key override.".to_owned(),
+                note: None,
                 env_var: Some("FERROFIN_OMDB_KEY".to_owned()),
                 flag: None,
                 default: Some("Jellyfin's shared key".to_owned()),
@@ -100,6 +102,9 @@ fn settings() -> ServerSettingsDto {
                 applies: ServerSettingApplies::Restart,
                 min: None,
                 max: None,
+                options: Vec::new(),
+                store: ServerSettingStore::ConfigFile,
+                custom: false,
             },
             ServerSettingDto {
                 key: "port".to_owned(),
@@ -108,6 +113,7 @@ fn settings() -> ServerSettingsDto {
                 kind: ServerSettingKind::Integer,
                 unit: None,
                 description: "HTTP port.".to_owned(),
+                note: None,
                 env_var: Some("FERROFIN_PORT".to_owned()),
                 flag: Some("--port".to_owned()),
                 default: Some("8096".to_owned()),
@@ -119,6 +125,9 @@ fn settings() -> ServerSettingsDto {
                 applies: ServerSettingApplies::Restart,
                 min: Some(0),
                 max: Some(65535),
+                options: Vec::new(),
+                store: ServerSettingStore::ConfigFile,
+                custom: false,
             },
             ServerSettingDto {
                 key: "wasm_subtitle_extract_mb".to_owned(),
@@ -127,6 +136,7 @@ fn settings() -> ServerSettingsDto {
                 kind: ServerSettingKind::Integer,
                 unit: Some(ServerSettingUnit::Mebibytes),
                 description: "Size cap of one subtitle track a plugin extracts.".to_owned(),
+                note: None,
                 env_var: Some("FERROFIN_WASM_SUBTITLE_EXTRACT_MB".to_owned()),
                 flag: None,
                 default: Some("10".to_owned()),
@@ -138,8 +148,50 @@ fn settings() -> ServerSettingsDto {
                 applies: ServerSettingApplies::Restart,
                 min: Some(1),
                 max: Some(128),
+                options: Vec::new(),
+                store: ServerSettingStore::ConfigFile,
+                custom: false,
+            },
+            custom_choice(),
+        ],
+    }
+}
+
+/// A choice whose stored value fits no option, with a note of its own.
+fn custom_choice() -> ServerSettingDto {
+    ServerSettingDto {
+        key: "log_format".to_owned(),
+        label: "Log format".to_owned(),
+        group: ServerSettingGroup::Logging,
+        kind: ServerSettingKind::Choice,
+        unit: None,
+        description: "How the server writes its log lines.".to_owned(),
+        note: Some("A longer note under the description.".to_owned()),
+        env_var: Some("FERROFIN_LOG_FORMAT".to_owned()),
+        flag: None,
+        default: Some("json".to_owned()),
+        value: Some(serde_json::json!("xml")),
+        saved_value: None,
+        source: ServerSettingSource::ConfigFile,
+        editable: true,
+        locked_reason: None,
+        applies: ServerSettingApplies::ProcessRestart,
+        min: None,
+        max: None,
+        options: vec![
+            ServerSettingOptionDto {
+                value: "json".to_owned(),
+                label: "JSON".to_owned(),
+                note: Some("One JSON object per line.".to_owned()),
+            },
+            ServerSettingOptionDto {
+                value: "text".to_owned(),
+                label: "Text".to_owned(),
+                note: None,
             },
         ],
+        store: ServerSettingStore::ConfigFile,
+        custom: true,
     }
 }
 
@@ -224,6 +276,29 @@ async fn an_admin_gets_every_setting_secrets_included() {
     assert_eq!(body["Settings"][2]["Label"], "Subtitle extraction limit");
     assert_eq!(body["Settings"][2]["Unit"], "MiB");
     assert_eq!(body["Settings"][2]["Group"], "Plugins");
+    // Where each setting is stored; a choice's options, its note, and a
+    // stored value that fits no option.
+    assert_eq!(body["Settings"][0]["Store"], "ConfigFile");
+    for absent in ["Note", "Options", "Custom"] {
+        assert!(
+            body["Settings"][0].get(absent).is_none(),
+            "{absent} in {body}"
+        );
+    }
+    assert_eq!(body["Settings"][3]["Kind"], "Choice");
+    assert_eq!(
+        body["Settings"][3]["Note"],
+        "A longer note under the description."
+    );
+    assert_eq!(body["Settings"][3]["Custom"], true);
+    assert_eq!(body["Settings"][3]["Value"], "xml");
+    assert_eq!(
+        body["Settings"][3]["Options"],
+        serde_json::json!([
+            { "Value": "json", "Label": "JSON", "Note": "One JSON object per line." },
+            { "Value": "text", "Label": "Text" }
+        ])
+    );
     assert_eq!(fake.calls(), 1);
 }
 
@@ -320,7 +395,8 @@ async fn an_admin_saves_changes_and_gets_what_was_saved() {
         serde_json::json!({
             "Changed": ["log_level", "scan_probe_concurrency"],
             "RestartRequired": true,
-            "ProcessRestartRequired": ["log_level"]
+            "ProcessRestartRequired": ["log_level"],
+            "AppliedNow": ["image_saving_convention"]
         })
     );
     let update = fake.last_update().expect("the manager got the update");
