@@ -924,6 +924,178 @@ async fn plain_subfolders_of_a_movie_library_are_folders_that_parent_their_title
     let _ = location;
 }
 
+/// In a mixed library a folder `SeriesResolver` takes inside a plain folder
+/// hangs off that folder, as a movie there does: `Folder.GetNonCachedChildren`
+/// resolves a folder's children with `ResolvePaths(…, this, …)`. The series'
+/// top parent stays the location, the folder is an ancestor of the series and
+/// of everything it holds (two plain folders down, both are), and a series
+/// at the top still hangs off the location. A series an older scan hung off
+/// the location moves to its folder on the next scan.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one tree, every property of it
+async fn a_mixed_librarys_plain_folder_parents_the_series_in_it() {
+    let lib = Library::of_type(
+        &[
+            "Anime/Show/tvshow.nfo",
+            "Anime/Show/Show S01E01.mkv",
+            "Anime/Show/trailers/Teaser.mkv",
+            "Anime/Firefly (2002)/Season 1/Firefly S01E01.mkv",
+            "Anime/Heat (1995)/Heat (1995).mkv",
+            "Anime/Classics/Retro/tvshow.nfo",
+            "Anime/Classics/Retro/Retro S01E01.mkv",
+            "Top/tvshow.nfo",
+            "Top/Top S01E01.mkv",
+        ],
+        CollectionTypeOptions::mixed,
+    )
+    .await;
+    lib.scanner.scan_all().await.unwrap();
+    let id =
+        |kind, path: &str| derive_item_id(kind, &lib.media.join(path).to_string_lossy()).unwrap();
+    let anime = id(BaseItemKind::Folder, "Anime");
+    let show = id(BaseItemKind::Series, "Anime/Show");
+    let flat = id(BaseItemKind::Episode, "Anime/Show/Show S01E01.mkv");
+    let firefly = id(BaseItemKind::Series, "Anime/Firefly (2002)");
+    let season = id(BaseItemKind::Season, "Anime/Firefly (2002)/Season 1");
+    let episode = id(
+        BaseItemKind::Episode,
+        "Anime/Firefly (2002)/Season 1/Firefly S01E01.mkv",
+    );
+    let heat = id(BaseItemKind::Movie, "Anime/Heat (1995)/Heat (1995).mkv");
+    let classics = id(BaseItemKind::Folder, "Anime/Classics");
+    let retro = id(BaseItemKind::Series, "Anime/Classics/Retro");
+    let retro_episode = id(
+        BaseItemKind::Episode,
+        "Anime/Classics/Retro/Retro S01E01.mkv",
+    );
+    let top = id(BaseItemKind::Series, "Top");
+    let location = lib.location();
+
+    let parent_of = |row: Option<BaseItemEntity>| {
+        let row = row.expect("scanned");
+        let id = |value: Option<String>| value.and_then(|p| Uuid::parse_str(&p).ok());
+        (id(row.parent_id), id(row.top_parent_id))
+    };
+    let at_top = (Some(location), Some(location));
+    assert_eq!(parent_of(lib.row(anime).await), at_top);
+    assert_eq!(parent_of(lib.row(top).await), at_top, "a top-level series");
+    let in_anime = (Some(anime), Some(location));
+    assert_eq!(parent_of(lib.row(heat).await), in_anime, "a movie");
+    assert_eq!(
+        parent_of(lib.row(show).await),
+        in_anime,
+        "a tvshow.nfo series"
+    );
+    assert_eq!(
+        parent_of(lib.row(firefly).await),
+        in_anime,
+        "a season-folder series"
+    );
+    assert_eq!(
+        parent_of(lib.row(retro).await),
+        (Some(classics), Some(location)),
+        "a series two plain folders down"
+    );
+    assert_eq!(
+        parent_of(lib.row(season).await),
+        (Some(firefly), Some(location))
+    );
+    assert_eq!(
+        parent_of(lib.row(episode).await),
+        (Some(season), Some(location))
+    );
+
+    // The ancestor closure runs from what a series holds through the folder
+    // up to the root.
+    let above = [location, lib.cf, lib.aggregate].map(guid_to_db);
+    for (item, expected) in [
+        (show, vec![anime]),
+        (flat, vec![show, anime]),
+        (firefly, vec![anime]),
+        (season, vec![firefly, anime]),
+        (episode, vec![season, firefly, anime]),
+        (retro, vec![classics, anime]),
+        (retro_episode, vec![retro, classics, anime]),
+    ] {
+        let ancestors = lib.ancestors(item).await;
+        for expected in expected.into_iter().map(guid_to_db).chain(above.clone()) {
+            assert!(
+                ancestors.contains(&expected),
+                "{item}: {expected} in {ancestors:?}"
+            );
+        }
+    }
+    assert!(
+        !lib.ancestors(top).await.contains(&guid_to_db(anime)),
+        "the top-level series is in no folder"
+    );
+    // The series' extra keeps an extra's shape: owned, with no parent and so
+    // no folder above it.
+    let teaser = id(BaseItemKind::Trailer, "Anime/Show/trailers/Teaser.mkv");
+    let row = lib.row(teaser).await.expect("the series' trailer");
+    assert_eq!(row.owner_id, Some(guid_to_db(show)));
+    assert_eq!(row.parent_id, None);
+    assert!(!lib.ancestors(teaser).await.contains(&guid_to_db(anime)));
+
+    // The folder lists its two series, its movie and its subfolder; the
+    // location lists the folder and the top-level series.
+    let children = |parent: Uuid| {
+        let items = Arc::clone(&lib.items);
+        async move {
+            let mut ids: Vec<Uuid> = items
+                .get_item_list(&InternalItemsQuery {
+                    parent_id: parent,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect();
+            ids.sort();
+            ids
+        }
+    };
+    let mut expected = vec![show, firefly, heat, classics];
+    expected.sort();
+    assert_eq!(children(anime).await, expected);
+    let mut expected = vec![anime, top];
+    expected.sort();
+    assert_eq!(children(location).await, expected);
+
+    // A rescan changes nothing.
+    let again = lib.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        (again.created, again.updated, again.removed),
+        (0, 0, 0),
+        "{again:?}"
+    );
+
+    // What an older scan stored: the series off the location, the folder in
+    // no ancestor list of it or what it holds. The next scan moves it.
+    sqlx::query(r#"UPDATE "BaseItems" SET "ParentId" = ?1 WHERE "Id" = ?2"#)
+        .bind(guid_to_db(location))
+        .bind(guid_to_db(show))
+        .execute(lib.db.writer())
+        .await
+        .unwrap();
+    sqlx::query(r#"DELETE FROM "AncestorIds" WHERE "ParentItemId" = ?1 AND "ItemId" IN (?2, ?3)"#)
+        .bind(guid_to_db(anime))
+        .bind(guid_to_db(show))
+        .bind(guid_to_db(flat))
+        .execute(lib.db.writer())
+        .await
+        .unwrap();
+    lib.scanner.scan_all().await.unwrap();
+    assert_eq!(parent_of(lib.row(show).await), in_anime, "moved on rescan");
+    for item in [show, flat] {
+        assert!(
+            lib.ancestors(item).await.contains(&guid_to_db(anime)),
+            "{item}"
+        );
+    }
+}
+
 /// A removed location's movie goes with its folder (the stale-row prune and
 /// `prune_orphan_locations` both reach it): its history is detached once —
 /// one placeholder copy, one snapshot — and the location coming back
