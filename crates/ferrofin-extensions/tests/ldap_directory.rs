@@ -26,8 +26,8 @@ use ferrofin_extensions::ldap_auth::directory::Ldap3Directory;
 use ferrofin_extensions::ldap_auth::provider::{LdapAuthProvider, PROVIDER_ID, PROVIDER_NAME};
 use ferrofin_extensions::ldap_auth::{
     CertificateVerification, ConnectionOptions, EXTENSION_ID, LdapAuthExtension, LdapConfig,
-    LdapConnection, LdapDirectory, LdapError, SearchScope, ldap_user_search, test_ldap_filters,
-    test_server_bind,
+    LdapConnection, LdapDirectory, LdapError, PASSWORD_MODIFY_OID, SearchOutcome, SearchScope,
+    ldap_user_search, test_ldap_filters, test_server_bind,
 };
 use ferrofin_extensions::{Extension, registered_plugins};
 use ferrofin_model::ldap::{
@@ -63,9 +63,6 @@ const GROUPS_DN: &str = "ou=groups,dc=example,dc=org";
 /// On a network that answers it with "unreachable" at once, the case still
 /// passes but no longer exercises the timeout: read its printed time.
 const UNROUTABLE: &str = "192.0.2.1";
-
-/// The RFC 3062 password modify operation's OID.
-const PASSWORD_MODIFY_OID: &str = "1.3.6.1.4.1.4203.1.11.1";
 
 const SEED: &str = "dn: dc=example,dc=org
 objectClass: top
@@ -401,6 +398,7 @@ async fn the_directory_client_against_openldap() {
     sign_in(&open, &plain).await;
     admin_filter(&plain).await;
     filter_test_and_user_search(&plain).await;
+    password_change(&plain).await;
     directory_operations(&plain).await;
     referrals(&files, &conf, scratch.path()).await;
 }
@@ -717,6 +715,11 @@ struct SignIn {
 
 impl SignIn {
     async fn new(config: &LdapConfig) -> Self {
+        Self::with_directory(config, Arc::new(Ldap3Directory::default())).await
+    }
+
+    /// As [`new`](Self::new), the provider connecting through `directory`.
+    async fn with_directory(config: &LdapConfig, directory: Arc<dyn LdapDirectory>) -> Self {
         let db = ferrofin_db::Database::connect_in_memory()
             .await
             .expect("connect");
@@ -738,7 +741,7 @@ impl SignIn {
             plugins,
             Arc::clone(&users) as Arc<dyn UserManager>,
             Arc::clone(&identities) as Arc<dyn ExternalIdentityStore>,
-            Arc::new(Ldap3Directory::default()),
+            directory,
         ))]);
         Self {
             users,
@@ -1223,6 +1226,144 @@ async fn filter_test_and_user_search(plain: &LdapConfig) {
         ))
     );
     println!("filter test and user search: ok");
+}
+
+/// The directory client with the RFC 3062 password modify operation hidden
+/// from the root DSE, as on a server that does not offer it.
+struct WithoutPasswordModify;
+
+#[async_trait::async_trait]
+impl LdapDirectory for WithoutPasswordModify {
+    async fn connect(
+        &self,
+        options: &ConnectionOptions,
+    ) -> Result<Box<dyn LdapConnection>, LdapError> {
+        Ok(Box::new(HidingPasswordModify(
+            Ldap3Directory::default().connect(options).await?,
+        )))
+    }
+}
+
+/// A connection of [`WithoutPasswordModify`].
+struct HidingPasswordModify(Box<dyn LdapConnection>);
+
+#[async_trait::async_trait]
+impl LdapConnection for HidingPasswordModify {
+    async fn simple_bind(&mut self, dn: &str, password: &str) -> Result<(), LdapError> {
+        self.0.simple_bind(dn, password).await
+    }
+
+    async fn search(
+        &mut self,
+        base: &str,
+        scope: SearchScope,
+        filter: &str,
+        attributes: &[&str],
+    ) -> Result<SearchOutcome, LdapError> {
+        self.0.search(base, scope, filter, attributes).await
+    }
+
+    async fn modify_replace(
+        &mut self,
+        dn: &str,
+        attribute: &str,
+        values: &[&str],
+    ) -> Result<(), LdapError> {
+        self.0.modify_replace(dn, attribute, values).await
+    }
+
+    async fn password_modify(
+        &mut self,
+        _user_dn: &str,
+        _new_password: &str,
+    ) -> Result<(), LdapError> {
+        panic!("the password modify operation is hidden, so it must not be sent");
+    }
+
+    async fn supported_extensions(&mut self) -> Result<Vec<String>, LdapError> {
+        let mut extensions = self.0.supported_extensions().await?;
+        extensions.retain(|oid| oid != PASSWORD_MODIFY_OID);
+        Ok(extensions)
+    }
+
+    async fn unbind(&mut self) {
+        self.0.unbind().await;
+    }
+}
+
+/// Password changes (`ChangePassword`) against the directory, bound as its
+/// administrator: through the RFC 3062 operation, which OpenLDAP offers, and
+/// through the password attribute where the root DSE does not list it. A reset
+/// (a blank password) never reaches it (D11).
+async fn password_change(plain: &LdapConfig) {
+    let config = LdapConfig {
+        ldap_bind_user: ADMIN_DN.to_owned(),
+        ldap_bind_password: Secret::new(ADMIN_PASSWORD),
+        ldap_search_filter: "(objectClass=inetOrgPerson)".to_owned(),
+        ldap_search_attributes: "uid, mail".to_owned(),
+        ldap_uid_attribute: "uid".to_owned(),
+        ldap_username_attribute: "uid".to_owned(),
+        allow_pass_change: true,
+        enable_all_folders: true,
+        ..plain.clone()
+    };
+    let signs_in = async |users: &SignIn, password: &str| {
+        users
+            .sign_in("ada", password)
+            .await
+            .expect("sign in")
+            .is_some()
+    };
+    let ada_id = |user: Option<ferrofin_db::entities::users::UserEntity>| {
+        uuid::Uuid::parse_str(&user.expect("ada").id).expect("id")
+    };
+
+    let users = SignIn::new(&config).await;
+    let ada = ada_id(users.sign_in("ada", ADA_PASSWORD).await.expect("sign in"));
+    users
+        .users
+        .change_password(ada, "ada-operation-secret")
+        .await
+        .expect("changed with the password modify operation");
+    assert!(signs_in(&users, "ada-operation-secret").await);
+    assert!(!signs_in(&users, ADA_PASSWORD).await);
+    for blank in ["", "   "] {
+        assert!(matches!(
+            users.users.change_password(ada, blank).await,
+            Err(ServiceError::InvalidInput(_))
+        ));
+    }
+    assert!(matches!(
+        users.users.reset_password(ada).await,
+        Err(ServiceError::InvalidInput(_))
+    ));
+    assert!(
+        signs_in(&users, "ada-operation-secret").await,
+        "a blank password or a reset leaves the directory alone"
+    );
+
+    let users = SignIn::with_directory(&config, Arc::new(WithoutPasswordModify)).await;
+    let ada = ada_id(
+        users
+            .sign_in("ada", "ada-operation-secret")
+            .await
+            .expect("sign in"),
+    );
+    users
+        .users
+        .change_password(ada, "ada-attribute-secret")
+        .await
+        .expect("changed through userPassword");
+    assert!(signs_in(&users, "ada-attribute-secret").await);
+    assert!(!signs_in(&users, "ada-operation-secret").await);
+    // Her first password back, for the cases that follow.
+    users
+        .users
+        .change_password(ada, ADA_PASSWORD)
+        .await
+        .expect("restored");
+    assert!(signs_in(&users, ADA_PASSWORD).await);
+    println!("password change: ok");
 }
 
 /// Grace, whom only the referred server's directory lists.

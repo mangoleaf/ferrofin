@@ -1410,6 +1410,7 @@ dependencies = [
  "chrono",
  "fancy-regex",
  "ferrofin-chromaprint",
+ "ferrofin-common",
  "ferrofin-core",
  "ferrofin-db",
  "ferrofin-health",
