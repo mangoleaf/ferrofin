@@ -367,21 +367,51 @@ async fn an_entry_without_the_username_attribute_is_a_bad_request_while_the_filt
     );
 }
 
+/// An administrator whose entry only a referred server holds is found there:
+/// the admin search follows the reference as the bind DN, as upstream's
+/// `LdapAuthHandler` binds.
 #[tokio::test]
-async fn the_admin_search_does_not_follow_references_yet() {
-    // TODO(gl-1148): a referral is followed with the bind credentials.
+async fn the_admin_search_follows_references_with_the_bind_credentials() {
     let harness = Harness::new(&with_admin_filter(ADMIN_FILTER)).await;
-    harness.directory.state().by_filter.insert(
-        ADMIN_FILTER.to_owned(),
-        SearchOutcome {
-            entries: Vec::new(),
-            references: vec!["ldap://elsewhere.example/dc=example,dc=org".to_owned()],
-        },
-    );
+    {
+        let mut state = harness.directory.state();
+        state.by_filter.insert(
+            ADMIN_FILTER.to_owned(),
+            SearchOutcome {
+                entries: Vec::new(),
+                references: vec![vec![
+                    "ldap://admins.example/ou=people,dc=example,dc=org??sub".to_owned(),
+                ]],
+            },
+        );
+        state.by_server.insert(
+            "admins.example".to_owned(),
+            SearchOutcome {
+                entries: vec![ada()],
+                references: Vec::new(),
+            },
+        );
+    }
     harness
         .sign_in("ada", ADA_PASSWORD)
         .await
         .expect("sign in")
         .expect("created");
-    assert!(!harness.is_administrator("ada").await);
+    assert!(harness.is_administrator("ada").await);
+    let state = harness.directory.state();
+    assert_eq!(
+        state.binds_at.last(),
+        Some(&("admins.example".to_owned(), READER_DN.to_owned())),
+        "bound at the referred server as the bind DN"
+    );
+    assert_eq!(
+        state.searches.last(),
+        Some(&(
+            "ou=people,dc=example,dc=org".to_owned(),
+            SearchScope::Subtree,
+            ADMIN_FILTER.to_owned(),
+            vec!["1.1".to_owned()],
+        )),
+        "the URL's base, the admin filter's own filter and attributes"
+    );
 }

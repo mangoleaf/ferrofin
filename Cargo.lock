@@ -1420,6 +1420,7 @@ dependencies = [
  "ferrofin-util",
  "futures-util",
  "ldap3",
+ "percent-encoding",
  "rcgen",
  "regex",
  "reqwest",

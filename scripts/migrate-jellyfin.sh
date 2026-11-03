@@ -21,9 +21,13 @@ keeps its relative position:
   JELLYFIN/root/default/        -> DATA_DIR/root/default/   (library definitions)
   JELLYFIN/metadata/            -> DATA_DIR/metadata/       (images)
   JELLYFIN_CONFIG/              -> CONFIG_DIR/              (XML configuration)
+  JELLYFIN/plugins/configurations/LDAP-Auth.xml
+                                -> DATA_DIR/plugins/configurations/
+                                   (LDAP-Auth's settings, imported on the first start)
 
 The rest of Jellyfin's data/ holds caches Ferrofin rebuilds or does not read, and
-its .NET plugins/ and "Subtitle Edit/" cannot run in Ferrofin; none are copied.
+the rest of its plugins/ (.NET plugins) and "Subtitle Edit/" cannot run in
+Ferrofin; none are copied.
 Files already at the destination are kept. The Jellyfin files are not modified.
 
 Options:
@@ -125,6 +129,16 @@ if [[ -d "$source_data/metadata" ]]; then
 fi
 if [[ -d "$source_config" ]]; then
     copy "$source_config" "$destination_config"
+fi
+# The one plugin file Ferrofin reads: Ferrofin's LDAP-Auth imports it once. It
+# holds the directory's bind password, so only the service user may read it.
+ldap_auth_xml=$source_data/plugins/configurations/LDAP-Auth.xml
+if [[ -f "$ldap_auth_xml" ]]; then
+    mkdir -p "$destination/plugins/configurations"
+    rsync -a --ignore-existing --chown=ferrofin:ferrofin --chmod=F600 "$ldap_auth_xml" "$destination/plugins/configurations/"
+    # Ferrofin installs WASM plugins into DATA_DIR/plugins, so the service user owns it.
+    chown ferrofin:ferrofin "$destination/plugins" "$destination/plugins/configurations"
+    echo "Copied $ldap_auth_xml -> $destination/plugins/configurations/"
 fi
 
 chown ferrofin:ferrofin "$destination" "$destination/data" "$destination/root"

@@ -25,9 +25,9 @@
 //!   not). The bind counts as refused only for the result codes that refuse
 //!   credentials ([`REFUSED_BIND`]). A directory that cannot be reached,
 //!   times out, fails the bind with another code, refuses the configured bind
-//!   DN, fails the user search or the admin filter's, or refers the user
-//!   search elsewhere is a server error, which the user manager does not
-//!   count toward lockout. Upstream answers each with an
+//!   DN, or fails the user search or the admin filter's (a referral that
+//!   cannot be followed included) is a server error, which the user manager
+//!   does not count toward lockout. Upstream answers each with an
 //!   `AuthenticationException`.
 //! - **The last administrator is never demoted by the admin filter** (D5):
 //!   the user manager keeps them one and logs a warning, and the sign-in
@@ -173,10 +173,9 @@ pub fn admin_search_filter(config: &LdapConfig, ldap_username: &str) -> String {
 }
 
 /// `LocateLdapUser`: searches the base DN's subtree as the configured bind DN
-/// with [`user_search_filter`] for `[LdapUsernameAttribute, LdapUidAttribute]`
-/// and returns the first entry, warning when there are more, or `None` when
-/// none matches. A search that found no entry but referred elsewhere is a
-/// failed search: the references are not followed yet (TODO(gl-1148)).
+/// with [`user_search_filter`] for `[LdapUsernameAttribute, LdapUidAttribute]`,
+/// following referrals, and returns the first entry, warning when there are
+/// more, or `None` when none matches.
 pub(crate) async fn locate_ldap_user(
     directory: &dyn LdapDirectory,
     config: &LdapConfig,
@@ -195,24 +194,17 @@ pub(crate) async fn locate_ldap_user(
         ],
     )
     .await?;
-    if found.entries.is_empty() {
-        if !found.references.is_empty() {
-            // TODO(gl-1148): follow referrals with the bind credentials, as
-            // upstream's `LdapAuthHandler` does.
-            return Err(BoundSearchError::Search(LdapError::Referral(
-                found.references,
-            )));
-        }
+    if found.is_empty() {
         tracing::debug!(username = ?username, "no LDAP entry matches the sign-in name");
         return Ok(None);
     }
-    if found.entries.len() > 1 {
+    if found.len() > 1 {
         tracing::warn!(
             username = ?username,
             "more than one LDAP result matched; using first result only"
         );
     }
-    let entry = found.entries.swap_remove(0);
+    let entry = found.swap_remove(0);
     tracing::debug!(username = ?username, dn = ?entry.dn, "found the LDAP entry");
     Ok(Some(entry))
 }
@@ -398,7 +390,7 @@ impl LdapAuthProvider {
     }
 
     /// The link key of an LDAP uid: this provider, no issuer, the uid.
-    fn identity(uid: &str) -> ExternalIdentityKey<'_> {
+    pub(super) fn identity(uid: &str) -> ExternalIdentityKey<'_> {
         ExternalIdentityKey {
             provider_id: PROVIDER_ID,
             issuer: "",
@@ -424,7 +416,8 @@ impl LdapAuthProvider {
     /// while the filter is off (see [`LdapConfig::admin_filter_enabled`]).
     ///
     /// It searches as the configured bind DN, on a connection of its own,
-    /// [`LdapConfig::admin_base_dn`]'s subtree with [`admin_search_filter`].
+    /// [`LdapConfig::admin_base_dn`]'s subtree with [`admin_search_filter`],
+    /// following referrals.
     /// With `EnableLdapAdminFilterMemberUid` any entry found makes the user an
     /// administrator; otherwise one of them must be the user's own entry (the
     /// DNs compared ordinally).
@@ -451,21 +444,10 @@ impl LdapAuthProvider {
         )
         .await
         .map_err(|error| search_failure(&error, "apply the admin filter", outage))?;
-        if !found.references.is_empty() {
-            // TODO(gl-1148): follow them with the bind credentials, as
-            // upstream's referral handler does. Until then the entries sent
-            // decide: failing instead would refuse every user who is not an
-            // administrator wherever a search returns references, as Active
-            // Directory's do at a domain root.
-            tracing::debug!(
-                references = ?found.references,
-                "the admin filter's search referred elsewhere; the references are not followed"
-            );
-        }
         let administrator = if config.enable_ldap_admin_filter_member_uid {
-            !found.entries.is_empty()
+            !found.is_empty()
         } else {
-            found.entries.iter().any(|admin| admin.dn == entry.dn)
+            found.iter().any(|admin| admin.dn == entry.dn)
         };
         tracing::debug!(dn = ?entry.dn, administrator, "applied the LDAP admin filter");
         Ok(Some(administrator))

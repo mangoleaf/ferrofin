@@ -27,17 +27,13 @@ pub(crate) struct ServerRecordingLibrary {
 }
 
 impl ServerRecordingLibrary {
-    /// Restarts the monitor so it watches the changed structure, then queues
-    /// the scan `AddVirtualFolder` and `RemoveVirtualFolder` end with: of the
-    /// new library alone, or of everything. Like the API's structure changes,
-    /// best-effort: the change has already happened.
+    /// Asks the monitor to watch the changed structure (it restarts on its
+    /// own task), then queues the scan `AddVirtualFolder` and
+    /// `RemoveVirtualFolder` end with: of the new library alone, or of
+    /// everything. Like the API's structure changes, best-effort: the change
+    /// has already happened.
     async fn after_structure_change(&self, scope: Option<Uuid>) {
-        if let Err(error) = self.monitor.stop().await {
-            tracing::warn!(%error, "failed to stop library monitor");
-        }
-        if let Err(error) = self.monitor.start().await {
-            tracing::warn!(%error, "failed to restart library monitor");
-        }
+        self.monitor.restart();
         let queued = match scope {
             Some(library_id) => self.library.queue_library_scan_scoped(library_id).await,
             None => self.library.queue_library_scan().await,
@@ -76,12 +72,7 @@ impl RecordingLibrary for ServerRecordingLibrary {
 
     async fn remove_media_path(&self, name: &str, path: &str) -> Result<(), ServiceError> {
         self.virtual_folders.remove_media_path(name, path).await?;
-        if let Err(error) = self.monitor.stop().await {
-            tracing::warn!(%error, "failed to stop library monitor");
-        }
-        if let Err(error) = self.monitor.start().await {
-            tracing::warn!(%error, "failed to restart library monitor");
-        }
+        self.monitor.restart();
         Ok(())
     }
 
