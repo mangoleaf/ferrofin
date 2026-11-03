@@ -2920,8 +2920,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // Only the configuration row goes, as upstream edits only the
         // configuration: the host's channels and airings stay listed until the
         // guide refresh the handler queues prunes them (migration 0046 dropped
-        // the cascade).
-        //
+        // the cascade). The Live TV gate's cached answer
+        // (`Database::live_tv_tuner_hosts_exist`) follows on the next request.
+        self.db.invalidate_live_tv_tuner_hosts();
         // Recount so deleting the last host hides the guide-refresh task. This
         // is bookkeeping, not part of the delete's contract: a failed recount
         // must not turn a committed delete into a client-visible error.
@@ -7590,8 +7591,12 @@ mod tests {
         )])))
         .await;
         // The synchronous flag the "Refresh Guide" task's hidden rule polls
-        // tracks the store through every mutation.
+        // tracks the store through every mutation, and so does the cached
+        // answer the Live TV gate reads.
+        mgr.db
+            .enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
         assert!(!mgr.has_tuner_hosts(), "no host configured yet");
+        assert!(!mgr.db.live_tv_tuner_hosts_exist().await.expect("gate"));
         let saved = mgr
             .save_tuner_host(TunerHostInfo {
                 type_: Some("m3u".to_owned()),
@@ -7603,6 +7608,10 @@ mod tests {
         let id = saved.id.clone().expect("id assigned");
         assert_eq!(saved.type_.as_deref(), Some("m3u"));
         assert!(mgr.has_tuner_hosts(), "saving a host reveals the task");
+        assert!(
+            mgr.db.live_tv_tuner_hosts_exist().await.expect("gate"),
+            "saving a host reaches the gate"
+        );
 
         let hosts = mgr.get_tuner_hosts().await.expect("list");
         assert_eq!(hosts.len(), 1);
@@ -7615,6 +7624,10 @@ mod tests {
         assert!(
             !mgr.has_tuner_hosts(),
             "deleting the last host hides the task again"
+        );
+        assert!(
+            !mgr.db.live_tv_tuner_hosts_exist().await.expect("gate"),
+            "deleting the last host reaches the gate"
         );
     }
 

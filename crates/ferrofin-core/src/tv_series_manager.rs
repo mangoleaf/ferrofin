@@ -174,7 +174,8 @@ impl FerrofinTvSeriesManager {
     /// row, and asking for every folder (seasons, albums, artists — 1,975 on
     /// the bench fixture) against the retired `CROSS JOIN` shape made that
     /// 10 M index probes and a 1.4 s home screen. The service maps each
-    /// collection folder to its physical folders, as
+    /// collection folder to its physical folders, and a view (a grouped view
+    /// an explicit `parentId` names) to the libraries behind it, as
     /// `LibraryManager.GetNextUpSeriesKeys` does.
     async fn resolve_parents(
         &self,

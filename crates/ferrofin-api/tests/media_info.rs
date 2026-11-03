@@ -2541,3 +2541,107 @@ async fn a_direct_play_veto_keeps_the_direct_play_transcode_reasons(
     let url = source["TranscodingUrl"].as_str().expect("a transcode");
     assert_eq!(url_param(url, "TranscodeReasons"), Some(reasons), "{url}");
 }
+
+/// `source` carrying one font attachment at stream index `index`.
+fn with_font(source: MediaSourceInfo, index: i32) -> MediaSourceInfo {
+    MediaSourceInfo {
+        media_attachments: vec![ferrofin_model::entities_media::MediaAttachment {
+            codec: Some("ttf".to_owned()),
+            index,
+            file_name: Some("font.ttf".to_owned()),
+            mime_type: Some("application/x-truetype-font".to_owned()),
+            ..Default::default()
+        }],
+        ..source
+    }
+}
+
+/// The `DeliveryUrl` of each source's first attachment, by source id.
+fn attachment_urls(sources: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+    let mut urls: Vec<_> = sources
+        .as_array()
+        .expect("sources")
+        .iter()
+        .map(|source| {
+            (
+                source["Id"].as_str().expect("id").to_owned(),
+                source["MediaAttachments"][0]["DeliveryUrl"].clone(),
+            )
+        })
+        .collect();
+    urls.sort_by(|a, b| a.0.cmp(&b.0));
+    urls
+}
+
+/// gl-1134: `MediaInfoHelper.SetDeviceSpecificData` (v12.4) ends by giving
+/// every attachment of each negotiated source the URL
+/// `/Videos/{item.Id}/{mediaSource.Id}/Attachments/{Index}`, the item id in
+/// .NET's default (hyphenated) spelling and the queried item's for every
+/// version. jellyfin-web hands each font's URL to its ASS renderer. Without a
+/// profile (none posted, none stored) no source is negotiated, so none gets
+/// one, as upstream calls `SetDeviceSpecificData` only with a profile.
+#[tokio::test]
+async fn a_negotiated_source_gives_each_attachment_its_delivery_url() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let sources = || {
+        versioned(vec![
+            with_font(version("v1", "aac"), 4),
+            with_font(version("v2", "ac3"), 5),
+        ])
+    };
+    let json = post_versions(
+        item_id,
+        sources(),
+        &serde_json::json!({"DeviceProfile": web_profile()}),
+    )
+    .await;
+    let item = item_id.as_hyphenated();
+    assert_eq!(
+        attachment_urls(&json["MediaSources"]),
+        [
+            (
+                "v1".to_owned(),
+                serde_json::json!(format!("/Videos/{item}/v1/Attachments/4"))
+            ),
+            (
+                "v2".to_owned(),
+                serde_json::json!(format!("/Videos/{item}/v2/Attachments/5"))
+            ),
+        ],
+        "{json}"
+    );
+
+    let json = post_versions(item_id, sources(), &serde_json::json!({})).await;
+    assert_eq!(
+        attachment_urls(&json["MediaSources"]),
+        [
+            ("v1".to_owned(), serde_json::Value::Null),
+            ("v2".to_owned(), serde_json::Value::Null),
+        ],
+        "{json}"
+    );
+}
+
+/// gl-1134: `POST /LiveStreams/Open` negotiates the opened source through the
+/// same `SetDeviceSpecificData` (`MediaInfoHelper.OpenMediaSource`), so its
+/// attachments get their URLs under the requested item.
+#[tokio::test]
+async fn an_opened_live_stream_gives_each_attachment_its_delivery_url() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let sources = versioned_opening(vec![version("v1", "aac")], with_font(opened_live("aac"), 6));
+    let state = versions_state(
+        item_id,
+        sources,
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    );
+    let json = post_open(
+        state,
+        &serde_json::json!({"OpenToken": "tok", "ItemId": item_id, "DeviceProfile": web_profile()}),
+    )
+    .await;
+    assert_eq!(
+        json["MediaSource"]["MediaAttachments"][0]["DeliveryUrl"],
+        format!("/Videos/{}/opened/Attachments/6", item_id.as_hyphenated()),
+        "{json}"
+    );
+}
