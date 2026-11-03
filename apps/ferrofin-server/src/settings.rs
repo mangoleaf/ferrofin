@@ -367,6 +367,18 @@ pub static SETTINGS: &[SettingSpec] = &[
         ..ROW
     },
     SettingSpec {
+        key: "detect_network_change",
+        env: Some("FERROFIN_DETECT_NETWORK_CHANGE"),
+        env_read: PARSED_BOOL,
+        group: Group::Network,
+        kind: SettingKind::Bool,
+        default: "true",
+        description: "Read the network interfaces again 2 seconds after the operating system \
+                      reports a network change, so local URLs and bind addresses follow it.",
+        running: |c| json!(c.detect_network_change),
+        ..ROW
+    },
+    SettingSpec {
         key: "login_backoff",
         env: Some("FERROFIN_LOGIN_BACKOFF"),
         env_read: PARSED_BOOL,

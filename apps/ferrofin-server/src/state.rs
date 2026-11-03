@@ -51,6 +51,39 @@ use crate::bootstrap::FfmpegPaths;
 use crate::config::Config;
 use crate::media_encoding::build_media_encoding;
 
+/// Starts the task that reads the network interfaces again after the
+/// operating system reports a network change ([`ferrofin_networking::network_change`]).
+/// Where the listener cannot be opened the server goes on without it, as
+/// with the setting off, and says so.
+fn start_network_change_monitor(
+    network: &Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    use ferrofin_networking::network_change;
+    match network_change::os_source() {
+        Ok(source) => Some(tokio::spawn(tracing::Instrument::instrument(
+            network_change::monitor(
+                source,
+                Arc::clone(network),
+                network_change::NETWORK_CHANGE_DELAY,
+            ),
+            tracing::info_span!(
+                parent: None,
+                "network_change_monitor",
+                task = "network_change_monitor",
+                trigger = "startup"
+            ),
+        ))),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "cannot listen for network changes: network interfaces are read again only \
+                 when the network settings are saved or the server restarts"
+            );
+            None
+        }
+    }
+}
+
 /// Reads the saved network configuration, or the default when there is none.
 ///
 /// The same `{config}/users/named/network.json` that
@@ -1769,6 +1802,8 @@ pub async fn build_app_state(
         Arc::clone(&configuration_write_lock),
     );
     let mut background = Vec::new();
+    // For the network-change monitor, started once nothing below can fail.
+    let changing_network = Arc::clone(&network);
     if let Some(mut rx) = fs_events {
         let monitor = Arc::clone(&library_monitor);
         background.push(tokio::spawn(async move {
@@ -3022,6 +3057,15 @@ pub async fn build_app_state(
         .with_merge_versions(merge_versions)
         .with_ldap(ldap)
         .with_playback_metrics(playback_metrics);
+
+    // `DetectNetworkChange`: the OS's network changes refresh the shared
+    // network manager for this lifetime (upstream subscribes in the
+    // `NetworkManager` constructor and unsubscribes in `Dispose`). Started
+    // last: a `background` handle dropped by an early return would not stop
+    // a task that never ends on its own.
+    if config.detect_network_change {
+        background.extend(start_network_change_monitor(&changing_network));
+    }
 
     Ok(WiredApp {
         server_id,
