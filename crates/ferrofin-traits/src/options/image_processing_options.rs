@@ -139,7 +139,7 @@ impl ImageProcessingOptions {
     }
 
     /// Whether the source image can be served untouched: no overlays and, when
-    /// `size` is known, the requested dimensions already match the source.
+    /// `size` is known, the source already satisfies the requested dimensions.
     /// Mirrors the public C# `HasDefaultOptions(path, ImageDimensions?)`.
     #[must_use]
     pub fn has_default_options(
@@ -178,9 +178,10 @@ impl ImageProcessingOptions {
         if self.max_height.is_some_and(|mh| size.height > mh) {
             return false;
         }
-        // C# compares against the raw int fields; an unset FillWidth/Height is 0,
-        // so any positive source dimension trips the guard, matching C# exactly.
-        if size.width > self.fill_width.unwrap_or(0) || size.height > self.fill_height.unwrap_or(0)
+        // C# FillWidth/FillHeight are `int?`: the lifted `>` against an unset
+        // one is false, so only a requested fill bounds the source.
+        if self.fill_width.is_some_and(|fw| size.width > fw)
+            || self.fill_height.is_some_and(|fh| size.height > fh)
         {
             return false;
         }
@@ -286,9 +287,58 @@ mod tests {
         let size = ImageDimensions::new(100, 50);
         assert!(opts.has_default_options("/a.jpg", Some(size)));
 
-        // A source larger than fill bounds is not default.
+        // A source of another width fails the exact-width check first; the fill
+        // guard alone is `one_filled_axis_bounds_only_that_axis`.
         let big = ImageDimensions::new(200, 50);
         assert!(!opts.has_default_options("/a.jpg", Some(big)));
+    }
+
+    #[test]
+    fn known_size_with_no_fill_is_default() {
+        // C# FillWidth/FillHeight are int?: with no fill requested the lifted
+        // `>` is false, so an image already within its bounds is served as is.
+        let size = ImageDimensions::new(640, 640);
+        let plain = ImageProcessingOptions {
+            quality: 95,
+            supported_output_formats: vec![ImageFormat::Jpg],
+            ..Default::default()
+        };
+        assert!(plain.has_default_options("/a.jpg", Some(size)));
+
+        let roomy = ImageProcessingOptions {
+            max_width: Some(2000),
+            ..plain.clone()
+        };
+        assert!(roomy.has_default_options("/a.jpg", Some(size)));
+
+        // A bound the source exceeds still forces the transform.
+        let tight = ImageProcessingOptions {
+            max_width: Some(320),
+            ..plain
+        };
+        assert!(!tight.has_default_options("/a.jpg", Some(size)));
+    }
+
+    #[test]
+    fn one_filled_axis_bounds_only_that_axis() {
+        let base = ImageProcessingOptions {
+            quality: 95,
+            supported_output_formats: vec![ImageFormat::Jpg],
+            ..Default::default()
+        };
+        let fill_width = ImageProcessingOptions {
+            fill_width: Some(100),
+            ..base.clone()
+        };
+        assert!(fill_width.has_default_options("/a.jpg", Some(ImageDimensions::new(100, 5000))));
+        assert!(!fill_width.has_default_options("/a.jpg", Some(ImageDimensions::new(101, 50))));
+
+        let fill_height = ImageProcessingOptions {
+            fill_height: Some(100),
+            ..base
+        };
+        assert!(fill_height.has_default_options("/a.jpg", Some(ImageDimensions::new(5000, 100))));
+        assert!(!fill_height.has_default_options("/a.jpg", Some(ImageDimensions::new(50, 101))));
     }
 
     #[test]
