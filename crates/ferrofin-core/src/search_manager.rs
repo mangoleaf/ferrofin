@@ -26,6 +26,7 @@ use ferrofin_model::querying::QueryResult;
 use ferrofin_model::search::{SearchHint, SearchQuery};
 use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::options::ItemImageInfo;
+use ferrofin_util::directory_path::DirectoryPath;
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -48,6 +49,9 @@ pub struct FerrofinSearchManager {
     items: Arc<dyn ItemRepository>,
     users: Arc<dyn UserManager>,
     images: Option<Arc<dyn ImageProcessor>>,
+    /// The internal metadata directory, the only place a Live TV hint's image
+    /// file is opened from.
+    metadata_root: Option<DirectoryPath>,
 }
 
 impl std::fmt::Debug for FerrofinSearchManager {
@@ -72,7 +76,16 @@ impl FerrofinSearchManager {
             items,
             users,
             images: None,
+            metadata_root: None,
         }
+    }
+
+    /// Attaches the internal metadata directory, the only place a Live TV
+    /// hint's image file is opened from; without it no such file is opened.
+    #[must_use]
+    pub fn with_metadata_root(mut self, metadata_root: impl Into<DirectoryPath>) -> Self {
+        self.metadata_root = Some(metadata_root.into());
+        self
     }
 
     /// Attaches the image processor the hints' artwork tags come from
@@ -277,7 +290,15 @@ impl FerrofinSearchManager {
                 .get(&hint.id)
                 .map(|row| parent_chain(row, &ancestors))
                 .unwrap_or_default();
-            fill_artwork(processor, hint, &parents, &images, &paths).await;
+            fill_artwork(
+                processor,
+                self.metadata_root.as_ref(),
+                hint,
+                &parents,
+                &images,
+                &paths,
+            )
+            .await;
         }
         Ok(())
     }
@@ -421,6 +442,7 @@ fn first_image(
 /// a tag hashes its owner's path from `paths` (`GetImageCacheTag(item, …)`).
 async fn fill_artwork(
     processor: &dyn ImageProcessor,
+    metadata_root: Option<&DirectoryPath>,
     hint: &mut SearchHint,
     parents: &[(Uuid, BaseItemKind)],
     images: &std::collections::HashMap<Uuid, Vec<ItemImageInfo>>,
@@ -442,9 +464,14 @@ async fn fill_artwork(
     {
         hint.primary_image_tag = Some(primary_tag);
         let own = images.get(&hint.id).map_or(&[][..], Vec::as_slice);
-        hint.primary_image_aspect_ratio =
-            crate::dto_service::primary_image_aspect_ratio(processor, hint.id, hint.type_, own)
-                .await;
+        hint.primary_image_aspect_ratio = crate::dto_service::primary_image_aspect_ratio(
+            processor,
+            metadata_root,
+            hint.id,
+            hint.type_,
+            own,
+        )
+        .await;
     }
     let with = |kind: ImageType| {
         move |(id, _): &&(Uuid, BaseItemKind)| first_image(images, *id, kind).is_some()

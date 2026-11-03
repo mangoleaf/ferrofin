@@ -110,7 +110,9 @@ use ferrofin_model::entities::ImageType;
 use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::options::{ImageCollageOptions, InternalItemsQuery, ItemImageInfo};
+use ferrofin_traits::options::{
+    ImageCollageOptions, InternalItemsQuery, ItemImageInfo, live_tv_image_is_internal,
+};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 use ferrofin_traits::providers::{GeneratedImageProvider, ItemUpdateType, MetadataRefreshOptions};
 use uuid::Uuid;
@@ -831,10 +833,8 @@ impl DynamicImageProviders {
         // needs a file extension to carry over.
         let mut paths = Vec::new();
         for id in ids {
-            let infos = self.items.get_image_infos(id).await?;
-            if let Some(primary) = infos
-                .iter()
-                .find(|i| i.image_type == ImageType::Primary && i.is_local_file())
+            let infos = self.local_images(id).await?;
+            if let Some(primary) = infos.iter().find(|i| i.image_type == ImageType::Primary)
                 && Path::new(&primary.path).extension().is_some()
             {
                 paths.push(primary.path.clone());
@@ -857,14 +857,40 @@ impl DynamicImageProviders {
 
     /// The item's local Primary path, else its local Thumb path.
     async fn primary_or_thumb_path(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
-        let infos = self.items.get_image_infos(id).await?;
+        let infos = self.local_images(id).await?;
         let pick = |kind: ImageType| {
             infos
                 .iter()
-                .find(|i| i.image_type == kind && i.is_local_file())
+                .find(|i| i.image_type == kind)
                 .map(|i| i.path.clone())
         };
         Ok(pick(ImageType::Primary).or_else(|| pick(ImageType::Thumb)))
+    }
+
+    /// The item's images a collage may draw: `IsLocalFile`, and for a Live TV
+    /// item only those in the internal metadata directory, the parent of the
+    /// item-art root ([`live_tv_image_is_internal`]). Upstream draws any local
+    /// file a Live TV item's row names.
+    async fn local_images(&self, id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
+        let served = self.items.get_image_infos_to_serve(id).await?;
+        let art_root = self.metadata_dir.resolve();
+        let mut images = Vec::with_capacity(served.images.len());
+        for image in served.images {
+            if !image.is_local_file() {
+                continue;
+            }
+            if served.live_tv {
+                let internal = match art_root.parent() {
+                    Some(root) => live_tv_image_is_internal(&image.path, root).await,
+                    None => false,
+                };
+                if !internal {
+                    continue;
+                }
+            }
+            images.push(image);
+        }
+        Ok(images)
     }
 
     /// `HasImage(ImageType.Primary)`.
@@ -1738,6 +1764,50 @@ mod tests {
             .await
             .expect("forced");
         assert_eq!(copy().await, recoloured, "a locked root is left alone");
+    }
+
+    /// A Live TV item's row is a source only from the internal metadata
+    /// directory, the parent of the item-art root.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_tv_row_is_a_source_only_from_the_metadata_directory() {
+        let fx = fixture().await;
+        let logos = fx.tmp.path().join("metadata").join("logos");
+        std::fs::create_dir_all(&logos).expect("logos");
+        let inside = write_png(&logos, "inside.png", [1, 2, 3]);
+        let outside = write_png(&fx.media_dir(), "outside.png", [4, 5, 6]);
+        let album = fx.seed(BaseItemKind::PhotoAlbum, "Album", None, None).await;
+        let channel = fx
+            .seed(BaseItemKind::LiveTvChannel, "Channel", None, Some(&outside))
+            .await;
+        fx.persistence
+            .set_parent_id(channel, album)
+            .await
+            .expect("parent");
+        fx.persistence
+            .set_ancestors(channel, &[album])
+            .await
+            .expect("ancestors");
+        let row = fx.items.retrieve_item(album).await.unwrap().unwrap();
+
+        let sources = fx
+            .providers
+            .sources_for(DynamicImageKind::PhotoAlbum, &row, album)
+            .await
+            .expect("sources");
+        assert!(sources.is_empty(), "{sources:?}");
+
+        seed_images(
+            &fx.db,
+            channel,
+            &[image_info(ImageType::Primary, &inside, None)],
+        )
+        .await;
+        let sources = fx
+            .providers
+            .sources_for(DynamicImageKind::PhotoAlbum, &row, album)
+            .await
+            .expect("sources");
+        assert_eq!(sources, [inside]);
     }
 
     /// `PhotoAlbumImageProvider` (`BaseFolderImageProvider`): the first photo
