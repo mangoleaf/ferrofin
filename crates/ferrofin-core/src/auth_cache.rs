@@ -215,6 +215,15 @@ impl AuthCache {
         })
     }
 
+    /// The `PrimaryImageTag` of the cached [`UserDto`] for `entity`'s user,
+    /// under the same freshness and entity checks as
+    /// [`AuthCache::get_user_dto`]: `Some(None)` for a cached user with no
+    /// profile image, `None` for a miss.
+    #[must_use]
+    pub fn primary_image_tag(&self, entity: &UserEntity) -> Option<Option<String>> {
+        self.read_user_dto(entity, |dto| dto.primary_image_tag.clone())
+    }
+
     /// Applies `read` to the cached [`UserDto`] for `entity`'s user, if it is
     /// fresher than the TTL and was built from an identical entity.
     fn read_user_dto<T>(&self, entity: &UserEntity, read: impl FnOnce(&UserDto) -> T) -> Option<T> {
@@ -375,6 +384,40 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         assert!(
             cache.latest_items_excludes(&entity).is_none(),
+            "an expired entry misses"
+        );
+    }
+
+    /// The `PrimaryImageTag` read serves the cached DTO's tag, a cached user
+    /// with no image included, and misses exactly when `get_user_dto` would.
+    #[tokio::test]
+    async fn the_primary_image_tag_read_misses_when_get_user_dto_would() {
+        let db = crate::test_support::test_db().await;
+        let entity = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x61)).await;
+        let cache = AuthCache::new(Duration::from_millis(30));
+        assert_eq!(cache.primary_image_tag(&entity), None, "nothing cached");
+        cache.put_user_dto(cache.generation(), &entity, UserDto::default());
+        assert_eq!(cache.primary_image_tag(&entity), Some(None), "no image");
+        let dto = UserDto {
+            primary_image_tag: Some("tag".to_owned()),
+            ..UserDto::default()
+        };
+        cache.put_user_dto(cache.generation(), &entity, dto);
+        assert_eq!(
+            cache.primary_image_tag(&entity),
+            Some(Some("tag".to_owned()))
+        );
+        let mut changed = entity.clone();
+        changed.username.push('2');
+        assert_eq!(
+            cache.primary_image_tag(&changed),
+            None,
+            "a changed row misses"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            cache.primary_image_tag(&entity),
+            None,
             "an expired entry misses"
         );
     }

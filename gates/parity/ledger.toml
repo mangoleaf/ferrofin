@@ -1284,28 +1284,6 @@ kind = "value"
 issue = 849
 reason = "Image cache tags hash the image file's path where Jellyfin hashes the item's path, so every image tag differs."
 
-# Ferrofin's session PlayState does not carry the reported MediaSourceId, PlayMethod and VolumeLevel (SessionManager.UpdateNowPlayingItem).
-[[entry]]
-request = "screen-playback-start/sessions"
-path = "[].PlayState.MediaSourceId"
-kind = "missing"
-issue = 119
-reason = "Ferrofin's session PlayState does not carry the reported MediaSourceId, PlayMethod and VolumeLevel (SessionManager.UpdateNowPlayingItem)."
-
-[[entry]]
-request = "screen-playback-start/sessions"
-path = "[].PlayState.PlayMethod"
-kind = "missing"
-issue = 119
-reason = "Ferrofin's session PlayState does not carry the reported MediaSourceId, PlayMethod and VolumeLevel (SessionManager.UpdateNowPlayingItem)."
-
-[[entry]]
-request = "screen-playback-start/sessions"
-path = "[].PlayState.VolumeLevel"
-kind = "missing"
-issue = 119
-reason = "Ferrofin's session PlayState does not carry the reported MediaSourceId, PlayMethod and VolumeLevel (SessionManager.UpdateNowPlayingItem)."
-
 # A Jellyfin bug not ported: a never-written item's UserData.Key is the key Jellyfin cached for the item's first request (its GUID when that request loaded no provider ids); Ferrofin computes it from the item's provider ids.
 [[entry]]
 request = "edge-fields-all"

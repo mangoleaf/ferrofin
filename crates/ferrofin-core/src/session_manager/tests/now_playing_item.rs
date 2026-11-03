@@ -15,7 +15,7 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::session::{
-    PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo, TranscodingInfo,
+    PlayMethod, PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo, TranscodingInfo,
 };
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::dto::DtoService;
@@ -330,18 +330,19 @@ async fn session_summaries_list_every_session_with_the_item_it_shows() {
             .await
             .expect("summaries"),
     );
-    let session = |user_id, now_playing_item_id, is_transcoding| SessionSummary {
+    let session = |user_id, now_playing_item_id, play_method, is_transcoding| SessionSummary {
         user_id,
         now_playing_item_id,
-        play_method: None,
+        play_method,
         is_transcoding,
     };
     assert_eq!(
         summaries,
         sorted(vec![
-            session(watcher, Some(item), true),
-            session(other, None, false),
-            session(Uuid::nil(), None, false),
+            // The reported PlayMethod: the fixture's report leaves the default.
+            session(watcher, Some(item), Some(PlayMethod::Transcode), true),
+            session(other, None, None, false),
+            session(Uuid::nil(), None, None, false),
         ])
     );
     assert_eq!(fixture.builds(), builds, "the summaries build nothing");
