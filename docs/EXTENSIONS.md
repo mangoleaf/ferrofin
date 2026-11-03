@@ -90,17 +90,18 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
 Four third-party Jellyfin plugins ship as extensions today. Each is a faithful port of a
 pinned upstream revision; the pins and the full delta live in
 [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md). LDAP-Auth is being ported in phases: so far it
-shows under Dashboard → Plugins, disabled, with upstream's settings page and its connection
-test, and once enabled with a server it signs directory users in (creating them on their
-first sign-in and following a directory rename). The admin filter, password changes, profile
-images, referrals and the import of an adopted Jellyfin's settings follow.
+shows under Dashboard → Plugins, disabled, with upstream's settings page and its connection,
+filter and user-search tests, and once enabled with a server it signs directory users in
+(creating them on their first sign-in, following a directory rename, and keeping their
+administrator flag in step with the admin filter). Password changes, profile images,
+referrals and the import of an adopted Jellyfin's settings follow.
 
 | Extension | Upstream | Ported rev | What it does |
 |---|---|---|---|
 | **Intro Skipper** | [intro-skipper/intro-skipper](https://github.com/intro-skipper/intro-skipper) | `db09359` | Intro, credits, recap, preview and commercial detection (audio fingerprints, chapters, black frames), exposed as media segments |
 | **File Transformation** | [IAmParadox27/jellyfin-plugin-file-transformation](https://github.com/IAmParadox27/jellyfin-plugin-file-transformation) | `f4f01c3` | Transform-on-serve hook other extensions build on |
 | **Merge Versions** | [danieladov/jellyfin-plugin-mergeversions](https://github.com/danieladov/jellyfin-plugin-mergeversions) | `e6f58d6` | Bulk-merge duplicate movie/episode versions into one item, two 24h tasks |
-| **LDAP-Auth** | [jellyfin/jellyfin-plugin-ldapauth](https://github.com/jellyfin/jellyfin-plugin-ldapauth) | `d11c86a` | Sign users in against an LDAP directory (in progress: the settings page, `POST /Ldap/TestServerBind` and sign-in so far) |
+| **LDAP-Auth** | [jellyfin/jellyfin-plugin-ldapauth](https://github.com/jellyfin/jellyfin-plugin-ldapauth) | `d11c86a` | Sign users in against an LDAP directory (in progress: the settings page and its three `POST /Ldap/*` tests, sign-in and the admin filter so far) |
 
 **Accepted divergences** (not bugs — do not "fix" them during an upstream sync): Ferrofin
 models version groups solely through the `PrimaryVersionId` pointer rather than Jellyfin's

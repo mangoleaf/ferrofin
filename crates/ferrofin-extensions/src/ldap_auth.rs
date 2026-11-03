@@ -10,13 +10,14 @@
 //!   with upstream's TLS options, simple bind, search, modify, the RFC 3062
 //!   password modify and the root DSE's supported extensions), implemented with
 //!   `ldap3` by [`directory::Ldap3Directory`];
-//! - [`LdapAuthService`] — `POST /Ldap/TestServerBind`
-//!   (`LdapController.TestServerBind`), which stays in `ferrofin-api` as a thin
-//!   handler over the [`LdapManager`] trait;
+//! - [`LdapAuthService`] — `POST /Ldap/TestServerBind`,
+//!   `POST /Ldap/TestLdapFilters` and `POST /Ldap/LdapUserSearch` (the three
+//!   `LdapController` actions), which stay in `ferrofin-api` as thin handlers
+//!   over the [`LdapManager`] trait;
 //! - [`provider::LdapAuthProvider`] — sign-in
-//!   (`LdapAuthenticationProviderPlugin.Authenticate`), the authentication
-//!   provider the extension contributes, listed by `GET /Auth/Providers` while
-//!   the plugin is enabled and names a server.
+//!   (`LdapAuthenticationProviderPlugin.Authenticate`) with its admin filter,
+//!   the authentication provider the extension contributes, listed by
+//!   `GET /Auth/Providers` while the plugin is enabled and names a server.
 //!
 //! Accepted divergences from the C# (see `docs/PLUGINS_UPSTREAM.md`):
 //! - The plugin is **disabled by default**, and `LdapServer` seeds empty
@@ -43,22 +44,38 @@
 //! - The `Error` text is Ferrofin's own: the RFC 4511 result name and the
 //!   server's diagnostic for a refused operation, or the transport's message.
 //!   Upstream reports the Novell client's exception message.
-//! - The connection test's base search asks for no attributes (`1.1`): the
-//!   count is the same, without every entry's attributes on the wire.
+//! - The connection test's base search, the filter test's searches and the
+//!   admin filter's search at sign-in ask for no attributes (`1.1`): they read
+//!   only the entries' DNs, which the server sends either way.
+//! - The filter test keeps the saved `EnableLdapAdminFilterMemberUid` when
+//!   the body leaves it out. Upstream saves the missing member as `false`, and
+//!   its own settings page never sends it, so pressing the test there turns
+//!   member-uid mode off until the page is saved again (a Jellyfin bug not
+//!   ported).
+//! - The filter test's `400` reports the directory client's own wording for a
+//!   filter that does not parse (`Filter Error`). Upstream pulls Novell's
+//!   parser message out of the exception's text.
+//! - TODO(gl-1148): the filter test and the admin filter at sign-in read only
+//!   the entries the directory sent; upstream also follows its search
+//!   references with the bind credentials.
 
 pub mod directory;
 pub mod provider;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use ferrofin_core::{PluginConfigPage, ScheduledTask};
-use ferrofin_model::ldap::{ServerConnectionInfo, ServerTestResponse};
+use ferrofin_model::ldap::{
+    LdapFilterResponse, LdapTestErrorResponse, ServerConnectionInfo, ServerTestResponse,
+    UserFilterInfo, UserSearchAttributes, UserSearchResponse,
+};
 use ferrofin_model::secret::Secret;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::ldap::LdapManager;
+use ferrofin_traits::ldap::{LdapManager, LdapTestAnswer};
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
 use ferrofin_traits::security::AuthenticationManager;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -95,6 +112,21 @@ const TESTING: &str = "Testing...";
 const SUCCESS: &str = "Success";
 /// The bind step when no bind password was given.
 const ANONYMOUS: &str = "Anonymous";
+
+/// The admin filter that turns it off, which the settings page saves for an
+/// empty box. An empty filter is off too.
+pub const ADMIN_FILTER_DISABLED: &str = "_disabled_";
+
+/// The `401` message for a directory that could not be reached or refused the
+/// configured bind DN: upstream `ConnectToLdap()`'s.
+const CONNECT_FAILED: &str = "Failed to Connect or Bind to server.";
+/// The `401` message for a user search the directory failed: upstream
+/// `LocateLdapUser`'s.
+const USER_FILTER_FAILED: &str = "Error completing LDAP login while applying user filter.";
+/// What the filter test's `400` puts before the reason, by the filter that
+/// failed.
+const USER_FILTER_LABEL: &str = "User Filter: ";
+const ADMIN_FILTER_LABEL: &str = "Admin Filter: ";
 
 /// The format of the directory attribute holding a user's picture (upstream
 /// `ProfileImageFormat`), stored by name.
@@ -302,6 +334,37 @@ impl LdapConfig {
         self.ldap_client_cert_path = connection.ldap_client_cert_path.unwrap_or_default();
         self.ldap_client_key_path = connection.ldap_client_key_path.unwrap_or_default();
         self.ldap_root_ca_path = connection.ldap_root_ca_path.unwrap_or_default();
+    }
+
+    /// Writes the filter test's filters into the configuration, as
+    /// `LdapController.TestLdapFilters` does before testing. A filter the body
+    /// left out is saved empty; a member-uid flag it left out keeps the saved
+    /// one (see the module's divergences).
+    pub fn apply_filters(&mut self, filters: UserFilterInfo) {
+        self.ldap_search_filter = filters.ldap_search_filter.unwrap_or_default();
+        self.ldap_admin_filter = filters.ldap_admin_filter.unwrap_or_default();
+        if let Some(member_uid) = filters.enable_ldap_admin_filter_member_uid {
+            self.enable_ldap_admin_filter_member_uid = member_uid;
+        }
+    }
+
+    /// Whether the admin filter is on: set, and not [`ADMIN_FILTER_DISABLED`]
+    /// (upstream's `!string.IsNullOrEmpty(AdminFilter) && AdminFilter !=
+    /// "_disabled_"`, an ordinal compare).
+    #[must_use]
+    pub fn admin_filter_enabled(&self) -> bool {
+        !self.ldap_admin_filter.is_empty() && self.ldap_admin_filter != ADMIN_FILTER_DISABLED
+    }
+
+    /// Where the admin filter searches at sign-in: `LdapAdminBaseDn`, or the
+    /// base DN while that is empty.
+    #[must_use]
+    pub fn admin_base_dn(&self) -> &str {
+        if self.ldap_admin_base_dn.is_empty() {
+            &self.ldap_base_dn
+        } else {
+            &self.ldap_admin_base_dn
+        }
     }
 }
 
@@ -657,6 +720,61 @@ pub(crate) async fn novell_bind(
     }
 }
 
+/// Why a search as the configured bind DN failed, by the step that failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum BoundSearchError {
+    /// The connection could not be opened, or StartTLS failed.
+    #[error("{0}")]
+    Connect(LdapError),
+    /// The directory refused the configured bind DN.
+    #[error("{0}")]
+    Bind(LdapError),
+    /// The search failed.
+    #[error("{0}")]
+    Search(LdapError),
+}
+
+/// `ConnectToLdap()` and a search on it, as the plugin searches: a connection
+/// of its own, bound as the configured bind DN, searching `base`'s subtree
+/// with `filter` for `attributes`, and closed again.
+pub(crate) async fn search_as_bind_dn(
+    directory: &dyn LdapDirectory,
+    config: &LdapConfig,
+    base: &str,
+    filter: &str,
+    attributes: &[&str],
+) -> Result<SearchOutcome, BoundSearchError> {
+    let options = ConnectionOptions::from_config(config);
+    let mut connection = directory
+        .connect(&options)
+        .await
+        .map_err(BoundSearchError::Connect)?;
+    let found = bind_and_search(connection.as_mut(), config, base, filter, attributes).await;
+    connection.unbind().await;
+    found
+}
+
+/// The bind and the search of [`search_as_bind_dn`].
+async fn bind_and_search(
+    connection: &mut dyn LdapConnection,
+    config: &LdapConfig,
+    base: &str,
+    filter: &str,
+    attributes: &[&str],
+) -> Result<SearchOutcome, BoundSearchError> {
+    novell_bind(
+        connection,
+        &config.ldap_bind_user,
+        config.ldap_bind_password.expose(),
+    )
+    .await
+    .map_err(BoundSearchError::Bind)?;
+    connection
+        .search(base, SearchScope::Subtree, filter, attributes)
+        .await
+        .map_err(BoundSearchError::Search)
+}
+
 /// The bind and base-search steps of the connection test.
 async fn bind_and_count(
     connection: &mut dyn LdapConnection,
@@ -691,6 +809,124 @@ async fn bind_and_count(
     }
     response.base_search = Some(format!("Found {} Entities", found.entries.len()));
     Ok(())
+}
+
+/// `GetFilteredUsers`: the DNs of the entries `filter` finds in the base DN's
+/// subtree, searching as the configured bind DN. An empty filter is Novell's
+/// `(objectclass=*)`.
+async fn filtered_users(
+    directory: &dyn LdapDirectory,
+    config: &LdapConfig,
+    filter: &str,
+) -> Result<HashSet<String>, BoundSearchError> {
+    let filter = if filter.is_empty() {
+        EMPTY_FILTER
+    } else {
+        filter
+    };
+    tracing::debug!(base_dn = ?config.ldap_base_dn, filter = ?filter, "LDAP filter search");
+    let found = search_as_bind_dn(
+        directory,
+        config,
+        &config.ldap_base_dn,
+        filter,
+        &[NO_ATTRIBUTES],
+    )
+    .await?;
+    if !found.references.is_empty() {
+        // TODO(gl-1148): follow them with the bind credentials, as upstream's
+        // referral handler does.
+        tracing::debug!(
+            references = ?found.references,
+            "the filter search referred elsewhere; the references are not followed"
+        );
+    }
+    Ok(found.entries.into_iter().map(|entry| entry.dn).collect())
+}
+
+/// The filter test — port of `LdapController.TestLdapFilters` once the body is
+/// saved: the distinct entries `LdapSearchFilter` finds, then, while the admin
+/// filter is on, those `LdapAdminFilter` finds, and whether the second are all
+/// among the first.
+///
+/// As upstream, both filters are used as written (a `{username}` in them is
+/// not replaced) and both search the base DN, the admin filter included. A
+/// directory that cannot be reached, or refuses the bind DN, is a `401` with
+/// upstream's message; a search the directory fails, the filter's included, is
+/// a `400` naming the filter.
+pub async fn test_ldap_filters(
+    directory: &dyn LdapDirectory,
+    config: &LdapConfig,
+) -> LdapTestAnswer<LdapFilterResponse> {
+    let users = match filtered_users(directory, config, &config.ldap_search_filter).await {
+        Ok(users) => users,
+        Err(error) => return filter_test_failure("user", USER_FILTER_LABEL, &error),
+    };
+    let admins = if config.admin_filter_enabled() {
+        match filtered_users(directory, config, &config.ldap_admin_filter).await {
+            Ok(admins) => admins,
+            Err(error) => return filter_test_failure("admin", ADMIN_FILTER_LABEL, &error),
+        }
+    } else {
+        HashSet::new()
+    };
+    LdapTestAnswer::Ok(LdapFilterResponse {
+        users: users.len(),
+        admins: admins.len(),
+        is_subset: admins.is_subset(&users),
+    })
+}
+
+/// The filter test's answer when the search of the `filter` filter (`user` or
+/// `admin`) failed; `label` begins a `400`'s message.
+fn filter_test_failure<T>(
+    filter: &str,
+    label: &str,
+    error: &BoundSearchError,
+) -> LdapTestAnswer<T> {
+    tracing::warn!(
+        filter,
+        error = ?error.to_string(),
+        "LDAP filter test failed"
+    );
+    match error {
+        BoundSearchError::Connect(_) | BoundSearchError::Bind(_) => {
+            LdapTestAnswer::Unauthorized(LdapTestErrorResponse::new(CONNECT_FAILED))
+        }
+        BoundSearchError::Search(error) => {
+            LdapTestAnswer::BadRequest(LdapTestErrorResponse::new(format!("{label}{error}")))
+        }
+    }
+}
+
+/// The user search — port of `LdapController.LdapUserSearch` once the body is
+/// saved, for a name that is not empty: the DN of the entry `username` signs
+/// in as (`LocateLdapUser`, the search sign-in runs).
+///
+/// Every failure is a `401` with upstream's message: a directory that cannot
+/// be reached or refuses the bind DN, a search the directory fails, and no
+/// matching entry.
+pub async fn ldap_user_search(
+    directory: &dyn LdapDirectory,
+    config: &LdapConfig,
+    username: &str,
+) -> LdapTestAnswer<UserSearchResponse> {
+    let message = match provider::locate_ldap_user(directory, config, username).await {
+        Ok(Some(entry)) => {
+            return LdapTestAnswer::Ok(UserSearchResponse {
+                located_dn: Some(entry.dn),
+            });
+        }
+        Ok(None) => provider::NO_MATCH,
+        Err(error) => {
+            tracing::warn!(error = ?error.to_string(), "LDAP user search failed");
+            match error {
+                BoundSearchError::Connect(_) | BoundSearchError::Bind(_) => CONNECT_FAILED,
+                BoundSearchError::Search(_) => USER_FILTER_FAILED,
+            }
+        }
+    };
+    LdapTestAnswer::Unauthorized(LdapTestErrorResponse::new(message))
 }
 
 /// The LDAP-Auth plugin's service: reads and saves its configuration through
@@ -741,6 +977,21 @@ impl LdapAuthService {
             .set_plugin_configuration(EXTENSION_ID, bytes)
             .await
     }
+
+    /// Reads the configuration, changes it with `apply` and saves it, as each
+    /// route does with its body before testing (`LdapPlugin.Instance
+    /// .UpdateConfiguration`), and returns what was saved. Holds the lock
+    /// that keeps two saves from losing each other's fields.
+    async fn update_config(
+        &self,
+        apply: impl FnOnce(&mut LdapConfig) + Send,
+    ) -> Result<LdapConfig, ServiceError> {
+        let _saving = self.config_lock.lock().await;
+        let mut config = self.config().await?;
+        apply(&mut config);
+        self.save_config(&config).await?;
+        Ok(config)
+    }
 }
 
 #[async_trait]
@@ -757,14 +1008,42 @@ impl LdapManager for LdapAuthService {
         connection: ServerConnectionInfo,
     ) -> Result<ServerTestResponse, ServiceError> {
         self.ensure_enabled().await?;
-        let config = {
-            let _saving = self.config_lock.lock().await;
-            let mut config = self.config().await?;
-            config.apply_connection(connection);
-            self.save_config(&config).await?;
-            config
-        };
+        let config = self
+            .update_config(|config| config.apply_connection(connection))
+            .await?;
         Ok(test_server_bind(self.directory.as_ref(), &config).await)
+    }
+
+    async fn test_ldap_filters(
+        &self,
+        filters: UserFilterInfo,
+    ) -> Result<LdapTestAnswer<LdapFilterResponse>, ServiceError> {
+        self.ensure_enabled().await?;
+        let config = self
+            .update_config(|config| config.apply_filters(filters))
+            .await?;
+        Ok(test_ldap_filters(self.directory.as_ref(), &config).await)
+    }
+
+    async fn ldap_user_search(
+        &self,
+        search: UserSearchAttributes,
+    ) -> Result<LdapTestAnswer<UserSearchResponse>, ServiceError> {
+        self.ensure_enabled().await?;
+        let UserSearchAttributes {
+            ldap_search_attributes,
+            test_search_username,
+        } = search;
+        let config = self
+            .update_config(|config| {
+                config.ldap_search_attributes = ldap_search_attributes.unwrap_or_default();
+            })
+            .await?;
+        // Upstream answers an empty name with an empty response, saving only.
+        let Some(username) = test_search_username.filter(|name| !name.is_empty()) else {
+            return Ok(LdapTestAnswer::Ok(UserSearchResponse::default()));
+        };
+        Ok(ldap_user_search(self.directory.as_ref(), &config, &username).await)
     }
 }
 

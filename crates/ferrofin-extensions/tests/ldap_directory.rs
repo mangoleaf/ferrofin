@@ -25,13 +25,16 @@ use ferrofin_extensions::ldap_auth::directory::Ldap3Directory;
 use ferrofin_extensions::ldap_auth::provider::{LdapAuthProvider, PROVIDER_ID, PROVIDER_NAME};
 use ferrofin_extensions::ldap_auth::{
     CertificateVerification, ConnectionOptions, EXTENSION_ID, LdapAuthExtension, LdapConfig,
-    LdapDirectory, SearchScope, test_server_bind,
+    LdapDirectory, SearchScope, ldap_user_search, test_ldap_filters, test_server_bind,
 };
 use ferrofin_extensions::{Extension, registered_plugins};
-use ferrofin_model::ldap::ServerTestResponse;
+use ferrofin_model::ldap::{
+    LdapFilterResponse, LdapTestErrorResponse, ServerTestResponse, UserSearchResponse,
+};
 use ferrofin_model::secret::Secret;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::{ExternalIdentityKey, ExternalIdentityStore};
+use ferrofin_traits::ldap::LdapTestAnswer;
 use ferrofin_traits::library::UserManager;
 use ferrofin_traits::plugins::PluginManager;
 use rcgen::{
@@ -52,6 +55,7 @@ const READER_DN: &str = "uid=reader,ou=people,dc=example,dc=org";
 const READER_PASSWORD: &str = "reader-secret";
 const ADA_DN: &str = "uid=ada,ou=people,dc=example,dc=org";
 const ADA_PASSWORD: &str = "ada-secret";
+const GROUPS_DN: &str = "ou=groups,dc=example,dc=org";
 
 /// An address no host answers (RFC 5737 TEST-NET-1), for the connect timeout.
 /// On a network that answers it with "unreachable" at once, the case still
@@ -85,11 +89,21 @@ uid: ada
 cn: Ada Lovelace
 sn: Lovelace
 mail: ada@example.org
+employeeType: jellyfin-admin
 userPassword: ada-secret
+
+dn: ou=groups,dc=example,dc=org
+objectClass: organizationalUnit
+ou: groups
+
+dn: cn=jellyfin-admins,ou=groups,dc=example,dc=org
+objectClass: groupOfNames
+cn: jellyfin-admins
+member: uid=ada,ou=people,dc=example,dc=org
 ";
 
-/// The four entries [`SEED`] creates.
-const SEEDED_ENTRIES: usize = 4;
+/// The six entries [`SEED`] creates.
+const SEEDED_ENTRIES: usize = 6;
 
 const START: &str = "set -e
 mkdir -p /tmp/ldapdata
@@ -383,6 +397,8 @@ async fn the_directory_client_against_openldap() {
 
     unroutable(&plain).await;
     sign_in(&open, &plain).await;
+    admin_filter(&plain).await;
+    filter_test_and_user_search(&plain).await;
     directory_operations(&plain).await;
 }
 
@@ -966,4 +982,242 @@ async fn outage(users: &SignIn, open: &Directory) {
         "the outage is not counted"
     );
     wait_until_up(open.ldap_port).await;
+}
+
+/// Connects and binds as the directory's administrator, to change entries.
+async fn directory_admin(
+    plain: &LdapConfig,
+) -> Box<dyn ferrofin_extensions::ldap_auth::LdapConnection> {
+    let mut admin = Ldap3Directory::default()
+        .connect(&ConnectionOptions::from_config(plain))
+        .await
+        .expect("connect");
+    admin
+        .simple_bind(ADMIN_DN, ADMIN_PASSWORD)
+        .await
+        .expect("admin bind");
+    admin
+}
+
+/// Whether the Ferrofin user `name` is an administrator.
+async fn is_administrator(users: &SignIn, name: &str) -> bool {
+    let user = users.user(name).await.expect("user");
+    users
+        .users
+        .get_user_dto(&user, None)
+        .await
+        .expect("dto")
+        .policy
+        .expect("policy")
+        .is_administrator
+}
+
+/// Makes the Ferrofin user `name` an administrator, as an administrator would.
+async fn make_administrator(users: &SignIn, name: &str) {
+    let user = users.user(name).await.expect("user");
+    let mut policy = users
+        .users
+        .get_user_dto(&user, None)
+        .await
+        .expect("dto")
+        .policy
+        .expect("policy");
+    policy.is_administrator = true;
+    users
+        .users
+        .update_policy(uuid::Uuid::parse_str(&user.id).expect("id"), &policy)
+        .await
+        .expect("policy");
+}
+
+/// Signs `name` in, which must succeed, and says whether they are then an
+/// administrator.
+async fn signs_in_as_administrator(users: &SignIn, name: &str, password: &str) -> bool {
+    users
+        .sign_in(name, password)
+        .await
+        .expect("sign in")
+        .expect("signed in");
+    is_administrator(users, name).await
+}
+
+/// The admin filter at sign-in (`Authenticate`'s admin block): Ada's entry
+/// carries `employeeType: jellyfin-admin` and she is the one member of
+/// `cn=jellyfin-admins`; the reader is neither.
+async fn admin_filter(plain: &LdapConfig) {
+    let by_uid = LdapConfig {
+        ldap_search_filter: "(objectClass=inetOrgPerson)".to_owned(),
+        ldap_search_attributes: "uid, mail".to_owned(),
+        ldap_uid_attribute: "uid".to_owned(),
+        ldap_username_attribute: "uid".to_owned(),
+        enable_all_folders: true,
+        ..plain.clone()
+    };
+
+    // DN-match mode: the filter must find the user's own entry.
+    let dn_match = LdapConfig {
+        ldap_admin_filter: "(employeeType=jellyfin-admin)".to_owned(),
+        ..by_uid.clone()
+    };
+    let users = SignIn::new(&dn_match).await;
+    assert!(signs_in_as_administrator(&users, "ada", ADA_PASSWORD).await);
+    assert!(!signs_in_as_administrator(&users, "reader", READER_PASSWORD).await);
+
+    // Removed from the directory's administrators while she is the only one:
+    // she signs in and stays one (D5).
+    let mut admin = directory_admin(plain).await;
+    admin
+        .modify_replace(ADA_DN, "employeeType", &[])
+        .await
+        .expect("remove employeeType");
+    assert!(signs_in_as_administrator(&users, "ada", ADA_PASSWORD).await);
+    // With another administrator she loses it, and gets it back once the
+    // directory names her again.
+    make_administrator(&users, "reader").await;
+    assert!(!signs_in_as_administrator(&users, "ada", ADA_PASSWORD).await);
+    admin
+        .modify_replace(ADA_DN, "employeeType", &["jellyfin-admin"])
+        .await
+        .expect("restore employeeType");
+    admin.unbind().await;
+    assert!(signs_in_as_administrator(&users, "ada", ADA_PASSWORD).await);
+
+    // Member-uid mode: any entry found counts, here the group, searched under
+    // LdapAdminBaseDn with the user's name in the filter.
+    let member_uid = LdapConfig {
+        ldap_admin_filter: "(&(objectClass=groupOfNames)\
+            (member=uid={username},ou=people,dc=example,dc=org))"
+            .to_owned(),
+        enable_ldap_admin_filter_member_uid: true,
+        ldap_admin_base_dn: GROUPS_DN.to_owned(),
+        ..by_uid.clone()
+    };
+    let users = SignIn::new(&member_uid).await;
+    assert!(signs_in_as_administrator(&users, "ada", ADA_PASSWORD).await);
+    assert!(!signs_in_as_administrator(&users, "reader", READER_PASSWORD).await);
+    // The same filter in DN-match mode finds the group, not Ada's entry.
+    let users = SignIn::new(&LdapConfig {
+        enable_ldap_admin_filter_member_uid: false,
+        ..member_uid
+    })
+    .await;
+    assert!(!signs_in_as_administrator(&users, "ada", ADA_PASSWORD).await);
+
+    // Turned off: the directory leaves the flag alone, so the reader, whom no
+    // filter names, stays the administrator they were made by hand.
+    let users = SignIn::new(&LdapConfig {
+        ldap_admin_filter: "_disabled_".to_owned(),
+        ..by_uid
+    })
+    .await;
+    assert!(!signs_in_as_administrator(&users, "ada", ADA_PASSWORD).await);
+    assert!(!signs_in_as_administrator(&users, "reader", READER_PASSWORD).await);
+    make_administrator(&users, "reader").await;
+    assert!(signs_in_as_administrator(&users, "reader", READER_PASSWORD).await);
+    println!("admin filter: ok");
+}
+
+/// The settings page's filter test (`TestLdapFilters`) and user search
+/// (`LdapUserSearch`) against the directory.
+async fn filter_test_and_user_search(plain: &LdapConfig) {
+    let directory = Ldap3Directory::default();
+    let config = LdapConfig {
+        ldap_search_filter: "(objectClass=inetOrgPerson)".to_owned(),
+        ldap_admin_filter: "(employeeType=jellyfin-admin)".to_owned(),
+        ldap_search_attributes: "uid, mail".to_owned(),
+        ..plain.clone()
+    };
+    let failure = |message: &str| LdapTestErrorResponse::new(message);
+    let filters = |search: &str, admin: &str| LdapConfig {
+        ldap_search_filter: search.to_owned(),
+        ldap_admin_filter: admin.to_owned(),
+        ..config.clone()
+    };
+
+    let answer = test_ldap_filters(&directory, &config).await;
+    println!("filter test: {answer:?}");
+    assert_eq!(
+        answer,
+        LdapTestAnswer::Ok(LdapFilterResponse {
+            users: 2,
+            admins: 1,
+            is_subset: true,
+        })
+    );
+    // The group is an admin the user filter does not find.
+    assert_eq!(
+        test_ldap_filters(
+            &directory,
+            &filters("(objectClass=inetOrgPerson)", "(cn=jellyfin-admins)")
+        )
+        .await,
+        LdapTestAnswer::Ok(LdapFilterResponse {
+            users: 2,
+            admins: 1,
+            is_subset: false,
+        })
+    );
+    assert_eq!(
+        test_ldap_filters(&directory, &filters("(uid=ada", "_disabled_")).await,
+        LdapTestAnswer::BadRequest(failure("User Filter: Filter Error"))
+    );
+    assert_eq!(
+        test_ldap_filters(&directory, &filters("(uid=*)", "(employeeType=")).await,
+        LdapTestAnswer::BadRequest(failure("Admin Filter: Filter Error"))
+    );
+    let missing_base = test_ldap_filters(
+        &directory,
+        &LdapConfig {
+            ldap_base_dn: "dc=missing,dc=org".to_owned(),
+            ..config.clone()
+        },
+    )
+    .await;
+    println!("filter test under a missing base DN: {missing_base:?}");
+    assert!(
+        matches!(&missing_base, LdapTestAnswer::BadRequest(error)
+            if error.message.starts_with("User Filter: No Such Object")),
+        "{missing_base:?}"
+    );
+    let wrong_bind = LdapConfig {
+        ldap_bind_password: Secret::new("wrong"),
+        ..config.clone()
+    };
+    assert_eq!(
+        test_ldap_filters(&directory, &wrong_bind).await,
+        LdapTestAnswer::Unauthorized(failure("Failed to Connect or Bind to server."))
+    );
+
+    for name in ["ada", "ada@example.org"] {
+        assert_eq!(
+            ldap_user_search(&directory, &config, name).await,
+            LdapTestAnswer::Ok(UserSearchResponse {
+                located_dn: Some(ADA_DN.to_owned()),
+            }),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        ldap_user_search(&directory, &config, "nobody").await,
+        LdapTestAnswer::Unauthorized(failure("Found no LDAP users matching provided username."))
+    );
+    assert_eq!(
+        ldap_user_search(&directory, &wrong_bind, "ada").await,
+        LdapTestAnswer::Unauthorized(failure("Failed to Connect or Bind to server."))
+    );
+    assert_eq!(
+        ldap_user_search(
+            &directory,
+            &LdapConfig {
+                ldap_base_dn: "dc=missing,dc=org".to_owned(),
+                ..config
+            },
+            "ada"
+        )
+        .await,
+        LdapTestAnswer::Unauthorized(failure(
+            "Error completing LDAP login while applying user filter."
+        ))
+    );
+    println!("filter test and user search: ok");
 }
