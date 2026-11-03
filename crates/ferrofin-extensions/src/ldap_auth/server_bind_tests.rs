@@ -630,3 +630,27 @@ async fn once_enabled_the_test_saves_the_connection_and_tests_with_it() {
     );
     assert!(saved.get("LdapUsers").is_none());
 }
+
+/// A stored configuration that does not parse is a server error whose text
+/// names the kind of error, never the value: serde would quote a bind
+/// password stored as a number.
+#[tokio::test]
+async fn an_unreadable_configuration_is_an_error_without_its_values() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let plugins = plugin_manager(dir.path());
+    let config_dir = dir.path().join(EXTENSION_ID.to_string());
+    std::fs::create_dir_all(&config_dir).expect("config dir");
+    std::fs::write(
+        config_dir.join("config.json"),
+        br#"{"LdapBindPassword": 9876543210}"#,
+    )
+    .expect("write");
+    let service = LdapAuthService::new(plugins, Arc::new(FakeDirectory::default()));
+    match service.config().await {
+        Err(ServiceError::Backend(message)) => {
+            assert!(message.contains("Data error"), "{message}");
+            assert!(!message.contains("9876543210"), "{message}");
+        }
+        other => panic!("expected a backend error, got {other:?}"),
+    }
+}

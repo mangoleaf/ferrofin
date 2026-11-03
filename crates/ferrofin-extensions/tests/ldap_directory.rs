@@ -1,5 +1,5 @@
-//! The LDAP-Auth directory client against a real directory: OpenLDAP 2.6 in a
-//! container, over plain LDAP, LDAPS and StartTLS.
+//! The LDAP-Auth directory client and sign-in against a real directory:
+//! OpenLDAP 2.6 in a container, over plain LDAP, LDAPS and StartTLS.
 //!
 //! Hand-run, like the ffmpeg gates; CI does not run it (D8):
 //!
@@ -16,15 +16,24 @@
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore;
+use ferrofin_core::{FerrofinPluginManager, FerrofinUserManager};
 use ferrofin_extensions::ldap_auth::directory::Ldap3Directory;
+use ferrofin_extensions::ldap_auth::provider::{LdapAuthProvider, PROVIDER_ID, PROVIDER_NAME};
 use ferrofin_extensions::ldap_auth::{
-    CertificateVerification, ConnectionOptions, LdapConfig, LdapDirectory, SearchScope,
-    test_server_bind,
+    CertificateVerification, ConnectionOptions, EXTENSION_ID, LdapAuthExtension, LdapConfig,
+    LdapDirectory, SearchScope, test_server_bind,
 };
+use ferrofin_extensions::{Extension, registered_plugins};
 use ferrofin_model::ldap::ServerTestResponse;
 use ferrofin_model::secret::Secret;
+use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::external_identities::{ExternalIdentityKey, ExternalIdentityStore};
+use ferrofin_traits::library::UserManager;
+use ferrofin_traits::plugins::PluginManager;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
@@ -42,6 +51,7 @@ const ADMIN_PASSWORD: &str = "admin-secret";
 const READER_DN: &str = "uid=reader,ou=people,dc=example,dc=org";
 const READER_PASSWORD: &str = "reader-secret";
 const ADA_DN: &str = "uid=ada,ou=people,dc=example,dc=org";
+const ADA_PASSWORD: &str = "ada-secret";
 
 /// An address no host answers (RFC 5737 TEST-NET-1), for the connect timeout.
 /// On a network that answers it with "unreachable" at once, the case still
@@ -100,6 +110,7 @@ TLSCACertificateFile /conf/client-ca.pem
 TLSCertificateFile /conf/server.pem
 TLSCertificateKeyFile /conf/server.key
 TLSVerifyClient {verify_client}
+allow bind_anon_dn
 database mdb
 maxsize 104857600
 suffix \"{BASE_DN}\"
@@ -371,6 +382,7 @@ async fn the_directory_client_against_openldap() {
     client_certificates(&mtls, &files, &ldaps, &start_tls).await;
 
     unroutable(&plain).await;
+    sign_in(&open, &plain).await;
     directory_operations(&plain).await;
 }
 
@@ -674,4 +686,284 @@ async fn directory_operations(plain: &LdapConfig) {
         .expect("the new password binds");
     ada.unbind().await;
     println!("search, modify, password modify and the root DSE: ok");
+}
+
+/// The user manager with LDAP-Auth enabled against the directory `config`
+/// names, over an in-memory database.
+struct SignIn {
+    users: Arc<FerrofinUserManager>,
+    identities: Arc<FerrofinExternalIdentityStore>,
+    _plugins_dir: tempfile::TempDir,
+}
+
+impl SignIn {
+    async fn new(config: &LdapConfig) -> Self {
+        let db = ferrofin_db::Database::connect_in_memory()
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrations");
+        let users = Arc::new(FerrofinUserManager::new(db.clone()));
+        let identities = Arc::new(FerrofinExternalIdentityStore::new(db));
+        let plugins_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("plugins");
+        let extensions: Vec<Arc<dyn Extension>> = vec![Arc::new(LdapAuthExtension)];
+        let plugins = Arc::new(FerrofinPluginManager::new(
+            registered_plugins(&extensions),
+            plugins_dir.path().to_path_buf(),
+        ));
+        plugins.enable_plugin(EXTENSION_ID).await.expect("enable");
+        plugins
+            .set_plugin_configuration(EXTENSION_ID, serde_json::to_vec(config).expect("json"))
+            .await
+            .expect("configure");
+        users.set_extension_providers(vec![Arc::new(LdapAuthProvider::new(
+            plugins,
+            Arc::clone(&users) as Arc<dyn UserManager>,
+            Arc::clone(&identities) as Arc<dyn ExternalIdentityStore>,
+            Arc::new(Ldap3Directory::default()),
+        ))]);
+        Self {
+            users,
+            identities,
+            _plugins_dir: plugins_dir,
+        }
+    }
+
+    async fn sign_in(
+        &self,
+        name: &str,
+        password: &str,
+    ) -> Result<Option<ferrofin_db::entities::users::UserEntity>, ServiceError> {
+        let started = Instant::now();
+        let result = self
+            .users
+            .authenticate_user(name, password, "127.0.0.1", true)
+            .await;
+        println!(
+            "sign in as {name:?}: {} in {:.2?}",
+            match &result {
+                Ok(Some(user)) => format!("signed in as {:?}", user.username),
+                Ok(None) => "refused (counted)".to_owned(),
+                Err(error) => format!("{error}"),
+            },
+            started.elapsed()
+        );
+        result
+    }
+
+    async fn user(&self, name: &str) -> Option<ferrofin_db::entities::users::UserEntity> {
+        self.users.get_user_by_name(name).await.expect("lookup")
+    }
+}
+
+/// Sign-in through LDAP-Auth (`Authenticate`): an empty password at a
+/// directory that accepts unauthenticated binds, a first sign-in creating the
+/// user, a wrong password, a directory rename, an adopted user relinked by
+/// name, and a directory that stops answering.
+async fn sign_in(open: &Directory, plain: &LdapConfig) {
+    let config = LdapConfig {
+        ldap_search_filter: "(objectClass=inetOrgPerson)".to_owned(),
+        ldap_search_attributes: "uid, cn, mail".to_owned(),
+        ldap_uid_attribute: "uid".to_owned(),
+        ldap_username_attribute: "cn".to_owned(),
+        enable_all_folders: true,
+        ..plain.clone()
+    };
+    let users = SignIn::new(&config).await;
+    let listed: Vec<_> = users
+        .users
+        .get_authentication_providers()
+        .await
+        .expect("providers")
+        .into_iter()
+        .filter_map(|pair| pair.id.zip(pair.name))
+        .collect();
+    assert!(
+        listed.contains(&(PROVIDER_ID.to_owned(), PROVIDER_NAME.to_owned())),
+        "{listed:?}"
+    );
+    let options = ConnectionOptions::from_config(plain);
+    empty_password(&users, &options).await;
+    first_sign_in_and_rename(&users, &options).await;
+    adopted_user(&users).await;
+    outage(&users, open).await;
+    println!("sign-in: ok");
+}
+
+/// This directory takes a DN with an empty password as an unauthenticated
+/// bind (`allow bind_anon_dn`); sign-in never sends one.
+async fn empty_password(users: &SignIn, options: &ConnectionOptions) {
+    let mut raw = Ldap3Directory::default()
+        .connect(options)
+        .await
+        .expect("connect");
+    raw.simple_bind(ADA_DN, "")
+        .await
+        .expect("the directory accepts an unauthenticated bind");
+    raw.unbind().await;
+    assert!(matches!(
+        users.sign_in("ada", "").await,
+        Err(ServiceError::Unauthorized(_))
+    ));
+    assert_eq!(users.user("Ada Lovelace").await, None, "no account");
+}
+
+/// A first sign-in creates Ada, named by her cn and linked by her uid; a
+/// wrong password under her Ferrofin name is a counted failure; a directory
+/// rename is followed at the next sign-in.
+async fn first_sign_in_and_rename(users: &SignIn, options: &ConnectionOptions) {
+    let ada = users
+        .sign_in("ada", ADA_PASSWORD)
+        .await
+        .expect("sign in")
+        .expect("created");
+    assert_eq!(ada.username, "Ada Lovelace");
+    assert_eq!(ada.authentication_provider_id, PROVIDER_ID);
+    assert_eq!(ada.password_reset_provider_id, PROVIDER_ID);
+    let key = ExternalIdentityKey {
+        provider_id: PROVIDER_ID,
+        issuer: "",
+        subject: "ada",
+    };
+    assert_eq!(
+        users
+            .identities
+            .find(key)
+            .await
+            .expect("find")
+            .map(|link| link.user_id.to_string().to_uppercase()),
+        Some(ada.id.clone())
+    );
+
+    assert_eq!(
+        users
+            .sign_in("Ada Lovelace", "wrong")
+            .await
+            .expect("sign in"),
+        None
+    );
+    assert_eq!(
+        users
+            .user("Ada Lovelace")
+            .await
+            .expect("ada")
+            .invalid_login_attempt_count,
+        1
+    );
+
+    let mut admin = Ldap3Directory::default()
+        .connect(options)
+        .await
+        .expect("connect");
+    admin
+        .simple_bind(ADMIN_DN, ADMIN_PASSWORD)
+        .await
+        .expect("admin bind");
+    admin
+        .modify_replace(ADA_DN, "cn", &["Ada King"])
+        .await
+        .expect("rename");
+    let renamed = users
+        .sign_in("ada", ADA_PASSWORD)
+        .await
+        .expect("sign in")
+        .expect("signed in");
+    assert_eq!(renamed.id, ada.id);
+    assert_eq!(renamed.username, "Ada King");
+    admin
+        .modify_replace(ADA_DN, "cn", &["Ada Lovelace"])
+        .await
+        .expect("rename back");
+    admin.unbind().await;
+    // Back under her first name for the cases that follow.
+    users
+        .sign_in("ada", ADA_PASSWORD)
+        .await
+        .expect("sign in")
+        .expect("signed in");
+}
+
+/// An adopted user saved with the upstream provider id, never linked, signs
+/// in and is linked by name.
+async fn adopted_user(users: &SignIn) {
+    let reader = users.users.create_user("reader").await.expect("create");
+    let reader_id = uuid::Uuid::parse_str(&reader.id).expect("id");
+    let mut policy = users
+        .users
+        .get_user_dto(&reader, None)
+        .await
+        .expect("dto")
+        .policy
+        .expect("policy");
+    PROVIDER_ID.clone_into(&mut policy.authentication_provider_id);
+    users
+        .users
+        .update_policy(reader_id, &policy)
+        .await
+        .expect("policy");
+    let relinked = users
+        .sign_in("reader", READER_PASSWORD)
+        .await
+        .expect("sign in")
+        .expect("signed in");
+    assert_eq!(relinked.id, reader.id);
+}
+
+/// A directory that stops answering (the container paused): a server error
+/// within the operation timeout, not counted, while a local user signs in
+/// before it gives up.
+async fn outage(users: &SignIn, open: &Directory) {
+    let local = users.users.create_user("carol").await.expect("create");
+    users
+        .users
+        .change_password(
+            uuid::Uuid::parse_str(&local.id).expect("id"),
+            "carol-secret",
+        )
+        .await
+        .expect("password");
+    let attempts = |user: Option<ferrofin_db::entities::users::UserEntity>| {
+        user.expect("ada").invalid_login_attempt_count
+    };
+    // One counted failure first, so "unchanged" is not just zero.
+    assert_eq!(
+        users
+            .sign_in("Ada Lovelace", "wrong")
+            .await
+            .expect("sign in"),
+        None
+    );
+    let before = attempts(users.user("Ada Lovelace").await);
+    assert_eq!(before, 1);
+    docker(&["pause", &open.id]);
+    let started = Instant::now();
+    let (directory_user, local_user) = tokio::join!(
+        async {
+            let result = users.sign_in("Ada Lovelace", ADA_PASSWORD).await;
+            (result, Instant::now())
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let result = users.sign_in("carol", "carol-secret").await;
+            (result, Instant::now())
+        }
+    );
+    let elapsed = started.elapsed();
+    docker(&["unpause", &open.id]);
+    assert!(
+        matches!(directory_user.0, Err(ServiceError::Backend(_))),
+        "{:?}",
+        directory_user.0
+    );
+    assert!(elapsed < Duration::from_secs(12), "{elapsed:?}");
+    assert!(local_user.0.expect("sign in").is_some());
+    assert!(
+        local_user.1 < directory_user.1,
+        "the local user did not wait for the directory"
+    );
+    assert_eq!(
+        attempts(users.user("Ada Lovelace").await),
+        before,
+        "the outage is not counted"
+    );
+    wait_until_up(open.ldap_port).await;
 }

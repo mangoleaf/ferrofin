@@ -30,8 +30,8 @@ use ferrofin_drawing::ImageLimits;
 use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_model::server_settings::{
     ServerSettingApplies as Applies, ServerSettingDto, ServerSettingGroup as Group,
-    ServerSettingKind, ServerSettingSource as Source, ServerSettingsDto, ServerSettingsUpdateDto,
-    ServerSettingsUpdateResultDto,
+    ServerSettingKind, ServerSettingSource as Source, ServerSettingUnit as Unit, ServerSettingsDto,
+    ServerSettingsUpdateDto, ServerSettingsUpdateResultDto,
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::PluginManager;
@@ -123,10 +123,14 @@ pub struct SettingSpec {
     pub env_read: EnvRead,
     /// The command-line flag that sets it, e.g. `--port`.
     pub flag: Option<&'static str>,
-    /// The group the page lists it under.
+    /// Its readable name, which heads its row on the page.
+    pub label: &'static str,
+    /// The tab the page lists it on.
     pub group: Group,
     /// The kind of value it holds.
     pub kind: SettingKind,
+    /// The unit its value is in, which the page shows beside it.
+    pub unit: Option<Unit>,
     /// Whether the page may change it.
     pub access: SettingAccess,
     /// What a change needs before it applies.
@@ -222,15 +226,18 @@ const PARSED_U32: EnvRead = EnvRead::Parsed(parses::<u32>);
 const PARSED_BOOL: EnvRead = EnvRead::Parsed(parses_as_bool);
 
 /// What every row starts from: an editable, unflagged setting whose variable
-/// applies whatever it holds. Each row names its key, variable, group, kind,
-/// default, description and running value.
+/// applies whatever it holds. Each row names its key, variable, label, tab,
+/// kind, default, description and running value, and its unit when it has
+/// one.
 const ROW: SettingSpec = SettingSpec {
     key: "",
     env: None,
     env_read: EnvRead::Raw,
     flag: None,
+    label: "",
     group: Group::Library,
     kind: SettingKind::Text,
+    unit: None,
     access: SettingAccess::Editable,
     applies: Applies::Restart,
     default: "",
@@ -242,60 +249,12 @@ const ROW: SettingSpec = SettingSpec {
 /// Every bootstrap setting, in the order the page lists them.
 // One row per setting: the length is the table's.
 pub static SETTINGS: &[SettingSpec] = &[
-    // ---- Paths ------------------------------------------------------------
-    SettingSpec {
-        key: "data_dir",
-        env: Some("FERROFIN_DATA_DIR"),
-        flag: Some("--data-dir"),
-        group: Group::Paths,
-        kind: SettingKind::Path,
-        access: SettingAccess::ReadOnly(SET_AT_STARTUP),
-        applies: Applies::ProcessRestart,
-        default: "$XDG_DATA_HOME/ferrofin, else /var/lib/ferrofin",
-        description: "Program-data root: holds the database and derives the directories below.",
-        running: |c| json!(c.data_dir),
-        ..ROW
-    },
-    SettingSpec {
-        key: "config_dir",
-        env: Some("FERROFIN_CONFIG_DIR"),
-        group: Group::Paths,
-        kind: SettingKind::Path,
-        access: SettingAccess::ReadOnly(SET_AT_STARTUP),
-        applies: Applies::ProcessRestart,
-        default: "{data_dir}/config",
-        description: "Holds system.json and branding.json.",
-        running: |c| json!(c.config_dir),
-        ..ROW
-    },
-    SettingSpec {
-        key: "cache_dir",
-        env: Some("FERROFIN_CACHE_DIR"),
-        group: Group::Paths,
-        kind: SettingKind::Path,
-        access: SettingAccess::ReadOnly(SET_AT_STARTUP),
-        applies: Applies::ProcessRestart,
-        default: "{data_dir}/cache",
-        description: "Cache root, the transcode and segment cache included.",
-        running: |c| json!(c.cache_dir),
-        ..ROW
-    },
-    SettingSpec {
-        key: "web_dir",
-        env: Some("FERROFIN_WEB_DIR"),
-        group: Group::Paths,
-        kind: SettingKind::Path,
-        access: SettingAccess::ReadOnly(SET_AT_STARTUP),
-        default: "{data_dir}/web",
-        description: "The built jellyfin-web served at /web; without it the server is API-only.",
-        running: |c| json!(c.web_dir),
-        ..ROW
-    },
-    // ---- Network and identity ---------------------------------------------
+    // ---- Network -----------------------------------------------------------
     SettingSpec {
         key: "bind_addr",
         env: Some("FERROFIN_BIND_ADDR"),
         flag: Some("--bind"),
+        label: "Listen address",
         group: Group::Network,
         access: SettingAccess::ReadOnly(
             "Dashboard → Networking → Local network addresses decides which addresses the \
@@ -321,6 +280,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_PORT"),
         env_read: EnvRead::Parsed(parses::<u16>),
         flag: Some("--port"),
+        label: "HTTP port",
         group: Group::Network,
         kind: PORT,
         access: SettingAccess::ReadOnly(
@@ -337,6 +297,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "https_port",
         env: Some("FERROFIN_HTTPS_PORT"),
         env_read: EnvRead::Parsed(parses::<u16>),
+        label: "HTTPS port",
         group: Group::Network,
         kind: PORT,
         access: SettingAccess::ReadOnly(
@@ -353,6 +314,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "published_url",
         env: Some("FERROFIN_PUBLISHED_URL"),
         flag: Some("--published-url"),
+        label: "Published server URL",
         group: Group::Network,
         kind: SettingKind::Url,
         access: SettingAccess::ReadOnly(
@@ -367,6 +329,7 @@ pub static SETTINGS: &[SettingSpec] = &[
     SettingSpec {
         key: "base_url",
         env: Some("FERROFIN_BASE_URL"),
+        label: "Base URL",
         group: Group::Network,
         access: SettingAccess::ReadOnly(
             "Set it with the base_url key in config.toml or the FERROFIN_BASE_URL environment \
@@ -381,6 +344,7 @@ pub static SETTINGS: &[SettingSpec] = &[
     SettingSpec {
         key: "server_name",
         env: Some("FERROFIN_SERVER_NAME"),
+        label: "Server name",
         group: Group::Network,
         access: SettingAccess::ReadOnly(
             "Dashboard → General → Server name. This value is used only when that is empty.",
@@ -394,6 +358,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "quick_connect_pending_per_ip",
         env: Some("FERROFIN_QUICK_CONNECT_PENDING_PER_IP"),
         env_read: PARSED_U32,
+        label: "Pending Quick Connect requests per address",
         group: Group::Network,
         kind: whole_numbers(config::QUICK_CONNECT_PENDING_PER_IP_RANGE),
         default: "10",
@@ -405,6 +370,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "login_backoff",
         env: Some("FERROFIN_LOGIN_BACKOFF"),
         env_read: PARSED_BOOL,
+        label: "Login backoff",
         group: Group::Network,
         kind: SettingKind::Bool,
         default: "true",
@@ -417,6 +383,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "login_backoff_attempts",
         env: Some("FERROFIN_LOGIN_BACKOFF_ATTEMPTS"),
         env_read: PARSED_U32,
+        label: "Failed logins before backoff",
         group: Group::Network,
         kind: LOGIN_BACKOFF_ATTEMPTS,
         default: "5",
@@ -429,12 +396,13 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "login_backoff_max_delay_secs",
         env: Some("FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS"),
         env_read: PARSED_U32,
+        label: "Longest login wait",
         group: Group::Network,
         kind: LOGIN_BACKOFF_MAX_DELAY,
+        unit: Some(Unit::Seconds),
         default: "30",
-        description: "Longest wait, in seconds, the login backoff gives an attempt. An address \
-                      that would wait longer is refused as a wrong password; an account only \
-                      waits.",
+        description: "Longest wait the login backoff gives an attempt. An address that would wait \
+                      longer is refused as a wrong password; an account only waits.",
         running: |c| json!(c.login_backoff_max_delay_secs),
         ..ROW
     },
@@ -442,10 +410,12 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "login_backoff_window_mins",
         env: Some("FERROFIN_LOGIN_BACKOFF_WINDOW_MINS"),
         env_read: PARSED_U32,
+        label: "Failed login memory",
         group: Group::Network,
         kind: LOGIN_BACKOFF_WINDOW,
+        unit: Some(Unit::Minutes),
         default: "15",
-        description: "Minutes the login backoff remembers an account's or an address's failed \
+        description: "How long the login backoff remembers an account's or an address's failed \
                       logins after the last one.",
         running: |c| json!(c.login_backoff_window_mins),
         ..ROW
@@ -454,43 +424,131 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "login_backoff_max_tracked",
         env: Some("FERROFIN_LOGIN_BACKOFF_MAX_TRACKED"),
         env_read: PARSED_U32,
+        label: "Login backoff tracking limit",
         group: Group::Network,
         kind: LOGIN_BACKOFF_MAX_TRACKED,
+        unit: Some(Unit::Items),
         default: "100000",
         description: "Most accounts and addresses the login backoff remembers at once; past \
                       it, the ones not yet made to wait are forgotten first.",
         running: |c| json!(c.login_backoff_max_tracked),
         ..ROW
     },
-    // ---- ffmpeg -----------------------------------------------------------
+    // ---- Library -----------------------------------------------------------
     SettingSpec {
-        key: "ffmpeg_path",
-        env: Some("FERROFIN_FFMPEG_PATH"),
-        flag: Some("--ffmpeg"),
-        group: Group::Ffmpeg,
-        kind: SettingKind::Path,
-        access: SettingAccess::ReadOnly(NO_EXECUTABLE_FROM_THE_WEB),
-        default: "found on $PATH",
-        description: "Path to ffmpeg. Without ffmpeg there is no transcoding.",
-        running: |c| json!(c.ffmpeg_path),
+        key: "scan_probe_concurrency",
+        env: Some("FERROFIN_SCAN_PROBE_CONCURRENCY"),
+        env_read: PARSED_U32,
+        label: "Concurrent scan probes",
+        group: Group::Library,
+        kind: whole_numbers(config::SCAN_PROBE_CONCURRENCY_RANGE),
+        default: "8, capped at the cores",
+        description: "ffprobe processes a library scan keeps in flight. Keep it low on a \
+                      spinning disk or a network mount.",
+        running: |c| json!(c.scan_probe_concurrency),
         ..ROW
     },
     SettingSpec {
-        key: "ffprobe_path",
-        env: Some("FERROFIN_FFPROBE_PATH"),
-        group: Group::Ffmpeg,
-        kind: SettingKind::Path,
-        access: SettingAccess::ReadOnly(NO_EXECUTABLE_FROM_THE_WEB),
-        default: "found on $PATH",
-        description: "Path to ffprobe, which library scans run.",
-        running: |c| json!(c.ffprobe_path),
+        key: "scan_progress_every",
+        env: Some("FERROFIN_SCAN_PROGRESS_EVERY"),
+        env_read: PARSED_U32,
+        label: "Scan progress interval",
+        group: Group::Library,
+        kind: whole_numbers(config::SCAN_PROGRESS_EVERY_RANGE),
+        unit: Some(Unit::Items),
+        default: "100",
+        description: "Items between scan-progress log lines; 0 turns them off.",
+        running: |c| json!(c.scan_progress_every),
+        ..ROW
+    },
+    SettingSpec {
+        key: "scan_directory_cache_records",
+        env: Some("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS"),
+        env_read: PARSED_U32,
+        label: "Scan directory cache size",
+        group: Group::Library,
+        kind: whole_numbers(config::SCAN_DIRECTORY_CACHE_RECORDS_RANGE),
+        unit: Some(Unit::Items),
+        default: "100000",
+        description: "Directory-listing records one library scan keeps before it lists folders \
+                      again.",
+        running: |c| json!(c.scan_directory_cache_records),
+        ..ROW
+    },
+    SettingSpec {
+        key: "scan_directory_cache_idle_secs",
+        env: Some("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS"),
+        env_read: PARSED_U32,
+        label: "Scan directory cache lifetime",
+        group: Group::Library,
+        kind: whole_numbers(config::SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE),
+        unit: Some(Unit::Seconds),
+        default: "300",
+        description: "How long a library scan's directory listings survive unread.",
+        running: |c| json!(c.scan_directory_cache_idle_secs),
+        ..ROW
+    },
+    // ---- Trickplay ---------------------------------------------------------
+    SettingSpec {
+        key: "trickplay_concurrency",
+        env: Some("FERROFIN_TRICKPLAY_CONCURRENCY"),
+        env_read: EnvRead::NonBlank,
+        label: "Concurrent trickplay images",
+        group: Group::Trickplay,
+        kind: SettingKind::CountOrAuto,
+        default: "auto",
+        description: "Trickplay images generated at once, or auto for the image-encoding limit.",
+        running: |c| json!(c.trickplay_concurrency),
+        ..ROW
+    },
+    // ---- Images ------------------------------------------------------------
+    SettingSpec {
+        key: "image_decode_max_megapixels",
+        env: Some("FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS"),
+        env_read: PARSED_U32,
+        label: "Largest decoded image",
+        group: Group::Images,
+        kind: whole_numbers(ImageLimits::DECODE_MEGAPIXELS),
+        unit: Some(Unit::Megapixels),
+        default: "200",
+        description: "Largest image decoded; a larger one is served as its original file.",
+        running: |c| json!(c.image_decode_max_megapixels),
+        ..ROW
+    },
+    SettingSpec {
+        key: "image_decode_max_memory_mb",
+        env: Some("FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB"),
+        env_read: PARSED_U32,
+        label: "Image decode memory limit",
+        group: Group::Images,
+        kind: whole_numbers(ImageLimits::DECODE_MEMORY_MB),
+        unit: Some(Unit::Mebibytes),
+        default: "512",
+        description: "Memory one image decode may take; an image needing more is served as its \
+                      original file.",
+        running: |c| json!(c.image_decode_max_memory_mb),
+        ..ROW
+    },
+    SettingSpec {
+        key: "image_resize_budget_mb",
+        env: Some("FERROFIN_IMAGE_RESIZE_BUDGET_MB"),
+        env_read: PARSED_U32,
+        label: "Image resize memory budget",
+        group: Group::Images,
+        kind: whole_numbers(ImageLimits::RESIZE_BUDGET_MB),
+        unit: Some(Unit::Mebibytes),
+        default: "2048",
+        description: "Memory all image resizes in flight share; a resize needing more alone serves \
+                      the original file.",
+        running: |c| json!(c.image_resize_budget_mb),
         ..ROW
     },
     SettingSpec {
         key: "ffmpeg_img_extract_perf_tradeoff",
         env: Some("FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF"),
         env_read: PARSED_BOOL,
-        group: Group::Ffmpeg,
+        label: "Fast image extraction",
+        group: Group::Images,
         kind: SettingKind::Bool,
         default: "false",
         description: "Extract chapter images and thumbnails from keyframes only: faster, and \
@@ -499,10 +557,241 @@ pub static SETTINGS: &[SettingSpec] = &[
         ..ROW
     },
     SettingSpec {
+        key: "image_download_max_mb",
+        env: Some("FERROFIN_IMAGE_DOWNLOAD_MAX_MB"),
+        env_read: PARSED_U32,
+        label: "Image download limit",
+        group: Group::Images,
+        kind: whole_numbers(ferrofin_providers::rate_limit::RequestLimits::DOWNLOAD_MAX_MB),
+        unit: Some(Unit::Mebibytes),
+        default: "64",
+        description: "Largest remote image downloaded, and largest OMDb or OpenSubtitles response; \
+                      a larger one is refused and the read stops there.",
+        running: |c| json!(c.image_download_max_mb),
+        ..ROW
+    },
+    SettingSpec {
+        key: "image_negative_cache_ttl_secs",
+        env: Some("FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS"),
+        env_read: EnvRead::Parsed(parses::<u64>),
+        label: "Failed image retry delay",
+        group: Group::Images,
+        kind: provider_seconds(ferrofin_providers::IMAGE_NEGATIVE_CACHE_TTL_SECS),
+        unit: Some(Unit::Seconds),
+        default: "3600",
+        description: "How long a remote image URL that gave no image is left alone before it is \
+                      tried again.",
+        running: |c| json!(c.image_negative_cache_ttl_secs),
+        ..ROW
+    },
+    SettingSpec {
+        key: "image_private_http_allow",
+        env: Some("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW"),
+        env_read: EnvRead::NonBlank,
+        label: "Private hosts for image downloads",
+        group: Group::Images,
+        // As wasm_private_http_allow (owner decision D5): letting the server
+        // reach private addresses takes host access, not just an admin
+        // session.
+        access: SettingAccess::ReadOnly(
+            "Lets image downloads reach the LAN, loopback and cloud-metadata addresses it lists. \
+             Set it by hand in config.toml (image_private_http_allow) or \
+             FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW, so an admin session alone cannot grant it.",
+        ),
+        default: "no private address but a Live TV tuner's host",
+        description: "Private hosts, addresses and CIDR networks image downloads may reach, \
+                      comma-separated; Live TV tuners' hosts are always allowed.",
+        running: |c| json!(c.image_private_http_allow),
+        ..ROW
+    },
+    // ---- Providers ---------------------------------------------------------
+    SettingSpec {
+        key: "omdb_api_key",
+        env: Some("FERROFIN_OMDB_KEY"),
+        label: "OMDb API key",
+        group: Group::Providers,
+        kind: SettingKind::Secret,
+        default: "Jellyfin's shared key",
+        description: "OMDb API key override; blank uses Jellyfin's shared key.",
+        running: |c| json!(c.omdb_api_key),
+        ..ROW
+    },
+    SettingSpec {
+        key: "tvdb_api_key",
+        env: Some("FERROFIN_TVDB_KEY"),
+        label: "TheTVDB API key",
+        group: Group::Providers,
+        kind: SettingKind::Secret,
+        default: "Jellyfin's shared key",
+        description: "TheTVDB API key override; blank uses Jellyfin's shared key.",
+        running: |c| json!(c.tvdb_api_key),
+        ..ROW
+    },
+    SettingSpec {
+        key: "tvdb_subscriber_pin",
+        env: Some("FERROFIN_TVDB_PIN"),
+        label: "TheTVDB subscriber PIN",
+        group: Group::Providers,
+        kind: SettingKind::Secret,
+        default: "none",
+        description: "TheTVDB subscriber PIN, for a paid subscription.",
+        running: |c| json!(c.tvdb_subscriber_pin),
+        ..ROW
+    },
+    SettingSpec {
+        key: "fanart_personal_api_key",
+        env: Some("FERROFIN_FANART_KEY"),
+        label: "fanart.tv personal API key",
+        group: Group::Providers,
+        kind: SettingKind::Secret,
+        default: "none",
+        description: "fanart.tv personal key, sent alongside the shared project key.",
+        running: |c| json!(c.fanart_personal_api_key),
+        ..ROW
+    },
+    SettingSpec {
+        key: "tvdb_cache_hours",
+        env: Some("FERROFIN_TVDB_CACHE_HOURS"),
+        env_read: EnvRead::NonBlank,
+        label: "TheTVDB cache lifetime",
+        group: Group::Providers,
+        kind: whole_numbers(config::TVDB_CACHE_HOURS_RANGE),
+        unit: Some(Unit::Hours),
+        default: "1",
+        description: "How long TheTVDB lookups are reused.",
+        // The hours in use: a whole number outside the range is clamped.
+        running: |c| {
+            let raw = c.tvdb_cache_hours.as_deref();
+            match raw.map(|raw| raw.trim().parse::<u32>()) {
+                Some(Ok(hours)) => json!(config::clamp_tvdb_cache_hours(hours)),
+                _ => whole_number_as_written(raw),
+            }
+        },
+        ..ROW
+    },
+    SettingSpec {
+        key: "tvdb_token_days",
+        env: Some("FERROFIN_TVDB_TOKEN_DAYS"),
+        env_read: EnvRead::NonBlank,
+        label: "TheTVDB token lifetime",
+        group: Group::Providers,
+        kind: SettingKind::Integer { min: 1, max: 29 },
+        unit: Some(Unit::Days),
+        default: "25",
+        description: "How long TheTVDB's sign-in token is used before signing in again.",
+        running: |c| whole_number_as_written(c.tvdb_token_days.as_deref()),
+        ..ROW
+    },
+    SettingSpec {
+        key: "musicbrainz_base_url",
+        env: Some("FERROFIN_MUSICBRAINZ_URL"),
+        label: "MusicBrainz server",
+        group: Group::Providers,
+        kind: SettingKind::Url,
+        default: "https://musicbrainz.org",
+        description: "MusicBrainz server, e.g. a mirror, which lifts the one-request-a-second \
+                      limit.",
+        running: |c| json!(c.musicbrainz_base_url),
+        ..ROW
+    },
+    SettingSpec {
+        key: "studios_repo_url",
+        env: Some("FERROFIN_STUDIOS_REPO_URL"),
+        label: "Studio Images repository",
+        group: Group::Providers,
+        kind: SettingKind::Url,
+        default: "Jellyfin's studio artwork repository",
+        description: "Studio Images artwork repository.",
+        running: |c| json!(c.studios_repo_url),
+        ..ROW
+    },
+    SettingSpec {
+        key: "provider_timeout_seconds",
+        env: Some("FERROFIN_PROVIDER_TIMEOUT_SECONDS"),
+        env_read: EnvRead::Parsed(parses::<u64>),
+        label: "Provider request timeout",
+        group: Group::Providers,
+        kind: provider_seconds(ferrofin_providers::rate_limit::RequestLimits::TIMEOUT_SECONDS),
+        unit: Some(Unit::Seconds),
+        default: "20",
+        description: "Per-attempt timeout of a metadata-provider request.",
+        running: |c| json!(c.provider_timeout_seconds),
+        ..ROW
+    },
+    SettingSpec {
+        key: "provider_max_wait_seconds",
+        env: Some("FERROFIN_PROVIDER_MAX_WAIT_SECONDS"),
+        env_read: EnvRead::Parsed(parses::<u64>),
+        label: "Longest provider wait",
+        group: Group::Providers,
+        kind: provider_seconds(ferrofin_providers::rate_limit::RequestLimits::MAX_WAIT_SECONDS),
+        unit: Some(Unit::Seconds),
+        default: "60",
+        description: "Longest pacing or quota wait before a metadata lookup is skipped.",
+        running: |c| json!(c.provider_max_wait_seconds),
+        ..ROW
+    },
+    // ---- Performance -------------------------------------------------------
+    SettingSpec {
+        key: "db_pool",
+        env: Some("FERROFIN_DB_POOL"),
+        env_read: EnvRead::NonBlank,
+        label: "Database connections",
+        group: Group::Performance,
+        kind: SettingKind::CountOrAuto,
+        default: "auto",
+        description: "SQLite connection count, or auto to size it to the cores.",
+        running: |c| json!(c.db_pool),
+        ..ROW
+    },
+    SettingSpec {
+        key: "db_statement_cache",
+        env: Some("FERROFIN_DB_STATEMENT_CACHE"),
+        env_read: EnvRead::NonBlank,
+        label: "Statement cache size",
+        group: Group::Performance,
+        kind: STATEMENT_CACHE,
+        unit: Some(Unit::Items),
+        default: "200",
+        description: "Prepared statements each SQLite connection keeps.",
+        running: |c| json!(c.db_statement_cache),
+        ..ROW
+    },
+    SettingSpec {
+        key: "auth_cache_ttl_secs",
+        env: Some("FERROFIN_AUTH_CACHE_TTL_SECS"),
+        env_read: EnvRead::NonBlank,
+        label: "Access token cache lifetime",
+        group: Group::Performance,
+        kind: CACHE_TTL,
+        unit: Some(Unit::Seconds),
+        default: "30",
+        description: "How long a resolved access token is served from memory; only bounds changes \
+                      made outside the server.",
+        running: |c| json!(c.auth_cache_ttl_secs),
+        ..ROW
+    },
+    SettingSpec {
+        key: "row_cache_ttl_secs",
+        env: Some("FERROFIN_ROW_CACHE_TTL_SECS"),
+        env_read: EnvRead::NonBlank,
+        label: "Access check cache lifetime",
+        group: Group::Performance,
+        kind: CACHE_TTL,
+        unit: Some(Unit::Seconds),
+        default: "30",
+        description: "How long the access check serves users' and libraries' rows, and whether a \
+                      Live TV tuner is configured, from memory; only bounds changes made outside \
+                      the server.",
+        running: |c| json!(c.row_cache_ttl_secs),
+        ..ROW
+    },
+    SettingSpec {
         key: "max_transcodes",
         env: Some("FERROFIN_MAX_TRANSCODES"),
         env_read: PARSED_U32,
-        group: Group::Ffmpeg,
+        label: "Transcode limit",
+        group: Group::Performance,
         kind: TRANSCODE_CAP,
         default: "0",
         description: "Most jobs re-encoding a stream the server runs at once; past it a user's \
@@ -515,7 +804,8 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "max_transcodes_per_user",
         env: Some("FERROFIN_MAX_TRANSCODES_PER_USER"),
         env_read: PARSED_U32,
-        group: Group::Ffmpeg,
+        label: "Transcode limit per user",
+        group: Group::Performance,
         kind: TRANSCODE_CAP,
         default: "0",
         description: "Most jobs re-encoding a stream one user runs at once; past it their \
@@ -524,146 +814,25 @@ pub static SETTINGS: &[SettingSpec] = &[
         running: |c| json!(c.max_transcodes_per_user),
         ..ROW
     },
-    // ---- Library and database ---------------------------------------------
-    SettingSpec {
-        key: "library_roots",
-        env: Some("FERROFIN_LIBRARY_ROOTS"),
-        kind: SettingKind::PathList,
-        access: SettingAccess::ReadOnly(FIRST_BOOT_ONLY),
-        default: "none",
-        description: "Folders a fresh install starts with as libraries.",
-        running: |c| json!(c.library_roots),
-        ..ROW
-    },
-    SettingSpec {
-        key: "admin_user",
-        env: Some("FERROFIN_ADMIN_USER"),
-        access: SettingAccess::ReadOnly(FIRST_BOOT_ONLY),
-        default: "admin",
-        description: "Username of the administrator seeded on first boot.",
-        running: |c| json!(c.admin_user),
-        ..ROW
-    },
-    SettingSpec {
-        key: "admin_password",
-        env: Some("FERROFIN_ADMIN_PASSWORD"),
-        kind: SettingKind::Secret,
-        access: SettingAccess::ReadOnly(FIRST_BOOT_ONLY),
-        default: "none: the administrator is seeded without a password",
-        description: "Password of the administrator seeded on first boot.",
-        running: |c| json!(c.admin_password),
-        ..ROW
-    },
-    SettingSpec {
-        key: "db_pool",
-        env: Some("FERROFIN_DB_POOL"),
-        env_read: EnvRead::NonBlank,
-        kind: SettingKind::CountOrAuto,
-        default: "auto",
-        description: "SQLite connection count, or auto to size it to the cores.",
-        running: |c| json!(c.db_pool),
-        ..ROW
-    },
-    SettingSpec {
-        key: "db_statement_cache",
-        env: Some("FERROFIN_DB_STATEMENT_CACHE"),
-        env_read: EnvRead::NonBlank,
-        kind: STATEMENT_CACHE,
-        default: "200",
-        description: "Prepared statements each SQLite connection keeps.",
-        running: |c| json!(c.db_statement_cache),
-        ..ROW
-    },
-    SettingSpec {
-        key: "scan_probe_concurrency",
-        env: Some("FERROFIN_SCAN_PROBE_CONCURRENCY"),
-        env_read: PARSED_U32,
-        kind: whole_numbers(config::SCAN_PROBE_CONCURRENCY_RANGE),
-        default: "8, capped at the cores",
-        description: "ffprobe processes a library scan keeps in flight. Keep it low on a \
-                      spinning disk or a network mount.",
-        running: |c| json!(c.scan_probe_concurrency),
-        ..ROW
-    },
-    SettingSpec {
-        key: "scan_progress_every",
-        env: Some("FERROFIN_SCAN_PROGRESS_EVERY"),
-        env_read: PARSED_U32,
-        kind: whole_numbers(config::SCAN_PROGRESS_EVERY_RANGE),
-        default: "100",
-        description: "Items between scan-progress log lines; 0 turns them off.",
-        running: |c| json!(c.scan_progress_every),
-        ..ROW
-    },
-    SettingSpec {
-        key: "scan_directory_cache_records",
-        env: Some("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS"),
-        env_read: PARSED_U32,
-        kind: whole_numbers(config::SCAN_DIRECTORY_CACHE_RECORDS_RANGE),
-        default: "100000",
-        description: "Directory-listing records one library scan keeps before it lists folders \
-                      again.",
-        running: |c| json!(c.scan_directory_cache_records),
-        ..ROW
-    },
-    SettingSpec {
-        key: "scan_directory_cache_idle_secs",
-        env: Some("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS"),
-        env_read: PARSED_U32,
-        kind: whole_numbers(config::SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE),
-        default: "300",
-        description: "Seconds a library scan's directory listings survive unread.",
-        running: |c| json!(c.scan_directory_cache_idle_secs),
-        ..ROW
-    },
-    SettingSpec {
-        key: "auth_cache_ttl_secs",
-        env: Some("FERROFIN_AUTH_CACHE_TTL_SECS"),
-        env_read: EnvRead::NonBlank,
-        kind: CACHE_TTL,
-        default: "30",
-        description: "Seconds a resolved access token is served from memory; only bounds \
-                      changes made outside the server.",
-        running: |c| json!(c.auth_cache_ttl_secs),
-        ..ROW
-    },
-    SettingSpec {
-        key: "row_cache_ttl_secs",
-        env: Some("FERROFIN_ROW_CACHE_TTL_SECS"),
-        env_read: EnvRead::NonBlank,
-        kind: CACHE_TTL,
-        default: "30",
-        description: "Seconds the access check serves users' and libraries' rows, and whether \
-                      a Live TV tuner is configured, from memory; only bounds changes made \
-                      outside the server.",
-        running: |c| json!(c.row_cache_ttl_secs),
-        ..ROW
-    },
-    SettingSpec {
-        key: "trickplay_concurrency",
-        env: Some("FERROFIN_TRICKPLAY_CONCURRENCY"),
-        env_read: EnvRead::NonBlank,
-        kind: SettingKind::CountOrAuto,
-        default: "auto",
-        description: "Trickplay images generated at once, or auto for the image-encoding limit.",
-        running: |c| json!(c.trickplay_concurrency),
-        ..ROW
-    },
     SettingSpec {
         key: "playback_metrics_queue",
         env: Some("FERROFIN_PLAYBACK_METRICS_QUEUE"),
         env_read: PARSED_U32,
+        label: "Playback metrics queue",
+        group: Group::Performance,
         kind: whole_numbers(config::PLAYBACK_METRICS_QUEUE_RANGE),
+        unit: Some(Unit::Events),
         default: "1024",
-        description: "Depth of the playback-metrics write queue, in events.",
+        description: "Depth of the playback-metrics write queue.",
         running: |c| json!(c.playback_metrics_queue),
         ..ROW
     },
-    // ---- Observability ----------------------------------------------------
+    // ---- Logging -----------------------------------------------------------
     SettingSpec {
         key: "log_level",
         env: Some("FERROFIN_LOG"),
-        group: Group::Observability,
+        label: "Log level",
+        group: Group::Logging,
         applies: Applies::ProcessRestart,
         default: "info",
         description: "Log filter, in RUST_LOG syntax; RUST_LOG wins when it is set.",
@@ -682,7 +851,8 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "log_format",
         env: Some("FERROFIN_LOG_FORMAT"),
         env_read: EnvRead::NonBlank,
-        group: Group::Observability,
+        label: "Log format",
+        group: Group::Logging,
         applies: Applies::ProcessRestart,
         default: "json",
         description: "Stdout log lines: json, or text for running the server by hand.",
@@ -707,7 +877,8 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "enable_metrics",
         env: Some("FERROFIN_ENABLE_METRICS"),
         env_read: PARSED_BOOL,
-        group: Group::Observability,
+        label: "Prometheus metrics",
+        group: Group::Logging,
         kind: SettingKind::Bool,
         access: SettingAccess::ReadOnly(
             "Dashboard → General → Enable metrics, unless this is set.",
@@ -721,10 +892,12 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "metrics_sample_interval",
         env: Some("FERROFIN_METRICS_SAMPLE_INTERVAL"),
         env_read: PARSED_U32,
-        group: Group::Observability,
+        label: "Metrics sample interval",
+        group: Group::Logging,
         kind: whole_numbers(config::METRICS_SAMPLE_INTERVAL_RANGE),
+        unit: Some(Unit::Seconds),
         default: "15",
-        description: "Seconds between process-metric samples.",
+        description: "Time between process-metric samples.",
         running: |c| json!(c.metrics_sample_interval),
         ..ROW
     },
@@ -732,11 +905,13 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "metrics_scan_duration_buckets",
         env: Some("FERROFIN_METRICS_SCAN_DURATION_BUCKETS"),
         env_read: EnvRead::NonBlank,
-        group: Group::Observability,
+        label: "Scan duration buckets",
+        group: Group::Logging,
         kind: SettingKind::NumberList,
+        unit: Some(Unit::Seconds),
         applies: Applies::ProcessRestart,
         default: "1–2.5–5 per decade, 0.001 to 5000",
-        description: "Bucket boundaries, in seconds, of the library-scan duration histograms.",
+        description: "Bucket boundaries of the library-scan duration histograms.",
         running: |c| json!(c.metrics_scan_duration_buckets),
         // An invalid list is the default, with a warning (`scan_metrics::install`).
         check: |value| {
@@ -750,40 +925,12 @@ pub static SETTINGS: &[SettingSpec] = &[
         ..ROW
     },
     SettingSpec {
-        key: "shutdown_timeout_secs",
-        env: Some("FERROFIN_SHUTDOWN_TIMEOUT_SECS"),
-        env_read: PARSED_U32,
-        group: Group::Observability,
-        kind: whole_numbers(config::SHUTDOWN_TIMEOUT_SECS_RANGE),
-        default: "30",
-        description: "Seconds a shutdown or restart waits for requests in flight.",
-        running: |c| json!(c.shutdown_timeout_secs),
-        ..ROW
-    },
-    SettingSpec {
-        key: "disable_extensions",
-        env: Some("FERROFIN_DISABLE_EXTENSIONS"),
-        env_read: PARSED_BOOL,
-        group: Group::Observability,
-        kind: SettingKind::Bool,
-        // Not "would remove this page": owner decision D4 keeps the Ferrofin
-        // settings extension registered whatever this says.
-        access: SettingAccess::ReadOnly(
-            "A measurement switch: it removes the other compiled-in extensions, with their \
-             tasks and hooks, so a benchmark compares Ferrofin with a Jellyfin that has no \
-             plugins. Set it where the benchmark starts the server.",
-        ),
-        default: "false",
-        description: "Register none of the compiled-in extensions but this one.",
-        running: |c| json!(c.disable_extensions),
-        ..ROW
-    },
-    SettingSpec {
         key: "OTEL_EXPORTER_OTLP_ENDPOINT",
         env: Some("OTEL_EXPORTER_OTLP_ENDPOINT"),
         // A blank endpoint exports nothing (`bootstrap::build_tracer_provider`).
         env_read: EnvRead::NonBlank,
-        group: Group::Observability,
+        label: "Trace export endpoint",
+        group: Group::Logging,
         kind: SettingKind::Url,
         access: SettingAccess::EnvOnly,
         applies: Applies::ProcessRestart,
@@ -795,216 +942,25 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "OTEL_TRACES_SAMPLER_ARG",
         env: Some("OTEL_TRACES_SAMPLER_ARG"),
         env_read: EnvRead::Parsed(parses_as_ratio),
-        group: Group::Observability,
+        label: "Trace sampling ratio",
+        group: Group::Logging,
         access: SettingAccess::EnvOnly,
         applies: Applies::ProcessRestart,
         default: "0.25",
         description: "Share of traces exported when trace export is on, 0 to 1.",
         ..ROW
     },
-    // ---- Metadata providers -----------------------------------------------
-    SettingSpec {
-        key: "omdb_api_key",
-        env: Some("FERROFIN_OMDB_KEY"),
-        group: Group::Providers,
-        kind: SettingKind::Secret,
-        default: "Jellyfin's shared key",
-        description: "OMDb API key override; blank uses Jellyfin's shared key.",
-        running: |c| json!(c.omdb_api_key),
-        ..ROW
-    },
-    SettingSpec {
-        key: "tvdb_api_key",
-        env: Some("FERROFIN_TVDB_KEY"),
-        group: Group::Providers,
-        kind: SettingKind::Secret,
-        default: "Jellyfin's shared key",
-        description: "TheTVDB API key override; blank uses Jellyfin's shared key.",
-        running: |c| json!(c.tvdb_api_key),
-        ..ROW
-    },
-    SettingSpec {
-        key: "tvdb_subscriber_pin",
-        env: Some("FERROFIN_TVDB_PIN"),
-        group: Group::Providers,
-        kind: SettingKind::Secret,
-        default: "none",
-        description: "TheTVDB subscriber PIN, for a paid subscription.",
-        running: |c| json!(c.tvdb_subscriber_pin),
-        ..ROW
-    },
-    SettingSpec {
-        key: "fanart_personal_api_key",
-        env: Some("FERROFIN_FANART_KEY"),
-        group: Group::Providers,
-        kind: SettingKind::Secret,
-        default: "none",
-        description: "fanart.tv personal key, sent alongside the shared project key.",
-        running: |c| json!(c.fanart_personal_api_key),
-        ..ROW
-    },
-    SettingSpec {
-        key: "tvdb_cache_hours",
-        env: Some("FERROFIN_TVDB_CACHE_HOURS"),
-        env_read: EnvRead::NonBlank,
-        group: Group::Providers,
-        kind: whole_numbers(config::TVDB_CACHE_HOURS_RANGE),
-        default: "1",
-        description: "Hours TheTVDB lookups are reused.",
-        // The hours in use: a whole number outside the range is clamped.
-        running: |c| {
-            let raw = c.tvdb_cache_hours.as_deref();
-            match raw.map(|raw| raw.trim().parse::<u32>()) {
-                Some(Ok(hours)) => json!(config::clamp_tvdb_cache_hours(hours)),
-                _ => whole_number_as_written(raw),
-            }
-        },
-        ..ROW
-    },
-    SettingSpec {
-        key: "tvdb_token_days",
-        env: Some("FERROFIN_TVDB_TOKEN_DAYS"),
-        env_read: EnvRead::NonBlank,
-        group: Group::Providers,
-        kind: SettingKind::Integer { min: 1, max: 29 },
-        default: "25",
-        description: "Days TheTVDB's sign-in token is used before signing in again.",
-        running: |c| whole_number_as_written(c.tvdb_token_days.as_deref()),
-        ..ROW
-    },
-    SettingSpec {
-        key: "musicbrainz_base_url",
-        env: Some("FERROFIN_MUSICBRAINZ_URL"),
-        group: Group::Providers,
-        kind: SettingKind::Url,
-        default: "https://musicbrainz.org",
-        description: "MusicBrainz server, e.g. a mirror, which lifts the one-request-a-second \
-                      limit.",
-        running: |c| json!(c.musicbrainz_base_url),
-        ..ROW
-    },
-    SettingSpec {
-        key: "studios_repo_url",
-        env: Some("FERROFIN_STUDIOS_REPO_URL"),
-        group: Group::Providers,
-        kind: SettingKind::Url,
-        default: "Jellyfin's studio artwork repository",
-        description: "Studio Images artwork repository.",
-        running: |c| json!(c.studios_repo_url),
-        ..ROW
-    },
-    SettingSpec {
-        key: "provider_timeout_seconds",
-        env: Some("FERROFIN_PROVIDER_TIMEOUT_SECONDS"),
-        env_read: EnvRead::Parsed(parses::<u64>),
-        group: Group::Providers,
-        kind: provider_seconds(ferrofin_providers::rate_limit::RequestLimits::TIMEOUT_SECONDS),
-        default: "20",
-        description: "Per-attempt timeout of a metadata-provider request, in seconds.",
-        running: |c| json!(c.provider_timeout_seconds),
-        ..ROW
-    },
-    SettingSpec {
-        key: "provider_max_wait_seconds",
-        env: Some("FERROFIN_PROVIDER_MAX_WAIT_SECONDS"),
-        env_read: EnvRead::Parsed(parses::<u64>),
-        group: Group::Providers,
-        kind: provider_seconds(ferrofin_providers::rate_limit::RequestLimits::MAX_WAIT_SECONDS),
-        default: "60",
-        description: "Longest pacing or quota wait before a metadata lookup is skipped, in \
-                      seconds.",
-        running: |c| json!(c.provider_max_wait_seconds),
-        ..ROW
-    },
-    // ---- Images -----------------------------------------------------------
-    SettingSpec {
-        key: "image_decode_max_megapixels",
-        env: Some("FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS"),
-        env_read: PARSED_U32,
-        group: Group::Images,
-        kind: whole_numbers(ImageLimits::DECODE_MEGAPIXELS),
-        default: "200",
-        description: "Largest image decoded, in megapixels; a larger one is served as its \
-                      original file.",
-        running: |c| json!(c.image_decode_max_megapixels),
-        ..ROW
-    },
-    SettingSpec {
-        key: "image_decode_max_memory_mb",
-        env: Some("FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB"),
-        env_read: PARSED_U32,
-        group: Group::Images,
-        kind: whole_numbers(ImageLimits::DECODE_MEMORY_MB),
-        default: "512",
-        description: "Memory one image decode may take, in MiB; an image needing more is \
-                      served as its original file.",
-        running: |c| json!(c.image_decode_max_memory_mb),
-        ..ROW
-    },
-    SettingSpec {
-        key: "image_resize_budget_mb",
-        env: Some("FERROFIN_IMAGE_RESIZE_BUDGET_MB"),
-        env_read: PARSED_U32,
-        group: Group::Images,
-        kind: whole_numbers(ImageLimits::RESIZE_BUDGET_MB),
-        default: "2048",
-        description: "Memory all image resizes in flight share, in MiB; a resize needing more \
-                      alone serves the original file.",
-        running: |c| json!(c.image_resize_budget_mb),
-        ..ROW
-    },
-    SettingSpec {
-        key: "image_download_max_mb",
-        env: Some("FERROFIN_IMAGE_DOWNLOAD_MAX_MB"),
-        env_read: PARSED_U32,
-        group: Group::Images,
-        kind: whole_numbers(ferrofin_providers::rate_limit::RequestLimits::DOWNLOAD_MAX_MB),
-        default: "64",
-        description: "Largest remote image downloaded, in MiB, and largest OMDb or \
-                      OpenSubtitles response; a larger one is refused and the read stops there.",
-        running: |c| json!(c.image_download_max_mb),
-        ..ROW
-    },
-    SettingSpec {
-        key: "image_negative_cache_ttl_secs",
-        env: Some("FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS"),
-        env_read: EnvRead::Parsed(parses::<u64>),
-        group: Group::Images,
-        kind: provider_seconds(ferrofin_providers::IMAGE_NEGATIVE_CACHE_TTL_SECS),
-        default: "3600",
-        description: "Seconds a remote image URL that gave no image is left alone before it is \
-                      tried again.",
-        running: |c| json!(c.image_negative_cache_ttl_secs),
-        ..ROW
-    },
-    SettingSpec {
-        key: "image_private_http_allow",
-        env: Some("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW"),
-        env_read: EnvRead::NonBlank,
-        group: Group::Images,
-        // As wasm_private_http_allow (owner decision D5): letting the server
-        // reach private addresses takes host access, not just an admin
-        // session.
-        access: SettingAccess::ReadOnly(
-            "Lets image downloads reach the LAN, loopback and cloud-metadata addresses it lists. \
-             Set it by hand in config.toml (image_private_http_allow) or \
-             FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW, so an admin session alone cannot grant it.",
-        ),
-        default: "no private address but a Live TV tuner's host",
-        description: "Private hosts, addresses and CIDR networks image downloads may reach, \
-                      comma-separated; Live TV tuners' hosts are always allowed.",
-        running: |c| json!(c.image_private_http_allow),
-        ..ROW
-    },
-    // ---- WASM plugins -----------------------------------------------------
+    // ---- Plugins -----------------------------------------------------------
     SettingSpec {
         key: "wasm_call_timeout_secs",
         env: Some("FERROFIN_WASM_CALL_TIMEOUT_SECS"),
         env_read: PARSED_U32,
-        group: Group::Wasm,
+        label: "Plugin call timeout",
+        group: Group::Plugins,
         kind: whole_numbers(config::WASM_CALL_TIMEOUT_SECS_RANGE),
+        unit: Some(Unit::Seconds),
         default: "30",
-        description: "Deadline of one plugin call, in seconds.",
+        description: "Deadline of one plugin call.",
         running: |c| json!(c.wasm_call_timeout_secs),
         ..ROW
     },
@@ -1012,10 +968,12 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "wasm_memory_limit_mb",
         env: Some("FERROFIN_WASM_MEMORY_LIMIT_MB"),
         env_read: PARSED_U32,
-        group: Group::Wasm,
+        label: "Plugin memory limit",
+        group: Group::Plugins,
         kind: whole_numbers(config::WASM_MEMORY_LIMIT_MB_RANGE),
+        unit: Some(Unit::Mebibytes),
         default: "128",
-        description: "Memory cap of one plugin, in MiB.",
+        description: "Memory cap of one plugin.",
         running: |c| json!(c.wasm_memory_limit_mb),
         ..ROW
     },
@@ -1023,8 +981,10 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "wasm_event_queue_capacity",
         env: Some("FERROFIN_WASM_EVENT_QUEUE_CAPACITY"),
         env_read: PARSED_U32,
-        group: Group::Wasm,
+        label: "Plugin event queue",
+        group: Group::Plugins,
         kind: whole_numbers(config::WASM_EVENT_QUEUE_CAPACITY_RANGE),
+        unit: Some(Unit::Events),
         default: "256",
         description: "Event queue depth of one plugin.",
         running: |c| json!(c.wasm_event_queue_capacity),
@@ -1033,7 +993,8 @@ pub static SETTINGS: &[SettingSpec] = &[
     SettingSpec {
         key: "wasm_private_http_allow",
         env: Some("FERROFIN_WASM_PRIVATE_HTTP_ALLOW"),
-        group: Group::Wasm,
+        label: "Plugins allowed on private networks",
+        group: Group::Plugins,
         // Owner decision D5: granting it must take host access, not just an
         // admin session.
         access: SettingAccess::ReadOnly(
@@ -1052,10 +1013,12 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "max_plugin_download_mb",
         env: Some("FERROFIN_MAX_PLUGIN_DOWNLOAD_MB"),
         env_read: PARSED_U32,
-        group: Group::Wasm,
+        label: "Plugin download limit",
+        group: Group::Plugins,
         kind: whole_numbers(config::MAX_PLUGIN_DOWNLOAD_MB_RANGE),
+        unit: Some(Unit::Mebibytes),
         default: "128",
-        description: "Size cap of a plugin downloaded from a repository, in MiB.",
+        description: "Size cap of a plugin downloaded from a repository.",
         running: |c| json!(c.max_plugin_download_mb),
         ..ROW
     },
@@ -1063,7 +1026,8 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "wasm_analysis_concurrency",
         env: Some("FERROFIN_WASM_ANALYSIS_CONCURRENCY"),
         env_read: PARSED_U32,
-        group: Group::Wasm,
+        label: "Concurrent plugin analyses",
+        group: Group::Plugins,
         kind: whole_numbers(config::WASM_ANALYSIS_CONCURRENCY_RANGE),
         default: "a quarter of the cores, at least one",
         description: "Media decodes plugin analysis may run at once.",
@@ -1074,10 +1038,12 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "wasm_state_limit_mb",
         env: Some("FERROFIN_WASM_STATE_LIMIT_MB"),
         env_read: PARSED_U32,
-        group: Group::Wasm,
+        label: "Plugin state limit",
+        group: Group::Plugins,
         kind: whole_numbers(config::WASM_STATE_LIMIT_MB_RANGE),
+        unit: Some(Unit::Mebibytes),
         default: "8",
-        description: "Key/value state cap of one plugin, in MiB.",
+        description: "Key/value state cap of one plugin.",
         running: |c| json!(c.wasm_state_limit_mb),
         ..ROW
     },
@@ -1085,10 +1051,12 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "wasm_image_download_mb",
         env: Some("FERROFIN_WASM_IMAGE_DOWNLOAD_MB"),
         env_read: PARSED_U32,
-        group: Group::Wasm,
+        label: "Plugin artwork download limit",
+        group: Group::Plugins,
         kind: whole_numbers(config::WASM_IMAGE_DOWNLOAD_MB_RANGE),
+        unit: Some(Unit::Mebibytes),
         default: "20",
-        description: "Size cap of one plugin artwork download, in MiB.",
+        description: "Size cap of one plugin artwork download.",
         running: |c| json!(c.wasm_image_download_mb),
         ..ROW
     },
@@ -1096,10 +1064,12 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "wasm_image_timeout_secs",
         env: Some("FERROFIN_WASM_IMAGE_TIMEOUT_SECS"),
         env_read: PARSED_U32,
-        group: Group::Wasm,
+        label: "Plugin artwork download timeout",
+        group: Group::Plugins,
         kind: whole_numbers(config::WASM_IMAGE_TIMEOUT_SECS_RANGE),
+        unit: Some(Unit::Seconds),
         default: "30",
-        description: "Time limit of one plugin artwork download, in seconds.",
+        description: "Time limit of one plugin artwork download.",
         running: |c| json!(c.wasm_image_timeout_secs),
         ..ROW
     },
@@ -1107,10 +1077,12 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "wasm_write_content_mb",
         env: Some("FERROFIN_WASM_WRITE_CONTENT_MB"),
         env_read: PARSED_U32,
-        group: Group::Wasm,
+        label: "Plugin lyrics and subtitles limit",
+        group: Group::Plugins,
         kind: whole_numbers(config::WASM_WRITE_CONTENT_MB_RANGE),
+        unit: Some(Unit::Mebibytes),
         default: "2",
-        description: "Size cap of the lyrics or subtitles a plugin writes, in MiB.",
+        description: "Size cap of the lyrics or subtitles a plugin writes.",
         running: |c| json!(c.wasm_write_content_mb),
         ..ROW
     },
@@ -1118,11 +1090,158 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "wasm_subtitle_extract_mb",
         env: Some("FERROFIN_WASM_SUBTITLE_EXTRACT_MB"),
         env_read: PARSED_U32,
-        group: Group::Wasm,
+        label: "Subtitle extraction limit",
+        group: Group::Plugins,
         kind: whole_numbers(config::WASM_SUBTITLE_EXTRACT_MB_RANGE),
+        unit: Some(Unit::Mebibytes),
         default: "10",
-        description: "Size cap of one subtitle track a plugin extracts, in MiB.",
+        description: "Size cap of one subtitle track a plugin extracts.",
         running: |c| json!(c.wasm_subtitle_extract_mb),
+        ..ROW
+    },
+    // ---- System ------------------------------------------------------------
+    SettingSpec {
+        key: "data_dir",
+        env: Some("FERROFIN_DATA_DIR"),
+        flag: Some("--data-dir"),
+        label: "Data directory",
+        group: Group::System,
+        kind: SettingKind::Path,
+        access: SettingAccess::ReadOnly(SET_AT_STARTUP),
+        applies: Applies::ProcessRestart,
+        default: "$XDG_DATA_HOME/ferrofin, else /var/lib/ferrofin",
+        description: "Program-data root: holds the database and derives the directories below.",
+        running: |c| json!(c.data_dir),
+        ..ROW
+    },
+    SettingSpec {
+        key: "config_dir",
+        env: Some("FERROFIN_CONFIG_DIR"),
+        label: "Configuration directory",
+        group: Group::System,
+        kind: SettingKind::Path,
+        access: SettingAccess::ReadOnly(SET_AT_STARTUP),
+        applies: Applies::ProcessRestart,
+        default: "{data_dir}/config",
+        description: "Holds system.json and branding.json.",
+        running: |c| json!(c.config_dir),
+        ..ROW
+    },
+    SettingSpec {
+        key: "cache_dir",
+        env: Some("FERROFIN_CACHE_DIR"),
+        label: "Cache directory",
+        group: Group::System,
+        kind: SettingKind::Path,
+        access: SettingAccess::ReadOnly(SET_AT_STARTUP),
+        applies: Applies::ProcessRestart,
+        default: "{data_dir}/cache",
+        description: "Cache root, the transcode and segment cache included.",
+        running: |c| json!(c.cache_dir),
+        ..ROW
+    },
+    SettingSpec {
+        key: "web_dir",
+        env: Some("FERROFIN_WEB_DIR"),
+        label: "Web client directory",
+        group: Group::System,
+        kind: SettingKind::Path,
+        access: SettingAccess::ReadOnly(SET_AT_STARTUP),
+        default: "{data_dir}/web",
+        description: "The built jellyfin-web served at /web; without it the server is API-only.",
+        running: |c| json!(c.web_dir),
+        ..ROW
+    },
+    SettingSpec {
+        key: "ffmpeg_path",
+        env: Some("FERROFIN_FFMPEG_PATH"),
+        flag: Some("--ffmpeg"),
+        label: "ffmpeg path",
+        group: Group::System,
+        kind: SettingKind::Path,
+        access: SettingAccess::ReadOnly(NO_EXECUTABLE_FROM_THE_WEB),
+        default: "found on $PATH",
+        description: "Path to ffmpeg. Without ffmpeg there is no transcoding.",
+        running: |c| json!(c.ffmpeg_path),
+        ..ROW
+    },
+    SettingSpec {
+        key: "ffprobe_path",
+        env: Some("FERROFIN_FFPROBE_PATH"),
+        label: "ffprobe path",
+        group: Group::System,
+        kind: SettingKind::Path,
+        access: SettingAccess::ReadOnly(NO_EXECUTABLE_FROM_THE_WEB),
+        default: "found on $PATH",
+        description: "Path to ffprobe, which library scans run.",
+        running: |c| json!(c.ffprobe_path),
+        ..ROW
+    },
+    SettingSpec {
+        key: "library_roots",
+        env: Some("FERROFIN_LIBRARY_ROOTS"),
+        label: "Initial libraries",
+        group: Group::System,
+        kind: SettingKind::PathList,
+        access: SettingAccess::ReadOnly(FIRST_BOOT_ONLY),
+        default: "none",
+        description: "Folders a fresh install starts with as libraries.",
+        running: |c| json!(c.library_roots),
+        ..ROW
+    },
+    SettingSpec {
+        key: "admin_user",
+        env: Some("FERROFIN_ADMIN_USER"),
+        label: "Initial administrator",
+        group: Group::System,
+        access: SettingAccess::ReadOnly(FIRST_BOOT_ONLY),
+        default: "admin",
+        description: "Username of the administrator seeded on first boot.",
+        running: |c| json!(c.admin_user),
+        ..ROW
+    },
+    SettingSpec {
+        key: "admin_password",
+        env: Some("FERROFIN_ADMIN_PASSWORD"),
+        label: "Initial administrator password",
+        group: Group::System,
+        kind: SettingKind::Secret,
+        access: SettingAccess::ReadOnly(FIRST_BOOT_ONLY),
+        default: "none: the administrator is seeded without a password",
+        description: "Password of the administrator seeded on first boot.",
+        running: |c| json!(c.admin_password),
+        ..ROW
+    },
+    SettingSpec {
+        key: "shutdown_timeout_secs",
+        env: Some("FERROFIN_SHUTDOWN_TIMEOUT_SECS"),
+        env_read: PARSED_U32,
+        label: "Shutdown timeout",
+        group: Group::System,
+        kind: whole_numbers(config::SHUTDOWN_TIMEOUT_SECS_RANGE),
+        unit: Some(Unit::Seconds),
+        default: "30",
+        description: "How long a shutdown or restart waits for requests in flight.",
+        running: |c| json!(c.shutdown_timeout_secs),
+        ..ROW
+    },
+    SettingSpec {
+        key: "disable_extensions",
+        env: Some("FERROFIN_DISABLE_EXTENSIONS"),
+        env_read: PARSED_BOOL,
+        label: "Disable extensions",
+        group: Group::System,
+        kind: SettingKind::Bool,
+        // Not "would remove this page": owner decision D4 keeps the Ferrofin
+        // settings extension registered whatever this says.
+        access: SettingAccess::ReadOnly(
+            "A measurement switch: it removes the other compiled-in extensions, with their \
+             tasks and hooks, so a benchmark compares Ferrofin with a Jellyfin that has no \
+             plugins. Set it where the benchmark starts the server.",
+        ),
+        default: "false",
+        description: "Register none of the compiled-in extensions but this one.",
+        running: |c| json!(c.disable_extensions),
         ..ROW
     },
 ];
@@ -1339,8 +1458,10 @@ fn setting(
     let (kind, min, max) = spec.kind.to_dto();
     ServerSettingDto {
         key: spec.key.to_owned(),
+        label: spec.label.to_owned(),
         group: spec.group,
         kind,
+        unit: spec.unit,
         description: spec.description.to_owned(),
         env_var: spec.env.map(str::to_owned),
         flag: spec.flag.map(str::to_owned),

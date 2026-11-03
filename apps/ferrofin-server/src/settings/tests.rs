@@ -173,6 +173,208 @@ fn every_rows_variable_has_a_row_in_the_docs() {
     }
 }
 
+/// The page's tabs and the rows on each, in order: owner decision D5, and the
+/// owner's placement of the rows D5's table predates (on gl-1172).
+const TABS: &[(Group, &[&str])] = &[
+    (
+        Group::Network,
+        &[
+            "bind_addr",
+            "port",
+            "https_port",
+            "published_url",
+            "base_url",
+            "server_name",
+            "quick_connect_pending_per_ip",
+            "login_backoff",
+            "login_backoff_attempts",
+            "login_backoff_max_delay_secs",
+            "login_backoff_window_mins",
+            "login_backoff_max_tracked",
+        ],
+    ),
+    (
+        Group::Library,
+        &[
+            "scan_probe_concurrency",
+            "scan_progress_every",
+            "scan_directory_cache_records",
+            "scan_directory_cache_idle_secs",
+        ],
+    ),
+    (Group::Trickplay, &["trickplay_concurrency"]),
+    (
+        Group::Images,
+        &[
+            "image_decode_max_megapixels",
+            "image_decode_max_memory_mb",
+            "image_resize_budget_mb",
+            "ffmpeg_img_extract_perf_tradeoff",
+            "image_download_max_mb",
+            "image_negative_cache_ttl_secs",
+            "image_private_http_allow",
+        ],
+    ),
+    (
+        Group::Providers,
+        &[
+            "omdb_api_key",
+            "tvdb_api_key",
+            "tvdb_subscriber_pin",
+            "fanart_personal_api_key",
+            "tvdb_cache_hours",
+            "tvdb_token_days",
+            "musicbrainz_base_url",
+            "studios_repo_url",
+            "provider_timeout_seconds",
+            "provider_max_wait_seconds",
+        ],
+    ),
+    (
+        Group::Performance,
+        &[
+            "db_pool",
+            "db_statement_cache",
+            "auth_cache_ttl_secs",
+            "row_cache_ttl_secs",
+            "max_transcodes",
+            "max_transcodes_per_user",
+            "playback_metrics_queue",
+        ],
+    ),
+    (
+        Group::Logging,
+        &[
+            "log_level",
+            "log_format",
+            "enable_metrics",
+            "metrics_sample_interval",
+            "metrics_scan_duration_buckets",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_TRACES_SAMPLER_ARG",
+        ],
+    ),
+    (
+        Group::Plugins,
+        &[
+            "wasm_call_timeout_secs",
+            "wasm_memory_limit_mb",
+            "wasm_event_queue_capacity",
+            "wasm_private_http_allow",
+            "max_plugin_download_mb",
+            "wasm_analysis_concurrency",
+            "wasm_state_limit_mb",
+            "wasm_image_download_mb",
+            "wasm_image_timeout_secs",
+            "wasm_write_content_mb",
+            "wasm_subtitle_extract_mb",
+        ],
+    ),
+    (
+        Group::System,
+        &[
+            "data_dir",
+            "config_dir",
+            "cache_dir",
+            "web_dir",
+            "ffmpeg_path",
+            "ffprobe_path",
+            "library_roots",
+            "admin_user",
+            "admin_password",
+            "shutdown_timeout_secs",
+            "disable_extensions",
+        ],
+    ),
+];
+
+/// A tab's place in the page's order. Exhaustive, so a new tab must be
+/// placed here and in [`TABS`].
+fn tab_position(group: Group) -> usize {
+    match group {
+        Group::Network => 0,
+        Group::Library => 1,
+        Group::Trickplay => 2,
+        Group::Images => 3,
+        Group::Providers => 4,
+        Group::Performance => 5,
+        Group::Logging => 6,
+        Group::Plugins => 7,
+        Group::System => 8,
+    }
+}
+
+/// The table lists exactly [`TABS`], each tab's rows together and the tabs in
+/// the page's order: the page opens its tabs in the order the rows come.
+#[test]
+fn every_row_is_on_its_tab_and_the_tabs_come_in_order() {
+    let rows: Vec<(Group, &str)> = SETTINGS.iter().map(|spec| (spec.group, spec.key)).collect();
+    let pinned: Vec<(Group, &str)> = TABS
+        .iter()
+        .flat_map(|(group, keys)| keys.iter().map(move |key| (*group, *key)))
+        .collect();
+    assert_eq!(rows, pinned);
+    let tabs: Vec<usize> = TABS.iter().map(|(group, _)| tab_position(*group)).collect();
+    assert_eq!(tabs, (0..9).collect::<Vec<_>>(), "nine tabs, in order");
+}
+
+/// Every row has a readable name of its own, which is not its key.
+#[test]
+fn every_row_has_a_label_of_its_own() {
+    let mut labels = BTreeSet::new();
+    for spec in SETTINGS {
+        assert!(!spec.label.trim().is_empty(), "{}: no label", spec.key);
+        assert_ne!(spec.label, spec.key, "{}: the label is the key", spec.key);
+        assert!(
+            labels.insert(spec.label),
+            "{}: the label `{}` is another row's",
+            spec.key,
+            spec.label
+        );
+    }
+}
+
+/// A row that shows its unit beside the value does not state it again in its
+/// description.
+#[test]
+fn a_rows_description_leaves_its_unit_to_the_unit() {
+    for spec in SETTINGS {
+        let stated = match spec.unit {
+            Some(Unit::Mebibytes) => "mib",
+            Some(Unit::Seconds) => "second",
+            Some(Unit::Minutes) => "minute",
+            Some(Unit::Hours) => "hour",
+            Some(Unit::Days) => "day",
+            Some(Unit::Megapixels) => "megapixel",
+            // What is counted is the description's subject.
+            Some(Unit::Items | Unit::Events) | None => continue,
+        };
+        // The unit as a word, singular or plural: not "today" for "day".
+        let description = spec.description.to_lowercase();
+        let states_it = description
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|word| word.strip_suffix('s').unwrap_or(word) == stated);
+        assert!(!states_it, "{}: {}", spec.key, spec.description);
+    }
+}
+
+/// The report carries each row's label and unit.
+#[test]
+fn the_report_carries_each_rows_label_and_unit() {
+    let env = FakeEnv::new();
+    let report = report(&load(Cli::default(), &env), &env);
+    for spec in SETTINGS {
+        let setting = entry(&report, spec.key);
+        assert_eq!(setting.label, spec.label, "{}", spec.key);
+        assert_eq!(setting.unit, spec.unit, "{}", spec.key);
+        assert_eq!(setting.group, spec.group, "{}", spec.key);
+    }
+    let subtitles = entry(&report, "wasm_subtitle_extract_mb");
+    assert_eq!(subtitles.label, "Subtitle extraction limit");
+    assert_eq!(subtitles.unit, Some(Unit::Mebibytes));
+    assert_eq!(entry(&report, "port").unit, None);
+}
+
 /// Every numeric row has a range of its own, not the bounds of the number
 /// type the loader reads it as; [`sample`] lies inside it and is not the
 /// default; and no description says `0` means the default, since the page

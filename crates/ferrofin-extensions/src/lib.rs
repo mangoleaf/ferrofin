@@ -550,9 +550,27 @@ mod tests {
             !descriptor.enabled,
             "D3: disabled until an admin enables it"
         );
-        // Nobody signs in through it yet, so `GET /Auth/Providers` is unchanged.
-        let cx = context().await;
-        assert!(ldap.auth_providers(&cx).is_empty());
+        // It contributes the sign-in provider under upstream's name and id,
+        // which stays out of `GET /Auth/Providers` while the plugin is off.
+        let (cx, users) = context_with_users().await;
+        let providers = ldap.auth_providers(&cx);
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name(), "LDAP-Authentication");
+        assert_eq!(
+            providers[0].id(),
+            "Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin"
+        );
+        assert!(!providers[0].is_enabled().await.expect("enabled"));
+        register_auth_providers(std::slice::from_ref(&ldap), &cx, &users);
+        let listed: Vec<Option<String>> = cx
+            .users
+            .get_authentication_providers()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|pair| pair.name)
+            .collect();
+        assert_eq!(listed, [Some("Default".to_owned())]);
         assert!(ldap.password_reset_providers(&cx).is_empty());
         assert!(ldap.tasks(&cx).is_empty());
     }
