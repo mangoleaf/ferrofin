@@ -1418,9 +1418,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    (RefreshTrickplayDataInternal), create_tiles and move_dir (CreateTiles), \
                    and scheduled_tasks/library.rs TrickplayImagesTask, compared with \
                    MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
-                   How ffmpeg extracts the frames on the software path is the \
-                   trickplay-extraction row's; the hardware path and how many generations run \
-                   at once are not part of this row",
+                   How ffmpeg extracts the frames, on either path, is the \
+                   trickplay-extraction row's; how many generations run at once is not part \
+                   of this row",
         date: "2026-11-02",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
