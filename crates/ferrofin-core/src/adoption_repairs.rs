@@ -1,7 +1,8 @@
 //! One-shot boot repairs that port Jellyfin 12.0's code migrations for the
 //! data a schema migration cannot compute — the routines under
 //! `Jellyfin.Server/Migrations/Routines/2026*` that touch linked children,
-//! extras and version groups.
+//! extras and version groups, and the one that sweeps the extracted data
+//! left on disk for items no longer stored.
 //!
 //! Each repair is keyed in `FerrofinMeta` (or on the adoption record) and runs
 //! once per database; a second boot is a no-op. They run on every path — a
@@ -14,7 +15,7 @@
 //! saved after a repair ran stays as it was, so read "Migrations and one-shot
 //! repairs" in `CONTRIBUTING.md` before adding one.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ferrofin_db::Database;
 use ferrofin_db::entities::playback::UserDataEntity;
@@ -23,7 +24,7 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_util::string_extensions::upper_invariant;
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use uuid::Uuid;
 
@@ -1906,6 +1907,352 @@ pub async fn run_sweep_missing_items(
         );
     }
     Ok(())
+}
+
+/// The folders Jellyfin 12.0's `CleanupOrphanedExternalData`
+/// (`Jellyfin.Server/Migrations/Routines/20260525010000_CleanupOrphanedExternalData.cs`)
+/// sweeps, as this server resolves them.
+#[derive(Debug, Clone)]
+pub struct ExtractedDataRoots {
+    /// `IApplicationPaths.DataPath`, whose `attachments` and `subtitles`
+    /// folders hold the extracted attachment and subtitle caches.
+    pub data: PathBuf,
+    /// `IApplicationPaths.TrickplayPath` (`{data}/trickplay`): the trickplay
+    /// tiles not saved beside the media.
+    pub trickplay: PathBuf,
+    /// `IServerApplicationPaths.InternalMetadataPath`, whose `library` folder
+    /// holds each item's chapter images.
+    pub internal_metadata: PathBuf,
+}
+
+impl ExtractedDataRoots {
+    /// Upstream's four `CleanupGuidIndexedRoot` calls, in its order: each
+    /// root's label, path, and the subfolder of an orphan's folder that goes
+    /// (the whole folder when `None`).
+    fn sweeps(&self) -> [(&'static str, PathBuf, Option<&'static str>); 4] {
+        [
+            ("attachment", self.data.join("attachments"), None),
+            ("subtitle", self.data.join("subtitles"), None),
+            ("trickplay", self.trickplay.clone(), None),
+            (
+                "chapter image",
+                self.internal_metadata.join("library"),
+                Some("chapters"),
+            ),
+        ]
+    }
+}
+
+/// The `FerrofinMeta` key of [`cleanup_orphaned_external_data`].
+const ORPHANED_EXTERNAL_DATA_KEY: &str = "orphaned_external_data_cleaned_v150";
+
+/// Upstream's `ProgressLogStep`: the sweep logs its progress every this many
+/// directories it examines under a root.
+const ORPHAN_SWEEP_PROGRESS_STEP: usize = 500;
+
+/// The one-shot port of Jellyfin 12.0's `CleanupOrphanedExternalData`: the
+/// extracted data earlier versions left behind for items that are no longer
+/// stored. Under each of its roots ([`ExtractedDataRoots`]) it walks the
+/// two-character prefix folders and their `{id}` folders, and removes each
+/// `{id}` folder — under the metadata root only its `chapters` folder —
+/// whose id no `BaseItems` row has. Nothing else is touched: a folder whose
+/// name is not two characters at the first level, or not an id at the
+/// second, stays, and so do Ferrofin's `{metadata}/library/{GUID}` art
+/// folders and every trickplay folder saved beside the media.
+///
+/// Runs once on every database, Ferrofin's own and adopted ones alike:
+/// every Ferrofin before this one left these folders behind when a library
+/// scan removed an item. A database Jellyfin 12 already swept has nothing
+/// left to find.
+///
+/// It reads the database, never the library locations or the media, so a
+/// location that is unreachable cannot make it remove anything: an item
+/// under it keeps its row, and its folders with it.
+///
+/// Unlike upstream, the stored ids are read again after a root's walk, and
+/// a folder whose item was stored in between stays: the previous version
+/// can still be scanning during a rolling update, and its new items'
+/// extracted data must not go. An id folder is read as `Guid.TryParse`
+/// reads it, in the spellings both parsers take: 32 hex digits, hyphenated
+/// or braced, in either case. And where upstream's walk throws on a folder
+/// it cannot read and fails the start, this one logs it, passes over that
+/// folder, and leaves the sweep to run again on the next start; only a root
+/// that does not exist counts as swept.
+///
+/// Returns the number of folders removed.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the stored ids cannot be read or the
+/// bookkeeping write fails; the sweep is not marked done then.
+#[tracing::instrument(skip_all, name = "cleanup_orphaned_external_data")]
+pub async fn cleanup_orphaned_external_data(
+    db: &Database,
+    roots: &ExtractedDataRoots,
+) -> Result<usize, ServiceError> {
+    if !once(db, ORPHANED_EXTERNAL_DATA_KEY).await? {
+        return Ok(0);
+    }
+    let known = std::sync::Arc::new(stored_item_ids(db).await?);
+    let mut removed = 0;
+    let mut complete = true;
+    for (label, root, subfolder) in roots.sweeps() {
+        let swept = sweep_orphaned_root(db, label, root, subfolder, &known).await?;
+        removed += swept.removed;
+        complete &= swept.complete;
+    }
+    if complete {
+        done(db, ORPHANED_EXTERNAL_DATA_KEY).await?;
+    }
+    Ok(removed)
+}
+
+/// [`cleanup_orphaned_external_data`] and its summary line, for the
+/// composition root.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the sweep fails.
+pub async fn run_cleanup_orphaned_external_data(
+    db: &Database,
+    roots: &ExtractedDataRoots,
+) -> Result<(), ServiceError> {
+    let removed = cleanup_orphaned_external_data(db, roots).await?;
+    if removed > 0 {
+        tracing::info!(
+            folders = removed,
+            "removed extracted data of items that no longer exist"
+        );
+    }
+    Ok(())
+}
+
+/// Every stored item's id (`context.BaseItems.Select(b => b.Id)`).
+async fn stored_item_ids(db: &Database) -> Result<HashSet<Uuid>, ServiceError> {
+    let ids: Vec<String> = sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems""#)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect())
+}
+
+/// What one root's sweep did.
+#[derive(Debug, Default)]
+struct RootSweep {
+    /// The orphaned folders removed.
+    removed: usize,
+    /// Whether every folder under the root could be read: a sweep with a
+    /// part it could not read runs again on the next start.
+    complete: bool,
+}
+
+/// What one root's walk found.
+#[derive(Debug, Default)]
+struct RootWalk {
+    /// How many `{id}` folders it examined.
+    scanned: usize,
+    /// Each orphan's id, with the folder to remove.
+    orphans: Vec<(Uuid, PathBuf)>,
+    /// Whether every folder under the root could be read.
+    complete: bool,
+}
+
+/// `CleanupGuidIndexedRoot` for one root: the walk on the blocking pool,
+/// then — the stored ids read again — the removals.
+async fn sweep_orphaned_root(
+    db: &Database,
+    label: &'static str,
+    root: PathBuf,
+    subfolder: Option<&'static str>,
+    known: &std::sync::Arc<HashSet<Uuid>>,
+) -> Result<RootSweep, ServiceError> {
+    // `Directory.Exists` resolves a relative root against the working
+    // directory, and so does this: every folder removed is absolute.
+    let root = match std::path::absolute(&root) {
+        Ok(root) => root,
+        Err(err) => {
+            tracing::warn!(data = label, path = %root.display(), %err, "could not resolve an extracted-data folder; it is swept on the next start");
+            return Ok(RootSweep::default());
+        }
+    };
+    let walk_known = std::sync::Arc::clone(known);
+    let walk_root = root.clone();
+    let walk = tokio::task::spawn_blocking(move || {
+        orphaned_folders(label, &walk_root, subfolder, &walk_known)
+    })
+    .await
+    .map_err(|err| ServiceError::Backend(format!("sweeping orphaned {label} data: {err}")))?;
+    let removed = if walk.orphans.is_empty() {
+        0
+    } else {
+        let stored = stored_item_ids(db).await?;
+        let orphans: Vec<PathBuf> = walk
+            .orphans
+            .into_iter()
+            .filter(|(id, _)| !stored.contains(id))
+            .map(|(_, folder)| folder)
+            .collect();
+        tokio::task::spawn_blocking(move || remove_orphaned_folders(&orphans))
+            .await
+            .map_err(|err| {
+                ServiceError::Backend(format!("removing orphaned {label} data: {err}"))
+            })?
+    };
+    tracing::info!(
+        data = label,
+        path = %root.display(),
+        scanned = walk.scanned,
+        removed,
+        complete = walk.complete,
+        "finished the orphaned extracted-data cleanup"
+    );
+    Ok(RootSweep {
+        removed,
+        complete: walk.complete,
+    })
+}
+
+/// The walk of one root (`CleanupGuidIndexedRoot`'s loops): each `{id}`
+/// folder under a two-character folder whose id is not in `known`, with the
+/// folder to remove (`{id}/{subfolder}`, only where it exists). A root that
+/// does not exist is a complete, empty walk; one that cannot be read, or a
+/// folder or entry under it that cannot be, makes it incomplete (logged),
+/// and the rest is still walked.
+fn orphaned_folders(
+    label: &str,
+    root: &Path,
+    subfolder: Option<&str>,
+    known: &HashSet<Uuid>,
+) -> RootWalk {
+    let mut walk = RootWalk {
+        complete: true,
+        ..RootWalk::default()
+    };
+    match std::fs::metadata(root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            tracing::info!(data = label, path = %root.display(), "skipping the orphaned extracted-data cleanup: not a folder");
+            return walk;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(data = label, path = %root.display(), "skipping the orphaned extracted-data cleanup: the folder does not exist");
+            return walk;
+        }
+        Err(err) => {
+            tracing::warn!(data = label, path = %root.display(), %err, "could not read an extracted-data folder; it is swept on the next start");
+            walk.complete = false;
+            return walk;
+        }
+    }
+    tracing::info!(data = label, path = %root.display(), "looking for orphaned extracted data");
+    let Some(prefixes) = list_folder(label, root, &mut walk) else {
+        return walk;
+    };
+    for prefix in prefixes {
+        // `prefixName.Length != 2`, in UTF-16 code units as .NET counts.
+        let two_characters = prefix
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().encode_utf16().count() == 2);
+        if !two_characters || !prefix.is_dir() {
+            continue;
+        }
+        let Some(folders) = list_folder(label, &prefix, &mut walk) else {
+            continue;
+        };
+        for folder in folders {
+            if !folder.is_dir() {
+                continue;
+            }
+            walk.scanned += 1;
+            if walk.scanned.is_multiple_of(ORPHAN_SWEEP_PROGRESS_STEP) {
+                tracing::info!(
+                    data = label,
+                    scanned = walk.scanned,
+                    found = walk.orphans.len(),
+                    "looking for orphaned extracted data"
+                );
+            }
+            let Some(id) = folder
+                .file_name()
+                .and_then(|name| folder_guid(&name.to_string_lossy()))
+            else {
+                continue;
+            };
+            if known.contains(&id) {
+                continue;
+            }
+            let target = match subfolder {
+                Some(sub) => folder.join(sub),
+                None => folder,
+            };
+            if subfolder.is_some() && !target.is_dir() {
+                continue;
+            }
+            walk.orphans.push((id, target));
+        }
+    }
+    walk
+}
+
+/// The entries of `folder`, or `None` when it cannot be listed; a listing,
+/// or an entry of it, that fails marks `walk` incomplete (logged).
+fn list_folder(label: &str, folder: &Path, walk: &mut RootWalk) -> Option<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(folder) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(data = label, path = %folder.display(), %err, "could not list an extracted-data folder; it is swept on the next start");
+            walk.complete = false;
+            return None;
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(err) => {
+                tracing::warn!(data = label, path = %folder.display(), %err, "could not read an entry of an extracted-data folder; it is swept on the next start");
+                walk.complete = false;
+            }
+        }
+    }
+    Some(paths)
+}
+
+/// `Guid.TryParse` of a folder name, over the spellings it shares with
+/// [`Uuid::parse_str`]: 32 hex digits, hyphenated, or hyphenated in braces,
+/// in either case. A `urn:uuid:` name, which .NET does not parse, is not an
+/// id; nor is .NET's parenthesised or hex-array form, which the server never
+/// writes: such a folder stays.
+fn folder_guid(name: &str) -> Option<Uuid> {
+    if !matches!(name.len(), 32 | 36 | 38) {
+        return None;
+    }
+    Uuid::parse_str(name).ok()
+}
+
+/// `TryDelete` for each orphaned folder: a folder that cannot be removed is
+/// logged and passed over. Never a root, an empty or a relative path
+/// ([`crate::item_deletion::is_deletable_path`]). Returns how many went.
+fn remove_orphaned_folders(folders: &[PathBuf]) -> usize {
+    let mut removed = 0;
+    for folder in folders {
+        if !crate::item_deletion::is_deletable_path(folder) {
+            tracing::warn!(path = %folder.display(), "refusing to delete an orphaned folder at a root or relative path");
+            continue;
+        }
+        match std::fs::remove_dir_all(folder) {
+            Ok(()) => {
+                tracing::debug!(path = %folder.display(), "removed an orphaned folder");
+                removed += 1;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(path = %folder.display(), %err, "could not delete an orphaned folder");
+            }
+        }
+    }
+    removed
 }
 
 /// The items `CleanupItemsFromDeletedLibraries` deletes: those whose
@@ -6363,5 +6710,1214 @@ mod tests {
             "outside every location, and none resolved"
         );
         assert!(exists(&f.db, unrooted).await);
+    }
+
+    /// The four roots `CleanupOrphanedExternalData` sweeps, under `dir`.
+    fn extracted_roots(dir: &Path) -> ExtractedDataRoots {
+        ExtractedDataRoots {
+            data: dir.join("data"),
+            trickplay: dir.join("data/trickplay"),
+            internal_metadata: dir.join("metadata"),
+        }
+    }
+
+    /// An item's folder under a GUID-indexed root, `{root}/{xx}/{name}`,
+    /// with a file in it.
+    fn id_folder(root: &Path, name: &str) -> PathBuf {
+        let folder = root.join(&name[..2]).join(name);
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("data"), b"x").expect("file");
+        folder
+    }
+
+    /// An orphan's attachment, subtitle and trickplay folders go whole and
+    /// its chapter images go from its metadata folder, which stays; a stored
+    /// item keeps all of them in either id spelling; folders that are not
+    /// `{xx}/{id}` stay; a second boot is a no-op.
+    #[tokio::test]
+    async fn orphaned_extracted_data_is_removed_once() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().expect("temp");
+        let roots = extracted_roots(dir.path());
+        let (live, orphan) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_item(&db, live, BaseItemKind::Movie).await;
+        let spellings = |id: Uuid| {
+            [
+                id.hyphenated().to_string(),
+                id.simple().to_string().to_uppercase(),
+            ]
+        };
+        let mut kept = Vec::new();
+        let mut gone = Vec::new();
+        for root in [
+            roots.data.join("attachments"),
+            roots.data.join("subtitles"),
+            roots.trickplay.clone(),
+        ] {
+            for name in spellings(live) {
+                kept.push(id_folder(&root, &name));
+            }
+            for name in spellings(orphan) {
+                gone.push(id_folder(&root, &name));
+            }
+            // Not two characters, not an id, a `urn:uuid:` name: no item's.
+            let odd = root.join("abc").join(orphan.hyphenated().to_string());
+            std::fs::create_dir_all(&odd).expect("odd");
+            kept.push(odd);
+            kept.push(id_folder(&root, "zz-not-an-id"));
+            kept.push(id_folder(&root, &orphan.urn().to_string()));
+        }
+        // The metadata root: only an orphan's `chapters` folder goes.
+        let metadata = roots.internal_metadata.join("library");
+        let orphan_meta = id_folder(&metadata, &orphan.simple().to_string());
+        std::fs::create_dir_all(orphan_meta.join("chapters")).expect("chapters");
+        let live_meta = id_folder(&metadata, &live.simple().to_string());
+        std::fs::create_dir_all(live_meta.join("chapters")).expect("chapters");
+        // Ferrofin's own art folder is no `{xx}/{id}` folder.
+        let art = metadata.join(orphan.hyphenated().to_string().to_uppercase());
+        std::fs::create_dir_all(&art).expect("art");
+
+        let removed = cleanup_orphaned_external_data(&db, &roots)
+            .await
+            .expect("sweep");
+        assert_eq!(
+            removed,
+            gone.len() + 1,
+            "every orphan folder and the chapters"
+        );
+        for folder in &gone {
+            assert!(!folder.exists(), "{} removed", folder.display());
+        }
+        for folder in &kept {
+            assert!(folder.exists(), "{} kept", folder.display());
+        }
+        assert!(
+            !orphan_meta.join("chapters").exists(),
+            "orphan's chapters removed"
+        );
+        assert!(
+            orphan_meta.join("data").exists(),
+            "the rest of its metadata folder stays"
+        );
+        assert!(
+            live_meta.join("chapters").exists(),
+            "a stored item's chapters stay"
+        );
+        assert!(art.exists(), "an art folder is not swept");
+
+        let late = id_folder(&roots.trickplay, &Uuid::new_v4().hyphenated().to_string());
+        assert_eq!(
+            cleanup_orphaned_external_data(&db, &roots)
+                .await
+                .expect("again"),
+            0
+        );
+        assert!(late.exists(), "a second boot sweeps nothing");
+    }
+
+    /// No root on disk: nothing to do, and the sweep is still done.
+    #[tokio::test]
+    async fn missing_roots_are_skipped_and_the_sweep_is_done() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().expect("temp");
+        let roots = extracted_roots(dir.path());
+        assert_eq!(
+            cleanup_orphaned_external_data(&db, &roots)
+                .await
+                .expect("sweep"),
+            0
+        );
+        let orphan = id_folder(&roots.trickplay, &Uuid::new_v4().hyphenated().to_string());
+        cleanup_orphaned_external_data(&db, &roots)
+            .await
+            .expect("again");
+        assert!(orphan.exists(), "done on the first boot");
+    }
+
+    /// A root or a prefix folder that cannot be listed is passed over and the
+    /// sweep runs again on the next boot.
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case::root(false)]
+    #[case::prefix_folder(true)]
+    #[tokio::test]
+    async fn an_unlistable_folder_is_swept_on_the_next_boot(#[case] prefix: bool) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let db = test_db().await;
+        let dir = tempfile::tempdir().expect("temp");
+        let roots = extracted_roots(dir.path());
+        let orphan = id_folder(&roots.trickplay, &Uuid::new_v4().hyphenated().to_string());
+        let locked = if prefix {
+            orphan.parent().expect("prefix").to_path_buf()
+        } else {
+            roots.trickplay.clone()
+        };
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("lock");
+        let listable = std::fs::read_dir(&locked).is_ok();
+        let first = cleanup_orphaned_external_data(&db, &roots).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+        if listable {
+            // Running as root: permissions do not stop the listing, and
+            // nothing here can be checked.
+            eprintln!("skipped: the locked folder is still listable (running as root?)");
+            return;
+        }
+        assert_eq!(first.expect("sweep"), 0);
+        assert!(orphan.exists());
+        assert_eq!(
+            cleanup_orphaned_external_data(&db, &roots)
+                .await
+                .expect("again"),
+            1,
+            "swept on the next boot"
+        );
+        assert!(!orphan.exists());
+    }
+
+    /// An item stored after the ids were first read (the previous version
+    /// still scanning) keeps its folder: the ids are read again before
+    /// anything goes.
+    #[tokio::test]
+    async fn an_item_stored_during_the_walk_keeps_its_folder() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().expect("temp");
+        let roots = extracted_roots(dir.path());
+        let (stored, orphan) = (Uuid::new_v4(), Uuid::new_v4());
+        let stored_folder = id_folder(&roots.trickplay, &stored.hyphenated().to_string());
+        let orphan_folder = id_folder(&roots.trickplay, &orphan.hyphenated().to_string());
+        // The ids as the boot first read them, before `stored` was saved.
+        let before = std::sync::Arc::new(HashSet::new());
+        seed_item(&db, stored, BaseItemKind::Movie).await;
+        let removed = sweep_orphaned_root(&db, "trickplay", roots.trickplay.clone(), None, &before)
+            .await
+            .expect("sweep");
+        assert_eq!((removed.removed, removed.complete), (1, true));
+        assert!(stored_folder.exists(), "stored since: kept");
+        assert!(!orphan_folder.exists());
+    }
+
+    /// `Guid.TryParse`'s spellings that the server writes; nothing else.
+    #[test]
+    fn folder_names_parse_as_ids_in_the_spellings_both_parsers_take() {
+        let id = Uuid::new_v4();
+        for name in [
+            id.simple().to_string(),
+            id.simple().to_string().to_uppercase(),
+            id.hyphenated().to_string(),
+            id.hyphenated().to_string().to_uppercase(),
+            id.braced().to_string(),
+        ] {
+            assert_eq!(folder_guid(&name), Some(id), "{name}");
+        }
+        for name in [
+            id.urn().to_string(),
+            format!("({})", id.hyphenated()),
+            format!(" {}", id.hyphenated()),
+            "ab".to_owned(),
+            String::new(),
+        ] {
+            assert_eq!(folder_guid(&name), None, "{name}");
+        }
+    }
+}
+
+// Rebases the absolute paths a database stores under a previous program-data
+// directory onto this server's directories (gl-1165).
+//
+// Jellyfin stores `{program data}/root`, its library folders and every image
+// path absolute: `ReverseVirtualPath` tokenises only `{program data}/data` and
+// the metadata directory, and `BaseItemMapper.MapImageToEntity` saves image
+// paths raw. Ferrofin writes every path resolved. The ids of items under
+// program data are derived from the path relative to it (`GetNewItemId`), so
+// after the directory moves (a Debian `/var/lib/jellyfin` adopted into
+// `/var/lib/ferrofin`, or Ferrofin's own data directory relocated) every id
+// still matches and only the stored paths are stale.
+//
+// Upstream resets only the root folders' own paths after a move
+// (`CreateRootFolder`, `GetUserRootFolder`); everything else stays where it
+// was, in Jellyfin too. The repair is Ferrofin's own because its documented
+// migration is such a move. It stores what upstream would have stored had it
+// written under the new directories, and writes nothing on a server that did
+// not move.
+
+/// The columns that can hold an absolute program-data path.
+const PATH_COLUMNS: [(&str, &str); 7] = [
+    ("BaseItems", "Path"),
+    ("BaseItemImageInfos", "Path"),
+    ("Chapters", "ImagePath"),
+    ("MediaStreamInfos", "Path"),
+    ("ImageInfos", "Path"),
+    ("FerrofinLiveTvRecordings", "Path"),
+    ("FerrofinLiveTvListingProviders", "Path"),
+];
+
+/// The table holding user profile images, which are also found by their
+/// `users/<name>` folder ([`profile_image_target`]).
+const PROFILE_IMAGE_TABLE: &str = "ImageInfos";
+
+/// The extension of the database snapshot [`rebase_program_data_paths`]
+/// takes (`jellyfin.db.pre-program-data-move`).
+const PROGRAM_DATA_SNAPSHOT_EXTENSION: &str = "db.pre-program-data-move";
+
+/// This server's directories, as absolute paths.
+#[derive(Debug, Clone)]
+pub struct ProgramDataDirs {
+    /// `{program data}/root`, the aggregate root folder.
+    pub root: String,
+    /// The internal metadata directory.
+    pub metadata: String,
+    /// `{program data}/data`.
+    pub data: String,
+    /// The configuration directory.
+    pub config: String,
+}
+
+impl ProgramDataDirs {
+    /// Each directory with the name it has under program data, which is where
+    /// a previous program-data directory kept it.
+    fn by_name(&self) -> [(&'static str, &str); 4] {
+        [
+            ("root", &self.root),
+            ("metadata", &self.metadata),
+            ("data", &self.data),
+            ("config", &self.config),
+        ]
+    }
+}
+
+/// What [`rebase_program_data_paths`] changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rebased {
+    /// The previous program-data directories the database's rows named.
+    pub from: Vec<String>,
+    /// Rows rewritten across every path column.
+    pub rows: u64,
+}
+
+/// Rewrites the paths a database stores under a previous program-data
+/// directory onto `dirs`.
+///
+/// The previous directories come from rows whose ids survive a move and whose
+/// paths have a fixed place under program data
+/// ([`previous_program_data_dirs`]). Each path in [`PATH_COLUMNS`] under one of
+/// them is rewritten once, from its stored value, to the same place under the
+/// matching directory of `dirs` (`{old}/root`, `{old}/metadata`, `{old}/data`,
+/// `{old}/config`), and a profile image `…/users/<name>/<file>` to
+/// `{config}/users/<name>/<file>`, but only when that file exists: a file that
+/// did not move keeps its row. A path that already works under one of `dirs`
+/// is left alone, which settles a move into or out of a subdirectory of the
+/// old directory. The rewrite takes a database snapshot first and commits
+/// whole.
+///
+/// Returns `None` when nothing was rewritten. A server that did not move only
+/// reads its root and library rows. A root or library row whose own folder was
+/// not copied keeps naming the old directory, so each start checks again until
+/// it is.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a query or the snapshot fails; no row is
+/// changed in that case.
+pub async fn rebase_program_data_paths(
+    db: &Database,
+    derivation: &IdDerivation,
+    dirs: &ProgramDataDirs,
+) -> Result<Option<Rebased>, ServiceError> {
+    let Some(plan) = plan_rebase(db, derivation, dirs).await? else {
+        return Ok(None);
+    };
+    apply_rebase(db, &plan).await
+}
+
+/// The rewrites [`rebase_program_data_paths`] makes, read without the write
+/// lock: [`apply_rebase`] writes each only if its row still holds the path
+/// read here.
+#[derive(Debug, Clone)]
+struct RebasePlan {
+    /// The previous program-data directories.
+    from: Vec<String>,
+    /// `(index into PATH_COLUMNS, rowid, stored path, new path)`.
+    rewrites: Vec<(usize, i64, String, String)>,
+}
+
+/// The previous directories and each row's rewrite, or `None` when nothing
+/// moved or no moved file is there.
+async fn plan_rebase(
+    db: &Database,
+    derivation: &IdDerivation,
+    dirs: &ProgramDataDirs,
+) -> Result<Option<RebasePlan>, ServiceError> {
+    let previous = previous_program_data_dirs(db, derivation, dirs).await?;
+    if previous.is_empty() {
+        return Ok(None);
+    }
+    // Keyed by column and rowid: a row under two nested previous directories
+    // is found twice and rewritten once.
+    let mut stored = BTreeMap::new();
+    for (column, (table, name)) in PATH_COLUMNS.into_iter().enumerate() {
+        for (rowid, path) in rows_to_check(db, table, name, &previous).await? {
+            stored.insert((column, rowid), path);
+        }
+    }
+    // One line before the file checks, which on slow storage can take a while.
+    tracing::info!(
+        paths = stored.len(),
+        from = ?previous,
+        "checking stored paths under a previous program-data directory"
+    );
+    let (checked_dirs, checked_previous) = (dirs.clone(), previous.clone());
+    // `try_exists` per row: the blocking pool, not a runtime worker.
+    let rewrites: Vec<(usize, i64, String, String)> = tokio::task::spawn_blocking(move || {
+        stored
+            .into_iter()
+            .filter_map(|((column, rowid), path)| {
+                let profile = PATH_COLUMNS[column].0 == PROFILE_IMAGE_TABLE;
+                rebased_path(&path, &checked_previous, &checked_dirs, profile)
+                    .map(|to| (column, rowid, path, to))
+            })
+            .collect()
+    })
+    .await
+    .map_err(|err| ServiceError::Backend(format!("checking moved paths: {err}")))?;
+    Ok((!rewrites.is_empty()).then_some(RebasePlan {
+        from: previous,
+        rewrites,
+    }))
+}
+
+/// Writes `plan` after a database snapshot, in one transaction; a row saved
+/// since the plan was read keeps its value. `None` when no row was rewritten.
+async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased>, ServiceError> {
+    // It rewrites paths users' artwork hangs on: the file as it was goes aside
+    // first, as before the other row-rewriting repairs.
+    if let Some(backup) = db
+        .snapshot_once(PROGRAM_DATA_SNAPSHOT_EXTENSION)
+        .await
+        .map_err(meta_err)?
+    {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before rewriting paths under a previous program-data directory"
+        );
+    }
+    // One statement per column, not per row, keeps the write lock short (the
+    // other version waits 30 s for it): each column's rewrites go into a
+    // temporary table keyed by rowid, and the column is updated from it.
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
+    sqlx::query(
+        r#"CREATE TEMP TABLE "FerrofinPathRebase"
+           ("Row" INTEGER PRIMARY KEY, "Old" TEXT NOT NULL, "New" TEXT NOT NULL)"#,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let mut rows = 0;
+    for (column, (table, name)) in PATH_COLUMNS.into_iter().enumerate() {
+        let moves: Vec<(i64, &str, &str)> = plan
+            .rewrites
+            .iter()
+            .filter(|(of, ..)| *of == column)
+            .map(|(_, rowid, from, to)| (*rowid, from.as_str(), to.as_str()))
+            .collect();
+        if moves.is_empty() {
+            continue;
+        }
+        let moves =
+            serde_json::to_string(&moves).map_err(|e| ServiceError::Backend(e.to_string()))?;
+        sqlx::query(r#"DELETE FROM temp."FerrofinPathRebase""#)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query(
+            r#"INSERT INTO temp."FerrofinPathRebase" ("Row", "Old", "New")
+               SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'),
+                      json_extract(value, '$[2]')
+               FROM json_each(?1)"#,
+        )
+        .bind(moves)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        // Table and column names come from `PATH_COLUMNS`. Compare-and-set: a
+        // row saved since it was read keeps its value.
+        rows += sqlx::query(sqlx::AssertSqlSafe(format!(
+            r#"UPDATE "{table}" SET "{name}" = r."New" FROM temp."FerrofinPathRebase" r
+               WHERE r."Row" = "{table}".rowid AND r."Old" = "{table}"."{name}""#
+        )))
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+    }
+    sqlx::query(r#"DROP TABLE temp."FerrofinPathRebase""#)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)?;
+    Ok((rows > 0).then(|| Rebased {
+        from: plan.from.clone(),
+        rows,
+    }))
+}
+
+/// The previous program-data directories the database's rows still name.
+///
+/// Each is read from a row whose id survives a move, by the place that row's
+/// path has under program data: the aggregate root (`root`), the user root
+/// (`root/default`) and each library folder whose id is the one its name
+/// derives under this server's root (`root/default/<name>`). `ensure()`
+/// re-paths the aggregate root on the first start after a move (since v1.4.0),
+/// so on a database started since, the user root and the libraries are what
+/// still name the old directory. Empty when no row names a directory other
+/// than this server's program data, and for a database with
+/// [`IdDerivation::LegacyLowercase`] ids: they embed the absolute path, so
+/// after a move none is the id derived here.
+async fn previous_program_data_dirs(
+    db: &Database,
+    derivation: &IdDerivation,
+    dirs: &ProgramDataDirs,
+) -> Result<Vec<String>, ServiceError> {
+    let root = Path::new(&dirs.root);
+    let Some(program_data) = root.parent() else {
+        return Ok(Vec::new());
+    };
+    let user_views = root.join("default");
+    let aggregate = crate::item_type_lookup::aggregate_folder_id(derivation, &dirs.root);
+    let user_root =
+        crate::item_type_lookup::user_root_folder_id(derivation, &user_views.to_string_lossy());
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT "Id", "Path" FROM "BaseItems"
+           WHERE ("Id" IN (?1, ?2) OR "Type" = ?3) AND "Path" IS NOT NULL"#,
+    )
+    .bind(aggregate.map(guid_to_db))
+    .bind(user_root.map(guid_to_db))
+    .bind(stored_type_name(BaseItemKind::CollectionFolder))
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    let mut previous = BTreeSet::new();
+    for (id, path) in rows {
+        let (Ok(id), path) = (Uuid::parse_str(&id), Path::new(&path)) else {
+            continue;
+        };
+        let place = if Some(id) == aggregate {
+            PathBuf::from("root")
+        } else if Some(id) == user_root {
+            PathBuf::from("root/default")
+        } else {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let at_this_root = user_views.join(name);
+            if derive_item_id_with(
+                derivation,
+                BaseItemKind::CollectionFolder,
+                &at_this_root.to_string_lossy(),
+            ) != Some(id)
+            {
+                continue;
+            }
+            Path::new("root/default").join(name)
+        };
+        if let Some(old) = path
+            .ends_with(&place)
+            .then(|| path.ancestors().nth(place.components().count()))
+            .flatten()
+            .filter(|old| old.is_absolute() && *old != program_data)
+        {
+            previous.insert(old.to_string_lossy().into_owned());
+        }
+    }
+    Ok(previous.into_iter().collect())
+}
+
+/// The `(rowid, path)` rows of `table.column` that may move: those under a
+/// `previous` directory, and every profile image (its old configuration
+/// directory need not have been under program data, as Debian's
+/// `/etc/jellyfin` is not).
+async fn rows_to_check(
+    db: &Database,
+    table: &str,
+    column: &str,
+    previous: &[String],
+) -> Result<Vec<(i64, String)>, ServiceError> {
+    // Table and column names come from `PATH_COLUMNS`; the directory is bound.
+    if table == PROFILE_IMAGE_TABLE {
+        return sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            r#"SELECT rowid, "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL"#
+        )))
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err);
+    }
+    let mut found = Vec::new();
+    for old in previous {
+        // Paths below the directory (never the directory itself, which names
+        // none of its subdirectories): `/var/lib/jellyfin/`, or `/` for the root.
+        let below = format!("{}/", old.trim_end_matches('/'));
+        let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            r#"SELECT rowid, "{column}" FROM "{table}"
+               WHERE substr("{column}", 1, length(?1)) = ?1"#
+        )))
+        .bind(below)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+        found.extend(rows);
+    }
+    Ok(found)
+}
+
+/// Where `stored` moves to: see [`rebase_program_data_paths`].
+///
+/// Of the previous directories, the longest that holds `stored` is tried first
+/// (`TryReplaceSubPath`, so a directory matches only whole components), and
+/// the first target whose file exists wins; a profile image falls back to
+/// [`profile_image_target`]. `None` keeps the row as it is.
+fn rebased_path(
+    stored: &str,
+    previous: &[String],
+    dirs: &ProgramDataDirs,
+    profile: bool,
+) -> Option<String> {
+    let exists = |path: &str| Path::new(path).try_exists().is_ok_and(|found| found);
+    let current = dirs.by_name();
+    if current
+        .iter()
+        .any(|(_, dir)| Path::new(stored).starts_with(dir))
+        && exists(stored)
+    {
+        return None;
+    }
+    let mut targets = Vec::new();
+    for old in previous {
+        for (name, to) in current {
+            let from = Path::new(old).join(name).to_string_lossy().into_owned();
+            if let Some(target) =
+                ferrofin_util::path_extensions::try_replace_sub_path(stored, &from, to)
+            {
+                targets.push((from.len(), target));
+            }
+        }
+    }
+    targets.sort_by_key(|(prefix, _)| std::cmp::Reverse(*prefix));
+    let profile_target = profile.then(|| profile_image_target(stored, &dirs.config));
+    targets
+        .into_iter()
+        .map(|(_, target)| target)
+        .chain(profile_target.flatten())
+        .find(|target| target != stored && exists(target))
+}
+
+/// `{config}/users/<name>/<file>` for a profile image stored as
+/// `…/users/<name>/<file>`, where upstream saves one
+/// (`{UserConfigurationDirectoryPath}/{Username}`, `ImageController`). The
+/// folder keeps the name the image was saved under, which a rename does not
+/// change, so that is the name used.
+fn profile_image_target(stored: &str, config: &str) -> Option<String> {
+    let path = Path::new(stored);
+    let file = path.file_name()?;
+    let user = path.parent()?;
+    let name = user.file_name()?;
+    if user.parent()?.file_name()? != "users" {
+        return None;
+    }
+    Some(
+        Path::new(config)
+            .join("users")
+            .join(name)
+            .join(file)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(test)]
+mod program_data_tests {
+    use ferrofin_model::data::BaseItemKind;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::test_support::{seed_folder_item, seed_named_user, test_db};
+
+    const MOVIE: Uuid = Uuid::from_u128(0xa3);
+    const PLAYLISTS: Uuid = Uuid::from_u128(0xa4);
+    const USER: Uuid = Uuid::from_u128(0xa5);
+
+    /// This server's directories under `program_data`, with the configuration
+    /// directory inside it, as the Debian package has it.
+    fn dirs(program_data: &Path) -> ProgramDataDirs {
+        let dir = |name: &str| program_data.join(name).to_string_lossy().into_owned();
+        ProgramDataDirs {
+            root: dir("root"),
+            metadata: dir("metadata"),
+            data: dir("data"),
+            config: format!("{}/", dir("config")),
+        }
+    }
+
+    fn derivation(program_data: &Path) -> IdDerivation {
+        IdDerivation::Jellyfin {
+            program_data_path: Some(program_data.to_string_lossy().into_owned()),
+        }
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    async fn seed(db: &Database, id: Uuid, kind: BaseItemKind, path: &str) {
+        seed_folder_item(db, id, kind, "x", None).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .bind(path)
+            .execute(db.writer())
+            .await
+            .unwrap();
+    }
+
+    async fn seed_image(db: &Database, item: Uuid, path: &str) {
+        sqlx::query(
+            r#"INSERT INTO "BaseItemImageInfos"
+               ("Id", "ItemId", "Path", "ImageType", "DateModified", "Width", "Height")
+               VALUES (?1, ?2, ?3, 0, '2026-01-01 00:00:00', 0, 0)"#,
+        )
+        .bind(guid_to_db(Uuid::new_v4()))
+        .bind(guid_to_db(item))
+        .bind(path)
+        .execute(db.writer())
+        .await
+        .unwrap();
+    }
+
+    async fn item_path(db: &Database, id: Uuid) -> String {
+        sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_one(db.writer())
+            .await
+            .unwrap()
+    }
+
+    async fn image_paths(db: &Database) -> Vec<String> {
+        sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItemImageInfos" ORDER BY "Path""#)
+            .fetch_all(db.writer())
+            .await
+            .unwrap()
+    }
+
+    /// A database written under `old`, served from `program_data`, with the
+    /// moved files where this server keeps them.
+    struct Moved {
+        db: Database,
+        temp: tempfile::TempDir,
+        program_data: PathBuf,
+        old: String,
+        aggregate: Uuid,
+        user_root: Uuid,
+        library: Uuid,
+    }
+
+    impl Moved {
+        fn pd(&self) -> String {
+            self.program_data.to_string_lossy().into_owned()
+        }
+
+        async fn rebase(&self) -> Option<Rebased> {
+            rebase_program_data_paths(
+                &self.db,
+                &derivation(&self.program_data),
+                &dirs(&self.program_data),
+            )
+            .await
+            .unwrap()
+        }
+    }
+
+    /// Where the previous program data was, from this server's.
+    #[derive(Debug, Clone, Copy)]
+    enum Previous {
+        /// Debian's `/var/lib/jellyfin`, adopted elsewhere. The documented
+        /// migration copies, so the originals are still there.
+        Elsewhere,
+        /// The parent of this one: `/srv/ferrofin` moved to `/srv/ferrofin/data`.
+        Parent,
+        /// A child of this one: the deb's old `/var/lib/ferrofin/data` moved to
+        /// `/var/lib/ferrofin`.
+        Child,
+    }
+
+    /// One row under `old` in each path column besides the item and image
+    /// ones, with its file at the same place under `program_data`; the first
+    /// two belong to the movie (`?2`).
+    async fn seed_other_path_columns(db: &Database, old: &str, program_data: &Path) {
+        for (statement, relative, of_movie) in [
+            (
+                r#"INSERT INTO "Chapters" ("ItemId", "ChapterIndex", "StartPositionTicks", "ImagePath")
+                   VALUES (?2, 0, 0, ?1)"#,
+                "metadata/library/cf/cf75/chapters/0.jpg",
+                true,
+            ),
+            (
+                r#"INSERT INTO "MediaStreamInfos"
+                   ("ItemId", "StreamIndex", "StreamType", "IsDefault", "IsExternal", "IsForced", "Path")
+                   VALUES (?2, 0, 2, 0, 1, 0, ?1)"#,
+                "data/subtitles/cf75/0.srt",
+                true,
+            ),
+            (
+                r#"INSERT INTO "FerrofinLiveTvRecordings" ("Id", "ChannelId", "StartDate", "Path")
+                   VALUES ('recording', 'channel', '2026-01-01 00:00:00', ?1)"#,
+                "data/livetv/recordings/News.ts",
+                false,
+            ),
+            (
+                r#"INSERT INTO "FerrofinLiveTvListingProviders" ("Id", "Type", "Path", "Data")
+                   VALUES ('guide', 'xmltv', ?1, '{}')"#,
+                "data/guide.xml",
+                false,
+            ),
+        ] {
+            touch(&program_data.join(relative));
+            let mut insert = sqlx::query(statement).bind(format!("{old}/{relative}"));
+            if of_movie {
+                insert = insert.bind(guid_to_db(MOVIE));
+            }
+            insert.execute(db.writer()).await.unwrap();
+        }
+    }
+
+    /// The moved files under `program_data`, and for [`Previous::Elsewhere`]
+    /// the original poster still under `old`.
+    fn seed_files(program_data: &Path, old: &str, previous: Previous) {
+        std::fs::create_dir_all(program_data.join("root/default/Movies")).unwrap();
+        std::fs::create_dir_all(program_data.join("data/collections/Heist [boxset]")).unwrap();
+        touch(&program_data.join("metadata/library/cf/cf75/poster.jpg"));
+        // Where a prefix match that ignored component boundaries would send
+        // the look-alike `metadata-other` row.
+        touch(&program_data.join("metadata-other/poster.jpg"));
+        if matches!(previous, Previous::Elsewhere) {
+            // An original that still exists moves all the same: it may be
+            // unreadable, and it may be deleted later.
+            touch(Path::new(&format!(
+                "{old}/metadata/library/cf/cf75/poster.jpg"
+            )));
+        }
+    }
+
+    async fn moved(previous: Previous) -> Moved {
+        let temp = tempfile::tempdir().unwrap();
+        // Nested so that `Previous::Parent` is `{old}/data`, where a rewrite
+        // of the rewritten paths would land.
+        let program_data = temp.path().join("srv/ferrofin/data");
+        let old = match previous {
+            Previous::Elsewhere => temp
+                .path()
+                .join("var/lib/jellyfin")
+                .to_string_lossy()
+                .into_owned(),
+            Previous::Parent => program_data
+                .parent()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            Previous::Child => program_data.join("data").to_string_lossy().into_owned(),
+        };
+        let mode = derivation(&program_data);
+        let root = program_data.join("root");
+        let aggregate =
+            crate::item_type_lookup::aggregate_folder_id(&mode, &root.to_string_lossy()).unwrap();
+        let user_root = crate::item_type_lookup::user_root_folder_id(
+            &mode,
+            &root.join("default").to_string_lossy(),
+        )
+        .unwrap();
+        let library = derive_item_id_with(
+            &mode,
+            BaseItemKind::CollectionFolder,
+            &root.join("default/Movies").to_string_lossy(),
+        )
+        .unwrap();
+        seed_files(&program_data, &old, previous);
+
+        let db = test_db().await;
+        seed(
+            &db,
+            aggregate,
+            BaseItemKind::AggregateFolder,
+            &format!("{old}/root"),
+        )
+        .await;
+        seed(
+            &db,
+            user_root,
+            BaseItemKind::UserRootFolder,
+            &format!("{old}/root/default"),
+        )
+        .await;
+        seed(
+            &db,
+            library,
+            BaseItemKind::CollectionFolder,
+            &format!("{old}/root/default/Movies"),
+        )
+        .await;
+        seed(
+            &db,
+            MOVIE,
+            BaseItemKind::Movie,
+            "/srv/media/movies/Honeyland (2019)",
+        )
+        .await;
+        seed(
+            &db,
+            PLAYLISTS,
+            BaseItemKind::PlaylistsFolder,
+            "%AppDataPath%/playlists",
+        )
+        .await;
+        seed(
+            &db,
+            Uuid::from_u128(0xa6),
+            BaseItemKind::BoxSet,
+            &format!("{old}/data/collections/Heist [boxset]"),
+        )
+        .await;
+        for path in [
+            format!("{old}/metadata/library/cf/cf75/poster.jpg"),
+            format!("{old}/metadata/library/gone/poster.jpg"),
+            format!("{old}/metadata-other/poster.jpg"),
+            "/srv/media/movies/Honeyland (2019)/fanart.jpg".to_owned(),
+            "%MetadataPath%/library/ab/abcd/poster.jpg".to_owned(),
+        ] {
+            seed_image(&db, MOVIE, &path).await;
+        }
+        seed_other_path_columns(&db, &old, &program_data).await;
+        Moved {
+            db,
+            temp,
+            program_data,
+            old,
+            aggregate,
+            user_root,
+            library,
+        }
+    }
+
+    #[rstest]
+    #[case::elsewhere(Previous::Elsewhere)]
+    #[case::into_a_subdirectory(Previous::Parent)]
+    #[case::out_of_a_subdirectory(Previous::Child)]
+    #[tokio::test]
+    async fn rewrites_each_moved_path_once_where_its_file_is(#[case] previous: Previous) {
+        let moved = moved(previous).await;
+        let (old, pd) = (moved.old.clone(), moved.pd());
+
+        let rebased = moved.rebase().await;
+
+        assert_eq!(
+            rebased,
+            Some(Rebased {
+                from: vec![old.clone()],
+                rows: 9,
+            })
+        );
+        for (table, column, relative) in [
+            (
+                "Chapters",
+                "ImagePath",
+                "metadata/library/cf/cf75/chapters/0.jpg",
+            ),
+            ("MediaStreamInfos", "Path", "data/subtitles/cf75/0.srt"),
+            (
+                "FerrofinLiveTvRecordings",
+                "Path",
+                "data/livetv/recordings/News.ts",
+            ),
+            ("FerrofinLiveTvListingProviders", "Path", "data/guide.xml"),
+        ] {
+            let stored: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                r#"SELECT "{column}" FROM "{table}""#
+            )))
+            .fetch_one(moved.db.writer())
+            .await
+            .unwrap();
+            assert_eq!(stored, format!("{pd}/{relative}"), "{table}.{column}");
+        }
+        assert_eq!(
+            item_path(&moved.db, moved.aggregate).await,
+            format!("{pd}/root")
+        );
+        assert_eq!(
+            item_path(&moved.db, moved.user_root).await,
+            format!("{pd}/root/default")
+        );
+        assert_eq!(
+            item_path(&moved.db, moved.library).await,
+            format!("{pd}/root/default/Movies")
+        );
+        assert_eq!(
+            item_path(&moved.db, Uuid::from_u128(0xa6)).await,
+            format!("{pd}/data/collections/Heist [boxset]")
+        );
+        assert_eq!(
+            item_path(&moved.db, MOVIE).await,
+            "/srv/media/movies/Honeyland (2019)"
+        );
+        assert_eq!(
+            item_path(&moved.db, PLAYLISTS).await,
+            "%AppDataPath%/playlists"
+        );
+        let mut expected = vec![
+            format!("{pd}/metadata/library/cf/cf75/poster.jpg"),
+            // No file at the new place: the row keeps its path.
+            format!("{old}/metadata/library/gone/poster.jpg"),
+            format!("{old}/metadata-other/poster.jpg"),
+            "/srv/media/movies/Honeyland (2019)/fanart.jpg".to_owned(),
+            "%MetadataPath%/library/ab/abcd/poster.jpg".to_owned(),
+        ];
+        expected.sort();
+        assert_eq!(image_paths(&moved.db).await, expected);
+    }
+
+    #[tokio::test]
+    async fn a_database_whose_aggregate_root_v1_4_already_repathed_is_still_rebased() {
+        let moved = moved(Previous::Elsewhere).await;
+        let pd = moved.pd();
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(moved.aggregate))
+            .bind(format!("{pd}/root"))
+            .execute(moved.db.writer())
+            .await
+            .unwrap();
+
+        let rebased = moved.rebase().await;
+
+        assert_eq!(
+            rebased.map(|r| (r.from, r.rows)),
+            Some((vec![moved.old.clone()], 8))
+        );
+        assert_eq!(
+            item_path(&moved.db, moved.library).await,
+            format!("{pd}/root/default/Movies")
+        );
+        assert!(
+            image_paths(&moved.db)
+                .await
+                .contains(&format!("{pd}/metadata/library/cf/cf75/poster.jpg"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_start_writes_nothing() {
+        let moved = moved(Previous::Elsewhere).await;
+        moved.rebase().await;
+
+        assert_eq!(moved.rebase().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_row_saved_after_the_plan_keeps_its_value() {
+        let moved = moved(Previous::Elsewhere).await;
+        let plan = plan_rebase(
+            &moved.db,
+            &derivation(&moved.program_data),
+            &dirs(&moved.program_data),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // The previous version, still running, saves the library meanwhile.
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = '/saved/meanwhile' WHERE "Id" = ?1"#)
+            .bind(guid_to_db(moved.library))
+            .execute(moved.db.writer())
+            .await
+            .unwrap();
+
+        let applied = apply_rebase(&moved.db, &plan).await.unwrap();
+
+        assert_eq!(applied.map(|r| r.rows), Some(8));
+        assert_eq!(
+            item_path(&moved.db, moved.library).await,
+            "/saved/meanwhile"
+        );
+        assert_eq!(
+            apply_rebase(&moved.db, &plan).await.unwrap(),
+            None,
+            "a plan none of whose rows still holds the path read rewrites nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_copy_left_under_this_server_s_directories_keeps_its_row() {
+        // `/var/lib/ferrofin/data` copied, not moved, to `/var/lib/ferrofin`:
+        // the old copy sits inside this server's data directory and works.
+        let moved = moved(Previous::Child).await;
+        let left = format!("{}/metadata/library/cf/cf75/poster.jpg", moved.old);
+        touch(Path::new(&left));
+
+        moved.rebase().await;
+
+        assert!(image_paths(&moved.db).await.contains(&left));
+    }
+
+    #[tokio::test]
+    async fn rows_under_two_previous_directories_are_each_rebased() {
+        // Adopted from Jellyfin, then the Ferrofin data directory moved too:
+        // the library folder names the second directory.
+        let moved = moved(Previous::Elsewhere).await;
+        let pd = moved.pd();
+        let second = "/var/lib/ferrofin/data";
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(moved.library))
+            .bind(format!("{second}/root/default/Movies"))
+            .execute(moved.db.writer())
+            .await
+            .unwrap();
+        seed_image(
+            &moved.db,
+            MOVIE,
+            &format!("{second}/metadata/library/cf/cf75/poster.jpg"),
+        )
+        .await;
+
+        let rebased = moved.rebase().await.unwrap();
+
+        let mut from = vec![moved.old.clone(), second.to_owned()];
+        from.sort();
+        assert_eq!(rebased.from, from);
+        assert_eq!(
+            item_path(&moved.db, moved.library).await,
+            format!("{pd}/root/default/Movies")
+        );
+        let poster = format!("{pd}/metadata/library/cf/cf75/poster.jpg");
+        let images = image_paths(&moved.db).await;
+        assert_eq!(images.iter().filter(|path| **path == poster).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_database_with_legacy_lowercase_ids_is_not_found_moved() {
+        let moved = moved(Previous::Elsewhere).await;
+
+        let rebased = rebase_program_data_paths(
+            &moved.db,
+            &IdDerivation::LegacyLowercase,
+            &dirs(&moved.program_data),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rebased, None);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_did_not_move_writes_nothing() {
+        let moved = moved(Previous::Elsewhere).await;
+        let pd = moved.pd();
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "Path" = ?1 || substr("Path", length(?2) + 1)
+               WHERE substr("Path", 1, length(?2) + 1) = ?2 || '/'"#,
+        )
+        .bind(&pd)
+        .bind(&moved.old)
+        .execute(moved.db.writer())
+        .await
+        .unwrap();
+
+        assert_eq!(moved.rebase().await, None);
+        assert!(
+            image_paths(&moved.db).await.contains(&format!(
+                "{}/metadata/library/cf/cf75/poster.jpg",
+                moved.old
+            )),
+            "paths under a directory no root row names are not this repair's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_root_row_outside_a_program_data_layout_is_no_evidence_of_a_move() {
+        let moved = moved(Previous::Elsewhere).await;
+        for (id, path) in [
+            (moved.aggregate, "/srv/library"),
+            (moved.user_root, "/srv/library/default"),
+            (moved.library, "/srv/Movies"),
+        ] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(path)
+                .execute(moved.db.writer())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(moved.rebase().await, None);
+        assert_eq!(item_path(&moved.db, moved.aggregate).await, "/srv/library");
+    }
+
+    #[tokio::test]
+    async fn a_library_row_whose_id_is_not_its_name_s_is_no_evidence_of_a_move() {
+        let moved = moved(Previous::Elsewhere).await;
+        for id in [moved.aggregate, moved.user_root, moved.library] {
+            sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .execute(moved.db.writer())
+                .await
+                .unwrap();
+        }
+        seed(
+            &moved.db,
+            Uuid::from_u128(0xa7),
+            BaseItemKind::CollectionFolder,
+            &format!("{}/root/default/Movies", moved.old),
+        )
+        .await;
+
+        assert_eq!(moved.rebase().await, None);
+    }
+
+    #[tokio::test]
+    async fn profile_images_move_under_the_folder_name_they_were_saved_with() {
+        let moved = moved(Previous::Elsewhere).await;
+        let pd = moved.pd();
+        // Renamed since: the folder still has the name the image was saved under.
+        seed_named_user(&moved.db, USER, "giles").await;
+        // Whose image was never copied.
+        seed_named_user(&moved.db, Uuid::from_u128(0xa8), "nobody").await;
+        touch(&moved.program_data.join("config/users/gilesw/profile.png"));
+        // Debian's `/etc/jellyfin`, copied: the original is still there.
+        let etc = moved.temp.path().join("etc/jellyfin/users");
+        let (copied, missing) = (
+            etc.join("gilesw/profile.png")
+                .to_string_lossy()
+                .into_owned(),
+            etc.join("nobody/profile.png")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        touch(Path::new(&copied));
+        for (user, path) in [(USER, &copied), (Uuid::from_u128(0xa8), &missing)] {
+            sqlx::query(
+                r#"INSERT INTO "ImageInfos" ("LastModified", "Path", "UserId") VALUES ('2026-01-01', ?1, ?2)"#,
+            )
+            .bind(path)
+            .bind(guid_to_db(user))
+            .execute(moved.db.writer())
+            .await
+            .unwrap();
+        }
+
+        moved.rebase().await;
+
+        let paths: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "ImageInfos" ORDER BY "Path""#)
+                .fetch_all(moved.db.writer())
+                .await
+                .unwrap();
+        let mut expected = vec![missing, format!("{pd}/config/users/gilesw/profile.png")];
+        expected.sort();
+        assert_eq!(paths, expected);
     }
 }

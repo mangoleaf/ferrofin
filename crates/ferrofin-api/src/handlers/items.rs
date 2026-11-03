@@ -58,13 +58,14 @@ pub(crate) async fn require_visible_item(
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))
 }
 
-/// Refuses a scope the user may not open, as `ItemsController` refuses a
-/// library: a `401`, before the query runs.
+/// Refuses a scope the user may not open: a `403`, before the query runs.
 ///
-/// Divergence (owner decision 2026-10-31, gl-1091): library access is a hard
-/// boundary on every route that takes a scope, where upstream applies
-/// `IsVisible` on `GET /Items` alone. A library or a view keeps `IsVisible`, so
-/// the hottest browse pays nothing more; anything else takes
+/// Divergence (owner decisions 2026-10-31 and 2026-11-01, gl-1091, gl-1136):
+/// library access is a hard boundary on every route that takes a scope, where
+/// upstream applies `IsVisible` on `GET /Items` alone and answers `401`. The
+/// user is authorized and policy forbids the scope, and a client can read a
+/// `401` as a dead session and sign them out. A library or a view keeps
+/// `IsVisible`, so the hottest browse pays nothing more; anything else takes
 /// `IsVisibleStandalone`, which walks up to the library. An API key is exempt,
 /// as upstream ("api keys can always access all folders"), and with no user
 /// there is nobody to refuse.
@@ -91,7 +92,9 @@ pub(crate) async fn require_scope_visible(
     if visible {
         Ok(())
     } else {
-        Err(ApiError::Unauthorized("Unauthorized access".into()))
+        Err(ApiError::Forbidden(
+            "Access to this item is not permitted".into(),
+        ))
     }
 }
 
@@ -203,7 +206,7 @@ pub(crate) async fn resolve_user(
     state: &AppState,
     auth: &AuthorizationInfo,
     user_id: Option<Uuid>,
-) -> Result<UserEntity, ApiError> {
+) -> Result<Arc<UserEntity>, ApiError> {
     let effective = effective_user_id(state, auth, user_id).await?;
     if effective.is_nil() {
         return Err(ApiError::BadRequest("no user for request".to_owned()));
@@ -225,7 +228,7 @@ pub(crate) async fn resolve_user_or_api_key(
     state: &AppState,
     auth: &AuthorizationInfo,
     user_id: Option<Uuid>,
-) -> Result<Option<UserEntity>, ApiError> {
+) -> Result<Option<Arc<UserEntity>>, ApiError> {
     let effective = effective_user_id(state, auth, user_id).await?;
     if effective.is_nil() {
         return if auth.is_api_key {
@@ -243,18 +246,19 @@ async fn load_user(
     state: &AppState,
     auth: &AuthorizationInfo,
     effective: Uuid,
-) -> Result<UserEntity, ApiError> {
-    // The auth layer already loaded the caller's row — reuse it instead of
-    // re-fetching the identical user on every user-scoped request.
+) -> Result<Arc<UserEntity>, ApiError> {
+    // The auth layer already loaded the caller's row — share it instead of
+    // re-fetching (or copying) the identical user on every user-scoped request.
     if effective == auth.user_id()
         && let Some(user) = &auth.user
     {
-        return Ok(user.clone());
+        return Ok(Arc::clone(user));
     }
     state
         .users
         .get_user_by_id(effective)
         .await?
+        .map(Arc::new)
         .ok_or_else(|| ApiError::NotFound(format!("user {effective}")))
 }
 
@@ -291,7 +295,7 @@ pub(crate) async fn resolve_user_opt(
     state: &AppState,
     auth: &AuthorizationInfo,
     user_id: Option<Uuid>,
-) -> Result<Option<UserEntity>, ApiError> {
+) -> Result<Option<Arc<UserEntity>>, ApiError> {
     let effective = effective_user_id(state, auth, user_id).await?;
     if effective.is_nil() {
         return Ok(None);
@@ -300,9 +304,9 @@ pub(crate) async fn resolve_user_opt(
     if effective == auth.user_id()
         && let Some(user) = &auth.user
     {
-        return Ok(Some(user.clone()));
+        return Ok(Some(Arc::clone(user)));
     }
-    Ok(state.users.get_user_by_id(effective).await?)
+    Ok(state.users.get_user_by_id(effective).await?.map(Arc::new))
 }
 
 /// The query parameters honoured by `GET /Items`.
@@ -822,12 +826,18 @@ async fn get_items(
     let dtos = if linked_children {
         state
             .dto
-            .get_linked_children_dtos(&result.items, &options, internal.user.as_ref())
+            .get_linked_children_dtos(&result.items, &options, internal.user.as_deref())
             .await?
     } else {
         state
             .dto
-            .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
+            .get_base_item_dtos(
+                &result.items,
+                &options,
+                internal.user.as_deref(),
+                None,
+                true,
+            )
             .await?
     };
     Ok(Json(QueryResult::new(
@@ -1026,7 +1036,7 @@ fn official_rating_score(
 /// Convert HTTP query fields once, retaining the resolved user for DTO projection.
 fn items_query_options(
     query: &ItemsQuery,
-    user: Option<UserEntity>,
+    user: Option<Arc<UserEntity>>,
 ) -> Result<InternalItemsQuery, ApiError> {
     Ok(InternalItemsQuery {
         user,
@@ -1379,11 +1389,19 @@ fn delete_with_files() -> DeleteOptions {
 async fn delete_one(state: &AppState, auth: &AuthorizationInfo, id: Uuid) -> Result<(), ApiError> {
     let item = state
         .library
-        .get_item_by_id_for_user(id, auth.user.as_ref())
+        .get_item_by_id_for_user(id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {id}")))?;
     require_can_delete(state, auth, &item).await?;
     state.library.delete_item(id, &delete_with_files()).await?;
+    // A recording is this item upstream, so `/LiveTv/Recordings` ends with it.
+    // The delete has happened, so a failure here does not undo that answer.
+    let path = item.path.as_deref().filter(|path| !path.is_empty());
+    if let (Some(live_tv), Some(path)) = (state.live_tv.as_ref(), path)
+        && let Err(error) = live_tv.forget_recordings(path).await
+    {
+        tracing::warn!(item_id = %id, %error, "could not forget a deleted item's recordings");
+    }
     Ok(())
 }
 
@@ -1654,7 +1672,7 @@ async fn get_ancestors(
     Query(query): Query<AncestorsQuery>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
-    require_visible_item(&state, item_id, user.as_ref()).await?;
+    require_visible_item(&state, item_id, user.as_deref()).await?;
     let mut chain = state
         .library
         .get_ancestors(item_id)
@@ -1690,7 +1708,7 @@ async fn get_ancestors(
     let options = DtoOptions::default();
     let dtos = state
         .dto
-        .get_base_item_dtos(&ancestors, &options, user.as_ref(), None, true)
+        .get_base_item_dtos(&ancestors, &options, user.as_deref(), None, true)
         .await?;
     Ok(Json(dtos))
 }
@@ -1870,13 +1888,7 @@ async fn get_resume_items(
     //          .Select(i => i.Id).ToArray();` (:952-961)
     let mut ancestor_ids: Vec<Uuid> = Vec::new();
     if query.parent_id.is_none_or(|id| id.is_nil()) {
-        let exclude_folder_ids = state
-            .users
-            .get_user_dto(&user, None)
-            .await?
-            .configuration
-            .map(|c| c.latest_items_excludes)
-            .unwrap_or_default();
+        let exclude_folder_ids = state.users.latest_items_excludes(&user).await?;
         if !exclude_folder_ids.is_empty() {
             // `GetUserRootFolder().GetChildren(user, true)` — the user-root
             // children the USER can see (`Folder.IsVisible`: blocked-/enabled-
@@ -1914,8 +1926,8 @@ async fn get_resume_items(
     };
 
     // The user row moves into the query and is borrowed back out for the DTO
-    // projection below — `resolve_user` already cloned it off the auth context,
-    // and a second full copy of every string on it buys nothing.
+    // projection below — it is the auth context's shared row (`resolve_user`),
+    // and the query holds the same handle rather than a copy.
     let mut internal = InternalItemsQuery {
         user: Some(user),
         start_index: query.start_index,
@@ -1936,14 +1948,20 @@ async fn get_resume_items(
         ..InternalItemsQuery::default()
     };
     if let Some(parent) = query.parent_id {
-        require_scope_id_visible(&state, &auth, Some(parent), internal.user.as_ref()).await?;
+        require_scope_id_visible(&state, &auth, Some(parent), internal.user.as_deref()).await?;
         internal.parent_id = parent;
     }
 
     let result = state.library.query_items(&internal).await?;
     let dtos = state
         .dto
-        .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
+        .get_base_item_dtos(
+            &result.items,
+            &options,
+            internal.user.as_deref(),
+            None,
+            true,
+        )
         .await?;
     Ok(Json(QueryResult::new(
         Some(result.start_index),
@@ -2018,10 +2036,9 @@ fn is_direct_children_browse(short_type_name: &str) -> bool {
     )
 }
 
-/// ItemsController refuses an explicit parent the user may not open with a 401,
-/// and API keys bypass this gate; see [`require_scope_visible`], which is
-/// stricter than upstream's `IsVisible`. Container-only browses re-root to
-/// UserRootFolder before the check.
+/// An explicit parent the user may not open is refused, and API keys bypass this
+/// gate: see [`require_scope_visible`], which is stricter than upstream's
+/// `IsVisible`. A container-only browse is held to the parent it names too.
 /// Whether the parent is itself a library, and a `boxsets` one, is left in
 /// `library` for the library browse defaults ([`apply_library_browse_defaults`]).
 async fn check_parent_visibility(
@@ -2035,19 +2052,23 @@ async fn check_parent_visibility(
     if query.parent_id.is_nil() {
         return Ok((None, true));
     }
-    let parent = state
-        .library
-        .get_item_by_id(query.parent_id)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest(format!("Invalid parent id: {}", query.parent_id)))?;
+    let parent = Arc::new(
+        state
+            .library
+            .get_item_by_id(query.parent_id)
+            .await?
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("Invalid parent id: {}", query.parent_id))
+            })?,
+    );
     let kind = parent.type_.rsplit('.').next().unwrap_or(&parent.type_);
-    let rerooted = matches!(
-        query.include_item_types.as_slice(),
-        [BaseItemKind::BoxSet | BaseItemKind::Playlist]
-    ) && !matches!(kind, "BoxSet" | "Playlist");
-    if kind != "UserRootFolder" && !rerooted {
-        require_scope_visible(state, auth, &parent, query.user.as_ref()).await?;
+    if kind != "UserRootFolder" {
+        require_scope_visible(state, auth, &parent, query.user.as_deref()).await?;
     }
+    // The query carries the row, as upstream's controller works from the
+    // item `GetParentItem` read: the container redirect, the folder display
+    // policy and the repository's scope use it instead of reading it again.
+    query.parent_row = Some(Arc::clone(&parent));
     let kind_from = |row: &ferrofin_db::entities::base_items::BaseItemEntity| {
         serde_json::from_value(serde_json::Value::String(
             row.type_
@@ -2133,13 +2154,15 @@ async fn check_parent_visibility(
     if let Some(parent_id) = parent_id
         && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
     {
-        if !query.recursive || kind_from(&query_parent) == Some(BaseItemKind::Season) {
+        let (kind, folder_policy) = (kind_from(&query_parent), !is_channel(&query_parent));
+        if !query.recursive || kind == Some(BaseItemKind::Season) {
             // A default view delegates to that Season's GetItemsInternal even
             // for recursive requests; its aired selection needs the real row.
             query.parent_id = parent_id;
             query.user_root_children = false;
+            query.parent_row = Some(Arc::new(query_parent));
         }
-        return Ok((kind_from(&query_parent), !is_channel(&query_parent)));
+        return Ok((kind, folder_policy));
     }
     Ok((kind_from(&parent), false))
 }
@@ -2247,8 +2270,13 @@ async fn redirect_container_browse(
     if internal.parent_id.is_nil() {
         return;
     }
-    let Ok(Some(parent)) = state.library.get_item_by_id(internal.parent_id).await else {
-        return;
+    let parent = if let Some(row) = internal.known_parent_row() {
+        Arc::clone(row)
+    } else {
+        let Ok(Some(row)) = state.library.get_item_by_id(internal.parent_id).await else {
+            return;
+        };
+        Arc::new(row)
     };
     // The parent is itself a container of the requested kind → a direct
     // children browse, no re-rooting (C# `item is not BoxSet/Playlist`).
@@ -2447,7 +2475,7 @@ mod tests {
         let caller = fake_user_entity(Uuid::from_u128(1), "caller");
         let other = fake_user_entity(Uuid::from_u128(2), "other");
         let auth = |policy: Option<UserPolicy>| AuthorizationInfo {
-            user: Some(caller.clone()),
+            user: Some(Arc::new(caller.clone())),
             user_policy: policy.map(std::sync::Arc::new),
             is_authenticated: true,
             ..AuthorizationInfo::default()
@@ -2516,7 +2544,7 @@ mod tests {
         ] {
             let parent_id = Uuid::new_v4();
             let mut query = InternalItemsQuery {
-                user: Some(crate::test_support::sample_user()),
+                user: Some(Arc::new(crate::test_support::sample_user())),
                 parent_id,
                 parent_type: parent,
                 include_item_types: vec![BaseItemKind::Audio],
@@ -2659,7 +2687,8 @@ mod tests {
             let Query(query) =
                 Query::<ItemsQuery>::try_from_uri(&format!("/Items?{q}").parse().expect("uri"))
                     .expect(q);
-            items_query_options(&query, Some(crate::test_support::sample_user())).expect("maps")
+            items_query_options(&query, Some(Arc::new(crate::test_support::sample_user())))
+                .expect("maps")
         };
         let internal = bind("audioLanguages=eng,ger&subtitleLanguages=fre");
         assert_eq!(internal.audio_languages, ["eng", "ger"]);
@@ -2688,7 +2717,8 @@ mod tests {
         )
         .expect("binds");
         let internal =
-            items_query_options(&query, Some(crate::test_support::sample_user())).expect("maps");
+            items_query_options(&query, Some(Arc::new(crate::test_support::sample_user())))
+                .expect("maps");
         assert_eq!(
             (internal.is_missing, internal.is_unaired),
             (Some(false), Some(true))

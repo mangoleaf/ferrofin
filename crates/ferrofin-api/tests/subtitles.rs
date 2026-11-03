@@ -1240,7 +1240,7 @@ async fn subtitle_management_gates_every_operation_but_deletion_requires_admin()
         let info = AuthorizationInfo {
             is_authenticated: true,
             is_api_key: api_key,
-            user: (!api_key).then(sample_user),
+            user: (!api_key).then(sample_user).map(Arc::new),
             user_policy: Some(Arc::new(UserPolicy {
                 is_administrator: admin,
                 enable_subtitle_management: enabled,

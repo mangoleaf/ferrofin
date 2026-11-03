@@ -174,7 +174,8 @@ impl FerrofinTvSeriesManager {
     /// row, and asking for every folder (seasons, albums, artists — 1,975 on
     /// the bench fixture) against the retired `CROSS JOIN` shape made that
     /// 10 M index probes and a 1.4 s home screen. The service maps each
-    /// collection folder to its physical folders, as
+    /// collection folder to its physical folders, and a view (a grouped view
+    /// an explicit `parentId` names) to the libraries behind it, as
     /// `LibraryManager.GetNextUpSeriesKeys` does.
     async fn resolve_parents(
         &self,
@@ -199,7 +200,7 @@ impl FerrofinTvSeriesManager {
         // answers no parents and Next Up is empty, rather than every folder
         // in the library.
         let query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             user_root_children: true,
             include_item_types: vec![
                 BaseItemKind::CollectionFolder,
@@ -256,8 +257,10 @@ impl FerrofinTvSeriesManager {
         let include_rewatching = request.enable_rewatching;
 
         let query = InternalItemsQuery {
-            user: Some(user.clone()),
-            dto_options: dto_options.clone(),
+            user: Some(Arc::new(user.clone())),
+            // The trait hands in `&DtoOptions`: one copy here, as before; the
+            // query's own clones then share it.
+            dto_options: Arc::new(dto_options.clone()),
             ..InternalItemsQuery::default()
         };
 
@@ -559,7 +562,7 @@ impl TvSeriesManager for FerrofinTvSeriesManager {
         // the resumable/specials rules can drop any of them — 12 items where
         // v12 answers 16.
         let keys_query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             top_parent_ids: parents,
             ..InternalItemsQuery::default()
         };

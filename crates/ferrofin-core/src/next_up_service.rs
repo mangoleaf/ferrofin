@@ -22,7 +22,10 @@
 //! per series. One next-up request costs:
 //!
 //! * 1 query mapping the scope's collection folders to their physical
-//!   folders, then 1 for the eligible series keys ([`get_next_up_series_keys`]);
+//!   folders (none while the library set is cached), 1 reading the views
+//!   among the other parents when there are any (plus the grouping arm's own
+//!   reads when one is a grouped view), then 1 for the eligible series keys
+//!   ([`get_next_up_series_keys`]);
 //! * 1 query for the projection of every episode of those series joined to the
 //!   user's `UserData` — `(id, season, episode, premiere date, virtual,
 //!   version group, played, resume position, last played)` — from which the
@@ -33,7 +36,9 @@
 //! * 1 query for the full rows of the episodes on the page the manager settled
 //!   on ([`get_next_up_episode_rows`]), none when no episode is on it.
 //!
-//! So 4 round-trips in the default configuration and 5 with specials on. Unlike
+//! So 4 round-trips in the default configuration, one more when the scope holds
+//! a parent other than a library with physical folders (the playlists folder
+//! the default scope lists, a view), and one more with specials on. Unlike
 //! C#, the batch loads no full row but the specials': its picks and last watched
 //! episodes come from the projection, so an episode picked outside the requested
 //! page never has its row read, and a last watched row is never read.
@@ -47,6 +52,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
 use ferrofin_model::data::BaseItemKind;
 use uuid::Uuid;
@@ -61,7 +67,7 @@ use ferrofin_db::enums::LinkedChildType;
 use sqlx::{QueryBuilder, Sqlite};
 
 use crate::db_error::db_err;
-use crate::item_repository::library_top_parents_by_view;
+use crate::item_repository::{library_top_parents_by_view, view_top_parent_ids};
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{PLACEHOLDER_ID, TopParentTerm, push_access_filter};
 
@@ -120,10 +126,19 @@ impl FerrofinNextUpService {
     /// `LibraryManager.GetNextUpSeriesKeys`'s `SetTopParentIdsOrAncestors`
     /// step, per parent (`GetTopParentIdsForQuery`): a collection folder
     /// contributes its `PhysicalFolderIds` and itself (what the rows a
-    /// Ferrofin scan saved carry, `library_top_parents_by_view`), anything
-    /// else — a Live TV or playlists view, a physical folder, or any id on a
-    /// Ferrofin-written database where the view IS the top parent —
-    /// contributes itself.
+    /// Ferrofin scan saved carry, `library_top_parents_by_view`); a
+    /// `UserView` the libraries behind it (`view_top_parent_ids`: a grouped
+    /// view the libraries `user` grouped into it, a view with a
+    /// `DisplayParentId` that library, a Live TV view itself); anything else
+    /// — a playlists folder, a physical folder, or a collection folder with
+    /// no `PhysicalFolderIds` — contributes itself.
+    ///
+    /// A scope whose every parent is a view standing for no library matches
+    /// nothing: upstream then sets `AncestorIds` and leaves `TopParentIds`
+    /// empty, and its keys statement, which filters on `TopParentIds` alone,
+    /// matches nothing. An empty list would match nothing in the keys statement
+    /// here too, but the batch's access filter reads it as no scope, so the
+    /// placeholder id stands in for it.
     ///
     /// The manager hands over the user's library folders (3–7 ids), and this
     /// list must stay that small: the keys statement's `TopParentId IN (…)`
@@ -131,14 +146,28 @@ impl FerrofinNextUpService {
     /// library (seasons, albums, artists — 1,975 on the bench fixture)
     /// against the retired `CROSS JOIN` shape, which walked it once per
     /// `UserData` row, is what made the statement 10 M index probes and 1.4 s.
-    async fn top_parent_ids(&self, parents: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
-        let by_view = library_top_parents_by_view(&self.db, parents).await?;
+    /// A grouped view adds only the grouped libraries' ids.
+    async fn top_parent_ids(
+        &self,
+        parents: &[Uuid],
+        user: &UserEntity,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        let by_library = library_top_parents_by_view(&self.db, parents).await?;
+        let others: Vec<Uuid> = parents
+            .iter()
+            .filter(|id| !by_library.contains_key(id))
+            .copied()
+            .collect();
+        let by_view = view_top_parent_ids(&self.db, &others, Some(user)).await?;
         let mut out = Vec::with_capacity(parents.len());
         for id in parents {
-            match by_view.get(id) {
+            match by_library.get(id).or_else(|| by_view.get(id)) {
                 Some(folders) => out.extend(folders.iter().copied()),
                 None => out.push(*id),
             }
+        }
+        if out.is_empty() && !parents.is_empty() {
+            out.push(Uuid::parse_str(PLACEHOLDER_ID).unwrap_or_else(|_| Uuid::nil()));
         }
         Ok(out)
     }
@@ -265,7 +294,7 @@ impl NextUpService for FerrofinNextUpService {
             return Ok(Vec::new());
         }
         let episode_type = Self::episode_type()?;
-        let top_parents = self.top_parent_ids(&filter.top_parent_ids).await?;
+        let top_parents = self.top_parent_ids(&filter.top_parent_ids, user).await?;
 
         // Series (by presentation key) whose most-recently-played episode within
         // the requested libraries is at/after the cutoff, newest first.
@@ -309,7 +338,7 @@ impl NextUpService for FerrofinNextUpService {
         let top_parents = if filter.top_parent_ids.is_empty() {
             Vec::new()
         } else {
-            self.top_parent_ids(&filter.top_parent_ids).await?
+            self.top_parent_ids(&filter.top_parent_ids, user).await?
         };
         let access = Access {
             filter,
@@ -919,11 +948,12 @@ mod tests {
     use super::FerrofinNextUpService;
     use crate::test_support::{
         clear_index_number, corrupt_last_played_date, seed_episode, seed_item_with_data, seed_user,
-        seed_user_data, test_db,
+        seed_user_data, seed_user_with_defaults, test_db,
     };
     use chrono::{DateTime, Utc};
     use ferrofin_db::Database;
     use ferrofin_db::entities::users::UserEntity;
+    use ferrofin_db::enums::PreferenceKind;
     use ferrofin_db::store::{datetime_to_db, guid_to_db};
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_traits::options::InternalItemsQuery;
@@ -937,7 +967,7 @@ mod tests {
 
     fn query_for(user: UserEntity, top_parent: Uuid) -> InternalItemsQuery {
         InternalItemsQuery {
-            user: Some(user),
+            user: Some(std::sync::Arc::new(user)),
             top_parent_ids: vec![top_parent],
             ..Default::default()
         }
@@ -1041,6 +1071,111 @@ mod tests {
             .await
             .expect("keys");
         assert_eq!(keys, vec!["series-a".to_owned()]);
+    }
+
+    /// A view scope stands for the libraries behind it (`GetTopParentIdsForQuery`,
+    /// which `SetTopParentIdsOrAncestors` runs on every parent): a grouped view
+    /// for each library the user grouped into it, a view with a
+    /// `DisplayParentId` for that library, each library by its
+    /// `PhysicalFolderIds` and itself. No row carries a view as its
+    /// `TopParentId`. A view that stands for no library — a movies view when
+    /// only TV libraries are grouped — matches nothing, never the whole server,
+    /// in the keys statement and in the batch alike.
+    #[tokio::test]
+    async fn series_keys_scope_resolves_a_view_to_the_libraries_behind_it() {
+        let db = test_db().await;
+        let id = |n: u128| Uuid::from_u128(0x1120_0000 + n);
+        let (grouped_one, grouped_two, ungrouped) = (id(1), id(2), id(3));
+        let (tv_view, movies_view, library_view) = (id(4), id(5), id(6));
+        // An adopted library: its items hang off the physical folder.
+        let physical = id(8);
+        seed_item_with_data(
+            &db,
+            grouped_one,
+            BaseItemKind::CollectionFolder,
+            "Shows One",
+            &format!(
+                r#"{{"CollectionType":"tvshows","PhysicalFolderIds":["{}"]}}"#,
+                physical.simple()
+            ),
+        )
+        .await;
+        for (library, name) in [(grouped_two, "Shows Two"), (ungrouped, "Shows Three")] {
+            seed_item_with_data(
+                &db,
+                library,
+                BaseItemKind::CollectionFolder,
+                name,
+                r#"{"CollectionType":"tvshows"}"#,
+            )
+            .await;
+        }
+        let user = seed_user_with_defaults(&db, id(7)).await;
+        crate::user_entity_ext::set_preference(
+            &db,
+            &user.id,
+            PreferenceKind::GroupedFolders,
+            &[guid_to_db(grouped_one), guid_to_db(grouped_two)],
+        )
+        .await
+        .expect("group the libraries");
+        for (view, data) in [
+            (tv_view, r#"{"ViewType":"tvshows"}"#.to_owned()),
+            (movies_view, r#"{"ViewType":"movies"}"#.to_owned()),
+            (
+                library_view,
+                format!(r#"{{"ViewType":"tvshows","DisplayParentId":"{ungrouped}"}}"#),
+            ),
+        ] {
+            seed_item_with_data(&db, view, BaseItemKind::UserView, "View", &data).await;
+        }
+
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let (in_physical, in_grouped, in_ungrouped, next) = (id(10), id(11), id(12), id(13));
+        seed_episode(&db, in_physical, "series-a", 1, 1, false, Some(physical)).await;
+        seed_episode(&db, in_grouped, "series-b", 1, 1, false, Some(grouped_two)).await;
+        seed_episode(&db, next, "series-b", 1, 2, false, Some(grouped_two)).await;
+        seed_episode(&db, in_ungrouped, "series-c", 1, 1, false, Some(ungrouped)).await;
+        for (episode, played) in [
+            (in_physical, "2019-01-01T00:00:00Z"),
+            (in_grouped, "2021-01-01T00:00:00Z"),
+            (in_ungrouped, "2020-01-01T00:00:00Z"),
+        ] {
+            seed_user_data(&db, user_id, episode, true, Some(ts(played))).await;
+        }
+
+        let svc = FerrofinNextUpService::new(db);
+        let keys = |view| {
+            let query = query_for(user.clone(), view);
+            let svc = svc.clone();
+            async move {
+                svc.get_next_up_series_keys(&query, ts("2000-01-01T00:00:00Z"))
+                    .await
+                    .expect("keys")
+            }
+        };
+        assert_eq!(
+            keys(tv_view).await,
+            vec!["series-b".to_owned(), "series-a".to_owned()]
+        );
+        assert_eq!(keys(library_view).await, vec!["series-c".to_owned()]);
+        assert_eq!(keys(movies_view).await, Vec::<String>::new());
+
+        // A batch given a scope reads it the same way. The manager hands the
+        // batch none (as upstream does), so this guards the service's contract.
+        let next_up = |view| {
+            let query = query_for(user.clone(), view);
+            let svc = svc.clone();
+            async move {
+                svc.get_next_up_episodes_batch(&query, &["series-b".to_owned()], false, false)
+                    .await
+                    .expect("batch")
+                    .get("series-b")
+                    .and_then(|result| result.next_up.as_ref().map(|e| e.id.clone()))
+            }
+        };
+        assert_eq!(next_up(tv_view).await, Some(guid_to_db(next)));
+        assert_eq!(next_up(movies_view).await, None);
     }
 
     #[tokio::test]

@@ -129,9 +129,9 @@ async fn get_persons(
     Query(query): Query<PersonsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
-    let user_id = user.as_ref().map(user_uuid).transpose()?;
+    let user_id = user.as_deref().map(user_uuid).transpose()?;
     for scope in [query.parent_id, query.appears_in_item_id] {
-        crate::handlers::items::require_scope_id_visible(&state, &auth, scope, user.as_ref())
+        crate::handlers::items::require_scope_id_visible(&state, &auth, scope, user.as_deref())
             .await?;
     }
     // C# folds `filters ∋ IsFavorite` onto the tri-state when `isFavorite` is
@@ -171,7 +171,7 @@ async fn get_persons(
         query.enable_image_types.as_deref(),
     );
     // People carry no aggregated counts (Jellyfin passes none here).
-    let projected = project_item_rows(&state, result, &options, user.as_ref()).await?;
+    let projected = project_item_rows(&state, result, &options, user.as_deref()).await?;
     Ok(Json(projected))
 }
 
@@ -204,7 +204,7 @@ async fn get_person(
     let options = DtoOptions::default();
     let dto = state
         .dto
-        .get_base_item_dto(&item, &options, user.as_ref(), None)
+        .get_base_item_dto(&item, &options, user.as_deref(), None)
         .await?;
     Ok(Json(dto))
 }

@@ -113,7 +113,7 @@ impl FerrofinSearchManager {
     /// `ORDER BY`.
     fn to_item_query(
         query: &SearchQuery,
-        user: Option<ferrofin_db::entities::users::UserEntity>,
+        user: Option<std::sync::Arc<ferrofin_db::entities::users::UserEntity>>,
     ) -> InternalItemsQuery {
         /// C# `SearchEngine.AddIfMissing`.
         fn add_if_missing(list: &mut Vec<BaseItemKind>, kind: BaseItemKind) {
@@ -212,7 +212,10 @@ impl FerrofinSearchManager {
         let user = if query.user_id.is_nil() {
             None
         } else {
-            self.users.get_user_by_id(query.user_id).await?
+            self.users
+                .get_user_by_id(query.user_id)
+                .await?
+                .map(std::sync::Arc::new)
         };
         self.items
             .get_item_list(&Self::to_item_query(query, user))

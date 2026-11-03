@@ -25,7 +25,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrofin_core::system_manager::LifecycleController;
+use ferrofin_core::user_manager::LoginBackoffSettings;
 use ferrofin_drawing::ImageLimits;
+use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_model::server_settings::{
     ServerSettingApplies as Applies, ServerSettingDto, ServerSettingGroup as Group,
     ServerSettingKind, ServerSettingSource as Source, ServerSettingsDto, ServerSettingsUpdateDto,
@@ -165,21 +167,6 @@ const ENV_ONLY: &str = "OpenTelemetry's standard variable, read from the environ
 /// filter (`bootstrap::init_tracing`).
 const RUST_LOG: &str = "RUST_LOG";
 
-/// The largest `u32`, the bound of the settings the loader reads as one.
-const U32_MAX: i64 = 4_294_967_295;
-
-/// An integer the loader reads as a `u32`.
-const U32: SettingKind = SettingKind::Integer {
-    min: 0,
-    max: U32_MAX,
-};
-
-/// A count the loader requires to be positive (`resolve_positive`).
-const POSITIVE: SettingKind = SettingKind::Integer {
-    min: 1,
-    max: U32_MAX,
-};
-
 /// A port.
 const PORT: SettingKind = SettingKind::Integer {
     min: 0,
@@ -190,6 +177,42 @@ const PORT: SettingKind = SettingKind::Integer {
 const CACHE_TTL: SettingKind = SettingKind::Integer {
     min: *config::CACHE_TTL_RANGE_SECS.start() as i64,
     max: *config::CACHE_TTL_RANGE_SECS.end() as i64,
+};
+
+/// The statement cache's bounds ([`config::STATEMENT_CACHE_RANGE`]).
+const STATEMENT_CACHE: SettingKind = SettingKind::Integer {
+    min: *config::STATEMENT_CACHE_RANGE.start() as i64,
+    max: *config::STATEMENT_CACHE_RANGE.end() as i64,
+};
+
+/// The transcode caps' bounds ([`TranscodeLimits::RANGE`]).
+const TRANSCODE_CAP: SettingKind = SettingKind::Integer {
+    min: *TranscodeLimits::RANGE.start() as i64,
+    max: *TranscodeLimits::RANGE.end() as i64,
+};
+
+/// The login backoff's attempts ([`LoginBackoffSettings::ATTEMPTS_RANGE`]).
+const LOGIN_BACKOFF_ATTEMPTS: SettingKind = SettingKind::Integer {
+    min: *LoginBackoffSettings::ATTEMPTS_RANGE.start() as i64,
+    max: *LoginBackoffSettings::ATTEMPTS_RANGE.end() as i64,
+};
+
+/// The login backoff's maximum delay ([`LoginBackoffSettings::MAX_DELAY_RANGE_SECS`]).
+const LOGIN_BACKOFF_MAX_DELAY: SettingKind = SettingKind::Integer {
+    min: *LoginBackoffSettings::MAX_DELAY_RANGE_SECS.start() as i64,
+    max: *LoginBackoffSettings::MAX_DELAY_RANGE_SECS.end() as i64,
+};
+
+/// The login backoff's key cap ([`LoginBackoffSettings::MAX_TRACKED_RANGE`]).
+const LOGIN_BACKOFF_MAX_TRACKED: SettingKind = SettingKind::Integer {
+    min: *LoginBackoffSettings::MAX_TRACKED_RANGE.start() as i64,
+    max: *LoginBackoffSettings::MAX_TRACKED_RANGE.end() as i64,
+};
+
+/// The login backoff's window ([`LoginBackoffSettings::WINDOW_RANGE_MINS`]).
+const LOGIN_BACKOFF_WINDOW: SettingKind = SettingKind::Integer {
+    min: *LoginBackoffSettings::WINDOW_RANGE_MINS.start() as i64,
+    max: *LoginBackoffSettings::WINDOW_RANGE_MINS.end() as i64,
 };
 
 /// [`EnvRead::Parsed`] for a variable the loader reads as a `u32`.
@@ -372,11 +395,71 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_QUICK_CONNECT_PENDING_PER_IP"),
         env_read: PARSED_U32,
         group: Group::Network,
-        kind: U32,
+        kind: whole_numbers(config::QUICK_CONNECT_PENDING_PER_IP_RANGE),
         default: "10",
-        description: "Unauthorized Quick Connect requests one client IP may hold at once; 0 \
-                      means the default.",
+        description: "Unauthorized Quick Connect requests one client IP may hold at once.",
         running: |c| json!(c.quick_connect_pending_per_ip),
+        ..ROW
+    },
+    SettingSpec {
+        key: "login_backoff",
+        env: Some("FERROFIN_LOGIN_BACKOFF"),
+        env_read: PARSED_BOOL,
+        group: Group::Network,
+        kind: SettingKind::Bool,
+        default: "true",
+        description: "Make an account's and a client address's next logins wait after \
+                      repeated failures. The backoff never disables an account.",
+        running: |c| json!(c.login_backoff),
+        ..ROW
+    },
+    SettingSpec {
+        key: "login_backoff_attempts",
+        env: Some("FERROFIN_LOGIN_BACKOFF_ATTEMPTS"),
+        env_read: PARSED_U32,
+        group: Group::Network,
+        kind: LOGIN_BACKOFF_ATTEMPTS,
+        default: "5",
+        description: "Failed logins an account or a client address may make before its next \
+                      attempts are made to wait.",
+        running: |c| json!(c.login_backoff_attempts),
+        ..ROW
+    },
+    SettingSpec {
+        key: "login_backoff_max_delay_secs",
+        env: Some("FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS"),
+        env_read: PARSED_U32,
+        group: Group::Network,
+        kind: LOGIN_BACKOFF_MAX_DELAY,
+        default: "30",
+        description: "Longest wait, in seconds, the login backoff gives an attempt. An address \
+                      that would wait longer is refused as a wrong password; an account only \
+                      waits.",
+        running: |c| json!(c.login_backoff_max_delay_secs),
+        ..ROW
+    },
+    SettingSpec {
+        key: "login_backoff_window_mins",
+        env: Some("FERROFIN_LOGIN_BACKOFF_WINDOW_MINS"),
+        env_read: PARSED_U32,
+        group: Group::Network,
+        kind: LOGIN_BACKOFF_WINDOW,
+        default: "15",
+        description: "Minutes the login backoff remembers an account's or an address's failed \
+                      logins after the last one.",
+        running: |c| json!(c.login_backoff_window_mins),
+        ..ROW
+    },
+    SettingSpec {
+        key: "login_backoff_max_tracked",
+        env: Some("FERROFIN_LOGIN_BACKOFF_MAX_TRACKED"),
+        env_read: PARSED_U32,
+        group: Group::Network,
+        kind: LOGIN_BACKOFF_MAX_TRACKED,
+        default: "100000",
+        description: "Most accounts and addresses the login backoff remembers at once; past \
+                      it, the ones not yet made to wait are forgotten first.",
+        running: |c| json!(c.login_backoff_max_tracked),
         ..ROW
     },
     // ---- ffmpeg -----------------------------------------------------------
@@ -413,6 +496,32 @@ pub static SETTINGS: &[SettingSpec] = &[
         description: "Extract chapter images and thumbnails from keyframes only: faster, and \
                       the image may be less typical of the scene.",
         running: |c| json!(c.ffmpeg_img_extract_perf_tradeoff),
+        ..ROW
+    },
+    SettingSpec {
+        key: "max_transcodes",
+        env: Some("FERROFIN_MAX_TRANSCODES"),
+        env_read: PARSED_U32,
+        group: Group::Ffmpeg,
+        kind: TRANSCODE_CAP,
+        default: "0",
+        description: "Most jobs re-encoding a stream the server runs at once; past it a user's \
+                      idle job on the same device is ended, and a new one is refused if that \
+                      makes no room. 0 means no cap.",
+        running: |c| json!(c.max_transcodes),
+        ..ROW
+    },
+    SettingSpec {
+        key: "max_transcodes_per_user",
+        env: Some("FERROFIN_MAX_TRANSCODES_PER_USER"),
+        env_read: PARSED_U32,
+        group: Group::Ffmpeg,
+        kind: TRANSCODE_CAP,
+        default: "0",
+        description: "Most jobs re-encoding a stream one user runs at once; past it their \
+                      idle job on the same device is ended, and a new one is refused if none \
+                      is idle. 0 means no cap.",
+        running: |c| json!(c.max_transcodes_per_user),
         ..ROW
     },
     // ---- Library and database ---------------------------------------------
@@ -456,10 +565,20 @@ pub static SETTINGS: &[SettingSpec] = &[
         ..ROW
     },
     SettingSpec {
+        key: "db_statement_cache",
+        env: Some("FERROFIN_DB_STATEMENT_CACHE"),
+        env_read: EnvRead::NonBlank,
+        kind: STATEMENT_CACHE,
+        default: "200",
+        description: "Prepared statements each SQLite connection keeps.",
+        running: |c| json!(c.db_statement_cache),
+        ..ROW
+    },
+    SettingSpec {
         key: "scan_probe_concurrency",
         env: Some("FERROFIN_SCAN_PROBE_CONCURRENCY"),
         env_read: PARSED_U32,
-        kind: U32,
+        kind: whole_numbers(config::SCAN_PROBE_CONCURRENCY_RANGE),
         default: "8, capped at the cores",
         description: "ffprobe processes a library scan keeps in flight. Keep it low on a \
                       spinning disk or a network mount.",
@@ -470,7 +589,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "scan_progress_every",
         env: Some("FERROFIN_SCAN_PROGRESS_EVERY"),
         env_read: PARSED_U32,
-        kind: U32,
+        kind: whole_numbers(config::SCAN_PROGRESS_EVERY_RANGE),
         default: "100",
         description: "Items between scan-progress log lines; 0 turns them off.",
         running: |c| json!(c.scan_progress_every),
@@ -479,8 +598,8 @@ pub static SETTINGS: &[SettingSpec] = &[
     SettingSpec {
         key: "scan_directory_cache_records",
         env: Some("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS"),
-        env_read: EnvRead::NonBlank,
-        kind: POSITIVE,
+        env_read: PARSED_U32,
+        kind: whole_numbers(config::SCAN_DIRECTORY_CACHE_RECORDS_RANGE),
         default: "100000",
         description: "Directory-listing records one library scan keeps before it lists folders \
                       again.",
@@ -490,8 +609,8 @@ pub static SETTINGS: &[SettingSpec] = &[
     SettingSpec {
         key: "scan_directory_cache_idle_secs",
         env: Some("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS"),
-        env_read: EnvRead::NonBlank,
-        kind: POSITIVE,
+        env_read: PARSED_U32,
+        kind: whole_numbers(config::SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE),
         default: "300",
         description: "Seconds a library scan's directory listings survive unread.",
         running: |c| json!(c.scan_directory_cache_idle_secs),
@@ -514,8 +633,9 @@ pub static SETTINGS: &[SettingSpec] = &[
         env_read: EnvRead::NonBlank,
         kind: CACHE_TTL,
         default: "30",
-        description: "Seconds the access check serves users' and libraries' rows from memory; \
-                      only bounds changes made outside the server.",
+        description: "Seconds the access check serves users' and libraries' rows, and whether \
+                      a Live TV tuner is configured, from memory; only bounds changes made \
+                      outside the server.",
         running: |c| json!(c.row_cache_ttl_secs),
         ..ROW
     },
@@ -533,7 +653,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "playback_metrics_queue",
         env: Some("FERROFIN_PLAYBACK_METRICS_QUEUE"),
         env_read: PARSED_U32,
-        kind: U32,
+        kind: whole_numbers(config::PLAYBACK_METRICS_QUEUE_RANGE),
         default: "1024",
         description: "Depth of the playback-metrics write queue, in events.",
         running: |c| json!(c.playback_metrics_queue),
@@ -602,9 +722,9 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_METRICS_SAMPLE_INTERVAL"),
         env_read: PARSED_U32,
         group: Group::Observability,
-        kind: U32,
+        kind: whole_numbers(config::METRICS_SAMPLE_INTERVAL_RANGE),
         default: "15",
-        description: "Seconds between process-metric samples; 0 means the default.",
+        description: "Seconds between process-metric samples.",
         running: |c| json!(c.metrics_sample_interval),
         ..ROW
     },
@@ -634,7 +754,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_SHUTDOWN_TIMEOUT_SECS"),
         env_read: PARSED_U32,
         group: Group::Observability,
-        kind: U32,
+        kind: whole_numbers(config::SHUTDOWN_TIMEOUT_SECS_RANGE),
         default: "30",
         description: "Seconds a shutdown or restart waits for requests in flight.",
         running: |c| json!(c.shutdown_timeout_secs),
@@ -728,10 +848,17 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_TVDB_CACHE_HOURS"),
         env_read: EnvRead::NonBlank,
         group: Group::Providers,
-        kind: POSITIVE,
+        kind: whole_numbers(config::TVDB_CACHE_HOURS_RANGE),
         default: "1",
         description: "Hours TheTVDB lookups are reused.",
-        running: |c| whole_number_as_written(c.tvdb_cache_hours.as_deref()),
+        // The hours in use: a whole number outside the range is clamped.
+        running: |c| {
+            let raw = c.tvdb_cache_hours.as_deref();
+            match raw.map(|raw| raw.trim().parse::<u32>()) {
+                Some(Ok(hours)) => json!(config::clamp_tvdb_cache_hours(hours)),
+                _ => whole_number_as_written(raw),
+            }
+        },
         ..ROW
     },
     SettingSpec {
@@ -795,7 +922,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS"),
         env_read: PARSED_U32,
         group: Group::Images,
-        kind: image_limit(ImageLimits::DECODE_MEGAPIXELS),
+        kind: whole_numbers(ImageLimits::DECODE_MEGAPIXELS),
         default: "200",
         description: "Largest image decoded, in megapixels; a larger one is served as its \
                       original file.",
@@ -807,7 +934,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB"),
         env_read: PARSED_U32,
         group: Group::Images,
-        kind: image_limit(ImageLimits::DECODE_MEMORY_MB),
+        kind: whole_numbers(ImageLimits::DECODE_MEMORY_MB),
         default: "512",
         description: "Memory one image decode may take, in MiB; an image needing more is \
                       served as its original file.",
@@ -819,11 +946,54 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_IMAGE_RESIZE_BUDGET_MB"),
         env_read: PARSED_U32,
         group: Group::Images,
-        kind: image_limit(ImageLimits::RESIZE_BUDGET_MB),
+        kind: whole_numbers(ImageLimits::RESIZE_BUDGET_MB),
         default: "2048",
         description: "Memory all image resizes in flight share, in MiB; a resize needing more \
                       alone serves the original file.",
         running: |c| json!(c.image_resize_budget_mb),
+        ..ROW
+    },
+    SettingSpec {
+        key: "image_download_max_mb",
+        env: Some("FERROFIN_IMAGE_DOWNLOAD_MAX_MB"),
+        env_read: PARSED_U32,
+        group: Group::Images,
+        kind: whole_numbers(ferrofin_providers::rate_limit::RequestLimits::DOWNLOAD_MAX_MB),
+        default: "64",
+        description: "Largest remote image downloaded, in MiB, and largest OMDb or \
+                      OpenSubtitles response; a larger one is refused and the read stops there.",
+        running: |c| json!(c.image_download_max_mb),
+        ..ROW
+    },
+    SettingSpec {
+        key: "image_negative_cache_ttl_secs",
+        env: Some("FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS"),
+        env_read: EnvRead::Parsed(parses::<u64>),
+        group: Group::Images,
+        kind: provider_seconds(ferrofin_providers::IMAGE_NEGATIVE_CACHE_TTL_SECS),
+        default: "3600",
+        description: "Seconds a remote image URL that gave no image is left alone before it is \
+                      tried again.",
+        running: |c| json!(c.image_negative_cache_ttl_secs),
+        ..ROW
+    },
+    SettingSpec {
+        key: "image_private_http_allow",
+        env: Some("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW"),
+        env_read: EnvRead::NonBlank,
+        group: Group::Images,
+        // As wasm_private_http_allow (owner decision D5): letting the server
+        // reach private addresses takes host access, not just an admin
+        // session.
+        access: SettingAccess::ReadOnly(
+            "Lets image downloads reach the LAN, loopback and cloud-metadata addresses it lists. \
+             Set it by hand in config.toml (image_private_http_allow) or \
+             FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW, so an admin session alone cannot grant it.",
+        ),
+        default: "no private address but a Live TV tuner's host",
+        description: "Private hosts, addresses and CIDR networks image downloads may reach, \
+                      comma-separated; Live TV tuners' hosts are always allowed.",
+        running: |c| json!(c.image_private_http_allow),
         ..ROW
     },
     // ---- WASM plugins -----------------------------------------------------
@@ -832,9 +1002,9 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_WASM_CALL_TIMEOUT_SECS"),
         env_read: PARSED_U32,
         group: Group::Wasm,
-        kind: U32,
+        kind: whole_numbers(config::WASM_CALL_TIMEOUT_SECS_RANGE),
         default: "30",
-        description: "Deadline of one plugin call, in seconds; 0 means the default.",
+        description: "Deadline of one plugin call, in seconds.",
         running: |c| json!(c.wasm_call_timeout_secs),
         ..ROW
     },
@@ -843,9 +1013,9 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_WASM_MEMORY_LIMIT_MB"),
         env_read: PARSED_U32,
         group: Group::Wasm,
-        kind: U32,
+        kind: whole_numbers(config::WASM_MEMORY_LIMIT_MB_RANGE),
         default: "128",
-        description: "Memory cap of one plugin, in MiB; 0 means the default.",
+        description: "Memory cap of one plugin, in MiB.",
         running: |c| json!(c.wasm_memory_limit_mb),
         ..ROW
     },
@@ -854,9 +1024,9 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_WASM_EVENT_QUEUE_CAPACITY"),
         env_read: PARSED_U32,
         group: Group::Wasm,
-        kind: U32,
+        kind: whole_numbers(config::WASM_EVENT_QUEUE_CAPACITY_RANGE),
         default: "256",
-        description: "Event queue depth of one plugin; 0 means the default.",
+        description: "Event queue depth of one plugin.",
         running: |c| json!(c.wasm_event_queue_capacity),
         ..ROW
     },
@@ -883,10 +1053,9 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_MAX_PLUGIN_DOWNLOAD_MB"),
         env_read: PARSED_U32,
         group: Group::Wasm,
-        kind: U32,
+        kind: whole_numbers(config::MAX_PLUGIN_DOWNLOAD_MB_RANGE),
         default: "128",
-        description: "Size cap of a plugin downloaded from a repository, in MiB; 0 means the \
-                      default.",
+        description: "Size cap of a plugin downloaded from a repository, in MiB.",
         running: |c| json!(c.max_plugin_download_mb),
         ..ROW
     },
@@ -895,7 +1064,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_WASM_ANALYSIS_CONCURRENCY"),
         env_read: PARSED_U32,
         group: Group::Wasm,
-        kind: U32,
+        kind: whole_numbers(config::WASM_ANALYSIS_CONCURRENCY_RANGE),
         default: "a quarter of the cores, at least one",
         description: "Media decodes plugin analysis may run at once.",
         running: |c| json!(c.wasm_analysis_concurrency),
@@ -906,7 +1075,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_WASM_STATE_LIMIT_MB"),
         env_read: PARSED_U32,
         group: Group::Wasm,
-        kind: U32,
+        kind: whole_numbers(config::WASM_STATE_LIMIT_MB_RANGE),
         default: "8",
         description: "Key/value state cap of one plugin, in MiB.",
         running: |c| json!(c.wasm_state_limit_mb),
@@ -917,7 +1086,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_WASM_IMAGE_DOWNLOAD_MB"),
         env_read: PARSED_U32,
         group: Group::Wasm,
-        kind: U32,
+        kind: whole_numbers(config::WASM_IMAGE_DOWNLOAD_MB_RANGE),
         default: "20",
         description: "Size cap of one plugin artwork download, in MiB.",
         running: |c| json!(c.wasm_image_download_mb),
@@ -928,7 +1097,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_WASM_IMAGE_TIMEOUT_SECS"),
         env_read: PARSED_U32,
         group: Group::Wasm,
-        kind: U32,
+        kind: whole_numbers(config::WASM_IMAGE_TIMEOUT_SECS_RANGE),
         default: "30",
         description: "Time limit of one plugin artwork download, in seconds.",
         running: |c| json!(c.wasm_image_timeout_secs),
@@ -939,7 +1108,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_WASM_WRITE_CONTENT_MB"),
         env_read: PARSED_U32,
         group: Group::Wasm,
-        kind: U32,
+        kind: whole_numbers(config::WASM_WRITE_CONTENT_MB_RANGE),
         default: "2",
         description: "Size cap of the lyrics or subtitles a plugin writes, in MiB.",
         running: |c| json!(c.wasm_write_content_mb),
@@ -950,7 +1119,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         env: Some("FERROFIN_WASM_SUBTITLE_EXTRACT_MB"),
         env_read: PARSED_U32,
         group: Group::Wasm,
-        kind: U32,
+        kind: whole_numbers(config::WASM_SUBTITLE_EXTRACT_MB_RANGE),
         default: "10",
         description: "Size cap of one subtitle track a plugin extracts, in MiB.",
         running: |c| json!(c.wasm_subtitle_extract_mb),
@@ -968,8 +1137,10 @@ const fn provider_seconds(range: std::ops::RangeInclusive<u64>) -> SettingKind {
     }
 }
 
-/// An image limit's bounds, from `ferrofin_drawing::ImageLimits`.
-const fn image_limit(range: std::ops::RangeInclusive<u32>) -> SettingKind {
+/// A whole-number setting's kind: the values the loader clamps it to, from
+/// the range next to where it is resolved (`config`, `ImageLimits`,
+/// `RequestLimits`).
+const fn whole_numbers(range: std::ops::RangeInclusive<u32>) -> SettingKind {
     SettingKind::Integer {
         min: *range.start() as i64,
         max: *range.end() as i64,

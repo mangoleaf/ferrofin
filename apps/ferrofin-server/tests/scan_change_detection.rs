@@ -1210,6 +1210,9 @@ impl Harness {
             },
             // A passwordless administrator: no PBKDF2 round in a debug build.
             admin_password: String::new(),
+            // The mock serves its images on loopback, which image downloads refuse
+            // unless the allow-list names it.
+            image_private_http_allow: Some("127.0.0.1".to_owned()),
             ..Config::test_stub(temp.path())
         };
         let (server, base, config) = boot::spawn_server(&client, make_config).await;

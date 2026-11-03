@@ -967,7 +967,7 @@ async fn plugin_route_forwards_identity_only_through_the_default_policy() {
     use ferrofin_traits::options::AuthorizationInfo;
     let identity = |is_authenticated: bool, policy: UserPolicy| AuthorizationInfo {
         is_authenticated,
-        user: Some(ferrofin_api::test_support::sample_user()),
+        user: Some(Arc::new(ferrofin_api::test_support::sample_user())),
         user_policy: Some(Arc::new(policy)),
         ..AuthorizationInfo::default()
     };

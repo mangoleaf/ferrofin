@@ -285,12 +285,25 @@ for changes to those paths.
 
 The image limits have the same kind of gate. `image_limits_cgroup` boots the real binary in a
 `systemd-run --user --scope` with a hard memory cap and swap off, and checks that each limit holds
-there: the pixel limit, the resize budget, the memory limit on a Photo item, and the budget shared
-by concurrent resizes. It needs a systemd user session and CI does not run it: run it by hand for
-changes to `ferrofin-drawing/src/limits.rs`:
+there: the pixel limit, the resize budget, the memory limit on a Photo item, the budget shared
+by concurrent resizes, and remote images past the download limit. It needs a systemd user session
+and CI does not run it: run it by hand for changes to `ferrofin-drawing/src/limits.rs` or to
+`ferrofin-providers/src/image_download.rs`:
 
 ```bash
 FERROFIN_CGROUP_TESTS=1 cargo test -p ferrofin-server --test image_limits_cgroup
+```
+
+The LDAP-Auth extension's directory client has one too. `ldap_directory` starts two OpenLDAP
+containers (built from `alpine:3.22` on the first run, certificates generated per run) and runs
+the settings page's connection test over plain LDAP, LDAPS and StartTLS: a custom root CA, a
+client certificate, skip-verify, a certificate for the wrong name refused, a wrong bind
+password, and an unroutable address failing within the 5-second connect timeout; then search,
+modify, the password-modify operation and the root DSE. It needs `docker`, and CI does not run
+it: run it by hand for changes to `crates/ferrofin-extensions/src/ldap_auth/`:
+
+```bash
+FERROFIN_LDAP_TESTS=1 cargo test -p ferrofin-extensions --test ldap_directory -- --nocapture
 ```
 
 Similarly, the end-to-end WASM plugin test builds the reference guest from source (needs the

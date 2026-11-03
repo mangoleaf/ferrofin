@@ -250,8 +250,10 @@ impl LibraryScanner {
                 "removing a virtual episode"
             );
         }
+        // `LibraryManager.DeleteItem`, as upstream's `RemoveObsoleteEpisodes`:
+        // the episode's art and metadata folders go with its row.
         let doomed: Vec<Uuid> = obsolete.iter().map(|(episode, _)| episode.id).collect();
-        Ok(self.persistence.delete_items(&doomed).await?.len())
+        Ok(self.delete_with_item_data(&doomed, false).await?.len())
     }
 }
 

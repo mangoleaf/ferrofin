@@ -336,9 +336,12 @@ async fn an_image_over_the_limits_still_reports_its_size() {
 }
 
 /// A collage leaves out an image over a decode limit, and one that decodes
-/// but is past the budget to resize.
+/// but is past the budget to resize. A JPEG, which a collage decodes at a
+/// reduced scale (gl-1056), is held to the same decode limit.
 #[rstest]
 #[case::decode("big.png", 600, 600, ImageLimits { max_pixels: 320_000, ..ROOMY })]
+// Large enough that a reduced scale covers twice either collage's cell.
+#[case::decode_jpeg("big.jpg", 3200, 3200, ImageLimits { max_pixels: 10_000_000, ..ROOMY })]
 #[case::resize("wide.png", 2000, 100, ImageLimits { resize_budget: 100_000, ..ROOMY })]
 #[tokio::test]
 async fn a_collage_skips_an_image_the_limits_refuse(
@@ -378,14 +381,19 @@ async fn a_collage_skips_an_image_the_limits_refuse(
         .await
         .expect("a collage");
 
+    // The refused image is red and the usable one bluer than it is red, so a
+    // JPEG's rounding cannot pass one off as the other.
     let drawn = image::open(&output).expect("a PNG").to_rgba8();
     let pixel = drawn.get_pixel(100, 100).0;
-    assert_ne!(pixel[0], 0xFF, "the refused image is not drawn: {pixel:?}");
-    assert!(pixel[2] > 0, "the usable image is drawn: {pixel:?}");
+    assert!(
+        pixel[2] > pixel[0],
+        "the usable image is drawn, not the refused one: {pixel:?}"
+    );
 }
 
 #[rstest]
 #[case::decode("big.png", 2000, 2000, ImageLimits { max_pixels: 1_000_000, ..ROOMY })]
+#[case::decode_jpeg("big.jpg", 2000, 2000, ImageLimits { max_pixels: 1_000_000, ..ROOMY })]
 // 360 is the wall's row height.
 #[case::resize("wide.png", 4000, 100, ImageLimits { resize_budget: 4000 * 360 * 16 - 1, ..ROOMY })]
 #[tokio::test]
@@ -414,8 +422,9 @@ async fn a_splashscreen_skips_an_image_the_limits_refuse(
     let drawn = image::open(fixture.path("splashscreen.png"))
         .expect("a PNG")
         .to_rgba8();
+    // Red, where everything else drawn is no redder than it is blue.
     assert!(
-        drawn.pixels().all(|pixel| pixel.0[0] != 0xFF),
+        drawn.pixels().all(|pixel| pixel.0[0] <= pixel.0[2]),
         "the refused image is not drawn"
     );
 
@@ -452,6 +461,7 @@ async fn a_trickplay_frame_over_a_limit_is_refused() {
                 90,
                 200,
                 None,
+                true,
             )
             .await,
         "image_decode_max_megapixels",

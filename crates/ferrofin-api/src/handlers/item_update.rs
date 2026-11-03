@@ -73,7 +73,7 @@ pub(crate) async fn update_item(
 ) -> Result<StatusCode, ApiError> {
     let mut item = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     // `var isLockedChanged = item.IsLocked != (request.LockData ?? false)`.
@@ -946,7 +946,7 @@ async fn update_item_content_type(
 ) -> Result<StatusCode, ApiError> {
     let item = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let folder = state.library.containing_folder_path(&item).await;
@@ -1207,7 +1207,7 @@ async fn refresh_item(
 ) -> Result<StatusCode, ApiError> {
     let item = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
 
@@ -1221,8 +1221,8 @@ async fn refresh_item(
     // Every refresh runs with the request's options: both modes (`None`
     // when omitted, `ItemRefreshController.cs:64-65`), the replace flags,
     // `ForceSave` and `RemoveOldMetadata` as the controller sets them
-    // (`:76-89`), and `RegenerateTrickplay` (which the scan carries but does
-    // not act on yet: see the `TrickplayProvider` work item in the scanner).
+    // (`:76-89`), and `RegenerateTrickplay`, which a `FullRefresh` honours
+    // (`TrickplayProvider`).
     let options = MetadataRefreshOptions::for_item_refresh(
         metadata_refresh_mode,
         image_refresh_mode,
@@ -1306,7 +1306,7 @@ async fn get_metadata_editor(
 ) -> Result<Json<MetadataEditorInfo>, ApiError> {
     let item = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
 

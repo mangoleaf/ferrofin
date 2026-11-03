@@ -1,0 +1,730 @@
+//! The statements a request runs, end to end.
+//!
+//! Each test boots the real composition root over a temp data dir with a
+//! scanned movies library (and the playlists folder every server provisions),
+//! and records, through a global subscriber, the `sqlx::query` events emitted
+//! inside one request's span (the SQLite worker enters the caller's span).
+//!
+//! - `GET /Users/{id}/Views` (gl-981). The home screen's view row asks three
+//!   questions about the libraries' physical folders: the scope of 12.2's
+//!   `HasVisibleItem` probe for the playlists folder, that probe's own query,
+//!   and the views' `ChildCount` (`GetChildCountSourceIds`). All three read
+//!   `CollectionFolder` rows, which the library set the visibility check caches
+//!   already holds, `Data` included. The probe's scope also looks for the Live
+//!   TV view among the `UserView` rows it has just read. So a warm request reads
+//!   neither again. Then, the set still warm, it toggles the library's
+//!   `Enabled` option through the dashboard's endpoint and checks the user's
+//!   scope follows on the next request.
+//! - A library browse whose page holds a movie with versions (gl-1083). Its
+//!   version resume (`GetResumeUserDataBatch`) takes the page's own items' user
+//!   data from the page, as upstream's cache answers them, and reads only what
+//!   the user stored on the versions off the page: none here, so no user-data
+//!   key is derived.
+//! - `GET /Users/{id}/Views` on a server holding the Live TV view (gl-1154).
+//!   The Live TV gate (`IsLiveTvEnabled`: the user's permission, and whether a
+//!   tuner is configured) is asked three times by one views request, and
+//!   upstream answers it from the `LiveTvOptions` it holds in memory. So the
+//!   tuner hosts are read once after a write to them, and not again while
+//!   that answer is cached; a tuner added or removed through the API reaches
+//!   the very next request.
+//! - `GET /Items?parentId=` on a library and on a box set (gl-1153). The
+//!   handler's parent visibility check reads the parent's row, and the query
+//!   carries it, so the repository's scope resolution, the folder listing
+//!   and the box set's display order work from it: the parent's row is read
+//!   once, as upstream's controller reads it once (`GetParentItem`).
+
+use std::sync::Mutex;
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use ferrofin_db::Database;
+use ferrofin_server::config::Config;
+use ferrofin_server::state::{WiredApp, build_app_state};
+use ferrofin_traits::library::ScanTrigger;
+use tower::ServiceExt as _;
+use tracing::Instrument as _;
+use tracing_subscriber::layer::{Context, SubscriberExt as _};
+use tracing_subscriber::registry::LookupSpan;
+
+const ADMIN_USER: &str = "admin";
+const ADMIN_PASSWORD: &str = "request-statements-pw";
+
+const CLIENT_AUTH: &str = r#"MediaBrowser Client="Request Statements", Device="Test Rig", DeviceId="rig-rs", Version="1.0.0""#;
+
+/// The span the recorded views request runs in.
+const VIEWS_SPAN: &str = "gl981_views_request";
+
+/// The span the recorded browse with a version group runs in.
+const VERSIONS_SPAN: &str = "gl1083_version_resume_request";
+
+/// The span the recorded views requests around a tuner's writes run in.
+const LIVE_TV_SPAN: &str = "gl1154_live_tv_views_request";
+
+/// The span the recorded browses of a parent run in.
+const PARENT_SPAN: &str = "gl1153_parent_browse_request";
+
+/// The statements recorded inside each test's span, in order, tagged with the
+/// span: `cargo test` runs a binary's tests on threads of one process.
+static STATEMENTS: Mutex<Vec<(&'static str, String)>> = Mutex::new(Vec::new());
+
+/// Records the text of every `sqlx::query` event emitted inside one of the
+/// recorded spans.
+struct Statements;
+
+impl<S> tracing_subscriber::Layer<S> for Statements
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+        if event.metadata().target() != "sqlx::query" {
+            return;
+        }
+        let Some(span) = ctx.event_scope(event).and_then(|mut scope| {
+            scope.find_map(|span| {
+                [VIEWS_SPAN, VERSIONS_SPAN, LIVE_TV_SPAN, PARENT_SPAN]
+                    .into_iter()
+                    .find(|name| span.name() == *name)
+            })
+        }) else {
+            return;
+        };
+        let mut text = StatementText(String::new());
+        event.record(&mut text);
+        STATEMENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((
+                span,
+                text.0.split_whitespace().collect::<Vec<_>>().join(" "),
+            ));
+    }
+}
+
+/// Forgets what was recorded inside `span`.
+fn clear_statements(span: &str) {
+    STATEMENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(recorded, _)| *recorded != span);
+}
+
+/// The statements recorded inside `span`, in order.
+fn statements_in(span: &str) -> Vec<String> {
+    STATEMENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(recorded, _)| *recorded == span)
+        .map(|(_, statement)| statement.clone())
+        .collect()
+}
+
+/// sqlx's `summary` (the statement's start) and `db.statement` (the whole
+/// statement, when the summary is cut short).
+struct StatementText(String);
+
+impl tracing::field::Visit for StatementText {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if matches!(field.name(), "summary" | "db.statement") {
+            self.0.push_str(value);
+            self.0.push(' ');
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if matches!(field.name(), "summary" | "db.statement") {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, "{value:?} ");
+        }
+    }
+}
+
+/// A booted server plus what the test drives it with.
+struct Harness {
+    wired: WiredApp,
+    /// The server's database, whose cached library set the test checks.
+    db: Database,
+    /// The movies library's media directory.
+    movies_dir: String,
+    _temp: tempfile::TempDir,
+}
+
+/// Boots the composition root over a temp DB and seeds the admin, with a
+/// movies directory holding `files` (paths under it).
+async fn boot(files: &[&str]) -> Harness {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::create_dir_all(temp.path().join("config")).expect("config dir");
+    let config = Config {
+        server_name: "ferrofin-request-statements".to_owned(),
+        admin_user: ADMIN_USER.to_owned(),
+        admin_password: ADMIN_PASSWORD.to_owned(),
+        ..Config::test_stub(temp.path())
+    };
+    let movies_dir = temp.path().join("movies");
+    for file in files {
+        let path = movies_dir.join(file);
+        std::fs::create_dir_all(path.parent().expect("movie dir")).expect("movie dir");
+        std::fs::write(path, [0u8; 1024]).expect("movie file");
+    }
+    std::fs::create_dir_all(&config.data_dir).expect("data dir");
+    let db = Database::connect(&config.database_url())
+        .await
+        .expect("open db");
+    db.run_migrations().await.expect("migrations");
+    let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        encoder_app_path_display: None,
+        ffmpeg: std::path::PathBuf::from("ffmpeg"),
+        ffprobe: std::path::PathBuf::from("ffprobe"),
+        capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
+        chromaprint_muxer: false,
+    };
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+    let wired = build_app_state(&db, &config, &ffmpeg, None, shutdown_tx)
+        .await
+        .expect("wire app state");
+    ferrofin_server::seed::seed_default_admin(wired.state.users.as_ref(), &config)
+        .await
+        .expect("seed admin");
+    Harness {
+        wired,
+        db,
+        movies_dir: movies_dir.to_string_lossy().into_owned(),
+        _temp: temp,
+    }
+}
+
+/// Sends `method uri` with `auth_header` and an optional JSON body; returns
+/// status + JSON body.
+async fn send(
+    router: &axum::Router,
+    auth_header: &str,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, auth_header);
+    let body = match body {
+        Some(json) => {
+            request = request.header(header::CONTENT_TYPE, "application/json");
+            Body::from(json.to_string())
+        }
+        None => Body::empty(),
+    };
+    let response = router
+        .clone()
+        .oneshot(request.body(body).expect("request"))
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let json = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("valid JSON body")
+    };
+    (status, json)
+}
+
+/// Percent-encodes a path for a query string, keeping `/`.
+fn urlencoding(value: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(char::from(byte));
+            }
+            _ => {
+                let _ = write!(out, "%{byte:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// Installs [`Statements`] as the process's subscriber, once.
+fn record_statements() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Statements))
+            .expect("no other subscriber in this binary");
+    });
+}
+
+/// Signs the admin in, adds the movies library with no remote fetchers and
+/// scans it; returns the admin's authorization header and user id.
+async fn sign_in_and_scan(harness: &Harness, router: &axum::Router) -> (String, String) {
+    let (status, auth) = send(
+        router,
+        CLIENT_AUTH,
+        "POST",
+        "/Users/AuthenticateByName",
+        Some(serde_json::json!({ "Username": ADMIN_USER, "Pw": ADMIN_PASSWORD })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin authenticates: {auth}");
+    let token = auth["AccessToken"].as_str().expect("token");
+    let user_id = auth["User"]["Id"].as_str().expect("user id").to_owned();
+    let auth_header = format!(
+        r#"MediaBrowser Client="Request Statements", Device="Test Rig", DeviceId="rig-rs", Version="1.0.0", Token="{token}""#
+    );
+
+    // No remote metadata or image fetchers: a scan that asks TMDb waits on it.
+    let (status, body) = send(
+        router,
+        &auth_header,
+        "POST",
+        &format!(
+            "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}&refreshLibrary=false",
+            urlencoding(&harness.movies_dir)
+        ),
+        Some(serde_json::json!({"LibraryOptions": {"TypeOptions": [
+            {"Type": "Movie", "MetadataFetchers": [], "ImageFetchers": []}
+        ]}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "library added: {body}");
+    // Awaited, not queued: the end of a scan writes the library row, which
+    // drops the cached library set the recorded request is meant to find.
+    assert!(
+        harness
+            .wired
+            .state
+            .library
+            .run_library_scan(ScanTrigger::Api, None)
+            .await
+            .expect("scan"),
+        "the scan ran"
+    );
+    (auth_header, user_id)
+}
+
+#[tokio::test]
+async fn a_warm_views_request_reads_no_library_row_again() {
+    record_statements();
+    let harness = boot(&[
+        "Film Alpha (1999)/Film Alpha (1999).mkv",
+        "Film Beta (2004)/Film Beta (2004).mkv",
+    ])
+    .await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let views_uri = format!("/Users/{user_id}/Views");
+    let movies_count = |views: &serde_json::Value| {
+        views["Items"].as_array().and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["Name"] == "Movies")
+                .and_then(|item| item["ChildCount"].as_i64())
+        })
+    };
+
+    // Warm: the visibility check has cached the library set.
+    let (status, warm) = send(&router, &auth_header, "GET", &views_uri, None).await;
+    assert_eq!(status, StatusCode::OK, "views: {warm}");
+    assert!(
+        harness.db.cached_libraries().is_some(),
+        "a views request leaves the library set cached"
+    );
+    clear_statements(VIEWS_SPAN);
+    let (status, views) = send(&router, &auth_header, "GET", &views_uri, None)
+        .instrument(tracing::info_span!(VIEWS_SPAN))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(views, warm, "the recorded request answers as the warm one");
+    assert_eq!(movies_count(&views), Some(2), "{views}");
+    let statements = statements_in(VIEWS_SPAN);
+    let listing = statements.join("\n");
+    // The recording sees the request: its child count is there.
+    assert!(
+        statements
+            .iter()
+            .any(|s| s.contains(r#"SELECT bi."ParentId", COUNT(*)"#)),
+        "the views' child count is recorded:\n{listing}"
+    );
+    assert!(
+        !statements
+            .iter()
+            .any(|s| s.contains(r#"WHERE "Data" IS NOT NULL AND +"Type" ="#)),
+        "the libraries' physical folders come from the cached library set:\n{listing}"
+    );
+    assert!(
+        !statements
+            .iter()
+            .any(|s| s.contains(r#"WHERE "Type" = ?1 AND ("Path" LIKE"#)),
+        "the Live TV view is found among the rows the scope read:\n{listing}"
+    );
+    assert!(
+        harness.db.cached_libraries().is_some(),
+        "the set stayed cached through the recorded request"
+    );
+
+    a_dashboard_toggle_reaches_the_next_request(&harness, &router, &auth_header, &user_id).await;
+}
+
+/// A movie with two versions on a library browse, the runtime-sorted edge
+/// request of the release gate: the page's version resume
+/// (`GetResumeUserDataBatch`, `DtoService.cs:171-180`) takes the primary's
+/// user data from the page, as upstream's `GetUserDataBatch` answers it from
+/// the cache the page's batch filled, and reads only what the user stored on
+/// the version off the page. Nothing is stored, so no user-data key is
+/// derived: the key read (`identity_ids`) exists to choose among stored rows
+/// and to key a never-written row, which nothing here shows.
+#[tokio::test]
+async fn a_version_group_s_resume_derives_no_key_for_unwritten_versions() {
+    record_statements();
+    let harness = boot(&[
+        "Film Alpha (1999)/Film Alpha (1999).mkv",
+        "Film Gamma (2010)/Film Gamma (2010) - 1080p.mkv",
+        "Film Gamma (2010)/Film Gamma (2010) - 2160p.mkv",
+    ])
+    .await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let (status, views) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!("/Users/{user_id}/Views"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "views: {views}");
+    let movies = views["Items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["Name"] == "Movies"))
+        .and_then(|item| item["Id"].as_str())
+        .expect("the Movies view")
+        .to_owned();
+    let browse = format!(
+        "/Items?userId={user_id}&parentId={movies}&includeItemTypes=Movie&recursive=true\
+         &sortBy=Runtime,SortName&sortOrder=Ascending&limit=50"
+    );
+    let (status, warm) = send(&router, &auth_header, "GET", &browse, None).await;
+    assert_eq!(status, StatusCode::OK, "browse: {warm}");
+    let gammas = warm["Items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|item| item["Name"] == "Film Gamma (2010)")
+        .count();
+    assert_eq!(gammas, 1, "the versions list once: {warm}");
+
+    clear_statements(VERSIONS_SPAN);
+    let (status, page) = send(&router, &auth_header, "GET", &browse, None)
+        .instrument(tracing::info_span!(VERSIONS_SPAN))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page, warm, "the recorded request answers as the warm one");
+    let statements = statements_in(VERSIONS_SPAN);
+    let listing = statements.join("\n");
+    // The page's version group is read, so the resume had a group to fold,
+    // and then the user data of the one version off the page, alone: the
+    // grouped movie on the page answers with the page's own.
+    let versions_read = statements
+        .iter()
+        .position(|s| s.contains(r#"AS "HasVersions""#))
+        .unwrap_or_else(|| panic!("the page's versions are read:\n{listing}"));
+    assert!(
+        statements[versions_read..]
+            .iter()
+            .any(|s| s.contains(r#"FROM "UserData""#) && s.contains(r#""ItemId" IN (?2)"#)),
+        "the version off the page is read, alone:\n{listing}"
+    );
+    assert!(
+        !statements.iter().any(|s| s.contains("identity_ids")),
+        "no user-data key is derived for a version nobody played:\n{listing}"
+    );
+}
+
+/// The Live TV gate behind a views request, on a server whose database holds
+/// the Live TV view: upstream's `IsLiveTvEnabled` asks its in-memory
+/// `LiveTvOptions.TunerHosts`, so the tuner hosts are read once after a write
+/// to them and not again while that answer is cached, and a tuner added or
+/// removed through the dashboard's endpoints reaches the very next request.
+#[tokio::test]
+async fn the_live_tv_gate_reads_the_tuner_hosts_once_and_follows_their_writes() {
+    record_statements();
+    let harness = boot(&["Film Alpha (1999)/Film Alpha (1999).mkv"]).await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let views_uri = format!("/Users/{user_id}/Views");
+
+    let (listed, _) = live_tv_views(&router, &auth_header, &views_uri).await;
+    assert!(!listed, "no tuner, no Live TV view");
+
+    let playlist = std::path::Path::new(&harness.movies_dir).with_file_name("tuner.m3u");
+    std::fs::write(
+        &playlist,
+        "#EXTM3U\n#EXTINF:-1 tvg-id=\"one\" tvg-chno=\"1\",one\nhttp://tuner.invalid/one\n",
+    )
+    .expect("playlist");
+    let (status, tuner) = send(
+        &router,
+        &auth_header,
+        "POST",
+        "/LiveTv/TunerHosts",
+        Some(serde_json::json!({ "Type": "m3u", "Url": playlist.to_string_lossy() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "tuner added: {tuner}");
+    let tuner_id = tuner["Id"].as_str().expect("tuner id").to_owned();
+    let (listed, _) = live_tv_views(&router, &auth_header, &views_uri).await;
+    assert!(listed, "a tuner added reaches the next request");
+
+    let (status, body) = send(
+        &router,
+        &auth_header,
+        "DELETE",
+        &format!("/LiveTv/TunerHosts?id={tuner_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "tuner deleted: {body}");
+    // The Live TV view's row stays behind, so the gate is asked by
+    // `ensure_live_tv_view`, by the playlists probe's scope and by
+    // `without_disabled_live_tv`: one answer serves all three.
+    let (listed, reads) = live_tv_views(&router, &auth_header, &views_uri).await;
+    assert!(!listed, "a tuner removed reaches the next request");
+    assert_eq!(
+        reads.len(),
+        1,
+        "the delete dropped the cached answer, which is read once:\n{}",
+        reads.join("\n")
+    );
+    let (listed, reads) = live_tv_views(&router, &auth_header, &views_uri).await;
+    assert!(!listed);
+    assert!(
+        reads.is_empty(),
+        "a warm request answers from memory:\n{}",
+        reads.join("\n")
+    );
+}
+
+/// `GET views_uri`, recorded inside [`LIVE_TV_SPAN`]: whether it lists the
+/// Live TV view, and the statements it ran against the tuner hosts.
+async fn live_tv_views(
+    router: &axum::Router,
+    auth_header: &str,
+    views_uri: &str,
+) -> (bool, Vec<String>) {
+    clear_statements(LIVE_TV_SPAN);
+    let (status, views) = send(router, auth_header, "GET", views_uri, None)
+        .instrument(tracing::info_span!(LIVE_TV_SPAN))
+        .await;
+    assert_eq!(status, StatusCode::OK, "views: {views}");
+    let listed = views["Items"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["CollectionType"] == "livetv"));
+    let reads = statements_in(LIVE_TV_SPAN)
+        .into_iter()
+        .filter(|s| s.contains(r#""FerrofinLiveTvTunerHosts""#))
+        .collect();
+    (listed, reads)
+}
+
+/// A browse that names a parent reads the parent's row once: the parent
+/// visibility check reads it whole (`SELECT *`), and nothing reads it again,
+/// neither whole nor as the repository's view row (`Type`, `Data`, … and
+/// whether it has linked children). Upstream's `GetItems` reads the parent
+/// once (`GetParentItem`) and works from that item. Covered: the release
+/// gate's runtime-sorted library browse, a library's own children, and a box
+/// set's listing and recursive browse; a box set's recursive browse still
+/// asks whether the set has linked children, the one thing its row does not
+/// say.
+#[tokio::test]
+async fn a_browse_reads_its_parent_s_row_once() {
+    record_statements();
+    let harness = boot(&[
+        "Film Alpha (1999)/Film Alpha (1999).mkv",
+        "Film Beta (2004)/Film Beta (2004).mkv",
+    ])
+    .await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let (status, views) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!("/Users/{user_id}/Views"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "views: {views}");
+    let movies = views["Items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["Name"] == "Movies"))
+        .and_then(|item| item["Id"].as_str())
+        .expect("the Movies view")
+        .to_owned();
+    let (status, films) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!("/Items?userId={user_id}&recursive=true&includeItemTypes=Movie"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "films: {films}");
+    let ids: Vec<&str> = films["Items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|item| item["Id"].as_str())
+        .collect();
+    assert_eq!(ids.len(), 2, "{films}");
+    let (status, set) = send(
+        &router,
+        &auth_header,
+        "POST",
+        &format!("/Collections?name=Pair&ids={}", ids.join(",")),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "collection: {set}");
+    let set = set["Id"].as_str().expect("the set's id").to_owned();
+
+    // (request, its whole-row reads by id, its `LinkedChildren` probes, how
+    // many items it answers)
+    let browses = [
+        (
+            format!(
+                "/Items?userId={user_id}&parentId={movies}&includeItemTypes=Movie\
+                 &recursive=true&sortBy=Runtime,SortName&sortOrder=Ascending&limit=50"
+            ),
+            1,
+            0,
+            2,
+        ),
+        (
+            format!("/Items?userId={user_id}&parentId={movies}"),
+            1,
+            0,
+            2,
+        ),
+        // The set's listing also reads the user root, whose libraries bound
+        // the linked members the user may see (`GetLinkedChildren(user)`).
+        (format!("/Items?userId={user_id}&parentId={set}"), 2, 0, 2),
+        // A recursive browse of the set still asks whether it has linked
+        // children, which its row does not say.
+        (
+            format!("/Items?userId={user_id}&parentId={set}&recursive=true"),
+            1,
+            1,
+            2,
+        ),
+    ];
+    for (uri, whole_rows, probes, items) in browses {
+        browse_reading_the_parent_once(&router, &auth_header, &uri, whole_rows, probes, items)
+            .await;
+    }
+}
+
+/// Sends `uri` warm, then again inside [`PARENT_SPAN`], and checks the
+/// recorded request reads `whole_rows` rows whole by id, never the
+/// repository's view row, and `probes` times whether a parent has linked
+/// children, answering `items` items as the warm one does.
+async fn browse_reading_the_parent_once(
+    router: &axum::Router,
+    auth_header: &str,
+    uri: &str,
+    whole_rows: usize,
+    probes: usize,
+    items: i64,
+) {
+    let (status, warm) = send(router, auth_header, "GET", uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {warm}");
+    assert_eq!(warm["TotalRecordCount"], items, "{uri}: {warm}");
+    clear_statements(PARENT_SPAN);
+    let (status, page) = send(router, auth_header, "GET", uri, None)
+        .instrument(tracing::info_span!(PARENT_SPAN))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page, warm, "the recorded request answers as the warm one");
+    let statements = statements_in(PARENT_SPAN);
+    let listing = statements.join("\n");
+    let count = |needle: &str| statements.iter().filter(|s| s.contains(needle)).count();
+    assert_eq!(
+        count(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1 AND "Id" <> ?2"#),
+        whole_rows,
+        "{uri}: the parent's row is read once:\n{listing}"
+    );
+    assert_eq!(
+        count(r#"AS "_HasLinkedChildren" FROM "BaseItems" WHERE "Id" = ?1"#),
+        0,
+        "{uri}: the scope works from the row the handler read:\n{listing}"
+    );
+    assert_eq!(
+        count(r#"SELECT EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = ?1)"#),
+        probes,
+        "{uri}: linked children are looked up only where they scope the browse:\n{listing}"
+    );
+}
+
+/// With the library set warm, a library disabled from the dashboard leaves
+/// the user's scope on the very next request, and comes back when enabled:
+/// the options write drops the cached set the scope now reads `Enabled` from.
+async fn a_dashboard_toggle_reaches_the_next_request(
+    harness: &Harness,
+    router: &axum::Router,
+    auth_header: &str,
+    user_id: &str,
+) {
+    let views_uri = format!("/Users/{user_id}/Views");
+    let movies_in_scope = async || {
+        let (status, page) = send(
+            router,
+            auth_header,
+            "GET",
+            &format!("/Items?userId={user_id}&recursive=true&includeItemTypes=Movie&limit=0"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "browse: {page}");
+        page["TotalRecordCount"].as_i64()
+    };
+    assert_eq!(movies_in_scope().await, Some(2));
+    let (status, folders) = send(router, auth_header, "GET", "/Library/VirtualFolders", None).await;
+    assert_eq!(status, StatusCode::OK, "{folders}");
+    let movies = folders
+        .as_array()
+        .and_then(|folders| folders.iter().find(|folder| folder["Name"] == "Movies"))
+        .expect("the Movies library")
+        .clone();
+    let library = uuid::Uuid::parse_str(movies["ItemId"].as_str().expect("ItemId")).expect("id");
+    for (enabled, expected) in [(false, 0), (true, 2)] {
+        // The views' visibility check loads the set again after a toggle.
+        let (status, _) = send(router, auth_header, "GET", &views_uri, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let set = harness
+            .db
+            .cached_libraries()
+            .expect("the set is warm before the toggle");
+        assert_eq!(
+            set.options.get(&library).map(|options| options.enabled),
+            Some(!enabled),
+            "the set holds the value the toggle has to replace"
+        );
+        let mut options = movies["LibraryOptions"].clone();
+        options["Enabled"] = serde_json::json!(enabled);
+        let (status, body) = send(
+            router,
+            auth_header,
+            "POST",
+            "/Library/VirtualFolders/LibraryOptions",
+            Some(serde_json::json!({"Id": movies["ItemId"], "LibraryOptions": options})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "options saved: {body}");
+        assert_eq!(
+            movies_in_scope().await,
+            Some(expected),
+            "Enabled = {enabled} reaches the next request"
+        );
+    }
+}

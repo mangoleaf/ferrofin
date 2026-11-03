@@ -2,6 +2,7 @@
 //! episodes: which card each series gets.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
@@ -192,7 +193,7 @@ fn latest_filter(
     played: bool,
 ) -> ferrofin_traits::options::InternalItemsQuery {
     ferrofin_traits::options::InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         is_played: Some(played),
         is_folder: Some(false),
         is_virtual_item: Some(false),

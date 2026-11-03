@@ -63,6 +63,9 @@ work across subsystems:
 | `library` | library name/id |
 | `task` | scheduled-task key |
 | `provider` | metadata provider name |
+| `tuner` | Live TV tuner host id |
+| `listings_provider` | Live TV listings provider id |
+| `channel` | Live TV channel name |
 | `job_id` | transcode/other job id |
 | `path` | filesystem path |
 | `config_file` | the bootstrap `config.toml` in use, as context (the startup banner, configuration warnings), when `path` would name the wrong subject |
@@ -88,6 +91,20 @@ header contents stay out — spans and events alike. Secret hygiene
 (`ferrofin-model/src/secret.rs`, `secrecy`-backed) is load-bearing; keep it. Raw
 filesystem paths and entity IDs **are** fine in logs (unlike metric labels — different
 rules; cardinality doesn't bind logs).
+
+A URL an operator configured is not fine. An IPTV tuner or guide URL can carry the account
+in its userinfo, its query or its path, and no rule tells a credential in a path from an
+ordinary one, so log the id of what it belongs to and only its scheme and host
+(`ferrofin_util::source_url::redact_url`). The same goes for error text, which ends up in
+a log or a `4xx` body: `reqwest::Error` prints the URL in its `Display` and `Debug`, so
+take it off with `without_url()`. ffmpeg needs the real URL, and it prints that URL and
+every segment URL itself, so a job reading one has its `FFmpeg.*.log`, its debug argument
+line and the stderr tail in its errors filtered (`transcoding::ffmpeg_log`). The
+`-user_agent` and `-referer` values go too. An ordinary file transcode's log stays byte
+for byte. A `.strm` item's media path is its target URL, so whatever names that path does
+the same: subtitle extraction, a failed probe and the `.strm` reader log it through
+`redact_url`, and an error that quotes the input or ffmpeg's arguments (attachment
+extraction, a failed spawn) passes them through `redact_urls_in`.
 
 ## 6. The sinks are fixed
 

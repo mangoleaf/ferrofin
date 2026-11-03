@@ -87,7 +87,12 @@ pub(super) fn sample(spec: &SettingSpec) -> String {
         "log_format" => "\"text\"".to_owned(),
         "wasm_private_http_allow" => "\"*\"".to_owned(),
         _ => match spec.kind {
-            SettingKind::Bool => "true".to_owned(),
+            // The value that is not the default, so setting it changes something.
+            SettingKind::Bool => (spec.default != "true").to_string(),
+            // Inside the range and not the default.
+            SettingKind::Integer { min, .. } if (min + 1).to_string() == spec.default => {
+                (min + 2).to_string()
+            }
             SettingKind::Integer { min, .. } => (min + 1).to_string(),
             SettingKind::CountOrAuto => "2".to_owned(),
             SettingKind::Text | SettingKind::Secret => "\"sample\"".to_owned(),
@@ -165,6 +170,90 @@ fn every_rows_variable_has_a_row_in_the_docs() {
         );
         assert!(!spec.description.is_empty(), "{}: no description", spec.key);
         assert!(!spec.default.is_empty(), "{}: no default", spec.key);
+    }
+}
+
+/// Every numeric row has a range of its own, not the bounds of the number
+/// type the loader reads it as; [`sample`] lies inside it and is not the
+/// default; and no description says `0` means the default, since the page
+/// refuses `0` where the loader reads it so (Reset restores a default).
+#[test]
+fn every_numeric_row_has_a_range_of_its_own() {
+    for spec in SETTINGS {
+        assert!(
+            !spec.description.contains("0 means the default"),
+            "{}: {}",
+            spec.key,
+            spec.description
+        );
+        let SettingKind::Integer { min, max } = spec.kind else {
+            continue;
+        };
+        assert!(
+            max < i64::from(u32::MAX),
+            "{}: {min} to {max} is its number type's",
+            spec.key
+        );
+        let sample: i64 = sample(spec).parse().expect("a number");
+        assert!(
+            (min..=max).contains(&sample),
+            "{}: the sample {sample} is outside {min} to {max}",
+            spec.key
+        );
+        assert_ne!(
+            sample.to_string(),
+            spec.default,
+            "{}: the sample is the default",
+            spec.key
+        );
+    }
+}
+
+/// The page and the loader share each range: a value past either end in
+/// `config.toml` boots and runs inside the row's range, so the page never
+/// shows a value in use it would refuse to save.
+#[test]
+fn the_value_in_use_stays_inside_each_rows_range() {
+    // Out of range, these stop the server: the ports do not fit their number
+    // type, and the database's limits and the login backoff's security
+    // settings are checked strictly.
+    let refused_at_boot = [
+        "port",
+        "https_port",
+        "db_statement_cache",
+        "auth_cache_ttl_secs",
+        "row_cache_ttl_secs",
+        "login_backoff_attempts",
+        "login_backoff_max_delay_secs",
+        "login_backoff_window_mins",
+        "login_backoff_max_tracked",
+    ];
+    let in_use = |key: &str, value: i64| {
+        let line = format!("{key} = {value}");
+        let data = DataDir::new(std::slice::from_ref(&line));
+        let config = Config::load_from(data.cli(), &FakeEnv::new())
+            .unwrap_or_else(|err| panic!("{line} stops the server: {err:#}"));
+        (spec(key).running)(&config)
+            .as_i64()
+            .unwrap_or_else(|| panic!("{line}: no number in use"))
+    };
+    for spec in file_rows() {
+        let SettingKind::Integer { min, max } = spec.kind else {
+            continue;
+        };
+        // Out of range, TheTVDB's token age is the default where the client
+        // is built; the row shows the value as written.
+        if refused_at_boot.contains(&spec.key) || spec.key == "tvdb_token_days" {
+            continue;
+        }
+        let value = in_use(spec.key, max + 1);
+        assert!(value <= max, "{} = {}: {value} in use", spec.key, max + 1);
+        // `0` below a range that starts at 1 is the default on some rows,
+        // which `config::tests` covers.
+        if min > 1 {
+            let value = in_use(spec.key, min - 1);
+            assert!(value >= min, "{} = {}: {value} in use", spec.key, min - 1);
+        }
     }
 }
 
@@ -437,6 +526,10 @@ fn read_only_settings_carry_their_note_whatever_sets_them() {
         (
             "wasm_private_http_allow",
             "Lets the named WASM plugins reach",
+        ),
+        (
+            "image_private_http_allow",
+            "Lets image downloads reach the LAN",
         ),
         // Owner decision D2: jellyfin-web's own pages cover these.
         (
@@ -734,5 +827,15 @@ async fn the_manager_reports_the_restart_flag_and_answers_not_found_while_disabl
     assert!(
         matches!(result, Err(ServiceError::NotFound(_))),
         "{result:?}"
+    );
+}
+
+/// The statement cache row shows the default the database applies when the
+/// setting is unset.
+#[test]
+fn the_statement_cache_row_shows_the_database_default() {
+    assert_eq!(
+        spec("db_statement_cache").default,
+        ferrofin_db::DEFAULT_STATEMENT_CACHE_CAPACITY.to_string()
     );
 }

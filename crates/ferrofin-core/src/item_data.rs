@@ -110,6 +110,39 @@ pub(crate) fn stored_collection_type(data: Option<&str>) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
+/// A library row's `PhysicalLocationsList` from its `Data`, as stored: a virtual-path token stays
+/// in it. No list, or `Data` that does not parse, reads as none; an entry that is not a string is
+/// left out.
+pub(crate) fn stored_physical_locations(data: Option<&str>) -> Vec<String> {
+    #[cfg(test)]
+    PHYSICAL_LOCATION_PARSES.with(|parses| parses.set(parses.get() + 1));
+    parse_data(data)
+        .get("PhysicalLocationsList")
+        .and_then(Value::as_array)
+        .map(|locations| {
+            locations
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times [`stored_physical_locations`] parsed a `Data` on this thread.
+    static PHYSICAL_LOCATION_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: how many times [`stored_physical_locations`] parsed a `Data` on this thread, for the
+/// tests that pin how often a path does. A plain `#[tokio::test]` runs on the test's own thread;
+/// a `multi_thread` runtime or `spawn_blocking` would parse where this cannot see it.
+#[cfg(test)]
+pub(crate) fn physical_location_parses() -> usize {
+    PHYSICAL_LOCATION_PARSES.with(std::cell::Cell::get)
+}
+
 /// The `LinkedChildren` array from a parsed `Data` object, or empty.
 #[must_use]
 pub fn read_linked_children(data: &Map<String, Value>) -> Vec<LinkedChildJson> {
@@ -1314,6 +1347,28 @@ pub(crate) async fn fail_data_writes_of(db: &Database, item: Uuid) {
 mod tests {
     use super::*;
     use crate::test_support::{seed_item, seed_named_item, test_db};
+
+    /// `PhysicalLocationsList` as the visibility check and the DTO's collection folders have always
+    /// read it: anything but an array of strings in an object reads as no locations, and the
+    /// strings of a mixed array are kept, tokens and case untouched.
+    #[rstest::rstest]
+    #[case::no_data(None, &[])]
+    #[case::empty(Some(""), &[])]
+    #[case::malformed(Some("{"), &[])]
+    #[case::not_an_object(Some(r#"["/media/a"]"#), &[])]
+    #[case::no_list(Some(r#"{"CollectionType":"movies"}"#), &[])]
+    #[case::not_a_list(Some(r#"{"PhysicalLocationsList":"/media/a"}"#), &[])]
+    #[case::other_casing(Some(r#"{"physicalLocationsList":["/media/a"]}"#), &[])]
+    #[case::mixed_entries(
+        Some(r#"{"PhysicalLocationsList":["/Media/A",1,null,"%MetadataPath%/b"]}"#),
+        &["/Media/A", "%MetadataPath%/b"]
+    )]
+    fn stored_physical_locations_reads_the_list_as_stored(
+        #[case] data: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        assert_eq!(stored_physical_locations(data), expected);
+    }
 
     /// `Video.UpdateFromResolvedItem` (`Video.cs:500-526`) over the `Data`
     /// blob: the `AdditionalParts`/`LocalAlternateVersions` the resolver's

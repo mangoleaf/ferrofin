@@ -39,7 +39,7 @@ use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::media_info::LiveStreamRequest;
 use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use ferrofin_model::search::{SearchHint, SearchQuery};
-use ferrofin_model::users::UserPolicy;
+use ferrofin_model::users::{ForgotPasswordResult, PinRedeemResult, UserPolicy};
 use uuid::Uuid;
 
 use crate::error::ServiceError;
@@ -1464,6 +1464,19 @@ pub struct PolicySaved {
     pub newly_disabled: bool,
 }
 
+/// What [`UserManager::apply_external_administrator`] did with the
+/// administrator flag a sign-in reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminFlagOutcome {
+    /// The user already had that flag; nothing was written.
+    Unchanged,
+    /// The user was promoted or demoted.
+    Applied,
+    /// The flag would have demoted the last administrator, so the user stays
+    /// one.
+    KeptLastAdministrator,
+}
+
 /// The state of the server a policy save is checked against: the user's
 /// current policy flags and the counts `UserController.UpdateUserPolicy`
 /// takes over all users.
@@ -1566,6 +1579,11 @@ pub trait UserManager: Send + Sync {
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError>;
 
     /// Authenticates a user by name/password, returning the row on success.
+    ///
+    /// The implementation may pace repeated failures (Ferrofin's login
+    /// backoff): the call can wait up to its configured maximum delay before
+    /// checking the password, and `Ok(None)` can also mean an attempt it
+    /// refused without checking the password, answered like a wrong password.
     async fn authenticate_user(
         &self,
         username: &str,
@@ -1577,8 +1595,54 @@ pub trait UserManager: Send + Sync {
     /// Lists the available authentication providers.
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError>;
 
-    /// Lists the available password-reset providers.
+    /// Lists the enabled password-reset providers, the default first, then by
+    /// name (`UserManager.GetPasswordResetProviders`).
     async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError>;
+
+    /// Starts a forgotten-password request (`POST /Users/ForgotPassword`,
+    /// `UserManager.StartForgotPasswordProcess`).
+    ///
+    /// The account `entered_username` names, if any, picks the provider by its
+    /// saved `PasswordResetProviderId`. An unknown name, a blank one, or a
+    /// saved id naming no enabled provider goes to the built-in PIN-file
+    /// provider. `is_in_network` is whether the request came from the local
+    /// network.
+    ///
+    /// The default fails, so impls without a reset store compile unchanged;
+    /// the concrete manager overrides it.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the chosen provider surfaces (the PIN file cannot be written).
+    async fn start_forgot_password_process(
+        &self,
+        entered_username: &str,
+        is_in_network: bool,
+    ) -> Result<ForgotPasswordResult, ServiceError> {
+        let _ = (entered_username, is_in_network);
+        Err(ServiceError::backend(
+            "start_forgot_password_process is not wired on this UserManager",
+        ))
+    }
+
+    /// Redeems a forgotten-password PIN (`POST /Users/ForgotPassword/Pin`,
+    /// `UserManager.RedeemPasswordResetPin`): every provider is offered it in
+    /// turn, and the first that redeems it answers.
+    ///
+    /// The default fails, so impls without a reset store compile unchanged;
+    /// the concrete manager overrides it.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::NotFound`] when no provider redeems the PIN (upstream's
+    /// built-in provider throws `ResourceNotFoundException`), or whatever a
+    /// provider surfaces (a password that cannot be saved).
+    async fn redeem_password_reset_pin(&self, pin: &str) -> Result<PinRedeemResult, ServiceError> {
+        let _ = pin;
+        Err(ServiceError::backend(
+            "redeem_password_reset_pin is not wired on this UserManager",
+        ))
+    }
 
     /// Projects a user row into the full public [`UserDto`].
     ///
@@ -1593,6 +1657,36 @@ pub trait UserManager: Send + Sync {
         user: &UserEntity,
         server_id: Option<String>,
     ) -> Result<UserDto, ServiceError>;
+
+    /// The libraries `user` hides from Latest
+    /// (`UserConfiguration.LatestItemsExcludes`), as [`Self::get_user_dto`]
+    /// reports them.
+    ///
+    /// `/Items/Latest` and `/UserItems/Resume` need only this list. The default
+    /// body builds the whole DTO; a manager that caches the DTO answers from
+    /// the cache without copying it.
+    async fn latest_items_excludes(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(self
+            .get_user_dto(user, None)
+            .await?
+            .configuration
+            .map(|c| c.latest_items_excludes)
+            .unwrap_or_default())
+    }
+
+    /// The cache tag of `user`'s profile image (C#
+    /// `ImageProcessor.GetImageCacheTag(User)`), `None` when they have none:
+    /// the `PrimaryImageTag` [`Self::get_user_dto`] reports.
+    ///
+    /// Every request on a session stamps it as the session's
+    /// `UserPrimaryImageTag`. The default body builds the whole DTO; a manager
+    /// that caches the DTO answers from the cache without copying it.
+    async fn user_primary_image_tag(
+        &self,
+        user: &UserEntity,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(self.get_user_dto(user, None).await?.primary_image_tag)
+    }
 
     /// Updates a user's configuration (stopgap; prefer [`Self::update_user`]).
     async fn update_configuration(
@@ -1655,6 +1749,64 @@ pub trait UserManager: Send + Sync {
         Ok(PolicySaved {
             newly_disabled: policy.is_disabled && !state.was_disabled,
         })
+    }
+
+    /// Sets the administrator flag an external sign-in reported for a user:
+    /// an authentication provider's
+    /// [`ProviderAuthenticationResult::administrator`](crate::security::ProviderAuthenticationResult::administrator),
+    /// or a directory or identity-provider role on a sign-in path that does
+    /// not go through [`Self::authenticate_user`].
+    ///
+    /// The last administrator is never demoted, an owner decision
+    /// (2026-11-01): the user stays one and the sign-in goes on
+    /// ([`AdminFlagOutcome::KeptLastAdministrator`], which the concrete
+    /// manager logs as a warning). Unlike [`policy_update_refusal`], this
+    /// never refuses. The caller may hold the user's login lock, so an
+    /// implementation must not take it.
+    ///
+    /// The default reads the flags through this trait and saves with
+    /// [`Self::update_policy`], so impls without a store of their own compile
+    /// unchanged. An implementation whose `update_policy` takes the user's
+    /// login lock must override it, or the password path waits on that lock
+    /// forever. The concrete manager overrides it to count the
+    /// administrators inside the transaction that writes the flag, so two
+    /// administrators demoted by concurrent sign-ins cannot both pass the
+    /// check, and to take no lock.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::NotFound`] for an unknown user, or whatever the save
+    /// surfaces.
+    async fn apply_external_administrator(
+        &self,
+        user_id: Uuid,
+        administrator: bool,
+    ) -> Result<AdminFlagOutcome, ServiceError> {
+        let user = self
+            .get_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("user {user_id}")))?;
+        let mut policy = self
+            .get_user_dto(&user, None)
+            .await?
+            .policy
+            .unwrap_or_default();
+        if policy.is_administrator == administrator {
+            return Ok(AdminFlagOutcome::Unchanged);
+        }
+        if !administrator {
+            let mut administrators = 0_usize;
+            for other in self.get_users().await? {
+                let other = self.get_user_dto(&other, None).await?.policy;
+                administrators += usize::from(other.is_some_and(|p| p.is_administrator));
+            }
+            if administrators <= 1 {
+                return Ok(AdminFlagOutcome::KeptLastAdministrator);
+            }
+        }
+        policy.is_administrator = administrator;
+        self.update_policy(user_id, &policy).await?;
+        Ok(AdminFlagOutcome::Applied)
     }
 
     /// Clears a user's profile image: deletes the stored file (a missing file is
@@ -1950,6 +2102,26 @@ pub trait UserDataManager: Send + Sync {
         user_id: Uuid,
     ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError>;
 
+    /// [`Self::get_user_data_batch`] for a caller that reads only what the
+    /// user played: the item's play state, position and last-played date.
+    /// Each item the user stored a row for is answered as there.
+    ///
+    /// An item the user never wrote may be absent. The empty row
+    /// [`Self::get_user_data_batch`] answers for it is keyed by the item's
+    /// first user-data key, which has to be derived from the item's metadata,
+    /// yet it is never played and holds no position, so such a caller answers
+    /// alike without it. The concrete manager leaves those items out and
+    /// derives keys only for the items with a stored row, to choose between
+    /// their rows. The default answers with [`Self::get_user_data_batch`],
+    /// so fakes and other impls compile unchanged.
+    async fn get_stored_user_data_batch(
+        &self,
+        item_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        self.get_user_data_batch(item_ids, user_id).await
+    }
+
     /// Updates play state from a reported position, returning whether the item
     /// is now considered played to completion.
     async fn update_play_state(
@@ -2141,9 +2313,11 @@ pub trait UserViewManager: Send + Sync {
     /// Gets the user-root children `user` may open.
     ///
     /// Port of `GetUserRootFolder().GetChildren(user, true)`: the rows of
-    /// [`get_media_folders`](Self::get_media_folders) that pass `IsVisible`.
-    /// Unlike [`get_user_views`](Self::get_user_views), the user's home-screen
-    /// choice (`MyMediaExcludes`) does not narrow it.
+    /// [`get_media_folders`](Self::get_media_folders) that pass `IsVisible`,
+    /// with the libraries first and the playlists folder after them, where
+    /// `get_media_folders` sorts it among them. Unlike
+    /// [`get_user_views`](Self::get_user_views), the user's home-screen choice
+    /// (`MyMediaExcludes`) does not narrow it.
     ///
     /// # Errors
     /// Returns a backend error when the implementation has no visibility
@@ -2575,6 +2749,43 @@ pub trait LibraryMonitor: Send + Sync {
 }
 
 fn _assert_object_safe_library_monitor(_: &dyn LibraryMonitor) {}
+
+/// What Live TV's recordings need of the library: the part of
+/// `ILibraryManager` that `RecordingsManager` calls.
+///
+/// Ferrofin's own seam rather than the managers themselves, because a
+/// structure change here also has to restart the library monitor and queue the
+/// scan, which upstream's `AddVirtualFolder(.., refreshLibrary: true)` does
+/// inside the library manager. The composition root implements it over
+/// [`VirtualFolderManager`], [`LibraryManager`] and [`LibraryMonitor`].
+#[async_trait]
+pub trait RecordingLibrary: Send + Sync {
+    /// `ILibraryManager.GetVirtualFolders`.
+    async fn virtual_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError>;
+
+    /// `ILibraryManager.AddVirtualFolder(name, type, options, refreshLibrary: true)`.
+    async fn add_virtual_folder(
+        &self,
+        name: &str,
+        collection_type: Option<CollectionTypeOptions>,
+        options: &LibraryOptions,
+    ) -> Result<(), ServiceError>;
+
+    /// `ILibraryManager.RemoveVirtualFolder(name, refreshLibrary: true)`.
+    async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError>;
+
+    /// `ILibraryManager.RemoveMediaPath(name, path)`.
+    async fn remove_media_path(&self, name: &str, path: &str) -> Result<(), ServiceError>;
+
+    /// `ILibraryManager.QueueLibraryScan`.
+    async fn queue_library_scan(&self) -> Result<(), ServiceError>;
+
+    /// `RecordingsManager.TriggerRefresh(path)`: queues the refresh of the item
+    /// nearest `path`, which also drops the item of a file that has gone.
+    async fn refresh_path(&self, path: &str) -> Result<(), ServiceError>;
+}
+
+fn _assert_object_safe_recording_library(_: &dyn RecordingLibrary) {}
 
 /// The server's own file writes, which the library monitor must not take for
 /// a change to rescan: `ILibraryMonitor.ReportFileSystemChangeBeginning` and

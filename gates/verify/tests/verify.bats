@@ -405,27 +405,30 @@ EOJ
 # (and no saver file, so one test can run twice over the same scratch folder).
 WITH_REQUESTS='.[1].requests = 3 | .[3].requests = 1 | .[4].requests = 2 | .[8].requests = 1 | .[9].requests = 1 | .[10].requests = 1 | del(.[11].saver)'
 
-# tv_scenario [jq-filter]: the same for a TV library: the scratch series, its season and its
-# episodes, the season refreshing whenever an episode file comes or goes; no request at all,
-# as the scratch series has no provider ids.
+# tv_scenario [jq-filter]: the same for a TV library: the scratch series, made by the refresh
+# before the rows from its tvshow.nfo, then its season and its episodes. Only the episodes are
+# ever updated: a folder is not refreshed because a file came or went. Row 8 leaves the cleared
+# official rating null, as the editor save rewrote the episode's NFO without it (and "Replace
+# all metadata" reads no NFO a saver would rewrite). No request at all, as the scratch series
+# has no provider ids.
 tv_scenario() {
   jq "${1:-.}" > scenario.json <<'EOJ'
 [
-  {},
-  {"created": 5, "probes": 3},
+  {"created": 1},
+  {"created": 4, "unchanged": 1, "probes": 3},
   {"unchanged": 5},
   {"updated": 1, "unchanged": 4, "probes": 1},
-  {"created": 1, "updated": 1, "probes": 1},
-  {"removed": 1, "updated": 1},
+  {"created": 1, "probes": 1},
+  {"removed": 1},
   {"updated": 1, "unchanged": 4, "patch": {"S01E03": {"Overview": "Rewritten by the verify script."}}},
   {"unchanged": 5},
-  {"updated": 1, "probes": 1, "patch": {"S01E01": {"OfficialRating": "PG"}}},
-  {"updated": 1, "probes": 1, "patch": {"S01E01": {"Overview": "Written by the verify script."}}},
-  {"updated": 1, "probes": 1, "patch": {"S01E01": {"CommunityRating": 6.5}}},
-  {"updated": 2, "probes": 1, "patch": {"S01E02": {"ImageTags": {"Primary": "t"}}}},
+  {"updated": 1, "probes": 1},
+  {"updated": 1, "probes": 1, "patch": {"S01E01": {"Overview": ""}}},
+  {"updated": 1, "probes": 1, "patch": {"S01E01": {"CommunityRating": null}}},
+  {"updated": 1, "probes": 1, "patch": {"S01E02": {"ImageTags": {"Primary": "t"}}}},
   {"updated": 1, "probes": 1},
   {"unchanged": 5},
-  {"updated": 2, "probes": 1}
+  {"updated": 1, "probes": 1}
 ]
 EOJ
 }
@@ -571,22 +574,29 @@ LIB_ID=f137a2dd21bbc1b99aa5c0f6bf02a805
   done
 }
 
-@test "run: a TV library with the fetchers on checks every row but the first for no requests" {
+@test "run: a TV library with the fetchers on checks every row for no requests" {
   SCRATCH="lib/Ferrofin Verify Show"
   mkdir -p "$SCRATCH"
-  # Row 1: the new scratch series searches for its match (not counted).
-  tv_scenario '.[1].requests = 2'
+  # The refresh before the rows: the new scratch series searches for its match (not counted).
+  tv_scenario '.[0].requests = 2'
   FAKE_KIND=tvshows FAKE_FETCHERS=on fake
   whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
   [ "$status" -eq 0 ]
   [[ "$output" == *"remote metadata fetchers for Series/Season/Episode: on"* ]]
-  [[ "$output" == *"row 1's provider requests are not checked; the scratch series has no provider ids,"*"so every other row expects 0"* ]]
+  [[ "$output" == *"a new scratch series searches for its match in the refresh before the rows, which is"*"not checked; the scratch series has no provider ids, so every row expects 0"* ]]
   [[ "$output" == *"summary: 13 PASS, 0 FAIL, 0 SKIP"* ]]
   [[ "$output" == *"an empty series 'Ferrofin Verify Show' stays in"*"delete the empty folder"* ]]
   [ -z "$(ls -A "$SCRATCH")" ]
   stop_fake
-  # A request for an episode, fetchers on or not, is a failure.
-  tv_scenario '.[1].requests = 2 | .[3].requests = 1'
+  # A request for an episode, fetchers on or not, is a failure, row 1's new ones included.
+  tv_scenario '.[0].requests = 2 | .[1].requests = 1'
+  FAKE_KIND=tvshows FAKE_FETCHERS=on fake
+  whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"   1  FAIL"*"provider requests 1 (want = 0)"* ]]
+  [ -z "$(ls -A "$SCRATCH")" ]
+  stop_fake
+  tv_scenario '.[0].requests = 2 | .[3].requests = 1'
   FAKE_KIND=tvshows FAKE_FETCHERS=on fake
   whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
   [ "$status" -eq 1 ]
@@ -594,10 +604,53 @@ LIB_ID=f137a2dd21bbc1b99aa5c0f6bf02a805
   [ -z "$(ls -A "$SCRATCH")" ]
 }
 
+@test "run: row 8 refills the rating unless the editor save rewrote the NFO" {
+  SCRATCH="lib/Ferrofin Verify Show"
+  mkdir -p "$SCRATCH"
+  # A TV library with no savers chosen: the edit rewrote the episode's NFO, so a refill fails.
+  tv_scenario '.[8].patch = {"S01E01": {"OfficialRating": "PG"}}'
+  FAKE_KIND=tvshows fake
+  whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"an editor save writes the NFO the scan reads (the NFO saver): true"* ]]
+  [[ "$output" == *"   8  FAIL"*"OfficialRating 'PG' (want 'null')"* ]]
+  stop_fake
+  # Savers chosen without Nfo (the dashboard's default): the NFO keeps the rating.
+  FAKE_KIND=tvshows FAKE_SAVERS='[]' fake
+  whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"the NFO saver): false"* ]]
+  [[ "$output" == *"summary: 13 PASS, 0 FAIL, 0 SKIP"* ]]
+  stop_fake
+  tv_scenario
+  FAKE_KIND=tvshows FAKE_SAVERS='[]' fake
+  whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"   8  FAIL"*"the cleared official rating was not filled"* ]]
+  stop_fake
+  # None chosen, but the server disables the Nfo saver for episodes: the rating is refilled.
+  tv_scenario '.[8].patch = {"S01E01": {"OfficialRating": "PG"}}'
+  FAKE_KIND=tvshows FAKE_CONFIG='{"MetadataOptions":[{"ItemType":"Episode","DisabledMetadataSavers":["Nfo"]}]}' fake
+  whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"the NFO saver): false"* ]]
+  stop_fake
+  # A movies library whose savers include Nfo: the edit wrote movie.nfo, which the scan reads.
+  rmdir "$SCRATCH"
+  SCRATCH=lib/scratch
+  mkdir -p "$SCRATCH"
+  movies_scenario 'del(.[8].patch)'
+  FAKE_SAVERS='["Nfo"]' fake
+  whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"the NFO saver): true"* ]]
+  [[ "$output" == *"summary: 12 PASS, 0 FAIL, 1 SKIP"* ]]
+}
+
 @test "run: a scratch series that matched a real show stops the run after row 1" {
   SCRATCH="lib/Ferrofin Verify Show"
   mkdir -p "$SCRATCH"
-  tv_scenario '.[1].requests = 2 | .[1].patch = {"SERIES": {"ProviderIds": {"Tmdb": "1399"}}}'
+  tv_scenario '.[0].requests = 2 | .[0].patch = {"SERIES": {"ProviderIds": {"Tmdb": "1399"}}}'
   FAKE_KIND=tvshows FAKE_FETCHERS=on fake
   whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
   [ "$status" -eq 1 ]
@@ -609,21 +662,23 @@ LIB_ID=f137a2dd21bbc1b99aa5c0f6bf02a805
 @test "run: a TV library is on when any of its kinds is, not only Episode" {
   SCRATCH="lib/Ferrofin Verify Show"
   mkdir -p "$SCRATCH"
-  # Series ticked, Episode not: the series' own search is a request row 1 must not refuse.
-  tv_scenario '.[1].requests = 2'
+  # Series ticked, Episode not: the series' own search, before the rows, is not refused.
+  tv_scenario '.[0].requests = 2'
   FAKE_KIND=tvshows FAKE_TYPE_OPTIONS='[{"Type":"Series","MetadataFetchers":["TheMovieDb"]},
     {"Type":"Season","MetadataFetchers":[]},{"Type":"Episode","MetadataFetchers":[]}]' fake
   whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
   [ "$status" -eq 0 ]
   [[ "$output" == *"remote metadata fetchers for Series/Season/Episode: on"* ]]
+  [[ "$output" == *"a new scratch series searches for its match"* ]]
   [[ "$output" == *"summary: 13 PASS, 0 FAIL, 0 SKIP"* ]]
   stop_fake
-  # Every kind off: row 1's request is then a failure.
+  # Every kind off: the series searches nothing, and a request in row 1 is a failure.
   tv_scenario '.[1].requests = 2'
   FAKE_KIND=tvshows FAKE_FETCHERS=off fake
   whole_run "$BASE" "$LIB_ID" "$TMP/$SCRATCH"
   [ "$status" -eq 1 ]
   [[ "$output" == *"remote metadata fetchers for Series/Season/Episode: off"* ]]
+  [[ "$output" != *"a new scratch series searches for its match"* ]]
   [[ "$output" == *"   1  FAIL"*"provider requests 2 (want = 0)"* ]]
 }
 

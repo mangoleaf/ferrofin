@@ -178,10 +178,24 @@ ferrofin:
     # FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS: "100000"
     # FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS: "300"
     # Seconds a resolved access token, and a user's permissions with the libraries'
-    # rows and options, are served from memory (5-300, default 30 each). Changes
-    # made through the server apply at once; these only bound changes made outside it.
+    # rows and options and whether a Live TV tuner exists, are served from memory
+    # (5-300, default 30 each). Changes made through the server apply at once; these
+    # only bound changes made outside it.
     # FERROFIN_AUTH_CACHE_TTL_SECS: "30"
     # FERROFIN_ROW_CACHE_TTL_SECS: "30"
+    # Failed logins an account or a client address may make before its next attempts
+    # wait (1 s, doubling to the maximum; the backoff never disables an account). Add the
+    # ingress to Known proxies, or every client shares its address and one
+    # guesser can get everyone's logins refused.
+    # FERROFIN_LOGIN_BACKOFF: "true"
+    # FERROFIN_LOGIN_BACKOFF_ATTEMPTS: "5"
+    # FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS: "30"
+    # FERROFIN_LOGIN_BACKOFF_WINDOW_MINS: "15"
+    # FERROFIN_LOGIN_BACKOFF_MAX_TRACKED: "100000"
+    # Prepared statements each SQLite connection keeps (100-1024, default 200).
+    # Each connection of the pool keeps its own, about 16 KiB a statement, so a
+    # larger value costs memory on every connection.
+    # FERROFIN_DB_STATEMENT_CACHE: "200"
     # How many trickplay images are generated at once (default: auto, up to the
     # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
     # hardware acceleration holds GPU memory; "1" matches Jellyfin.
@@ -208,6 +222,21 @@ ferrofin:
     # FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS: "200"
     # FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB: "512"
     # FERROFIN_IMAGE_RESIZE_BUDGET_MB: "2048"
+
+    # The largest remote image downloaded, and how long a URL that gave no image
+    # (a channel logo that is gone, say) is left alone before it is tried again.
+    # FERROFIN_IMAGE_DOWNLOAD_MAX_MB: "64"
+    # FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS: "3600"
+    # Image downloads refuse private/LAN addresses, a Live TV tuner's host
+    # aside. List the LAN hosts or networks that serve your artwork:
+    # FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW: "nas.lan,192.168.1.0/24"
+
+    # The most jobs re-encoding a stream the server runs at once, and one user
+    # runs at once. Past either cap the user's idle job on the same device is
+    # ended first; with none to end, the client gets 503 with Retry-After. 0
+    # means no cap.
+    # FERROFIN_MAX_TRANSCODES: "0"
+    # FERROFIN_MAX_TRANSCODES_PER_USER: "0"
 
     # WASM plugins (sandboxed, runtime-installed): install from a plugin
     # repository in the dashboard (Plugins → Repositories → Catalog), or place

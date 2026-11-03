@@ -282,6 +282,10 @@ pub trait TrickplayFrameExtractor: Send + Sync {
 /// so an anamorphic source has to be un-stretched from its aspect ratio first.
 /// Without it the extractor can only take the software path.
 #[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent switches, each a setting of its own"
+)]
 pub struct TrickplayExtraction<'a> {
     /// The source media path.
     pub input_path: &'a str,
@@ -316,6 +320,11 @@ pub struct TrickplayExtraction<'a> {
     /// only. Most of the speedup, and the one thing that can fail on a file
     /// with a broken keyframe index; the extractor retries without it.
     pub keyframe_only: bool,
+    /// `TrickplayOptions::full_chroma`: write 4:4:4 frames on the software
+    /// path (`build_trickplay_args`), which a job with nothing on the GPU
+    /// takes too. A job on the hardware path keeps 4:2:0: its frames go
+    /// through a hardware decoder, scaler or encoder.
+    pub full_chroma: bool,
 }
 
 /// Compile-time assertion that [`TrickplayFrameExtractor`] is object-safe.
@@ -659,6 +668,10 @@ pub struct HlsStreamRequest {
     /// copying a stream when its transcoding permission is disabled, matching
     /// `EncodingHelper.TryStreamCopy`; remuxing controls playback negotiation.
     pub playback_permissions: Option<crate::library::PlaybackPermissions>,
+    /// The authenticated user the stream is for, never populated from query
+    /// parameters; `None` for a userless API key. The transcode manager counts
+    /// a user's running transcodes against its per-user cap by it.
+    pub user_id: Option<Uuid>,
     /// Whether the request came from the local network
     /// (`INetworkManager.IsInLocalNetwork(remoteIp)`): disables the adaptive
     /// bitrate variants, which "within the local network will likely do more
@@ -691,6 +704,7 @@ impl Default for HlsStreamRequest {
     fn default() -> Self {
         Self {
             item_id: Uuid::nil(),
+            user_id: None,
             media_source_id: None,
             live_stream_id: None,
             play_session_id: None,
@@ -938,6 +952,21 @@ pub trait HlsStreamManager: Send + Sync {
         play_session_id: &str,
         is_user_paused: Option<bool>,
     ) -> Result<(), ServiceError>;
+
+    /// The transcoding job running for `play_session_id`, if any, matched
+    /// without regard to case.
+    ///
+    /// Port of `TranscodeManager.GetTranscodingJob(playSessionId)`, which
+    /// `PlaystateController.ValidatePlayMethod` asks before it keeps a
+    /// reported `Transcode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the job registry cannot be read.
+    async fn get_transcoding_job(
+        &self,
+        play_session_id: &str,
+    ) -> Result<Option<TranscodingJobHandle>, ServiceError>;
 }
 
 /// Compile-time assertion that [`HlsStreamManager`] is object-safe.

@@ -370,7 +370,7 @@ async fn playback_info(
     request: PlaybackRequest,
 ) -> Result<PlaybackInfoResponse, ApiError> {
     let user = resolve_user_opt(state, auth, request.user_id).await?;
-    let item = require_visible_item(state, item_id, user.as_ref()).await?;
+    let item = require_visible_item(state, item_id, user.as_deref()).await?;
     let resolved_user_id = match &user {
         Some(user) => user_uuid(user)?,
         None => effective_user_id(state, auth, request.user_id).await?,
@@ -378,7 +378,7 @@ async fn playback_info(
     let mut media_sources = resolve_playback_media_sources(
         state,
         &item,
-        user.as_ref(),
+        user.as_deref(),
         resolved_user_id,
         request.media_source_id.as_deref(),
         request.live_stream_id.as_deref(),
@@ -425,7 +425,7 @@ async fn playback_info(
         let decisions = set_device_specific_data(
             state,
             auth,
-            user.as_ref(),
+            user.as_deref(),
             resolved_user_id,
             item_id,
             item.media_type.as_deref(),
@@ -568,7 +568,7 @@ async fn open_media_source(
         set_device_specific_data(
             state,
             auth,
-            user.as_ref(),
+            user.as_deref(),
             request.user_id,
             request.item_id,
             item.media_type.as_deref(),
@@ -598,8 +598,9 @@ async fn open_media_source(
 
 /// `MediaInfoHelper.SetDeviceSpecificData` over every source of an item: the
 /// user's policy and bitrate limit, then one [`apply_stream_decision`] each,
-/// with the track picks applied only to the version `request` names. Returns
-/// each decided source's id with its decision.
+/// with the track picks applied only to the version `request` names, and the
+/// source's attachment URLs ([`set_attachment_delivery_urls`]). Returns each
+/// decided source's id with its decision.
 #[allow(clippy::too_many_arguments)] // mirrors the C# parameter surface
 async fn set_device_specific_data(
     state: &AppState,
@@ -663,8 +664,24 @@ async fn set_device_specific_data(
         if let Some(decision) = decision {
             decisions.push((source.id.clone(), decision));
         }
+        set_attachment_delivery_urls(source, item_id);
     }
     Ok(decisions)
+}
+
+/// The tail of `SetDeviceSpecificData`: every attachment of a negotiated
+/// source is served at `/Videos/{item.Id}/{mediaSource.Id}/Attachments/{Index}`
+/// (`MediaInfoHelper.cs:350-358`), the item id in .NET's default `Guid`
+/// spelling. jellyfin-web hands each font's URL to its subtitle renderer.
+fn set_attachment_delivery_urls(source: &mut MediaSourceInfo, item_id: Uuid) {
+    let source_id = source.id.as_deref().unwrap_or_default();
+    for attachment in &mut source.media_attachments {
+        attachment.delivery_url = Some(format!(
+            "/Videos/{}/{source_id}/Attachments/{}",
+            item_id.as_hyphenated(),
+            attachment.index
+        ));
+    }
 }
 
 /// The media source `UniversalAudioController.GetUniversalAudioStream` acts
@@ -698,7 +715,7 @@ pub(crate) async fn universal_audio_source(
     transcoding_protocol: Option<MediaStreamProtocol>,
 ) -> Result<Option<UniversalAudioSource>, ApiError> {
     let user = resolve_user_opt(state, auth, user_id).await?;
-    let item = require_visible_item(state, item_id, user.as_ref()).await?;
+    let item = require_visible_item(state, item_id, user.as_deref()).await?;
     let resolved_user_id = match &user {
         Some(user) => user_uuid(user)?,
         None => effective_user_id(state, auth, user_id).await?,
@@ -706,7 +723,7 @@ pub(crate) async fn universal_audio_source(
     // Every version (the universal route takes no live stream id), narrowed
     // below rather than by the helper's exact match.
     let mut media_sources =
-        resolve_playback_media_sources(state, &item, user.as_ref(), resolved_user_id, None, None)
+        resolve_playback_media_sources(state, &item, user.as_deref(), resolved_user_id, None, None)
             .await?;
     // The version is matched in either GUID spelling, as the static stream
     // routes match it (`MediaSourceInfo::id_matches`): the universal URL's
@@ -738,7 +755,7 @@ pub(crate) async fn universal_audio_source(
     set_device_specific_data(
         state,
         auth,
-        user.as_ref(),
+        user.as_deref(),
         resolved_user_id,
         item_id,
         item.media_type.as_deref(),
@@ -749,6 +766,9 @@ pub(crate) async fn universal_audio_source(
     )
     .await?;
     sort_media_sources(&mut media_sources, max_streaming_bitrate, item_id);
+    // The response is a redirect to a remote source's `Path` when it may be
+    // direct played, so a tuner's never gets that far for a non-administrator.
+    hide_live_source_urls(state, auth, &mut media_sources).await?;
     Ok(media_sources
         .into_iter()
         .next()
@@ -1220,9 +1240,9 @@ async fn get_playback_info(
         ..PlaybackRequest::default()
     };
     let client = super::system::context_from_parts(&state, &parts);
-    Ok(Json(
-        playback_info(&state, &auth, &client, item_id, request).await?,
-    ))
+    let mut response = playback_info(&state, &auth, &client, item_id, request).await?;
+    hide_live_source_urls(&state, &auth, &mut response.media_sources).await?;
+    Ok(Json(response))
 }
 
 /// The `POST /Items/{itemId}/PlaybackInfo` body — the client's device profile,
@@ -1366,9 +1386,9 @@ async fn post_playback_info(
         flags: flags_from(&query, Some(&body)),
     };
     let client = super::system::context_from_parts(&state, &parts);
-    Ok(Json(
-        playback_info(&state, &auth, &client, item_id, request).await?,
-    ))
+    let mut response = playback_info(&state, &auth, &client, item_id, request).await?;
+    hide_live_source_urls(&state, &auth, &mut response.media_sources).await?;
+    Ok(Json(response))
 }
 
 /// Query parameters for `POST /LiveStreams/Open`.
@@ -1505,8 +1525,46 @@ async fn open_live_stream(
     let effective = effective_user_id(&state, &auth, query.user_id.or(dto.user_id)).await?;
     let request = live_stream_request(query, dto, effective);
     let client = super::system::context_from_parts(&state, &parts);
-    let media_source = open_media_source(&state, &auth, &client, &request).await?;
+    let mut media_source = open_media_source(&state, &auth, &client, &request).await?;
+    hide_live_source_urls(&state, &auth, std::slice::from_mut(&mut media_source)).await?;
     Ok(Json(LiveStreamResponse::new(media_source)))
+}
+
+/// Takes, from a caller who is not an administrator, the `Path` of every
+/// HTTP M3U tuner source and its direct play, opened or not
+/// ([`path_is_private`](MediaSourceInfo::path_is_private)). The client streams
+/// through `/Videos/{id}/stream`, which the server relays from the source it
+/// holds, or through the source's `TranscodingUrl`.
+///
+/// That `Path` is the tuner's upstream channel URL, and an IPTV service's
+/// usually carries the account's user name and password
+/// (`http://host/live/USER/PASS/1.ts`). Upstream hands it to every user with
+/// Live TV access; this diverges on purpose, as the `livetv` configuration
+/// blanking does. An opened source is treated alike: a stream that is not
+/// shared keeps the tuner URL. Direct play goes with the `Path` because
+/// jellyfin-web plays `Path` as it stands while `SupportsDirectPlay` is set,
+/// and a source that could be direct played stays direct streamable, or it
+/// would have no way left to play.
+///
+/// An administrator keeps both, and so does an API key
+/// ([`is_administrator_identity`](crate::auth::is_administrator_identity)).
+/// Only the response changes: the source the server reads keeps its URL.
+async fn hide_live_source_urls(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    sources: &mut [MediaSourceInfo],
+) -> Result<(), ApiError> {
+    if !sources.iter().any(|source| source.path_is_private)
+        || crate::auth::is_administrator_identity(state, auth).await?
+    {
+        return Ok(());
+    }
+    for source in sources.iter_mut().filter(|source| source.path_is_private) {
+        source.path = Some(String::new());
+        source.supports_direct_stream |= source.supports_direct_play;
+        source.supports_direct_play = false;
+    }
+    Ok(())
 }
 
 /// Folds the query and the posted body into one [`LiveStreamRequest`].

@@ -473,7 +473,8 @@ pub async fn store_listing_provider(
 /// `config.TunerHosts[index] = info` keeps the posted spelling of a matched id.
 /// Channel ids do not derive from the tuner id, so a rename moves no channel or
 /// its user data. One transaction, so a failed write leaves the old rows as
-/// they were.
+/// they were. Once committed, the cached answer of whether a tuner exists is
+/// dropped ([`Database::invalidate_live_tv_tuner_hosts`]).
 ///
 /// # Errors
 ///
@@ -514,7 +515,9 @@ pub async fn store_tuner_host(
     .execute(&mut *tx)
     .await
     .map_err(db_err)?;
-    tx.commit().await.map_err(db_err)
+    tx.commit().await.map_err(db_err)?;
+    db.invalidate_live_tv_tuner_hosts();
+    Ok(())
 }
 
 /// The tuner-facing external id of one channel, or `None` when the lineup does

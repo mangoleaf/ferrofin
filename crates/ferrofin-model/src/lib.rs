@@ -27,6 +27,7 @@ pub mod globalization;
 pub mod intro_skipper;
 pub mod io;
 pub mod json;
+pub mod ldap;
 pub mod library;
 pub mod live_tv;
 pub mod lyrics;

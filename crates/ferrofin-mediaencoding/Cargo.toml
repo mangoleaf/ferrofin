@@ -30,6 +30,8 @@ tracing.workspace = true
 notify.workspace = true
 
 [dev-dependencies]
+# Decodes trickplay frames as the tile packer does, to check their colours.
+image.workspace = true
 rstest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

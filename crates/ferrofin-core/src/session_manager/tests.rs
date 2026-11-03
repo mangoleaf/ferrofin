@@ -655,6 +655,127 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
     assert_eq!(resolved.user_id, user_id);
 }
 
+/// Upstream throws one message from `UserManager.AuthenticateUser` (no such
+/// user) and `AuthenticateNewSessionInternal` (wrong password), so a caller
+/// cannot tell them apart. The two are written in different managers here.
+#[tokio::test]
+async fn unknown_user_and_wrong_password_fail_with_one_message() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "bob").await;
+    set_permission(&db, &user.id, PermissionKind::EnableRemoteAccess, true)
+        .await
+        .unwrap();
+    FerrofinUserManager::new(db.clone())
+        .change_password(user_id, "right")
+        .await
+        .unwrap();
+
+    let attempt = |username: &str| AuthenticationRequest {
+        username: Some(username.to_owned()),
+        password: Some(Secret::new("guess")),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device_name: Some("Firefox".to_owned()),
+        remote_endpoint: Some("127.0.0.1".to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    let unknown = mgr.authenticate_new_session(&attempt("nobody")).await;
+    let wrong = mgr.authenticate_new_session(&attempt("bob")).await;
+    let (Err(ServiceError::Unauthorized(unknown)), Err(ServiceError::Unauthorized(wrong))) =
+        (unknown, wrong)
+    else {
+        panic!("both must be an authentication failure");
+    };
+    assert_eq!(unknown, wrong);
+    assert_eq!(unknown, "Invalid username or password entered.");
+}
+
+/// The login routes answer every refusal with one body, so the log is the only
+/// place left that says why. These three happen once the password is settled,
+/// each logged where it is decided.
+#[tokio::test]
+async fn refused_logins_log_their_reason() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let logs = crate::test_support::CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let attempt = |username: &str, remote: &str| AuthenticationRequest {
+        username: Some(username.to_owned()),
+        password: Some(Secret::new("")),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some("dev-1".to_owned()),
+        device_name: Some("Firefox".to_owned()),
+        remote_endpoint: Some(remote.to_owned()),
+        ..AuthenticationRequest::default()
+    };
+
+    // No `EnableRemoteAccess`, from outside the local network.
+    let remote = seed_named_user(&db, Uuid::new_v4(), "remote").await;
+    set_permission(&db, &remote.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
+    let refused = mgr
+        .authenticate_new_session(&attempt("remote", "1.2.3.4"))
+        .await;
+    assert!(matches!(refused, Err(ServiceError::Forbidden(_))));
+
+    // No `EnableAllDevices`, and this device is not on the user's list.
+    let bound = seed_named_user(&db, Uuid::new_v4(), "bound").await;
+    set_permission(&db, &bound.id, PermissionKind::EnableRemoteAccess, true)
+        .await
+        .unwrap();
+    let refused = mgr
+        .authenticate_new_session(&attempt("bound", "127.0.0.1"))
+        .await;
+    assert!(matches!(refused, Err(ServiceError::Forbidden(_))));
+
+    // One session allowed, and the first login holds it.
+    let capped_id = Uuid::new_v4();
+    let capped = seed_named_user(&db, capped_id, "capped").await;
+    FerrofinUserManager::new(db.clone())
+        .update_policy(
+            capped_id,
+            &ferrofin_model::users::UserPolicy {
+                max_active_sessions: 1,
+                ..ferrofin_model::users::UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    for permission in [
+        PermissionKind::EnableRemoteAccess,
+        PermissionKind::EnableAllDevices,
+    ] {
+        set_permission(&db, &capped.id, permission, true)
+            .await
+            .unwrap();
+    }
+    let request = attempt("capped", "127.0.0.1");
+    mgr.authenticate_new_session(&request).await.unwrap();
+    let refused = mgr.authenticate_new_session(&request).await;
+    assert!(matches!(refused, Err(ServiceError::Forbidden(_))));
+
+    let log = logs.text();
+    let missing: Vec<&str> = ["remote_access", "device", "max_sessions"]
+        .into_iter()
+        .filter(|reason| {
+            !log.lines().any(|line| {
+                line.contains("login failed") && line.contains(&format!("reason=\"{reason}\""))
+            })
+        })
+        .collect();
+    assert!(missing.is_empty(), "no line for {missing:?} in: {log}");
+}
+
 #[tokio::test]
 async fn authenticate_new_session_enforces_password_and_returns_the_token() {
     // The interactive path (`authenticate_new_session`) runs the password check
@@ -2266,7 +2387,8 @@ async fn a_logout_or_an_already_stopped_stream_is_not_released_on_session_end() 
         mgr.get_session_snapshot(stopped.id.as_deref().expect("id"))
             .await
             .unwrap()
-            .now_playing_live_stream_id,
+            .play_state
+            .live_stream_id,
         None,
         "a stop clears the session's live stream (C# `RemoveNowPlayingItem`)"
     );
@@ -2309,7 +2431,8 @@ async fn the_sessions_live_stream_follows_the_reports() {
             mgr.get_session_snapshot(&session_id)
                 .await
                 .unwrap()
-                .now_playing_live_stream_id
+                .play_state
+                .live_stream_id
         }
     };
     mgr.on_playback_start(&PlaybackStartInfo {
@@ -3632,6 +3755,7 @@ async fn progress_alone_restores_the_now_playing_item() {
         item_id,
         position_ticks: Some(1000),
         is_paused: true,
+        can_seek: true,
         ..PlaybackProgressInfo::default()
     };
     mgr.on_playback_progress(&paused, false).await.unwrap();
@@ -3646,7 +3770,8 @@ async fn progress_alone_restores_the_now_playing_item() {
         super::session_info_to_dto(&first)
             .play_state
             .unwrap()
-            .can_seek
+            .can_seek,
+        "the report's CanSeek (C# `PlayState.CanSeek = info.CanSeek`)"
     );
     let paused_since = first
         .last_paused_date
@@ -4028,7 +4153,7 @@ async fn an_idle_stop_keeps_the_position_against_the_version_played() {
         .find(|s| s.id == session_id)
         .expect("session");
     assert!(session.now_playing_item_id.is_none());
-    assert!(session.now_playing_media_source_id.is_none());
+    assert!(session.play_state.media_source_id.is_none());
 }
 
 /// One tick of the loop: the inactive check only with a threshold above 0,
@@ -4498,3 +4623,9 @@ mod device_reads;
 /// The session's `NowPlayingItem`, built once per item on the report that
 /// names it, and the session summaries that read it.
 mod now_playing_item;
+
+/// The session's play state, queue, transcoding info and now-viewing item.
+mod play_state;
+
+/// The session DTO members that do not follow the playback state.
+mod session_dto;

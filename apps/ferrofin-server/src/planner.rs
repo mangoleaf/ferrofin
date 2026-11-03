@@ -8356,6 +8356,48 @@ mod tests {
         assert_eq!(plan.state.output_audio_codec.as_deref(), Some("copy"));
     }
 
+    /// What the transcode caps count, read off real plans: only a job copying
+    /// every stream is free.
+    #[tokio::test]
+    async fn only_a_plan_copying_every_stream_escapes_the_transcode_caps() {
+        let both = || vec![video_stream("h264"), audio_stream("aac")];
+        let codecs = |video: &str, audio: &str| {
+            let mut req = request("abc");
+            req.video_codec = Some(video.to_owned());
+            req.audio_codec = Some(audio.to_owned());
+            req
+        };
+        let encodes = async |streams: Vec<MediaStream>, req: HlsStreamRequest, is_audio: bool| {
+            planner(vec![source("abc", streams)])
+                .plan(&req, is_audio, None, PlaylistKind::Vod)
+                .await
+                .unwrap()
+                .state
+                .encodes_any_stream()
+        };
+
+        assert!(
+            !encodes(both(), codecs("h264", "aac"), false).await,
+            "a remux"
+        );
+        assert!(
+            encodes(both(), codecs("h264", "mp3"), false).await,
+            "copied video, re-encoded audio"
+        );
+        assert!(
+            encodes(both(), codecs("hevc", "aac"), false).await,
+            "re-encoded video, copied audio"
+        );
+        assert!(
+            encodes(vec![audio_stream("aac")], codecs("h264", "aac"), true).await,
+            "a music transcode"
+        );
+        assert!(
+            !encodes(vec![video_stream("h264")], codecs("h264", "aac"), false).await,
+            "a silent video copied, whatever audio codec the plan names"
+        );
+    }
+
     /// An EVENT plan (`live.m3u8`) writes an event playlist with routed
     /// segment URIs and, for mpegts, no global header. The configured auto
     /// preset is veryfast on both EVENT and VOD jobs.
@@ -8483,6 +8525,37 @@ mod tests {
             progressive_container(&request, false, &source, Some("hevc"), None).unwrap(),
             "mp4"
         );
+    }
+
+    /// Every kind of job carries the request's `DeviceId`: past a transcode cap
+    /// only a job of the same device gives up its slot, so a plan that dropped
+    /// it would leave "next episode" refused.
+    #[tokio::test]
+    async fn every_plan_carries_the_requests_device() {
+        let root = tempfile::tempdir().unwrap();
+        let (planner, _) = planner_with_persisted_encoding(
+            vec![source(
+                "abc",
+                vec![video_stream("hevc"), audio_stream("aac")],
+            )],
+            root.path(),
+        )
+        .await;
+        let mut request = request("abc");
+        request.device_id = Some("living-room-tv".to_owned());
+        request.output_container = Some("mp4".to_owned());
+        for (segment, kind) in [
+            (Some(0), PlaylistKind::Vod),
+            (Some(0), PlaylistKind::Event),
+            (None, PlaylistKind::Progressive),
+        ] {
+            let plan = planner.plan(&request, false, segment, kind).await.unwrap();
+            assert_eq!(
+                plan.state.device_id.as_deref(),
+                Some("living-room-tv"),
+                "{kind:?}"
+            );
+        }
     }
 
     #[tokio::test]

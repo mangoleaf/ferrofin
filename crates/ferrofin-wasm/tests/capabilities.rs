@@ -14,8 +14,7 @@ use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_wasm::bindings::types::{HttpRequest, ItemQuery, MediaSegment};
 use ferrofin_wasm::capabilities::{
-    Collaborators, MAX_QUERY_ROWS, http_fetch, is_private_address, query_items,
-    write_media_segments,
+    Collaborators, MAX_QUERY_ROWS, http_fetch, query_items, write_media_segments,
 };
 
 mod common;
@@ -307,61 +306,8 @@ async fn write_media_segments_validates_types_and_ranges() {
 
 #[test]
 fn http_fetch_denies_private_destinations_unless_allowlisted() {
-    // Loopback, link-local (cloud metadata), RFC1918, and v4-mapped v6 are
-    // all private; public addresses are not.
-    for private in [
-        "127.0.0.1",
-        "169.254.169.254", // cloud metadata / link-local
-        "10.1.2.3",        // RFC1918
-        "172.16.0.1",
-        "192.168.1.1",
-        "100.64.0.1",      // CGNAT (Tailscale)
-        "100.100.100.100", // CGNAT interior
-        "198.18.0.5",      // benchmarking
-        "192.0.0.1",       // IETF protocol assignments
-        "240.0.0.1",       // reserved
-        "224.0.0.1",       // multicast
-        "::1",
-        "fe80::1",
-        "fd00::1",
-        "ff02::1",           // v6 multicast
-        "::ffff:10.0.0.1",   // v4-mapped RFC1918
-        "::ffff:100.64.0.1", // v4-mapped CGNAT
-        // IPv6 forms that carry a private IPv4 reach it through a NAT64
-        // gateway, a 6to4 relay or IPv4-compatible routing.
-        "64:ff9b::a9fe:a9fe", // NAT64 → cloud metadata
-        "64:ff9b::7f00:1",    // NAT64 → loopback
-        "64:ff9b:1::1",       // local-use NAT64 prefix (not globally reachable)
-        "2002:7f00:1::",      // 6to4 → loopback
-        "2002:c0a8:101::1",   // 6to4 → 192.168.1.1
-        "2002:a00:1::",       // 6to4 → 10.0.0.1
-        "::127.0.0.1",        // IPv4-compatible loopback
-        "::10.0.0.1",         // IPv4-compatible RFC1918
-    ] {
-        assert!(
-            is_private_address(private.parse().unwrap()),
-            "{private} must be private"
-        );
-    }
-    for public in [
-        "1.1.1.1",
-        "8.8.8.8",
-        "93.184.216.34",
-        "100.63.255.255", // just below CGNAT
-        "100.128.0.0",    // just above CGNAT
-        "2606:4700:4700::1111",
-        "64:ff9b::808:808", // NAT64 → 8.8.8.8
-        "2002:808:808::1",  // 6to4 → 8.8.8.8
-        "::8.8.8.8",        // IPv4-compatible public
-        "64:ff9b:2::1",     // just past the local-use NAT64 prefix
-        "64:ff9b:0:0:1::1", // not the NAT64 /96: a non-zero middle
-    ] {
-        assert!(
-            !is_private_address(public.parse().unwrap()),
-            "{public} must be public"
-        );
-    }
-
+    // Which addresses are private is `ferrofin_providers::destination`'s
+    // (`is_private_address`, tested there); this is the host applying it.
     // A non-allowlisted plugin cannot reach the loopback listener; the
     // denial names the address class and the knob that grants access.
     let (url, _server) = one_shot_http("200 OK", b"nope");
@@ -494,6 +440,115 @@ fn state_kv_round_trips_caps_and_deletes() {
     // A corrupt file reads as empty rather than erroring.
     std::fs::write(&path, b"not json").unwrap();
     assert_eq!(get_state(Some(&path), "cursor"), None);
+}
+
+/// Sets the state file's modified time, as a rewrite inside one coarse
+/// timestamp tick would leave it.
+fn set_modified(path: &std::path::Path, modified: std::time::SystemTime) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+}
+
+/// Rewrites the state file in place (same inode) with `from` replaced by
+/// `to`, and puts its modified time back: a change its stamp cannot show.
+fn swap_unseen(path: &std::path::Path, from: &str, to: &str) {
+    let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(text.contains(from), "{from} is not in {text}");
+    std::fs::write(path, text.replace(from, to)).unwrap();
+    set_modified(path, modified);
+}
+
+/// A `get-state` keeps the parsed map while the file's stamp is unchanged,
+/// instead of reading and parsing the whole file again per call: with the
+/// contents swapped behind the same length, modified time and inode, the
+/// value last read or written is what comes back, for a map read from the
+/// file (as after a restart) and for one a write just made.
+#[test]
+fn get_state_keeps_the_parsed_map_while_the_file_is_unchanged() {
+    use ferrofin_wasm::capabilities::{get_state, set_state};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plugin.state.json");
+    set_state(Some(&path), "cursor", Some(b"1".to_vec())).unwrap();
+    assert_eq!(get_state(Some(&path), "cursor"), Some(b"1".to_vec()));
+    swap_unseen(&path, "31", "32");
+    assert_eq!(get_state(Some(&path), "cursor"), Some(b"1".to_vec()));
+
+    set_state(Some(&path), "cursor", Some(b"3".to_vec())).unwrap();
+    swap_unseen(&path, "33", "34");
+    assert_eq!(get_state(Some(&path), "cursor"), Some(b"3".to_vec()));
+
+    // Read from the file, not written here: kept all the same.
+    std::fs::write(&path, br#"{"cursor":"3535"}"#).unwrap();
+    assert_eq!(get_state(Some(&path), "cursor"), Some(b"55".to_vec()));
+    swap_unseen(&path, "3535", "3636");
+    assert_eq!(get_state(Some(&path), "cursor"), Some(b"55".to_vec()));
+}
+
+/// Every change made elsewhere to the state file reaches `get-state`: a
+/// rewrite (a backup restore), a file renamed over it (another server's
+/// `set-state` during a rolling update), and its removal (an uninstall).
+#[test]
+fn get_state_sees_every_change_to_the_file() {
+    use ferrofin_wasm::capabilities::{get_state, set_state};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plugin.state.json");
+    set_state(Some(&path), "cursor", Some(b"1".to_vec())).unwrap();
+    assert_eq!(get_state(Some(&path), "cursor"), Some(b"1".to_vec()));
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    // Rewritten elsewhere: a new length, then the same length at a new time.
+    std::fs::write(&path, br#"{"cursor":"3333"}"#).unwrap();
+    assert_eq!(get_state(Some(&path), "cursor"), Some(b"33".to_vec()));
+    std::fs::write(&path, br#"{"cursor":"3434"}"#).unwrap();
+    set_modified(&path, modified + std::time::Duration::from_secs(1));
+    assert_eq!(get_state(Some(&path), "cursor"), Some(b"44".to_vec()));
+
+    // Renamed over it elsewhere: same length, same modified time, new file.
+    #[cfg(unix)]
+    {
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let other = dir.path().join("other.state.json");
+        std::fs::write(&other, br#"{"cursor":"3535"}"#).unwrap();
+        set_modified(&other, modified);
+        std::fs::rename(&other, &path).unwrap();
+        assert_eq!(get_state(Some(&path), "cursor"), Some(b"55".to_vec()));
+    }
+
+    // Removed: unset, and the next write starts from an empty map.
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(get_state(Some(&path), "cursor"), None);
+    set_state(Some(&path), "other", Some(b"x".to_vec())).unwrap();
+    assert_eq!(get_state(Some(&path), "cursor"), None);
+    assert_eq!(get_state(Some(&path), "other"), Some(b"x".to_vec()));
+}
+
+/// A `set-state` builds on the file, never on the map `get-state` kept: a
+/// change the stamp cannot show is written back, not undone, and a file
+/// corrupted behind an unchanged stamp is still refused.
+#[test]
+fn set_state_reads_the_file_not_the_kept_map() {
+    use ferrofin_wasm::capabilities::{get_state, set_state};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plugin.state.json");
+    set_state(Some(&path), "a", Some(b"1".to_vec())).unwrap();
+    swap_unseen(&path, "31", "32");
+    assert_eq!(get_state(Some(&path), "a"), Some(b"1".to_vec()));
+    set_state(Some(&path), "b", Some(b"x".to_vec())).unwrap();
+    assert_eq!(get_state(Some(&path), "a"), Some(b"2".to_vec()));
+
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let garbage = vec![b'!'; std::fs::read(&path).unwrap().len()];
+    std::fs::write(&path, &garbage).unwrap();
+    set_modified(&path, modified);
+    assert_eq!(get_state(Some(&path), "a"), Some(b"2".to_vec()));
+    let err = set_state(Some(&path), "c", Some(b"y".to_vec())).unwrap_err();
+    assert!(err.contains("corrupt"), "{err}");
+    assert_eq!(std::fs::read(&path).unwrap(), garbage);
 }
 
 // The artwork download runs the plugin's declared-egress gate host-side:

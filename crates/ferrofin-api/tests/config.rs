@@ -92,7 +92,7 @@ impl AuthService for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_authenticated: true,
             ..Default::default()
         })
@@ -107,7 +107,7 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_authenticated: true,
             ..Default::default()
         })
@@ -821,6 +821,11 @@ async fn an_unregistered_named_configuration_is_neither_served_nor_saved() {
     }
 
     let document = serde_json::json!({"CustomSetting":{"NestedValue":[1,"two",false]}});
+    // `[FromRoute, Required]`: a whitespace-only key never reaches the action.
+    assert_eq!(
+        post(app.clone(), "/System/Configuration/%20", &document).await,
+        StatusCode::BAD_REQUEST
+    );
     assert_eq!(
         post(app, "/System/Configuration/never-saved", &document).await,
         StatusCode::INTERNAL_SERVER_ERROR
@@ -1934,4 +1939,38 @@ async fn current_web_configuration_payloads_survive_save_and_readback() {
             );
         }
     }
+}
+
+/// `TrickplayOptions.FullChroma` is Ferrofin's own opt-in: saved when a body
+/// carries it, and absent again, as in Jellyfin's document, once a save
+/// leaves it out.
+#[tokio::test]
+async fn the_trickplay_full_chroma_opt_in_is_saved_and_dropped_with_the_document() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/dashboard-settings.json")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    });
+    let full_chroma = |bytes: &[u8]| json(bytes)["TrickplayOptions"].get("FullChroma").cloned();
+
+    let (_, bytes) = get(app.clone(), "/System/Configuration").await;
+    assert_eq!(full_chroma(&bytes), None, "off by default, and not written");
+
+    let mut on = fixture["server"].clone();
+    on["TrickplayOptions"]["FullChroma"] = serde_json::json!(true);
+    assert_eq!(
+        post(app.clone(), "/System/Configuration", &on).await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, bytes) = get(app.clone(), "/System/Configuration").await;
+    assert_eq!(full_chroma(&bytes), Some(serde_json::json!(true)));
+
+    assert_eq!(
+        post(app.clone(), "/System/Configuration", &fixture["server"]).await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, bytes) = get(app, "/System/Configuration").await;
+    assert_eq!(full_chroma(&bytes), None);
 }

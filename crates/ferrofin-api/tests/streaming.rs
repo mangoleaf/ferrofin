@@ -85,7 +85,7 @@ impl AuthService for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -99,7 +99,7 @@ impl AuthorizationContext for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })

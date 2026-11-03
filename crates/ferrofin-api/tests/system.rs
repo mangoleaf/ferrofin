@@ -80,12 +80,8 @@ fn user() -> UserEntity {
 
 /// An auth stub that authenticates as [`USER_ID`].
 /// `elevated` authenticates as an API key, satisfying `RequiresElevation` on
-/// `Info/Storage`, `Logs`, `Logs/Log` and `Shutdown`. Off by default so
-/// `Info/Public`, `Ping` and `Endpoint` keep proving they work unelevated.
-///
-/// `Restart` is gated too, but by `LocalAccessOrRequiresElevation` — the
-/// caller's peer address decides, and `elevated` only matters off-network. Its
-/// tests inject `ConnectInfo` rather than relying on this flag.
+/// `Info/Storage`, `Logs`, `Logs/Log`, `Restart` and `Shutdown`. Off by default
+/// so `Info/Public`, `Ping` and `Endpoint` keep proving they work unelevated.
 struct OkAuth {
     elevated: bool,
 }
@@ -98,7 +94,7 @@ impl AuthService for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_api_key: self.elevated,
             is_authenticated: true,
             ..Default::default()
@@ -114,7 +110,7 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_api_key: self.elevated,
             is_authenticated: true,
             ..Default::default()
@@ -380,8 +376,8 @@ fn full_state() -> AppState {
     full_state_with(false)
 }
 
-/// The elevated state, for `Info/Storage`, `Logs`, `Logs/Log`, `Shutdown` and
-/// the dashboard configuration pages.
+/// The elevated state, for `Info/Storage`, `Logs`, `Logs/Log`, `Restart`,
+/// `Shutdown` and the dashboard configuration pages.
 fn elevated_full_state() -> AppState {
     full_state_with(true)
 }
@@ -897,8 +893,8 @@ async fn system_restart_and_shutdown_no_content() {
 /// `POST /System/Restart` from `peer`, as the state's user.
 ///
 /// `peer` is injected the way the composition root's `with_connect_info` does
-/// it — as a `ConnectInfo` request extension — so the policy sees a real peer
-/// address. `None` stands for a request with no connection to ask.
+/// it — as a `ConnectInfo` request extension — so a gate that read the address
+/// would see a real one. `None` stands for a request with no connection to ask.
 async fn restart_from(app: AppState, peer: Option<&str>) -> StatusCode {
     let mut request = Request::builder()
         .method("POST")
@@ -914,74 +910,75 @@ async fn restart_from(app: AppState, peer: Option<&str>) -> StatusCode {
     create_router(app).oneshot(request).await.unwrap().status()
 }
 
-// `LocalAccessOrRequiresElevation`: someone at the machine (or on the LAN) may
-// restart it, a stranger may not. Before this gate the route took plain
-// `RequireAuth`, so any account with a token could bounce the server from
-// anywhere.
+// Admin only, by owner decision (gl-1103): stricter than upstream's
+// `LocalAccessOrRequiresElevation`, which also admits any caller on the local
+// network. The source address decides nothing, as on `/System/Shutdown`.
 #[tokio::test]
-async fn restart_is_allowed_from_the_local_network_whoever_asks() {
+async fn restart_requires_an_administrator_from_any_address() {
     for peer in [
-        "127.0.0.1:5000",
-        "[::1]:5000",
-        "192.168.1.5:5000",
-        "10.0.0.7:5000",
+        Some("127.0.0.1:5000"),
+        Some("[::1]:5000"),
+        Some("192.168.1.5:5000"),
+        Some("10.0.0.7:5000"),
+        Some("172.17.0.1:5000"),
+        Some("[::ffff:127.0.0.1]:5000"),
+        Some("[::ffff:192.168.1.5]:5000"),
+        Some("203.0.113.9:5000"),
+        Some("[2001:db8::1]:5000"),
+        Some("[::ffff:203.0.113.9]:5000"),
+        None,
     ] {
         assert_eq!(
-            restart_from(full_state(), Some(peer)).await,
+            restart_from(full_state(), peer).await,
+            StatusCode::FORBIDDEN,
+            "{peer:?}: an ordinary account must not restart the server"
+        );
+        assert_eq!(
+            restart_from(elevated_full_state(), peer).await,
             StatusCode::NO_CONTENT,
-            "{peer} is on the local network — a non-admin may restart from there"
+            "{peer:?}: an administrator may restart from anywhere"
         );
     }
+}
+
+/// `GET /System/Endpoint`'s `IsInNetwork` for a caller at `peer`.
+async fn endpoint_is_in_network(peer: &str) -> bool {
+    let mut request = Request::builder()
+        .uri("/System/Endpoint")
+        .header("X-Emby-Token", "tok")
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    let response = create_router(elevated_full_state())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    json(&body)["IsInNetwork"]
+        .as_bool()
+        .expect("IsInNetwork is a bool")
 }
 
 // A dual-stack bind (`--bind ::`) delivers every IPv4 client as an
 // IPv4-mapped IPv6 address. Left unmapped, `::ffff:127.0.0.1` matches no IPv6
 // local prefix, so the same-machine web client reads as off-network.
 #[tokio::test]
-async fn restart_treats_ipv4_mapped_ipv6_peers_as_the_ipv4_address() {
+async fn endpoint_treats_ipv4_mapped_ipv6_peers_as_the_ipv4_address() {
     for peer in ["[::ffff:127.0.0.1]:5000", "[::ffff:192.168.1.5]:5000"] {
-        assert_eq!(
-            restart_from(full_state(), Some(peer)).await,
-            StatusCode::NO_CONTENT,
+        assert!(
+            endpoint_is_in_network(peer).await,
             "{peer} is a mapped local IPv4 address"
         );
     }
-    assert_eq!(
-        restart_from(full_state(), Some("[::ffff:203.0.113.9]:5000")).await,
-        StatusCode::FORBIDDEN,
+    assert!(
+        !endpoint_is_in_network("[::ffff:203.0.113.9]:5000").await,
         "a mapped PUBLIC IPv4 address must stay remote — unmapping must not \
          make everything local"
-    );
-}
-
-#[tokio::test]
-async fn restart_from_off_network_requires_an_administrator() {
-    for peer in ["203.0.113.9:5000", "[2001:db8::1]:5000"] {
-        assert_eq!(
-            restart_from(full_state(), Some(peer)).await,
-            StatusCode::FORBIDDEN,
-            "{peer} is off-network — an ordinary account must not restart the server"
-        );
-        assert_eq!(
-            restart_from(elevated_full_state(), Some(peer)).await,
-            StatusCode::NO_CONTENT,
-            "{peer} is off-network, but an administrator may still restart"
-        );
-    }
-}
-
-// Deliberate divergence: C# accepts a null peer address as local. Here the
-// address is missing only when there is no connection to ask, so the unknown
-// case is the guarded one rather than the permissive one.
-#[tokio::test]
-async fn restart_treats_an_unknown_peer_as_remote() {
-    assert_eq!(
-        restart_from(full_state(), None).await,
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
-        restart_from(elevated_full_state(), None).await,
-        StatusCode::NO_CONTENT
     );
 }
 

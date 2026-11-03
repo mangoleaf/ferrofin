@@ -454,7 +454,7 @@ impl AuthService for AuthedAuthService {
 pub fn authenticated_user_info() -> AuthorizationInfo {
     AuthorizationInfo {
         is_authenticated: true,
-        user: Some(sample_user()),
+        user: Some(Arc::new(sample_user())),
         user_policy: Some(Arc::new(UserPolicy {
             enable_remote_access: true,
             ..UserPolicy::default()
@@ -632,6 +632,13 @@ fake_library_manager!(FakeLibrary {
     ) -> Result<bool, ferrofin_traits::error::ServiceError> {
         Ok(true)
     }
+    async fn get_visible_item_ids(
+        &self,
+        ids: &[Uuid],
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(ids.to_vec())
+    }
 });
 
 /// [`FakeLibrary`] in the middle of a full library validation
@@ -657,6 +664,25 @@ fake_library_manager!(CountingScans {
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+});
+
+/// [`FakeLibrary`] whose standalone visibility check refuses every item and
+/// counts the times it ran, for the listings that must not ask once per row.
+#[derive(Default)]
+pub struct CountingRefusals(pub std::sync::atomic::AtomicUsize);
+
+fake_library_manager!(CountingRefusals {
+    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(false)
     }
 });
 
@@ -737,7 +763,7 @@ impl AuthService for AuthedUserService {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             is_authenticated: true,
-            user: Some(sample_user()),
+            user: Some(Arc::new(sample_user())),
             ..AuthorizationInfo::default()
         })
     }

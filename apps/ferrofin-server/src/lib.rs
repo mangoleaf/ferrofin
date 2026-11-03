@@ -30,6 +30,7 @@ mod log_lines;
 pub mod media_encoding;
 pub mod metrics_wiring;
 pub mod planner;
+mod recording_library;
 pub mod seed;
 pub mod settings;
 mod startup;
@@ -235,12 +236,12 @@ async fn shutdown_signal(
 
 /// The graceful-shutdown future handed to axum: waits for the first shutdown
 /// trigger, then tells connected clients before the socket drains, so they
-/// show "server unavailable" instead of silently hanging (C# sends
-/// `ServerShuttingDown` for restart and shutdown alike — 10.11.8 has no
-/// `ServerRestarting` push — so both drain the same way), and closes every
-/// WebSocket: an upgraded connection is outside axum's drain, and a socket
-/// that survived would stay bound to the OLD host's session manager after an
-/// in-process restart (Kestrel closes them on stop; clients reconnect).
+/// show "server unavailable" instead of silently hanging (`ServerShuttingDown`
+/// for restart and shutdown alike, where C# sends `ServerRestarting` for a
+/// restart: gl-1123), and closes every WebSocket: an upgraded connection is
+/// outside axum's drain, and a socket that survived would stay bound to the OLD
+/// host's session manager after an in-process restart (Kestrel closes them on
+/// stop; clients reconnect).
 async fn announce_shutdown(
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     sessions: Arc<dyn ferrofin_traits::session::SessionManager>,
@@ -822,7 +823,7 @@ async fn tear_down_host(
     sampler: Option<tokio::task::JoinHandle<()>>,
 ) {
     stop_background_tasks(discovery.into_iter().chain(sampler).collect()).await;
-    cancel_running_tasks(wired.state.tasks.as_ref()).await;
+    wired.task_manager.shutdown().await;
     wired.state.library.shutdown_scans().await;
     stop_background_tasks(wired.background).await;
 }
@@ -1125,22 +1126,6 @@ fn listen_addresses(
         port,
         &interfaces,
     )
-}
-
-/// Cancels every scheduled task currently running (best-effort: a task that
-/// finishes in between is simply no longer running).
-async fn cancel_running_tasks(tasks: &dyn ferrofin_traits::tasks::TaskManager) {
-    let Ok(list) = tasks.get_tasks().await else {
-        return;
-    };
-    for task in list {
-        if task.state == ferrofin_model::tasks::TaskState::Running
-            && let Some(id) = task.id.as_deref()
-            && let Err(e) = tasks.cancel_task(id).await
-        {
-            tracing::debug!(task = id, error = %e, "could not cancel a running task on shutdown");
-        }
-    }
 }
 
 /// The on-disk roots a scheduled backup restore writes to, resolved before the

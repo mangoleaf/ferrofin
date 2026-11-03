@@ -26,6 +26,7 @@ use ferrofin_model::dto::{
     BaseItemDto, DayOfWeek, MediaSourceInfo, MediaSourceType, NameIdPair, NameValuePair, SortOrder,
 };
 use ferrofin_model::entities::ImageType;
+use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::live_tv::LiveTvOptions;
 use ferrofin_model::live_tv::{
     ChannelMappingOptionsDto, ChannelType, GuideInfo, ItemSortBy, ListingsProviderInfo, LiveTvInfo,
@@ -37,12 +38,14 @@ use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{SelfWrite, SelfWriteGuard, UserViewManager};
+use ferrofin_traits::library::{RecordingLibrary, SelfWrite, SelfWriteGuard, UserViewManager};
 use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 use ferrofin_traits::providers::ProviderManager;
-use ferrofin_traits::stubs::{LiveStreamFile, LiveTvChannelQuery, LiveTvManager};
+use ferrofin_traits::stubs::{
+    LiveStreamFile, LiveTvChannelQuery, LiveTvManager, RecordingVisibility,
+};
 use ferrofin_traits::system::LocalApiAccess;
 use serde::de::DeserializeOwned;
 
@@ -478,6 +481,18 @@ pub struct FerrofinLiveTvManager {
     /// The media encoder, for the encoded recorder's ffmpeg. Absent in tests
     /// and on a server with no ffmpeg, where only the direct recorder runs.
     encoder: Option<Arc<dyn MediaEncoder>>,
+    /// The library side of the recording folders
+    /// ([`set_recording_library`](Self::set_recording_library)), in an
+    /// `Arc<OnceLock<_>>` so every clone sees it once the composition root has
+    /// built the library layer. Unset, a recording is never a library item.
+    recording_library: Arc<OnceLock<Arc<dyn RecordingLibrary>>>,
+    /// One `CreateRecordingFolders` pass at a time. Upstream's triggers can
+    /// overlap, and two passes would each add a "Recordings" library.
+    recording_folders_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes writing `named/livetv.json` with a save over the API, which
+    /// holds the same lock
+    /// ([`set_recording_library`](Self::set_recording_library)).
+    options_write_lock: Arc<OnceLock<Arc<tokio::sync::Mutex<()>>>>,
     /// Brackets each recording as it is written, so a recording inside a
     /// watched library is not rescanned mid-write (`RecordingsManager`'s
     /// `ReportFileSystemChangeBeginning`/`Complete`). `None` in unit tests.
@@ -1044,6 +1059,9 @@ impl FerrofinLiveTvManager {
             unparseable_rows: Arc::new(Mutex::new(HashMap::new())),
             options_warned: Arc::new(Mutex::new(None)),
             encoder: None,
+            recording_library: Arc::new(OnceLock::new()),
+            recording_folders_lock: Arc::new(tokio::sync::Mutex::new(())),
+            options_write_lock: Arc::new(OnceLock::new()),
             self_writes: None,
             release_date_format: crate::recording_metadata::default_release_date_format(),
             metadata_language: None,
@@ -1134,6 +1152,21 @@ impl FerrofinLiveTvManager {
     pub fn with_tuner_source(mut self, source: Arc<dyn TunerStreamSource>) -> Self {
         self.tuner_source = source;
         self
+    }
+
+    /// Attaches the library side of the recording folders, which is what makes
+    /// a recording a library item, and the lock a save of the `livetv` named
+    /// configuration holds, which keeps `MediaLocationsCreated` from racing one.
+    ///
+    /// The composition root calls this once the library layer exists; a second
+    /// call is ignored.
+    pub fn set_recording_library(
+        &self,
+        library: Arc<dyn RecordingLibrary>,
+        options_write_lock: Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let _ = self.recording_library.set(library);
+        let _ = self.options_write_lock.set(options_write_lock);
     }
 
     /// Attaches the host that answers where this server's API is reached
@@ -1983,8 +2016,8 @@ impl FerrofinLiveTvManager {
         // Upstream's `GetChannels` throws on a bad document, so the mapping
         // dialog shows an error instead of "no channels".
         if let Some(e) = guide.error {
-            let path = info.path.as_deref().unwrap_or_default();
-            return Err(ServiceError::Backend(format!("{path}: {e}")));
+            let source = crate::fetch::redact_url(info.path.as_deref().unwrap_or_default());
+            return Err(ServiceError::Backend(format!("{source}: {e}")));
         }
         Ok(guide
             .channels
@@ -2015,7 +2048,8 @@ impl FerrofinLiveTvManager {
                 .is_ok_and(|meta| meta.is_file())
         {
             return Err(ServiceError::not_found(format!(
-                "Could not find the XmlTv file specified: {path}"
+                "Could not find the XmlTv file specified: {}",
+                crate::fetch::redact_url(path)
             )));
         }
         Ok(())
@@ -2458,7 +2492,12 @@ impl FerrofinLiveTvManager {
                 let (document, probe) =
                     parse_guide(document, self.guide_language(provider), |_| false).await?;
                 if let Some(e) = &probe.error {
-                    tracing::warn!(%path, error = %e, "live tv: guide document unreadable; keeping the stored guide");
+                    tracing::warn!(
+                        listings_provider = provider.id.as_deref().unwrap_or_default(),
+                        path = %crate::fetch::redact_url(path),
+                        error = %e,
+                        "live tv: guide document unreadable; keeping the stored guide"
+                    );
                     Ok((None, false))
                 } else {
                     Ok((
@@ -2471,7 +2510,12 @@ impl FerrofinLiveTvManager {
                 }
             }
             Err(e) => {
-                tracing::warn!(%path, error = %e, "live tv: guide fetch failed");
+                tracing::warn!(
+                    listings_provider = provider.id.as_deref().unwrap_or_default(),
+                    path = %crate::fetch::redact_url(path),
+                    error = %e,
+                    "live tv: guide fetch failed"
+                );
                 Ok((None, false))
             }
         }
@@ -2798,6 +2842,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         )
         .await?;
         self.tuner_flag.store(true, Ordering::Relaxed);
+        self.spawn_recording_folders();
         Ok(info)
     }
 
@@ -2846,7 +2891,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
                         }
                         tracing::info!(
                             host = host.name(),
-                            url = device.url.as_deref().unwrap_or_default(),
+                            url = %crate::fetch::redact_url(device.url.as_deref().unwrap_or_default()),
                             "live tv: discovered a tuner device"
                         );
                         found.push(device);
@@ -2875,8 +2920,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // Only the configuration row goes, as upstream edits only the
         // configuration: the host's channels and airings stay listed until the
         // guide refresh the handler queues prunes them (migration 0046 dropped
-        // the cascade).
-        //
+        // the cascade). The Live TV gate's cached answer
+        // (`Database::live_tv_tuner_hosts_exist`) follows on the next request.
+        self.db.invalidate_live_tv_tuner_hosts();
         // Recount so deleting the last host hides the guide-refresh task. This
         // is bookkeeping, not part of the delete's contract: a failed recount
         // must not turn a committed delete into a client-visible error.
@@ -2884,6 +2930,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             Ok(any) => self.tuner_flag.store(any, Ordering::Relaxed),
             Err(e) => tracing::warn!(error = %e, "live tv: tuner-host recount failed"),
         }
+        self.spawn_recording_folders();
         Ok(())
     }
 
@@ -2927,7 +2974,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
                     .await?;
             }
         }
-        self.store_listing_provider(info).await
+        let saved = self.store_listing_provider(info).await?;
+        self.spawn_recording_folders();
+        Ok(saved)
     }
 
     async fn delete_listing_provider(&self, id: &str) -> Result<(), ServiceError> {
@@ -2940,6 +2989,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         .await
         .map_err(db_err)?;
         self.xmltv.invalidate(id).await;
+        self.spawn_recording_folders();
         Ok(())
     }
 
@@ -3047,6 +3097,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // Stored as it is: `SetChannelMapping` saves the configuration
         // without running the provider's `Validate`.
         let info = self.store_listing_provider(info).await?;
+        self.spawn_recording_folders();
 
         let tuner_channels = self.channels_for_listings_provider(&info).await?;
         let provider_channels = self.provider_channels(&info).await?;
@@ -3132,7 +3183,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // same channel, which is the whole point of putting it there.
         let dtos = self
             .dto_service()?
-            .get_base_item_dtos(&entities, &list_options, query.user.as_ref(), None, true)
+            .get_base_item_dtos(&entities, &list_options, query.user.as_deref(), None, true)
             .await?;
         Ok(QueryResult::new(Some(start_index), Some(total), dtos))
     }
@@ -3205,7 +3256,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let mut list_options = options.clone();
         remove_fields(&mut list_options);
         let items = self
-            .program_dtos(&rows, &list_options, query.user.as_ref())
+            .program_dtos(&rows, &list_options, query.user.as_deref())
             .await?;
 
         // Same rule as the item repository: the count is only bought when
@@ -3296,7 +3347,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let mut list_options = options.clone();
         remove_fields(&mut list_options);
         let items = self
-            .program_dtos(&rows, &list_options, query.user.as_ref())
+            .program_dtos(&rows, &list_options, query.user.as_deref())
             .await?;
         Ok(QueryResult::new(query.start_index, Some(total), items))
     }
@@ -3342,6 +3393,8 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
+        // `GuideManager.RefreshGuide` starts here.
+        self.create_recording_folders().await;
         let generation = self.refresh_generation.fetch_add(1, Ordering::SeqCst) + 1;
         // FETCH FIRST, OUTSIDE THE LOCK. `guide_lock` exists to keep two passes
         // from interleaving their WRITES (see the field doc); holding it across
@@ -3396,9 +3449,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
                     // channel cache rather than failing the whole refresh, so
                     // one unreachable tuner must not lose the others' guide.
                     clean_database = false;
+                    // No URL field: the error names the host it asked, and
+                    // an HDHomeRun `Url` with no scheme reads as a path here.
                     tracing::warn!(
                         tuner = %id,
-                        url = tuner.url.as_deref().unwrap_or_default(),
                         error = %e,
                         "live tv: tuner lineup fetch failed"
                     );
@@ -3469,28 +3523,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             });
         }
         if clean_database {
-            // `CleanDatabase(newChannelIdList, [LiveTvChannel], …)` then
-            // `CleanDatabase(newProgramIdList, [LiveTvProgram], …)`: everything
-            // this pass did not re-emit goes. With no listings provider left the
-            // kept programme set is empty and the whole guide drains, which is
-            // what removing a provider is supposed to do. Channels go first so a
-            // dropped channel takes its airings with it via the FK cascade.
-            let stale: Vec<String> = crate::guide_repository::all_channel_ids(&self.db)
-                .await?
-                .into_iter()
-                .filter(|id| !kept_channels.contains(id))
-                .collect();
-            if !stale.is_empty() {
-                crate::guide_repository::delete_channels(&self.db, &stale).await?;
-            }
-            let stale: Vec<String> = crate::guide_repository::all_program_ids(&self.db)
-                .await?
-                .into_iter()
-                .filter(|id| !Uuid::parse_str(id).is_ok_and(|id| kept_programs.contains_key(&id)))
-                .collect();
-            if !stale.is_empty() {
-                crate::guide_repository::delete_programs(&self.db, &stale).await?;
-            }
+            self.clean_guide(&kept_channels, &kept_programs).await?;
         }
         // The lineup is settled; mirror it into `BaseItems` before the
         // programmes, exactly as `RefreshChannelsInternal` stores each channel
@@ -3628,7 +3661,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             min_end_date: Some(now),
             limit: i32::try_from(channel_ids.len()).ok(),
             order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
-            user: user.cloned(),
+            user: user.cloned().map(Arc::new),
             ..InternalItemsQuery::default()
         };
         let program_rows = self.query_program_rows(&query, now).await?;
@@ -4194,6 +4227,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             &ferrofin_model::live_tv::RecordingQuery::default(),
             None,
             &DtoOptions::default(),
+            None,
         )
         .await
     }
@@ -4203,8 +4237,17 @@ impl LiveTvManager for FerrofinLiveTvManager {
         query: &ferrofin_model::live_tv::RecordingQuery,
         user: Option<&UserEntity>,
         options: &DtoOptions,
+        visible: Option<&dyn RecordingVisibility>,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        let rows = crate::dvr_repository::recording_rows(&self.db, query).await?;
+        let mut rows = crate::dvr_repository::recording_rows(&self.db, query).await?;
+        let mut gone = HashSet::new();
+        for row in &rows {
+            if Self::recording_file_is_gone(row).await {
+                gone.insert(row.id.clone());
+            }
+        }
+        rows.retain(|row| !gone.contains(&row.id));
+        let rows = Self::visible_recording_rows(rows, visible).await?;
         let start_index = query.start_index.unwrap_or(0);
         let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
         let page: Vec<crate::projection::RecordingRow> = rows
@@ -4236,6 +4279,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let Some(row) = crate::dvr_repository::recording_row(&self.db, id).await? else {
             return Ok(None);
         };
+        if Self::recording_file_is_gone(&row).await {
+            return Ok(None);
+        }
         // The single-recording path keeps every requested field (upstream's
         // `GetRecording` uses `new DtoOptions()` and never strips).
         Ok(self
@@ -4371,11 +4417,66 @@ impl LiveTvManager for FerrofinLiveTvManager {
         if let Some(timer_id) = row.as_ref().and_then(|row| row.timer_id.as_deref()) {
             self.cancel_recording(timer_id);
         }
-        if let Some(path) = row.and_then(|row| row.path) {
+        let path = row.and_then(|row| row.path);
+        if let Some(path) = &path {
             // Best-effort: a row whose file has already gone still deletes.
-            let _ = tokio::fs::remove_file(&path).await;
+            let _ = tokio::fs::remove_file(path).await;
         }
-        crate::dvr_repository::delete_recording(&self.db, id).await
+        crate::dvr_repository::delete_recording(&self.db, id).await?;
+        // The library item goes with the file, as upstream's `DeleteItem`
+        // removes it. The refresh of a path that has gone drops its row.
+        if let Some(path) = &path {
+            self.refresh_recording_path(path).await;
+        }
+        Ok(())
+    }
+
+    async fn forget_recordings(&self, path: &str) -> Result<(), ServiceError> {
+        crate::dvr_repository::delete_recordings_at(&self.db, path).await
+    }
+
+    async fn get_recording_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
+        let options = self.live_tv_options().await;
+        Ok(crate::recording_folders::recording_folders(&options, &self.paths.data_dir).await)
+    }
+
+    async fn create_recording_folders(&self) {
+        let Some(library) = self.recording_library.get().cloned() else {
+            return;
+        };
+        // On a task of its own: upstream's belongs to no request, and a client
+        // that hangs up must not stop a pass between adding a library and
+        // saving that it did, which would leave the library unrecorded.
+        let manager = self.clone();
+        // The caller's own span, or a root of its own for the two that have
+        // none: a save's worker and a queued guide refresh.
+        let span = match tracing::Span::current() {
+            current if current.is_none() => {
+                tracing::info_span!(parent: None, "recording_folders", trigger = "api")
+            }
+            current => current,
+        };
+        let pass = tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                let _one_pass = manager.recording_folders_lock.lock().await;
+                // `CreateRecordingFolders`' catch-all: nothing here fails a guide
+                // refresh, a recording or a configuration save.
+                if let Err(error) = manager.sync_recording_folders(library.as_ref()).await {
+                    tracing::error!(%error, "live tv: error creating the recording folders");
+                }
+            },
+            span,
+        ));
+        if let Err(error) = pass.await {
+            tracing::error!(%error, "live tv: the recording folders pass failed");
+        }
+    }
+
+    fn paths_being_recorded(&self) -> Vec<String> {
+        self.active_recordings_lock()
+            .values()
+            .map(|recording| recording.path.display().to_string())
+            .collect()
     }
 
     async fn start_dvr(&self) -> Result<(), ServiceError> {
@@ -4690,6 +4791,210 @@ impl FerrofinLiveTvManager {
             );
         }
         LiveTvOptions::default()
+    }
+
+    /// `CleanDatabase(newChannelIdList, [LiveTvChannel], …)` then
+    /// `CleanDatabase(newProgramIdList, [LiveTvProgram], …)`: everything a
+    /// guide refresh did not re-emit goes. With no listings provider left the
+    /// kept programme set is empty and the whole guide drains, which is what
+    /// removing a provider is supposed to do. Channels go first so a dropped
+    /// channel takes its airings with it via the FK cascade.
+    async fn clean_guide(
+        &self,
+        kept_channels: &HashSet<String>,
+        kept_programs: &HashMap<Uuid, ProgramImages>,
+    ) -> Result<(), ServiceError> {
+        let stale: Vec<String> = crate::guide_repository::all_channel_ids(&self.db)
+            .await?
+            .into_iter()
+            .filter(|id| !kept_channels.contains(id))
+            .collect();
+        if !stale.is_empty() {
+            crate::guide_repository::delete_channels(&self.db, &stale).await?;
+        }
+        let stale: Vec<String> = crate::guide_repository::all_program_ids(&self.db)
+            .await?
+            .into_iter()
+            .filter(|id| !Uuid::parse_str(id).is_ok_and(|id| kept_programs.contains_key(&id)))
+            .collect();
+        if !stale.is_empty() {
+            crate::guide_repository::delete_programs(&self.db, &stale).await?;
+        }
+        Ok(())
+    }
+
+    /// `OnNamedConfigurationUpdated` for a save of a tuner or a listings
+    /// provider, which upstream keeps in the `livetv` configuration. Its
+    /// `async void` is waited for by nobody, so neither is this: the handler's
+    /// `queue_guide_refresh` comes right after the save, and a client that
+    /// hangs up during a pass must not lose it.
+    fn spawn_recording_folders(&self) {
+        if self.recording_library.get().is_none() {
+            return;
+        }
+        let manager = self.clone();
+        tokio::spawn(tracing::Instrument::instrument(
+            async move { manager.create_recording_folders().await },
+            tracing::info_span!(parent: None, "recording_folders", trigger = "api"),
+        ));
+    }
+
+    /// `RecordingsManager.CreateRecordingFolders`, inside its catch-all: see
+    /// [`crate::recording_folders`].
+    ///
+    /// One known limit: when a failed adoption left no `livetv.json` and this
+    /// pass adds a library, the file it creates holds the defaults, and the
+    /// seed, which skips an existing file, is not retried at the next boot.
+    async fn sync_recording_folders(
+        &self,
+        library: &dyn RecordingLibrary,
+    ) -> Result<(), ServiceError> {
+        let pass = crate::recording_folders::RecordingFolders {
+            library,
+            data_dir: &self.paths.data_dir,
+        };
+        // Nothing is decided from a document that cannot be read: the defaults
+        // `live_tv_options` answers for it would add a library at the default
+        // path, and an empty list would settle what it inherited.
+        let stored = self.stored_live_tv_options().await?;
+        let on_file = stored.is_some();
+        let options = stored.unwrap_or_default();
+        let folders =
+            crate::recording_folders::recording_folders(&options, &self.paths.data_dir).await;
+        let mut created = options.media_locations_created;
+        // No file yet settles nothing: an adoption whose seed failed retries
+        // it on the next boot, and that list still has to be read.
+        if on_file && !pass.is_settled().await {
+            let kept = crate::recording_folders::RecordingFolders::settle_inherited_locations(
+                created.clone(),
+                &folders,
+            );
+            if kept != created {
+                self.save_media_locations(&kept).await?;
+                created = kept;
+            }
+            pass.mark_settled().await;
+        }
+
+        let added = pass.add_missing(&folders).await?;
+        let Some((locations, to_remove)) =
+            crate::recording_folders::updated_locations(&created, added, &folders)
+        else {
+            return Ok(());
+        };
+        self.save_media_locations(&locations).await?;
+        if !on_file {
+            // That made the file, so every entry in it is this server's own.
+            pass.mark_settled().await;
+        }
+        for path in to_remove {
+            pass.remove_from_libraries(&path).await?;
+        }
+        Ok(())
+    }
+
+    /// The stored Live TV options, `None` when there is no file yet. Unlike
+    /// [`live_tv_options`](Self::live_tv_options), a file that cannot be read
+    /// or parsed is an error.
+    async fn stored_live_tv_options(&self) -> Result<Option<LiveTvOptions>, ServiceError> {
+        let path = &self.paths.options_file;
+        if path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let failed = |error: &dyn std::fmt::Display| {
+            ServiceError::backend(format!("{}: {error}", path.display()))
+        };
+        match tokio::fs::read_to_string(path).await {
+            Ok(body) => serde_json::from_str(&body)
+                .map(Some)
+                .map_err(|e| failed(&e)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(failed(&error)),
+        }
+    }
+
+    /// `_config.SaveConfiguration("livetv", config)` after `CreateRecordingFolders`
+    /// changed `MediaLocationsCreated`.
+    ///
+    /// Edits the stored document rather than writing the options back, so the
+    /// members this manager does not model survive, and refuses one it cannot
+    /// read: `live_tv_options` answered the defaults for that, and writing them
+    /// would lose what is there.
+    async fn save_media_locations(&self, locations: &[String]) -> Result<(), ServiceError> {
+        let path = self.paths.options_file.clone();
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let lock = self.options_write_lock.get().cloned();
+        let _save = match &lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let failed = |error: &dyn std::fmt::Display| {
+            ServiceError::backend(format!("{}: {error}", path.display()))
+        };
+        let mut document = match tokio::fs::read_to_string(&path).await {
+            Ok(body) => serde_json::from_str::<serde_json::Value>(&body).map_err(|e| failed(&e))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::to_value(LiveTvOptions::default()).map_err(|e| failed(&e))?
+            }
+            Err(error) => return Err(failed(&error)),
+        };
+        let Some(members) = document.as_object_mut() else {
+            return Err(failed(&"not a JSON object"));
+        };
+        members.insert(
+            "MediaLocationsCreated".to_owned(),
+            serde_json::json!(locations),
+        );
+        let json = serde_json::to_vec_pretty(&document).map_err(|e| failed(&e))?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| failed(&e))?;
+        }
+        let target = path.clone();
+        tokio::task::spawn_blocking(move || {
+            ferrofin_util::file_helper::atomic_write(&target, &json)
+        })
+        .await
+        .map_err(|e| failed(&e))?
+        .map_err(|e| failed(&e))
+    }
+
+    /// Whether a finished recording's file has gone from under the server. A
+    /// recording is a library item upstream, so that ends it.
+    /// ([`forget_recordings`](LiveTvManager::forget_recordings) is the same for
+    /// a library delete, which can take the folder too.)
+    ///
+    /// A capture still has a file to come, a file that cannot be checked is
+    /// taken to be there, and so is one whose folder has gone too, which is
+    /// what an unmounted share looks like: upstream keeps an offline library's
+    /// items.
+    async fn recording_file_is_gone(row: &crate::projection::RecordingRow) -> bool {
+        let path = match row.path.as_deref() {
+            Some(path) if !path.is_empty() && row.status != "InProgress" => {
+                std::path::Path::new(path)
+            }
+            _ => return false,
+        };
+        if tokio::fs::try_exists(path).await.unwrap_or(true) {
+            return false;
+        }
+        match path.parent() {
+            Some(folder) => tokio::fs::try_exists(folder).await.unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// Port of `RecordingsManager.TriggerRefresh`. A failure is logged: the
+    /// next scan finds the file anyway.
+    async fn refresh_recording_path(&self, path: &str) {
+        if let Some(library) = self.recording_library.get()
+            && let Err(error) = library.refresh_path(path).await
+        {
+            tracing::warn!(path, %error, "live tv: could not refresh a recording's path");
+        }
     }
 
     /// Every stored timer, whatever its status — C# `TimerManager.GetAll()`,
@@ -5445,6 +5750,10 @@ impl FerrofinLiveTvManager {
         if crate::dvr::is_empty_file(&target).await {
             let _ = tokio::fs::remove_file(&target).await;
         }
+        // `TriggerRefresh(recordingPath)`: scans leave a file being written
+        // alone (`paths_being_recorded`), so this is what makes the recording
+        // a library item.
+        self.refresh_recording_path(&target.to_string_lossy()).await;
         let recorded = tokio::fs::try_exists(&target).await.unwrap_or(false);
         self.settle_timer(timer, &info, recording_id, &target, recorded, outcome)
             .await
@@ -5556,6 +5865,24 @@ impl FerrofinLiveTvManager {
                 span,
             ));
         }
+        // `OnStarted`'s `CreateRecordingFolders`, which is what makes a first
+        // recording's directory a library, and which upstream's `async void`
+        // keeps from holding the recorder up. The recorder makes the directory
+        // upstream before this runs, so it is made here first; failing to make
+        // it is the recorder's to report.
+        if let Err(error) = crate::dvr::create_target_dir(target).await {
+            tracing::debug!(path = %target.display(), %error, "live tv: no recording directory yet");
+        }
+        let manager = self.clone();
+        tokio::spawn(tracing::Instrument::instrument(
+            async move { manager.create_recording_folders().await },
+            tracing::info_span!(
+                parent: None,
+                "recording_folders",
+                trigger = "schedule",
+                timer_id = %info.id
+            ),
+        ));
         // TODO(parity, open work item — NOT an accepted divergence; gl-749):
         // with `save_recording_images`, upstream also copies the programme's
         // artwork beside the recording (`SaveRecordingImages`), but the guide
@@ -5728,6 +6055,29 @@ impl FerrofinLiveTvManager {
             }
         }
         Ok(())
+    }
+
+    /// The rows `visible` keeps, in order; every row when there is no filter.
+    ///
+    /// Each row is asked about as the entity [`Self::get_recording_item`]
+    /// builds for it, which is what the caller's own read of one checks.
+    async fn visible_recording_rows(
+        rows: Vec<crate::projection::RecordingRow>,
+        visible: Option<&dyn RecordingVisibility>,
+    ) -> Result<Vec<crate::projection::RecordingRow>, ServiceError> {
+        let Some(visible) = visible else {
+            return Ok(rows);
+        };
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            if visible
+                .is_visible(&crate::projection::recording_entity(&row, parse_dt))
+                .await?
+            {
+                kept.push(row);
+            }
+        }
+        Ok(kept)
     }
 
     /// Projects recording rows through the DTO service and applies the
@@ -6902,6 +7252,7 @@ fn db_err(e: sqlx::Error) -> ServiceError {
 #[cfg(test)]
 mod tests {
     mod guide_mirror;
+    mod recording_folders;
     mod schedules_direct;
 
     use std::collections::HashMap;
@@ -7240,8 +7591,12 @@ mod tests {
         )])))
         .await;
         // The synchronous flag the "Refresh Guide" task's hidden rule polls
-        // tracks the store through every mutation.
+        // tracks the store through every mutation, and so does the cached
+        // answer the Live TV gate reads.
+        mgr.db
+            .enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
         assert!(!mgr.has_tuner_hosts(), "no host configured yet");
+        assert!(!mgr.db.live_tv_tuner_hosts_exist().await.expect("gate"));
         let saved = mgr
             .save_tuner_host(TunerHostInfo {
                 type_: Some("m3u".to_owned()),
@@ -7253,6 +7608,10 @@ mod tests {
         let id = saved.id.clone().expect("id assigned");
         assert_eq!(saved.type_.as_deref(), Some("m3u"));
         assert!(mgr.has_tuner_hosts(), "saving a host reveals the task");
+        assert!(
+            mgr.db.live_tv_tuner_hosts_exist().await.expect("gate"),
+            "saving a host reaches the gate"
+        );
 
         let hosts = mgr.get_tuner_hosts().await.expect("list");
         assert_eq!(hosts.len(), 1);
@@ -7265,6 +7624,10 @@ mod tests {
         assert!(
             !mgr.has_tuner_hosts(),
             "deleting the last host hides the task again"
+        );
+        assert!(
+            !mgr.db.live_tv_tuner_hosts_exist().await.expect("gate"),
+            "deleting the last host reaches the gate"
         );
     }
 
@@ -9549,6 +9912,7 @@ mod tests {
         );
         assert_eq!(opened.container.as_deref(), Some("ts"));
         assert!(opened.requires_closing);
+        assert!(opened.path_is_private, "stays set once buffered");
         let live_id = opened.live_stream_id.clone().expect("live stream id");
         assert_eq!(
             live_id,
@@ -9576,6 +9940,7 @@ mod tests {
             .expect("join");
         assert_eq!(joined.live_stream_id.as_deref(), Some(live_id.as_str()));
         assert_eq!(joined.path.as_deref(), Some(path.as_str()));
+        assert!(joined.path_is_private);
         assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         // The first close only decrements; the stream stays up for the other.
@@ -10075,6 +10440,7 @@ mod tests {
                 },
                 None,
                 &DtoOptions::default(),
+                None,
             )
             .await
             .expect("recordings")
@@ -10088,6 +10454,104 @@ mod tests {
             "nothing may still report itself as recording"
         );
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    /// Keeps the recordings whose file is not under `/hidden`, and records the
+    /// path of each entity it is asked about.
+    #[derive(Default)]
+    struct HidesFolder(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::stubs::RecordingVisibility for HidesFolder {
+        async fn is_visible(&self, recording: &BaseItemEntity) -> Result<bool, ServiceError> {
+            let path = recording.path.clone().unwrap_or_default();
+            let visible = !path.starts_with("/hidden/");
+            self.0.lock().expect("lock").push(path);
+            Ok(visible)
+        }
+    }
+
+    /// The listing filter runs over every row the query selects, each as the
+    /// entity the recording's own read resolves, before paging, so
+    /// `TotalRecordCount` counts only what it keeps.
+    #[tokio::test]
+    async fn recordings_are_filtered_before_paging() {
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let start = Utc::now();
+        let mut ids = HashMap::new();
+        for (minutes, path) in [
+            (5, "/hidden/e.ts"),
+            (4, "/open/d.ts"),
+            (3, "/hidden/c.ts"),
+            (2, "/open/b.ts"),
+            (1, "/hidden/a.ts"),
+        ] {
+            let id = Uuid::new_v4();
+            let timer = crate::dvr::TimerRecordingInfo {
+                id: format!("timer-{minutes}"),
+                name: path.to_owned(),
+                ..crate::dvr::TimerRecordingInfo::default()
+            };
+            crate::dvr_repository::insert_recording(
+                &mgr.db,
+                id,
+                &timer,
+                std::path::Path::new(path),
+                start + chrono::Duration::minutes(minutes),
+            )
+            .await
+            .expect("insert");
+            ids.insert(path, id);
+            assert_eq!(
+                mgr.get_recording_item(id)
+                    .await
+                    .expect("item")
+                    .expect("row")
+                    .path
+                    .as_deref(),
+                Some(path)
+            );
+        }
+        let filter = HidesFolder::default();
+        let page = mgr
+            .get_recordings_matching(
+                &ferrofin_model::live_tv::RecordingQuery {
+                    start_index: Some(1),
+                    limit: Some(1),
+                    ..ferrofin_model::live_tv::RecordingQuery::default()
+                },
+                None,
+                &DtoOptions::default(),
+                Some(&filter),
+            )
+            .await
+            .expect("recordings");
+        assert_eq!(page.total_record_count, 2, "the filtered total");
+        assert_eq!(page.start_index, 1);
+        let listed: Vec<Uuid> = page.items.iter().map(|dto| dto.id).collect();
+        assert_eq!(listed, vec![ids["/open/b.ts"]]);
+        assert_eq!(
+            *filter.0.lock().expect("lock"),
+            [
+                "/hidden/e.ts",
+                "/open/d.ts",
+                "/hidden/c.ts",
+                "/open/b.ts",
+                "/hidden/a.ts"
+            ],
+            "every row, once, newest first"
+        );
+
+        let everything = mgr
+            .get_recordings_matching(
+                &ferrofin_model::live_tv::RecordingQuery::default(),
+                None,
+                &DtoOptions::default(),
+                None,
+            )
+            .await
+            .expect("recordings");
+        assert_eq!(everything.total_record_count, 5, "no filter, every row");
     }
 
     #[tokio::test]
@@ -10315,6 +10779,7 @@ mod tests {
                     },
                     None,
                     &DtoOptions::default(),
+                    None,
                 )
                 .await
                 .expect("recordings");
@@ -11812,7 +12277,7 @@ mod tests {
         let favorites = mgr
             .get_channels(
                 &LiveTvChannelQuery {
-                    user: Some(user.clone()),
+                    user: Some(Arc::new(user.clone())),
                     is_favorite: Some(true),
                     ..LiveTvChannelQuery::default()
                 },
@@ -11826,7 +12291,7 @@ mod tests {
         let sorted = mgr
             .get_channels(
                 &LiveTvChannelQuery {
-                    user: Some(user.clone()),
+                    user: Some(Arc::new(user.clone())),
                     enable_favorite_sorting: true,
                     ..LiveTvChannelQuery::default()
                 },
@@ -13179,14 +13644,28 @@ mod tests {
             )
         }
 
+        /// Everything captured so far.
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+
         /// The captured lines logged at `level` (`"WARN"`, `"DEBUG"`, …) that
         /// mention `needle`.
         fn lines_at(&self, level: &str, needle: &str) -> Vec<String> {
-            let text = String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned();
-            text.lines()
+            self.text()
+                .lines()
                 .filter(|line| line.contains(&format!(" {level} ")) && line.contains(needle))
                 .map(str::to_owned)
                 .collect()
+        }
+
+        /// No captured line shows any of [`SOURCE_ACCOUNT`].
+        #[track_caller]
+        fn assert_no_source_account(&self) {
+            let text = self.text();
+            for secret in SOURCE_ACCOUNT {
+                assert!(!text.contains(secret), "{secret} logged:\n{text}");
+            }
         }
     }
 
@@ -13206,6 +13685,295 @@ mod tests {
 
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
+        }
+    }
+
+    /// What [`credentialed_source`] puts in a URL. No log line shows any of it.
+    const SOURCE_ACCOUNT: [&str; 4] = ["acct-user", "info-secret", "path-secret", "query-secret"];
+
+    /// Where [`credentialed_source`] points: port 0 refuses every connection.
+    const SOURCE_HOST: &str = "http://127.0.0.1:0";
+
+    /// A source at [`SOURCE_HOST`] with the account in its userinfo, path and
+    /// query.
+    fn credentialed_source() -> String {
+        "http://acct-user:info-secret@127.0.0.1:0/live/acct-user/path-secret/source\
+         ?username=acct-user&password=query-secret"
+            .to_owned()
+    }
+
+    /// Answers `body` until `down` is set, then fails as the real fetcher does.
+    #[derive(Default)]
+    struct SourceGoesDown {
+        body: String,
+        down: std::sync::atomic::AtomicBool,
+        real: crate::fetch::ReqwestFetcher,
+    }
+
+    impl SourceGoesDown {
+        fn answering(body: &str) -> Arc<Self> {
+            Arc::new(Self {
+                body: body.to_owned(),
+                ..Self::default()
+            })
+        }
+
+        fn go_down(&self) {
+            self.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SourceFetcher for SourceGoesDown {
+        async fn fetch(&self, url: &str) -> Result<String, ServiceError> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                self.real.fetch(url).await
+            } else {
+                Ok(self.body.clone())
+            }
+        }
+    }
+
+    /// A manager over `fetcher` with `url` saved as an XMLTV provider.
+    async fn manager_with_guide_source(
+        fetcher: &Arc<SourceGoesDown>,
+        url: &str,
+    ) -> (FerrofinLiveTvManager, ListingsProviderInfo) {
+        let mgr = manager_with_fetcher(Arc::clone(fetcher) as Arc<dyn SourceFetcher>).await;
+        let provider = mgr
+            .save_listing_provider(
+                as_xmltv(ListingsProviderInfo {
+                    path: Some(url.to_owned()),
+                    ..ListingsProviderInfo::default()
+                }),
+                false,
+                false,
+            )
+            .await
+            .expect("provider");
+        (mgr, provider)
+    }
+
+    /// A failed tuner and a failed guide name themselves by id and host, and
+    /// neither the fields nor the error text show the account in the URL.
+    #[tokio::test]
+    async fn a_failed_refresh_logs_the_sources_by_id_and_host_without_their_account() {
+        let url = credentialed_source();
+        let fetcher = SourceGoesDown::answering("#EXTM3U\n");
+        let (mgr, provider) = manager_with_guide_source(&fetcher, &url).await;
+        let tuner = mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("m3u".to_owned()),
+                url: Some(url.clone()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect("tuner");
+        fetcher.go_down();
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = logs.install();
+            mgr.refresh_guide().await.expect("refresh");
+        }
+
+        logs.assert_no_source_account();
+        let failed = logs.lines_at("WARN", "tuner lineup fetch failed");
+        assert_eq!(failed.len(), 1, "{}", logs.text());
+        assert!(
+            failed[0].contains(tuner.id.as_deref().expect("id")) && failed[0].contains(SOURCE_HOST),
+            "{failed:?}"
+        );
+        let failed = logs.lines_at("WARN", "guide fetch failed");
+        assert_eq!(failed.len(), 1, "{}", logs.text());
+        assert!(
+            failed[0].contains(provider.id.as_deref().expect("id"))
+                && failed[0].contains(SOURCE_HOST),
+            "{failed:?}"
+        );
+    }
+
+    /// `GetApiUrl` adds the scheme an HDHomeRun tuner's `Url` leaves out, so
+    /// the stored value is a URL however it reads. The row is stored directly:
+    /// saving it would leave the device's answer cached, and this refresh
+    /// starts cold, as after a restart, so it asks the device.
+    #[tokio::test]
+    async fn a_failed_hdhomerun_tuner_with_no_scheme_logs_only_its_host() {
+        let mgr = manager_with_fetcher(Arc::new(crate::fetch::ReqwestFetcher::new())).await;
+        let id = Uuid::new_v4().simple().to_string();
+        let url = "acct-user:info-secret@127.0.0.1:0/path-secret";
+        let tuner = TunerHostInfo {
+            id: Some(id.clone()),
+            type_: Some("hdhomerun".to_owned()),
+            url: Some(url.to_owned()),
+            ..TunerHostInfo::default()
+        };
+        let data = serde_json::to_string(&tuner).expect("json");
+        crate::guide_repository::store_tuner_host(&mgr.db, None, &id, url, "hdhomerun", &data)
+            .await
+            .expect("store");
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = logs.install();
+            mgr.refresh_guide().await.expect("refresh");
+        }
+
+        logs.assert_no_source_account();
+        let failed = logs.lines_at("WARN", "tuner lineup fetch failed");
+        assert_eq!(failed.len(), 1, "{}", logs.text());
+        assert!(
+            failed[0].contains(&id) && failed[0].contains(SOURCE_HOST),
+            "{failed:?}"
+        );
+    }
+
+    /// A download that fails with a cached copy to fall back to warns and goes on.
+    #[tokio::test]
+    async fn a_guide_falling_back_to_its_cached_copy_logs_no_account() {
+        let url = credentialed_source();
+        let fetcher = SourceGoesDown::answering(XMLTV);
+        let (mgr, provider) = manager_with_guide_source(&fetcher, &url).await;
+        mgr.xmltv.get_xml(&provider).await.expect("first download");
+        let cache_file = mgr
+            .xmltv
+            .cache_file_for_test(provider.id.as_deref().expect("id"));
+        std::fs::File::options()
+            .write(true)
+            .open(&cache_file)
+            .expect("cache file")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_hours(2))
+            .expect("age");
+        fetcher.go_down();
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = logs.install();
+            mgr.xmltv.get_xml(&provider).await.expect("fallback");
+        }
+
+        logs.assert_no_source_account();
+        let warned = logs.lines_at("WARN", "using the previously downloaded file");
+        assert_eq!(warned.len(), 1, "{}", logs.text());
+        assert!(warned[0].contains(SOURCE_HOST), "{warned:?}");
+    }
+
+    /// An unreadable guide is a listings error in both its readers: the refresh
+    /// logs it and the mapping dialog answers it.
+    #[tokio::test]
+    async fn an_unreadable_guide_is_reported_without_its_account() {
+        let url = credentialed_source();
+        let fetcher = SourceGoesDown::answering("<tv><channel id=\"one\"");
+        let (mgr, provider) = manager_with_guide_source(&fetcher, &url).await;
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = logs.install();
+            mgr.refresh_guide().await.expect("refresh");
+        }
+
+        logs.assert_no_source_account();
+        let warned = logs.lines_at("WARN", "guide document unreadable");
+        assert_eq!(warned.len(), 1, "{}", logs.text());
+        assert!(
+            warned[0].contains(provider.id.as_deref().expect("id"))
+                && warned[0].contains(SOURCE_HOST),
+            "{warned:?}"
+        );
+        let error = mgr
+            .provider_channels(&provider)
+            .await
+            .expect_err("unreadable");
+        let text = error.to_string();
+        assert!(text.contains(SOURCE_HOST), "{text}");
+        for secret in SOURCE_ACCOUNT {
+            assert!(!text.contains(secret), "{text}");
+        }
+    }
+
+    /// A rejected M3U line is the playlist's own text: `/live/<user>/<pass>/1.ts`
+    /// is shaped like a path and is not one, so the channel's name stands for it.
+    #[tokio::test]
+    async fn a_rejected_m3u_line_is_logged_by_its_channel_name() {
+        let fetcher = SourceGoesDown::answering(
+            "#EXTM3U\n#EXTINF:-1,Rejected\n/live/acct-user/path-secret/1.ts\n",
+        );
+        let mgr = manager_with_fetcher(Arc::clone(&fetcher) as Arc<dyn SourceFetcher>).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = logs.install();
+            mgr.refresh_guide().await.expect("refresh");
+        }
+
+        logs.assert_no_source_account();
+        assert_eq!(
+            logs.lines_at("DEBUG", "\"Rejected\"").len(),
+            1,
+            "{}",
+            logs.text()
+        );
+    }
+
+    /// Discovery logs what a device said about itself, which it can say anything in.
+    #[tokio::test]
+    async fn a_discovered_device_is_logged_by_its_host() {
+        let mgr = manager_with(FakeFetcher(HashMap::new()))
+            .await
+            .with_tuner_hosts(vec![Arc::new(DiscoveringHost(vec![TunerHostInfo {
+                type_: Some("discovering".to_owned()),
+                url: Some(credentialed_source()),
+                ..TunerHostInfo::default()
+            }]))]);
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = logs.install();
+            mgr.discover_tuners(0, false).await.expect("discover");
+        }
+
+        logs.assert_no_source_account();
+        assert_eq!(
+            logs.lines_at("INFO", "discovered a tuner device").len(),
+            1,
+            "{}",
+            logs.text()
+        );
+    }
+
+    /// A `404` body is surfaced to the caller, and a `Path` with a scheme
+    /// `is_http` does not know is judged a missing file.
+    #[tokio::test]
+    async fn a_guide_path_that_is_no_file_is_refused_without_its_account() {
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+
+        let error = mgr
+            .save_listing_provider(
+                as_xmltv(ListingsProviderInfo {
+                    path: Some(
+                        "rtsp://acct-user:info-secret@guide.example/path-secret/guide.xml"
+                            .to_owned(),
+                    ),
+                    ..ListingsProviderInfo::default()
+                }),
+                false,
+                false,
+            )
+            .await
+            .expect_err("no such file");
+
+        assert!(matches!(error, ServiceError::NotFound(_)), "{error:?}");
+        let text = error.to_string();
+        assert!(text.contains("rtsp://guide.example"), "{text}");
+        for secret in SOURCE_ACCOUNT {
+            assert!(!text.contains(secret), "{text}");
         }
     }
 

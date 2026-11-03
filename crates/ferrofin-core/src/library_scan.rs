@@ -1468,7 +1468,12 @@ fn spawn_probe(
             }
             Err(e) => {
                 run.finish(crate::scan_metrics::ProbeResult::Failed);
-                let path = request.media_source.path.as_deref();
+                // A `.strm` item's path is its target URL, which can carry an account.
+                let path = request
+                    .media_source
+                    .path
+                    .as_deref()
+                    .map(ferrofin_util::source_url::redact_url);
                 tracing::warn!(error = %e, ?path, "media probe failed; item left unprobed");
                 return None;
             }
@@ -4057,6 +4062,8 @@ pub struct LibraryScanner {
     /// materialized itself — Jellyfin's carry one and the DTO emits it
     /// unconditionally. Absent → those rows keep a `NULL` `Path`.
     by_name: Option<crate::by_name_store::ByNameStore>,
+    /// The files being recorded ([`with_recording_paths`](Self::with_recording_paths)).
+    recording_paths: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
     /// Brackets the files the scan writes beside the media (embedded lyrics
     /// saved as `.lrc`), as upstream's `LyricManager` does. `None` in unit
     /// tests.
@@ -4120,6 +4127,14 @@ pub struct LibraryScanner {
     /// named after an item whose kind (and so id) changed. `None` until
     /// [`with_path_manager`](Self::with_path_manager): those folders stay.
     path_manager: Option<Arc<dyn ferrofin_traits::system::PathManager>>,
+    /// The cleanup `LibraryManager.DeleteItem` runs before a row goes — its
+    /// metadata folders, then its extracted data (trickplay tiles in both
+    /// locations, chapter images, subtitle and attachment caches) — which
+    /// every row a scan removes takes too
+    /// ([`delete_with_item_data`](Self::delete_with_item_data)). `None` until
+    /// [`with_item_data_cleanup`](Self::with_item_data_cleanup) (unit tests),
+    /// or with no item repository: a removal deletes rows only.
+    item_data: Option<Arc<crate::item_data_cleanup::ItemDataCleanup>>,
     /// Reads the server-wide per-kind `MetadataOptions`
     /// (`ServerConfiguration.MetadataOptions`), live: the fetcher gate for a
     /// kind a library saved no `TypeOptions` entry for, and for an item in no
@@ -4323,6 +4338,7 @@ impl LibraryScanner {
             item_repository: None,
             years: None,
             by_name: None,
+            recording_paths: None,
             self_writes: None,
             studios_client: None,
             metadata_dir: None,
@@ -4339,6 +4355,7 @@ impl LibraryScanner {
             change_notifier: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             path_manager: None,
+            item_data: None,
             root_folder: None,
             metadata_options: None,
             metadata_locale: None,
@@ -4587,6 +4604,26 @@ impl LibraryScanner {
         self
     }
 
+    /// Reads the files Live TV is recording to right now, which the walk leaves
+    /// out until the capture's own refresh finds them.
+    ///
+    /// TODO(parity, open work item — NOT an accepted divergence; gl-1077):
+    /// upstream gives such a file an item from `OnStarted`, which
+    /// `Video.SourceType` (`LiveTV`), `IsCompleteMedia` and `DtoService`'s
+    /// `Type: Recording` keep away from everything a finished video reaches.
+    /// None of that is ported, so an item here would be a partial file posing
+    /// as a finished one. Un-defer path: port those, then remove this.
+    ///
+    /// Called once by the composition root.
+    #[must_use]
+    pub fn with_recording_paths(
+        mut self,
+        read: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
+        self.recording_paths = Some(read);
+        self
+    }
+
     /// Brackets the files the scan writes beside the media (embedded lyrics
     /// saved as `.lrc`) on `guard`, so the library monitor takes them for the
     /// server's own writes. Called once by the composition root.
@@ -4639,6 +4676,17 @@ impl LibraryScanner {
         path_manager: Arc<dyn ferrofin_traits::system::PathManager>,
     ) -> Self {
         self.path_manager = Some(path_manager);
+        self
+    }
+
+    /// The library manager's delete cleanup (the item's metadata folders and
+    /// extracted data), which every row a scan removes takes before it goes.
+    #[must_use]
+    pub fn with_item_data_cleanup(
+        mut self,
+        cleanup: Arc<crate::item_data_cleanup::ItemDataCleanup>,
+    ) -> Self {
+        self.item_data = Some(cleanup);
         self
     }
 
@@ -5246,7 +5294,10 @@ impl LibraryScanner {
         if orphans.is_empty() {
             return Vec::new();
         }
-        match self.persistence.delete_items(&orphans).await {
+        // The removed library's items go with their data, the trickplay
+        // folders beside their media included, as upstream's `DeleteItem`
+        // of the location's folder takes its children's.
+        match self.delete_with_item_data(&orphans, false).await {
             Ok(deleted) => {
                 tracing::info!(
                     removed = deleted.len(),
@@ -9457,7 +9508,7 @@ impl LibraryScanner {
             }),
             _ => Vec::new(),
         };
-        let deleted = self.persistence.delete_items(ids).await?;
+        let deleted = self.delete_with_item_data(ids, false).await?;
         if let Some(notifier) = &self.change_notifier {
             let gone: std::collections::HashSet<&Uuid> = deleted.iter().collect();
             let rows: Vec<BaseItemEntity> = rows
@@ -9467,6 +9518,125 @@ impl LibraryScanner {
             notifier.record_removed(&rows);
         }
         Ok(deleted)
+    }
+
+    /// Deletes `ids` and everything the delete takes with them
+    /// ([`ItemPersistenceService::delete_items`]), each of those rows first
+    /// losing its metadata folders and extracted data, in upstream's order
+    /// (`DeleteItem`/`DeleteItemsUnsafeFast`: metadata paths, then
+    /// `DeleteExternalItemFiles`, then the rows). The rows cleaned are the
+    /// ones the delete takes, listed just before it
+    /// ([`ItemPersistenceService::deletion_closure_ids`]), so a row a re-key
+    /// moved to a new id, or one this scan keeps, is never touched; they are
+    /// read and cleaned a batch at a time, so removing a library does not
+    /// hold every row it had.
+    ///
+    /// With `keep_shared_media`, a row's trickplay folder beside its media
+    /// stays while a video file it is named after is still on disk
+    /// ([`media_folders_in_use`]): the folder is named after the file
+    /// without its extension, so the item now at that file (the same file
+    /// resolved anew, `Movie.mp4` replacing `Movie.mkv`, a case-only rename
+    /// on a case-insensitive mount) shares it, whether or not this scan
+    /// planned that item. Upstream deletes the stale item before the new one
+    /// is built; here the prune runs after the walk, when the new item may
+    /// already have its tiles. The row's own file counts too: a row the scan
+    /// removes while its file is still there (excluded, or taken by another
+    /// item) keeps that folder, which may be another item's, where upstream
+    /// would delete it.
+    ///
+    /// Every row the delete takes is cleaned, the extras and versions it
+    /// owns included, where upstream's `DeleteItem` (and `DELETE /Items`
+    /// here) cleans the item and the rows below it only: an owned row's data
+    /// would otherwise stay on disk for good.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] when the rows cannot be listed or deleted;
+    /// when the listing fails nothing is touched. A batch whose rows cannot
+    /// be read (a row that does not decode) is logged and deleted without
+    /// its cleanup, so one bad row never stops a library's prune. A delete
+    /// that fails after the cleanup leaves its rows without that data, as
+    /// upstream's does: its files go first too.
+    async fn delete_with_item_data(
+        &self,
+        ids: &[Uuid],
+        keep_shared_media: bool,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        if let (Some(item_data), Some(items)) = (&self.item_data, &self.item_repository) {
+            let closure = self.persistence.deletion_closure_ids(ids).await?;
+            for batch in closure.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+                let rows = match items.retrieve_items(batch).await {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::warn!(
+                            %err,
+                            rows = batch.len(),
+                            "could not read removed rows; their extracted data and metadata folders stay"
+                        );
+                        continue;
+                    }
+                };
+                let kept = if keep_shared_media {
+                    self.media_folders_in_use(&rows).await
+                } else {
+                    std::collections::HashSet::new()
+                };
+                let rows: Vec<&BaseItemEntity> = rows.iter().collect();
+                item_data
+                    .delete_item_data(&rows, &|row: &BaseItemEntity| kept.contains(&row.id))
+                    .await;
+            }
+        }
+        self.persistence.delete_items(ids).await
+    }
+
+    /// The ids of the `rows` whose trickplay folder beside their media is on
+    /// disk and named after a video file still beside it (the same name
+    /// without its extension, case-folded): the item at that file, if any,
+    /// uses that folder too. Checked on the blocking pool, one listing per
+    /// directory holding such a folder; a folder whose directory cannot be
+    /// listed is counted in use.
+    async fn media_folders_in_use(
+        &self,
+        rows: &[BaseItemEntity],
+    ) -> std::collections::HashSet<String> {
+        let folders: Vec<(String, std::path::PathBuf)> = rows
+            .iter()
+            .filter_map(|row| {
+                let path = self.virtual_paths.expand(row.path.as_deref()?);
+                let containing_folder =
+                    crate::video_versions::containing_folder_path_at(row, &path);
+                let folder = crate::path_manager::trickplay_folder_beside(
+                    ferrofin_traits::system::MediaLocation {
+                        path: &path,
+                        containing_folder: &containing_folder,
+                    },
+                )?;
+                Some((row.id.clone(), folder))
+            })
+            .collect();
+        if folders.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let checked = tokio::task::spawn_blocking(move || {
+            let mut naming = None;
+            let mut stems = VideoStemsByDir::default();
+            folders
+                .into_iter()
+                .filter(|(_, folder)| folder.is_dir())
+                .filter(|(_, folder)| {
+                    let naming = naming.get_or_insert_with(NamingOptions::new);
+                    stems.in_use(folder, naming)
+                })
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .await;
+        checked.unwrap_or_else(|err| {
+            // Nothing is known to be free: keep every such folder.
+            tracing::warn!(%err, "checking the trickplay folders beside removed media failed");
+            rows.iter().map(|row| row.id.clone()).collect()
+        })
     }
 
     /// The dynamic image providers over this scanner's stores, when it has all
@@ -9884,8 +10054,10 @@ impl LibraryScanner {
                 continue;
             }
             // Exactly what went: the rows and everything the delete took
-            // with them (the extras `delete_items` removes with an owner).
-            match self.persistence.delete_items(&ids).await {
+            // with them (the extras `delete_items` removes with an owner),
+            // each with its metadata folders and extracted data, but never a
+            // trickplay folder beside media a video file still on disk shares.
+            match self.delete_with_item_data(&ids, true).await {
                 Ok(deleted) => {
                     if scope.is_some() {
                         log_pruned(&deleted, &existing, &children);
@@ -11999,21 +12171,11 @@ impl LibraryScanner {
                 // `TvdbEpisodeProvider` names no `ResultLanguage`.
                 let mut answer = RemoteAnswer::for_row(row, None);
                 apply_tvdb_episode(&mut answer.item, &ep, display_order.is_empty());
-                // TVDB's per-episode record credits only guest stars and
-                // crew (directors/writers); the series' regular actors live
-                // on the series record. TMDB per-episode credits include
-                // regulars, so when TMDB runs first the fold already has
-                // actors. But when this TVDB answer is the only source —
-                // the series has no TMDB id, or TMDB returned nothing — the
-                // episode page would show no actors at all. Merge the
-                // cached series' actors in ahead of the episode credits,
-                // deduplicating anyone the episode already credits.
-                let series_people = cache
-                    .series_tvdb
-                    .get(&series_id)
-                    .map(|d| d.people.as_slice())
-                    .unwrap_or_default();
-                answer.people = Some(merge_series_cast(tvdb_people(&ep.people), series_people));
+                // `MapEpisodeToResult` `ResetPeople`s and maps the episode's
+                // own `Characters` (`TvdbEpisodeProvider.cs:225,272-308`): a
+                // list, empty when TVDB credits nobody. Nothing upstream adds
+                // the series' regulars to an episode.
+                answer.people = Some(tvdb_people(&ep.people));
                 // `TvdbEpisodeProvider` sets the episode's Tvdb id and the
                 // IMDb id its remote ids carry.
                 answer
@@ -12055,15 +12217,15 @@ impl LibraryScanner {
     }
 
     /// The stored row and `LockedFields` of every credited person whose
-    /// biography is about to be fetched (one read each); a person the store
-    /// cannot answer for is absent.
+    /// biography is about to be fetched ([`fetches_biography`]; one read
+    /// each); a person the store cannot answer for is absent.
     async fn person_locks(
         &self,
         written: &[ferrofin_traits::persistence::WrittenPerson],
     ) -> Option<HashMap<Uuid, PersonLock>> {
         let ids: Vec<Uuid> = written
             .iter()
-            .filter(|p| p.needs_details)
+            .filter(|p| fetches_biography(p))
             .map(|p| p.id)
             .collect();
         let Some(repo) = &self.item_repository else {
@@ -12171,8 +12333,11 @@ impl LibraryScanner {
         let stored = self.stored_person_image_metadata(&written).await;
         let person_locks = self.person_locks(&written).await;
         let server_locale = self.server_metadata_locale();
-        let folders = if written.iter().any(|person| person.needs_details) {
-            match self.virtual_folders.get_virtual_folders().await {
+        // Read only for a biography fetch, which most credits never make (a
+        // person with no TMDB id, or one already described), and from the
+        // libraries' snapshot: the full listing re-heals every library.
+        let folders = if written.iter().any(fetches_biography) {
+            match self.virtual_folders.library_folders().await {
                 Ok(folders) => Some(folders),
                 Err(error) => {
                     tracing::warn!(%error, "could not read credited people's library locale");
@@ -12180,7 +12345,7 @@ impl LibraryScanner {
                 }
             }
         } else {
-            Some(Vec::new())
+            Some(Arc::from([]))
         };
         let mut locale_cache = ArtworkCache::default();
         for person in written {
@@ -12779,7 +12944,17 @@ impl LibraryScanner {
             } else {
                 keep_stored_images(&mut images, stored, &self.virtual_paths);
             }
-            adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
+            // Embedded images mean `PhotoProvider` ran: a first, full or
+            // required refresh (`GetProviders`), never a plain rescan of an
+            // unchanged photo. Its `ImageUpdate` result forces
+            // `UpdateImagesAsync` (`RunMetadataSavers`), so the photo's own
+            // file is measured again whatever its date says.
+            for image in images
+                .iter_mut()
+                .filter(|image| Some(image.path.as_str()) != entity.path.as_deref())
+            {
+                adopt_stored_image_metadata(std::slice::from_mut(image), &art_cache.stored_images);
+            }
             cut_short |= self
                 .finish_artwork(entity, &mut images, stored, dirs.as_deref())
                 .await;
@@ -14697,12 +14872,17 @@ impl LibraryScanner {
                 // `DotIgnoreIgnoreRule` (`.ignore` files). Every listing of the
                 // walk comes through here, `FindExtras`' own filter included.
                 let mut dot_ignore = ctx.dot_ignore.borrow_mut();
+                // Read after the listing: a capture registers before it
+                // creates its file, so a file listed here is never missed.
+                let recording = self.recording_paths.as_ref().map(|read| read());
+                let recording = recording.as_deref().unwrap_or_default();
                 entries
                     .into_iter()
                     .filter(|entry| {
                         let is_dir = entry.type_ == FileSystemEntryType::Directory;
                         if crate::resolvers::should_ignore_path(&entry.path)
                             || dot_ignore.should_ignore(&entry.path, is_dir)
+                            || recording.contains(&entry.path)
                         {
                             ctx.excluded.borrow_mut().push(entry.path.clone());
                             false
@@ -18574,6 +18754,14 @@ fn photo_exif_fields(
     ]
 }
 
+/// Whether [`LibraryScanner::enrich_people`] fetches `person`'s biography: it
+/// has none yet, and a TMDB id to look one up by. Only these need the stored
+/// row, its locks and the libraries; a credit from an NFO without ids never
+/// does, however often it is written.
+fn fetches_biography(person: &ferrofin_traits::persistence::WrittenPerson) -> bool {
+    person.needs_details && person.provider_id.is_some()
+}
+
 /// A credited person's stored row and `LockedFields`.
 struct PersonLock {
     /// The stored `Person` row.
@@ -19117,6 +19305,45 @@ fn kept_row(ids: &[Uuid], weights: &HashMap<Uuid, ItemUserWeight>) -> Option<Uui
             .unwrap_or_else(|| ItemUserWeight::none(id))
             .keep_rank()
     })
+}
+
+/// The video files' names without their extension, case-folded, in each
+/// directory asked about, each listed once: a trickplay folder beside media,
+/// `{stem}.trickplay`, is still in use while its directory holds a video
+/// file named `{stem}` ([`Self::in_use`]).
+#[derive(Default)]
+struct VideoStemsByDir(HashMap<std::path::PathBuf, Option<std::collections::HashSet<String>>>);
+
+impl VideoStemsByDir {
+    /// Whether a video file named like `folder` is beside it. A directory
+    /// that cannot be listed counts as holding one, so nothing is deleted on
+    /// a guess.
+    fn in_use(&mut self, folder: &std::path::Path, naming: &NamingOptions) -> bool {
+        let (Some(dir), Some(name)) = (folder.parent(), folder.file_name()) else {
+            return false;
+        };
+        let stem = crate::path_manager::file_stem(&name.to_string_lossy()).to_lowercase();
+        self.0
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| {
+                // An entry that cannot be read fails the whole listing.
+                let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
+                    .ok()?
+                    .collect::<Result<_, _>>()
+                    .ok()?;
+                Some(
+                    entries
+                        .iter()
+                        .filter(|entry| entry.path().is_file())
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .filter(|name| video_resolver::is_video_file(name, naming))
+                        .map(|name| crate::path_manager::file_stem(&name).to_lowercase())
+                        .collect(),
+                )
+            })
+            .as_ref()
+            .is_none_or(|stems| stems.contains(&stem))
+    }
 }
 
 /// Whether the stored type name `type_name` is a kind the scan plans a video
@@ -22819,30 +23046,6 @@ fn dedup_images_by_type(images: Vec<RemoteImage>) -> Vec<RemoteImage> {
         .collect()
 }
 
-/// Merges a series' regular actors into an episode's own TVDB credits.
-///
-/// TVDB's per-episode record only carries guest stars and crew; the series
-/// regulars live on the series record. Series actors (in TVDB billing order)
-/// come first, then the episode's own credits. A regular already credited on
-/// the episode keeps the episode's entry (its role is the more specific one).
-fn merge_series_cast(
-    episode_people: Vec<PeopleEntity>,
-    series_people: &[ferrofin_providers::TvdbPerson],
-) -> Vec<PeopleEntity> {
-    let credited: std::collections::HashSet<String> = episode_people
-        .iter()
-        .map(|p| p.name.to_lowercase())
-        .collect();
-    let mut people: Vec<PeopleEntity> = tvdb_people(series_people)
-        .into_iter()
-        .filter(|p| {
-            p.person_type.as_deref() == Some("Actor") && !credited.contains(&p.name.to_lowercase())
-        })
-        .collect();
-    people.extend(episode_people);
-    people
-}
-
 /// Maps TVDB credited people to persistable [`PeopleEntity`] rows. TVDB carries
 /// no numeric person provider id (so `provider_id` is `None`, and the TMDB bio
 /// enrichment skips them); their profile image URL is preserved.
@@ -24758,6 +24961,8 @@ mod tests {
         routes: Vec<(&'static str, &'static str)>,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = Arc::clone(&requests);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -27203,6 +27408,8 @@ mod tests {
     /// else — enough HTTP for the studios client (blocking, own thread).
     fn spawn_art_server(manifest: &'static str, image: &'static [u8]) -> String {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -27493,6 +27700,307 @@ mod tests {
         assert_eq!(f.production_locations.as_deref(), Some("Leeds"));
         let o = row(open).await;
         assert_eq!(o.overview.as_deref(), Some("TMDB bio."));
+    }
+
+    /// A [`VirtualFolderManager`](ferrofin_traits::library::VirtualFolderManager)
+    /// with no library, counting the full listings and the snapshot reads it
+    /// answers: a per-item lookup reads the snapshot (gl-1084).
+    #[derive(Default)]
+    struct CountingFolders {
+        listings: std::sync::atomic::AtomicUsize,
+        snapshots: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingFolders {
+        /// `(full listings, snapshot reads)` so far.
+        fn counts(&self) -> (usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (self.listings.load(SeqCst), self.snapshots.load(SeqCst))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::library::VirtualFolderManager for CountingFolders {
+        async fn get_virtual_folders(
+            &self,
+        ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, super::ServiceError>
+        {
+            self.listings
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Vec::new())
+        }
+        async fn library_folders(
+            &self,
+        ) -> Result<
+            std::sync::Arc<[ferrofin_model::entities_media::VirtualFolderInfo]>,
+            super::ServiceError,
+        > {
+            self.snapshots
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(std::sync::Arc::from([]))
+        }
+        async fn add_virtual_folder(
+            &self,
+            _name: &str,
+            _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
+            _options: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<Option<uuid::Uuid>, super::ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn remove_virtual_folder(&self, _name: &str) -> Result<(), super::ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn rename_virtual_folder(
+            &self,
+            _name: &str,
+            _new_name: &str,
+        ) -> Result<(), super::ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn add_media_path(
+            &self,
+            _name: &str,
+            _path: &ferrofin_model::configuration::MediaPathInfo,
+        ) -> Result<(), super::ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn update_media_path(
+            &self,
+            _name: &str,
+            _path: &ferrofin_model::configuration::MediaPathInfo,
+        ) -> Result<(), super::ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn remove_media_path(
+            &self,
+            _name: &str,
+            _path: &str,
+        ) -> Result<(), super::ServiceError> {
+            unimplemented!("fake")
+        }
+        async fn update_library_options(
+            &self,
+            _name: &str,
+            _options: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<(), super::ServiceError> {
+            unimplemented!("fake")
+        }
+    }
+
+    /// The server configuration over `root`, as the savers read it.
+    async fn saver_configuration(
+        root: &std::path::Path,
+    ) -> std::sync::Arc<crate::FerrofinServerConfigurationManager> {
+        let paths = std::sync::Arc::new(crate::FerrofinServerApplicationPaths::new(
+            root,
+            root.join("log"),
+            root.join("server-config"),
+            root.join("cache"),
+            root.join("web"),
+        ));
+        std::sync::Arc::new(
+            crate::FerrofinServerConfigurationManager::load(paths)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// gl-1084: the people pass reads the libraries only for a biography it
+    /// fetches, which takes a TMDB id: credits from an NFO without ids (most
+    /// of a scan's) read nothing, however often they are written. And then
+    /// from the libraries' snapshot, not the full listing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enrich_people_reads_the_libraries_only_for_a_biography_it_fetches() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::people_repository::FerrofinPeopleRepository;
+        use crate::test_support::test_db;
+        use ferrofin_traits::persistence::{ItemRepository, WrittenPerson};
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let body = r#"{"id": 1, "name": "P", "biography": "TMDB bio."}"#;
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let db = test_db().await;
+        let persistence = std::sync::Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: std::sync::Arc<dyn ItemRepository> = std::sync::Arc::new(
+            FerrofinItemRepository::new(db.clone(), std::sync::Arc::new(ItemTypeLookup::new())),
+        );
+        let person = super::Uuid::new_v4();
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(person),
+                type_: stored_type_name(BaseItemKind::Person).unwrap().to_owned(),
+                name: Some("P".into()),
+                ..Default::default()
+            }])
+            .await
+            .expect("seed");
+        let tmp = tempfile::tempdir().unwrap();
+        let folders = std::sync::Arc::new(CountingFolders::default());
+        let scanner = LibraryScanner::new(
+            folders.clone(),
+            std::sync::Arc::new(FerrofinFileSystem::new()),
+            persistence.clone(),
+        )
+        .with_items(std::sync::Arc::clone(&items))
+        .with_metadata(
+            std::sync::Arc::new(ferrofin_providers::TmdbClient::new().with_base_url(&base)),
+            tmp.path().join("People"),
+        );
+        let people = FerrofinPeopleRepository::new(db.clone());
+        let credit = |provider_id| WrittenPerson {
+            id: person,
+            needs_details: true,
+            image_url: None,
+            provider_id,
+        };
+
+        scanner.enrich_people(&people, vec![credit(None)]).await;
+        assert_eq!(folders.counts(), (0, 0), "no TMDB id, no library read");
+
+        scanner.enrich_people(&people, vec![credit(Some(1))]).await;
+        assert_eq!(folders.counts(), (0, 1), "the snapshot, once");
+        let row = items.retrieve_item(person).await.unwrap().unwrap();
+        assert_eq!(row.overview.as_deref(), Some("TMDB bio."), "fetched");
+    }
+
+    /// gl-1084: the artwork destination saver runs for every item a scan saves,
+    /// and reads where artwork goes only when an image was acquired this pass,
+    /// from the libraries' snapshot. An item whose images are local or already
+    /// saved reads no setting, and so cannot fail on one.
+    #[tokio::test]
+    async fn saving_artwork_reads_destinations_only_for_an_acquired_image() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::test_support::test_db;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let items = std::sync::Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            std::sync::Arc::new(ItemTypeLookup::new()),
+        ));
+        let folders = std::sync::Arc::new(CountingFolders::default());
+        let meta = tmp.path().join("metadata");
+        let saver = ferrofin_providers::image_save::ImageFileSaver::new(
+            items,
+            folders.clone(),
+            saver_configuration(tmp.path()).await,
+            meta.clone().into(),
+        );
+        let movie_dir = tmp.path().join("movies").join("Heat (1995)");
+        let movie = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(super::Uuid::new_v4()),
+            type_: stored_type_name(BaseItemKind::Movie).unwrap().to_owned(),
+            path: Some(
+                movie_dir
+                    .join("Heat (1995).mkv")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..Default::default()
+        };
+        let image = |path: std::path::PathBuf, image_type| ItemImageInfo {
+            path: path.to_string_lossy().into_owned(),
+            image_type,
+            date_modified: chrono::DateTime::UNIX_EPOCH,
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        };
+        let local = image(movie_dir.join("poster.jpg"), ImageType::Primary);
+        let published = image(meta.join("heat").join("backdrop.jpg"), ImageType::Backdrop);
+        saver
+            .save_all(&movie, &mut [local, published.clone()], &[published])
+            .await
+            .expect("nothing to publish");
+        assert_eq!(folders.counts(), (0, 0), "no destination asked for");
+
+        let fetched = image(meta.join("heat").join("logo.png"), ImageType::Logo);
+        saver
+            .save_all(&movie, &mut [fetched], &[])
+            .await
+            .expect("no library saves beside the media");
+        assert_eq!(folders.counts(), (0, 1), "the snapshot, once");
+    }
+
+    /// gl-1084: the NFO saver refuses a scan's `MetadataImport` of an episode
+    /// before reading any option, as `IsSaverEnabledForItem` asks the saver
+    /// first, and reads the library's options from the snapshot when the
+    /// update could save.
+    #[tokio::test]
+    async fn the_nfo_saver_reads_library_options_only_for_an_update_it_can_save() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+        use crate::media_stream_repository::FerrofinMediaStreamRepository;
+        use crate::people_repository::FerrofinPeopleRepository;
+        use crate::test_support::test_db;
+        use ferrofin_traits::providers::ItemUpdateType;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = test_db().await;
+        let persistence = std::sync::Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let episode = super::Uuid::new_v4();
+        let season = tmp.path().join("Show").join("Season 01");
+        std::fs::create_dir_all(&season).unwrap();
+        persistence
+            .save_items(&[BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(episode),
+                type_: stored_type_name(BaseItemKind::Episode).unwrap().to_owned(),
+                name: Some("Pilot".into()),
+                path: Some(
+                    season
+                        .join("Show - S01E01.mkv")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..Default::default()
+            }])
+            .await
+            .expect("seed");
+        let folders = std::sync::Arc::new(CountingFolders::default());
+        let saver = ferrofin_providers::nfo_save::NfoSaver::new(
+            std::sync::Arc::new(FerrofinItemRepository::new(
+                db.clone(),
+                std::sync::Arc::new(ItemTypeLookup::new()),
+            )),
+            persistence,
+            std::sync::Arc::new(FerrofinPeopleRepository::new(db.clone())),
+            std::sync::Arc::new(FerrofinMediaStreamRepository::new(db.clone())),
+            folders.clone(),
+            saver_configuration(tmp.path()).await,
+        );
+
+        saver
+            .save(episode, ItemUpdateType::MetadataImport)
+            .await
+            .expect("refused");
+        assert_eq!(folders.counts(), (0, 0), "refused before the options");
+
+        saver
+            .save(episode, ItemUpdateType::MetadataEdit)
+            .await
+            .expect("no library saves it");
+        assert_eq!(folders.counts(), (0, 1), "the snapshot, once");
+        assert!(
+            !season.join("Show - S01E01.nfo").exists(),
+            "local saving is off"
+        );
     }
 
     /// A person's downloaded profile art must be persisted with its real pixel
@@ -27845,7 +28353,7 @@ mod tests {
             b"x",
         )
         .unwrap();
-        let base = spawn_art_server("Mosfilm\nLenfilm", b"JPEGDATA");
+        let base = spawn_art_server("Mosfilm\nLenfilm", b"GIF89aDATA");
         scanner(&base)
             .enrich_studio_images(super::ScanRun::defaults())
             .await
@@ -27870,6 +28378,8 @@ mod tests {
         use ferrofin_db::entities::base_items::BaseItemEntity;
         use ferrofin_model::data::BaseItemKind;
         use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
 
         let db = test_db().await;
         let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
@@ -27912,7 +28422,7 @@ mod tests {
         };
         let (studio_id, unknown_id) = (studio("Mosfilm"), studio("Nowhere Films"));
 
-        let base = spawn_art_server("Mosfilm", b"JPEGDATA");
+        let base = spawn_art_server("Mosfilm", b"GIF89aDATA");
         let tmp = tempfile::tempdir().unwrap();
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(
             FerrofinVirtualFolderManager::new(tmp.path().join("default"))
@@ -27937,7 +28447,7 @@ mod tests {
             images[0].image_type,
             ferrofin_model::entities::ImageType::Thumb
         );
-        assert_eq!(std::fs::read(&images[0].path).unwrap(), b"JPEGDATA");
+        assert_eq!(std::fs::read(&images[0].path).unwrap(), b"GIF89aDATA");
         // Both were answered for — a thumb, and none — so both are refreshed.
         for id in [studio_id, unknown_id] {
             let row = items.retrieve_item(id).await.unwrap().unwrap();
@@ -28474,6 +28984,8 @@ mod tests {
     /// Returns its base URL and the requests it answered.
     fn spawn_music_stub() -> (String, Arc<MusicHits>) {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let hits = Arc::new(MusicHits::default());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -29488,52 +30000,6 @@ mod tests {
         assert_eq!(named.name.as_deref(), Some("The Real Title"));
     }
 
-    #[test]
-    fn merge_series_cast_prepends_regulars_and_dedupes() {
-        use ferrofin_providers::TvdbPerson;
-        let ep_people = super::tvdb_people(&[
-            TvdbPerson {
-                name: "Guest Star".into(),
-                person_type: "GuestStar".into(),
-                role: Some("Villain".into()),
-                image_url: None,
-            },
-            TvdbPerson {
-                name: "Bill Burr".into(),
-                person_type: "Actor".into(),
-                role: Some("Frank (voice)".into()),
-                image_url: None,
-            },
-        ]);
-        let series_people = vec![
-            TvdbPerson {
-                name: "Bill Burr".into(),
-                person_type: "Actor".into(),
-                role: Some("Frank Murphy".into()),
-                image_url: None,
-            },
-            TvdbPerson {
-                name: "Laura Dern".into(),
-                person_type: "Actor".into(),
-                role: Some("Sue Murphy".into()),
-                image_url: None,
-            },
-            TvdbPerson {
-                name: "Series Writer".into(),
-                person_type: "Writer".into(),
-                role: None,
-                image_url: None,
-            },
-        ];
-        let merged = super::merge_series_cast(ep_people, &series_people);
-        let names: Vec<&str> = merged.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["Laura Dern", "Guest Star", "Bill Burr"]);
-        let bill = merged.iter().find(|p| p.name == "Bill Burr").unwrap();
-        assert_eq!(bill.role.as_deref(), Some("Frank (voice)"));
-        let alone = super::merge_series_cast(super::tvdb_people(&series_people[..1]), &[]);
-        assert_eq!(alone.len(), 1);
-    }
-
     /// A TVDB stand-in's body for an episode lookup: the series' episode
     /// list and the episode record, crediting `characters` (a JSON array).
     fn tvdb_episode_body(characters: &str) -> &'static str {
@@ -29662,6 +30128,42 @@ mod tests {
         assert_eq!(credited(&result.credits), [None, Some(Vec::new())]);
     }
 
+    /// TheTVDB's answer for an episode is the episode's own `Characters`
+    /// (`MapEpisodeToResult`, `TvdbEpisodeProvider.cs:225,272-308`), whatever
+    /// the scan already knows about the series. A series record fetched
+    /// earlier in the scan adds nothing to it, so the same episode gets the
+    /// same credits from every scan.
+    #[tokio::test]
+    async fn a_tvdb_first_episode_gets_only_its_own_characters() {
+        let credits = r#"[{"personName":"Guest Star","peopleType":"Guest Star","name":"Villain"}]"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let (tmdb, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (scanner, mut cache, mut episode) =
+            tmdb_and_tvdb_episode_fixture(&tmdb, tvdb_episode_body(credits), tmp.path()).await;
+        cache.series_tvdb.insert(
+            "SERIES".to_owned(),
+            ferrofin_providers::TvdbSeriesDetails {
+                tvdb_id: 121_361,
+                people: vec![ferrofin_providers::TvdbPerson {
+                    name: "Series Regular".into(),
+                    person_type: "Actor".into(),
+                    role: Some("Lead".into()),
+                    image_url: None,
+                }],
+                ..Default::default()
+            },
+        );
+
+        let tvdb_first = tvdb_first_options();
+        let result = fold_episode(&scanner, &mut cache, &mut episode, Some(&tvdb_first)).await;
+
+        assert_eq!(
+            credited(&result.credits).first(),
+            Some(&Some(vec!["Guest Star".to_owned()])),
+            "TheTVDB's answer is the episode's characters alone"
+        );
+    }
+
     // ---------------------------------------------------------------------
     // TMDB episode provider
     // ---------------------------------------------------------------------
@@ -29695,6 +30197,8 @@ mod tests {
         Arc<std::sync::atomic::AtomicUsize>,
     ) {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         // Every request, not just season fetches: a series lookup never asks
         // for a season, so a season-only counter cannot prove TMDB stayed out.
@@ -33412,6 +33916,8 @@ mod tests {
     /// the provider fold could be deleted with the whole suite green.
     fn spawn_tvdb_server(search: Option<&'static str>, details: Option<&'static str>) -> String {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -34363,6 +34869,8 @@ mod tests {
         vote_tenths: Arc<std::sync::atomic::AtomicU32>,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = Arc::clone(&requests);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -34848,6 +35356,8 @@ mod tests {
     /// Returns the base URL and every request line.
     fn spawn_artwork_server(still: bool) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = Arc::clone(&requests);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -34863,7 +35373,7 @@ mod tests {
                 let (status, payload) = if line.contains("/missing/") {
                     ("404 Not Found", "{}".to_owned())
                 } else if line.contains("/img/") {
-                    ("200 OK", "image".to_owned())
+                    ("200 OK", "GIF89aimage".to_owned())
                 } else if line.contains("/tv/1399/season/1/episode/1/images") {
                     (
                         "200 OK",
@@ -35072,7 +35582,7 @@ mod tests {
             if plugin_wins {
                 b"\x89PNG\r\n\x1a\nplugin".as_slice()
             } else {
-                b"image".as_slice()
+                b"GIF89aimage".as_slice()
             }
         );
         assert!(
@@ -35350,7 +35860,7 @@ mod tests {
                 if plugin_wins {
                     b"\x89PNG\r\n\x1a\nplugin".as_slice()
                 } else {
-                    b"remote".as_slice()
+                    b"GIF89aremote".as_slice()
                 }
             );
         }
@@ -35358,6 +35868,8 @@ mod tests {
 
     fn spawn_music_artwork_stub() -> String {
         use std::io::{Read as _, Write as _};
+        // Images are served on loopback, which downloads refuse by default.
+        ferrofin_providers::destination::test_support::allow_loopback_images();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -35367,7 +35879,7 @@ mod tests {
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]);
                 let (body, content_type) = if request.starts_with("GET /image") {
-                    ("remote".to_owned(), "image/jpeg")
+                    ("GIF89aremote".to_owned(), "image/jpeg")
                 } else if request.contains("/album-mb.php") {
                     (
                         format!(r#"{{"album":[{{"strAlbumThumb":"http://{addr}/image"}}]}}"#),
@@ -38371,6 +38883,124 @@ mod tests {
             count_type_like(&db, "%TV.Episode").await,
             1,
             "unreachable location skips the prune"
+        );
+    }
+
+    /// Records each `DeleteExternalItemFiles` call's id and media path.
+    #[derive(Default)]
+    struct RecordingExternalData {
+        calls: std::sync::Mutex<Vec<(uuid::Uuid, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::system::ExternalDataManager for RecordingExternalData {
+        async fn delete_external_item_data(
+            &self,
+            _item_id: uuid::Uuid,
+            _media: ferrofin_traits::system::MediaLocation<'_>,
+        ) -> Result<(), ServiceError> {
+            unimplemented!("a scan removal only removes the files")
+        }
+
+        async fn delete_external_item_files(
+            &self,
+            item_id: uuid::Uuid,
+            media: ferrofin_traits::system::MediaLocation<'_>,
+        ) -> Result<(), ServiceError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((item_id, media.path.to_owned()));
+            Ok(())
+        }
+    }
+
+    /// A scan removal cleans every row the delete takes, past one batch of
+    /// reads, before the rows go. With the shared-media guard, a row's media
+    /// path is withheld (so the trickplay folder beside it stays) only while
+    /// that folder is on disk and a video file of its name is beside it: a
+    /// container swap keeps it, a sidecar of the same name does not.
+    #[tokio::test]
+    async fn a_scan_removal_cleans_every_row_it_deletes_and_spares_shared_media() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let external = Arc::new(RecordingExternalData::default());
+        let cleanup = Arc::new(crate::item_data_cleanup::ItemDataCleanup::new(
+            crate::app_paths::test_paths(tmp.path()),
+        ));
+        cleanup.set_external_data(external.clone());
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items)
+            .with_item_data_cleanup(cleanup);
+
+        // More rows than one batch reads.
+        let many: Vec<uuid::Uuid> = (0..=ferrofin_db::BATCH_BIND_CHUNK)
+            .map(|_| uuid::Uuid::new_v4())
+            .collect();
+        for id in &many {
+            crate::test_support::seed_item(&db, *id, BaseItemKind::Movie).await;
+        }
+        let mut deleted = scanner.delete_with_item_data(&many, false).await.unwrap();
+        deleted.sort_unstable();
+        let mut cleaned: Vec<uuid::Uuid> = external
+            .calls
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|(id, _)| id)
+            .collect();
+        cleaned.sort_unstable();
+        let mut expected = many.clone();
+        expected.sort_unstable();
+        assert_eq!(deleted, expected, "every row deleted");
+        assert_eq!(cleaned, expected, "every row cleaned, across batches");
+
+        // `Mike.mkv` became `Mike.mp4`; `Kilo.mkv` is gone, its NFO stays;
+        // `Lima.mkv` is still there (excluded, or taken by another item).
+        let media = tmp.path().join("media");
+        for path in ["Mike.mp4", "Kilo.nfo", "Lima.mkv"] {
+            std::fs::create_dir_all(&media).unwrap();
+            std::fs::write(media.join(path), b"").unwrap();
+        }
+        for folder in ["Mike.trickplay", "Kilo.trickplay", "Lima.trickplay"] {
+            std::fs::create_dir_all(media.join(folder)).unwrap();
+        }
+        let (mike, kilo, lima) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        for (id, name) in [(mike, "Mike.mkv"), (kilo, "Kilo.mkv"), (lima, "Lima.mkv")] {
+            crate::test_support::seed_item(&db, id, BaseItemKind::Movie).await;
+            let path = media.join(name).to_string_lossy().into_owned();
+            crate::test_support::set_item_path(&db, id, &path).await;
+        }
+        scanner
+            .delete_with_item_data(&[mike, kilo, lima], true)
+            .await
+            .unwrap();
+        let calls: std::collections::HashMap<uuid::Uuid, String> =
+            external.calls.lock().unwrap().drain(..).collect();
+        assert_eq!(calls[&mike], "", "Mike.trickplay is the new Mike.mp4's");
+        assert_eq!(calls[&lima], "", "Lima.mkv is still there");
+        assert_eq!(
+            calls[&kilo],
+            media.join("Kilo.mkv").to_string_lossy(),
+            "no video named Kilo is left"
         );
     }
 

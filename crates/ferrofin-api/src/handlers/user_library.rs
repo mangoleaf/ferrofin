@@ -647,13 +647,7 @@ async fn get_latest_media(
     );
     // The views the user excluded from "latest"
     // (`user.GetPreferenceValues<Guid>(PreferenceKind.LatestItemExcludes)`).
-    let latest_item_excludes = state
-        .users
-        .get_user_dto(&user, None)
-        .await?
-        .configuration
-        .map(|c| c.latest_items_excludes)
-        .unwrap_or_default();
+    let latest_item_excludes = state.users.latest_items_excludes(&user).await?;
     let latest_query = ferrofin_traits::options::LatestItemsQuery {
         user: Some(user.clone()),
         parent_id: query.parent_id,

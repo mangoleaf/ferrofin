@@ -209,7 +209,7 @@ fn folder_items_query(
         ..InternalItemsQuery::default()
     };
     if let Some(user) = user {
-        query.set_user(user);
+        query.set_user(Arc::new(user));
     }
     if kind == BaseItemKind::Series {
         query.series_presentation_unique_key =
@@ -889,7 +889,7 @@ impl CollectionManager for FerrofinCollectionManager {
         use std::collections::HashSet;
         let collections = if let Some(folder) = self.get_collections_folder(false).await? {
             let query = InternalItemsQuery {
-                user: user.cloned(),
+                user: user.cloned().map(Arc::new),
                 parent_id: Uuid::parse_str(&folder.id)
                     .map_err(|error| ServiceError::backend(error.to_string()))?,
                 include_item_types: vec![BaseItemKind::BoxSet],
@@ -1191,7 +1191,7 @@ impl FerrofinPlaylistManager {
                         ..InternalItemsQuery::default()
                     };
                     if let Some(user) = user.clone() {
-                        query.set_user(user);
+                        query.set_user(Arc::new(user));
                     }
                     if kind == BaseItemKind::MusicGenre {
                         query.genre_ids = vec![id];
@@ -1296,8 +1296,10 @@ impl FerrofinPlaylistManager {
 
     /// Which of `entries` are in the caller's member list: a manual link
     /// (`GET /Playlists/{id}/Items` lists only those) to an existing member
-    /// the caller sees (`IsVisible(user)`). Every manual entry without the
-    /// evaluator.
+    /// the caller can open. That is the listing's check, the standalone one
+    /// that also walks the member's library, where upstream's `MoveItemAsync`
+    /// reads `IsVisible(user)` (gl-1092): a move's index counts the list the
+    /// caller was given. Every manual entry without the evaluator.
     async fn visible_entries(
         &self,
         entries: &[Entry],
@@ -1312,7 +1314,7 @@ impl FerrofinPlaylistManager {
             .filter_map(|(child, _)| Uuid::parse_str(child).ok())
             .collect();
         let rows = self.items.retrieve_items(&ids).await?;
-        let visible = visibility.visible(&rows, &user, false).await?;
+        let visible = visibility.visible(&rows, &user, true).await?;
         let by_id: std::collections::HashMap<Uuid, bool> = rows
             .iter()
             .zip(visible)

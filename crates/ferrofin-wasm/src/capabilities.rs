@@ -13,6 +13,9 @@ use uuid::Uuid;
 
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::media_segments::{MediaSegmentDto, MediaSegmentType};
+use ferrofin_providers::destination::{
+    DestinationRefused, PublicOnlyResolver, environment_proxy, is_private_address,
+};
 use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::InternalItemsQuery;
@@ -109,66 +112,6 @@ impl EgressPolicy {
     }
 }
 
-/// Whether an address is in a range the private-HTTP policy denies by
-/// default: loopback, link-local (incl. cloud metadata services), RFC1918,
-/// CGNAT (`100.64.0.0/10` — Tailscale's default range), IPv6 ULA, and the
-/// reserved/multicast blocks a public HTTP fetch should never target.
-/// An IPv6 address that carries an IPv4 one reaches that IPv4 host, so it
-/// takes the IPv4 rule: IPv4-mapped (`::ffff:0:0/96`), IPv4-compatible
-/// (`::/96`, RFC 4291), NAT64 (`64:ff9b::/96`, RFC 6052) and 6to4
-/// (`2002::/16`, RFC 3056). The local-use NAT64 prefix `64:ff9b:1::/48`
-/// (RFC 8215) is not globally reachable, so it is private whatever it embeds.
-///
-/// The CGNAT and reserved-block checks are open-coded because
-/// `Ipv4Addr::is_shared`/`is_reserved` are still nightly-only and we pin
-/// stable.
-#[must_use]
-pub fn is_private_address(addr: std::net::IpAddr) -> bool {
-    match addr {
-        std::net::IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
-            v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_private()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()               // 224.0.0.0/4
-                // CGNAT 100.64.0.0/10 (Tailscale, carrier NAT).
-                || (a == 100 && (64..128).contains(&b))
-                // Benchmarking 198.18.0.0/15.
-                || (a == 198 && (b == 18 || b == 19))
-                // IETF protocol assignments 192.0.0.0/24.
-                || (a == 192 && b == 0 && v4.octets()[2] == 0)
-                // Reserved for future use 240.0.0.0/4 (excl. broadcast, above).
-                || a >= 240
-        }
-        std::net::IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
-                return true;
-            }
-            let segments = v6.segments();
-            let from_segments =
-                |hi: u16, lo: u16| std::net::Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
-            // `to_ipv4` is the mapped and the compatible form; `::1` and `::`
-            // are caught above, since the compatible form reads them as
-            // `0.0.0.1` and `0.0.0.0`.
-            let embedded = v6.to_ipv4().or_else(|| match segments {
-                [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] | [0x2002, hi, lo, ..] => {
-                    Some(from_segments(hi, lo))
-                }
-                _ => None,
-            });
-            if let Some(v4) = embedded {
-                return is_private_address(std::net::IpAddr::V4(v4));
-            }
-            v6.is_multicast()
-                || v6.is_unicast_link_local()
-                || v6.is_unique_local()
-                || matches!(segments, [0x64, 0xff9b, 1, ..])
-        }
-    }
-}
-
 /// The guest HTTP clients, built once per plugin host and shared by every
 /// plugin and every call, so connections are pooled and no call spawns a
 /// client runtime of its own.
@@ -179,12 +122,13 @@ pub fn is_private_address(addr: std::net::IpAddr) -> bool {
 /// - `open` resolves as the system does and honours an environment proxy.
 ///   It serves plugins the admin granted private-network access
 ///   (`FERROFIN_WASM_PRIVATE_HTTP_ALLOW`).
-/// - `vetted` resolves through [`PublicOnlyResolver`], which refuses a name
-///   with any private or loopback address, and never uses a proxy. The
-///   resolver vets every resolution the client makes, new pooled connections
-///   included, and the client connects only to the addresses it returned, so
-///   a short-TTL record that alternates public and private cannot win a
-///   re-resolve race (the DNS-rebinding TOCTOU).
+/// - `vetted` resolves through [`PublicOnlyResolver`] (the guard the image
+///   downloads share), which refuses a name with any private or loopback
+///   address, and never uses a proxy. The resolver vets every resolution the
+///   client makes, new pooled connections included, and the client connects
+///   only to the addresses it returned, so a short-TTL record that alternates
+///   public and private cannot win a re-resolve race (the DNS-rebinding
+///   TOCTOU).
 ///
 /// A proxy resolves the destination itself, out of the resolver's sight. So
 /// when the environment configures one (`environment_proxy`), a hostname
@@ -236,30 +180,11 @@ impl GuestHttp {
             vetted: build(
                 reqwest::blocking::Client::builder()
                     .no_proxy()
-                    .dns_resolver(Arc::new(PublicOnlyResolver { refused })),
+                    .dns_resolver(Arc::new(PublicOnlyResolver::new(Arc::new(refused)))),
             )?,
             environment_proxy,
         })
     }
-}
-
-/// Whether the environment configures an outbound proxy reqwest would use:
-/// a non-empty `ALL_PROXY`, `HTTP_PROXY` or `HTTPS_PROXY`, in either case.
-///
-/// Over-reporting only sends fetches down the proxied path, which vets them
-/// too. A proxy this misses cannot bypass the check either: the vetted
-/// client never uses a proxy, so the fetch connects directly.
-fn environment_proxy(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
-    [
-        "ALL_PROXY",
-        "all_proxy",
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-    ]
-    .iter()
-    .any(|name| var(name).is_some_and(|value| !value.is_empty()))
 }
 
 /// Enforces the private-destination policy for one hostname before a
@@ -296,74 +221,6 @@ fn pinned_client(
         .resolve(host, std::net::SocketAddr::new(vetted, 0))
         .build()
         .map_err(|e| format!("building pinned http client: {e}"))
-}
-
-/// Why [`PublicOnlyResolver`] refused a hostname. Carried through reqwest's
-/// error chain so [`http_fetch`] can tell the guest exactly that.
-#[derive(Debug)]
-enum DestinationRefused {
-    /// The name resolves to an address the policy denies.
-    Private {
-        host: String,
-        address: std::net::IpAddr,
-    },
-    /// The name does not resolve.
-    Unresolvable { host: String, error: std::io::Error },
-    /// The name resolves to nothing.
-    Empty { host: String },
-}
-
-impl std::fmt::Display for DestinationRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Private { host, address } => {
-                write!(f, "`{host}` resolves to the private address {address}")
-            }
-            Self::Unresolvable { host, error } => write!(f, "could not resolve `{host}`: {error}"),
-            Self::Empty { host } => write!(f, "`{host}` resolved to no addresses"),
-        }
-    }
-}
-
-impl std::error::Error for DestinationRefused {}
-
-/// The vetted client's DNS resolver: the system lookup, refused when ANY
-/// address of the name is one the private-destination policy denies.
-struct PublicOnlyResolver {
-    refused: fn(std::net::IpAddr) -> bool,
-}
-
-impl reqwest::dns::Resolve for PublicOnlyResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_owned();
-        let refused = self.refused;
-        Box::pin(async move {
-            // The system lookup blocks, as reqwest's own resolver does.
-            let lookup = host.clone();
-            let resolved = tokio::task::spawn_blocking(move || {
-                std::net::ToSocketAddrs::to_socket_addrs(&(lookup.as_str(), 0))
-                    .map(Iterator::collect::<Vec<_>>)
-            })
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-            let addrs = resolved.map_err(|error| {
-                Box::new(DestinationRefused::Unresolvable {
-                    host: host.clone(),
-                    error,
-                }) as Box<dyn std::error::Error + Send + Sync>
-            })?;
-            if addrs.is_empty() {
-                return Err(Box::new(DestinationRefused::Empty { host }) as _);
-            }
-            if let Some(private) = addrs.iter().find(|a| refused(a.ip())) {
-                return Err(Box::new(DestinationRefused::Private {
-                    host,
-                    address: private.ip(),
-                }) as _);
-            }
-            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
 }
 
 /// The guest-visible refusal of a private destination: the address class
@@ -609,7 +466,7 @@ pub fn query_items(cx: &Collaborators, query: &ItemQuery) -> Result<Vec<ItemSumm
                 .block_on(cx.users.get_user_by_id(uid))
                 .map_err(|e| format!("user lookup failed: {e}"))?
                 .ok_or_else(|| format!("no such user {uid}"))?;
-            internal.set_user(user);
+            internal.set_user(Arc::new(user));
             Some(uid)
         }
         None => None,
@@ -1138,13 +995,13 @@ fn from_hex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Reads a plugin's state map from disk, leniently: missing OR corrupt
-/// file = empty. Only safe for READS — see [`read_state_for_write`].
-fn read_state(path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+/// Reads a plugin's state map from disk; `None` when the file is missing,
+/// unreadable or corrupt, which READS treat as empty. Writes go through
+/// [`read_state_for_write`] instead.
+fn read_state(path: &std::path::Path) -> Option<std::collections::BTreeMap<String, String>> {
     std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
 }
 
 /// Reads the state map for a WRITE: only a genuinely-absent file may read
@@ -1162,10 +1019,31 @@ fn read_state_for_write(
     }
 }
 
-/// Executes `get-state` for a guest.
+/// Executes `get-state` for a guest. A missing or corrupt state file reads
+/// as empty. The parsed map is kept between calls and used while the file's
+/// length, modified time and (on unix) inode are unchanged, so polling a key
+/// costs a `stat`, not a read and parse of the whole file.
 #[must_use]
 pub fn get_state(path: Option<&std::path::Path>, key: &str) -> Option<Vec<u8>> {
-    read_state(path?).get(key).and_then(|v| from_hex(v))
+    let path = path?;
+    let slot = state_slot(path);
+    let mut kept = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(stamp) = StateStamp::of(path) else {
+        // Missing (an uninstall removes it), or no modified time to check a
+        // kept map against: read it and keep nothing.
+        *kept = None;
+        return from_hex(read_state(path)?.get(key)?);
+    };
+    if kept.as_ref().is_none_or(|old| old.stamp != stamp) {
+        // Drop the stale map first, so it and the new one are never held at
+        // once. An unreadable or corrupt file is not kept: it reads as empty
+        // now and is read again next time.
+        *kept = None;
+        *kept = read_state(path).map(|map| KeptState { stamp, map });
+    }
+    from_hex(kept.as_ref()?.map.get(key)?)
 }
 
 /// Executes `set-state` for a guest: `None` deletes; writes are atomic
@@ -1181,22 +1059,67 @@ pub fn set_state(
     set_state_capped(path, key, value, STATE_TOTAL_DEFAULT)
 }
 
-type StateWriteLocks =
-    std::collections::HashMap<std::path::PathBuf, std::sync::Weak<std::sync::Mutex<()>>>;
+/// A state file's length, modified time and (on unix) inode: what
+/// [`get_state`] checks a kept map against before using it. A write made
+/// here replaces the kept map itself ([`set_state_capped`]), so the stamp
+/// only has to notice the file changing elsewhere: a backup restore rewrites
+/// it, an uninstall removes it, and while a rolling update runs two servers
+/// the other one's `set-state` renames a new file over it, which the inode
+/// tells apart even inside one modified-time tick.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StateStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    inode: u64,
+}
 
-fn state_write_lock(path: &Path) -> Arc<std::sync::Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<std::sync::Mutex<StateWriteLocks>> =
-        std::sync::OnceLock::new();
-    let mut locks = LOCKS
-        .get_or_init(|| std::sync::Mutex::new(StateWriteLocks::new()))
+impl StateStamp {
+    /// The stamp of the file at `path`; `None` when it is missing or has no
+    /// modified time.
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok()?,
+            #[cfg(unix)]
+            inode: std::os::unix::fs::MetadataExt::ino(&meta),
+        })
+    }
+}
+
+/// A state map as read from, or last written to, the file with `stamp`.
+struct KeptState {
+    stamp: StateStamp,
+    map: std::collections::BTreeMap<String, String>,
+}
+
+/// One state file's lock, taken by its reads and writes alike, guarding the
+/// map last read or written there.
+type StateSlot = Arc<std::sync::Mutex<Option<KeptState>>>;
+
+type StateSlots = std::collections::HashMap<std::path::PathBuf, StateSlot>;
+
+/// The slot for the state file at `path`. Slots live as long as the
+/// process, one per state path (one per plugin), so each plugin keeps about
+/// the size of its state file in memory, plus per-entry overhead; a removed
+/// plugin's map stays until the process exits or its path is read again.
+/// Reads take the slot's lock too: a read racing a write cannot keep the
+/// older map after the write replaced it, which the stamp alone cannot tell
+/// apart when both files have the same length, modified time and inode (a
+/// freed inode number can be reused).
+fn state_slot(path: &Path) -> StateSlot {
+    static SLOTS: std::sync::OnceLock<std::sync::Mutex<StateSlots>> = std::sync::OnceLock::new();
+    let mut slots = SLOTS
+        .get_or_init(|| std::sync::Mutex::new(StateSlots::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(lock) = locks.get(path).and_then(std::sync::Weak::upgrade) {
-        return lock;
+    if let Some(slot) = slots.get(path) {
+        return Arc::clone(slot);
     }
-    let lock = Arc::new(std::sync::Mutex::new(()));
-    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
-    lock
+    let slot = StateSlot::default();
+    slots.insert(path.to_path_buf(), Arc::clone(&slot));
+    slot
 }
 
 /// [`set_state`] with an explicit total cap (the host passes the
@@ -1211,15 +1134,23 @@ pub fn set_state_capped(
     total_cap: usize,
 ) -> Result<(), String> {
     let path = path.ok_or("state is not available in this context")?;
-    let lock = state_write_lock(path);
-    let _guard = lock
+    let slot = state_slot(path);
+    let mut kept = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let map = state_after_set(path, key, value, total_cap)?;
     let bytes = serde_json::to_vec(&map).map_err(|e| format!("serialize state: {e}"))?;
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("write state: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))
+    // Stamped before the rename, which keeps length, modified time and
+    // inode: the stamp is this write's file even if another server renames
+    // its own over it straight after.
+    let stamp = StateStamp::of(&tmp);
+    std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))?;
+    // Keep what was just written: the next read needs no parse, and a
+    // rewrite inside one modified-time tick cannot pass for the old file.
+    *kept = stamp.map(|stamp| KeptState { stamp, map });
+    Ok(())
 }
 
 /// The would-be state map after setting `key` to `value`, refused at the
@@ -1584,31 +1515,5 @@ mod tests {
             matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
             "nothing was sent"
         );
-    }
-
-    #[test]
-    fn an_environment_proxy_is_any_non_empty_proxy_variable() {
-        let env = |set: &'static [(&'static str, &'static str)]| {
-            move |name: &str| {
-                set.iter()
-                    .find(|(key, _)| *key == name)
-                    .map(|(_, value)| std::ffi::OsString::from(*value))
-            }
-        };
-        assert!(!super::environment_proxy(env(&[])));
-        assert!(!super::environment_proxy(env(&[("HTTP_PROXY", "")])));
-        assert!(!super::environment_proxy(env(&[("NO_PROXY", "*")])));
-        for name in [
-            "ALL_PROXY",
-            "all_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-        ] {
-            let set: &'static [(&'static str, &'static str)] =
-                Box::leak(vec![(name, "http://proxy:3128")].into_boxed_slice());
-            assert!(super::environment_proxy(env(set)), "{name}");
-        }
     }
 }
