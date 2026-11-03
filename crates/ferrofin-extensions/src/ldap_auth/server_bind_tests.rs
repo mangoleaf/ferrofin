@@ -340,7 +340,7 @@ async fn a_search_reference_fails_the_base_search_as_novells_iterator_does() {
     let directory = FakeDirectory::answering(Script {
         search: Ok(SearchOutcome {
             entries: entries(2).entries,
-            references: vec!["ldap://other.example/dc=other".to_owned()],
+            references: vec![vec!["ldap://other.example/dc=other".to_owned()]],
         }),
         ..Script::default()
     });

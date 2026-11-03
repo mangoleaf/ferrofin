@@ -23,7 +23,12 @@
 //!   server;
 //! - [`adoption`] — the one-time import of an adopted Jellyfin's
 //!   `LDAP-Auth.xml`, its uid map included, which turns the plugin on when a
-//!   user's saved authentication provider is LDAP-Auth's (B7, D7).
+//!   user's saved authentication provider is LDAP-Auth's (B7, D7);
+//! - `referrals` — following the referrals the user search (at sign-in, in
+//!   a password change and on the settings page), the filter test and the
+//!   admin filter's search meet, with the bind credentials, as upstream's
+//!   `GetSearchConstraints` and `LdapAuthHandler` do. The user's own bind and
+//!   a password write stay on the configured server.
 //!
 //! Accepted divergences from the C# (see `docs/PLUGINS_UPSTREAM.md`):
 //! - The plugin is **disabled by default**, and `LdapServer` seeds empty
@@ -65,13 +70,15 @@
 //! - The filter test's `400` reports the directory client's own wording for a
 //!   filter that does not parse (`Filter Error`). Upstream pulls Novell's
 //!   parser message out of the exception's text.
-//! - TODO(gl-1148): the filter test and the admin filter at sign-in read only
-//!   the entries the directory sent; upstream also follows its search
-//!   references with the bind credentials.
+//! - A followed referral keeps the configured TLS, its chain stops after
+//!   [`REFERRAL_HOP_LIMIT`] referrals, and its URL is read as RFC 4516 writes
+//!   it: see `referrals`. Upstream's Novell client connects to a referred
+//!   server in plain LDAP and never stops a referral loop.
 
 pub mod adoption;
 pub mod directory;
 pub mod provider;
+mod referrals;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -107,6 +114,15 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// counts as one. A search's timer restarts with every entry the server sends,
 /// so a long answer that keeps arriving is not cut off.
 pub const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most referrals a search follows in a row (owner decision, Novell's
+/// default `HopLimit`): a referred server that refers the search on once more
+/// fails it, which is what stops a referral loop.
+pub const REFERRAL_HOP_LIMIT: usize = 10;
+
+/// The `referral` result code (RFC 4511 section 4.1.9): the server holds
+/// none of the operation's target and names where to send it.
+const REFERRAL: u32 = 10;
 
 /// What upstream's Novell client searches for when the filter is empty, as the
 /// connection test's base search does.
@@ -490,14 +506,16 @@ impl LdapEntry {
     }
 }
 
-/// What a search found.
+/// What a search found on one server.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SearchOutcome {
     /// The entries, in the order the server sent them.
     pub entries: Vec<LdapEntry>,
-    /// The URLs of every search reference (continuation) the server sent,
-    /// which are not followed.
-    pub references: Vec<String>,
+    /// The search references (continuations) the server sent, in order: each
+    /// names, by its URLs, a part of the tree another server holds, and its
+    /// URLs are alternatives of each other (RFC 4511 section 4.5.3). The
+    /// connection does not follow them.
+    pub references: Vec<Vec<String>>,
 }
 
 /// The OID of the RFC 3062 password modify extended operation, which a root
@@ -534,10 +552,45 @@ pub enum LdapError {
     /// The server did not answer within [`OPERATION_TIMEOUT`].
     #[error("the directory did not answer within {} seconds", OPERATION_TIMEOUT.as_secs())]
     Timeout,
-    /// A search sent search references (continuations to other servers),
-    /// which are not followed. The message is Novell's.
+    /// A search sent search references (continuations to other servers)
+    /// where they are not followed: the connection test's base search, as
+    /// upstream's. The message is Novell's.
     #[error("Search result reference received, and referral following is off")]
     Referral(Vec<String>),
+    /// The server referred the whole search elsewhere (a `referral` result,
+    /// code 10), to any one of `urls`. It reads as that result.
+    #[error("{}", describe_result(REFERRAL, message))]
+    Referred {
+        /// The URLs the referral names, alternatives of each other.
+        urls: Vec<String>,
+        /// The server's diagnostic message, often empty.
+        message: String,
+    },
+    /// A referral could not be followed: no URL of it could be connected to
+    /// and bound at, or the server it named failed the search.
+    #[error("the referral to {server} failed: {reason}")]
+    ReferralFailed {
+        /// The referred server, `host:port` (the last one tried).
+        server: String,
+        /// Why it failed.
+        reason: Box<LdapError>,
+    },
+    /// A referral's last URL cannot be followed (it is not an `ldap://` or
+    /// `ldaps://` URL, or does not parse), or it names none; the reason, not
+    /// the URL, which may carry a password.
+    #[error("the directory referred the search to a URL that cannot be followed: {0}")]
+    ReferralUrl(String),
+    /// A referred server referred the search on once more after
+    /// [`REFERRAL_HOP_LIMIT`] referrals in a row.
+    #[error(
+        "the search was referred more than {} times in a row, the last time by {server}: the \
+         directory may refer in a loop",
+        REFERRAL_HOP_LIMIT
+    )]
+    ReferralHopLimit {
+        /// The server that sent the referral past the limit, `host:port`.
+        server: String,
+    },
     /// The connection failed during an operation.
     #[error("{0}")]
     Connection(String),
@@ -555,7 +608,7 @@ fn result_name(code: u32) -> Option<&'static str> {
         6 => "Compare True",
         7 => "Authentication Method Not Supported",
         8 => "Strong Authentication Required",
-        10 => "Referral",
+        REFERRAL => "Referral",
         11 => "Administrative Limit Exceeded",
         12 => "Unavailable Critical Extension",
         13 => "Confidentiality Required",
@@ -626,8 +679,10 @@ pub trait LdapConnection: Send {
     async fn simple_bind(&mut self, dn: &str, password: &str) -> Result<(), LdapError>;
 
     /// Searches `base` with `filter`, returning the `attributes` asked for
-    /// (none named returns every user attribute). A result other than success
-    /// is an [`LdapError::Result`].
+    /// (none named returns every user attribute) and the search references the
+    /// server sent, which it does not follow. A `referral` result naming URLs
+    /// is an [`LdapError::Referred`]; any other result than success is an
+    /// [`LdapError::Result`].
     async fn search(
         &mut self,
         base: &str,
@@ -750,34 +805,45 @@ pub(crate) enum BoundSearchError {
     Search(LdapError),
 }
 
-/// `ConnectToLdap()` and a search on it, as the plugin searches: a connection
-/// of its own, bound as the configured bind DN, searching `base`'s subtree
-/// with `filter` for `attributes`, and closed again.
+/// `ConnectToLdap()` and a search on it with upstream's `GetSearchConstraints`,
+/// as the plugin searches: a connection of its own, bound as the configured
+/// bind DN, searching `base`'s subtree with `filter` for `attributes`, and
+/// closed again. The referrals the search meets are then followed with the
+/// bind credentials (`referrals`), and the entries of every server that
+/// answered are returned, the configured server's first.
 pub(crate) async fn search_as_bind_dn(
     directory: &dyn LdapDirectory,
     config: &LdapConfig,
     base: &str,
     filter: &str,
     attributes: &[&str],
-) -> Result<SearchOutcome, BoundSearchError> {
+) -> Result<Vec<LdapEntry>, BoundSearchError> {
     let options = ConnectionOptions::from_config(config);
     let mut connection = directory
         .connect(&options)
         .await
         .map_err(BoundSearchError::Connect)?;
-    let found = bind_and_search(connection.as_mut(), config, base, filter, attributes).await;
+    let answer = bind_and_search(connection.as_mut(), config, base, filter, attributes).await;
     connection.unbind().await;
-    found
+    let search = referrals::Search {
+        base: base.to_owned(),
+        scope: SearchScope::Subtree,
+        filter: filter.to_owned(),
+    };
+    referrals::follow(directory, config, &options, &search, attributes, answer?)
+        .await
+        .map_err(BoundSearchError::Search)
 }
 
-/// The bind and the search of [`search_as_bind_dn`].
+/// The bind and the search of [`search_as_bind_dn`]: what the search
+/// answered, a referral included, once the bind succeeded.
 async fn bind_and_search(
     connection: &mut dyn LdapConnection,
     config: &LdapConfig,
     base: &str,
     filter: &str,
     attributes: &[&str],
-) -> Result<SearchOutcome, BoundSearchError> {
+) -> Result<Result<SearchOutcome, LdapError>, BoundSearchError> {
     novell_bind(
         connection,
         &config.ldap_bind_user,
@@ -785,10 +851,9 @@ async fn bind_and_search(
     )
     .await
     .map_err(BoundSearchError::Bind)?;
-    connection
+    Ok(connection
         .search(base, SearchScope::Subtree, filter, attributes)
-        .await
-        .map_err(BoundSearchError::Search)
+        .await)
 }
 
 /// The bind and base-search steps of the connection test.
@@ -818,18 +883,21 @@ async fn bind_and_count(
             &[NO_ATTRIBUTES],
         )
         .await?;
-    // Upstream's search does not follow referrals, and Novell's result
-    // iterator throws on the first search reference it reaches.
+    // Upstream's base search sets no search constraints, so it does not
+    // follow referrals, and Novell's result iterator throws on the first
+    // search reference it reaches.
     if !found.references.is_empty() {
-        return Err(LdapError::Referral(found.references));
+        return Err(LdapError::Referral(
+            found.references.into_iter().flatten().collect(),
+        ));
     }
     response.base_search = Some(format!("Found {} Entities", found.entries.len()));
     Ok(())
 }
 
 /// `GetFilteredUsers`: the DNs of the entries `filter` finds in the base DN's
-/// subtree, searching as the configured bind DN. An empty filter is Novell's
-/// `(objectclass=*)`.
+/// subtree, searching as the configured bind DN and following referrals. An
+/// empty filter is Novell's `(objectclass=*)`.
 async fn filtered_users(
     directory: &dyn LdapDirectory,
     config: &LdapConfig,
@@ -849,15 +917,7 @@ async fn filtered_users(
         &[NO_ATTRIBUTES],
     )
     .await?;
-    if !found.references.is_empty() {
-        // TODO(gl-1148): follow them with the bind credentials, as upstream's
-        // referral handler does.
-        tracing::debug!(
-            references = ?found.references,
-            "the filter search referred elsewhere; the references are not followed"
-        );
-    }
-    Ok(found.entries.into_iter().map(|entry| entry.dn).collect())
+    Ok(found.into_iter().map(|entry| entry.dn).collect())
 }
 
 /// The filter test — port of `LdapController.TestLdapFilters` once the body is

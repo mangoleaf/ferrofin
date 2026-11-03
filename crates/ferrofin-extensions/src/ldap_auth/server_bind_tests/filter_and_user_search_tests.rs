@@ -236,26 +236,6 @@ async fn a_failed_search_is_a_bad_request_naming_the_filter() {
 }
 
 #[tokio::test]
-async fn the_filter_tests_references_are_not_followed_yet() {
-    // TODO(gl-1148): a referral is followed with the bind credentials.
-    let directory = FakeDirectory::answering(Script {
-        search: Ok(SearchOutcome {
-            entries: vec![entry("uid=ada,dc=example,dc=org")],
-            references: vec!["ldap://elsewhere.example/dc=example,dc=org".to_owned()],
-        }),
-        ..Script::default()
-    });
-    assert_eq!(
-        test_ldap_filters(&directory, &filters_config()).await,
-        LdapTestAnswer::Ok(LdapFilterResponse {
-            users: 1,
-            admins: 1,
-            is_subset: true,
-        })
-    );
-}
-
-#[tokio::test]
 async fn the_user_search_finds_the_entry_a_name_signs_in_as() {
     let config = LdapConfig {
         ldap_search_attributes: "uid, mail".to_owned(),
@@ -300,11 +280,11 @@ async fn the_user_search_finds_the_entry_a_name_signs_in_as() {
     Script { search: Err(LdapError::Timeout), ..Script::default() },
     "Error completing LDAP login while applying user filter."
 )]
-#[case::only_referrals(
+#[case::a_referral_loop(
     Script {
         search: Ok(SearchOutcome {
             entries: Vec::new(),
-            references: vec!["ldap://elsewhere.example/dc=example,dc=org".to_owned()],
+            references: vec![vec!["ldap://ldap.example/dc=example,dc=org".to_owned()]],
         }),
         ..Script::default()
     },
