@@ -421,6 +421,11 @@ pub struct InternalItemsQuery {
     pub enable_group_by_metadata_key: bool,
     /// Restrict to items with chapter images.
     pub has_chapter_images: Option<bool>,
+    /// Only the items the "Plugin media analysis" pass has not offered to
+    /// this plugin yet: no `FerrofinPluginOfferedItems` row for the item and
+    /// plugin (see [`PluginOfferedItemStore`](crate::plugins::PluginOfferedItemStore)).
+    /// Ferrofin's own: Jellyfin has no plugin analysis pass.
+    pub not_offered_to_plugin: Option<Uuid>,
     /// The sort order.
     pub order_by: Vec<(ItemSortBy, SortOrder)>,
 
@@ -638,6 +643,7 @@ impl Default for InternalItemsQuery {
             exclude_provider_ids: None,
             enable_group_by_metadata_key: false,
             has_chapter_images: None,
+            not_offered_to_plugin: None,
             order_by: Vec::new(),
             min_date_created: None,
             min_date_last_saved: None,
@@ -742,6 +748,7 @@ impl InternalItemsQuery {
             || self.has_special_feature.is_some()
             || self.has_trailer.is_some()
             || self.has_chapter_images.is_some()
+            || self.not_offered_to_plugin.is_some()
             || self.min_critic_rating.is_some()
             || self.min_community_rating.is_some()
             || self.min_parental_rating.is_some()

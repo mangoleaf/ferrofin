@@ -91,8 +91,8 @@ pub struct Database {
     /// One snapshot or one vacuum-and-checkpoint pass at a time
     /// ([`Database::try_maintenance_turn`]), shared by every clone.
     maintenance: Arc<tokio::sync::Mutex<()>>,
-    /// The cross-request caches of policy and library rows ([`crate::row_cache`]), shared by
-    /// every clone.
+    /// The cross-request caches of policy and library rows and of whether a tuner host exists
+    /// ([`crate::row_cache`]), shared by every clone.
     rows: Arc<crate::row_cache::RowCache>,
     /// The on-disk database file, when file-backed (`None` for in-memory).
     /// Lets [`Database::run_migrations`] snapshot the file before a
@@ -459,12 +459,7 @@ impl Database {
         Ok(rows)
     }
 
-    /// How many Live TV tuner hosts are configured.
-    ///
-    /// The Live TV availability gate reads this — C#
-    /// `LiveTvManager.IsLiveTvEnabled` tests `TunerHosts.Length > 0`, and with
-    /// no tuner Jellyfin leaves the Live TV view out of `GetUserViews`
-    /// entirely.
+    /// How many Live TV tuner hosts are configured, read from the database.
     ///
     /// # Errors
     ///
@@ -474,6 +469,31 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
         Ok(count)
+    }
+
+    /// Whether any Live TV tuner host is configured, from the cross-request cache or, on a miss,
+    /// [`Database::live_tv_tuner_count`] ([`crate::row_cache`]).
+    ///
+    /// The Live TV availability gate reads this — C# `LiveTvManager.IsLiveTvEnabled` tests
+    /// `TunerHosts.Length > 0` on the `LiveTvOptions` it holds in memory, and with no tuner
+    /// Jellyfin leaves the Live TV view out of `GetUserViews` entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read fails.
+    pub async fn live_tv_tuner_hosts_exist(&self) -> Result<bool> {
+        if let Some(hit) = self.rows.tuner_hosts_exist() {
+            return Ok(hit);
+        }
+        let generation = self.rows.tuner_generation();
+        let exist = self.live_tv_tuner_count().await? > 0;
+        Ok(self.rows.put_tuner_hosts_exist(generation, exist))
+    }
+
+    /// Drops the cached answer of [`Database::live_tv_tuner_hosts_exist`]. Called after a
+    /// committed write to `FerrofinLiveTvTunerHosts`.
+    pub fn invalidate_live_tv_tuner_hosts(&self) {
+        self.rows.invalidate_tuner_hosts();
     }
 
     /// Writes a `FerrofinMeta` value, replacing any existing one.
@@ -617,7 +637,7 @@ impl Database {
     ///
     /// Deliberately unconditional rather than `#[cfg(test)]`: its caller is a
     /// test in ANOTHER crate, and `cfg(test)` only applies while this one is
-    /// being tested.
+    /// being tested. Drops the cached answer of [`Database::live_tv_tuner_hosts_exist`].
     ///
     /// # Errors
     ///
@@ -626,10 +646,12 @@ impl Database {
         sqlx::query(r#"DELETE FROM "FerrofinLiveTvTunerHosts""#)
             .execute(&self.writer)
             .await?;
+        self.invalidate_live_tv_tuner_hosts();
         Ok(())
     }
 
-    /// Writes a Live TV tuner host, replacing any row with the same id.
+    /// Writes a Live TV tuner host, replacing any row with the same id, then drops the cached
+    /// answer of [`Database::live_tv_tuner_hosts_exist`].
     ///
     /// # Errors
     ///
@@ -651,6 +673,7 @@ impl Database {
         .bind(data)
         .execute(&self.writer)
         .await?;
+        self.invalidate_live_tv_tuner_hosts();
         Ok(())
     }
 

@@ -707,6 +707,7 @@ async fn a_recording_lists_while_it_has_a_file_and_deletes_with_its_item() {
             &ferrofin_model::live_tv::RecordingQuery::default(),
             None,
             &DtoOptions::default(),
+            None,
         )
         .await
         .expect("recordings")
@@ -791,6 +792,7 @@ async fn a_library_delete_forgets_the_recordings_under_its_path() {
             &ferrofin_model::live_tv::RecordingQuery::default(),
             None,
             &DtoOptions::default(),
+            None,
         )
         .await
         .expect("recordings")
@@ -841,6 +843,7 @@ async fn a_library_delete_forgets_the_recordings_under_its_path() {
                 },
                 None,
                 &DtoOptions::default(),
+                None,
             )
             .await
             .expect("recordings")

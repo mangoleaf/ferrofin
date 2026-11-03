@@ -154,6 +154,13 @@ impl NfoSaver {
         let Some(path) = policy::save_path(&row) else {
             return Ok(());
         };
+        // `IsSaverEnabledForItem` asks the saver first (`saver.IsEnabledFor(
+        // item, updateType)`, `ProviderManager.cs:868`), and no option makes it
+        // write what the update type refuses: a scan's `MetadataImport` of
+        // anything but a season with its `season.nfo`.
+        if policy::kind(&row).is_some_and(|kind| policy::update_refused(kind, update, &path)) {
+            return Ok(());
+        }
         let lock = {
             let mut locks = self
                 .locks
@@ -180,7 +187,9 @@ impl NfoSaver {
         let Some(kind) = policy::kind(&row) else {
             return Ok(());
         };
-        let folders = self.folders.get_virtual_folders().await?;
+        // The libraries' snapshot, as upstream's `GetLibraryOptions(item)`
+        // reads them from memory (`ProviderManager.cs:804`).
+        let folders = self.folders.library_folders().await?;
         let library = ferrofin_model::entities_media::owning_library(
             &folders,
             row.top_parent_id.as_deref(),

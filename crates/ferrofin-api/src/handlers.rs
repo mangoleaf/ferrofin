@@ -935,6 +935,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// the `/socket` dashboard streams, which no contract operation describes;
 /// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
 /// frames, which the tile operations serve but no response shows;
+/// `trickplay` is which sets of trickplay images are made, kept and replaced,
+/// shared by the item refresh, the library scan and the Generate Trickplay
+/// Images task;
 /// `scan-failure-isolation` is what the library scan does about a row or a
 /// write that fails, which no operation's response shows;
 /// `progressive-transcode` is who may reach ffmpeg through the stream routes,
@@ -951,6 +954,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "scan-failure-isolation",
     "progressive-transcode",
     "trickplay-extraction",
+    "trickplay",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -1253,7 +1257,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         ferrofin: "The write path, plus the read path only where a page's version groups get \
                    their user data. ferrofin-core user_data_manager.rs mutate_row \
                    (SaveUserData with its retired-key update, GetUserData, ResolveUserDataRow), \
-                   save_user_data_with_reason (the UpdateUserItemDataDto SaveUserData), \
+                   with the item's keys from user_data_key_repository.rs load_identities and \
+                   KEY_ROWS_SQL (GetUserDataKeys, from the series a Season or an Episode \
+                   names in SeriesId, else its nearest Series parent, read in the same \
+                   statement as the item), save_user_data_with_reason (the \
+                   UpdateUserItemDataDto SaveUserData), \
                    save_play_state and apply_play_report (UpdatePlayState), \
                    reset_playback_stream_selections (ResetPlaybackStreamSelections), \
                    record_playback_start, set_likes, mark_item_played, mark_item_unplayed, \
@@ -1261,6 +1269,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Session/SessionManager.cs (OnPlaybackStart, \
                    OnPlaybackProgress, UpdatePlaybackSettings, OnPlaybackStopped), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
+                   MediaBrowser.Controller/Entities/TV/Episode.cs and \
+                   MediaBrowser.Controller/Entities/TV/Season.cs (Series, FindSeriesId, \
+                   GetUserDataKeys), \
                    MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
                    Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
                    UpdateUserItemRatingInternal). The version groups: dto_service.rs prefetch's \
@@ -1336,9 +1347,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              same check, as PlaybackInfo does. A DVR recording has no row here, so it takes \
              Live TV access, IsVisibleStandalone over its entity, the libraries holding its \
              file and then its channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
-             now share; upstream's recording is a library item, whose library holds it. On the \
-             routes upstream leaves anonymous, no credential, a token that names nobody and an \
-             API key stay so, which binds a client that sends its token. The legacy /hls/ \
+             now share and GET /LiveTv/Recordings lists by; upstream's recording is a library \
+             item, whose library holds it. On the routes upstream leaves anonymous, no \
+             credential, a token that names nobody and an API key stay so, which binds a \
+             client that sends its token. The legacy /hls/ \
              routes are outside this: they serve a transcode's file by its random name, and \
              the item id selects nothing, as upstream. Deliberate divergence (owner decision \
              2026-10-31, gl-1090).",
@@ -1400,6 +1412,56 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              free. The user is the authorization's, as upstream's StartFfMpeg userId is; an \
              API key has none, so it is outside the per-user cap and inside the server-wide \
              one.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "trickplay",
+        upstream_file: "Jellyfin.Server.Implementations/Trickplay/TrickplayManager.cs",
+        upstream_method: "RefreshTrickplayDataAsync",
+        ferrofin: "Which trickplay sets a refresh discovers, imports, keeps, generates, replaces \
+                   and prunes, for an item refresh (Replace included), the library scan and \
+                   the Generate Trickplay Images task. ferrofin-core trickplay_manager.rs \
+                   refresh_media (RefreshTrickplayDataAsync, with CanGenerateTrickplay and \
+                   DiscoverExistingTrickplayAsync), refresh_width \
+                   (RefreshTrickplayDataInternal), create_tiles and move_dir (CreateTiles), \
+                   and scheduled_tasks/library.rs TrickplayImagesTask, compared with \
+                   MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
+                   How ffmpeg extracts the frames, on either path, is the \
+                   trickplay-extraction row's; how many generations run at once is not part \
+                   of this row",
+        date: "2026-11-02",
+        divergences: &[
+            "An explicit Replace does not delete the item's trickplay folder and rows first: \
+             each selected width is generated in the work directory and swapped in, so the old \
+             images serve until then and a failed Replace keeps them, and the rows and folders \
+             of other widths go once every selected width has its row (with no width \
+             selected, nothing is removed, where upstream's Replace empties the folder); with \
+             extraction disabled it prunes first as upstream. A video narrower than two selected \
+             widths generates their one set once. When the row save fails after the swap, the \
+             new tiles stay if the width's stored row names their folder (upstream deletes them, \
+             which would now leave the video without its old set). Deliberate divergence \
+             (owner decision 2026-11-01, D7 of the Trickplay quality milestone, gl-1138).",
+            "After WidthResolutions or FullChroma change since the last Generate Trickplay \
+             Images run that finished (recorded in FerrofinMeta, and on the first boot after \
+             upgrading), the next run checks every video: a set whose first tile's chroma \
+             differs from the setting is regenerated and swapped in the same way, and a width \
+             Ferrofin made sets at and the current settings do not select is removed once the \
+             selected widths exist: one an earlier run selected, or one a library scan or an \
+             item refresh made under settings other than those recorded (recorded before it is \
+             made, which also checks again after a change back). A user-placed grid stays. The \
+             run is recorded only when every video's sets match, so an interrupted run, or one \
+             that could not replace a set, checks again. A run with no width selected is no \
+             checking pass and records nothing (in a library with extraction on it makes and \
+             removes nothing), so the next change still removes the \
+             widths recorded before it. Upstream never replaces images unasked. Deliberate \
+             divergence (owner decisions 2026-11-01, D3 and D5, gl-1138; gl-1178).",
+            "Importing a width's folder that has no row counts only its .jpg tiles; upstream \
+             counts every file in it, so a stray file there makes the import fail on its image \
+             size. Jellyfin bug not ported.",
+            "TrickplayOptions has a Ferrofin-only FullChroma member, off by default and absent \
+             from the JSON while off, which writes 4:4:4 tiles, from 4:4:4 frames on the \
+             software path (see the trickplay-extraction row), instead of 4:2:0 (owner \
+             decision 2026-11-01, D6, gl-1128).",
         ],
     },
 ];
@@ -1467,7 +1529,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/TvShowsController.cs",
         upstream_method: "GetNextUp",
         ferrofin: "handlers/tv_shows.rs get_next_up → ferrofin-core tv_series_manager.rs \
-               (TVSeriesManager) → next_up_service.rs (NextUpService)",
+               (TVSeriesManager) → next_up_service.rs (NextUpService, top_parent_ids → \
+               item_repository.rs view_top_parent_ids)",
         date: "2026-10-19",
         divergences: &[
             "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
@@ -1982,6 +2045,49 @@ pub const VERIFIED: &[Verified] = &[
          there) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/Recordings",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetRecordings",
+        ferrofin: "handlers/live_tv.rs get_recordings (items.rs resolve_user_opt, \
+               program_dto_options; ListedRecordingVisibility → recording_visible_given, \
+               holding_libraries, libraries_allow) → ferrofin-livetv manager.rs \
+               get_recordings_matching (dvr_repository.rs recording_rows, \
+               visible_recording_rows, remove_fields, recording_dtos, \
+               add_info_to_recording_dtos) (RequestHelpers.GetUserId, \
+               LiveTvManager.GetRecordingsAsync, GetEmbyRecordingsAsync, \
+               GetRecordingFoldersAsync, RemoveFields)",
+        date: "2026-11-02",
+        divergences: &[
+            "Recordings are the rows of Ferrofin's DVR table, not library items under the \
+         recording folders, so the list differs wherever the two models do: an id is the \
+         row's, not the library item's; a recording file with no row (one from an adopted \
+         Jellyfin database, or a partial file) is not listed; channelId, status, seriesTimerId \
+         and isNews filter the rows, where upstream ignores them; isMovie, isSeries, isKids \
+         and isSports match the programme's flags, either way, where upstream matches the \
+         Movie and Episode kinds and, for true only, the Sports, Kids, Children and Family \
+         genres; isInProgress=false filters the rows, where upstream ignores it, and \
+         isInProgress=true keeps limit and counts every capture in progress, where upstream \
+         drops limit and counts the page; the order is the capture's creation time, newest \
+         first, then the name; enableTotalRecordCount=false still counts every recording, \
+         where upstream reports the page's length; the parental rating, blocked and allowed \
+         tag and unrated rules see a Video with no rating or tags, where upstream applies \
+         them to the library item, its library's tags included; and a recording no library \
+         holds is listed, where upstream lists only under the recording folders the user may \
+         see, and answers an empty page when there is none. Fix path: gl-1077.",
+            "A request with no user (an API key naming none, or an administrator naming an \
+         account that does not exist) lists every recording, as GET \
+         /LiveTv/Recordings/{recordingId} answers the same request for each, while GET \
+         /LiveTv/Recordings/Folders answers it an empty list; upstream's \
+         GetEmbyRecordingsAsync answers an empty page for a null user. Deliberate: API keys \
+         are exempt from the library rule gl-1091 made a hard boundary.",
+            "The 400 (a value the query binder cannot convert) and 403 (another user's id \
+         without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
+         Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
     },
     Verified {
         method: "delete",

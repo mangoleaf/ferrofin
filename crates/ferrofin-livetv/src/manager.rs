@@ -43,7 +43,9 @@ use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 use ferrofin_traits::providers::ProviderManager;
-use ferrofin_traits::stubs::{LiveStreamFile, LiveTvChannelQuery, LiveTvManager};
+use ferrofin_traits::stubs::{
+    LiveStreamFile, LiveTvChannelQuery, LiveTvManager, RecordingVisibility,
+};
 use ferrofin_traits::system::LocalApiAccess;
 use serde::de::DeserializeOwned;
 
@@ -2918,8 +2920,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // Only the configuration row goes, as upstream edits only the
         // configuration: the host's channels and airings stay listed until the
         // guide refresh the handler queues prunes them (migration 0046 dropped
-        // the cascade).
-        //
+        // the cascade). The Live TV gate's cached answer
+        // (`Database::live_tv_tuner_hosts_exist`) follows on the next request.
+        self.db.invalidate_live_tv_tuner_hosts();
         // Recount so deleting the last host hides the guide-refresh task. This
         // is bookkeeping, not part of the delete's contract: a failed recount
         // must not turn a committed delete into a client-visible error.
@@ -4224,6 +4227,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             &ferrofin_model::live_tv::RecordingQuery::default(),
             None,
             &DtoOptions::default(),
+            None,
         )
         .await
     }
@@ -4233,6 +4237,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         query: &ferrofin_model::live_tv::RecordingQuery,
         user: Option<&UserEntity>,
         options: &DtoOptions,
+        visible: Option<&dyn RecordingVisibility>,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
         let mut rows = crate::dvr_repository::recording_rows(&self.db, query).await?;
         let mut gone = HashSet::new();
@@ -4242,6 +4247,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             }
         }
         rows.retain(|row| !gone.contains(&row.id));
+        let rows = Self::visible_recording_rows(rows, visible).await?;
         let start_index = query.start_index.unwrap_or(0);
         let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
         let page: Vec<crate::projection::RecordingRow> = rows
@@ -6051,6 +6057,29 @@ impl FerrofinLiveTvManager {
         Ok(())
     }
 
+    /// The rows `visible` keeps, in order; every row when there is no filter.
+    ///
+    /// Each row is asked about as the entity [`Self::get_recording_item`]
+    /// builds for it, which is what the caller's own read of one checks.
+    async fn visible_recording_rows(
+        rows: Vec<crate::projection::RecordingRow>,
+        visible: Option<&dyn RecordingVisibility>,
+    ) -> Result<Vec<crate::projection::RecordingRow>, ServiceError> {
+        let Some(visible) = visible else {
+            return Ok(rows);
+        };
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            if visible
+                .is_visible(&crate::projection::recording_entity(&row, parse_dt))
+                .await?
+            {
+                kept.push(row);
+            }
+        }
+        Ok(kept)
+    }
+
     /// Projects recording rows through the DTO service and applies the
     /// recording post-pass.
     async fn recording_dtos(
@@ -7562,8 +7591,12 @@ mod tests {
         )])))
         .await;
         // The synchronous flag the "Refresh Guide" task's hidden rule polls
-        // tracks the store through every mutation.
+        // tracks the store through every mutation, and so does the cached
+        // answer the Live TV gate reads.
+        mgr.db
+            .enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
         assert!(!mgr.has_tuner_hosts(), "no host configured yet");
+        assert!(!mgr.db.live_tv_tuner_hosts_exist().await.expect("gate"));
         let saved = mgr
             .save_tuner_host(TunerHostInfo {
                 type_: Some("m3u".to_owned()),
@@ -7575,6 +7608,10 @@ mod tests {
         let id = saved.id.clone().expect("id assigned");
         assert_eq!(saved.type_.as_deref(), Some("m3u"));
         assert!(mgr.has_tuner_hosts(), "saving a host reveals the task");
+        assert!(
+            mgr.db.live_tv_tuner_hosts_exist().await.expect("gate"),
+            "saving a host reaches the gate"
+        );
 
         let hosts = mgr.get_tuner_hosts().await.expect("list");
         assert_eq!(hosts.len(), 1);
@@ -7587,6 +7624,10 @@ mod tests {
         assert!(
             !mgr.has_tuner_hosts(),
             "deleting the last host hides the task again"
+        );
+        assert!(
+            !mgr.db.live_tv_tuner_hosts_exist().await.expect("gate"),
+            "deleting the last host reaches the gate"
         );
     }
 
@@ -10399,6 +10440,7 @@ mod tests {
                 },
                 None,
                 &DtoOptions::default(),
+                None,
             )
             .await
             .expect("recordings")
@@ -10412,6 +10454,104 @@ mod tests {
             "nothing may still report itself as recording"
         );
         let _ = tokio::fs::remove_file(path).await;
+    }
+
+    /// Keeps the recordings whose file is not under `/hidden`, and records the
+    /// path of each entity it is asked about.
+    #[derive(Default)]
+    struct HidesFolder(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::stubs::RecordingVisibility for HidesFolder {
+        async fn is_visible(&self, recording: &BaseItemEntity) -> Result<bool, ServiceError> {
+            let path = recording.path.clone().unwrap_or_default();
+            let visible = !path.starts_with("/hidden/");
+            self.0.lock().expect("lock").push(path);
+            Ok(visible)
+        }
+    }
+
+    /// The listing filter runs over every row the query selects, each as the
+    /// entity the recording's own read resolves, before paging, so
+    /// `TotalRecordCount` counts only what it keeps.
+    #[tokio::test]
+    async fn recordings_are_filtered_before_paging() {
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let start = Utc::now();
+        let mut ids = HashMap::new();
+        for (minutes, path) in [
+            (5, "/hidden/e.ts"),
+            (4, "/open/d.ts"),
+            (3, "/hidden/c.ts"),
+            (2, "/open/b.ts"),
+            (1, "/hidden/a.ts"),
+        ] {
+            let id = Uuid::new_v4();
+            let timer = crate::dvr::TimerRecordingInfo {
+                id: format!("timer-{minutes}"),
+                name: path.to_owned(),
+                ..crate::dvr::TimerRecordingInfo::default()
+            };
+            crate::dvr_repository::insert_recording(
+                &mgr.db,
+                id,
+                &timer,
+                std::path::Path::new(path),
+                start + chrono::Duration::minutes(minutes),
+            )
+            .await
+            .expect("insert");
+            ids.insert(path, id);
+            assert_eq!(
+                mgr.get_recording_item(id)
+                    .await
+                    .expect("item")
+                    .expect("row")
+                    .path
+                    .as_deref(),
+                Some(path)
+            );
+        }
+        let filter = HidesFolder::default();
+        let page = mgr
+            .get_recordings_matching(
+                &ferrofin_model::live_tv::RecordingQuery {
+                    start_index: Some(1),
+                    limit: Some(1),
+                    ..ferrofin_model::live_tv::RecordingQuery::default()
+                },
+                None,
+                &DtoOptions::default(),
+                Some(&filter),
+            )
+            .await
+            .expect("recordings");
+        assert_eq!(page.total_record_count, 2, "the filtered total");
+        assert_eq!(page.start_index, 1);
+        let listed: Vec<Uuid> = page.items.iter().map(|dto| dto.id).collect();
+        assert_eq!(listed, vec![ids["/open/b.ts"]]);
+        assert_eq!(
+            *filter.0.lock().expect("lock"),
+            [
+                "/hidden/e.ts",
+                "/open/d.ts",
+                "/hidden/c.ts",
+                "/open/b.ts",
+                "/hidden/a.ts"
+            ],
+            "every row, once, newest first"
+        );
+
+        let everything = mgr
+            .get_recordings_matching(
+                &ferrofin_model::live_tv::RecordingQuery::default(),
+                None,
+                &DtoOptions::default(),
+                None,
+            )
+            .await
+            .expect("recordings");
+        assert_eq!(everything.total_record_count, 5, "no filter, every row");
     }
 
     #[tokio::test]
@@ -10639,6 +10779,7 @@ mod tests {
                     },
                     None,
                     &DtoOptions::default(),
+                    None,
                 )
                 .await
                 .expect("recordings");

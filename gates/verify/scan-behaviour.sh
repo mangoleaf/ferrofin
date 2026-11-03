@@ -19,8 +19,9 @@
 #   SCRATCH_DIR         an EMPTY folder inside that library, as this machine sees it, best
 #                       directly under the library root (never inside a real item's folder).
 #                       In a tvshows library it becomes the scratch series: it must be
-#                       directly under the root and named "Ferrofin Verify …", and an empty
-#                       series with its name stays in the library after the run.
+#                       directly under the root and named "Ferrofin Verify …", the script
+#                       writes its tvshow.nfo before the rows, and an empty series with its
+#                       name stays in the library after the run.
 #   SERVER_SCRATCH_DIR  the same folder as the server sees it, when that differs (a container
 #                       or sandbox mounting the library elsewhere); default SCRATCH_DIR
 #   --clip FILE         a small real video to copy as the scratch media; default: generated
@@ -237,7 +238,24 @@ REMOTE=$(jq -r --argjson kinds "$KINDS" '
       elif (.MetadataFetchers | length) > 0 then "on"
       else "off" end ]
   | if any(. == "on") then "on" elif all(. == "off") then "off" else "unknown" end' <<<"$library")
-MONITOR_DELAY=$(api GET /System/Configuration | jq -r '.LibraryMonitorDelay // 0') || MONITOR_DELAY=0
+CONFIG=$(api GET /System/Configuration) || CONFIG='{}'
+MONITOR_DELAY=$(jq -r '.LibraryMonitorDelay // 0' <<<"$CONFIG") || MONITOR_DELAY=0
+# Whether an editor save of a scratch item (row 7's) writes the NFO the scan reads for it,
+# so row 8 finds no rating there to fill again: ProviderManager.IsSaverEnabledForItem. With the
+# library's metadata savers chosen: when they include Nfo. With none chosen: never when the
+# server disables Nfo for the item's type (its first MetadataOptions entry, as
+# GetMetadataOptionsForType); otherwise when the library saves metadata into media folders or
+# the saver's file exists already. An episode's NFO saver writes the episode's own NFO, which
+# the script made; a movie's writes movie.nfo, which nothing made.
+case $KIND in movies) SAVER_TYPE=Movie ;; *) SAVER_TYPE=Episode ;; esac
+NFO_DISABLED=$(jq -r --arg type "$SAVER_TYPE" '
+  [(.MetadataOptions // [])[] | select((.ItemType // "" | ascii_downcase) == ($type | ascii_downcase))][0]
+  | any((.DisabledMetadataSavers // [])[]; ascii_downcase == "nfo")' <<<"$CONFIG") || NFO_DISABLED=false
+EDIT_REWRITES_NFO=$(jq -r --arg kind "$KIND" --argjson disabled "$NFO_DISABLED" '
+  .LibraryOptions as $o
+  | if $o.MetadataSavers != null then any($o.MetadataSavers[]; ascii_downcase == "nfo")
+    elif $disabled then false
+    else ($o.SaveLocalMetadata // false) or $kind == "tvshows" end' <<<"$library") || EDIT_REWRITES_NFO=false
 
 if [ -z "$CLIP" ] && command -v ffmpeg >/dev/null; then
   CLIP=$WORK/clip.mkv
@@ -247,9 +265,10 @@ fi
 
 echo "Ferrofin scan-behaviour check: $BASE, library '$LIB_NAME' ($KIND), scratch $SERVER"
 echo "remote metadata fetchers for $(jq -r 'join("/")' <<<"$KINDS"): $REMOTE; LibraryMonitorDelay ${MONITOR_DELAY}s"
+echo "an editor save writes the NFO the scan reads (the NFO saver): $EDIT_REWRITES_NFO"
 if [ "$KIND" = tvshows ] && [ "$REMOTE" != off ]; then
-  echo "(TV: row 1's provider requests are not checked; the scratch series has no provider ids,"
-  echo " so every other row expects 0)"
+  echo "(TV: a new scratch series searches for its match in the refresh before the rows, which is"
+  echo " not checked; the scratch series has no provider ids, so every row expects 0)"
 fi
 if [ -z "$CLIP" ] || [ ! -s "$CLIP" ]; then
   echo "SKIP: no scratch media — no --clip, and ffmpeg is missing or could not make a clip. Every"
@@ -262,14 +281,17 @@ fi
 # A, B, C and D are the scratch items: A for the metadata rows, B for the lock rows, C for the
 # NFO row (and row 13 in a TV library), D for the webhook rows.
 if [ "$KIND" = movies ]; then
-  NFO_KIND=movie; NEW_ITEMS=3; PARENT_UPDATES=0
+  NFO_KIND=movie; NEW_ITEMS=3
   rel() { printf 'Ferrofin Verify %s (%s)/Ferrofin Verify %s (%s).%s' "$1" "$2" "$1" "$2" "$3"; }
   A=$(rel Alpha 2001 mkv); B=$(rel Beta 2002 mkv); C=$(rel Gamma 2003 mkv); D=$(rel Delta 2004 mkv)
   POSTER="$(dirname "$B")/poster.png"
 else
-  # The series, its season and three episodes; a new or removed episode moves the season
-  # folder's mtime, so the season goes through the refresh decision with it.
-  NFO_KIND=episodedetails; NEW_ITEMS=5; PARENT_UPDATES=1
+  # A season and three episodes of the scratch series, which the refresh before the rows
+  # made (or an earlier run did). A file that comes or goes moves its folder's mtime, and that
+  # refreshes no folder: a directory's metadata carries no times upstream
+  # (ManagedFileSystem.GetFileSystemMetadata), so a series or season stores no DateModified
+  # and BaseItem.RequiresRefresh never fires for it. A rescan updates the episodes alone.
+  NFO_KIND=episodedetails; NEW_ITEMS=4
   rel() { printf 'Season 01/Ferrofin Verify Show - S01E0%s.%s' "$1" "$2"; }
   A=$(rel 1 mkv); B=$(rel 2 mkv); C=$(rel 3 mkv); D=$(rel 4 mkv)
   POSTER="${B%.mkv}-thumb.png"
@@ -345,6 +367,15 @@ if [ "$KIND" = tvshows ]; then
     [ "$(jq -r '.ProviderIds // {} | length' <<<"$series")" = 0 ] ||
       refuse "$SERVER is a series with provider ids: the scratch folder must not be a real series"
   fi
+  # The NFO goes in before the refresh that precedes the rows, which reads it: a new series at
+  # its first refresh, whatever the NFO's mtime; one an earlier run left behind when the NFO is
+  # more than a minute newer than its last save (BaseNfoProvider.HasChanged), so that one's
+  # NFO is dated now, not an hour back. No later scan would: the folder changing refreshes no
+  # series. Its plot, ratings and trailer meet the scan's "already enriched" gates, so the
+  # series asks its providers nothing again.
+  verify_nfo tvshow "$VERIFY_PREFIX Show" "Written by the verify script." ferrofinverify >"$WORK/nfo"
+  new_file tvshow.nfo "$WORK/nfo"
+  [ -z "$existing" ] || touch -m -- "$LOCAL/tvshow.nfo"
 fi
 
 # ---- rows -----------------------------------------------------------------------------------
@@ -369,7 +400,8 @@ counts() { echo "created=$CREATED updated=$UPDATED unchanged=$UNCHANGED removed=
 # expect_providers: a row that runs the remote providers asks them when they are on, and
 # never when they are off. In a TV library it asks nothing either way: an episode's (and a
 # season's) remote lookup starts from its series' provider ids, and row 1 stops the run unless
-# the scratch series has none.
+# the scratch series has none. The series' own search for its match is made when it is new,
+# by the refresh before the rows, which is not checked.
 expect_providers() {
   if [ "$KIND" = tvshows ]; then
     verify_expect FAILS "provider requests" "$PROVIDERS" eq 0
@@ -379,16 +411,6 @@ expect_providers() {
     on) verify_expect FAILS "provider requests" "$PROVIDERS" ge 1 ;;
     off) verify_expect FAILS "provider requests" "$PROVIDERS" eq 0 ;;
   esac
-}
-# expect_first_providers: row 1. In a TV library with the fetchers on, the new (or changed)
-# scratch series searches for its match: how many requests that takes is the provider's
-# business, so they are not counted.
-expect_first_providers() {
-  if [ "$KIND" = tvshows ]; then
-    [ "$REMOTE" != off ] || verify_expect FAILS "provider requests" "$PROVIDERS" eq 0
-    return
-  fi
-  expect_providers
 }
 # scan <trigger>: waits for the row's scan and observes it; a scan that never ends stops the
 # run (every later row builds on this one's state).
@@ -441,7 +463,8 @@ finish() {
 
 verify_row_line row result scenario observed
 
-# Row 0 (not a check): absorb whatever changed in the library before the run.
+# Row 0 (not a check): absorb whatever changed in the library before the run. In a TV library
+# it makes the scratch series from its tvshow.nfo (or refreshes the one an earlier run left).
 scrape "$BEFORE" >/dev/null
 if ! refresh_library || ! wait_scans "$BEFORE" "$AFTER" api 1 "$SCAN_TIMEOUT"; then
   refuse "the library refresh before the rows did not finish"
@@ -451,13 +474,14 @@ verify_row_line 0 - "library refresh before the rows (not checked)" "$(counts)"
 
 # 1: the first scan of new items creates them and asks the providers.
 row_start 1 "first scan of new items"
-# A TV library's scratch folder is a series: one a scan has already seen (as an empty series)
-# is not created again, and its changed folder puts it through the refresh decision.
-PARENT_BEFORE=0
-if [ "$KIND" = tvshows ] && [ -n "$(series_id)" ]; then NEW_ITEMS=4; PARENT_BEFORE=1; fi
+# In a TV library the scratch series is not new (row 0 made it), and its new season and
+# episodes update it in no way this counts: its changed folder refreshes nothing (see the
+# scratch layout), and its tvshow.nfo is not a minute newer than its last save. Only its
+# DateLastMediaAdded moves, to its newest episode's date: a column the scan's closing pass
+# writes alone, as no item update. (Jellyfin saves the whole series for that column: gl-1182.)
+# (A server that made no series in row 0 makes it now, one more new item.)
+if [ "$KIND" = tvshows ] && [ -z "$(series_id)" ]; then NEW_ITEMS=5; fi
 if [ "$KIND" = tvshows ]; then
-  verify_nfo tvshow "$VERIFY_PREFIX Show" "Written by the verify script." ferrofinverify >"$WORK/nfo"
-  new_file tvshow.nfo "$WORK/nfo"
   new_video "$A"; new_video "$B" ferrofinverifyb; new_video "$C"
 else
   new_video "$A" ferrofinverifya; new_video "$B" ferrofinverifyb; new_video "$C" ferrofinverifyc
@@ -467,16 +491,17 @@ refresh_library || verify_fail FAILS "the refresh was refused"
 scan api
 SAVED_AT=$SECONDS
 verify_expect FAILS created "$CREATED" eq "$NEW_ITEMS"
-verify_expect FAILS updated "$UPDATED" eq "$PARENT_BEFORE"
+verify_expect FAILS updated "$UPDATED" eq 0
 [ "$KIND" != tvshows ] || SERIES_ID=$(series_id)
 verify_expect FAILS removed "$REMOVED" eq 0
 verify_expect FAILS probes "$PROBES" eq 3
-expect_first_providers
+expect_providers
 ID_A=$(item_id "$A"); ID_B=$(item_id "$B"); ID_C=$(item_id "$C")
 if [ -z "$ID_A" ] || [ -z "$ID_B" ] || [ -z "$ID_C" ]; then verify_fail FAILS "the scratch items are not all in /Items"; fi
 if [ "$KIND" = tvshows ]; then
-  # Row 1's fuzzy name search may have pinned a real show on the scratch series: then its
-  # episodes would ask that show's providers, and no later row could expect 0.
+  # The new series' fuzzy name search (row 0's, with the fetchers on) may have pinned a real
+  # show on it: then its episodes would ask that show's providers, and no later row could
+  # expect 0.
   if [ -z "$SERIES_ID" ]; then
     verify_fail FAILS "the scratch series is not in /Items"
   else
@@ -514,7 +539,7 @@ row_start 5 "webhook: add one file"
 new_video "$D"
 webhook "$D" Created; scan webhook
 verify_expect FAILS created "$CREATED" eq 1
-verify_expect FAILS updated "$UPDATED" le "$PARENT_UPDATES"
+verify_expect FAILS updated "$UPDATED" eq 0
 verify_expect FAILS removed "$REMOVED" eq 0
 verify_expect FAILS probes "$PROBES" eq 1
 expect_providers
@@ -528,7 +553,7 @@ rm -f -- "$LOCAL/$D" "$LOCAL/${D%.mkv}.nfo"
 webhook "$D" Deleted; scan webhook
 verify_expect FAILS removed "$REMOVED" eq 1
 verify_expect FAILS created "$CREATED" eq 0
-verify_expect FAILS updated "$UPDATED" le "$PARENT_UPDATES"
+verify_expect FAILS updated "$UPDATED" eq 0
 verify_expect FAILS probes "$PROBES" eq 0
 verify_expect FAILS "provider requests" "$PROVIDERS" eq 0
 [ -z "$(item_id "$D")" ] || verify_fail FAILS "the deleted item is still in /Items"
@@ -566,7 +591,8 @@ verify_expect_str FAILS LockData "$(jq -r '.LockData' <<<"$dto")" false
 verify_expect_str FAILS OfficialRating "$(jq -r '.OfficialRating' <<<"$dto")" null
 row_end "$(counts)"
 
-# 8: "Search for missing metadata" fills the cleared official rating, keeps the edited overview.
+# 8: "Search for missing metadata" keeps the edited overview and fills the cleared official
+# rating, unless row 7's save rewrote the NFO without it.
 row_start 8 "\"Search for missing metadata\" on the item"
 refresh_item "$ID_A" false; scan api
 verify_expect FAILS updated "$UPDATED" eq 1
@@ -574,7 +600,13 @@ verify_expect FAILS probes "$PROBES" eq 1
 expect_providers
 dto=$(item "$ID_A")
 verify_expect_str FAILS Overview "$(jq -r '.Overview // ""' <<<"$dto")" "Edited by the verify script."
-[ "$(jq -r '.OfficialRating' <<<"$dto")" != null ] || verify_fail FAILS "the cleared official rating was not filled"
+if [ "$EDIT_REWRITES_NFO" = true ]; then
+  # Row 7's editor save wrote the NFO the scan reads (EDIT_REWRITES_NFO) without the rating,
+  # so nothing holds one to fill it from.
+  verify_expect_str FAILS OfficialRating "$(jq -r '.OfficialRating' <<<"$dto")" null
+else
+  [ "$(jq -r '.OfficialRating' <<<"$dto")" != null ] || verify_fail FAILS "the cleared official rating was not filled"
+fi
 row_end "$(counts) OfficialRating=$(jq -r '.OfficialRating' <<<"$dto")"
 
 # 9: "Replace all metadata" replaces the unlocked overview.
@@ -610,8 +642,9 @@ base64 -d <<<"$VERIFY_POSTER_PNG" >"$WORK/poster.png"
 new_file "$POSTER" "$WORK/poster.png"
 touch -m -- "$LOCAL/$B"
 refresh_library; scan api
-# The item, and in a TV library its season: the new file moved the season folder's mtime.
-verify_expect FAILS updated "$UPDATED" eq $((1 + PARENT_UPDATES))
+# The item alone: in a TV library the new file moved its season folder's mtime, which
+# refreshes no folder.
+verify_expect FAILS updated "$UPDATED" eq 1
 verify_expect FAILS created "$CREATED" eq 0
 # A locked item's file is still probed: the probe is not a remote provider.
 verify_expect FAILS probes "$PROBES" eq 1
@@ -659,7 +692,7 @@ else
   scrape "$BEFORE" >/dev/null
   refresh_library; scan api
   verify_expect FAILS "probes after a sidecar" "$PROBES" eq 1
-  verify_expect FAILS "updated after a sidecar" "$UPDATED" eq $((1 + PARENT_UPDATES))
+  verify_expect FAILS "updated after a sidecar" "$UPDATED" eq 1
   verify_expect FAILS "provider requests after a sidecar" "$PROVIDERS" eq 0
   verify_expect_str FAILS "after a save" "$(item "$ID_C" | jq -cS "$fields")" "$before_fields"
   row_end "quiet: $quiet; sidecar: $(counts)"

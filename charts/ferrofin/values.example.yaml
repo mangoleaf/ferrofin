@@ -178,8 +178,9 @@ ferrofin:
     # FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS: "100000"
     # FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS: "300"
     # Seconds a resolved access token, and a user's permissions with the libraries'
-    # rows and options, are served from memory (5-300, default 30 each). Changes
-    # made through the server apply at once; these only bound changes made outside it.
+    # rows and options and whether a Live TV tuner exists, are served from memory
+    # (5-300, default 30 each). Changes made through the server apply at once; these
+    # only bound changes made outside it.
     # FERROFIN_AUTH_CACHE_TTL_SECS: "30"
     # FERROFIN_ROW_CACHE_TTL_SECS: "30"
     # Failed logins an account or a client address may make before its next attempts
