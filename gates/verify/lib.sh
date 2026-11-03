@@ -74,7 +74,8 @@ verify_inside() {
 # can match is not asked about again on every scan (the backfill heuristics): a title and a
 # plot, a community rating and a critic rating (the gates OMDb adds when it is on for the
 # type: TMDb's asks for a critic rating, OMDb's alone for an overview and both ratings), an
-# official rating (the field row 7 clears and row 8 fills, which no gate reads), and
+# official rating (the field row 7 clears and row 8 fills again, unless row 7's save rewrote
+# the NFO; no gate reads it), and
 # optionally a YouTube trailer (TMDb's gate for a movie or series).
 verify_nfo() {
   local kind=$1 title=$2 plot=$3 trailer=${4:-}
