@@ -910,14 +910,14 @@ const SMALL: u128 = 40;
 /// Episodes a season in the larger.
 const LARGE: u128 = 80;
 
-/// The most allocations a request may add per episode of the series. What
-/// is left is about two for each listed episode in the aired-order sort
-/// (`stable_sort_by` merges through new vectors), and up to four while the
-/// parser reads a `Data` blob with an escaped string, growing its scratch
-/// buffer; everything else the handler keeps per episode lives in vectors
-/// that grow by doubling. Copying an episode's season, copying the episode
-/// for each season that lists it, a presentation key per season and episode,
-/// or a `serde_json::Value` of its `Data` each cost ten or more per episode.
+/// The most allocations a request may add per episode of the series. The
+/// parser takes up to four while it reads a `Data` blob with an escaped
+/// string, growing its scratch buffer; the aired-order sort allocates the same
+/// two buffers whatever the length (gl-1051), and everything else the handler
+/// keeps per episode lives in vectors that grow by doubling. Copying an
+/// episode's season, copying the episode for each season that lists it, a
+/// presentation key per season and episode, or a `serde_json::Value` of its
+/// `Data` each cost ten or more per episode.
 const PER_EPISODE_BUDGET: usize = 8;
 
 /// One season and all of them, with specials within seasons and without:
