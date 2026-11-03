@@ -233,6 +233,7 @@ pub mod people_repository;
 pub mod playback_activity;
 pub mod playback_metrics;
 pub mod plugin_manager;
+pub mod plugin_offered_item_repository;
 mod query_restrictions;
 pub mod quick_connect_manager;
 use ferrofin_providers::refresh_plan;

@@ -434,9 +434,15 @@ async fn orphan_cleanup_terminates_on_parent_cycles() {
     assert_eq!(foreign_key_violations(&pool).await, 0);
 }
 
-/// Every foreign key to `BaseItems` has its explicit delete in 0042 (nothing
-/// cascades with foreign keys off), so a table that gains one later fails here
-/// instead of at a user's boot.
+/// Tables a later migration creates with a foreign key to `BaseItems`: 0042
+/// never clears them. Each starts empty after 0042 has run, and Ferrofin writes
+/// them, and deletes items, with foreign keys on, so their `ON DELETE CASCADE`
+/// keeps them clean. Each must not exist yet when 0042 runs.
+const CREATED_EMPTY_AFTER_0042: [&str; 1] = ["FerrofinPluginOfferedItems"];
+
+/// Every foreign key to `BaseItems` that exists when 0042 runs has its explicit
+/// delete there (nothing cascades with foreign keys off), so a table that gains
+/// one later fails here instead of at a user's boot.
 #[tokio::test]
 async fn orphan_cleanup_covers_every_foreign_key_to_baseitems() {
     let db = Database::connect_in_memory().await.expect("database");
@@ -445,6 +451,42 @@ async fn orphan_cleanup_covers_every_foreign_key_to_baseitems() {
         .fetch_all(db.pool())
         .await
         .expect("dependents");
+    for table in CREATED_EMPTY_AFTER_0042 {
+        assert!(
+            dependents.contains(&(table.to_owned(), "ItemId".to_owned())),
+            "{table} references BaseItems: {dependents:?}"
+        );
+        let on_delete: Vec<String> = sqlx::query_scalar(
+            r#"SELECT "on_delete" FROM pragma_foreign_key_list(?1) WHERE "table" = 'BaseItems'"#,
+        )
+        .bind(table)
+        .fetch_all(db.pool())
+        .await
+        .expect("on_delete");
+        assert_eq!(
+            on_delete,
+            ["CASCADE"],
+            "{table}: the cascade is what keeps it clean"
+        );
+    }
+    let (_at_0041, pool_at_0041) = migrated_before_cleanup().await;
+    for table in CREATED_EMPTY_AFTER_0042 {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        )
+        .bind(table)
+        .fetch_one(&pool_at_0041)
+        .await
+        .expect("sqlite_master");
+        assert_eq!(
+            exists, 0,
+            "{table} exists when 0042 runs, so 0042 must clear it"
+        );
+    }
+    let dependents: Vec<(String, String)> = dependents
+        .into_iter()
+        .filter(|(table, _)| !CREATED_EMPTY_AFTER_0042.contains(&table.as_str()))
+        .collect();
     for known in [("UserData", "ItemId"), ("FerrofinPlaylists", "PlaylistId")] {
         assert!(
             dependents.contains(&(known.0.to_owned(), known.1.to_owned())),

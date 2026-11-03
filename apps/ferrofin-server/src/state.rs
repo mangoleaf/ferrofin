@@ -1985,11 +1985,19 @@ pub async fn build_app_state(
         )
         .map_err(|e| anyhow::anyhow!("wasm artifact validator init: {e}"))?,
     );
+    // Which items the "Plugin media analysis" pass offered to which plugin:
+    // the pass reads and writes it, an uninstall forgets the plugin's.
+    let plugin_offered_items: Arc<dyn ferrofin_traits::plugins::PluginOfferedItemStore> = Arc::new(
+        ferrofin_core::plugin_offered_item_repository::FerrofinPluginOfferedItemStore::new(
+            db.clone(),
+        ),
+    );
     let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> = Arc::new(
         ferrofin_core::FerrofinPluginManager::new(
             registered_plugins,
             config.config_dir.join("plugins"),
         )
+        .with_offered_items(Arc::clone(&plugin_offered_items))
         .with_installer(
             config.data_dir.join("plugins"),
             Arc::clone(&wasm_validator),
@@ -2632,7 +2640,7 @@ pub async fn build_app_state(
     });
     // The analysis driver (offers new items to analyzer plugins) exists
     // only when some loaded plugin declares scan-targets.
-    if let Some(task) = wasm_host.analysis_task(&plugins) {
+    if let Some(task) = wasm_host.analysis_task(&plugins, plugin_offered_items) {
         task_manager.register(task);
     }
 
