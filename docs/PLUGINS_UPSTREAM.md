@@ -255,7 +255,9 @@ Conventions:
   `supportedExtension`: with `1.3.6.1.4.1.4203.1.11.1` it sends the RFC 3062 password modify
   operation for the entry's DN without the old password; else it replaces `LdapPasswordAttribute`
   with the new password; with that empty too, upstream's `InvalidOperationException` (`Password
-  attribute is not set`, a `500`). The bind DN must be allowed to set users' passwords.
+  attribute is not set`, a `500`). The bind DN must be allowed to set users' passwords. The
+  write goes to the configured server, also for an entry the search found behind a referral
+  (see Referrals).
 - Password reset (v24, `d11c86a`): the same provider is the password-reset provider
   (`IPasswordResetProvider`, registered through `Extension::password_reset_providers` under the
   same name and id), so the users it creates, whose `PasswordResetProviderId` is its id, have
@@ -293,8 +295,8 @@ Conventions:
   message (`Failed to Connect or Bind to server.`, `Error completing LDAP login while applying
   user filter.`, `Found no LDAP users matching provided username.`).
 - Referrals (v24, `d11c86a`): `GetSearchConstraints` with `LdapAuthHandler`, on the three
-  searches upstream sets them on: `LocateLdapUser`'s (sign-in and the user search),
-  `GetFilteredUsers` (the filter test) and the admin filter's search at sign-in. A search
+  searches upstream sets them on: `LocateLdapUser`'s (sign-in, the password change and the user
+  search), `GetFilteredUsers` (the filter test) and the admin filter's search at sign-in. A search
   reference and a `referral` result are followed alike, as the configured bind DN with its
   password, to the first of their URLs that connects and takes that bind (the URLs are
   alternatives, as Novell's `GetReferralConnection` tries them); the search there takes the
@@ -302,11 +304,13 @@ Conventions:
   attributes, as Novell's `RebuildRequest` does. The entries found there join the search's,
   after those of the server that referred, and a referral a referred server sends is followed
   the same way. A referral none of whose URLs connects and binds, or whose server fails the
-  search, fails the whole search, naming that server (`host:port`): a server error at sign-in,
-  a `400` in the filter test, a `401` in the user search, as any failed search is. The
-  connection test's base search and the user's own bind (`ConnectToLdap(userDn, password)`,
-  which stays on the configured server) follow no referral, as upstream's set no search
-  constraints.
+  search, fails the whole search, naming that server (`host:port`): a server error at sign-in
+  and in a password change, a `400` in the filter test, a `401` in the user search, as any
+  failed search is. The connection test's base search, the user's own bind
+  (`ConnectToLdap(userDn, password)`) and the password change's write follow no referral and
+  stay on the configured server, as upstream's set no search constraints: a password change
+  for a user only a referred server holds is written to the configured server, which refuses it
+  (a `500`) unless it holds the entry or chains the write, as upstream's.
 - `POST /Ldap/TestServerBind`, `/Ldap/TestLdapFilters` and `/Ldap/LdapUserSearch` are the
   plugin's own controller, not contract operations, so they are in `handlers::PLUGIN_ROUTES`
   (matched ignoring case, as the page calls `ldap/TestServerBind` and the others so) and have no

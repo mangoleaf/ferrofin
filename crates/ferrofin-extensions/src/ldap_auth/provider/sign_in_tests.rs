@@ -84,6 +84,7 @@ impl FakeDirectory {
         let mut state = self.state();
         state.connects = 0;
         state.binds.clear();
+        state.binds_at.clear();
         state.searches.clear();
         state.unbinds = 0;
         state.writes.clear();

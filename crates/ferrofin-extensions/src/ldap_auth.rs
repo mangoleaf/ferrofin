@@ -21,9 +21,11 @@
 //!   provider the extension contributes, listed by `GET /Auth/Providers` and
 //!   `GET /Auth/PasswordResetProviders` while the plugin is enabled and names a
 //!   server;
-//! - `referrals` — following the referrals the user search, the filter test
-//!   and the admin filter's search meet, with the bind credentials, as
-//!   upstream's `GetSearchConstraints` and `LdapAuthHandler` do.
+//! - `referrals` — following the referrals the user search (at sign-in, in
+//!   a password change and on the settings page), the filter test and the
+//!   admin filter's search meet, with the bind credentials, as upstream's
+//!   `GetSearchConstraints` and `LdapAuthHandler` do. The user's own bind and
+//!   a password write stay on the configured server.
 //!
 //! Accepted divergences from the C# (see `docs/PLUGINS_UPSTREAM.md`):
 //! - The plugin is **disabled by default**, and `LdapServer` seeds empty
