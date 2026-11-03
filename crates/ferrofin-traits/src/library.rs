@@ -3090,6 +3090,23 @@ pub trait VirtualFolderManager: Send + Sync {
         Ok(0)
     }
 
+    /// Takes library `library`'s `CollectionFolder._requiresRefresh`: whether
+    /// the locations or physical folders recorded on its row changed since its
+    /// refresh last began, clearing it as `BeforeMetadataRefresh` does.
+    ///
+    /// Upstream's `CollectionFolder.RequiresRefresh` compares the stored
+    /// `PhysicalLocations` and `PhysicalFolderIds` with the resolved ones, and
+    /// `CreateResolveArgs` sets the flag when they differ. An implementation
+    /// that records new locations on the row before any refresh reads them
+    /// keeps that comparison's answer here. A library refresh in a mode other
+    /// than `None` takes it, once, when it plans the library.
+    ///
+    /// The default has none to take.
+    fn take_library_requires_refresh(&self, library: Uuid) -> bool {
+        let _ = library;
+        false
+    }
+
     /// Adds a media path (and its `.mblink` shortcut) to an existing library.
     ///
     /// Port of `ILibraryManager.AddMediaPath`: the library must exist and the
