@@ -302,6 +302,31 @@ pub async fn delete_recording(db: &Database, recording_id: Uuid) -> Result<(), S
     Ok(())
 }
 
+/// Deletes the finished recordings whose file is `path` or under it. A capture
+/// in progress keeps its row, and a blank or root `path` names nothing: it
+/// would otherwise match every recording.
+///
+/// # Errors
+///
+/// Fails when the write fails.
+pub async fn delete_recordings_at(db: &Database, path: &str) -> Result<(), ServiceError> {
+    let path = path.trim_end_matches('/');
+    if path.trim().is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        r#"DELETE FROM "FerrofinLiveTvRecordings"
+           WHERE "Status" <> 'InProgress'
+             AND ("Path" = ?1 OR substr("Path", 1, length(?2)) = ?2)"#,
+    )
+    .bind(path)
+    .bind(format!("{path}/"))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
 /// One recording by id, or `None` when unknown.
 ///
 /// # Errors

@@ -529,7 +529,7 @@ pub async fn record_encoded(
 }
 
 /// Creates the directory a recording is written into.
-async fn create_target_dir(target: &Path) -> Result<(), ServiceError> {
+pub(crate) async fn create_target_dir(target: &Path) -> Result<(), ServiceError> {
     let Some(parent) = target.parent() else {
         return Err(ServiceError::backend(format!(
             "{} has no parent directory",
@@ -631,6 +631,18 @@ fn date_string(date: DateTime<Utc>) -> String {
         .to_string()
 }
 
+/// Port of `RecordingsManager.DefaultRecordingPath`: the configured
+/// `RecordingPath`, else `{data}/livetv/recordings`.
+#[must_use]
+pub fn default_recording_path(options: &LiveTvOptions, data_dir: &Path) -> PathBuf {
+    options
+        .recording_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map_or_else(|| data_dir.join("livetv").join("recordings"), PathBuf::from)
+}
+
 /// Where a recording is written, and the series folder it belongs to (if any).
 ///
 /// Port of `RecordingsManager.GetRecordingPath`: the kind of programme selects
@@ -643,12 +655,7 @@ pub fn recording_path(
     options: &LiveTvOptions,
     data_dir: &Path,
 ) -> (PathBuf, Option<PathBuf>) {
-    let default_root: PathBuf = options
-        .recording_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map_or_else(|| data_dir.join("livetv").join("recordings"), PathBuf::from);
+    let default_root = default_recording_path(options, data_dir);
 
     // A custom root only skips the kind subfolder when it differs from the
     // default one (C# `allowSubfolder = customRecordingPath == recordingPath`).
