@@ -371,6 +371,42 @@ pub async fn delete_programs(db: &Database, ids: &[String]) -> Result<(), Servic
     delete_by_id(db, "FerrofinLiveTvPrograms", ids).await
 }
 
+/// The ids of the airings stored on one channel, read on `conn`: inside a
+/// guide write's transaction, which removes those it did not re-emit.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub(crate) async fn channel_program_ids(
+    conn: &mut sqlx::SqliteConnection,
+    channel_id: &str,
+) -> Result<Vec<String>, ServiceError> {
+    sqlx::query_scalar(r#"SELECT "Id" FROM "FerrofinLiveTvPrograms" WHERE "ChannelId" = ?1"#)
+        .bind(channel_id)
+        .fetch_all(conn)
+        .await
+        .map_err(db_err)
+}
+
+/// [`delete_programs`] on `conn`: inside a guide write's transaction.
+///
+/// # Errors
+///
+/// Fails when the database write fails.
+pub(crate) async fn delete_programs_in(
+    conn: &mut sqlx::SqliteConnection,
+    ids: &[String],
+) -> Result<(), ServiceError> {
+    for chunk in ids.chunks(IDS_PER_DELETE) {
+        delete_by_id_statement("FerrofinLiveTvPrograms", chunk)
+            .build()
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    }
+    Ok(())
+}
+
 /// Deletes rows of `table` by id, in bind-limit chunks.
 ///
 /// `table` is one of two crate-private literals, never caller input.
@@ -379,17 +415,30 @@ async fn delete_by_id(
     table: &'static str,
     ids: &[String],
 ) -> Result<(), ServiceError> {
-    for chunk in ids.chunks(500) {
-        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
-            sqlx::QueryBuilder::new(format!(r#"DELETE FROM "{table}" WHERE "Id" IN ("#));
-        let mut separated = qb.separated(", ");
-        for id in chunk {
-            separated.push_bind(id);
-        }
-        qb.push(")");
-        qb.build().execute(db.writer()).await.map_err(db_err)?;
+    for chunk in ids.chunks(IDS_PER_DELETE) {
+        delete_by_id_statement(table, chunk)
+            .build()
+            .execute(db.writer())
+            .await
+            .map_err(db_err)?;
     }
     Ok(())
+}
+
+/// How many ids one delete-by-id statement binds, under SQLite's
+/// 999-parameter limit.
+const IDS_PER_DELETE: usize = 500;
+
+/// The statement deleting the rows of `table` whose ids are `ids`.
+fn delete_by_id_statement(table: &'static str, ids: &[String]) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
+        sqlx::QueryBuilder::new(format!(r#"DELETE FROM "{table}" WHERE "Id" IN ("#));
+    let mut separated = qb.separated(", ");
+    for id in ids {
+        separated.push_bind(id);
+    }
+    qb.push(")");
+    qb
 }
 
 /// The tuner-host configuration table.
@@ -771,6 +820,32 @@ pub mod test_support {
             .await
             .map_err(db_err)?;
         Ok(())
+    }
+
+    /// Pins every airing's `DateCreated` to a sentinel value.
+    pub async fn pin_program_dates(db: &Database, value: &str) -> Result<(), ServiceError> {
+        sqlx::query(r#"UPDATE "FerrofinLiveTvPrograms" SET "DateCreated" = ?1"#)
+            .bind(value)
+            .execute(db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Every stored airing as `(title, its channel's tvg-id, DateCreated)`,
+    /// by title.
+    pub async fn program_dates(
+        db: &Database,
+    ) -> Result<Vec<(String, String, Option<String>)>, ServiceError> {
+        sqlx::query_as(
+            r#"SELECT p."Title", c."TvgId", p."DateCreated"
+               FROM "FerrofinLiveTvPrograms" p
+               JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId"
+               ORDER BY p."Title""#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
     }
 
     /// Every channel's stored `DateCreated`.
