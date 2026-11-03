@@ -2410,10 +2410,12 @@ pub trait UserViewManager: Send + Sync {
     /// Port of `UserViewManager.GetLatestItems`: ONE query across every parent
     /// (the root folders the user may open minus `latest_item_excludes`, or
     /// the `parent_id` folder), ordered `DateCreated DESC, SortName DESC, ProductionYear DESC`
-    /// and over-fetched to `limit * 5` rows; a tvshows or music parent takes
-    /// its own per-collection-type query instead
-    /// ([`ItemRepository::get_latest_item_list`] — one Episode, Season or
-    /// Series card per newest series for tvshows, the newest albums for music).
+    /// and over-fetched to `limit * 5` rows. A grouped request whose first
+    /// typed parent is tvshows, music or movies takes that type's own query
+    /// instead, and one with no typed parent the `unknown` merge of the movies
+    /// and tvshows ones ([`ItemRepository::get_latest_item_list`] — one
+    /// Episode, Season or Series card per newest series for tvshows, the newest
+    /// albums for music, the newest row of each presentation key for movies).
     /// The rows are then bucketed by their `LatestItemsIndexContainer` (episode
     /// → series, track → music album, photo → photo album; folders and every
     /// other kind — a `MusicAlbum` included — stand alone) in first-seen order,
