@@ -132,6 +132,10 @@ pub struct WiredApp {
     /// hold — do not outlive it (Jellyfin disposes its `CoreAppHost` per
     /// `StartServer` iteration).
     pub background: Vec<tokio::task::JoinHandle<()>>,
+    /// The scheduled-task registry behind `state.tasks`: the composition root
+    /// shuts it down when the lifetime ends, recording each run it cuts off as
+    /// `Aborted` (Jellyfin disposes its `TaskManager` with the host).
+    pub task_manager: FerrofinTaskManager,
     /// HTTPS for this lifetime, when the server listens with it
     /// (`ListenWithHttps`): the certificate the HTTPS listeners serve.
     pub https: Option<crate::tls::HttpsServing>,
@@ -3017,6 +3021,7 @@ pub async fn build_app_state(
         file_transformations,
         lifecycle: lifecycle_concrete,
         background,
+        task_manager,
         https,
     })
 }
