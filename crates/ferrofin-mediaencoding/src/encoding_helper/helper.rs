@@ -34,6 +34,7 @@ use ferrofin_traits::media_encoding::TranscodingJobType;
 
 use crate::encoder::FfmpegVersion;
 
+use super::bitstream;
 use super::transcode_state::{BaseEncodingJobOptions, EncoderCapabilities, EncodingJobInfo};
 
 /// The container/codec-name validation pattern.
@@ -572,11 +573,11 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
 
     /// Decides whether `video_stream` can be stream-copied (direct-play video).
     ///
-    /// Port of `CanStreamCopyVideo`. The DOVI dynamic-metadata-removal branch
-    /// (which consults a hardware encoder capability that the hardware-transcoding roadmap
-    /// phase 8 wires in) is handled
-    /// conservatively: if a static-HDR stream is not directly range-compatible
-    /// the copy is refused (matching the C# refuse-when-uncertain intent).
+    /// Port of `CanStreamCopyVideo`, whose range block asks this helper's
+    /// [`EncoderCapabilities`] whether ffmpeg can strip the dynamic HDR
+    /// metadata a copy needs removed. One divergence there: a Dolby Vision copy
+    /// to a client that did not list `DOVI` needs its RPU stripped (see
+    /// `range_type_copy_ok`).
     #[must_use]
     pub fn can_stream_copy_video(
         &self,
@@ -624,7 +625,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             return false;
         }
 
-        if !profile_range_rotation_copy_ok(state, video_stream, codec) {
+        if !profile_range_rotation_copy_ok(&self.capabilities, state, video_stream, codec) {
             return false;
         }
 
@@ -1941,7 +1942,8 @@ fn video_profile_score(codec: &str, profile: &str) -> i32 {
 /// Port of the profile-score, range-type, and rotation blocks of
 /// `CanStreamCopyVideo`; split out so `can_stream_copy_video` stays readable.
 /// Returns `false` if any of the three would force a re-encode.
-fn profile_range_rotation_copy_ok(
+fn profile_range_rotation_copy_ok<C: EncoderCapabilities>(
+    caps: &C,
     state: &EncodingJobInfo,
     video_stream: &MediaStream,
     codec: &str,
@@ -1965,7 +1967,7 @@ fn profile_range_rotation_copy_ok(
 
     let requested_range_types = state.requested_range_types(codec);
     if !requested_range_types.is_empty()
-        && !range_type_copy_ok(video_stream, &requested_range_types)
+        && !range_type_copy_ok(caps, state, video_stream, &requested_range_types)
     {
         return false;
     }
@@ -1987,11 +1989,31 @@ fn profile_range_rotation_copy_ok(
 
 /// The video-range portion of the copy decision.
 ///
-/// Port of the range-type block of `CanStreamCopyVideo`; the DOVI
-/// dynamic-metadata-removal escape hatch (the hardware-transcoding roadmap phase 8) is
-/// replaced by a conservative refusal, matching the C# refuse-when-uncertain
-/// intent.
-fn range_type_copy_ok(video_stream: &MediaStream, requested: &[String]) -> bool {
+/// Port of the range-type block of `CanStreamCopyVideo`, for a client that
+/// declared range types (`requested`). A stream whose range type the client
+/// lists copies. So does one the client plays as a fallback: a Dolby Vision
+/// profile 8 stream on the HDR10, HLG or SDR base layer it lists
+/// (`DOVIWithHDR10`, `DOVIWithHLG`, `DOVIWithSDR`), and HDR10+ as HDR10.
+/// Otherwise static HDR is refused, and a stream with dynamic metadata copies
+/// when this ffmpeg can strip what the client needs removed
+/// (`CanEncoderRemoveDynamicHdrMetadata(ShouldRemoveDynamicHdrMetadata(state),
+/// videoStream)`).
+///
+/// Divergence (owner decision 2026-10-31, gl-737): a Dolby Vision stream with a
+/// base layer, copied to a client that listed neither `DOVI` nor the stream's
+/// own range type, has its RPU stripped where upstream copies it through
+/// ([`bitstream::strips_dovi_for_a_client_without_dovi`]): a Dolby Vision
+/// profile 8.1 AV1 title copied to jellyfin-web with its RPU did not render.
+/// Such a copy is refused, and the video transcoded, when this ffmpeg cannot
+/// strip the RPU from the stream's codec or
+/// the job's output takes no bitstream filter
+/// ([`bitstream::video_bit_stream_filters_apply`]).
+fn range_type_copy_ok<C: EncoderCapabilities>(
+    caps: &C,
+    state: &EncodingJobInfo,
+    video_stream: &MediaStream,
+    requested: &[String],
+) -> bool {
     let range = video_stream.video_range_type();
     if range == VideoRangeType::Unknown {
         return false;
@@ -1999,6 +2021,7 @@ fn range_type_copy_ok(video_stream: &MediaStream, requested: &[String]) -> bool 
 
     let has = |name: &str| requested.iter().any(|r| r.eq_ignore_ascii_case(name));
     let request_hdr10 = has("HDR10");
+    let request_hlg = has("HLG");
     let request_sdr = has("SDR");
     let request_dovi = has("DOVI");
 
@@ -2012,21 +2035,39 @@ fn range_type_copy_ok(video_stream: &MediaStream, requested: &[String]) -> bool 
         return false;
     }
 
-    let range_name = video_range_type_name(range);
-    let directly_supported = requested
-        .iter()
-        .any(|r| r.eq_ignore_ascii_case(&range_name));
+    if has(&video_range_type_name(range)) {
+        return true;
+    }
 
-    // Copying a Dolby Vision stream to a client that only supports the fallback
-    // range (e.g. a browser that lists HDR10 but not DOVI) requires stripping the
-    // DV RPU so the base layer plays clean — a capability Ferrofin does not have.
-    // So we do NOT treat DoviWith{HDR10,HLG,SDR} as copyable via the base-range
-    // fallback; those transcode instead (matches the C# "remove metadata or
-    // refuse" intent, minus the removal path). HDR10+ is safe to copy as HDR10 —
-    // its dynamic metadata is SEI the decoder ignores, with a valid HDR10 base.
-    let hdr10plus_fallback_ok = request_hdr10 && range == VideoRangeType::Hdr10Plus;
+    let fallback = (request_hdr10 && range == VideoRangeType::DoviWithHdr10)
+        || (request_hlg && range == VideoRangeType::DoviWithHlg)
+        || (request_sdr && range == VideoRangeType::DoviWithSdr)
+        || (request_hdr10 && range == VideoRangeType::Hdr10Plus);
+    if !fallback {
+        // Static HDR the client did not list.
+        if matches!(
+            range,
+            VideoRangeType::Hdr10Plus | VideoRangeType::Hdr10 | VideoRangeType::Hlg
+        ) {
+            return false;
+        }
+        // Refuse when a removal is required for compatibility and this
+        // ffmpeg cannot perform it.
+        if !bitstream::can_remove_dynamic_hdr_metadata(
+            caps,
+            bitstream::should_remove_dynamic_hdr_metadata(state),
+            Some(video_stream),
+        ) {
+            return false;
+        }
+    }
 
-    directly_supported || hdr10plus_fallback_ok
+    !bitstream::strips_dovi_for_a_client_without_dovi(state)
+        || (bitstream::can_remove_dynamic_hdr_metadata(
+            caps,
+            bitstream::HdrMetadataRemoval::RemoveDovi,
+            Some(video_stream),
+        ) && bitstream::video_bit_stream_filters_apply(state))
 }
 
 /// The PascalCase wire name of a video range type. Port of
@@ -2152,6 +2193,8 @@ mod tests {
     use ferrofin_model::dto::MediaSourceInfo;
     use ferrofin_model::entities::MediaStreamType;
 
+    use super::super::hw::capabilities::FfmpegCapabilities;
+    use super::super::test_streams::{invalid_dovi, with_range};
     use super::super::transcode_state::{NoOptionalEncoders, TranscodeDisplayNames};
     use super::*;
 
@@ -3247,30 +3290,166 @@ mod tests {
         assert!(!helper(vec![]).can_stream_copy_video(&state, &stream));
     }
 
-    #[test]
-    fn range_type_copy_refuses_dovi_fallback_allows_direct() {
-        // Dolby Vision Profile 8.1 (bl_compat 1) over an HDR10 base layer, e.g.
-        // Mickey 17: video_range_type resolves to DoviWithHdr10.
-        let dovi = MediaStream {
-            codec: Some("av1".to_owned()),
-            index: 0,
-            stream_type: MediaStreamType::Video,
-            color_space: Some("bt2020nc".to_owned()),
-            color_transfer: Some("smpte2084".to_owned()),
-            color_primaries: Some("bt2020".to_owned()),
-            dv_profile: Some(8),
-            dv_bl_signal_compatibility_id: Some(1),
-            rpu_present_flag: Some(1),
-            bl_present_flag: Some(1),
-            ..MediaStream::default()
+    // ----- the range block of CanStreamCopyVideo ------------------------------
+
+    /// A helper whose ffmpeg answers every bitstream-filter option
+    /// `supports_removal`: upstream's `EncodingHelperDoviTests.CreateHelper`,
+    /// which mocks `SupportsBitStreamFilterWithOption` that way.
+    fn removal_helper(supports_removal: bool) -> EncodingHelper<FfmpegCapabilities> {
+        let caps = FfmpegCapabilities::builder()
+            .all_bsf_options(supports_removal)
+            .build();
+        EncodingHelper::with_processor_count(caps, 8)
+    }
+
+    /// An HLS stream copy of `stream` for a client declaring `ranges`:
+    /// upstream's `EncodingHelperDoviTests.CreateState` job.
+    fn copy_job(stream: &MediaStream, ranges: Option<&str>) -> EncodingJobInfo {
+        let mut state = job(std::slice::from_ref(stream));
+        state.transcoding_type = TranscodingJobType::Hls;
+        state.output_video_codec = Some("copy".to_owned());
+        state.media_source.container = Some("mkv".to_owned());
+        state.base_request.video_range_type = ranges.map(str::to_owned);
+        state
+    }
+
+    /// `(with removal support, without it)`: whether `stream` copies for a
+    /// client declaring `ranges`, once with an ffmpeg that can strip dynamic
+    /// HDR metadata and once with one that cannot.
+    fn copies(stream: &MediaStream, ranges: Option<&str>) -> (bool, bool) {
+        let state = copy_job(stream, ranges);
+        (
+            removal_helper(true).can_stream_copy_video(&state, stream),
+            removal_helper(false).can_stream_copy_video(&state, stream),
+        )
+    }
+
+    /// Port of `EncodingHelperDoviTests.CanStreamCopyVideo_InvalidDovi_RequiresRemovalSupportOnlyForDoviClients`
+    /// (v12.4), with one row changed by a divergence. Upstream copies an
+    /// invalid Dolby Vision stream to an `HDR10` client with its RPU, so it
+    /// copies there without removal support (`true`). Ferrofin strips the RPU
+    /// for every client that did not list `DOVI` (owner decision 2026-10-31,
+    /// gl-737), so without removal support that copy is refused.
+    #[rstest]
+    #[case(None, true)]
+    #[case(Some("HDR10"), false)]
+    #[case(Some("DOVI"), false)]
+    #[case(Some("SDR,DOVI"), false)]
+    fn an_invalid_dovi_copy_needs_removal_support_once_the_client_declares_ranges(
+        #[case] requested: Option<&str>,
+        #[case] copy_without_removal_support: bool,
+    ) {
+        for codec in ["hevc", "av1"] {
+            for transfer in ["bt709", "smpte2084"] {
+                let stream = invalid_dovi(codec, Some(transfer));
+                assert_eq!(
+                    copies(&stream, requested),
+                    (true, copy_without_removal_support),
+                    "{codec}/{transfer}/{requested:?}"
+                );
+            }
+        }
+    }
+
+    /// The range block for every range type a fallback or the removal check
+    /// reaches, as `(with removal support, without it)`. Upstream's answers,
+    /// except where a client that did not list `DOVI` would get a Dolby Vision
+    /// stream with its RPU: Ferrofin strips it there (owner decision
+    /// 2026-10-31, gl-737), so the copy needs an ffmpeg that can.
+    #[rstest]
+    // The three base-layer fallbacks. Upstream: `(true, true)`, no removal.
+    #[case::p8_1_to_hdr10("hevc", VideoRangeType::DoviWithHdr10, "SDR,HDR10,HLG", (true, false))]
+    #[case::p8_1_av1_to_hdr10("av1", VideoRangeType::DoviWithHdr10, "SDR,HDR10,HDR10Plus,HLG", (true, false))]
+    #[case::p8_4_to_hlg("hevc", VideoRangeType::DoviWithHlg, "SDR,HLG", (true, false))]
+    #[case::p8_2_to_sdr("hevc", VideoRangeType::DoviWithSdr, "SDR,HDR10", (true, false))]
+    // A Dolby Vision player takes the RPU: nothing is removed, as upstream.
+    #[case::p8_1_to_a_dovi_player("hevc", VideoRangeType::DoviWithHdr10, "SDR,HDR10,DOVI", (true, true))]
+    #[case::p8_4_to_a_dovi_player("hevc", VideoRangeType::DoviWithHlg, "HLG,DOVI", (true, true))]
+    // The stream's own range type listed: a direct copy.
+    #[case::p8_1_listed("hevc", VideoRangeType::DoviWithHdr10, "SDR,HDR10,DOVIWithHDR10", (true, true))]
+    #[case::p8_2_listed("hevc", VideoRangeType::DoviWithSdr, "SDR,DOVIWithSDR", (true, true))]
+    // HDR10+ plays as HDR10, with no Dolby Vision to strip.
+    #[case::hdr10_plus_to_hdr10("hevc", VideoRangeType::Hdr10Plus, "SDR,HDR10", (true, true))]
+    // SDR the only range: no HDR stream copies, whatever its base layer.
+    #[case::p8_2_to_sdr_only("hevc", VideoRangeType::DoviWithSdr, "SDR", (false, false))]
+    // Profile 5 has no base layer to fall back to.
+    #[case::p5_to_hdr10("hevc", VideoRangeType::Dovi, "SDR,HDR10", (false, false))]
+    // Static HDR the client did not list.
+    #[case::hdr10_to_hlg("hevc", VideoRangeType::Hdr10, "SDR,HLG", (false, false))]
+    #[case::hlg_to_hdr10("hevc", VideoRangeType::Hlg, "SDR,HDR10", (false, false))]
+    #[case::hdr10_plus_to_hlg("hevc", VideoRangeType::Hdr10Plus, "SDR,HLG", (false, false))]
+    // The removal check. Upstream plans these removals itself.
+    #[case::p7_to_hdr10("hevc", VideoRangeType::DoviWithEl, "SDR,HDR10", (true, false))]
+    #[case::p7_hdr10_plus_to_hdr10("hevc", VideoRangeType::DoviWithElhdr10Plus, "SDR,HDR10", (true, false))]
+    #[case::p8_1_hdr10_plus_to_a_dovi_player("hevc", VideoRangeType::DoviWithHdr10Plus, "SDR,HDR10,DOVI", (true, false))]
+    #[case::p7_hdr10_plus_to_an_el_player("hevc", VideoRangeType::DoviWithElhdr10Plus, "HDR10,DOVIWithEL", (true, false))]
+    // The removal check where upstream plans none and copies the RPU through.
+    // Upstream: `(true, true)`.
+    #[case::p8_1_hdr10_plus_to_hdr10("hevc", VideoRangeType::DoviWithHdr10Plus, "SDR,HDR10,HDR10Plus", (true, false))]
+    #[case::p7_to_hlg("hevc", VideoRangeType::DoviWithEl, "SDR,HLG", (true, false))]
+    #[case::p8_1_to_hlg("hevc", VideoRangeType::DoviWithHdr10, "SDR,HLG", (true, false))]
+    #[case::invalid_to_an_el_client("hevc", VideoRangeType::DoviInvalid, "HDR10,DOVIWithEL", (true, false))]
+    fn the_range_block_copies_a_fallback_and_strips_what_the_client_did_not_list(
+        #[case] codec: &str,
+        #[case] range_type: VideoRangeType,
+        #[case] requested: &str,
+        #[case] expected: (bool, bool),
+    ) {
+        let stream = with_range(
+            MediaStream {
+                codec: Some(codec.to_owned()),
+                ..MediaStream::default()
+            },
+            range_type,
+        );
+        assert_eq!(
+            copies(&stream, Some(requested)),
+            expected,
+            "{codec}/{range_type:?}/{requested}"
+        );
+    }
+
+    /// The RPU strip for a client that did not list `DOVI` has to reach the
+    /// command line, so the copy needs an output that takes a bitstream filter
+    /// (upstream's gates on the copy's `-bsf:v`): every HLS job, a progressive
+    /// one only into MPEG-TS, and only from a source not already in Annex B
+    /// form. Elsewhere it transcodes. A Dolby Vision player is not affected:
+    /// it copies there, as upstream.
+    #[rstest]
+    #[case::hls(TranscodingJobType::Hls, None, Some("4"), (true, true))]
+    #[case::hls_unknown_nal_length(TranscodingJobType::Hls, None, None, (true, true))]
+    #[case::progressive_ts(TranscodingJobType::Progressive, Some("ts"), Some("4"), (true, true))]
+    #[case::progressive_mkv(TranscodingJobType::Progressive, Some("mkv"), Some("4"), (false, true))]
+    #[case::progressive_mp4(TranscodingJobType::Progressive, Some("mp4"), Some("4"), (false, true))]
+    #[case::annex_b(TranscodingJobType::Hls, None, Some("0"), (false, true))]
+    fn a_stripped_copy_needs_an_output_the_strip_reaches(
+        #[case] job_type: TranscodingJobType,
+        #[case] container: Option<&str>,
+        #[case] nal_length_size: Option<&str>,
+        #[case] expected: (bool, bool),
+    ) {
+        let stream = MediaStream {
+            nal_length_size: nal_length_size.map(str::to_owned),
+            ..with_range(
+                MediaStream {
+                    codec: Some("hevc".to_owned()),
+                    ..MediaStream::default()
+                },
+                VideoRangeType::DoviWithHdr10,
+            )
         };
-        assert_eq!(dovi.video_range_type(), VideoRangeType::DoviWithHdr10);
-        // A client that supports HDR10 but not DOVI must NOT copy — the DV RPU
-        // can't be stripped, so the base-range fallback would ship a broken
-        // stream. It transcodes instead.
-        assert!(!range_type_copy_ok(&dovi, &["HDR10".to_owned()]));
-        // A DOVI-capable client (lists the DOVI range directly) may copy.
-        assert!(range_type_copy_ok(&dovi, &["DOVIWithHDR10".to_owned()]));
+        let helper = removal_helper(true);
+        let copies_for = |ranges: &str| {
+            let mut state = copy_job(&stream, Some(ranges));
+            state.transcoding_type = job_type;
+            state.output_container = container.map(str::to_owned);
+            helper.can_stream_copy_video(&state, &stream)
+        };
+        assert_eq!(
+            (copies_for("SDR,HDR10"), copies_for("SDR,HDR10,DOVI")),
+            expected,
+            "{job_type:?}/{container:?}/{nal_length_size:?}"
+        );
     }
 
     // ----- can_stream_copy_audio ---------------------------------------------
