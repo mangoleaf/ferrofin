@@ -24,6 +24,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, MediaSourceManager};
 use ferrofin_traits::media_encoding::{
     AttachmentExtractor, ExtractedAttachment, HlsStreamManager, HlsStreamRequest, ServedFile,
+    TranscodingJobHandle,
 };
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::{AuthorizationInfo, InternalItemsQuery};
@@ -103,6 +104,12 @@ impl HlsStreamManager for FakeHls {
         _play_session_id: &str,
         _is_user_paused: Option<bool>,
     ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn get_transcoding_job(
+        &self,
+        _play_session_id: &str,
+    ) -> Result<Option<TranscodingJobHandle>, ServiceError> {
         unimplemented!("unused")
     }
 }

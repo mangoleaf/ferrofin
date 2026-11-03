@@ -133,7 +133,8 @@ fn pts_frame_rate(stream: Option<&MediaStream>) -> Option<f32> {
 /// colour bars, 5.1.9, 6.1.1, 7.1.3 and later bring a BT.709 source within 2
 /// levels of its colours, while 4.4.2 lands up to 15 off. Below this the
 /// software graph converts no matrix and gives upstream's colours (see the
-/// module's departures).
+/// module's departures), and so does the image extraction of
+/// [`crate::encoder::media_encoder`].
 pub const MIN_FFMPEG_JPEG_MATRIX_CONVERSION: FfmpegVersion = FfmpegVersion::new(5, 1);
 
 /// `setpts=N/{rate:F3}/TB,`, the filter upstream splices in front of the

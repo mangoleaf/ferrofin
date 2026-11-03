@@ -382,14 +382,17 @@ pub trait SessionManager: Send + Sync {
         capabilities: &ClientCapabilities,
     ) -> Result<(), ServiceError>;
 
-    /// Records live transcoding information for a device.
+    /// Records live transcoding information for a device, on the device's
+    /// session active last (C# `ReportTranscodingInfo`: the first of
+    /// `Sessions`, ordered by `LastActivityDate` descending).
     async fn report_transcoding_info(
         &self,
         device_id: &str,
         info: &TranscodingInfo,
     ) -> Result<(), ServiceError>;
 
-    /// Clears any recorded transcoding information for a device.
+    /// Clears the transcoding information of the device's session active last
+    /// (C# `ClearTranscodingInfo`, which reports `null` the same way).
     async fn clear_transcoding_info(&self, device_id: &str) -> Result<(), ServiceError>;
 
     /// Gets the sessions visible to a user, filtered by device/activity.

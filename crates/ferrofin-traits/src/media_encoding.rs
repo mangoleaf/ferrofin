@@ -952,6 +952,21 @@ pub trait HlsStreamManager: Send + Sync {
         play_session_id: &str,
         is_user_paused: Option<bool>,
     ) -> Result<(), ServiceError>;
+
+    /// The transcoding job running for `play_session_id`, if any, matched
+    /// without regard to case.
+    ///
+    /// Port of `TranscodeManager.GetTranscodingJob(playSessionId)`, which
+    /// `PlaystateController.ValidatePlayMethod` asks before it keeps a
+    /// reported `Transcode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the job registry cannot be read.
+    async fn get_transcoding_job(
+        &self,
+        play_session_id: &str,
+    ) -> Result<Option<TranscodingJobHandle>, ServiceError>;
 }
 
 /// Compile-time assertion that [`HlsStreamManager`] is object-safe.

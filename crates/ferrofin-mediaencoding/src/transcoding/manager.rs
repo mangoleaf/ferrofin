@@ -174,6 +174,13 @@ pub trait SessionReporter: Send + Sync {
     /// them when stderr statistics provide framerate and completion values.
     async fn report_started(&self, job: &TranscodingJobHandle, info: TranscodingInfo);
 
+    /// Tells the session layer that `job`'s ffmpeg never started, so its
+    /// device stops showing the transcode [`Self::report_started`] published.
+    ///
+    /// Port of the `ClearTranscodingInfo(state.Request.DeviceId)` in
+    /// `TranscodeManager.OnTranscodeFailedToStart`.
+    async fn on_job_failed_to_start(&self, job: &TranscodingJobHandle);
+
     /// Tears a killed `job` down, deleting its partial output when
     /// `delete_files` is set.
     ///
@@ -207,6 +214,10 @@ impl<S: SessionReporter + ?Sized> SessionReporter for std::sync::Arc<S> {
         (**self).report_started(job, info).await;
     }
 
+    async fn on_job_failed_to_start(&self, job: &TranscodingJobHandle) {
+        (**self).on_job_failed_to_start(job).await;
+    }
+
     async fn on_job_killed(
         &self,
         job: &TranscodingJobHandle,
@@ -232,6 +243,7 @@ impl SessionReporter for NoopSessionReporter {
         _info: ferrofin_model::session::TranscodingInfo,
     ) {
     }
+    async fn on_job_failed_to_start(&self, _job: &TranscodingJobHandle) {}
     async fn on_job_killed(
         &self,
         _job: &TranscodingJobHandle,
@@ -1089,6 +1101,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             Ok(child) => child,
             Err(e) => {
                 self.remove_job_by_path(&handle.path, handle.job_type);
+                self.reporter.on_job_failed_to_start(&handle).await;
                 return Err(e.into());
             }
         };
@@ -2058,11 +2071,14 @@ mod tests {
     }
 
     /// A reporter that records the kills it was asked to perform.
+    #[derive(Default)]
     pub(super) struct RecordingReporter {
         /// `(path, delete_files, close_live_stream)` per teardown.
         pub(super) killed: Mutex<Vec<(String, bool, bool)>>,
         /// `(device_id, accelerator, video_codec)` per started job.
         pub(super) started: Mutex<Vec<(String, super::HardwareAccelerationType, Option<String>)>>,
+        /// The device of each job whose ffmpeg never started.
+        pub(super) failed: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -2078,6 +2094,12 @@ mod tests {
                     .unwrap_or(super::HardwareAccelerationType::none),
                 info.video_codec,
             ));
+        }
+        async fn on_job_failed_to_start(&self, job: &TranscodingJobHandle) {
+            self.failed
+                .lock()
+                .unwrap()
+                .push(job.device_id.clone().unwrap_or_default());
         }
         async fn report_progress(
             &self,
@@ -2100,10 +2122,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_notifies_reporter_with_delete_flag() {
-        let reporter = Arc::new(RecordingReporter {
-            killed: Mutex::new(Vec::new()),
-            started: Mutex::new(Vec::new()),
-        });
+        let reporter = Arc::new(RecordingReporter::default());
         let m = TranscodeManagerImpl::new(ReporterHandle(Arc::clone(&reporter)));
         m.register_job(handle("s1", "/t/a.m3u8", TranscodingJobType::Hls, "dev1"));
         m.kill_transcoding_jobs("dev1", Some("s1"), true)
@@ -2121,10 +2140,7 @@ mod tests {
         // Upstream's two callers differ exactly here: `OnTranscodeKillTimerStopped`
         // passes `closeLiveStream: true` (the consumer is gone for good),
         // `KillTranscodingJobs` passes `false`.
-        let reporter = Arc::new(RecordingReporter {
-            killed: Mutex::new(Vec::new()),
-            started: Mutex::new(Vec::new()),
-        });
+        let reporter = Arc::new(RecordingReporter::default());
         let m = TranscodeManagerImpl::new(ReporterHandle(Arc::clone(&reporter)));
         let job = handle("s2", "/t/b.m3u8", TranscodingJobType::Hls, "dev2");
         m.register_job(job);
@@ -2151,6 +2167,9 @@ mod tests {
             info: ferrofin_model::session::TranscodingInfo,
         ) {
             self.0.report_started(job, info).await;
+        }
+        async fn on_job_failed_to_start(&self, job: &TranscodingJobHandle) {
+            self.0.on_job_failed_to_start(job).await;
         }
         async fn report_progress(&self, job: &TranscodingJobHandle, progress: TranscodingProgress) {
             self.0.report_progress(job, progress).await;
@@ -2382,10 +2401,7 @@ mod start_ffmpeg_tests {
             extra_files: vec!["out.m3u8".to_owned()],
             ..FakeScript::default()
         });
-        let reporter = Arc::new(super::tests::RecordingReporter {
-            killed: Mutex::new(Vec::new()),
-            started: Mutex::new(Vec::new()),
-        });
+        let reporter = Arc::new(super::tests::RecordingReporter::default());
         let m = TranscodeManagerImpl::new(super::tests::ReporterHandle(Arc::clone(&reporter)));
 
         let mut st = state(&playlist, Some(&playlist));
@@ -2463,15 +2479,19 @@ mod start_ffmpeg_tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let playlist = tmp.path().join("s").join("out.m3u8");
-        let m = manager();
+        let reporter = Arc::new(super::tests::RecordingReporter::default());
+        let m = TranscodeManagerImpl::new(super::tests::ReporterHandle(Arc::clone(&reporter)));
         let st = state(&playlist, None);
         let err = m
             .start_ffmpeg(&FailingSeam, ffmpeg_req(&st, &playlist, vec![]))
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "boom");
-        // Failed start removes the job (OnTranscodeFailedToStart).
+        // Failed start removes the job and clears the device's transcoding
+        // info (OnTranscodeFailedToStart), after the start had published it.
         assert_eq!(m.active_job_count(), 0);
+        assert_eq!(reporter.started.lock().unwrap().len(), 1);
+        assert_eq!(*reporter.failed.lock().unwrap(), vec!["dev".to_owned()]);
     }
 
     #[tokio::test]

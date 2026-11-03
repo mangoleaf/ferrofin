@@ -125,6 +125,10 @@ trait LiveStreamReleaser: Send + Sync {
         device_id: &str,
         info: &ferrofin_model::session::TranscodingInfo,
     ) -> Result<(), ServiceError>;
+
+    /// Withdraws what [`Self::publish_transcoding_info`] published for
+    /// `device_id` (`ISessionManager.ClearTranscodingInfo`).
+    async fn clear_transcoding_info(&self, device_id: &str) -> Result<(), ServiceError>;
 }
 
 #[async_trait]
@@ -135,6 +139,11 @@ impl LiveStreamReleaser for Arc<dyn ferrofin_traits::session::SessionManager> {
         info: &ferrofin_model::session::TranscodingInfo,
     ) -> Result<(), ServiceError> {
         self.report_transcoding_info(device_id, info).await
+    }
+
+    async fn clear_transcoding_info(&self, device_id: &str) -> Result<(), ServiceError> {
+        ferrofin_traits::session::SessionManager::clear_transcoding_info(self.as_ref(), device_id)
+            .await
     }
 
     async fn release(&self, live_stream_id: &str, session_id: &str) -> Result<(), ServiceError> {
@@ -187,6 +196,21 @@ impl<R: LiveStreamReleaser> ferrofin_mediaencoding::SessionReporter
         {
             // Best effort: a dashboard panel is not worth failing a transcode.
             tracing::warn!(%device_id, %error, "reporting the transcode to the session failed");
+        }
+    }
+
+    /// `OnTranscodeFailedToStart`: `if (!string.IsNullOrWhiteSpace(
+    /// state.Request.DeviceId)) ClearTranscodingInfo(state.Request.DeviceId)`.
+    async fn on_job_failed_to_start(
+        &self,
+        job: &ferrofin_traits::media_encoding::TranscodingJobHandle,
+    ) {
+        let Some(device_id) = job.device_id.as_deref().filter(|d| !d.trim().is_empty()) else {
+            return;
+        };
+        if let Err(error) = self.releaser.clear_transcoding_info(device_id).await {
+            // Best effort, as publishing it was: the transcode already failed.
+            tracing::warn!(%device_id, %error, "clearing the failed transcode from the session failed");
         }
     }
 
@@ -1096,6 +1120,8 @@ mod tests {
         /// `(device_id, hardware_acceleration_type)`.
         reported:
             std::sync::Mutex<Vec<(String, ferrofin_model::entities::HardwareAccelerationType)>>,
+        /// Every device whose transcoding info was cleared.
+        cleared: std::sync::Mutex<Vec<String>>,
         fail: bool,
     }
 
@@ -1111,6 +1137,14 @@ mod tests {
                 info.hardware_acceleration_type
                     .unwrap_or(ferrofin_model::entities::HardwareAccelerationType::none),
             ));
+            Ok(())
+        }
+
+        async fn clear_transcoding_info(&self, device_id: &str) -> Result<(), ServiceError> {
+            self.cleared
+                .lock()
+                .expect("lock")
+                .push(device_id.to_owned());
             Ok(())
         }
 
@@ -1251,6 +1285,25 @@ mod tests {
             .report_started(&job, ferrofin_model::session::TranscodingInfo::default())
             .await;
         assert!(reporter.releaser.reported.lock().expect("lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transcode_that_fails_to_start_is_cleared_from_its_device() {
+        use ferrofin_mediaencoding::SessionReporter as _;
+        let reporter = LiveStreamReleasingReporter {
+            releaser: RecordingReleaser::default(),
+        };
+        let mut job = killed_job(None, Some("sess"));
+        reporter.on_job_failed_to_start(&job).await;
+        // `IsNullOrWhiteSpace`: a blank device has nothing to clear.
+        job.device_id = Some("  ".to_owned());
+        reporter.on_job_failed_to_start(&job).await;
+        job.device_id = None;
+        reporter.on_job_failed_to_start(&job).await;
+        assert_eq!(
+            *reporter.releaser.cleared.lock().expect("lock"),
+            vec!["dev".to_owned()]
+        );
     }
 
     /// A [`TrickplayManager`](ferrofin_traits::trickplay::TrickplayManager) with

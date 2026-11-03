@@ -110,6 +110,8 @@ pub struct SessionInfoDto {
     pub now_playing_queue: Option<Vec<QueueItem>>,
 
     /// Gets or sets the now playing queue full items.
+    // A member of the vendored 10.11.8 contract only: v12.4's `SessionInfoDto`
+    // has none, so the server leaves it `None` and never sends the key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub now_playing_queue_full_items: Option<Vec<crate::dto::BaseItemDto>>,
 
