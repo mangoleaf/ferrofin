@@ -4503,17 +4503,22 @@ async fn rekey_one(
     Ok(true)
 }
 
-/// [`rekey_one`], then the moved item's new `path`, if it has one.
+/// [`rekey_one`], then the moved item's new `path`, if it has one, and —
+/// when the move lists rows to fold into it — its users' rows brought into
+/// agreement ([`agree_user_data`]).
 async fn rekey_one_at(
     conn: &mut sqlx::SqliteConnection,
     m: &ItemRekey,
     path: Option<&str>,
     references: &[RekeyReference],
     kind: RekeyKind,
-) -> Result<bool, sqlx::Error> {
-    let made = rekey_one(conn, m, references, kind).await?;
+) -> Result<bool, ServiceError> {
+    let made = rekey_one(conn, m, references, kind).await.map_err(db_err)?;
     if made && let Some(path) = path {
-        set_item_path_in(conn, m.to, path).await?;
+        set_item_path_in(conn, m.to, path).await.map_err(db_err)?;
+    }
+    if made && !m.merged.is_empty() {
+        agree_user_data(conn, m.to).await?;
     }
     Ok(made)
 }
@@ -4544,7 +4549,8 @@ async fn is_stored(conn: &mut sqlx::SqliteConnection, id: Uuid) -> Result<bool, 
 /// `to` has none in that table, else goes; its Intro Skipper rows follow by
 /// that extension's rule ([`crate::intro_skipper_repository::fold_item_rows`]).
 /// Then the row is deleted, its own data (streams, images, people, …) with
-/// it. A `loser` not stored is skipped.
+/// it. A `loser` not stored is skipped. [`rekey_one_at`] brings the kept
+/// item's user-data rows into agreement once the move's folds are done.
 async fn merge_one(
     conn: &mut sqlx::SqliteConnection,
     (loser, to): (Uuid, Uuid),
@@ -4656,7 +4662,9 @@ async fn merge_one(
 
 /// [`merge_one`]'s user data: `loser`'s rows move to `to`, its guid-keyed
 /// row renamed; on a (user, key) both hold, the row played later (then more
-/// often) stays.
+/// often) stays. That leaves a user's rows of `to` under different keys
+/// free to disagree; [`agree_user_data`] settles them once the move's
+/// folds are done.
 async fn merge_user_data(
     conn: &mut sqlx::SqliteConnection,
     loser: Uuid,
@@ -4706,6 +4714,80 @@ const USER_DATA_BEATS: &str = r#"(coalesce(julianday(l."LastPlayedDate"), -1)
                     OR (coalesce(julianday(l."LastPlayedDate"), -1)
                           = coalesce(julianday(w."LastPlayedDate"), -1)
                         AND l."PlayCount" > w."PlayCount"))"#;
+
+/// After a fold into item `to`, inside the caller's transaction: each user's
+/// `UserData` rows of `to` take the nine user fields of the row its DTO
+/// reads, the first of `to`'s user-data keys the user holds
+/// (`ResolveUserDataRow`, [`crate::user_data_keys::user_data_keys`]). A user
+/// holding none of them takes the row upstream's harmonize routine would
+/// keep: played latest, then most often, then furthest, then the lowest key
+/// ([`crate::adoption_repairs::harmonize_conflicting_user_data`]; the dates
+/// are compared to the millisecond here, through `julianday`).
+///
+/// The keys are the item's as stored when the move is done. A move that
+/// changes what the item is ([`RekeyKind::Changed`]) has dropped its
+/// provider ids unless the item is locked, so a movie's keys are then its id
+/// alone until a refresh matches it again: its guid-keyed row is the one the
+/// DTO reads, and the one the others take.
+///
+/// [`merge_user_data`] resolves history per key, so without this a user's
+/// rows of the kept item can disagree: one key played, another resumable or
+/// a favourite. The DTO reads one of them, but the list filters (`IsPlayed`,
+/// `IsResumable`, `IsFavorite`) match any, so the item would sit in a list
+/// its DTO contradicts until the user's next save of it brought the rows
+/// into line (`UserDataManager`'s retired-key update). This is that update,
+/// made by the fold. It follows the row the DTO reads, not the latest play:
+/// where the user holds one of the keys it changes nothing the DTO reads,
+/// only the rows the lists match, and an explicit unplay under that key is
+/// never undone by an older row's play. (Holding none, the DTO reads
+/// whichever row comes first, so no choice keeps it.)
+///
+/// No row is deleted; `CustomDataKey` and `RetentionDate` stay, and a
+/// user's source row is left as it is.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the item's keys or the update fail.
+async fn agree_user_data(conn: &mut sqlx::SqliteConnection, to: Uuid) -> Result<(), ServiceError> {
+    let keys = crate::user_data_key_repository::load_keys(conn, to)
+        .await?
+        .unwrap_or_else(|| vec![to.to_string()]);
+    let keys = serde_json::to_string(&keys).map_err(|e| ServiceError::backend(e.to_string()))?;
+    sqlx::query(AGREE_USER_DATA)
+        .bind(guid_to_db(to))
+        .bind(keys)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// [`agree_user_data`]'s statement: item `?1`, its user-data keys `?2` (a
+/// JSON array, in order). `source` names each user's row to copy, chosen
+/// before anything is written; only users holding more than one row are
+/// touched. The values are copied as stored, the date's text included, so
+/// the rows agree byte for byte.
+const AGREE_USER_DATA: &str = r#"WITH source AS MATERIALIZED (
+       SELECT held."UserId", (
+           SELECT s."CustomDataKey" FROM "UserData" AS s
+           LEFT JOIN json_each(?2) AS k ON k.value = s."CustomDataKey"
+           WHERE s."ItemId" = ?1 AND s."UserId" = held."UserId"
+           ORDER BY k.key IS NULL, k.key, julianday(s."LastPlayedDate") DESC,
+                    s."PlayCount" DESC, s."PlaybackPositionTicks" DESC, s."CustomDataKey"
+           LIMIT 1) AS "CustomDataKey"
+       FROM "UserData" AS held WHERE held."ItemId" = ?1
+       GROUP BY held."UserId" HAVING COUNT(*) > 1
+   )
+   UPDATE "UserData" AS r SET
+       "AudioStreamIndex" = s."AudioStreamIndex", "IsFavorite" = s."IsFavorite",
+       "LastPlayedDate" = s."LastPlayedDate", "Likes" = s."Likes",
+       "PlaybackPositionTicks" = s."PlaybackPositionTicks", "PlayCount" = s."PlayCount",
+       "Played" = s."Played", "Rating" = s."Rating",
+       "SubtitleStreamIndex" = s."SubtitleStreamIndex"
+   FROM source CROSS JOIN "UserData" AS s
+   WHERE s."ItemId" = ?1 AND s."UserId" = source."UserId"
+     AND s."CustomDataKey" = source."CustomDataKey"
+     AND r."ItemId" = ?1 AND r."UserId" = source."UserId"
+     AND r."CustomDataKey" <> source."CustomDataKey""#;
 
 /// Before item `item`'s user-data rows keyed `old` are renamed to `new`:
 /// where a user has a row under each, the one played later (then more
@@ -13340,7 +13422,9 @@ mod tests {
     /// `rekey_items` folds a row standing for the same item into a stored
     /// target (`from` = `to`): a user-data row the loser played later
     /// replaces the target's, one the target played later stays, one the
-    /// target has none for moves (its guid key renamed); a container already
+    /// target has none for moves (its guid key renamed), and each user's rows
+    /// then take the values of the one the DTO reads (the guid key: the
+    /// target has no provider ids); a container already
     /// holding the target drops the loser, another re-points to the target;
     /// the loser's extra follows; the loser is deleted, the foreign keys
     /// whole. `item_user_weights` reads what users made of each row.
@@ -13444,11 +13528,13 @@ mod tests {
         user_data.sort();
         let mut expected = vec![
             (guid_to_db(target), guid_to_db(first), target.to_string(), 3),
+            // The target's row stayed under this key (played later), then
+            // took the guid-keyed row's values, the loser's later play.
             (
                 guid_to_db(target),
                 guid_to_db(first),
                 "shared".to_owned(),
-                1,
+                3,
             ),
             (
                 guid_to_db(target),
@@ -13756,6 +13842,209 @@ mod tests {
                 .await
                 .expect("user data");
         assert_eq!(rows, vec![(guid_to_db(kept), kept.to_string(), 1)]);
+    }
+
+    /// `user`'s user-data rows of `item`: each key and its nine user fields
+    /// as one JSON array, sorted by key.
+    async fn user_fields(
+        db: &ferrofin_db::Database,
+        item: Uuid,
+        user: Uuid,
+    ) -> Vec<(String, String)> {
+        sqlx::query_as(
+            r#"SELECT "CustomDataKey", json_array("AudioStreamIndex", "IsFavorite",
+                 "LastPlayedDate", "Likes", "PlaybackPositionTicks", "PlayCount", "Played",
+                 "Rating", "SubtitleStreamIndex")
+               FROM "UserData" WHERE "ItemId" = ?1 AND "UserId" = ?2 ORDER BY 1"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(guid_to_db(user))
+        .fetch_all(db.pool())
+        .await
+        .expect("user data")
+    }
+
+    /// A fold leaves each user's rows of the kept item agreeing with the row
+    /// its DTO reads, the first of its keys the user holds (a movie with a
+    /// TMDB id: `["603", <its id>]`), in all nine user fields. Where that
+    /// row is the loser's play, the kept row's resume position takes it;
+    /// where it is an unplay, it stands against the loser's later play,
+    /// which the per-key rule alone keeps under the guid key. A user holding
+    /// none of the keys takes the latest play among their rows. No row is
+    /// deleted, and a user's only row is left as it is.
+    #[tokio::test]
+    async fn a_fold_brings_each_users_rows_into_agreement_with_the_row_its_dto_reads() {
+        let (kept, loser) = (Uuid::from_u128(0xF501), Uuid::from_u128(0xF502));
+        let [played, unplayed, unkeyed, single] =
+            [0xF510_u128, 0xF520, 0xF530, 0xF540].map(Uuid::from_u128);
+        let db = test_db().await;
+        seed_item(&db, kept, BaseItemKind::Movie).await;
+        seed_item(&db, loser, BaseItemKind::Video).await;
+        crate::test_support::seed_provider_id(&db, kept, "Tmdb", "603").await;
+        for (user, name) in [
+            (played, "p"),
+            (unplayed, "u"),
+            (unkeyed, "k"),
+            (single, "s"),
+        ] {
+            crate::test_support::seed_named_user(&db, user, name).await;
+        }
+        let (kept_key, loser_key) = (kept.to_string(), loser.to_string());
+        let (kept_key, loser_key) = (kept_key.as_str(), loser_key.as_str());
+        // (item, user, key, favourite, played, play count, ticks, the month
+        // of 2026 it was last played); each row's place numbers its stream
+        // indexes, rating and likes.
+        for (n, (item, user, key, favourite, was_played, count, ticks, month)) in [
+            (loser, played, "603", true, true, 2, 0, 1),
+            (kept, played, kept_key, false, false, 1, 4200, 6),
+            (kept, unplayed, "603", false, false, 0, 0, 1),
+            (loser, unplayed, loser_key, true, true, 3, 0, 6),
+            (loser, unkeyed, "tt0133093", true, true, 1, 0, 2),
+            (loser, unkeyed, "old-key", false, false, 1, 300, 3),
+            (loser, single, loser_key, false, true, 1, 0, 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let n = i64::try_from(n).expect("index");
+            sqlx::query(
+                r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey",
+                   "AudioStreamIndex", "IsFavorite", "LastPlayedDate", "Likes", "PlayCount",
+                   "PlaybackPositionTicks", "Played", "Rating", "SubtitleStreamIndex")
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?4, ?4)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(user))
+            .bind(key)
+            .bind(n)
+            .bind(favourite)
+            .bind(format!("2026-{month:02}-01 00:00:00"))
+            .bind(n % 2 == 0)
+            .bind(count)
+            .bind(ticks)
+            .bind(was_played)
+            .execute(db.writer())
+            .await
+            .expect("user data");
+        }
+        // Each user's row the fold must copy, and the keys it leaves them.
+        let mut expected = Vec::new();
+        for (user, from, source, keys) in [
+            (played, loser, "603", vec!["603", kept_key]),
+            (unplayed, kept, "603", vec!["603", kept_key]),
+            (unkeyed, loser, "old-key", vec!["old-key", "tt0133093"]),
+            (single, loser, loser_key, vec![kept_key]),
+        ] {
+            let fields = user_fields(&db, from, user).await;
+            let (_, values) = fields
+                .into_iter()
+                .find(|(key, _)| key == source)
+                .expect("row");
+            let rows: Vec<(String, String)> = keys
+                .into_iter()
+                .map(|key| (key.to_owned(), values.clone()))
+                .collect();
+            expected.push((user, rows));
+        }
+
+        let merge = ferrofin_traits::persistence::ItemRekey {
+            from: kept,
+            to: kept,
+            type_name: crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+                .expect("type")
+                .to_owned(),
+            dirs: Vec::new(),
+            merged: vec![loser],
+            extra: false,
+        };
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        assert_eq!(svc.rekey_items(&[merge]).await.expect("fold").len(), 1);
+        for (user, mut rows) in expected {
+            rows.sort();
+            assert_eq!(user_fields(&db, kept, user).await, rows, "{user}");
+        }
+    }
+
+    /// A move that first folds its stored target into the moved row (the
+    /// target among `merged`), then moves that row to the target's id, brings
+    /// the rows into agreement after the move, with the keys the item has
+    /// then. A kind change (`RekeyKind::Changed`, the scanner) has dropped
+    /// the unlocked item's provider ids, so its guid-keyed row is the one
+    /// the DTO reads and the one the others take; a boot repair's move
+    /// (`RekeyKind::Represented`) keeps them, so its TMDB-keyed row is.
+    #[rstest::rstest]
+    #[case::changed(crate::item_persistence_service::RekeyKind::Changed, true)]
+    #[case::represented(crate::item_persistence_service::RekeyKind::Represented, false)]
+    #[tokio::test]
+    async fn a_move_that_folds_its_target_agrees_on_the_moved_items_keys(
+        #[case] kind: super::RekeyKind,
+        #[case] guid_row_read: bool,
+    ) {
+        let (from, to, user) = (
+            Uuid::from_u128(0xF601),
+            Uuid::from_u128(0xF602),
+            Uuid::from_u128(0xF610),
+        );
+        let db = test_db().await;
+        seed_item(&db, from, BaseItemKind::Video).await;
+        seed_item(&db, to, BaseItemKind::Movie).await;
+        crate::test_support::seed_provider_id(&db, from, "Tmdb", "603").await;
+        crate::test_support::seed_named_user(&db, user, "user").await;
+        let guid_key = to.to_string();
+        // The moved row's play under its TMDB key; the stored target's
+        // resume position under its guid key.
+        for (item, key, played, count, ticks, month) in [
+            (from, "603", true, 2, 0, 1),
+            (to, guid_key.as_str(), false, 1, 4200, 6),
+        ] {
+            sqlx::query(
+                r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
+                   "LastPlayedDate", "PlayCount", "PlaybackPositionTicks", "Played")
+                   VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(user))
+            .bind(key)
+            .bind(format!("2026-{month:02}-01 00:00:00"))
+            .bind(count)
+            .bind(ticks)
+            .bind(played)
+            .execute(db.writer())
+            .await
+            .expect("user data");
+        }
+        let (source_item, source_key) = if guid_row_read {
+            (to, guid_key.as_str())
+        } else {
+            (from, "603")
+        };
+        let (_, values) = user_fields(&db, source_item, user)
+            .await
+            .into_iter()
+            .find(|(key, _)| key == source_key)
+            .expect("source row");
+
+        let movie = crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+            .expect("type")
+            .to_owned();
+        let moves = [ferrofin_traits::persistence::ItemRekey {
+            from,
+            to,
+            type_name: movie,
+            dirs: Vec::new(),
+            merged: vec![to],
+            extra: false,
+        }];
+        assert_eq!(
+            super::rekey_rows(&db, &moves, kind)
+                .await
+                .expect("move")
+                .len(),
+            1
+        );
+        let mut expected = vec![("603".to_owned(), values.clone()), (guid_key, values)];
+        expected.sort();
+        assert_eq!(user_fields(&db, to, user).await, expected);
     }
 
     /// `delete_items` takes the rows no foreign key reaches with the item —

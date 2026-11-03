@@ -1495,7 +1495,9 @@ pub trait ItemPersistenceService: Send + Sync {
     /// row the item already has for the same user and key kept by the later
     /// `LastPlayedDate`, then the higher `PlayCount`), its playlist and
     /// collection entries and every other row's reference to it follow, and
-    /// the row is deleted. Returns the moves made.
+    /// the row is deleted. Each user's user-data rows of the item then take
+    /// the values of the row its DTO reads, so the list filters agree with
+    /// it. Returns the moves made.
     ///
     /// The default (a stub/fake service) moves nothing; the scan then plans
     /// the item anew and the old row is pruned.

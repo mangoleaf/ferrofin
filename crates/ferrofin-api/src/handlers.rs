@@ -1303,9 +1303,19 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    (GetUserDataBatch, whose cache answers the page's items, and \
                    GetResumeUserDataBatch), Emby.Server.Implementations/Dto/DtoService.cs \
                    (GetBaseItemDtos) and Emby.Server.Implementations/Library/\
-                   MediaSourceManager.cs (SetAlternateVersionResumeStates)",
-        date: "2026-11-02",
+                   MediaSourceManager.cs (SetAlternateVersionResumeStates). After a scan or \
+                   boot-repair fold, item_persistence_service.rs agree_user_data (the \
+                   retired-key update of SaveUserData, from the row ResolveUserDataRow reads), \
+                   compared with Jellyfin.Server.Implementations/Item/\
+                   ItemPersistenceService.cs (ReattachUserDataAsync, ReconcileUserDataAsync)",
+        date: "2026-11-03",
         divergences: &[
+            "After a scan or boot-repair fold, which upstream does not have (it deletes the \
+             duplicate, and ReconcileUserDataAsync gives the user's rows the most recent play when \
+             its detached history reattaches), each user's rows of the kept item take the values \
+             of the row the DTO reads (the first current key the user holds, else the most recent \
+             play), so an explicit unplay under that key stands against an older row's later \
+             play.",
             "Each change reads the row inside its write transaction, so two overlapping saves of \
              one item both land; upstream's GetUserData hands each caller a copy and SaveUserData \
              writes every column back, so there the later save undoes the earlier one.",
