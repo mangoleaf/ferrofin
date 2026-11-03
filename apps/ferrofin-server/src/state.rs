@@ -2742,8 +2742,8 @@ pub async fn build_app_state(
     let sync_play_users = Arc::clone(&users);
     let sync_play_library = Arc::clone(&library);
 
-    // The policy and library row caches (ferrofin_db::row_cache), on only now: the boot repairs
-    // above write those rows outside the managers that invalidate them.
+    // The policy, library and tuner-presence row caches (ferrofin_db::row_cache), on only now: the
+    // boot repairs above write those rows outside the managers that invalidate them.
     db.enable_row_cache(
         config
             .row_cache_ttl_secs
