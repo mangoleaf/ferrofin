@@ -11,9 +11,10 @@
 //! Every image request runs through the wired
 //! [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor) (the real
 //! `image`-crate encoder at the composition root): the `maxWidth`/`maxHeight`/
-//! `width`/`height`/`fillWidth`/`fillHeight`/`format`/`blur` parameters resize and
-//! format-convert the bytes, and the positional-parameter URL lifts its
-//! `format`/`maxWidth`/`maxHeight` path segments into the same transform. A plain
+//! `width`/`height`/`fillWidth`/`fillHeight`/`format`/`blur`/`backgroundColor`/
+//! `foregroundLayer` parameters resize, composite and format-convert the
+//! bytes, and the positional-parameter URL lifts its `format`/`maxWidth`/
+//! `maxHeight` path segments into the same transform. A plain
 //! request (or an unwired processor) serves the **stored original** untouched,
 //! except on the user-image routes, which reach the processor on every request
 //! as `GetImageResult` does (gl-1118 is the other routes). When the request
@@ -145,6 +146,12 @@ pub(crate) struct ImageQuery {
     /// Gaussian blur radius.
     #[serde(default)]
     blur: Option<i32>,
+    /// A colour the image is drawn over (`SKColor.Parse`), for transparent images.
+    #[serde(default)]
+    background_color: Option<String>,
+    /// A black layer drawn over the image, its opacity `1 - value`.
+    #[serde(default)]
+    foreground_layer: Option<String>,
     /// The image's cache tag (`md5(path+dateModified)`): purely a cache key —
     /// when present the URL is content-addressed, so the response is served
     /// with Jellyfin's immutable caching contract (`Cache-Control`/`ETag`).
@@ -170,7 +177,7 @@ impl ImageQuery {
     }
 
     /// Whether the request goes through the processor: one that asks for a
-    /// transform (resize/format/blur), and every user-image request. Any other
+    /// transform (resize/format/blur/compositing), and every user-image request. Any other
     /// plain request serves the stored original untouched, where upstream
     /// reaches `ProcessImage` too (gl-1118).
     fn wants_transform(&self) -> bool {
@@ -183,6 +190,8 @@ impl ImageQuery {
             || self.fill_width.is_some()
             || self.fill_height.is_some()
             || self.blur.is_some()
+            || self.background_color.is_some()
+            || self.foreground_layer.is_some()
     }
 }
 
@@ -511,6 +520,8 @@ pub(crate) async fn serve_image_file(
             fill_width: query.fill_width,
             fill_height: query.fill_height,
             blur: query.blur,
+            background_color: query.background_color.clone(),
+            foreground_layer: query.foreground_layer.clone(),
             quality: query.quality.unwrap_or(100),
             // C# `GetOutputFormats(format)`: an explicit `format` wins outright,
             // otherwise the list is derived from what the *client* advertised.
@@ -829,7 +840,8 @@ async fn get_item_image_by_index(
 /// [`ImageQuery`], over any same-named query parameter, so the transform is
 /// applied just as the query-string form would. The transforms the path does
 /// not carry (`width`, `height`, `quality`, `fillWidth`, `fillHeight`,
-/// `blur`) come from the query string, as `GetItemImage2` takes them.
+/// `blur`, `backgroundColor`, `foregroundLayer`) come from the query string, as
+/// `GetItemImage2` takes them.
 ///
 /// TODO(overlays): `percentPlayed`/`unplayedCount` bind and are validated, but
 /// the overlays themselves are not drawn yet — Jellyfin renders them in

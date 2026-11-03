@@ -1101,6 +1101,40 @@ async fn a_photos_image_is_processed_with_auto_orientation() {
     assert_eq!(*photo.auto_orient.lock().expect("lock"), [true, true]);
 }
 
+/// gl-805: `backgroundColor`, `foregroundLayer` and `blur` each reach the
+/// processor on their own.
+#[rstest::rstest]
+#[case::background("backgroundColor=%23FF0000", Some("#FF0000"), None, None)]
+#[case::foreground("foregroundLayer=0.6", None, Some("0.6"), None)]
+#[case::blur("blur=4", None, None, Some(4))]
+#[tokio::test]
+async fn compositing_parameters_reach_the_processor(
+    #[case] query: &str,
+    #[case] background: Option<&str>,
+    #[case] foreground: Option<&str>,
+    #[case] blur: Option<i32>,
+) {
+    let img = TempImage::new(b"PNGDATA");
+    let processor = Arc::new(RecordingProcessor::default());
+    let mut s = stubs(img.path(), String::new());
+    s.processor = Some(processor.clone());
+    let uri = format!("/Items/{ITEM_ID}/Images/Primary?{query}");
+
+    let (status, _) = send(&s, "GET", &uri, None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let options = processor
+        .asked
+        .lock()
+        .expect("asked lock")
+        .first()
+        .cloned()
+        .expect("the image was processed");
+    assert_eq!(options.background_color.as_deref(), background);
+    assert_eq!(options.foreground_layer.as_deref(), foreground);
+    assert_eq!(options.blur, blur);
+}
+
 #[tokio::test]
 async fn head_item_image_is_ok_without_body() {
     let img = TempImage::new(b"PNGDATA");
