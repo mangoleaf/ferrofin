@@ -1079,7 +1079,8 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let cache = TempDir::new().expect("cache");
         // A real jpeg the encoder can probe; high quality + matching format +
-        // fill bounds covering it → HasDefaultOptions holds.
+        // fill bounds covering it → HasDefaultOptions holds (as an unset fill
+        // would: see `bounds_the_image_already_meets_serve_the_original`).
         let input = fixture(&dir, "orig.jpg", 640, 480);
         let encoder = Arc::new(CountingEncoder {
             work: None,
@@ -1122,6 +1123,38 @@ mod tests {
             proc.cache_file_path(&input, &oriented, 95, dt, ImageFormat::Jpg)
                 .expect("key")
         );
+    }
+
+    #[tokio::test]
+    async fn bounds_the_image_already_meets_serve_the_original() {
+        // gl-1117: `?maxWidth=2000` on a 640-wide poster, no fill requested.
+        // Upstream's lifted `int?` fill comparison passes, so ProcessImage
+        // serves the stored file without an encode.
+        let dir = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let input = fixture(&dir, "poster.jpg", 640, 480);
+        let encoder = Arc::new(CountingEncoder {
+            work: None,
+            calls: AtomicUsize::new(0),
+            return_original: None,
+        });
+        let proc = processor_with(encoder.clone(), &cache, FakeFs::with(&[&input]));
+
+        let options = ImageProcessingOptions {
+            image: ItemImageInfo {
+                path: input.clone(),
+                width: 640,
+                height: 480,
+                ..Default::default()
+            },
+            quality: 96,
+            supported_output_formats: vec![ImageFormat::Jpg],
+            max_width: Some(2000),
+            ..Default::default()
+        };
+        let processed = proc.process_image(&options).await.expect("process");
+        assert_eq!(processed.path, input);
+        assert_eq!(encoder.calls.load(Ordering::SeqCst), 0);
     }
 
     #[rstest::rstest]

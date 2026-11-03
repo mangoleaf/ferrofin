@@ -2,7 +2,8 @@
 //! file: once a file has them, nothing a server does again — a library scan,
 //! the three scheduled tasks, every choice of jellyfin-web's refresh dialog
 //! but "replace trickplay images" (a deliberate redo), a restart — runs
-//! ffmpeg on it, and a full refresh only re-probes it.
+//! ffmpeg on it, and a full refresh only re-probes it. A trickplay settings
+//! change replaces only the sets that no longer match, once.
 //!
 //! Real ffmpeg behind a logging wrapper, on three generated episodes with
 //! chapters and a shared intro. Needs `ffmpeg` and `ffprobe` on `PATH`:
@@ -592,7 +593,30 @@ async fn extraction_and_analysis_never_repeat_for_unchanged_files() {
 
     // A restart keeps all of it: the records are persisted, not cached.
     let server = Server::boot(root, &ffmpeg, &ffprobe).await;
-    let last = assert_nothing_repeats(&server, &targets, root, &media, analysed).await;
+    assert_nothing_repeats(&server, &targets, root, &media, analysed).await;
+
+    // A trickplay settings change is checked against the sets on disk once,
+    // by the task's next run. The 160-pixel videos are narrower than both
+    // widths, so adding 640 leaves their one set as it is; a chroma change
+    // replaces it once per file. Then nothing repeats again.
+    for (change, runs) in [("WidthResolutions", 0), ("FullChroma", files)] {
+        let mut config = server.get("/System/Configuration").await;
+        config["TrickplayOptions"][change] = match change {
+            "WidthResolutions" => json!([320, 640]),
+            _ => json!(true),
+        };
+        server.post("/System/Configuration", Some(&config)).await;
+        let before = calls(root, &media);
+        server.run_task("RefreshTrickplayImages").await;
+        let after = calls(root, &media);
+        assert_eq!(
+            after.ffmpeg,
+            before.ffmpeg + runs,
+            "{change}: one trickplay run per file to replace: {after:?}"
+        );
+    }
+    let replaced = calls(root, &media);
+    let last = assert_nothing_repeats(&server, &targets, root, &media, replaced).await;
     server.shutdown().await;
     assert_eq!(
         calls(root, &media),

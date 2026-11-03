@@ -223,7 +223,9 @@ fn every_editable_setting_saves_what_a_hand_written_line_holds() {
             ("log_format", _) => json!("text"),
             // As `sample`: the value that is not the default.
             (_, SettingKind::Bool) => json!(spec.default != "true"),
-            (_, SettingKind::Integer { min, .. }) => json!(min + 1),
+            (_, SettingKind::Integer { .. }) => {
+                json!(sample(spec).parse::<i64>().expect("a number"))
+            }
             (_, SettingKind::CountOrAuto) => json!(2),
             (_, SettingKind::Text | SettingKind::Secret) => json!("sample"),
             (_, SettingKind::Url) => json!("http://sample.invalid"),
@@ -512,18 +514,18 @@ fn an_invalid_value_leaves_the_file_byte_identical() {
             "above zero",
         ),
         // The kinds.
-        ("scan_probe_concurrency", json!(-1), "whole number from 0"),
-        ("scan_probe_concurrency", json!(4.5), "whole number from 0"),
-        ("scan_probe_concurrency", json!("4"), "whole number from 0"),
-        ("scan_probe_concurrency", json!(true), "whole number from 0"),
+        ("scan_probe_concurrency", json!(-1), "whole number from 1"),
+        ("scan_probe_concurrency", json!(4.5), "whole number from 1"),
+        ("scan_probe_concurrency", json!("4"), "whole number from 1"),
+        ("scan_probe_concurrency", json!(true), "whole number from 1"),
         ("auth_cache_ttl_secs", json!(4), "from 5 to 300"),
-        ("image_decode_max_megapixels", json!(15), "from 16 to 1000"),
+        ("image_decode_max_megapixels", json!(49), "from 50 to 1000"),
         (
             "image_decode_max_memory_mb",
             json!(4096),
-            "from 128 to 2048",
+            "from 256 to 2048",
         ),
-        ("image_resize_budget_mb", json!(0), "from 256 to 16384"),
+        ("image_resize_budget_mb", json!(0), "from 512 to 8192"),
         ("image_download_max_mb", json!(15), "from 16 to 256"),
         (
             "image_negative_cache_ttl_secs",
@@ -591,6 +593,44 @@ fn a_transcode_cap_outside_its_range_is_refused() {
         let message = refused(err);
         assert!(message.contains("from 0 to 1024"), "{message}");
     }
+}
+
+/// B1: a value outside a setting's range is refused naming the range, and the
+/// file is untouched. That includes `0` on the rows where the loader reads it
+/// as the default: Reset is how a value goes back to its default.
+#[test]
+fn a_value_outside_a_settings_range_is_refused_naming_it() {
+    let original = "log_level = \"debug\"\n";
+    let data = DataDir::new(&[]);
+    std::fs::write(data.config_file(), original).expect("write");
+    let env = FakeEnv::new();
+    for (key, value, range) in [
+        ("quick_connect_pending_per_ip", json!(0), "from 1 to 1000"),
+        ("metrics_sample_interval", json!(0), "from 1 to 300"),
+        ("wasm_call_timeout_secs", json!(0), "from 1 to 600"),
+        ("wasm_memory_limit_mb", json!(0), "from 16 to 4096"),
+        ("wasm_event_queue_capacity", json!(0), "from 16 to 65536"),
+        ("max_plugin_download_mb", json!(0), "from 8 to 1024"),
+        ("wasm_subtitle_extract_mb", json!(0), "from 1 to 128"),
+        ("wasm_subtitle_extract_mb", json!(129), "from 1 to 128"),
+        ("scan_progress_every", json!(100_001), "from 0 to 100000"),
+        (
+            "scan_directory_cache_records",
+            json!(999),
+            "from 1000 to 10000000",
+        ),
+        ("tvdb_cache_hours", json!(169), "from 1 to 168"),
+        ("shutdown_timeout_secs", json!(4), "from 5 to 600"),
+    ] {
+        let err = saved(&data, &env, &[(key, value.clone())]).expect_err("refused");
+        let message = refused(err);
+        assert!(message.contains(key), "{key} = {value}: {message}");
+        assert!(message.contains(range), "{key} = {value}: {message}");
+        assert_eq!(contents(&data), original, "{key} = {value}");
+    }
+    // `0` is "off" for the scan's progress lines, inside its range.
+    let keys = saved(&data, &env, &[("scan_progress_every", json!(0))]).expect("saved");
+    assert_eq!(keys, ["scan_progress_every"]);
 }
 
 /// A message from the loader names `config.toml`, not the staged file it read.
@@ -927,18 +967,21 @@ async fn saves_at_once_each_land_whole() {
     );
 
     let manager = Arc::new(manager);
-    let keys = SETTINGS
+    let changes = SETTINGS
         .iter()
         .filter(|spec| spec.access == SettingAccess::Editable)
-        .filter(|spec| {
-            matches!(spec.kind, SettingKind::Integer { min, max } if min <= 100 && max > 1_000)
+        // A value inside each row's range.
+        .filter_map(|spec| match spec.kind {
+            SettingKind::Integer { min, max } if max > 1_000 => {
+                Some((spec.key, 100.clamp(min, max)))
+            }
+            _ => None,
         })
-        .map(|spec| spec.key)
         .take(8);
     let mut saves = tokio::task::JoinSet::new();
-    for key in keys {
+    for (key, value) in changes {
         let manager = Arc::clone(&manager);
-        saves.spawn(async move { manager.update(update(&[(key, json!(100))])).await });
+        saves.spawn(async move { manager.update(update(&[(key, json!(value))])).await });
     }
     let mut written = Vec::new();
     while let Some(save) = saves.join_next().await {

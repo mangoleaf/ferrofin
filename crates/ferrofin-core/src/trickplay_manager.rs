@@ -22,13 +22,21 @@
 //!   dimensions are ignored before division or database insertion.
 //! - The hardware-acceleration / keyframe-only extraction options select the
 //!   software ffmpeg path (see [`TrickplayFrameExtractor`]).
+//! - A Replace does not prune first: each width is generated in the work
+//!   directory and swapped in, so the old images serve until then and a
+//!   failed Replace keeps them. Widths no longer selected go afterwards.
+//! - After a change of the selected widths or the chroma, the next Generate
+//!   Trickplay Images run replaces the sets that no longer match the same way
+//!   (upstream never replaces images unasked). The settings of the last
+//!   finished pass are kept in `FerrofinMeta`, so passes with nothing changed
+//!   read no tiles.
 //!
 //! The manifest key mirrors C#: trickplay is keyed by *media-source id*, and the
 //! primary media source of an item is the item's own id in the dashless
 //! `ToString("N")` form, so [`Self::get_trickplay_manifest`] nests the
 //! resolutions under that string (the same one `MediaSources[].Id` carries).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -52,7 +60,7 @@ use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtract
 use ferrofin_traits::options::ImageCollageOptions;
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::system::{MediaLocation, PathManager};
-use ferrofin_traits::trickplay::TrickplayManager;
+use ferrofin_traits::trickplay::{TrickplayCheck, TrickplayManager};
 
 use crate::db_error::db_err;
 use crate::media_source_manager::stream_to_dto;
@@ -65,6 +73,58 @@ const TICKS_PER_MS: i64 = 10_000;
 /// values are reset to this, mirroring the C# guard in
 /// `RefreshTrickplayDataAsync`.
 const MIN_INTERVAL_MS: i32 = 1000;
+
+/// The `FerrofinMeta` key holding the [`PassSettings`] the last finished
+/// Generate Trickplay Images pass ran under.
+const PASS_SETTINGS_KEY: &str = "trickplay_pass_settings";
+
+/// What a set of trickplay images is checked against after a settings change
+/// (D5): the selected widths and the chroma. `Qscale` and JPEG quality are not
+/// readable back from the files, so a hand edit of them needs a Replace, as in
+/// Jellyfin.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PassSettings {
+    widths: Vec<i32>,
+    full_chroma: bool,
+    /// Present while sets may be on disk that the recorded settings do not
+    /// describe: the widths of checking passes started since that have not
+    /// finished, and of sets made under other settings outside a checking
+    /// pass (a library scan, an item refresh). The next run then checks
+    /// again, even after a change back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unfinished: Option<Vec<i32>>,
+}
+
+/// A checking pass's [`TrickplayCheck::settings`]: the settings it records
+/// when it finishes, and the `unfinished` widths it wrote when it began, so a
+/// width recorded as made while it ran stays recorded.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PassCheck {
+    settings: PassSettings,
+    begun: Vec<i32>,
+}
+
+impl PassSettings {
+    fn of(options: &TrickplayOptions) -> Self {
+        let mut widths: Vec<i32> = options
+            .width_resolutions
+            .iter()
+            .copied()
+            .filter(|width| *width > 0)
+            .collect();
+        widths.sort_unstable();
+        widths.dedup();
+        Self {
+            widths,
+            full_chroma: options.full_chroma,
+            unfinished: None,
+        }
+    }
+
+    fn encode(&self) -> Result<String, ServiceError> {
+        serde_json::to_string(self).map_err(ServiceError::backend_source)
+    }
+}
 
 /// The concrete trickplay manager.
 #[derive(Clone)]
@@ -88,6 +148,9 @@ pub struct FerrofinTrickplayManager {
     /// then finds the first one's tiles and row and skips them, and one
     /// refresh's prune never removes a folder the other has just moved in.
     item_locks: Arc<KeyedLocks>,
+    /// One read-and-write of the recorded pass settings at a time, so a set
+    /// recorded as made while a pass begins or finishes is not lost.
+    pass_settings: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinTrickplayManager {
@@ -201,6 +264,7 @@ impl FerrofinTrickplayManager {
                 tokio::sync::Semaphore::MAX_PERMITS,
             )),
             item_locks: Arc::new(KeyedLocks::new()),
+            pass_settings: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -368,20 +432,7 @@ impl FerrofinTrickplayManager {
                 "trickplay media source has no video stream",
             ));
         };
-        // The width has to be even, otherwise a lot of filters cannot sample it;
-        // a video narrower than the setting caps the width at the video's —
-        // its video STREAM's width (`mediaSource.VideoStream.Width`,
-        // `TrickplayManager.cs:427-431`), and only when it has one: the item
-        // row's `Width` is 0 for a probe that found no dimensions, which is
-        // "unknown", not a zero-pixel video.
-        let mut actual_width = 2 * (width / 2);
-        let narrower = video_stream
-            .width
-            .map(i64::from)
-            .filter(|video_width| *video_width < i64::from(width));
-        if let Some(video_width) = narrower {
-            actual_width = i32::try_from(2 * (video_width / 2)).unwrap_or(actual_width);
-        }
+        let (actual_width, narrower) = generated_width(width, video_stream);
         if actual_width <= 0 {
             return Ok(());
         }
@@ -415,6 +466,9 @@ impl FerrofinTrickplayManager {
         if ctx.save_with_media {
             probe_write_access(&output_dir)?;
         }
+        // A set the recorded settings cannot be told about is not made: the
+        // width fails and the next run tries again.
+        self.record_set_made(width, options).await?;
 
         // Generate: extract thumbnails into a temp dir, pack them into tiles.
         let _slot = self
@@ -455,7 +509,10 @@ impl FerrofinTrickplayManager {
 
     /// Runs the frame extraction plus [`Self::create_tiles`], saving the
     /// resulting info row; on a save failure the freshly written tiles are
-    /// removed so no files stay behind without a row (mirroring the C#).
+    /// removed so no files stay behind without a row (mirroring the C#),
+    /// unless they replaced a set whose row names their folder (or the rows
+    /// cannot be read): that set is already gone, and the row still points at
+    /// the new tiles, whose timing it may describe until the next save.
     async fn extract_and_tile(
         &self,
         ctx: &WidthRefreshContext<'_>,
@@ -491,7 +548,13 @@ impl FerrofinTrickplayManager {
         if let Err(e) = self.save_trickplay_info(&info).await {
             // Make sure no files stay in metadata folders when the info row
             // wasn't saved.
-            let _ = std::fs::remove_dir_all(output_dir);
+            let orphaned = self
+                .resolutions_for(ctx.item_id)
+                .await
+                .is_ok_and(|rows| !row_names_folder(&rows, actual_width, options));
+            if orphaned {
+                let _ = std::fs::remove_dir_all(output_dir);
+            }
             return Err(e);
         }
         tracing::info!(
@@ -896,14 +959,19 @@ impl FerrofinTrickplayManager {
     }
     /// Scan callers supply the fresh probe context; scheduled tasks read it
     /// from the repository. Both use one extraction and storage implementation.
+    ///
+    /// `check` is a checking pass ([`TrickplayManager::check_trickplay_data`]),
+    /// for which this returns whether the item's sets now match
+    /// ([`Self::sets_match`]); it is `true` otherwise.
     async fn refresh_media(
         &self,
         item_id: Uuid,
         entity: &BaseItemEntity,
         media_streams: Vec<MediaStream>,
         replace: bool,
+        check: Option<&TrickplayCheck>,
         library_options: &LibraryOptions,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<bool, ServiceError> {
         // Held across discovery, the existing-tiles checks, generation and
         // the prune, as upstream's `_resourcePool` is held across the first
         // three; the generation slots below bound only the ffmpeg work.
@@ -921,7 +989,7 @@ impl FerrofinTrickplayManager {
             has_streams,
             self.is_active_recording(entity).await?,
         ) else {
-            return Ok(());
+            return Ok(true);
         };
         // Catalog what is already on disk before pruning or generating.
         if !replace {
@@ -945,10 +1013,13 @@ impl FerrofinTrickplayManager {
         // When extraction is disabled and files live next to media, treat them
         // as user-managed: discovery above already catalogued what is on disk.
         if !enabled && !replace && library_options.save_trickplay_with_media {
-            return Ok(());
+            return Ok(true);
         }
 
-        if !enabled || replace {
+        // Upstream also prunes first on a Replace. Ferrofin's Replace keeps
+        // each old set until its new one is swapped in (D7), so a video never
+        // goes without images and a failed Replace loses nothing.
+        if !enabled {
             // Prune existing data.
             if Path::new(&trickplay_dir).exists()
                 && let Err(e) = std::fs::remove_dir_all(&trickplay_dir)
@@ -960,12 +1031,12 @@ impl FerrofinTrickplayManager {
             }
             self.delete_trickplay_data(item_id).await?;
             if !replace {
-                return Ok(());
+                return Ok(true);
             }
         }
 
         Self::clamp_generation_interval(&mut options);
-        tracing::debug!(item = %item_id, replace, "trickplay refresh");
+        tracing::debug!(item_id = %item_id, replace, check = check.is_some(), "trickplay refresh");
         let ctx = WidthRefreshContext {
             item_id,
             media_path: &media_path,
@@ -974,18 +1045,244 @@ impl FerrofinTrickplayManager {
             trickplay_dir: &trickplay_dir,
             save_with_media: library_options.save_trickplay_with_media,
         };
+        // On a checking pass, the widths Ferrofin made sets at (earlier
+        // passes' and those a scan or refresh recorded), as this video narrows
+        // them, and the sets on disk before anything is regenerated.
+        let previous: Option<HashSet<i32>> =
+            check.zip(ctx.video_stream.as_ref()).map(|(check, stream)| {
+                check
+                    .previous_widths
+                    .iter()
+                    .map(|width| generated_width(*width, stream).0)
+                    .collect()
+            });
+        let rows = if previous.is_some() {
+            self.resolutions_for(item_id).await?
+        } else {
+            HashMap::new()
+        };
+        let generated = self.refresh_widths(&ctx, replace, &rows, &options).await;
+
+        if replace || previous.is_some() {
+            self.remove_dropped_widths(item_id, &generated, previous.as_ref())
+                .await?;
+        }
+        self.prune_unexpected_folders(item_id, &trickplay_dir)
+            .await?;
+        match previous {
+            Some(previous) => {
+                self.sets_match(
+                    item_id,
+                    &trickplay_dir,
+                    &generated,
+                    &previous,
+                    options.full_chroma,
+                )
+                .await
+            }
+            None => Ok(true),
+        }
+    }
+
+    /// Refreshes each selected width, returning the widths generated for this
+    /// video. `rows` are the sets on disk on a checking pass (empty
+    /// otherwise): one at another chroma is regenerated and swapped in.
+    async fn refresh_widths(
+        &self,
+        ctx: &WidthRefreshContext<'_>,
+        replace: bool,
+        rows: &HashMap<i32, TrickplayInfoEntity>,
+        options: &TrickplayOptions,
+    ) -> HashSet<i32> {
+        let mut generated = HashSet::new();
         for width in &options.width_resolutions {
             if *width <= 0 {
                 continue;
             }
+            let target = ctx
+                .video_stream
+                .as_ref()
+                .map(|stream| generated_width(*width, stream).0)
+                .filter(|target| *target > 0);
+            // A video narrower than two settings gives both one set.
+            if let Some(target) = target
+                && !generated.insert(target)
+            {
+                continue;
+            }
+            let replace_width = replace
+                || target
+                    .and_then(|target| rows.get(&target))
+                    .is_some_and(|row| {
+                        chroma_mismatch(ctx.trickplay_dir, row, options.full_chroma)
+                    });
             // Per-width failures are logged and do not abort the remaining
             // resolutions (the C# catch-and-log).
-            if let Err(e) = self.refresh_width(&ctx, replace, *width, &options).await {
-                tracing::error!(item = %item_id, width, "error creating trickplay images: {e}");
+            if let Err(e) = self
+                .refresh_width(ctx, replace_width, *width, options)
+                .await
+            {
+                tracing::error!(item_id = %ctx.item_id, width, "error creating trickplay images: {e}");
             }
         }
+        generated
+    }
 
-        self.prune_unexpected_folders(item_id, &trickplay_dir).await
+    /// Whether an item's sets match the settings after a checking pass: each
+    /// selected width's set, where it has one, at the chroma asked for, and no
+    /// width of `previous` (those Ferrofin made sets at) left behind. A set
+    /// that could not be replaced (a failed generation, a missing file) keeps
+    /// the pass from being recorded, so the next run checks it again. A width
+    /// with no set at all does not: every run generates a missing width anyway.
+    async fn sets_match(
+        &self,
+        item_id: Uuid,
+        trickplay_dir: &str,
+        generated: &HashSet<i32>,
+        previous: &HashSet<i32>,
+        full_chroma: bool,
+    ) -> Result<bool, ServiceError> {
+        // No width selected for this video: nothing is removed (a video keeps
+        // its images), so there is nothing to wait for either.
+        if generated.is_empty() {
+            return Ok(true);
+        }
+        let rows = self.resolutions_for(item_id).await?;
+        let left_behind = rows
+            .keys()
+            .find(|width| previous.contains(width) && !generated.contains(width));
+        let mismatched = generated
+            .iter()
+            .filter_map(|width| rows.get(width))
+            .find(|row| chroma_mismatch(trickplay_dir, row, full_chroma));
+        if left_behind.is_some() || mismatched.is_some() {
+            tracing::debug!(
+                item_id = %item_id,
+                left_behind,
+                mismatched = mismatched.map(|row| row.width),
+                "trickplay images still differ from the settings"
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// After a Replace or a checking pass, removes the rows of widths no
+    /// longer selected once every selected width (`generated`) has a row, so a
+    /// video is never left without images; [`Self::prune_unexpected_folders`]
+    /// then removes their folders. A Replace (`previous` is `None`) removes
+    /// every other width, as upstream's prune-first Replace leaves none. A
+    /// checking pass removes only the widths Ferrofin made sets at (the
+    /// passes' widths, and those [`Self::record_set_made`] recorded), so a
+    /// user-placed grid stays.
+    async fn remove_dropped_widths(
+        &self,
+        item_id: Uuid,
+        generated: &HashSet<i32>,
+        previous: Option<&HashSet<i32>>,
+    ) -> Result<(), ServiceError> {
+        let rows = self.resolutions_for(item_id).await?;
+        if generated.is_empty() || !generated.iter().all(|width| rows.contains_key(width)) {
+            return Ok(());
+        }
+        for width in rows.keys().filter(|width| {
+            !generated.contains(width) && previous.is_none_or(|p| p.contains(width))
+        }) {
+            tracing::debug!(item_id = %item_id, width, "removing trickplay images of a width no longer selected");
+            self.delete_trickplay_row(item_id, *width).await?;
+        }
+        Ok(())
+    }
+
+    /// Records the current trickplay widths and chroma as those of the last
+    /// finished Generate Trickplay Images pass when none are recorded, as on
+    /// the first boot after upgrading: the images on disk are taken to match
+    /// them, so an upgrade never starts a library-wide job, and a change made
+    /// before the task's first run is still caught.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when the configuration or `FerrofinMeta`
+    /// cannot be read or written.
+    pub async fn record_trickplay_settings_once(&self) -> Result<(), ServiceError> {
+        let current = PassSettings::of(&self.trickplay_options().await?);
+        let _settings = self.pass_settings.lock().await;
+        self.recorded_pass_settings(&current).await.map(drop)
+    }
+
+    /// Records, before a set of `width` is made under `options`, that a set
+    /// may be on disk the recorded settings do not describe: `width` joins the
+    /// `unfinished` widths unless the recorded settings already cover it (it
+    /// is among their widths, at their chroma) or it is there already. A
+    /// library scan or an item refresh after a settings change thus leaves a
+    /// set the next checking pass removes once its width is dropped, or
+    /// replaces at the chroma asked for, even after a change back. Settings
+    /// this version cannot read already check everything once and remove no
+    /// width, so they are left as they are.
+    async fn record_set_made(
+        &self,
+        width: i32,
+        options: &TrickplayOptions,
+    ) -> Result<(), ServiceError> {
+        let current = PassSettings::of(options);
+        let _settings = self.pass_settings.lock().await;
+        let Some(stored) = self.recorded_pass_settings(&current).await? else {
+            return Ok(());
+        };
+        let Ok(mut last) = serde_json::from_str::<PassSettings>(&stored) else {
+            return Ok(());
+        };
+        let covered = last.widths.contains(&width) && last.full_chroma == current.full_chroma;
+        if covered || last.unfinished.as_ref().is_some_and(|w| w.contains(&width)) {
+            return Ok(());
+        }
+        tracing::debug!(
+            width,
+            "trickplay images made under settings no pass has recorded"
+        );
+        let unfinished = last.unfinished.get_or_insert_default();
+        unfinished.push(width);
+        unfinished.sort_unstable();
+        self.db.meta_set(PASS_SETTINGS_KEY, &last.encode()?).await?;
+        Ok(())
+    }
+
+    /// The recorded settings of the last finished pass, recording `current`
+    /// (and returning `None`) when there are none.
+    async fn recorded_pass_settings(
+        &self,
+        current: &PassSettings,
+    ) -> Result<Option<String>, ServiceError> {
+        let stored = self.db.meta_get(PASS_SETTINGS_KEY).await?;
+        if stored.is_none() {
+            self.db
+                .meta_set(PASS_SETTINGS_KEY, &current.encode()?)
+                .await?;
+        }
+        Ok(stored)
+    }
+
+    /// Refreshes an item from its stored row and streams.
+    async fn refresh_stored(
+        &self,
+        item_id: Uuid,
+        replace: bool,
+        check: Option<&TrickplayCheck>,
+        library_options: &LibraryOptions,
+    ) -> Result<bool, ServiceError> {
+        let Some(entity) = self.items.retrieve_item(item_id).await? else {
+            return Ok(true);
+        };
+        let streams = self.media_streams(item_id).await?;
+        self.refresh_media(
+            item_id,
+            &entity,
+            streams.into_iter().map(stream_to_dto).collect(),
+            replace,
+            check,
+            library_options,
+        )
+        .await
     }
 }
 
@@ -997,18 +1294,9 @@ impl TrickplayManager for FerrofinTrickplayManager {
         replace: bool,
         library_options: &LibraryOptions,
     ) -> Result<(), ServiceError> {
-        let Some(entity) = self.items.retrieve_item(item_id).await? else {
-            return Ok(());
-        };
-        let streams = self.media_streams(item_id).await?;
-        self.refresh_media(
-            item_id,
-            &entity,
-            streams.into_iter().map(stream_to_dto).collect(),
-            replace,
-            library_options,
-        )
-        .await
+        self.refresh_stored(item_id, replace, None, library_options)
+            .await
+            .map(drop)
     }
 
     async fn refresh_trickplay_for_media(
@@ -1031,9 +1319,100 @@ impl TrickplayManager for FerrofinTrickplayManager {
             entity,
             streams.iter().cloned().map(stream_to_dto).collect(),
             replace,
+            None,
             library_options,
         )
         .await
+        .map(drop)
+    }
+
+    async fn begin_trickplay_pass(&self) -> Result<Option<TrickplayCheck>, ServiceError> {
+        let current = PassSettings::of(&self.trickplay_options().await?);
+        let _settings = self.pass_settings.lock().await;
+        let Some(stored) = self.recorded_pass_settings(&current).await? else {
+            return Ok(None);
+        };
+        // With no width selected a pass makes no set and removes none (a video
+        // keeps its images), so it checks nothing and records nothing: the
+        // next change still removes the widths recorded now.
+        if current.widths.is_empty() {
+            return Ok(None);
+        }
+        // A value this version cannot read checks everything once and
+        // removes no width.
+        let mut last = serde_json::from_str::<PassSettings>(&stored).unwrap_or(PassSettings {
+            widths: Vec::new(),
+            full_chroma: current.full_chroma,
+            unfinished: Some(Vec::new()),
+        });
+        if last == current {
+            return Ok(None);
+        }
+        tracing::debug!(previous = stored, "trickplay settings changed");
+        let mut previous_widths: Vec<i32> = last
+            .widths
+            .iter()
+            .chain(last.unfinished.iter().flatten())
+            .copied()
+            .collect();
+        previous_widths.sort_unstable();
+        previous_widths.dedup();
+        // Recorded before any set is replaced, so an interrupted pass is
+        // checked again whatever the settings are next.
+        let unfinished = last.unfinished.get_or_insert_default();
+        unfinished.extend(&current.widths);
+        unfinished.sort_unstable();
+        unfinished.dedup();
+        let begun = unfinished.clone();
+        self.db.meta_set(PASS_SETTINGS_KEY, &last.encode()?).await?;
+        let check = PassCheck {
+            settings: current,
+            begun,
+        };
+        Ok(Some(TrickplayCheck {
+            previous_widths,
+            settings: serde_json::to_string(&check).map_err(ServiceError::backend_source)?,
+        }))
+    }
+
+    async fn check_trickplay_data(
+        &self,
+        item_id: Uuid,
+        check: &TrickplayCheck,
+        library_options: &LibraryOptions,
+    ) -> Result<bool, ServiceError> {
+        self.refresh_stored(item_id, false, Some(check), library_options)
+            .await
+    }
+
+    async fn finish_trickplay_pass(&self, check: &TrickplayCheck) -> Result<(), ServiceError> {
+        let PassCheck {
+            settings: mut finished,
+            begun,
+        } = serde_json::from_str(&check.settings).map_err(ServiceError::backend_source)?;
+        let _settings = self.pass_settings.lock().await;
+        // Widths recorded as made since the pass began (a scan under settings
+        // changed again meanwhile) stay recorded, so the next change still
+        // removes their sets. A width the pass began with is not told apart:
+        // a set a scan made at it mid-pass at the other chroma waits for the
+        // next settings change to be checked.
+        let made: Vec<i32> = self
+            .db
+            .meta_get(PASS_SETTINGS_KEY)
+            .await?
+            .and_then(|stored| serde_json::from_str::<PassSettings>(&stored).ok())
+            .and_then(|now| now.unfinished)
+            .into_iter()
+            .flatten()
+            .filter(|width| !begun.contains(width))
+            .collect();
+        if !made.is_empty() {
+            finished.unfinished = Some(made);
+        }
+        self.db
+            .meta_set(PASS_SETTINGS_KEY, &finished.encode()?)
+            .await?;
+        Ok(())
     }
 
     async fn get_trickplay_resolutions(
@@ -1376,6 +1755,94 @@ fn ceil_to_i32(value: f64) -> i32 {
     }
 }
 
+/// The width a `width` setting generates at for a video, and the video's
+/// width when that capped it. The width has to be even, otherwise a lot of
+/// filters cannot sample it; a video narrower than the setting caps the width
+/// at the video's — its video STREAM's width (`mediaSource.VideoStream.Width`,
+/// `TrickplayManager.cs:427-431`), and only when it has one: the item row's
+/// `Width` is 0 for a probe that found no dimensions, which is "unknown", not
+/// a zero-pixel video.
+fn generated_width(width: i32, video_stream: &MediaStream) -> (i32, Option<i64>) {
+    let narrower = video_stream
+        .width
+        .map(i64::from)
+        .filter(|video_width| *video_width < i64::from(width));
+    let even = 2 * (width / 2);
+    let generated = narrower.map_or(even, |video_width| {
+        i32::try_from(2 * (video_width / 2)).unwrap_or(even)
+    });
+    (generated, narrower)
+}
+
+/// Whether a JPEG samples chroma as often as luma (4:4:4), from the sampling
+/// factors in its frame header, read without decoding the image. Components
+/// are compared with each other: ffmpeg writes 4:4:4 as `(1, 2)` on every
+/// component and `jpeg-encoder` as `(1, 1)`. `None` when the file is not a
+/// readable JPEG or is grayscale.
+fn jpeg_full_chroma(path: &Path) -> Option<bool> {
+    use std::io::{BufReader, Read as _};
+    let mut file = BufReader::new(std::fs::File::open(path).ok()?);
+    let mut soi = [0u8; 2];
+    file.read_exact(&mut soi).ok()?;
+    if soi != [0xFF, 0xD8] {
+        return None;
+    }
+    loop {
+        let mut marker = [0u8; 4];
+        file.read_exact(&mut marker).ok()?;
+        if marker[0] != 0xFF {
+            return None;
+        }
+        let length = u16::from_be_bytes([marker[2], marker[3]]);
+        match marker[1] {
+            // Frame headers; C4 (DHT), C8 (JPG) and CC (DAC) are not.
+            0xC0..=0xCF if !matches!(marker[1], 0xC4 | 0xC8 | 0xCC) => {
+                let mut header = vec![0u8; usize::from(length.checked_sub(2)?)];
+                file.read_exact(&mut header).ok()?;
+                // precision, height (2), width (2), component count, then
+                // (id, sampling, table) per component.
+                let count = usize::from(*header.get(5)?);
+                let factors = (0..count)
+                    .map(|k| header.get(7 + 3 * k).copied())
+                    .collect::<Option<Vec<u8>>>()?;
+                return (count > 1).then(|| factors.iter().all(|f| *f == factors[0]));
+            }
+            // Start of scan or end of image before any frame header.
+            0xDA | 0xD9 => return None,
+            _ => file.seek_relative(i64::from(length) - 2).ok()?,
+        }
+    }
+}
+
+/// Whether the row stored for `width` names the folder a generation at
+/// `options` writes: then that folder replaced a set the row still serves.
+fn row_names_folder(
+    rows: &HashMap<i32, TrickplayInfoEntity>,
+    width: i32,
+    options: &TrickplayOptions,
+) -> bool {
+    rows.get(&width).is_some_and(|row| {
+        (row.tile_width, row.tile_height) == (options.tile_width, options.tile_height)
+    })
+}
+
+/// On a checking pass, whether a stored set was written at another chroma
+/// than `full_chroma`, read from its first tile's frame header (D5). A tile
+/// that cannot be read counts as matching.
+fn chroma_mismatch(trickplay_dir: &str, row: &TrickplayInfoEntity, full_chroma: bool) -> bool {
+    let tile = Path::new(trickplay_dir)
+        .join(format!(
+            "{} - {}x{}",
+            row.width, row.tile_width, row.tile_height
+        ))
+        .join("0.jpg");
+    let Some(found) = jpeg_full_chroma(&tile) else {
+        tracing::debug!(path = %tile.display(), "cannot read the chroma of a trickplay tile; keeping it");
+        return false;
+    };
+    found != full_chroma
+}
+
 /// Whether `dir` exists and directly contains at least one `.jpg` file
 /// (C# `HasTrickplayTiles`).
 fn has_tiles(dir: &Path) -> bool {
@@ -1424,35 +1891,73 @@ fn probe_write_access(dir: &Path) -> Result<(), ServiceError> {
 
 /// Moves the flat directory `src` to `dst`, replacing `dst` if present; falls
 /// back to copy-and-delete when a rename crosses filesystems.
+///
+/// The tiles are first brought beside `dst` (renamed, or copied across
+/// filesystems), then the old `dst` is renamed aside and the new one renamed
+/// in, so the old set serves until the gap between those two renames. A
+/// staging or old folder left by a crash has no row, so the item's next
+/// refresh prunes it.
 fn move_dir(src: &Path, dst: &Path) -> Result<(), ServiceError> {
+    let staged = dst.with_extension("partial");
+    let old = dst.with_extension("old");
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             ServiceError::backend(format!("cannot create {}: {e}", parent.display()))
         })?;
     }
-    if dst.exists() {
-        std::fs::remove_dir_all(dst)
-            .map_err(|e| ServiceError::backend(format!("cannot replace {}: {e}", dst.display())))?;
-    }
-    if std::fs::rename(src, dst).is_ok() {
-        return Ok(());
-    }
-    // Cross-device fallback: copy the (flat) tile files, then drop the source.
-    std::fs::create_dir_all(dst)
-        .map_err(|e| ServiceError::backend(format!("cannot create {}: {e}", dst.display())))?;
-    let entries = std::fs::read_dir(src)
-        .map_err(|e| ServiceError::backend(format!("cannot read {}: {e}", src.display())))?;
-    for entry in entries.filter_map(Result::ok) {
-        let from = entry.path();
-        if from.is_file()
-            && let Some(name) = from.file_name()
-        {
-            std::fs::copy(&from, dst.join(name))
-                .map_err(|e| ServiceError::backend(format!("cannot copy tile: {e}")))?;
+    for leftover in [&staged, &old] {
+        if leftover.exists() {
+            std::fs::remove_dir_all(leftover).map_err(|e| {
+                ServiceError::backend(format!("cannot remove {}: {e}", leftover.display()))
+            })?;
         }
     }
-    std::fs::remove_dir_all(src)
-        .map_err(|e| ServiceError::backend(format!("cannot remove {}: {e}", src.display())))?;
+    if std::fs::rename(src, &staged).is_err() {
+        // Cross-device fallback: copy the (flat) tile files, then drop the source.
+        std::fs::create_dir_all(&staged).map_err(|e| {
+            ServiceError::backend(format!("cannot create {}: {e}", staged.display()))
+        })?;
+        let entries = std::fs::read_dir(src)
+            .map_err(|e| ServiceError::backend(format!("cannot read {}: {e}", src.display())))?;
+        for entry in entries.filter_map(Result::ok) {
+            let from = entry.path();
+            if from.is_file()
+                && let Some(name) = from.file_name()
+            {
+                std::fs::copy(&from, staged.join(name))
+                    .map_err(|e| ServiceError::backend(format!("cannot copy tile: {e}")))?;
+            }
+        }
+        std::fs::remove_dir_all(src)
+            .map_err(|e| ServiceError::backend(format!("cannot remove {}: {e}", src.display())))?;
+    }
+    let replacing = dst.exists();
+    if replacing {
+        std::fs::rename(dst, &old)
+            .map_err(|e| ServiceError::backend(format!("cannot replace {}: {e}", dst.display())))?;
+    }
+    if let Err(e) = std::fs::rename(&staged, dst) {
+        // Put the old set back rather than leave none.
+        let restored = if replacing {
+            std::fs::rename(&old, dst)
+                .err()
+                .map_or_else(String::new, |restore| {
+                    format!(
+                        "; the old images could not be put back from {}: {restore}",
+                        old.display()
+                    )
+                })
+        } else {
+            String::new()
+        };
+        return Err(ServiceError::backend(format!(
+            "cannot move to {}: {e}{restored}",
+            dst.display()
+        )));
+    }
+    if replacing && let Err(e) = std::fs::remove_dir_all(&old) {
+        tracing::warn!(path = %old.display(), "cannot remove replaced trickplay images: {e}");
+    }
     Ok(())
 }
 
@@ -1572,9 +2077,9 @@ mod tests {
     /// One hour, as runtime ticks.
     const HOUR_TICKS: i64 = 3_600_000 * 10_000;
 
-    /// A config manager returning a fixed [`TrickplayOptions`].
+    /// A config manager returning the [`TrickplayOptions`] a test sets.
     struct FixedConfig {
-        options: TrickplayOptions,
+        options: Mutex<TrickplayOptions>,
         paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths>,
     }
 
@@ -1586,7 +2091,7 @@ mod tests {
 
         async fn configuration(&self) -> Result<Arc<ServerConfiguration>, ServiceError> {
             Ok(Arc::new(ServerConfiguration {
-                trickplay_options: self.options.clone(),
+                trickplay_options: self.options.lock().expect("lock").clone(),
                 ..ServerConfiguration::default()
             }))
         }
@@ -1729,6 +2234,8 @@ mod tests {
         last_streams: Mutex<Vec<MediaStream>>,
         last_output: Mutex<Option<String>>,
         hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+        /// Fails every extraction while set, as a broken file or ffmpeg would.
+        fail: std::sync::atomic::AtomicBool,
     }
 
     impl FakeExtractor {
@@ -1744,6 +2251,7 @@ mod tests {
                 last_streams: Mutex::new(Vec::new()),
                 last_output: Mutex::new(None),
                 hold: None,
+                fail: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -1775,6 +2283,9 @@ mod tests {
             *self.last_full_chroma.lock().expect("lock") = Some(request.full_chroma);
             *self.last_stream.lock().expect("lock") = request.video_stream.cloned();
             *self.last_streams.lock().expect("lock") = request.media_streams.to_vec();
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(ServiceError::backend("extraction failed"));
+            }
             let output_dir = request.output_dir;
             *self.last_output.lock().unwrap() = Some(output_dir.to_owned());
             let max_width = request.max_width;
@@ -1808,6 +2319,15 @@ mod tests {
         /// The application paths the manager's configuration reports.
         paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths>,
         encoder: Arc<RecordingEncoder>,
+        /// The configuration the manager reads, for a test to change.
+        config: Arc<FixedConfig>,
+    }
+
+    impl Rig {
+        /// Changes the trickplay settings, as an admin saving them would.
+        fn set_options(&self, options: TrickplayOptions) {
+            *self.config.options.lock().expect("lock") = options;
+        }
     }
 
     fn rig(db: &Database, options: TrickplayOptions, extractor: FakeExtractor) -> Rig {
@@ -1827,13 +2347,14 @@ mod tests {
             db.clone(),
             Arc::new(ItemTypeLookup::new()),
         ));
+        let config = Arc::new(FixedConfig {
+            options: Mutex::new(options),
+            paths: Arc::clone(&paths),
+        });
         let mgr = FerrofinTrickplayManager::new(
             db.clone(),
             Arc::clone(&pm),
-            Arc::new(FixedConfig {
-                options,
-                paths: Arc::clone(&paths),
-            }),
+            Arc::clone(&config) as Arc<dyn ServerConfigurationManager>,
             items,
             Arc::new(crate::FerrofinMediaStreamRepository::new(db.clone())),
             Arc::clone(&extractor) as Arc<dyn TrickplayFrameExtractor>,
@@ -1847,6 +2368,7 @@ mod tests {
             media_dir,
             paths,
             encoder,
+            config,
         }
     }
 
@@ -2279,7 +2801,7 @@ mod tests {
         let db = test_db().await;
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
-        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
 
         r.mgr
             .refresh_trickplay_data(item, false, &extraction_on())
@@ -2294,21 +2816,594 @@ mod tests {
             .expect("second");
         assert_eq!(r.extractor.calls(), 1, "existing data is skipped");
 
-        // Replace wipes the directory (a stale marker vanishes) and re-extracts.
-        let root =
-            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false));
-        std::fs::write(root.join("stale.txt"), b"x").expect("marker");
+        // Replace re-extracts (the swap is covered below).
         r.mgr
             .refresh_trickplay_data(item, true, &extraction_on())
             .await
             .expect("replace");
         assert_eq!(r.extractor.calls(), 2, "replace regenerates");
-        assert!(
-            !root.join("stale.txt").exists(),
-            "old directory was cleared"
-        );
         let res = r.mgr.get_trickplay_resolutions(item).await.expect("res");
         assert_eq!(res[&320].thumbnail_count, 4);
+    }
+
+    /// The folder of an item's internal set at `width` on the 2×2 grid.
+    fn set_dir(r: &Rig, item: Uuid, media: &str, width: i32) -> PathBuf {
+        PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(media), false))
+            .join(format!("{width} - 2x2"))
+    }
+
+    /// `options_2x2` with chroma sampled as often as luma.
+    fn full_chroma_2x2(widths: &[i32]) -> TrickplayOptions {
+        TrickplayOptions {
+            full_chroma: true,
+            ..options_2x2(widths)
+        }
+    }
+
+    /// The chroma is read from the frame header, comparing components with
+    /// each other: ffmpeg's mjpeg declares 4:4:4 as `(1, 2)` on every
+    /// component, `jpeg-encoder` as `(1, 1)`.
+    #[rstest::rstest]
+    #[case::ffmpeg_full(&[0x12, 0x12, 0x12], Some(true))]
+    #[case::encoder_full(&[0x11, 0x11, 0x11], Some(true))]
+    #[case::subsampled(&[0x22, 0x11, 0x11], Some(false))]
+    #[case::grayscale(&[0x11], None)]
+    fn the_chroma_is_read_from_the_frame_header(
+        #[case] factors: &[u8],
+        #[case] expected: Option<bool>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("0.jpg");
+        // SOI, an APP0 to skip, then SOF0: length, precision, height, width,
+        // component count and (id, sampling, table) per component.
+        let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+        let count = u8::try_from(factors.len()).expect("count");
+        bytes.extend([0xFF, 0xC0, 0x00, 8 + 3 * count, 8, 0, 16, 0, 16, count]);
+        for (id, sampling) in (1u8..).zip(factors) {
+            bytes.extend([id, *sampling, 0]);
+        }
+        bytes.extend([0xFF, 0xD9]);
+        std::fs::write(&path, bytes).expect("write");
+        assert_eq!(super::jpeg_full_chroma(&path), expected);
+    }
+
+    /// The new tiles replace the old set whole, and a staging folder a crash
+    /// left behind is not mixed into them.
+    #[test]
+    fn move_dir_replaces_the_old_set_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (src, dst) = (dir.path().join("work"), dir.path().join("320 - 2x2"));
+        let staged = dir.path().join("320 - 2x2.partial");
+        let old = dir.path().join("320 - 2x2.old");
+        for (folder, files) in [
+            (&src, &["0.jpg"][..]),
+            (&dst, &["0.jpg", "1.jpg"]),
+            (&staged, &["stale.jpg"]),
+            (&old, &["stale.jpg"]),
+        ] {
+            std::fs::create_dir_all(folder).expect("folder");
+            for file in files {
+                std::fs::write(folder.join(file), folder.to_string_lossy().as_bytes())
+                    .expect("file");
+            }
+        }
+        super::move_dir(&src, &dst).expect("move");
+        assert_eq!(
+            std::fs::read(dst.join("0.jpg")).expect("tile"),
+            src.to_string_lossy().as_bytes()
+        );
+        assert!(!dst.join("1.jpg").exists() && !dst.join("stale.jpg").exists());
+        assert!(!src.exists() && !staged.exists() && !old.exists());
+    }
+
+    /// A row save that fails after the swap keeps the new tiles only when the
+    /// width's stored row names their folder: the set it replaced is gone.
+    #[test]
+    fn a_failed_save_keeps_only_a_folder_its_stored_row_names() {
+        let rows: std::collections::HashMap<i32, TrickplayInfoEntity> =
+            [(320, info(Uuid::nil(), 320))].into();
+        let grid_10x10 = TrickplayOptions {
+            tile_width: 10,
+            tile_height: 10,
+            ..TrickplayOptions::default()
+        };
+        assert!(super::row_names_folder(&rows, 320, &grid_10x10));
+        assert!(!super::row_names_folder(&rows, 640, &grid_10x10), "no row");
+        assert!(
+            !super::row_names_folder(&rows, 320, &options_2x2(&[320])),
+            "a row of another grid"
+        );
+    }
+
+    /// One Generate Trickplay Images run over `items`, as the task makes it:
+    /// a checking pass after a settings change, recorded once every item
+    /// matches, and a plain refresh otherwise.
+    async fn run_pass(r: &Rig, items: &[Uuid]) {
+        let check = r.mgr.begin_trickplay_pass().await.expect("begin");
+        let mut complete = true;
+        for item in items {
+            match &check {
+                Some(check) => {
+                    complete &= r
+                        .mgr
+                        .check_trickplay_data(*item, check, &extraction_on())
+                        .await
+                        .expect("check");
+                }
+                None => r
+                    .mgr
+                    .refresh_trickplay_data(*item, false, &extraction_on())
+                    .await
+                    .expect("refresh"),
+            }
+        }
+        if let Some(check) = check
+            && complete
+        {
+            r.mgr.finish_trickplay_pass(&check).await.expect("finish");
+        }
+    }
+
+    /// The stored widths of an item, in order.
+    async fn stored_widths(r: &Rig, item: Uuid) -> Vec<i32> {
+        let mut widths: Vec<i32> = r
+            .mgr
+            .get_trickplay_resolutions(item)
+            .await
+            .expect("rows")
+            .into_keys()
+            .collect();
+        widths.sort_unstable();
+        widths
+    }
+
+    /// A run with no width selected keeps every set and is no checking pass,
+    /// so the widths of the last pass that made sets stay recorded and the
+    /// next change still removes them.
+    #[tokio::test]
+    async fn a_run_with_no_width_selected_keeps_the_widths_the_next_change_removes() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        run_pass(&r, &[item]).await;
+
+        r.set_options(options_2x2(&[]));
+        assert_eq!(r.mgr.begin_trickplay_pass().await.expect("begin"), None);
+        run_pass(&r, &[item]).await;
+        assert_eq!(stored_widths(&r, item).await, vec![320], "the images stay");
+
+        r.set_options(options_2x2(&[640]));
+        run_pass(&r, &[item]).await;
+        assert_eq!(stored_widths(&r, item).await, vec![640]);
+    }
+
+    /// A set made outside a checking pass (a library scan, an item refresh)
+    /// under settings other than the recorded ones is recorded as made, so a
+    /// later change removes it; under the recorded settings nothing is
+    /// written.
+    #[tokio::test]
+    async fn a_width_made_outside_a_pass_after_a_change_goes_on_the_next_change() {
+        let db = test_db().await;
+        let (item, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        run_pass(&r, &[item]).await;
+        seed_video(&db, &r, other, Some(HOUR_TICKS), None).await;
+        r.mgr
+            .refresh_trickplay_data(other, false, &extraction_on())
+            .await
+            .expect("scan under the recorded settings");
+        assert_eq!(
+            db.meta_get(super::PASS_SETTINGS_KEY)
+                .await
+                .expect("meta")
+                .as_deref(),
+            Some(r#"{"widths":[320],"full_chroma":false}"#)
+        );
+
+        r.set_options(options_2x2(&[640]));
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("scan");
+        assert_eq!(stored_widths(&r, item).await, vec![320, 640]);
+        r.set_options(options_2x2(&[480]));
+        run_pass(&r, &[item, other]).await;
+        assert_eq!(stored_widths(&r, item).await, vec![480]);
+        assert_eq!(stored_widths(&r, other).await, vec![480]);
+        assert_eq!(r.mgr.begin_trickplay_pass().await.expect("begin"), None);
+    }
+
+    /// A set a scan makes while a checking pass runs, under settings changed
+    /// again since the pass began, stays recorded as made when the pass
+    /// finishes.
+    #[tokio::test]
+    async fn a_width_made_while_a_pass_runs_stays_recorded_after_it() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        run_pass(&r, &[item]).await;
+
+        r.set_options(options_2x2(&[640]));
+        let check = r
+            .mgr
+            .begin_trickplay_pass()
+            .await
+            .expect("begin")
+            .expect("check");
+        assert!(
+            r.mgr
+                .check_trickplay_data(item, &check, &extraction_on())
+                .await
+                .expect("check")
+        );
+        r.set_options(options_2x2(&[480]));
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("scan");
+        assert_eq!(stored_widths(&r, item).await, vec![480, 640]);
+        r.set_options(options_2x2(&[640]));
+        r.mgr.finish_trickplay_pass(&check).await.expect("finish");
+
+        let check = r
+            .mgr
+            .begin_trickplay_pass()
+            .await
+            .expect("begin")
+            .expect("the scan's width is checked");
+        assert_eq!(check.previous_widths, vec![480, 640]);
+        assert!(
+            r.mgr
+                .check_trickplay_data(item, &check, &extraction_on())
+                .await
+                .expect("check")
+        );
+        r.mgr.finish_trickplay_pass(&check).await.expect("finish");
+        assert_eq!(stored_widths(&r, item).await, vec![640]);
+        assert_eq!(r.mgr.begin_trickplay_pass().await.expect("begin"), None);
+    }
+
+    /// A set a scan makes at another chroma is checked once the settings
+    /// change back, and replaced at the chroma asked for.
+    #[tokio::test]
+    async fn a_set_made_at_another_chroma_is_checked_after_a_change_back() {
+        let db = test_db().await;
+        let (item, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        run_pass(&r, &[item]).await;
+
+        r.set_options(full_chroma_2x2(&[320]));
+        let media = seed_video(&db, &r, other, Some(HOUR_TICKS), None).await;
+        r.mgr
+            .refresh_trickplay_data(other, false, &extraction_on())
+            .await
+            .expect("scan");
+        let tile = set_dir(&r, other, &media, 320).join("0.jpg");
+        assert_eq!(super::jpeg_full_chroma(&tile), Some(true));
+
+        r.set_options(options_2x2(&[320]));
+        run_pass(&r, &[item, other]).await;
+        assert_eq!(super::jpeg_full_chroma(&tile), Some(false));
+        assert_eq!(r.mgr.begin_trickplay_pass().await.expect("begin"), None);
+    }
+
+    #[test]
+    fn a_file_without_a_frame_header_has_no_chroma() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cases: [(&str, &[u8]); 3] = [
+            ("not-a-jpeg", b"not a jpeg"),
+            ("scan-first", &[0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02]),
+            ("truncated", &[0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 8]),
+        ];
+        for (name, bytes) in cases {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).expect("write");
+            assert_eq!(super::jpeg_full_chroma(&path), None, "{name}");
+        }
+        assert_eq!(super::jpeg_full_chroma(&dir.path().join("missing")), None);
+    }
+
+    /// The first boot after upgrading records the settings and checks
+    /// nothing; only a change checks, and changing it back cancels out until
+    /// a pass has started. A pass that did not finish is checked again, even
+    /// after a change back, and its widths count as made.
+    #[tokio::test]
+    async fn only_a_settings_change_since_the_last_finished_pass_checks() {
+        let db = test_db().await;
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        let begin = || async { r.mgr.begin_trickplay_pass().await.expect("begin") };
+        r.mgr.record_trickplay_settings_once().await.expect("boot");
+        assert_eq!(
+            db.meta_get(super::PASS_SETTINGS_KEY)
+                .await
+                .expect("meta")
+                .as_deref(),
+            Some(r#"{"widths":[320],"full_chroma":false}"#)
+        );
+        assert_eq!(begin().await, None);
+
+        r.set_options(full_chroma_2x2(&[640, 320, 640]));
+        r.set_options(options_2x2(&[320]));
+        assert_eq!(begin().await, None, "changed back before any pass");
+
+        r.set_options(full_chroma_2x2(&[640, 320, 640]));
+        let check = begin().await.expect("a change checks");
+        assert_eq!(check.previous_widths, vec![320]);
+        r.set_options(options_2x2(&[320]));
+        let again = begin().await.expect("an unfinished pass is checked again");
+        assert_eq!(again.previous_widths, vec![320, 640]);
+        r.mgr.finish_trickplay_pass(&again).await.expect("finish");
+        assert_eq!(begin().await, None);
+
+        // Order and repeats of the widths do not count as a change.
+        r.set_options(full_chroma_2x2(&[640, 320]));
+        let check = begin().await.expect("check");
+        r.mgr.finish_trickplay_pass(&check).await.expect("finish");
+        r.set_options(full_chroma_2x2(&[640, 320, 640]));
+        assert_eq!(begin().await, None);
+
+        // A value this version cannot read checks once and removes nothing.
+        db.meta_set(super::PASS_SETTINGS_KEY, "not json")
+            .await
+            .expect("meta");
+        assert_eq!(
+            begin().await.expect("check").previous_widths,
+            Vec::<i32>::new()
+        );
+    }
+
+    /// B7/B10: a checking pass replaces a set written at the old chroma, and
+    /// the old set serves until the new one is swapped in; outside a checking
+    /// pass no tile is read and nothing is regenerated.
+    #[tokio::test]
+    async fn a_checking_pass_swaps_in_a_set_at_the_new_chroma_while_the_old_one_serves() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut extractor = FakeExtractor::new(4, 180);
+        extractor.hold = Some((entered.clone(), release.clone()));
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), extractor);
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        release.notify_one();
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("first");
+        entered.notified().await;
+        r.mgr.begin_trickplay_pass().await.expect("record");
+        let tile = set_dir(&r, item, &media, 320).join("0.jpg");
+        assert_eq!(super::jpeg_full_chroma(&tile), Some(false));
+
+        r.set_options(full_chroma_2x2(&[320]));
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("plain refresh");
+        assert_eq!(r.extractor.calls(), 1, "a plain refresh never checks");
+
+        let check = r
+            .mgr
+            .begin_trickplay_pass()
+            .await
+            .expect("begin")
+            .expect("check");
+        let pass = {
+            let mgr = r.mgr.clone();
+            let check = check.clone();
+            tokio::spawn(async move {
+                mgr.check_trickplay_data(item, &check, &extraction_on())
+                    .await
+            })
+        };
+        entered.notified().await;
+        let served = r
+            .mgr
+            .get_trickplay_tile_path(item, 320, 0)
+            .await
+            .expect("path")
+            .expect("row");
+        assert_eq!(
+            super::jpeg_full_chroma(Path::new(&served)),
+            Some(false),
+            "the old set serves while the new one is made"
+        );
+        release.notify_one();
+        assert!(pass.await.expect("join").expect("check"), "item matches");
+        assert_eq!(r.extractor.calls(), 2);
+        assert_eq!(super::jpeg_full_chroma(&tile), Some(true));
+
+        // Checked again, the set matches: nothing is generated.
+        assert!(
+            r.mgr
+                .check_trickplay_data(item, &check, &extraction_on())
+                .await
+                .expect("again")
+        );
+        assert_eq!(r.extractor.calls(), 2);
+    }
+
+    /// B8/B14: a failed replacement, on a checking pass or an explicit
+    /// Replace, keeps the old set and its row, reports the item unfinished so
+    /// the pass is not recorded, and the next run retries.
+    #[tokio::test]
+    async fn a_failed_replacement_keeps_the_old_set() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("first");
+        r.mgr.begin_trickplay_pass().await.expect("record");
+        let tile = set_dir(&r, item, &media, 320).join("0.jpg");
+        let old = std::fs::read(&tile).expect("old tile");
+
+        r.set_options(full_chroma_2x2(&[320]));
+        let check = r
+            .mgr
+            .begin_trickplay_pass()
+            .await
+            .expect("begin")
+            .expect("check");
+        // An offline file cannot be replaced either.
+        let away = format!("{media}.away");
+        std::fs::rename(&media, &away).expect("take the file away");
+        assert!(
+            !r.mgr
+                .check_trickplay_data(item, &check, &extraction_on())
+                .await
+                .expect("check"),
+            "a set at the old chroma is left"
+        );
+        std::fs::rename(&away, &media).expect("bring it back");
+        r.extractor.fail.store(true, Ordering::SeqCst);
+        assert!(
+            !r.mgr
+                .check_trickplay_data(item, &check, &extraction_on())
+                .await
+                .expect("check"),
+            "the item is unfinished"
+        );
+        r.mgr
+            .refresh_trickplay_data(item, true, &extraction_on())
+            .await
+            .expect("replace");
+        assert_eq!(r.extractor.calls(), 3);
+        assert_eq!(std::fs::read(&tile).expect("tile"), old, "old tiles stay");
+        assert!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .expect("rows")
+                .contains_key(&320),
+            "and their row"
+        );
+
+        r.extractor.fail.store(false, Ordering::SeqCst);
+        assert!(
+            r.mgr
+                .check_trickplay_data(item, &check, &extraction_on())
+                .await
+                .expect("retry")
+        );
+        assert_eq!(super::jpeg_full_chroma(&tile), Some(true));
+    }
+
+    /// B9: a width no longer selected goes only once every selected width has
+    /// its set, folder included; a user-placed grid stays through a checking
+    /// pass, and a Replace leaves only the selected widths, as upstream's.
+    #[tokio::test]
+    async fn a_dropped_width_goes_only_once_the_selected_widths_exist() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("first");
+        r.mgr.begin_trickplay_pass().await.expect("record");
+        let user = set_dir(&r, item, &media, 480);
+        std::fs::create_dir_all(&user).expect("user grid");
+        image::RgbImage::new(960, 540)
+            .save(user.join("0.jpg"))
+            .expect("user tile");
+        let widths = |rows: std::collections::HashMap<i32, TrickplayInfoEntity>| {
+            let mut widths: Vec<i32> = rows.into_keys().collect();
+            widths.sort_unstable();
+            widths
+        };
+
+        r.set_options(options_2x2(&[640]));
+        let check = r
+            .mgr
+            .begin_trickplay_pass()
+            .await
+            .expect("begin")
+            .expect("check");
+        r.extractor.fail.store(true, Ordering::SeqCst);
+        assert!(
+            !r.mgr
+                .check_trickplay_data(item, &check, &extraction_on())
+                .await
+                .expect("failing check")
+        );
+        assert!(set_dir(&r, item, &media, 320).join("0.jpg").is_file());
+        assert_eq!(
+            widths(r.mgr.get_trickplay_resolutions(item).await.expect("rows")),
+            vec![320, 480]
+        );
+
+        r.extractor.fail.store(false, Ordering::SeqCst);
+        assert!(
+            r.mgr
+                .check_trickplay_data(item, &check, &extraction_on())
+                .await
+                .expect("check")
+        );
+        assert_eq!(
+            widths(r.mgr.get_trickplay_resolutions(item).await.expect("rows")),
+            vec![480, 640]
+        );
+        assert!(!set_dir(&r, item, &media, 320).exists(), "disk freed");
+        assert!(user.join("0.jpg").is_file(), "a user-placed grid stays");
+
+        r.mgr
+            .refresh_trickplay_data(item, true, &extraction_on())
+            .await
+            .expect("replace");
+        assert_eq!(
+            widths(r.mgr.get_trickplay_resolutions(item).await.expect("rows")),
+            vec![640]
+        );
+        assert!(!user.exists());
+    }
+
+    /// A video narrower than both widths gives them one set: it is made once,
+    /// checked once and never removed as a dropped width.
+    #[tokio::test]
+    async fn a_video_narrower_than_both_widths_makes_one_set_and_keeps_it() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), Some(300)).await;
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("first");
+        r.mgr.begin_trickplay_pass().await.expect("record");
+
+        r.set_options(full_chroma_2x2(&[320, 640]));
+        let check = r
+            .mgr
+            .begin_trickplay_pass()
+            .await
+            .expect("begin")
+            .expect("check");
+        assert!(
+            r.mgr
+                .check_trickplay_data(item, &check, &extraction_on())
+                .await
+                .expect("check")
+        );
+        assert_eq!(r.extractor.calls(), 2, "one regeneration for both widths");
+        r.mgr
+            .refresh_trickplay_data(item, true, &extraction_on())
+            .await
+            .expect("replace");
+        assert_eq!(r.extractor.calls(), 3, "one Replace for both widths");
+        let rows = r.mgr.get_trickplay_resolutions(item).await.expect("rows");
+        assert_eq!(rows.keys().copied().collect::<Vec<_>>(), vec![300]);
+        assert_eq!(
+            super::jpeg_full_chroma(&set_dir(&r, item, &media, 300).join("0.jpg")),
+            Some(true)
+        );
     }
 
     #[tokio::test]
