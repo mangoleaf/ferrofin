@@ -2106,8 +2106,6 @@ async fn forgot_password_hands_the_name_and_network_to_the_user_manager() {
         assert_eq!(body["PinFile"], "/data/passwordreset0123.json");
         assert!(body["PinExpirationDate"].is_string());
     }
-    // A missing or blank EnteredUsername is not pinned here: upstream answers
-    // it 400 ([Required] required string), which gl-1156 tracks.
     assert_eq!(
         *users.forgot_requests.lock().unwrap(),
         vec![("bob".to_owned(), false), ("bob".to_owned(), true)]
@@ -2120,21 +2118,195 @@ async fn recovery_request(
     body: serde_json::Value,
     peer: &str,
 ) -> axum::response::Response {
+    raw_recovery_request(router, path, &body.to_string(), peer, None).await
+}
+
+/// [`recovery_request`] with the body as sent, and the address the
+/// connection was accepted on when `local` names one.
+async fn raw_recovery_request(
+    router: &axum::Router,
+    path: &str,
+    body: &str,
+    peer: &str,
+    local: Option<&str>,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .extension(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().unwrap(),
+        ));
+    if let Some(local) = local {
+        request = request.extension(ferrofin_api::ip_access::ConnectionLocalAddr(
+            local.parse().unwrap(),
+        ));
+    }
     router
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(path)
-                .header("content-type", "application/json")
-                .extension(axum::extract::ConnectInfo(
-                    peer.parse::<std::net::SocketAddr>().unwrap(),
-                ))
-                .body(Body::from(body.to_string()))
-                .unwrap(),
-        )
+        .oneshot(request.body(Body::from(body.to_owned())).unwrap())
         .await
         .unwrap()
+}
+
+/// Upstream's `EnteredUsername` and `Pin` are `[Required] public required
+/// string`. System.Text.Json refuses a body that leaves the member out (keyed
+/// `$`), and `[Required]` then refuses a `null`, empty or whitespace one,
+/// keyed by the member alone. Both refusals are 400s before the action runs.
+/// The messages were measured on Jellyfin 12.4.0.
+#[rstest::rstest]
+#[case::name_left_out(
+    "/Users/ForgotPassword",
+    "{}",
+    "$",
+    "JSON deserialization for type 'Jellyfin.Api.Models.UserDtos.ForgotPasswordDto' was \
+     missing required properties including: 'EnteredUsername'."
+)]
+#[case::name_null(
+    "/Users/ForgotPassword",
+    r#"{"EnteredUsername":null}"#,
+    "EnteredUsername",
+    "The EnteredUsername field is required."
+)]
+#[case::name_empty(
+    "/Users/ForgotPassword",
+    r#"{"EnteredUsername":""}"#,
+    "EnteredUsername",
+    "The EnteredUsername field is required."
+)]
+#[case::name_whitespace(
+    "/Users/ForgotPassword",
+    r#"{"enteredUsername":" \t　"}"#,
+    "EnteredUsername",
+    "The EnteredUsername field is required."
+)]
+#[case::pin_left_out(
+    "/Users/ForgotPassword/Pin",
+    r#"{"EnteredUsername":"bob"}"#,
+    "$",
+    "JSON deserialization for type 'Jellyfin.Api.Models.UserDtos.ForgotPasswordPinDto' was \
+     missing required properties including: 'Pin'."
+)]
+#[case::pin_null(
+    "/Users/ForgotPassword/Pin",
+    r#"{"Pin":null}"#,
+    "Pin",
+    "The Pin field is required."
+)]
+#[case::pin_empty(
+    "/Users/ForgotPassword/Pin",
+    r#"{"Pin":""}"#,
+    "Pin",
+    "The Pin field is required."
+)]
+#[case::pin_whitespace(
+    "/Users/ForgotPassword/Pin",
+    r#"{"pin":"  "}"#,
+    "Pin",
+    "The Pin field is required."
+)]
+#[tokio::test]
+async fn forgot_password_routes_refuse_a_missing_or_blank_member_with_400(
+    #[case] path: &str,
+    #[case] body: &str,
+    #[case] key: &str,
+    #[case] message: &str,
+) {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let response = raw_recovery_request(&router, path, body, "127.0.0.1:4321", None).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["title"], "One or more validation errors occurred.");
+    assert_eq!(body["errors"][key], serde_json::json!([message]), "{body}");
+    if key != "$" {
+        assert_eq!(
+            body["errors"].as_object().unwrap().len(),
+            1,
+            "a member refusal names the member alone: {body}"
+        );
+    }
+    assert!(users.forgot_requests.lock().unwrap().is_empty());
+    assert!(users.redeemed_pins.lock().unwrap().is_empty());
+}
+
+/// Everything logged while a test runs.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CapturedLog {
+    /// Takes what was logged since the last call.
+    fn take(&self) -> String {
+        String::from_utf8(std::mem::take(&mut *self.0.lock().unwrap())).unwrap()
+    }
+}
+
+/// `UserController.ForgotPassword` warns with the client's address when the
+/// request does not come from the local network, where `isLocal` is
+/// `HttpContext.IsLocal()` (the connection's local address is the client's) or
+/// `IsInLocalNetwork(ip)`. That flag is also what the user manager is given.
+#[tokio::test]
+async fn forgot_password_warns_with_the_address_of_a_request_from_outside_the_local_network() {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let body = r#"{"EnteredUsername":"bob"}"#;
+    let path = "/Users/ForgotPassword";
+
+    let remote = raw_recovery_request(&router, path, body, "203.0.113.8:4321", None).await;
+    assert_eq!(remote.status(), StatusCode::OK);
+    let logged = log.take();
+    assert!(
+        logged.contains("WARN")
+            && logged.contains("outside the local network")
+            && logged.contains("remote_ip=203.0.113.8"),
+        "{logged}"
+    );
+
+    for (peer, local) in [
+        ("127.0.0.1:4321", None),
+        ("192.168.1.20:4321", None),
+        ("203.0.113.8:4321", Some("203.0.113.8:8096")),
+    ] {
+        let response = raw_recovery_request(&router, path, body, peer, local).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let logged = log.take();
+        assert!(
+            !logged.contains("outside the local network"),
+            "{peer} {local:?}: {logged}"
+        );
+    }
+    // A refused body never reaches the action, so it logs nothing.
+    let refused = raw_recovery_request(&router, path, "{}", "203.0.113.8:4321", None).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert!(!log.take().contains("outside the local network"));
+
+    assert_eq!(
+        *users.forgot_requests.lock().unwrap(),
+        vec![
+            ("bob".to_owned(), false),
+            ("bob".to_owned(), true),
+            ("bob".to_owned(), true),
+            ("bob".to_owned(), true),
+        ]
+    );
 }
 
 #[tokio::test]
