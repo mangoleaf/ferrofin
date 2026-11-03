@@ -823,7 +823,7 @@ async fn tear_down_host(
     sampler: Option<tokio::task::JoinHandle<()>>,
 ) {
     stop_background_tasks(discovery.into_iter().chain(sampler).collect()).await;
-    cancel_running_tasks(wired.state.tasks.as_ref()).await;
+    wired.task_manager.shutdown().await;
     wired.state.library.shutdown_scans().await;
     stop_background_tasks(wired.background).await;
 }
@@ -1126,22 +1126,6 @@ fn listen_addresses(
         port,
         &interfaces,
     )
-}
-
-/// Cancels every scheduled task currently running (best-effort: a task that
-/// finishes in between is simply no longer running).
-async fn cancel_running_tasks(tasks: &dyn ferrofin_traits::tasks::TaskManager) {
-    let Ok(list) = tasks.get_tasks().await else {
-        return;
-    };
-    for task in list {
-        if task.state == ferrofin_model::tasks::TaskState::Running
-            && let Some(id) = task.id.as_deref()
-            && let Err(e) = tasks.cancel_task(id).await
-        {
-            tracing::debug!(task = id, error = %e, "could not cancel a running task on shutdown");
-        }
-    }
 }
 
 /// The on-disk roots a scheduled backup restore writes to, resolved before the
