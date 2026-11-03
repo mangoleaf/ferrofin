@@ -612,6 +612,31 @@ async fn a_disabled_splashscreen_is_visible_to_administrators_only() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `GetSplashscreen` passes `GetImageResult` no response headers, so it sends
+/// neither of the DLNA headers every other image route carries (gl-1118).
+#[tokio::test]
+async fn a_splashscreen_sends_no_dlna_headers() {
+    let dir = std::env::temp_dir().join(format!("ferrofin-splash-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("splashscreen.png"), b"png-bytes").expect("splash");
+    let mut branding = default_branding();
+    branding.splashscreen_enabled = true;
+    let config = make_config(branding, &dir.to_string_lossy());
+
+    let (status, headers, _) = get_as(config, &Caller::Anonymous, "/Branding/Splashscreen").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers.get("transfermode.dlna.org").is_none(),
+        "{headers:?}"
+    );
+    assert!(
+        headers.get("realtimeinfo.dlna.org").is_none(),
+        "{headers:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A `tag` earns the 365-day immutable caching of `GetImageResult`; without
 /// one the response is plain `public`.
 #[tokio::test]

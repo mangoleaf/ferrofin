@@ -40,16 +40,22 @@ const RESIZE_BYTES_PER_PIXEL: u64 = 16;
 ///
 /// A file's header is enough to check the first two, so an image over them
 /// costs no memory. The third covers what a Lanczos3 or Triangle resize
-/// allocates on top of the decoded image.
+/// allocates on top of the decoded image, and what an image request's
+/// compositing (`backgroundColor`, `blur`, `foregroundLayer`) draws and
+/// writes it with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageLimits {
     /// The most pixels (width × height) an image may have to be decoded.
     pub max_pixels: u64,
     /// The most bytes one decode may allocate, the `image` crate's `max_alloc`.
     pub max_alloc: u64,
-    /// The most bytes of scratch memory the resizes in flight hold between
-    /// them. A resize needs 16 bytes per pixel of the source's width by the
-    /// output's height, whatever the image's format.
+    /// The most bytes of scratch memory the resizes and compositing in flight
+    /// hold between them. A resize needs 16 bytes per pixel of the source's
+    /// width by the output's height, whatever the image's format; compositing
+    /// (`backgroundColor`, `blur`, `foregroundLayer`) 4 per output pixel, 3
+    /// more when the output is a JPEG, and for a blur 64 more per pixel of the
+    /// output's longest side. The encoders' own working memory is outside it,
+    /// for every image written.
     pub resize_budget: u64,
 }
 
@@ -255,6 +261,27 @@ impl ImageMemory {
         Ok(image.resize_exact(width, height, filter))
     }
 
+    /// Runs `draw` while holding `bytes` of the resize budget, as
+    /// [`Self::resize_exact`] holds a resize's scratch, or
+    /// [`ServiceError::InvalidInput`] when `bytes` alone are over the budget.
+    /// `what` names the work in that error.
+    pub(crate) fn draw<T>(
+        &self,
+        bytes: u64,
+        what: &str,
+        draw: impl FnOnce() -> T,
+    ) -> Result<T, ServiceError> {
+        if bytes > self.limits.resize_budget {
+            return Err(ServiceError::invalid_input(format!(
+                "cannot {what}: it takes {bytes} bytes, over the budget of {} \
+                 (image_resize_budget_mb)",
+                self.limits.resize_budget
+            )));
+        }
+        let _held = (bytes > 0).then(|| self.hold(bytes));
+        Ok(draw())
+    }
+
     /// Takes `bytes` of the resize budget, waiting for this resize's turn and
     /// for them to be free. `bytes` is at most the budget, so that always
     /// happens.
@@ -352,6 +379,21 @@ mod tests {
                 assert!(message.contains(setting), "{message}");
             }
         }
+    }
+
+    /// `draw` runs work that fits the resize budget and refuses what is over it
+    /// alone, naming the setting.
+    #[test]
+    fn drawing_is_held_against_the_resize_budget() {
+        let memory = ImageMemory::new(ImageLimits {
+            resize_budget: 1000,
+            ..ImageLimits::default()
+        });
+        assert_eq!(memory.draw(1000, "draw", || 7).expect("fits"), 7);
+        let err = memory
+            .draw(1001, "draw", || 7)
+            .expect_err("over the budget");
+        assert!(err.to_string().contains("image_resize_budget_mb"), "{err}");
     }
 
     /// A panorama is long, so the pixel limit is on the product, never a side.

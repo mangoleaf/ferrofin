@@ -238,6 +238,50 @@ async fn a_resize_past_the_budget_is_refused_and_one_on_it_runs(
     );
 }
 
+/// gl-805: compositing holds, until the JPEG is written, 4 bytes per pixel
+/// for its RGBA canvas and 3 for the JPEG writer's premultiplied copy, and a
+/// blur 64 more per pixel of the longest side for its sums. At the same size
+/// the resize holds nothing, so the budget is the compositing's alone.
+#[rstest]
+#[case::background(Some("#000"), None, 100 * 7)]
+#[case::blur(None, Some(2), 100 * 7 + 10 * 64)]
+#[tokio::test]
+async fn compositing_past_the_budget_is_refused_and_on_it_runs(
+    #[case] background: Option<&str>,
+    #[case] blur: Option<i32>,
+    #[case] held: u64,
+) {
+    let fixture = Fixture::new();
+    let input = fixture.color("in.png", 10, 10);
+    let output = fixture.path("out.jpg");
+    let options = ImageProcessingOptions {
+        background_color: background.map(str::to_owned),
+        blur,
+        ..Default::default()
+    };
+
+    let past = ImageCrateEncoder::new().with_limits(ImageLimits {
+        resize_budget: held - 1,
+        ..ROOMY
+    });
+    assert_refused(
+        encode(&past, &input, &output, false, &options).await,
+        "image_resize_budget_mb",
+    );
+    assert!(!Path::new(&output).exists());
+
+    let on = ImageCrateEncoder::new().with_limits(ImageLimits {
+        resize_budget: held,
+        ..ROOMY
+    });
+    assert_eq!(
+        encode(&on, &input, &output, false, &options)
+            .await
+            .expect("the budget holds it"),
+        output
+    );
+}
+
 /// A format change at the same size is a copy, not a resize, so an image that
 /// could never be resized can still change format.
 #[tokio::test]

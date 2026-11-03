@@ -722,8 +722,9 @@ pub static SETTINGS: &[SettingSpec] = &[
         kind: whole_numbers(ImageLimits::RESIZE_BUDGET_MB),
         unit: Some(Unit::Mebibytes),
         default: "2048",
-        description: "Memory all image resizes in flight share; a resize needing more alone serves \
-                      the original file.",
+        description: "Memory all image resizes and compositing (background colour, blur, \
+                      foreground layer) in flight share; work needing more alone serves the \
+                      original file.",
         running: |c| json!(c.image_resize_budget_mb),
         ..ROW
     },

@@ -35,11 +35,10 @@
 //! - Every decode and resize runs under [`ImageLimits`] ([`crate::limits`]),
 //!   which upstream has no counterpart for. An image they refuse is
 //!   [`ServiceError::InvalidInput`], and the processor serves the original.
-//! - The overlay work Skia does inside `EncodeImage` (background colour, blur,
-//!   foreground layer: gl-805; unplayed/percent-played indicators: gl-806) is
-//!   **not** ported yet — this encoder does auto-orientation, resize and
-//!   format-convert only, so `has_default_options` and `auto_orient` already
-//!   decide whether re-encoding is needed.
+//! - `EncodeImage`'s background colour, blur and foreground layer are drawn
+//!   after the resize ([`composite`]); its unplayed/percent-played indicators
+//!   are not (gl-806), so a request for one alone is resized and re-encoded
+//!   undecorated.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -227,7 +226,10 @@ impl ImageCrateEncoder {
                     image.height()
                 )));
             }
-            let rgba = image.to_rgba8();
+            let rgba = match image {
+                DynamicImage::ImageRgba8(rgba) => Cow::Borrowed(rgba),
+                other => Cow::Owned(other.to_rgba8()),
+            };
             // Precision loss is irrelevant: quality is clamped to 0..=100.
             #[allow(clippy::cast_precision_loss)]
             let quality = quality.clamp(0, 100) as f32;
@@ -319,6 +321,11 @@ impl ImageCrateEncoder {
         let quality = quality as u8;
         let rgb = match image {
             DynamicImage::ImageRgb8(rgb) => Cow::Borrowed(rgb),
+            // Skia's JPEG encoder ignores alpha and writes the premultiplied
+            // colour, so a clear pixel is black and a blur's faded edge dark
+            // (measured on Jellyfin 12.4).
+            DynamicImage::ImageRgba8(rgba) => Cow::Owned(premultiplied_rgb(rgba)),
+            other if other.color().has_alpha() => Cow::Owned(premultiplied_rgb(&other.to_rgba8())),
             other => Cow::Owned(other.to_rgb8()),
         };
         // JPEG's frame header stores the dimensions in 16 bits, so anything wider
@@ -433,12 +440,10 @@ impl ImageCrateEncoder {
 
         let resized =
             source.resize_to(memory, input_path, |size| get_new_image_size(options, size))?;
-        Self::write(
-            &resized,
-            output_path,
-            Self::crate_format(output_format),
-            quality,
-        )?;
+        let format = Self::crate_format(output_format);
+        composite(memory, resized, options, format, |image| {
+            Self::write(image, output_path, format, quality)
+        })?;
         Ok(output_path.to_owned())
     }
 
@@ -742,6 +747,300 @@ pub(crate) fn decode_resized(
     EncodeSource::open(memory, path, false)?.resize_to(memory, path, target_of)
 }
 
+/// `EncodeImage`'s drawing after the resize, then `write`: a canvas cleared
+/// to `backgroundColor` (`SKColor.Parse`), the image drawn over it through a
+/// `blur` filter of that sigma ([`blur_decal`]), then a black layer of alpha
+/// `(1 - foregroundLayer) * 255` (`0.4` when the value is not a number). With
+/// none of the three the resized image is written as it is, as upstream's
+/// "all we're doing is resizing" branch encodes it. A colour `SKColor.Parse`
+/// throws on is [`ServiceError::InvalidInput`], so the processor serves the
+/// original, as `ProcessImage`'s catch does.
+///
+/// Every step works in place on one RGBA copy of the image. That copy, the
+/// blur's line of sums and the JPEG writer's premultiplied copy
+/// ([`premultiplied_rgb`]) are held against the resize budget until `write`
+/// returns; the encoder's own working memory is not counted, as for every
+/// write. Blends round (Skia's integer `SrcOver`); the encoder promises
+/// decodable output of the right size, not Skia's bytes.
+fn composite(
+    memory: &ImageMemory,
+    image: DynamicImage,
+    options: &ImageProcessingOptions,
+    format: CrateFormat,
+    write: impl FnOnce(&DynamicImage) -> Result<(), ServiceError>,
+) -> Result<(), ServiceError> {
+    let background = options
+        .background_color
+        .as_deref()
+        .filter(|color| !color.trim().is_empty());
+    let foreground = options
+        .foreground_layer
+        .as_deref()
+        .filter(|layer| !layer.trim().is_empty());
+    let blur = options.blur.unwrap_or(0);
+    if background.is_none() && foreground.is_none() && blur == 0 {
+        return write(&image);
+    }
+    let background = background
+        .map(|color| {
+            parse_sk_color(color).ok_or_else(|| {
+                ServiceError::invalid_input(format!("backgroundColor {color:?} is not a colour"))
+            })
+        })
+        .transpose()?;
+
+    let pixels = u64::from(image.width()) * u64::from(image.height());
+    let sums_bytes = if blur > 0 {
+        u64::from(image.width().max(image.height())) * BLUR_SUMS_BYTES
+    } else {
+        0
+    };
+    let jpeg_bytes = if format == CrateFormat::Jpeg {
+        pixels * 3
+    } else {
+        0
+    };
+    memory.draw(
+        pixels * 4 + sums_bytes + jpeg_bytes,
+        "composite the image",
+        || {
+            let mut canvas = image.into_rgba8();
+            // A negative blur draws through no filter, as `blur > 0 ? … : null`.
+            if blur > 0 {
+                blur_decal(&mut canvas, f64::from(blur));
+            }
+            if let Some(color) = background {
+                for pixel in canvas.pixels_mut() {
+                    *pixel = src_over(*pixel, color);
+                }
+            }
+            if let Some(layer) = foreground {
+                // ponytail: Rust's float syntax, not .NET's double.TryParse (no
+                // thousands separators); any other value is upstream's 0.4.
+                let opacity = layer.trim().parse::<f64>().unwrap_or(0.4);
+                // `(byte)((1 - opacity) * 0xFF)`: truncating, and saturating as
+                // .NET 9+ converts, which `as` matches.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let shade = image::Rgba([0, 0, 0, ((1.0 - opacity) * 255.0) as u8]);
+                for pixel in canvas.pixels_mut() {
+                    *pixel = src_over(shade, *pixel);
+                }
+            }
+            write(&DynamicImage::ImageRgba8(canvas))
+        },
+    )?
+}
+
+/// The third running sum of each channel, [`blur_decal`]'s scratch per pixel
+/// of the image's longest side.
+type ChannelSums = [i128; 4];
+
+/// The bytes of a [`ChannelSums`], held against the resize budget.
+const BLUR_SUMS_BYTES: u64 = std::mem::size_of::<ChannelSums>() as u64;
+
+/// `top` drawn over `bottom` (`SrcOver`), both unpremultiplied, rounded.
+fn src_over(top: image::Rgba<u8>, bottom: image::Rgba<u8>) -> image::Rgba<u8> {
+    let top_alpha = f32::from(top[3]) / 255.0;
+    let bottom_alpha = f32::from(bottom[3]) / 255.0 * (1.0 - top_alpha);
+    let alpha = top_alpha + bottom_alpha;
+    if alpha <= 0.0 {
+        return image::Rgba([0, 0, 0, 0]);
+    }
+    let channel = |i: usize| {
+        let mixed = (f32::from(top[i]) * top_alpha + f32::from(bottom[i]) * bottom_alpha) / alpha;
+        // In 0..=255: a weighted mean of two channels.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let mixed = mixed.round() as u8;
+        mixed
+    };
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let alpha = (alpha * 255.0).round() as u8;
+    image::Rgba([channel(0), channel(1), channel(2), alpha])
+}
+
+/// `SKImageFilter.CreateBlur(sigma, sigma)` as Skia draws it: a Gaussian,
+/// here approximated by three box blurs (Kovesi's sizes), over premultiplied
+/// pixels, with Skia's default `Decal` edges, so outside the image is
+/// transparent and the edges fade (measured on Jellyfin 12.4: a white
+/// image's corner alpha is 113 at `blur=1` and 80 at `blur=3`, and a sigma far
+/// past the image's size leaves it almost clear).
+///
+/// Each axis is one pass of [`blur_line`], exact and linear in the pixels
+/// whatever the sigma, as Skia answers `blur=2147483647` at once; the only
+/// scratch is one row or column of [`ChannelSums`].
+fn blur_decal(image: &mut RgbaImage, sigma: f64) {
+    for pixel in image.pixels_mut() {
+        let alpha = u32::from(pixel[3]);
+        for c in 0..3 {
+            pixel[c] = mul_div_255(u32::from(pixel[c]), alpha);
+        }
+    }
+    let (width, height) = image.dimensions();
+    let (width, height) = (width as usize, height as usize);
+    let raw: &mut [u8] = image;
+    let mut sums: Vec<ChannelSums> = vec![[0; 4]; width.max(height)];
+    let radii = box_radii(sigma);
+    for row in 0..height {
+        blur_line(raw, &mut sums, row * width * 4, 4, width, radii);
+    }
+    for column in 0..width {
+        blur_line(raw, &mut sums, column * 4, width * 4, height, radii);
+    }
+    for pixel in image.pixels_mut() {
+        let alpha = u32::from(pixel[3]);
+        for c in 0..3 {
+            // Premultiplied, so the channel is at most the alpha; a clear
+            // pixel has no colour.
+            #[allow(clippy::cast_possible_truncation)]
+            let channel = (u32::from(pixel[c]) * 255 + alpha / 2)
+                .checked_div(alpha)
+                .map_or(0, |channel| channel.min(255) as u8);
+            pixel[c] = channel;
+        }
+    }
+}
+
+/// `image`'s colour premultiplied by its alpha, the alpha dropped: what
+/// Skia's JPEG encoder writes for a pixel that is not opaque.
+fn premultiplied_rgb(image: &RgbaImage) -> RgbImage {
+    RgbImage::from_fn(image.width(), image.height(), |x, y| {
+        let [r, g, b, a] = image.get_pixel(x, y).0;
+        let a = u32::from(a);
+        image::Rgb([r, g, b].map(|c| mul_div_255(u32::from(c), a)))
+    })
+}
+
+/// `value * alpha / 255`, rounded.
+fn mul_div_255(value: u32, alpha: u32) -> u8 {
+    // At most 255 * 255 / 255.
+    #[allow(clippy::cast_possible_truncation)]
+    let product = ((value * alpha + 127) / 255) as u8;
+    product
+}
+
+/// The three box radii whose successive blurs approximate a Gaussian of
+/// `sigma` (Kovesi, "Fast Almost-Gaussian Filtering", 2010): `m` boxes of the
+/// odd width just under the ideal one, the rest two wider.
+fn box_radii(sigma: f64) -> [usize; 3] {
+    const PASSES: f64 = 3.0;
+    let ideal = (12.0 * sigma * sigma / PASSES + 1.0).sqrt();
+    let mut lower = ideal.floor();
+    if lower % 2.0 == 0.0 {
+        lower -= 1.0;
+    }
+    let narrow =
+        (12.0 * sigma * sigma - PASSES * lower * lower - 4.0 * PASSES * lower - 3.0 * PASSES)
+            / (-4.0 * lower - 4.0);
+    let narrow = narrow.round();
+    // Widths are odd and at least 1; `as` saturates a huge sigma's width.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let radius = |width: f64| (width as usize).saturating_sub(1) / 2;
+    std::array::from_fn(|i| {
+        #[allow(clippy::cast_precision_loss)]
+        let wide = (i as f64) >= narrow;
+        radius(if wide { lower + 2.0 } else { lower })
+    })
+}
+
+/// The three box blurs of `radii` over `len` pixels `stride` bytes apart from
+/// `start`, in place, pixels outside the line counting as transparent
+/// (`Decal`).
+///
+/// A box blur of radius `r` is `Q(x + r) - Q(x - r - 1)` for `Q` the line's
+/// running sum, so three are an alternating sum of eight values of the third
+/// running sum `Q³`, offset by `±r` per box. Past the line's end `Q³` is the
+/// polynomial the constant total makes it, so the values far outside a huge
+/// box cost nothing, and nothing beyond the line is stored or cut off between
+/// boxes, which would lose the light a box spreads past an edge before the
+/// next brings it back. The sums are exact (`i128`), and each pixel rounds once.
+fn blur_line(
+    raw: &mut [u8],
+    cubes: &mut [ChannelSums],
+    start: usize,
+    stride: usize,
+    len: usize,
+    radii: [usize; 3],
+) {
+    // Q¹, Q² and Q³ at the line's last pixel, per channel.
+    let (mut q1, mut q2, mut q3) = ([0i128; 4], [0i128; 4], [0i128; 4]);
+    for (i, cube) in cubes.iter_mut().take(len).enumerate() {
+        let at = start + i * stride;
+        for c in 0..4 {
+            q1[c] += i128::from(raw[at + c]);
+            q2[c] += q1[c];
+            q3[c] += q2[c];
+        }
+        *cube = q3;
+    }
+    let len_i = len as i128;
+    let cube = |x: i128, c: usize| -> i128 {
+        if x < 0 {
+            0
+        } else if x < len_i {
+            // In 0..len.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let index = x as usize;
+            cubes[index][c]
+        } else {
+            let past = x - len_i + 1;
+            q3[c] + past * q2[c] + q1[c] * past * (past + 1) / 2
+        }
+    };
+    let radii = radii.map(|r| r as i128);
+    let window: i128 = radii.iter().map(|r| 2 * r + 1).product();
+    // The eight corners: each box adds `+r` (sign +) or `-r - 1` (sign -).
+    let corners: [(i128, i128); 8] = std::array::from_fn(|corner| {
+        (0..3).fold((0, 1), |(offset, sign), i| {
+            if (corner >> i) & 1 == 0 {
+                (offset + radii[i], sign)
+            } else {
+                (offset - radii[i] - 1, -sign)
+            }
+        })
+    });
+    let mut out = [0u8; 4];
+    for i in 0..len {
+        let x = i as i128;
+        for (c, value) in out.iter_mut().enumerate() {
+            let total: i128 = corners
+                .iter()
+                .map(|&(offset, sign)| sign * cube(x + offset, c))
+                .sum();
+            // The kernel is non-negative, so the total is a weighted sum of
+            // bytes: in 0..=255 · window, and the rounded mean in 0..=255.
+            debug_assert!((0..=255 * window).contains(&total), "{total} / {window}");
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let mean = ((total + window / 2) / window).clamp(0, 255) as u8;
+            *value = mean;
+        }
+        // Every read above is of `cubes`, filled before the first write.
+        let at = start + i * stride;
+        raw[at..at + 4].copy_from_slice(&out);
+    }
+}
+
+/// SkiaSharp's `SKColor.TryParse`: `[#]RGB`, `[#]ARGB`, `[#]RRGGBB` or
+/// `[#]AARRGGBB` in hex, alpha first, surrounding whitespace ignored. `None` for
+/// anything else, where `SKColor.Parse` throws.
+fn parse_sk_color(text: &str) -> Option<image::Rgba<u8>> {
+    let hex = text.trim();
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    // A single digit stands for itself twice (`F` is `FF`).
+    let nibble = |i: usize| u8::from_str_radix(&hex[i..=i], 16).ok().map(|d| d * 17);
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    let [a, r, g, b] = match hex.len() {
+        3 => [Some(u8::MAX), nibble(0), nibble(1), nibble(2)],
+        4 => [nibble(0), nibble(1), nibble(2), nibble(3)],
+        6 => [Some(u8::MAX), byte(0), byte(2), byte(4)],
+        8 => [byte(0), byte(2), byte(4), byte(6)],
+        _ => return None,
+    };
+    Some(image::Rgba([r?, g?, b?, a?]))
+}
+
 /// An image [`EncodeSource::decode_covering`] produced.
 struct CoveringImage {
     /// The upright pixels.
@@ -976,7 +1275,8 @@ impl ImageEncoder for ImageCrateEncoder {
     /// (`SkiaEncoder.GetBitmap` → `OrientImage`), so the resize sees the
     /// upright size. `orientation` is unused: Skia falls back to it only when
     /// the codec cannot open the file, and then has no bitmap to draw either.
-    /// The played/unplayed/blur overlays are not drawn.
+    /// The background colour, blur and foreground layer are drawn after the
+    /// resize ([`composite`]); the played/unplayed indicators are not (gl-806).
     ///
     /// A JPEG is sized from its header and decoded only once the target is
     /// known, at the smallest DCT scale still covering twice it
@@ -1513,6 +1813,293 @@ mod tests {
             enc.get_image_size(&output).await.expect("probe out"),
             ImageDimensions::new(100, 50)
         );
+    }
+
+    /// Encodes `pixels` (a PNG at `name`) with `options` to a PNG and decodes
+    /// the result.
+    async fn composited(
+        name: &str,
+        pixels: RgbaImage,
+        options: ImageProcessingOptions,
+    ) -> RgbaImage {
+        let dir = TempDir::new().expect("tempdir");
+        let input = dir.path().join(name).to_string_lossy().into_owned();
+        DynamicImage::ImageRgba8(pixels)
+            .save(&input)
+            .expect("write fixture");
+        let output = out_path(&dir, "out.png");
+        let written = ImageCrateEncoder::new()
+            .encode_image(
+                &input,
+                Utc::now(),
+                &output,
+                false,
+                None,
+                100,
+                &ImageProcessingOptions {
+                    supported_output_formats: vec![ImageFormat::Png],
+                    ..options
+                },
+                ImageFormat::Png,
+            )
+            .await
+            .expect("encode");
+        assert_eq!(written, output, "re-encoded, not passed through");
+        image::open(&output).expect("decode").into_rgba8()
+    }
+
+    /// gl-805: `EncodeImage` clears the canvas to `backgroundColor` and draws
+    /// the image over it, so a transparent image takes the colour, and a
+    /// half-transparent one blends with it.
+    #[tokio::test]
+    async fn a_background_colour_shows_through_transparency() {
+        let mut pixels = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 0]));
+        pixels.put_pixel(0, 0, Rgba([255, 255, 255, 255]));
+        let out = composited(
+            "clear.png",
+            pixels,
+            ImageProcessingOptions {
+                background_color: Some("#FF0000".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(*out.get_pixel(7, 7), Rgba([255, 0, 0, 255]));
+        assert_eq!(*out.get_pixel(0, 0), Rgba([255, 255, 255, 255]));
+    }
+
+    /// A blank `backgroundColor` or `foregroundLayer` draws nothing
+    /// (`IsNullOrWhiteSpace`), and is not parsed as a colour.
+    #[rstest]
+    #[case::background(Some("  "), None)]
+    #[case::foreground(None, Some("\t"))]
+    #[tokio::test]
+    async fn a_blank_compositing_value_draws_nothing(
+        #[case] background: Option<&str>,
+        #[case] foreground: Option<&str>,
+    ) {
+        let out = composited(
+            "clear.png",
+            RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 0])),
+            ImageProcessingOptions {
+                background_color: background.map(str::to_owned),
+                foreground_layer: foreground.map(str::to_owned),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(out.get_pixel(1, 1).0, [0, 0, 0, 0]);
+    }
+
+    /// gl-805: `foregroundLayer` draws black at alpha `(1 - value) * 255`
+    /// over the image; a value that is no number is upstream's 0.4.
+    #[rstest]
+    #[case::half("0.5", 128)]
+    #[case::not_a_number("dark", 102)]
+    #[case::opaque_layer("0", 0)]
+    #[tokio::test]
+    async fn a_foreground_layer_darkens_the_image(#[case] layer: &str, #[case] grey: u8) {
+        let out = composited(
+            "white.png",
+            RgbaImage::from_pixel(4, 4, Rgba([255, 255, 255, 255])),
+            ImageProcessingOptions {
+                foreground_layer: Some(layer.to_owned()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let [r, g, b, a] = out.get_pixel(2, 2).0;
+        assert_eq!(a, 255);
+        assert!(r == g && g == b, "{:?}", out.get_pixel(2, 2));
+        assert!(r.abs_diff(grey) <= 1, "{layer}: {r} vs {grey}");
+    }
+
+    /// gl-805: `blur` filters the image, so a hard black/white edge comes
+    /// back with greys across it; a blur of 0 (or below) leaves it sharp.
+    #[rstest]
+    #[case::blurred(Some(3), true)]
+    #[case::zero(Some(0), false)]
+    #[case::negative(Some(-2), false)]
+    #[tokio::test]
+    async fn blur_softens_an_edge(#[case] blur: Option<i32>, #[case] softened: bool) {
+        let pixels = RgbaImage::from_fn(16, 4, |x, _| {
+            if x < 8 {
+                Rgba([0, 0, 0, 255])
+            } else {
+                Rgba([255, 255, 255, 255])
+            }
+        });
+        let out = composited(
+            "edge.png",
+            pixels,
+            ImageProcessingOptions {
+                blur,
+                ..Default::default()
+            },
+        )
+        .await;
+        let edge = out.get_pixel(7, 2).0[0];
+        assert_eq!(edge != 0, softened, "pixel at the edge: {edge}");
+    }
+
+    /// Skia blurs premultiplied pixels with `Decal` edges, so an opaque
+    /// image's corners fade to transparent while keeping their colour (no dark
+    /// fringe), and its middle stays opaque.
+    #[tokio::test]
+    async fn a_blur_fades_the_edges_without_darkening_them() {
+        let out = composited(
+            "white.png",
+            RgbaImage::from_pixel(32, 32, Rgba([255, 255, 255, 255])),
+            ImageProcessingOptions {
+                blur: Some(2),
+                ..Default::default()
+            },
+        )
+        .await;
+        let corner = out.get_pixel(0, 0).0;
+        assert!(corner[3] < 200, "corner {corner:?}");
+        // Radii 1, 1, 2: an edge keeps (1 + 9/45) / 2 of the kernel, 0.6.
+        for (x, y) in [(0, 16), (31, 16), (16, 0), (16, 31)] {
+            assert_eq!(out.get_pixel(x, y).0[3], 153, "the edge at {x},{y}");
+        }
+        assert_eq!(&corner[..3], &[255, 255, 255], "corner {corner:?}");
+        assert_eq!(out.get_pixel(16, 16).0, [255, 255, 255, 255]);
+    }
+
+    /// Skia writes a JPEG from premultiplied pixels, so a blur's faded corner
+    /// comes back dark in a JPEG (Jellyfin 12.4: a white image's corner is 80
+    /// grey at `blur=3`), and an opaque pixel keeps its colour.
+    #[test]
+    fn a_jpeg_takes_the_premultiplied_colour() {
+        let mut image = RgbaImage::from_pixel(2, 1, Rgba([255, 255, 255, 255]));
+        image.put_pixel(0, 0, Rgba([255, 200, 0, 80]));
+        let rgb = premultiplied_rgb(&image);
+        assert_eq!(rgb.get_pixel(0, 0).0, [80, 63, 0]);
+        assert_eq!(rgb.get_pixel(1, 0).0, [255, 255, 255]);
+    }
+
+    /// The blur is linear in the pixels whatever the sigma, so the largest `blur` a
+    /// query can carry returns at once, as Skia's does, with an image all but
+    /// clear.
+    #[tokio::test]
+    async fn the_largest_blur_returns_at_once() {
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            composited(
+                "big-blur.png",
+                RgbaImage::from_pixel(64, 64, Rgba([10, 200, 30, 255])),
+                ImageProcessingOptions {
+                    blur: Some(i32::MAX),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("returns at once");
+        assert!(
+            out.pixels().all(|p| p[3] <= 1),
+            "{:?}",
+            out.get_pixel(32, 32)
+        );
+    }
+
+    /// `blur_line` is the three boxes over the line padded with transparency,
+    /// nothing cut off between them: checked against that convolution done
+    /// the long way, with boxes shorter and longer than the line.
+    #[rstest]
+    #[case(12, [2, 2, 3])]
+    #[case(5, [7, 9, 12])]
+    #[case(1, [0, 0, 1])]
+    #[case(8, [0, 0, 0])]
+    #[case(30, [1, 4, 40])]
+    fn blur_line_is_the_three_boxes_over_transparency(
+        #[case] len: usize,
+        #[case] radii: [usize; 3],
+    ) {
+        // Truncation is the point: varied bytes from the index.
+        #[allow(clippy::cast_possible_truncation)]
+        let line: Vec<u8> = (0..len * 4).map(|i| (i * 97 % 256) as u8).collect();
+        let mut raw = line.clone();
+        let mut sums = vec![[0; 4]; len];
+        blur_line(&mut raw, &mut sums, 0, 4, len, radii);
+
+        let pad: usize = radii.iter().sum();
+        let window: i128 = radii.iter().map(|&r| 2 * r as i128 + 1).product();
+        for c in 0..4 {
+            let mut signal = vec![0i128; len + 2 * pad];
+            for i in 0..len {
+                signal[i + pad] = i128::from(line[i * 4 + c]);
+            }
+            for r in radii {
+                signal = (0..signal.len())
+                    .map(|x| {
+                        signal[x.saturating_sub(r)..=(x + r).min(signal.len() - 1)]
+                            .iter()
+                            .sum()
+                    })
+                    .collect();
+            }
+            for i in 0..len {
+                let expected = (signal[i + pad] + window / 2) / window;
+                assert_eq!(
+                    i128::from(raw[i * 4 + c]),
+                    expected,
+                    "pixel {i}, channel {c}"
+                );
+            }
+        }
+    }
+
+    /// Kovesi's box widths for sigma 3: 5, 5 and 7 (radii 2, 2 and 3); a
+    /// sigma of 1 is two boxes of width 1 and one of 3.
+    #[rstest]
+    #[case(3.0, [2, 2, 3])]
+    #[case(1.0, [0, 0, 1])]
+    fn box_radii_follow_kovesi(#[case] sigma: f64, #[case] radii: [usize; 3]) {
+        assert_eq!(box_radii(sigma), radii);
+    }
+
+    /// A colour `SKColor.Parse` throws on fails the encode, which the
+    /// processor answers with the original file.
+    #[tokio::test]
+    async fn an_unparsable_background_colour_fails_the_encode() {
+        let dir = TempDir::new().expect("tempdir");
+        let input = fixture(&dir, "in.png", 4, 4);
+        let err = ImageCrateEncoder::new()
+            .encode_image(
+                &input,
+                Utc::now(),
+                &out_path(&dir, "out.png"),
+                false,
+                None,
+                100,
+                &ImageProcessingOptions {
+                    background_color: Some("red".to_owned()),
+                    supported_output_formats: vec![ImageFormat::Png],
+                    ..Default::default()
+                },
+                ImageFormat::Png,
+            )
+            .await
+            .expect_err("red is not hex");
+        assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+    }
+
+    /// SkiaSharp's `SKColor.TryParse` cases: three, four, six or eight hex
+    /// digits, alpha first, `#` and surrounding whitespace optional.
+    #[rstest]
+    #[case("#F00", Some([255, 0, 0, 255]))]
+    #[case("8F00", Some([255, 0, 0, 0x88]))]
+    #[case("#123456", Some([0x12, 0x34, 0x56, 255]))]
+    #[case(" #80ff0000 ", Some([255, 0, 0, 0x80]))]
+    #[case("", None)]
+    #[case("#", None)]
+    #[case("#12", None)]
+    #[case("#12345", None)]
+    #[case("#GGG", None)]
+    #[case("red", None)]
+    fn sk_color_parse(#[case] text: &str, #[case] rgba: Option<[u8; 4]>) {
+        assert_eq!(parse_sk_color(text).map(|c| c.0), rgba, "{text:?}");
     }
 
     /// An EXIF block holding only `Orientation = 6` (rotate 90° clockwise),

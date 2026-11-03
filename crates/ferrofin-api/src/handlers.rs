@@ -1569,6 +1569,54 @@ pub struct Verified {
     pub refs: &'static [&'static str],
 }
 
+/// The code path the item image rows share after their handler.
+macro_rules! item_image_tail {
+    () => {
+        "authorize_image_item (GetItemById(itemId, User.GetUserId()): a signed-in user's \
+         item must be visible to them, anonymous and API-key callers are not checked) → \
+         serve_item_image (BaseItem.GetImageInfo: get_chapter_image for a Chapter, else \
+         select_image's GetImages(type).ElementAtOrDefault(index), so a negative index is a \
+         404) → serve_image_file (GetImageInternal, GetImageResult: local_image for \
+         ConvertImageToLocal; ProcessImage on every request; the two DLNA headers; Age, \
+         Vary and the disposition on every answer; is_fresh's 304 for an If-None-Match \
+         naming the tag or an If-Modified-Since at or after ProcessImage's date, both \
+         skipped under no-cache (a Cache-Control value that is exactly no-cache, as \
+         StringValues.Contains), with the type and that date's Last-Modified; then \
+         PhysicalFile's own If-Modified-Since (ignored when in the future) and \
+         If-Unmodified-Since against the served file, with that file's Last-Modified, and \
+         none of its range processing) → \
+         ferrofin-drawing processor.rs process_image (ImageProcessor.ProcessImage) → \
+         image_encoder.rs encode_image and composite (SkiaEncoder.EncodeImage: the blur, \
+         backgroundColor and foregroundLayer steps) → limits.rs ImageMemory. Measured on \
+         12.4 with a BMP and a transparent PNG primary: no transform, quality, Range, \
+         If-None-Match, If-Modified-Since (past, the file's own date and future, with and \
+         without no-cache), Cache-Control spellings, If-Unmodified-Since, \
+         If-Match, backgroundColor (valid and not), foregroundLayer, blur from 1 to \
+         2147483647, a hex imageIndex and a malformed percentPlayed; the images match in \
+         format and size, and in pixels within rounding and the blur's box approximation \
+         of Skia's Gaussian (with its Decal edges and premultiplied JPEG), not in bytes \
+         (the image crate, not Skia)"
+    };
+}
+
+/// The divergences the four item image rows share (GET and HEAD, plain and
+/// indexed).
+const ITEM_IMAGE_DIVERGENCES: &[&str] = &[
+    "percentPlayed and unplayedCount are bound but not drawn, and not passed to the \
+     processor: a request naming a percentPlayed between 0 and 100 or a positive \
+     unplayedCount (the values GetImageInternal keeps) and nothing else serves the stored \
+     file where upstream re-encodes it with the overlay. Fix path: gl-806.",
+    "foregroundLayer is read as an invariant decimal; upstream's double.TryParse reads it \
+     in the server's culture (in a comma-decimal culture, 0,5 is a half).",
+    "If-Modified-Since is compared with ProcessImage's date in UTC; upstream's \
+     DateTime.TryParse reads the header as the server's local time, so outside UTC its \
+     own check is off by the offset (PhysicalFile's, against the file, is not). Jellyfin \
+     bug not ported.",
+    "A remote image that cannot be downloaded is a 404; upstream's ConvertImageToLocal \
+     throws, a 500. Jellyfin bug not ported.",
+    "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+];
+
 /// **The API-parity record.** One row per contract operation whose Ferrofin
 /// implementation has been compared against the upstream Jellyfin C#
 /// ([`UPSTREAM_TAG`], or the earlier tag [`VERIFIED_AGAINST_EARLIER_PIN`]
@@ -1867,6 +1915,60 @@ pub const VERIFIED: &[Verified] = &[
         refs: &["images"],
     },
     Verified {
+        method: "get",
+        path: "/Items/{itemId}/Images/{imageType}",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "GetItemImage",
+        ferrofin: concat!(
+            "handlers/images.rs get_item_image (ImageQuery: every member the action \
+             declares is bound, so a malformed number is a 400; imageIndex from the query \
+             through the binder's int rules, 0 when absent) → ",
+            item_image_tail!()
+        ),
+        date: "2026-11-03",
+        divergences: ITEM_IMAGE_DIVERGENCES,
+        refs: &["images"],
+    },
+    Verified {
+        method: "head",
+        path: "/Items/{itemId}/Images/{imageType}",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "GetItemImage",
+        ferrofin: "HeadItemImage is GetItemImage's own action: handlers/images.rs \
+               get_item_image, the GET row's path, with ServeFile sending the headers alone \
+               (measured on 12.4, Range included)",
+        date: "2026-11-03",
+        divergences: ITEM_IMAGE_DIVERGENCES,
+        refs: &["images"],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/{itemId}/Images/{imageType}/{imageIndex}",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "GetItemImageByIndex",
+        ferrofin: concat!(
+            "handlers/images.rs get_item_image_by_index (ImageQuery: every member the action \
+             declares is bound, so a malformed number is a 400; the index is the route's, \
+             and the query's imageIndex, which the action does not declare, is not read) → ",
+            item_image_tail!()
+        ),
+        date: "2026-11-03",
+        divergences: ITEM_IMAGE_DIVERGENCES,
+        refs: &["images"],
+    },
+    Verified {
+        method: "head",
+        path: "/Items/{itemId}/Images/{imageType}/{imageIndex}",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "GetItemImageByIndex",
+        ferrofin: "HeadItemImageByIndex is GetItemImageByIndex's own action: \
+               handlers/images.rs get_item_image_by_index, the GET row's path, with ServeFile \
+               sending the headers alone",
+        date: "2026-11-03",
+        divergences: ITEM_IMAGE_DIVERGENCES,
+        refs: &["images"],
+    },
+    Verified {
         method: "post",
         path: "/UserImage",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
@@ -2040,6 +2142,32 @@ pub const VERIFIED: &[Verified] = &[
                get_countries (COUNTRIES, data/countries.json byte-equal to UPSTREAM_TAG's)",
         date: "2026-10-28",
         divergences: &[],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Branding/Splashscreen",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "GetSplashscreen",
+        ferrofin: "handlers/branding.rs get_splashscreen (only tag and format are bound; \
+               !SplashscreenEnabled is a 404 unless the caller is an administrator; \
+               resolve_splashscreen_path: SplashscreenLocation when that file exists, else \
+               {DataPath}/splashscreen.png, else a 404) → handlers/images.rs \
+               ImageQuery::splashscreen (no sizes, quality 90, and none of the DLNA \
+               headers, as GetSplashscreen passes GetImageResult none) → serve_image_file \
+               (GetImageResult: ProcessImage on every request, so a format the client's \
+               output formats do not list is re-encoded) → ferrofin-drawing processor.rs \
+               process_image. Measured on 12.4 with a BMP and a PNG splashscreen, as an \
+               administrator: plain and If-Modified-Since",
+        date: "2026-11-03",
+        divergences: &[
+            "Age, Last-Modified on a 304 and the If-Modified-Since check count from the \
+         splashscreen file's modification time. Upstream's ItemImageInfo carries no \
+         DateModified, so a splashscreen served as stored has an Age counted from \
+         0001-01-01 and answers any If-Modified-Since with a 304, and a client that cached \
+         one never sees its replacement. Jellyfin bug not ported.",
+            "The 404 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
         refs: &[],
     },
     Verified {

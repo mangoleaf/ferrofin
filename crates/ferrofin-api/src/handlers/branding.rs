@@ -174,7 +174,7 @@ async fn get_splashscreen(
         &image,
         0,
         false,
-        &ImageQuery::tagged(query.tag, query.format),
+        &ImageQuery::splashscreen(query.tag, query.format),
         request,
     )
     .await

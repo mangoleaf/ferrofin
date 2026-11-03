@@ -470,10 +470,11 @@ pub struct Config {
     /// with a warning.
     pub image_decode_max_memory_mb: u32,
 
-    /// The memory all image resizes in flight share, in MiB. Resolved
+    /// The memory all image resizes and compositing in flight share, in MiB. Resolved
     /// `FERROFIN_IMAGE_RESIZE_BUDGET_MB` env > `image_resize_budget_mb` in
     /// `config.toml` > 2048, clamped to [`ImageLimits::RESIZE_BUDGET_MB`] with
-    /// a warning. A resize that alone needs more serves the original file.
+    /// a warning. A resize or compositing that alone needs more serves the
+    /// original file.
     pub image_resize_budget_mb: u32,
 
     /// The largest remote image downloaded, in MiB. Resolved
