@@ -20,7 +20,7 @@ Conventions:
 | Intro Skipper | https://github.com/intro-skipper/intro-skipper | `db09359` | 10.11/prerelease | ported |
 | File Transformation | https://github.com/IAmParadox27/jellyfin-plugin-file-transformation | `f4f01c3` | 2.5.10.0 | ported |
 | Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
-| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, its three test routes, sign-in, the admin filter, password changes and resets (milestone "LDAP-Auth plugin port") |
+| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, its three test routes, sign-in, the admin filter, password changes and resets, the adopted settings' import (milestone "LDAP-Auth plugin port") |
 
 ## Per-plugin notes
 
@@ -203,8 +203,8 @@ Conventions:
 - Ferrofin files: `crates/ferrofin-extensions/src/ldap_auth.rs` (the extension, the
   configuration, the `LdapDirectory` seam, the settings page's three tests and their service),
   `ldap_auth/directory.rs` (the `ldap3` client and its rustls configuration),
-  `ldap_auth/provider.rs` (the sign-in provider) and `ldap_auth/adoption.rs` (the
-  `LDAP-Auth.xml` import), vendored
+  `ldap_auth/provider.rs` (the sign-in, password-change and password-reset provider) and
+  `ldap_auth/adoption.rs` (the `LDAP-Auth.xml` import), vendored
   assets `crates/ferrofin-extensions/assets/ldapauth/`, the trait seam
   `crates/ferrofin-traits/src/ldap.rs`, the wire types `crates/ferrofin-model/src/ldap.rs`,
   and the thin HTTP handler `crates/ferrofin-api/src/handlers/ldap.rs`. The live directory
