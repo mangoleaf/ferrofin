@@ -370,6 +370,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "detect_network_change",
         env: Some("FERROFIN_DETECT_NETWORK_CHANGE"),
         env_read: PARSED_BOOL,
+        label: "Follow network changes",
         group: Group::Network,
         kind: SettingKind::Bool,
         default: "true",
