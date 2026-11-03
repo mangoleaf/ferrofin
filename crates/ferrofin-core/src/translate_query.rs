@@ -471,14 +471,24 @@ pub(crate) fn build_latest_tv_series_query(filter: &InternalItemsQuery) -> Query
 /// builds its base query with `TranslateQuery` alone, and the de-duplication
 /// is what the limit counts. The caller's `order_by` and `start_index` play no
 /// part, as upstream.
+///
+/// `without_series` keeps only the rows with no `SeriesName`: the movies half
+/// of the `unknown` arm (`Querying.cs:136`, `baseQuery.Where(e => e.SeriesName
+/// == null)`).
 #[must_use]
-pub(crate) fn build_latest_movies_query(filter: &InternalItemsQuery) -> QueryBuilder<Sqlite> {
+pub(crate) fn build_latest_movies_query(
+    filter: &InternalItemsQuery,
+    without_series: bool,
+) -> QueryBuilder<Sqlite> {
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
         r#"SELECT bi."Id" AS "Id", bi."PresentationUniqueKey" AS "PresentationUniqueKey"
            FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
     );
     qb.push_bind(PLACEHOLDER_ID);
     append_predicates(&mut qb, filter);
+    if without_series {
+        qb.push(r#" AND bi."SeriesName" IS NULL"#);
+    }
     qb.push(
         r#" AND bi."PresentationUniqueKey" IS NOT NULL ORDER BY bi."DateCreated" DESC, bi."Id" DESC"#,
     );
@@ -3674,10 +3684,15 @@ mod tests {
 
     /// The movies arm of the grouped Latest (`build_latest_movies_query`), as
     /// the user-view manager sends it for a movies library and for the unscoped
-    /// home row: the libraries' rows come off an index seek by top parent,
-    /// never a scan of every item.
+    /// home row, and its `without_series` form, the movies half of a mixed
+    /// library's `unknown` arm (whose shows half is the TV arm's statements,
+    /// pinned in `latest_tv_repository`): the libraries' rows come off an index
+    /// seek by top parent, never a scan of every item.
+    #[rstest::rstest]
+    #[case::movies_arm(false)]
+    #[case::unknown_arm_movies_half(true)]
     #[tokio::test]
-    async fn latest_movies_rows_seek_the_libraries() {
+    async fn latest_movies_rows_seek_the_libraries(#[case] without_series: bool) {
         use ferrofin_model::data::MediaType;
         use sqlx::{Execute, Row};
         let db = crate::test_support::test_db().await;
@@ -3689,7 +3704,7 @@ mod tests {
             limit: Some(20),
             ..InternalItemsQuery::default()
         };
-        let mut builder = super::build_latest_movies_query(&filter);
+        let mut builder = super::build_latest_movies_query(&filter, without_series);
         let mut query = builder.build();
         let args = query.take_arguments().expect("arguments").expect("binds");
         let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());

@@ -358,6 +358,16 @@ impl EncodingJobInfo {
         codec.is_some_and(|c| c.eq_ignore_ascii_case("copy"))
     }
 
+    /// Whether a progressive job keeps the source's timestamps (`-copyts`):
+    /// the client asked for it (`CopyTimestamps`) and the runtime is known, as
+    /// upstream's progressive command requires (`state.RunTimeTicks.HasValue &&
+    /// state.BaseRequest.CopyTimestamps`). Not the HLS rule: upstream's HLS
+    /// command copies timestamps whatever the request says.
+    #[must_use]
+    pub fn copies_timestamps(&self) -> bool {
+        self.base_request.copy_timestamps && self.run_time_ticks.is_some()
+    }
+
     /// Whether this job re-encodes any stream, video or audio: what the
     /// [`TranscodeLimits`](crate::transcoding::TranscodeLimits) caps count.
     ///

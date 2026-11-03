@@ -396,10 +396,11 @@ pub trait ItemRepository: Send + Sync {
             .collect())
     }
 
-    /// The "latest media" rows of a **tvshows, music or movies** library — port
-    /// of C# `BaseItemRepository.GetLatestItemList`.
+    /// The "latest media" rows of a **tvshows, music or movies** library, or of
+    /// a parent set with no collection type (**unknown**) — port of C#
+    /// `BaseItemRepository.GetLatestItemList`.
     ///
-    /// The three types answer differently (all v12):
+    /// The four types answer differently (all v12):
     ///
     /// - **tvshows** (`GetLatestTvShowItems`) — ONE row for each of the newest
     ///   `filter.limit` series (by the newest row the filter matches, grouped
@@ -416,12 +417,14 @@ pub trait ItemRepository: Send + Sync {
     /// - **movies** (`GetLatestMovieItems`) — the rows the filter matches that
     ///   carry a presentation key, newest first (`DateCreated DESC, Id DESC`),
     ///   the first of each key, `filter.limit` of them. The filter's `order_by`
-    ///   and `start_index` play no part, and the caller groups the rows.
+    ///   and `start_index` play no part, and the caller groups the rows;
+    /// - **unknown** — the movies answer over the rows with no `SeriesName`
+    ///   and the tvshows answer, `filter.limit` of each, merged by each row's
+    ///   own `DateCreated` (then `Id`), newest first, and cut to
+    ///   `filter.limit`. The caller groups the rows.
     ///
-    /// Any other collection type returns an empty list and the caller uses
-    /// [`get_item_list`](Self::get_item_list) for it. Note that is wider than
-    /// the C# early exit, which also has an `unknown` arm (a mixed library's
-    /// latest movies and shows): not ported yet, gl-383.
+    /// Any other collection type returns an empty list, as the C# early exit
+    /// does, and the caller uses [`get_item_list`](Self::get_item_list) for it.
     async fn get_latest_item_list(
         &self,
         filter: &InternalItemsQuery,
@@ -1183,8 +1186,9 @@ pub trait ItemPersistenceService: Send + Sync {
     /// whose stored `DateModified` still matches the file's mtime is *not*
     /// refreshed, so upstream never re-decodes an unchanged poster. Ferrofin
     /// holds its image rows in the database rather than on an in-memory
-    /// `BaseItem`, so the scan reads them back — once for the whole run, in the
-    /// same shape as the other scan prereads, never once per item.
+    /// `BaseItem`, so the scan reads them back in batches — one stored-row
+    /// window of its plan at a time, and its albums' once for their covers —
+    /// never once per item.
     ///
     /// The default returns nothing (stub/fake services), which is safe: a
     /// caller that finds no stored metadata simply recomputes.
@@ -1909,7 +1913,8 @@ pub trait ItemPersistenceService: Send + Sync {
 
     /// The external ids already recorded for each of `item_ids`, keyed by item.
     ///
-    /// A scanner reads these once up front so a re-scan resolves each item by
+    /// A scanner reads these in batches ahead of its walk (one stored-row
+    /// window of its plan at a time) so a re-scan resolves each item by
     /// the id a previous pass matched — C# `info.GetProviderId` — instead of
     /// searching by title again. The default is an empty map, for stub
     /// services with no store behind them.

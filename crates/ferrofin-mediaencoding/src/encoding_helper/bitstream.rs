@@ -1,10 +1,12 @@
 //! Bitstream filters: container fixups, stripping dynamic HDR metadata a
-//! client cannot handle, and the HLS copied-audio trim.
+//! client cannot handle, the HLS copied-audio trim, and the trim of an
+//! embedded subtitle sidecar in a seeked stream.
 //!
 //! Port of C# `EncodingHelper.ShouldRemoveDynamicHdrMetadata`,
 //! `CanEncoderRemoveDynamicHdrMetadata`, `IsDoviRemoved`, `IsHdr10PlusRemoved`,
 //! `GetBitStreamArgs` (10.11.z 1403-1540), `GetCopiedAudioTrimBsf` and
-//! `GetAudioBitStreamArguments`.
+//! `GetAudioBitStreamArguments`. The sidecar trim has no upstream counterpart
+//! ([`embedded_sidecar_trim_arguments`]).
 //!
 //! **Why this exists at all: it is what lets a Dolby Vision file stream-copy to
 //! a client that cannot play it.** Without these filters the only options are
@@ -38,6 +40,7 @@
 //! ([`video_bit_stream_filters_apply`]).
 
 use ferrofin_model::data::{VideoRange, VideoRangeType};
+use ferrofin_model::dlna::SubtitleDeliveryMethod;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_traits::media_encoding::TranscodingJobType;
@@ -454,6 +457,81 @@ pub fn audio_bit_stream_arguments(
         return None;
     }
     Some(format!("-bsf:a {}", filters.join(",")))
+}
+
+/// The first ffmpeg whose `setts` filter can rewrite a packet's duration
+/// (its `duration` option and `DURATION` constant arrived after 5.0).
+const MIN_FFMPEG_SETTS_DURATION: FfmpegVersion = FfmpegVersion::new(5, 1);
+
+/// The output options that trim an embedded external subtitle to the start
+/// of a seeked stream, for the embedded track (`s:0`). `None` when the media
+/// file is not seeked (`seeked`: its `-ss` is past 0), the subtitle is not an
+/// external track embedded into the output, or the job copies timestamps.
+///
+/// Divergence, a Jellyfin bug not ported (gl-930): `GetInputArgument` seeks
+/// the sidecar with the media file's `-ss`, and a subtitle file's seek lands
+/// on the last cue that starts at or before that time, even one already over.
+/// Its timestamp is then negative on the output clock, and Matroska, which
+/// writes no negative timestamps, moves every stream later by it: a seek to
+/// 9 s past a cue at 3.5-8 s started the video 5.5 s into the file (measured
+/// on ffmpeg 4.4.2, 8.1.3-Jellyfin and 9.0.2), and the gap grows with the time
+/// since the last cue. An MP4 keeps the stale cue at the start instead.
+///
+/// From ffmpeg 5.1 the cues are trimmed as upstream's
+/// `SubtitleEncoder.FilterEvents` trims a sidecar it serves from a start
+/// position: the `noise` filter drops a cue that has ended by the start, and
+/// `setts` starts one still on screen at the start, its duration cut to the
+/// time it has left (measured on 8.1.3-Jellyfin and 9.0.2, a copied track and
+/// one converted to ASS or `mov_text` alike). A cue that ends exactly at the
+/// start goes too: upstream keeps it with no length, which shows nothing, but
+/// MP4's `mov_text` would stretch it to the next cue. ffmpeg 5.0's `setts`
+/// cannot change a duration, so there the `noise` filter, upstream's
+/// copied-audio trim tool, drops every cue that starts before the start, the
+/// one on screen included. An older ffmpeg has no `drop` option, and a
+/// version that cannot be read counts as the oldest supported: `-copypriorss`
+/// then drops those cues of a copied track.
+///
+/// TODO(gl-1199): before ffmpeg 5.1 a cue on screen at the start is dropped
+/// rather than started at 0, and before 5.0 a track converted to another codec
+/// (`subtitleCodec`) is still shifted, since `-copypriorss` only reaches stream
+/// copy. A converted bitmap sidecar, which such an ffmpeg reads from its
+/// start, shifts it by the start position less its first cue's time. Fix path:
+/// convert the sidecar with the server's subtitle encoder from the start
+/// position (`FilterEvents`) and add that file unseeked.
+///
+/// TODO(gl-1200): a bitmap sidecar's packets carry no duration, so every one
+/// before the start is dropped and a bitmap on screen at the start shows only
+/// from the next display set; from ffmpeg 5.1 an embedded one is also still
+/// seeked, past the start by its first cue's time and inside a display set.
+/// Fix path: read every bitmap sidecar unseeked on the movie's clock, and
+/// start the last display set before the start at 0 instead of dropping it.
+///
+/// A job that copies timestamps (`-copyts -avoid_negative_ts disabled`) keeps
+/// the source's clock, on which nothing before the seek is negative and no
+/// stream moves (measured: the drop changes nothing there). The stream routes
+/// do not bind `copyTimestamps` yet (gl-1040), so no job does today.
+#[must_use]
+pub fn embedded_sidecar_trim_arguments(
+    state: &EncodingJobInfo,
+    seeked: bool,
+    ffmpeg_version: Option<FfmpegVersion>,
+) -> Option<&'static str> {
+    let embeds_sidecar = state.subtitle_delivery_method == SubtitleDeliveryMethod::Embed
+        && state
+            .subtitle_stream
+            .as_ref()
+            .is_some_and(|sub| sub.is_external);
+    if !seeked || !embeds_sidecar || state.copies_timestamps() {
+        return None;
+    }
+    let at_least = |minimum| ffmpeg_version.is_some_and(|version| version >= minimum);
+    Some(if at_least(MIN_FFMPEG_SETTS_DURATION) {
+        "-bsf:s:0 noise=drop='lt(pts\\,0)*lte(pts+duration\\,0)',setts=pts='max(PTS\\,0)':dts='max(DTS\\,0)':duration='DURATION+min(PTS\\,0)'"
+    } else if at_least(MIN_FFMPEG_NOISE_BSF_DROP) {
+        "-bsf:s:0 noise=drop='lt(pts\\,0)'"
+    } else {
+        "-copypriorss:s:0 0"
+    })
 }
 
 #[cfg(test)]
@@ -1162,6 +1240,94 @@ mod tests {
                 Some(FfmpegVersion::new(5, 0))
             ),
             Some(format!("-bsf:a noise=drop='lt(pts*tb\\,{cutoff})'")),
+        );
+    }
+
+    /// A progressive job embedding the subtitle `sub` (`None`: no subtitle).
+    fn embed_state(sub: Option<MediaStream>, method: SubtitleDeliveryMethod) -> EncodingJobInfo {
+        EncodingJobInfo {
+            subtitle_stream: sub,
+            subtitle_delivery_method: method,
+            ..audio_bsf_state(
+                TranscodingJobType::Progressive,
+                "libx264",
+                "aac",
+                "aac",
+                "mkv",
+                DEFAULT_SEEK_TICKS,
+            )
+        }
+    }
+
+    /// A subtitle stream, external (a sidecar) or inside the media file.
+    fn subtitle(external: bool) -> MediaStream {
+        MediaStream {
+            codec: Some("subrip".to_owned()),
+            index: 2,
+            stream_type: MediaStreamType::Subtitle,
+            is_external: external,
+            path: external.then(|| "/media/movie.en.srt".to_owned()),
+            ..MediaStream::default()
+        }
+    }
+
+    const FILTER_EVENTS: &str = "-bsf:s:0 noise=drop='lt(pts\\,0)*lte(pts+duration\\,0)',setts=pts='max(PTS\\,0)':dts='max(DTS\\,0)':duration='DURATION+min(PTS\\,0)'";
+    const NOISE_DROP: &str = "-bsf:s:0 noise=drop='lt(pts\\,0)'";
+    const COPY_PRIOR: &str = "-copypriorss:s:0 0";
+
+    /// An embedded sidecar in a seeked stream is trimmed to the output's start
+    /// (gl-930): from ffmpeg 5.1 as `FilterEvents` trims it (elapsed cues
+    /// dropped, the one on screen started at 0), on 5.0 every cue before the
+    /// start dropped by the `noise` filter, `-copypriorss` on an older or
+    /// unread version. Nothing for an unseeked stream, a track in the media
+    /// file, another delivery method or no subtitle.
+    #[rstest]
+    #[case::from_5_1(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((5, 1)), Some(FILTER_EVENTS))]
+    #[case::current(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((9, 0)), Some(FILTER_EVENTS))]
+    #[case::on_5_0(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((5, 0)), Some(NOISE_DROP))]
+    #[case::before_5_0(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((4, 4)), Some(COPY_PRIOR))]
+    #[case::unknown_version(
+        true,
+        Some(subtitle(true)),
+        SubtitleDeliveryMethod::Embed,
+        None,
+        Some(COPY_PRIOR)
+    )]
+    #[case::not_seeked(false, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((9, 0)), None)]
+    #[case::internal_track(true, Some(subtitle(false)), SubtitleDeliveryMethod::Embed, Some((9, 0)), None)]
+    #[case::burned_in(true, Some(subtitle(true)), SubtitleDeliveryMethod::Encode, Some((9, 0)), None)]
+    #[case::external_delivery(true, Some(subtitle(true)), SubtitleDeliveryMethod::External, Some((9, 0)), None)]
+    #[case::no_subtitle(true, None, SubtitleDeliveryMethod::Embed, Some((9, 0)), None)]
+    fn an_embedded_sidecar_drops_the_cues_before_a_seek(
+        #[case] seeked: bool,
+        #[case] sub: Option<MediaStream>,
+        #[case] method: SubtitleDeliveryMethod,
+        #[case] version: Option<(i32, i32)>,
+        #[case] expected: Option<&str>,
+    ) {
+        let state = embed_state(sub, method);
+        let version = version.map(|(major, minor)| FfmpegVersion::new(major, minor));
+        assert_eq!(
+            embedded_sidecar_trim_arguments(&state, seeked, version),
+            expected
+        );
+    }
+
+    /// Copied timestamps keep the source's clock, so nothing is dropped; they
+    /// count only with a known runtime, as the planner's `-copyts` does.
+    #[rstest]
+    #[case::copied(Some(6_000_000_000), None)]
+    #[case::unknown_runtime(None, Some(FILTER_EVENTS))]
+    fn copied_timestamps_keep_the_sidecar_cues(
+        #[case] run_time_ticks: Option<i64>,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut state = embed_state(Some(subtitle(true)), SubtitleDeliveryMethod::Embed);
+        state.base_request.copy_timestamps = true;
+        state.run_time_ticks = run_time_ticks;
+        assert_eq!(
+            embedded_sidecar_trim_arguments(&state, true, Some(FfmpegVersion::new(9, 0))),
+            expected
         );
     }
 }

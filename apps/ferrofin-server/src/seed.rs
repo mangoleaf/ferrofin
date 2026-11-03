@@ -176,12 +176,7 @@ pub async fn seed_library_roots(
     if add_root_libraries(virtual_folders, roots).await == 0 {
         return;
     }
-    if let Err(error) = monitor.stop().await {
-        tracing::warn!(%error, "failed to stop the library monitor after seeding libraries");
-    }
-    if let Err(error) = monitor.start().await {
-        tracing::warn!(%error, "failed to restart the library monitor after seeding libraries");
-    }
+    monitor.restart();
     if let Err(error) = library.queue_library_scan().await {
         tracing::warn!(%error, "failed to queue the first scan of the seeded libraries");
     }

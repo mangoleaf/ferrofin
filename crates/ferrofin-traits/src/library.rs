@@ -2410,10 +2410,12 @@ pub trait UserViewManager: Send + Sync {
     /// Port of `UserViewManager.GetLatestItems`: ONE query across every parent
     /// (the root folders the user may open minus `latest_item_excludes`, or
     /// the `parent_id` folder), ordered `DateCreated DESC, SortName DESC, ProductionYear DESC`
-    /// and over-fetched to `limit * 5` rows; a tvshows or music parent takes
-    /// its own per-collection-type query instead
-    /// ([`ItemRepository::get_latest_item_list`] — one Episode, Season or
-    /// Series card per newest series for tvshows, the newest albums for music).
+    /// and over-fetched to `limit * 5` rows. A grouped request whose first
+    /// typed parent is tvshows, music or movies takes that type's own query
+    /// instead, and one with no typed parent the `unknown` merge of the movies
+    /// and tvshows ones ([`ItemRepository::get_latest_item_list`] — one
+    /// Episode, Season or Series card per newest series for tvshows, the newest
+    /// albums for music, the newest row of each presentation key for movies).
     /// The rows are then bucketed by their `LatestItemsIndexContainer` (episode
     /// → series, track → music album, photo → photo album; folders and every
     /// other kind — a `MusicAlbum` included — stand alone) in first-seen order,
@@ -2795,11 +2797,24 @@ fn _assert_object_safe_music_manager(_: &dyn MusicManager) {}
 /// surface failures uniformly.
 #[async_trait]
 pub trait LibraryMonitor: Send + Sync {
-    /// Starts monitoring.
+    /// Starts monitoring: watches the libraries' roots as they are now. A
+    /// library-structure change asks for [`restart`](Self::restart) instead,
+    /// which does not wait for the watches.
     async fn start(&self) -> Result<(), ServiceError>;
 
     /// Stops monitoring.
     async fn stop(&self) -> Result<(), ServiceError>;
+
+    /// Asks for the watches to be rebuilt for the library structure as it is
+    /// now, a [`stop`](Self::stop) and then a [`start`](Self::start): what
+    /// every library-structure change ends with (`LibraryStructureController`,
+    /// `LibraryManager.AddVirtualFolder`). Returns before any watch exists, as
+    /// upstream's `Start` does (it creates each watcher on a thread-pool task):
+    /// a recursive watch walks the library's whole tree, and the change that
+    /// asked has already been made. Overlapping requests are served one
+    /// restart at a time, each reading the structure when it runs, so the
+    /// watches end up matching the latest one.
+    fn restart(&self);
 
     /// Signals that a change at `path` is beginning (suppress self-triggering).
     async fn report_file_system_change_beginning(&self, path: &str) -> Result<(), ServiceError>;
