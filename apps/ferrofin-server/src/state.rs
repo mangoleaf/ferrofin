@@ -2147,6 +2147,9 @@ pub async fn build_app_state(
                 db.clone(),
             ),
         ),
+        // The providers' own download path, so an extension's image fetch keeps
+        // the destination policy and size limit set above.
+        remote_images: Arc::new(ferrofin_providers::remote_images::LimitedImageFetcher),
     };
     // The user manager was built long before the extensions: their
     // authentication and password-reset providers fill its late slots now,

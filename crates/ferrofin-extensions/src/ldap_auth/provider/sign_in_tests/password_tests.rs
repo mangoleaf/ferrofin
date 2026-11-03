@@ -29,16 +29,6 @@ impl Harness {
         id_of(&user)
     }
 
-    /// A provider over this harness, as the extension builds one.
-    fn provider(&self) -> LdapAuthProvider {
-        LdapAuthProvider::new(
-            Arc::clone(&self.plugins) as Arc<dyn PluginManager>,
-            Arc::clone(&self.users) as Arc<dyn UserManager>,
-            Arc::clone(&self.identities) as Arc<dyn ExternalIdentityStore>,
-            Arc::new(self.directory.clone()),
-        )
-    }
-
     /// Registers LDAP-Auth's password-reset provider, as boot does.
     fn with_reset_provider(&self) {
         self.users

@@ -261,6 +261,11 @@ const CSHARP_TASK_TYPE_NAMES: &[(&str, &str)] = &[
         "MergeEpisodesTask",
         "Jellyfin.Plugin.MergeVersions.ScheduledTasks.MergeEpisodesTask",
     ),
+    // jellyfin-plugin-ldapauth @ d11c86a — LDAP-Auth/LdapProfileImageSyncTask.cs.
+    (
+        "LdapProfileImageSync",
+        "Jellyfin.Plugin.LDAP_Auth.LdapProfileImageSyncTask",
+    ),
 ];
 
 /// The wire id of the task registered under `key` — the port of
@@ -340,6 +345,17 @@ mod task_id_tests {
         assert_eq!(
             task_id_for_key("TmdbRefreshUpcomingEpisodes"),
             "1ee23a5dd39fb4225715375c91bc2990"
+        );
+    }
+
+    /// LDAP-Auth's profile-image task: the MD5 of
+    /// `Jellyfin.Plugin.LDAP_Auth.LdapProfileImageSyncTask` as a .NET `Guid`,
+    /// computed outside the code under test.
+    #[test]
+    fn the_ldap_profile_image_task_has_the_plugins_id() {
+        assert_eq!(
+            task_id_for_key("LdapProfileImageSync"),
+            "76cba34af0fabda24dffccae78f7aaf8"
         );
     }
 

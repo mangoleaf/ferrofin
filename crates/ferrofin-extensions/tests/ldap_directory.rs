@@ -40,6 +40,7 @@ use ferrofin_traits::external_identities::{ExternalIdentityKey, ExternalIdentity
 use ferrofin_traits::ldap::LdapTestAnswer;
 use ferrofin_traits::library::UserManager;
 use ferrofin_traits::plugins::PluginManager;
+use ferrofin_traits::remote_images::{RemoteImageError, RemoteImageFetcher};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
@@ -91,6 +92,9 @@ sn: Lovelace
 mail: ada@example.org
 employeeType: jellyfin-admin
 userPassword: ada-secret
+jpegPhoto:: /9j/4AAQSkZJRgABAQAAAQABAAD/2Q==
+description: /9j/2wAEAQL/2Q==
+labeledURI: http://pictures.example.org/ada.jpg
 
 dn: ou=groups,dc=example,dc=org
 objectClass: organizationalUnit
@@ -101,6 +105,18 @@ objectClass: groupOfNames
 cn: jellyfin-admins
 member: uid=ada,ou=people,dc=example,dc=org
 ";
+
+/// Ada's pictures in [`SEED`]: her `jpegPhoto` (binary), her `description`
+/// (Base64), and the picture her `labeledURI` names, which [`Pictures`]
+/// serves.
+const ADA_PHOTO: &[u8] = &[
+    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01,
+    0x00, 0x01, 0x00, 0x00, 0xFF, 0xD9,
+];
+const ADA_DESCRIBED: &[u8] = &[0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x04, 0x01, 0x02, 0xFF, 0xD9];
+const ADA_DESCRIBED_BASE64: &str = "/9j/2wAEAQL/2Q==";
+const ADA_PICTURE_URL: &str = "http://pictures.example.org/ada.jpg";
+const ADA_LINKED: &[u8] = &[0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x04, 0x05, 0x06, 0xFF, 0xD9];
 
 /// The six entries [`SEED`] creates.
 const SEEDED_ENTRIES: usize = 6;
@@ -397,6 +413,7 @@ async fn the_directory_client_against_openldap() {
 
     unroutable(&plain).await;
     sign_in(&open, &plain).await;
+    profile_images(&plain).await;
     admin_filter(&plain).await;
     filter_test_and_user_search(&plain).await;
     password_change(&plain).await;
@@ -706,12 +723,37 @@ async fn directory_operations(plain: &LdapConfig) {
     println!("search, modify, password modify and the root DSE: ok");
 }
 
+/// The picture server: [`ADA_LINKED`] at [`ADA_PICTURE_URL`], nothing
+/// elsewhere. The server's own fetcher, its limits and its refusal of private
+/// addresses are proven in `ferrofin-providers`; this proves the URL the
+/// directory gives is the one fetched.
+#[derive(Default)]
+struct Pictures {
+    fetched: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl RemoteImageFetcher for Pictures {
+    async fn fetch_image(&self, url: &str) -> Result<Vec<u8>, RemoteImageError> {
+        self.fetched.lock().expect("fetched").push(url.to_owned());
+        if url == ADA_PICTURE_URL {
+            Ok(ADA_LINKED.to_vec())
+        } else {
+            Err(RemoteImageError::Missing)
+        }
+    }
+}
+
 /// The user manager with LDAP-Auth enabled against the directory `config`
 /// names, over an in-memory database.
 struct SignIn {
     users: Arc<FerrofinUserManager>,
     identities: Arc<FerrofinExternalIdentityStore>,
+    /// The provider sign-in goes through, which also runs the picture sync.
+    provider: Arc<LdapAuthProvider>,
+    pictures: Arc<Pictures>,
     _plugins_dir: tempfile::TempDir,
+    _profile_dir: tempfile::TempDir,
 }
 
 impl SignIn {
@@ -725,7 +767,11 @@ impl SignIn {
             .await
             .expect("connect");
         db.run_migrations().await.expect("migrations");
-        let users = Arc::new(FerrofinUserManager::new(db.clone()));
+        let profile_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("profiles");
+        let users = Arc::new(
+            FerrofinUserManager::new(db.clone())
+                .with_profile_image_dir(profile_dir.path().to_path_buf()),
+        );
         let identities = Arc::new(FerrofinExternalIdentityStore::new(db));
         let plugins_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("plugins");
         let extensions: Vec<Arc<dyn Extension>> = vec![Arc::new(LdapAuthExtension)];
@@ -738,17 +784,49 @@ impl SignIn {
             .set_plugin_configuration(EXTENSION_ID, serde_json::to_vec(config).expect("json"))
             .await
             .expect("configure");
-        users.set_extension_providers(vec![Arc::new(LdapAuthProvider::new(
+        let pictures = Arc::new(Pictures::default());
+        let provider = Arc::new(LdapAuthProvider::new(
             plugins,
             Arc::clone(&users) as Arc<dyn UserManager>,
             Arc::clone(&identities) as Arc<dyn ExternalIdentityStore>,
             directory,
-        ))]);
+            Arc::clone(&pictures) as Arc<dyn RemoteImageFetcher>,
+        ));
+        users.set_extension_providers(vec![Arc::clone(&provider) as Arc<_>]);
         Self {
             users,
             identities,
+            provider,
+            pictures,
             _plugins_dir: plugins_dir,
+            _profile_dir: profile_dir,
         }
+    }
+
+    /// The bytes of `user`'s profile image, or `None` without one.
+    async fn picture(&self, user: &ferrofin_db::entities::users::UserEntity) -> Option<Vec<u8>> {
+        let id = uuid::Uuid::parse_str(&user.id).expect("id");
+        let image = self
+            .users
+            .get_profile_image(id)
+            .await
+            .expect("profile image")?;
+        Some(std::fs::read(&image.path).expect("read the picture"))
+    }
+
+    /// The avatar hash on `uid`'s link.
+    async fn avatar_hash(&self, uid: &str) -> Option<String> {
+        let key = ExternalIdentityKey {
+            provider_id: PROVIDER_ID,
+            issuer: "",
+            subject: uid,
+        };
+        self.identities
+            .find(key)
+            .await
+            .expect("find")
+            .expect("linked")
+            .avatar_hash
     }
 
     async fn sign_in(
@@ -903,6 +981,91 @@ async fn first_sign_in_and_rename(users: &SignIn, options: &ConnectionOptions) {
         .await
         .expect("sign in")
         .expect("signed in");
+}
+
+/// Profile images (B12): a new user's picture from a binary (`jpegPhoto`), a
+/// Base64 (`description`) and a URL (`labeledURI`) attribute, each told apart
+/// by the `Default` format; then the sync task following a changed picture and
+/// removing one the directory no longer has. Ada's entry is restored after.
+async fn profile_images(plain: &LdapConfig) {
+    let config = |attribute: &str| LdapConfig {
+        ldap_search_filter: "(objectClass=inetOrgPerson)".to_owned(),
+        ldap_search_attributes: "uid".to_owned(),
+        ldap_uid_attribute: "uid".to_owned(),
+        ldap_username_attribute: "uid".to_owned(),
+        enable_all_folders: true,
+        enable_ldap_profile_image_sync: true,
+        remove_images_not_in_ldap: true,
+        ldap_profile_image_attribute: attribute.to_owned(),
+        ..plain.clone()
+    };
+    for (attribute, expected) in [
+        ("jpegPhoto", ADA_PHOTO),
+        ("description", ADA_DESCRIBED),
+        ("labeledURI", ADA_LINKED),
+    ] {
+        let users = SignIn::new(&config(attribute)).await;
+        let ada = users
+            .sign_in("ada", ADA_PASSWORD)
+            .await
+            .expect("sign in")
+            .expect("created");
+        assert_eq!(
+            users.picture(&ada).await.as_deref(),
+            Some(expected),
+            "{attribute}"
+        );
+        assert!(users.avatar_hash("ada").await.is_some(), "{attribute}");
+        println!("first sign-in picture from {attribute}: ok");
+    }
+
+    let users = SignIn::new(&config("description")).await;
+    let ada = users
+        .sign_in("ada", ADA_PASSWORD)
+        .await
+        .expect("sign in")
+        .expect("created");
+    let first_hash = users.avatar_hash("ada").await;
+    assert!(
+        users.pictures.fetched.lock().expect("fetched").is_empty(),
+        "a Base64 picture is not fetched"
+    );
+    let mut admin = Ldap3Directory::default()
+        .connect(&ConnectionOptions::from_config(plain))
+        .await
+        .expect("connect");
+    admin
+        .simple_bind(ADMIN_DN, ADMIN_PASSWORD)
+        .await
+        .expect("admin bind");
+
+    // A changed picture is taken.
+    admin
+        .modify_replace(ADA_DN, "description", &["/9j/2wAEAwT/2Q=="])
+        .await
+        .expect("change the picture");
+    users.provider.sync_profile_images().await.expect("sync");
+    assert_eq!(
+        users.picture(&ada).await.as_deref(),
+        Some(&[0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x04, 0x03, 0x04, 0xFF, 0xD9][..])
+    );
+    assert_ne!(users.avatar_hash("ada").await, first_hash);
+
+    // One the directory no longer has goes, with RemoveImagesNotInLdap on.
+    admin
+        .modify_replace(ADA_DN, "description", &[])
+        .await
+        .expect("remove the picture");
+    users.provider.sync_profile_images().await.expect("sync");
+    assert_eq!(users.picture(&ada).await, None);
+    assert_eq!(users.avatar_hash("ada").await, None);
+
+    admin
+        .modify_replace(ADA_DN, "description", &[ADA_DESCRIBED_BASE64])
+        .await
+        .expect("restore the picture");
+    admin.unbind().await;
+    println!("profile image sync: ok");
 }
 
 /// An adopted user saved with the upstream provider id, never linked, signs

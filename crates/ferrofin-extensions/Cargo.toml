@@ -31,6 +31,9 @@ reqwest.workspace = true
 ldap3.workspace = true
 # Decoding the DN and filter of the LDAP URLs a referral names.
 percent-encoding.workspace = true
+# LDAP-Auth's profile images: Base64 attributes and avatar hashes, URL attributes.
+base64.workspace = true
+url.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 thiserror.workspace = true

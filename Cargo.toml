@@ -242,6 +242,9 @@ bitflags = "2.13.2"
 crc32fast = "1.5.2"
 regex = "1"
 percent-encoding = "2.3.2"
+# Base64 with .NET's rules (`Base64.IsValid`, `Convert.FromBase64String`) for
+# LDAP-Auth's profile images. Already in the lock file as a transitive dependency.
+base64 = "0.23.1"
 # CLDR root collation — the port of .NET `StringComparison.InvariantCulture`
 # used by the Live TV name sort. ICU4X 2.x is already in the tree (icu_normalizer
 # 2.2 via idna), so this shares icu_collections/icu_provider/zerovec.

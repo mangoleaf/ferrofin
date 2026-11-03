@@ -82,6 +82,11 @@ pub struct ExtensionContext {
     /// users: an authentication provider finds and records through it who
     /// signs in with which identity.
     pub external_identities: Arc<dyn ferrofin_traits::external_identities::ExternalIdentityStore>,
+    /// Image downloads under the server's limits (no private address unless
+    /// `image_private_http_allow` lists it, `image_download_max_mb`): how an
+    /// extension fetches a picture it was given as a URL, such as an LDAP
+    /// user's.
+    pub remote_images: Arc<dyn ferrofin_traits::remote_images::RemoteImageFetcher>,
 }
 
 /// A curated, compiled-in capability that surfaces as a Jellyfin plugin.
@@ -291,6 +296,9 @@ mod tests {
                 ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(
                     db.clone(),
                 ),
+            ),
+            remote_images: Arc::new(
+                crate::ldap_auth::provider::profile_image::FakeImages::default(),
             ),
         };
         (cx, users)
@@ -590,7 +598,24 @@ mod tests {
             .map(|pair| pair.name)
             .collect();
         assert_eq!(listed, [Some("Default Password Reset Provider".to_owned())]);
-        assert!(ldap.tasks(&cx).is_empty());
+        // `LdapProfileImageSyncTask`, as upstream names and schedules it.
+        let tasks = ldap.tasks(&cx);
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
+        assert_eq!(task.key(), "LdapProfileImageSync");
+        assert_eq!(task.name(), "LDAP - Synchronize profile images");
+        assert_eq!(
+            task.description(),
+            "Synchronizes user profile images from LDAP."
+        );
+        assert_eq!(task.category(), "Application");
+        let triggers = task.default_triggers();
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(
+            triggers[0].type_,
+            ferrofin_model::tasks::TaskTriggerInfoType::IntervalTrigger
+        );
+        assert_eq!(triggers[0].interval_ticks, Some(24 * 3600 * 10_000_000));
     }
 
     #[tokio::test]
