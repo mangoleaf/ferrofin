@@ -34,9 +34,12 @@ struct State {
     accounts: HashMap<String, String>,
     /// What every search answers.
     entries: Vec<LdapEntry>,
-    references: Vec<String>,
+    references: Vec<Vec<String>>,
     /// What a search with one of these filters answers instead.
     by_filter: HashMap<String, SearchOutcome>,
+    /// What a search on a connection to one of these servers answers before
+    /// anything else: the servers a referral names.
+    by_server: HashMap<String, SearchOutcome>,
     /// Failures to answer with instead.
     connect: Option<LdapError>,
     search: Option<LdapError>,
@@ -46,17 +49,23 @@ struct State {
     // The calls.
     connects: usize,
     binds: Vec<(String, String)>,
+    /// The server each bind was sent to, with its DN.
+    binds_at: Vec<(String, String)>,
     searches: Vec<(String, SearchScope, String, Vec<String>)>,
     unbinds: usize,
 }
 
-/// An [`LdapDirectory`] (and its connections) over a shared [`State`].
+/// An [`LdapDirectory`] over a shared [`State`], and each of its
+/// connections, to the server it names.
 #[derive(Clone, Default)]
-struct FakeDirectory(Arc<Mutex<State>>);
+struct FakeDirectory {
+    state: Arc<Mutex<State>>,
+    server: String,
+}
 
 impl FakeDirectory {
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        self.0.lock().expect("state")
+        self.state.lock().expect("state")
     }
 
     /// Forgets the calls made so far.
@@ -80,14 +89,17 @@ impl FakeDirectory {
 impl LdapDirectory for FakeDirectory {
     async fn connect(
         &self,
-        _options: &ConnectionOptions,
+        options: &ConnectionOptions,
     ) -> Result<Box<dyn LdapConnection>, LdapError> {
         let mut state = self.state();
         state.connects += 1;
         if let Some(error) = &state.connect {
             return Err(error.clone());
         }
-        Ok(Box::new(self.clone()))
+        Ok(Box::new(Self {
+            state: Arc::clone(&self.state),
+            server: options.server.clone(),
+        }))
     }
 }
 
@@ -96,6 +108,7 @@ impl LdapConnection for FakeDirectory {
     async fn simple_bind(&mut self, dn: &str, password: &str) -> Result<(), LdapError> {
         let mut state = self.state();
         state.binds.push((dn.to_owned(), password.to_owned()));
+        state.binds_at.push((self.server.clone(), dn.to_owned()));
         if let Some(error) = state.bind.get(dn) {
             return Err(error.clone());
         }
@@ -132,7 +145,11 @@ impl LdapConnection for FakeDirectory {
         {
             return Err(error.clone());
         }
-        if let Some(outcome) = state.by_filter.get(filter) {
+        if let Some(outcome) = state
+            .by_server
+            .get(&self.server)
+            .or_else(|| state.by_filter.get(filter))
+        {
             return Ok(outcome.clone());
         }
         Ok(SearchOutcome {
@@ -882,9 +899,9 @@ async fn a_refused_bind_is_a_failed_attempt(#[case] code: u32) {
 #[case::connection_lost_at_the_users_bind(|state: &mut State| {
     state.bind.insert(ADA_DN.to_owned(), LdapError::Connection("reset".to_owned()));
 })]
-#[case::only_referrals(|state: &mut State| {
+#[case::a_referral_loop(|state: &mut State| {
     state.entries.clear();
-    state.references = vec!["ldap://elsewhere.example/dc=example,dc=org".to_owned()];
+    state.references = vec![vec!["ldap://ldap.example/dc=example,dc=org".to_owned()]];
 })]
 #[tokio::test]
 async fn a_directory_that_cannot_answer_is_a_server_error_and_no_failed_attempt(
@@ -936,6 +953,55 @@ async fn the_first_of_several_matches_is_used() {
         .expect("sign in")
         .expect("signed in");
     assert_eq!(user.username, "ada");
+}
+
+/// A user whose entry only a referred server holds is found there, the
+/// search following the reference as the bind DN, and signs in with their
+/// password checked at the configured server, as upstream binds the user
+/// there (`ConnectToLdap(userDn, password)` follows no referral).
+#[tokio::test]
+async fn a_user_found_only_behind_a_referral_signs_in_at_the_configured_server() {
+    let harness = Harness::new(&config()).await;
+    {
+        let mut state = harness.directory.state();
+        state.entries.clear();
+        state.references = vec![vec![
+            "ldap://partners.example/ou=partners,dc=example,dc=org??sub".to_owned(),
+        ]];
+        state.by_server.insert(
+            "partners.example".to_owned(),
+            SearchOutcome {
+                entries: vec![entry(
+                    "uid=grace,ou=partners,dc=example,dc=org",
+                    &[("uid", "grace"), ("mail", "grace@example.org")],
+                )],
+                references: Vec::new(),
+            },
+        );
+        state.accounts.insert(
+            "uid=grace,ou=partners,dc=example,dc=org".to_owned(),
+            "grace-secret".to_owned(),
+        );
+    }
+    let user = harness
+        .sign_in("grace", "grace-secret")
+        .await
+        .expect("sign in")
+        .expect("created");
+    assert_eq!(user.username, "grace");
+    assert!(harness.link("grace").await.is_some(), "linked by uid");
+    assert_eq!(
+        harness.directory.state().binds_at,
+        [
+            ("ldap.example".to_owned(), READER_DN.to_owned()),
+            ("partners.example".to_owned(), READER_DN.to_owned()),
+            (
+                "ldap.example".to_owned(),
+                "uid=grace,ou=partners,dc=example,dc=org".to_owned()
+            ),
+        ],
+        "the bind DN at both servers, the user at the configured one"
+    );
 }
 
 #[tokio::test]

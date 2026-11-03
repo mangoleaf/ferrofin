@@ -28,6 +28,8 @@ regex.workspace = true
 reqwest.workspace = true
 # The LDAP-Auth extension's directory client, its TLS configuration and errors.
 ldap3.workspace = true
+# Decoding the DN and filter of the LDAP URLs a referral names.
+percent-encoding.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 thiserror.workspace = true

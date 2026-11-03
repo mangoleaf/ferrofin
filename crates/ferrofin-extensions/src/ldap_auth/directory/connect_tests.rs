@@ -627,6 +627,14 @@ async fn a_search_returns_entries_and_references_and_fails_on_a_bad_result() {
             ),
             entry("uid=bob,dc=example", &[]),
             tlv(0x73, &octets(b"ldap://other.example/dc=other")),
+            tlv(
+                0x73,
+                &[
+                    octets(b"ldap://dc1.example/ou=two,dc=example"),
+                    octets(b"ldap://dc2.example/ou=two,dc=example"),
+                ]
+                .concat(),
+            ),
             tlv(0x65, &ldap_result(0, "")),
         ],
         _ => Vec::new(),
@@ -665,7 +673,14 @@ async fn a_search_returns_entries_and_references_and_fails_on_a_bad_result() {
     );
     assert_eq!(
         found.references,
-        vec!["ldap://other.example/dc=other".to_owned()]
+        [
+            vec!["ldap://other.example/dc=other".to_owned()],
+            vec![
+                "ldap://dc1.example/ou=two,dc=example".to_owned(),
+                "ldap://dc2.example/ou=two,dc=example".to_owned(),
+            ],
+        ],
+        "each reference apart, its URLs alternatives in the order sent"
     );
     assert_eq!(
         connection
@@ -677,6 +692,87 @@ async fn a_search_returns_entries_and_references_and_fails_on_a_bad_result() {
         }),
         "a filter that does not parse is Novell's Filter Error"
     );
+}
+
+#[tokio::test]
+async fn a_referral_result_keeps_its_urls() {
+    let mut referral = ldap_result(10, "");
+    referral.extend(tlv(
+        0xa3,
+        &[
+            octets(b"ldap://dc1.example/dc=example"),
+            octets(b"ldaps://dc2.example/dc=example"),
+        ]
+        .concat(),
+    ));
+    let port = ldap_server(move |op| match op {
+        0x63 => vec![tlv(0x65, &referral)],
+        _ => Vec::new(),
+    })
+    .await;
+    let mut connection = Ldap3Directory::default()
+        .connect(&plain(port))
+        .await
+        .expect("connect");
+    let error = connection
+        .search("dc=example", SearchScope::Subtree, "(objectClass=*)", &[])
+        .await
+        .expect_err("referred");
+    assert_eq!(
+        error,
+        LdapError::Referred {
+            urls: vec![
+                "ldap://dc1.example/dc=example".to_owned(),
+                "ldaps://dc2.example/dc=example".to_owned(),
+            ],
+            message: String::new(),
+        }
+    );
+    assert_eq!(error.to_string(), "Referral", "it reads as the result");
+}
+
+#[tokio::test]
+async fn a_referral_result_naming_no_url_is_that_result() {
+    let port = ldap_server(|op| match op {
+        0x63 => vec![tlv(0x65, &ldap_result(10, "nowhere"))],
+        _ => Vec::new(),
+    })
+    .await;
+    let mut connection = Ldap3Directory::default()
+        .connect(&plain(port))
+        .await
+        .expect("connect");
+    assert_eq!(
+        connection
+            .search("dc=example", SearchScope::Subtree, "(objectClass=*)", &[])
+            .await,
+        Err(LdapError::Result {
+            code: 10,
+            message: "nowhere".to_owned(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_search_reference_that_cannot_be_read_fails_the_search() {
+    let port = ldap_server(|op| match op {
+        // A reference whose URL is an integer, not an octet string's text.
+        0x63 => vec![
+            tlv(0x73, &tlv(0x30, &tlv(0x02, &[1]))),
+            tlv(0x65, &ldap_result(0, "")),
+        ],
+        _ => Vec::new(),
+    })
+    .await;
+    let mut connection = Ldap3Directory::default()
+        .connect(&plain(port))
+        .await
+        .expect("connect");
+    let error = connection
+        .search("dc=example", SearchScope::Subtree, "(objectClass=*)", &[])
+        .await
+        .expect_err("unreadable");
+    assert!(matches!(error, LdapError::Connection(_)), "{error:?}");
 }
 
 #[tokio::test]
