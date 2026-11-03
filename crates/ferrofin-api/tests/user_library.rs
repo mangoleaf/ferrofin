@@ -210,7 +210,7 @@ impl AuthService for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: self.user(),
+            user: self.user().map(Arc::new),
             is_api_key: self.elevated || self.keyless_user,
             is_authenticated: true,
             ..AuthorizationInfo::default()
@@ -225,7 +225,7 @@ impl AuthorizationContext for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: self.user(),
+            user: self.user().map(Arc::new),
             is_api_key: self.elevated || self.keyless_user,
             is_authenticated: true,
             ..AuthorizationInfo::default()
@@ -1481,7 +1481,7 @@ impl HidingAuth {
         let mut user = user_entity(USER_ID, "alice");
         user.hide_played_in_latest = true;
         AuthorizationInfo {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         }

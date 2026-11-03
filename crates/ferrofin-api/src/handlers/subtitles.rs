@@ -79,7 +79,7 @@ async fn require_item(
 ) -> Result<(), ApiError> {
     if state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .is_none()
     {
@@ -101,7 +101,7 @@ async fn require_video(
 ) -> Result<(), ApiError> {
     let is_video = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .is_some_and(|item| super::videos::is_video(&item));
     if !is_video {

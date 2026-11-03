@@ -65,7 +65,7 @@ async fn get_external_id_infos(
 ) -> Result<Json<Vec<ExternalIdInfo>>, ApiError> {
     if state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .is_none()
     {
@@ -317,7 +317,7 @@ async fn apply_search_criteria(
 ) -> Result<axum::http::StatusCode, ApiError> {
     let Some(item) = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
     else {
         return Err(ApiError::NotFound(format!("item {item_id}")));

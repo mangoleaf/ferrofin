@@ -14,6 +14,8 @@
 //! just its route wiring plus the manager call that differs — extracting the
 //! reuse rather than copying it into six files.
 
+use std::sync::Arc;
+
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::querying::QueryResult;
@@ -192,7 +194,7 @@ impl ByNameListQuery {
     /// a `400` — ASP.NET's binder and C# `ApplyFilters` reject them the same way.
     pub(crate) fn base_query(
         &self,
-        user: Option<UserEntity>,
+        user: Option<Arc<UserEntity>>,
     ) -> Result<ferrofin_traits::options::InternalItemsQuery, ApiError> {
         let mut ancestor_ids = Vec::new();
         if let Some(parent) = self.parent_id {
@@ -227,10 +229,10 @@ impl ByNameListQuery {
             // The repository computes per-kind counts only when `ItemCounts`
             // is requested (v12 `ByName.cs:251`), and the controller adds it
             // when a type filter is set — see [`Self::should_include_item_types`].
-            dto_options: DtoOptions {
+            dto_options: Arc::new(DtoOptions {
                 fields: self.requested_fields(),
                 ..DtoOptions::default()
-            },
+            }),
             include_item_types,
             exclude_item_types,
             media_types,
@@ -293,7 +295,7 @@ impl ByNameListQuery {
     pub(crate) async fn artists_query(
         &self,
         state: &AppState,
-        user: Option<UserEntity>,
+        user: Option<Arc<UserEntity>>,
     ) -> Result<ferrofin_traits::options::InternalItemsQuery, ApiError> {
         let mut query = self.base_query(user)?;
         if let Some(ids) = resolve_by_name_ids(
@@ -781,7 +783,12 @@ mod tests {
             ..ByNameListQuery::default()
         };
         assert!(typed.should_include_item_types());
-        let fields = typed.base_query(None).expect("query").dto_options.fields;
+        let fields = typed
+            .base_query(None)
+            .expect("query")
+            .dto_options
+            .fields
+            .clone();
         assert_eq!(fields, vec![ItemFields::ItemCounts]);
 
         let by_field = ByNameListQuery {

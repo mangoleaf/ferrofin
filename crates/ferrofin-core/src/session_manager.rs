@@ -1208,7 +1208,7 @@ impl FerrofinSessionManager {
                     .get_item_list(&InternalItemsQuery {
                         parent_id: item_id,
                         is_virtual_item: Some(false),
-                        user: user.cloned(),
+                        user: user.cloned().map(Arc::new),
                         order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
                         ..InternalItemsQuery::default()
                     })
@@ -1269,7 +1269,7 @@ impl FerrofinSessionManager {
             recursive: true,
             is_folder: Some(false),
             is_virtual_item: Some(false),
-            user: user.cloned(),
+            user: user.cloned().map(Arc::new),
             order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
             ..InternalItemsQuery::default()
         };
@@ -1417,7 +1417,7 @@ impl FerrofinSessionManager {
                 recursive: true,
                 is_folder: Some(false),
                 is_virtual_item: Some(false),
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 ancestor_ids: vec![series_id],
                 include_item_types: vec![BaseItemKind::Episode],
                 order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],

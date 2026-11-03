@@ -99,7 +99,7 @@ impl AuthService for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_api_key: self.elevated,
             is_authenticated: true,
             user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
@@ -119,7 +119,7 @@ impl AuthorizationContext for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_api_key: self.elevated,
             is_authenticated: true,
             user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {

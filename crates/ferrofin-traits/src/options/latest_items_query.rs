@@ -1,5 +1,7 @@
 //! The request half of `UserViewManager::get_latest_items`.
 
+use std::sync::Arc;
+
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use uuid::Uuid;
@@ -23,7 +25,7 @@ pub const LATEST_ITEMS_FALLBACK_LIMIT: i32 = 10;
 pub struct LatestItemsQuery {
     /// The requesting user (C# `User`). Scopes the played predicate and the
     /// user-specific query context; `None` only for user-less in-process calls.
-    pub user: Option<UserEntity>,
+    pub user: Option<Arc<UserEntity>>,
     /// Localizes the search to one folder (C# `ParentId`; `None`/nil = the
     /// root folders the user may open). A library folder scopes by `TopParentId`; any other folder
     /// (a series, a season) scopes by the `AncestorIds` closure.

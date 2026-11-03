@@ -88,7 +88,7 @@ impl AuthService for AdminAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(ADMIN_ID, "admin", Some("hash"))),
+            user: Some(Arc::new(user_entity(ADMIN_ID, "admin", Some("hash")))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
