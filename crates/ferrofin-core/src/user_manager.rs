@@ -50,7 +50,8 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{
-    AdminFlagOutcome, PolicyGuardState, PolicySaved, UserManager, policy_update_refusal,
+    AdminFlagOutcome, ExternalUserSetup, PolicyGuardState, PolicySaved, UserManager,
+    policy_update_refusal,
 };
 use ferrofin_traits::security::{AuthenticationManager, PasswordResetManager};
 
@@ -1288,6 +1289,58 @@ impl UserManager for FerrofinUserManager {
         // transaction — see its docs for why it cannot live out here.
         self.insert_user(name, |_tx, _uid| Box::pin(async { Ok(()) }))
             .await
+    }
+
+    async fn create_external_user(
+        &self,
+        name: &str,
+        setup: &ExternalUserSetup,
+    ) -> Result<UserEntity, ServiceError> {
+        require_valid_username(name)?;
+        // Set up inside the insert's transaction: committed first and set up
+        // after, the row would for a moment be a passwordless local account,
+        // which the built-in provider signs in with an empty password.
+        let setup = setup.clone();
+        let user = self
+            .insert_user(name, move |tx, id| {
+                Box::pin(async move {
+                    user_repository::set_providers(
+                        &mut **tx,
+                        id,
+                        &setup.authentication_provider_id,
+                        &setup.password_reset_provider_id,
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    set_permission_tx(
+                        tx,
+                        id,
+                        PermissionKind::EnableAllFolders,
+                        setup.enable_all_folders,
+                    )
+                    .await?;
+                    if let Some(folders) = &setup.enabled_folders {
+                        set_preference_tx(tx, id, PreferenceKind::EnabledFolders, folders).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await?;
+        // `CreateUserAsync` publishes `UserCreatedEventArgs`, which
+        // `UserCreatedLogger` records, whoever created the user.
+        if let Some(activity) = &self.activity
+            && let Err(error) = activity
+                .create_entry(ferrofin_traits::activity::ActivityLogCreate {
+                    name: format!("User {} has been created", user.username),
+                    type_: "UserCreated".to_owned(),
+                    user_id: Uuid::parse_str(&user.id).ok(),
+                    ..Default::default()
+                })
+                .await
+        {
+            tracing::debug!(user_id = %user.id, error = %error, "could not record the user's creation");
+        }
+        Ok(user)
     }
 
     async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError> {
