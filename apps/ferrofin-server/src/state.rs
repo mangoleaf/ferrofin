@@ -1245,6 +1245,18 @@ pub async fn build_app_state(
     );
     let nfo_listener: Arc<dyn ferrofin_traits::library::UserDataSaveListener> = nfo_saver.clone();
     user_data_impl.set_save_listener(Arc::downgrade(&nfo_listener))?;
+    let item_visibility = Arc::new(
+        ferrofin_core::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::clone(&item_repository),
+            Arc::clone(&localization),
+            ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
+        )
+        .with_virtual_paths(virtual_paths.clone()),
+    );
+    // Held weakly by the repository and the count service: the evaluator owns
+    // the repository. `set` fails only if already set, which nothing else does.
+    let _ = scope_visibility.set(Arc::downgrade(&item_visibility));
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
@@ -1277,6 +1289,9 @@ pub async fn build_app_state(
             .with_people(Arc::clone(&people_repository))
             // A box set's or playlist's refresh takes its members' rating.
             .with_linked_children(Arc::clone(&linked_children_service))
+            // Every refresh stores the item's parental score by the rule the
+            // scan and a metadata edit use (`BaseItem.OnMetadataChanged`).
+            .with_rating_scorer(Arc::clone(&item_visibility) as _)
             // A genre's, music genre's or playlist's refresh redraws its
             // generated Primary, as the scan's closing pass draws it.
             .with_generated_images(Arc::new(
@@ -1329,18 +1344,6 @@ pub async fn build_app_state(
             }),
     );
 
-    let item_visibility = Arc::new(
-        ferrofin_core::item_visibility::ItemVisibility::new(
-            db.clone(),
-            Arc::clone(&item_repository),
-            Arc::clone(&localization),
-            ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
-        )
-        .with_virtual_paths(virtual_paths.clone()),
-    );
-    // Held weakly by the repository and the count service: the evaluator owns
-    // the repository. `set` fails only if already set, which nothing else does.
-    let _ = scope_visibility.set(Arc::downgrade(&item_visibility));
     // The virtual-folder manager gives `/Items/Latest` each library's collection
     // type (C# `CollectionFolder.CollectionType`), which is why the user-view
     // manager is built after it.

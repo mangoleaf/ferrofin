@@ -1160,6 +1160,10 @@ pub struct LocalProviderManager {
     /// A box set's or playlist's members, which its refresh takes its
     /// rating from. Absent → the rating is left as stored.
     linked_children: Option<Arc<dyn ferrofin_traits::persistence::LinkedChildrenService>>,
+    /// What a refresh stores as the item's parental score (C#
+    /// `BaseItem.OnMetadataChanged`), by the rule the scan and a metadata edit
+    /// use. Absent → the stored score is left as it is.
+    rating_scorer: Option<Arc<dyn ferrofin_traits::providers::ParentalRatingScorer>>,
     /// The providers that draw a genre's, music genre's or playlist's Primary
     /// from other items' artwork, run by the refresh as upstream's custom
     /// providers. Absent → a refresh draws no such image.
@@ -1304,6 +1308,7 @@ impl std::fmt::Debug for LocalProviderManager {
             .field("has_tvdb", &self.tvdb.is_some())
             .field("has_people", &self.people.is_some())
             .field("has_linked_children", &self.linked_children.is_some())
+            .field("has_rating_scorer", &self.rating_scorer.is_some())
             .field("has_generated_images", &self.generated_images.is_some())
             .field("has_localization", &self.localization.is_some())
             .field("dynamic_fetchers", &self.dynamic_fetchers.len())
@@ -1381,6 +1386,7 @@ impl LocalProviderManager {
             tvdb: None,
             people: None,
             linked_children: None,
+            rating_scorer: None,
             generated_images: None,
             localization: None,
             kind_by_type_name: HashMap::new(),
@@ -1521,6 +1527,19 @@ impl LocalProviderManager {
         linked_children: Arc<dyn ferrofin_traits::persistence::LinkedChildrenService>,
     ) -> Self {
         self.linked_children = Some(linked_children);
+        self
+    }
+
+    /// Attaches the rule a refresh stores the item's parental score by
+    /// (`BaseItem.OnMetadataChanged`), the one the scan and a metadata edit
+    /// use: its custom, else official, rating along its display chain, scored
+    /// against its metadata country.
+    #[must_use]
+    pub fn with_rating_scorer(
+        mut self,
+        scorer: Arc<dyn ferrofin_traits::providers::ParentalRatingScorer>,
+    ) -> Self {
+        self.rating_scorer = Some(scorer);
         self
     }
 
@@ -2732,8 +2751,9 @@ impl LocalProviderManager {
         failures += u32::from(local_images_failed);
         let fetched = fetched.unwrap_or_default();
         // A box set or playlist (`EnableUpdatingOfficialRatingFromChildren`)
-        // scores ratings against its `GetPreferredMetadataCountryCode()`.
-        let rating_scorer = match (
+        // scores its members' ratings (`UpdateOfficialRating`) against its
+        // `GetPreferredMetadataCountryCode()`.
+        let member_rating_scale = match (
             BaseItemKind::from_stored_type_name(&stored.type_),
             &self.localization,
         ) {
@@ -2756,7 +2776,7 @@ impl LocalProviderManager {
         {
             crate::metadata_merge::update_from_members(&mut base, kind, &members, &locked_fields);
             // `UpdateOfficialRating` (`:623-635`).
-            if let Some((localization, country)) = &rating_scorer
+            if let Some((localization, country)) = &member_rating_scale
                 && !stored.is_locked
                 && !locked_fields.contains(&MetadataField::OfficialRating)
             {
@@ -2826,16 +2846,16 @@ impl LocalProviderManager {
             _ => current,
         };
         let mut row = merged.item;
-        // `OnMetadataChanged` (`BaseItem.cs:2935-2967`): the container's
-        // stored parental score follows its own custom, else official, rating.
-        if let Some((localization, country)) = &rating_scorer {
-            let score = [&row.custom_rating, &row.official_rating]
-                .into_iter()
-                .find_map(|rating| rating.as_deref().filter(|r| !r.is_empty()))
-                .and_then(|rating| localization.get_rating_score(rating, Some(country)));
-            row.inherited_parental_rating_value = score.map(|s| i64::from(s.score));
-            row.inherited_parental_rating_sub_value =
-                score.and_then(|s| s.sub_score.map(i64::from));
+        // `OnMetadataChanged` (`BaseItem.cs:2968-3000`): every refresh, of any
+        // kind and whatever the lock, re-derives the stored parental score
+        // (and the `UnratedType` its kind blocks under) from the row it saves,
+        // as `LibraryManager.UpdateItemsAsync` does before every save
+        // (`LibraryManager.cs:2665`); a changed score is a change to save, as
+        // `BeforeSave`'s does (`MetadataService.cs:341-345`).
+        if let Some(scorer) = &self.rating_scorer {
+            scorer
+                .update_rating_scores(std::slice::from_mut(&mut row))
+                .await?;
         }
         crate::season::apply_zero_display_name(&mut row, &locked_fields, library.as_ref());
         crate::metadata_merge::settle_sort_name(&mut row);
@@ -10773,6 +10793,146 @@ mod tests {
         );
     }
 
+    /// Core's parental scoring as the refresh sees it: each row's own custom,
+    /// else official, rating, scored by [`EnglishAndFrench`]. The display
+    /// chain and the metadata country it also follows are core's, tested
+    /// there and end to end.
+    struct OwnRatingScores;
+
+    #[async_trait]
+    impl ferrofin_traits::providers::ParentalRatingScorer for OwnRatingScores {
+        async fn update_rating_scores(
+            &self,
+            items: &mut [BaseItemEntity],
+        ) -> Result<(), ServiceError> {
+            use ferrofin_traits::localization::LocalizationManager as _;
+            for item in items {
+                let score = [&item.custom_rating, &item.official_rating]
+                    .into_iter()
+                    .find_map(|rating| rating.as_deref().filter(|r| !r.is_empty()))
+                    .and_then(|rating| EnglishAndFrench.get_rating_score(rating, None));
+                item.inherited_parental_rating_value = score.map(|s| i64::from(s.score));
+                item.inherited_parental_rating_sub_value =
+                    score.and_then(|s| s.sub_score.map(i64::from));
+            }
+            Ok(())
+        }
+    }
+
+    /// gl-325: the refresh of an item with no file of its own re-derives its
+    /// stored parental score whatever its kind (`MetadataService.BeforeSave` →
+    /// `OnMetadataChanged`), locked or not, from the row it saves: a score left
+    /// by an older rating table is replaced, and a rating that is gone takes
+    /// its score with it.
+    #[rstest::rstest]
+    #[case::season("TV.Season", Some("R"), None, false, Some(17))]
+    #[case::person_locked("Person", Some("PG"), Some(17), true, Some(10))]
+    #[case::rating_gone("TV.Season", None, Some(17), false, None)]
+    #[tokio::test]
+    async fn a_refresh_stores_the_score_of_the_rating_it_saves(
+        #[case] kind: &str,
+        #[case] rating: Option<&str>,
+        #[case] stored_score: Option<i64>,
+        #[case] is_locked: bool,
+        #[case] score: Option<i64>,
+    ) {
+        let item_id = Uuid::new_v4();
+        let mut stored = row(kind, "Pathless");
+        stored.id = item_id.to_string();
+        stored.official_rating = rating.map(str::to_owned);
+        stored.inherited_parental_rating_value = stored_score;
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        stored.is_locked = is_locked;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_rating_scorer(Arc::new(OwnRatingScores));
+        mgr.refresh_full_item(item_id, &MetadataRefreshOptions::default())
+            .await
+            .expect("refresh succeeds");
+        let saved = store
+            .saved
+            .lock()
+            .expect("lock")
+            .last()
+            .cloned()
+            .expect("saved: the score changed");
+        assert_eq!(saved.official_rating.as_deref(), rating);
+        assert_eq!(saved.inherited_parental_rating_value, score);
+    }
+
+    /// A scorer whose storage read fails.
+    struct FailingScores;
+
+    #[async_trait]
+    impl ferrofin_traits::providers::ParentalRatingScorer for FailingScores {
+        async fn update_rating_scores(
+            &self,
+            _items: &mut [BaseItemEntity],
+        ) -> Result<(), ServiceError> {
+            Err(ServiceError::backend("parent chain unreadable"))
+        }
+    }
+
+    /// A path-less season's refresh through `scorer`, its stored row rated
+    /// `R` with `stored_score`; the refresh's result and the rows it saved.
+    async fn refresh_scored_season(
+        scorer: Arc<dyn ferrofin_traits::providers::ParentalRatingScorer>,
+        stored_score: Option<i64>,
+    ) -> (Result<(), ServiceError>, Vec<BaseItemEntity>) {
+        let item_id = Uuid::new_v4();
+        let mut stored = row("TV.Season", "Pathless");
+        stored.id = item_id.to_string();
+        // Settled, so the score is the only thing a refresh could change.
+        stored.sort_name = Some("Pathless".to_owned());
+        stored.official_rating = Some("R".to_owned());
+        stored.inherited_parental_rating_value = stored_score;
+        stored.date_last_refreshed = Some(chrono::Utc::now());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = Arc::new(RecordingStore::default());
+        let mgr = LocalProviderManager::default()
+            .with_remote_images(
+                Arc::new(crate::tmdb::TmdbClient::new()),
+                Arc::new(FakeItems {
+                    rows: HashMap::from([(item_id, stored)]),
+                    seen: tx,
+                }),
+            )
+            .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
+            .with_rating_scorer(scorer);
+        let result = mgr
+            .refresh_full_item(item_id, &MetadataRefreshOptions::default())
+            .await;
+        let saved = store.saved.lock().expect("lock").clone();
+        (result, saved)
+    }
+
+    /// A score the refresh would store again is no change: a Default refresh
+    /// of a refreshed item saves nothing.
+    #[tokio::test]
+    async fn a_refresh_whose_score_holds_saves_nothing() {
+        let (result, saved) = refresh_scored_season(Arc::new(OwnRatingScores), Some(17)).await;
+        result.expect("refresh succeeds");
+        assert!(saved.is_empty(), "nothing changed: {saved:?}");
+    }
+
+    /// A score that cannot be derived fails the refresh before anything is
+    /// saved, as a metadata edit's save does: the row keeps the score it had.
+    #[tokio::test]
+    async fn a_score_that_cannot_be_derived_fails_the_refresh() {
+        let (result, saved) = refresh_scored_season(Arc::new(FailingScores), None).await;
+        assert!(result.is_err(), "the scorer's error reaches the caller");
+        assert!(saved.is_empty(), "nothing saved: {saved:?}");
+    }
+
     /// A container's members, for its rating (`GetLinkedChildren`).
     struct Members(Vec<Uuid>);
 
@@ -10860,7 +11020,8 @@ mod tests {
             )
             .with_image_store(Arc::clone(&store) as _, std::env::temp_dir())
             .with_localization(Arc::new(EnglishAndFrench))
-            .with_linked_children(Arc::new(Members(members)));
+            .with_linked_children(Arc::new(Members(members)))
+            .with_rating_scorer(Arc::new(OwnRatingScores));
         let options = MetadataRefreshOptions {
             force_save,
             ..MetadataRefreshOptions::default()
