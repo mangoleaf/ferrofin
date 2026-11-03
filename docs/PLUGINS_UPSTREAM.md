@@ -404,8 +404,9 @@ Conventions:
     must belong to them (by its uid link, or by name for an account LDAP-Auth owns), as at
     sign-in; otherwise the change is a `401` and nothing is written. Upstream writes to whichever
     entry matched first, so a person who can make their own entry match another user's name (a
-    `mail` they may edit) would have that user's new password set on their own entry. The name
-    leg trusts the username attribute, as sign-in does (TODO(gl-1188)).
+    `mail` they may edit) would have that user's new password set on their own entry. The match
+    trusts the username and uid attributes, as sign-in does, so where users can write them a new
+    password can still reach the wrong entry (kept as upstream by owner decision, gl-1188).
   - **No PIN is ever this provider's to redeem**: `RedeemPasswordResetPin` answers no match.
     Upstream throws `NotImplementedException`, which stops the redemption before a later
     provider could redeem its own.
@@ -440,7 +441,19 @@ Conventions:
     (`LdapUsernameAttribute`) is still trusted, as upstream trusts it: an entry with no uid link
     yet whose username attribute names an account LDAP-Auth owns is relinked to that account
     (upstream's relink after a uid change), so that attribute must be one users cannot edit.
-    TODO(gl-1188): how to close that is an owner decision.
+    In a directory where users can write their own username attribute (OpenLDAP's common
+    `by self write`), a user with no account linked to their uid yet can set it to an
+    LDAP-owned account's name and sign in to that account with their own password, whatever its
+    rights (while the admin filter is on, the account's administrator flag then follows the
+    filter for the signing-in user's own entry). When the account's own user next signs in, it
+    is relinked back, so the two can keep taking it from each other, and a relink does not end a
+    session already issued. The uid attribute (`LdapUidAttribute`) is trusted the same way, as
+    upstream's `GetLdapUser` trusts it: a user who can write their own can set it to a linked
+    user's uid and sign in to that account, which is then renamed to their own username
+    attribute. Kept as upstream by owner decision (gl-1188, 2026-11-03: to be revisited if it is
+    proven a security issue). The username-attribute route was then reproduced live against
+    OpenLDAP, the directory administrator editing the entry standing in for a user; the uid route
+    is read from the code, not run. Whether that triggers the revisit is the owner's call.
   - **A relink by name is written only after the password is checked.** Upstream saves it
     before it binds as the user, so a wrong password still writes it.
   - **An entry without the uid attribute is not linked.** Upstream stores it with a null

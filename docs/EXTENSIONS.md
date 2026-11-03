@@ -102,6 +102,15 @@ LDAP-Auth's. With profile-image sync on, a new user's picture comes from the dir
 Base64 or a URL), and the "LDAP - Synchronize profile images" task keeps every LDAP user's
 current.
 
+> **Warning:** LDAP-Auth's username and uid attributes must be ones users cannot change on
+> their own entry. As upstream, a directory user is matched to an existing LDAP-Auth account by
+> `LdapUidAttribute` (`uid` by default) and, when no account is linked to their uid yet, by
+> `LdapUsernameAttribute` (`cn` by default). Where users can write either attribute (many
+> directories let users edit their own `cn`, such as OpenLDAP's common `by self write`), one of
+> them can set it to another LDAP user's value and sign in to that account, whatever its rights,
+> with their own password. Choose attributes only administrators can write, or restrict
+> self-writes to them.
+
 | Extension | Upstream | Ported rev | What it does |
 |---|---|---|---|
 | **Intro Skipper** | [intro-skipper/intro-skipper](https://github.com/intro-skipper/intro-skipper) | `db09359` | Intro, credits, recap, preview and commercial detection (audio fingerprints, chapters, black frames), exposed as media segments |

@@ -45,8 +45,17 @@
 //!   would let them sign in as that user. The entry's username attribute is
 //!   still trusted, as upstream trusts it: an entry with no uid link yet whose
 //!   username attribute names an account LDAP-Auth owns is relinked to it, so
-//!   that attribute must be one users cannot edit. TODO(gl-1188): the owner
-//!   decides how to close that.
+//!   that attribute must be one users cannot edit: where users can write it,
+//!   one with no account linked to their uid yet can take any LDAP-owned
+//!   account, whatever its rights, with their own password. The uid
+//!   attribute is trusted the same way: a user who can write their own can
+//!   point it at a linked user's uid, and signs in to that account, renamed
+//!   to their own username attribute. Kept as upstream by owner decision
+//!   (gl-1188, 2026-11-03: to be revisited if it is proven a security issue).
+//!   The username-attribute route was reproduced live on 2026-11-03, the
+//!   directory administrator editing the entry standing in for a user; the
+//!   uid route is read from the code. Whether that triggers the revisit is
+//!   the owner's call.
 //! - **A link is written only after the password is checked.** Upstream
 //!   records a relink by name before it binds as the user.
 //! - **An entry without the uid attribute is not linked.** Upstream stores a
@@ -66,8 +75,10 @@
 //!   as at sign-in; otherwise the change is a `401` and nothing is written.
 //!   Upstream writes to whichever entry matched first, so a person who can
 //!   make their own entry match another user's name would have that user's
-//!   new password set on their entry. The name leg trusts the username
-//!   attribute, as sign-in does (TODO(gl-1188)).
+//!   new password set on their entry. The match trusts the username and uid
+//!   attributes, as sign-in does, so where users can write them a new
+//!   password can still reach the wrong entry (kept as upstream by owner
+//!   decision, gl-1188).
 //! - **A new user is created with its provider ids in one transaction**
 //!   ([`UserManager::create_external_user`]). Upstream saves them after
 //!   creating the user, a moment in which the account has no password and
