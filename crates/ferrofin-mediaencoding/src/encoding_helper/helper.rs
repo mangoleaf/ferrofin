@@ -1802,9 +1802,10 @@ const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// read (it counts as the oldest supported, as for every version gate), gets
 /// upstream's unsynced form, so a bitmap sidecar there is still early by its
 /// first cue's time. Fix path: offset it by its probed start time.
-/// TODO(gl-930): an embedded `.srt` seeked into a progressive stream that
-/// starts mid-file can keep a cue from before the start, whose negative
-/// timestamp the muxer answers by shifting every stream.
+///
+/// A seeked sidecar can still bring a cue from before the seek; the embed
+/// drops it on the output side
+/// ([`embedded_sidecar_trim_arguments`](super::bitstream::embedded_sidecar_trim_arguments)).
 #[must_use]
 pub fn external_stream_input_arguments(
     state: &EncodingJobInfo,
