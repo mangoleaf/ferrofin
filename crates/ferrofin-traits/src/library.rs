@@ -1744,6 +1744,20 @@ pub trait UserManager: Send + Sync {
             .unwrap_or_default())
     }
 
+    /// The cache tag of `user`'s profile image (C#
+    /// `ImageProcessor.GetImageCacheTag(User)`), `None` when they have none:
+    /// the `PrimaryImageTag` [`Self::get_user_dto`] reports.
+    ///
+    /// Every request on a session stamps it as the session's
+    /// `UserPrimaryImageTag`. The default body builds the whole DTO; a manager
+    /// that caches the DTO answers from the cache without copying it.
+    async fn user_primary_image_tag(
+        &self,
+        user: &UserEntity,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(self.get_user_dto(user, None).await?.primary_image_tag)
+    }
+
     /// Updates a user's configuration (stopgap; prefer [`Self::update_user`]).
     async fn update_configuration(
         &self,

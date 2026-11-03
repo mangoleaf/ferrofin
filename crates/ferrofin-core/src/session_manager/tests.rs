@@ -2387,7 +2387,8 @@ async fn a_logout_or_an_already_stopped_stream_is_not_released_on_session_end() 
         mgr.get_session_snapshot(stopped.id.as_deref().expect("id"))
             .await
             .unwrap()
-            .now_playing_live_stream_id,
+            .play_state
+            .live_stream_id,
         None,
         "a stop clears the session's live stream (C# `RemoveNowPlayingItem`)"
     );
@@ -2430,7 +2431,8 @@ async fn the_sessions_live_stream_follows_the_reports() {
             mgr.get_session_snapshot(&session_id)
                 .await
                 .unwrap()
-                .now_playing_live_stream_id
+                .play_state
+                .live_stream_id
         }
     };
     mgr.on_playback_start(&PlaybackStartInfo {
@@ -3753,6 +3755,7 @@ async fn progress_alone_restores_the_now_playing_item() {
         item_id,
         position_ticks: Some(1000),
         is_paused: true,
+        can_seek: true,
         ..PlaybackProgressInfo::default()
     };
     mgr.on_playback_progress(&paused, false).await.unwrap();
@@ -3767,7 +3770,8 @@ async fn progress_alone_restores_the_now_playing_item() {
         super::session_info_to_dto(&first)
             .play_state
             .unwrap()
-            .can_seek
+            .can_seek,
+        "the report's CanSeek (C# `PlayState.CanSeek = info.CanSeek`)"
     );
     let paused_since = first
         .last_paused_date
@@ -4149,7 +4153,7 @@ async fn an_idle_stop_keeps_the_position_against_the_version_played() {
         .find(|s| s.id == session_id)
         .expect("session");
     assert!(session.now_playing_item_id.is_none());
-    assert!(session.now_playing_media_source_id.is_none());
+    assert!(session.play_state.media_source_id.is_none());
 }
 
 /// One tick of the loop: the inactive check only with a threshold above 0,
@@ -4619,3 +4623,9 @@ mod device_reads;
 /// The session's `NowPlayingItem`, built once per item on the report that
 /// names it, and the session summaries that read it.
 mod now_playing_item;
+
+/// The session's play state, queue, transcoding info and now-viewing item.
+mod play_state;
+
+/// The session DTO members that do not follow the playback state.
+mod session_dto;

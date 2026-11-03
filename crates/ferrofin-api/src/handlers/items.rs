@@ -2052,15 +2052,23 @@ async fn check_parent_visibility(
     if query.parent_id.is_nil() {
         return Ok((None, true));
     }
-    let parent = state
-        .library
-        .get_item_by_id(query.parent_id)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest(format!("Invalid parent id: {}", query.parent_id)))?;
+    let parent = Arc::new(
+        state
+            .library
+            .get_item_by_id(query.parent_id)
+            .await?
+            .ok_or_else(|| {
+                ApiError::BadRequest(format!("Invalid parent id: {}", query.parent_id))
+            })?,
+    );
     let kind = parent.type_.rsplit('.').next().unwrap_or(&parent.type_);
     if kind != "UserRootFolder" {
         require_scope_visible(state, auth, &parent, query.user.as_deref()).await?;
     }
+    // The query carries the row, as upstream's controller works from the
+    // item `GetParentItem` read: the container redirect, the folder display
+    // policy and the repository's scope use it instead of reading it again.
+    query.parent_row = Some(Arc::clone(&parent));
     let kind_from = |row: &ferrofin_db::entities::base_items::BaseItemEntity| {
         serde_json::from_value(serde_json::Value::String(
             row.type_
@@ -2146,13 +2154,15 @@ async fn check_parent_visibility(
     if let Some(parent_id) = parent_id
         && let Some(query_parent) = state.library.get_item_by_id(parent_id).await?
     {
-        if !query.recursive || kind_from(&query_parent) == Some(BaseItemKind::Season) {
+        let (kind, folder_policy) = (kind_from(&query_parent), !is_channel(&query_parent));
+        if !query.recursive || kind == Some(BaseItemKind::Season) {
             // A default view delegates to that Season's GetItemsInternal even
             // for recursive requests; its aired selection needs the real row.
             query.parent_id = parent_id;
             query.user_root_children = false;
+            query.parent_row = Some(Arc::new(query_parent));
         }
-        return Ok((kind_from(&query_parent), !is_channel(&query_parent)));
+        return Ok((kind, folder_policy));
     }
     Ok((kind_from(&parent), false))
 }
@@ -2260,8 +2270,13 @@ async fn redirect_container_browse(
     if internal.parent_id.is_nil() {
         return;
     }
-    let Ok(Some(parent)) = state.library.get_item_by_id(internal.parent_id).await else {
-        return;
+    let parent = if let Some(row) = internal.known_parent_row() {
+        Arc::clone(row)
+    } else {
+        let Ok(Some(row)) = state.library.get_item_by_id(internal.parent_id).await else {
+            return;
+        };
+        Arc::new(row)
     };
     // The parent is itself a container of the requested kind → a direct
     // children browse, no re-rooting (C# `item is not BoxSet/Playlist`).

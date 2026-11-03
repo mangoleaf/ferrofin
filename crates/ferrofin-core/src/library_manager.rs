@@ -1392,7 +1392,7 @@ impl FerrofinLibraryManager {
         let mut resolved = query.clone();
         if resolved.parent_type.is_none()
             && !resolved.parent_id.is_nil()
-            && let Some(parent) = self.items.retrieve_item(resolved.parent_id).await?
+            && let Some(parent) = self.parent_item(&resolved).await?
         {
             resolved.parent_type = serde_json::from_value(serde_json::Value::String(
                 parent
@@ -1487,6 +1487,24 @@ impl FerrofinLibraryManager {
         self.folder_post_filter_result(items, query).await.map(Some)
     }
 
+    /// The query's parent: the row its caller already read
+    /// ([`InternalItemsQuery::known_parent_row`]), else read now. Upstream's
+    /// folder is the item the controller read, so a browse reads its parent
+    /// once.
+    async fn parent_item(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Option<Arc<BaseItemEntity>>, ServiceError> {
+        if let Some(row) = query.known_parent_row() {
+            return Ok(Some(Arc::clone(row)));
+        }
+        Ok(self
+            .items
+            .retrieve_item(query.parent_id)
+            .await?
+            .map(Arc::new))
+    }
+
     /// Season.GetItemsInternal: select aired episodes before Filter and paging.
     /// The existing LibraryManager traits query seam keeps API independent of core.
     async fn season_display_result(
@@ -1494,13 +1512,13 @@ impl FerrofinLibraryManager {
         query: &InternalItemsQuery,
         include_specials: bool,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
-        let season = self.items.retrieve_item(query.parent_id).await?;
+        let season = self.parent_item(query).await?;
         let episodes = match season {
             Some(season) => {
                 season_episode_rows(
                     self.items.as_ref(),
                     query.parent_id,
-                    season,
+                    Arc::unwrap_or_clone(season),
                     query,
                     include_specials,
                 )
@@ -1521,6 +1539,7 @@ impl FerrofinLibraryManager {
             user: resolved.user.clone(),
             parent_id: resolved.parent_id,
             parent_type: resolved.parent_type,
+            parent_row: resolved.parent_row.clone(),
             group_by_presentation_unique_key: false,
             ..InternalItemsQuery::default()
         };
@@ -1621,6 +1640,7 @@ impl FerrofinLibraryManager {
                 user: resolved.user.clone(),
                 parent_id: resolved.parent_id,
                 parent_type: resolved.parent_type,
+                parent_row: resolved.parent_row.clone(),
                 group_by_presentation_unique_key: false,
                 ..InternalItemsQuery::default()
             })
@@ -1655,7 +1675,7 @@ impl FerrofinLibraryManager {
         {
             return Ok(());
         }
-        let Some(set) = self.items.retrieve_item(query.parent_id).await? else {
+        let Some(set) = self.parent_item(query).await? else {
             return Ok(());
         };
         let data = crate::item_data::parse_data(set.data.as_deref());

@@ -252,17 +252,30 @@ PCM, or ≤ 16 sampled stills ≤ 320 px per call. Fingerprinting, loudness, sil
 black-frame detection — and analyses nobody has written yet — are all guest code over
 these windows; extraction runs under a global decode budget (`FERROFIN_WASM_ANALYSIS_CONCURRENCY`,
 default a quarter of the cores) so plugin analysis never starves transcodes. Plugins that declare `scan-targets` are
-offered each new matching item once by the "Plugin media analysis" dashboard
-task. When the plugin's circuit breaker stops a pass, the items it did not reach are
-offered after the restart, and an item sharing the cut-off item's creation time (or, on
-a first pass, an undated one) can be offered again, so analysis must be idempotent.
+offered each matching item by the "Plugin media analysis" dashboard task, once per
+plugin: the server records in its database each item it offered to each plugin, and
+each pass offers the items not recorded yet. An item is offered whatever its creation
+date says, so media moved or copied in with old file times, unpacked from an archive,
+or a photo with an old EXIF date is offered like any other. An item is left for a later
+pass while its library turns the plugin's segments off (Media segment providers in the
+library's settings), or when the server refused the plugin's segment write for it. When
+the plugin's circuit breaker stops a pass, the items it did not reach are offered after
+the restart. Offers are recorded a page of items at a time, so a server that stops
+partway through a page offers that page's items again: analysis must be idempotent.
+Uninstalling a plugin forgets what it was offered, so installed again it is offered the
+whole library. Servers before this record kept a watermark instead, the newest creation
+time offered; on upgrade, each plugin's first pass counts every item at or before its
+watermark as offered, so nothing is offered twice. An item the watermark had already
+passed over with its old creation time stays unoffered after the upgrade: to have a
+plugin analyze those, uninstall and install it again (an uninstall also removes the
+plugin's settings and stored data).
 Why a host-driven pass instead of each plugin polling `query-items` with its own
-cursor (which the 0.3 surface already allowed): the offer-once watermark lives under a
-`host:`-reserved state key a guest can neither read nor rewind (a self-managed cursor
-could be rewound to re-burn the shared decode budget), disabled plugins are centrally
-skipped, N analyzers appear as one dashboard task instead of N, and future scan
-behaviors (changed-item re-offers, scan-completion triggering, progress) evolve
-host-side without another ABI change. A guest error never fails a scan. Trust note: this grants
+cursor (which the 0.3 surface already allowed): the record of what was offered is the
+server's, out of the guest's reach (a self-managed cursor could be rewound to re-burn
+the shared decode budget), disabled plugins are centrally skipped, N analyzers appear
+as one dashboard task instead of N, and future scan behaviors (changed-item re-offers,
+scan-completion triggering, progress) evolve host-side without another ABI change. A
+guest error never fails a scan. Trust note: this grants
 the guest **media content**, one rung above catalog metadata — leaving the sandbox
 still requires declared egress, and a genuine analysis plugin declares `[]`.
 

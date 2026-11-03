@@ -215,7 +215,8 @@ struct ViewRow {
     #[sqlx(rename = "ParentId")]
     parent_id: Option<String>,
     /// The view's path, which identifies a Live TV view written without a
-    /// `Data` blob.
+    /// `Data` blob: as stored, or expanded in a row built from one the caller
+    /// read ([`FerrofinItemRepository::view_row_of`]).
     #[sqlx(rename = "Path")]
     path: Option<String>,
     /// The serialized blob carrying `ViewType` and `DisplayParentId`.
@@ -225,6 +226,10 @@ struct ViewRow {
     #[sqlx(rename = "TopParentId")]
     top_parent_id: Option<String>,
     /// Persisted link presence, independent of a stale serialized Data array.
+    /// A row built from one the caller read ([`FerrofinItemRepository::view_row_of`])
+    /// looks it up only for a recursive browse of a box set or a playlist, the
+    /// one browse that reads it ([`FerrofinItemRepository::linked_container_scope`]),
+    /// and says `false` otherwise.
     #[sqlx(rename = "_HasLinkedChildren")]
     has_linked_children: bool,
 }
@@ -928,7 +933,51 @@ impl FerrofinItemRepository {
         {
             return Ok(None);
         }
+        if let Some(row) = filter.known_parent_row() {
+            return Self::view_row_of(&self.db, filter, row).await.map(Some);
+        }
         Self::query_view_row(&self.db, filter.parent_id).await
+    }
+
+    /// The [`ViewRow`] of a parent the caller has already read
+    /// ([`InternalItemsQuery::known_parent_row`]), so a browse reads its
+    /// parent's row once: upstream's controller reads the parent once
+    /// (`GetParentItem`) and works from that item.
+    ///
+    /// That row went through [`Self::mapped`], so its `Path` is expanded where
+    /// [`Self::query_view_row`] reads the stored one. Only a view's path is
+    /// read, and only for its `/views/livetv` or `/views/folders` tail, which
+    /// the expansion leaves alone: Jellyfin stores a view under
+    /// `%MetadataPath%/views/`, Ferrofin under the expanded directory.
+    /// Whether it has linked children is read only for a recursive browse of
+    /// a box set or a playlist, the one browse that asks
+    /// ([`Self::linked_container_scope`]); `filter` is the browse the row
+    /// scopes, as at every caller of [`Self::query_parent_row`].
+    async fn view_row_of(
+        db: &Database,
+        filter: &InternalItemsQuery,
+        row: &BaseItemEntity,
+    ) -> Result<ViewRow, ServiceError> {
+        let has_linked_children = filter.recursive
+            && matches!(
+                crate::item_type_lookup::kind_from_type_name(&row.type_),
+                Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
+            )
+            && sqlx::query_scalar(
+                r#"SELECT EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = ?1)"#,
+            )
+            .bind(guid_to_db(filter.parent_id))
+            .fetch_one(db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(ViewRow {
+            type_name: row.type_.clone(),
+            parent_id: row.parent_id.clone(),
+            path: row.path.clone(),
+            data: row.data.clone(),
+            top_parent_id: row.top_parent_id.clone(),
+            has_linked_children,
+        })
     }
 
     /// Resolves the virtual library views a browse names into the physical
@@ -2470,6 +2519,60 @@ pub(crate) async fn library_top_parents_by_view(
     Ok(by_view)
 }
 
+/// A [`ViewRow`] and the id it was read for.
+#[derive(sqlx::FromRow)]
+struct IdentifiedViewRow {
+    #[sqlx(rename = "Id")]
+    id: String,
+    #[sqlx(flatten)]
+    row: ViewRow,
+}
+
+/// The `TopParentId`s each `UserView` among `ids` stands for, as
+/// `GetTopParentIdsForQuery` translates a view
+/// ([`FerrofinItemRepository::top_parent_ids_for_query`]): a grouped view the
+/// libraries `user` grouped into it, a view with a `DisplayParentId` or
+/// `ParentId` what that item stands for, a Live TV view itself. A view that
+/// stands for nothing maps to an empty list. Ids that are not views are absent.
+///
+/// For a scope built from a handful of parents: one read of the views' rows,
+/// then only the reads a followed pointer or the grouping arm needs.
+pub(crate) async fn view_top_parent_ids(
+    db: &Database,
+    ids: &[Uuid],
+    user: Option<&UserEntity>,
+) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+    let Some(user_view) = stored_type_name(BaseItemKind::UserView) else {
+        return Ok(HashMap::new());
+    };
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT "Id", "Type", "ParentId", "Path", "Data", "TopParentId",
+           EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = "BaseItems"."Id")
+               AS "_HasLinkedChildren"
+           FROM "BaseItems" WHERE +"Type" = "#,
+    );
+    qb.push_bind(user_view).push(" AND ");
+    push_in_list(&mut qb, r#""Id""#, &to_guid_strings(ids));
+    let rows: Vec<IdentifiedViewRow> = qb
+        .build_query_as()
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+    let mut by_view = HashMap::with_capacity(rows.len());
+    for IdentifiedViewRow { id, row } in rows {
+        let Ok(id) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        let folders =
+            FerrofinItemRepository::top_parent_ids_for_query(db, id, user, 0, Some(row)).await?;
+        by_view.insert(id, folders.unwrap_or_default());
+    }
+    Ok(by_view)
+}
+
 /// `AdjacentTo` over an ordered result (v12.2 `ApplyAdjacencyFilter`,
 /// `UserViewBuilder.FilterForAdjacency`): the item and its immediate
 /// neighbours, in `items`' order, or nothing when the item is not in `items`.
@@ -3066,7 +3169,7 @@ async fn visible_view_rows(
     // `live_tv_enabled_for`. Jellyfin leaves it out of `GetUserViews`
     // otherwise, so it is out of this scope too. The row is looked for
     // first, among the `UserView` rows just read: most databases have none,
-    // and then neither of the gate's two queries needs to run at all.
+    // and then the gate is not asked at all.
     let live_tv_view = match live_tv_view_among(
         rows.iter()
             .map(|(id, type_, path, _)| (id.as_str(), type_.as_str(), path.as_deref())),
@@ -3697,6 +3800,7 @@ impl ItemRepository for FerrofinItemRepository {
         let scope = InternalItemsQuery {
             parent_id: query.parent_id,
             parent_type: query.parent_type,
+            parent_row: query.parent_row.clone(),
             group_by_presentation_unique_key: false,
             ..InternalItemsQuery::default()
         };
@@ -5947,6 +6051,139 @@ mod tests {
             collapse_box_set_items: Some(false),
             order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
             ..Default::default()
+        }
+    }
+
+    /// The view row's path has a second reader, the folders view a path
+    /// alone identifies (`is_folders_view_fields`): a row built from the one
+    /// the caller read carries the expanded path, and both read as the
+    /// folders view (gl-1153).
+    #[tokio::test]
+    async fn a_handed_folders_view_row_reads_as_the_folders_view() {
+        let db = test_db().await;
+        let data_root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(data_root.path());
+        let repository =
+            repo(&db).with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
+        let folders = Uuid::from_u128(0x1153_0007);
+        seed_named_item(&db, folders, BaseItemKind::UserView, "Folders").await;
+        crate::test_support::set_item_path(&db, folders, "%MetadataPath%/views/folders").await;
+        let is_folders_view = |row: &ViewRow| {
+            crate::user_view_manager::is_folders_view_fields(
+                &row.type_name,
+                row.path.as_deref(),
+                row.data.as_deref(),
+            )
+        };
+        let handed = repository
+            .retrieve_item(folders)
+            .await
+            .unwrap()
+            .expect("the folders view");
+        let from_handed =
+            FerrofinItemRepository::view_row_of(&db, &linked_descendant_query(folders), &handed)
+                .await
+                .unwrap();
+        let stored = FerrofinItemRepository::query_view_row(&db, folders)
+            .await
+            .unwrap()
+            .expect("the stored row");
+        assert_ne!(from_handed.path, stored.path, "expanded, and stored");
+        assert!(is_folders_view(&from_handed) && is_folders_view(&stored));
+    }
+
+    /// A browse handed the parent's row its caller read (gl-1153) scopes
+    /// exactly as one that reads the row here, for the two fields the two
+    /// rows can differ in: a view's path, expanded in the handed row and
+    /// stored in the one read here, and whether a box set has linked
+    /// children, which the handed row leaves to a lookup. A row read for
+    /// another parent is not used.
+    #[tokio::test]
+    async fn a_parent_row_the_caller_read_scopes_a_browse_as_a_row_read_here() {
+        let db = test_db().await;
+        let data_root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(data_root.path());
+        let repository =
+            repo(&db).with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
+        let live_tv = Uuid::from_u128(0x1153_0001);
+        let programme = Uuid::from_u128(0x1153_0002);
+        let linked_set = Uuid::from_u128(0x1153_0003);
+        let unlinked_set = Uuid::from_u128(0x1153_0004);
+        let member = Uuid::from_u128(0x1153_0005);
+        let physical = Uuid::from_u128(0x1153_0006);
+
+        // A Live TV view stored without a `Data` blob, as Jellyfin stores its
+        // path: only the tokenized path says what it is.
+        seed_named_item(&db, live_tv, BaseItemKind::UserView, "Live TV").await;
+        crate::test_support::set_item_path(&db, live_tv, "%MetadataPath%/views/livetv").await;
+        seed_top_parented_item(&db, programme, BaseItemKind::Movie, "On Live TV", live_tv).await;
+        for (id, kind, name, parent, ancestors) in [
+            (linked_set, BaseItemKind::BoxSet, "Linked Set", None, vec![]),
+            (
+                unlinked_set,
+                BaseItemKind::BoxSet,
+                "Unlinked Set",
+                None,
+                vec![],
+            ),
+            (member, BaseItemKind::Movie, "Linked Member", None, vec![]),
+            (
+                physical,
+                BaseItemKind::Movie,
+                "Physical Child",
+                Some(unlinked_set),
+                vec![unlinked_set],
+            ),
+        ] {
+            seed_linked_descendant_item(&db, id, kind, name, parent, &ancestors).await;
+        }
+        seed_descendant_link(&db, linked_set, member, 0).await;
+
+        let read = |id: Uuid| {
+            let repository = &repository;
+            async move { repository.retrieve_item(id).await.unwrap().map(Arc::new) }
+        };
+        let handed = read(live_tv).await.expect("the view");
+        assert_ne!(
+            handed.path.as_deref(),
+            Some("%MetadataPath%/views/livetv"),
+            "the handed row's path is the expanded one"
+        );
+        let browse = |parent: Uuid, parent_row: Option<Arc<BaseItemEntity>>| {
+            let repository = &repository;
+            async move {
+                let result = repository
+                    .get_items(&InternalItemsQuery {
+                        parent_row,
+                        ..linked_descendant_query(parent)
+                    })
+                    .await
+                    .unwrap();
+                let names: Vec<String> = result
+                    .items
+                    .into_iter()
+                    .filter_map(|row| row.name)
+                    .collect();
+                (result.total_record_count, names)
+            }
+        };
+        for (parent, expected) in [
+            (live_tv, "On Live TV"),
+            (linked_set, "Linked Member"),
+            (unlinked_set, "Physical Child"),
+        ] {
+            let fresh = browse(parent, None).await;
+            assert_eq!(fresh, (1, vec![expected.to_owned()]), "{expected}");
+            assert_eq!(
+                browse(parent, read(parent).await).await,
+                fresh,
+                "{expected}: the handed row"
+            );
+            assert_eq!(
+                browse(parent, read(programme).await).await,
+                fresh,
+                "{expected}: another parent's row"
+            );
         }
     }
 

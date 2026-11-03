@@ -1,11 +1,14 @@
 //! Cross-request caches of the rows the per-user visibility check reads on every by-id request: a
 //! user's `Permissions` and `Preferences`, and the library set (every `CollectionFolder` row and
 //! each library's options and physical locations). They change rarely and were read several times
-//! per request (gl-973).
+//! per request (gl-973). A third entry keeps whether any Live TV tuner host is configured: one
+//! views request asks the Live TV gate (C# `LiveTvManager.IsLiveTvEnabled`, which upstream answers
+//! from the `LiveTvOptions` it holds in memory) up to three times (gl-1154).
 //!
 //! Every runtime writer of those rows invalidates what it wrote, after its commit:
 //! [`Database::invalidate_user_policy`], [`Database::invalidate_all_user_policies`],
-//! [`Database::invalidate_libraries`] and [`Database::note_items_written`]. A read-through caller
+//! [`Database::invalidate_libraries`], [`Database::note_items_written`] and
+//! [`Database::invalidate_live_tv_tuner_hosts`]. A read-through caller
 //! takes the generation **before** its database read and stores only if no invalidation came in
 //! between, so a read taken before a write is never stored after it (the auth cache's rule,
 //! `ferrofin_core::auth_cache`). Entries also expire after the TTL given to
@@ -21,6 +24,7 @@
 //! [`Database::invalidate_all_user_policies`]: crate::Database::invalidate_all_user_policies
 //! [`Database::invalidate_libraries`]: crate::Database::invalidate_libraries
 //! [`Database::note_items_written`]: crate::Database::note_items_written
+//! [`Database::invalidate_live_tv_tuner_hosts`]: crate::Database::invalidate_live_tv_tuner_hosts
 //! [`Database::enable_row_cache`]: crate::Database::enable_row_cache
 
 use std::collections::HashMap;
@@ -101,6 +105,9 @@ pub(crate) struct RowCache {
     /// Library-set reads under way ([`LibraryLoad`]): while one is, any item write may be in it.
     library_loads: AtomicUsize,
     libraries: RwLock<Option<Stamped<LibrarySet>>>,
+    tuner_generation: AtomicU64,
+    /// Whether any Live TV tuner host is configured, and when that was read.
+    tuner_hosts: RwLock<Option<(bool, Instant)>>,
 }
 
 /// A library-set read under way, from [`Database::begin_library_load`](crate::Database::begin_library_load):
@@ -135,6 +142,8 @@ impl RowCache {
             library_generation: AtomicU64::new(0),
             library_loads: AtomicUsize::new(0),
             libraries: RwLock::new(None),
+            tuner_generation: AtomicU64::new(0),
+            tuner_hosts: RwLock::new(None),
         }
     }
 
@@ -269,6 +278,43 @@ impl RowCache {
             self.invalidate_libraries();
         }
     }
+
+    pub(crate) fn tuner_generation(&self) -> u64 {
+        self.tuner_generation.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn tuner_hosts_exist(&self) -> Option<bool> {
+        if !self.enabled() {
+            return None;
+        }
+        let slot = *self
+            .tuner_hosts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        slot.filter(|(_, at)| at.elapsed() < self.ttl())
+            .map(|(exist, _)| exist)
+    }
+
+    /// Stores `exist` unless an invalidation came after `generation` was taken; returns it either way.
+    pub(crate) fn put_tuner_hosts_exist(&self, generation: u64, exist: bool) -> bool {
+        let mut slot = self
+            .tuner_hosts
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Checked under the write lock: an invalidation bumps the generation before it takes the lock.
+        if self.enabled() && self.tuner_generation() == generation {
+            *slot = Some((exist, Instant::now()));
+        }
+        exist
+    }
+
+    pub(crate) fn invalidate_tuner_hosts(&self) {
+        self.tuner_generation.fetch_add(1, Ordering::SeqCst);
+        *self
+            .tuner_hosts
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
 }
 
 #[cfg(test)]
@@ -294,7 +340,9 @@ mod tests {
         let generation = cache.policy_generation();
         cache.put_policy(generation, "a", rows(1));
         let _ = cache.begin_library_load().store(LibrarySet::default());
+        cache.put_tuner_hosts_exist(cache.tuner_generation(), true);
         assert!(cache.policy("a").is_none() && cache.libraries().is_none());
+        assert_eq!(cache.tuner_hosts_exist(), None);
     }
 
     #[test]
@@ -345,6 +393,24 @@ mod tests {
         assert!(cache.policy("a").is_none());
         let _ = cache.begin_library_load().store(LibrarySet::default());
         assert!(cache.libraries().is_none());
+        cache.put_tuner_hosts_exist(cache.tuner_generation(), true);
+        assert_eq!(cache.tuner_hosts_exist(), None);
+    }
+
+    #[test]
+    fn a_tuner_read_taken_before_a_tuner_write_is_not_stored() {
+        let cache = enabled(ROW_CACHE_TTL);
+        let generation = cache.tuner_generation();
+        cache.invalidate_tuner_hosts();
+        assert!(
+            cache.put_tuner_hosts_exist(generation, true),
+            "the caller still gets what it read"
+        );
+        assert_eq!(cache.tuner_hosts_exist(), None, "but it is not stored");
+        cache.put_tuner_hosts_exist(cache.tuner_generation(), true);
+        assert_eq!(cache.tuner_hosts_exist(), Some(true));
+        cache.invalidate_tuner_hosts();
+        assert_eq!(cache.tuner_hosts_exist(), None, "a write drops the answer");
     }
 
     #[test]

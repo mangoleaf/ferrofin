@@ -132,6 +132,14 @@ impl ImageFileSaver {
         images: &mut [ItemImageInfo],
         previous: &[ItemImageInfo],
     ) -> Result<(), ServiceError> {
+        let acquired = |image: &ItemImageInfo| {
+            !previous.contains(image) && self.managed(Path::new(&image.path))
+        };
+        // A scan saves every item through here, most of them with no image
+        // acquired this pass: their destinations are never asked for.
+        if !images.iter().any(&acquired) {
+            return Ok(());
+        }
         let Some(settings) = self.settings(item).await? else {
             return Ok(());
         };
@@ -142,7 +150,7 @@ impl ImageFileSaver {
                 .iter()
                 .filter(|old: &&ItemImageInfo| old.image_type == image.image_type)
                 .count();
-            if !previous.contains(image) && self.managed(Path::new(&image.path)) {
+            if acquired(image) {
                 match self
                     .publish(
                         item,
@@ -233,7 +241,10 @@ impl ImageFileSaver {
                 | "CollectionFolder"
         ) && self.in_server_directories(item))
         {
-            let folders = self.folders.get_virtual_folders().await?;
+            // The libraries' snapshot, as upstream's `GetLibraryOptions(item)`
+            // reads them from memory: the dashboard's full listing re-heals
+            // and re-reads every library, once per saved item.
+            let folders = self.folders.library_folders().await?;
             let options = ferrofin_model::entities_media::owning_library(
                 &folders,
                 item.top_parent_id.as_deref(),

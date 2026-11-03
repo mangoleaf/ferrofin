@@ -147,13 +147,19 @@ pub async fn cached_guid_preference(
 /// entirely — which is why it is absent both from `/Users/{id}/Views` and from
 /// the library scope an unscoped query is confined to.
 ///
+/// Both halves come from the cross-request row cache, as upstream answers
+/// them from the user it holds and its in-memory `LiveTvOptions`: one views
+/// request asks this up to three times.
+///
 /// # Errors
-/// Returns [`ServiceError::Db`] if either query fails.
+/// Returns [`ServiceError::Db`] if either read fails.
 pub async fn live_tv_enabled_for(db: &Database, user_id: &str) -> Result<bool, ServiceError> {
     if !cached_permission(db, user_id, PermissionKind::EnableLiveTvAccess).await? {
         return Ok(false);
     }
-    Ok(db.live_tv_tuner_count().await.map_err(ServiceError::from)? > 0)
+    db.live_tv_tuner_hosts_exist()
+        .await
+        .map_err(ServiceError::from)
 }
 
 /// Whether the user has the given permission (C# `HasPermission`).

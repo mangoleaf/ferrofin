@@ -65,6 +65,7 @@ impl SessionReporter for Reporter {
     async fn report_started(&self, _job: &TranscodingJobHandle, _info: TranscodingInfo) {
         *self.0.started.lock().unwrap() += 1;
     }
+    async fn on_job_failed_to_start(&self, _job: &TranscodingJobHandle) {}
     async fn on_job_killed(
         &self,
         job: &TranscodingJobHandle,

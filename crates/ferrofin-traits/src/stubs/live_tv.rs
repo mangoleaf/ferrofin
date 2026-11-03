@@ -238,6 +238,25 @@ pub fn filter_timers(timers: Vec<TimerInfoDto>, query: &TimerQuery) -> Vec<Timer
     selected
 }
 
+/// Which recordings a listing may show its caller: the rule the caller's own
+/// read of one applies, which lives above this crate, over the library and the
+/// virtual folders.
+///
+/// Upstream's recordings are library items, so `GetEmbyRecordingsAsync` gets
+/// the same answer from `InternalItemsQuery(user)` under the recording folders
+/// the user may see.
+#[async_trait]
+pub trait RecordingVisibility: Send + Sync {
+    /// Whether the listing may show `recording`, the entity
+    /// [`LiveTvManager::get_recording_item`] resolves for the same row.
+    async fn is_visible(
+        &self,
+        recording: &ferrofin_db::entities::base_items::BaseItemEntity,
+    ) -> Result<bool, ServiceError>;
+}
+
+fn _assert_object_safe_recording_visibility(_: &dyn RecordingVisibility) {}
+
 /// The Live TV manager.
 ///
 /// Port of `ILiveTvManager` (read + configuration slice).
@@ -673,8 +692,11 @@ pub trait LiveTvManager: Send + Sync {
     /// Lists the recordings a query selects, projected for `user`.
     ///
     /// Port of `LiveTvManager.GetRecordingsAsync`: the in-progress/status/
-    /// channel/series-timer filters and paging, then the DTO projection with
-    /// the list-path `RemoveFields` strip and the recording post-pass.
+    /// channel/series-timer filters, then the drop of a finished recording
+    /// whose file has gone (a library item upstream), then `visible` (when
+    /// given) before paging so `TotalRecordCount` counts only what it keeps,
+    /// then the DTO projection with the list-path `RemoveFields` strip and the
+    /// recording post-pass.
     ///
     /// The default ignores the query — the "nothing recorded" state.
     async fn get_recordings_matching(
@@ -682,8 +704,9 @@ pub trait LiveTvManager: Send + Sync {
         query: &RecordingQuery,
         user: Option<&UserEntity>,
         options: &DtoOptions,
+        visible: Option<&dyn RecordingVisibility>,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        let _ = (query, user, options);
+        let _ = (query, user, options, visible);
         self.get_recordings().await
     }
 

@@ -3371,6 +3371,86 @@ async fn a_recording_plays_for_whoever_may_read_it() {
     );
 }
 
+/// The recording ids `GET /LiveTv/Recordings{query}` answers `token`, without
+/// dashes, and its `TotalRecordCount`.
+async fn listed_recordings(f: &Fixture, query: &str, token: &str) -> (Vec<String>, u64) {
+    let uri = format!("/LiveTv/Recordings{query}");
+    let (status, page) = call(&f.router, "GET", &uri, Some(token), None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {page}");
+    let ids = page["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["Id"].as_str().unwrap().replace('-', ""))
+        .collect();
+    (ids, page["TotalRecordCount"].as_u64().unwrap())
+}
+
+/// `GET /LiveTv/Recordings` lists only what `GET /LiveTv/Recordings/{id}` lets
+/// the user open, as upstream's library query under the recording folders the
+/// user may see does. A recording inside a library the user cannot open is left
+/// out before paging, so `TotalRecordCount` counts what the user can page
+/// through.
+#[tokio::test]
+async fn the_recordings_list_keeps_to_what_the_user_may_open() {
+    let f = fixture().await;
+    let channel = uuid::Uuid::from_u128(0xdead);
+    let mut open = Vec::new();
+    for name in ["open-a", "open-b"] {
+        open.push(stored_recording(&f, "recordings", name, channel).await);
+    }
+    let mut kept_out = Vec::new();
+    for name in ["kept-out-a", "kept-out-b", "kept-out-c"] {
+        kept_out.push(stored_recording(&f, "more", name, channel).await);
+    }
+    let sorted = |mut ids: Vec<String>| {
+        ids.sort();
+        ids
+    };
+    let everything = sorted(open.iter().chain(&kept_out).cloned().collect());
+
+    let (ids, total) = listed_recordings(&f, "", &f.admin).await;
+    assert_eq!((sorted(ids), total), (everything.clone(), 5));
+    let (ids, total) = listed_recordings(&f, "", &f.viewer).await;
+    assert_eq!((sorted(ids), total), (sorted(open.clone()), 2));
+    // The same rule as the recording's own route.
+    for (id, expected) in open
+        .iter()
+        .map(|id| (id, StatusCode::OK))
+        .chain(kept_out.iter().map(|id| (id, StatusCode::NOT_FOUND)))
+    {
+        let uri = format!("/LiveTv/Recordings/{id}");
+        assert_eq!(
+            call(&f.router, "GET", &uri, Some(&f.viewer), None).await.0,
+            expected,
+            "{uri}"
+        );
+    }
+
+    // Paging runs over what is left, whichever way the rows interleave.
+    let mut paged = Vec::new();
+    for start in 0..3 {
+        let query = format!("?startIndex={start}&limit=1");
+        let (ids, total) = listed_recordings(&f, &query, &f.viewer).await;
+        assert_eq!(total, 2, "{query}");
+        assert_eq!(ids.len(), usize::from(start < 2), "{query}");
+        paged.extend(ids);
+    }
+    assert_eq!(sorted(paged), sorted(open.clone()));
+
+    // A request naming the user is held to that user, as by id; one with no
+    // user at all (an API key naming none) is not, as by id.
+    let viewer_id = &f.viewer_id;
+    let named = format!("?userId={viewer_id}");
+    let (ids, total) = listed_recordings(&f, &named, &f.admin).await;
+    assert_eq!((sorted(ids), total), (sorted(open.clone()), 2));
+    let key = only_api_key(&f).await;
+    let (ids, total) = listed_recordings(&f, &named, &key).await;
+    assert_eq!((sorted(ids), total), (sorted(open.clone()), 2));
+    let (ids, total) = listed_recordings(&f, "", &key).await;
+    assert_eq!((sorted(ids), total), (everything, 5));
+}
+
 /// A channel is a row with no path, so the library list does not reach it. Its
 /// rule is `PlaybackInfo`'s, whose answer the stream route repeats: rating and
 /// tag rules hide it, and "Live TV access" does not, there or here.

@@ -1777,6 +1777,18 @@ impl UserManager for FerrofinUserManager {
         Ok(dto)
     }
 
+    async fn user_primary_image_tag(
+        &self,
+        user: &UserEntity,
+    ) -> Result<Option<String>, ServiceError> {
+        // A hit copies the one tag instead of the whole DTO; a miss builds the
+        // DTO (and caches it) exactly as `get_user_dto` would.
+        if let Some(tag) = self.auth_cache.primary_image_tag(user) {
+            return Ok(tag);
+        }
+        Ok(self.get_user_dto(user, None).await?.primary_image_tag)
+    }
+
     async fn latest_items_excludes(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
         // A hit copies the one list instead of the whole DTO; a miss builds the
         // DTO (and caches it) exactly as `get_user_dto` would.
