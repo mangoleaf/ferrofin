@@ -42,6 +42,7 @@ pub mod options;
 pub mod persistence;
 pub mod plugins;
 pub mod providers;
+pub mod remote_images;
 pub mod security;
 pub mod server_settings;
 pub mod session;

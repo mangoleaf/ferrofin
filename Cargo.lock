@@ -1407,6 +1407,7 @@ name = "ferrofin-extensions"
 version = "0.4.1"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "chrono",
  "fancy-regex",
  "ferrofin-chromaprint",
@@ -1436,6 +1437,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "x509-parser",
 ]

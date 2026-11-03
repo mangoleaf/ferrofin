@@ -471,12 +471,29 @@ pub(crate) async fn download_image(url: &str) -> Result<(Vec<u8>, String), Image
 /// GETs `url` for a caller that names the file itself, so it needs no media
 /// type and only the bytes have to be an image. `None` on any failure.
 pub(crate) async fn download_bytes(url: &str) -> Option<Vec<u8>> {
-    let response = send(url).await.ok()?.response;
-    if !response.status().is_success() {
-        return None;
+    fetch_image_bytes(url).await.ok()
+}
+
+/// [`download_bytes`] with the reason it found no image: `404`/`403` is
+/// [`Missing`](ImageFetchError::Missing), another status that is not a
+/// success [`Unavailable`](ImageFetchError::Unavailable), and a body whose
+/// first bytes are no image [`NotAnImage`](ImageFetchError::NotAnImage).
+pub(crate) async fn fetch_image_bytes(url: &str) -> Result<Vec<u8>, ImageFetchError> {
+    let response = send(url).await?.response;
+    match response.status() {
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::FORBIDDEN => {
+            return Err(ImageFetchError::Missing);
+        }
+        status if !status.is_success() => return Err(ImageFetchError::Unavailable),
+        _ => {}
     }
-    let bytes = response.counted_bytes().await.ok()?;
-    is_image(&bytes).then_some(bytes)
+    let bytes = response.counted_bytes().await?;
+    if !is_image(&bytes) {
+        return Err(ImageFetchError::NotAnImage(
+            "the response's content is not an image".to_owned(),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// The media-type resolution above, without the I/O. `redirected` is

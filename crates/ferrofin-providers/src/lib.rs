@@ -41,6 +41,7 @@ pub mod plugin_config;
 pub mod provider_manager;
 pub mod rate_limit;
 pub mod refresh_plan;
+pub mod remote_images;
 pub mod season;
 pub mod similarity;
 pub mod studios;

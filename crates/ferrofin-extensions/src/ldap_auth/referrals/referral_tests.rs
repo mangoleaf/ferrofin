@@ -15,7 +15,8 @@ use rstest::rstest;
 
 use super::super::{
     ADMIN_FILTER_DISABLED, BoundSearchError, CertificateVerification, ClientCertificate,
-    LdapConnection, NO_ATTRIBUTES, ldap_user_search, search_as_bind_dn, test_ldap_filters,
+    LdapConnection, NO_ATTRIBUTES, REFERRAL_BUDGET, ldap_user_search, search_as_bind_dn,
+    test_ldap_filters,
 };
 use super::*;
 
@@ -560,16 +561,23 @@ async fn a_referred_server_that_fails_the_search_fails_it_naming_the_server() {
 const TO_DC2: &str = "ldap://dc2.example/ou=partners,dc=example,dc=org";
 
 /// A search that skipped a referral and then fails still warns once about
-/// the skipped one: a referred server fails the search, or the hop limit
-/// stops a loop.
+/// the skipped one: a referred server fails the search, or a loop runs out
+/// of the referral budget (the skipped referral counts, so before the hop
+/// limit).
 #[rstest]
-#[case::a_referred_server_fails_the_search(Server::failing(
-    PARTNERS_DN,
-    LdapError::Result { code: 32, message: String::new() }
-))]
-#[case::the_hop_limit_stops_a_loop(Server::failing(PARTNERS_DN, referred(&[TO_DC2])))]
+#[case::a_referred_server_fails_the_search(
+    Server::failing(PARTNERS_DN, LdapError::Result { code: 32, message: String::new() }),
+    "the referral to dc2.example:389 failed: No Such Object"
+)]
+#[case::a_loop_runs_out_of_the_budget(
+    Server::failing(PARTNERS_DN, referred(&[TO_DC2])),
+    "the search was referred more than 10 times in all"
+)]
 #[tokio::test]
-async fn a_search_that_fails_after_skipping_a_referral_warns_about_it(#[case] dc2: Server) {
+async fn a_search_that_fails_after_skipping_a_referral_warns_about_it(
+    #[case] dc2: Server,
+    #[case] failure: &str,
+) {
     let logs = CapturedLogs::default();
     let _guard = logs.subscribe();
     let network = Network::of([
@@ -589,15 +597,7 @@ async fn a_search_that_fails_after_skipping_a_referral_warns_about_it(#[case] dc
         ("dc2.example", dc2),
     ]);
     let error = search(&network, &config()).await.expect_err("fails");
-    assert!(
-        matches!(
-            error,
-            BoundSearchError::Search(
-                LdapError::ReferralFailed { .. } | LdapError::ReferralHopLimit { .. }
-            )
-        ),
-        "{error:?}"
-    );
+    assert!(error.to_string().starts_with(failure), "{error}");
     assert_eq!(
         logs.line("WARN", SKIPPED),
         logs.line(
@@ -606,6 +606,42 @@ async fn a_search_that_fails_after_skipping_a_referral_warns_about_it(#[case] dc
         ),
         "one warning, naming the skipped server"
     );
+}
+
+/// A loop chased before any other referral still stops at the hop limit,
+/// within the budget (gl-1208): the referral beside it is never chased, so
+/// nothing is skipped.
+#[tokio::test]
+async fn a_loop_chased_first_stops_at_the_hop_limit() {
+    let logs = CapturedLogs::default();
+    let _guard = logs.subscribe();
+    let network = Network::of([
+        (
+            "dc1.example",
+            Server::answering(
+                BASE_DN,
+                found(
+                    &[ADA_DN],
+                    &[
+                        &[TO_DC2],
+                        &["ldap://gone.example/ou=gone,dc=example,dc=org"],
+                    ],
+                ),
+            ),
+        ),
+        (
+            "dc2.example",
+            Server::failing(PARTNERS_DN, referred(&[TO_DC2])),
+        ),
+    ]);
+    assert_eq!(
+        search(&network, &config()).await,
+        Err(BoundSearchError::Search(LdapError::ReferralHopLimit {
+            server: "dc2.example:389".to_owned(),
+        }))
+    );
+    assert_eq!(network.calls().connects.len(), 1 + REFERRAL_HOP_LIMIT);
+    assert_eq!(logs.count("WARN", SKIPPED), 0);
 }
 
 /// A `referral` result is skipped alike: the server that sent it holds none
@@ -929,6 +965,149 @@ async fn exactly_the_hop_limit_of_referrals_is_followed() {
         }))
     );
     assert_eq!(longer.calls().connects.len(), REFERRAL_HOP_LIMIT + 1);
+}
+
+/// A tree of servers `depth` levels below `n.example`: each refers the
+/// search to `fanout` servers one level down (`n0`, `n1`, … then `n00`, …),
+/// and each finds the one entry `uid=<its name>`.
+fn tree(fanout: usize, depth: usize) -> Network {
+    fn grow(name: &str, fanout: usize, depth: usize, servers: &mut Vec<(String, Server)>) {
+        let children: Vec<String> = if depth == 0 {
+            Vec::new()
+        } else {
+            (0..fanout).map(|i| format!("{name}{i}")).collect()
+        };
+        let answer = SearchOutcome {
+            entries: vec![LdapEntry {
+                dn: format!("uid={name},{BASE_DN}"),
+                attributes: Vec::new(),
+            }],
+            references: children
+                .iter()
+                .map(|child| vec![format!("ldap://{child}.example/{BASE_DN}")])
+                .collect(),
+        };
+        servers.push((
+            format!("{name}.example"),
+            Server::answering(BASE_DN, answer),
+        ));
+        for child in &children {
+            grow(child, fanout, depth - 1, servers);
+        }
+    }
+    let mut servers = Vec::new();
+    grow("n", fanout, depth, &mut servers);
+    Network::of(servers)
+}
+
+/// The configuration searching `n.example`, the root of a [`tree`].
+fn tree_config() -> LdapConfig {
+    LdapConfig {
+        ldap_server: "n.example".to_owned(),
+        ..config()
+    }
+}
+
+/// A server answering each search with several references (gl-1208): every
+/// referral is a hop or two deep, far inside the hop limit, yet one search
+/// would chase them all. The budget stops the search at the referral past
+/// [`REFERRAL_BUDGET`], before connecting for it.
+#[tokio::test]
+async fn the_referral_budget_bounds_the_referrals_of_one_search_in_all() {
+    // 3 + 9 referrals, two deep.
+    let network = tree(3, 2);
+    assert_eq!(
+        search(&network, &tree_config()).await,
+        Err(BoundSearchError::Search(LdapError::ReferralBudget {
+            // Depth first: n0 and its three, n1 and its three, n2 and n20;
+            // the next, n21, is n2's.
+            server: "n2.example:389".to_owned(),
+        }))
+    );
+    assert_eq!(
+        network.calls().connects.len(),
+        1 + REFERRAL_BUDGET,
+        "the configured server, then one per referral within the budget"
+    );
+}
+
+/// Exactly [`REFERRAL_BUDGET`] referrals are chased; one more fails the
+/// search, naming the budget.
+#[tokio::test]
+async fn exactly_the_referral_budget_of_referrals_is_chased() {
+    let within = tree(REFERRAL_BUDGET, 1);
+    let entries = search(&within, &tree_config()).await.expect("within");
+    assert_eq!(entries.len(), 1 + REFERRAL_BUDGET);
+
+    let past = tree(REFERRAL_BUDGET + 1, 1);
+    let error = search(&past, &tree_config()).await.expect_err("past");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "the search was referred more than {REFERRAL_BUDGET} times in all, the last time by \
+             n.example:389: no search follows more referrals than that"
+        )
+    );
+    assert_eq!(past.calls().connects.len(), 1 + REFERRAL_BUDGET);
+}
+
+/// A skipped referral costs its connection attempts as a followed one does,
+/// so it counts toward the budget; a referral counts once whatever its URLs.
+#[tokio::test]
+async fn skipped_referrals_count_toward_the_budget_once_each() {
+    let gone: Vec<String> = (0..REFERRAL_BUDGET)
+        .map(|i| format!("ldap://gone{i}.example/{BASE_DN}"))
+        .collect();
+    let mut references: Vec<Vec<&str>> = gone.iter().map(|url| vec![url.as_str()]).collect();
+    references.push(vec!["ldap://dc2.example/ou=partners,dc=example,dc=org"]);
+    let references: Vec<&[&str]> = references.iter().map(Vec::as_slice).collect();
+    let network = Network::of([
+        (
+            "dc1.example",
+            Server::answering(BASE_DN, found(&[ADA_DN], &references)),
+        ),
+        (
+            "dc2.example",
+            Server::answering(PARTNERS_DN, found(&[GRACE_DN], &[])),
+        ),
+    ]);
+    assert_eq!(
+        search(&network, &config()).await,
+        Err(BoundSearchError::Search(LdapError::ReferralBudget {
+            server: "dc1.example:389".to_owned(),
+        }))
+    );
+    assert!(
+        !network
+            .calls()
+            .servers()
+            .contains(&"dc2.example".to_owned()),
+        "the referral past the budget is not chased"
+    );
+
+    // Two URLs each, every one failing: still one referral each.
+    let pairs: Vec<[String; 2]> = (0..REFERRAL_BUDGET)
+        .map(|i| {
+            [
+                format!("ldap://gone{i}a.example/{BASE_DN}"),
+                format!("ldap://gone{i}b.example/{BASE_DN}"),
+            ]
+        })
+        .collect();
+    let pairs: Vec<[&str; 2]> = pairs
+        .iter()
+        .map(|[a, b]| [a.as_str(), b.as_str()])
+        .collect();
+    let references: Vec<&[&str]> = pairs.iter().map(<[&str; 2]>::as_slice).collect();
+    let network = Network::of([(
+        "dc1.example",
+        Server::answering(BASE_DN, found(&[ADA_DN], &references)),
+    )]);
+    assert_eq!(
+        search(&network, &config()).await,
+        Ok(vec![ADA_DN.to_owned()])
+    );
+    assert_eq!(network.calls().connects.len(), 1 + 2 * REFERRAL_BUDGET);
 }
 
 /// The connection to a referred server keeps the configured TLS and its

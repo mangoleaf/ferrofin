@@ -9,7 +9,9 @@
 //! external-identity store, then by name for a user LDAP-Auth already owns),
 //! checks the password by binding as the entry, asks the admin filter whether
 //! the user is an administrator, then creates the user or follows a directory
-//! rename. The administrator flag goes back to the user manager in
+//! rename, giving a user it creates their directory picture
+//! (`profile_image`, which also holds the `LdapProfileImageSync` task).
+//! The administrator flag goes back to the user manager in
 //! [`ProviderAuthenticationResult::administrator`], which applies it and never
 //! demotes the last administrator (D5).
 //!
@@ -26,10 +28,11 @@
 //!   credentials ([`REFUSED_BIND`]). A directory that cannot be reached,
 //!   times out, fails the bind with another code, refuses the configured bind
 //!   DN, or fails the user search or the admin filter's (a referred server
-//!   failing it and a referral loop included) is a server error, which the
-//!   user manager does not count toward lockout. Upstream answers each with an
-//!   `AuthenticationException`. A referral that leads to no server is
-//!   skipped, so a user only it holds is no matching entry.
+//!   failing it, a referral loop and the referral budget included) is a
+//!   server error, which the user manager does not count toward lockout.
+//!   Upstream answers each with an `AuthenticationException`. A referral that
+//!   leads to no server is skipped, so a user only it holds is no matching
+//!   entry.
 //! - **The last administrator is never demoted by the admin filter** (D5):
 //!   the user manager keeps them one and logs a warning, and the sign-in
 //!   succeeds. Upstream demotes them.
@@ -44,8 +47,17 @@
 //!   would let them sign in as that user. The entry's username attribute is
 //!   still trusted, as upstream trusts it: an entry with no uid link yet whose
 //!   username attribute names an account LDAP-Auth owns is relinked to it, so
-//!   that attribute must be one users cannot edit. TODO(gl-1188): the owner
-//!   decides how to close that.
+//!   that attribute must be one users cannot edit: where users can write it,
+//!   one with no account linked to their uid yet can take any LDAP-owned
+//!   account, whatever its rights, with their own password. The uid
+//!   attribute is trusted the same way: a user who can write their own can
+//!   point it at a linked user's uid, and signs in to that account, renamed
+//!   to their own username attribute. Kept as upstream by owner decision
+//!   (gl-1188, 2026-11-03: to be revisited if it is proven a security issue).
+//!   The username-attribute route was reproduced live on 2026-11-03, the
+//!   directory administrator editing the entry standing in for a user; the
+//!   uid route is read from the code. Whether that triggers the revisit is
+//!   the owner's call.
 //! - **A link is written only after the password is checked.** Upstream
 //!   records a relink by name before it binds as the user.
 //! - **An entry without the uid attribute is not linked.** Upstream stores a
@@ -65,8 +77,10 @@
 //!   as at sign-in; otherwise the change is a `401` and nothing is written.
 //!   Upstream writes to whichever entry matched first, so a person who can
 //!   make their own entry match another user's name would have that user's
-//!   new password set on their entry. The name leg trusts the username
-//!   attribute, as sign-in does (TODO(gl-1188)).
+//!   new password set on their entry. The match trusts the username and uid
+//!   attributes, as sign-in does, so where users can write them a new
+//!   password can still reach the wrong entry (kept as upstream by owner
+//!   decision, gl-1188).
 //! - **A new user is created with its provider ids in one transaction**
 //!   ([`UserManager::create_external_user`]). Upstream saves them after
 //!   creating the user, a moment in which the account has no password and
@@ -86,6 +100,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::{ExternalIdentityKey, ExternalIdentityStore};
 use ferrofin_traits::library::{ExternalUserSetup, UserManager};
 use ferrofin_traits::plugins::PluginManager;
+use ferrofin_traits::remote_images::RemoteImageFetcher;
 use ferrofin_traits::security::{
     AuthenticationManager, PasswordResetManager, ProviderAuthenticationResult,
 };
@@ -175,8 +190,9 @@ pub fn admin_search_filter(config: &LdapConfig, ldap_username: &str) -> String {
 
 /// `LocateLdapUser`: searches the base DN's subtree as the configured bind DN
 /// with [`user_search_filter`] for `[LdapUsernameAttribute, LdapUidAttribute]`,
-/// following referrals, and returns the first entry, warning when there are
-/// more, or `None` when none matches.
+/// and `LdapProfileImageAttribute` while profile-image sync is on, following
+/// referrals, and returns the first entry, warning when there are more, or
+/// `None` when none matches.
 pub(crate) async fn locate_ldap_user(
     directory: &dyn LdapDirectory,
     config: &LdapConfig,
@@ -184,15 +200,21 @@ pub(crate) async fn locate_ldap_user(
 ) -> Result<Option<LdapEntry>, BoundSearchError> {
     let filter = user_search_filter(config, username);
     tracing::debug!(base_dn = ?config.ldap_base_dn, filter = ?filter, "LDAP user search");
+    let mut attributes = vec![
+        config.ldap_username_attribute.as_str(),
+        config.ldap_uid_attribute.as_str(),
+    ];
+    // An empty name names no attribute an entry could have, so it is not
+    // sent: a server may refuse it.
+    if config.enable_ldap_profile_image_sync && !config.ldap_profile_image_attribute.is_empty() {
+        attributes.push(config.ldap_profile_image_attribute.as_str());
+    }
     let mut found = search_as_bind_dn(
         directory,
         config,
         &config.ldap_base_dn,
         &filter,
-        &[
-            config.ldap_username_attribute.as_str(),
-            config.ldap_uid_attribute.as_str(),
-        ],
+        &attributes,
     )
     .await?;
     if found.is_empty() {
@@ -319,6 +341,8 @@ pub struct LdapAuthProvider {
     users: Arc<dyn UserManager>,
     identities: Arc<dyn ExternalIdentityStore>,
     directory: Arc<dyn LdapDirectory>,
+    /// Fetches a picture the directory gives as a URL.
+    images: Arc<dyn RemoteImageFetcher>,
     /// Whether the configuration that cannot be read was already warned
     /// about, so a broken file warns once rather than at every sign-in.
     warned_unreadable: AtomicBool,
@@ -334,19 +358,22 @@ struct FoundUser {
 impl LdapAuthProvider {
     /// A provider over the plugin manager (the enabled flag and the
     /// configuration), the user accounts it finds and creates, the store of
-    /// LDAP uid links, and the directory it connects through.
+    /// LDAP uid links, the directory it connects through, and the fetcher of
+    /// pictures the directory gives as URLs.
     #[must_use]
     pub fn new(
         plugins: Arc<dyn PluginManager>,
         users: Arc<dyn UserManager>,
         identities: Arc<dyn ExternalIdentityStore>,
         directory: Arc<dyn LdapDirectory>,
+        images: Arc<dyn RemoteImageFetcher>,
     ) -> Self {
         Self {
             plugins,
             users,
             identities,
             directory,
+            images,
             warned_unreadable: AtomicBool::new(false),
         }
     }
@@ -487,9 +514,9 @@ impl LdapAuthProvider {
         }
     }
 
-    /// Links `user_id` to the entry's uid (`PluginConfiguration.AddUser`). An
-    /// entry without the uid attribute is not linked: see the module's
-    /// divergences.
+    /// Links `user_id` to the entry's uid (`PluginConfiguration.AddUser`),
+    /// with no avatar hash until a picture is stored. An entry without the uid
+    /// attribute is not linked: see the module's divergences.
     async fn link(&self, user_id: &str, uid: &str) -> Result<(), ServiceError> {
         if uid.is_empty() {
             return Ok(());
@@ -628,7 +655,24 @@ impl AuthenticationManager for LdapAuthProvider {
                     .then(|| config.enabled_folders.clone()),
             };
             let created = self.users.create_external_user(&name, &setup).await?;
+            // Linked before the picture, which may be a download, so a
+            // concurrent sign-in finds the user by their uid meanwhile.
             self.link(&created.id, &uid).await?;
+            if let Some(avatar_hash) = self.first_picture(&config, &entry, &created).await
+                && !uid.is_empty()
+                && let Err(error) = self
+                    .identities
+                    .set_avatar_hash(Self::identity(&uid), Some(&avatar_hash))
+                    .await
+            {
+                // The account and its picture exist; the task stores the
+                // picture again, with its hash, on its next run.
+                tracing::warn!(
+                    user_id = %created.id,
+                    %error,
+                    "the new LDAP user's picture hash cannot be recorded"
+                );
+            }
             return Ok(ProviderAuthenticationResult {
                 username: name,
                 // Upstream sets the flag on every user it creates, `false`
@@ -639,6 +683,7 @@ impl AuthenticationManager for LdapAuthProvider {
         };
 
         if needs_link {
+            // A relink by name records no picture, as `AddUser(…, string.Empty)`.
             self.link(&user.id, &uid).await?;
         }
         let name = ldap_username.ok_or_else(|| no_username(&config))?;
@@ -790,6 +835,8 @@ impl PasswordResetManager for LdapAuthProvider {
         Ok(PinRedeemResult::default())
     }
 }
+
+pub(crate) mod profile_image;
 
 #[cfg(test)]
 mod sign_in_tests;

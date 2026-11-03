@@ -44,8 +44,9 @@ pub trait Extension: Send + Sync {
 An extension receives **only manager trait objects**, never concrete types — an
 `ExtensionContext` bundling the `LibraryManager`, `MediaSegmentManager`, `PluginManager`,
 `MergeVersionsManager`, `UserManager`, the `ExternalIdentityStore` (which outside identity,
-such as an LDAP uid, belongs to which user), an optional audio `Fingerprinter`, and a
-per-extension cache dir. It
+such as an LDAP uid, belongs to which user), the `RemoteImageFetcher` (image downloads under
+the server's limits: no private address unless `image_private_http_allow` lists it, and
+`image_download_max_mb`), an optional audio `Fingerprinter`, and a per-extension cache dir. It
 is the same dependency-injection seam the rest of the server uses (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md)), so an extension can do real work — scan the library,
 persist media segments, register background tasks — without reaching into implementation
@@ -97,14 +98,25 @@ administrator flag in step with the admin filter), following the referrals its s
 Their password changes reach the directory, and a forgotten password sends them to the
 configured reset page. An adopted Jellyfin's LDAP-Auth settings and uid map are imported once
 on the first start, and the plugin is turned on when a user's saved authentication provider is
-LDAP-Auth's. Profile images follow.
+LDAP-Auth's. With profile-image sync on, a new user's picture comes from the directory (binary,
+Base64 or a URL), and the "LDAP - Synchronize profile images" task keeps every LDAP user's
+current.
+
+> **Warning:** LDAP-Auth's username and uid attributes must be ones users cannot change on
+> their own entry. As upstream, a directory user is matched to an existing LDAP-Auth account by
+> `LdapUidAttribute` (`uid` by default) and, when no account is linked to their uid yet, by
+> `LdapUsernameAttribute` (`cn` by default). Where users can write either attribute (many
+> directories let users edit their own `cn`, such as OpenLDAP's common `by self write`), one of
+> them can set it to another LDAP user's value and sign in to that account, whatever its rights,
+> with their own password. Choose attributes only administrators can write, or restrict
+> self-writes to them.
 
 | Extension | Upstream | Ported rev | What it does |
 |---|---|---|---|
 | **Intro Skipper** | [intro-skipper/intro-skipper](https://github.com/intro-skipper/intro-skipper) | `db09359` | Intro, credits, recap, preview and commercial detection (audio fingerprints, chapters, black frames), exposed as media segments |
 | **File Transformation** | [IAmParadox27/jellyfin-plugin-file-transformation](https://github.com/IAmParadox27/jellyfin-plugin-file-transformation) | `f4f01c3` | Transform-on-serve hook other extensions build on |
 | **Merge Versions** | [danieladov/jellyfin-plugin-mergeversions](https://github.com/danieladov/jellyfin-plugin-mergeversions) | `e6f58d6` | Bulk-merge duplicate movie/episode versions into one item, two 24h tasks |
-| **LDAP-Auth** | [jellyfin/jellyfin-plugin-ldapauth](https://github.com/jellyfin/jellyfin-plugin-ldapauth) | `d11c86a` | Sign users in against an LDAP directory (in progress: the settings page and its three `POST /Ldap/*` tests, sign-in, the admin filter, password changes and resets, referrals, and the adopted settings' import so far) |
+| **LDAP-Auth** | [jellyfin/jellyfin-plugin-ldapauth](https://github.com/jellyfin/jellyfin-plugin-ldapauth) | `d11c86a` | Sign users in against an LDAP directory (in progress: the settings page and its three `POST /Ldap/*` tests, sign-in, the admin filter, password changes and resets, referrals, the adopted settings' import, and profile images so far) |
 
 **Accepted divergences** (not bugs — do not "fix" them during an upstream sync): Ferrofin
 models version groups solely through the `PrimaryVersionId` pointer rather than Jellyfin's
