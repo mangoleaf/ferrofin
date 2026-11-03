@@ -25,9 +25,12 @@ Past the end of the scenario, a scan completes and changes nothing.
 The library is a movies library, or a tvshows one when FAKE_KIND=tvshows. In a TV library the
 scratch folder is a series: FAKE_SERIES (a JSON object) puts one with those fields there before
 the run, as a server that already scanned the folder would have; otherwise one appears (named
-after the folder, no provider ids) once the folder holds an episode. FAKE_FETCHERS=on or off
-saves the library's metadata-fetcher choice for every kind of its items (TheMovieDb ticked, or
-none); FAKE_TYPE_OPTIONS (a JSON list) saves exactly that; unset, the library saved none.
+after the folder, no provider ids) once the folder holds a file, as the script writes the
+series' tvshow.nfo before its first scan. FAKE_FETCHERS=on or off saves the library's
+metadata-fetcher choice for every kind of its items (TheMovieDb ticked, or none);
+FAKE_TYPE_OPTIONS (a JSON list) saves exactly that; unset, the library saved none.
+FAKE_SAVERS (a JSON list) is the library's chosen metadata savers; unset, it chose none.
+FAKE_CONFIG (a JSON object) adds fields to the server configuration.
 """
 
 import hashlib
@@ -45,6 +48,8 @@ KIND = os.environ.get("FAKE_KIND", "movies")
 SERIES = json.loads(os.environ["FAKE_SERIES"]) if os.environ.get("FAKE_SERIES") else None
 SERIES_ID = "5e1e5e1e5e1e5e1e5e1e5e1e5e1e5e1e"
 FETCHERS = os.environ.get("FAKE_FETCHERS")
+SAVERS = json.loads(os.environ["FAKE_SAVERS"]) if os.environ.get("FAKE_SAVERS") else None
+CONFIG = json.loads(os.environ.get("FAKE_CONFIG") or "{}")
 KINDS = ["Movie"] if KIND == "movies" else ["Series", "Season", "Episode"]
 if os.environ.get("FAKE_TYPE_OPTIONS"):
     TYPE_OPTIONS = json.loads(os.environ["FAKE_TYPE_OPTIONS"])
@@ -126,6 +131,11 @@ def videos():
     return sorted(found)
 
 
+def holds_files():
+    """Whether any file is under the scratch folder."""
+    return any(files for _, _, files in os.walk(SCRATCH))
+
+
 def series():
     """The scratch series' DTO, made on first use."""
     if SERIES_ID not in dtos:
@@ -177,16 +187,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if method == "GET" and path == "/Users/Me":
                 return self.reply(200, {"Name": "admin", "Policy": {"IsAdministrator": True}})
             if method == "GET" and path == "/System/Configuration":
-                return self.reply(200, {"LibraryMonitorDelay": 0})
+                return self.reply(200, {"LibraryMonitorDelay": 0, **CONFIG})
             if method == "GET" and path == "/Library/VirtualFolders":
                 return self.reply(200, [{
                     "Name": "Lib", "ItemId": LIBRARY_ID, "CollectionType": KIND,
                     "Locations": [LIBRARY_ROOT],
-                    "LibraryOptions": {"EnableRealtimeMonitor": False, "TypeOptions": TYPE_OPTIONS},
+                    "LibraryOptions": {"EnableRealtimeMonitor": False, "TypeOptions": TYPE_OPTIONS,
+                                       "MetadataSavers": SAVERS},
                 }])
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             if method == "GET" and path == "/Items" and query.get("IncludeItemTypes") == ["Series"]:
-                there = SERIES or (KIND == "tvshows" and videos())
+                there = SERIES or (KIND == "tvshows" and holds_files())
                 items = [{"Id": SERIES_ID, "Path": SCRATCH}] if there else []
                 if there:
                     series()

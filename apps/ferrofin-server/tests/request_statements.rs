@@ -20,6 +20,13 @@
 //!   data from the page, as upstream's cache answers them, and reads only what
 //!   the user stored on the versions off the page: none here, so no user-data
 //!   key is derived.
+//! - `GET /Users/{id}/Views` on a server holding the Live TV view (gl-1154).
+//!   The Live TV gate (`IsLiveTvEnabled`: the user's permission, and whether a
+//!   tuner is configured) is asked three times by one views request, and
+//!   upstream answers it from the `LiveTvOptions` it holds in memory. So the
+//!   tuner hosts are read once after a write to them, and not again while
+//!   that answer is cached; a tuner added or removed through the API reaches
+//!   the very next request.
 
 use std::sync::Mutex;
 
@@ -45,6 +52,9 @@ const VIEWS_SPAN: &str = "gl981_views_request";
 /// The span the recorded browse with a version group runs in.
 const VERSIONS_SPAN: &str = "gl1083_version_resume_request";
 
+/// The span the recorded views requests around a tuner's writes run in.
+const LIVE_TV_SPAN: &str = "gl1154_live_tv_views_request";
+
 /// The statements recorded inside each test's span, in order, tagged with the
 /// span: `cargo test` runs a binary's tests on threads of one process.
 static STATEMENTS: Mutex<Vec<(&'static str, String)>> = Mutex::new(Vec::new());
@@ -63,7 +73,7 @@ where
         }
         let Some(span) = ctx.event_scope(event).and_then(|mut scope| {
             scope.find_map(|span| {
-                [VIEWS_SPAN, VERSIONS_SPAN]
+                [VIEWS_SPAN, VERSIONS_SPAN, LIVE_TV_SPAN]
                     .into_iter()
                     .find(|name| span.name() == *name)
             })
@@ -422,6 +432,92 @@ async fn a_version_group_s_resume_derives_no_key_for_unwritten_versions() {
         !statements.iter().any(|s| s.contains("identity_ids")),
         "no user-data key is derived for a version nobody played:\n{listing}"
     );
+}
+
+/// The Live TV gate behind a views request, on a server whose database holds
+/// the Live TV view: upstream's `IsLiveTvEnabled` asks its in-memory
+/// `LiveTvOptions.TunerHosts`, so the tuner hosts are read once after a write
+/// to them and not again while that answer is cached, and a tuner added or
+/// removed through the dashboard's endpoints reaches the very next request.
+#[tokio::test]
+async fn the_live_tv_gate_reads_the_tuner_hosts_once_and_follows_their_writes() {
+    record_statements();
+    let harness = boot(&["Film Alpha (1999)/Film Alpha (1999).mkv"]).await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let views_uri = format!("/Users/{user_id}/Views");
+
+    let (listed, _) = live_tv_views(&router, &auth_header, &views_uri).await;
+    assert!(!listed, "no tuner, no Live TV view");
+
+    let playlist = std::path::Path::new(&harness.movies_dir).with_file_name("tuner.m3u");
+    std::fs::write(
+        &playlist,
+        "#EXTM3U\n#EXTINF:-1 tvg-id=\"one\" tvg-chno=\"1\",one\nhttp://tuner.invalid/one\n",
+    )
+    .expect("playlist");
+    let (status, tuner) = send(
+        &router,
+        &auth_header,
+        "POST",
+        "/LiveTv/TunerHosts",
+        Some(serde_json::json!({ "Type": "m3u", "Url": playlist.to_string_lossy() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "tuner added: {tuner}");
+    let tuner_id = tuner["Id"].as_str().expect("tuner id").to_owned();
+    let (listed, _) = live_tv_views(&router, &auth_header, &views_uri).await;
+    assert!(listed, "a tuner added reaches the next request");
+
+    let (status, body) = send(
+        &router,
+        &auth_header,
+        "DELETE",
+        &format!("/LiveTv/TunerHosts?id={tuner_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "tuner deleted: {body}");
+    // The Live TV view's row stays behind, so the gate is asked by
+    // `ensure_live_tv_view`, by the playlists probe's scope and by
+    // `without_disabled_live_tv`: one answer serves all three.
+    let (listed, reads) = live_tv_views(&router, &auth_header, &views_uri).await;
+    assert!(!listed, "a tuner removed reaches the next request");
+    assert_eq!(
+        reads.len(),
+        1,
+        "the delete dropped the cached answer, which is read once:\n{}",
+        reads.join("\n")
+    );
+    let (listed, reads) = live_tv_views(&router, &auth_header, &views_uri).await;
+    assert!(!listed);
+    assert!(
+        reads.is_empty(),
+        "a warm request answers from memory:\n{}",
+        reads.join("\n")
+    );
+}
+
+/// `GET views_uri`, recorded inside [`LIVE_TV_SPAN`]: whether it lists the
+/// Live TV view, and the statements it ran against the tuner hosts.
+async fn live_tv_views(
+    router: &axum::Router,
+    auth_header: &str,
+    views_uri: &str,
+) -> (bool, Vec<String>) {
+    clear_statements(LIVE_TV_SPAN);
+    let (status, views) = send(router, auth_header, "GET", views_uri, None)
+        .instrument(tracing::info_span!(LIVE_TV_SPAN))
+        .await;
+    assert_eq!(status, StatusCode::OK, "views: {views}");
+    let listed = views["Items"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["CollectionType"] == "livetv"));
+    let reads = statements_in(LIVE_TV_SPAN)
+        .into_iter()
+        .filter(|s| s.contains(r#""FerrofinLiveTvTunerHosts""#))
+        .collect();
+    (listed, reads)
 }
 
 /// With the library set warm, a library disabled from the dashboard leaves

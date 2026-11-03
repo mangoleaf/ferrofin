@@ -132,6 +132,10 @@ pub struct WiredApp {
     /// hold — do not outlive it (Jellyfin disposes its `CoreAppHost` per
     /// `StartServer` iteration).
     pub background: Vec<tokio::task::JoinHandle<()>>,
+    /// The scheduled-task registry behind `state.tasks`: the composition root
+    /// shuts it down when the lifetime ends, recording each run it cuts off as
+    /// `Aborted` (Jellyfin disposes its `TaskManager` with the host).
+    pub task_manager: FerrofinTaskManager,
     /// HTTPS for this lifetime, when the server listens with it
     /// (`ListenWithHttps`): the certificate the HTTPS listeners serve.
     pub https: Option<crate::tls::HttpsServing>,
@@ -1992,11 +1996,19 @@ pub async fn build_app_state(
         )
         .map_err(|e| anyhow::anyhow!("wasm artifact validator init: {e}"))?,
     );
+    // Which items the "Plugin media analysis" pass offered to which plugin:
+    // the pass reads and writes it, an uninstall forgets the plugin's.
+    let plugin_offered_items: Arc<dyn ferrofin_traits::plugins::PluginOfferedItemStore> = Arc::new(
+        ferrofin_core::plugin_offered_item_repository::FerrofinPluginOfferedItemStore::new(
+            db.clone(),
+        ),
+    );
     let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> = Arc::new(
         ferrofin_core::FerrofinPluginManager::new(
             registered_plugins,
             config.config_dir.join("plugins"),
         )
+        .with_offered_items(Arc::clone(&plugin_offered_items))
         .with_installer(
             config.data_dir.join("plugins"),
             Arc::clone(&wasm_validator),
@@ -2639,7 +2651,7 @@ pub async fn build_app_state(
     });
     // The analysis driver (offers new items to analyzer plugins) exists
     // only when some loaded plugin declares scan-targets.
-    if let Some(task) = wasm_host.analysis_task(&plugins) {
+    if let Some(task) = wasm_host.analysis_task(&plugins, plugin_offered_items) {
         task_manager.register(task);
     }
 
@@ -2742,8 +2754,8 @@ pub async fn build_app_state(
     let sync_play_users = Arc::clone(&users);
     let sync_play_library = Arc::clone(&library);
 
-    // The policy and library row caches (ferrofin_db::row_cache), on only now: the boot repairs
-    // above write those rows outside the managers that invalidate them.
+    // The policy, library and tuner-presence row caches (ferrofin_db::row_cache), on only now: the
+    // boot repairs above write those rows outside the managers that invalidate them.
     db.enable_row_cache(
         config
             .row_cache_ttl_secs
@@ -3006,6 +3018,7 @@ pub async fn build_app_state(
         file_transformations,
         lifecycle: lifecycle_concrete,
         background,
+        task_manager,
         https,
     })
 }

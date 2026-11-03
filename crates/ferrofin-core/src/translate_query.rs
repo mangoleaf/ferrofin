@@ -1753,12 +1753,13 @@ fn build_box_set_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryB
 }
 
 /// Appends the media-attribute predicates: subtitle presence, chapter
-/// images, image types, owned-extra presence (trailer / theme song / theme
-/// video / special feature), then the `Data`-blob matches
-/// ([`append_data_blob_predicates`]).
+/// images, the plugin analysis pass's not-offered anti-join, image types,
+/// owned-extra presence (trailer / theme song / theme video / special
+/// feature), then the `Data`-blob matches ([`append_data_blob_predicates`]).
 ///
 /// Ports of C# `TranslateQuery`'s `HasSubtitles`, `HasChapterImages`,
-/// `ImageTypes` and the `ExtraIds`-backed extra filters.
+/// `ImageTypes` and the `ExtraIds`-backed extra filters; the anti-join
+/// (`not_offered_to_plugin`) is Ferrofin's own.
 fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     // Subtitle presence (v12 `TranslateQuery.cs:897-918`, criteria
     // `HasSubtitles`): an item matches on its own subtitle streams or an
@@ -1783,6 +1784,18 @@ fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Int
         push_item_version_or_folder_matching(qb, MediaTable::Chapters, &|qb, alias| {
             qb.push(format!(r#"{alias}."ImagePath" IS NOT NULL"#));
         });
+    }
+    // The plugin media-analysis pass's anti-join (Ferrofin's own; Jellyfin has
+    // no such pass): the items not offered to this plugin yet. One primary-key
+    // probe per row, as the table's key leads with `ItemId`
+    // (`not_offered_items_probe_the_offered_key` pins it).
+    if let Some(plugin) = filter.not_offered_to_plugin {
+        qb.push(
+            r#" AND NOT EXISTS (SELECT 1 FROM "FerrofinPluginOfferedItems" po
+                WHERE po."ItemId" = bi."Id" AND po."PluginId" = "#,
+        )
+        .push_bind(guid_to_db(plugin))
+        .push(")");
     }
 
     // Image presence: an `EXISTS` over the item's image rows whose `ImageType`

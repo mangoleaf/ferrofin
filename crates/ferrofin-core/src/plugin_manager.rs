@@ -462,6 +462,10 @@ pub struct FerrofinPluginManager {
     /// construction, so these ids are skipped by every lookup instead, which
     /// also stops the host running them until the restart.
     removed: Mutex<HashSet<Uuid>>,
+    /// The record of the items the "Plugin media analysis" pass offered to
+    /// each analyzer plugin; an uninstall forgets the plugin's, as it removes
+    /// the plugin's state file. `None` only at the unit-test seam.
+    offered_items: Option<Arc<dyn ferrofin_traits::plugins::PluginOfferedItemStore>>,
 }
 
 /// The in-process event a plugin configuration save publishes, with
@@ -520,7 +524,21 @@ impl FerrofinPluginManager {
             legacy_repositories_migrated: tokio::sync::OnceCell::new(),
             events: None,
             removed: Mutex::default(),
+            offered_items: None,
         }
+    }
+
+    /// Attaches the record of the items the "Plugin media analysis" pass
+    /// offered to each plugin, so an uninstall forgets the plugin's and the
+    /// plugin installed again is offered the whole library. Called once by the
+    /// composition root.
+    #[must_use]
+    pub fn with_offered_items(
+        mut self,
+        offered_items: Arc<dyn ferrofin_traits::plugins::PluginOfferedItemStore>,
+    ) -> Self {
+        self.offered_items = Some(offered_items);
+        self
     }
 
     /// Announces configuration saves on `events` (see
@@ -950,6 +968,17 @@ impl PluginManager for FerrofinPluginManager {
                 let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.state.json")));
                 let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.segments")));
                 let _ = std::fs::remove_dir_all(self.plugins_dir.join(id.to_string()));
+                // The items the analysis pass offered it go with its state,
+                // so the plugin installed again is offered the whole library.
+                if let Some(offered_items) = &self.offered_items
+                    && let Err(error) = offered_items.forget_plugin(id).await
+                {
+                    tracing::warn!(
+                        plugin = %id,
+                        %error,
+                        "could not forget the items offered to the uninstalled plugin; installed again, it is offered only the items added since"
+                    );
+                }
                 // `DeletePlugin`'s `_plugins.Remove`: gone from every lookup,
                 // so it no longer runs, until the restart that drops it.
                 self.removed
@@ -2784,6 +2813,67 @@ mod tests {
             rig.mgr.remove_plugin(PKG_ID).await,
             Err(ServiceError::NotFound(_))
         ));
+    }
+
+    /// Uninstalling a WASM plugin forgets the items the analysis pass offered
+    /// it (and only it), as it removes the plugin's state file, so the plugin
+    /// installed again is offered the whole library. A store that fails does
+    /// not fail the uninstall.
+    #[tokio::test]
+    async fn an_uninstall_forgets_the_items_offered_to_the_plugin() {
+        use crate::plugin_offered_item_repository::FerrofinPluginOfferedItemStore;
+        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+        use ferrofin_traits::plugins::PluginOfferedItemStore;
+        let db = crate::test_support::test_db().await;
+        let item = Uuid::from_u128(0x0FFE);
+        crate::FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[ferrofin_db::entities::base_items::BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(item),
+                type_: crate::item_type_lookup::stored_type_name(
+                    ferrofin_model::data::BaseItemKind::Movie,
+                )
+                .expect("movie")
+                .to_owned(),
+                ..Default::default()
+            }])
+            .await
+            .expect("item");
+        let store = Arc::new(FerrofinPluginOfferedItemStore::new(db.clone()));
+        let other = Uuid::from_u128(0x0123);
+        for plugin in [PKG_ID, other] {
+            store.mark_offered(plugin, &[item]).await.expect("offered");
+        }
+        let mut rig = update_rig("0.9.0", true, true).await;
+        rig.mgr = rig.mgr.with_offered_items(store.clone());
+
+        rig.mgr.remove_plugin(PKG_ID).await.expect("uninstall");
+        let repository = crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let not_offered = |plugin| ferrofin_traits::options::InternalItemsQuery {
+            include_item_types: vec![ferrofin_model::data::BaseItemKind::Movie],
+            not_offered_to_plugin: Some(plugin),
+            ..ferrofin_traits::options::InternalItemsQuery::default()
+        };
+        assert_eq!(
+            repository.get_item_ids(&not_offered(PKG_ID)).await.unwrap(),
+            [item],
+            "forgotten: offered again"
+        );
+        assert_eq!(
+            repository.get_item_ids(&not_offered(other)).await.unwrap(),
+            Vec::<Uuid>::new(),
+            "the other plugin's offers stay"
+        );
+
+        let mut rig = update_rig("0.9.0", true, true).await;
+        rig.mgr = rig.mgr.with_offered_items(store);
+        db.close().await;
+        rig.mgr
+            .remove_plugin(PKG_ID)
+            .await
+            .expect("uninstalled even when the store fails");
     }
 
     /// A plugin dropped in by hand under its own file name (the documented
