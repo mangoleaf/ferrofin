@@ -321,6 +321,19 @@ impl<F: FileMeta> ImageProcessor<F> {
         if options.auto_orient {
             filename.push_str(",autoorient");
         }
+        // Ferrofin-local too: earlier builds re-encoded a `blur` request
+        // unblurred under the same key (gl-805), so a drawn blur needs its own.
+        if options.blur.is_some_and(|blur| blur > 0) {
+            filename.push_str(",blurdrawn");
+        }
+        // And earlier builds wrote a JPEG of an image with alpha with its
+        // straight colour, where Skia's (and now Ferrofin's) is premultiplied:
+        // any source but a JPEG may carry alpha.
+        if format == ImageFormat::Jpg
+            && !matches!(extension_of(original_path).as_str(), ".jpg" | ".jpeg")
+        {
+            filename.push_str(",premultiplied");
+        }
 
         filename.push_str(",v=");
         filename.push(self.cache_version);
@@ -1123,6 +1136,39 @@ mod tests {
             proc.cache_file_path(&input, &oriented, 95, dt, ImageFormat::Jpg)
                 .expect("key")
         );
+    }
+
+    /// Earlier builds cached a `blur` request unblurred, and a transparent
+    /// image's JPEG with its straight colour, under upstream's key: a drawn
+    /// blur and a premultiplied JPEG each take a token of their own.
+    #[test]
+    fn drawn_blurs_and_premultiplied_jpegs_have_their_own_keys() {
+        let proc = ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), "/cache");
+        let dt = Utc.timestamp_opt(1_500_000_000, 0).single().expect("ts");
+        let key = |path: &str, blur: Option<i32>| {
+            let options = ImageProcessingOptions {
+                blur,
+                ..Default::default()
+            };
+            proc.cache_file_path(path, &options, 90, dt, ImageFormat::Jpg)
+                .expect("key")
+        };
+        let upstream = |path: &str, blur: &str| {
+            let ticks = ImageProcessor::<StdFileMeta>::dotnet_ticks(dt);
+            let filename = format!(
+                "{path},quality=90,datemodified={ticks},f=Jpg{blur},v={DEFAULT_CACHE_VERSION}"
+            );
+            ImageProcessor::<StdFileMeta>::cache_path_unique(
+                Path::new("/cache/resized-images"),
+                &filename,
+                ".jpg",
+            )
+            .expect("key")
+        };
+        assert_eq!(key("/a.jpg", None), upstream("/a.jpg", ""));
+        assert_eq!(key("/a.jpg", Some(0)), upstream("/a.jpg", ",blur=0"));
+        assert_ne!(key("/a.jpg", Some(3)), upstream("/a.jpg", ",blur=3"));
+        assert_ne!(key("/a.png", None), upstream("/a.png", ""));
     }
 
     #[tokio::test]

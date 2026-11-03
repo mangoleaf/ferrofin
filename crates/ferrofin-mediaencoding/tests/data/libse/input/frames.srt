@@ -1,0 +1,11 @@
+1
+00:00:01,12 --> 00:00:02,20
+Two-digit fractions are frames
+
+2
+00:00:03,00 --> 00:00:04,24
+read at 23.976 fps
+
+3
+00:00:05,30 --> 00:00:06,01
+and never past 999 ms

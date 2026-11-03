@@ -1,0 +1,17 @@
+[Script Info]
+; This is a Sub Station Alpha v4 script.
+Title: untitled
+ScriptType: v4.00
+Collisions: Normal
+PlayDepth: 0
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding
+Style: Default,Arial,20,16777215,65535,0,0,0,0,1,1,1,2,10,10,10,0,1
+
+[Events]
+Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: Marked=0,0:00:01.00,0:00:02.00,*Default,NTP,0000,0000,0000,,numbered ten
+Dialogue: Marked=0,0:00:03.00,0:00:04.00,*Default,NTP,0000,0000,0000,,no number line
+Dialogue: Marked=0,0:00:05.00,0:00:06.00,*Default,NTP,0000,0000,0000,,numbered thirty\Nstray line joins the cue before
+Dialogue: Marked=0,0:00:07.00,0:00:08.00,*Default,NTP,0000,0000,0000,,thirty-one

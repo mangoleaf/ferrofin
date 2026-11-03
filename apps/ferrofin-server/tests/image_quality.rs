@@ -213,6 +213,63 @@ async fn an_image_already_within_its_bounds_is_served_as_stored() {
     );
 }
 
+/// gl-1118: `GetImageResult` calls `ProcessImage` on every request, so a
+/// request naming no transform reaches the processor: a stored BMP, which no
+/// client format lists, comes back as a JPEG (the splashscreen's at its fixed
+/// 90), and a lone `quality` re-encodes the stored poster.
+#[tokio::test]
+async fn a_request_naming_no_transform_still_reaches_the_processor() {
+    let Fixture {
+        wired,
+        _temp: temp,
+        router,
+        token,
+        movie,
+    } = fixture().await;
+    let splash = temp.path().join("splash.bmp");
+    image::RgbImage::from_fn(64, 64, |x, y| {
+        image::Rgb([
+            u8::try_from(x * 4).expect("byte"),
+            u8::try_from(y * 4).expect("byte"),
+            64,
+        ])
+    })
+    .save(&splash)
+    .expect("bmp");
+    let mut branding = wired.state.config.get_branding().await.expect("branding");
+    branding.splashscreen_location = Some(splash.to_string_lossy().into_owned());
+    wired
+        .state
+        .config
+        .update_branding(&branding)
+        .await
+        .expect("save branding");
+    let (status, body) = call(&router, "GET", "/Branding/Splashscreen", Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        &body[..3],
+        &[0xFF, 0xD8, 0xFF],
+        "the BMP is re-encoded as a JPEG"
+    );
+    assert_eq!(first_quant_table(&body)[0], 3, "at the splashscreen's 90");
+
+    let stored =
+        std::fs::read(temp.path().join(MOVIE).with_file_name("poster.png")).expect("stored poster");
+    let (status, poster) = call(
+        &router,
+        "GET",
+        &format!("/Items/{movie}/Images/Primary?quality=50"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        poster != stored,
+        "a lone quality under 90 re-encodes the poster"
+    );
+}
+
 /// The first quantization table (`DQT`) of a baseline JPEG, in zigzag order.
 fn first_quant_table(jpeg: &[u8]) -> Vec<u8> {
     let mut at = 2;

@@ -329,6 +329,48 @@ async fn images_past_the_limits_are_served_whole_under_a_cap() {
     );
 }
 
+/// gl-805: a `blur` draws and writes under the resize budget. At 512 MiB a
+/// blurred JPEG of an 8000-pixel square photo fits (7 bytes a pixel and a
+/// line of sums, about 428 MiB) and is made; a 12000-pixel one would take about
+/// 962 MiB and is served whole. Neither is resized, so the budget is the
+/// compositing's alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn compositing_is_held_against_the_budget_under_a_cap() {
+    if !enabled() {
+        return;
+    }
+    let root = tempfile::tempdir().expect("tempdir");
+    let photos = root.path().join("photos");
+    std::fs::create_dir_all(&photos).expect("photos");
+    write_png(&photos.join("fits.png"), 8_000, 8_000, 1);
+    write_png(&photos.join("past.png"), 12_000, 12_000, 1);
+    let mut server = CappedServer::boot(
+        root.path(),
+        "1500M",
+        &[("FERROFIN_IMAGE_RESIZE_BUDGET_MB", "512")],
+    )
+    .await;
+    let ids = server.add_photos(&photos, 2).await;
+
+    for (name, drawn) in [("fits.png", true), ("past.png", false)] {
+        let (status, body) = server
+            .get(&format!(
+                "/Items/{}/Images/Primary?blur=3&format=jpg",
+                ids[name]
+            ))
+            .await;
+        assert_eq!(status, 200, "{name}");
+        let original = std::fs::read(photos.join(name)).expect("fixture");
+        if drawn {
+            assert!(body.starts_with(&[0xFF, 0xD8, 0xFF]), "{name}: a JPEG");
+        } else {
+            assert_eq!(body, original, "{name}: the original file");
+        }
+        assert!(server.is_running(), "{name}: the server was killed");
+    }
+    assert_eq!(server.oom_kills(), 0);
+}
+
 /// Each resize fits the budget and together they would not fit the cap, so
 /// sharing the budget is what holds. All of them finish, resized.
 #[tokio::test(flavor = "multi_thread")]

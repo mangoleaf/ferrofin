@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{CommandFactory, Parser};
-use ferrofin_model::configuration::ImageSavingConvention;
+use ferrofin_model::configuration::TrickplayOptions;
 use ferrofin_traits::plugins::PluginManager;
 
 use super::*;
@@ -159,56 +159,10 @@ impl ServerConfigurationManager for FakeConfiguration {
     }
 }
 
-/// A row stored in the server configuration, registered only in tests until
-/// the first real one (gl-1139): the image naming convention, a choice with
-/// a note, whose unnamed values ([`ImageSavingConvention::Unrecognized`]) are
+/// The key of a row stored in the server configuration: Image Quality, a
+/// choice with a note per option, whose other `Qscale` and chroma pairs are
 /// Custom.
-pub(super) const STORED_ROW: SettingSpec = SettingSpec {
-    key: "image_saving_convention",
-    label: "Image naming",
-    group: Group::Images,
-    kind: SettingKind::Choice,
-    applies: Applies::Immediately,
-    default: "Legacy",
-    description: "How images saved beside the media are named.",
-    note: "A row the tests register, stored in the server configuration.",
-    options: &[
-        SettingOption {
-            value: "Legacy",
-            label: "Legacy",
-            note: "Jellyfin's own names.",
-        },
-        SettingOption {
-            value: "Compatible",
-            label: "Compatible",
-            note: "",
-        },
-    ],
-    store: SettingStore::ServerConfiguration(ConfigurationField {
-        read: |configuration| match configuration.image_saving_convention {
-            ImageSavingConvention::Legacy => json!("Legacy"),
-            ImageSavingConvention::Compatible => json!("Compatible"),
-            ImageSavingConvention::Unrecognized(n) => json!(n.to_string()),
-        },
-        write: |configuration, value| {
-            configuration.image_saving_convention = match value.as_str() {
-                Some("Compatible") => ImageSavingConvention::Compatible,
-                _ => ImageSavingConvention::Legacy,
-            };
-        },
-    }),
-    ..ROW
-};
-
-/// [`SETTINGS`] and [`STORED_ROW`].
-pub(super) fn rows_with_a_stored_one() -> &'static [SettingSpec] {
-    static ROWS: std::sync::LazyLock<&'static [SettingSpec]> = std::sync::LazyLock::new(|| {
-        let mut rows = SETTINGS.to_vec();
-        rows.push(STORED_ROW);
-        Box::leak(rows.into_boxed_slice())
-    });
-    *ROWS
-}
+pub(super) const STORED: &str = "trickplay_image_quality";
 
 pub(super) fn spec(key: &str) -> &'static SettingSpec {
     SETTINGS
@@ -251,10 +205,12 @@ pub(super) fn sample(spec: &SettingSpec) -> String {
     }
 }
 
+/// The rows `config.toml` holds: not environment-only, not stored in the
+/// server configuration.
 fn file_rows() -> impl Iterator<Item = &'static SettingSpec> {
-    SETTINGS
-        .iter()
-        .filter(|spec| spec.access != SettingAccess::EnvOnly)
+    SETTINGS.iter().filter(|spec| {
+        spec.access != SettingAccess::EnvOnly && matches!(spec.store, SettingStore::ConfigFile)
+    })
 }
 
 /// The report `config` gives under `env`, the way the route runs it.
@@ -309,19 +265,22 @@ fn every_config_toml_key_has_one_row_and_every_rows_key_is_one() {
     }
 }
 
-/// (b) Every row's variable has a row in `docs/CONFIG.md`; every row has a
-/// description and a default.
+/// (b) Every row's variable, or the label of a row stored in the server
+/// configuration (which has none), has a row in `docs/CONFIG.md`; every row
+/// has a description and a default.
 #[test]
 fn every_rows_variable_has_a_row_in_the_docs() {
     let docs = include_str!("../../../../docs/CONFIG.md");
     for spec in SETTINGS {
-        let var = spec
-            .env
-            .unwrap_or_else(|| panic!("{} has no variable", spec.key));
-        assert!(
-            docs.contains(&format!("| `{var}` |")),
-            "{var}: no row in docs/CONFIG.md"
-        );
+        let named = match spec.store {
+            SettingStore::ServerConfiguration(_) => format!("| {} |", spec.label),
+            SettingStore::ConfigFile => format!(
+                "| `{}` |",
+                spec.env
+                    .unwrap_or_else(|| panic!("{} has no variable", spec.key))
+            ),
+        };
+        assert!(docs.contains(&named), "{named}: no row in docs/CONFIG.md");
         assert!(!spec.description.is_empty(), "{}: no description", spec.key);
         assert!(!spec.default.is_empty(), "{}: no default", spec.key);
     }
@@ -358,7 +317,14 @@ const TABS: &[(Group, &[&str])] = &[
             "scan_directory_cache_idle_secs",
         ],
     ),
-    (Group::Trickplay, &["trickplay_concurrency"]),
+    (
+        Group::Trickplay,
+        &[
+            "trickplay_preview_size",
+            "trickplay_image_quality",
+            "trickplay_concurrency",
+        ],
+    ),
     (
         Group::Images,
         &[
@@ -1287,7 +1253,7 @@ fn a_choice_in_config_toml_that_fits_no_option_is_custom() {
 /// its default.
 #[test]
 fn every_choice_offers_its_default_and_every_stored_row_applies_at_once() {
-    for spec in rows_with_a_stored_one() {
+    for spec in SETTINGS {
         if spec.kind == SettingKind::Choice {
             let values: BTreeSet<&str> = spec.options.iter().map(|option| option.value).collect();
             assert!(spec.options.len() >= 2, "{}: no choice", spec.key);
@@ -1331,53 +1297,134 @@ fn every_choice_offers_its_default_and_every_stored_row_applies_at_once() {
     }
 }
 
-/// B11, B12: a row stored in the server configuration is read from it, with
-/// its note: a new server's value as the default, another as set there, an
-/// unnamed one as Custom. It applies at once and nothing locks it.
-#[test]
-fn a_row_stored_in_the_server_configuration_is_read_from_it() {
+/// The report's row `key` on a new server's configuration with `trickplay`
+/// as its `TrickplayOptions`.
+fn stored_row(key: &str, trickplay: TrickplayOptions) -> ServerSettingDto {
     let data = DataDir::new(&[]);
     let env = FakeEnv::new();
     let running = load(data.cli(), &env);
-    let stored = |convention| {
-        let configuration = ServerConfiguration {
-            image_saving_convention: convention,
-            ..ServerConfiguration::default()
-        };
-        let report = snapshot(
-            rows_with_a_stored_one(),
-            &running,
-            &env,
-            &configuration,
-            false,
+    let configuration = ServerConfiguration {
+        trickplay_options: trickplay,
+        ..ServerConfiguration::default()
+    };
+    let report = snapshot(SETTINGS, &running, &env, &configuration, false).expect("report");
+    entry(&report, key).clone()
+}
+
+/// B11, B12 of the settings page; gl-1139 B2, B6: a row stored in the server
+/// configuration is read from it, with its notes: a new server's value as the
+/// default, another as set there, a pair that fits no option as Custom. It
+/// applies at once and nothing locks it.
+#[test]
+fn a_row_stored_in_the_server_configuration_is_read_from_it() {
+    let stored = |full_chroma, qscale| {
+        stored_row(
+            STORED,
+            TrickplayOptions {
+                full_chroma,
+                qscale,
+                ..TrickplayOptions::default()
+            },
         )
-        .expect("report");
-        entry(&report, STORED_ROW.key).clone()
     };
 
-    let row = stored(ImageSavingConvention::Legacy);
-    assert_eq!(row.note.as_deref(), Some(STORED_ROW.note));
+    let row = stored(false, 4);
+    assert_eq!(row.label, "Image Quality");
+    assert_eq!(row.group, Group::Trickplay);
+    assert_eq!(row.note.as_deref(), Some(TRICKPLAY_CHANGE));
     assert_eq!(row.store, ServerSettingStore::ServerConfiguration);
     assert_eq!(row.applies, Applies::Immediately);
     assert_eq!(row.source, Source::Default);
-    assert_eq!(row.value, Some(json!("Legacy")));
+    assert_eq!(row.value, Some(json!("disk")));
     assert!(row.editable, "{row:?}");
     assert_eq!(row.locked_reason, None);
     assert_eq!(row.env_var, None);
     assert!(!row.custom);
-    assert_eq!(
-        row.options[0].note.as_deref(),
-        Some("Jellyfin's own names.")
+    let labels: Vec<&str> = row.options.iter().map(|o| o.label.as_str()).collect();
+    assert_eq!(labels, ["Optimize Disk Usage", "Optimize Quality"]);
+    assert!(
+        row.options.iter().all(|option| option.note.is_some()),
+        "{row:?}"
     );
-    assert_eq!(row.options[1].note, None);
 
-    let row = stored(ImageSavingConvention::Compatible);
+    let row = stored(true, 2);
     assert_eq!(row.source, Source::ServerConfiguration);
-    assert_eq!(row.value, Some(json!("Compatible")));
+    assert_eq!(row.value, Some(json!("quality")));
     assert!(!row.custom);
 
-    let row = stored(ImageSavingConvention::Unrecognized(7));
-    assert_eq!(row.source, Source::ServerConfiguration);
-    assert_eq!(row.value, Some(json!("7")));
-    assert!(row.custom);
+    // Either half of a pair alone, as a dashboard edit of Qscale leaves it.
+    for (full_chroma, qscale, shown) in [
+        (false, 2, "Qscale 2, 4:2:0"),
+        (true, 4, "Qscale 4, 4:4:4"),
+        (false, 7, "Qscale 7, 4:2:0"),
+    ] {
+        let row = stored(full_chroma, qscale);
+        assert_eq!(row.source, Source::ServerConfiguration);
+        assert_eq!(row.value, Some(json!(shown)));
+        assert!(row.custom, "{row:?}");
+    }
+}
+
+/// gl-1139 B1, B2: every option of a row stored in the server configuration
+/// reads back as itself once written, over a new server's configuration and
+/// over one whose value is Custom.
+#[test]
+fn every_stored_option_reads_back_as_itself() {
+    let custom = ServerConfiguration {
+        trickplay_options: TrickplayOptions {
+            width_resolutions: vec![480],
+            qscale: 7,
+            full_chroma: true,
+            ..TrickplayOptions::default()
+        },
+        ..ServerConfiguration::default()
+    };
+    let mut seen = 0;
+    for spec in SETTINGS {
+        let SettingStore::ServerConfiguration(field) = spec.store else {
+            continue;
+        };
+        for option in spec.options {
+            for start in [ServerConfiguration::default(), custom.clone()] {
+                let mut configuration = start;
+                (field.write)(&mut configuration, &json!(option.value));
+                assert_eq!(
+                    (field.read)(&configuration),
+                    json!(option.value),
+                    "{}: {}",
+                    spec.key,
+                    option.value
+                );
+            }
+            seen += 1;
+        }
+    }
+    assert!(seen > 0, "no row is stored in the server configuration");
+}
+
+/// gl-1139 B1, B6: Preview Size reads `WidthResolutions` in any order, a
+/// width listed twice counting once, and any other list as Custom.
+#[test]
+fn preview_size_reads_the_widths_in_any_order() {
+    for (widths, shown, custom) in [
+        (vec![320], "320", false),
+        (vec![640], "640", false),
+        (vec![320, 640], "both", false),
+        (vec![640, 320], "both", false),
+        (vec![320, 320], "320", false),
+        (vec![480], "480", true),
+        (vec![640, 320, 480], "320, 480, 640", true),
+        (vec![], "none", true),
+    ] {
+        let row = stored_row(
+            "trickplay_preview_size",
+            TrickplayOptions {
+                width_resolutions: widths.clone(),
+                ..TrickplayOptions::default()
+            },
+        );
+        assert_eq!(row.value, Some(json!(shown)), "{widths:?}");
+        assert_eq!(row.custom, custom, "{widths:?}");
+        assert_eq!(row.source == Source::Default, shown == "320", "{widths:?}");
+    }
 }

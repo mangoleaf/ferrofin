@@ -7,9 +7,13 @@
 //! image path reads `%MetadataPath%/library/ab/abcd…/poster.jpg`. That is what
 //! makes a Jellyfin database portable between data directories — and what
 //! makes an adopted one unreadable until the same expansion is applied on
-//! Ferrofin's side. Ferrofin writes resolved paths, so expanding on read is
-//! the identity for rows it wrote itself; a save of an adopted item row keeps
-//! its stored token form while the path saved is that form's expansion
+//! Ferrofin's side. Ferrofin writes resolved paths, except for the rows it
+//! makes in its data directory for the Collections library's folder, a box set
+//! and a created playlist, which it stores tokenised as upstream does
+//! ([`VirtualPathExpander::reverse`]), so they follow a move of that
+//! directory. Expanding on read is the identity for the other rows it wrote
+//! itself. A save of a row stored tokenised keeps its token form while the
+//! path saved is that form's expansion
 //! (`FerrofinItemPersistenceService::upsert_item`).
 
 use std::borrow::Cow;
@@ -80,7 +84,8 @@ impl VirtualPathExpander {
     }
 
     /// [`Self::expand`] without a copy when there is nothing to expand: `path` itself, borrowed,
-    /// when it holds neither token in any case (every path Ferrofin writes, every media path),
+    /// when it holds neither token in any case (every media path, and every path Ferrofin
+    /// writes but a box set's, a created playlist's and the Collections folder's),
     /// else [`Self::expand`]'s string. The text is [`Self::expand`]'s either way.
     #[must_use]
     pub fn expand_cow<'p>(&self, path: &'p str) -> Cow<'p, str> {

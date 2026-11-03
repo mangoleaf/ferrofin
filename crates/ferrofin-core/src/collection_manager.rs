@@ -492,7 +492,8 @@ pub struct FerrofinCollectionManager {
     /// Holds the Collections library. `None` in unit tests: only its folder
     /// is made, with no library listing it.
     virtual_folders: Option<Arc<dyn VirtualFolderManager>>,
-    /// Reads the tokens an adopted folder row stores in its path.
+    /// Reads the tokens an adopted folder row stores in its path, and writes
+    /// them into a new box set's (`ReverseVirtualPath`).
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
     /// One provision at a time: two first creates at once would otherwise each
     /// add a library (`Collections`, `Collections2`).
@@ -539,7 +540,10 @@ impl FerrofinCollectionManager {
     }
 
     /// Expands the `%AppDataPath%` an adopted folder row stores (and that a
-    /// provisioned one stores too). Called once by the composition root.
+    /// provisioned one stores too), and stores each new box set's folder as
+    /// `%AppDataPath%/collections/<name> [boxset]`, as upstream's save does,
+    /// so the box set follows a move of the data directory. Called once by
+    /// the composition root.
     #[must_use]
     pub fn with_virtual_paths(
         mut self,
@@ -723,6 +727,11 @@ impl CollectionManager for FerrofinCollectionManager {
             new_box_set_folder_and_id(&self.db, &mode, &collections, &options.name).await?;
         // `ReportFileSystemChangeBeginning(path)` around the whole create.
         let _write = SelfWrite::begin(self.self_writes.as_ref(), &path);
+        // `AddChild`'s save stores the path through `ReverseVirtualPath`
+        // (`BaseItemMapper.Map` → `GetPathToSave`): a folder in the data
+        // directory as `%AppDataPath%/collections/…`, which every read
+        // expands, so the box set follows a move of that directory.
+        let stored = self.virtual_paths.reverse(&path);
         // The row and its path commit together, so no box set is ever
         // stored without the folder it was made with.
         let written = async {
@@ -737,7 +746,7 @@ impl CollectionManager for FerrofinCollectionManager {
                 options.is_locked,
             )
             .await?;
-            crate::item_persistence_service::set_item_path_in(&mut tx, id, &path)
+            crate::item_persistence_service::set_item_path_in(&mut tx, id, &stored)
                 .await
                 .map_err(db_err)?;
             crate::library_structure_repository::add_ancestors_in(&mut tx, id, &ancestors).await?;
@@ -1017,6 +1026,10 @@ pub struct FerrofinPlaylistManager {
     /// Announces each committed change of a playlist ([`Self::announce_added`],
     /// [`Self::announce_updated`]). `None` in unit tests: nothing is announced.
     persistence: Option<Arc<dyn ItemPersistenceService>>,
+    /// Stores a new playlist's folder in the `%AppDataPath%` form
+    /// (`ReverseVirtualPath`). The identity in unit tests: the path is stored
+    /// as made.
+    virtual_paths: crate::virtual_paths::VirtualPathExpander,
 }
 
 impl std::fmt::Debug for FerrofinPlaylistManager {
@@ -1045,7 +1058,20 @@ impl FerrofinPlaylistManager {
             providers: None,
             self_writes: None,
             persistence: None,
+            virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
         }
+    }
+
+    /// Stores each new playlist's folder as `%AppDataPath%/playlists/<name>`,
+    /// as upstream's save does, so the playlist follows a move of the data
+    /// directory. Called once by the composition root.
+    #[must_use]
+    pub fn with_virtual_paths(
+        mut self,
+        virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    ) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
     }
 
     /// Announces each committed playlist change to the library-changed
@@ -1446,6 +1472,9 @@ impl PlaylistManager for FerrofinPlaylistManager {
         let (path, id) = new_playlist_folder_and_id(&self.db, &mode, &playlists, &name).await?;
         // `ReportFileSystemChangeBeginning(path)` around the whole create.
         let _write = SelfWrite::begin(self.self_writes.as_ref(), &path);
+        // `AddChild`'s save stores `%AppDataPath%/playlists/…`
+        // (`ReverseVirtualPath`), as for a box set.
+        let stored = self.virtual_paths.reverse(&path);
         // One writer transaction: a playlist row committed without its owner
         // row would open to every caller as its owner (`decide_access`), and
         // no boot import could repair it.
@@ -1461,7 +1490,7 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 false,
             )
             .await?;
-            crate::item_persistence_service::set_item_path_in(&mut tx, id, &path)
+            crate::item_persistence_service::set_item_path_in(&mut tx, id, &stored)
                 .await
                 .map_err(db_err)?;
             // The ownership meta row (C# `OwnerUserId`/`OpenAccess`).
@@ -1974,6 +2003,8 @@ impl PlaylistManager for FerrofinPlaylistManager {
     }
 }
 
+#[cfg(test)]
+mod data_directory_tests;
 #[cfg(test)]
 mod playlist_announcements_tests;
 #[cfg(test)]
