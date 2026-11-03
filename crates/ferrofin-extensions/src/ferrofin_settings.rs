@@ -193,6 +193,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_settings_page_lists_the_settings_in_tabs_by_name_and_unit() {
+        let html = settings_html();
+        // A tab per group the report names, in its order; the panels are
+        // shown one at a time.
+        assert!(
+            html.contains(r#"class="ferrofinTabs" role="tablist""#),
+            "{html}"
+        );
+        assert!(html.contains("setAttribute('role', 'tab')"), "{html}");
+        assert!(html.contains("setAttribute('role', 'tabpanel')"), "{html}");
+        // Each row is headed by its readable name, with its key and variable
+        // on a line below, and its value in its unit.
+        assert!(html.contains("setting.Label"), "{html}");
+        assert!(html.contains("ferrofinSettingIds"), "{html}");
+        assert!(html.contains("setting.Unit"), "{html}");
+        // The groups are named as the report names them: none is hardcoded.
+        assert!(!html.contains("GROUP_TITLES"), "{html}");
+    }
+
     #[rstest::rstest]
     #[case::release("v1.5.0", "1.5.0.0")]
     #[case::after_a_release("v1.4.0-55-ge60eae77a188", "1.4.0.0")]

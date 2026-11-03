@@ -177,9 +177,10 @@ Wired and working, with a documented limitation or lighter verification:
 
 - **Ferrofin settings page** — Ferrofin's own, with no Jellyfin counterpart, so checked in
   jellyfin-web only. Dashboard → Plugins → **Ferrofin** → Settings, or the dashboard menu's
-  Ferrofin entry, lists every Ferrofin setting in groups with the value in use, its default, where
-  it comes from (default, `config.toml`, environment variable or flag), its variable and flag,
-  and, for each one the page may not change, why and where it is changed instead. Secrets are
+  Ferrofin entry, lists every Ferrofin setting in nine tabs, by a readable name with its key and
+  variable below, with the value in use in its unit, its default, where it comes from (default,
+  `config.toml`, environment variable or flag), its flag, and, for each one the page may not
+  change, why and where it is changed instead. Secrets are
   shown to administrators, marked as secrets. The rest are edited there: Save writes the changes
   to `config.toml`, a refused value shows the server's message next to it, Reset to default removes
   the key, and Restart now applies them, all but the few that need a full process restart, which

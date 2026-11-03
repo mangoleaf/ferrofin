@@ -45,10 +45,11 @@ boots.
 
 ### Seeing what is set
 
-`GET /Ferrofin/Settings` (administrators only) reports every setting below with the value in
-use, its default, and where that value comes from: a flag, a variable, `config.toml` or the
-default. A value `config.toml` holds that is not in use (the file changed since the server
-started, or a flag or variable outranks it) is reported beside it. Each setting also says
+`GET /Ferrofin/Settings` (administrators only) reports every setting below with its readable
+name (`Label`), its tab (`Group`), the value in use and its unit (`Unit`, when it has one), its
+default, and where that value comes from: a flag, a variable, `config.toml` or the default. A
+value `config.toml` holds that is not in use (the file changed since the server started, or a flag
+or variable outranks it) is reported beside it. Each setting also says
 whether the Ferrofin settings page may change it, and when it may not, why: a flag or a variable
 sets it (change those where the server is started), or it is one the web never changes (the
 directories, the ffmpeg and ffprobe executables, the first-boot seed settings,
@@ -60,10 +61,11 @@ to the **Ferrofin** plugin under Dashboard → Plugins and answers `404` while t
 disabled.
 
 That plugin's settings page shows the report: open it from the plugin's Settings link or the
-dashboard menu's **Ferrofin** entry. It lists the settings in groups (Paths, Network and
-identity, ffmpeg, Library and database, Observability, Metadata providers, Images, WASM plugins), each
-with its value, default, source, variable and flag, and the reason for any it may not change;
-secrets are marked as secrets. Disabling the plugin hides the page and the menu entry.
+dashboard menu's **Ferrofin** entry. It lists the settings in nine tabs (Network, Library,
+Trickplay, Images, Providers, Performance, Logging, Plugins, System), the first open. Each setting
+is headed by a readable name, with its `config.toml` key and variable on a small line below, and
+shows its value in its unit, its default, source and flag, and the reason for any it may not
+change; secrets are marked as secrets. Disabling the plugin hides the page and the menu entry.
 
 ### Editing settings from the dashboard
 
