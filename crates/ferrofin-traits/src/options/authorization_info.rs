@@ -10,7 +10,8 @@ use uuid::Uuid;
 /// The authorization context resolved for an incoming request.
 ///
 /// Mirrors C# `AuthorizationInfo`. Port rule applied: the C# `User` domain
-/// property becomes an [`Option`]`<`[`UserEntity`]`>` (the persistence row).
+/// property becomes an [`Option`]`<`[`Arc`]`<`[`UserEntity`]`>>` (the
+/// persistence row, shared with the auth cache and the queries built from it).
 /// This is a server-side request-context value, never serialized over the wire,
 /// so it carries no serde derives (and [`UserEntity`] has none either).
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -34,7 +35,10 @@ pub struct AuthorizationInfo {
     pub is_api_key: bool,
 
     /// The authenticated user, if the token resolved to one.
-    pub user: Option<UserEntity>,
+    ///
+    /// Shared, not owned: the auth cache, every copy of this info and every
+    /// query a handler builds from it point at the one row.
+    pub user: Option<Arc<UserEntity>>,
 
     /// Policy resolved with the user token, sharing its cache invalidation.
     /// Absent for API keys and requests without a resolved user.
@@ -79,13 +83,15 @@ impl AuthorizationInfo {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::sync::Arc;
+
     use super::{AuthorizationInfo, UserEntity};
     use uuid::Uuid;
 
     /// Builds a minimal [`UserEntity`] carrying only the id we care about.
     /// [`UserEntity`] has no `Default`, so every field is spelled out.
-    fn user_with_id(id: &str) -> UserEntity {
+    pub(crate) fn user_with_id(id: &str) -> UserEntity {
         UserEntity {
             id: id.to_owned(),
             audio_language_preference: None,
@@ -131,10 +137,26 @@ mod tests {
     fn user_id_parses_entity_id() {
         let id = Uuid::from_u128(0x1234);
         let info = AuthorizationInfo {
-            user: Some(user_with_id(&id.to_string())),
+            user: Some(Arc::new(user_with_id(&id.to_string()))),
             ..Default::default()
         };
         assert_eq!(info.user_id(), id);
+    }
+
+    /// A handler copies the auth info out of the request (`auth.rs`) and the
+    /// user rides along into every query it builds: the copy must share the
+    /// row, not duplicate each of its `String` columns.
+    #[test]
+    fn a_copy_shares_the_user_row() {
+        let info = AuthorizationInfo {
+            user: Some(Arc::new(user_with_id("u"))),
+            ..Default::default()
+        };
+        let copy = info.clone();
+        assert!(Arc::ptr_eq(
+            info.user.as_ref().expect("user"),
+            copy.user.as_ref().expect("user")
+        ));
     }
 
     #[test]

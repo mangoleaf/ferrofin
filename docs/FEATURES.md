@@ -1,7 +1,7 @@
 # Feature status
 
-**Parity: 41 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
-17 compared against v12.2 and owed a re-check, 6 subsystem rows (as of 2026-11-02; the
+**Parity: 44 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
+14 compared against v12.2 and owed a re-check, 8 subsystem rows (as of 2026-11-02; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
 Ferrofin answers the way Jellyfin does (identical, in another order, a known difference, filed, new), is in
@@ -116,7 +116,9 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     the command line. Ferrofin quotes such a path; an ordinary one (`/dev/dri/renderD128`)
     is passed exactly as Jellyfin passes it.
 - **Live TV** — M3U **and HDHomeRun** tuners + XMLTV **and Schedules Direct** guides,
-  channels/programs, DB-backed DVR timers & recordings. The Schedules Direct provider is a
+  channels/programs, DB-backed DVR timers & recordings, with each recording folder a library of
+  its own, so a finished recording is scanned like any other media. A recording in progress is
+  listed by `/LiveTv/Recordings` and joins its library when it ends. The Schedules Direct provider is a
   port of Jellyfin 12.2's `SchedulesDirect` (login, lineups, the station map, schedules,
   program details and artwork, SD's error codes and daily limits); it is verified against
   Jellyfin's own JSON fixtures and a fake SD API, and **has not been run against a real
@@ -143,6 +145,20 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   off. Off by default, as in Jellyfin.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
+  - **Departure from Jellyfin: trickplay images are replaced, not deleted first.** "Replace
+    existing trickplay images" makes each width's new images before it swaps them in for the
+    old ones, so a video keeps its preview (apart from the moment between two folder
+    renames) and a failed Replace keeps the old images; Jellyfin deletes them all first.
+    After the trickplay widths (`WidthResolutions`) or the chroma (`FullChroma`) change, the
+    next Generate Trickplay Images run replaces the images that no longer match the same way,
+    then removes the widths no longer selected that Ferrofin made, once the selected ones
+    exist: those of earlier runs, and those a library scan or an item refresh made after a
+    change; Jellyfin keeps old images until a Replace. Only that run reads the existing
+    tiles, and it counts as done only when every video's images match, so an interrupted
+    run, or one that could not replace a set, checks again next time. A run with no width
+    selected checks nothing, and the next change still removes the old widths. A `Qscale` or JPEG
+    quality edited by hand still needs a Replace, as in Jellyfin. Upgrading records the
+    current settings and replaces nothing.
   - **Accepted divergence (a fix, not a gap):** Jellyfin passes every 3D scaler unquoted
     (`-vf {3}`), and those graphs contain spaces, so the command line is split apart and
     no 3D layout gets chapter or thumbnail images. Ferrofin quotes the filter graph.
@@ -161,14 +177,16 @@ Wired and working, with a documented limitation or lighter verification:
 
 - **Ferrofin settings page** — Ferrofin's own, with no Jellyfin counterpart, so checked in
   jellyfin-web only. Dashboard → Plugins → **Ferrofin** → Settings, or the dashboard menu's
-  Ferrofin entry, lists every Ferrofin setting in groups with the value in use, its default, where
-  it comes from (default, `config.toml`, environment variable or flag), its variable and flag,
-  and, for each one the page may not change, why and where it is changed instead. Secrets are
-  shown to administrators, marked as secrets. The rest are edited there: Save writes the changes
-  to `config.toml`, a refused value shows the server's message next to it, Reset to default removes
-  the key, and Restart now applies them, all but the few that need a full process restart, which
-  say so ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)). Disabling the Ferrofin
-  plugin hides the page.
+  Ferrofin entry, lists every Ferrofin setting in nine tabs, with a search across them and filters
+  for changed settings, those needing a restart and read-only ones. Each has a readable name with
+  its key, variable, flag and default below, what sets it (`config.toml`, environment variable or
+  flag), and, for each one the page may not change, its value with a lock, why and where it is
+  changed instead. Secrets are shown to administrators, marked as secrets. The rest are edited
+  there, each on one line with its default shown while unset: Save writes the changes of every
+  tab to `config.toml`, a refused value shows the server's message next to it, Reset to default
+  removes the key, and Restart now applies them, all but the few that need a full process restart,
+  which say so ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)). Disabling the
+  Ferrofin plugin hides the page.
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote

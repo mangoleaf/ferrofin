@@ -16,6 +16,8 @@
 //! Season filters and aired special positioning use persisted season identities,
 //! presentation keys and episode metadata, with user visibility applied first.
 
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -533,15 +535,20 @@ async fn get_upcoming_episodes(
     Query(query): Query<UpcomingParams>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
-    crate::handlers::items::require_scope_id_visible(&state, &auth, query.parent_id, user.as_ref())
-        .await?;
-    let options = build_dto_options(
+    crate::handlers::items::require_scope_id_visible(
+        &state,
+        &auth,
+        query.parent_id,
+        user.as_deref(),
+    )
+    .await?;
+    let options = Arc::new(build_dto_options(
         query.fields.as_deref(),
         query.enable_images,
         query.image_type_limit,
         query.enable_image_types.as_deref(),
         query.enable_user_data,
-    );
+    ));
 
     // C# `DateTime.UtcNow.Date.AddDays(-1)` — midnight yesterday, UTC.
     let min_premiere_date = (chrono::Utc::now().date_naive() - chrono::Duration::days(1))
@@ -559,7 +566,7 @@ async fn get_upcoming_episodes(
         start_index: query.start_index,
         limit: query.limit,
         recursive: true,
-        dto_options: options.clone(),
+        dto_options: Arc::clone(&options),
         ..InternalItemsQuery::default()
     };
     if let Some(parent) = query.parent_id {
@@ -570,7 +577,7 @@ async fn get_upcoming_episodes(
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
     let dtos = state
         .dto
-        .get_base_item_dtos(&items, &options, user.as_ref(), None, true)
+        .get_base_item_dtos(&items, &options, user.as_deref(), None, true)
         .await?;
     Ok(Json(QueryResult::new(query.start_index, Some(total), dtos)))
 }
@@ -666,13 +673,13 @@ async fn get_episodes(
     Query(query): Query<EpisodesParams>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
-    let options = build_dto_options(
+    let options = Arc::new(build_dto_options(
         query.fields.as_deref(),
         query.enable_images,
         query.image_type_limit,
         query.enable_image_types.as_deref(),
         query.enable_user_data,
-    );
+    ));
     // Source admits missing rows before applying the explicit request filter.
     let include_missing =
         auth.is_api_key || user.as_ref().is_some_and(|u| u.display_missing_episodes);
@@ -684,7 +691,7 @@ async fn get_episodes(
     let (series_key, selected_season, actual_series_id) = if let Some(season_id) = query.season_id {
         let (season, chain) = state
             .library
-            .get_item_by_id_for_user_with_chain(season_id, user.as_ref())
+            .get_item_by_id_for_user_with_chain(season_id, user.as_deref())
             .await?
             .filter(|(item, _)| item.type_.ends_with("Season"))
             .ok_or_else(|| ApiError::NotFound(format!("No season exists with Id {season_id}")))?;
@@ -721,7 +728,7 @@ async fn get_episodes(
     } else {
         let series = state
             .library
-            .get_item_by_id_for_user(series_id, user.as_ref())
+            .get_item_by_id_for_user(series_id, user.as_deref())
             .await?
             .filter(|item| item.type_.ends_with("Series"))
             .ok_or_else(|| ApiError::NotFound("Series not found".to_owned()))?;
@@ -737,7 +744,7 @@ async fn get_episodes(
             include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
             order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
             is_missing: (!include_missing).then_some(false),
-            dto_options: options.clone(),
+            dto_options: Arc::clone(&options),
             ..Default::default()
         })
         .await?;
@@ -902,7 +909,7 @@ async fn get_episodes(
                     item_ids: ids,
                     include_item_types: vec![BaseItemKind::Episode],
                     order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
-                    dto_options: options.clone(),
+                    dto_options: Arc::clone(&options),
                     ..Default::default()
                 })
                 .await?;
@@ -913,7 +920,7 @@ async fn get_episodes(
     let page = paginate(episodes, query.start_index, query.limit);
     let dtos = state
         .dto
-        .get_base_item_dtos(&page, &options, user.as_ref(), None, true)
+        .get_base_item_dtos(&page, &options, user.as_deref(), None, true)
         .await?;
     Ok(Json(QueryResult::new(query.start_index, Some(total), dtos)))
 }
@@ -981,18 +988,18 @@ async fn get_seasons(
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
     let series = state
         .library
-        .get_item_by_id_for_user(series_id, user.as_ref())
+        .get_item_by_id_for_user(series_id, user.as_deref())
         .await?
         .filter(|i| i.type_.ends_with("Series"))
         .ok_or_else(|| ApiError::NotFound(format!("series {series_id}")))?;
     let series_key = series_presentation_key(&series);
-    let options = build_dto_options(
+    let options = Arc::new(build_dto_options(
         query.fields.as_deref(),
         query.enable_images,
         query.image_type_limit,
         query.enable_image_types.as_deref(),
         query.enable_user_data,
-    );
+    ));
 
     let internal = InternalItemsQuery {
         user: user.clone(),
@@ -1000,9 +1007,9 @@ async fn get_seasons(
         include_item_types: vec![BaseItemKind::Season],
         order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
         is_special_season: query.is_special_season,
-        is_missing: season_is_missing(user.as_ref(), query.is_missing),
+        is_missing: season_is_missing(user.as_deref(), query.is_missing),
         adjacent_to: query.adjacent_to,
-        dto_options: options.clone(),
+        dto_options: Arc::clone(&options),
         ..InternalItemsQuery::default()
     };
 
@@ -1010,7 +1017,7 @@ async fn get_seasons(
     let total = i32::try_from(seasons.len()).unwrap_or(i32::MAX);
     let dtos = state
         .dto
-        .get_base_item_dtos(&seasons, &options, user.as_ref(), None, true)
+        .get_base_item_dtos(&seasons, &options, user.as_deref(), None, true)
         .await?;
     Ok(Json(QueryResult::new(None, Some(total), dtos)))
 }

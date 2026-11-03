@@ -2,6 +2,7 @@
 //! ~140-field query struct the library/persistence layer filters items with.
 
 use chrono::{DateTime, Utc};
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::{BaseItemKind, CollectionType, MediaType, UnratedItem};
 use ferrofin_model::dto::SortOrder;
@@ -10,6 +11,7 @@ use ferrofin_model::entities_media::ParentalRatingScore;
 use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::querying::ItemFilter;
 use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 use uuid::Uuid;
 
 use super::DtoOptions;
@@ -44,6 +46,11 @@ pub struct DescendantQueryRoots {
     pub link_roots: Vec<Uuid>,
 }
 
+/// The options [`InternalItemsQuery::default`] starts from, built once: every
+/// default query shares them instead of building the all-fields list again.
+static DEFAULT_DTO_OPTIONS: LazyLock<Arc<DtoOptions>> =
+    LazyLock::new(|| Arc::new(DtoOptions::default()));
+
 /// The central item query. Every field is an optional filter, a pagination/sort
 /// control, or DTO/user context; an empty query matches everything.
 ///
@@ -67,7 +74,11 @@ pub struct InternalItemsQuery {
     /// The maximum number of results to return.
     pub limit: Option<i32>,
     /// The user the query is scoped to.
-    pub user: Option<UserEntity>,
+    ///
+    /// Shared, not owned: the resolve chain copies the query two to three
+    /// times per browse, and each copy takes a refcount instead of a copy of
+    /// every column.
+    pub user: Option<Arc<UserEntity>>,
     /// Whether repository resolution has loaded the user content preferences.
     pub user_preferences_loaded: bool,
     /// Whether any library, parental rating or tag rule hides content from
@@ -347,6 +358,15 @@ pub struct InternalItemsQuery {
     pub folder_query_recursive: bool,
     /// The parent item kind, if known.
     pub parent_type: Option<BaseItemKind>,
+    /// The parent's row as the caller already read it, through
+    /// `ItemRepository::retrieve_item` (its `Path` expanded), so the
+    /// repository's scope resolution and the folder display policy work from
+    /// it instead of reading the row again: upstream's controller reads the
+    /// parent once (`GetParentItem`) and works from the item it holds. Read it with
+    /// [`known_parent_row`](Self::known_parent_row), which returns it only
+    /// while its id is still [`parent_id`](Self::parent_id); a query that
+    /// moves its parent needs no reset.
+    pub parent_row: Option<Arc<BaseItemEntity>>,
     /// Restrict to physical and linked descendants of this item.
     /// Internal scope used for recursive BoxSet/Playlist reads; filters and
     /// paging apply to the resulting rows, never to traversal intermediates.
@@ -411,6 +431,11 @@ pub struct InternalItemsQuery {
     pub enable_group_by_metadata_key: bool,
     /// Restrict to items with chapter images.
     pub has_chapter_images: Option<bool>,
+    /// Only the items the "Plugin media analysis" pass has not offered to
+    /// this plugin yet: no `FerrofinPluginOfferedItems` row for the item and
+    /// plugin (see [`PluginOfferedItemStore`](crate::plugins::PluginOfferedItemStore)).
+    /// Ferrofin's own: Jellyfin has no plugin analysis pass.
+    pub not_offered_to_plugin: Option<Uuid>,
     /// The sort order.
     pub order_by: Vec<(ItemSortBy, SortOrder)>,
 
@@ -423,7 +448,10 @@ pub struct InternalItemsQuery {
     pub min_date_last_saved_for_user: Option<DateTime<Utc>>,
 
     /// The DTO field/image toggles used when materializing results.
-    pub dto_options: DtoOptions,
+    ///
+    /// Shared like [`user`](Self::user). A caller that changes one copy's
+    /// options goes through [`Arc::make_mut`], which leaves the others alone.
+    pub dto_options: Arc<DtoOptions>,
 
     // --- audio/subtitle language absence filters ---
     /// Exclude items that have an audio track with this language.
@@ -600,6 +628,7 @@ impl Default for InternalItemsQuery {
             apply_folder_display_options: false,
             folder_query_recursive: false,
             parent_type: None,
+            parent_row: None,
             descendant_of_id: None,
             linked_order_of: None,
             descendant_roots: None,
@@ -625,11 +654,12 @@ impl Default for InternalItemsQuery {
             exclude_provider_ids: None,
             enable_group_by_metadata_key: false,
             has_chapter_images: None,
+            not_offered_to_plugin: None,
             order_by: Vec::new(),
             min_date_created: None,
             min_date_last_saved: None,
             min_date_last_saved_for_user: None,
-            dto_options: DtoOptions::default(),
+            dto_options: Arc::clone(&DEFAULT_DTO_OPTIONS),
             has_no_audio_track_with_language: None,
             has_no_internal_subtitle_track_with_language: None,
             has_no_external_subtitle_track_with_language: None,
@@ -729,6 +759,7 @@ impl InternalItemsQuery {
             || self.has_special_feature.is_some()
             || self.has_trailer.is_some()
             || self.has_chapter_images.is_some()
+            || self.not_offered_to_plugin.is_some()
             || self.min_critic_rating.is_some()
             || self.min_community_rating.is_some()
             || self.min_parental_rating.is_some()
@@ -772,7 +803,7 @@ impl InternalItemsQuery {
     /// preferences table, not on [`UserEntity`], so repository query resolution populates
     /// those three fields from a preference lookup before translating SQL, along
     /// with [`user_has_content_restrictions`](Self::user_has_content_restrictions).
-    pub fn set_user(&mut self, user: UserEntity) {
+    pub fn set_user(&mut self, user: Arc<UserEntity>) {
         self.user_preferences_loaded = false;
         self.user_has_content_restrictions = false;
         self.block_unrated_items.clear();
@@ -806,6 +837,16 @@ impl InternalItemsQuery {
             self.parent_id = Uuid::nil();
             self.parent_type = None;
         }
+    }
+
+    /// The [`parent_row`](Self::parent_row) the caller read, while its id is
+    /// still [`parent_id`](Self::parent_id); [`None`] when none was read, or
+    /// when the query has since moved to another parent (or to none).
+    #[must_use]
+    pub fn known_parent_row(&self) -> Option<&Arc<BaseItemEntity>> {
+        self.parent_row.as_ref().filter(|row| {
+            !self.parent_id.is_nil() && Uuid::parse_str(&row.id) == Ok(self.parent_id)
+        })
     }
 
     /// Translates a set of [`ItemFilter`] flags onto the tri-state boolean
@@ -880,7 +921,11 @@ pub struct ConflictingFilters;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{ConflictingFilters, InternalItemsQuery, SourceType};
+    use crate::options::authorization_info::tests::user_with_id;
+    use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::querying::ItemFilter;
     use uuid::Uuid;
@@ -901,6 +946,22 @@ mod tests {
         );
         // A fresh query has no narrowing filters.
         assert!(!q.has_filters());
+    }
+
+    /// The resolve chain clones the query two to three times per browse: the
+    /// user row and the DTO options must come along as shared handles, not as
+    /// deep copies of every `String` column and both option lists.
+    #[test]
+    fn a_query_copy_shares_the_user_and_the_dto_options() {
+        let mut q = InternalItemsQuery::default();
+        q.set_user(Arc::new(user_with_id(&Uuid::from_u128(7).to_string())));
+        let copy = q.clone();
+        assert!(Arc::ptr_eq(
+            q.user.as_ref().expect("user"),
+            copy.user.as_ref().expect("user")
+        ));
+        assert!(Arc::ptr_eq(&q.dto_options, &copy.dto_options));
+        assert_eq!(copy.user_id(), Some(Uuid::from_u128(7)));
     }
 
     #[test]
@@ -957,6 +1018,32 @@ mod tests {
         q.set_parent(None);
         assert_eq!(q.parent_id, Uuid::nil());
         assert!(q.parent_type.is_none());
+    }
+
+    #[test]
+    fn the_known_parent_row_is_the_one_read_for_the_current_parent() {
+        let id = Uuid::from_u128(9);
+        let row = BaseItemEntity {
+            id: id.hyphenated().to_string().to_uppercase(),
+            ..BaseItemEntity::default()
+        };
+        let mut q = InternalItemsQuery {
+            parent_id: id,
+            parent_row: Some(Arc::new(row.clone())),
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(
+            q.known_parent_row().map(|row| &**row),
+            Some(&row),
+            "ids compare as Guids"
+        );
+        q.parent_id = Uuid::from_u128(10);
+        assert!(q.known_parent_row().is_none(), "a moved parent");
+        q.set_parent(None);
+        assert!(q.known_parent_row().is_none(), "no parent");
+        q.parent_id = id;
+        q.parent_row = None;
+        assert!(q.known_parent_row().is_none(), "nothing read");
     }
 
     #[test]

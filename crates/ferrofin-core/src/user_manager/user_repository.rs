@@ -39,6 +39,30 @@ pub(super) async fn set_authentication_provider(
     Ok(())
 }
 
+/// Sets the providers a user signs in and resets their password through, on
+/// any executor (the insert's transaction, for a user an outside provider
+/// creates).
+pub(super) async fn set_providers<'e, E>(
+    executor: E,
+    user_id: &str,
+    authentication_provider_id: &str,
+    password_reset_provider_id: &str,
+) -> Result<(), sqlx::Error>
+where
+    E: SqliteExecutor<'e>,
+{
+    sqlx::query(
+        r#"UPDATE "Users" SET "AuthenticationProviderId" = ?2, "PasswordResetProviderId" = ?3
+           WHERE "Id" = ?1"#,
+    )
+    .bind(user_id)
+    .bind(authentication_provider_id)
+    .bind(password_reset_provider_id)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
 /// Stores a user's password hash (`None` for a password-less user), bumping
 /// `RowVersion` as an EF save of the entity does.
 pub(super) async fn set_password(

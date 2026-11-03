@@ -9,9 +9,9 @@
 //! semantics as C# `GetResult`, and only then reading the page's episode rows
 //! and projecting them to [`BaseItemDto`](ferrofin_model::dto::BaseItemDto)
 //! through the injected [`DtoService`](ferrofin_traits::dto::DtoService). C#
-//! materialises every pick before it pages; here a regular episode picked outside
-//! the page is decided, ordered and counted from the batch's facts and never
-//! loaded.
+//! materialises every pick before it pages; here a pick outside the page, an
+//! episode or a special, is decided, ordered and counted from the batch's facts
+//! and never loaded.
 //!
 //! Port rules applied:
 //! - The two C# `GetNextUp` overloads collapse to the single trait method
@@ -92,44 +92,10 @@ impl std::fmt::Debug for FerrofinTvSeriesManager {
     }
 }
 
-/// A series' pick: the batch's next (or next played) episode, whose full row is
-/// read once the page is known, or one of the specials the batch already holds
-/// in full.
-#[derive(Clone, Copy)]
-enum Pick<'a> {
-    Episode(&'a NextUpEpisode),
-    Special(&'a BaseItemEntity),
-}
-
-impl<'a> Pick<'a> {
-    /// The pick's stored id.
-    fn id(self) -> &'a str {
-        match self {
-            Self::Episode(episode) => &episode.id,
-            Self::Special(row) => &row.id,
-        }
-    }
-
-    /// The pick's operand for the aired-order sort. A [`NextUpEpisode`] is
-    /// never a special, so it has no `Airs*` numbers.
-    fn aired_order(self) -> AiredOrder {
-        match self {
-            Self::Episode(episode) => AiredOrder {
-                season: episode.parent_index_number,
-                episode: episode.index_number,
-                premiere: episode.premiere_date,
-                airs_before_season: None,
-                airs_after_season: None,
-                airs_before_episode: None,
-            },
-            Self::Special(row) => aired_order(row),
-        }
-    }
-}
-
-/// A pick and the date it is ordered by: C#'s
+/// A series' pick, an episode or a special of its batch result, whose full row
+/// is read once the page is known; and the date it is ordered by: C#'s
 /// `(DateTime LastWatchedDate, Episode Episode)` tuple.
-type DatedPick<'a> = (DateTime<Utc>, Pick<'a>);
+type DatedPick<'a> = (DateTime<Utc>, &'a NextUpEpisode);
 
 impl FerrofinTvSeriesManager {
     /// Creates a TV-series manager from its injected collaborators.
@@ -174,7 +140,8 @@ impl FerrofinTvSeriesManager {
     /// row, and asking for every folder (seasons, albums, artists — 1,975 on
     /// the bench fixture) against the retired `CROSS JOIN` shape made that
     /// 10 M index probes and a 1.4 s home screen. The service maps each
-    /// collection folder to its physical folders, as
+    /// collection folder to its physical folders, and a view (a grouped view
+    /// an explicit `parentId` names) to the libraries behind it, as
     /// `LibraryManager.GetNextUpSeriesKeys` does.
     async fn resolve_parents(
         &self,
@@ -199,7 +166,7 @@ impl FerrofinTvSeriesManager {
         // answers no parents and Next Up is empty, rather than every folder
         // in the library.
         let query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             user_root_children: true,
             include_item_types: vec![
                 BaseItemKind::CollectionFolder,
@@ -256,8 +223,10 @@ impl FerrofinTvSeriesManager {
         let include_rewatching = request.enable_rewatching;
 
         let query = InternalItemsQuery {
-            user: Some(user.clone()),
-            dto_options: dto_options.clone(),
+            user: Some(Arc::new(user.clone())),
+            // The trait hands in `&DtoOptions`: one copy here, as before; the
+            // query's own clones then share it.
+            dto_options: Arc::new(dto_options.clone()),
             ..InternalItemsQuery::default()
         };
 
@@ -301,7 +270,7 @@ impl FerrofinTvSeriesManager {
     /// are materialised ([`Self::page_rows`]).
     async fn to_result(
         &self,
-        picks: Vec<Pick<'_>>,
+        picks: Vec<&NextUpEpisode>,
         request: &NextUpQuery,
         user: &UserEntity,
         options: &DtoOptions,
@@ -316,7 +285,7 @@ impl FerrofinTvSeriesManager {
             .start_index
             .and_then(|s| usize::try_from(s).ok())
             .unwrap_or(0);
-        let mut page: Vec<Pick<'_>> = picks.into_iter().skip(start).collect();
+        let mut page: Vec<&NextUpEpisode> = picks.into_iter().skip(start).collect();
         if let Some(limit) = request.limit
             && limit > 0
         {
@@ -337,17 +306,18 @@ impl FerrofinTvSeriesManager {
     }
 
     /// The full rows of a page's picks, in page order: one read of its
-    /// episodes' rows, each moved out of the answer, and its specials cloned
-    /// out of the batch, where both of a series' picks can be the same one.
+    /// episodes' and specials' rows, each moved out of the answer, where both
+    /// of a series' picks can be the same one.
     ///
-    /// An episode deleted since the batch has no row: it drops out of the page,
-    /// and the total, taken from the picks, still counts it.
-    async fn page_rows(&self, page: &[Pick<'_>]) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    /// An episode or special deleted since the batch has no row: it drops out
+    /// of the page, and the total, taken from the picks, still counts it.
+    async fn page_rows(
+        &self,
+        page: &[&NextUpEpisode],
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         let mut refs: HashMap<uuid::Uuid, usize> = HashMap::new();
         for pick in page {
-            if let Pick::Episode(episode) = pick
-                && let Ok(id) = uuid::Uuid::parse_str(&episode.id)
-            {
+            if let Ok(id) = uuid::Uuid::parse_str(&pick.id) {
                 *refs.entry(id).or_insert(0) += 1;
             }
         }
@@ -362,12 +332,9 @@ impl FerrofinTvSeriesManager {
 
         Ok(page
             .iter()
-            .filter_map(|pick| match pick {
-                Pick::Special(row) => Some((*row).clone()),
-                Pick::Episode(episode) => {
-                    let id = uuid::Uuid::parse_str(&episode.id).ok()?;
-                    take_row(&mut rows, &mut refs, id)
-                }
+            .filter_map(|pick| {
+                let id = uuid::Uuid::parse_str(&pick.id).ok()?;
+                take_row(&mut rows, &mut refs, id)
             })
             .collect())
     }
@@ -408,8 +375,8 @@ fn determine_next_episode(
     include_specials: bool,
     include_resumable: bool,
     include_played: bool,
-) -> Option<Pick<'_>> {
-    let (next, last_watched) = if include_played {
+) -> Option<&NextUpEpisode> {
+    let (mut next, last_watched) = if include_played {
         (
             result.next_played_for_rewatching.as_ref(),
             result.last_watched_for_rewatching.as_ref(),
@@ -417,23 +384,22 @@ fn determine_next_episode(
     } else {
         (result.next_up.as_ref(), result.last_watched.as_ref())
     };
-    let mut next = next.map(Pick::Episode);
 
     if include_specials && !result.specials.is_empty() {
-        let mut considered: Vec<(AiredOrder, Pick<'_>)> = result
+        let mut considered: Vec<(AiredOrder, &NextUpEpisode)> = result
             .specials
             .iter()
-            .map(|row| (aired_order(row), Pick::Special(row)))
+            .map(|special| (episode_aired_order(special), special))
             .filter(|(order, _)| {
                 order.airs_before_season.is_some() || order.airs_after_season.is_some()
             })
             .collect();
         considered.extend(
             last_watched
-                .map(Pick::Episode)
-                .map(|pick| (pick.aired_order(), pick)),
+                .into_iter()
+                .chain(next)
+                .map(|episode| (episode_aired_order(episode), episode)),
         );
-        considered.extend(next.map(|pick| (pick.aired_order(), pick)));
 
         if !considered.is_empty() {
             // `LibraryManager.Sort(…, AiredEpisodeOrder, Ascending)` — LINQ's
@@ -443,15 +409,15 @@ fn determine_next_episode(
             // strictly against its numbered siblings). `slice::sort_by` may
             // panic on such a comparator since Rust 1.81.
             stable_sort_by(&mut considered, |a, b| a.0.compare(&b.0));
-            let mut sorted: Box<dyn Iterator<Item = Pick<'_>>> =
+            let mut sorted: Box<dyn Iterator<Item = &NextUpEpisode>> =
                 Box::new(considered.into_iter().map(|(_, pick)| pick));
             if let Some(last) = last_watched {
-                sorted = Box::new(sorted.skip_while(|pick| pick.id() != last.id).skip(1));
+                sorted = Box::new(sorted.skip_while(|pick| pick.id != last.id).skip(1));
             }
             if !include_played {
                 sorted =
                     Box::new(sorted.filter(|pick| {
-                        !result.user_data.get(pick.id()).is_some_and(|ud| ud.played)
+                        !result.user_data.get(&pick.id).is_some_and(|ud| ud.played)
                     }));
             }
             next = sorted.next();
@@ -462,7 +428,7 @@ fn determine_next_episode(
     if !include_resumable
         && result
             .user_data
-            .get(next.id())
+            .get(&next.id)
             .is_some_and(|ud| ud.playback_position_ticks > 0)
     {
         // The resume progress may live on an alternate version — the
@@ -504,18 +470,44 @@ pub(crate) fn aired_order(episode: &BaseItemEntity) -> AiredOrder {
         airs_after_season: None,
         airs_before_episode: None,
     };
-    if episode.parent_index_number == Some(0)
-        && let Some(blob) = episode
-            .data
-            .as_deref()
-            .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
-    {
-        let number = |key: &str| blob.get(key).and_then(serde_json::Value::as_i64);
-        order.airs_before_season = number("AirsBeforeSeasonNumber");
-        order.airs_after_season = number("AirsAfterSeasonNumber");
-        order.airs_before_episode = number("AirsBeforeEpisodeNumber");
+    if episode.parent_index_number == Some(0) {
+        [
+            order.airs_before_season,
+            order.airs_after_season,
+            order.airs_before_episode,
+        ] = airs_numbers(episode.data.as_deref());
     }
     order
+}
+
+/// The `AirsBeforeSeasonNumber`, `AirsAfterSeasonNumber` and
+/// `AirsBeforeEpisodeNumber` members of an episode's `Data` blob, in that
+/// order: each one an integer in `i64` range, else `None`, and all three
+/// `None` when the blob is missing or no JSON. Only a special's are read
+/// ([`aired_order`], and the next-up batch's specials).
+pub(crate) fn airs_numbers(data: Option<&str>) -> [Option<i64>; 3] {
+    let Some(blob) = data.and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok()) else {
+        return [None; 3];
+    };
+    let number = |key: &str| blob.get(key).and_then(serde_json::Value::as_i64);
+    [
+        number("AirsBeforeSeasonNumber"),
+        number("AirsAfterSeasonNumber"),
+        number("AirsBeforeEpisodeNumber"),
+    ]
+}
+
+/// A batch episode's operand for the aired-order sort. Only a special carries
+/// `Airs*` numbers.
+fn episode_aired_order(episode: &NextUpEpisode) -> AiredOrder {
+    AiredOrder {
+        season: episode.parent_index_number,
+        episode: episode.index_number,
+        premiere: episode.premiere_date,
+        airs_before_season: episode.airs_before_season_number,
+        airs_after_season: episode.airs_after_season_number,
+        airs_before_episode: episode.airs_before_episode_number,
+    }
 }
 
 #[async_trait]
@@ -559,7 +551,7 @@ impl TvSeriesManager for FerrofinTvSeriesManager {
         // the resumable/specials rules can drop any of them — 12 items where
         // v12 answers 16.
         let keys_query = InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             top_parent_ids: parents,
             ..InternalItemsQuery::default()
         };
@@ -636,7 +628,7 @@ mod tests {
             id: guid_to_db(id),
             parent_index_number: Some(season),
             index_number: Some(index),
-            premiere_date: None,
+            ..NextUpEpisode::default()
         }
     }
 
@@ -1284,14 +1276,14 @@ mod tests {
         assert_eq!(next_up.row_reads(), reads, "one read, of this page");
     }
 
-    /// Two series, the newest one's pick a special the batch holds in full:
-    /// a page of that special reads no row, and a page with the other series
-    /// too reads that episode's alone.
+    /// Two series, the newest one's pick a special: its row is read with the
+    /// page's, in the page's one read. A page of that special reads its row
+    /// alone, and a page with the other series too reads both rows at once.
     #[rstest]
     #[case::the_special_alone(Some(1), false)]
     #[case::the_special_and_an_episode(None, true)]
     #[tokio::test]
-    async fn a_picked_special_is_not_read_again(
+    async fn a_picked_special_is_read_with_the_page(
         #[case] limit: Option<i32>,
         #[case] shows_the_episode: bool,
     ) {
@@ -1344,13 +1336,18 @@ mod tests {
             .expect("next up");
 
         let ids: Vec<Uuid> = result.items.iter().map(|i| i.id).collect();
-        let read = next_up.row_reads().concat();
         if shows_the_episode {
             assert_eq!(ids, vec![sp, other]);
-            assert_eq!(read, vec![other]);
+            let mut both = vec![sp, other];
+            both.sort_unstable();
+            assert_eq!(next_up.row_reads(), vec![both], "one read, of this page");
         } else {
             assert_eq!(ids, vec![sp]);
-            assert!(read.is_empty(), "a special needs no read: {read:?}");
+            assert_eq!(
+                next_up.row_reads(),
+                vec![vec![sp]],
+                "the special's row alone"
+            );
         }
     }
 
@@ -1394,6 +1391,7 @@ mod tests {
 
         let ids: Vec<Uuid> = out.items.iter().map(|i| i.id).collect();
         assert_eq!(ids, vec![sp, sp]);
+        assert_eq!(next_up.row_reads(), vec![vec![sp]], "one read of its row");
     }
 
     /// A repeated key repeats its pick, as C#'s loop over the keys does, and
@@ -1431,10 +1429,14 @@ mod tests {
         assert_eq!(next_up.row_reads(), vec![vec![ep]]);
     }
 
-    /// An episode deleted between the batch and the row read has no row: it
-    /// drops out of the page, and the rest of the page still answers.
+    /// An episode or special deleted between the batch and the row read has
+    /// no row: it drops out of the page, and the rest of the page still
+    /// answers.
+    #[rstest]
+    #[case::an_episode(false)]
+    #[case::a_special(true)]
     #[tokio::test]
-    async fn an_episode_deleted_since_the_batch_drops_out_of_the_page() {
+    async fn a_pick_deleted_since_the_batch_drops_out_of_the_page(#[case] special_pick: bool) {
         let db = test_db().await;
         let user_id = Uuid::new_v4();
         let user = seed_user(&db, user_id).await;
@@ -1442,11 +1444,20 @@ mod tests {
 
         let gone = Uuid::new_v4();
         let kept = Uuid::new_v4();
+        let series_a = if special_pick {
+            with_special(
+                batch_result(
+                    Some((episode(Uuid::new_v4(), 1, 5), None)),
+                    Some(episode(Uuid::new_v4(), 2, 1)),
+                ),
+                special(gone, 1, Some(2), None, None),
+                false,
+            )
+        } else {
+            batch_result(None, Some(episode(gone, 1, 1)))
+        };
         let mut batch = HashMap::new();
-        batch.insert(
-            "series-a".to_owned(),
-            batch_result(None, Some(episode(gone, 1, 1))),
-        );
+        batch.insert("series-a".to_owned(), series_a);
         batch.insert(
             "series-b".to_owned(),
             batch_result(None, Some(episode(kept, 1, 1))),
@@ -1454,7 +1465,7 @@ mod tests {
         let keys = vec!["series-a".to_owned(), "series-b".to_owned()];
         let mut next_up = FakeNextUpService::new(keys, batch);
         next_up.deleted = vec![gone];
-        let mgr = manager(user, library, Arc::new(next_up), false);
+        let mgr = manager(user, library, Arc::new(next_up), true);
 
         let out = mgr
             .get_next_up(
@@ -1827,44 +1838,36 @@ mod tests {
 
     // ── DetermineNextEpisode: the specials merge ──
 
-    /// A special row carrying the given `Airs*` numbers in its `Data` blob.
+    /// The batch's view of a special carrying the given `Airs*` numbers.
     fn special(
         id: Uuid,
         index: i64,
         before_season: Option<i64>,
         after_season: Option<i64>,
         before_episode: Option<i64>,
-    ) -> BaseItemEntity {
-        let mut blob = serde_json::Map::new();
-        if let Some(n) = before_season {
-            blob.insert("AirsBeforeSeasonNumber".to_owned(), n.into());
-        }
-        if let Some(n) = after_season {
-            blob.insert("AirsAfterSeasonNumber".to_owned(), n.into());
-        }
-        if let Some(n) = before_episode {
-            blob.insert("AirsBeforeEpisodeNumber".to_owned(), n.into());
-        }
-        BaseItemEntity {
-            data: Some(serde_json::Value::Object(blob).to_string()),
-            ..episode_row(id, 0, index)
+    ) -> NextUpEpisode {
+        NextUpEpisode {
+            airs_before_season_number: before_season,
+            airs_after_season_number: after_season,
+            airs_before_episode_number: before_episode,
+            ..episode(id, 0, index)
         }
     }
 
     /// Adds a special to a batch result, with its played flag.
     fn with_special(
         mut result: NextUpEpisodeBatchResult,
-        row: BaseItemEntity,
+        special: NextUpEpisode,
         played: bool,
     ) -> NextUpEpisodeBatchResult {
         result.user_data.insert(
-            row.id.clone(),
+            special.id.clone(),
             NextUpEpisodeUserData {
                 played,
                 ..NextUpEpisodeUserData::default()
             },
         );
-        result.specials.push(row);
+        result.specials.push(special);
         result
     }
 
@@ -1894,7 +1897,7 @@ mod tests {
         );
         let pick = determine_next_episode(&result, true, true, false).expect("a pick");
         let expected = if expect_special { sp } else { next };
-        assert_eq!(pick.id(), guid_to_db(expected));
+        assert_eq!(pick.id, guid_to_db(expected));
     }
 
     /// With `DisplaySpecialsWithinSeasons` off the specials are not consulted
@@ -1911,7 +1914,7 @@ mod tests {
             false,
         );
         let pick = determine_next_episode(&result, false, true, false).expect("a pick");
-        assert_eq!(pick.id(), guid_to_db(next));
+        assert_eq!(pick.id, guid_to_db(next));
     }
 
     /// A special that airs before the very episode the user stopped at is
@@ -1928,7 +1931,7 @@ mod tests {
             false,
         );
         let pick = determine_next_episode(&result, true, true, false).expect("a pick");
-        assert_eq!(pick.id(), guid_to_db(next));
+        assert_eq!(pick.id, guid_to_db(next));
     }
 
     /// The resumable rule applies after the merge — to whatever the pick is.
@@ -1950,7 +1953,7 @@ mod tests {
             .playback_position_ticks = 1;
         assert!(determine_next_episode(&result, true, false, false).is_none());
         assert_eq!(
-            determine_next_episode(&result, true, true, false).map(|pick| pick.id().to_owned()),
+            determine_next_episode(&result, true, true, false).map(|pick| pick.id.clone()),
             Some(guid_to_db(sp))
         );
     }
@@ -2032,7 +2035,7 @@ mod tests {
         // next row sorts last, so the pick is that row — an unstable sort
         // could place the last watched row among the specials and pick one.
         assert_eq!(
-            determine_next_episode(&result, true, true, false).map(|pick| pick.id().to_owned()),
+            determine_next_episode(&result, true, true, false).map(|pick| pick.id.clone()),
             Some(guid_to_db(next))
         );
     }
@@ -2071,7 +2074,7 @@ mod tests {
         );
         let pick = determine_next_episode(&result, true, true, false).expect("a pick");
         let expected = if expect_special { sp } else { next };
-        assert_eq!(pick.id(), guid_to_db(expected));
+        assert_eq!(pick.id, guid_to_db(expected));
     }
 
     /// Rewatching decides the `*ForRewatching` pair and keeps played rows.
@@ -2089,7 +2092,7 @@ mod tests {
             },
         );
         let pick = determine_next_episode(&result, false, false, true).expect("a pick");
-        assert_eq!(pick.id(), guid_to_db(next_played));
+        assert_eq!(pick.id, guid_to_db(next_played));
     }
 
     // ── AiredEpisodeOrderComparer, transliterated from upstream's
@@ -2225,7 +2228,10 @@ mod tests {
     /// special's.
     #[test]
     fn aired_order_reads_airs_numbers_from_the_data_blob_of_specials_only() {
-        let sp = special(Uuid::new_v4(), 1, Some(1), None, Some(2));
+        let sp = BaseItemEntity {
+            data: Some(r#"{"AirsBeforeSeasonNumber":1,"AirsBeforeEpisodeNumber":2}"#.to_owned()),
+            ..episode_row(Uuid::new_v4(), 0, 1)
+        };
         let o = aired_order(&sp);
         assert_eq!(o.airs_before_season, Some(1));
         assert_eq!(o.airs_before_episode, Some(2));

@@ -307,7 +307,15 @@ fn spells<'a>(path: &str, spelled: impl Iterator<Item = &'a str>) -> bool {
 pub fn canonicalize_path(path: &str) -> Option<String> {
     static INDEX: OnceLock<RouteIndex> = OnceLock::new();
     INDEX
-        .get_or_init(|| RouteIndex::new(axum_routes().into_iter().map(|(_, path)| path)))
+        .get_or_init(|| {
+            RouteIndex::new(
+                axum_routes().into_iter().map(|(_, path)| path).chain(
+                    crate::handlers::PLUGIN_ROUTES
+                        .iter()
+                        .map(|(_, path, _)| (*path).to_owned()),
+                ),
+            )
+        })
         .canonicalize(path)
 }
 
@@ -333,6 +341,29 @@ mod tests {
         assert_eq!(
             canonicalize_path("/SYSTEM/INFO/PUBLIC").as_deref(),
             Some("/System/Info/Public")
+        );
+    }
+
+    #[test]
+    fn canonicalize_recases_a_ported_plugins_own_routes() {
+        // The LDAP-Auth settings page calls `ldap/TestServerBind`.
+        assert_eq!(
+            canonicalize_path("/ldap/TestServerBind").as_deref(),
+            Some("/Ldap/TestServerBind")
+        );
+        assert_eq!(
+            canonicalize_path("/LDAP/testserverbind").as_deref(),
+            Some("/Ldap/TestServerBind")
+        );
+        assert_eq!(canonicalize_path("/Ldap/TestServerBind"), None);
+        // And the filter test and user search, which it calls the same way.
+        assert_eq!(
+            canonicalize_path("/ldap/TestLdapFilters").as_deref(),
+            Some("/Ldap/TestLdapFilters")
+        );
+        assert_eq!(
+            canonicalize_path("/ldap/LdapUserSearch").as_deref(),
+            Some("/Ldap/LdapUserSearch")
         );
     }
 

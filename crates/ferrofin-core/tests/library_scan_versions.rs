@@ -1863,6 +1863,72 @@ async fn tvshows_collection_groups_episode_versions() {
     assert_eq!(data_list(&lone, "AdditionalParts"), Some(Vec::new()));
 }
 
+const SNL_DEC16: &str =
+    "Show (1975)/Season 49/Show (1975) - 2023-12-16 06 00 00 - Guest A; Band A.ts";
+const SNL_DEC09: &str =
+    "Show (1975)/Season 49/Show (1975) - 2023-12-09 06 00 00 - Guest B; Band B.ts";
+const SNL_JAN14: &str =
+    "Show (1975)/Season 2017/Show (1975) - 2017-01-14 00 00 00 - Guest C; Band C.ts";
+const SNL_OCT28: &str =
+    "Show (1975)/Season 2017/Show (1975) - 2017-10-28 00 00 00 - Episode 10-28.ts";
+const SNL_OCT28_SPECIAL: &str =
+    "Show (1975)/Season 2017/Show (1975) - 2017-10-28 00 00 00 - Halloween Special.ts";
+
+/// Episodes named by air date key their versions on the date
+/// (`VideoListResolver.GetEpisodeVersionKey`, `D{yyyyMMdd}`): two airings
+/// in one season folder — a numbered one and a year one — stay two episodes,
+/// with no number, the date from the file, and no version link either way,
+/// on the first scan and on a rescan; two files of one airing are one episode
+/// with a local alternate, as upstream groups them.
+#[tokio::test]
+async fn by_date_episodes_in_one_season_stay_separate() {
+    let f = shows(&[
+        SNL_DEC16,
+        SNL_DEC09,
+        SNL_JAN14,
+        SNL_OCT28,
+        SNL_OCT28_SPECIAL,
+    ])
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    f.scanner.scan_all().await.unwrap();
+
+    for (file, date) in [
+        (SNL_DEC16, "2023-12-16"),
+        (SNL_DEC09, "2023-12-09"),
+        (SNL_JAN14, "2017-01-14"),
+    ] {
+        let row = f.row(file).await;
+        assert_eq!(kind_of(&row), "Episode", "{file}");
+        assert_eq!(row.owner_id, None, "{file}");
+        assert_eq!(row.primary_version_id, None, "{file}");
+        assert_eq!(row.index_number, None, "{file}");
+        assert_eq!(
+            row.premiere_date.map(|d| d.format("%Y-%m-%d").to_string()),
+            Some(date.to_owned()),
+            "{file}"
+        );
+        assert_eq!(
+            data_list(&row, "LocalAlternateVersions"),
+            Some(Vec::new()),
+            "{file}"
+        );
+    }
+    let episodes: Vec<String> = f.titles().await.into_iter().map(|(_, path)| path).collect();
+    assert_eq!(episodes.len(), 4, "{episodes:?}");
+
+    // One airing, two recordings: one episode and its alternate.
+    let (first, second) = (f.row(SNL_OCT28).await, f.row(SNL_OCT28_SPECIAL).await);
+    let (primary, alternate) = if second.owner_id.is_some() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!(alternate.owner_id.as_ref(), Some(&primary.id));
+    assert_eq!(alternate.primary_version_id.as_ref(), Some(&primary.id));
+    assert_eq!(primary.primary_version_id, None);
+}
+
 /// A two-part episode is ONE episode: its first file the `Episode`, listing
 /// the other as `AdditionalParts`, which is a `Video` it owns, hung in its
 /// season in its folder state (`Video.RefreshMetadataForOwnedVideo`). The
@@ -2091,7 +2157,7 @@ async fn next_up_of(
     let top = Uuid::parse_str(episode.top_parent_id.as_deref().unwrap()).unwrap();
     let service = ferrofin_core::FerrofinNextUpService::new(f.db.clone());
     let filter = ferrofin_traits::options::InternalItemsQuery {
-        user: Some(user_row(f, user).await),
+        user: Some(Arc::new(user_row(f, user).await)),
         top_parent_ids: vec![top],
         ..Default::default()
     };
@@ -2386,7 +2452,7 @@ async fn every_version_a_user_may_open_passes_the_source_filter() {
     let user = user_row_of(&f, user).await;
     let visible = |grouped: bool| {
         let mut q = query(grouped);
-        q.user = Some(user.clone());
+        q.user = Some(Arc::new(user.clone()));
         q
     };
     assert_eq!(repo.get_item_ids(&visible(false)).await.unwrap().len(), 3);

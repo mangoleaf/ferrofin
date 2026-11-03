@@ -193,6 +193,70 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_settings_page_lists_the_settings_in_tabs_by_name_and_unit() {
+        let html = settings_html();
+        // A tab per group the report names, in its order; the panels are
+        // shown one at a time.
+        assert!(
+            html.contains(r#"class="ferrofinTabs" role="tablist""#),
+            "{html}"
+        );
+        assert!(html.contains("setAttribute('role', 'tab')"), "{html}");
+        assert!(html.contains("setAttribute('role', 'tabpanel')"), "{html}");
+        // Each row is headed by its readable name, with its key and variable
+        // on a line below, and its value in its unit.
+        assert!(html.contains("setting.Label"), "{html}");
+        assert!(html.contains("ferrofinSettingIds"), "{html}");
+        assert!(html.contains("setting.Unit"), "{html}");
+        // The groups are named as the report names them: none is hardcoded.
+        assert!(!html.contains("GROUP_TITLES"), "{html}");
+    }
+
+    #[test]
+    fn the_settings_page_edits_a_setting_on_one_line_and_finds_it_by_search_and_filters() {
+        let html = settings_html();
+        // The value field has no "Set to" label: an unset one shows the
+        // default as its placeholder, and Reset to default sits beside it.
+        assert!(!html.contains("Set to"), "{html}");
+        assert!(
+            html.contains("setAttribute('placeholder', setting.Default)"),
+            "{html}"
+        );
+        assert!(html.contains("ferrofinReset"), "{html}");
+        // A setting fixed by a variable or a flag shows its value as text,
+        // with a lock and the reason, which names what sets it.
+        assert!(html.contains("ferrofinLocked"), "{html}");
+        assert!(html.contains("icon('lock')"), "{html}");
+        assert!(html.contains("setting.LockedReason"), "{html}");
+        // A search box and three filters above the tabs, across every tab.
+        for class in [
+            "ferrofinSearch",
+            "ferrofinFilterChanged",
+            "ferrofinFilterRestart",
+            "ferrofinFilterLocked",
+        ] {
+            assert!(html.contains(&format!("class=\"{class}\"")), "{class}");
+        }
+        // The search reads the name, the description, the key, the variable
+        // and the flag.
+        for member in [
+            "setting.Label",
+            "setting.Description",
+            "setting.Key",
+            "setting.EnvVar",
+            "setting.Flag",
+        ] {
+            assert!(html.contains(&format!("{member} ||")), "{member}");
+        }
+        // Junk in a number box is sent for the server to refuse: the browser
+        // reports it as an empty value, which would pass for no change.
+        assert!(html.contains("validity.badInput"), "{html}");
+        // Each tab counts its unsaved edits, and marks a refusal on it.
+        assert!(html.contains("ferrofinTabCount"), "{html}");
+        assert!(html.contains("ferrofinTabRefused"), "{html}");
+    }
+
     #[rstest::rstest]
     #[case::release("v1.5.0", "1.5.0.0")]
     #[case::after_a_release("v1.4.0-55-ge60eae77a188", "1.4.0.0")]

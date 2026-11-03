@@ -151,6 +151,16 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
 p12-keystore = "0.4.1"
+# The LDAP-Auth extension's directory client: LDAP, LDAPS and StartTLS over the
+# same rustls + aws-lc-rs stack (no default features, so neither native-tls nor
+# ring comes in).
+ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-aws-lc-rs"] }
+# The system's trusted roots for an LDAP-Auth TLS configuration Ferrofin builds
+# itself (a client certificate, or the default checks): what ldap3 reads too.
+rustls-native-certs = "0.8.5"
+# A certificate's validity period, for LDAP-Auth's check of a server certificate
+# given as its own root CA (already built for ldap3 and p12-keystore).
+x509-parser = "0.18.1"
 # Self-signed certificates for the HTTPS tests (dev-dependency only).
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 
@@ -205,7 +215,13 @@ chardetng = "0.1.17"
 shlex = "2"              # ffmpeg command strings → argv (ferrofin-mediaencoding `split_args`)
 async-trait = "0.1.92"
 libc = "0.2"
-windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
+] }
 pbkdf2 = "0.13.0"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
 sha2 = "0.11.0"            # PBKDF2-HMAC-SHA512 (default hash id)
 sha1 = "0.11.0"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)

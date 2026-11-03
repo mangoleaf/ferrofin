@@ -178,10 +178,23 @@ ferrofin:
     # FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS: "100000"
     # FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS: "300"
     # Seconds a resolved access token, and a user's permissions with the libraries'
-    # rows and options, are served from memory (5-300, default 30 each). Changes
-    # made through the server apply at once; these only bound changes made outside it.
+    # rows and options and whether a Live TV tuner exists, are served from memory
+    # (5-300, default 30 each). Changes made through the server apply at once; these
+    # only bound changes made outside it.
     # FERROFIN_AUTH_CACHE_TTL_SECS: "30"
     # FERROFIN_ROW_CACHE_TTL_SECS: "30"
+    # Read the network interfaces again 2 s after the OS reports a network change
+    # (Jellyfin's DetectNetworkChange, on by default).
+    # FERROFIN_DETECT_NETWORK_CHANGE: "true"
+    # Failed logins an account or a client address may make before its next attempts
+    # wait (1 s, doubling to the maximum; the backoff never disables an account). Add the
+    # ingress to Known proxies, or every client shares its address and one
+    # guesser can get everyone's logins refused.
+    # FERROFIN_LOGIN_BACKOFF: "true"
+    # FERROFIN_LOGIN_BACKOFF_ATTEMPTS: "5"
+    # FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS: "30"
+    # FERROFIN_LOGIN_BACKOFF_WINDOW_MINS: "15"
+    # FERROFIN_LOGIN_BACKOFF_MAX_TRACKED: "100000"
     # Prepared statements each SQLite connection keeps (100-1024, default 200).
     # Each connection of the pool keeps its own, about 16 KiB a statement, so a
     # larger value costs memory on every connection.
@@ -222,8 +235,9 @@ ferrofin:
     # FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW: "nas.lan,192.168.1.0/24"
 
     # The most jobs re-encoding a stream the server runs at once, and one user
-    # runs at once. Past either cap the user's idle jobs are ended first; with
-    # none to end, the client gets 503 with Retry-After. 0 means no cap.
+    # runs at once. Past either cap the user's idle job on the same device is
+    # ended first; with none to end, the client gets 503 with Retry-After. 0
+    # means no cap.
     # FERROFIN_MAX_TRANSCODES: "0"
     # FERROFIN_MAX_TRANSCODES_PER_USER: "0"
 

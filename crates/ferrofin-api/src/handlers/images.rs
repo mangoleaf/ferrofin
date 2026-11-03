@@ -58,7 +58,9 @@ use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::drawing::ImageFormat;
 use ferrofin_model::dto::ImageInfo;
 use ferrofin_model::entities::ImageType;
-use ferrofin_traits::options::{ImageProcessingOptions, ItemImageInfo, ItemImagesToServe};
+use ferrofin_traits::options::{
+    ImageProcessingOptions, ItemImageInfo, ItemImagesToServe, live_tv_image_is_internal,
+};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
@@ -420,32 +422,16 @@ fn select_image(
         .nth(usize::try_from(index).unwrap_or(0))
 }
 
-/// Whether a Live TV channel's or programme's `image` may be served.
-///
-/// Its rows hold what a tuner or a guide supplied, which is kept only as a URL
-/// (`ferrofin_livetv::projection::is_artwork_url`), but a row saved before that
-/// rule, or by the previous version during a rolling update, can hold a value
-/// that is not one. A local row is served only from the internal metadata
-/// directory, where the server itself writes (a logo set in the metadata
-/// editor, or the logo an adopted Jellyfin database downloaded). The paths are
-/// resolved before they are compared. A row whose file is gone goes by the
-/// nearest ancestor that exists, so one in the metadata directory stays listed
-/// with no size, as upstream lists it, and can be deleted in the image editor.
-/// Every other item's images may legitimately be anywhere in its library.
+/// Whether a Live TV channel's or programme's `image` may be served: a URL, or
+/// a file [`live_tv_image_is_internal`] accepts. A row in the metadata directory
+/// whose file is gone stays listed with no size, as upstream lists it, and can
+/// be deleted in the image editor.
 async fn live_tv_image_is_servable(state: &AppState, image: &ItemImageInfo) -> bool {
     if !image.is_local_file() {
         return true;
     }
     let root = state.config.application_paths().internal_metadata_path();
-    let Ok(root) = tokio::fs::canonicalize(root).await else {
-        return false;
-    };
-    for ancestor in std::path::Path::new(&image.path).ancestors() {
-        if let Ok(resolved) = tokio::fs::canonicalize(ancestor).await {
-            return resolved.starts_with(root);
-        }
-    }
-    false
+    live_tv_image_is_internal(&image.path, std::path::Path::new(&root)).await
 }
 
 /// `image` with a local path: itself when local, else its downloaded copy
@@ -933,7 +919,7 @@ async fn get_item_image_infos(
 ) -> Result<axum::Json<Vec<ImageInfo>>, ApiError> {
     let item = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let images = state.library.get_item_images(item_id).await?;
@@ -1533,7 +1519,7 @@ async fn set_item_image(
     body: String,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    require_item(&state, item_id, auth.user.as_ref()).await?;
+    require_item(&state, item_id, auth.user.as_deref()).await?;
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
@@ -1568,7 +1554,7 @@ async fn set_item_image_by_index(
     body: String,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    require_item(&state, item_id, auth.user.as_ref()).await?;
+    require_item(&state, item_id, auth.user.as_deref()).await?;
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
@@ -1601,7 +1587,7 @@ async fn delete_item_image(
     Query(query): Query<ImageQuery>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    require_item(&state, item_id, auth.user.as_ref()).await?;
+    require_item(&state, item_id, auth.user.as_deref()).await?;
     let index = query.image_index.unwrap_or(0);
     state
         .providers
@@ -1633,7 +1619,7 @@ async fn delete_item_image_by_index(
     Path((item_id, image_type, image_index)): Path<(Uuid, String, i32)>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    require_item(&state, item_id, auth.user.as_ref()).await?;
+    require_item(&state, item_id, auth.user.as_deref()).await?;
     state
         .providers
         .delete_image(item_id, image_type, Some(image_index))
@@ -1680,7 +1666,7 @@ async fn update_item_image_index(
     Query(query): Query<UpdateImageIndexQuery>,
 ) -> Result<StatusCode, ApiError> {
     let image_type = parse_image_type(&image_type)?;
-    require_item(&state, item_id, auth.user.as_ref()).await?;
+    require_item(&state, item_id, auth.user.as_deref()).await?;
     let swapped = state
         .library
         .swap_images(item_id, image_type, image_index, query.new_index)

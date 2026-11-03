@@ -45,7 +45,7 @@ use ferrofin_mediaencoding::{EncodingJobInfo, TranscodeDisplayNames, TranscodeMa
 use ferrofin_model::configuration::EncodingOptions;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{
-    HlsStreamManager, HlsStreamRequest, ServedFile, TranscodingJobType,
+    HlsStreamManager, HlsStreamRequest, ServedFile, TranscodingJobHandle, TranscodingJobType,
 };
 use ferrofin_traits::system::ServerApplicationPaths;
 use ferrofin_traits::trickplay::TrickplayManager;
@@ -1140,6 +1140,16 @@ where
             .ping_transcoding_job(play_session_id, is_user_paused)
             .await
     }
+
+    async fn get_transcoding_job(
+        &self,
+        play_session_id: &str,
+    ) -> Result<Option<TranscodingJobHandle>, ServiceError> {
+        use ferrofin_traits::media_encoding::TranscodeManager as _;
+        self.manager
+            .get_transcoding_job_by_session(play_session_id)
+            .await
+    }
 }
 
 impl<P, T, C, S> HlsStreamManagerImpl<P, T, C, S>
@@ -1581,7 +1591,8 @@ mod tests {
                 wait_for_path: (kind == PlaylistKind::Progressive).then(|| playlist.clone()),
                 segment_container: Some(self.segment_container.clone()),
                 play_session_id: Some("sess".to_owned()),
-                device_id: Some("dev".to_owned()),
+                // The request's, as the real planner carries it.
+                device_id: request.device_id.clone(),
             };
             // The real planner's event args differ; the fake tags them so the
             // live path's choice of plan is observable.
@@ -2252,10 +2263,11 @@ mod tests {
         assert_eq!(mgr.restart_failures.lock().unwrap()[key].0, 1);
     }
 
-    /// The manager learns the user from the request on every start path: a
-    /// user's idle job yields to that user and to nobody else.
+    /// The manager learns the user from the authorization and the device from
+    /// the request's `DeviceId` on every start path: a user's idle job yields
+    /// to that user on that device, and to nobody else.
     #[tokio::test]
-    async fn every_start_path_passes_the_authenticated_user_on() {
+    async fn every_start_path_passes_the_user_and_device_on() {
         let alice = Some(uuid::Uuid::from_u128(0xA11CE));
         let bob = Some(uuid::Uuid::from_u128(0xB0B));
         for path in START_PATHS {
@@ -2268,6 +2280,16 @@ mod tests {
                 ..req()
             };
             assert_refused(path, &start_through(&mgr, path, &as_bob).await);
+            let as_alice_on_another_device = HlsStreamRequest {
+                user_id: alice,
+                device_id: Some("other".to_owned()),
+                query_string: "?deviceId=other".to_owned(),
+                ..req()
+            };
+            assert_refused(
+                path,
+                &start_through(&mgr, path, &as_alice_on_another_device).await,
+            );
             let as_alice = HlsStreamRequest {
                 user_id: alice,
                 ..req()
@@ -2626,6 +2648,32 @@ mod tests {
             mgr.ping_transcoding_job("", None).await,
             Err(ServiceError::InvalidInput(_))
         ));
+    }
+
+    /// `GetTranscodingJob(playSessionId)`, which `ValidatePlayMethod` asks: the
+    /// registry's job for the play session, matched without regard to case.
+    #[tokio::test]
+    async fn get_transcoding_job_finds_the_play_sessions_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+        assert!(mgr.get_transcoding_job("play-1").await.unwrap().is_none());
+        mgr.manager.register_job(TranscodingJobHandle {
+            play_session_id: Some("play-1".to_owned()),
+            path: tmp.path().join("job.m3u8").to_string_lossy().into_owned(),
+            job_type: TranscodingJobType::Hls,
+            device_id: Some("dev".to_owned()),
+            live_stream_id: None,
+        });
+        for id in ["play-1", "PLAY-1"] {
+            let job = mgr.get_transcoding_job(id).await.unwrap();
+            assert_eq!(
+                job.and_then(|job| job.play_session_id).as_deref(),
+                Some("play-1"),
+                "{id}"
+            );
+        }
+        assert!(mgr.get_transcoding_job("play-2").await.unwrap().is_none());
+        assert!(mgr.get_transcoding_job("").await.unwrap().is_none());
     }
 
     #[test]

@@ -290,7 +290,8 @@ pub fn sw_vid_filter_chain(input: &ChainInput<'_>) -> FilterChain {
 /// `tonemapx` needs `yuv420p10` input to reshape a stream with no compatible
 /// base layer, so the format is forced to `yuv420p` and ffmpeg is left to
 /// convert, rather than being handed the nv12 the rest of the chain would use.
-fn sw_tonemap_filter(
+#[must_use]
+pub fn sw_tonemap_filter(
     options: &EncodingOptions,
     out_format: &str,
     requires_dovi_reshaping: bool,

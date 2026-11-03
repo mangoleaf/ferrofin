@@ -96,6 +96,14 @@ async fn extracts_an_attached_picture_by_stream_index() {
     // 32x24 per the IHDR chunk.
     assert_eq!(u32::from_be_bytes(bytes[16..20].try_into().unwrap()), 32);
     assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 24);
+    // The extraction ends in a conversion to the JPEG's BT.601 matrix
+    // (gl-1158). An RGB picture has no matrix to convert, so this only checks
+    // that the conversion leaves a PNG of one as it was.
+    let pixel = image::open(&out).unwrap().to_rgb8().get_pixel(16, 12).0;
+    assert!(
+        pixel[0] >= 250 && pixel[1] <= 4 && pixel[2] <= 4,
+        "still red: {pixel:?}"
+    );
 
     // A stream that is not a picture yields an error and leaves no file.
     let before = std::fs::read_dir(&temp).unwrap().count();

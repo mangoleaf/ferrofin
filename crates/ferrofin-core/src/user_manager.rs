@@ -15,9 +15,11 @@
 //! load-bearing rather than incidental — a guard evaluated on the *read* pool
 //! and acted on through the *writer* pool is a check-then-act, and the
 //! last-user / last-admin / duplicate-name guards below are all written in the
-//! transaction that acts on them for exactly that reason. The `.NET` event manager
-//! (`UserCreated`/`UserUpdated`/…) is out of scope (event wiring lands
-//! separately).
+//! transaction that acts on them for exactly that reason. A committed rename
+//! or policy save publishes `UserUpdated` on the event bus
+//! ([`with_events`](FerrofinUserManager::with_events)), as upstream's
+//! `RenameUser` and `UpdatePolicyAsync` publish `UserUpdatedEventArgs`; its
+//! consumers are in [`crate::user_updated`].
 //!
 //! Faithful port simplifications, each flagged:
 //! - `authenticate_user` shares the configured network policy with HTTP auth,
@@ -50,7 +52,8 @@ use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{
-    AdminFlagOutcome, PolicyGuardState, PolicySaved, UserManager, policy_update_refusal,
+    AdminFlagOutcome, ExternalUserSetup, PolicyGuardState, PolicySaved, UserManager,
+    policy_update_refusal,
 };
 use ferrofin_traits::security::{AuthenticationManager, PasswordResetManager};
 
@@ -82,7 +85,10 @@ const DEFAULT_BOOTSTRAP_USERNAME: &str = "MyJellyfinUser";
 
 type LoginLocks = Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>;
 
+mod login_backoff;
 mod user_repository;
+
+pub use login_backoff::LoginBackoffSettings;
 
 /// The concrete user manager.
 ///
@@ -99,6 +105,8 @@ mod user_repository;
 pub struct FerrofinUserManager {
     db: Database,
     login_locks: Arc<LoginLocks>,
+    /// Ferrofin's login backoff, shared by every clone.
+    login_backoff: Arc<login_backoff::LoginBackoff>,
     network: Option<Arc<RwLock<ferrofin_networking::NetworkManager>>>,
     default_provider: DefaultAuthenticationProvider,
     invalid_provider: InvalidAuthProvider,
@@ -133,6 +141,10 @@ pub struct FerrofinUserManager {
     /// Optional activity-log seam: a lockout is recorded as a dashboard Alert
     /// (port of upstream's `UserLockedOutLogger`). `None` in tests.
     activity: Option<Arc<dyn ferrofin_traits::activity::ActivityManager>>,
+    /// Where a rename or a policy save is announced
+    /// ([`USER_UPDATED_EVENT`](crate::user_updated::USER_UPDATED_EVENT)).
+    /// `None` in tests, which then announce nothing.
+    events: Option<Arc<dyn ferrofin_traits::events::EventManager>>,
     /// Server configuration, read to resolve a user's cast receiver against
     /// the configured applications (upstream does this at DTO time). `None`
     /// in tests, which then echo the stored value.
@@ -213,6 +225,10 @@ impl FerrofinUserManager {
     /// `Where(IsEnabled)` then `Where(id)`, with the same result: a provider
     /// another user's sign-in never selects is not consulted, so an extension
     /// provider whose `is_enabled` fails cannot fail a local account's sign-in.
+    ///
+    /// When nothing matches, the invalid provider stands in, and a warning
+    /// names the user and the saved id as upstream's does. That covers a sign-in
+    /// and a password change alike.
     async fn authentication_providers_for(
         &self,
         user: Option<&UserEntity>,
@@ -229,6 +245,16 @@ impl FerrofinUserManager {
             }
         }
         if candidates.is_empty() {
+            tracing::warn!(
+                username = user.map(|u| tracing::field::display(&u.username)),
+                user_id = user.map(|u| tracing::field::display(&u.id)),
+                // Saved text an administrator or an adopted database supplied:
+                // Debug escapes it (LOGGING.md, rule 6).
+                authentication_provider_id = wanted.map(tracing::field::debug),
+                "the user's saved authentication provider is missing or disabled; assigning \
+                 the invalid provider, which refuses every sign-in and ignores a password \
+                 change, until this is corrected"
+            );
             candidates.push(&self.invalid_provider);
         }
         Ok(candidates)
@@ -359,6 +385,9 @@ impl FerrofinUserManager {
         Self {
             db,
             login_locks: Arc::new(Mutex::new(HashMap::new())),
+            login_backoff: Arc::new(login_backoff::LoginBackoff::new(
+                LoginBackoffSettings::DEFAULT,
+            )),
             network: None,
             default_provider: DefaultAuthenticationProvider::new(),
             invalid_provider: InvalidAuthProvider::new(),
@@ -369,6 +398,7 @@ impl FerrofinUserManager {
             password_reset_lock: Arc::default(),
             server_id: None,
             activity: None,
+            events: None,
             config: None,
             profile_image_dir: None,
             image_processor: None,
@@ -591,6 +621,44 @@ impl FerrofinUserManager {
             .then_some(sent)
     }
 
+    /// Admits a login attempt to the login backoff: how long it waits, or
+    /// `None` when its address is refused. Unknown names are paced like known
+    /// ones, folded as the lookup folds them, which keeps the backoff from
+    /// telling the two apart.
+    fn admit_login(
+        &self,
+        user: Option<&UserEntity>,
+        username: &str,
+        remote_endpoint: &str,
+    ) -> Option<(std::time::Duration, login_backoff::Attempt<'_>)> {
+        let user_id = user.map(|user| user.id.as_str());
+        let account = login_backoff::account_key(user_id, username);
+        let who = login_backoff::Who {
+            account: &account,
+            user_id,
+            username,
+            address: (!remote_endpoint.is_empty()).then_some(remote_endpoint),
+        };
+        let admitted = self.login_backoff.admit(&who, std::time::Instant::now());
+        if admitted.is_none() {
+            tracing::debug!(
+                username = ?username,
+                remote_ip = remote_endpoint,
+                reason = "backoff",
+                "login refused by the login backoff"
+            );
+        }
+        admitted
+    }
+
+    /// Sets the login backoff (`login_backoff_*`; [`LoginBackoffSettings::DEFAULT`]
+    /// until the composition root calls this).
+    #[must_use]
+    pub fn with_login_backoff(mut self, settings: LoginBackoffSettings) -> Self {
+        self.login_backoff = Arc::new(login_backoff::LoginBackoff::new(settings));
+        self
+    }
+
     /// Attaches the activity-log seam so an account lockout is recorded as a
     /// dashboard Alert.
     #[must_use]
@@ -600,6 +668,35 @@ impl FerrofinUserManager {
     ) -> Self {
         self.activity = Some(activity);
         self
+    }
+
+    /// Attaches the event bus a committed rename or policy save is announced
+    /// on, so its consumers ([`crate::user_updated::subscribe`]) run whoever
+    /// called the manager.
+    #[must_use]
+    pub fn with_events(mut self, events: Arc<dyn ferrofin_traits::events::EventManager>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// Publishes [`USER_UPDATED_EVENT`](crate::user_updated::USER_UPDATED_EVENT)
+    /// for `user_id`, after a committed rename or policy save: upstream's
+    /// `PublishAsync(new UserUpdatedEventArgs(user))` and `OnUserUpdated`.
+    /// The bus logs a failing consumer and goes on, so this never fails the
+    /// save it follows. A save calls it after releasing its own login lock,
+    /// as upstream raises the event once `_userLock` is released; the
+    /// consumers take no login lock, so the sign-in path may hold its own.
+    async fn announce_user_updated(&self, user_id: Uuid) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        if let Ok(payload) = serde_json::to_string(&user_id)
+            && let Err(error) = events
+                .publish(crate::user_updated::USER_UPDATED_EVENT, &payload)
+                .await
+        {
+            tracing::debug!(user_id = %user_id, %error, "could not announce the user update");
+        }
     }
 
     /// Installs the shared [`crate::auth_cache::AuthCache`] (composition root
@@ -785,7 +882,7 @@ impl FerrofinUserManager {
     ) -> Result<PolicySaved, ServiceError> {
         let id = guid_to_db(user_id);
         let login_lock = self.login_lock(&id);
-        let _login_guard = login_lock.lock().await;
+        let login_guard = login_lock.lock().await;
         self.require_user(user_id).await?;
 
         // "The default number of login attempts is 3, but for some god forsaken
@@ -878,6 +975,8 @@ impl FerrofinUserManager {
         // One `SaveChangesAsync`: all or nothing.
         tx.commit().await.map_err(db_err)?;
         self.users_changed();
+        drop(login_guard);
+        self.announce_user_updated(user_id).await;
         Ok(PolicySaved {
             newly_disabled: policy.is_disabled && !was_disabled,
         })
@@ -1128,6 +1227,7 @@ impl UserManager for FerrofinUserManager {
             return Err(db_err(e));
         }
         self.users_changed();
+        self.announce_user_updated(user_id).await;
         Ok(())
     }
 
@@ -1230,6 +1330,58 @@ impl UserManager for FerrofinUserManager {
             .await
     }
 
+    async fn create_external_user(
+        &self,
+        name: &str,
+        setup: &ExternalUserSetup,
+    ) -> Result<UserEntity, ServiceError> {
+        require_valid_username(name)?;
+        // Set up inside the insert's transaction: committed first and set up
+        // after, the row would for a moment be a passwordless local account,
+        // which the built-in provider signs in with an empty password.
+        let setup = setup.clone();
+        let user = self
+            .insert_user(name, move |tx, id| {
+                Box::pin(async move {
+                    user_repository::set_providers(
+                        &mut **tx,
+                        id,
+                        &setup.authentication_provider_id,
+                        &setup.password_reset_provider_id,
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    set_permission_tx(
+                        tx,
+                        id,
+                        PermissionKind::EnableAllFolders,
+                        setup.enable_all_folders,
+                    )
+                    .await?;
+                    if let Some(folders) = &setup.enabled_folders {
+                        set_preference_tx(tx, id, PreferenceKind::EnabledFolders, folders).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await?;
+        // `CreateUserAsync` publishes `UserCreatedEventArgs`, which
+        // `UserCreatedLogger` records, whoever created the user.
+        if let Some(activity) = &self.activity
+            && let Err(error) = activity
+                .create_entry(ferrofin_traits::activity::ActivityLogCreate {
+                    name: format!("User {} has been created", user.username),
+                    type_: "UserCreated".to_owned(),
+                    user_id: Uuid::parse_str(&user.id).ok(),
+                    ..Default::default()
+                })
+                .await
+        {
+            tracing::debug!(user_id = %user.id, error = %error, "could not record the user's creation");
+        }
+        Ok(user)
+    }
+
     async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError> {
         // "At least one user" and "at least one admin" are invariants over the
         // whole table, so they are read INSIDE the transaction that deletes —
@@ -1263,14 +1415,16 @@ impl UserManager for FerrofinUserManager {
             )));
         }
 
-        // The `Permissions`/`Preferences`/`AccessSchedules`/`ImageInfos` rows are
-        // removed with the user; delete them explicitly so the port does not
-        // depend on schema cascade configuration.
+        // The `Permissions`/`Preferences`/`AccessSchedules`/`ImageInfos` rows and
+        // the user's `FerrofinExternalIdentities` links are removed with the
+        // user; delete them explicitly so the port does not depend on schema
+        // cascade configuration.
         for table in [
             "Permissions",
             "Preferences",
             "AccessSchedules",
             "ImageInfos",
+            "FerrofinExternalIdentities",
         ] {
             let sql = format!(r#"DELETE FROM "{table}" WHERE "UserId" = ?1"#);
             sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -1339,6 +1493,17 @@ impl UserManager for FerrofinUserManager {
         }
 
         let user = self.get_user_by_name(username).await?;
+        // Ferrofin's login backoff paces repeated failures before the lock, so
+        // a waiting attempt holds nothing. The attempt is dropped on every way
+        // out but success, which counts as a failure.
+        let Some((wait, attempt)) = self.admit_login(user.as_ref(), username, remote_endpoint)
+        else {
+            // Answered as a wrong password, which every caller already handles.
+            return Ok(None);
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
         // Authentication reads the user before password verification and writes
         // its counters afterwards. A writer transaction alone cannot serialize
         // that whole span. Match C#'s per-user lock and reload inside it.
@@ -1431,6 +1596,7 @@ impl UserManager for FerrofinUserManager {
         }
 
         tracing::info!(user_id = %user.id, username = %user.username, "login succeeded");
+        attempt.succeeded();
         // The writes above touch this user's row only.
         self.user_changed(&user.id);
         Ok(Some(user))
@@ -1650,6 +1816,32 @@ impl UserManager for FerrofinUserManager {
         Ok(dto)
     }
 
+    async fn user_primary_image_tag(
+        &self,
+        user: &UserEntity,
+    ) -> Result<Option<String>, ServiceError> {
+        // A hit copies the one tag instead of the whole DTO; a miss builds the
+        // DTO (and caches it) exactly as `get_user_dto` would.
+        if let Some(tag) = self.auth_cache.primary_image_tag(user) {
+            return Ok(tag);
+        }
+        Ok(self.get_user_dto(user, None).await?.primary_image_tag)
+    }
+
+    async fn latest_items_excludes(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
+        // A hit copies the one list instead of the whole DTO; a miss builds the
+        // DTO (and caches it) exactly as `get_user_dto` would.
+        if let Some(excludes) = self.auth_cache.latest_items_excludes(user) {
+            return Ok(excludes);
+        }
+        Ok(self
+            .get_user_dto(user, None)
+            .await?
+            .configuration
+            .map(|c| c.latest_items_excludes)
+            .unwrap_or_default())
+    }
+
     async fn update_configuration(
         &self,
         user_id: Uuid,
@@ -1730,6 +1922,11 @@ impl UserManager for FerrofinUserManager {
     /// administrators. It takes no login lock: the password path calls it
     /// while holding the user's, which does not nest (`save_policy` would wait
     /// on it forever).
+    ///
+    /// It announces nothing, unlike a policy save: upstream's LDAP plugin
+    /// writes the flag with `UpdateUserAsync` (jellyfin-plugin-ldapauth v24,
+    /// `LdapAuthenticationProviderPlugin.Authenticate`), which publishes no
+    /// `UserUpdatedEventArgs`.
     async fn apply_external_administrator(
         &self,
         user_id: Uuid,
@@ -2900,6 +3097,11 @@ mod tests {
         // First build populates the cache; a repeat with the same entity hits it.
         let first = mgr.get_user_dto(&user, None).await.expect("dto");
         assert_eq!(mgr.auth_cache.get_user_dto(&user), Some(first.clone()));
+        assert_eq!(
+            mgr.auth_cache.latest_items_excludes(&user),
+            Some(Vec::new()),
+            "the list read hits the same cached DTO"
+        );
         let second = mgr.get_user_dto(&user, None).await.expect("dto again");
         assert_eq!(second, first);
 
@@ -2935,8 +3137,62 @@ mod tests {
         let mut renamed = user.clone();
         renamed.username = "erin2".to_owned();
         assert!(mgr.auth_cache.get_user_dto(&renamed).is_none());
+        assert!(
+            mgr.auth_cache.latest_items_excludes(&renamed).is_none(),
+            "the list read checks the entity the DTO was built from too"
+        );
         let fresh = mgr.get_user_dto(&renamed, None).await.expect("dto renamed");
         assert_eq!(fresh.name.as_deref(), Some("erin2"));
+    }
+
+    /// `/Items/Latest` and `/UserItems/Resume` read one list off the user's
+    /// configuration. The read answers what `get_user_dto` would, from a cold
+    /// cache and from a warm one, and follows a configuration change.
+    #[tokio::test]
+    async fn latest_items_excludes_reads_the_configuration_get_user_dto_builds() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let user = mgr.create_user("fern").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        let excluded = vec![Uuid::from_u128(0xa1), Uuid::from_u128(0xa2)];
+        let config = UserConfiguration {
+            latest_items_excludes: excluded.clone(),
+            ..mgr
+                .get_user_dto(&user, None)
+                .await
+                .expect("dto")
+                .configuration
+                .expect("configuration")
+        };
+        mgr.update_configuration(id, &config).await.expect("update");
+
+        // Cold: the update cleared the cache, so this read builds and caches.
+        assert!(mgr.auth_cache.get_user_dto(&user).is_none());
+        assert_eq!(
+            mgr.latest_items_excludes(&user).await.expect("cold read"),
+            excluded
+        );
+        assert!(
+            mgr.auth_cache.get_user_dto(&user).is_some(),
+            "a cold read leaves the DTO cached for the next request"
+        );
+        // Warm: the same answer from the cached DTO.
+        assert_eq!(
+            mgr.latest_items_excludes(&user).await.expect("warm read"),
+            excluded
+        );
+
+        let cleared = UserConfiguration {
+            latest_items_excludes: Vec::new(),
+            ..config
+        };
+        mgr.update_configuration(id, &cleared).await.expect("clear");
+        assert_eq!(
+            mgr.latest_items_excludes(&user)
+                .await
+                .expect("after change"),
+            Vec::<Uuid>::new()
+        );
     }
 
     #[rstest::rstest]
@@ -3265,7 +3521,13 @@ mod tests {
                     is_active: true,
                     user_id: user.id.clone(),
                 };
-                cache.put(generation, token, device, Some(user.clone()), None);
+                cache.put(
+                    generation,
+                    token,
+                    device,
+                    Some(Arc::new(user.clone())),
+                    None,
+                );
                 cache.put_user_dto(generation, user, UserDto::default());
             }
         };
@@ -3330,7 +3592,12 @@ mod tests {
         #[case] locked_at: Option<i64>,
     ) {
         let db = test_db().await;
-        let mgr = FerrofinUserManager::new(db);
+        // Upstream's lockout, not Ferrofin's backoff, whose wait would slow
+        // the final login.
+        let mgr = FerrofinUserManager::new(db).with_login_backoff(LoginBackoffSettings {
+            attempts: 0,
+            ..LoginBackoffSettings::DEFAULT
+        });
         let user = mgr.create_user("sentinel").await.unwrap();
         let uid = Uuid::parse_str(&user.id).unwrap();
         let mut policy = UserPolicy {
@@ -3379,7 +3646,12 @@ mod tests {
         #[case] expected: i64,
     ) {
         let db = test_db().await;
-        let mgr = FerrofinUserManager::new(db);
+        // Upstream's counter, not Ferrofin's backoff, which would refuse most
+        // of these before they count.
+        let mgr = FerrofinUserManager::new(db).with_login_backoff(LoginBackoffSettings {
+            attempts: 0,
+            ..LoginBackoffSettings::DEFAULT
+        });
         let user = mgr.create_user("concurrent").await.unwrap();
         let uid = Uuid::parse_str(&user.id).unwrap();
         mgr.update_policy(

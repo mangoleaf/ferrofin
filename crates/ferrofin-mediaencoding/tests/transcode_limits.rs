@@ -28,6 +28,9 @@ const ALICE: Option<Uuid> = Some(Uuid::from_u128(0xA11CE));
 const BOB: Option<Uuid> = Some(Uuid::from_u128(0xB0B));
 /// An API key has no user.
 const API_KEY: Option<Uuid> = None;
+/// The device every start comes from unless a test names another, as one
+/// player's "next episode" does.
+const TV: Option<&str> = Some("living-room-tv");
 
 /// What the job does to each stream of the source.
 #[derive(Clone, Copy)]
@@ -62,6 +65,7 @@ impl SessionReporter for Reporter {
     async fn report_started(&self, _job: &TranscodingJobHandle, _info: TranscodingInfo) {
         *self.0.started.lock().unwrap() += 1;
     }
+    async fn on_job_failed_to_start(&self, _job: &TranscodingJobHandle) {}
     async fn on_job_killed(
         &self,
         job: &TranscodingJobHandle,
@@ -121,8 +125,20 @@ impl Fixture {
         user: Option<Uuid>,
         streams: Streams,
     ) -> Result<TranscodingJobHandle, StartFfmpegError> {
+        self.start_from(session, user, TV, streams).await
+    }
+
+    /// [`Self::start`] from `device`, the request's `DeviceId`.
+    async fn start_from(
+        &self,
+        session: &str,
+        user: Option<Uuid>,
+        device: Option<&str>,
+        streams: Streams,
+    ) -> Result<TranscodingJobHandle, StartFfmpegError> {
         let playlist = self.playlist(session);
-        let job = state(&playlist, session, streams);
+        let mut job = state(&playlist, session, streams);
+        job.device_id = device.map(str::to_owned);
         self.manager
             .start_ffmpeg(&self.fake, request(&job, &playlist, self.log_dir(), user))
             .await
@@ -192,7 +208,7 @@ fn state(output_path: &Path, session: &str, streams: Streams) -> EncodingJobInfo
         wait_for_path: Some(output_path.to_path_buf()),
         segment_container: Some("ts".to_owned()),
         play_session_id: Some(session.to_owned()),
-        device_id: Some(format!("device-{session}")),
+        device_id: TV.map(str::to_owned),
     }
 }
 
@@ -485,8 +501,8 @@ async fn eviction_keeps_a_live_stream_the_next_job_reads(
 }
 
 /// A client that hangs up on a start leaves a job nobody waits for. Its slot
-/// goes to the same user's next start, not to the ping timeout, whether or not
-/// the process had started yet.
+/// goes to the same user's next start from the same device, not to the ping
+/// timeout, whether or not the process had started yet.
 #[rstest]
 #[case::while_spawning(true)]
 #[case::while_waiting_for_output(false)]
@@ -586,6 +602,76 @@ async fn the_server_cap_also_evicts_the_users_own_idle_job() {
         .await
         .expect("evicts a1");
     assert_eq!(fixture.killed(), ["a1"]);
+}
+
+/// Two devices on one account. A job with no request is also a player between
+/// two segment requests, so a start from another device past a cap is refused:
+/// ending that job would have its next segment restart it and end this one in
+/// turn, the two devices ending each other's jobs.
+#[rstest]
+#[case::per_user_cap(0, 1, TranscodeRefused::User)]
+#[case::server_cap(1, 0, TranscodeRefused::Server)]
+#[tokio::test]
+async fn another_device_of_the_user_is_refused_and_its_stream_kept(
+    #[case] server: u32,
+    #[case] per_user: u32,
+    #[case] refusal: TranscodeRefused,
+) {
+    let fixture = Fixture::new(server, per_user);
+    let playing = fixture.start("tv", ALICE, TRANSCODE).await.unwrap();
+
+    let refused = fixture
+        .start_from("tablet", ALICE, Some("bedroom-tablet"), TRANSCODE)
+        .await;
+
+    assert_eq!(refused_by(refused), refusal);
+    assert_eq!(fixture.killed(), Vec::<String>::new());
+    assert_eq!(fixture.spawned(), 1, "nothing spawned for the tablet");
+    assert!(
+        fixture
+            .manager
+            .begin_request_guard(&playing.path, playing.job_type)
+            .is_some(),
+        "the TV's next segment request finds its job"
+    );
+}
+
+/// The job evicted is one of the same device, its `DeviceId` compared ignoring
+/// ASCII case, as upstream's `KillTranscodingJobs` ignores case. Unless both
+/// sides carry a device there is no telling a player of the same device, so
+/// nothing is evicted.
+#[rstest]
+#[case::same_device(Some("tv"), Some("tv"), true)]
+#[case::same_device_in_another_case(Some("Living-Room-TV"), Some("living-room-tv"), true)]
+#[case::another_device(Some("tv"), Some("tablet"), false)]
+#[case::no_device_on_either(None, None, false)]
+#[case::empty_device_on_both(Some(""), Some(""), false)]
+#[case::no_device_on_the_new_start(Some("tv"), None, false)]
+#[case::no_device_on_the_idle_job(None, Some("tv"), false)]
+#[tokio::test]
+async fn only_a_job_of_the_same_device_is_evicted(
+    #[case] idle_device: Option<&str>,
+    #[case] next_device: Option<&str>,
+    #[case] evicted: bool,
+) {
+    let fixture = Fixture::new(0, 1);
+    fixture
+        .start_from("ep1", ALICE, idle_device, TRANSCODE)
+        .await
+        .unwrap();
+
+    let next = fixture
+        .start_from("ep2", ALICE, next_device, TRANSCODE)
+        .await;
+
+    if evicted {
+        next.expect("the same device's idle job gives up its slot");
+        assert_eq!(fixture.killed(), ["ep1"]);
+    } else {
+        assert_eq!(refused_by(next), TranscodeRefused::User);
+        assert_eq!(fixture.killed(), Vec::<String>::new());
+    }
+    assert_eq!(fixture.manager.active_job_count(), 1);
 }
 
 /// A job still starting holds a slot and has its start as a consumer, so a

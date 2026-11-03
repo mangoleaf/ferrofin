@@ -321,9 +321,9 @@ pub struct TrickplayExtraction<'a> {
     /// with a broken keyframe index; the extractor retries without it.
     pub keyframe_only: bool,
     /// `TrickplayOptions::full_chroma`: write 4:4:4 frames on the software
-    /// path (`build_trickplay_args`). A job on the hardware path keeps its
-    /// chain's 4:2:0. So does one whose source the GPU cannot decode, which
-    /// could be 4:4:4: that is open work (gl-1132).
+    /// path (`build_trickplay_args`), which a job with nothing on the GPU
+    /// takes too. A job on the hardware path keeps 4:2:0: its frames go
+    /// through a hardware decoder, scaler or encoder.
     pub full_chroma: bool,
 }
 
@@ -952,6 +952,21 @@ pub trait HlsStreamManager: Send + Sync {
         play_session_id: &str,
         is_user_paused: Option<bool>,
     ) -> Result<(), ServiceError>;
+
+    /// The transcoding job running for `play_session_id`, if any, matched
+    /// without regard to case.
+    ///
+    /// Port of `TranscodeManager.GetTranscodingJob(playSessionId)`, which
+    /// `PlaystateController.ValidatePlayMethod` asks before it keeps a
+    /// reported `Transcode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] if the job registry cannot be read.
+    async fn get_transcoding_job(
+        &self,
+        play_session_id: &str,
+    ) -> Result<Option<TranscodingJobHandle>, ServiceError>;
 }
 
 /// Compile-time assertion that [`HlsStreamManager`] is object-safe.

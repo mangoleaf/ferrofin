@@ -2,9 +2,9 @@
 //! published-URL resolver.
 //!
 //! Live managers refresh operating-system interfaces at boot, configuration saves,
-//! and peer URL resolution. Mock and provided snapshots remain deterministic.
-//! TODO: refresh shared policy caches on OS network events (Linux rtnetlink and
-//! corresponding Windows/macOS notifications), with debounce and parity tests.
+//! peer URL resolution and OS network changes ([`NetworkManager::on_network_change`],
+//! driven by [`crate::network_change`]). Mock and provided snapshots remain
+//! deterministic.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -31,7 +31,8 @@ const IPV6_ANY: IpAddr = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
 
 /// The startup configuration bag (`Microsoft.Extensions.Configuration.IConfiguration`).
 ///
-/// Only two keys are consumed (see [`crate::config_keys`]); a plain string map
+/// The manager reads one key from it, `PublishedServerUrl`
+/// ([`crate::config_keys`]); a plain string map
 /// is sufficient and mirrors the `IConfiguration[key]` indexer semantics
 /// (missing key → `None`).
 #[derive(Debug, Clone, Default)]
@@ -180,10 +181,14 @@ impl HostLookup {
     }
 }
 
+/// Reads the operating system's interfaces for the enabled families
+/// (IPv4, IPv6): `NetworkManager.GetInterfacesCore`.
+pub type InterfaceEnumerator = Arc<dyn Fn(bool, bool) -> Vec<IpData> + Send + Sync>;
+
 enum InterfaceSource {
     Mock(String),
     Provided(Vec<IpData>),
-    Live,
+    Live(InterfaceEnumerator),
 }
 
 impl NetworkManager {
@@ -237,8 +242,20 @@ impl NetworkManager {
     /// Constructs a manager that enumerates live OS interfaces.
     #[must_use]
     pub fn live(config: NetworkConfiguration) -> Self {
+        Self::live_with_enumerator(config, Arc::new(crate::interfaces::enumerate))
+    }
+
+    /// Constructs a live manager that reads its interfaces from `enumerator`
+    /// instead of the operating system, every time [`Self::live`] would
+    /// enumerate them: at construction, [`Self::refresh_interfaces`],
+    /// [`Self::update_settings`] and [`Self::on_network_change`].
+    #[must_use]
+    pub fn live_with_enumerator(
+        config: NetworkConfiguration,
+        enumerator: InterfaceEnumerator,
+    ) -> Self {
         let mut manager = Self::with_defaults(config, "");
-        manager.interface_source = InterfaceSource::Live;
+        manager.interface_source = InterfaceSource::Live(enumerator);
         manager.refresh_interfaces();
         manager
     }
@@ -286,10 +303,80 @@ impl NetworkManager {
 
     /// Refreshes live interfaces and dependent settings; injected snapshots stay fixed.
     pub fn refresh_interfaces(&mut self) {
-        if matches!(self.interface_source, InterfaceSource::Live) {
+        if matches!(self.interface_source, InterfaceSource::Live(_)) {
             let config = self.config.clone();
             self.update_settings(&config);
         }
+    }
+
+    /// Re-reads the interfaces after the operating system reported a network
+    /// change (`NetworkManager.OnNetworkChange`, after its 2-second wait,
+    /// which [`crate::network_change::monitor`] owns).
+    ///
+    /// Like upstream, this re-enumerates the interfaces, re-initializes the
+    /// LAN subnets and re-applies the bind settings. The remote address
+    /// filter, `KnownProxies` and the published-server overrides are left as
+    /// they are, except when IPv6 is enabled but the operating system has no
+    /// IPv6 (`Socket.OSSupportsIPv6`), where upstream runs the whole
+    /// `UpdateSettings`. The network information is then logged at debug
+    /// (`PrintNetworkInformation`). Mock and provided snapshots stay fixed.
+    pub fn on_network_change(&mut self) {
+        self.on_network_change_with(os_supports_ipv6);
+    }
+
+    /// [`Self::on_network_change`] asking `os_supports_ipv6` whether the
+    /// operating system has IPv6, only when IPv6 is enabled (upstream's
+    /// `IsIPv6Enabled && !Socket.OSSupportsIPv6`), so both of its branches
+    /// can be tested.
+    pub fn on_network_change_with(&mut self, os_supports_ipv6: impl FnOnce() -> bool) {
+        let InterfaceSource::Live(enumerator) = &self.interface_source else {
+            return;
+        };
+        let enumerator = Arc::clone(enumerator);
+        let config = self.config.clone();
+        if config.enable_ipv6 && !os_supports_ipv6() {
+            self.update_settings(&config);
+        } else {
+            self.interfaces = enumerator(config.enable_ipv4, config.enable_ipv6);
+            self.initialize_lan(&config);
+            self.enforce_bind_settings(&config);
+        }
+        self.log_network_information();
+    }
+
+    /// `NetworkManager.PrintNetworkInformation` at its debug level, as one
+    /// event.
+    fn log_network_information(&self) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let ipv4_first = |addresses: &mut Vec<IpAddr>| addresses.sort_by_key(|a| !a.is_ipv4());
+        let mut interfaces: Vec<IpAddr> = self.interfaces.iter().map(|x| x.address).collect();
+        ipv4_first(&mut interfaces);
+        let mut bind: Vec<IpAddr> = self
+            .get_all_bind_interfaces(false)
+            .iter()
+            .map(|x| x.address)
+            .collect();
+        ipv4_first(&mut bind);
+        tracing::debug!(
+            lan_subnets = ?cidrs(&self.lan_subnets),
+            lan_exclusions = ?cidrs(&self.excluded_subnets),
+            used_lan_subnets = ?cidrs(
+                self.lan_subnets
+                    .iter()
+                    .filter(|s| !self.excluded_subnets.contains(s))
+            ),
+            interface_addresses = ?interfaces,
+            bind_addresses = ?bind,
+            remote_ip_filter = if self.config.is_remote_ip_filter_blacklist {
+                "Blocklist"
+            } else {
+                "Allowlist"
+            },
+            filtered_subnets = ?cidrs(&self.remote_address_filter),
+            "network information after a network change"
+        );
     }
 
     /// The network configuration the manager was last given
@@ -363,9 +450,7 @@ impl NetworkManager {
         self.initialize_remote(config);
 
         self.interfaces = match &self.interface_source {
-            InterfaceSource::Live => {
-                crate::interfaces::enumerate(config.enable_ipv4, config.enable_ipv6)
-            }
+            InterfaceSource::Live(enumerator) => enumerator(config.enable_ipv4, config.enable_ipv6),
             InterfaceSource::Provided(interfaces) => interfaces.clone(),
             InterfaceSource::Mock(settings) if settings.is_empty() => Vec::new(),
             InterfaceSource::Mock(settings) => {
@@ -1234,6 +1319,21 @@ fn dedup(addresses: &mut Vec<IpAddr>) {
             true
         }
     });
+}
+
+/// Subnets as upstream prints them: `BaseAddress/PrefixLength`.
+fn cidrs<'a>(subnets: impl IntoIterator<Item = &'a IpNetwork>) -> Vec<String> {
+    subnets
+        .into_iter()
+        .map(|s| format!("{}/{}", s.base_address, s.prefix_length))
+        .collect()
+}
+
+/// Whether the operating system can open an IPv6 socket
+/// (`Socket.OSSupportsIPv6`). A host booted with `ipv6.disable=1` cannot;
+/// one with only the `disable_ipv6` sysctl set still can, as for .NET.
+fn os_supports_ipv6() -> bool {
+    std::net::UdpSocket::bind((IPV6_ANY, 0)).is_ok()
 }
 
 /// Keeps the first interface for each distinct address (`DistinctBy(Address)`).

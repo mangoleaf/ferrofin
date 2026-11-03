@@ -34,6 +34,7 @@ pub mod ffmpeg;
 pub mod file_transformation;
 pub mod fingerprint;
 pub mod intro_skipper;
+pub mod ldap_auth;
 mod library_pages;
 pub mod merge_versions;
 
@@ -77,14 +78,19 @@ pub struct ExtensionContext {
     /// other. Both live for the whole process, so the cycle is never freed,
     /// which is harmless.
     pub users: Arc<dyn UserManager>,
+    /// Links from outside identities (an LDAP uid, later an OIDC subject) to
+    /// users: an authentication provider finds and records through it who
+    /// signs in with which identity.
+    pub external_identities: Arc<dyn ferrofin_traits::external_identities::ExternalIdentityStore>,
 }
 
 /// A curated, compiled-in capability that surfaces as a Jellyfin plugin.
 pub trait Extension: Send + Sync {
     /// Stable id — also the plugin id in `/Plugins`.
     fn id(&self) -> Uuid;
-    /// The `/Plugins` presentation (name, version, description). `enabled` is set
-    /// by the plugin manager from persisted state, so the value here is ignored.
+    /// The `/Plugins` presentation (name, version, description). `enabled` is the
+    /// plugin's default: the plugin manager reports it until an administrator
+    /// enables or disables the plugin, and the persisted choice after that.
     fn descriptor(&self) -> PluginDescriptor;
     /// The seed configuration written on first run (the plugin config schema).
     fn default_config(&self) -> Vec<u8>;
@@ -132,6 +138,7 @@ pub fn builtin_extensions() -> Vec<Arc<dyn Extension>> {
         Arc::new(file_transformation::FileTransformationExtension),
         Arc::new(merge_versions::MergeVersionsExtension),
         Arc::new(ferrofin_settings::FerrofinSettingsExtension),
+        Arc::new(ldap_auth::LdapAuthExtension),
     ]
 }
 
@@ -280,6 +287,11 @@ mod tests {
             ),
             chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
             users: Arc::clone(&users) as Arc<dyn UserManager>,
+            external_identities: Arc::new(
+                ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(
+                    db.clone(),
+                ),
+            ),
         };
         (cx, users)
     }
@@ -502,7 +514,7 @@ mod tests {
     #[test]
     fn registered_plugins_carry_each_extensions_seed_config_and_pages() {
         let extensions = builtin_extensions();
-        assert_eq!(extensions.len(), 4);
+        assert_eq!(extensions.len(), 5);
         let plugins = registered_plugins(&extensions);
         assert_eq!(plugins.len(), extensions.len());
         for (plugin, ext) in plugins.iter().zip(&extensions) {
@@ -522,7 +534,45 @@ mod tests {
     fn extension_ids_are_unique() {
         let ids: std::collections::HashSet<Uuid> =
             builtin_extensions().iter().map(|e| e.id()).collect();
-        assert_eq!(ids.len(), 4, "plugin ids double as /Plugins keys");
+        assert_eq!(ids.len(), 5, "plugin ids double as /Plugins keys");
+    }
+
+    #[tokio::test]
+    async fn ldap_auth_is_listed_under_the_upstream_guid_and_off_by_default() {
+        let id = Uuid::parse_str("958aad66-3784-4d2a-b89a-a7b6fab6e25c").expect("guid");
+        let ldap = builtin_extensions()
+            .into_iter()
+            .find(|e| e.id() == id)
+            .expect("LDAP-Auth is a built-in extension");
+        let descriptor = ldap.descriptor();
+        assert_eq!(descriptor.name, "LDAP-Auth");
+        assert!(
+            !descriptor.enabled,
+            "D3: disabled until an admin enables it"
+        );
+        // It contributes the sign-in provider under upstream's name and id,
+        // which stays out of `GET /Auth/Providers` while the plugin is off.
+        let (cx, users) = context_with_users().await;
+        let providers = ldap.auth_providers(&cx);
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name(), "LDAP-Authentication");
+        assert_eq!(
+            providers[0].id(),
+            "Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin"
+        );
+        assert!(!providers[0].is_enabled().await.expect("enabled"));
+        register_auth_providers(std::slice::from_ref(&ldap), &cx, &users);
+        let listed: Vec<Option<String>> = cx
+            .users
+            .get_authentication_providers()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|pair| pair.name)
+            .collect();
+        assert_eq!(listed, [Some("Default".to_owned())]);
+        assert!(ldap.password_reset_providers(&cx).is_empty());
+        assert!(ldap.tasks(&cx).is_empty());
     }
 
     #[tokio::test]

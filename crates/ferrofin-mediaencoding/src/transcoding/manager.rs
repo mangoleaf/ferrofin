@@ -77,7 +77,8 @@ pub struct StartFfMpegRequest<'a> {
     pub hardware_acceleration_type: HardwareAccelerationType,
     /// The authenticated user the job is for, from the authorization and
     /// never the query; `None` for a userless API key. The per-user cap counts
-    /// by it, and only this user's idle jobs are evicted for this job.
+    /// by it, and only this user's idle jobs from the same device (the state's
+    /// `DeviceId`) are evicted for this job.
     pub user_id: Option<uuid::Uuid>,
 }
 
@@ -173,6 +174,13 @@ pub trait SessionReporter: Send + Sync {
     /// them when stderr statistics provide framerate and completion values.
     async fn report_started(&self, job: &TranscodingJobHandle, info: TranscodingInfo);
 
+    /// Tells the session layer that `job`'s ffmpeg never started, so its
+    /// device stops showing the transcode [`Self::report_started`] published.
+    ///
+    /// Port of the `ClearTranscodingInfo(state.Request.DeviceId)` in
+    /// `TranscodeManager.OnTranscodeFailedToStart`.
+    async fn on_job_failed_to_start(&self, job: &TranscodingJobHandle);
+
     /// Tears a killed `job` down, deleting its partial output when
     /// `delete_files` is set.
     ///
@@ -206,6 +214,10 @@ impl<S: SessionReporter + ?Sized> SessionReporter for std::sync::Arc<S> {
         (**self).report_started(job, info).await;
     }
 
+    async fn on_job_failed_to_start(&self, job: &TranscodingJobHandle) {
+        (**self).on_job_failed_to_start(job).await;
+    }
+
     async fn on_job_killed(
         &self,
         job: &TranscodingJobHandle,
@@ -231,6 +243,7 @@ impl SessionReporter for NoopSessionReporter {
         _info: ferrofin_model::session::TranscodingInfo,
     ) {
     }
+    async fn on_job_failed_to_start(&self, _job: &TranscodingJobHandle) {}
     async fn on_job_killed(
         &self,
         _job: &TranscodingJobHandle,
@@ -496,27 +509,41 @@ impl RegisteredJob {
                 .is_none_or(|running| !running.child.has_exited())
     }
 
-    /// Whether this job may be killed to admit another of its user's: it holds
-    /// a slot and nobody is reading from it right now. A job still starting
-    /// has its start as a consumer, unless the client hung up on that start.
-    fn is_evictable_for(&self, user: uuid::Uuid) -> bool {
-        self.user_id == Some(user) && self.active_request_count <= 0 && self.holds_transcode_slot()
+    /// Whether this job may be killed to admit another of `user`'s from
+    /// `device`: it is that user's, from that device (its `DeviceId`, ignoring
+    /// ASCII case as the kill-by-device path does; upstream's
+    /// `KillTranscodingJobs` uses `OrdinalIgnoreCase`), it holds a slot, and
+    /// nobody is reading from it right now. A job still starting has its start
+    /// as a consumer, unless the client hung up on that start.
+    fn is_evictable_for(&self, user: uuid::Uuid, device: &str) -> bool {
+        self.user_id == Some(user)
+            && self
+                .handle
+                .device_id
+                .as_deref()
+                .is_some_and(|own| own.eq_ignore_ascii_case(device))
+            && self.active_request_count <= 0
+            && self.holds_transcode_slot()
     }
 }
 
-/// Makes room in `jobs` for one more re-encoding job of `user`: `Ok(None)` when
-/// there is room, the job taken out to make it, or the cap that refuses it.
+/// Makes room in `jobs` for one more re-encoding job of `user` from `device`,
+/// the request's `DeviceId`: `Ok(None)` when there is room, the job taken out
+/// to make it, or the cap that refuses it.
 ///
 /// One job is always enough, since every job counted came through here. It is
-/// the user's own longest-idle job, so "next episode" works while the last
-/// episode's job waits for its ping timeout, and a second device of the same
-/// user survives when it can. An idle job is not always abandoned: an HLS
-/// player between two segment requests has no active request either. A job
-/// without a user has no idle jobs to give up.
+/// the longest-idle job of the same user on the same device, so "next episode"
+/// works while the last episode's job waits for its ping timeout. Another
+/// device's job is never taken: an idle job is not always abandoned, since an
+/// HLS player between two segment requests has no active request either, and
+/// ending it would have that player's next segment restart it and end this
+/// job in turn. That start is refused instead, until a job ends. A start
+/// without a user or without a device has no idle job to give up.
 fn take_job_to_admit(
     jobs: &mut Vec<RegisteredJob>,
     limits: TranscodeLimits,
     user: Option<uuid::Uuid>,
+    device: Option<&str>,
 ) -> Result<Option<RegisteredJob>, TranscodeRefused> {
     let running = |user: Option<uuid::Uuid>| {
         jobs.iter()
@@ -528,10 +555,11 @@ fn take_job_to_admit(
     if !server_full && !user_full {
         return Ok(None);
     }
-    let longest_idle = user.and_then(|user| {
+    let device = device.filter(|device| !device.is_empty());
+    let longest_idle = user.zip(device).and_then(|(user, device)| {
         jobs.iter()
             .enumerate()
-            .filter(|(_, job)| job.is_evictable_for(user))
+            .filter(|(_, job)| job.is_evictable_for(user, device))
             .min_by_key(|(_, job)| job.last_activity)
             .map(|(index, _)| index)
     });
@@ -605,8 +633,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     }
 
     /// Caps the concurrent re-encoding jobs, server-wide and per user. A start
-    /// past a cap first evicts that user's idle jobs and is otherwise refused
-    /// before anything is created or spawned.
+    /// past a cap first evicts an idle job of the same user on the same device
+    /// and is otherwise refused before anything is created or spawned.
     ///
     /// Divergence from upstream, which has no cap; see
     /// [`limits`](super::limits).
@@ -898,12 +926,14 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 
     /// [`register_job`](Self::register_job) for a starting job of `user`, past
     /// the [`TranscodeLimits`] check when it `encodes`, returning the idle job
-    /// it replaces, if any, for the caller to tear down.
+    /// of the same device (`handle.device_id`) it replaces, if any, for the
+    /// caller to tear down.
     ///
     /// The count and the insert happen under one lock, so concurrent starts
     /// cannot both pass the check. The job enters with its start as a consumer,
     /// which the caller's [`TranscodeRequestGuard`] releases: under the same
-    /// lock, so a concurrent start of the same user cannot take it for idle.
+    /// lock, so a concurrent start from the same user and device cannot take
+    /// it for idle.
     fn register_job_for_user(
         &self,
         handle: &TranscodingJobHandle,
@@ -912,7 +942,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     ) -> Result<Option<RegisteredJob>, TranscodeRefused> {
         let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
         let evicted = if encodes {
-            take_job_to_admit(&mut jobs, self.limits, user)?
+            take_job_to_admit(&mut jobs, self.limits, user, handle.device_id.as_deref())?
         } else {
             None
         };
@@ -1071,6 +1101,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             Ok(child) => child,
             Err(e) => {
                 self.remove_job_by_path(&handle.path, handle.job_type);
+                self.reporter.on_job_failed_to_start(&handle).await;
                 return Err(e.into());
             }
         };
@@ -1332,10 +1363,10 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     }
 
     /// Kills an idle job taken out of the registry to admit `next`, another of
-    /// its user's. The same teardown as the idle reaper's, which this job would
-    /// otherwise have met at its ping timeout, except for a `next` on the same
-    /// live stream: as on a seek restart, that one is about to re-open ffmpeg
-    /// on the same tuner, so the tuner stays open.
+    /// its user's from the same device. The same teardown as the idle reaper's,
+    /// which this job would otherwise have met at its ping timeout, except for
+    /// a `next` on the same live stream: as on a seek restart, that one is
+    /// about to re-open ffmpeg on the same tuner, so the tuner stays open.
     async fn evict_job(&self, job: RegisteredJob, next: &TranscodingJobHandle) {
         let RegisteredJob {
             handle,
@@ -1348,7 +1379,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             play_session_id = handle.play_session_id.as_deref().unwrap_or(""),
             device_id = handle.device_id.as_deref().unwrap_or(""),
             playing = %playing_label,
-            "killing idle transcode job to admit the same user's next one"
+            "killing idle transcode job to admit the same device's next one"
         );
         let same_live_stream =
             handle.live_stream_id.is_some() && handle.live_stream_id == next.live_stream_id;
@@ -2040,11 +2071,14 @@ mod tests {
     }
 
     /// A reporter that records the kills it was asked to perform.
+    #[derive(Default)]
     pub(super) struct RecordingReporter {
         /// `(path, delete_files, close_live_stream)` per teardown.
         pub(super) killed: Mutex<Vec<(String, bool, bool)>>,
         /// `(device_id, accelerator, video_codec)` per started job.
         pub(super) started: Mutex<Vec<(String, super::HardwareAccelerationType, Option<String>)>>,
+        /// The device of each job whose ffmpeg never started.
+        pub(super) failed: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -2060,6 +2094,12 @@ mod tests {
                     .unwrap_or(super::HardwareAccelerationType::none),
                 info.video_codec,
             ));
+        }
+        async fn on_job_failed_to_start(&self, job: &TranscodingJobHandle) {
+            self.failed
+                .lock()
+                .unwrap()
+                .push(job.device_id.clone().unwrap_or_default());
         }
         async fn report_progress(
             &self,
@@ -2082,10 +2122,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_notifies_reporter_with_delete_flag() {
-        let reporter = Arc::new(RecordingReporter {
-            killed: Mutex::new(Vec::new()),
-            started: Mutex::new(Vec::new()),
-        });
+        let reporter = Arc::new(RecordingReporter::default());
         let m = TranscodeManagerImpl::new(ReporterHandle(Arc::clone(&reporter)));
         m.register_job(handle("s1", "/t/a.m3u8", TranscodingJobType::Hls, "dev1"));
         m.kill_transcoding_jobs("dev1", Some("s1"), true)
@@ -2103,10 +2140,7 @@ mod tests {
         // Upstream's two callers differ exactly here: `OnTranscodeKillTimerStopped`
         // passes `closeLiveStream: true` (the consumer is gone for good),
         // `KillTranscodingJobs` passes `false`.
-        let reporter = Arc::new(RecordingReporter {
-            killed: Mutex::new(Vec::new()),
-            started: Mutex::new(Vec::new()),
-        });
+        let reporter = Arc::new(RecordingReporter::default());
         let m = TranscodeManagerImpl::new(ReporterHandle(Arc::clone(&reporter)));
         let job = handle("s2", "/t/b.m3u8", TranscodingJobType::Hls, "dev2");
         m.register_job(job);
@@ -2133,6 +2167,9 @@ mod tests {
             info: ferrofin_model::session::TranscodingInfo,
         ) {
             self.0.report_started(job, info).await;
+        }
+        async fn on_job_failed_to_start(&self, job: &TranscodingJobHandle) {
+            self.0.on_job_failed_to_start(job).await;
         }
         async fn report_progress(&self, job: &TranscodingJobHandle, progress: TranscodingProgress) {
             self.0.report_progress(job, progress).await;
@@ -2364,10 +2401,7 @@ mod start_ffmpeg_tests {
             extra_files: vec!["out.m3u8".to_owned()],
             ..FakeScript::default()
         });
-        let reporter = Arc::new(super::tests::RecordingReporter {
-            killed: Mutex::new(Vec::new()),
-            started: Mutex::new(Vec::new()),
-        });
+        let reporter = Arc::new(super::tests::RecordingReporter::default());
         let m = TranscodeManagerImpl::new(super::tests::ReporterHandle(Arc::clone(&reporter)));
 
         let mut st = state(&playlist, Some(&playlist));
@@ -2445,15 +2479,19 @@ mod start_ffmpeg_tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let playlist = tmp.path().join("s").join("out.m3u8");
-        let m = manager();
+        let reporter = Arc::new(super::tests::RecordingReporter::default());
+        let m = TranscodeManagerImpl::new(super::tests::ReporterHandle(Arc::clone(&reporter)));
         let st = state(&playlist, None);
         let err = m
             .start_ffmpeg(&FailingSeam, ffmpeg_req(&st, &playlist, vec![]))
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "boom");
-        // Failed start removes the job (OnTranscodeFailedToStart).
+        // Failed start removes the job and clears the device's transcoding
+        // info (OnTranscodeFailedToStart), after the start had published it.
         assert_eq!(m.active_job_count(), 0);
+        assert_eq!(reporter.started.lock().unwrap().len(), 1);
+        assert_eq!(*reporter.failed.lock().unwrap(), vec!["dev".to_owned()]);
     }
 
     #[tokio::test]

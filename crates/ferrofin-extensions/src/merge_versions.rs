@@ -41,6 +41,19 @@
 //!   alternate from its own series' episode list and skewing season counts.
 //!   The bulk episode task also self-heals: links whose key no longer matches
 //!   their primary's are unlinked and regrouped within their own series.
+//! - The episode key's title fallback (no provider id, no episode number)
+//!   also carries the core resolver's version key read from the file name
+//!   (`D{yyyyMMdd}` for a name by air date, `S{n}E{n}` for one with both
+//!   numbers): upstream's (season, name, year) is the same for every airing
+//!   of a show whose files are named by date, so the task merged a whole
+//!   season of daily or weekly airings into one episode. The stored
+//!   `PremiereDate` is not used: an NFO, or a row adopted from Jellyfin
+//!   (server-local midnight), can store an airing's date on another day. A
+//!   file name with no such key keeps upstream's key. The self-heal above
+//!   releases those links on the next run. It also undoes a group made by
+//!   hand through `POST /Videos/MergeVersions` of two airings, or of two
+//!   copies only one of whose file names carries the key; the playlist and
+//!   collection entries that merge rerouted to the primary stay on it.
 //! - Ferrofin models a version group solely by the `PrimaryVersionId` pointer;
 //!   the upstream `OwnerId`/`LocalAlternateVersions`/`LinkedAlternateVersions`
 //!   columns and the linked-child reroute are Jellyfin-internal representation
@@ -50,7 +63,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
@@ -58,6 +71,8 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
+use ferrofin_naming::common::NamingOptions;
+use ferrofin_naming::video::VideoListResolver;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::merge_versions::{MergeProgress, MergeVersionsManager};
@@ -844,9 +859,14 @@ fn percent(index: usize, total: usize) -> f64 {
     100.0 * (index + 1) as f64 / total.max(1) as f64
 }
 
+/// The naming rules [`episode_merge_key`] reads an episode's file name with.
+static NAMING: LazyLock<NamingOptions> = LazyLock::new(NamingOptions::new);
+
 /// The upstream 12.0 `GetEpisodeMergeKey`: the first non-blank provider id
 /// (`Tvdb` → `Tmdb` → `Imdb`), else season/episode numbers, else title
-/// fields. The caller lowercases the key (`StringComparer.OrdinalIgnoreCase`).
+/// fields and — unlike upstream — the file name's version key (its air date,
+/// or its season and episode numbers).
+/// The caller lowercases the key (`StringComparer.OrdinalIgnoreCase`).
 fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<String>) -> String {
     // Every branch is scoped to the series *identity* (presentation key), not
     // the series name — a deliberate divergence from upstream, which groups by
@@ -881,14 +901,38 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
         .unwrap_or_default();
         return format!("{series}|number:{parent}:{index}:{end}");
     }
-    format!(
+    // The title fallback also carries the file name's version key — a second
+    // deliberate divergence. Upstream keys it on (series, season, name, year)
+    // alone, and for an episode named by air date (`Show - 2023-12-16 -
+    // Guest.ts`) none of those tell two airings apart: Jellyfin clears its
+    // `IndexNumber` (`LibraryManager.FillMissingEpisodeNumbersFromPath`,
+    // `IsByDate`), its name is the series' and its year the series' or the
+    // season's, so every airing in a season shares one key and the bulk task
+    // hid all but one behind it as "versions". The key is the one the core
+    // resolver groups episode files by (`VideoListResolver.GetEpisodeVersionKey`:
+    // `D{yyyyMMdd}`, or `S{n}E{n}` when the name has both numbers but the row
+    // does not), so two copies of one airing still merge and two airings no
+    // longer do. It is read from the file name, not the stored
+    // `PremiereDate`: that has several writers (the scan's UTC midnight, an
+    // adopted Jellyfin row's server-local midnight, an NFO), so it can put two
+    // airings on one day or one airing on two. A file name with no such key
+    // keeps the upstream key unchanged.
+    let key = format!(
         "{series}|title:{}:{}:{}",
         ep.season_name.as_deref().unwrap_or_default(),
         ep.name.as_deref().unwrap_or_default(),
         ep.production_year
             .map(|y| y.to_string())
             .unwrap_or_default()
-    )
+    );
+    match ep
+        .path
+        .as_deref()
+        .and_then(|path| VideoListResolver::new(&NAMING).episode_version_key(path))
+    {
+        Some(version) => format!("{key}:{version}"),
+        None => key,
+    }
 }
 
 /// Whether `item` is an owned row that is no extra — a stacked part or a
@@ -1343,6 +1387,73 @@ mod tests {
         let ep = episode("Show", "Season 1", "Pilot", None);
         assert_eq!(
             episode_merge_key(&ep, |_| None),
+            "Show|title:Season 1:Pilot:2020"
+        );
+    }
+
+    /// The title fallback tells date-named airings apart by the date in the
+    /// file name — the core resolver's version key, `D{yyyyMMdd}` — never by
+    /// the stored `PremiereDate`, which has several writers: the scan's UTC
+    /// midnight, an adopted Jellyfin row's server-local midnight, an NFO.
+    #[test]
+    fn episode_merge_key_keys_dated_airings_on_the_file_name() {
+        let aired = |file: &str, stored: &str| BaseItemEntity {
+            path: Some(format!("/tv/Show (1975)/Season 49/{file}")),
+            premiere_date: Some(stored.parse().expect("date")),
+            ..episode("Show", "Season 49", "Show", None)
+        };
+        // Adopted rows from a London server around the March clock change:
+        // Sunday's local midnight is 00:00Z, Monday's is 23:00Z on Sunday.
+        let sunday = aired(
+            "Show (1975) - 2024-03-31 06 00 00 - Guest A.ts",
+            "2024-03-31T00:00:00Z",
+        );
+        let monday = aired(
+            "Show (1975) - 2024-04-01 06 00 00 - Guest B.ts",
+            "2024-03-31T23:00:00Z",
+        );
+        assert_ne!(
+            episode_merge_key(&sunday, |_| None),
+            episode_merge_key(&monday, |_| None)
+        );
+        assert_eq!(
+            episode_merge_key(&sunday, |_| None),
+            "Show|title:Season 49:Show:2020:D20240331"
+        );
+        // A copy of Sunday's airing in another folder, stored a day earlier
+        // (Jellyfin's local midnight on a server ahead of UTC): one key.
+        let copy = aired(
+            "HD/Show (1975) - 2024-03-31 06 00 00 - Guest A.mkv",
+            "2024-03-30T23:00:00Z",
+        );
+        assert_eq!(
+            episode_merge_key(&sunday, |_| None),
+            episode_merge_key(&copy, |_| None)
+        );
+        // A provider id still outranks the date.
+        let tvdb = |p: &str| (p == "Tvdb").then(|| "6008035".to_owned());
+        assert_eq!(
+            episode_merge_key(&sunday, tvdb),
+            episode_merge_key(&monday, tvdb)
+        );
+        // A row with no numbers whose file name has both carries them, as the
+        // core resolver keys it: two different episodes stay apart.
+        let numbered = BaseItemEntity {
+            path: Some("/tv/Show/Season 1/Show - S01E02 - Pilot.mkv".to_owned()),
+            ..episode("Show", "Season 1", "Pilot", None)
+        };
+        assert_eq!(
+            episode_merge_key(&numbered, |_| None),
+            "Show|title:Season 1:Pilot:2020:S1E2"
+        );
+        // No date in the file name: the plugin's key, whatever is stored.
+        let pilot = BaseItemEntity {
+            path: Some("/tv/Show/Season 1/Pilot.mkv".to_owned()),
+            premiere_date: Some("2020-01-05T00:00:00Z".parse().expect("date")),
+            ..episode("Show", "Season 1", "Pilot", None)
+        };
+        assert_eq!(
+            episode_merge_key(&pilot, |_| None),
             "Show|title:Season 1:Pilot:2020"
         );
     }
@@ -2045,6 +2156,102 @@ mod tests {
         assert_eq!(primary_of(&db, &svc, other).await, None);
     }
 
+    /// Sets an episode's stored air date, an RFC 3339 instant
+    /// (read-modify-write, as `set_episode_fields`).
+    async fn set_premiere_date(db: &Database, id: Uuid, instant: &str) {
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+        let mut item = FerrofinItemRepository::new(db.clone(), lookup)
+            .retrieve_item(id)
+            .await
+            .expect("read")
+            .expect("row");
+        item.premiere_date = Some(instant.parse().expect("date"));
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[item])
+            .await
+            .expect("set premiere date");
+    }
+
+    // A season of episodes named by air date (`Show - 2023-12-16 - Guest.ts`):
+    // no number, no provider id, the series' name and one production year.
+    // The airings stay separate episodes, a link an earlier run made between
+    // two airings is released, and two copies of one airing still merge, all
+    // by the date in the file name. The stored dates are adopted rows: the
+    // airings as a London server stores them around the March clock change
+    // (local midnight is 00:00Z on Sunday, 23:00Z the day before from Monday
+    // on), and the second copy as a server an hour ahead of UTC stores it.
+    // Keyed on them, Sunday and Monday would share a day and the two copies
+    // would not.
+    #[tokio::test]
+    async fn merge_episodes_keeps_by_date_airings_apart() {
+        let db = test_db().await;
+        let (sun, mon, tue) = (
+            Uuid::from_u128(0x481),
+            Uuid::from_u128(0x482),
+            Uuid::from_u128(0x483),
+        );
+        let (copy_a, copy_b) = (Uuid::from_u128(0x484), Uuid::from_u128(0x485));
+        for (id, width, file, stored) in [
+            (
+                sun,
+                1920,
+                "Show (1975) - 2024-03-31 06 00 00 - Guest A.ts",
+                "2024-03-31T00:00:00Z",
+            ),
+            (
+                mon,
+                1920,
+                "Show (1975) - 2024-04-01 06 00 00 - Guest B.ts",
+                "2024-03-31T23:00:00Z",
+            ),
+            (
+                tue,
+                1920,
+                "Show (1975) - 2024-04-02 06 00 00 - Guest C.ts",
+                "2024-04-01T23:00:00Z",
+            ),
+            (
+                copy_a,
+                1920,
+                "Show (1975) - 2024-03-24 06 00 00 - Guest D.ts",
+                "2024-03-24T00:00:00Z",
+            ),
+            (
+                copy_b,
+                640,
+                "HD/Show (1975) - 2024-03-24 06 00 00 - Guest D.mkv",
+                "2024-03-23T23:00:00Z",
+            ),
+        ] {
+            let path = format!("/tv/Show (1975)/Season 49/{file}");
+            seed(&db, id, BaseItemKind::Episode, Some(&path), width).await;
+            set_episode_fields(&db, id, "Show", "Season 49", "Show", None, 1975).await;
+            set_premiere_date(&db, id, stored).await;
+        }
+        // What the date-blind key left behind: two airings hidden behind a third.
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        for id in [sun, tue] {
+            persistence
+                .set_primary_version_id(id, Some(mon))
+                .await
+                .expect("seed stale link");
+        }
+
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+        svc.merge_episodes(None).await.expect("merge episodes");
+
+        for id in [sun, mon, tue] {
+            assert_eq!(primary_of(&db, &svc, id).await, None, "airing {id}");
+        }
+        assert_eq!(
+            primary_of(&db, &svc, copy_b).await,
+            Some(copy_a.to_string()),
+            "two copies of one airing are one episode"
+        );
+        assert_eq!(primary_of(&db, &svc, copy_a).await, None);
+    }
+
     /// Sets the series-row identity the scoped merge key reads.
     async fn set_series_key(db: &Database, id: Uuid, key: &str) {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
@@ -2276,6 +2483,11 @@ mod tests {
             ),
             chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
             users: Arc::new(ferrofin_core::FerrofinUserManager::new(db.clone())),
+            external_identities: Arc::new(
+                ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(
+                    db.clone(),
+                ),
+            ),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);

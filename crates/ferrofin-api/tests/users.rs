@@ -101,7 +101,7 @@ impl AuthService for AdminAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(ADMIN_ID, "admin", Some("hash"))),
+            user: Some(Arc::new(user_entity(ADMIN_ID, "admin", Some("hash")))),
             token: Some("current-session".into()),
             is_authenticated: true,
             ..AuthorizationInfo::default()
@@ -130,8 +130,7 @@ struct MemUsers {
     deleted: Mutex<Option<Uuid>>,
     /// Makes `delete_user` refuse, as the last user or the last admin.
     refuse_delete: std::sync::atomic::AtomicBool,
-    /// Makes `get_user_dto` answer the policy last saved for that user, so the
-    /// device check after a policy save reads what was saved.
+    /// Makes `get_user_dto` answer the policy last saved for that user.
     echo_saved_policy: std::sync::atomic::AtomicBool,
     /// Listed by `get_users` before the two fixed accounts.
     listed_first: Option<UserEntity>,
@@ -391,12 +390,10 @@ impl QuickConnect for OkQuickConnect {
     }
 }
 
-/// Records token revocation and user-session pushes while leaving unrelated
-/// session methods unused.
+/// Records token revocation while leaving unrelated session methods unused.
 #[derive(Default)]
 struct NoopSessions {
     revoked: Mutex<Vec<(Uuid, String)>>,
-    pushed: Mutex<Vec<(Vec<Uuid>, SessionMessageType)>>,
 }
 
 #[async_trait]
@@ -476,16 +473,13 @@ impl SessionManager for NoopSessions {
     }
     async fn send_message_to_user_sessions(
         &self,
-        user_ids: &[Uuid],
-        message_type: SessionMessageType,
+        _user_ids: &[Uuid],
+        _message_type: SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {
-        // The user-update handlers push UserUpdated/UserDeleted here
-        // best-effort; delivery is covered by ferrofin-core's tests.
-        self.pushed
-            .lock()
-            .unwrap()
-            .push((user_ids.to_vec(), message_type));
+        // The delete handler pushes UserDeleted here best-effort. A rename's
+        // or policy save's UserUpdated comes from the user manager, which is a
+        // fake here (apps/ferrofin-server/tests/user_updated_push.rs).
         Ok(())
     }
     async fn send_message_to_user_device_sessions(
@@ -751,7 +745,7 @@ impl AuthService for OkAuthService {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(hsp_user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(hsp_user_entity(USER_ID, "alice"))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -770,7 +764,7 @@ impl AuthorizationContext for OkAuthContext {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(hsp_user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(hsp_user_entity(USER_ID, "alice"))),
             client: Some("Wolphin".to_owned()),
             version: Some("1.0".to_owned()),
             device_id: Some("dev-1".to_owned()),
@@ -1364,8 +1358,7 @@ impl SessionManager for OkSessions {
         _message_type: ferrofin_model::session::SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {
-        // The user-update handlers push UserUpdated/UserDeleted here
-        // best-effort; delivery is covered by ferrofin-core's tests.
+        // The delete handler pushes UserDeleted here best-effort.
         Ok(())
     }
     async fn send_message_to_user_device_sessions(
@@ -1877,16 +1870,10 @@ async fn update_policy_records_and_guards_last_admin() {
 }
 
 /// Upstream binds the body into `new UserPolicy()`, so a member it leaves out
-/// keeps the constructor's value (`UserPolicy.cs`), not `false`/`0`. With
-/// `EnableAllDevices` kept, `DeviceAccessHost` signs no device out: the saved
-/// policy is what the device check reads here, and a check that went on to the
-/// devices would reach `FakeDevices`, which panics.
+/// keeps the constructor's value (`UserPolicy.cs`), not `false`/`0`.
 #[tokio::test]
 async fn update_policy_partial_body_keeps_the_constructor_defaults() {
     let users = Arc::new(MemUsers::default());
-    users
-        .echo_saved_policy
-        .store(true, std::sync::atomic::Ordering::Relaxed);
     let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
     let body = serde_json::json!({
         "AuthenticationProviderId": "a",
@@ -2614,57 +2601,6 @@ async fn update_user_renames_whenever_the_name_differs(
     assert_eq!(renamed.as_ref().map(|(_, name)| name.as_str()), renamed_to);
 }
 
-/// v12.2 raises `UserUpdatedEventArgs`, whose `UserUpdatedNotifier` is the only
-/// sender of `UserUpdated`, from `RenameUser` and `UpdatePolicyAsync` alone:
-/// `UpdateUser` renames only when the name changed, and
-/// `UpdateConfigurationAsync` raises nothing.
-#[rstest::rstest]
-#[case::update_without_rename("/Users?userId=BOB", r#"{"Name":"bob","Policy":null}"#, false)]
-#[case::update_with_rename("/Users?userId=BOB", r#"{"Name":"robert","Policy":null}"#, true)]
-#[case::user_scoped_update("/Users/BOB", r#"{"Name":"bob","Policy":null}"#, false)]
-#[case::configuration("/Users/Configuration?userId=BOB", "{}", false)]
-#[case::user_scoped_configuration("/Users/BOB/Configuration", "{}", false)]
-#[case::policy("/Users/BOB/Policy", "POLICY", true)]
-#[tokio::test]
-async fn only_a_rename_or_a_policy_save_pushes_user_updated(
-    #[case] uri: &str,
-    #[case] body: &str,
-    #[case] pushes: bool,
-) {
-    let sessions = Arc::new(NoopSessions::default());
-    let router = create_router(state_with_sessions(
-        Arc::new(MemUsers::default()),
-        Arc::new(MemConfig::new(true)),
-        Arc::new(ferrofin_api::test_support::FakeActivity),
-        Arc::new(AdminAuth),
-        sessions.clone(),
-    ));
-    let body = if body == "POLICY" {
-        serde_json::to_string(&complete_policy()).unwrap()
-    } else {
-        body.to_owned()
-    };
-    let response = router
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(uri.replace("BOB", &BOB_ID.to_string()))
-                .header("X-Emby-Token", "t")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    let expected = if pushes {
-        vec![(vec![BOB_ID], SessionMessageType::UserUpdated)]
-    } else {
-        Vec::new()
-    };
-    assert_eq!(*sessions.pushed.lock().unwrap(), expected);
-}
-
 /// `UserDto`'s constructor supplies a default `UserConfiguration`, so a body
 /// without `Configuration` resets the stored settings to the defaults, as a
 /// live Jellyfin 12.2 does. `"Configuration": null` (a 500 upstream) saves
@@ -2806,7 +2742,7 @@ async fn account_updates_respect_preferences_and_api_key_elevation() {
             _: &RequestContext,
         ) -> Result<AuthorizationInfo, ServiceError> {
             Ok(AuthorizationInfo {
-                user: Some(user_entity(BOB_ID, "bob", None)),
+                user: Some(Arc::new(user_entity(BOB_ID, "bob", None))),
                 is_authenticated: true,
                 ..Default::default()
             })
@@ -2868,7 +2804,7 @@ impl AuthService for TokenAuth {
             .find(|(name, _)| name.eq_ignore_ascii_case("X-Emby-Token"))
             .map(|(_, value)| value.as_str());
         let signed_in = |user: UserEntity| AuthorizationInfo {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         };

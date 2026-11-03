@@ -205,7 +205,7 @@ async fn movie_page_fixture() -> (Database, InternalItemsQuery) {
         .expect("nullable sort keys");
 
     let base = InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         recursive: true,
         top_parent_ids: vec![library],
         include_item_types: vec![BaseItemKind::Movie],
@@ -296,7 +296,7 @@ async fn movie_page_hydration_plan_materializes_keys_before_primary_key_fetches(
     let db = fresh_db().await;
     let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
     let filter = InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         include_item_types: vec![BaseItemKind::Movie],
         limit: Some(100),
         start_index: Some(1500),
@@ -345,7 +345,7 @@ async fn grouped_browse_plan_computes_representatives_once() {
     let db = fresh_db().await;
     let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
     let filter = InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         recursive: true,
         include_item_types: vec![BaseItemKind::Movie],
         limit: Some(100),
@@ -399,7 +399,7 @@ async fn person_type_filter_plan_stays_on_the_items_credits() {
     let db = fresh_db().await;
     let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB10)).await;
     let by_name = InternalItemsQuery {
-        user: Some(user.clone()),
+        user: Some(Arc::new(user.clone())),
         include_item_types: vec![BaseItemKind::Movie],
         person: Some("Chris Maker".to_owned()),
         person_types: vec!["Director".to_owned()],
@@ -521,7 +521,7 @@ async fn movie_page_hydration_leaves_other_query_plans_unchanged() {
     let db = fresh_db().await;
     let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
     let filter = InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         include_item_types: vec![BaseItemKind::Movie],
         limit: Some(100),
         order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
@@ -1298,7 +1298,7 @@ async fn user_data_sorts_order_by_play_state() {
     for sort in [ItemSortBy::PlayCount, ItemSortBy::DatePlayed] {
         let rows = repository
             .get_item_list(&InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 order_by: vec![(sort, SortOrder::Descending)],
                 ..Default::default()
             })
@@ -1348,7 +1348,7 @@ async fn user_data_sorts_order_by_play_state() {
     ] {
         let rows = repository
             .get_item_list(&InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 include_item_types: vec![BaseItemKind::Movie],
                 order_by: vec![(sort, direction)],
                 ..Default::default()
@@ -1499,7 +1499,7 @@ async fn paged_user_data_sort_with_total_count_works() {
     ] {
         let result = repository
             .get_items(&InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 parent_id: library,
                 recursive: true,
                 include_item_types: vec![BaseItemKind::Movie],
@@ -1806,7 +1806,7 @@ async fn a_created_collection_survives_an_unscoped_user_query() {
     let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xABCD)).await;
     let rows = repository
         .get_item_list(&InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             recursive: true,
             ..Default::default()
         })
@@ -2179,7 +2179,7 @@ async fn series_date_played_orders_series_by_their_newest_finished_episode() {
         async move {
             repo(&db)
                 .get_item_list(&InternalItemsQuery {
-                    user,
+                    user: user.map(Arc::new),
                     search_term,
                     include_item_types: vec![BaseItemKind::Series],
                     order_by,
@@ -2266,7 +2266,7 @@ async fn series_date_played_plan_groups_the_users_plays_once() {
     let db = fresh_db().await;
     let user = series_play_fixture(&db).await;
     let filter = InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         include_item_types: vec![BaseItemKind::Series],
         order_by: vec![
             (ItemSortBy::SeriesDatePlayed, SortOrder::Descending),

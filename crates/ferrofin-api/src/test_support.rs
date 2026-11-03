@@ -454,7 +454,7 @@ impl AuthService for AuthedAuthService {
 pub fn authenticated_user_info() -> AuthorizationInfo {
     AuthorizationInfo {
         is_authenticated: true,
-        user: Some(sample_user()),
+        user: Some(Arc::new(sample_user())),
         user_policy: Some(Arc::new(UserPolicy {
             enable_remote_access: true,
             ..UserPolicy::default()
@@ -667,6 +667,25 @@ fake_library_manager!(CountingScans {
     }
 });
 
+/// [`FakeLibrary`] whose standalone visibility check refuses every item and
+/// counts the times it ran, for the listings that must not ask once per row.
+#[derive(Default)]
+pub struct CountingRefusals(pub std::sync::atomic::AtomicUsize);
+
+fake_library_manager!(CountingRefusals {
+    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(false)
+    }
+});
+
 /// An ffmpeg build with the common audio encoders (`SupportsEncoder`), for
 /// the routes whose negotiation transcodes audio; a state built by
 /// [`AppState::new`] has none.
@@ -744,7 +763,7 @@ impl AuthService for AuthedUserService {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             is_authenticated: true,
-            user: Some(sample_user()),
+            user: Some(Arc::new(sample_user())),
             ..AuthorizationInfo::default()
         })
     }

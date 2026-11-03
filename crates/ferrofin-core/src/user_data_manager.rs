@@ -1025,7 +1025,7 @@ impl FerrofinUserDataManager {
         // `new InternalItemsQuery(user)`: `set_user` also carries the user's
         // parental-rating cap.
         let mut query = ferrofin_traits::options::InternalItemsQuery::default();
-        query.set_user(user.clone());
+        query.set_user(Arc::new(user.clone()));
         if counts
             .get_linked_children_count_batch(&[id])
             .await?
@@ -1484,7 +1484,7 @@ fn member_query(
     played: bool,
 ) -> ferrofin_traits::options::InternalItemsQuery {
     use ferrofin_traits::options::InternalItemsQuery;
-    let user_entity = Some(user.clone());
+    let user_entity = Some(Arc::new(user.clone()));
     match kind_from_type_name(&folder.type_) {
         // `BoxSet.GetLinkedChildren(user)`: the parent query merges the
         // manual links (a legacy set's children are its rows on disk), and
@@ -1870,6 +1870,13 @@ impl UserDataManager for FerrofinUserDataManager {
             let Ok(id) = Uuid::parse_str(&item.id) else {
                 continue;
             };
+            // A page may list an item twice (a playlist's repeated entry):
+            // its first occurrence already took the rows, so resolve each id
+            // once, as upstream's `GetUserDataBatch` reads its grouped rows
+            // without removing them.
+            if map.contains_key(&id) {
+                continue;
+            }
             let candidates = stored.remove(&id).unwrap_or_default();
             // `ResolveUserDataRow` answers with an only row whatever the
             // item's keys are, so they are derived only to choose between
@@ -2940,7 +2947,7 @@ mod tests {
         let resume = || async {
             repository
                 .get_item_list(&InternalItemsQuery {
-                    user: Some(user.clone()),
+                    user: Some(Arc::new(user.clone())),
                     is_resumable: Some(true),
                     ..InternalItemsQuery::default()
                 })
@@ -3651,6 +3658,53 @@ mod tests {
             .expect("rows");
         assert_eq!(map[&year].key, "Year-2021");
         assert!(map[&year].is_favorite);
+    }
+
+    /// A page that lists an item twice (a playlist with a repeated entry)
+    /// resolves every occurrence from the stored rows: upstream's
+    /// `GetUserDataBatch` reads its grouped rows with `TryGetValue` and never
+    /// removes them (`UserDataManager.cs:242-256`). Covers the one-row
+    /// shortcut and the choice between several rows.
+    #[tokio::test]
+    async fn an_item_listed_twice_keeps_its_stored_row() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let single = Uuid::from_u128(0xF601);
+        let several = Uuid::from_u128(0xF602);
+        seed_user(&db, user).await;
+        seed_item(&db, single, BaseItemKind::Movie).await;
+        seed_item(&db, several, BaseItemKind::Movie).await;
+        for (item, key, count) in [
+            (single, "legacy-key".to_owned(), 4),
+            (several, several.to_string(), 7),
+            (several, "0-stale-key".to_owned(), 1),
+        ] {
+            sqlx::query(r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "PlayCount", "IsFavorite", "PlaybackPositionTicks", "Played") VALUES (?1, ?2, ?3, ?4, 1, 0, 1)"#)
+                .bind(guid_to_db(item)).bind(guid_to_db(user)).bind(key).bind(count).execute(db.writer()).await.unwrap();
+        }
+        let (single_row, several_row) = (
+            fetch_item(&db, single).await,
+            fetch_item(&db, several).await,
+        );
+        let page = [
+            single_row.clone(),
+            several_row.clone(),
+            single_row,
+            several_row,
+        ];
+        let mgr = FerrofinUserDataManager::new(db, config());
+
+        let map = mgr
+            .get_user_data_dtos_for_rows(&page, user, false)
+            .await
+            .expect("rows");
+        assert_eq!(
+            (map[&single].key.as_str(), map[&single].play_count),
+            ("legacy-key", 4)
+        );
+        assert_eq!(map[&several].play_count, 7);
+        assert!(map[&single].played && map[&single].is_favorite);
+        assert!(map[&several].played && map[&several].is_favorite);
     }
 
     #[tokio::test]

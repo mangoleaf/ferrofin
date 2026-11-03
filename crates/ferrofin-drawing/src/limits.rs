@@ -57,17 +57,16 @@ impl ImageLimits {
     /// `image_decode_max_megapixels`'s default.
     pub const DEFAULT_DECODE_MEGAPIXELS: u32 = 200;
     /// The values `image_decode_max_megapixels` takes.
-    pub const DECODE_MEGAPIXELS: RangeInclusive<u32> = 16..=1000;
+    pub const DECODE_MEGAPIXELS: RangeInclusive<u32> = 50..=1000;
     /// `image_decode_max_memory_mb`'s default, the `image` crate's `max_alloc`
     /// default.
     pub const DEFAULT_DECODE_MEMORY_MB: u32 = 512;
     /// The values `image_decode_max_memory_mb` takes.
-    pub const DECODE_MEMORY_MB: RangeInclusive<u32> = 128..=2048;
+    pub const DECODE_MEMORY_MB: RangeInclusive<u32> = 256..=2048;
     /// `image_resize_budget_mb`'s default.
     pub const DEFAULT_RESIZE_BUDGET_MB: u32 = 2048;
-    /// The values `image_resize_budget_mb` takes. The ceiling is what one
-    /// resize of a 1000 MP image can need.
-    pub const RESIZE_BUDGET_MB: RangeInclusive<u32> = 256..=16_384;
+    /// The values `image_resize_budget_mb` takes.
+    pub const RESIZE_BUDGET_MB: RangeInclusive<u32> = 512..=8192;
 
     /// The limits from the settings' units: megapixels and MiB.
     #[must_use]
@@ -483,7 +482,8 @@ mod tests {
 
     /// Resizes take the budget in the order they came: a small one that would
     /// fit now waits behind a large one that does not, so a stream of small
-    /// resizes can never starve it.
+    /// resizes can never starve it. The two do not fit together either, so the
+    /// small one records itself only after the large one gives its bytes back.
     #[test]
     fn a_large_resize_is_not_passed_over_by_a_small_one() {
         let memory = memory_with_budget(100);
@@ -497,20 +497,20 @@ mod tests {
             })
         };
 
-        let large = resize(60);
+        let large = resize(70);
         wait_for_turns(&memory, 2);
-        let small = resize(10);
+        let small = resize(40);
         wait_for_turns(&memory, 3);
         std::thread::sleep(Duration::from_millis(50));
         assert!(
             order.lock().unwrap().is_empty(),
-            "10 would fit, but came second"
+            "40 would fit, but came second"
         );
 
         drop(held);
         large.join().expect("the large resize ends");
         small.join().expect("the small resize ends");
-        assert_eq!(*order.lock().unwrap(), [60, 10]);
+        assert_eq!(*order.lock().unwrap(), [70, 40]);
     }
 
     /// Two resizes that fit together run together: the turn order costs no

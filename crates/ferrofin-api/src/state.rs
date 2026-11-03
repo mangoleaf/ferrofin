@@ -104,8 +104,9 @@ pub(crate) fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
 /// object so the concrete type is chosen at the composition root, not baked into
 /// this crate.
 pub struct Inner {
-    /// Serializes named saves through validation, persistence and live updates.
-    pub configuration_write_lock: tokio::sync::Mutex<()>,
+    /// Serializes named saves through validation, persistence and live updates,
+    /// and with the Live TV manager's own write of `livetv`.
+    pub configuration_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Store validators registered by the composition root, keyed case-insensitively.
     pub configuration_validators: std::collections::HashMap<
         String,
@@ -289,6 +290,12 @@ pub struct Inner {
     /// the plugin unavailable (`404`, like a Jellyfin server without the
     /// plugin's controller).
     pub merge_versions: Option<Arc<dyn ferrofin_traits::merge_versions::MergeVersionsManager>>,
+
+    /// The LDAP-Auth extension's service backing the `/Ldap/*` routes. `None`
+    /// until the composition root wires it via [`AppState::with_ldap`]; while
+    /// unset those routes report the plugin unavailable (`404`, like a
+    /// Jellyfin server without the plugin's controller).
+    pub ldap: Option<Arc<dyn ferrofin_traits::ldap::LdapManager>>,
 }
 
 /// How many [`FileSystem`] calls handlers may have on the blocking pool at once
@@ -433,7 +440,7 @@ impl AppState {
         tasks: Arc<dyn TaskManager>,
     ) -> Self {
         Self::from_inner(Inner {
-            configuration_write_lock: tokio::sync::Mutex::new(()),
+            configuration_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             configuration_validators: std::collections::HashMap::new(),
             committed_configuration_checks: Vec::new(),
             // Wired by the composition root via `with_network`.
@@ -456,6 +463,7 @@ impl AppState {
             plugin_routes: None,
             playback_metrics: None,
             merge_versions: None,
+            ldap: None,
             music,
             similar_items,
             search,
@@ -641,6 +649,20 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_library_monitor must be called before the state is shared");
         inner.library_monitor = library_monitor;
+        self
+    }
+
+    /// Shares the named-configuration save lock with whoever else writes those
+    /// files. Called once by the composition root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state has already been shared.
+    #[must_use]
+    pub fn with_configuration_write_lock(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_configuration_write_lock must be called before the state is shared");
+        inner.configuration_write_lock = lock;
         self
     }
 
@@ -1048,6 +1070,23 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_merge_versions must be called before the state is shared");
         inner.merge_versions = Some(merge_versions);
+        self
+    }
+
+    /// Wires the LDAP-Auth extension's service behind the `/Ldap/*` routes.
+    ///
+    /// [`new`](Self::new) leaves it unset (the routes report the plugin
+    /// unavailable); the composition root calls this with the
+    /// `ferrofin-extensions` implementation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_ldap(mut self, ldap: Arc<dyn ferrofin_traits::ldap::LdapManager>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_ldap must be called before the state is shared");
+        inner.ldap = Some(ldap);
         self
     }
 

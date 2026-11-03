@@ -202,6 +202,11 @@ scanning. If Jellyfin used a custom metadata directory, copy its contents into t
 Machine-specific encoder, cache, and certificate paths are also not automatically carried
 over; configure those for this host, including HTTPS if your deployment requires it.
 
+The database still names `/var/lib/jellyfin` and `/etc/jellyfin` for the library folders,
+artwork and profile images. The first start points each of those paths at the copy under
+Ferrofin's directories, but only where the copy exists; a path whose file is missing keeps
+its old value. So copy everything before that start.
+
 ```sh
 sudo systemctl enable --now ferrofin
 journalctl -u ferrofin -f
@@ -211,6 +216,11 @@ Verify the following before resuming normal use:
 
 - The journal reports database adoption and the `jellyfin.db.pre-ferrofin` backup beside
   the adopted database. Investigate any configuration-import warnings.
+- The journal reports "rewrote stored paths under a previous program-data directory", after
+  a snapshot (`jellyfin.db.pre-program-data-move`). That copy holds the database just before
+  the rewrite, already adopted and migrated, so it is not a way back to Jellyfin:
+  `jellyfin.db.pre-ferrofin` is.
+  Moving Ferrofin's own data directory later is handled the same way.
 - Your existing users can log in, and watch history, libraries, library settings, and
   artwork are present. Library `options.xml` files are imported into `options.json`.
 - The server keeps Jellyfin's identity: `/System/Info/Public` reports the same `Id` as

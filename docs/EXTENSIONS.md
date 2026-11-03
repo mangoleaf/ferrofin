@@ -43,8 +43,9 @@ pub trait Extension: Send + Sync {
 
 An extension receives **only manager trait objects**, never concrete types — an
 `ExtensionContext` bundling the `LibraryManager`, `MediaSegmentManager`, `PluginManager`,
-`MergeVersionsManager`, `UserManager`, an optional audio `Fingerprinter`, and a per-extension
-cache dir. It
+`MergeVersionsManager`, `UserManager`, the `ExternalIdentityStore` (which outside identity,
+such as an LDAP uid, belongs to which user), an optional audio `Fingerprinter`, and a
+per-extension cache dir. It
 is the same dependency-injection seam the rest of the server uses (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md)), so an extension can do real work — scan the library,
 persist media segments, register background tasks — without reaching into implementation
@@ -86,15 +87,21 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
 
 ## The ported plugins
 
-Three third-party Jellyfin plugins ship as extensions today. Each is a faithful port of a
+Four third-party Jellyfin plugins ship as extensions today. Each is a faithful port of a
 pinned upstream revision; the pins and the full delta live in
-[`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md).
+[`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md). LDAP-Auth is being ported in phases: so far it
+shows under Dashboard → Plugins, disabled, with upstream's settings page and its connection,
+filter and user-search tests, and once enabled with a server it signs directory users in
+(creating them on their first sign-in, following a directory rename, and keeping their
+administrator flag in step with the admin filter). Password changes, profile images,
+referrals and the import of an adopted Jellyfin's settings follow.
 
 | Extension | Upstream | Ported rev | What it does |
 |---|---|---|---|
 | **Intro Skipper** | [intro-skipper/intro-skipper](https://github.com/intro-skipper/intro-skipper) | `db09359` | Intro, credits, recap, preview and commercial detection (audio fingerprints, chapters, black frames), exposed as media segments |
 | **File Transformation** | [IAmParadox27/jellyfin-plugin-file-transformation](https://github.com/IAmParadox27/jellyfin-plugin-file-transformation) | `f4f01c3` | Transform-on-serve hook other extensions build on |
 | **Merge Versions** | [danieladov/jellyfin-plugin-mergeversions](https://github.com/danieladov/jellyfin-plugin-mergeversions) | `e6f58d6` | Bulk-merge duplicate movie/episode versions into one item, two 24h tasks |
+| **LDAP-Auth** | [jellyfin/jellyfin-plugin-ldapauth](https://github.com/jellyfin/jellyfin-plugin-ldapauth) | `d11c86a` | Sign users in against an LDAP directory (in progress: the settings page and its three `POST /Ldap/*` tests, sign-in and the admin filter so far) |
 
 **Accepted divergences** (not bugs — do not "fix" them during an upstream sync): Ferrofin
 models version groups solely through the `PrimaryVersionId` pointer rather than Jellyfin's
@@ -114,13 +121,16 @@ dashboard's Disable toggle turns them off. Its version is the server's release.
 `FERROFIN_DISABLE_EXTENSIONS` leaves it registered: it has nothing to fire inside a benchmark.
 
 Its settings page, the Settings link under Dashboard → Plugins → Ferrofin and the dashboard
-menu's **Ferrofin** entry, lists every setting that route reports, in groups: the value in use,
-the default, a badge for where the value comes from (default, `config.toml`, environment or
-flag), the environment variable and flag that set it, and, for a setting the page may not
-change, a lock with the reason and where it is changed instead. Secrets are shown to the
-administrator, marked as secrets. A setting the page may change has a control for its kind and
-**Reset to default**: Save posts the changed ones, a refused value shows the server's message next
-to it, and **Restart now** applies them ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)).
+menu's **Ferrofin** entry, lists every setting that route reports, in a tab per group, with a
+search box and filters (changed, needs restart, hide read-only) above the tabs. Each setting has a
+readable name with the `config.toml` key, environment variable, flag and default below it, a badge
+for what sets it (`config.toml`, environment or flag) when anything does, and, for a setting the
+page may not change, its value as text with a lock, the reason and where it is changed instead.
+Secrets are shown to the administrator, marked as secrets. A setting the page may change is edited
+on one line: a field for its kind showing the default, muted, when nothing sets it, its unit and
+**Reset to default**. Each tab counts its unsaved edits; Save posts the changed ones of every tab,
+a refused value shows the server's message next to it, and **Restart now** applies them
+([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)).
 The page holds no setting itself, since `GET /web/ConfigurationPage` is anonymous: its script reads
 them from the admin-only route and sets every string as text, never as HTML. Disabling the plugin
 removes the page and the menu entry.
@@ -246,17 +256,30 @@ PCM, or ≤ 16 sampled stills ≤ 320 px per call. Fingerprinting, loudness, sil
 black-frame detection — and analyses nobody has written yet — are all guest code over
 these windows; extraction runs under a global decode budget (`FERROFIN_WASM_ANALYSIS_CONCURRENCY`,
 default a quarter of the cores) so plugin analysis never starves transcodes. Plugins that declare `scan-targets` are
-offered each new matching item once by the "Plugin media analysis" dashboard
-task. When the plugin's circuit breaker stops a pass, the items it did not reach are
-offered after the restart, and an item sharing the cut-off item's creation time (or, on
-a first pass, an undated one) can be offered again, so analysis must be idempotent.
+offered each matching item by the "Plugin media analysis" dashboard task, once per
+plugin: the server records in its database each item it offered to each plugin, and
+each pass offers the items not recorded yet. An item is offered whatever its creation
+date says, so media moved or copied in with old file times, unpacked from an archive,
+or a photo with an old EXIF date is offered like any other. An item is left for a later
+pass while its library turns the plugin's segments off (Media segment providers in the
+library's settings), or when the server refused the plugin's segment write for it. When
+the plugin's circuit breaker stops a pass, the items it did not reach are offered after
+the restart. Offers are recorded a page of items at a time, so a server that stops
+partway through a page offers that page's items again: analysis must be idempotent.
+Uninstalling a plugin forgets what it was offered, so installed again it is offered the
+whole library. Servers before this record kept a watermark instead, the newest creation
+time offered; on upgrade, each plugin's first pass counts every item at or before its
+watermark as offered, so nothing is offered twice. An item the watermark had already
+passed over with its old creation time stays unoffered after the upgrade: to have a
+plugin analyze those, uninstall and install it again (an uninstall also removes the
+plugin's settings and stored data).
 Why a host-driven pass instead of each plugin polling `query-items` with its own
-cursor (which the 0.3 surface already allowed): the offer-once watermark lives under a
-`host:`-reserved state key a guest can neither read nor rewind (a self-managed cursor
-could be rewound to re-burn the shared decode budget), disabled plugins are centrally
-skipped, N analyzers appear as one dashboard task instead of N, and future scan
-behaviors (changed-item re-offers, scan-completion triggering, progress) evolve
-host-side without another ABI change. A guest error never fails a scan. Trust note: this grants
+cursor (which the 0.3 surface already allowed): the record of what was offered is the
+server's, out of the guest's reach (a self-managed cursor could be rewound to re-burn
+the shared decode budget), disabled plugins are centrally skipped, N analyzers appear
+as one dashboard task instead of N, and future scan behaviors (changed-item re-offers,
+scan-completion triggering, progress) evolve host-side without another ABI change. A
+guest error never fails a scan. Trust note: this grants
 the guest **media content**, one rung above catalog metadata — leaving the sandbox
 still requires declared egress, and a genuine analysis plugin declares `[]`.
 

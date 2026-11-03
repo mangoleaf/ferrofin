@@ -16,9 +16,11 @@
 //! individually-named vars).
 
 use std::net::IpAddr;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use ferrofin_core::user_manager::LoginBackoffSettings;
 use ferrofin_drawing::ImageLimits;
 use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_providers::rate_limit::RequestLimits;
@@ -172,6 +174,7 @@ struct FileConfig {
     db_statement_cache: Option<u32>,
     enable_metrics: Option<bool>,
     disable_extensions: Option<bool>,
+    detect_network_change: Option<bool>,
     metrics_sample_interval: Option<u32>,
     metrics_scan_duration_buckets: Option<Vec<f64>>,
     shutdown_timeout_secs: Option<u32>,
@@ -195,6 +198,11 @@ struct FileConfig {
     wasm_subtitle_extract_mb: Option<u32>,
     playback_metrics_queue: Option<u32>,
     quick_connect_pending_per_ip: Option<u32>,
+    login_backoff: Option<bool>,
+    login_backoff_attempts: Option<u32>,
+    login_backoff_max_delay_secs: Option<u32>,
+    login_backoff_window_mins: Option<u32>,
+    login_backoff_max_tracked: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -407,8 +415,10 @@ pub struct Config {
     /// each series the season provider reads a season's id from. Resolved
     /// `FERROFIN_TVDB_CACHE_HOURS` env > `tvdb_cache_hours` in `config.toml` >
     /// unset; validated by [`tvdb_cache_duration`](Self::tvdb_cache_duration)
-    /// where the client is built, so a bad value warns (tracing is up by
-    /// then) and the default applies — it never stops the server.
+    /// where the client is built, so a value outside
+    /// [`TVDB_CACHE_HOURS_RANGE`] is clamped and one that is no whole number
+    /// is the default, each with a warning (tracing is up by then) — it never
+    /// stops the server.
     pub tvdb_cache_hours: Option<String>,
 
     /// How old TheTVDB's bearer token may get before Ferrofin logs in again,
@@ -507,8 +517,8 @@ pub struct Config {
     pub ffmpeg_img_extract_perf_tradeoff: bool,
 
     /// Re-encoding jobs the whole server may run at once; `0` is no cap. Past
-    /// it a signed-in user's idle jobs are ended first, and a start that still
-    /// has no room is answered `503` with `Retry-After`. Resolved
+    /// it a signed-in user's idle job on the same device is ended first, and a
+    /// start that still has no room is answered `503` with `Retry-After`. Resolved
     /// `FERROFIN_MAX_TRANSCODES` env > `max_transcodes` in `config.toml` > `0`,
     /// clamped to [`TranscodeLimits::RANGE`].
     pub max_transcodes: u32,
@@ -568,7 +578,7 @@ pub struct Config {
     pub enable_metrics: Option<bool>,
 
     /// Suppress the compiled-in extensions (intro skipper, file
-    /// transformation, merge versions) — `true` registers none of them but
+    /// transformation, merge versions, LDAP-Auth) — `true` registers none of them but
     /// the Ferrofin settings extension, the server's own settings page
     /// (`ferrofin_extensions::registered_extensions`).
     ///
@@ -584,12 +594,20 @@ pub struct Config {
     /// to Jellyfin.
     pub disable_extensions: bool,
 
+    /// Whether the server listens for the operating system's network changes
+    /// and reads its network interfaces again after each one (Jellyfin's
+    /// `DetectNetworkChange` startup key, `True` by default; `--nonetchange`
+    /// turns it off). Resolved `FERROFIN_DETECT_NETWORK_CHANGE` env >
+    /// `detect_network_change` in `config.toml` > `true`.
+    pub detect_network_change: bool,
+
     /// Metrics gauge-sampler interval, in seconds. `None` = the 15 s default
     /// (aligned with the Prometheus scrape interval). Resolved
     /// `FERROFIN_METRICS_SAMPLE_INTERVAL` env > `metrics_sample_interval` in
-    /// `config.toml` > default. Only consulted when `EnableMetrics` is set; kept
-    /// out of the API `ServerConfiguration` so `/System/Configuration` stays
-    /// byte-identical to Jellyfin.
+    /// `config.toml` > default, clamped to [`METRICS_SAMPLE_INTERVAL_RANGE`]
+    /// with a warning; zero is the default. Only consulted when `EnableMetrics`
+    /// is set; kept out of the API `ServerConfiguration` so
+    /// `/System/Configuration` stays byte-identical to Jellyfin.
     pub metrics_sample_interval: Option<u32>,
 
     /// Bucket boundaries (seconds, ascending) of the library-scan duration
@@ -612,14 +630,16 @@ pub struct Config {
     /// client mid-stream would keep a draining host alive indefinitely, so an
     /// in-process restart during playback would never come back. Resolved
     /// `FERROFIN_SHUTDOWN_TIMEOUT_SECS` env > `shutdown_timeout_secs` in
-    /// `config.toml` > 30.
+    /// `config.toml` > 30, clamped to [`SHUTDOWN_TIMEOUT_SECS_RANGE`] with a
+    /// warning.
     pub shutdown_timeout_secs: u32,
 
     /// Library-scan progress cadence: emit a progress `info!` every N items.
     /// `None` = the 100-item default; `0` disables progress logs. Resolved in
     /// order: `FERROFIN_SCAN_PROGRESS_EVERY` env, then `scan_progress_every` in
-    /// `config.toml`, else the default. A logging knob only — mistuning it changes
-    /// log density, never scan correctness.
+    /// `config.toml`, else the default, clamped to [`SCAN_PROGRESS_EVERY_RANGE`]
+    /// with a warning. A logging knob only — mistuning it changes log density,
+    /// never scan correctness.
     pub scan_progress_every: Option<u32>,
 
     /// How many ffprobe processes a library scan keeps in flight. The probe is
@@ -630,7 +650,8 @@ pub struct Config {
     /// on a spinning disk or a network mount, where a wide window turns
     /// sequential reads into seek thrash. Resolved
     /// `FERROFIN_SCAN_PROBE_CONCURRENCY` env > `scan_probe_concurrency` in
-    /// `config.toml` > default.
+    /// `config.toml` > default, clamped to [`SCAN_PROBE_CONCURRENCY_RANGE`]
+    /// with a warning.
     pub scan_probe_concurrency: Option<u32>,
 
     /// The directory listings one library scan keeps: dropped whole once
@@ -640,16 +661,16 @@ pub struct Config {
     /// a folder is listed again. `None` = upstream's
     /// `DirectoryService.MaxCachedRecords` (100 000). Resolved
     /// `FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS` env >
-    /// `scan_directory_cache_records` in `config.toml` > default; `0` is an
-    /// error.
+    /// `scan_directory_cache_records` in `config.toml` > default, clamped to
+    /// [`SCAN_DIRECTORY_CACHE_RECORDS_RANGE`] with a warning, `0` included.
     pub scan_directory_cache_records: Option<u32>,
 
     /// How long, in seconds, a library scan's directory listings survive
     /// unread before they are dropped whole. `None` = upstream's
     /// `DirectoryService.IdleTimeoutMs` (300 s). Resolved
     /// `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` env >
-    /// `scan_directory_cache_idle_secs` in `config.toml` > default; `0` is an
-    /// error.
+    /// `scan_directory_cache_idle_secs` in `config.toml` > default, clamped to
+    /// [`SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE`] with a warning, `0` included.
     pub scan_directory_cache_idle_secs: Option<u32>,
 
     /// How long, in seconds, a resolved access token (its device, user and
@@ -664,8 +685,9 @@ pub struct Config {
     /// How long, in seconds, the per-user access check may serve a user's
     /// policy rows and the libraries' rows and options from its cache
     /// (`ferrofin_db::row_cache`), which the user-library scope and every
-    /// lookup of a library's physical folders also read. `None` = 30 s
-    /// (`ROW_CACHE_TTL`). As for
+    /// lookup of a library's physical folders also read. The cache also holds
+    /// whether a Live TV tuner is configured, which the Live TV gate reads.
+    /// `None` = 30 s (`ROW_CACHE_TTL`). As for
     /// the auth cache, it only bounds edits made outside the server. Resolved
     /// `FERROFIN_ROW_CACHE_TTL_SECS` env > `row_cache_ttl_secs` in
     /// `config.toml` > default; must be within [`CACHE_TTL_RANGE_SECS`].
@@ -684,13 +706,15 @@ pub struct Config {
     /// Per-guest-call deadline for WASM plugins, in seconds. `None` = the
     /// 30 s default (`ferrofin_wasm::WasmSettings`). Resolved
     /// `FERROFIN_WASM_CALL_TIMEOUT_SECS` env > `wasm_call_timeout_secs` in
-    /// `config.toml` > default; zero is treated as unset.
+    /// `config.toml` > default, clamped to [`WASM_CALL_TIMEOUT_SECS_RANGE`]
+    /// with a warning; zero is treated as unset.
     pub wasm_call_timeout_secs: Option<u32>,
 
     /// Per-plugin linear-memory cap for WASM plugins, in MiB. `None` = the
     /// 128 MiB default (a `memory.grow` ceiling, never a reservation).
     /// Resolved `FERROFIN_WASM_MEMORY_LIMIT_MB` env > `wasm_memory_limit_mb`
-    /// in `config.toml` > default; zero is treated as unset.
+    /// in `config.toml` > default, clamped to [`WASM_MEMORY_LIMIT_MB_RANGE`]
+    /// with a warning; zero is treated as unset.
     pub wasm_memory_limit_mb: Option<u32>,
 
     /// Per-plugin event queue depth for WASM plugins. `None` = the 256
@@ -698,8 +722,9 @@ pub struct Config {
     /// hints; the DB is the truth), and web requests may hold at most half
     /// of it. Resolved
     /// `FERROFIN_WASM_EVENT_QUEUE_CAPACITY` env >
-    /// `wasm_event_queue_capacity` in `config.toml` > default; zero is
-    /// treated as unset.
+    /// `wasm_event_queue_capacity` in `config.toml` > default, clamped to
+    /// [`WASM_EVENT_QUEUE_CAPACITY_RANGE`] with a warning; zero is treated as
+    /// unset.
     pub wasm_event_queue_capacity: Option<u32>,
 
     /// WASM plugins allowed to `http-fetch` private/loopback destinations:
@@ -713,31 +738,36 @@ pub struct Config {
     /// settings and cursors fit easily; stats-heavy plugins (e.g. a
     /// playback-reporting port) may need more. Resolved
     /// `FERROFIN_WASM_STATE_LIMIT_MB` env > `wasm_state_limit_mb` in
-    /// `config.toml` > default.
+    /// `config.toml` > default, clamped to [`WASM_STATE_LIMIT_MB_RANGE`] with a
+    /// warning.
     pub wasm_state_limit_mb: Option<u32>,
 
     /// Cap on one plugin-artwork download, in MiB. `None`/zero = 20 MiB
     /// (posters/backdrops are single-digit MiB; anything larger is not
     /// artwork). Resolved `FERROFIN_WASM_IMAGE_DOWNLOAD_MB` env >
-    /// `wasm_image_download_mb` in `config.toml` > default.
+    /// `wasm_image_download_mb` in `config.toml` > default, clamped to
+    /// [`WASM_IMAGE_DOWNLOAD_MB_RANGE`] with a warning.
     pub wasm_image_download_mb: Option<u32>,
 
     /// Wall-clock bound on one plugin-artwork download, in seconds.
     /// `None`/zero = 30 s (a CDN GET, not a transfer job). Resolved
     /// `FERROFIN_WASM_IMAGE_TIMEOUT_SECS` env > `wasm_image_timeout_secs`
-    /// in `config.toml` > default.
+    /// in `config.toml` > default, clamped to
+    /// [`WASM_IMAGE_TIMEOUT_SECS_RANGE`] with a warning.
     pub wasm_image_timeout_secs: Option<u32>,
 
     /// Cap on one plugin `write-lyrics`/`write-subtitles` payload, in MiB.
     /// `None`/zero = 2 MiB (settings-class writes, not media). Resolved
     /// `FERROFIN_WASM_WRITE_CONTENT_MB` env > `wasm_write_content_mb` in
-    /// `config.toml` > default.
+    /// `config.toml` > default, clamped to [`WASM_WRITE_CONTENT_MB_RANGE`]
+    /// with a warning.
     pub wasm_write_content_mb: Option<u32>,
 
     /// Cap on one plugin-extracted subtitle track, in MiB. `None`/zero =
     /// 10 MiB (generous for SRT text). Resolved
     /// `FERROFIN_WASM_SUBTITLE_EXTRACT_MB` env >
-    /// `wasm_subtitle_extract_mb` in `config.toml` > default.
+    /// `wasm_subtitle_extract_mb` in `config.toml` > default, clamped to
+    /// [`WASM_SUBTITLE_EXTRACT_MB_RANGE`] with a warning.
     pub wasm_subtitle_extract_mb: Option<u32>,
 
     /// Depth of the playback-metrics write queue, in events. `None`/zero =
@@ -747,30 +777,67 @@ pub struct Config {
     /// queue drops the event with a warning rather than blocking. Raise it if
     /// `playback-metrics queue full` shows up in the log under a load spike.
     /// Resolved `FERROFIN_PLAYBACK_METRICS_QUEUE` env >
-    /// `playback_metrics_queue` in `config.toml` > default.
+    /// `playback_metrics_queue` in `config.toml` > default, clamped to
+    /// [`PLAYBACK_METRICS_QUEUE_RANGE`] with a warning.
     pub playback_metrics_queue: Option<u32>,
 
     /// Unauthorized Quick Connect requests one remote IP may hold at once;
     /// the next `POST /QuickConnect/Initiate` from that IP drops its oldest.
     /// `None`/zero = `ferrofin_core::quick_connect_manager::DEFAULT_PENDING_PER_IP` (10). Jellyfin has no
     /// cap. Resolved `FERROFIN_QUICK_CONNECT_PENDING_PER_IP` env >
-    /// `quick_connect_pending_per_ip` in `config.toml` > default.
+    /// `quick_connect_pending_per_ip` in `config.toml` > default, clamped to
+    /// [`QUICK_CONNECT_PENDING_PER_IP_RANGE`] with a warning.
     pub quick_connect_pending_per_ip: Option<u32>,
+
+    /// Whether Ferrofin's login backoff runs (Jellyfin has none): repeated
+    /// failed logins make an account's and a client address's next attempts
+    /// wait. Resolved `FERROFIN_LOGIN_BACKOFF` env > `login_backoff` in
+    /// `config.toml` > `true`.
+    pub login_backoff: bool,
+
+    /// Failed logins an account or a client address may make before its
+    /// attempts are paced. Resolved `FERROFIN_LOGIN_BACKOFF_ATTEMPTS` env >
+    /// `login_backoff_attempts` in `config.toml` > 5; within
+    /// [`LoginBackoffSettings::ATTEMPTS_RANGE`].
+    pub login_backoff_attempts: u32,
+
+    /// The longest wait, in seconds, the login backoff gives an attempt. An
+    /// address whose attempt would wait longer is refused; an account's
+    /// attempts only wait, this long at most. Resolved
+    /// `FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS` env >
+    /// `login_backoff_max_delay_secs` in `config.toml` > 30; within
+    /// [`LoginBackoffSettings::MAX_DELAY_RANGE_SECS`].
+    pub login_backoff_max_delay_secs: u32,
+
+    /// How long, in minutes, the login backoff remembers an account's or an
+    /// address's failures after the last one. Resolved
+    /// `FERROFIN_LOGIN_BACKOFF_WINDOW_MINS` env > `login_backoff_window_mins`
+    /// in `config.toml` > 15; within [`LoginBackoffSettings::WINDOW_RANGE_MINS`].
+    pub login_backoff_window_mins: u32,
+
+    /// The most accounts and addresses the login backoff remembers at once;
+    /// past it, the ones not yet paced are forgotten first. Resolved
+    /// `FERROFIN_LOGIN_BACKOFF_MAX_TRACKED` env > `login_backoff_max_tracked`
+    /// in `config.toml` > 100,000; within
+    /// [`LoginBackoffSettings::MAX_TRACKED_RANGE`].
+    pub login_backoff_max_tracked: u32,
 
     /// Concurrent media-decode budget for WASM plugin analysis
     /// (`extract-audio`/`extract-frames`). `None`/zero = a quarter of the
     /// visible cores, at least one — plugin analysis must never starve
     /// transcodes, but a NAS and a 32-core host disagree on what that
     /// means. Resolved `FERROFIN_WASM_ANALYSIS_CONCURRENCY` env >
-    /// `wasm_analysis_concurrency` in `config.toml` > default.
+    /// `wasm_analysis_concurrency` in `config.toml` > default, clamped to
+    /// [`WASM_ANALYSIS_CONCURRENCY_RANGE`] with a warning.
     pub wasm_analysis_concurrency: Option<u32>,
 
     /// Size cap on a plugin artifact downloaded during a repository install,
     /// in MiB. `None` = the 128 MiB default (sized for interpreter-language
     /// guests bundling their runtime; an abuse guard, not a tuning knob).
     /// Resolved `FERROFIN_MAX_PLUGIN_DOWNLOAD_MB` env >
-    /// `max_plugin_download_mb` in `config.toml` > default; zero is treated
-    /// as unset.
+    /// `max_plugin_download_mb` in `config.toml` > default, clamped to
+    /// [`MAX_PLUGIN_DOWNLOAD_MB_RANGE`] with a warning; zero is treated as
+    /// unset.
     pub max_plugin_download_mb: Option<u32>,
 }
 
@@ -1124,31 +1191,60 @@ impl Config {
             disable_extensions: parse_bool_var(env, "FERROFIN_DISABLE_EXTENSIONS")
                 .or(file.disable_extensions)
                 .unwrap_or(false),
+            detect_network_change: parse_bool_var(env, "FERROFIN_DETECT_NETWORK_CHANGE")
+                .or(file.detect_network_change)
+                .unwrap_or(true),
             metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
             metrics_scan_duration_buckets: env
                 .var("FERROFIN_METRICS_SCAN_DURATION_BUCKETS")
                 .filter(|raw| !raw.trim().is_empty())
                 .map(|raw| parse_bucket_list(&raw))
                 .or(file.metrics_scan_duration_buckets),
-            shutdown_timeout_secs: parse_var(env, "FERROFIN_SHUTDOWN_TIMEOUT_SECS")
-                .or(file.shutdown_timeout_secs)
-                .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
-            scan_progress_every: parse_var(env, "FERROFIN_SCAN_PROGRESS_EVERY")
-                .or(file.scan_progress_every),
-            scan_probe_concurrency: parse_var(env, "FERROFIN_SCAN_PROBE_CONCURRENCY")
-                .or(file.scan_probe_concurrency),
-            scan_directory_cache_records: resolve_positive(
+            shutdown_timeout_secs: resolve_clamped(
+                env,
+                "FERROFIN_SHUTDOWN_TIMEOUT_SECS",
+                "shutdown_timeout_secs",
+                file.shutdown_timeout_secs,
+                DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+                SHUTDOWN_TIMEOUT_SECS_RANGE,
+                "seconds",
+            ),
+            scan_progress_every: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_SCAN_PROGRESS_EVERY",
+                "scan_progress_every",
+                file.scan_progress_every,
+                &SCAN_PROGRESS_EVERY_RANGE,
+                "items",
+                Zero::InRange,
+            ),
+            scan_probe_concurrency: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_SCAN_PROBE_CONCURRENCY",
+                "scan_probe_concurrency",
+                file.scan_probe_concurrency,
+                &SCAN_PROBE_CONCURRENCY_RANGE,
+                "processes",
+                Zero::Default,
+            ),
+            scan_directory_cache_records: resolve_clamped_or_unset(
                 env,
                 "FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS",
                 "scan_directory_cache_records",
                 file.scan_directory_cache_records,
-            )?,
-            scan_directory_cache_idle_secs: resolve_positive(
+                &SCAN_DIRECTORY_CACHE_RECORDS_RANGE,
+                "records",
+                Zero::InRange,
+            ),
+            scan_directory_cache_idle_secs: resolve_clamped_or_unset(
                 env,
                 "FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS",
                 "scan_directory_cache_idle_secs",
                 file.scan_directory_cache_idle_secs,
-            )?,
+                &SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE,
+                "seconds",
+                Zero::InRange,
+            ),
             auth_cache_ttl_secs: resolve_cache_ttl(
                 env,
                 "FERROFIN_AUTH_CACHE_TTL_SECS",
@@ -1162,34 +1258,153 @@ impl Config {
                 file.row_cache_ttl_secs,
             )?,
             trickplay_concurrency: resolve_trickplay_concurrency(env, file.trickplay_concurrency)?,
-            wasm_call_timeout_secs: parse_var(env, "FERROFIN_WASM_CALL_TIMEOUT_SECS")
-                .or(file.wasm_call_timeout_secs),
-            wasm_memory_limit_mb: parse_var(env, "FERROFIN_WASM_MEMORY_LIMIT_MB")
-                .or(file.wasm_memory_limit_mb),
-            wasm_event_queue_capacity: parse_var(env, "FERROFIN_WASM_EVENT_QUEUE_CAPACITY")
-                .or(file.wasm_event_queue_capacity),
+            wasm_call_timeout_secs: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_CALL_TIMEOUT_SECS",
+                "wasm_call_timeout_secs",
+                file.wasm_call_timeout_secs,
+                &WASM_CALL_TIMEOUT_SECS_RANGE,
+                "seconds",
+                Zero::Default,
+            ),
+            wasm_memory_limit_mb: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_MEMORY_LIMIT_MB",
+                "wasm_memory_limit_mb",
+                file.wasm_memory_limit_mb,
+                &WASM_MEMORY_LIMIT_MB_RANGE,
+                "MiB",
+                Zero::Default,
+            ),
+            wasm_event_queue_capacity: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_EVENT_QUEUE_CAPACITY",
+                "wasm_event_queue_capacity",
+                file.wasm_event_queue_capacity,
+                &WASM_EVENT_QUEUE_CAPACITY_RANGE,
+                "events",
+                Zero::Default,
+            ),
             wasm_private_http_allow: env
                 .var("FERROFIN_WASM_PRIVATE_HTTP_ALLOW")
                 .or(file.wasm_private_http_allow)
                 .filter(|s| !s.trim().is_empty()),
-            max_plugin_download_mb: parse_var(env, "FERROFIN_MAX_PLUGIN_DOWNLOAD_MB")
-                .or(file.max_plugin_download_mb),
-            wasm_analysis_concurrency: parse_var(env, "FERROFIN_WASM_ANALYSIS_CONCURRENCY")
-                .or(file.wasm_analysis_concurrency),
-            wasm_state_limit_mb: parse_var(env, "FERROFIN_WASM_STATE_LIMIT_MB")
-                .or(file.wasm_state_limit_mb),
-            wasm_image_download_mb: parse_var(env, "FERROFIN_WASM_IMAGE_DOWNLOAD_MB")
-                .or(file.wasm_image_download_mb),
-            wasm_image_timeout_secs: parse_var(env, "FERROFIN_WASM_IMAGE_TIMEOUT_SECS")
-                .or(file.wasm_image_timeout_secs),
-            wasm_write_content_mb: parse_var(env, "FERROFIN_WASM_WRITE_CONTENT_MB")
-                .or(file.wasm_write_content_mb),
-            wasm_subtitle_extract_mb: parse_var(env, "FERROFIN_WASM_SUBTITLE_EXTRACT_MB")
-                .or(file.wasm_subtitle_extract_mb),
-            playback_metrics_queue: parse_var(env, "FERROFIN_PLAYBACK_METRICS_QUEUE")
-                .or(file.playback_metrics_queue),
-            quick_connect_pending_per_ip: parse_var(env, "FERROFIN_QUICK_CONNECT_PENDING_PER_IP")
-                .or(file.quick_connect_pending_per_ip),
+            max_plugin_download_mb: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_MAX_PLUGIN_DOWNLOAD_MB",
+                "max_plugin_download_mb",
+                file.max_plugin_download_mb,
+                &MAX_PLUGIN_DOWNLOAD_MB_RANGE,
+                "MiB",
+                Zero::Default,
+            ),
+            wasm_analysis_concurrency: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_ANALYSIS_CONCURRENCY",
+                "wasm_analysis_concurrency",
+                file.wasm_analysis_concurrency,
+                &WASM_ANALYSIS_CONCURRENCY_RANGE,
+                "decodes",
+                Zero::Default,
+            ),
+            wasm_state_limit_mb: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_STATE_LIMIT_MB",
+                "wasm_state_limit_mb",
+                file.wasm_state_limit_mb,
+                &WASM_STATE_LIMIT_MB_RANGE,
+                "MiB",
+                Zero::Default,
+            ),
+            wasm_image_download_mb: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_IMAGE_DOWNLOAD_MB",
+                "wasm_image_download_mb",
+                file.wasm_image_download_mb,
+                &WASM_IMAGE_DOWNLOAD_MB_RANGE,
+                "MiB",
+                Zero::Default,
+            ),
+            wasm_image_timeout_secs: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_IMAGE_TIMEOUT_SECS",
+                "wasm_image_timeout_secs",
+                file.wasm_image_timeout_secs,
+                &WASM_IMAGE_TIMEOUT_SECS_RANGE,
+                "seconds",
+                Zero::Default,
+            ),
+            wasm_write_content_mb: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_WRITE_CONTENT_MB",
+                "wasm_write_content_mb",
+                file.wasm_write_content_mb,
+                &WASM_WRITE_CONTENT_MB_RANGE,
+                "MiB",
+                Zero::Default,
+            ),
+            wasm_subtitle_extract_mb: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_SUBTITLE_EXTRACT_MB",
+                "wasm_subtitle_extract_mb",
+                file.wasm_subtitle_extract_mb,
+                &WASM_SUBTITLE_EXTRACT_MB_RANGE,
+                "MiB",
+                Zero::Default,
+            ),
+            playback_metrics_queue: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_PLAYBACK_METRICS_QUEUE",
+                "playback_metrics_queue",
+                file.playback_metrics_queue,
+                &PLAYBACK_METRICS_QUEUE_RANGE,
+                "events",
+                Zero::Default,
+            ),
+            quick_connect_pending_per_ip: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_QUICK_CONNECT_PENDING_PER_IP",
+                "quick_connect_pending_per_ip",
+                file.quick_connect_pending_per_ip,
+                &QUICK_CONNECT_PENDING_PER_IP_RANGE,
+                "requests",
+                Zero::Default,
+            ),
+            login_backoff: parse_bool_var(env, "FERROFIN_LOGIN_BACKOFF")
+                .or(file.login_backoff)
+                .unwrap_or(true),
+            login_backoff_attempts: resolve_ranged(
+                env,
+                "FERROFIN_LOGIN_BACKOFF_ATTEMPTS",
+                "login_backoff_attempts",
+                file.login_backoff_attempts,
+                LoginBackoffSettings::DEFAULT_ATTEMPTS,
+                LoginBackoffSettings::ATTEMPTS_RANGE,
+            )?,
+            login_backoff_max_delay_secs: resolve_ranged(
+                env,
+                "FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS",
+                "login_backoff_max_delay_secs",
+                file.login_backoff_max_delay_secs,
+                LoginBackoffSettings::DEFAULT_MAX_DELAY_SECS,
+                LoginBackoffSettings::MAX_DELAY_RANGE_SECS,
+            )?,
+            login_backoff_window_mins: resolve_ranged(
+                env,
+                "FERROFIN_LOGIN_BACKOFF_WINDOW_MINS",
+                "login_backoff_window_mins",
+                file.login_backoff_window_mins,
+                LoginBackoffSettings::DEFAULT_WINDOW_MINS,
+                LoginBackoffSettings::WINDOW_RANGE_MINS,
+            )?,
+            login_backoff_max_tracked: resolve_ranged(
+                env,
+                "FERROFIN_LOGIN_BACKOFF_MAX_TRACKED",
+                "login_backoff_max_tracked",
+                file.login_backoff_max_tracked,
+                LoginBackoffSettings::DEFAULT_MAX_TRACKED,
+                LoginBackoffSettings::MAX_TRACKED_RANGE,
+            )?,
         };
         // The file's warnings first, then the variables', in the order read.
         load_warnings.extend(env.warnings.take());
@@ -1230,28 +1445,38 @@ impl Config {
     }
 
     /// TheTVDB's cache duration ([`tvdb_cache_hours`](Self::tvdb_cache_hours)):
-    /// the configured whole hours, or the plugin's default of one hour
+    /// the configured whole hours, clamped to [`TVDB_CACHE_HOURS_RANGE`] with
+    /// a warning, or the plugin's default of one hour
     /// ([`ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION`]) when unset. A
-    /// value that is not a whole number of hours above zero is refused with
-    /// a warning and the default is used, as the sibling settings do; call
-    /// it once tracing is installed.
+    /// value that is not a whole number of hours is refused with a warning
+    /// and the default is used, as the sibling settings do; call it once
+    /// tracing is installed.
     #[must_use]
     pub fn tvdb_cache_duration(&self) -> std::time::Duration {
         let default = ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION;
         let Some(raw) = self.tvdb_cache_hours.as_deref() else {
             return default;
         };
-        match raw.trim().parse::<u32>() {
-            Ok(hours) if hours > 0 => std::time::Duration::from_hours(u64::from(hours)),
-            _ => {
-                tracing::warn!(
-                    value = raw,
-                    default_hours = default.as_secs() / 3600,
-                    "FERROFIN_TVDB_CACHE_HOURS / tvdb_cache_hours is not a whole number of hours above zero; using the default"
-                );
-                default
-            }
+        // `hours` is the value used in both warnings.
+        let Ok(written) = raw.trim().parse::<u32>() else {
+            tracing::warn!(
+                value = raw,
+                hours = default.as_secs() / 3600,
+                "FERROFIN_TVDB_CACHE_HOURS / tvdb_cache_hours is not a whole number of hours; using the default"
+            );
+            return default;
+        };
+        let hours = clamp_tvdb_cache_hours(written);
+        if hours != written {
+            tracing::warn!(
+                value = raw,
+                hours,
+                min = TVDB_CACHE_HOURS_RANGE.start(),
+                max = TVDB_CACHE_HOURS_RANGE.end(),
+                "FERROFIN_TVDB_CACHE_HOURS / tvdb_cache_hours is outside its range; using the nearest bound"
+            );
         }
+        std::time::Duration::from_hours(u64::from(hours))
     }
 
     /// The private hosts and networks image downloads may reach
@@ -1416,6 +1641,7 @@ impl Config {
             db_statement_cache: None,
             enable_metrics: None,
             disable_extensions: false,
+            detect_network_change: true,
             metrics_sample_interval: None,
             metrics_scan_duration_buckets: None,
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
@@ -1439,7 +1665,29 @@ impl Config {
             wasm_subtitle_extract_mb: None,
             playback_metrics_queue: None,
             quick_connect_pending_per_ip: None,
+            // Off, so a test's failed logins do not make its next logins wait;
+            // the login backoff's own tests turn it on.
+            login_backoff: false,
+            login_backoff_attempts: LoginBackoffSettings::DEFAULT_ATTEMPTS,
+            login_backoff_max_delay_secs: LoginBackoffSettings::DEFAULT_MAX_DELAY_SECS,
+            login_backoff_window_mins: LoginBackoffSettings::DEFAULT_WINDOW_MINS,
+            login_backoff_max_tracked: LoginBackoffSettings::DEFAULT_MAX_TRACKED,
         }
+    }
+
+    /// The login backoff these settings describe.
+    #[must_use]
+    pub fn login_backoff_settings(&self) -> LoginBackoffSettings {
+        LoginBackoffSettings::new(
+            if self.login_backoff {
+                self.login_backoff_attempts
+            } else {
+                0
+            },
+            self.login_backoff_max_delay_secs,
+            self.login_backoff_window_mins,
+            self.login_backoff_max_tracked,
+        )
     }
 }
 
@@ -1457,9 +1705,82 @@ fn keep_running<T: Clone + PartialEq>(
     }
 }
 
+// The ranges of the counts below (owner decision D2 of the settings-page
+// milestone). The settings page reads each as its row's bounds, so the page, a
+// save and startup cannot disagree.
+
+/// The unauthorized Quick Connect requests one client IP may hold
+/// (`quick_connect_pending_per_ip`).
+pub const QUICK_CONNECT_PENDING_PER_IP_RANGE: RangeInclusive<u32> = 1..=1_000;
+
+/// The ffprobe processes a library scan keeps in flight
+/// (`scan_probe_concurrency`).
+pub const SCAN_PROBE_CONCURRENCY_RANGE: RangeInclusive<u32> = 1..=64;
+
+/// The items between scan-progress log lines (`scan_progress_every`); `0`
+/// turns them off.
+pub const SCAN_PROGRESS_EVERY_RANGE: RangeInclusive<u32> = 0..=100_000;
+
+/// The directory-listing records one library scan keeps
+/// (`scan_directory_cache_records`).
+pub const SCAN_DIRECTORY_CACHE_RECORDS_RANGE: RangeInclusive<u32> = 1_000..=10_000_000;
+
+/// The seconds a library scan's directory listings survive unread
+/// (`scan_directory_cache_idle_secs`).
+pub const SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE: RangeInclusive<u32> = 30..=3_600;
+
+/// The events the playback-metrics write queue holds
+/// (`playback_metrics_queue`).
+pub const PLAYBACK_METRICS_QUEUE_RANGE: RangeInclusive<u32> = 64..=65_536;
+
+/// The seconds between process-metric samples (`metrics_sample_interval`).
+pub const METRICS_SAMPLE_INTERVAL_RANGE: RangeInclusive<u32> = 1..=300;
+
+/// The seconds a shutdown or restart waits for requests in flight
+/// (`shutdown_timeout_secs`).
+pub const SHUTDOWN_TIMEOUT_SECS_RANGE: RangeInclusive<u32> = 5..=600;
+
+/// The hours TheTVDB lookups are reused (`tvdb_cache_hours`).
+pub const TVDB_CACHE_HOURS_RANGE: RangeInclusive<u32> = 1..=168;
+
+/// The seconds one WASM plugin call may run (`wasm_call_timeout_secs`).
+pub const WASM_CALL_TIMEOUT_SECS_RANGE: RangeInclusive<u32> = 1..=600;
+
+/// The MiB of memory one WASM plugin may grow to (`wasm_memory_limit_mb`).
+pub const WASM_MEMORY_LIMIT_MB_RANGE: RangeInclusive<u32> = 16..=4_096;
+
+/// The events one WASM plugin's queue holds (`wasm_event_queue_capacity`).
+pub const WASM_EVENT_QUEUE_CAPACITY_RANGE: RangeInclusive<u32> = 16..=65_536;
+
+/// The MiB a plugin downloaded from a repository may take
+/// (`max_plugin_download_mb`).
+pub const MAX_PLUGIN_DOWNLOAD_MB_RANGE: RangeInclusive<u32> = 8..=1_024;
+
+/// The media decodes plugin analysis may run at once
+/// (`wasm_analysis_concurrency`).
+pub const WASM_ANALYSIS_CONCURRENCY_RANGE: RangeInclusive<u32> = 1..=64;
+
+/// The MiB of key/value state one WASM plugin may keep
+/// (`wasm_state_limit_mb`).
+pub const WASM_STATE_LIMIT_MB_RANGE: RangeInclusive<u32> = 1..=256;
+
+/// The MiB one plugin artwork download may take (`wasm_image_download_mb`).
+pub const WASM_IMAGE_DOWNLOAD_MB_RANGE: RangeInclusive<u32> = 1..=256;
+
+/// The seconds one plugin artwork download may take
+/// (`wasm_image_timeout_secs`).
+pub const WASM_IMAGE_TIMEOUT_SECS_RANGE: RangeInclusive<u32> = 5..=300;
+
+/// The MiB of lyrics or subtitles one plugin write may hold
+/// (`wasm_write_content_mb`).
+pub const WASM_WRITE_CONTENT_MB_RANGE: RangeInclusive<u32> = 1..=64;
+
+/// The MiB one subtitle track a plugin extracts may take
+/// (`wasm_subtitle_extract_mb`).
+pub const WASM_SUBTITLE_EXTRACT_MB_RANGE: RangeInclusive<u32> = 1..=128;
+
 /// Resolves a number with a range: `env_key` when it parses, else `file`, else
-/// `default`, clamped to `range`. A value outside warns, naming both layers'
-/// keys and `unit`, and the server starts on the clamped one: a limit never
+/// `default`, clamped to `range` ([`clamp_with_warning`]): a limit never
 /// stops a boot.
 fn resolve_clamped<T>(
     env: &dyn Env,
@@ -1467,13 +1788,70 @@ fn resolve_clamped<T>(
     file_key: &str,
     file: Option<T>,
     default: T,
-    range: std::ops::RangeInclusive<T>,
+    range: RangeInclusive<T>,
     unit: &str,
 ) -> T
 where
     T: Copy + Ord + std::fmt::Display + std::str::FromStr,
 {
     let value = parse_var(env, env_key).or(file).unwrap_or(default);
+    clamp_with_warning(env, env_key, file_key, value, &range, unit)
+}
+
+/// `hours` of `tvdb_cache_hours` clamped to [`TVDB_CACHE_HOURS_RANGE`]: the
+/// hours TheTVDB lookups are reused for ([`Config::tvdb_cache_duration`]).
+#[must_use]
+pub fn clamp_tvdb_cache_hours(hours: u32) -> u32 {
+    hours.clamp(
+        *TVDB_CACHE_HOURS_RANGE.start(),
+        *TVDB_CACHE_HOURS_RANGE.end(),
+    )
+}
+
+/// What `0` means to a count [`resolve_clamped_or_unset`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Zero {
+    /// A value like any other, clamped when it is outside the range.
+    InRange,
+    /// The default, as the setting's docs say: kept, and the consumer applies
+    /// its default.
+    Default,
+}
+
+/// Resolves a count whose default its consumer applies: `env_key` when it
+/// parses, else `file`, else `None`, clamped to `range`
+/// ([`clamp_with_warning`]). With [`Zero::Default`], `0` is kept as it is.
+fn resolve_clamped_or_unset(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<u32>,
+    range: &RangeInclusive<u32>,
+    unit: &str,
+    zero: Zero,
+) -> Option<u32> {
+    let value = parse_var(env, env_key).or(file)?;
+    if value == 0 && zero == Zero::Default {
+        return Some(0);
+    }
+    Some(clamp_with_warning(
+        env, env_key, file_key, value, range, unit,
+    ))
+}
+
+/// `value` clamped to `range`. A value outside warns, naming both layers'
+/// keys, the range in `unit` and the value used, and the server starts on it.
+fn clamp_with_warning<T>(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    value: T,
+    range: &RangeInclusive<T>,
+    unit: &str,
+) -> T
+where
+    T: Copy + Ord + std::fmt::Display,
+{
     let clamped = value.clamp(*range.start(), *range.end());
     if clamped != value {
         env.warn(format!(
@@ -1529,12 +1907,20 @@ fn resolve_log_format(env: &dyn Env, file: Option<String>) -> LogFormat {
 
 /// Resolves the metrics sampler interval (seconds): `FERROFIN_METRICS_SAMPLE_INTERVAL`
 /// env > `metrics_sample_interval` in `config.toml` > `None` (the sampler's 15 s
-/// default). A zero or unparsable value falls back to the default — a mistuned
-/// scrape knob changes cadence, never correctness.
+/// default), clamped to [`METRICS_SAMPLE_INTERVAL_RANGE`] with a warning. A
+/// zero or unparsable value falls back to the default — a mistuned scrape knob
+/// changes cadence, never correctness.
 fn resolve_metrics_interval(env: &dyn Env, file: Option<u32>) -> Option<u32> {
-    parse_var(env, "FERROFIN_METRICS_SAMPLE_INTERVAL")
-        .or(file)
-        .filter(|&s| s > 0)
+    resolve_clamped_or_unset(
+        env,
+        "FERROFIN_METRICS_SAMPLE_INTERVAL",
+        "metrics_sample_interval",
+        file,
+        &METRICS_SAMPLE_INTERVAL_RANGE,
+        "seconds",
+        Zero::Default,
+    )
+    .filter(|&s| s > 0)
 }
 
 /// Parses a comma-separated list of bucket boundaries (seconds). An entry
@@ -1606,11 +1992,39 @@ fn resolve_positive(
     Ok(file)
 }
 
+/// Resolves a whole number that must lie within `range`: the `env_key` env
+/// var > `file_key` in `config.toml` > `default`. Anything else is an error,
+/// so a typo is noticed instead of silently changing a security setting. An
+/// empty env value is unset.
+fn resolve_ranged(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<u32>,
+    default: u32,
+    range: std::ops::RangeInclusive<u32>,
+) -> anyhow::Result<u32> {
+    let value = match env.var(env_key).filter(|s| !s.trim().is_empty()) {
+        Some(raw) => raw
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid {env_key} `{raw}`: expected a whole number"))?,
+        None => file.unwrap_or(default),
+    };
+    anyhow::ensure!(
+        range.contains(&value),
+        "invalid {env_key} / {file_key} `{value}`: expected {} to {}",
+        range.start(),
+        range.end()
+    );
+    Ok(value)
+}
+
 /// The seconds a cache lifetime setting may take (`auth_cache_ttl_secs`,
 /// `row_cache_ttl_secs`): from 5, below which a busy client's request burst
 /// stops hitting the cache, to 300, past which an edit made outside the server
 /// goes unseen for longer than an operator would wait for it.
-pub const CACHE_TTL_RANGE_SECS: std::ops::RangeInclusive<u32> = 5..=300;
+pub const CACHE_TTL_RANGE_SECS: RangeInclusive<u32> = 5..=300;
 
 /// [`resolve_positive`] for a cache lifetime, which must also lie within
 /// [`CACHE_TTL_RANGE_SECS`].
@@ -1637,7 +2051,7 @@ fn resolve_cache_ttl(
 /// default, which one browse of the library outgrows, to 1024. Every
 /// connection keeps its own statements, so the memory a larger cache holds is
 /// multiplied by the pool size.
-pub const STATEMENT_CACHE_RANGE: std::ops::RangeInclusive<u32> = 100..=1024;
+pub const STATEMENT_CACHE_RANGE: RangeInclusive<u32> = 100..=1024;
 
 /// Resolves the per-connection statement cache: `FERROFIN_DB_STATEMENT_CACHE`
 /// env > `db_statement_cache` in `config.toml` > `None` (the default). A value
@@ -2695,7 +3109,7 @@ mod tests {
             .with("FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB", "999999")
             .with("FERROFIN_IMAGE_RESIZE_BUDGET_MB", "lots");
         let cfg = Config::load_from(cli, &env).unwrap();
-        assert_eq!(image_limits(&cfg), (16, 2048, 4096));
+        assert_eq!(image_limits(&cfg), (50, 2048, 4096));
         assert_eq!(cfg.load_warnings.len(), 3, "{:?}", cfg.load_warnings);
         for variable in [
             "FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS",
@@ -2858,6 +3272,31 @@ mod tests {
         assert_eq!(cfg.db_pool, None, "no knob set ⇒ auto sizing");
     }
 
+    /// Network-change detection resolves env > `config.toml` > on, as
+    /// Jellyfin's `DetectNetworkChange` defaults to `True`.
+    #[test]
+    fn detect_network_change_defaults_on_and_env_beats_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "detect_network_change = false\n").unwrap();
+        let load =
+            |cli: Cli, env: &FakeEnv| Config::load_from(cli, env).unwrap().detect_network_change;
+        let from_file = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert!(load(Cli::default(), &FakeEnv::new()));
+        assert!(!load(
+            Cli::default(),
+            &FakeEnv::new().with("FERROFIN_DETECT_NETWORK_CHANGE", "off")
+        ));
+        assert!(!load(from_file(), &FakeEnv::new()));
+        assert!(load(
+            from_file(),
+            &FakeEnv::new().with("FERROFIN_DETECT_NETWORK_CHANGE", "1")
+        ));
+    }
+
     /// The extension kill-switch resolves env > file > off, and accepts the
     /// boolean spellings people actually write.
     ///
@@ -3004,17 +3443,14 @@ mod tests {
         );
     }
 
-    /// A value that is not a whole number of hours above zero — from the
-    /// env or the file — warns and falls back to the default, never stops
-    /// the server.
+    /// A value that is not a whole number of hours — from the env or the
+    /// file — warns and falls back to the default, never stops the server.
     #[test]
     fn a_bad_tvdb_cache_hours_falls_back_to_the_default() {
-        let cases: [(Option<&str>, &str); 9] = [
-            (Some("0"), ""),
+        let cases: [(Option<&str>, &str); 7] = [
             (Some("-3"), ""),
             (Some("1.5"), ""),
             (Some("6h"), ""),
-            (None, "tvdb_cache_hours = 0\n"),
             (None, "tvdb_cache_hours = -2\n"),
             (None, "tvdb_cache_hours = 1.5\n"),
             (None, "tvdb_cache_hours = \"6h\"\n"),
@@ -3327,6 +3763,62 @@ mod tests {
     }
 
     #[test]
+    fn login_backoff_settings_resolve_and_refuse_values_out_of_range() {
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            unset.login_backoff_settings(),
+            LoginBackoffSettings::DEFAULT
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(
+            &toml,
+            "login_backoff = false\nlogin_backoff_attempts = 3\n\
+             login_backoff_max_delay_secs = 300\nlogin_backoff_window_mins = 1\n\
+             login_backoff_max_tracked = 1000\n",
+        )
+        .unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let from_file = Config::load_from(cli(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            (
+                from_file.login_backoff_attempts,
+                from_file.login_backoff_max_delay_secs,
+                from_file.login_backoff_window_mins,
+                from_file.login_backoff_max_tracked
+            ),
+            (3, 300, 1, 1000)
+        );
+        assert_eq!(from_file.login_backoff_settings().attempts, 0, "off");
+        let env = FakeEnv::new().with("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "20");
+        assert_eq!(
+            Config::load_from(cli(), &env)
+                .unwrap()
+                .login_backoff_attempts,
+            20
+        );
+        for (key, value) in [
+            ("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "0"),
+            ("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "2"),
+            ("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "21"),
+            ("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "five"),
+            ("FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS", "4"),
+            ("FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS", "0"),
+            ("FERROFIN_LOGIN_BACKOFF_WINDOW_MINS", "1441"),
+            ("FERROFIN_LOGIN_BACKOFF_WINDOW_MINS", "0"),
+            ("FERROFIN_LOGIN_BACKOFF_MAX_TRACKED", "999"),
+            ("FERROFIN_LOGIN_BACKOFF_MAX_TRACKED", "10000001"),
+        ] {
+            let env = FakeEnv::new().with(key, value);
+            let err = Config::load_from(Cli::default(), &env).unwrap_err();
+            assert!(err.to_string().contains(key), "{key}={value}: {err}");
+        }
+    }
+
+    #[test]
     fn quick_connect_pending_per_ip_env_beats_file() {
         let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
         assert_eq!(unset.quick_connect_pending_per_ip, None);
@@ -3487,7 +3979,7 @@ row_cache_ttl_secs = 10
     }
 
     #[test]
-    fn scan_directory_cache_limits_resolve_and_reject_zero() {
+    fn scan_directory_cache_limits_resolve_and_clamp_zero() {
         // Unset → None (the scanner keeps upstream's values).
         let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
         assert_eq!(cfg.scan_directory_cache_records, None);
@@ -3500,16 +3992,39 @@ row_cache_ttl_secs = 10
         assert_eq!(cfg.scan_directory_cache_records, Some(5000));
         assert_eq!(cfg.scan_directory_cache_idle_secs, Some(60));
 
-        for (key, value) in [
-            ("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "0"),
-            ("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "lots"),
-            ("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "0"),
-            ("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "-5"),
+        // Never a refusal to boot: 0 is clamped, and a value that does not
+        // parse is ignored, each with a warning naming the variable.
+        for (key, value, records, idle) in [
+            (
+                "FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS",
+                "0",
+                Some(1000),
+                None,
+            ),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "lots", None, None),
+            (
+                "FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS",
+                "0",
+                None,
+                Some(30),
+            ),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "-5", None, None),
         ] {
-            let err = Config::load_from(Cli::default(), &FakeEnv::new().with(key, value))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(key), "{key}={value}: {err}");
+            let cfg = Config::load_from(Cli::default(), &FakeEnv::new().with(key, value)).unwrap();
+            assert_eq!(
+                (
+                    cfg.scan_directory_cache_records,
+                    cfg.scan_directory_cache_idle_secs
+                ),
+                (records, idle),
+                "{key}={value}"
+            );
+            assert_eq!(cfg.load_warnings.len(), 1, "{key}={value}");
+            assert!(
+                cfg.load_warnings[0].contains(key),
+                "{key}={value}: {:?}",
+                cfg.load_warnings
+            );
         }
 
         let dir = tempfile::tempdir().unwrap();
@@ -3520,26 +4035,30 @@ row_cache_ttl_secs = 10
                 config_file: Some(toml.clone()),
                 ..Cli::default()
             };
-            Config::load_from(cli, &FakeEnv::new())
+            Config::load_from(cli, &FakeEnv::new()).unwrap()
         };
         let cfg =
-            load("scan_directory_cache_records = 7\nscan_directory_cache_idle_secs = 9\n").unwrap();
-        assert_eq!(cfg.scan_directory_cache_records, Some(7));
-        assert_eq!(cfg.scan_directory_cache_idle_secs, Some(9));
-        let err = load("scan_directory_cache_idle_secs = 0\n").unwrap_err();
+            load("scan_directory_cache_records = 7000\nscan_directory_cache_idle_secs = 90\n");
+        assert_eq!(cfg.scan_directory_cache_records, Some(7000));
+        assert_eq!(cfg.scan_directory_cache_idle_secs, Some(90));
+        let cfg = load("scan_directory_cache_records = 7\nscan_directory_cache_idle_secs = 0\n");
+        assert_eq!(cfg.scan_directory_cache_records, Some(1000));
+        assert_eq!(cfg.scan_directory_cache_idle_secs, Some(30));
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
         assert!(
-            err.to_string().contains("scan_directory_cache_idle_secs"),
-            "{err}"
+            cfg.load_warnings[1].contains("scan_directory_cache_idle_secs"),
+            "{:?}",
+            cfg.load_warnings
         );
         // Env wins over the file.
-        std::fs::write(&toml, "scan_directory_cache_records = 7\n").unwrap();
+        std::fs::write(&toml, "scan_directory_cache_records = 7000\n").unwrap();
         let cli = Cli {
             config_file: Some(toml.clone()),
             ..Cli::default()
         };
-        let env = FakeEnv::new().with("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "11");
+        let env = FakeEnv::new().with("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "11000");
         let cfg = Config::load_from(cli, &env).unwrap();
-        assert_eq!(cfg.scan_directory_cache_records, Some(11));
+        assert_eq!(cfg.scan_directory_cache_records, Some(11000));
     }
 
     #[test]
@@ -3557,6 +4076,302 @@ row_cache_ttl_secs = 10
         let env = FakeEnv::new().with("FERROFIN_SCAN_PROGRESS_EVERY", "0");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.scan_progress_every, Some(0));
+    }
+
+    /// A count with no default of its own in the loader, from the variable or
+    /// `config.toml`, is clamped to its range with a warning naming the
+    /// setting and the value used; the server still boots.
+    #[test]
+    fn a_count_outside_its_range_is_clamped_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(
+            &toml,
+            "wasm_subtitle_extract_mb = 100000\nplayback_metrics_queue = 8\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(toml),
+            ..Cli::default()
+        };
+        let env = FakeEnv::new()
+            .with("FERROFIN_SCAN_PROBE_CONCURRENCY", "500")
+            .with("FERROFIN_WASM_MEMORY_LIMIT_MB", "4");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(
+            cfg.wasm_subtitle_extract_mb,
+            Some(128),
+            "the file's, clamped"
+        );
+        assert_eq!(cfg.playback_metrics_queue, Some(64), "the file's, clamped");
+        assert_eq!(
+            cfg.scan_probe_concurrency,
+            Some(64),
+            "the variable's, clamped"
+        );
+        assert_eq!(
+            cfg.wasm_memory_limit_mb,
+            Some(16),
+            "the variable's, clamped"
+        );
+        assert_eq!(cfg.load_warnings.len(), 4, "{:?}", cfg.load_warnings);
+        for (setting, used) in [
+            ("wasm_subtitle_extract_mb", "using 128"),
+            ("playback_metrics_queue", "using 64"),
+            ("FERROFIN_SCAN_PROBE_CONCURRENCY", "using 64"),
+            ("FERROFIN_WASM_MEMORY_LIMIT_MB", "using 16"),
+        ] {
+            assert!(
+                cfg.load_warnings
+                    .iter()
+                    .any(|w| w.contains(setting) && w.contains(used)),
+                "{setting}: {:?}",
+                cfg.load_warnings
+            );
+        }
+    }
+
+    /// The two counts with a zero of their own clamp above their range too:
+    /// `scan_progress_every`, whose `0` is off, and `metrics_sample_interval`,
+    /// whose `0` is the sampler's default.
+    #[test]
+    fn the_counts_with_a_zero_of_their_own_clamp_above_their_range() {
+        let env = FakeEnv::new()
+            .with("FERROFIN_SCAN_PROGRESS_EVERY", "200000")
+            .with("FERROFIN_METRICS_SAMPLE_INTERVAL", "1000");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.scan_progress_every, Some(100_000));
+        assert_eq!(cfg.metrics_sample_interval, Some(300));
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+        for (setting, used) in [
+            ("scan_progress_every", "using 100000"),
+            ("metrics_sample_interval", "using 300"),
+        ] {
+            assert!(
+                cfg.load_warnings
+                    .iter()
+                    .any(|w| w.contains(setting) && w.contains(used)),
+                "{setting}: {:?}",
+                cfg.load_warnings
+            );
+        }
+    }
+
+    /// The shutdown timeout, which the loader defaults itself, is clamped the
+    /// same way, from either layer.
+    #[test]
+    fn the_shutdown_timeout_is_clamped_with_a_warning() {
+        let env = FakeEnv::new().with("FERROFIN_SHUTDOWN_TIMEOUT_SECS", "100000");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.shutdown_timeout_secs, 600);
+        assert_eq!(cfg.load_warnings.len(), 1, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("using 600"),
+            "{:?}",
+            cfg.load_warnings
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "shutdown_timeout_secs = 0\n").unwrap();
+        let cli = Cli {
+            config_file: Some(toml),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.shutdown_timeout_secs, 5);
+        assert!(
+            cfg.load_warnings[0].contains("shutdown_timeout_secs"),
+            "{:?}",
+            cfg.load_warnings
+        );
+    }
+
+    /// `0` is the default where the setting's docs say so, from either layer:
+    /// kept, so the consumer applies its default, and no warning.
+    #[test]
+    fn zero_stays_the_default_where_the_docs_say_so() {
+        let keys = [
+            "quick_connect_pending_per_ip",
+            "scan_probe_concurrency",
+            "playback_metrics_queue",
+            "wasm_call_timeout_secs",
+            "wasm_memory_limit_mb",
+            "wasm_event_queue_capacity",
+            "max_plugin_download_mb",
+            "wasm_analysis_concurrency",
+            "wasm_state_limit_mb",
+            "wasm_image_download_mb",
+            "wasm_image_timeout_secs",
+            "wasm_write_content_mb",
+            "wasm_subtitle_extract_mb",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        let lines: Vec<String> = keys.iter().map(|key| format!("{key} = 0\n")).collect();
+        std::fs::write(&toml, lines.concat()).unwrap();
+        let cli = Cli {
+            config_file: Some(toml),
+            ..Cli::default()
+        };
+        let env = FakeEnv::new().with("FERROFIN_METRICS_SAMPLE_INTERVAL", "0");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        for value in [
+            cfg.quick_connect_pending_per_ip,
+            cfg.scan_probe_concurrency,
+            cfg.playback_metrics_queue,
+            cfg.wasm_call_timeout_secs,
+            cfg.wasm_memory_limit_mb,
+            cfg.wasm_event_queue_capacity,
+            cfg.max_plugin_download_mb,
+            cfg.wasm_analysis_concurrency,
+            cfg.wasm_state_limit_mb,
+            cfg.wasm_image_download_mb,
+            cfg.wasm_image_timeout_secs,
+            cfg.wasm_write_content_mb,
+            cfg.wasm_subtitle_extract_mb,
+        ] {
+            assert_eq!(value, Some(0));
+        }
+        assert_eq!(cfg.metrics_sample_interval, None, "the sampler's default");
+    }
+
+    /// TheTVDB's cache duration outside 1 to 168 hours, from the env or the
+    /// file, is clamped where the client is built, with a warning naming the
+    /// setting and the hours used.
+    #[test]
+    fn a_tvdb_cache_hours_outside_its_range_is_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        for (env_value, file, hours, warns) in [
+            (Some("500"), "", 168, true),
+            (Some("168"), "", 168, false),
+            (Some("0"), "", 1, true),
+            (None, "tvdb_cache_hours = 1000\n", 168, true),
+            (None, "tvdb_cache_hours = 0\n", 1, true),
+            (None, "tvdb_cache_hours = 24\n", 24, false),
+        ] {
+            std::fs::write(&toml, file).unwrap();
+            let cli = Cli {
+                config_file: Some(toml.clone()),
+                ..Cli::default()
+            };
+            let env = match env_value {
+                Some(value) => FakeEnv::new().with("FERROFIN_TVDB_CACHE_HOURS", value),
+                None => FakeEnv::new(),
+            };
+            let cfg = Config::load_from(cli, &env).unwrap();
+            let logs = crate::test_logs::CapturedLogs::default();
+            let duration = {
+                let _capture = logs.install();
+                cfg.tvdb_cache_duration()
+            };
+            assert_eq!(duration.as_secs() / 3600, hours, "{env_value:?} {file:?}");
+            let warnings = logs.lines_at("WARN");
+            if warns {
+                assert_eq!(warnings.len(), 1, "{env_value:?} {file:?}: {warnings:?}");
+                assert!(
+                    warnings[0].contains("tvdb_cache_hours")
+                        && warnings[0].contains(&format!("hours={hours}")),
+                    "{warnings:?}"
+                );
+            } else {
+                assert!(warnings.is_empty(), "{env_value:?} {file:?}: {warnings:?}");
+            }
+        }
+    }
+
+    /// Every default lies inside its setting's range, wherever the default
+    /// is defined.
+    #[test]
+    fn every_default_lies_inside_its_range() {
+        let count = |n: usize| u32::try_from(n).expect("a u32");
+        let secs = |d: std::time::Duration| u32::try_from(d.as_secs()).expect("a u32");
+        let wasm = ferrofin_wasm::WasmSettings::default();
+        let directories = ferrofin_core::library_scan::DirectoryCacheLimits::default();
+        for (key, default, range) in [
+            (
+                "quick_connect_pending_per_ip",
+                count(ferrofin_core::quick_connect_manager::DEFAULT_PENDING_PER_IP),
+                QUICK_CONNECT_PENDING_PER_IP_RANGE,
+            ),
+            (
+                "scan_probe_concurrency",
+                count(ferrofin_core::library_scan::DEFAULT_SCAN_PROBE_CONCURRENCY),
+                SCAN_PROBE_CONCURRENCY_RANGE,
+            ),
+            (
+                "scan_directory_cache_records",
+                count(directories.max_records.get()),
+                SCAN_DIRECTORY_CACHE_RECORDS_RANGE,
+            ),
+            (
+                "scan_directory_cache_idle_secs",
+                secs(directories.idle_timeout),
+                SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE,
+            ),
+            (
+                "playback_metrics_queue",
+                count(ferrofin_core::playback_metrics::DEFAULT_QUEUE_DEPTH),
+                PLAYBACK_METRICS_QUEUE_RANGE,
+            ),
+            (
+                "shutdown_timeout_secs",
+                DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+                SHUTDOWN_TIMEOUT_SECS_RANGE,
+            ),
+            (
+                "tvdb_cache_hours",
+                secs(ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION) / 3600,
+                TVDB_CACHE_HOURS_RANGE,
+            ),
+            (
+                "wasm_call_timeout_secs",
+                wasm.call_timeout_secs,
+                WASM_CALL_TIMEOUT_SECS_RANGE,
+            ),
+            (
+                "wasm_memory_limit_mb",
+                wasm.memory_limit_mb,
+                WASM_MEMORY_LIMIT_MB_RANGE,
+            ),
+            (
+                "wasm_event_queue_capacity",
+                wasm.event_queue_capacity,
+                WASM_EVENT_QUEUE_CAPACITY_RANGE,
+            ),
+            (
+                "wasm_state_limit_mb",
+                wasm.state_limit_mb,
+                WASM_STATE_LIMIT_MB_RANGE,
+            ),
+            (
+                "wasm_image_download_mb",
+                wasm.image_download_mb,
+                WASM_IMAGE_DOWNLOAD_MB_RANGE,
+            ),
+            (
+                "wasm_image_timeout_secs",
+                wasm.image_timeout_secs,
+                WASM_IMAGE_TIMEOUT_SECS_RANGE,
+            ),
+            (
+                "wasm_write_content_mb",
+                wasm.write_content_mb,
+                WASM_WRITE_CONTENT_MB_RANGE,
+            ),
+            (
+                "wasm_subtitle_extract_mb",
+                wasm.subtitle_extract_mb,
+                WASM_SUBTITLE_EXTRACT_MB_RANGE,
+            ),
+        ] {
+            assert!(
+                range.contains(&default),
+                "{key}: {default} outside {range:?}"
+            );
+        }
     }
 
     /// A test server's scan never reaches a public metadata provider:

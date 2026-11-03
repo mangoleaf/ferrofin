@@ -10,6 +10,8 @@
 //! `QueryResult<BaseItemDto>`); identity args are [`uuid::Uuid`]; `Task<T>` →
 //! `async fn -> Result<T, ServiceError>`.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -17,6 +19,7 @@ use uuid::Uuid;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::DayOfWeek;
 use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, NameIdPair, SortOrder};
+use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::live_tv::{
     ChannelMappingOptionsDto, ChannelType, DayPattern, GuideInfo, ItemSortBy, KeepUntil,
     ListingsProviderInfo, LiveTvInfo, RecordingQuery, RecordingStatus, SeriesTimerInfoDto,
@@ -39,7 +42,7 @@ pub struct LiveTvChannelQuery {
     /// Restrict to one channel type (TV or Radio).
     pub channel_type: Option<ChannelType>,
     /// The requesting user, if any.
-    pub user: Option<UserEntity>,
+    pub user: Option<Arc<UserEntity>>,
     /// The index of the first record to return.
     pub start_index: Option<i32>,
     /// The maximum number of records to return.
@@ -234,6 +237,25 @@ pub fn filter_timers(timers: Vec<TimerInfoDto>, query: &TimerQuery) -> Vec<Timer
     selected.sort_by_key(|timer| timer.base.start_date);
     selected
 }
+
+/// Which recordings a listing may show its caller: the rule the caller's own
+/// read of one applies, which lives above this crate, over the library and the
+/// virtual folders.
+///
+/// Upstream's recordings are library items, so `GetEmbyRecordingsAsync` gets
+/// the same answer from `InternalItemsQuery(user)` under the recording folders
+/// the user may see.
+#[async_trait]
+pub trait RecordingVisibility: Send + Sync {
+    /// Whether the listing may show `recording`, the entity
+    /// [`LiveTvManager::get_recording_item`] resolves for the same row.
+    async fn is_visible(
+        &self,
+        recording: &ferrofin_db::entities::base_items::BaseItemEntity,
+    ) -> Result<bool, ServiceError>;
+}
+
+fn _assert_object_safe_recording_visibility(_: &dyn RecordingVisibility) {}
 
 /// The Live TV manager.
 ///
@@ -670,8 +692,11 @@ pub trait LiveTvManager: Send + Sync {
     /// Lists the recordings a query selects, projected for `user`.
     ///
     /// Port of `LiveTvManager.GetRecordingsAsync`: the in-progress/status/
-    /// channel/series-timer filters and paging, then the DTO projection with
-    /// the list-path `RemoveFields` strip and the recording post-pass.
+    /// channel/series-timer filters, then the drop of a finished recording
+    /// whose file has gone (a library item upstream), then `visible` (when
+    /// given) before paging so `TotalRecordCount` counts only what it keeps,
+    /// then the DTO projection with the list-path `RemoveFields` strip and the
+    /// recording post-pass.
     ///
     /// The default ignores the query — the "nothing recorded" state.
     async fn get_recordings_matching(
@@ -679,8 +704,9 @@ pub trait LiveTvManager: Send + Sync {
         query: &RecordingQuery,
         user: Option<&UserEntity>,
         options: &DtoOptions,
+        visible: Option<&dyn RecordingVisibility>,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        let _ = (query, user, options);
+        let _ = (query, user, options, visible);
         self.get_recordings().await
     }
 
@@ -753,6 +779,41 @@ pub trait LiveTvManager: Send + Sync {
     /// Port of `TimerManager.RestartTimers`, which upstream runs when the Live
     /// TV service starts. The default has no timers to arm.
     async fn start_dvr(&self) -> Result<(), ServiceError> {
+        Ok(())
+    }
+
+    /// The folders recordings are written to, each as the library it should
+    /// be: "Recordings", "Recorded Movies" and "Recorded Shows", as far as
+    /// they are configured and their directories exist.
+    ///
+    /// Port of `IRecordingsManager.GetRecordingFolders`. The default has none.
+    async fn get_recording_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+
+    /// Makes each recording folder a library, unless a library already holds
+    /// its location, and removes the locations it made that are no longer
+    /// recording folders.
+    ///
+    /// Port of `IRecordingsManager.CreateRecordingFolders`, which catches and
+    /// logs everything, so it has no error to answer with. The default does
+    /// nothing.
+    async fn create_recording_folders(&self) {}
+
+    /// The files being written right now, read from memory so a library scan
+    /// can ask for each directory it lists. Unlike
+    /// [`active_recording_paths`](Self::active_recording_paths) this keeps a
+    /// capture that was told to stop until its file is closed. The default has
+    /// none.
+    fn paths_being_recorded(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Drops the finished recordings at or under `path`, whose library item
+    /// was deleted. Upstream's recording is that item, so nothing is left of it
+    /// to list. The default has none.
+    async fn forget_recordings(&self, path: &str) -> Result<(), ServiceError> {
+        let _ = path;
         Ok(())
     }
 

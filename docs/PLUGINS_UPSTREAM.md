@@ -20,6 +20,7 @@ Conventions:
 | Intro Skipper | https://github.com/intro-skipper/intro-skipper | `db09359` | 10.11/prerelease | ported |
 | File Transformation | https://github.com/IAmParadox27/jellyfin-plugin-file-transformation | `f4f01c3` | 2.5.10.0 | ported |
 | Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
+| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, its three test routes, sign-in and the admin filter (milestone "LDAP-Auth plugin port") |
 
 ## Per-plugin notes
 
@@ -159,7 +160,22 @@ Conventions:
   with one name, and the name-scoped key merged episodes across them —
   hiding each alternate from its own series' list and skewing season counts.
   The bulk episode task self-heals links whose key no longer matches their
-  primary's (unlink + regroup within the series). For the same reason movie
+  primary's (unlink + regroup within the series). The key's title fallback (no
+  provider id, no episode number) also carries the core resolver's version
+  key read from the episode's file name (`GetEpisodeVersionKey`: `D{yyyyMMdd}`
+  for a name by air date, `S{n}E{n}` for one with both numbers): upstream's
+  `title:{SeriesName}:{SeasonName}:{Name}:{ProductionYear}`
+  is the same for every airing of a show whose files are named by date —
+  `IsByDate` clears the number, the name is the series', the year the
+  series' — so the task merged a whole season of airings into one episode.
+  Two copies of one airing still merge, as the core resolver groups them. The
+  stored `PremiereDate` is not used: an NFO, or a row adopted from Jellyfin
+  (server-local midnight), can store an airing's date on another day. A file
+  name with no such key keeps upstream's key. The self-heal also undoes a
+  group made by hand through `POST /Videos/MergeVersions` of two airings, or
+  of two copies only one of whose file names carries the key; the playlist
+  and collection entries that merge rerouted to the primary stay on it.
+  For the same two-libraries reason as the series-row scoping, movie
   grouping is keyed by (owning library `TopParentId`, `Tmdb` id) rather than
   the `Tmdb` id alone: the same film held in a cold (NAS) and a hot (local)
   library is two intentional entries, and merging them hid one behind the
@@ -182,3 +198,194 @@ Conventions:
   snapshot of the matching ids, then the rows by id, `PAGE_SIZE` at a time)
   and keeps only the fields the grouping reads, so the groups and merges are
   the same.
+
+### LDAP-Auth
+- Ferrofin files: `crates/ferrofin-extensions/src/ldap_auth.rs` (the extension, the
+  configuration, the `LdapDirectory` seam, the settings page's three tests and their service),
+  `ldap_auth/directory.rs` (the `ldap3` client and its rustls configuration) and
+  `ldap_auth/provider.rs` (the sign-in provider), vendored
+  assets `crates/ferrofin-extensions/assets/ldapauth/`, the trait seam
+  `crates/ferrofin-traits/src/ldap.rs`, the wire types `crates/ferrofin-model/src/ldap.rs`,
+  and the thin HTTP handler `crates/ferrofin-api/src/handlers/ldap.rs`. The live directory
+  test is `crates/ferrofin-extensions/tests/ldap_directory.rs` (`FERROFIN_LDAP_TESTS=1`,
+  OpenLDAP in docker; CI does not run it).
+- Ported so far (v24, `d11c86a`): `LdapPlugin` (GUID, name `LDAP-Auth`, version 24,
+  `ConfigurationFileName` `LDAP-Auth.xml`, the settings page under its name),
+  `PluginConfiguration` with upstream's defaults, `GetConnectionOptions` and its certificate
+  callbacks, and `LdapController.TestServerBind` with
+  `LdapAuthenticationProviderPlugin.TestServerBind`: the body is saved into the
+  configuration first, then connect, StartTLS, bind (`Anonymous` for an empty password, as
+  Novell's client binds) and a subtree count of the base DN with Novell's filter for an empty
+  one, `(objectclass=*)`, each step `Testing...` until it passes and `Error` naming the
+  failure. The route is administrators only (`RequiresElevation`), answers `404` while the
+  plugin is disabled, and refuses a body without `LdapServer` or `LdapBaseDn`
+  (`[Required]`) with ASP.NET's validation problem. With both `UseSsl` and `UseStartTls`
+  set, StartTLS is still sent over the LDAPS connection, as Novell's client sends it, and
+  the server's refusal is the StartTLS step's error (`ldap3` alone would skip it). A server
+  given as an IPv6 address works over TLS too: the certificate is checked against the
+  address. For a host name, a certificate with no DNS name among its subject alternative
+  names is matched by its subject common name, OpenSSL's fallback, which .NET uses on
+  Linux.
+- Sign-in (v24, `d11c86a`): `LdapAuthenticationProviderPlugin.Authenticate`,
+  `LocateLdapUser`, `ConnectToLdap` and `LdapUtils.SanitizeFilter`, as the authentication
+  provider the extension contributes: `Name` `LDAP-Authentication`, stored id
+  `Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin`, so an adopted Jellyfin's
+  LDAP users select it. The bind DN searches the base DN's subtree for `[UsernameAttr,
+  UidAttr]` with `LdapSearchFilter`, its `{username}` replaced ignoring case, or else
+  `(&<filter>(|(<attr>=<name>)…))` over `LdapSearchAttributes` with spaces removed, split on
+  commas (an empty item kept), the name escaped byte for byte as `SanitizeFilter` does; the
+  first entry is used, with upstream's warning when there are more. The user is found by the
+  entry's uid (the external-identity store), else by the username attribute when that user's
+  `AuthenticationProviderId` is LDAP-Auth's, who is then linked; a local account of that name
+  is never taken. The password is checked by binding as the entry on a connection of its own.
+  A new user is created when `CreateUsersFromLdap` is on, with both provider ids,
+  `EnableAllFolders` and, when that is off, `EnabledFolders` as configured (the strings as
+  given, as `SetPreference` stores them), and linked; with it off, upstream's message and a
+  `401`. A returning user follows a directory rename (`RenameUser`, case-sensitive compare).
+  An entry without the username attribute is a `400`, as upstream's create or rename with a
+  null name throws an `ArgumentException`. The provider is enabled only with the plugin and a
+  server (D3);
+  upstream's `IsEnabled` is always `true`. `ChangePassword` with `AllowPassChange` off is
+  upstream's `NotImplementedException`, a `500`. Password changes and resets, profile
+  images, referrals and the `LDAP-Auth.xml` import are later phases of the milestone.
+- Admin filter (v24, `d11c86a`): the admin block of `Authenticate`. While `LdapAdminFilter` is
+  neither empty nor `_disabled_` (ordinal), after the password is checked the bind DN searches,
+  on a connection of its own, the subtree of `LdapAdminBaseDn` (the base DN when that is empty)
+  with the filter's `{username}` replaced, ignoring case, by the entry's username attribute
+  escaped as `SanitizeFilter` does. With `EnableLdapAdminFilterMemberUid` any entry found makes
+  the user an administrator; otherwise one of them must be the user's entry (DNs compared
+  ordinally). A new user gets the flag at creation (`false` while the filter is off, as upstream
+  sets it); a returning user's flag follows it at each sign-in, and is left alone while the
+  filter is off. The provider reports the flag in `ProviderAuthenticationResult.administrator`
+  and the user manager applies it, because the login lock it holds does not nest.
+- `LdapController.TestLdapFilters` with `GetFilteredUsers` (v24, `d11c86a`): the body
+  (`UserFilterInfo`) is saved into the configuration first, then the bind DN counts the distinct
+  DNs `LdapSearchFilter` finds in the base DN's subtree and, while the admin filter is on, those
+  `LdapAdminFilter` finds, answering `LdapFilterResponse` (`Users`, `Admins`, `IsSubset`). As
+  upstream, both filters are used as written (no `{username}` replaced) and both search the base
+  DN, not `LdapAdminBaseDn`; an empty filter is Novell's `(objectclass=*)`. A directory that
+  cannot be reached or refuses the bind DN is a `401` with `Failed to Connect or Bind to
+  server.`; a search it fails, a filter that does not parse included, is a `400` with `User
+  Filter: ` or `Admin Filter: ` before the reason, each as `LdapTestErrorResponse`
+  (`{"Message": …}`).
+- `LdapController.LdapUserSearch` with `LocateLdapUser` (v24, `d11c86a`): the body
+  (`UserSearchAttributes`) saves `LdapSearchAttributes`, then, for a `TestSearchUsername` that
+  is not empty, answers `UserSearchResponse` with the `LocatedDn` of the entry the name signs in
+  as (the sign-in's own search); with no name, `{}`. A directory that cannot be reached or
+  refuses the bind DN, a search it fails, and no matching entry are each a `401` with upstream's
+  message (`Failed to Connect or Bind to server.`, `Error completing LDAP login while applying
+  user filter.`, `Found no LDAP users matching provided username.`).
+- `POST /Ldap/TestServerBind`, `/Ldap/TestLdapFilters` and `/Ldap/LdapUserSearch` are the
+  plugin's own controller, not contract operations, so they are in `handlers::PLUGIN_ROUTES`
+  (matched ignoring case, as the page calls `ldap/TestServerBind` and the others so) and have no
+  `handlers::VERIFIED` row; this section is their record. All three are administrators only
+  (`RequiresElevation`), answer `404` while the plugin is disabled, and refuse a body that does
+  not bind with ASP.NET's validation problem.
+- Accepted divergences (do NOT "fix" during sync):
+  - **An empty password is refused before any connection.** Novell's client turns it into an
+    anonymous bind, which upstream then refuses as not `Bound` (kept too, at the user's bind);
+    `ldap3` would send it, and a directory may accept an unauthenticated bind (RFC 4513
+    section 5.1.2), which would sign anyone in.
+  - **Only the directory refusing the user's own bind counts as a failed sign-in** (owner
+    decision D4), with no matching entry and creation turned off: each is a `401`, which the
+    user manager counts toward lockout when the name signed in with is an account's (creation
+    turned off only arises for a name that is not). The user's bind counts as refused only for
+    the result codes
+    that refuse credentials: `constraintViolation` (19, a password policy's lockout),
+    `inappropriateAuthentication` (48), `invalidCredentials` (49), `insufficientAccessRights`
+    (50) and `unwillingToPerform` (53). A directory that cannot be reached, does not answer
+    within the D6 timeouts, fails the user's bind with any other code (`busy`, `unavailable`,
+    `other`, …), refuses the configured bind DN, fails the user search or the admin filter's
+    search, or refers the user search elsewhere with no entry, is a `500` that is not counted,
+    and other users' sign-ins go on. Upstream answers each with an `AuthenticationException`, a
+    counted `401` (`Error completing LDAP login while applying admin filter.` for the admin
+    filter's search). Ferrofin's login backoff still counts such an attempt for pacing, as it
+    counts every attempt that does not succeed.
+  - **The admin filter never demotes the last administrator** (owner decision D5): removed
+    from the directory's administrators while no other administrator exists, the user signs in,
+    stays one, and the server logs a warning. With two or more the filter demotes as upstream
+    does. The user manager reads the count in the transaction that writes the flag.
+  - **An entry without the username attribute is a `400` while the admin filter is on**, as it
+    is when the user is created or renamed. Upstream's `SanitizeFilter` throws a
+    `NullReferenceException` on the null name first, a `500`.
+  - **The filter test keeps the saved `EnableLdapAdminFilterMemberUid` when the body leaves it
+    out** (a Jellyfin bug not ported). Upstream saves the missing member as `false`, and its own
+    settings page never sends it, so pressing "Test filters" there turns member-uid mode off
+    until the page is saved again, and the admin filter then demotes the administrators it found
+    through a group. A body that sends it still sets it, and a `null` does not bind, as a C#
+    `bool` refuses it.
+  - **A filter the directory client cannot parse** is reported as `User Filter: Filter Error`
+    (or `Admin Filter: …`): `ldap3` gives no reason. Upstream pulls Novell's parser message out of
+    the exception text with a regex.
+  - **Search references are not followed yet** by the filter test or the admin filter's search,
+    which read only the entries the directory sent: TODO(gl-1148). Upstream follows them with
+    the bind credentials (`LdapAuthHandler`). Until then an administrator whose entry (or group)
+    only a referred server holds is not found, and the filter demotes them unless they are the
+    last one; failing the sign-in instead would refuse every other user wherever a search returns
+    references, as Active Directory's do at a domain root. A user search that found no entry but
+    a reference is a failed search, as at sign-in.
+  - **A name that finds another account's entry is refused** (a counted `401`). When the name
+    signed in with is a Ferrofin user's, the entry the search found must be that user's (by
+    its uid link, or by name). Upstream signs in the user the name named with whichever entry
+    came first, and creates or renames another account on the way, so a person who can make
+    their own entry match another user's name (a `mail` or `displayName` they may edit) could
+    sign in as that user with their own password. The entry's username attribute
+    (`LdapUsernameAttribute`) is still trusted, as upstream trusts it: an entry with no uid link
+    yet whose username attribute names an account LDAP-Auth owns is relinked to that account
+    (upstream's relink after a uid change), so that attribute must be one users cannot edit.
+    TODO(gl-1188): how to close that is an owner decision.
+  - **A relink by name is written only after the password is checked.** Upstream saves it
+    before it binds as the user, so a wrong password still writes it.
+  - **An entry without the uid attribute is not linked.** Upstream stores it with a null
+    `LdapUid`, which no lookup finds, and in doing so drops that user's earlier link and every
+    other null-uid link; its profile-image sync then fails on the null uid. Such a user is
+    found by name at each sign-in, and keeps the link of the uid they had.
+  - **A new user is created with its provider ids and folder access in one transaction**
+    (`UserManager::create_external_user`). Upstream's `CreateUserAsync` commits a local,
+    passwordless user first and sets the provider ids after, a moment in which the built-in
+    provider signs that user in with an empty password. The "User … has been created"
+    activity entry is recorded as `CreateUserAsync` records it.
+  - **Off by default** (owner decision D3): the plugin is disabled in `/Plugins` until an
+    administrator enables it, and `LdapServer` seeds empty instead of
+    `ldap-server.contoso.com`. Upstream's provider is always enabled and would try the
+    placeholder host on every sign-in of an unknown name.
+  - **No `LdapUsers` in the configuration** (D12): which LDAP uid belongs to which user lives in
+    Ferrofin's external-identity table, so `GET /Plugins/{id}/Configuration` does not return
+    it, and a `LdapUsers` member posted to it is dropped. Upstream's settings page never reads
+    or writes it.
+  - **Timeouts** (D6): opening a connection (the TCP connect and an LDAPS handshake) gives up
+    after 5 seconds, and each operation, StartTLS included, after 10 seconds without an
+    answer (a search's timer restarts with each entry). Upstream sets none.
+  - **A custom root CA is the only trust anchor**: the server's certificate must chain to a
+    certificate in that file, or be one of the file's certificates itself (a self-signed
+    server certificate given as the root CA, which webpki alone refuses when it is marked as a
+    CA, as `openssl req -x509` marks it), and it must be valid for the server's name and
+    within its validity period. Upstream also rejects a name mismatch, but its chain policy
+    sets `AllowUnknownCertificateAuthority`, with which .NET accepts a chain ending at a root
+    that is not in the file. A root CA file with a certificate rustls cannot use as a root
+    skips it, and fails only when none is usable.
+  - **Unreadable certificate files** fail the test's Connect step with the reason. Upstream
+    reads the client certificate before its `try`, so the request fails with a `500`; a client
+    certificate is read here only for a TLS connection, where it is used.
+  - **Error wording**: `Error` is the RFC 4511 result name (spelled as Novell's client does,
+    `Invalid Credentials`) with the server's diagnostic, or the transport's own message
+    (rustls' certificate errors, `could not connect to host:port within 5 seconds`, `the
+    directory closed the connection: …`). Upstream reports the Novell exception's message.
+  - **The base search asks for no attributes** (`1.1`), and neither do the filter test's
+    searches or the admin filter's at sign-in: they read only DNs, the same either way, without
+    the directory sending every entry's attributes. A search reference fails the connection
+    test's base search with Novell's `Search result reference received, and referral following
+    is off`, as upstream's iterator throws on one there.
+  - **Certificate checks are webpki's** beyond the name and the trust anchor: X.509 v3
+    certificates only, no SHA-1 signatures in a chain, the `serverAuth` extended key usage
+    when the certificate lists any, and no revocation check (.NET checks revocation online,
+    ignoring an unknown status).
+  - **The common-name fallback is Ferrofin's own, and narrower**: an exact match ignoring
+    case, with no wildcard, for a host name only (never for an IP address), and off
+    whenever any root in the root CA file or the system store, or any intermediate the
+    server presents, carries name constraints, since webpki checks those against
+    alternative names only. A legacy certificate naming its host only as a wildcard or an
+    address in the common name may connect upstream and is refused here; both fail closed.
+  - **A stored `LdapProfileImageFormat` that names no format** reads as `Default`, so one bad
+    value cannot make the configuration unreadable. .NET's deserializer fails the whole
+    configuration and the plugin starts from its defaults.

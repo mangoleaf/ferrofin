@@ -44,11 +44,20 @@ pub struct ServerSettingDto {
     /// for (an OpenTelemetry variable), that variable's name.
     pub key: String,
 
-    /// The group the settings page lists it under.
+    /// The setting's readable name, which heads its row on the settings page,
+    /// e.g. "Subtitle extraction limit".
+    pub label: String,
+
+    /// The tab the settings page lists it on.
     pub group: ServerSettingGroup,
 
     /// The kind of value it holds, which picks the page's control.
     pub kind: ServerSettingKind,
+
+    /// The unit its value is in, which the page shows beside it. Absent for a
+    /// value that has none, such as an on/off, a path or a URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<ServerSettingUnit>,
 
     /// What the setting does, in one line.
     pub description: String,
@@ -114,8 +123,10 @@ impl std::fmt::Debug for ServerSettingDto {
         };
         f.debug_struct("ServerSettingDto")
             .field("key", &self.key)
+            .field("label", &self.label)
             .field("group", &self.group)
             .field("kind", &self.kind)
+            .field("unit", &self.unit)
             .field("description", &self.description)
             .field("env_var", &self.env_var)
             .field("flag", &self.flag)
@@ -132,25 +143,58 @@ impl std::fmt::Debug for ServerSettingDto {
     }
 }
 
-/// The groups the settings page lists the settings in.
+/// The tabs the settings page lists the settings on, in the page's order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 pub enum ServerSettingGroup {
-    /// The data, configuration, cache and web directories.
-    Paths,
-    /// Listening, the advertised addresses and the server's identity.
+    /// Listening, the advertised addresses, the server's identity and the
+    /// limits on signing in.
     Network,
-    /// The ffmpeg and ffprobe executables and how they are used.
-    Ffmpeg,
-    /// Library scans, the database and first-boot seeding.
+    /// Library scans.
     Library,
-    /// Logging, metrics, trace export and shutdown.
-    Observability,
+    /// Trickplay image generation.
+    Trickplay,
+    /// Image decoding, resizing and downloading.
+    Images,
     /// The remote metadata providers: keys, mirrors and request limits.
     Providers,
-    /// The limits of image decoding, resizing and downloading.
-    Images,
+    /// The database, the caches, the transcode caps and the metrics queue.
+    Performance,
+    /// Logging, metrics and trace export.
+    Logging,
     /// The limits of sandboxed WASM plugins.
-    Wasm,
+    Plugins,
+    /// The directories, the executables, first-boot seeding, shutdown and the
+    /// extensions switch.
+    System,
+}
+
+/// The unit a setting's value is in, as the settings page shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+pub enum ServerSettingUnit {
+    /// Mebibytes.
+    #[serde(rename = "MiB")]
+    Mebibytes,
+    /// Seconds.
+    #[serde(rename = "seconds")]
+    Seconds,
+    /// Minutes.
+    #[serde(rename = "minutes")]
+    Minutes,
+    /// Hours.
+    #[serde(rename = "hours")]
+    Hours,
+    /// Days.
+    #[serde(rename = "days")]
+    Days,
+    /// Megapixels: an image's width times its height, in millions.
+    #[serde(rename = "megapixels")]
+    Megapixels,
+    /// A count of items, records or entries.
+    #[serde(rename = "items")]
+    Items,
+    /// A count of queued events.
+    #[serde(rename = "events")]
+    Events,
 }
 
 /// The kind of value a setting holds.
@@ -245,8 +289,10 @@ mod tests {
     fn setting(kind: ServerSettingKind) -> ServerSettingDto {
         ServerSettingDto {
             key: "omdb_api_key".to_owned(),
+            label: "OMDb API key".to_owned(),
             group: ServerSettingGroup::Providers,
             kind,
+            unit: None,
             description: "OMDb API key".to_owned(),
             env_var: Some("FERROFIN_OMDB_KEY".to_owned()),
             flag: None,
@@ -277,13 +323,15 @@ mod tests {
     fn serializes_pascal_case_and_leaves_out_what_is_unset() {
         let json = serde_json::to_value(setting(ServerSettingKind::Secret)).expect("serialize");
         assert_eq!(json["Key"], "omdb_api_key");
+        assert_eq!(json["Label"], "OMDb API key");
+        assert_eq!(json["Group"], "Providers");
         assert_eq!(json["EnvVar"], "FERROFIN_OMDB_KEY");
         assert_eq!(json["Kind"], "Secret");
         assert_eq!(json["Source"], "ConfigFile");
         assert_eq!(json["Applies"], "Restart");
         assert_eq!(json["Value"], "hunter2-running");
         assert_eq!(json["SavedValue"], "hunter2-saved");
-        for absent in ["Flag", "Default", "LockedReason", "Min", "Max"] {
+        for absent in ["Unit", "Flag", "Default", "LockedReason", "Min", "Max"] {
             assert!(json.get(absent).is_none(), "{absent} in {json}");
         }
 
@@ -300,6 +348,30 @@ mod tests {
         assert_eq!(json["Settings"][0]["Key"], "omdb_api_key");
         let back: ServerSettingsDto = serde_json::from_value(json).expect("round trip");
         assert_eq!(back, all);
+    }
+
+    #[test]
+    fn a_unit_serializes_as_the_page_shows_it() {
+        let units = [
+            (ServerSettingUnit::Mebibytes, "MiB"),
+            (ServerSettingUnit::Seconds, "seconds"),
+            (ServerSettingUnit::Minutes, "minutes"),
+            (ServerSettingUnit::Hours, "hours"),
+            (ServerSettingUnit::Days, "days"),
+            (ServerSettingUnit::Megapixels, "megapixels"),
+            (ServerSettingUnit::Items, "items"),
+            (ServerSettingUnit::Events, "events"),
+        ];
+        for (unit, shown) in units {
+            let setting = ServerSettingDto {
+                unit: Some(unit),
+                ..setting(ServerSettingKind::Integer)
+            };
+            let json = serde_json::to_value(&setting).expect("serialize");
+            assert_eq!(json["Unit"], shown, "{unit:?}");
+            let back: ServerSettingDto = serde_json::from_value(json).expect("round trip");
+            assert_eq!(back.unit, Some(unit));
+        }
     }
 
     #[test]

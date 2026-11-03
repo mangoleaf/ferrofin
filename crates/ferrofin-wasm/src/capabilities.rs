@@ -466,7 +466,7 @@ pub fn query_items(cx: &Collaborators, query: &ItemQuery) -> Result<Vec<ItemSumm
                 .block_on(cx.users.get_user_by_id(uid))
                 .map_err(|e| format!("user lookup failed: {e}"))?
                 .ok_or_else(|| format!("no such user {uid}"))?;
-            internal.set_user(user);
+            internal.set_user(Arc::new(user));
             Some(uid)
         }
         None => None,

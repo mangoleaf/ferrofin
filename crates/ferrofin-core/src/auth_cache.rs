@@ -47,10 +47,11 @@ use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::UserDto;
 use ferrofin_model::users::UserPolicy;
+use uuid::Uuid;
 
 type TokenResolution = (
     Arc<DeviceEntity>,
-    Option<UserEntity>,
+    Option<Arc<UserEntity>>,
     Option<Arc<UserPolicy>>,
 );
 
@@ -78,7 +79,7 @@ const AUTH_CACHE_MAX_ENTRIES: usize = 4096;
 #[derive(Debug, Clone)]
 struct CachedAuth {
     device: Arc<DeviceEntity>,
-    user: Option<UserEntity>,
+    user: Option<Arc<UserEntity>>,
     policy: Option<Arc<UserPolicy>>,
     cached_at: Instant,
 }
@@ -148,12 +149,9 @@ impl AuthCache {
 
     /// The cached resolution for `token`, if present and fresher than the TTL.
     ///
-    /// The device row comes back as a shared [`Arc`] (callers only read it), so
-    /// a hit costs one refcount bump rather than a deep copy of every column.
-    /// The user entity is still cloned because [`AuthorizationInfo`] owns it
-    /// outright.
-    ///
-    /// [`AuthorizationInfo`]: ferrofin_traits::options::AuthorizationInfo
+    /// The device row, the user row and the policy come back as shared
+    /// [`Arc`]s (callers only read them), so a hit costs refcount bumps rather
+    /// than a deep copy of every column.
     #[must_use]
     pub fn get(&self, token: &str) -> Option<TokenResolution> {
         let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
@@ -175,7 +173,7 @@ impl AuthCache {
         generation: u64,
         token: &str,
         device: DeviceEntity,
-        user: Option<UserEntity>,
+        user: Option<Arc<UserEntity>>,
         policy: Option<Arc<UserPolicy>>,
     ) {
         let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
@@ -201,6 +199,34 @@ impl AuthCache {
     /// login stamp, rename, config column — misses and is rebuilt).
     #[must_use]
     pub fn get_user_dto(&self, entity: &UserEntity) -> Option<UserDto> {
+        self.read_user_dto(entity, UserDto::clone)
+    }
+
+    /// The `LatestItemsExcludes` list of the cached [`UserDto`] for `entity`'s
+    /// user, under the same freshness and entity checks as
+    /// [`AuthCache::get_user_dto`], copying only that list.
+    #[must_use]
+    pub fn latest_items_excludes(&self, entity: &UserEntity) -> Option<Vec<Uuid>> {
+        self.read_user_dto(entity, |dto| {
+            dto.configuration
+                .as_ref()
+                .map(|c| c.latest_items_excludes.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    /// The `PrimaryImageTag` of the cached [`UserDto`] for `entity`'s user,
+    /// under the same freshness and entity checks as
+    /// [`AuthCache::get_user_dto`]: `Some(None)` for a cached user with no
+    /// profile image, `None` for a miss.
+    #[must_use]
+    pub fn primary_image_tag(&self, entity: &UserEntity) -> Option<Option<String>> {
+        self.read_user_dto(entity, |dto| dto.primary_image_tag.clone())
+    }
+
+    /// Applies `read` to the cached [`UserDto`] for `entity`'s user, if it is
+    /// fresher than the TTL and was built from an identical entity.
+    fn read_user_dto<T>(&self, entity: &UserEntity, read: impl FnOnce(&UserDto) -> T) -> Option<T> {
         let dtos = self
             .user_dtos
             .read()
@@ -209,7 +235,7 @@ impl AuthCache {
         if hit.cached_at.elapsed() > self.ttl || hit.entity != *entity {
             return None;
         }
-        Some(hit.dto.clone())
+        Some(read(&hit.dto))
     }
 
     /// Caches a user's assembled DTO alongside the entity it was built from,
@@ -331,6 +357,71 @@ mod tests {
         assert!(cache.get("tok").is_none(), "expired entry misses");
     }
 
+    /// The `LatestItemsExcludes` read serves only a DTO `get_user_dto` would:
+    /// one within the TTL, built from the same entity.
+    #[tokio::test]
+    async fn the_latest_excludes_read_misses_when_get_user_dto_would() {
+        let db = crate::test_support::test_db().await;
+        let entity = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x60)).await;
+        let excluded = vec![uuid::Uuid::from_u128(0xe1)];
+        let dto = UserDto {
+            configuration: Some(ferrofin_model::configuration::UserConfiguration {
+                latest_items_excludes: excluded.clone(),
+                ..Default::default()
+            }),
+            ..UserDto::default()
+        };
+        let cache = AuthCache::new(Duration::from_millis(30));
+        cache.put_user_dto(cache.generation(), &entity, dto);
+
+        assert_eq!(cache.latest_items_excludes(&entity), Some(excluded));
+        let mut changed = entity.clone();
+        changed.username.push('2');
+        assert!(
+            cache.latest_items_excludes(&changed).is_none(),
+            "a row that changed since misses"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            cache.latest_items_excludes(&entity).is_none(),
+            "an expired entry misses"
+        );
+    }
+
+    /// The `PrimaryImageTag` read serves the cached DTO's tag, a cached user
+    /// with no image included, and misses exactly when `get_user_dto` would.
+    #[tokio::test]
+    async fn the_primary_image_tag_read_misses_when_get_user_dto_would() {
+        let db = crate::test_support::test_db().await;
+        let entity = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x61)).await;
+        let cache = AuthCache::new(Duration::from_millis(30));
+        assert_eq!(cache.primary_image_tag(&entity), None, "nothing cached");
+        cache.put_user_dto(cache.generation(), &entity, UserDto::default());
+        assert_eq!(cache.primary_image_tag(&entity), Some(None), "no image");
+        let dto = UserDto {
+            primary_image_tag: Some("tag".to_owned()),
+            ..UserDto::default()
+        };
+        cache.put_user_dto(cache.generation(), &entity, dto);
+        assert_eq!(
+            cache.primary_image_tag(&entity),
+            Some(Some("tag".to_owned()))
+        );
+        let mut changed = entity.clone();
+        changed.username.push('2');
+        assert_eq!(
+            cache.primary_image_tag(&changed),
+            None,
+            "a changed row misses"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            cache.primary_image_tag(&entity),
+            None,
+            "an expired entry misses"
+        );
+    }
+
     /// Finding #3: a hit must hand out a shared handle to the device row, not a
     /// deep copy of it. Pointer identity across two hits is the proof — a
     /// per-hit clone would give two distinct allocations.
@@ -352,6 +443,31 @@ mod tests {
             "no per-hit String reallocation"
         );
         assert_eq!(first.access_token, "tok", "the shared row is the right one");
+    }
+
+    /// The user row is shared the same way: every request that hits the cache
+    /// reads it, and a deep copy costs one allocation per `String` column.
+    #[tokio::test]
+    async fn hits_share_the_user_row_instead_of_deep_copying_it() {
+        let db = crate::test_support::test_db().await;
+        let entity = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x5f)).await;
+        let cache = AuthCache::default();
+        cache.put(
+            cache.generation(),
+            "tok",
+            device("tok"),
+            Some(Arc::new(entity.clone())),
+            None,
+        );
+
+        let (_, first, _) = cache.get("tok").expect("first hit");
+        let (_, second, _) = cache.get("tok").expect("second hit");
+        let (first, second) = (first.expect("user"), second.expect("user"));
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "both hits point at the one cached user row"
+        );
+        assert_eq!(*first, entity, "the shared row is the right one");
     }
 
     #[test]
@@ -421,14 +537,14 @@ mod tests {
             generation,
             "tried",
             device("tried"),
-            Some(tried.clone()),
+            Some(Arc::new(tried.clone())),
             None,
         );
         cache.put(
             generation,
             "other",
             device("other"),
-            Some(other.clone()),
+            Some(Arc::new(other.clone())),
             None,
         );
         cache.put(generation, "api-key", device("api-key"), None, None);
@@ -437,7 +553,13 @@ mod tests {
 
         let in_flight = cache.generation();
         cache.invalidate_user(&tried.id.to_ascii_lowercase());
-        cache.put(in_flight, "late", device("late"), Some(other.clone()), None);
+        cache.put(
+            in_flight,
+            "late",
+            device("late"),
+            Some(Arc::new(other.clone())),
+            None,
+        );
 
         assert!(cache.get("tried").is_none());
         assert!(cache.get_user_dto(&tried).is_none());

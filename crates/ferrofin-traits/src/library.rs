@@ -1477,6 +1477,25 @@ pub enum AdminFlagOutcome {
     KeptLastAdministrator,
 }
 
+/// How [`UserManager::create_external_user`] sets up a user an outside
+/// authentication provider creates at their first sign-in: what upstream's
+/// LDAP plugin writes onto the new `User` before `UpdateUserAsync`
+/// (jellyfin-plugin-ldapauth v24, `LdapAuthenticationProviderPlugin.Authenticate`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExternalUserSetup {
+    /// Saved as the user's `AuthenticationProviderId`, so their sign-ins go
+    /// to that provider.
+    pub authentication_provider_id: String,
+    /// Saved as the user's `PasswordResetProviderId`.
+    pub password_reset_provider_id: String,
+    /// The `EnableAllFolders` permission.
+    pub enable_all_folders: bool,
+    /// The `EnabledFolders` preference, the library ids as given, stored as
+    /// upstream's `SetPreference` stores them; `None` keeps the new user's
+    /// empty one.
+    pub enabled_folders: Option<Vec<String>>,
+}
+
 /// The state of the server a policy save is checked against: the user's
 /// current policy flags and the counts `UserController.UpdateUserPolicy`
 /// takes over all users.
@@ -1534,7 +1553,10 @@ pub trait UserManager: Send + Sync {
     /// Gets a user row by name, or `None`.
     async fn get_user_by_name(&self, name: &str) -> Result<Option<UserEntity>, ServiceError>;
 
-    /// Renames a user.
+    /// Renames a user. The concrete manager then announces the rename, as
+    /// upstream's `RenameUser` publishes `UserUpdatedEventArgs`: the user's
+    /// sessions are sent `UserUpdated` and their devices re-checked, whoever
+    /// called.
     async fn rename_user(
         &self,
         user_id: Uuid,
@@ -1569,6 +1591,57 @@ pub trait UserManager: Send + Sync {
     /// Creates a user with the given name and returns the new row.
     async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError>;
 
+    /// Creates a user `name` whose sign-ins belong to an outside
+    /// authentication provider, set up as `setup` says, and returns the new
+    /// row. Upstream's LDAP plugin calls `CreateUserAsync`, sets the provider
+    /// ids and the folder access on the user, then saves it with
+    /// `UpdateUserAsync`.
+    ///
+    /// The concrete manager writes the row and `setup` in one transaction.
+    /// Created first and set up after, the account would for a moment be a
+    /// local one without a password, which the built-in provider signs in
+    /// with an empty password; upstream has that window. It also records the
+    /// "User … has been created" activity entry, as `CreateUserAsync` does.
+    /// The default creates the user and then saves `setup` with
+    /// [`Self::update_policy`], so impls without a store of their own compile
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::InvalidInput`] for a name that is not valid or is
+    /// already taken, or whatever the save surfaces.
+    async fn create_external_user(
+        &self,
+        name: &str,
+        setup: &ExternalUserSetup,
+    ) -> Result<UserEntity, ServiceError> {
+        let user = self.create_user(name).await?;
+        let user_id =
+            Uuid::parse_str(&user.id).map_err(|error| ServiceError::backend(error.to_string()))?;
+        let mut policy = self
+            .get_user_dto(&user, None)
+            .await?
+            .policy
+            .unwrap_or_default();
+        policy
+            .authentication_provider_id
+            .clone_from(&setup.authentication_provider_id);
+        policy
+            .password_reset_provider_id
+            .clone_from(&setup.password_reset_provider_id);
+        policy.enable_all_folders = setup.enable_all_folders;
+        if let Some(folders) = &setup.enabled_folders {
+            policy.enabled_folders = folders
+                .iter()
+                .filter_map(|folder| Uuid::parse_str(folder).ok())
+                .collect();
+        }
+        self.update_policy(user_id, &policy).await?;
+        self.get_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("user {user_id}")))
+    }
+
     /// Deletes a user by id.
     async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError>;
 
@@ -1579,6 +1652,11 @@ pub trait UserManager: Send + Sync {
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError>;
 
     /// Authenticates a user by name/password, returning the row on success.
+    ///
+    /// The implementation may pace repeated failures (Ferrofin's login
+    /// backoff): the call can wait up to its configured maximum delay before
+    /// checking the password, and `Ok(None)` can also mean an attempt it
+    /// refused without checking the password, answered like a wrong password.
     async fn authenticate_user(
         &self,
         username: &str,
@@ -1653,6 +1731,36 @@ pub trait UserManager: Send + Sync {
         server_id: Option<String>,
     ) -> Result<UserDto, ServiceError>;
 
+    /// The libraries `user` hides from Latest
+    /// (`UserConfiguration.LatestItemsExcludes`), as [`Self::get_user_dto`]
+    /// reports them.
+    ///
+    /// `/Items/Latest` and `/UserItems/Resume` need only this list. The default
+    /// body builds the whole DTO; a manager that caches the DTO answers from
+    /// the cache without copying it.
+    async fn latest_items_excludes(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(self
+            .get_user_dto(user, None)
+            .await?
+            .configuration
+            .map(|c| c.latest_items_excludes)
+            .unwrap_or_default())
+    }
+
+    /// The cache tag of `user`'s profile image (C#
+    /// `ImageProcessor.GetImageCacheTag(User)`), `None` when they have none:
+    /// the `PrimaryImageTag` [`Self::get_user_dto`] reports.
+    ///
+    /// Every request on a session stamps it as the session's
+    /// `UserPrimaryImageTag`. The default body builds the whole DTO; a manager
+    /// that caches the DTO answers from the cache without copying it.
+    async fn user_primary_image_tag(
+        &self,
+        user: &UserEntity,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(self.get_user_dto(user, None).await?.primary_image_tag)
+    }
+
     /// Updates a user's configuration (stopgap; prefer [`Self::update_user`]).
     async fn update_configuration(
         &self,
@@ -1660,7 +1768,9 @@ pub trait UserManager: Send + Sync {
         config: &UserConfiguration,
     ) -> Result<(), ServiceError>;
 
-    /// Updates a user's policy (stopgap; prefer [`Self::update_user`]).
+    /// Updates a user's policy (stopgap; prefer [`Self::update_user`]). The
+    /// concrete manager announces every save, as upstream's
+    /// `UpdatePolicyAsync` does, like [`Self::rename_user`].
     async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError>;
 
     /// Saves a policy as `POST /Users/{userId}/Policy` does: the save
@@ -1677,7 +1787,8 @@ pub trait UserManager: Send + Sync {
     ///
     /// [`ServiceError::NotFound`] for an unknown user,
     /// [`ServiceError::Forbidden`] with the guard's message when a guard
-    /// refuses, or whatever the save surfaces.
+    /// refuses, or whatever the save surfaces. The concrete manager announces
+    /// a save that passes, as [`Self::update_policy`] does.
     async fn update_policy_guarded(
         &self,
         user_id: Uuid,
@@ -1741,7 +1852,9 @@ pub trait UserManager: Send + Sync {
     /// # Errors
     ///
     /// [`ServiceError::NotFound`] for an unknown user, or whatever the save
-    /// surfaces.
+    /// surfaces. The concrete manager announces nothing, as upstream's LDAP
+    /// plugin saves the flag with `UpdateUserAsync`; this default saves
+    /// through [`Self::update_policy`], which an implementation may announce.
     async fn apply_external_administrator(
         &self,
         user_id: Uuid,
@@ -2714,6 +2827,43 @@ pub trait LibraryMonitor: Send + Sync {
 }
 
 fn _assert_object_safe_library_monitor(_: &dyn LibraryMonitor) {}
+
+/// What Live TV's recordings need of the library: the part of
+/// `ILibraryManager` that `RecordingsManager` calls.
+///
+/// Ferrofin's own seam rather than the managers themselves, because a
+/// structure change here also has to restart the library monitor and queue the
+/// scan, which upstream's `AddVirtualFolder(.., refreshLibrary: true)` does
+/// inside the library manager. The composition root implements it over
+/// [`VirtualFolderManager`], [`LibraryManager`] and [`LibraryMonitor`].
+#[async_trait]
+pub trait RecordingLibrary: Send + Sync {
+    /// `ILibraryManager.GetVirtualFolders`.
+    async fn virtual_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError>;
+
+    /// `ILibraryManager.AddVirtualFolder(name, type, options, refreshLibrary: true)`.
+    async fn add_virtual_folder(
+        &self,
+        name: &str,
+        collection_type: Option<CollectionTypeOptions>,
+        options: &LibraryOptions,
+    ) -> Result<(), ServiceError>;
+
+    /// `ILibraryManager.RemoveVirtualFolder(name, refreshLibrary: true)`.
+    async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError>;
+
+    /// `ILibraryManager.RemoveMediaPath(name, path)`.
+    async fn remove_media_path(&self, name: &str, path: &str) -> Result<(), ServiceError>;
+
+    /// `ILibraryManager.QueueLibraryScan`.
+    async fn queue_library_scan(&self) -> Result<(), ServiceError>;
+
+    /// `RecordingsManager.TriggerRefresh(path)`: queues the refresh of the item
+    /// nearest `path`, which also drops the item of a file that has gone.
+    async fn refresh_path(&self, path: &str) -> Result<(), ServiceError>;
+}
+
+fn _assert_object_safe_recording_library(_: &dyn RecordingLibrary) {}
 
 /// The server's own file writes, which the library monitor must not take for
 /// a change to rescan: `ILibraryMonitor.ReportFileSystemChangeBeginning` and

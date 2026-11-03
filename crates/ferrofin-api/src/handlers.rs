@@ -165,6 +165,7 @@ pub mod intro_skipper;
 pub mod item_lookup;
 pub mod item_update;
 pub mod items;
+pub mod ldap;
 pub mod library;
 pub mod library_structure;
 pub mod live_tv;
@@ -788,6 +789,23 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("post", "/FileTransformation/RegisterTransformation"),
 ];
 
+/// `(method, path, extension-id)` for every route a compiled-in extension
+/// registers that is **not a contract operation**: a ported plugin's own
+/// controller, which the vendored spec does not describe.
+///
+/// They are in neither [`REAL_ROUTES`] nor [`EXTENSION_ROUTES`] (contract
+/// operations only) and carry no [`VERIFIED`] row; each plugin's comparison
+/// with its upstream is recorded in `docs/PLUGINS_UPSTREAM.md`. Like every
+/// ASP.NET route they are matched ignoring case
+/// ([`canonicalize_path`](crate::routes::canonicalize_path) reads this list):
+/// a plugin's settings page calls them as it spells them.
+pub const PLUGIN_ROUTES: &[(&str, &str, &str)] = &[
+    // LDAP-Auth plugin (see handlers::ldap).
+    ("post", "/Ldap/TestServerBind", "ldap-auth"),
+    ("post", "/Ldap/TestLdapFilters", "ldap-auth"),
+    ("post", "/Ldap/LdapUserSearch", "ldap-auth"),
+];
+
 /// `(method, path, extension-id)` for every route owned by a **compiled-in
 /// extension** (`ferrofin-extensions`); core routes are everything in
 /// [`REAL_ROUTES`] not listed here.
@@ -895,21 +913,12 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     ("delete", "/Audio/{itemId}/Lyrics", "v12.2"),
     ("get", "/Audio/{itemId}/RemoteSearch/Lyrics", "v12.2"),
     ("post", "/Items/{itemId}/ContentType", "v12.2"),
-    // gl-1027: a padded lyric extension is trimmed and saved.
-    ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
-    // gl-1028: a whitespace-only route id is not the validation 400.
     (
         "post",
         "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
         "v12.2",
     ),
-    ("get", "/Providers/Lyrics/{lyricId}", "v12.2"),
-    ("get", "/DisplayPreferences/{displayPreferencesId}", "v12.2"),
-    (
-        "post",
-        "/DisplayPreferences/{displayPreferencesId}",
-        "v12.2",
-    ),
+    ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
     // gl-1059: "EnabledTuners": null or "ChannelMappings": null is a 400, not
     // bound.
     ("post", "/LiveTv/ListingProviders", "v12.2"),
@@ -926,6 +935,11 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// operation crosses several of them, so one row states their divergences once
 /// and operation rows name it in [`Verified::refs`]. `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
+/// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
+/// frames, which the tile operations serve but no response shows;
+/// `trickplay` is which sets of trickplay images are made, kept and replaced,
+/// shared by the item refresh, the library scan and the Generate Trickplay
+/// Images task;
 /// `scan-failure-isolation` is what the library scan does about a row or a
 /// write that fails, which no operation's response shows;
 /// `progressive-transcode` is who may reach ffmpeg through the stream routes,
@@ -941,6 +955,8 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "websocket-streams",
     "scan-failure-isolation",
     "progressive-transcode",
+    "trickplay-extraction",
+    "trickplay",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -1018,6 +1034,84 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         ],
     },
     VerifiedSubsystem {
+        key: "trickplay-extraction",
+        upstream_file: "MediaBrowser.MediaEncoding/Encoder/MediaEncoder.cs",
+        upstream_method: "ExtractVideoImagesOnIntervalAccelerated",
+        ferrofin: "The ffmpeg run that writes a video's trickplay frames, which the trickplay \
+                   tiles are packed from: ferrofin-mediaencoding encoder/trickplay_extractor.rs \
+                   extract_trickplay_frames, plan, build_trickplay_args, SwTonemap and run on the \
+                   software path, and build_accelerated_trickplay_args with \
+                   supports_keyframe_only_decode, display_corrected_height, frame_matrix and \
+                   mjpeg_quality on the hardware one, compared with \
+                   ExtractVideoImagesOnIntervalAccelerated and \
+                   ExtractVideoImagesOnIntervalInternal and, in \
+                   MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs, \
+                   GetVideoProcessingFilterParam, GetSwVidFilterChain, IsSwTonemapAvailable, \
+                   the software fallbacks of GetNvidiaVidFilterChain, GetVaapiVidFilterChain and \
+                   GetIntelVidFilterChain, and GetInputArgument, GetInputVideoHwaccelArgs and \
+                   GetMjpegEncoder as the trickplay job calls them. The vendor filter chains \
+                   themselves are the transcode ports in encoding_helper/hw and are not part of \
+                   this row",
+        date: "2026-11-02",
+        divergences: &[
+            "The fps= sampler is emitted for every stream, where upstream's GetFramerateParam \
+             emits none for a stream ffprobe read no frame rate for, or one whose rate is not \
+             above the sampling rate, and then writes a frame per keyframe or throws (12.0-rc3, \
+             PR 17304); a stream with no frame rate is sampled on its container timestamps \
+             with no setpts. A Jellyfin bug, deliberately not ported. The rate is printed as \
+             the exact 1000/interval, not upstream's float widened to double.",
+            "An interlaced source is deinterlaced at frame rate whatever \"Double the frame \
+             rate when deinterlacing\" says, because upstream's setpts would number the \
+             doubled frames at the source's rate and stretch the timeline twofold. A Jellyfin \
+             bug, deliberately not ported.",
+            "On the software path the graph is built in upstream's order but with the \
+             dar-aware software scale rather than GetSwScaleFilter, and with no setparams \
+             re-tag of an SDR frame and no closing format=yuv420p, so a 4:2:2 or 4:4:4 source \
+             keeps its chroma.",
+            "On the software path, on an ffmpeg without tonemapx, an HDR frame is not \
+             re-tagged BT.709 either: from ffmpeg 5.1 the scale converts its BT.2020 matrix \
+             to BT.601, and the frame stays un-tone-mapped, as upstream's does.",
+            "On the software path, on ffmpeg 5.1 or later, the frame is converted to the \
+             BT.601 matrix a JPEG decoder reads, in the scale, or behind tonemapx for an HDR \
+             source, whose output is BT.709. Upstream converts none, so its BT.709 previews \
+             shift colour (gl-1129): a Jellyfin bug, deliberately not ported.",
+            "With TrickplayOptions full_chroma, a Ferrofin setting that is off by default, the \
+             software path's frame is held at 4:4:4 from the scale on, and an HDR source is \
+             tone-mapped ahead of the scale, because tonemapx writes 4:2:0 only.",
+            "A run that exits cleanly with no frames counts as failed, so a keyframe-only run \
+             that writes none retries the standard way. Upstream retries only after a non-zero \
+             exit or a hang, and its TrickplayManager then refuses the empty directory.",
+            "With trickplay hardware acceleration on, a job with nothing on the GPU, a source \
+             it cannot decode and a software MJPEG encoder, takes the software path with its \
+             divergences, where upstream runs the same GetSwVidFilterChain through the vendor \
+             chain. Neither initialises a device, except upstream with VAAPI or QSV when the \
+             server's hardware encoding is on, its MJPEG encoder is available (iHD for VAAPI) \
+             and trickplay's switch is off: GetInputVideoHwaccelArgs re-derives the encoder \
+             from the server's switch and starts a device nothing uses.",
+            "On ffmpeg 5.1 or later, frames a hardware decoder hands the software MJPEG encoder \
+             are converted to BT.601 at the end of the graph, from the matrix they hold (BT.709 \
+             when tone-mapped, else the probed colour space; a BT.601 or untagged source is not \
+             converted), where upstream converts none (gl-1157): a Jellyfin bug, deliberately \
+             not ported. Measured on NVENC; the VAAPI and QSV downloads were measured with CPU \
+             scalers in their formats, not on Intel or AMD hardware. Frames for a hardware \
+             MJPEG encoder are not converted yet, as upstream's are not: open work (gl-1169).",
+            "A stream whose aspect ratio is 0:1 or does not parse keeps its stored height, \
+             where upstream's height correction, which runs for every job, throws and the item \
+             gets no trickplay. For 1:0, which upstream turns into a height of 0 that only a \
+             fixed-size hardware scaler reads, and which then throws there too, the hardware \
+             path keeps the stored height. Jellyfin bugs, deliberately not ported.",
+            "The caller owns the frame directory, which the extractor clears before a retry, \
+             where upstream extracts each run into a fresh temporary directory.",
+            "The argument line is logged at debug, not information, because it is logged once \
+             per video and width (docs/conventions/LOGGING.md), and a run stopped for writing \
+             no new frame logs no lines of its own: its reason is in the error the caller \
+             logs.",
+            "AMF, VideoToolbox, RKMPP and V4L2M2M have no ported filter chain, so a job \
+             configured for one takes the software path. That is the owner's hardware scope \
+             decision (CLAUDE.md, Current scope).",
+        ],
+    },
+    VerifiedSubsystem {
         key: "websocket-streams",
         upstream_file: "MediaBrowser.Controller/Net/BasePeriodicWebSocketListener.cs",
         upstream_method: "HandleMessages",
@@ -1082,8 +1176,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    PrimaryImageTag); image serving and processing are compared per \
                    operation, apart from the Live TV artwork rule below (ferrofin-livetv \
                    projection.rs is_artwork_url, channel_images_update, \
-                   program_images_update, manager.rs add_provider_metadata; handlers/images.rs \
-                   live_tv_image_is_servable). ferrofin-drawing processor.rs \
+                   program_images_update, manager.rs add_provider_metadata; ferrofin-traits \
+                   item_image_info.rs live_tv_image_is_internal, read by handlers/images.rs \
+                   live_tv_image_is_servable, ferrofin-providers provider_manager.rs \
+                   delete_image and ferrofin-core dto_service.rs primary_image_aspect_ratio \
+                   and dynamic_images.rs local_images). ferrofin-drawing processor.rs \
                    get_image_cache_tag (the owning \
                    item's path, null as empty) and get_image_cache_tag_for_path (md5 of the \
                    UTF-16 path + DateModified ticks, as a .NET Guid \"N\") ← ferrofin-core \
@@ -1096,10 +1193,14 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    (the profile image's own path). Item paths as item_repository.rs mapped \
                    reads them (BaseItemMapper.Map's ExpandVirtualPath). Compared with \
                    Emby.Server.Implementations/Dto/DtoService.cs (GetImageCacheTag, \
+                   GetPrimaryImageAspectRatio, \
                    GetTagAndFillBlurhash, AddInheritedImages, AttachPeople), \
                    Jellyfin.Server.Implementations/Item/ChapterRepository.cs (Map), \
                    Jellyfin.Api/Controllers/ImageController.cs (GetItemImageInfos), \
                    Jellyfin.Api/Controllers/SearchController.cs (GetSearchHintResult), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (DeleteImageAsync), \
+                   Emby.Server.Implementations/Images/BaseDynamicImageProvider.cs \
+                   (GetStripCollageImagePaths), \
                    src/Jellyfin.LiveTv/LiveTvDtoService.cs (GetImageTag), \
                    src/Jellyfin.LiveTv/Guide/GuideManager.cs (GetChannel, UpdateImage), \
                    MediaBrowser.Controller/Entities/BaseItemExtensions.cs (SetImagePath) and \
@@ -1156,6 +1257,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              channel's or programme's stored row that is neither a URL nor a file in the \
              internal metadata directory is neither served nor listed. Upstream's SetImagePath \
              also accepts a local file path there. Jellyfin bug not ported.",
+            "The other uses of such a stored row stop at the same directory. DELETE removes the \
+             row and leaves the file, where DeleteImageAsync deletes any local file. A Primary \
+             with no stored size reports the kind's default PrimaryImageAspectRatio, as a file \
+             that cannot be read does, where GetPrimaryImageAspectRatio opens it. A collage \
+             skips it, where GetStripCollageImagePaths draws any local file. Same Jellyfin bug \
+             as the entry above, not ported.",
         ],
     },
     VerifiedSubsystem {
@@ -1163,9 +1270,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         upstream_file: "Emby.Server.Implementations/Library/UserDataManager.cs",
         upstream_method: "SaveUserData",
         ferrofin: "The write path, plus the read path only where a page's version groups get \
-                   their user data. ferrofin-core user_data_manager.rs mutate_row \
+                   their user data and where a page lists an item twice (get_user_data_dtos_for_rows \
+                   resolves each item once, so every occurrence gets its stored row, as \
+                   GetUserDataBatch's TryGetValue on the grouped rows does). ferrofin-core \
+                   user_data_manager.rs mutate_row \
                    (SaveUserData with its retired-key update, GetUserData, ResolveUserDataRow), \
-                   save_user_data_with_reason (the UpdateUserItemDataDto SaveUserData), \
+                   with the item's keys from user_data_key_repository.rs load_identities and \
+                   KEY_ROWS_SQL (GetUserDataKeys, from the series a Season or an Episode \
+                   names in SeriesId, else its nearest Series parent, read in the same \
+                   statement as the item), save_user_data_with_reason (the \
+                   UpdateUserItemDataDto SaveUserData), \
                    save_play_state and apply_play_report (UpdatePlayState), \
                    reset_playback_stream_selections (ResetPlaybackStreamSelections), \
                    record_playback_start, set_likes, mark_item_played, mark_item_unplayed, \
@@ -1173,6 +1287,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Session/SessionManager.cs (OnPlaybackStart, \
                    OnPlaybackProgress, UpdatePlaybackSettings, OnPlaybackStopped), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
+                   MediaBrowser.Controller/Entities/TV/Episode.cs and \
+                   MediaBrowser.Controller/Entities/TV/Season.cs (Series, FindSeriesId, \
+                   GetUserDataKeys), \
                    MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
                    Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
                    UpdateUserItemRatingInternal). The version groups: dto_service.rs prefetch's \
@@ -1248,9 +1365,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              same check, as PlaybackInfo does. A DVR recording has no row here, so it takes \
              Live TV access, IsVisibleStandalone over its entity, the libraries holding its \
              file and then its channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
-             now share; upstream's recording is a library item, whose library holds it. On the \
-             routes upstream leaves anonymous, no credential, a token that names nobody and an \
-             API key stay so, which binds a client that sends its token. The legacy /hls/ \
+             now share and GET /LiveTv/Recordings lists by; upstream's recording is a library \
+             item, whose library holds it. On the routes upstream leaves anonymous, no \
+             credential, a token that names nobody and an API key stay so, which binds a \
+             client that sends its token. The legacy /hls/ \
              routes are outside this: they serve a transcode's file by its random name, and \
              the item id selects nothing, as upstream. Deliberate divergence (owner decision \
              2026-10-31, gl-1090).",
@@ -1284,9 +1402,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    job on those routes and the HLS ones: ferrofin-mediaencoding \
                    transcoding/manager.rs start_ffmpeg, compared with \
                    MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs (StartFfMpeg, \
-                   PingTimer) and Emby.Server.Implementations/Session/SessionManager.cs \
-                   (MaxActiveSessions)",
-        date: "2026-11-01",
+                   PingTimer, KillTranscodingJobs) and \
+                   Emby.Server.Implementations/Session/SessionManager.cs (MaxActiveSessions)",
+        date: "2026-11-02",
         divergences: &[
             "A GET that would start a transcode on /Videos/{itemId}/stream, \
              /Videos/{itemId}/stream.{container}, /Audio/{itemId}/stream or \
@@ -1302,12 +1420,66 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              2026-10-31 and 2026-11-01, gl-1098), the settings max_transcodes and \
              max_transcodes_per_user, both 0, off, by default, which leaves StartFfMpeg's \
              behaviour as upstream's: it starts whatever it is asked to, and MaxActiveSessions \
-             applies only at login. Past a cap a start ends the same user's longest-idle job \
-             (no active request), the teardown the ping timeout would have brought, and with \
-             none idle answers 503 with Retry-After: 10 before anything is created. A job \
-             copying every stream is free. The user is the authorization's, as upstream's \
-             StartFfMpeg userId is; an API key has none, so it is outside the per-user cap \
-             and inside the server-wide one.",
+             applies only at login. Past a cap a start ends the longest-idle job (no active \
+             request) of the same user on the same device, the teardown the ping timeout \
+             would have brought, and with none idle answers 503 with Retry-After: 10 before \
+             anything is created. The device is the request's DeviceId, compared ignoring \
+             ASCII case (KillTranscodingJobs uses OrdinalIgnoreCase), and a start without one \
+             ends nothing: an HLS player between two segment requests is idle too, so \
+             another device's job is never ended (gl-1140). A job copying every stream is \
+             free. The user is the authorization's, as upstream's StartFfMpeg userId is; an \
+             API key has none, so it is outside the per-user cap and inside the server-wide \
+             one.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "trickplay",
+        upstream_file: "Jellyfin.Server.Implementations/Trickplay/TrickplayManager.cs",
+        upstream_method: "RefreshTrickplayDataAsync",
+        ferrofin: "Which trickplay sets a refresh discovers, imports, keeps, generates, replaces \
+                   and prunes, for an item refresh (Replace included), the library scan and \
+                   the Generate Trickplay Images task. ferrofin-core trickplay_manager.rs \
+                   refresh_media (RefreshTrickplayDataAsync, with CanGenerateTrickplay and \
+                   DiscoverExistingTrickplayAsync), refresh_width \
+                   (RefreshTrickplayDataInternal), create_tiles and move_dir (CreateTiles), \
+                   and scheduled_tasks/library.rs TrickplayImagesTask, compared with \
+                   MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
+                   How ffmpeg extracts the frames, on either path, is the \
+                   trickplay-extraction row's; how many generations run at once is not part \
+                   of this row",
+        date: "2026-11-02",
+        divergences: &[
+            "An explicit Replace does not delete the item's trickplay folder and rows first: \
+             each selected width is generated in the work directory and swapped in, so the old \
+             images serve until then and a failed Replace keeps them, and the rows and folders \
+             of other widths go once every selected width has its row (with no width \
+             selected, nothing is removed, where upstream's Replace empties the folder); with \
+             extraction disabled it prunes first as upstream. A video narrower than two selected \
+             widths generates their one set once. When the row save fails after the swap, the \
+             new tiles stay if the width's stored row names their folder (upstream deletes them, \
+             which would now leave the video without its old set). Deliberate divergence \
+             (owner decision 2026-11-01, D7 of the Trickplay quality milestone, gl-1138).",
+            "After WidthResolutions or FullChroma change since the last Generate Trickplay \
+             Images run that finished (recorded in FerrofinMeta, and on the first boot after \
+             upgrading), the next run checks every video: a set whose first tile's chroma \
+             differs from the setting is regenerated and swapped in the same way, and a width \
+             Ferrofin made sets at and the current settings do not select is removed once the \
+             selected widths exist: one an earlier run selected, or one a library scan or an \
+             item refresh made under settings other than those recorded (recorded before it is \
+             made, which also checks again after a change back). A user-placed grid stays. The \
+             run is recorded only when every video's sets match, so an interrupted run, or one \
+             that could not replace a set, checks again. A run with no width selected is no \
+             checking pass and records nothing (in a library with extraction on it makes and \
+             removes nothing), so the next change still removes the \
+             widths recorded before it. Upstream never replaces images unasked. Deliberate \
+             divergence (owner decisions 2026-11-01, D3 and D5, gl-1138; gl-1178).",
+            "Importing a width's folder that has no row counts only its .jpg tiles; upstream \
+             counts every file in it, so a stray file there makes the import fail on its image \
+             size. Jellyfin bug not ported.",
+            "TrickplayOptions has a Ferrofin-only FullChroma member, off by default and absent \
+             from the JSON while off, which writes 4:4:4 tiles, from 4:4:4 frames on the \
+             software path (see the trickplay-extraction row), instead of 4:2:0 (owner \
+             decision 2026-11-01, D6, gl-1128).",
         ],
     },
 ];
@@ -1375,7 +1547,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/TvShowsController.cs",
         upstream_method: "GetNextUp",
         ferrofin: "handlers/tv_shows.rs get_next_up → ferrofin-core tv_series_manager.rs \
-               (TVSeriesManager) → next_up_service.rs (NextUpService)",
+               (TVSeriesManager) → next_up_service.rs (NextUpService, top_parent_ids → \
+               item_repository.rs view_top_parent_ids)",
         date: "2026-10-19",
         divergences: &[
             "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
@@ -1479,9 +1652,135 @@ pub const VERIFIED: &[Verified] = &[
                (SessionManager.GetSessions, ToSessionInfoDto); the NowPlayingItem it copies \
                is built by on_playback_start and on_playback_progress \
                (kept_now_playing_item, now_playing_item → get_item_info; UpdateNowPlayingItem, \
-               GetItemInfo) and cleared by on_playback_stopped (RemoveNowPlayingItem)",
-        date: "2026-10-30",
+               GetItemInfo) and cleared by on_playback_stopped (RemoveNowPlayingItem); the \
+               PlayState and PlaylistItemId are the last report's (update_now_playing; \
+               UpdateNowPlayingItem, MediaSourceId the item's own when none is reported), the \
+               stop keeps a reported NowPlayingQueue and resets the PlayState \
+               (OnPlaybackStopped, RemoveNowPlayingItem); TranscodingInfo is cleared by a report \
+               that does not transcode, by the stop and by a transcode that fails to start \
+               (set_device_transcoding_info, on the device's session active last, as \
+               ReportTranscodingInfo's Sessions order; mediaencoding manager.rs start_ffmpeg → \
+               on_job_failed_to_start; ClearTranscodingInfo, OnTranscodeFailedToStart), whose \
+               reported PlayMethod handlers/playstate.rs validate_play_method keeps only while \
+               the play session transcodes (ValidatePlayMethod); NowViewingItem is \
+               report_now_viewing_item's (ReportNowViewingItem) and UserPrimaryImageTag is \
+               stamped by upsert_session (GetSessionInfo, GetImageCacheTag); \
+               LastPlaybackCheckIn is DateTime.MinValue until update_now_playing stamps it \
+               (SessionInfo.LastPlaybackCheckIn, UpdateNowPlayingItem) and \
+               NowPlayingQueueFullItems is never sent (v12.4's SessionInfoDto has none)",
+        date: "2026-11-02",
         divergences: SESSIONS_DIVERGENCES,
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Sessions/Playing",
+        upstream_file: "Jellyfin.Api/Controllers/PlaystateController.cs",
+        upstream_method: "ReportPlaybackStart",
+        ferrofin: "handlers/playstate.rs report_playback_start (validate_play_method: \
+               ValidatePlayMethod over AppState::hls get_transcoding_job, \
+               TranscodeManager.GetTranscodingJob; current_session_id: RequestHelpers.GetSessionId) \
+               → ferrofin-core session_manager.rs on_playback_start (SessionManager.OnPlaybackStart: \
+               update_live_stream_session_mapping, update_now_playing for UpdateNowPlayingItem, \
+               the ClearTranscodingInfo of a report that does not transcode, record_playback_start \
+               per session user on progress_item for GetProgressItem, the log line, the \
+               PlaybackStart event) → playback_activity.rs (PlaybackStartLogger)",
+        date: "2026-11-02",
+        divergences: PLAYBACK_START_DIVERGENCES,
+        refs: &["user-data"],
+    },
+    Verified {
+        method: "post",
+        path: "/PlayingItems/{itemId}",
+        upstream_file: "Jellyfin.Api/Controllers/PlaystateController.cs",
+        upstream_method: "OnPlaybackStart",
+        ferrofin: "handlers/playstate.rs on_playback_start (LegacyStartQuery: the query members \
+               with canSeek false and PlayMethod Transcode when absent) → the POST \
+               /Sessions/Playing path from validate_play_method on",
+        date: "2026-11-02",
+        divergences: PLAYBACK_START_DIVERGENCES,
+        refs: &["user-data"],
+    },
+    Verified {
+        method: "post",
+        path: "/Sessions/Playing/Progress",
+        upstream_file: "Jellyfin.Api/Controllers/PlaystateController.cs",
+        upstream_method: "ReportPlaybackProgress",
+        ferrofin: "handlers/playstate.rs report_playback_progress (validate_play_method: \
+               ValidatePlayMethod; AppState::hls ping_transcoding_job, the keep-alive upstream's \
+               TranscodeManager.OnPlaybackProgress runs off the PlaybackProgress event, here \
+               before the report reaches the session manager) → \
+               ferrofin-core session_manager.rs on_playback_progress \
+               (SessionManager.OnPlaybackProgress: kept_now_playing_item or the library item for \
+               GetNowPlayingItem, update_now_playing with the check-in only when not automated, \
+               the ClearTranscodingInfo of a report that does not transcode, update_play_progress \
+               per session user for OnPlaybackProgress(user, item, info), \
+               update_live_stream_session_mapping, the PlaybackProgress event)",
+        date: "2026-11-02",
+        divergences: PLAYBACK_PROGRESS_DIVERGENCES,
+        refs: &["user-data"],
+    },
+    Verified {
+        method: "post",
+        path: "/PlayingItems/{itemId}/Progress",
+        upstream_file: "Jellyfin.Api/Controllers/PlaystateController.cs",
+        upstream_method: "OnPlaybackProgress",
+        ferrofin: "handlers/playstate.rs on_playback_progress (LegacyProgressQuery: the query \
+               members with isPaused and isMuted false, PlayMethod Transcode and RepeatMode \
+               RepeatNone when absent) → the POST /Sessions/Playing/Progress path from \
+               validate_play_method on",
+        date: "2026-11-02",
+        divergences: PLAYBACK_PROGRESS_DIVERGENCES,
+        refs: &["user-data"],
+    },
+    Verified {
+        method: "post",
+        path: "/Sessions/Playing/Stopped",
+        upstream_file: "Jellyfin.Api/Controllers/PlaystateController.cs",
+        upstream_method: "ReportPlaybackStopped",
+        ferrofin: "handlers/playstate.rs report_playback_stopped (kill_session_transcodes: \
+               KillTranscodingJobs) → ferrofin-core session_manager.rs on_playback_stopped \
+               (SessionManager.OnPlaybackStopped: the negative-position refusal after releasing the \
+               live stream, the reported NowPlayingQueue and PlaylistItemId, RemoveNowPlayingItem's \
+               PlayState reset and ClearTranscodingInfo, save_stopped_play_state per session user \
+               unless the playback failed, the log line, close_live_stream_if_needed, the \
+               PlaybackStopped event) → playback_activity.rs (PlaybackStopLogger)",
+        date: "2026-11-02",
+        divergences: PLAYBACK_STOP_DIVERGENCES,
+        refs: &["user-data"],
+    },
+    Verified {
+        method: "delete",
+        path: "/PlayingItems/{itemId}",
+        upstream_file: "Jellyfin.Api/Controllers/PlaystateController.cs",
+        upstream_method: "OnPlaybackStopped",
+        ferrofin: "handlers/playstate.rs on_playback_stopped (LegacyStopQuery: mediaSourceId, \
+               nextMediaType, positionTicks, liveStreamId, playSessionId) → the POST \
+               /Sessions/Playing/Stopped path from kill_session_transcodes on",
+        date: "2026-11-02",
+        divergences: PLAYBACK_STOP_DIVERGENCES,
+        refs: &["user-data"],
+    },
+    Verified {
+        method: "post",
+        path: "/Sessions/Viewing",
+        upstream_file: "Jellyfin.Api/Controllers/SessionController.cs",
+        upstream_method: "ReportViewing",
+        ferrofin: "handlers/session.rs report_viewing (a missing or blank itemId a 400 before \
+               anything else, as [Required] model validation; sessionId absent or blank the \
+               caller's own, RequestHelpers.GetSessionId; controlling_session_id → \
+               assert_can_control: \
+               GetSession's 404 and AssertCanControl's 403) → ferrofin-core session_manager.rs \
+               report_now_viewing_item (SessionManager.ReportNowViewingItem: the library item, \
+               with no user check, built by get_item_info as GetItemInfo(item, null), an unknown \
+               item GetItemInfo's ArgumentNullException 400), shown by GET /Sessions",
+        date: "2026-11-02",
+        divergences: &[
+            "An itemId that is not a GUID answers 400; upstream's new Guid(itemId) throws a \
+         FormatException, a 500. Jellyfin bug not ported.",
+            "The 400 (a missing, malformed or unknown itemId), 403 and 404 bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
         refs: &[],
     },
     Verified {
@@ -1596,18 +1895,24 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "UploadLyrics",
-        ferrofin: "handlers/lyrics.rs upload_lyrics (upload_format, queue_high_priority_refresh) \
-               → ferrofin-core lyric_manager.rs save_lyric (decode_stream_text, save_targets, \
-               try_save_to_files)",
+        ferrofin: "handlers/lyrics.rs upload_lyrics (require_item, an empty body by its \
+               size hint, upload_format, then the Bytes read under upload_body_limit; \
+               queue_high_priority_refresh) → ferrofin-core lyric_manager.rs save_lyric \
+               (decode_stream_text, parse_by_format on the format as given, save_targets \
+               with save_extension, try_save_to_files)",
         date: "2026-10-24",
         divergences: &[
             "An upload with no Content-Length (a chunked body) is read and saved; upstream \
          tests Request.ContentLength and answers every chunked upload 400 \"No lyrics \
          uploaded\". Jellyfin bug not ported.",
             "A body past Kestrel's 30,000,000-byte default (MAX_UPLOAD_BODY_BYTES, the same \
-         cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
-         Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
-         Jellyfin bug not ported.",
+         cap) is a 413 once the item, the empty-body and the extension checks pass, where \
+         upstream reads it too; upstream's ExceptionMiddleware maps no \
+         BadHttpRequestException, so Kestrel's \"request body too large\" reaches the \
+         client as a plain-text 500. Jellyfin bug not ported.",
+            "The 400 (an empty body, a file name without an extension, a format no parser \
+         reads, a missing or blank fileName) and 404 (no such item, or one the caller may \
+         not see) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1644,13 +1949,14 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "DownloadRemoteLyrics",
-        ferrofin: "handlers/lyrics.rs download_remote_lyrics (queue_high_priority_refresh) → \
+        ferrofin: "handlers/lyrics.rs download_remote_lyrics (RequiredRouteString lyricId: \
+               ConvertEmptyStringToNull, then [Required]; queue_high_priority_refresh) → \
                ferrofin-core lyric_manager.rs download_lyrics (fetch_remote, save_targets, \
                try_save_to_files)",
         date: "2026-10-19",
         divergences: &[
-            "A lyricId of only whitespace is a 404 (no provider owns it); upstream's \
-         ArgumentException.ThrowIfNullOrWhiteSpace makes it a 500. Jellyfin bug not ported.",
+            "The 404 (no such item, one the caller may not see, or no lyric for the id) body \
+         is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1659,10 +1965,14 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Providers/Lyrics/{lyricId}",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "GetRemoteLyrics",
-        ferrofin: "handlers/lyrics.rs get_remote_lyrics → ferrofin-core lyric_manager.rs \
+        ferrofin: "handlers/lyrics.rs get_remote_lyrics (RequiredRouteString lyricId: \
+               ConvertEmptyStringToNull, then [Required]) → ferrofin-core lyric_manager.rs \
                get_remote_lyrics (fetch_remote, parse_by_format)",
-        date: "2026-10-19",
-        divergences: &[],
+        date: "2026-10-30",
+        divergences: &[
+            "The 404 (no provider owns the id, or it has no such lyric) body is Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
         refs: &[],
     },
     Verified {
@@ -1723,22 +2033,35 @@ pub const VERIFIED: &[Verified] = &[
                answers as ExceptionMiddleware does \
                outside Development, the same on a live 12.4 for each refusal. Compared: user \
                lookup and lock, provider order and selection by the saved id \
-               (AuthenticationManager::id, GetType().FullName), the provider's canonical \
-               username, the new-user policy, the saved provider id, the disabled, remote and \
-               schedule checks, the failure counter and lockout, the device and session \
-               limits, token rotation and session activity. The UserDto and SessionInfoDto \
+               (AuthenticationManager::id, GetType().FullName), the warning naming the user \
+               and the saved id when no enabled provider has it (InvalidAuthProvider then \
+               refuses the sign-in), the provider's canonical username, the new-user \
+               policy (saved with update_policy, which announces UserUpdated: the push, \
+               then the device check, as UpdatePolicyAsync does), the saved provider id, \
+               the disabled, remote and schedule checks, \
+               the failure counter and lockout, the device and session limits, token \
+               rotation and session activity, and that upstream has no login rate limit. \
+               The UserDto and SessionInfoDto \
                builders are shared with other routes and not compared here",
         date: "2026-11-02",
         divergences: &[
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "Ferrofin's login backoff (owner decisions on gl-1099; upstream has no rate limit): \
+         past login_backoff_attempts failures an account's and a client address's next \
+         attempts wait, from 1 s doubling to login_backoff_max_delay_secs. An address that \
+         would wait longer is answered as a wrong password without its password being \
+         checked; an account only waits. The backoff never disables an account.",
             "An authentication provider reports the user's administrator flag in its result \
          (ProviderAuthenticationResult.administrator) and the user manager applies it \
          (UserManager::apply_external_administrator), never demoting the last administrator: \
          that sign-in succeeds, the user stays one and a warning is logged. Upstream's LDAP \
          plugin writes the flag itself through UpdateUserAsync, which has no such guard. No \
          built-in provider reports a flag. \
-         Owner decision (2026-11-01).",
+         Owner decision (2026-11-01). Like UpdateUserAsync, applying it announces nothing (no \
+         UserUpdated push, no device check), so an administrator a provider demotes keeps \
+         the devices their policy refuses signed in until a later policy save or rename, as \
+         upstream does (gl-1191 asks the owner whether to keep that).",
             "Every failed login writes the dashboard's AuthenticationFailed entry, where upstream \
          publishes AuthenticationRequestEventArgs only for a wrong password: an exception from \
          AuthenticateUser (an unknown user, a disabled account) or a device or session-limit \
@@ -1940,6 +2263,49 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/LiveTv/Recordings",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetRecordings",
+        ferrofin: "handlers/live_tv.rs get_recordings (items.rs resolve_user_opt, \
+               program_dto_options; ListedRecordingVisibility → recording_visible_given, \
+               holding_libraries, libraries_allow) → ferrofin-livetv manager.rs \
+               get_recordings_matching (dvr_repository.rs recording_rows, \
+               visible_recording_rows, remove_fields, recording_dtos, \
+               add_info_to_recording_dtos) (RequestHelpers.GetUserId, \
+               LiveTvManager.GetRecordingsAsync, GetEmbyRecordingsAsync, \
+               GetRecordingFoldersAsync, RemoveFields)",
+        date: "2026-11-02",
+        divergences: &[
+            "Recordings are the rows of Ferrofin's DVR table, not library items under the \
+         recording folders, so the list differs wherever the two models do: an id is the \
+         row's, not the library item's; a recording file with no row (one from an adopted \
+         Jellyfin database, or a partial file) is not listed; channelId, status, seriesTimerId \
+         and isNews filter the rows, where upstream ignores them; isMovie, isSeries, isKids \
+         and isSports match the programme's flags, either way, where upstream matches the \
+         Movie and Episode kinds and, for true only, the Sports, Kids, Children and Family \
+         genres; isInProgress=false filters the rows, where upstream ignores it, and \
+         isInProgress=true keeps limit and counts every capture in progress, where upstream \
+         drops limit and counts the page; the order is the capture's creation time, newest \
+         first, then the name; enableTotalRecordCount=false still counts every recording, \
+         where upstream reports the page's length; the parental rating, blocked and allowed \
+         tag and unrated rules see a Video with no rating or tags, where upstream applies \
+         them to the library item, its library's tags included; and a recording no library \
+         holds is listed, where upstream lists only under the recording folders the user may \
+         see, and answers an empty page when there is none. Fix path: gl-1077.",
+            "A request with no user (an API key naming none, or an administrator naming an \
+         account that does not exist) lists every recording, as GET \
+         /LiveTv/Recordings/{recordingId} answers the same request for each, while GET \
+         /LiveTv/Recordings/Folders answers it an empty list; upstream's \
+         GetEmbyRecordingsAsync answers an empty page for a null user. Deliberate: API keys \
+         are exempt from the library rule gl-1091 made a hard boundary.",
+            "The 400 (a value the query binder cannot convert) and 403 (another user's id \
+         without the administrator role) bodies are Ferrofin's error shape, not upstream's. \
+         Fix path: gl-666.",
+        ],
+        refs: &["access-filtering"],
+    },
+    Verified {
         method: "delete",
         path: "/LiveTv/TunerHosts",
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
@@ -2009,6 +2375,64 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "post",
+        path: "/System/Configuration/{key}",
+        upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
+        upstream_method: "UpdateNamedConfiguration",
+        ferrofin: "handlers/config.rs update_named_configuration (normalize_named_configuration: \
+               GetConfigurationType and Deserialize) → save_named_configuration \
+               (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
+               the live network policy, the listeners, the committed checks for \
+               ApplicationHost.OnConfigurationUpdated) → for livetv \
+               LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
+               RecordingsManager.OnNamedConfigurationUpdated, which the Live TV manager's tuner \
+               and provider saves run too, as upstream's save of livetv does)",
+        date: "2026-10-30",
+        divergences: &[
+            "database is refused with a 400: Ferrofin has no other database provider (owner \
+         decision 2026-10-23).",
+            "livetv's TunerHosts and ListingProviders are the Live TV manager's rows, kept in \
+         the database, so lists in a posted document are stored with it but neither add nor \
+         change a tuner or a provider.",
+            "The save answers once CreateRecordingFolders has finished, where upstream's async \
+         void handler runs alongside it. It still cannot fail the save.",
+            "The first CreateRecordingFolders on a data directory forgets the \
+         MediaLocationsCreated entries that are not recording folders instead of removing \
+         them from their libraries: adoption carries that list over but not the recording \
+         paths, so upstream's rule would delete the library holding the recordings.",
+            "The 400 and 500 bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/Recordings/Folders",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetRecordingFolders",
+        ferrofin: "handlers/live_tv.rs get_recording_folders (resolve_user_opt, then \
+               LiveTvManager.GetRecordingFoldersAsync: FindByPath, IsVisibleStandalone and \
+               GetCollectionFolders over VirtualFolderManager::library_folders) → \
+               ferrofin-livetv recording_folders.rs recording_folders \
+               (RecordingsManager.GetRecordingFolders)",
+        date: "2026-10-30",
+        divergences: &[
+            "No channel's folder is added (GetChannelsInternalAsync with IsRecordingsFolder): \
+         Ferrofin has no channel plugins, by design.",
+            "A request with no user (an API key without userId, or a userId naming no account) \
+         answers an empty list. Upstream reads user.Id and fails with a 500; Jellyfin bug not \
+         ported.",
+            "A location resolves to the libraries holding it from their configured locations, \
+         not through FindByPath's stored Folder row, compared ignoring case. So a new library \
+         is answered before its first scan created that row, and so is a location no scan has \
+         stored under a larger library.",
+            "SortName compares ordinally rather than through OrderBy's culture comparer.",
+            "The 403 (another user's id without elevation) body is Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
         path: "/Users/{userId}/Policy",
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "UpdateUserPolicy",
@@ -2017,9 +2441,11 @@ pub const VERIFIED: &[Verified] = &[
                leaves out; policy_validation: UserPolicy's [Required(AllowEmptyStrings = false)] \
                provider ids; load_user: GetUserById's 400 for a nil id) → ferrofin-core \
                user_manager.rs update_policy_guarded (save_policy: UserManager.UpdatePolicyAsync \
-               behind ferrofin-traits policy_update_refusal) → session_manager.rs \
-               revoke_user_tokens; handlers/users.rs refresh_device_access (DeviceAccessHost)",
-        date: "2026-10-29",
+               behind ferrofin-traits policy_update_refusal; announce_user_updated: its \
+               UserUpdatedEventArgs and OnUserUpdated → ferrofin-core user_updated.rs, \
+               UserUpdatedNotifier then DeviceAccessHost) → session_manager.rs \
+               revoke_user_tokens",
+        date: "2026-11-02",
         divergences: &[
             "The three guards (the last administrator, an administrator disabled, the last \
          enabled user) are read inside the transaction that saves, and a newly disabled \
@@ -2027,6 +2453,10 @@ pub const VERIFIED: &[Verified] = &[
          before saving and revokes first, so two concurrent saves could both pass a guard and \
          leave the server without an administrator or an enabled user. Jellyfin bug not \
          ported.",
+            "Because the revocation waits for the guarded save, it comes after the save's \
+         UserUpdated push and device check: a newly disabled user's open sessions hear \
+         UserUpdated just before they are signed out, where upstream's are already gone when \
+         UpdatePolicyAsync publishes. Their end state is the same.",
             "The 400 (nil user id), 403 (a guard refused) and 404 (unknown user) bodies are \
          Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -2094,11 +2524,12 @@ pub const VERIFIED: &[Verified] = &[
                serde default for a missing Configuration; load_user: GetUserById's 400 for a \
                nil id, an API key's userId ?? User.GetUserId() included) → ferrofin-core \
                user_manager.rs rename_user (require_valid_username: ThrowIfInvalidUsername; \
-               move_profile_image_on), update_configuration (one writer transaction, as one \
-               SaveChangesAsync; accepted_cast_receiver_id); handlers/users.rs \
-               notify_user_updated (UserUpdatedNotifier) and refresh_device_access \
-               (DeviceAccessHost), both after a rename only",
-        date: "2026-10-29",
+               move_profile_image_on; announce_user_updated: RenameUser's \
+               UserUpdatedEventArgs and OnUserUpdated → ferrofin-core user_updated.rs, \
+               UserUpdatedNotifier then DeviceAccessHost), update_configuration (one writer \
+               transaction, as one SaveChangesAsync; accepted_cast_receiver_id; announces \
+               nothing)",
+        date: "2026-11-02",
         divergences: &[
             "\"Configuration\": null skips the configuration save, where upstream dereferences \
          the null in UpdateConfigurationAsync and answers 500. Jellyfin bug not ported.",
@@ -2289,8 +2720,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/DisplayPreferences/{displayPreferencesId}",
         upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
         upstream_method: "GetDisplayPreferences",
-        ferrofin: "handlers/display_preferences.rs get_display_preferences (Query: \
-               ConvertEmptyStringToNull, then [Required] client from query/required.json; \
+        ferrofin: "handlers/display_preferences.rs get_display_preferences \
+               (RequiredRouteString displayPreferencesId and Query: ConvertEmptyStringToNull, \
+               then [Required], client from query/required.json; \
                effective_user_id: RequestHelpers.GetUserId; resolve_item_id: Guid.TryParse \
                else GetMD5; index_by_name, chromecast_name, home_section_name) → ferrofin-core \
                display_preferences_manager.rs (get_display_preferences, \
@@ -2298,7 +2730,7 @@ pub const VERIFIED: &[Verified] = &[
                list_home_sections) → ferrofin-db database.rs home_sections (Order, then Id: \
                the Include(HomeSections) load order); ferrofin-model \
                dto/display_preferences_dto.rs",
-        date: "2026-10-25",
+        date: "2026-10-30",
         divergences: &[
             "CustomPrefs members are written in hash order, not upstream's insertion order \
          (the home sections, the scalar keys, then the stored preferences); the members and \
@@ -2314,8 +2746,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/DisplayPreferences/{displayPreferencesId}",
         upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
         upstream_method: "UpdateDisplayPreferences",
-        ferrofin: "handlers/display_preferences.rs update_display_preferences (Query: \
-               ConvertEmptyStringToNull, then [Required] client from query/required.json; \
+        ferrofin: "handlers/display_preferences.rs update_display_preferences \
+               (RequiredRouteString displayPreferencesId and Query: ConvertEmptyStringToNull, \
+               then [Required], client from query/required.json; \
                JsonBody DisplayPreferencesDto, resolve_item_id: Guid.TryParse else GetMD5, \
                take_pref/take_nullable_pref, enum_try_parse for Enum.TryParse/Enum.Parse, \
                parse_dotnet_int/parse_dotnet_bool for int.Parse/bool.Parse) → ferrofin-core \
@@ -2324,7 +2757,7 @@ pub const VERIFIED: &[Verified] = &[
                update_item_display_preferences, update_display_preferences, \
                set_home_sections) → ferrofin-db database.rs replace_home_sections; \
                ferrofin-model dto/display_preferences_dto.rs",
-        date: "2026-10-25",
+        date: "2026-10-30",
         divergences: &[
             "A missing or empty skipBackLength/skipForwardLength stores 10000/30000 ms; \
          upstream's controller stores 15000 for both. Fix path: gl-410.",
@@ -2747,16 +3180,45 @@ const NO_USER_USER_DATA_FILTER_DIVERGENCE: &str = "A user-data filter (`isFavori
      unfiltered (200); upstream's TranslateQuery dereferences the null User for the user-data \
      subqueries and fails (500). Jellyfin bug not ported.";
 
+/// The divergences of the two playback-start reports (`POST /Sessions/Playing`,
+/// `POST /PlayingItems/{itemId}`).
+const PLAYBACK_START_DIVERGENCES: &[&str] = &[
+    "A report's own Item is ignored: the session's NowPlayingItem and the activity entry \
+     come from the library item. Fix path: gl-1062.",
+    "SessionInfo.StartAutomaticProgress is not run, so the session's position does not \
+     advance between reports. Fix path: gl-803.",
+    "The activity entry is written in English, not the server's UI culture. Fix path: gl-429.",
+    "The 400 bodies (a body or query member that does not bind) are Ferrofin's error shape. \
+     Fix path: gl-666.",
+];
+
+/// The divergences of the two playback-progress reports.
+const PLAYBACK_PROGRESS_DIVERGENCES: &[&str] = &[
+    "A report's own Item is ignored: the session's NowPlayingItem comes from the library \
+     item. Fix path: gl-1062.",
+    "SessionInfo.StartAutomaticProgress is not re-armed by a report, so no automated progress \
+     follows it. Fix path: gl-803.",
+    "The 400 bodies (a body or query member that does not bind) are Ferrofin's error shape. \
+     Fix path: gl-666.",
+];
+
+/// The divergences of the two playback-stop reports.
+const PLAYBACK_STOP_DIVERGENCES: &[&str] = &[
+    "A stop naming no PlaySessionId kills every transcode on the caller's device; upstream \
+     kills none. Fix path: gl-1184.",
+    "A report's own Item is not used: the log line and the activity entry name the library \
+     item. Fix path: gl-1062.",
+    "The activity entry is written in English, not the server's UI culture. Fix path: gl-429.",
+    "The live stream is released and the stop published even when the user-data save fails, \
+     and the item is always read again rather than taken from the session, so an item deleted \
+     mid-play saves nothing; upstream skips the release when the save throws and throws on the \
+     deleted item. Jellyfin bug not ported.",
+    "The 400 bodies (a negative position, a body or query member that does not bind) are \
+     Ferrofin's error shape. Fix path: gl-666.",
+];
+
 /// The accepted divergences of `GET /Sessions`.
 const SESSIONS_DIVERGENCES: &[&str] = &[
-    "PlayState carries only PositionTicks, IsPaused and a CanSeek derived from the \
-     now-playing item, NowPlayingQueue is always empty, TranscodingInfo is never cleared, \
-     and PlaylistItemId, NowViewingItem and UserPrimaryImageTag are never filled, where \
-     upstream's UpdateNowPlayingItem, RemoveNowPlayingItem and LogSessionActivity keep them. \
-     Fix path: gl-119.",
-    "LastPlaybackCheckIn starts at the session's creation, where upstream's is \
-     0001-01-01 until a playback report; NowPlayingQueueFullItems is sent as [], a member \
-     v12.4's SessionInfoDto no longer has. Fix path: gl-837.",
     "A playback report's own Item is ignored and the NowPlayingItem is always built from the \
      library item; upstream shows a reported Item as sent. Fix path: gl-1062.",
     "A NowPlayingItem whose media source lookup fails is shown without its streams, and one \
@@ -2930,6 +3392,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     // The Ferrofin plugin's settings page — not a contract operation, so in
     // neither REAL_ROUTES nor EXTENSION_ROUTES.
     let router = ferrofin_settings::register(router);
+    // The LDAP-Auth plugin's own controller — not a contract operation, so
+    // listed in PLUGIN_ROUTES.
+    let router = ldap::register(router);
     // Live TV read surface — empty/disabled state so the web UI treats Live TV
     // as "not configured" instead of erroring on 501 (mutations stay stubbed).
     let router = live_tv::register(router);
