@@ -2,6 +2,7 @@
 //! ~140-field query struct the library/persistence layer filters items with.
 
 use chrono::{DateTime, Utc};
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::{BaseItemKind, CollectionType, MediaType, UnratedItem};
 use ferrofin_model::dto::SortOrder;
@@ -357,6 +358,15 @@ pub struct InternalItemsQuery {
     pub folder_query_recursive: bool,
     /// The parent item kind, if known.
     pub parent_type: Option<BaseItemKind>,
+    /// The parent's row as the caller already read it, through
+    /// `ItemRepository::retrieve_item` (its `Path` expanded), so the
+    /// repository's scope resolution and the folder display policy work from
+    /// it instead of reading the row again: upstream's controller reads the
+    /// parent once (`GetParentItem`) and works from the item it holds. Read it with
+    /// [`known_parent_row`](Self::known_parent_row), which returns it only
+    /// while its id is still [`parent_id`](Self::parent_id); a query that
+    /// moves its parent needs no reset.
+    pub parent_row: Option<Arc<BaseItemEntity>>,
     /// Restrict to physical and linked descendants of this item.
     /// Internal scope used for recursive BoxSet/Playlist reads; filters and
     /// paging apply to the resulting rows, never to traversal intermediates.
@@ -618,6 +628,7 @@ impl Default for InternalItemsQuery {
             apply_folder_display_options: false,
             folder_query_recursive: false,
             parent_type: None,
+            parent_row: None,
             descendant_of_id: None,
             linked_order_of: None,
             descendant_roots: None,
@@ -828,6 +839,16 @@ impl InternalItemsQuery {
         }
     }
 
+    /// The [`parent_row`](Self::parent_row) the caller read, while its id is
+    /// still [`parent_id`](Self::parent_id); [`None`] when none was read, or
+    /// when the query has since moved to another parent (or to none).
+    #[must_use]
+    pub fn known_parent_row(&self) -> Option<&Arc<BaseItemEntity>> {
+        self.parent_row.as_ref().filter(|row| {
+            !self.parent_id.is_nil() && Uuid::parse_str(&row.id) == Ok(self.parent_id)
+        })
+    }
+
     /// Translates a set of [`ItemFilter`] flags onto the tri-state boolean
     /// fields. Mirrors C# `ApplyFilters`.
     ///
@@ -904,6 +925,7 @@ mod tests {
 
     use super::{ConflictingFilters, InternalItemsQuery, SourceType};
     use crate::options::authorization_info::tests::user_with_id;
+    use ferrofin_db::entities::base_items::BaseItemEntity;
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::querying::ItemFilter;
     use uuid::Uuid;
@@ -996,6 +1018,32 @@ mod tests {
         q.set_parent(None);
         assert_eq!(q.parent_id, Uuid::nil());
         assert!(q.parent_type.is_none());
+    }
+
+    #[test]
+    fn the_known_parent_row_is_the_one_read_for_the_current_parent() {
+        let id = Uuid::from_u128(9);
+        let row = BaseItemEntity {
+            id: id.hyphenated().to_string().to_uppercase(),
+            ..BaseItemEntity::default()
+        };
+        let mut q = InternalItemsQuery {
+            parent_id: id,
+            parent_row: Some(Arc::new(row.clone())),
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(
+            q.known_parent_row().map(|row| &**row),
+            Some(&row),
+            "ids compare as Guids"
+        );
+        q.parent_id = Uuid::from_u128(10);
+        assert!(q.known_parent_row().is_none(), "a moved parent");
+        q.set_parent(None);
+        assert!(q.known_parent_row().is_none(), "no parent");
+        q.parent_id = id;
+        q.parent_row = None;
+        assert!(q.known_parent_row().is_none(), "nothing read");
     }
 
     #[test]

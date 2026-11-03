@@ -27,6 +27,11 @@
 //!   tuner hosts are read once after a write to them, and not again while
 //!   that answer is cached; a tuner added or removed through the API reaches
 //!   the very next request.
+//! - `GET /Items?parentId=` on a library and on a box set (gl-1153). The
+//!   handler's parent visibility check reads the parent's row, and the query
+//!   carries it, so the repository's scope resolution, the folder listing
+//!   and the box set's display order work from it: the parent's row is read
+//!   once, as upstream's controller reads it once (`GetParentItem`).
 
 use std::sync::Mutex;
 
@@ -55,6 +60,9 @@ const VERSIONS_SPAN: &str = "gl1083_version_resume_request";
 /// The span the recorded views requests around a tuner's writes run in.
 const LIVE_TV_SPAN: &str = "gl1154_live_tv_views_request";
 
+/// The span the recorded browses of a parent run in.
+const PARENT_SPAN: &str = "gl1153_parent_browse_request";
+
 /// The statements recorded inside each test's span, in order, tagged with the
 /// span: `cargo test` runs a binary's tests on threads of one process.
 static STATEMENTS: Mutex<Vec<(&'static str, String)>> = Mutex::new(Vec::new());
@@ -73,7 +81,7 @@ where
         }
         let Some(span) = ctx.event_scope(event).and_then(|mut scope| {
             scope.find_map(|span| {
-                [VIEWS_SPAN, VERSIONS_SPAN, LIVE_TV_SPAN]
+                [VIEWS_SPAN, VERSIONS_SPAN, LIVE_TV_SPAN, PARENT_SPAN]
                     .into_iter()
                     .find(|name| span.name() == *name)
             })
@@ -518,6 +526,144 @@ async fn live_tv_views(
         .filter(|s| s.contains(r#""FerrofinLiveTvTunerHosts""#))
         .collect();
     (listed, reads)
+}
+
+/// A browse that names a parent reads the parent's row once: the parent
+/// visibility check reads it whole (`SELECT *`), and nothing reads it again,
+/// neither whole nor as the repository's view row (`Type`, `Data`, … and
+/// whether it has linked children). Upstream's `GetItems` reads the parent
+/// once (`GetParentItem`) and works from that item. Covered: the release
+/// gate's runtime-sorted library browse, a library's own children, and a box
+/// set's listing and recursive browse; a box set's recursive browse still
+/// asks whether the set has linked children, the one thing its row does not
+/// say.
+#[tokio::test]
+async fn a_browse_reads_its_parent_s_row_once() {
+    record_statements();
+    let harness = boot(&[
+        "Film Alpha (1999)/Film Alpha (1999).mkv",
+        "Film Beta (2004)/Film Beta (2004).mkv",
+    ])
+    .await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let (status, views) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!("/Users/{user_id}/Views"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "views: {views}");
+    let movies = views["Items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["Name"] == "Movies"))
+        .and_then(|item| item["Id"].as_str())
+        .expect("the Movies view")
+        .to_owned();
+    let (status, films) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!("/Items?userId={user_id}&recursive=true&includeItemTypes=Movie"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "films: {films}");
+    let ids: Vec<&str> = films["Items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|item| item["Id"].as_str())
+        .collect();
+    assert_eq!(ids.len(), 2, "{films}");
+    let (status, set) = send(
+        &router,
+        &auth_header,
+        "POST",
+        &format!("/Collections?name=Pair&ids={}", ids.join(",")),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "collection: {set}");
+    let set = set["Id"].as_str().expect("the set's id").to_owned();
+
+    // (request, its whole-row reads by id, its `LinkedChildren` probes, how
+    // many items it answers)
+    let browses = [
+        (
+            format!(
+                "/Items?userId={user_id}&parentId={movies}&includeItemTypes=Movie\
+                 &recursive=true&sortBy=Runtime,SortName&sortOrder=Ascending&limit=50"
+            ),
+            1,
+            0,
+            2,
+        ),
+        (
+            format!("/Items?userId={user_id}&parentId={movies}"),
+            1,
+            0,
+            2,
+        ),
+        // The set's listing also reads the user root, whose libraries bound
+        // the linked members the user may see (`GetLinkedChildren(user)`).
+        (format!("/Items?userId={user_id}&parentId={set}"), 2, 0, 2),
+        // A recursive browse of the set still asks whether it has linked
+        // children, which its row does not say.
+        (
+            format!("/Items?userId={user_id}&parentId={set}&recursive=true"),
+            1,
+            1,
+            2,
+        ),
+    ];
+    for (uri, whole_rows, probes, items) in browses {
+        browse_reading_the_parent_once(&router, &auth_header, &uri, whole_rows, probes, items)
+            .await;
+    }
+}
+
+/// Sends `uri` warm, then again inside [`PARENT_SPAN`], and checks the
+/// recorded request reads `whole_rows` rows whole by id, never the
+/// repository's view row, and `probes` times whether a parent has linked
+/// children, answering `items` items as the warm one does.
+async fn browse_reading_the_parent_once(
+    router: &axum::Router,
+    auth_header: &str,
+    uri: &str,
+    whole_rows: usize,
+    probes: usize,
+    items: i64,
+) {
+    let (status, warm) = send(router, auth_header, "GET", uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {warm}");
+    assert_eq!(warm["TotalRecordCount"], items, "{uri}: {warm}");
+    clear_statements(PARENT_SPAN);
+    let (status, page) = send(router, auth_header, "GET", uri, None)
+        .instrument(tracing::info_span!(PARENT_SPAN))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page, warm, "the recorded request answers as the warm one");
+    let statements = statements_in(PARENT_SPAN);
+    let listing = statements.join("\n");
+    let count = |needle: &str| statements.iter().filter(|s| s.contains(needle)).count();
+    assert_eq!(
+        count(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1 AND "Id" <> ?2"#),
+        whole_rows,
+        "{uri}: the parent's row is read once:\n{listing}"
+    );
+    assert_eq!(
+        count(r#"AS "_HasLinkedChildren" FROM "BaseItems" WHERE "Id" = ?1"#),
+        0,
+        "{uri}: the scope works from the row the handler read:\n{listing}"
+    );
+    assert_eq!(
+        count(r#"SELECT EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = ?1)"#),
+        probes,
+        "{uri}: linked children are looked up only where they scope the browse:\n{listing}"
+    );
 }
 
 /// With the library set warm, a library disabled from the dashboard leaves
