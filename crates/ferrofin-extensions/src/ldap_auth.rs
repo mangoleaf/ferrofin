@@ -16,8 +16,11 @@
 //!   over the [`LdapManager`] trait;
 //! - [`provider::LdapAuthProvider`] — sign-in
 //!   (`LdapAuthenticationProviderPlugin.Authenticate`) with its admin filter,
-//!   the authentication provider the extension contributes, listed by
-//!   `GET /Auth/Providers` while the plugin is enabled and names a server;
+//!   password changes (`ChangePassword`) and forgotten passwords
+//!   (`StartForgotPasswordProcess`): the authentication and password-reset
+//!   provider the extension contributes, listed by `GET /Auth/Providers` and
+//!   `GET /Auth/PasswordResetProviders` while the plugin is enabled and names a
+//!   server;
 //! - [`adoption`] — the one-time import of an adopted Jellyfin's
 //!   `LDAP-Auth.xml`, its uid map included, which turns the plugin on when a
 //!   user's saved authentication provider is LDAP-Auth's (B7, D7).
@@ -85,7 +88,7 @@ use ferrofin_model::secret::Secret;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::ldap::{LdapManager, LdapTestAnswer};
 use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
-use ferrofin_traits::security::AuthenticationManager;
+use ferrofin_traits::security::{AuthenticationManager, PasswordResetManager};
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
@@ -496,6 +499,11 @@ pub struct SearchOutcome {
     /// which are not followed.
     pub references: Vec<String>,
 }
+
+/// The OID of the RFC 3062 password modify extended operation, which a root
+/// DSE lists in `supportedExtension` when the server offers it (Novell's
+/// `LdapKnownOids.Extensions.ModifyPassword`).
+pub const PASSWORD_MODIFY_OID: &str = "1.3.6.1.4.1.4203.1.11.1";
 
 /// The LDAP result code a client reports for a filter it cannot parse
 /// (`filterError`, RFC 1823), as Novell's `LdapLocalException` does.
@@ -1059,6 +1067,19 @@ impl LdapManager for LdapAuthService {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LdapAuthExtension;
 
+impl LdapAuthExtension {
+    /// The provider over the context's plugin manager, users and identity
+    /// links and a real directory client.
+    fn provider(cx: &ExtensionContext) -> provider::LdapAuthProvider {
+        provider::LdapAuthProvider::new(
+            Arc::clone(&cx.plugins),
+            Arc::clone(&cx.users),
+            Arc::clone(&cx.external_identities),
+            Arc::new(directory::Ldap3Directory::default()),
+        )
+    }
+}
+
 impl Extension for LdapAuthExtension {
     fn id(&self) -> Uuid {
         EXTENSION_ID
@@ -1100,12 +1121,16 @@ impl Extension for LdapAuthExtension {
     /// identity links and a real directory client. It gates itself on the
     /// plugin's enabled flag and a configured server.
     fn auth_providers(&self, cx: &ExtensionContext) -> Vec<Arc<dyn AuthenticationManager>> {
-        vec![Arc::new(provider::LdapAuthProvider::new(
-            Arc::clone(&cx.plugins),
-            Arc::clone(&cx.users),
-            Arc::clone(&cx.external_identities),
-            Arc::new(directory::Ldap3Directory::default()),
-        ))]
+        vec![Arc::new(Self::provider(cx))]
+    }
+
+    /// The forgotten-password provider: the same type as the sign-in one, as
+    /// upstream's class is both, gated the same way.
+    fn password_reset_providers(
+        &self,
+        cx: &ExtensionContext,
+    ) -> Vec<Arc<dyn PasswordResetManager>> {
+        vec![Arc::new(Self::provider(cx))]
     }
 
     fn tasks(&self, _cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>> {

@@ -571,7 +571,25 @@ mod tests {
             .map(|pair| pair.name)
             .collect();
         assert_eq!(listed, [Some("Default".to_owned())]);
-        assert!(ldap.password_reset_providers(&cx).is_empty());
+        // And the password-reset provider, under the same name and id, which
+        // stays out of `GET /Auth/PasswordResetProviders` while it is off.
+        let reset = ldap.password_reset_providers(&cx);
+        assert_eq!(reset.len(), 1);
+        assert_eq!(reset[0].name(), "LDAP-Authentication");
+        assert_eq!(
+            reset[0].id(),
+            "Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin"
+        );
+        assert!(!reset[0].is_enabled().await.expect("enabled"));
+        let listed: Vec<Option<String>> = cx
+            .users
+            .get_password_reset_providers()
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|pair| pair.name)
+            .collect();
+        assert_eq!(listed, [Some("Default Password Reset Provider".to_owned())]);
         assert!(ldap.tasks(&cx).is_empty());
     }
 

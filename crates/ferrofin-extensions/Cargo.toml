@@ -16,6 +16,7 @@ sha2.workspace = true
 futures-util.workspace = true
 fancy-regex.workspace = true
 ferrofin-chromaprint.workspace = true
+ferrofin-common.workspace = true
 ferrofin-traits.workspace = true
 ferrofin-core.workspace = true
 ferrofin-model.workspace = true

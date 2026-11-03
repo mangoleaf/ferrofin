@@ -1,7 +1,8 @@
-//! Sign-in through the directory: the authentication provider LDAP-Auth
-//! contributes, a port of `LdapAuthenticationProviderPlugin.Authenticate`,
-//! `LocateLdapUser`, `ConnectToLdap` and `LdapUtils.SanitizeFilter`
-//! (jellyfin-plugin-ldapauth v24, `d11c86a`).
+//! Sign-in through the directory: the authentication and password-reset
+//! provider LDAP-Auth contributes, a port of
+//! `LdapAuthenticationProviderPlugin.Authenticate`, `ChangePassword`,
+//! `StartForgotPasswordProcess`, `LocateLdapUser`, `ConnectToLdap` and
+//! `LdapUtils.SanitizeFilter` (jellyfin-plugin-ldapauth v24, `d11c86a`).
 //!
 //! A sign-in finds the user's directory entry as the bind DN, finds or
 //! relinks the Ferrofin user it belongs to (by LDAP uid through the
@@ -50,6 +51,21 @@
 //!   null `LdapUid`, which no lookup finds, and in doing so drops the user's
 //!   earlier link and every other null-uid link. Such a user is found by name
 //!   each time, and keeps the link of the uid they had.
+//! - **A blank new password is refused** (D11), before any connection, with
+//!   a `400`: a reset sends one. Upstream sends it to the directory, and RFC
+//!   3062 then has the directory set a random password nobody learns.
+//! - **A password change whose directory cannot be reached, or refuses the
+//!   bind DN, is a `500`**, as at sign-in (D4). Upstream answers `401`.
+//! - **No PIN is ever this provider's to redeem**: upstream throws
+//!   `NotImplementedException`, which would stop the redemption before a
+//!   later provider could redeem its own.
+//! - **A password change writes only to the user's own entry.** The entry
+//!   the user's name finds must belong to them (by its uid link, or by name),
+//!   as at sign-in; otherwise the change is a `401` and nothing is written.
+//!   Upstream writes to whichever entry matched first, so a person who can
+//!   make their own entry match another user's name would have that user's
+//!   new password set on their entry. The name leg trusts the username
+//!   attribute, as sign-in does (TODO(gl-1188)).
 //! - **A new user is created with its provider ids in one transaction**
 //!   ([`UserManager::create_external_user`]). Upstream saves them after
 //!   creating the user, a moment in which the account has no password and
@@ -60,19 +76,25 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
+use ferrofin_common::extensions::get_md5;
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_model::users::UserPolicy;
+use ferrofin_model::users::{
+    ForgotPasswordAction, ForgotPasswordResult, PinRedeemResult, UserPolicy,
+};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::external_identities::{ExternalIdentityKey, ExternalIdentityStore};
 use ferrofin_traits::library::{ExternalUserSetup, UserManager};
 use ferrofin_traits::plugins::PluginManager;
-use ferrofin_traits::security::{AuthenticationManager, ProviderAuthenticationResult};
-use ferrofin_util::string_extensions::replace_ignore_ascii_case;
+use ferrofin_traits::security::{
+    AuthenticationManager, PasswordResetManager, ProviderAuthenticationResult,
+};
+use ferrofin_util::string_extensions::{lower_invariant, replace_ignore_ascii_case};
 use uuid::Uuid;
 
 use super::{
-    BoundSearchError, ConnectionOptions, EXTENSION_ID, LdapConfig, LdapDirectory, LdapEntry,
-    LdapError, NO_ATTRIBUTES, config_error, novell_bind, search_as_bind_dn,
+    BoundSearchError, ConnectionOptions, EXTENSION_ID, LdapConfig, LdapConnection, LdapDirectory,
+    LdapEntry, LdapError, NO_ATTRIBUTES, PASSWORD_MODIFY_OID, config_error, novell_bind,
+    search_as_bind_dn,
 };
 
 /// The id LDAP-Auth's users store as their `AuthenticationProviderId` and
@@ -215,14 +237,85 @@ fn outage(step: &str, error: &LdapError) -> ServiceError {
     ServiceError::backend(format!("LDAP sign-in could not {step}: {error}"))
 }
 
-/// The [`outage`] for a search as the configured bind DN that failed at the
-/// connection, the bind, or the search the sign-in calls `search_step`.
-fn search_outage(search_step: &str, error: &BoundSearchError) -> ServiceError {
+/// A directory failure during a password change: a server error, as at
+/// sign-in (D4).
+fn change_failure(step: &str, error: &LdapError) -> ServiceError {
+    ServiceError::backend(format!("LDAP password change could not {step}: {error}"))
+}
+
+/// The error `failure` ([`outage`] or [`change_failure`]) makes for a search
+/// as the configured bind DN that failed at the connection, the bind, or the
+/// search, which the caller calls `search_step`.
+fn search_failure(
+    error: &BoundSearchError,
+    search_step: &str,
+    failure: fn(&str, &LdapError) -> ServiceError,
+) -> ServiceError {
     match error {
-        BoundSearchError::Connect(error) => outage("connect", error),
-        BoundSearchError::Bind(error) => outage("bind as the configured bind DN", error),
-        BoundSearchError::Search(error) => outage(search_step, error),
+        BoundSearchError::Connect(error) => failure("connect", error),
+        BoundSearchError::Bind(error) => failure("bind as the configured bind DN", error),
+        BoundSearchError::Search(error) => failure(search_step, error),
     }
+}
+
+/// The `401` of a password change whose name finds an entry that belongs to
+/// another account.
+const OTHER_ACCOUNTS_ENTRY: &str =
+    "The LDAP entry this user's name finds belongs to another account; no password was changed.";
+
+/// Upstream's `ChangePassword` sends a blank password as it is, and RFC 3062
+/// then has the directory set a random one nobody learns (D11).
+const BLANK_PASSWORD: &str =
+    "An LDAP user's password cannot be set blank; the directory was not changed.";
+
+/// The write half of `ChangePassword`, on `connection`: bound as the
+/// configured bind DN, the entry `dn` gets `new_password` through the RFC 3062
+/// password modify operation when the root DSE lists it, or else by replacing
+/// `LdapPasswordAttribute`; with neither, upstream's `InvalidOperationException`
+/// (a `500`).
+async fn set_password(
+    connection: &mut dyn LdapConnection,
+    config: &LdapConfig,
+    dn: &str,
+    new_password: &str,
+) -> Result<(), ServiceError> {
+    novell_bind(
+        connection,
+        &config.ldap_bind_user,
+        config.ldap_bind_password.expose(),
+    )
+    .await
+    .map_err(|error| change_failure("bind as the configured bind DN", &error))?;
+    let extensions = connection
+        .supported_extensions()
+        .await
+        .map_err(|error| change_failure("read the root DSE", &error))?;
+    let written = if extensions.iter().any(|oid| oid == PASSWORD_MODIFY_OID) {
+        tracing::debug!(dn = ?dn, "setting the password with the password modify operation");
+        connection.password_modify(dn, new_password).await
+    } else if !config.ldap_password_attribute.is_empty() {
+        tracing::debug!(
+            dn = ?dn,
+            attribute = ?config.ldap_password_attribute,
+            "setting the password attribute"
+        );
+        connection
+            .modify_replace(dn, &config.ldap_password_attribute, &[new_password])
+            .await
+    } else {
+        return Err(ServiceError::backend("Password attribute is not set"));
+    };
+    written.map_err(|error| change_failure("set the password", &error))
+}
+
+/// `PasswordResetUrl` with `$userId` (the id in .NET's lowercase `Guid` form)
+/// and `$userName` (the entered name lowercased as .NET's `ToLowerInvariant`
+/// does) replaced, ignoring case, as upstream's `StartForgotPasswordProcess`
+/// fills it. Both go in as they are, unencoded, as upstream puts them.
+#[must_use]
+pub fn password_reset_url(template: &str, user_id: Uuid, entered_username: &str) -> String {
+    let url = replace_ignore_ascii_case(template, "$userId", &user_id.to_string());
+    replace_ignore_ascii_case(&url, "$userName", &lower_invariant(entered_username))
 }
 
 /// The LDAP-Auth authentication provider. Reads the plugin's enabled flag
@@ -322,7 +415,7 @@ impl LdapAuthProvider {
     ) -> Result<LdapEntry, ServiceError> {
         locate_ldap_user(self.directory.as_ref(), config, username)
             .await
-            .map_err(|error| search_outage("search the directory", &error))?
+            .map_err(|error| search_failure(&error, "search the directory", outage))?
             .ok_or_else(|| ServiceError::unauthorized(NO_MATCH))
     }
 
@@ -357,7 +450,7 @@ impl LdapAuthProvider {
             &[NO_ATTRIBUTES],
         )
         .await
-        .map_err(|error| search_outage("apply the admin filter", &error))?;
+        .map_err(|error| search_failure(&error, "apply the admin filter", outage))?;
         if !found.references.is_empty() {
             // TODO(gl-1148): follow them with the bind credentials, as
             // upstream's referral handler does. Until then the entries sent
@@ -588,34 +681,130 @@ impl AuthenticationManager for LdapAuthProvider {
         })
     }
 
-    /// `ChangePassword`: refused with upstream's `NotImplementedException` (a
-    /// `500`) while `AllowPassChange` is off.
+    /// `ChangePassword`: finds the user's entry by their name as sign-in does
+    /// (`LocateLdapUser`), then, on a connection of its own bound as the bind
+    /// DN, writes the new password to it ([`set_password`]). The bind DN must
+    /// be allowed to set users' passwords.
+    ///
+    /// Refused before any connection while `AllowPassChange` is off
+    /// (upstream's `NotImplementedException`, a `500`), and for a blank new
+    /// password, which is what a reset sends (D11): a `400`. A name with no
+    /// entry is upstream's `401`, and so is one whose entry belongs to another
+    /// account (see the module's divergences). A directory that cannot be reached, or
+    /// refuses the bind DN, is a `500`, as at sign-in (D4); upstream answers
+    /// `401`.
     async fn change_password(
         &self,
-        _user: &UserEntity,
-        _new_password: &str,
+        user: &UserEntity,
+        new_password: &str,
     ) -> Result<(), ServiceError> {
-        let allowed = self
+        let Some(config) = self
             .usable_config()
             .await?
-            .is_some_and(|config| config.allow_pass_change);
-        if !allowed {
+            .filter(|config| config.allow_pass_change)
+        else {
             return Err(ServiceError::backend(
                 "password changes are turned off in the LDAP-Auth settings (AllowPassChange)",
             ));
+        };
+        if new_password.trim().is_empty() {
+            return Err(ServiceError::invalid_input(BLANK_PASSWORD));
         }
-        // TODO(gl-1146): write the password to the directory with the RFC 3062
-        // password modify operation, falling back to `LdapPasswordAttribute`,
-        // and refuse a blank one (D11).
-        Err(ServiceError::backend(
-            "changing an LDAP user's password in the directory is not ported yet",
-        ))
+        let entry = locate_ldap_user(self.directory.as_ref(), &config, &user.username)
+            .await
+            .map_err(|error| search_failure(&error, "find the user", change_failure))?
+            .ok_or_else(|| ServiceError::unauthorized(NO_MATCH))?;
+        // Only the user's own entry: see the module's divergences.
+        let uid = attribute_text(&entry, &config.ldap_uid_attribute).unwrap_or_default();
+        let ldap_username = attribute_text(&entry, &config.ldap_username_attribute);
+        if self
+            .find_user(&uid, ldap_username.as_deref())
+            .await?
+            .is_none_or(|found| found.user.id != user.id)
+        {
+            tracing::debug!(
+                user_id = %user.id,
+                dn = ?entry.dn,
+                "the LDAP entry the user's name found belongs to another account"
+            );
+            return Err(ServiceError::unauthorized(OTHER_ACCOUNTS_ENTRY));
+        }
+        let options = ConnectionOptions::from_config(&config);
+        let mut connection = self
+            .directory
+            .connect(&options)
+            .await
+            .map_err(|error| change_failure("connect", &error))?;
+        let changed = set_password(connection.as_mut(), &config, &entry.dn, new_password).await;
+        connection.unbind().await;
+        changed?;
+        tracing::info!(user_id = %user.id, dn = ?entry.dn, "changed the user's password in the directory");
+        Ok(())
     }
 
     /// Upstream's plugin has no `IHasNewUserPolicy`: it sets up the users it
     /// creates itself.
     fn new_user_policy(&self) -> Option<UserPolicy> {
         None
+    }
+}
+
+/// LDAP-Auth's password-reset provider: upstream's class is both providers,
+/// and the users it creates store its id as their `PasswordResetProviderId`
+/// too. A forgotten password is reset at the directory's own page.
+#[async_trait]
+impl PasswordResetManager for LdapAuthProvider {
+    fn name(&self) -> &str {
+        PROVIDER_NAME
+    }
+
+    fn id(&self) -> &str {
+        PROVIDER_ID
+    }
+
+    /// Enabled while the plugin is and a server is configured, as for sign-in
+    /// (D3). Upstream's is always enabled.
+    async fn is_enabled(&self) -> Result<bool, ServiceError> {
+        Ok(self.usable_config().await?.is_some())
+    }
+
+    /// `StartForgotPasswordProcess`: a `PinCode` answer whose `PinFile` is
+    /// `PasswordResetUrl`, filled in by [`password_reset_url`] with the user's
+    /// id, or the MD5 of the entered name (`GetMD5`) when it names no account.
+    /// With no URL configured, upstream's `NotImplementedException` (a `500`).
+    async fn start_forgot_password_process(
+        &self,
+        user: Option<&UserEntity>,
+        entered_username: &str,
+        _is_in_network: bool,
+    ) -> Result<ForgotPasswordResult, ServiceError> {
+        let template = self
+            .usable_config()
+            .await?
+            .and_then(|config| config.password_reset_url)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| {
+                ServiceError::backend(
+                    "no password reset page is set in the LDAP-Auth settings (PasswordResetUrl)",
+                )
+            })?;
+        let user_id = match user {
+            Some(user) => Uuid::parse_str(&user.id)
+                .map_err(|error| ServiceError::backend(error.to_string()))?,
+            None => get_md5(entered_username),
+        };
+        Ok(ForgotPasswordResult {
+            action: ForgotPasswordAction::PinCode,
+            pin_file: Some(password_reset_url(&template, user_id, entered_username)),
+            pin_expiration_date: None,
+        })
+    }
+
+    /// This provider issues no PINs, so none is its to redeem. Upstream throws
+    /// `NotImplementedException`, which would stop another provider redeeming
+    /// its own.
+    async fn redeem_password_reset_pin(&self, _pin: &str) -> Result<PinRedeemResult, ServiceError> {
+        Ok(PinRedeemResult::default())
     }
 }
 
