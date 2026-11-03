@@ -174,7 +174,8 @@ fn every_rows_variable_has_a_row_in_the_docs() {
 }
 
 /// The page's tabs and the rows on each, in order: owner decision D5, and the
-/// owner's placement of the rows D5's table predates (on gl-1172).
+/// owner's placement of the rows D5's table predates (on gl-1172) and of
+/// `detect_network_change` (on gl-1196).
 const TABS: &[(Group, &[&str])] = &[
     (
         Group::Network,
@@ -186,6 +187,7 @@ const TABS: &[(Group, &[&str])] = &[
             "base_url",
             "server_name",
             "quick_connect_pending_per_ip",
+            "detect_network_change",
             "login_backoff",
             "login_backoff_attempts",
             "login_backoff_max_delay_secs",
