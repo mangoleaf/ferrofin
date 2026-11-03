@@ -321,9 +321,9 @@ pub struct TrickplayExtraction<'a> {
     /// with a broken keyframe index; the extractor retries without it.
     pub keyframe_only: bool,
     /// `TrickplayOptions::full_chroma`: write 4:4:4 frames on the software
-    /// path (`build_trickplay_args`). A job on the hardware path keeps its
-    /// chain's 4:2:0. So does one whose source the GPU cannot decode, which
-    /// could be 4:4:4: that is open work (gl-1132).
+    /// path (`build_trickplay_args`), which a job with nothing on the GPU
+    /// takes too. A job on the hardware path keeps 4:2:0: its frames go
+    /// through a hardware decoder, scaler or encoder.
     pub full_chroma: bool,
 }
 
