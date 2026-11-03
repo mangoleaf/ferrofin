@@ -37,6 +37,33 @@ async fn get(router: &axum::Router, token: &str, path: &str) -> (StatusCode, Str
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// `method path` as the admin with a JSON `body`: the status and the JSON
+/// answer (`Null` for an empty one).
+async fn send(
+    router: &axum::Router,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::AUTHORIZATION, format!(r#"{AUTH}, Token="{token}""#))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 /// Logs the admin in: its access token and user id.
 async fn login(router: &axum::Router) -> (String, Uuid) {
     let request = Request::builder()
@@ -268,4 +295,107 @@ async fn a_start_after_the_program_data_directory_moved_rewrites_the_moved_paths
         expected,
         "a second start rewrites nothing"
     );
+}
+
+/// gl-941: a box set and a playlist made through the API store their folders
+/// as `%AppDataPath%/…`, as Jellyfin's save does, so after the program-data
+/// directory moves they read back under the new one with nothing rewritten.
+#[tokio::test]
+async fn a_box_set_and_a_playlist_follow_a_move_with_no_rewrite() {
+    let temp = tempfile::tempdir().unwrap();
+    let (before, after) = (temp.path().join("before"), temp.path().join("after"));
+    for root in [&before, &after] {
+        std::fs::create_dir_all(config(root).data_dir).unwrap();
+        std::fs::create_dir_all(root.join("config")).unwrap();
+    }
+    let db = Database::connect(&config(&before).database_url())
+        .await
+        .unwrap();
+    db.run_migrations().await.unwrap();
+    let router = start(&db, &before).await;
+    let (token, admin) = login(&router).await;
+
+    let (status, box_set) = send(&router, &token, "POST", "/Collections?name=Heist", None).await;
+    assert_eq!(status, StatusCode::OK, "{box_set}");
+    let (status, playlist) = send(
+        &router,
+        &token,
+        "POST",
+        "/Playlists",
+        Some(json!({"Name": "Road Trip", "UserId": admin.simple().to_string()})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{playlist}");
+    let made = [
+        (
+            box_set["Id"].as_str().unwrap().to_owned(),
+            "%AppDataPath%/collections/Heist [boxset]",
+            "data/collections/Heist [boxset]",
+        ),
+        (
+            playlist["Id"].as_str().unwrap().to_owned(),
+            "%AppDataPath%/playlists/Road Trip",
+            "data/playlists/Road Trip",
+        ),
+    ];
+    let stored = |id: String| {
+        let db = db.clone();
+        async move {
+            let id: Uuid = id.parse().unwrap();
+            sqlx::query_scalar::<_, Option<String>>(
+                r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+        }
+    };
+    let served = |router: axum::Router, id: String| {
+        let token = token.clone();
+        async move {
+            let (status, item) = send(
+                &router,
+                &token,
+                "GET",
+                &format!("/Users/{admin}/Items/{id}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{item}");
+            item["Path"].as_str().unwrap().to_owned()
+        }
+    };
+    let program_data = |root: &Path| config(root).data_dir;
+    for (id, token_path, under) in &made {
+        assert_eq!(stored(id.clone()).await.as_deref(), Some(*token_path));
+        let path = program_data(&before).join(under);
+        assert!(path.is_dir(), "{} is made", path.display());
+        assert_eq!(
+            served(router.clone(), id.clone()).await,
+            path.to_str().unwrap()
+        );
+    }
+
+    // The folders move; the database stays where the handle opened it.
+    for folder in ["data", "root"] {
+        std::fs::rename(
+            program_data(&before).join(folder),
+            program_data(&after).join(folder),
+        )
+        .unwrap();
+    }
+    let router = start(&db, &after).await;
+    for (id, token_path, under) in &made {
+        assert_eq!(
+            stored(id.clone()).await.as_deref(),
+            Some(*token_path),
+            "nothing rewrites it"
+        );
+        let path = program_data(&after).join(under);
+        assert_eq!(
+            served(router.clone(), id.clone()).await,
+            path.to_str().unwrap()
+        );
+    }
 }

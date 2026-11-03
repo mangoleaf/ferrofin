@@ -2214,7 +2214,9 @@ pub async fn build_app_state(
         .with_providers(Arc::clone(&providers))
         .with_self_writes(Arc::clone(&self_writes_guard))
         // Each playlist change announced as `ItemAdded`/`ItemUpdated`.
-        .with_item_persistence(Arc::clone(&item_persistence_service)),
+        .with_item_persistence(Arc::clone(&item_persistence_service))
+        // A new playlist's folder stored as `%AppDataPath%/playlists/<name>`.
+        .with_virtual_paths(virtual_paths.clone()),
     );
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),

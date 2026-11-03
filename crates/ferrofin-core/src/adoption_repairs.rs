@@ -6929,7 +6929,9 @@ mod tests {
 // Jellyfin stores `{program data}/root`, its library folders and every image
 // path absolute: `ReverseVirtualPath` tokenises only `{program data}/data` and
 // the metadata directory, and `BaseItemMapper.MapImageToEntity` saves image
-// paths raw. Ferrofin writes every path resolved. The ids of items under
+// paths raw. Ferrofin writes every path resolved, except the Collections
+// library's folder and the box sets and playlists created through the API
+// (gl-941), which it tokenises as upstream does and so never rewrites. The ids of items under
 // program data are derived from the path relative to it (`GetNewItemId`), so
 // after the directory moves (a Debian `/var/lib/jellyfin` adopted into
 // `/var/lib/ferrofin`, or Ferrofin's own data directory relocated) every id
