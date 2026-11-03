@@ -431,6 +431,12 @@ impl EncoderCapabilities for FfmpegCapabilities {
     fn is_vaapi_device_intel_ihd(&self) -> bool {
         self.is_vaapi_device_intel_ihd
     }
+
+    fn supports_bsf_with_option(&self, option: BsfOption) -> bool {
+        // The inherent method of the same name, which callers holding the
+        // concrete type reach directly.
+        FfmpegCapabilities::supports_bsf_with_option(self, option)
+    }
 }
 
 /// The same `SupportsEncoder`, on the service seam the playback negotiation
