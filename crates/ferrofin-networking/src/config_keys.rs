@@ -12,6 +12,9 @@ pub const ADDRESS_OVERRIDE_KEY: &str = "PublishedServerUrl";
 /// Startup key that toggles OS network-change detection
 /// (`ConfigurationExtensions.DetectNetworkChangeKey`).
 ///
-/// The change-detection machinery itself is deferred (OS eventing), but the key
-/// is preserved so a startup bag carrying it parses without surprises.
+/// Jellyfin defaults it to `True` (`ConfigurationOptions.DefaultConfiguration`)
+/// and `--nonetchange` sets it to `False`. This is the upstream key's name
+/// only: Ferrofin's bootstrap setting `detect_network_change`
+/// (`FERROFIN_DETECT_NETWORK_CHANGE`, also `true` by default) is what starts
+/// [`crate::network_change::monitor`].
 pub const DETECT_NETWORK_CHANGE_KEY: &str = "DetectNetworkChange";

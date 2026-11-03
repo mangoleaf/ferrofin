@@ -183,6 +183,9 @@ ferrofin:
     # only bound changes made outside it.
     # FERROFIN_AUTH_CACHE_TTL_SECS: "30"
     # FERROFIN_ROW_CACHE_TTL_SECS: "30"
+    # Read the network interfaces again 2 s after the OS reports a network change
+    # (Jellyfin's DetectNetworkChange, on by default).
+    # FERROFIN_DETECT_NETWORK_CHANGE: "true"
     # Failed logins an account or a client address may make before its next attempts
     # wait (1 s, doubling to the maximum; the backoff never disables an account). Add the
     # ingress to Known proxies, or every client shares its address and one
