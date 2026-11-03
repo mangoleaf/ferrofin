@@ -45,6 +45,13 @@
 //! - **A chain stops after [`REFERRAL_HOP_LIMIT`] referrals.** Novell's
 //!   `HopLimit` is 10 too, but its search results restart the count at every
 //!   referral they read, so there a referral loop never ends.
+//! - **A search chases at most [`REFERRAL_BUDGET`] referrals in all**,
+//!   followed or skipped (owner decision, gl-1208): the hop limit bounds only
+//!   a chain, and each referral costs the D6 timeouts again, so this bounds
+//!   how many referrals a search whose answers carry several references
+//!   chases. Novell's client sets no total, so a search meeting more than
+//!   that (a domain root with many child domains) works upstream and fails
+//!   here; a base DN below the partitions avoids it.
 //! - **URLs are read as RFC 4516 writes them**: the DN and the filter
 //!   percent-decoded, and the URL's scope used when it names one. Novell sends
 //!   the DN as written and ignores the scope, and a `referral` result's
@@ -53,8 +60,8 @@
 use std::borrow::Cow;
 
 use super::{
-    ConnectionOptions, LdapConfig, LdapDirectory, LdapEntry, LdapError, REFERRAL_HOP_LIMIT,
-    SearchOutcome, SearchScope, novell_bind,
+    ConnectionOptions, LdapConfig, LdapDirectory, LdapEntry, LdapError, REFERRAL_BUDGET,
+    REFERRAL_HOP_LIMIT, SearchOutcome, SearchScope, novell_bind,
 };
 
 /// The port of an LDAP URL that names none, over plain LDAP or StartTLS.
@@ -112,7 +119,9 @@ enum Chased {
 ///
 /// A referral that leads to no server is skipped (owner decision, gl-1207),
 /// and the search then logs one warning naming each server skipped and why,
-/// whether it succeeds or not.
+/// whether it succeeds or not. A referral past [`REFERRAL_HOP_LIMIT`] in a
+/// row, or past [`REFERRAL_BUDGET`] in all (followed or skipped, owner
+/// decision, gl-1208), fails the search before it is chased.
 pub(super) async fn follow(
     directory: &dyn LdapDirectory,
     config: &LdapConfig,
@@ -128,7 +137,22 @@ pub(super) async fn follow(
         let mut pending = Vec::new();
         let configured = server_label(&options.server, options.port);
         take(answer, search, &configured, 0, &mut entries, &mut pending)?;
+        // The referrals chased so far, followed or skipped.
+        let mut chased = 0;
         while let Some(referral) = pending.pop() {
+            // A chain past the hop limit is a loop, the more precise of the
+            // two errors; the budget bounds the referrals in all.
+            if referral.hops > REFERRAL_HOP_LIMIT {
+                return Err(LdapError::ReferralHopLimit {
+                    server: referral.from,
+                });
+            }
+            chased += 1;
+            if chased > REFERRAL_BUDGET {
+                return Err(LdapError::ReferralBudget {
+                    server: referral.from,
+                });
+            }
             match chase(directory, config, options, attributes, &referral).await? {
                 Chased::Answered {
                     server,
@@ -203,8 +227,8 @@ fn take(
 /// configured TLS (`options`), and searches there. Returns that server, the
 /// search it was asked and its answer, which may refer further; or, when no
 /// URL leads to a server that takes the bind, why each failed (Novell's
-/// `GetReferralConnection` fails alike). A referral past the hop limit, one
-/// naming no URL, and a referred server that fails the search are errors.
+/// `GetReferralConnection` fails alike). A referral naming no URL and a
+/// referred server that fails the search are errors.
 async fn chase(
     directory: &dyn LdapDirectory,
     config: &LdapConfig,
@@ -212,11 +236,6 @@ async fn chase(
     attributes: &[&str],
     referral: &Pending,
 ) -> Result<Chased, LdapError> {
-    if referral.hops > REFERRAL_HOP_LIMIT {
-        return Err(LdapError::ReferralHopLimit {
-            server: referral.from.clone(),
-        });
-    }
     if referral.urls.is_empty() {
         // RFC 4511 gives every referral at least one URL.
         return Err(LdapError::ReferralUrl(
