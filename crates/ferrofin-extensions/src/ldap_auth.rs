@@ -76,9 +76,12 @@
 //!   filter that does not parse (`Filter Error`). Upstream pulls Novell's
 //!   parser message out of the exception's text.
 //! - A followed referral keeps the configured TLS, its chain stops after
-//!   [`REFERRAL_HOP_LIMIT`] referrals, and its URL is read as RFC 4516 writes
-//!   it: see `referrals`. Upstream's Novell client connects to a referred
-//!   server in plain LDAP and never stops a referral loop.
+//!   [`REFERRAL_HOP_LIMIT`] referrals, one that leads to no server is skipped
+//!   with a warning wherever it arrives, and its URL is read as RFC 4516
+//!   writes it: see `referrals`. Upstream's Novell client connects to a
+//!   referred server in plain LDAP, never stops a referral loop, and drops a
+//!   referral it cannot follow when it comes after the last entry or is a
+//!   `referral` result.
 
 pub mod adoption;
 pub mod directory;
@@ -571,18 +574,20 @@ pub enum LdapError {
         /// The server's diagnostic message, often empty.
         message: String,
     },
-    /// A referral could not be followed: no URL of it could be connected to
-    /// and bound at, or the server it named failed the search.
+    /// A referral could not be followed: the server it named failed the
+    /// search, which fails it; or, in the warning for a skipped referral, a
+    /// URL of it could not be connected to and bound at.
     #[error("the referral to {server} failed: {reason}")]
     ReferralFailed {
-        /// The referred server, `host:port` (the last one tried).
+        /// The referred server, `host:port`.
         server: String,
         /// Why it failed.
         reason: Box<LdapError>,
     },
-    /// A referral's last URL cannot be followed (it is not an `ldap://` or
-    /// `ldaps://` URL, or does not parse), or it names none; the reason, not
-    /// the URL, which may carry a password.
+    /// A referral names no URL, which fails the search; or, in the warning
+    /// for a skipped referral, a URL of it cannot be followed (it is not an
+    /// `ldap://` or `ldaps://` URL, or does not parse). The reason, not the
+    /// URL, which may carry a password.
     #[error("the directory referred the search to a URL that cannot be followed: {0}")]
     ReferralUrl(String),
     /// A referred server referred the search on once more after

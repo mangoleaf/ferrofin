@@ -342,14 +342,22 @@ Conventions:
   URL's DN (else keeps its base), continues a one-level search at the base, and keeps its
   attributes, as Novell's `RebuildRequest` does. The entries found there join the search's,
   after those of the server that referred, and a referral a referred server sends is followed
-  the same way. A referral none of whose URLs connects and binds, or whose server fails the
-  search, fails the whole search, naming that server (`host:port`): a server error at sign-in
-  and in a password change, a `400` in the filter test, a `401` in the user search, as any
-  failed search is. The connection test's base search, the user's own bind
-  (`ConnectToLdap(userDn, password)`) and the password change's write follow no referral and
-  stay on the configured server, as upstream's set no search constraints: a password change
-  for a user only a referred server holds is written to the configured server, which refuses it
-  (a `500`) unless it holds the entry or chains the write, as upstream's.
+  the same way. A referral none of whose URLs leads to a server that takes the bind (the name
+  does not resolve, nothing answers, the TLS handshake or StartTLS fails, the bind DN is
+  refused there, or the URL does not parse) is skipped (owner decision, gl-1207): the entries
+  the other servers found stand, and the search logs one warning naming each server skipped
+  and why. A user only a skipped referral holds is therefore not found, and signs in as no
+  matching entry does: a `401`, counted toward lockout when the name is an account's (D4,
+  below), as upstream counts it. A referred server that takes the bind and fails the search,
+  and a referral past the hop limit, fail the whole search, naming that server (`host:port`):
+  a server error at sign-in and in a password change, a `400` in the filter test, a `401` in
+  the user search, as any failed search is. So does a referral that names no URL, which RFC
+  4511 does not allow (Novell's client throws an `IndexOutOfRangeException` there). The
+  connection test's base search, the user's own bind (`ConnectToLdap(userDn, password)`) and
+  the password change's write follow no referral and stay on the configured server, as
+  upstream's set no search constraints: a password change for a user only a referred server
+  holds is written to the configured server, which refuses it (a `500`) unless it holds the
+  entry or chains the write, as upstream's.
 - `POST /Ldap/TestServerBind`, `/Ldap/TestLdapFilters` and `/Ldap/LdapUserSearch` are the
   plugin's own controller, not contract operations, so they are in `handlers::PLUGIN_ROUTES`
   (matched ignoring case, as the page calls `ldap/TestServerBind` and the others so) and have no
@@ -371,11 +379,11 @@ Conventions:
     (50) and `unwillingToPerform` (53). A directory that cannot be reached, does not answer
     within the D6 timeouts, fails the user's bind with any other code (`busy`, `unavailable`,
     `other`, …), refuses the configured bind DN, or fails the user search or the admin
-    filter's search (a referral that cannot be followed included), is a `500` that is not
-    counted, and other users' sign-ins go on. Upstream answers each with an
-    `AuthenticationException`, a counted `401` (`Error completing LDAP login while applying
-    admin filter.` for the admin filter's search). Ferrofin's login backoff still counts such an
-    attempt for pacing, as it counts every attempt that does not succeed.
+    filter's search (a referred server failing it, a referral loop and a referral naming no URL
+    included), is a `500` that is not counted, and other users' sign-ins go on. Upstream answers
+    each with an `AuthenticationException`, a counted `401` (`Error completing LDAP login while
+    applying admin filter.` for the admin filter's search). Ferrofin's login backoff still
+    counts such an attempt for pacing, as it counts every attempt that does not succeed.
   - **The admin filter never demotes the last administrator** (owner decision D5): removed
     from the directory's administrators while no other administrator exists, the user signs in,
     stays one, and the server logs a warning. With two or more the filter demotes as upstream
@@ -421,6 +429,20 @@ Conventions:
     upstream sends them: a directory that can name any host in a referral can collect the bind
     password there, though with TLS configured (and `SkipSslVerify` off) that host must pass
     the certificate check first.
+  - **A referral that leads to no server is skipped wherever it arrives, with a warning**
+    (owner decision, gl-1207). Upstream gets this only by accident of Novell 3.6.0's search
+    results: `LdapSearchResults.BatchOfResults` keeps the `LdapReferralException` a failed chase
+    throws without counting it as an entry, so an iteration that has read every entry never sees
+    it (`ResetVectors` drops it), one followed by another entry throws it at the next `Next()`,
+    and a `referral` result that cannot be followed ends the results empty. Active Directory
+    sends its search references after the entries, where the two agree: a domain-root base DN
+    whose `ForestDnsZones`, `DomainDnsZones` and `Configuration` references do not resolve or
+    do not answer still signs users in. With TLS configured, a referred server whose certificate
+    is not valid for the name in the reference is skipped too; upstream connects to it in plain
+    LDAP with no check (see "A followed referral never downgrades TLS"). The order of a
+    search's entries and references is not kept here, so a reference before an entry is skipped
+    too, and upstream logs nothing; here each search that skipped any logs one warning naming
+    each server and why (a URL that does not parse by its reason, never quoted).
   - **A referral chain stops after 10 referrals in a row** (owner decision, Novell's default
     `HopLimit`): a referred server that refers the search on once more fails it, which is what
     stops a referral loop. Novell 3.6.0's search results restart the hop count at every

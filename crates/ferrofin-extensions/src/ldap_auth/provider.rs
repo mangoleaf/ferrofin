@@ -27,10 +27,11 @@
 //!   not). The bind counts as refused only for the result codes that refuse
 //!   credentials ([`REFUSED_BIND`]). A directory that cannot be reached,
 //!   times out, fails the bind with another code, refuses the configured bind
-//!   DN, or fails the user search or the admin filter's (a referral that
-//!   cannot be followed included) is a server error, which the user manager
-//!   does not count toward lockout. Upstream answers each with an
-//!   `AuthenticationException`.
+//!   DN, or fails the user search or the admin filter's (a referred server
+//!   failing it and a referral loop included) is a server error, which the
+//!   user manager does not count toward lockout. Upstream answers each with an
+//!   `AuthenticationException`. A referral that leads to no server is
+//!   skipped, so a user only it holds is no matching entry.
 //! - **The last administrator is never demoted by the admin filter** (D5):
 //!   the user manager keeps them one and logs a warning, and the sign-in
 //!   succeeds. Upstream demotes them.
