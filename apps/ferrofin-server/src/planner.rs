@@ -2108,7 +2108,7 @@ impl FerrofinStreamStatePlanner {
             if copying_video && state.run_time_ticks.is_none() {
                 push_split(&mut args, "-fflags +genpts");
             }
-            if state.base_request.copy_timestamps && state.run_time_ticks.is_some() {
+            if state.copies_timestamps() {
                 push_split(
                     &mut args,
                     "-copyts -avoid_negative_ts disabled -start_at_zero",
@@ -2327,6 +2327,17 @@ impl FerrofinStreamStatePlanner {
                         state,
                     ),
                 );
+                // An embedded sidecar seeked with the movie can bring a cue
+                // from before the start, which would start every stream late.
+                if let Some(trim) =
+                    ferrofin_mediaencoding::encoding_helper::bitstream::embedded_sidecar_trim_arguments(
+                        state,
+                        input_seek_ticks.is_some_and(|ticks| ticks > 0),
+                        caps.ffmpeg_version(),
+                    )
+                {
+                    push_split(&mut args, trim);
+                }
                 if playlist_path
                     .extension()
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
@@ -5017,7 +5028,8 @@ mod tests {
     }
 
     /// `GetInputArgument` adds a burned-in external bitmap as ffmpeg input 1,
-    /// seeked like the media file and decoded onto its own canvas, and the
+    /// read from its start on the media file's clock (upstream seeks it like
+    /// the media file) and decoded onto its own canvas, and the
     /// overlay reads its first stream there. Without the input, ffmpeg refused
     /// the overlay's `[1:0]` and the playback never started.
     #[rstest::rstest]
@@ -5049,11 +5061,19 @@ mod tests {
         let args = &plan.arguments;
         // The NVENC probe reports ffmpeg 7.0.1, which takes `-isync`: the
         // sidecar is then read from its start on the movie's clock. The plain
-        // probe reports no version, which keeps upstream's seeked input.
+        // probe reports no version, so no `-isync`: the bitmap is read from its
+        // start on its own timestamps, moved back by the seek (gl-929).
         let timing: &[&str] = if hardware {
             &["-canvas_size", "1920x1080", "-isync", "0"]
         } else {
-            &["-ss", "90000000", "-canvas_size", "1920x1080"]
+            &[
+                "-canvas_size",
+                "1920x1080",
+                "-seek_timestamp",
+                "1",
+                "-itsoffset",
+                "-90000000",
+            ]
         };
         let expected: Vec<&str> = ["-analyzeduration", "200M", "-probesize", "1G"]
             .into_iter()
@@ -5069,11 +5089,18 @@ mod tests {
     /// An external track embedded into a progressive MKV is input 1, mapped
     /// as `1:0`, text or bitmap alike (upstream PR 16448's StreamBuilder and
     /// map halves were ported; this is the input half).
+    ///
+    /// With no version probed (no `-isync`), a bitmap one is read on its own
+    /// timestamps (gl-929); a text one, which has no start time, as upstream.
     #[rstest::rstest]
-    #[case::srt("srt", "/media/movie.en.srt")]
-    #[case::pgs("PGSSUB", "/media/movie.en.sup")]
+    #[case::srt("srt", "/media/movie.en.srt", &[])]
+    #[case::pgs("PGSSUB", "/media/movie.en.sup", &["-seek_timestamp", "1"])]
     #[tokio::test]
-    async fn an_embedded_external_track_is_input_1(#[case] codec: &str, #[case] path: &str) {
+    async fn an_embedded_external_track_is_input_1(
+        #[case] codec: &str,
+        #[case] path: &str,
+        #[case] timing: &[&str],
+    ) {
         let src = source(
             "abc",
             vec![
@@ -5095,19 +5122,98 @@ mod tests {
             .unwrap();
 
         let args = &plan.arguments;
-        assert_eq!(
-            inputs_after_the_media(args),
-            [
-                "-analyzeduration",
-                "200M",
-                "-probesize",
-                "1G",
-                "-i",
-                &format!("file:{path}"),
-            ],
-            "{args:?}"
-        );
+        let input = format!("file:{path}");
+        let expected: Vec<&str> = ["-analyzeduration", "200M", "-probesize", "1G"]
+            .into_iter()
+            .chain(timing.iter().copied())
+            .chain(["-i", input.as_str()])
+            .collect();
+        assert_eq!(inputs_after_the_media(args), expected, "{args:?}");
         assert!(args.join(" ").contains("-map 1:0 "), "{args:?}");
+    }
+
+    /// The embedded-sidecar trim from ffmpeg 5.1: elapsed cues dropped, the
+    /// one on screen at the start started there.
+    const FILTER_EVENTS: &[&str] = &[
+        "-bsf:s:0",
+        "noise=drop='lt(pts\\,0)*lte(pts+duration\\,0)',setts=pts='max(PTS\\,0)':dts='max(DTS\\,0)':duration='DURATION+min(PTS\\,0)'",
+    ];
+    /// The embedded-sidecar trim on ffmpeg 5.0.
+    const NOISE_DROP: &[&str] = &["-bsf:s:0", "noise=drop='lt(pts\\,0)'"];
+    /// The embedded-sidecar trim before ffmpeg 5.0.
+    const COPY_PRIOR: &[&str] = &["-copypriorss:s:0", "0"];
+
+    /// A progressive stream that starts mid-file drops the cues its embedded
+    /// sidecar brings from before the start (gl-930): the sidecar's seek can
+    /// keep a cue already over, whose negative timestamp made the muxer start
+    /// every stream late. From ffmpeg 5.1 the cues are trimmed as upstream's
+    /// `FilterEvents` trims them, for a copied or a converted track; 5.0 drops
+    /// every cue before the start with the `noise` filter; an older or unread
+    /// version gets `-copypriorss`, for a copied one. The options follow the
+    /// embed arguments, ahead of the output. Nothing without a seek, and nothing
+    /// for a track inside the media file, whose seek keeps no such cue.
+    #[rstest::rstest]
+    #[case::from_5_1(Some((5, 1)), Some(9), true, None, FILTER_EVENTS)]
+    #[case::converted(Some((8, 1)), Some(9), true, Some("ass"), FILTER_EVENTS)]
+    #[case::on_5_0(Some((5, 0)), Some(9), true, None, NOISE_DROP)]
+    #[case::before_5_0(Some((4, 4)), Some(9), true, None, COPY_PRIOR)]
+    #[case::unknown_version(None, Some(9), true, None, COPY_PRIOR)]
+    #[case::no_seek(Some((8, 1)), None, true, None, &[])]
+    #[case::internal_track(Some((8, 1)), Some(9), false, None, &[])]
+    #[tokio::test]
+    async fn a_seeked_progressive_embed_drops_the_sidecar_cues_before_the_start(
+        #[case] version: Option<(i32, i32)>,
+        #[case] start_secs: Option<i64>,
+        #[case] external: bool,
+        #[case] subtitle_codec: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        let sub = if external {
+            sidecar("subrip", 2, "/media/movie.en.srt")
+        } else {
+            subtitle_stream("subrip", 2)
+        };
+        let mut capabilities = FfmpegCapabilities::builder();
+        if let Some((major, minor)) = version {
+            capabilities = capabilities.ffmpeg_version(FfmpegVersion::new(major, minor));
+        }
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source(
+                    "abc",
+                    vec![video_stream("hevc"), audio_stream("aac"), sub],
+                )],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            capabilities.build(),
+            EncodingOptions::default(),
+        );
+        let mut req = request("abc");
+        req.output_container = Some("mkv".to_owned());
+        req.video_codec = Some("h264".to_owned());
+        req.subtitle_stream_index = Some(2);
+        req.subtitle_method = Some("Embed".to_owned());
+        req.subtitle_codec = subtitle_codec.map(str::to_owned);
+        req.start_time_ticks = start_secs.map(|secs| secs * TICKS_PER_SECOND);
+
+        let plan = p
+            .plan(&req, false, None, PlaylistKind::Progressive)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        let disposition = args
+            .windows(2)
+            .position(|w| w == ["-disposition:s:0", "default"])
+            .unwrap_or_else(|| panic!("embedded: {args:?}"));
+        // Between the embed arguments and `-y <output>`.
+        assert_eq!(&args[disposition + 2..args.len() - 2], expected, "{args:?}");
+        let trims = args
+            .iter()
+            .filter(|arg| arg.starts_with("-bsf:s") || arg.starts_with("-copypriorss"))
+            .count();
+        assert_eq!(trims, expected.len() / 2, "{args:?}");
     }
 
     /// An external audio track selected for a transcode is the next input.
