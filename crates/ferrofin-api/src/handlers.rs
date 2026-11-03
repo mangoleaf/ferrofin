@@ -1251,7 +1251,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         upstream_file: "Emby.Server.Implementations/Library/UserDataManager.cs",
         upstream_method: "SaveUserData",
         ferrofin: "The write path, plus the read path only where a page's version groups get \
-                   their user data. ferrofin-core user_data_manager.rs mutate_row \
+                   their user data and where a page lists an item twice (get_user_data_dtos_for_rows \
+                   resolves each item once, so every occurrence gets its stored row, as \
+                   GetUserDataBatch's TryGetValue on the grouped rows does). ferrofin-core \
+                   user_data_manager.rs mutate_row \
                    (SaveUserData with its retired-key update, GetUserData, ResolveUserDataRow), \
                    save_user_data_with_reason (the UpdateUserItemDataDto SaveUserData), \
                    save_play_state and apply_play_report (UpdatePlayState), \
