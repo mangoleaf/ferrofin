@@ -24,9 +24,19 @@
 //!   wrong.
 //!
 //! The decision reads the *client's* declared range types, not the server's
-//! preferences: a player that never mentions Dolby Vision is deliberately
-//! allowed to copy a broken DOVI configuration, because an HDR10 player ignores
-//! the metadata it does not understand rather than crashing on it.
+//! preferences. Upstream lets a player that never mentions Dolby Vision copy
+//! the RPU through, a broken DOVI configuration included, because an HDR10
+//! player ignores metadata it does not understand rather than crashing on it.
+//!
+//! **Divergence (owner decision 2026-10-31, gl-737).** A Dolby Vision profile
+//! 8.1 AV1 title copied to jellyfin-web with its RPU did not render, although
+//! the browser plays the HDR10 base layer under it. So once a client has
+//! declared its range types, Ferrofin strips the RPU from every Dolby Vision
+//! stream it copies to a client that listed neither `DOVI` nor the stream's
+//! own range type ([`strips_dovi_for_a_client_without_dovi`]), where upstream
+//! plans no removal. The copy decision transcodes such a stream when this
+//! ffmpeg cannot strip it, or when the job's output takes no bitstream filter
+//! ([`video_bit_stream_filters_apply`]).
 
 use ferrofin_model::data::{VideoRange, VideoRangeType};
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
@@ -35,7 +45,8 @@ use ferrofin_model::entities_media::MediaStream;
 use ferrofin_traits::media_encoding::TranscodingJobType;
 
 use super::hw::capabilities::{BsfOption, FfmpegCapabilities};
-use super::transcode_state::EncodingJobInfo;
+use super::hw::tonemap::is_dovi;
+use super::transcode_state::{EncoderCapabilities, EncodingJobInfo};
 use crate::encoder::FfmpegVersion;
 
 /// What, if anything, has to be stripped from the bitstream.
@@ -154,14 +165,92 @@ fn range_type_name(t: VideoRangeType) -> String {
     t.json_name().into_owned()
 }
 
+/// Whether Ferrofin strips the Dolby Vision RPU from this copy where upstream
+/// copies it through.
+///
+/// Divergence (owner decision 2026-10-31, gl-737). True for a Dolby Vision
+/// stream with a base layer (every Dolby Vision range type but profile 5's
+/// `DOVI`, which has none to fall back to) when the client declared range types
+/// and listed neither `DOVI` nor the stream's own range type: it plays the base
+/// layer, the HDR10, HLG or SDR fallback of profile 8 among them. Upstream
+/// plans no removal for most of these and ships the RPU, as it did the
+/// Dolby Vision profile 8.1 AV1 title that then did not render in
+/// jellyfin-web. False where upstream's
+/// [`should_remove_dynamic_hdr_metadata`] strips HDR10+ instead, for an
+/// enhancement-layer player, which then gets the range type it listed.
+#[must_use]
+pub fn strips_dovi_for_a_client_without_dovi(state: &EncodingJobInfo) -> bool {
+    let Some(video) = state.video_stream.as_ref() else {
+        return false;
+    };
+    let range_type = video.video_range_type();
+    if range_type == VideoRangeType::Dovi || !is_dovi(Some(video)) {
+        return false;
+    }
+    let requested = state.requested_range_types(video.codec.as_deref().unwrap_or_default());
+    let wants = |t: VideoRangeType| {
+        let name = range_type_name(t);
+        requested.iter().any(|r| r.eq_ignore_ascii_case(&name))
+    };
+    !requested.is_empty()
+        && !wants(VideoRangeType::Dovi)
+        && !wants(range_type)
+        && should_remove_dynamic_hdr_metadata(state) != HdrMetadataRemoval::RemoveHdr10Plus
+}
+
+/// What this job strips from a copied video: upstream's
+/// [`should_remove_dynamic_hdr_metadata`], plus the RPU of
+/// [`strips_dovi_for_a_client_without_dovi`] when this ffmpeg can strip it.
+///
+/// Without the filters it is upstream's plan alone. The copy decision
+/// transcodes such a stream, so only a copy it cannot refuse (the client asked
+/// for `copy`, or may not transcode) gets here, and it gets upstream's
+/// arguments rather than a filter this ffmpeg does not have.
+#[must_use]
+pub fn dynamic_hdr_metadata_removal<C: EncoderCapabilities + ?Sized>(
+    caps: &C,
+    state: &EncodingJobInfo,
+) -> HdrMetadataRemoval {
+    if strips_dovi_for_a_client_without_dovi(state)
+        && can_remove_dynamic_hdr_metadata(
+            caps,
+            HdrMetadataRemoval::RemoveDovi,
+            state.video_stream.as_ref(),
+        )
+    {
+        return HdrMetadataRemoval::RemoveDovi;
+    }
+    should_remove_dynamic_hdr_metadata(state)
+}
+
+/// Whether a copied video's [`bit_stream_args`] reach the ffmpeg command line,
+/// and so whether a planned removal happens at all.
+///
+/// Upstream's gates on the copy's `-bsf:v`, in `DynamicHlsController`'s
+/// `GetVideoArguments` and `EncodingHelper.GetProgressiveVideoArguments`: a
+/// progressive job takes it only into MPEG-TS, and no job takes it for a source
+/// already in Annex B form (`NalLengthSize == "0"`).
+#[must_use]
+pub fn video_bit_stream_filters_apply(state: &EncodingJobInfo) -> bool {
+    (state.transcoding_type != TranscodingJobType::Progressive
+        || state
+            .output_container
+            .as_deref()
+            .is_some_and(|container| container.eq_ignore_ascii_case("ts")))
+        && state
+            .video_stream
+            .as_ref()
+            .is_some_and(|video| video.nal_length_size.as_deref() != Some("0"))
+}
+
 /// Whether this ffmpeg can perform `plan` on `video_stream`. Port of
 /// `CanEncoderRemoveDynamicHdrMetadata`.
 ///
 /// A `None` plan is trivially possible. The asymmetry between the two removals
 /// lives here: Dolby Vision has a generic fallback filter, HDR10+ does not.
 #[must_use]
-pub fn can_remove_dynamic_hdr_metadata(
-    caps: &FfmpegCapabilities,
+pub fn can_remove_dynamic_hdr_metadata<C: EncoderCapabilities + ?Sized>(
+    caps: &C,
     plan: HdrMetadataRemoval,
     video_stream: Option<&MediaStream>,
 ) -> bool {
@@ -183,14 +272,15 @@ pub fn can_remove_dynamic_hdr_metadata(
     }
 }
 
-/// Whether Dolby Vision will actually be stripped. Port of `IsDoviRemoved`.
+/// Whether Dolby Vision will actually be stripped. Port of `IsDoviRemoved`,
+/// over the job's plan ([`dynamic_hdr_metadata_removal`]).
 ///
 /// Both halves matter: the client has to need it removed **and** this ffmpeg
 /// has to be able to. A build that cannot is why the copy gets refused instead.
 #[must_use]
 pub fn is_dovi_removed(caps: &FfmpegCapabilities, state: &EncodingJobInfo) -> bool {
     state.video_stream.is_some()
-        && should_remove_dynamic_hdr_metadata(state) == HdrMetadataRemoval::RemoveDovi
+        && dynamic_hdr_metadata_removal(caps, state) == HdrMetadataRemoval::RemoveDovi
         && can_remove_dynamic_hdr_metadata(
             caps,
             HdrMetadataRemoval::RemoveDovi,
@@ -198,11 +288,12 @@ pub fn is_dovi_removed(caps: &FfmpegCapabilities, state: &EncodingJobInfo) -> bo
         )
 }
 
-/// Whether HDR10+ will actually be stripped. Port of `IsHdr10PlusRemoved`.
+/// Whether HDR10+ will actually be stripped. Port of `IsHdr10PlusRemoved`,
+/// over the job's plan ([`dynamic_hdr_metadata_removal`]).
 #[must_use]
 pub fn is_hdr10_plus_removed(caps: &FfmpegCapabilities, state: &EncodingJobInfo) -> bool {
     state.video_stream.is_some()
-        && should_remove_dynamic_hdr_metadata(state) == HdrMetadataRemoval::RemoveHdr10Plus
+        && dynamic_hdr_metadata_removal(caps, state) == HdrMetadataRemoval::RemoveHdr10Plus
         && can_remove_dynamic_hdr_metadata(
             caps,
             HdrMetadataRemoval::RemoveHdr10Plus,
@@ -218,7 +309,9 @@ pub fn is_hdr10_plus_removed(caps: &FfmpegCapabilities, state: &EncodingJobInfo)
 /// - **Container fixups.** `h264_mp4toannexb` / `hevc_mp4toannexb` convert
 ///   length-prefixed MP4 NAL units to the start-code form mpegts wants, and
 ///   `aac_adtstoasc` converts the other way for audio.
-/// - **HDR metadata removal**, appended to the HEVC/AV1 filter chain.
+/// - **HDR metadata removal**, appended to the HEVC/AV1 filter chain. It
+///   follows the job's plan ([`dynamic_hdr_metadata_removal`]), so it also
+///   strips the RPU Ferrofin removes where upstream does not.
 #[must_use]
 pub fn bit_stream_args(
     caps: &FfmpegCapabilities,
@@ -241,10 +334,12 @@ pub fn bit_stream_args(
 
     if is_h265(stream) {
         let mut filter = "-bsf:v hevc_mp4toannexb".to_owned();
-        // No capability re-check here, deliberately: the copy would already
-        // have been refused if this ffmpeg could not do the removal, and a bsf
-        // only appears on a copy at all.
-        match should_remove_dynamic_hdr_metadata(state) {
+        // No capability re-check here, deliberately: a bsf only appears on a
+        // copy, a copy is refused when this ffmpeg cannot do upstream's
+        // removal, and a copy that cannot be refused (the client asked for
+        // `copy`, or may not transcode) gets Ferrofin's own strip only when
+        // this ffmpeg has the filters (`dynamic_hdr_metadata_removal`).
+        match dynamic_hdr_metadata_removal(caps, state) {
             HdrMetadataRemoval::None => {}
             HdrMetadataRemoval::RemoveDovi => {
                 filter.push_str(
@@ -267,7 +362,7 @@ pub fn bit_stream_args(
     if is_av1(stream) {
         // AV1 needs no container fixup, so unlike HEVC there is nothing to
         // return when no metadata has to go.
-        return match should_remove_dynamic_hdr_metadata(state) {
+        return match dynamic_hdr_metadata_removal(caps, state) {
             HdrMetadataRemoval::None => None,
             HdrMetadataRemoval::RemoveDovi => Some(
                 if caps.supports_bsf_with_option(BsfOption::Av1MetadataRemoveDovi) {
@@ -611,10 +706,10 @@ mod tests {
         );
     }
 
-    // Transliterated from upstream's `EncodingHelperDoviTests` (v12.2,
+    // Transliterated from upstream's `EncodingHelperDoviTests` (v12.4,
     // `tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs`).
     // Its `CanStreamCopyVideo_InvalidDovi_RequiresRemovalSupportOnlyForDoviClients`
-    // is not ported here: it needs `CanStreamCopyVideo`'s range block (gl-737).
+    // is with the copy decision, in `helper.rs`.
 
     /// Upstream's `CreateState`: a copy of [`invalid_dovi`].
     fn invalid_dovi_state(codec: &str, transfer: Option<&str>) -> EncodingJobInfo {
@@ -623,9 +718,13 @@ mod tests {
         state
     }
 
-    /// Only a client that asked for DOVI gets an invalid stream's Dolby
-    /// Vision stripped, whatever its base layer: an SDR base no longer
-    /// skips the decision.
+    /// Port of `GetBitStreamArgs_InvalidDovi_PreservesClientDependentRemoval`.
+    /// Upstream strips an invalid stream's Dolby Vision only for a client that
+    /// asked for DOVI, whatever its base layer: an SDR base no longer skips the
+    /// decision. Three rows differ by a divergence (owner decision 2026-10-31,
+    /// gl-737): a client that declared `SDR`, `HDR10` or `DOVIWithEL` without
+    /// `DOVI` gets the RPU stripped too, where upstream copies it through. A
+    /// client that declared no ranges still gets it untouched.
     #[rstest]
     #[case("hevc", None, "hevc_metadata=remove_dovi=1")]
     #[case("hevc", Some("bt709"), "hevc_metadata=remove_dovi=1")]
@@ -645,9 +744,10 @@ mod tests {
         let no_removal = caps_with(&[]);
         for (requested, remove_dovi) in [
             (None, false),
-            (Some("SDR"), false),
-            (Some("HDR10"), false),
-            (Some("DOVIWithEL"), false),
+            // Upstream: false for these three.
+            (Some("SDR"), true),
+            (Some("HDR10"), true),
+            (Some("DOVIWithEL"), true),
             (Some("DOVI"), true),
             (Some("SDR,DOVI"), true),
         ] {
@@ -843,6 +943,126 @@ mod tests {
             bit_stream_args(&caps, &state, MediaStreamType::Video).as_deref(),
             Some(expected),
             "{codec}/{range_type:?}"
+        );
+    }
+
+    // ----- the RPU strip for a client that did not list DOVI -----------------
+
+    const HEVC_FIXUP: &str = "-bsf:v hevc_mp4toannexb";
+    const HEVC_STRIP: &str = "-bsf:v hevc_mp4toannexb,hevc_metadata=remove_dovi=1";
+    const AV1_STRIP: &str = "-bsf:v av1_metadata=remove_dovi=1";
+
+    /// Divergence (owner decision 2026-10-31, gl-737): a Dolby Vision stream
+    /// copied to a client that declared range types without `DOVI` or the
+    /// stream's own range type has its RPU stripped. Upstream plans no removal
+    /// for most of these rows (the base-layer fallbacks, HDR10+ beside Dolby
+    /// Vision, an invalid configuration) and copies the RPU through. The rows
+    /// a Dolby Vision player, a listed range type or upstream's own plan
+    /// decides are upstream's.
+    #[rstest]
+    #[case::p8_1_hevc(
+        "hevc",
+        VideoRangeType::DoviWithHdr10,
+        "SDR,HDR10,HLG",
+        Some(HEVC_STRIP)
+    )]
+    #[case::p8_1_av1(
+        "av1",
+        VideoRangeType::DoviWithHdr10,
+        "SDR,HDR10,HDR10Plus,HLG",
+        Some(AV1_STRIP)
+    )]
+    #[case::p8_4("hevc", VideoRangeType::DoviWithHlg, "SDR,HLG", Some(HEVC_STRIP))]
+    #[case::p8_2("hevc", VideoRangeType::DoviWithSdr, "SDR,HDR10", Some(HEVC_STRIP))]
+    #[case::p8_1_hdr10_plus(
+        "hevc",
+        VideoRangeType::DoviWithHdr10Plus,
+        "SDR,HDR10,HDR10Plus",
+        Some(HEVC_STRIP)
+    )]
+    #[case::p7_to_hlg("hevc", VideoRangeType::DoviWithEl, "SDR,HLG", Some(HEVC_STRIP))]
+    #[case::invalid("av1", VideoRangeType::DoviInvalid, "SDR,HDR10", Some(AV1_STRIP))]
+    // Upstream's own: a Dolby Vision player keeps the RPU...
+    #[case::dovi_player(
+        "hevc",
+        VideoRangeType::DoviWithHdr10,
+        "SDR,HDR10,DOVI",
+        Some(HEVC_FIXUP)
+    )]
+    #[case::dovi_player_av1("av1", VideoRangeType::DoviWithHdr10, "HDR10,DOVI", None)]
+    // ...so does a client that lists the stream's range type...
+    #[case::listed(
+        "hevc",
+        VideoRangeType::DoviWithHdr10,
+        "HDR10,DOVIWithHDR10",
+        Some(HEVC_FIXUP)
+    )]
+    // ...and one that declares no ranges at all.
+    #[case::no_ranges("hevc", VideoRangeType::DoviWithHdr10, "", Some(HEVC_FIXUP))]
+    // Profile 5 has no base layer the strip would leave playable.
+    #[case::p5("hevc", VideoRangeType::Dovi, "SDR,HDR10", Some(HEVC_FIXUP))]
+    // An enhancement-layer player loses the HDR10+ instead, as upstream.
+    #[case::el_player(
+        "hevc",
+        VideoRangeType::DoviWithElhdr10Plus,
+        "HDR10,DOVIWithEL",
+        Some("-bsf:v hevc_mp4toannexb,hevc_metadata=remove_hdr10plus=1")
+    )]
+    fn a_client_that_did_not_list_dovi_gets_the_rpu_stripped(
+        #[case] codec: &str,
+        #[case] range_type: VideoRangeType,
+        #[case] requested: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let requested: Vec<&str> = requested.split(',').filter(|r| !r.is_empty()).collect();
+        let state = state_with(video(codec, range_type), &requested);
+        let caps = all_bsf();
+        assert_eq!(
+            bit_stream_args(&caps, &state, MediaStreamType::Video).as_deref(),
+            expected,
+            "{codec}/{range_type:?}/{requested:?}"
+        );
+        assert_eq!(
+            is_dovi_removed(&caps, &state),
+            expected.is_some_and(|args| args.contains("remove_dovi")),
+            "{codec}/{range_type:?}/{requested:?}"
+        );
+    }
+
+    #[test]
+    fn the_strip_uses_the_generic_filter_where_the_codec_one_is_missing() {
+        let caps = caps_with(&[BsfOption::DoviRpuStrip]);
+        for (codec, expected) in [
+            ("hevc", "-bsf:v hevc_mp4toannexb,dovi_rpu=strip=1"),
+            ("av1", "-bsf:v dovi_rpu=strip=1"),
+        ] {
+            let state = state_with(video(codec, VideoRangeType::DoviWithHdr10), &["HDR10"]);
+            assert_eq!(
+                bit_stream_args(&caps, &state, MediaStreamType::Video).as_deref(),
+                Some(expected),
+                "{codec}"
+            );
+            assert!(is_dovi_removed(&caps, &state), "{codec}");
+        }
+    }
+
+    #[test]
+    fn an_ffmpeg_that_cannot_strip_gets_upstreams_arguments() {
+        // The copy check transcodes such a stream. A copy it cannot refuse (the
+        // client asked for `copy`, or may not transcode) gets what upstream
+        // sends rather than a filter this ffmpeg does not have.
+        let caps = caps_with(&[]);
+        let fallback = state_with(video("hevc", VideoRangeType::DoviWithHdr10), &["HDR10"]);
+        assert_eq!(
+            bit_stream_args(&caps, &fallback, MediaStreamType::Video).as_deref(),
+            Some(HEVC_FIXUP)
+        );
+        assert!(!is_dovi_removed(&caps, &fallback));
+        // Upstream's own removal plan is untouched.
+        let el = state_with(video("hevc", VideoRangeType::DoviWithEl), &["HDR10"]);
+        assert_eq!(
+            bit_stream_args(&caps, &el, MediaStreamType::Video).as_deref(),
+            Some("-bsf:v hevc_mp4toannexb,dovi_rpu=strip=1")
         );
     }
 

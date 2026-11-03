@@ -1999,20 +1999,16 @@ impl FerrofinStreamStatePlanner {
         // lets a Dolby Vision file copy through to a client that cannot play it
         // — the alternative is re-encoding a 4K HDR source.
         //
-        // The `NalLengthSize == "0"` gate is upstream's and it suppresses the
+        // The gates are upstream's, and the copy decision reads the same ones
+        // (`video_bit_stream_filters_apply`). A progressive job takes `-bsf:v`
+        // only into MPEG-TS, and the `NalLengthSize == "0"` gate suppresses the
         // metadata removal as well as the `mp4toannexb` conversion: a source
         // already in Annex B form gets no `-bsf:v` at all, so its Dolby Vision
-        // RPU survives even when the client asked for it gone.
+        // RPU survives even when a Dolby Vision player asked for it gone. For a
+        // client that did not list DOVI the copy decision transcodes such a
+        // stream instead of shipping its RPU.
         if copying_video
-            && (!progressive
-                || state
-                    .output_container
-                    .as_deref()
-                    .is_some_and(|container| container.eq_ignore_ascii_case("ts")))
-            && state
-                .video_stream
-                .as_ref()
-                .is_some_and(|v| v.nal_length_size.as_deref() != Some("0"))
+            && bitstream::video_bit_stream_filters_apply(state)
             && let Some(bsf) = ferrofin_mediaencoding::encoding_helper::bitstream::bit_stream_args(
                 caps,
                 state,
@@ -7718,6 +7714,142 @@ mod tests {
         req.query_string = "hevc-rangetype=DOVI".to_owned();
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert!(!plan.arguments.join(" ").contains("-bsf:v"));
+    }
+
+    /// A Dolby Vision profile 8.1 video on an HDR10 base layer
+    /// (`DOVIWithHDR10`), in MP4 framing.
+    fn dovi_p8_1(codec: &str) -> MediaStream {
+        let video = MediaStream {
+            color_transfer: Some("smpte2084".to_owned()),
+            color_primaries: Some("bt2020".to_owned()),
+            color_space: Some("bt2020nc".to_owned()),
+            dv_profile: Some(8),
+            dv_level: Some(6),
+            dv_bl_signal_compatibility_id: Some(1),
+            rpu_present_flag: Some(1),
+            bl_present_flag: Some(1),
+            nal_length_size: (codec == "hevc").then(|| "4".to_owned()),
+            ..video_stream(codec)
+        };
+        assert_eq!(
+            video.video_range_type(),
+            ferrofin_model::data::VideoRangeType::DoviWithHdr10
+        );
+        video
+    }
+
+    /// The plan for [`dovi_p8_1`] from a client playing `codec` or H.264 with
+    /// the range types `ranges`, on an ffmpeg with or without the Dolby Vision
+    /// strip filters.
+    async fn dovi_fallback_plan(
+        codec: &str,
+        ranges: &str,
+        strip: bool,
+        kind: PlaylistKind,
+        container: Option<&str>,
+    ) -> TranscodePlan {
+        use ferrofin_mediaencoding::BsfOption;
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![source("abc", vec![dovi_p8_1(codec), audio_stream("aac")])],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            FfmpegCapabilities::builder()
+                .bsf_option(BsfOption::HevcMetadataRemoveDovi, strip)
+                .bsf_option(BsfOption::Av1MetadataRemoveDovi, strip)
+                .bsf_option(BsfOption::DoviRpuStrip, strip)
+                .build(),
+            EncodingOptions::default(),
+        );
+        let mut req = request("abc");
+        req.segment_container = Some("mp4".to_owned());
+        req.video_codec = Some(format!("{codec},h264"));
+        req.output_container = container.map(str::to_owned);
+        req.query_string = format!("{codec}-rangetype={ranges}");
+        p.plan(&req, false, None, kind).await.unwrap()
+    }
+
+    /// Owner decision 2026-10-31 (gl-737): a Dolby Vision profile 8.1 stream
+    /// copies to a client that plays HDR10 but did not list DOVI, as jellyfin-web
+    /// on an HDR display declares it, with its RPU stripped in the copy's own
+    /// `-bsf:v` chain. The plan records the strip, so the master playlist
+    /// advertises no Dolby Vision, and fMP4 takes the plain HEVC tag, not the
+    /// Dolby Vision branch (`-strict -2`). Upstream copies this stream with its
+    /// RPU.
+    #[tokio::test]
+    async fn a_dolby_vision_fallback_copy_strips_the_rpu_for_a_client_without_dovi() {
+        let hdr10 = "SDR,HDR10,HDR10Plus,HLG";
+        for (codec, strip) in [
+            (
+                "hevc",
+                "-bsf:v hevc_mp4toannexb,hevc_metadata=remove_dovi=1",
+            ),
+            ("av1", "-bsf:v av1_metadata=remove_dovi=1"),
+        ] {
+            let plan = dovi_fallback_plan(codec, hdr10, true, PlaylistKind::Vod, None).await;
+            let args = plan.arguments.join(" ");
+            assert!(args.contains("-c:v copy"), "{codec}: {args}");
+            assert!(args.contains(strip), "{codec}: {args}");
+            assert_eq!(args.matches("-bsf:v").count(), 1, "{codec}: {args}");
+            assert!(plan.is_dovi_removed, "{codec}");
+            assert!(!args.contains("-strict -2"), "{codec}: {args}");
+            assert!(!args.contains("-tag:v:0 dav1"), "{codec}: {args}");
+            if codec == "hevc" {
+                assert!(args.contains("-tag:v:0 hvc1"), "{args}");
+            }
+        }
+    }
+
+    /// Where the RPU cannot be stripped the stream transcodes instead of going
+    /// out with it: an ffmpeg without the filters, and a progressive copy into
+    /// a container that takes no bitstream filter. A progressive MPEG-TS copy
+    /// takes the strip.
+    #[tokio::test]
+    async fn a_dolby_vision_fallback_transcodes_where_the_rpu_cannot_be_stripped() {
+        let hdr10 = "SDR,HDR10,HLG";
+        let plan = dovi_fallback_plan("hevc", hdr10, false, PlaylistKind::Vod, None).await;
+        let args = plan.arguments.join(" ");
+        assert!(!args.contains("-c:v copy"), "{args}");
+        assert!(!plan.is_dovi_removed);
+
+        let plan =
+            dovi_fallback_plan("hevc", hdr10, true, PlaylistKind::Progressive, Some("mkv")).await;
+        let args = plan.arguments.join(" ");
+        assert!(!args.contains("-c:v copy"), "{args}");
+
+        let plan =
+            dovi_fallback_plan("hevc", hdr10, true, PlaylistKind::Progressive, Some("ts")).await;
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-c:v copy"), "{args}");
+        assert!(
+            args.contains("-bsf:v hevc_mp4toannexb,hevc_metadata=remove_dovi=1"),
+            "{args}"
+        );
+    }
+
+    /// A Dolby Vision player copies the same stream with its RPU, on any
+    /// ffmpeg, as upstream: nothing is stripped, and fMP4 takes the Dolby
+    /// Vision branch (profile 8 keeps the `hvc1` tag, with `-strict -2`).
+    #[tokio::test]
+    async fn a_dolby_vision_player_copies_the_fallback_untouched() {
+        for ranges in ["SDR,HDR10,DOVI", "SDR,HDR10,DOVIWithHDR10"] {
+            let plan = dovi_fallback_plan("hevc", ranges, false, PlaylistKind::Vod, None).await;
+            let args = plan.arguments.join(" ");
+            assert!(args.contains("-c:v copy"), "{ranges}: {args}");
+            assert!(
+                args.contains("-bsf:v hevc_mp4toannexb "),
+                "{ranges}: {args}"
+            );
+            assert!(!args.contains("remove_dovi"), "{ranges}: {args}");
+            assert!(!args.contains("dovi_rpu"), "{ranges}: {args}");
+            assert!(!plan.is_dovi_removed, "{ranges}");
+        }
+        // The fMP4 Dolby Vision branch follows upstream's `DOVI` check.
+        let plan =
+            dovi_fallback_plan("hevc", "SDR,HDR10,DOVI", true, PlaylistKind::Vod, None).await;
+        let args = plan.arguments.join(" ");
+        assert!(args.contains("-tag:v:0 hvc1 -strict -2"), "{args}");
     }
 
     #[tokio::test]
