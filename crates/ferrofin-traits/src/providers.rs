@@ -622,6 +622,35 @@ pub trait GeneratedImageProvider: Send + Sync {
 
 fn _assert_object_safe_generated_image_provider(_: &dyn GeneratedImageProvider) {}
 
+/// What an item's refresh stores as its parental score.
+///
+/// Port of `BaseItem.OnMetadataChanged`, which `LibraryManager.UpdateItemsAsync`
+/// runs before every save and `MetadataService.BeforeSave` on every refresh:
+/// `GetParentalRatingScore`, the item's custom rating,
+/// else its official rating, each found along its display chain
+/// (`CustomRatingForComparison`, `OfficialRatingForComparison`), scored
+/// against its `GetPreferredMetadataCountryCode()`. The library scan and a
+/// metadata edit call the implementation directly; this is the seam the
+/// provider manager, below it in the crate graph, reaches it through.
+#[async_trait]
+pub trait ParentalRatingScorer: Send + Sync {
+    /// Sets each row's `InheritedParentalRatingValue` and
+    /// `InheritedParentalRatingSubValue` (both `None` when nothing in its
+    /// display chain is rated, or the rating has no score), and the
+    /// `UnratedType` its kind blocks under, from the row as passed and its
+    /// ancestors as stored.
+    ///
+    /// # Errors
+    ///
+    /// A storage read failure, or a parent chain that loops.
+    async fn update_rating_scores(
+        &self,
+        items: &mut [ferrofin_db::entities::base_items::BaseItemEntity],
+    ) -> Result<(), ServiceError>;
+}
+
+fn _assert_object_safe_parental_rating_scorer(_: &dyn ParentalRatingScorer) {}
+
 #[cfg(test)]
 mod tests {
     use super::{ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};

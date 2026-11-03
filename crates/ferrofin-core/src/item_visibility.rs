@@ -780,6 +780,15 @@ impl ItemVisibility {
     }
 }
 
+/// The rule the provider manager's refresh stores an item's parental score by,
+/// the one the scan and a metadata edit use.
+#[async_trait::async_trait]
+impl ferrofin_traits::providers::ParentalRatingScorer for ItemVisibility {
+    async fn update_rating_scores(&self, items: &mut [BaseItemEntity]) -> Result<(), ServiceError> {
+        ItemVisibility::update_rating_scores(self, items).await
+    }
+}
+
 struct Context<'a> {
     service: &'a ItemVisibility,
     user: Option<&'a UserEntity>,
