@@ -1099,9 +1099,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn connection_failure_opens_immediately_and_allows_later_probe() {
         let _clock = TestClock::start();
-        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Bound for the whole test and never listening, so connecting is
+        // refused. A port bound then dropped is free for another test
+        // process's listener, whose answers this request would then read
+        // (and whose script it would eat). The hold is exclusive only while
+        // this socket does not set SO_REUSEADDR, as the assert checks.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = socket.local_addr().unwrap();
-        drop(socket);
+        assert!(std::net::TcpListener::bind(addr).is_err(), "port is held");
         let url = format!("http://{addr}");
         let limiter = RateLimiter::new("offline");
         let http = reqwest::Client::new();
