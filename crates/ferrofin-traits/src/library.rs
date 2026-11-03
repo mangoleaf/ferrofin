@@ -1579,6 +1579,11 @@ pub trait UserManager: Send + Sync {
     async fn change_password(&self, user_id: Uuid, new_password: &str) -> Result<(), ServiceError>;
 
     /// Authenticates a user by name/password, returning the row on success.
+    ///
+    /// The implementation may pace repeated failures (Ferrofin's login
+    /// backoff): the call can wait up to its configured maximum delay before
+    /// checking the password, and `Ok(None)` can also mean an attempt it
+    /// refused without checking the password, answered like a wrong password.
     async fn authenticate_user(
         &self,
         username: &str,

@@ -1831,12 +1831,18 @@ pub const VERIFIED: &[Verified] = &[
                refuses the sign-in), the provider's canonical username, the new-user \
                policy, the saved provider id, the disabled, remote and schedule checks, \
                the failure counter and lockout, the device and session limits, token \
-               rotation and session activity. The UserDto and SessionInfoDto \
+               rotation and session activity, and that upstream has no login rate limit. \
+               The UserDto and SessionInfoDto \
                builders are shared with other routes and not compared here",
         date: "2026-11-02",
         divergences: &[
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "Ferrofin's login backoff (owner decisions on gl-1099; upstream has no rate limit): \
+         past login_backoff_attempts failures an account's and a client address's next \
+         attempts wait, from 1 s doubling to login_backoff_max_delay_secs. An address that \
+         would wait longer is answered as a wrong password without its password being \
+         checked; an account only waits. The backoff never disables an account.",
             "An authentication provider reports the user's administrator flag in its result \
          (ProviderAuthenticationResult.administrator) and the user manager applies it \
          (UserManager::apply_external_administrator), never demoting the last administrator: \

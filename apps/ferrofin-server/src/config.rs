@@ -19,6 +19,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use ferrofin_core::user_manager::LoginBackoffSettings;
 use ferrofin_drawing::ImageLimits;
 use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_providers::rate_limit::RequestLimits;
@@ -195,6 +196,11 @@ struct FileConfig {
     wasm_subtitle_extract_mb: Option<u32>,
     playback_metrics_queue: Option<u32>,
     quick_connect_pending_per_ip: Option<u32>,
+    login_backoff: Option<bool>,
+    login_backoff_attempts: Option<u32>,
+    login_backoff_max_delay_secs: Option<u32>,
+    login_backoff_window_mins: Option<u32>,
+    login_backoff_max_tracked: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -757,6 +763,39 @@ pub struct Config {
     /// `quick_connect_pending_per_ip` in `config.toml` > default.
     pub quick_connect_pending_per_ip: Option<u32>,
 
+    /// Whether Ferrofin's login backoff runs (Jellyfin has none): repeated
+    /// failed logins make an account's and a client address's next attempts
+    /// wait. Resolved `FERROFIN_LOGIN_BACKOFF` env > `login_backoff` in
+    /// `config.toml` > `true`.
+    pub login_backoff: bool,
+
+    /// Failed logins an account or a client address may make before its
+    /// attempts are paced. Resolved `FERROFIN_LOGIN_BACKOFF_ATTEMPTS` env >
+    /// `login_backoff_attempts` in `config.toml` > 5; within
+    /// [`LoginBackoffSettings::ATTEMPTS_RANGE`].
+    pub login_backoff_attempts: u32,
+
+    /// The longest wait, in seconds, the login backoff gives an attempt. An
+    /// address whose attempt would wait longer is refused; an account's
+    /// attempts only wait, this long at most. Resolved
+    /// `FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS` env >
+    /// `login_backoff_max_delay_secs` in `config.toml` > 30; within
+    /// [`LoginBackoffSettings::MAX_DELAY_RANGE_SECS`].
+    pub login_backoff_max_delay_secs: u32,
+
+    /// How long, in minutes, the login backoff remembers an account's or an
+    /// address's failures after the last one. Resolved
+    /// `FERROFIN_LOGIN_BACKOFF_WINDOW_MINS` env > `login_backoff_window_mins`
+    /// in `config.toml` > 15; within [`LoginBackoffSettings::WINDOW_RANGE_MINS`].
+    pub login_backoff_window_mins: u32,
+
+    /// The most accounts and addresses the login backoff remembers at once;
+    /// past it, the ones not yet paced are forgotten first. Resolved
+    /// `FERROFIN_LOGIN_BACKOFF_MAX_TRACKED` env > `login_backoff_max_tracked`
+    /// in `config.toml` > 100,000; within
+    /// [`LoginBackoffSettings::MAX_TRACKED_RANGE`].
+    pub login_backoff_max_tracked: u32,
+
     /// Concurrent media-decode budget for WASM plugin analysis
     /// (`extract-audio`/`extract-frames`). `None`/zero = a quarter of the
     /// visible cores, at least one — plugin analysis must never starve
@@ -1190,6 +1229,41 @@ impl Config {
                 .or(file.playback_metrics_queue),
             quick_connect_pending_per_ip: parse_var(env, "FERROFIN_QUICK_CONNECT_PENDING_PER_IP")
                 .or(file.quick_connect_pending_per_ip),
+            login_backoff: parse_bool_var(env, "FERROFIN_LOGIN_BACKOFF")
+                .or(file.login_backoff)
+                .unwrap_or(true),
+            login_backoff_attempts: resolve_ranged(
+                env,
+                "FERROFIN_LOGIN_BACKOFF_ATTEMPTS",
+                "login_backoff_attempts",
+                file.login_backoff_attempts,
+                LoginBackoffSettings::DEFAULT_ATTEMPTS,
+                LoginBackoffSettings::ATTEMPTS_RANGE,
+            )?,
+            login_backoff_max_delay_secs: resolve_ranged(
+                env,
+                "FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS",
+                "login_backoff_max_delay_secs",
+                file.login_backoff_max_delay_secs,
+                LoginBackoffSettings::DEFAULT_MAX_DELAY_SECS,
+                LoginBackoffSettings::MAX_DELAY_RANGE_SECS,
+            )?,
+            login_backoff_window_mins: resolve_ranged(
+                env,
+                "FERROFIN_LOGIN_BACKOFF_WINDOW_MINS",
+                "login_backoff_window_mins",
+                file.login_backoff_window_mins,
+                LoginBackoffSettings::DEFAULT_WINDOW_MINS,
+                LoginBackoffSettings::WINDOW_RANGE_MINS,
+            )?,
+            login_backoff_max_tracked: resolve_ranged(
+                env,
+                "FERROFIN_LOGIN_BACKOFF_MAX_TRACKED",
+                "login_backoff_max_tracked",
+                file.login_backoff_max_tracked,
+                LoginBackoffSettings::DEFAULT_MAX_TRACKED,
+                LoginBackoffSettings::MAX_TRACKED_RANGE,
+            )?,
         };
         // The file's warnings first, then the variables', in the order read.
         load_warnings.extend(env.warnings.take());
@@ -1439,7 +1513,29 @@ impl Config {
             wasm_subtitle_extract_mb: None,
             playback_metrics_queue: None,
             quick_connect_pending_per_ip: None,
+            // Off, so a test's failed logins do not make its next logins wait;
+            // the login backoff's own tests turn it on.
+            login_backoff: false,
+            login_backoff_attempts: LoginBackoffSettings::DEFAULT_ATTEMPTS,
+            login_backoff_max_delay_secs: LoginBackoffSettings::DEFAULT_MAX_DELAY_SECS,
+            login_backoff_window_mins: LoginBackoffSettings::DEFAULT_WINDOW_MINS,
+            login_backoff_max_tracked: LoginBackoffSettings::DEFAULT_MAX_TRACKED,
         }
+    }
+
+    /// The login backoff these settings describe.
+    #[must_use]
+    pub fn login_backoff_settings(&self) -> LoginBackoffSettings {
+        LoginBackoffSettings::new(
+            if self.login_backoff {
+                self.login_backoff_attempts
+            } else {
+                0
+            },
+            self.login_backoff_max_delay_secs,
+            self.login_backoff_window_mins,
+            self.login_backoff_max_tracked,
+        )
     }
 }
 
@@ -1604,6 +1700,34 @@ fn resolve_positive(
         "invalid {file_key} `0` in config.toml: expected a positive integer"
     );
     Ok(file)
+}
+
+/// Resolves a whole number that must lie within `range`: the `env_key` env
+/// var > `file_key` in `config.toml` > `default`. Anything else is an error,
+/// so a typo is noticed instead of silently changing a security setting. An
+/// empty env value is unset.
+fn resolve_ranged(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<u32>,
+    default: u32,
+    range: std::ops::RangeInclusive<u32>,
+) -> anyhow::Result<u32> {
+    let value = match env.var(env_key).filter(|s| !s.trim().is_empty()) {
+        Some(raw) => raw
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid {env_key} `{raw}`: expected a whole number"))?,
+        None => file.unwrap_or(default),
+    };
+    anyhow::ensure!(
+        range.contains(&value),
+        "invalid {env_key} / {file_key} `{value}`: expected {} to {}",
+        range.start(),
+        range.end()
+    );
+    Ok(value)
 }
 
 /// The seconds a cache lifetime setting may take (`auth_cache_ttl_secs`,
@@ -3324,6 +3448,62 @@ mod tests {
         };
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+    }
+
+    #[test]
+    fn login_backoff_settings_resolve_and_refuse_values_out_of_range() {
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            unset.login_backoff_settings(),
+            LoginBackoffSettings::DEFAULT
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(
+            &toml,
+            "login_backoff = false\nlogin_backoff_attempts = 3\n\
+             login_backoff_max_delay_secs = 300\nlogin_backoff_window_mins = 1\n\
+             login_backoff_max_tracked = 1000\n",
+        )
+        .unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let from_file = Config::load_from(cli(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            (
+                from_file.login_backoff_attempts,
+                from_file.login_backoff_max_delay_secs,
+                from_file.login_backoff_window_mins,
+                from_file.login_backoff_max_tracked
+            ),
+            (3, 300, 1, 1000)
+        );
+        assert_eq!(from_file.login_backoff_settings().attempts, 0, "off");
+        let env = FakeEnv::new().with("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "20");
+        assert_eq!(
+            Config::load_from(cli(), &env)
+                .unwrap()
+                .login_backoff_attempts,
+            20
+        );
+        for (key, value) in [
+            ("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "0"),
+            ("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "2"),
+            ("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "21"),
+            ("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "five"),
+            ("FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS", "4"),
+            ("FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS", "0"),
+            ("FERROFIN_LOGIN_BACKOFF_WINDOW_MINS", "1441"),
+            ("FERROFIN_LOGIN_BACKOFF_WINDOW_MINS", "0"),
+            ("FERROFIN_LOGIN_BACKOFF_MAX_TRACKED", "999"),
+            ("FERROFIN_LOGIN_BACKOFF_MAX_TRACKED", "10000001"),
+        ] {
+            let env = FakeEnv::new().with(key, value);
+            let err = Config::load_from(Cli::default(), &env).unwrap_err();
+            assert!(err.to_string().contains(key), "{key}={value}: {err}");
+        }
     }
 
     #[test]

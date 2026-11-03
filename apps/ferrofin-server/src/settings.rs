@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrofin_core::system_manager::LifecycleController;
+use ferrofin_core::user_manager::LoginBackoffSettings;
 use ferrofin_drawing::ImageLimits;
 use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_model::server_settings::{
@@ -203,6 +204,30 @@ const STATEMENT_CACHE: SettingKind = SettingKind::Integer {
 const TRANSCODE_CAP: SettingKind = SettingKind::Integer {
     min: *TranscodeLimits::RANGE.start() as i64,
     max: *TranscodeLimits::RANGE.end() as i64,
+};
+
+/// The login backoff's attempts ([`LoginBackoffSettings::ATTEMPTS_RANGE`]).
+const LOGIN_BACKOFF_ATTEMPTS: SettingKind = SettingKind::Integer {
+    min: *LoginBackoffSettings::ATTEMPTS_RANGE.start() as i64,
+    max: *LoginBackoffSettings::ATTEMPTS_RANGE.end() as i64,
+};
+
+/// The login backoff's maximum delay ([`LoginBackoffSettings::MAX_DELAY_RANGE_SECS`]).
+const LOGIN_BACKOFF_MAX_DELAY: SettingKind = SettingKind::Integer {
+    min: *LoginBackoffSettings::MAX_DELAY_RANGE_SECS.start() as i64,
+    max: *LoginBackoffSettings::MAX_DELAY_RANGE_SECS.end() as i64,
+};
+
+/// The login backoff's key cap ([`LoginBackoffSettings::MAX_TRACKED_RANGE`]).
+const LOGIN_BACKOFF_MAX_TRACKED: SettingKind = SettingKind::Integer {
+    min: *LoginBackoffSettings::MAX_TRACKED_RANGE.start() as i64,
+    max: *LoginBackoffSettings::MAX_TRACKED_RANGE.end() as i64,
+};
+
+/// The login backoff's window ([`LoginBackoffSettings::WINDOW_RANGE_MINS`]).
+const LOGIN_BACKOFF_WINDOW: SettingKind = SettingKind::Integer {
+    min: *LoginBackoffSettings::WINDOW_RANGE_MINS.start() as i64,
+    max: *LoginBackoffSettings::WINDOW_RANGE_MINS.end() as i64,
 };
 
 /// [`EnvRead::Parsed`] for a variable the loader reads as a `u32`.
@@ -390,6 +415,67 @@ pub static SETTINGS: &[SettingSpec] = &[
         description: "Unauthorized Quick Connect requests one client IP may hold at once; 0 \
                       means the default.",
         running: |c| json!(c.quick_connect_pending_per_ip),
+        ..ROW
+    },
+    SettingSpec {
+        key: "login_backoff",
+        env: Some("FERROFIN_LOGIN_BACKOFF"),
+        env_read: PARSED_BOOL,
+        group: Group::Network,
+        kind: SettingKind::Bool,
+        default: "true",
+        description: "Make an account's and a client address's next logins wait after \
+                      repeated failures. The backoff never disables an account.",
+        running: |c| json!(c.login_backoff),
+        ..ROW
+    },
+    SettingSpec {
+        key: "login_backoff_attempts",
+        env: Some("FERROFIN_LOGIN_BACKOFF_ATTEMPTS"),
+        env_read: PARSED_U32,
+        group: Group::Network,
+        kind: LOGIN_BACKOFF_ATTEMPTS,
+        default: "5",
+        description: "Failed logins an account or a client address may make before its next \
+                      attempts are made to wait.",
+        running: |c| json!(c.login_backoff_attempts),
+        ..ROW
+    },
+    SettingSpec {
+        key: "login_backoff_max_delay_secs",
+        env: Some("FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS"),
+        env_read: PARSED_U32,
+        group: Group::Network,
+        kind: LOGIN_BACKOFF_MAX_DELAY,
+        default: "30",
+        description: "Longest wait, in seconds, the login backoff gives an attempt. An address \
+                      that would wait longer is refused as a wrong password; an account only \
+                      waits.",
+        running: |c| json!(c.login_backoff_max_delay_secs),
+        ..ROW
+    },
+    SettingSpec {
+        key: "login_backoff_window_mins",
+        env: Some("FERROFIN_LOGIN_BACKOFF_WINDOW_MINS"),
+        env_read: PARSED_U32,
+        group: Group::Network,
+        kind: LOGIN_BACKOFF_WINDOW,
+        default: "15",
+        description: "Minutes the login backoff remembers an account's or an address's failed \
+                      logins after the last one.",
+        running: |c| json!(c.login_backoff_window_mins),
+        ..ROW
+    },
+    SettingSpec {
+        key: "login_backoff_max_tracked",
+        env: Some("FERROFIN_LOGIN_BACKOFF_MAX_TRACKED"),
+        env_read: PARSED_U32,
+        group: Group::Network,
+        kind: LOGIN_BACKOFF_MAX_TRACKED,
+        default: "100000",
+        description: "Most accounts and addresses the login backoff remembers at once; past \
+                      it, the ones not yet made to wait are forgotten first.",
+        running: |c| json!(c.login_backoff_max_tracked),
         ..ROW
     },
     // ---- ffmpeg -----------------------------------------------------------
