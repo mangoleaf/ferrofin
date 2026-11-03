@@ -1230,7 +1230,11 @@ fn subtitle_map_args(state: &EncodingJobInfo) -> String {
         if sub.is_external {
             // External subtitle is FFmpeg input 1. For single-stream files the
             // in-file index is 0; for multi-stream containers count the same-file
-            // streams preceding the selected one.
+            // streams preceding the selected one. The copy cut to the start
+            // (gl-1199) holds the one track, whatever file it came from.
+            if state.trimmed_subtitle_path.is_some() {
+                return " -map 1:0".to_owned();
+            }
             let in_file_index = state
                 .media_source
                 .media_streams
@@ -1845,9 +1849,14 @@ const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// sidecar's start time there (with or without the `-itsoffset`), where
 /// `-isync` still does.
 ///
-/// A seeked text sidecar can still bring a cue from before the seek; the
-/// embed drops it on the output side
+/// A seeked text sidecar can still bring a cue from before the seek. From
+/// ffmpeg 5.1 the embed drops it on the output side
 /// ([`embedded_sidecar_trim_arguments`](super::bitstream::embedded_sidecar_trim_arguments)).
+/// Fourth divergence (gl-1199): before 5.1, where that trim cannot cut the
+/// sidecar as upstream's `FilterEvents` would, an embed reads a copy the
+/// server cut to the start instead
+/// ([`EncodingJobInfo::trimmed_subtitle_path`]), neither seeked nor synced,
+/// since its cues already start at the start.
 #[must_use]
 pub fn external_stream_input_arguments(
     state: &EncodingJobInfo,
@@ -1871,14 +1880,20 @@ pub fn external_stream_input_arguments(
         .as_ref()
         .filter(|_| needs_external_subtitle_muxing(state))
     {
+        // The copy the server cut to the start is read in the sidecar's place.
+        let trimmed = state.trimmed_subtitle_path.as_deref();
         // An external stream always has a path. Were one missing, the input
         // still has to be there: the maps and pads number the inputs after
         // it, and ffmpeg then names the empty path in its error.
-        let mut path = sub.path.clone().unwrap_or_default();
+        let mut path = trimmed.map_or_else(
+            || sub.path.clone().unwrap_or_default(),
+            |copy| copy.to_string_lossy().into_owned(),
+        );
         let as_path = std::path::Path::new(&path);
-        if as_path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("sub"))
+        if trimmed.is_none()
+            && as_path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("sub"))
         {
             let idx = as_path.with_extension("idx");
             if idx.is_file() {
@@ -1897,8 +1912,9 @@ pub fn external_stream_input_arguments(
         let bitmap = !sub.is_text_subtitle_stream();
         let burned_in = should_encode_subtitle(state) && bitmap;
         // A bitmap sidecar is read from its start, embedded or burned in, on
-        // every ffmpeg (see the divergences).
-        if !bitmap {
+        // every ffmpeg, and the copy cut to the start is already on the
+        // output's clock (see the divergences).
+        if !bitmap && trimmed.is_none() {
             seek(&mut args);
         }
         if burned_in {
@@ -1914,7 +1930,7 @@ pub fn external_stream_input_arguments(
             if let Some(time) = fast_seek {
                 args.extend(["-itsoffset".to_owned(), format!("-{time}")]);
             }
-        } else {
+        } else if trimmed.is_none() {
             sync(&mut args);
         }
         args.extend(["-i".to_owned(), format!("file:{path}")]);
@@ -2274,6 +2290,7 @@ mod tests {
             input_container: None,
             is_input_video: true,
             subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
+            trimmed_subtitle_path: None,
             run_time_ticks: Some(1),
             transcoding_type: ferrofin_traits::media_encoding::TranscodingJobType::Progressive,
             supported_video_codecs: Vec::new(),

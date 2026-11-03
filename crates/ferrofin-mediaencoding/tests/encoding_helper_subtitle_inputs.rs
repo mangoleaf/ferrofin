@@ -76,6 +76,7 @@ fn build_state(
         input_container: None,
         is_input_video: true,
         subtitle_delivery_method: method.unwrap_or(SubtitleDeliveryMethod::Drop),
+        trimmed_subtitle_path: None,
         run_time_ticks: None,
         transcoding_type: TranscodingJobType::Progressive,
         supported_video_codecs: Vec::new(),
@@ -412,6 +413,72 @@ fn external_inputs_are_synced_to_the_media_files_clock(
     let input = format!("file:{path}");
     expected.extend(["-i", input.as_str()]);
     assert_eq!(inputs, expected);
+}
+
+/// The copy of a text sidecar the server cut to a seeked embed's start
+/// (gl-1199) is read in the sidecar's place, neither seeked nor synced: its
+/// cues already start at the start. An external audio track after it is still
+/// seeked like the media file.
+#[rstest]
+#[case::before_5_0(Some(FfmpegVersion::new(4, 4)))]
+#[case::unknown_version(None)]
+#[case::with_isync(Some(FfmpegVersion::new(5, 1)))]
+fn a_trimmed_copy_of_a_text_sidecar_is_read_unseeked(#[case] version: Option<FfmpegVersion>) {
+    let audio = MediaStream {
+        is_external: true,
+        path: Some("/media/movie.commentary.mka".to_owned()),
+        ..stream(3, MediaStreamType::Audio, "aac")
+    };
+    let sub = external_subtitle(2, "srt", "/media/movie.en.srt");
+    let mut state = build_state(
+        Some(sub.clone()),
+        Some(SubtitleDeliveryMethod::Embed),
+        Some(vec![audio.clone(), sub]),
+    );
+    state.audio_stream = Some(audio);
+    state.trimmed_subtitle_path = Some("/cache/transcodes/abc-stream.90000000.srt".into());
+
+    let inputs = external_stream_input_arguments(&state, Some("9"), version);
+
+    let sync: &[&str] = if version.is_some_and(|v| v >= FfmpegVersion::new(5, 1)) {
+        &["-isync", "0"]
+    } else {
+        &[]
+    };
+    let mut expected = vec![
+        "-analyzeduration",
+        "200M",
+        "-probesize",
+        "1G",
+        "-i",
+        "file:/cache/transcodes/abc-stream.90000000.srt",
+        "-ss",
+        "9",
+    ];
+    expected.extend(sync);
+    expected.extend(["-i", "/media/movie.commentary.mka"]);
+    assert_eq!(inputs, expected);
+}
+
+/// The copy holds the one track, so it is mapped as the first stream of
+/// input 1 even when it came out of a Matroska subtitle file's second.
+#[test]
+fn a_trimmed_copy_of_an_mks_track_maps_its_only_stream() {
+    let mks0 = external_subtitle(2, "subrip", "/media/movie.mks");
+    let mks1 = external_subtitle(3, "ass", "/media/movie.mks");
+    let mut state = build_state(
+        Some(mks1.clone()),
+        Some(SubtitleDeliveryMethod::Embed),
+        Some(vec![mks0, mks1]),
+    );
+    assert!(
+        map_args(&state).contains("-map 1:1"),
+        "{}",
+        map_args(&state)
+    );
+    state.trimmed_subtitle_path = Some("/cache/transcodes/abc-stream.90000000.ass".into());
+    let args = map_args(&state);
+    assert!(args.ends_with(" -map 1:0"), "{args}");
 }
 
 /// A seek clamped to the very start still names its time, which offsets a

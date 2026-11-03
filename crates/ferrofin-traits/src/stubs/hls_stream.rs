@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::error::ServiceError;
 use crate::media_encoding::{
     AttachmentExtractor, ExtractedAttachment, HlsStreamManager, HlsStreamRequest, ServedFile,
-    SubtitleEncoder, TranscodingJobHandle,
+    SubtitleEncoder, TranscodingJobHandle, TrimmedSubtitle,
 };
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities_media::MediaStream;
@@ -197,6 +197,15 @@ impl SubtitleEncoder for DisabledSubtitleEncoder {
         &self,
         _media_source: &MediaSourceInfo,
     ) -> Result<(), ServiceError> {
+        Err(Self::unavailable())
+    }
+
+    async fn get_trimmed_subtitles(
+        &self,
+        _subtitle_stream: &MediaStream,
+        _media_source: &MediaSourceInfo,
+        _start_time_ticks: i64,
+    ) -> Result<TrimmedSubtitle, ServiceError> {
         Err(Self::unavailable())
     }
 }

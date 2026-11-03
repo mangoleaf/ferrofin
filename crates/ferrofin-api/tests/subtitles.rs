@@ -346,6 +346,14 @@ impl SubtitleEncoder for StubEncoder {
     ) -> Result<(), ServiceError> {
         unimplemented!("unused")
     }
+    async fn get_trimmed_subtitles(
+        &self,
+        _subtitle_stream: &MediaStream,
+        _media_source: &MediaSourceInfo,
+        _start_time_ticks: i64,
+    ) -> Result<ferrofin_traits::media_encoding::TrimmedSubtitle, ServiceError> {
+        unimplemented!("unused")
+    }
 }
 
 /// The `(provider, config bytes)` of each `validate_provider_login` call.
@@ -459,6 +467,14 @@ impl SubtitleEncoder for PathEncoder {
         &self,
         _media_source: &MediaSourceInfo,
     ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn get_trimmed_subtitles(
+        &self,
+        _subtitle_stream: &MediaStream,
+        _media_source: &MediaSourceInfo,
+        _start_time_ticks: i64,
+    ) -> Result<ferrofin_traits::media_encoding::TrimmedSubtitle, ServiceError> {
         unimplemented!("unused")
     }
 }

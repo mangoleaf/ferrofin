@@ -4,7 +4,8 @@
 //! movie's clock, also on an ffmpeg the server knows no `-isync` for; an ASS
 //! track burned in with the fonts its file ships, extracted into the cache;
 //! and an `.srt` sidecar embedded into a progressive stream that starts
-//! mid-file.
+//! mid-file, also from the copy the server cuts to the start for an ffmpeg
+//! that cannot cut it.
 //!
 //! ffmpeg has no PGS encoder, so the subtitle is written here: display sets
 //! drawing a white box in the middle of a black picture ([`SHOWINGS`]).
@@ -792,28 +793,10 @@ fn generate_srt_movie(ffmpeg: &Path, folder: &Path) {
     assert!(status.success(), "generating the srt movie");
 }
 
-/// A progressive stream that starts mid-file and embeds the `.srt` sidecar,
-/// copied or converted to ASS, starts its video and audio at the start and
-/// trims the cues as upstream's `FilterEvents` does (gl-930). The sidecar's
-/// seek lands on the last cue that starts by the start point: from 8.2 s that
-/// is the 3.5-8 s cue, already over, which came out at -4.7 s on the output's
-/// clock, so Matroska moved every stream 4.7 s later; now it is gone. From 9 s
-/// it is the 8.5-11 s cue, still on screen, which moved every stream 0.5 s
-/// later; now it shows from 0 for the 2 s it has left.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_seeked_embed_of_a_text_sidecar_starts_every_stream_on_time() {
-    let Some((real_ffmpeg, real_ffprobe)) = tools() else {
-        return;
-    };
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    let movies = root.join("media").join("movies");
-    generate_srt_movie(&real_ffmpeg, &movies.join("Cues (2021)"));
-    let ffmpeg = wrapper(root, "ffmpeg", &real_ffmpeg);
-    let ffprobe = wrapper(root, "ffprobe", &real_ffprobe);
-
-    let server = Server::boot(root, &ffmpeg, &ffprobe).await;
-    let movie = &server.the_only_movie_in(&movies).await;
+/// The `.srt` sidecar's index among the scanned movie's streams in `movies`,
+/// with the item and media source ids.
+async fn the_srt_sidecar(server: &Server, movies: &Path) -> (String, String, i64) {
+    let movie = &server.the_only_movie_in(movies).await;
     let item = movie["Id"].as_str().expect("the movie was scanned");
     let source = &movie["MediaSources"][0];
     let source_id = source["Id"].as_str().unwrap();
@@ -825,13 +808,31 @@ async fn a_seeked_embed_of_a_text_sidecar_starts_every_stream_on_time() {
         .unwrap_or_else(|| panic!("the .srt sidecar in {source}"))["Index"]
         .as_i64()
         .unwrap();
+    (item.to_owned(), source_id.to_owned(), sidecar)
+}
 
+/// Streams the `.srt` movie from 8.2 s and from 9 s, the sidecar embedded
+/// copied as SubRip (no `subtitleCodec`) and converted to ASS, and checks
+/// that the video and audio start at the start and the cues are those
+/// upstream's `FilterEvents` keeps: the 3.5-8 s cue, over by 8.2 s, gone; the
+/// 8.5-11 s one from its time after the start, or from 0 for the 2 s it has
+/// left when it is on screen at 9 s; the 12-14 s one by its distance from
+/// the start; and none from 14.5 s, after the last cue, where the stream
+/// still plays with an empty subtitle track. The play sessions are
+/// `seeked-embed-{ticks}-{codec}`.
+async fn seeked_text_embeds_start_on_time(
+    server: &Server,
+    root: &Path,
+    ffprobe: &Path,
+    movies: &Path,
+) {
+    let (item, source_id, sidecar) = the_srt_sidecar(server, movies).await;
     // The width cap re-encodes the video, which then starts exactly at the
-    // seek. Each start, the subtitle copied as SubRip (no `subtitleCodec`) and
-    // converted to ASS; the cues expected as (start, duration) in seconds.
-    let starts: [(i64, [(f64, f64); 2]); 2] = [
-        (82_000_000, [(0.3, 2.5), (3.8, 2.0)]),
-        (90_000_000, [(0.0, 2.0), (3.0, 2.0)]),
+    // seek. The cues expected as (start, duration) in seconds.
+    let starts: [(i64, &[(f64, f64)]); 3] = [
+        (82_000_000, &[(0.3, 2.5), (3.8, 2.0)]),
+        (90_000_000, &[(0.0, 2.0), (3.0, 2.0)]),
+        (145_000_000, &[]),
     ];
     for ((ticks, expected), codec) in starts
         .iter()
@@ -853,18 +854,118 @@ async fn a_seeked_embed_of_a_text_sidecar_starts_every_stream_on_time() {
         let output = root.join(format!("seeked-embed-{ticks}-{codec}.mkv"));
         std::fs::write(&output, body).unwrap();
 
-        let video = packets(&real_ffprobe, &output, "v")[0].0;
-        let audio = packets(&real_ffprobe, &output, "a")[0].0;
+        let video = packets(ffprobe, &output, "v")[0].0;
+        let audio = packets(ffprobe, &output, "a")[0].0;
         let case = format!("from {ticks}, {codec:?}");
         assert!(video.abs() < 0.2, "{case}: the video starts at {video}");
         assert!(audio.abs() < 0.2, "{case}: the audio starts at {audio}");
-        let cues = packets(&real_ffprobe, &output, "s");
+        let cues = packets(ffprobe, &output, "s");
         assert_eq!(cues.len(), expected.len(), "{case}: {cues:?}");
-        for ((pts, duration), (start, length)) in cues.iter().zip(expected) {
+        for ((pts, duration), (start, length)) in cues.iter().zip(expected.iter()) {
             assert!((pts - start).abs() < 0.05, "{case}: {cues:?}");
             let duration = duration.unwrap_or_else(|| panic!("{case}: {cues:?}"));
             assert!((duration - length).abs() < 0.05, "{case}: {cues:?}");
         }
+    }
+}
+
+/// A progressive stream that starts mid-file and embeds the `.srt` sidecar,
+/// copied or converted to ASS, starts its video and audio at the start and
+/// trims the cues as upstream's `FilterEvents` does (gl-930). The sidecar's
+/// seek lands on the last cue that starts by the start point: from 8.2 s that
+/// is the 3.5-8 s cue, already over, which came out at -4.7 s on the output's
+/// clock, so Matroska moved every stream 4.7 s later; now it is gone. From 9 s
+/// it is the 8.5-11 s cue, still on screen, which moved every stream 0.5 s
+/// later; now it shows from 0 for the 2 s it has left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seeked_embed_of_a_text_sidecar_starts_every_stream_on_time() {
+    let Some((real_ffmpeg, real_ffprobe)) = tools() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let movies = root.join("media").join("movies");
+    generate_srt_movie(&real_ffmpeg, &movies.join("Cues (2021)"));
+    let ffmpeg = wrapper(root, "ffmpeg", &real_ffmpeg);
+    let ffprobe = wrapper(root, "ffprobe", &real_ffprobe);
+
+    let server = Server::boot(root, &ffmpeg, &ffprobe).await;
+    seeked_text_embeds_start_on_time(&server, root, &real_ffprobe, &movies).await;
+}
+
+/// The same streams on an ffmpeg the server reads no version of (counted as
+/// the oldest supported, 4.4), whose output trim cannot cut the sidecar as
+/// `FilterEvents` does (gl-1199): it dropped the cue on screen from 9 s, and
+/// on 4.4 a track converted to ASS started every stream 4.7 s late from 8.2
+/// s. The server cuts the sidecar to the start itself and the embed reads
+/// that copy, unseeked: every stream starts on time with the same cues. The
+/// copy lives beside the job's output and goes with it when the job is
+/// stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_readable_version_a_seeked_text_embed_reads_a_copy_cut_to_the_start() {
+    let Some((real_ffmpeg, real_ffprobe)) = tools() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let movies = root.join("media").join("movies");
+    generate_srt_movie(&real_ffmpeg, &movies.join("Cues (2021)"));
+    let ffmpeg = unread_version_wrapper(root, &real_ffmpeg);
+    let ffprobe = wrapper(root, "ffprobe", &real_ffprobe);
+
+    let server = Server::boot(root, &ffmpeg, &ffprobe).await;
+    seeked_text_embeds_start_on_time(&server, root, &real_ffprobe, &movies).await;
+
+    let calls = std::fs::read_to_string(root.join("calls.log")).unwrap();
+    let embeds: Vec<&str> = calls
+        .lines()
+        .filter(|line| line.starts_with("ffmpeg ") && line.contains("-disposition:s:0 default"))
+        .collect();
+    assert_eq!(embeds.len(), 6, "{calls}");
+    let mut copies = Vec::new();
+    for embed in embeds {
+        assert!(!embed.contains(".en.srt"), "the sidecar itself: {embed}");
+        assert!(
+            !embed.contains("-copypriorss") && !embed.contains("-bsf:s"),
+            "{embed}"
+        );
+        assert_eq!(
+            embed.matches(" -ss ").count(),
+            1,
+            "only the movie seeks: {embed}"
+        );
+        // The input after the movie's.
+        let copy = embed
+            .rsplit(" -i file:")
+            .next()
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_else(|| panic!("a subtitle input: {embed}"));
+        assert!(
+            [".82000000.srt", ".90000000.srt", ".145000000.srt"]
+                .iter()
+                .any(|end| copy.ends_with(end)),
+            "{copy}"
+        );
+        assert!(Path::new(copy).is_file(), "{copy}");
+        copies.push(copy.to_owned());
+    }
+
+    for ticks in [82_000_000, 90_000_000, 145_000_000] {
+        for codec in ["", "ass"] {
+            server
+                .send(
+                    reqwest::Method::DELETE,
+                    &format!(
+                        "/Videos/ActiveEncodings?deviceId=subtitle-streams\
+                         &playSessionId=seeked-embed-{ticks}-{codec}"
+                    ),
+                    None,
+                )
+                .await;
+        }
+    }
+    for copy in copies {
+        assert!(!Path::new(&copy).exists(), "deleted with its job: {copy}");
     }
 }
 

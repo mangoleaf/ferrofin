@@ -20,7 +20,7 @@ use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::media_encoding::SubtitleEncoder as SubtitleEncoderTrait;
+use ferrofin_traits::media_encoding::{SubtitleEncoder as SubtitleEncoderTrait, TrimmedSubtitle};
 use uuid::Uuid;
 
 use super::encoder::{SubtitleEncoder, SubtitleIo};
@@ -156,6 +156,18 @@ where
             .extract_all_extractable_subtitles(media_source)
             .await;
         Ok(())
+    }
+
+    async fn get_trimmed_subtitles(
+        &self,
+        subtitle_stream: &MediaStream,
+        media_source: &MediaSourceInfo,
+        start_time_ticks: i64,
+    ) -> Result<TrimmedSubtitle, ServiceError> {
+        self.encoder
+            .get_trimmed_subtitles(media_source, subtitle_stream, start_time_ticks)
+            .await
+            .map_err(|e| MediaEncodingError::process(e).into())
     }
 }
 
@@ -331,6 +343,34 @@ mod tests {
             .await
             .expect("path");
         assert_eq!(path, "/subs/a.srt");
+    }
+
+    #[tokio::test]
+    async fn trimmed_subtitles_are_the_track_from_the_start_in_its_format() {
+        let io = MemIo {
+            bytes: SRT_SAMPLE.as_bytes().to_vec(),
+        };
+        let enc = build(None, io);
+        let stream = srt_stream(0, "/subs/a.srt");
+        let trimmed = enc
+            .get_trimmed_subtitles(&stream, &MediaSourceInfo::default(), 5_000_000)
+            .await
+            .expect("trimmed");
+        assert_eq!(trimmed.format, "srt");
+        let text = String::from_utf8(trimmed.data).expect("utf8");
+        assert!(text.contains("00:00:00,500 --> 00:00:01,500"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn trimmed_subtitles_of_a_bitmap_track_are_a_process_error() {
+        let enc = build(None, MemIo { bytes: Vec::new() });
+        let mut stream = srt_stream(0, "/subs/a.sup");
+        stream.codec = Some("PGSSUB".to_owned());
+        let err = enc
+            .get_trimmed_subtitles(&stream, &MediaSourceInfo::default(), 0)
+            .await
+            .expect_err("no writer for a bitmap");
+        assert!(err.to_string().contains("Unsupported format"), "{err}");
     }
 
     #[tokio::test]

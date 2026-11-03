@@ -318,6 +318,13 @@ pub struct EncodingJobInfo {
     pub is_input_video: bool,
     /// The subtitle delivery method (`SubtitleDeliveryMethod`).
     pub subtitle_delivery_method: SubtitleDeliveryMethod,
+    /// A copy of the embedded external text subtitle that the server cut to
+    /// the job's start, read in place of the sidecar and not seeked, since its
+    /// cues already start at the start (gl-1199). Ferrofin's own: the planner
+    /// writes it where ffmpeg cannot cut a seeked sidecar itself
+    /// ([`embedded_sidecar_needs_trimmed_copy`](crate::encoding_helper::bitstream::embedded_sidecar_needs_trimmed_copy)).
+    /// `None` reads the sidecar itself.
+    pub trimmed_subtitle_path: Option<PathBuf>,
     /// The runtime, in ticks (`RunTimeTicks`); `None` marks an open-ended
     /// (segmented) live stream.
     pub run_time_ticks: Option<i64>,
@@ -715,6 +722,7 @@ mod derived_state_tests {
             input_container: None,
             is_input_video: true,
             subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
+            trimmed_subtitle_path: None,
             run_time_ticks: Some(1),
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),

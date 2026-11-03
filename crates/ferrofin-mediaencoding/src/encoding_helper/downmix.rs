@@ -287,6 +287,7 @@ mod tests {
             input_container: None,
             is_input_video: false,
             subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
+            trimmed_subtitle_path: None,
             run_time_ticks: None,
             transcoding_type: ferrofin_traits::media_encoding::TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
