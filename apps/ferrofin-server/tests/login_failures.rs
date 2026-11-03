@@ -35,16 +35,21 @@ struct Harness {
 
 /// Boots the composition root over a temp DB and seeds the administrator.
 async fn boot() -> Harness {
+    boot_with(|config| config).await
+}
+
+/// [`boot`] with the settings `configure` changes.
+async fn boot_with(configure: impl FnOnce(Config) -> Config) -> Harness {
     let temp = tempfile::tempdir().expect("temp dir");
     for dir in ["config", "data", "cache"] {
         std::fs::create_dir_all(temp.path().join(dir)).expect("dir");
     }
-    let config = Config {
+    let config = configure(Config {
         server_name: "ferrofin-login-failures".to_owned(),
         admin_user: ADMIN_USER.to_owned(),
         admin_password: ADMIN_PASSWORD.to_owned(),
         ..Config::test_stub(temp.path())
-    };
+    });
     let db = ferrofin_db::Database::connect(&config.database_url())
         .await
         .expect("open db");
@@ -325,4 +330,121 @@ async fn neighbouring_failures_keep_their_bodies() {
         wrong_current.json()["error"],
         "forbidden: invalid user or password entered"
     );
+}
+
+/// A login by name from the client at `address`.
+async fn login_from(
+    router: &axum::Router,
+    address: [u8; 4],
+    username: &str,
+    password: &str,
+) -> StatusCode {
+    let peer = std::net::SocketAddr::from((address, 40_000));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header(header::AUTHORIZATION, format!("MediaBrowser {IDENTITY}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .extension(axum::extract::ConnectInfo(peer))
+        .body(Body::from(
+            json!({ "Username": username, "Pw": password }).to_string(),
+        ))
+        .expect("request");
+    router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("response")
+        .status()
+}
+
+/// Ferrofin's login backoff (Jellyfin has none), through the composition
+/// root and real client addresses. Past the allowed failures an account's and
+/// an address's next logins wait. An address whose attempt would wait past
+/// the maximum is refused as a wrong password, without its password being
+/// checked; an account only waits, and is never disabled.
+///
+/// The account has no password, so a check costs no hashing and every wait
+/// measured is the backoff's.
+#[tokio::test]
+async fn repeated_failures_make_logins_wait_and_never_lock_the_account() {
+    use std::time::{Duration, Instant};
+
+    let harness = boot_with(|config| Config {
+        login_backoff: true,
+        login_backoff_attempts: 3,
+        login_backoff_max_delay_secs: 5,
+        ..config
+    })
+    .await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let admin = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
+    let token = admin.json()["AccessToken"]
+        .as_str()
+        .expect("AccessToken")
+        .to_owned();
+    let user_id = create_user(&router, &token, "no-password", "").await;
+    let guesser = [192, 0, 2, 1];
+    let other = [198, 51, 100, 7];
+
+    // Each wait is measured from a request sent before the one that waits,
+    // so a slow host can only lengthen what the assertions see.
+    let mut third_started = Instant::now();
+    for n in 1..=3 {
+        third_started = Instant::now();
+        let status = login_from(&router, guesser, "no-password", "guess").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "failure {n}");
+    }
+    // The fourth runs no earlier than 1 s after the third was let in.
+    let fourth_started = Instant::now();
+    let status = login_from(&router, guesser, "no-password", "guess").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        third_started.elapsed() >= Duration::from_secs(1),
+        "the fourth did not wait"
+    );
+
+    // The account waits from any address (2 s after the fourth), and is not
+    // locked: its right password signs in once the wait is over, which
+    // clears it.
+    let status = login_from(&router, other, "no-password", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        fourth_started.elapsed() >= Duration::from_secs(2),
+        "the account did not wait"
+    );
+    let user = send(
+        &router,
+        "GET",
+        &format!("/Users/{user_id}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(user.json()["Policy"]["IsDisabled"], json!(false));
+
+    // The guesser's address still counts its failures: one more try at
+    // another name makes its next attempt wait 4 s. Of four at once, one is
+    // let wait and three would wait past the 5 s maximum, so they are refused
+    // at once.
+    let status = login_from(&router, guesser, "someone-else", "guess").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let mut burst = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let router = router.clone();
+        burst.spawn(async move { login_from(&router, guesser, "someone-else", "guess").await });
+    }
+    for _ in 0..3 {
+        let refused = tokio::time::timeout(Duration::from_secs(2), burst.join_next())
+            .await
+            .expect("refused at once")
+            .expect("a task")
+            .expect("joined");
+        assert_eq!(refused, StatusCode::UNAUTHORIZED);
+    }
+    // Now even the right password is refused from the guesser's address,
+    // though the account itself was cleared.
+    let status = login_from(&router, guesser, "no-password", "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the address is paced");
+    burst.abort_all();
 }

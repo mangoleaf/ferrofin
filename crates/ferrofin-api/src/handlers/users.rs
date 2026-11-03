@@ -298,9 +298,9 @@ async fn authenticate_by_id(
 /// The reason stays out of the body, which would otherwise tell a caller which
 /// usernames exist and name a disabled account. jellyfin-web and the Kotlin SDK
 /// read only the status: `401` is bad credentials, `403` an account that may
-/// not sign in. The core logs each refused login at `warn` with its `reason`;
-/// the debug line here adds the text, and is the only record of Quick Connect
-/// being off.
+/// not sign in. The core logs each refused login with its `reason`, at `warn`,
+/// or at `debug` for an attempt its login backoff refused; the debug line here
+/// adds the text, and is the only record of Quick Connect being off.
 ///
 /// Every other failure is the caller's to answer as before, so a login's `400`
 /// or `500` keeps the shared [`ApiError`] body.
