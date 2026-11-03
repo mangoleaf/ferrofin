@@ -379,10 +379,35 @@ async fn an_episode_reads_neither_the_library_listing_nor_its_row_twice() {
     // The credited people's rows and locks serve a TMDB biography fetch,
     // which needs a TMDB id these guests do not have. Their credits are
     // written, so the people pass ran.
-    assert!(
-        scans.more(|s| s.starts_with(r#"INSERT INTO "PeopleBaseItemMap""#)) >= scans.each(1),
-        "the guests are credited:\n{listing}"
-    );
+    //
+    // An episode's cast is written a few statements at a time, not one or
+    // more per guest (gl-1181): each read (the name match, the clean-name
+    // match, the biographies) is one statement up to 256 people, and each
+    // insert (the new `Peoples` rows, the new `Person` items, the credits) one
+    // per power-of-two run of its rows. With two guests, each step is one.
+    for (step, prefix) in [
+        (
+            "name match",
+            r#"SELECT "Id", "Name", "PersonType" FROM "Peoples""#,
+        ),
+        ("new people", r#"INSERT INTO "Peoples""#),
+        (
+            "clean-name match",
+            r#"SELECT "CleanName", "Id" FROM "BaseItems""#,
+        ),
+        ("biographies", r#"SELECT "Id", "Overview" FROM "BaseItems""#),
+        (
+            "new person items",
+            r#"INSERT OR IGNORE INTO "BaseItems" ("Id","Type","Name","CleanName""#,
+        ),
+        ("credits", r#"INSERT INTO "PeopleBaseItemMap""#),
+    ] {
+        assert_eq!(
+            scans.more(|s| s.starts_with(prefix)),
+            scans.each(1),
+            "an episode's {step} is one statement:\n{listing}"
+        );
+    }
     assert_eq!(
         scans.more(|s| {
             s.starts_with(
