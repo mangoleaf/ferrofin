@@ -75,7 +75,7 @@ requests = ["GetCurrentUser", "GetUserById", "GetUsers", "AuthenticateUserByName
             "GetSessions", "*/session", "screen-playback-start/sessions"]
 reason = "Each server stamps the time it handled the harness's sign-in and its requests."
 
-# A playback start stamps the session's check-in on both servers (before one, Ferrofin's differs: gl-837 in the ledger).
+# A playback start stamps the session's check-in on both servers.
 [[rule]]
 paths = ["[].LastPlaybackCheckIn"]
 kind = "opaque"

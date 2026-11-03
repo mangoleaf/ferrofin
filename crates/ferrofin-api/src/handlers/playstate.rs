@@ -13,13 +13,12 @@
 //!   query-param forms of start/progress/stop, kept for older clients.
 //!
 //! Faithfulness notes:
-//! - `ValidatePlayMethod` downgrades a `Transcode` method to `DirectPlay` when no
-//!   transcoding job backs the play-session id. No transcode manager is ported at
-//!   this layer, so there is never a job → `Transcode` always becomes
-//!   `DirectPlay`, exactly as C# would for a non-transcoded session.
-//! - `PingPlaybackSession` / the transcode-kill on stop poke the transcode
-//!   manager, which is deferred; the reporting call to [`SessionManager`] still
-//!   runs, so the session/play-state bookkeeping is faithful.
+//! - `ValidatePlayMethod` keeps a reported `Transcode` only while the transcode
+//!   runtime (`AppState::hls`) runs a job for the report's play session, and
+//!   downgrades it to `DirectPlay` otherwise.
+//! - `PingPlaybackSession`, the progress report's keep-alive and the stop
+//!   report's kill go to the same runtime (`PingTranscodingJob`,
+//!   `KillTranscodingJobs`) before the report reaches the [`SessionManager`].
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -198,7 +197,8 @@ async fn report_playback_start(
     RequireAuth(auth): RequireAuth,
     JsonBody(mut info): JsonBody<PlaybackStartInfo>,
 ) -> Result<StatusCode, ApiError> {
-    info.play_method = validate_play_method(info.play_method);
+    info.play_method =
+        validate_play_method(&state, info.play_method, info.play_session_id.as_deref()).await?;
     info.session_id = Some(current_session_id(&state, &auth).await?);
     state.sessions.on_playback_start(&info).await?;
     record_metrics_started(&state, info.play_session_id.as_deref()).await;
@@ -240,7 +240,8 @@ async fn report_playback_progress(
     RequireAuth(auth): RequireAuth,
     JsonBody(mut info): JsonBody<PlaybackProgressInfo>,
 ) -> Result<StatusCode, ApiError> {
-    info.play_method = validate_play_method(info.play_method);
+    info.play_method =
+        validate_play_method(&state, info.play_method, info.play_session_id.as_deref()).await?;
     info.session_id = Some(current_session_id(&state, &auth).await?);
     // Each progress report keeps the session's transcode alive (upstream wires
     // SessionManager.PlaybackProgress → PingTranscodingJob) — without it the
@@ -367,7 +368,8 @@ async fn on_playback_start(
         live_stream_id: query.live_stream_id,
         ..PlaybackStartInfo::default()
     };
-    info.play_method = validate_play_method(info.play_method);
+    info.play_method =
+        validate_play_method(&state, info.play_method, info.play_session_id.as_deref()).await?;
     info.session_id = Some(current_session_id(&state, &auth).await?);
     state.sessions.on_playback_start(&info).await?;
     record_metrics_started(&state, info.play_session_id.as_deref()).await;
@@ -439,7 +441,8 @@ async fn on_playback_progress(
         repeat_mode: query.repeat_mode.unwrap_or(RepeatMode::RepeatNone),
         ..PlaybackProgressInfo::default()
     };
-    info.play_method = validate_play_method(info.play_method);
+    info.play_method =
+        validate_play_method(&state, info.play_method, info.play_session_id.as_deref()).await?;
     info.session_id = Some(current_session_id(&state, &auth).await?);
     // Keep the session's transcode alive, as the modern progress route does.
     if let Some(psid) = info.play_session_id.as_deref().filter(|s| !s.is_empty()) {
@@ -560,15 +563,27 @@ async fn kill_session_transcodes(
     }
 }
 
-/// C# `ValidatePlayMethod`: without a transcoding job (no transcode manager is
-/// ported here), a `Transcode` method downgrades to `DirectPlay`; other methods
-/// pass through unchanged.
-fn validate_play_method(method: PlayMethod) -> PlayMethod {
-    if method == PlayMethod::Transcode {
-        PlayMethod::DirectPlay
-    } else {
-        method
+/// C# `ValidatePlayMethod`: a `Transcode` report stays one only while a
+/// transcoding job runs for its play session
+/// (`_transcodeManager.GetTranscodingJob(playSessionId)`, none for a blank id),
+/// and is `DirectPlay` otherwise. Other methods pass through unchanged.
+async fn validate_play_method(
+    state: &AppState,
+    method: PlayMethod,
+    play_session_id: Option<&str>,
+) -> Result<PlayMethod, ApiError> {
+    if method != PlayMethod::Transcode {
+        return Ok(method);
     }
+    let job = match play_session_id.filter(|id| !id.trim().is_empty()) {
+        Some(id) => state.hls.get_transcoding_job(id).await?,
+        None => None,
+    };
+    Ok(if job.is_some() {
+        method
+    } else {
+        PlayMethod::DirectPlay
+    })
 }
 
 /// Asserts the item exists (C# `GetItemById` null-check → `404`).
