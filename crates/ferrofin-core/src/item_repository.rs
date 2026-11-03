@@ -251,9 +251,13 @@ impl FerrofinItemRepository {
     /// alternate in the primary's library is already hidden by the caller's
     /// filter (`ApplyAlternateVersionFiltering`), so this only decides between
     /// rows the filter kept.
+    ///
+    /// `without_series` reads only the rows with no `SeriesName`, as the
+    /// `unknown` arm's movies half does.
     async fn latest_movie_items(
         &self,
         filter: &InternalItemsQuery,
+        without_series: bool,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         use futures_util::TryStreamExt;
         let limit = filter
@@ -262,7 +266,7 @@ impl FerrofinItemRepository {
         let mut ids: Vec<String> = Vec::new();
         if limit > 0 {
             let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let mut qb = crate::translate_query::build_latest_movies_query(filter);
+            let mut qb = crate::translate_query::build_latest_movies_query(filter, without_series);
             let mut rows = qb
                 .build_query_as::<(String, String)>()
                 .fetch(self.db.pool());
@@ -3838,26 +3842,28 @@ impl ItemRepository for FerrofinItemRepository {
         filter: &InternalItemsQuery,
         collection_type: CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // Ferrofin implements three arms of v12's `BaseItemRepository.
-        // GetLatestItemList`: music (`Querying.cs:147-180`), tvshows
-        // (`GetLatestTvShowItems`, `:282-540`) and movies
-        // (`GetLatestMovieItems`, `:233-256`). Every other collection type
-        // returns empty and the user-view manager sends it through
-        // `get_item_list`. That is WIDER than the C# early exit
-        // (`Querying.cs:112-116`, which only rejects types outside
-        // `{movies, tvshows, music, unknown}`): the `unknown` arm (a mixed
-        // library's movies and shows, `:134-144`) is not ported yet — gl-383.
-        // Checked BEFORE `resolve_views` so the early exit costs no query.
+        // The four arms of v12's `BaseItemRepository.GetLatestItemList`:
+        // music (`Querying.cs:147-180`), tvshows (`GetLatestTvShowItems`,
+        // `:282-540`), movies (`GetLatestMovieItems`, `:233-256`) and
+        // `unknown` (`:134-144`, the merge of the last two for a parent set
+        // with no collection type). Every other collection type returns empty,
+        // as the C# early exit does (`:112-116`), and the user-view manager
+        // sends it through `get_item_list`. Checked BEFORE `resolve_views` so
+        // the early exit costs no query.
         if !matches!(
             collection_type,
-            CollectionType::tvshows | CollectionType::music | CollectionType::movies
+            CollectionType::tvshows
+                | CollectionType::music
+                | CollectionType::movies
+                | CollectionType::unknown
         ) {
             return Ok(Vec::new());
         }
         // This is the path jellyfin-web's per-library "Latest in …" rows take
-        // (grouping is on by default for tvshows, music and movies), so it needs
-        // the same view translation as every other browse — without it, Latest
-        // for one of those libraries on an adopted database comes back empty.
+        // (grouping is on by default for tvshows, music, movies and untyped
+        // libraries), so it needs the same view translation as every other
+        // browse — without it, Latest for one of those libraries on an
+        // adopted database comes back empty.
         let prepared = grouped_by_metadata_key(filter);
         let filter = prepared.as_ref().unwrap_or(filter);
         let resolved = self.resolve_views(filter).await?;
@@ -3872,7 +3878,26 @@ impl ItemRepository for FerrofinItemRepository {
                 .map(|rows| self.mapped_rows(rows));
         }
         if collection_type == CollectionType::movies {
-            return self.latest_movie_items(filter).await;
+            return self.latest_movie_items(filter, false).await;
+        }
+        if collection_type == CollectionType::unknown {
+            // The newest movies (rows with no `SeriesName`) and the TV cards,
+            // `limit` of each, merged newest first by each row's OWN
+            // `DateCreated` (`dto.DateCreated`, not the series' newest
+            // episode that orders the TV arm), then cut to `limit`.
+            let mut rows = self.latest_movie_items(filter, true).await?;
+            rows.extend(self.mapped_rows(
+                crate::latest_tv_repository::latest_tv_show_items(&self.db, filter).await?,
+            ));
+            rows.sort_by_cached_key(|row| {
+                std::cmp::Reverse((row.date_created, Uuid::parse_str(&row.id).ok()))
+            });
+            rows.truncate(
+                filter
+                    .limit
+                    .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0)),
+            );
+            return Ok(rows);
         }
         // v12's music arm: the newest `limit` MusicAlbum rows themselves,
         // one statement — which reads no track at all when the caller is

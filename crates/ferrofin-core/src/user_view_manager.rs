@@ -1538,13 +1538,14 @@ impl FerrofinUserViewManager {
     }
 
     /// Port of `UserViewManager.GetItemsForLatestItems`: resolves the parents,
-    /// derives the type / media-type / played rules from them, and runs the ONE
-    /// query that feeds the grouping in
+    /// derives the type / media-type / played rules from them, and reads the
+    /// rows that feed the grouping in
     /// [`get_latest_items`](UserViewManager::get_latest_items) — the plain form,
     /// or, for a grouped request whose first typed parent is a library or view
     /// of one of the three short-circuited types, that type's own query (one card per
     /// newest series for tvshows, the newest albums for music, the newest row
-    /// of each presentation key for movies).
+    /// of each presentation key for movies), or, when no parent is typed, the
+    /// `unknown` arm that merges the movies and tvshows ones.
     async fn items_for_latest_items(
         &self,
         query: &LatestItemsQuery,
@@ -1623,25 +1624,29 @@ impl FerrofinUserViewManager {
             // (the owner chose to follow v12 here on 2026-10-24), not an
             // artifact of this port.
             //
-            // The `null`-collection-type arm v12 added beside them
-            // (`:425-429`, a MIXED library's latest movies and shows) is not
-            // ported yet — gl-383. Port path: `GetLatestItemList`'s `unknown`
-            // arm (`Querying.cs:134-144`), the movies arm over the rows with no
-            // `SeriesName` concatenated with `latest_tv_repository`, re-sorted
-            // `DateCreated DESC, Id DESC` and cut to `limit`, then one more arm
-            // on the match below.
+            // No typed parent at all (`:425-429`) takes the `unknown` arm, the
+            // newest movies merged with the newest TV cards: a MIXED library,
+            // and also any parent that is neither a library nor a view (a
+            // folder, a series, a box set), as upstream's `collectionType is
+            // null` is.
             //
-            // The plain path below still over-fetches 10.11.8's `limit * 5`
-            // ([`LATEST_OVER_FETCH_FACTOR`]) where v12 fetches `limit * 2`
-            // (`:390`); the short-circuits overwrite it on the next line.
+            // The plain path below, which only a typed parent of another type
+            // (books, photos, …) or an ungrouped request still takes, over-fetches
+            // 10.11.8's `limit * 5` ([`LATEST_OVER_FETCH_FACTOR`]) where v12
+            // fetches `limit * 2` (`:390`); the short-circuits overwrite it on
+            // the next line.
             let collection_type = parents
                 .iter()
                 .filter(|p| p.is_collection_folder() || p.is_user_view())
                 .find_map(|p| p.collection_type);
-            if let Some(
-                ct @ (CollectionType::tvshows | CollectionType::music | CollectionType::movies),
-            ) = collection_type
-            {
+            let arm = match collection_type {
+                Some(
+                    ct @ (CollectionType::tvshows | CollectionType::music | CollectionType::movies),
+                ) => Some(ct),
+                None => Some(CollectionType::unknown),
+                Some(_) => None,
+            };
+            if let Some(ct) = arm {
                 internal.limit = Some(limit);
                 return self.items.get_latest_item_list(&internal, ct).await;
             }
@@ -2486,6 +2491,7 @@ mod tests {
         top_parent: Uuid,
         parent: Uuid,
         series: Option<(Uuid, &'a str)>,
+        season: Option<Uuid>,
         album: Option<&'a str>,
         is_folder: bool,
         media_type: Option<&'a str>,
@@ -2516,6 +2522,7 @@ mod tests {
                 top_parent: library,
                 parent: library,
                 series: None,
+                season: None,
                 album: None,
                 is_folder: kinds::is_folder(kind),
                 media_type,
@@ -2527,6 +2534,10 @@ mod tests {
         }
         fn of_series(mut self, series: Uuid, name: &'a str) -> Self {
             self.series = Some((series, name));
+            self
+        }
+        fn in_season(mut self, season: Uuid) -> Self {
+            self.season = Some(season);
             self
         }
         fn on_album(mut self, album: &'a str) -> Self {
@@ -2549,6 +2560,7 @@ mod tests {
                 parent_id: Some(guid_to_db(r.parent)),
                 series_id: r.series.map(|(id, _)| guid_to_db(id)),
                 series_name: r.series.map(|(_, name)| name.to_owned()),
+                season_id: r.season.map(guid_to_db),
                 album: r.album.map(str::to_owned),
                 is_folder: r.is_folder,
                 media_type: r.media_type.map(str::to_owned),
@@ -2797,14 +2809,173 @@ mod tests {
         );
     }
 
+    /// One series with ten new episodes beside two older movies, all in one
+    /// library; the episodes are in no season, so the series' card is its
+    /// newest episode.
+    async fn seed_series_burst(db: &Database, library: Uuid) -> (Uuid, Vec<Uuid>, [Uuid; 2]) {
+        let series = Uuid::from_u128(0x261);
+        let movies = [Uuid::from_u128(0x361), Uuid::from_u128(0x362)];
+        let episodes: Vec<Uuid> = (1..=10).map(|n| Uuid::from_u128(0x370 + n)).collect();
+        let names: Vec<String> = (1..=10).map(|n| format!("S1E{n:02}")).collect();
+        let mut rows = vec![
+            Row::new(series, BaseItemKind::Series, "Series 01", day(1), library),
+            Row::new(
+                movies[0],
+                BaseItemKind::Movie,
+                "Movie 0001",
+                day(2),
+                library,
+            ),
+            Row::new(
+                movies[1],
+                BaseItemKind::Movie,
+                "Movie 0002",
+                day(3),
+                library,
+            ),
+        ];
+        rows.extend(
+            episodes
+                .iter()
+                .zip(&names)
+                .zip(11..)
+                .map(|((id, name), d)| {
+                    Row::new(*id, BaseItemKind::Episode, name, day(d), library)
+                        .under(series)
+                        .of_series(series, "Series 01")
+                }),
+        );
+        seed(db, &rows).await;
+        (series, episodes, movies)
+    }
+
+    /// A grouped request whose parents carry no collection type (a mixed
+    /// library, scoped, or unscoped with no typed root folder: here no
+    /// playlists folder, which every real server has and whose `playlists`
+    /// type would send the unscoped request down the plain path, as
+    /// upstream) takes v12's `unknown` arm
+    /// (`UserViewManager.cs:425-429`, `Querying.cs:134-144`): the newest movies
+    /// and the newest TV cards, merged by date added. The plain path read
+    /// `limit * 5` rows, all ten of them the series' new episodes, and showed
+    /// one card (jellyfin/jellyfin#17672).
+    #[rstest::rstest]
+    #[case::scoped(true)]
+    #[case::unscoped(false)]
+    #[tokio::test]
+    async fn latest_for_a_mixed_library_merges_movies_and_shows(#[case] scoped: bool) {
+        let db = test_db().await;
+        let mixed = Uuid::from_u128(0x105);
+        seed_named_item(&db, mixed, BaseItemKind::CollectionFolder, "Mixed").await;
+        let (series, episodes, movies) = seed_series_burst(&db, mixed).await;
+        let mgr = manager_with_folders(&db, vec![(mixed, None)]);
+
+        let query = LatestItemsQuery {
+            parent_id: scoped.then_some(mixed),
+            limit: Some(2),
+            ..LatestItemsQuery::default()
+        };
+        assert_eq!(
+            shape(&latest(&mgr, query).await),
+            vec![(Some(series), vec![episodes[9]]), (None, vec![movies[1]])]
+        );
+    }
+
+    /// The `unknown` arm merges by each row's OWN `DateCreated`
+    /// (`Querying.cs:141`, `dto.DateCreated`), not by the series' newest
+    /// episode that orders the TV arm: three new episodes of a one-season
+    /// series make a Series card, which keeps the series' old date and so
+    /// sorts behind an older movie. Equal dates break on `Id DESC`: the card
+    /// (a larger id) before a movie of the same day, though the movies half
+    /// comes first.
+    #[tokio::test]
+    async fn latest_unknown_arm_orders_a_series_card_by_its_own_date() {
+        let db = test_db().await;
+        let mixed = Uuid::from_u128(0x105);
+        seed_named_item(&db, mixed, BaseItemKind::CollectionFolder, "Mixed").await;
+        let (series, season, movie, same_day) = (
+            Uuid::from_u128(0x281),
+            Uuid::from_u128(0x282),
+            Uuid::from_u128(0x283),
+            Uuid::from_u128(0x280),
+        );
+        let episodes = [
+            Uuid::from_u128(0x284),
+            Uuid::from_u128(0x285),
+            Uuid::from_u128(0x286),
+        ];
+        let mut rows = vec![
+            Row::new(series, BaseItemKind::Series, "Series 02", day(1), mixed),
+            Row::new(season, BaseItemKind::Season, "Season 1", day(1), mixed)
+                .under(series)
+                .of_series(series, "Series 02"),
+            Row::new(movie, BaseItemKind::Movie, "Movie 0003", day(10), mixed),
+            Row::new(same_day, BaseItemKind::Movie, "Movie 0004", day(1), mixed),
+        ];
+        rows.extend(episodes.iter().map(|id| {
+            Row::new(*id, BaseItemKind::Episode, "S1E", day(20), mixed)
+                .under(season)
+                .of_series(series, "Series 02")
+                .in_season(season)
+        }));
+        seed(&db, &rows).await;
+        let mgr = manager_with_folders(&db, vec![(mixed, None)]);
+
+        let query = LatestItemsQuery {
+            parent_id: Some(mixed),
+            limit: Some(3),
+            ..LatestItemsQuery::default()
+        };
+        assert_eq!(
+            shape(&latest(&mgr, query).await),
+            vec![
+                (None, vec![movie]),
+                (None, vec![series]),
+                (None, vec![same_day]),
+            ]
+        );
+    }
+
+    /// A parent that is neither a library nor a view (here a series) has no
+    /// collection type either, so upstream's `collectionType is null` sends it
+    /// through the `unknown` arm too: the series' one card, its newest
+    /// episode, where the plain path grouped every new episode under it.
+    #[tokio::test]
+    async fn latest_under_a_series_takes_the_unknown_arm() {
+        let db = test_db().await;
+        seed_named_item(&db, SHOWS, BaseItemKind::CollectionFolder, "Shows").await;
+        let (series, episodes, _) = seed_series_burst(&db, SHOWS).await;
+        // A series parent scopes through the ancestor closure.
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        for episode in &episodes {
+            persistence
+                .set_ancestors(*episode, &[series, SHOWS])
+                .await
+                .expect("ancestors");
+        }
+        let mgr = manager_with_folders(&db, vec![(SHOWS, Some(CollectionTypeOptions::tvshows))]);
+
+        let query = LatestItemsQuery {
+            parent_id: Some(series),
+            limit: Some(2),
+            ..LatestItemsQuery::default()
+        };
+        assert_eq!(
+            shape(&latest(&mgr, query).await),
+            vec![(Some(series), vec![episodes[9]])]
+        );
+    }
+
     /// Equal `DateCreated` (hard-linked fixtures share one btime) breaks on
-    /// `SortName DESC` — Jellyfin's `0500, 0499, …`, not the old `ASC`.
+    /// `SortName DESC` on the plain path — Jellyfin's `0500, 0499, …`, not the
+    /// old `ASC`. Ungrouped, so no arm of `GetLatestItemList` (which break ties
+    /// on `Id DESC`) takes the request; the names sort the opposite way to the
+    /// ids, so an `Id` tie-break would fail.
     #[tokio::test]
     async fn latest_breaks_date_created_ties_by_sort_name_desc() {
         let db = test_db().await;
         seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
         let ids: Vec<Uuid> = (1..=5).map(|n| Uuid::from_u128(0x400 + n)).collect();
-        let names: Vec<String> = (1..=5).map(|n| format!("Movie {n:04}")).collect();
+        let names: Vec<String> = (1..=5).map(|n| format!("Movie {:04}", 6 - n)).collect();
         let rows: Vec<Row<'_>> = ids
             .iter()
             .zip(&names)
@@ -2817,6 +2988,7 @@ mod tests {
             &mgr,
             LatestItemsQuery {
                 limit: Some(3),
+                group_items: false,
                 ..LatestItemsQuery::default()
             },
         )
@@ -2824,8 +2996,8 @@ mod tests {
         assert_eq!(
             shape(&groups),
             vec![
-                (None, vec![ids[4]]),
-                (None, vec![ids[3]]),
+                (None, vec![ids[0]]),
+                (None, vec![ids[1]]),
                 (None, vec![ids[2]]),
             ],
             "0005, 0004, 0003"
@@ -2838,6 +3010,10 @@ mod tests {
     /// date order. With `limit * 5 = 10` rows fetched the six seeded rows all
     /// reach the grouping loop — the old port cut the ITEM list at `limit`
     /// first, which could never show more than `limit` rows in total.
+    ///
+    /// The libraries are typed `musicvideos`, a type with no arm of its own:
+    /// untyped ones would take the `unknown` arm, which never reaches the
+    /// plain path's over-fetch.
     #[tokio::test]
     async fn latest_groups_episodes_under_their_series_and_stops_at_limit_groups() {
         let db = test_db().await;
@@ -2876,7 +3052,13 @@ mod tests {
             ],
         )
         .await;
-        let mgr = manager(&db);
+        let mgr = manager_with_folders(
+            &db,
+            vec![
+                (MOVIES, Some(CollectionTypeOptions::musicvideos)),
+                (SHOWS, Some(CollectionTypeOptions::musicvideos)),
+            ],
+        );
 
         let groups = latest(
             &mgr,
@@ -2993,7 +3175,8 @@ mod tests {
         )
         .await;
         // No virtual-folder manager, so the parent has no collection type and
-        // the request takes the GENERIC path — the only one that still resolves
+        // the request takes the `unknown` arm, whose rows (here every track
+        // and the music video, all from its movies half) still resolve their
         // index containers. A music-typed parent short-circuits into v12's
         // album query instead (`latest_parent_music_library_returns_newest_albums`),
         // which returns album rows and never groups anything.
@@ -3128,9 +3311,10 @@ mod tests {
             ],
         )
         .await;
-        // No virtual-folder manager: a type-less parent takes the plain query
-        // (`includeItemTypes` lifts its Video media-type default), so this is
-        // the container resolution on the non-grouped SQL path.
+        // No virtual-folder manager: a type-less parent takes the `unknown`
+        // arm (`includeItemTypes` lifts its Video media-type default), whose
+        // movies half reads the track, so this is the container resolution of
+        // a row no album query returned.
         let mgr = manager(&db);
 
         let groups = latest(
@@ -3356,11 +3540,24 @@ mod tests {
             vec![(Some(sa), vec![a_eps[11]]), (Some(sb), vec![b_new])]
         );
 
-        // The same request through a type-less parent (no virtual-folder
-        // manager) takes the plain path and stops at the 10-row over-fetch —
-        // all of it series A — which is what the grouped query exists to fix.
-        let plain = latest(
+        // A type-less parent (no virtual-folder manager) takes the `unknown`
+        // arm, whose shows half is this same answer (there are no movies).
+        let untyped = latest(
             &manager(&db),
+            LatestItemsQuery {
+                parent_id: Some(SHOWS),
+                limit: Some(2),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+        assert_eq!(shape(&untyped), shape(&groups));
+
+        // A parent of a type with no arm (`musicvideos`) takes the plain path
+        // and stops at the 10-row over-fetch — all of it series A — which is
+        // what the grouped query exists to fix.
+        let plain = latest(
+            &manager_with_folders(&db, vec![(SHOWS, Some(CollectionTypeOptions::musicvideos))]),
             LatestItemsQuery {
                 parent_id: Some(SHOWS),
                 limit: Some(2),
