@@ -13,16 +13,15 @@ use ferrofin_traits::server_settings::ServerSettingsManager;
 use serde_json::{Value, json};
 use tracing_subscriber::fmt::MakeWriter;
 
-use ferrofin_model::configuration::{ImageSavingConvention, ServerConfiguration};
+use ferrofin_model::configuration::{ServerConfiguration, TrickplayOptions};
 
 use super::{Stage, stage, to_toml};
 use crate::config::{Config, Env};
 use crate::settings::tests::{
-    DataDir, FakeConfiguration, FakeEnv, STORED_ROW, load, plugins, rows_with_a_stored_one, sample,
-    spec,
+    DataDir, FakeConfiguration, FakeEnv, STORED, load, plugins, sample, spec,
 };
 use crate::settings::{
-    FerrofinServerSettings, SAVES, SETTINGS, SettingAccess, SettingKind, SettingSpec,
+    FerrofinServerSettings, SAVES, SETTINGS, SettingAccess, SettingKind, SettingSpec, SettingStore,
 };
 
 /// Saves `changes` to `running`'s `config.toml` as a save of only
@@ -230,7 +229,10 @@ fn every_editable_setting_saves_what_a_hand_written_line_holds() {
     let env = FakeEnv::new();
     let mut seen = 0;
     for spec in SETTINGS {
-        if spec.access != SettingAccess::Editable {
+        // A row stored in the server configuration has no line: the stored
+        // rows' own tests save it.
+        if spec.access != SettingAccess::Editable || !matches!(spec.store, SettingStore::ConfigFile)
+        {
             continue;
         }
         seen += 1;
@@ -849,8 +851,7 @@ fn manager(
     (manager, lifecycle, plugins)
 }
 
-/// A manager over `data` and `configuration`, with the row stored in the
-/// server configuration that only the tests register ([`STORED_ROW`]).
+/// A manager over `data` and `configuration`.
 fn stored_manager(
     data: &DataDir,
     configuration: Arc<FakeConfiguration>,
@@ -867,8 +868,7 @@ fn stored_manager(
         plugins(data.path()),
         configuration,
     )
-    .with_env(env)
-    .with_rows(rows_with_a_stored_one());
+    .with_env(env);
     (manager, lifecycle)
 }
 
@@ -1103,24 +1103,22 @@ async fn a_row_stored_in_the_server_configuration_saves_through_it() {
     let (manager, lifecycle) = stored_manager(&data, Arc::clone(&configuration));
 
     let result = manager
-        .update(update(&[(STORED_ROW.key, json!("Compatible"))]))
+        .update(update(&[(STORED, json!("quality"))]))
         .await
         .expect("saved");
 
     assert_eq!(
         result,
         ServerSettingsUpdateResultDto {
-            applied_now: vec![STORED_ROW.key.to_owned()],
+            applied_now: vec![STORED.to_owned()],
             ..ServerSettingsUpdateResultDto::default()
         }
     );
     assert_eq!(configuration.updates(), 1);
+    let json = configuration.json();
     assert!(
-        configuration
-            .json()
-            .contains(r#""ImageSavingConvention":"Compatible""#),
-        "{}",
-        configuration.json()
+        json.contains(r#""Qscale":2"#) && json.contains(r#""FullChroma":true"#),
+        "{json}"
     );
     assert!(!lifecycle.has_pending_restart(), "a restart was marked");
     assert!(!data.config_file().exists(), "config.toml was written");
@@ -1129,9 +1127,9 @@ async fn a_row_stored_in_the_server_configuration_saves_through_it() {
     let row = report
         .settings
         .iter()
-        .find(|setting| setting.key == STORED_ROW.key)
+        .find(|setting| setting.key == STORED)
         .expect("the stored row is reported");
-    assert_eq!(row.value, Some(json!("Compatible")));
+    assert_eq!(row.value, Some(json!("quality")));
 }
 
 /// B12: a save that changes nothing stored leaves the server configuration as
@@ -1146,8 +1144,8 @@ async fn a_save_that_changes_nothing_stored_leaves_the_configuration_byte_identi
     let (manager, _lifecycle) = stored_manager(&data, Arc::clone(&configuration));
 
     for unchanged in [
-        update(&[(STORED_ROW.key, json!("Legacy"))]),
-        update(&[(STORED_ROW.key, Value::Null)]),
+        update(&[(STORED, json!("disk"))]),
+        update(&[(STORED, Value::Null)]),
     ] {
         let result = manager.update(unchanged).await.expect("saved");
         assert_eq!(result, ServerSettingsUpdateResultDto::default());
@@ -1170,7 +1168,10 @@ async fn a_save_that_changes_nothing_stored_leaves_the_configuration_byte_identi
 #[tokio::test]
 async fn a_custom_stored_value_stays_until_its_row_is_saved() {
     let custom = ServerConfiguration {
-        image_saving_convention: ImageSavingConvention::Unrecognized(7),
+        trickplay_options: TrickplayOptions {
+            qscale: 7,
+            ..TrickplayOptions::default()
+        },
         ..ServerConfiguration::default()
     };
     let configuration = FakeConfiguration::new(custom);
@@ -1191,16 +1192,16 @@ async fn a_custom_stored_value_stays_until_its_row_is_saved() {
     let row = report
         .settings
         .iter()
-        .find(|setting| setting.key == STORED_ROW.key)
+        .find(|setting| setting.key == STORED)
         .expect("the stored row is reported");
     assert!(row.custom, "{row:?}");
-    assert_eq!(row.value, Some(json!("7")));
+    assert_eq!(row.value, Some(json!("Qscale 7, 4:2:0")));
 
     let result = manager
-        .update(update(&[(STORED_ROW.key, Value::Null)]))
+        .update(update(&[(STORED, Value::Null)]))
         .await
         .expect("saved");
-    assert_eq!(result.applied_now, [STORED_ROW.key]);
+    assert_eq!(result.applied_now, [STORED]);
     assert_eq!(
         configuration.json(),
         FakeConfiguration::new(ServerConfiguration::default()).json()
@@ -1220,19 +1221,16 @@ async fn a_save_naming_both_stores_is_all_or_nothing() {
     let err = manager
         .update(update(&[
             ("db_pool", json!(4)),
-            (STORED_ROW.key, json!("Sideways")),
+            (STORED, json!("Sideways")),
         ]))
         .await
         .expect_err("refused");
     assert_eq!(
         refused(err),
-        "`image_saving_convention` takes one of Legacy, Compatible"
+        "`trickplay_image_quality` takes one of disk, quality"
     );
     let err = manager
-        .update(update(&[
-            ("db_pool", json!(0)),
-            (STORED_ROW.key, json!("Compatible")),
-        ]))
+        .update(update(&[("db_pool", json!(0)), (STORED, json!("quality"))]))
         .await
         .expect_err("refused");
     assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
@@ -1245,10 +1243,7 @@ async fn a_save_naming_both_stores_is_all_or_nothing() {
     let failing = FakeConfiguration::failing(ServerConfiguration::default());
     let (manager, lifecycle) = stored_manager(&data, failing);
     let err = manager
-        .update(update(&[
-            ("db_pool", json!(4)),
-            (STORED_ROW.key, json!("Compatible")),
-        ]))
+        .update(update(&[("db_pool", json!(4)), (STORED, json!("quality"))]))
         .await
         .expect_err("the update failed");
     assert!(matches!(err, ServiceError::Backend(_)), "{err:?}");
@@ -1261,14 +1256,11 @@ async fn a_save_naming_both_stores_is_all_or_nothing() {
 
     let (manager, lifecycle) = stored_manager(&data, Arc::clone(&configuration));
     let result = manager
-        .update(update(&[
-            ("db_pool", json!(4)),
-            (STORED_ROW.key, json!("Compatible")),
-        ]))
+        .update(update(&[("db_pool", json!(4)), (STORED, json!("quality"))]))
         .await
         .expect("saved");
     assert_eq!(result.changed, ["db_pool"]);
-    assert_eq!(result.applied_now, [STORED_ROW.key]);
+    assert_eq!(result.applied_now, [STORED]);
     assert!(result.restart_required);
     assert!(lifecycle.has_pending_restart());
     assert_eq!(contents(&data), "db_pool = 4\n");
@@ -1285,11 +1277,11 @@ async fn a_stored_row_saves_over_a_broken_config_toml() {
     std::fs::write(data.config_file(), "db_pool = [[[").expect("break config.toml");
 
     let result = manager
-        .update(update(&[(STORED_ROW.key, json!("Compatible"))]))
+        .update(update(&[(STORED, json!("quality"))]))
         .await
         .expect("saved");
 
-    assert_eq!(result.applied_now, [STORED_ROW.key]);
+    assert_eq!(result.applied_now, [STORED]);
     assert_eq!(configuration.updates(), 1);
     assert_eq!(contents(&data), "db_pool = [[[");
     assert!(!lifecycle.has_pending_restart());
@@ -1305,10 +1297,7 @@ async fn the_server_configuration_is_read_only_once_config_toml_is_staged() {
     let (manager, _lifecycle) = stored_manager(&data, Arc::clone(&configuration));
 
     let err = manager
-        .update(update(&[
-            ("db_pool", json!(0)),
-            (STORED_ROW.key, json!("Compatible")),
-        ]))
+        .update(update(&[("db_pool", json!(0)), (STORED, json!("quality"))]))
         .await
         .expect_err("refused");
     assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
@@ -1319,10 +1308,7 @@ async fn the_server_configuration_is_read_only_once_config_toml_is_staged() {
     );
 
     manager
-        .update(update(&[
-            ("db_pool", json!(4)),
-            (STORED_ROW.key, json!("Compatible")),
-        ]))
+        .update(update(&[("db_pool", json!(4)), (STORED, json!("quality"))]))
         .await
         .expect("saved");
     assert_eq!(configuration.reads(), 1);

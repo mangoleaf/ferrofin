@@ -73,7 +73,7 @@ fn saved() -> ServerSettingsUpdateResultDto {
         changed: vec!["log_level".to_owned(), "scan_probe_concurrency".to_owned()],
         restart_required: true,
         process_restart_required: vec!["log_level".to_owned()],
-        applied_now: vec!["image_saving_convention".to_owned()],
+        applied_now: vec!["trickplay_image_quality".to_owned()],
     }
 }
 
@@ -396,7 +396,7 @@ async fn an_admin_saves_changes_and_gets_what_was_saved() {
             "Changed": ["log_level", "scan_probe_concurrency"],
             "RestartRequired": true,
             "ProcessRestartRequired": ["log_level"],
-            "AppliedNow": ["image_saving_convention"]
+            "AppliedNow": ["trickplay_image_quality"]
         })
     );
     let update = fake.last_update().expect("the manager got the update");
