@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use ferrofin_core::FerrofinPluginManager;
 use ferrofin_core::FerrofinUserManager;
+use ferrofin_core::event_manager::FerrofinEventManager;
 use ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore;
 use ferrofin_model::secret::Secret;
 use ferrofin_traits::external_identities::ExternalIdentity;
@@ -219,6 +220,9 @@ fn config() -> LdapConfig {
 /// The user manager with LDAP-Auth registered, over a fake directory.
 struct Harness {
     users: Arc<FerrofinUserManager>,
+    /// The bus `users` announces renames and policy saves on (no consumer
+    /// until a test subscribes one).
+    events: FerrofinEventManager,
     identities: Arc<FerrofinExternalIdentityStore>,
     plugins: Arc<FerrofinPluginManager>,
     directory: FakeDirectory,
@@ -244,7 +248,9 @@ impl Harness {
             .await
             .expect("connect");
         db.run_migrations().await.expect("migrations");
-        let users = Arc::new(FerrofinUserManager::new(db.clone()));
+        let events = FerrofinEventManager::new();
+        let users =
+            Arc::new(FerrofinUserManager::new(db.clone()).with_events(Arc::new(events.clone())));
         let identities = Arc::new(FerrofinExternalIdentityStore::new(db));
         let plugins_dir = tempfile::tempdir().expect("tempdir");
         let extensions: Vec<Arc<dyn Extension>> = vec![Arc::new(LdapAuthExtension)];
@@ -270,6 +276,7 @@ impl Harness {
         ))]);
         Self {
             users,
+            events,
             identities,
             plugins,
             directory,
@@ -560,6 +567,27 @@ async fn a_returning_user_is_found_by_uid_and_follows_a_directory_rename() {
         .expect("created");
     assert_eq!(first.username, "Ada Lovelace");
 
+    // Upstream's `RenameUser` publishes `UserUpdatedEventArgs` from inside the
+    // plugin's `Authenticate`: the rename is announced once. Signed in by her
+    // stored name, the sign-in holds her own login lock meanwhile, and a
+    // consumer that reads her back through the manager, as the push and the
+    // device check do, lets it finish.
+    let announced = Arc::new(Mutex::new(Vec::new()));
+    let (reader, sink) = (Arc::clone(&harness.users), Arc::clone(&announced));
+    harness.events.subscribe(
+        ferrofin_core::user_updated::USER_UPDATED_EVENT,
+        Arc::new(move |payload: &str| {
+            let id: Uuid = serde_json::from_str(payload).expect("a user id");
+            let (reader, sink) = (Arc::clone(&reader), Arc::clone(&sink));
+            Box::pin(async move {
+                let user = reader.get_user_by_id(id).await?.expect("the user");
+                reader.get_user_dto(&user, None).await?;
+                sink.lock().unwrap().push(user.username);
+                Ok(())
+            })
+        }),
+    );
+
     // The directory renames her; her uid stays.
     harness.answer(vec![entry(
         ADA_DN,
@@ -569,15 +597,19 @@ async fn a_returning_user_is_found_by_uid_and_follows_a_directory_rename() {
             ("mail", "ada@example.org"),
         ],
     )]);
-    let renamed = harness
-        .sign_in("ada", ADA_PASSWORD)
-        .await
-        .expect("sign in")
-        .expect("signed in");
+    let renamed = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        harness.sign_in("Ada Lovelace", ADA_PASSWORD),
+    )
+    .await
+    .expect("the sign-in does not wait on its own announcement")
+    .expect("sign in")
+    .expect("signed in");
     assert_eq!(renamed.id, first.id, "the same account");
     assert_eq!(renamed.username, "Ada King");
     assert_eq!(harness.user("Ada Lovelace").await, None);
     assert_eq!(harness.links().await.len(), 1);
+    assert_eq!(*announced.lock().unwrap(), ["Ada King"]);
 }
 
 #[tokio::test]
