@@ -2073,8 +2073,9 @@ impl FerrofinLibraryManager {
 /// handled, is [`crate::item_deletion`]'s.
 impl FerrofinLibraryManager {
     /// A stored path with Jellyfin's `%AppDataPath%`/`%MetadataPath%` tokens
-    /// expanded (an adopted collection's or playlist's folder is stored that
-    /// way); Ferrofin's own rows carry resolved paths.
+    /// expanded (a collection's or playlist's folder is stored that way, an
+    /// adopted one's and one Ferrofin created alike); Ferrofin's other rows
+    /// carry resolved paths.
     fn expand_path(&self, stored: &str) -> String {
         self.app_paths.as_ref().map_or_else(
             || stored.to_owned(),

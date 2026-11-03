@@ -334,8 +334,14 @@ async fn an_adopted_library_is_reused() {
     lab.seed_jellyfin_library("Sammlungen").await;
     let box_set = lab.create("Heist").await;
     assert_eq!(box_set.parent_id, Some(guid_to_db(id(FOLDER_ID))));
+    // Stored as `AddChild`'s save stores it (gl-941), and read back here as
+    // stored: the lab's repository expands nothing.
     assert_eq!(
-        box_set.path,
+        box_set.path.as_deref(),
+        Some("%AppDataPath%/collections/Heist [boxset]")
+    );
+    assert_eq!(
+        lab.expander.expand_opt(box_set.path.as_deref()),
         Some(format!("{}/Heist [boxset]", lab.collections_str()))
     );
     assert_eq!(lab.library_names().await, ["Sammlungen"]);
@@ -364,7 +370,16 @@ async fn a_location_above_the_directory_is_the_folder() {
 
     let box_set = lab.create("Heist").await;
     assert_eq!(box_set.parent_id, Some(guid_to_db(above)));
-    assert_eq!(box_set.path, Some(format!("{data}/Heist [boxset]")));
+    // `ReverseVirtualPath` tokenises the data directory wherever the box set
+    // lies in it.
+    assert_eq!(
+        box_set.path.as_deref(),
+        Some("%AppDataPath%/Heist [boxset]")
+    );
+    assert_eq!(
+        lab.expander.expand_opt(box_set.path.as_deref()),
+        Some(format!("{data}/Heist [boxset]"))
+    );
     assert_eq!(lab.library_names().await, Vec::<String>::new());
 }
 

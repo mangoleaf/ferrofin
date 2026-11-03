@@ -2701,13 +2701,16 @@ pub const VERIFIED: &[Verified] = &[
                CommaDelimitedCollectionModelBinder ids; parentId bound and unused, as \
                upstream) → ferrofin-core collection_manager.rs create_collection \
                (CollectionManager.CreateCollectionAsync: new_box_set_folder_and_id for the \
-               [boxset] folder and AddChild's path-derived id, AddToCollectionAsync's refusal \
+               [boxset] folder and AddChild's path-derived id, its Path stored through \
+               VirtualPathExpander::reverse as AddChild's save stores it, \
+               %AppDataPath%/collections/<name> [boxset] (BaseItemMapper.Map → \
+               GetPathToSave → ReverseVirtualPath), AddToCollectionAsync's refusal \
                of an id naming no item after the box set is stored) and \
                ensure_collections_folder → collections_library.rs (EnsureLibraryFolder: \
                physical_folder for FindFolders, ensure_library for AddVirtualFolder with its \
                LibraryOptions, ensure_folder for the Folder row ValidateTopLibraryFolders \
                makes)",
-        date: "2026-10-30",
+        date: "2026-11-03",
         divergences: &[
             "A missing name makes a box set with an empty name, where upstream's \
          GetValidFilename dereferences the null and answers 500. Jellyfin bug not ported.",
@@ -3039,10 +3042,13 @@ pub const VERIFIED: &[Verified] = &[
                (PlaylistManager.CreatePlaylist: playlists_folder → item_persistence_service \
                playlists_folder_by_type, GetPlaylistsFolder's by-type lookup; \
                infer_media_type, require_user, \
-               new_playlist_folder_and_id, then report_item_added for AddChild's \
+               new_playlist_folder_and_id, its Path stored through \
+               VirtualPathExpander::reverse as AddChild's save stores it, \
+               %AppDataPath%/playlists/<name> (BaseItemMapper.Map → GetPathToSave → \
+               ReverseVirtualPath), then report_item_added for AddChild's \
                ItemAdded; playlist_items for AddToPlaylistInternal and \
                Playlist.GetPlaylistItems)",
-        date: "2026-10-28",
+        date: "2026-11-03",
         divergences: &[
             "A request with neither a body nor a name query is a 400; upstream's \
          GetValidFilename(null) throws a NullReferenceException (500). Jellyfin bug not \

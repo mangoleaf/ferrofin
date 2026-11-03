@@ -1738,14 +1738,15 @@ impl FerrofinItemPersistenceService {
         Ok(())
     }
 
-    /// The `Path` an adopted row stores, when the save of `item` must keep
+    /// The `Path` a tokenised row stores, when the save of `item` must keep
     /// it: Jellyfin stores a path in its data or metadata directory as
-    /// `%AppDataPath%/…` or `%MetadataPath%/…` (`ReverseVirtualPath`), and
-    /// every read expands it (`FerrofinItemRepository`'s rows, as
-    /// `BaseItemMapper.Map`), so a row read and saved back carries the
-    /// expansion. Ferrofin writes resolved paths (`virtual_paths`), so the
-    /// stored token form is kept only while it still expands to the path
-    /// saved; a path the save changes is written as given.
+    /// `%AppDataPath%/…` or `%MetadataPath%/…` (`ReverseVirtualPath`), and so
+    /// does Ferrofin for the box sets and playlists it creates, and every read
+    /// expands it (`FerrofinItemRepository`'s rows, as `BaseItemMapper.Map`),
+    /// so a row read and saved back carries the expansion. Ferrofin writes
+    /// other paths resolved (`virtual_paths`), so the stored token form is
+    /// kept only while it still expands to the path saved; a path the save
+    /// changes is written as given.
     ///
     /// Reads the stored path only for a path inside one of those directories
     /// (one a token could stand for): a media item's save reads nothing more.
