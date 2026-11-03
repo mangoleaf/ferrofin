@@ -25,12 +25,13 @@
 //! - `CreateSplashscreen` builds `{DataPath}/splashscreen.png` (see
 //!   [`crate::splashscreen`]). `GetImageBlurHash` is implemented (decode → 128x128 resize → BlurHash-encode);
 //!   its output is valid but not byte-identical to Skia's (see the method doc).
-//! - A JPEG headed for a blur hash or a smaller `EncodeImage` output is decoded
-//!   at the smallest DCT scale (1/8, 1/4, 1/2) that still covers the target
-//!   (twice the target for `EncodeImage`, `THUMBNAIL_DECODE_FACTOR`), as
-//!   Skia's codec decodes it for upstream's blur hash, so its full-size bitmap
-//!   is never built (see `scaled_jpeg`). Other formats, and targets no reduced
-//!   scale covers, decode in full.
+//! - A JPEG headed for a blur hash, a smaller `EncodeImage` output, a collage
+//!   cell or a splashscreen tile is decoded at the smallest DCT scale (1/8,
+//!   1/4, 1/2) that still covers the target (twice the target for everything
+//!   but the blur hash, `THUMBNAIL_DECODE_FACTOR`), as Skia's codec decodes it
+//!   for upstream's blur hash, so its full-size bitmap is never built (see
+//!   `scaled_jpeg`). Other formats, and targets no reduced scale covers,
+//!   decode in full.
 //! - Every decode and resize runs under [`ImageLimits`] ([`crate::limits`]),
 //!   which upstream has no counterpart for. An image they refuse is
 //!   [`ServiceError::InvalidInput`], and the processor serves the original.
@@ -430,20 +431,8 @@ impl ImageCrateEncoder {
             return Ok(input_path.to_owned());
         }
 
-        let new_size = get_new_image_size(options, original);
-
-        let decoded = source.decode_covering(memory, input_path, new_size)?;
-        // A full decode measures the upright image itself. When it differs
-        // from what the header read planned with (an EXIF orientation stored
-        // after the frame header, which the header read cannot see), plan from
-        // the decoded image, as this path always did.
-        let upright = image_dimensions(&decoded.image);
-        let new_size = if decoded.full_size && upright != original {
-            get_new_image_size(options, upright)
-        } else {
-            new_size
-        };
-        let resized = Self::resize_exact(memory, &decoded.image, new_size)?;
+        let resized =
+            source.resize_to(memory, input_path, |size| get_new_image_size(options, size))?;
         Self::write(
             &resized,
             output_path,
@@ -629,9 +618,10 @@ impl ImageCrateEncoder {
     }
 }
 
-/// The input of [`ImageCrateEncoder::encode_image_blocking`]: a JPEG whose
-/// header alone has been read, so it can still decode at a reduced scale once
-/// the target size is known, or an image already decoded in full.
+/// The input of [`ImageCrateEncoder::encode_image_blocking`] and
+/// [`decode_resized`]: a JPEG whose header alone has been read, so it can
+/// still decode at a reduced scale once the target size is known, or an image
+/// already decoded in full.
 enum EncodeSource {
     /// A JPEG `jpeg-decoder` handles (boxed: its decoder state is large).
     /// `orientation` is the EXIF orientation to apply, `None` when the caller
@@ -708,6 +698,48 @@ impl EncodeSource {
         }
         full_decode(memory, path, orientation.is_some()).map(full_size)
     }
+
+    /// The image resized with Lanczos3 to the size `target_of` gives for its
+    /// upright size, decoded through [`Self::decode_covering`].
+    ///
+    /// A full decode measures the upright image itself. When it differs from
+    /// what the header read planned with (an EXIF orientation stored after the
+    /// frame header, which the header read cannot see), the size is planned
+    /// again from the decoded image.
+    fn resize_to(
+        self,
+        memory: &ImageMemory,
+        path: &str,
+        target_of: impl Fn(ImageDimensions) -> ImageDimensions,
+    ) -> Result<DynamicImage, ServiceError> {
+        let planned = self.dimensions();
+        let target = target_of(planned);
+        let decoded = self.decode_covering(memory, path, target)?;
+        let upright = image_dimensions(&decoded.image);
+        let target = if decoded.full_size && upright != planned {
+            target_of(upright)
+        } else {
+            target
+        };
+        ImageCrateEncoder::resize_exact(memory, &decoded.image, target)
+    }
+}
+
+/// The image at `path` as stored (no EXIF orientation, as upstream's
+/// `SkiaEncoder.Decode(path, false, null, out _)` decodes collage and
+/// splashscreen sources), resized with Lanczos3 to the target `target_of`
+/// gives for its size.
+///
+/// A JPEG is sized from its header and decoded at the smallest DCT scale that
+/// still covers [`THUMBNAIL_DECODE_FACTOR`] times the target, as
+/// [`ImageEncoder::encode_image`] decodes one; anything else decodes in full.
+/// Upstream decodes in full and resizes; the size drawn is the same either way.
+pub(crate) fn decode_resized(
+    memory: &ImageMemory,
+    path: &str,
+    target_of: impl Fn(ImageDimensions) -> ImageDimensions,
+) -> Result<DynamicImage, ServiceError> {
+    EncodeSource::open(memory, path, false)?.resize_to(memory, path, target_of)
 }
 
 /// An image [`EncodeSource::decode_covering`] produced.
@@ -779,6 +811,9 @@ fn full_decode(
 /// for any thumbnail at most a quarter of the source's width and height.
 /// Lossless PNG output stays softer than the full decode's, about 9 dB further
 /// from that reference (median), where 1 cost about 15 dB.
+///
+/// Collage cells and splashscreen tiles, the same Lanczos3 shrink, decode at
+/// this factor too ([`decode_resized`], gl-1056).
 ///
 /// Not a setting (owner decision): the blur hash, whose 128 px input is
 /// blurred anyway, decodes at a factor of 1.
@@ -1149,7 +1184,8 @@ const COLLAGE_QUALITY: i32 = 90;
 /// each cell `width/2 × height/2`. Port of
 /// `StripCollageBuilder.BuildSquareCollageBitmap`; [`next_valid`] wraps, so
 /// fewer than four images repeat, and an image the limits refuse is skipped
-/// like an undecodable one.
+/// like an undecodable one. A JPEG is decoded at a reduced scale covering
+/// twice its cell ([`decode_resized`]).
 fn build_square_collage(
     memory: &ImageMemory,
     paths: &[String],
@@ -1158,6 +1194,7 @@ fn build_square_collage(
 ) -> RgbaImage {
     let cell_w = (width / 2).max(1);
     let cell_h = (height / 2).max(1);
+    let cell_size = ImageDimensions::new(cell_w, cell_h);
     let mut canvas = RgbaImage::new(
         u32::try_from(width).unwrap_or(1),
         u32::try_from(height).unwrap_or(1),
@@ -1167,15 +1204,7 @@ fn build_square_collage(
     for x in 0..2 {
         for y in 0..2 {
             let scaled = next_valid(paths, index, &mut |path| {
-                let decoded = memory.decode(path).ok()?;
-                memory
-                    .resize_exact(
-                        &decoded,
-                        u32::try_from(cell_w).unwrap_or(1),
-                        u32::try_from(cell_h).unwrap_or(1),
-                        imageops::FilterType::Lanczos3,
-                    )
-                    .ok()
+                decode_resized(memory, path, |_| cell_size).ok()
             });
             let Some((cell, next)) = scaled else {
                 index = paths.len();
@@ -1197,7 +1226,8 @@ fn build_square_collage(
 /// black rectangle at alpha `0x78`. Port of
 /// `StripCollageBuilder.BuildThumbCollageBitmap` without its library-name text
 /// (TODO(gl-804): the text needs a font rasterizer and a bundled font). An image
-/// the limits refuse is skipped like an undecodable one.
+/// the limits refuse is skipped like an undecodable one. A JPEG is decoded at a
+/// reduced scale covering twice the size it is drawn at ([`decode_resized`]).
 fn build_thumb_collage(
     memory: &ImageMemory,
     paths: &[String],
@@ -1211,19 +1241,18 @@ fn build_thumb_collage(
     );
 
     let backdrop = next_valid(paths, 0, &mut |path| {
-        let decoded = memory.decode(path).ok()?;
-        // resize to the same aspect as the original (C# width * h / w), in i64:
-        // the product overflows an i32 for an image far taller than it is wide.
-        let backdrop_height =
-            i64::from(width) * i64::from(decoded.height()) / i64::from(decoded.width().max(1));
-        memory
-            .resize_exact(
-                &decoded,
-                u32::try_from(width).unwrap_or(1),
-                u32::try_from(backdrop_height.max(1)).unwrap_or(u32::MAX),
-                imageops::FilterType::Lanczos3,
+        decode_resized(memory, path, |source| {
+            // resize to the same aspect as the original (C# width * h / w), in
+            // i64: the product overflows an i32 for an image far taller than
+            // it is wide.
+            let backdrop_height =
+                i64::from(width) * i64::from(source.height) / i64::from(source.width.max(1));
+            ImageDimensions::new(
+                width,
+                i32::try_from(backdrop_height.max(1)).unwrap_or(i32::MAX),
             )
-            .ok()
+        })
+        .ok()
     });
     if let Some((resized, _)) = backdrop {
         imageops::overlay(&mut canvas, &resized.to_rgba8(), 0, 0);
@@ -1695,6 +1724,38 @@ mod tests {
         assert!(
             bottom_blue > 180 && bottom_red < 60,
             "bottom {bottom_red}/{bottom_blue}"
+        );
+    }
+
+    /// gl-1056: a collage cell or splashscreen tile of a JPEG is sized from
+    /// the image as stored (its EXIF orientation is not applied, as upstream's
+    /// `Decode(path, false, null, …)` does not) and comes out the size and
+    /// look of a full decode. It is decoded at a reduced DCT scale covering
+    /// twice it (here 1/4, 400x300 for a 200x150 cell), which
+    /// `tests/image_decode_memory.rs` sees through the heap.
+    #[test]
+    fn a_jpeg_collage_cell_is_drawn_as_stored_like_the_full_decode() {
+        let dir = TempDir::new().expect("tempdir");
+        let input = jpeg_fixture(
+            &dir,
+            "photo.jpg",
+            &smooth_photo(1600, 1200),
+            Some(&ORIENTATION_6_EXIF),
+        );
+        let cell = decode_resized(&ImageMemory::default(), &input, |source| {
+            ImageDimensions::new(source.width / 8, source.height / 8)
+        })
+        .expect("decodes")
+        .to_rgb8();
+        let full = image::open(&input)
+            .expect("decodes")
+            .resize_exact(200, 150, imageops::FilterType::Lanczos3)
+            .to_rgb8();
+        assert_eq!(cell.dimensions(), (200, 150));
+        let diff = mean_abs_diff(cell.as_raw(), full.as_raw());
+        assert!(
+            diff < 2.0,
+            "mean difference {diff} levels from the full decode"
         );
     }
 
