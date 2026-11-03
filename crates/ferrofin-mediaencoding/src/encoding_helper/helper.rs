@@ -1793,11 +1793,27 @@ const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// times an embedded sidecar right, where upstream's progressive command,
 /// without `-copyts`, shifts it).
 ///
-/// Second divergence, where the sync is available: a burned-in sidecar is not
-/// seeked but read from its start, and the overlay draws each bitmap at its
-/// own time and drops those already over. Seeked and synced, ffmpeg (9.0.1,
-/// measured) decodes the bitmaps but never draws them. A subtitle on screen
-/// at the seek point is then drawn too, which a seek would skip.
+/// Second divergence (gl-1200): a bitmap sidecar (`.sup`, VobSub), embedded or
+/// burned in, is not seeked but read from its start, on every ffmpeg. Its
+/// start time is its first cue. Seeked with the media file's `-ss`, ffmpeg
+/// adds that start time to the target without `-copyts`, and the `.sup`
+/// demuxer's seek lands inside a display set; seeked to the media file's seek
+/// point with no start time added (`-ss` with `-seek_timestamp`), a seek
+/// before the first cue fails and loses that display set (gl-929). Seeked
+/// like the media file and synced, an embed from 1, 3 or 9 s kept only the
+/// end segment of the first display set after the start, so that subtitle
+/// never showed (ffmpeg 5.1.9, 6.1.1, 8.1.3-Jellyfin and 9.0.2, a `.sup` with
+/// cues at 3.5-8 s and 10.5-14 s), and a burned-in one was decoded but never
+/// drawn (9.0.1). Read from its start, a burned-in sidecar's overlay draws
+/// each bitmap at its own time, the one on screen at the seek point too, and
+/// drops those already over. Embedded, the display sets before the start, the
+/// one on screen included (gl-1215), are cut on the output side
+/// ([`embedded_sidecar_trim_arguments`](super::bitstream::embedded_sidecar_trim_arguments)).
+/// Reading a large sidecar from its start does not overflow ffmpeg's muxing
+/// queue: a 61 MB `.sup` embedded and burned in from 590 s completed on those
+/// four builds, the first box after the start whole. The measurements used
+/// `.sup` files; a VobSub, whose start time is its first cue too, takes the
+/// same form.
 ///
 /// Third divergence (gl-929): an ffmpeg older than 5.1 has no `-isync`, and
 /// one whose version cannot be read counts as the oldest supported, as for
@@ -1806,32 +1822,30 @@ const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// bitmap sidecar earlier by its first cue's time and seeked it that much too
 /// far: embedded, its cues came 3.5 s early; burned into a segment seeked to
 /// 9 s, the box was never drawn (a `.sup` with cues at 3.5-8 s and 10.5-14 s).
-/// A bitmap sidecar there, embedded or burned in, is read from its start with
-/// `-seek_timestamp 1`, which keeps ffmpeg from offsetting its timeline by its
-/// start time, and moved back by the media file's seek (`-itsoffset -<ss>`),
-/// which puts it on the media file's clock for a movie that starts at 0. It is
-/// not seeked: a seek before its first cue fails and loses that display set
-/// (a box from 3.5 s, seeked to 1 or 3 s, was never drawn) and one after can
-/// land inside a display set. Measured on ffmpeg 4.4.2 and 9.0.2 from 1, 3
-/// and 9 s, embedded and burned in; embedded, the cues before the start are
-/// cut on the output side
-/// ([`embedded_sidecar_trim_arguments`](super::bitstream::embedded_sidecar_trim_arguments)).
-/// A text sidecar reports no start time and keeps upstream's seeked form, and
-/// so does an external audio track.
+/// A bitmap sidecar there, read from its start, takes `-seek_timestamp 1`,
+/// which keeps ffmpeg from offsetting its timeline by its start time, and is
+/// moved back by the media file's seek (`-itsoffset -<ss>`). Measured on
+/// ffmpeg 4.4.2 and 9.0.2 from 1, 3 and 9 s, embedded and burned in. A text
+/// sidecar reports no start time and keeps upstream's seeked form, and so
+/// does an external audio track.
 ///
-/// TODO(gl-1200): `-isync` and `-seek_timestamp` differ for a movie whose own
-/// timeline does not start at 0 (an MPEG-TS): `-isync` puts the sidecar on the
-/// movie's absolute clock, `-seek_timestamp` on its time since the start. And
-/// from 5.1 an embedded bitmap sidecar is still seeked, past the start by its
-/// first cue's time, so cues starting in between are lost. Fix path: read
-/// every bitmap sidecar unseeked on every version, once the clock a TS movie's
-/// sidecar follows is decided. Under `-copyts -start_at_zero`, which no
-/// stream route binds yet (gl-1040), the pre-5.1 form is wrong as well:
-/// `-seek_timestamp` no longer cancels the sidecar's start time there (with or
-/// without the `-itsoffset`), where `-isync` still does.
+/// The clock: where `-isync` exists, a bitmap sidecar follows the media file's
+/// absolute timestamps, as upstream keeps it wherever it copies timestamps
+/// (`-copyts` without `-start_at_zero` for an external graphical subtitle);
+/// without it, the time since the media file's start. The two agree for a
+/// movie whose timeline starts at 0 (Matroska, MP4) and differ by its start
+/// time otherwise (an MPEG-TS). TODO(gl-1214): one clock on every ffmpeg,
+/// the owner's choice. The absolute clock needs the media file's container
+/// start time, which the server does not store, for
+/// `-itsoffset -(<ss> + start)` before 5.1; the since-start clock means the
+/// pre-5.1 form on every version. Under
+/// `-copyts -start_at_zero`, which no stream route binds yet (gl-1040), the
+/// pre-5.1 form is wrong as well: `-seek_timestamp` no longer cancels the
+/// sidecar's start time there (with or without the `-itsoffset`), where
+/// `-isync` still does.
 ///
-/// A seeked sidecar can still bring a cue from before the seek; the embed
-/// drops it on the output side
+/// A seeked text sidecar can still bring a cue from before the seek; the
+/// embed drops it on the output side
 /// ([`embedded_sidecar_trim_arguments`](super::bitstream::embedded_sidecar_trim_arguments)).
 #[must_use]
 pub fn external_stream_input_arguments(
@@ -1881,10 +1895,9 @@ pub fn external_stream_input_arguments(
         ]);
         let bitmap = !sub.is_text_subtitle_stream();
         let burned_in = should_encode_subtitle(state) && bitmap;
-        // Read from its start (see the divergences): a burned-in bitmap where
-        // `-isync` exists, and any bitmap where it does not.
-        let unseeked = if can_sync { burned_in } else { bitmap };
-        if !unseeked {
+        // A bitmap sidecar is read from its start, embedded or burned in, on
+        // every ffmpeg (see the divergences).
+        if !bitmap {
             seek(&mut args);
         }
         if burned_in {
