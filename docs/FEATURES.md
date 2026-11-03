@@ -149,8 +149,10 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     renames) and a failed Replace keeps the old images; Jellyfin deletes them all first.
     After the trickplay widths (`WidthResolutions`) or the chroma (`FullChroma`) change, the
     next Generate Trickplay Images run replaces the images that no longer match the same way,
-    then removes the widths earlier runs made that are no longer selected, once the selected
-    ones exist; Jellyfin keeps old images until a Replace. Only that run reads the existing
+    then removes the widths no longer selected that Ferrofin made, once the selected ones
+    exist: those of earlier runs, and those a library scan or an item refresh made after a
+    change; Jellyfin keeps old images until a Replace. A run with no width selected checks
+    nothing, and the next change still removes the old widths. Only that run reads the existing
     tiles, and it counts as done only when every video's images match, so an interrupted
     run, or one that could not replace a set, checks again next time. A `Qscale` or JPEG
     quality edited by hand still needs a Replace, as in Jellyfin. Upgrading records the

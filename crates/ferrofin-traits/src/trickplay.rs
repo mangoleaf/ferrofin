@@ -34,10 +34,11 @@ use crate::error::ServiceError;
 /// finished. Ferrofin's own: upstream never replaces images unasked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrickplayCheck {
-    /// The `WidthResolutions` the last finished pass ran under, and those of
-    /// any checking pass started since that did not finish. A stored width
-    /// among them that is no longer selected is removed once every selected
-    /// width has its images.
+    /// The `WidthResolutions` the last finished pass ran under, those of any
+    /// checking pass started since that did not finish, and those of sets
+    /// made since under other settings (a library scan, an item refresh). A
+    /// stored width among them that is no longer selected is removed once
+    /// every selected width has its images.
     pub previous_widths: Vec<i32>,
     /// The settings this pass runs under, in the implementation's own
     /// encoding, recorded by [`TrickplayManager::finish_trickplay_pass`].
@@ -85,7 +86,9 @@ pub trait TrickplayManager: Send + Sync {
     /// widths or chroma differ from those the last finished pass ran under, so
     /// this pass checks every item's images through
     /// [`Self::check_trickplay_data`], as when a checking pass started since
-    /// did not finish. `None` when they are unchanged, or when none are
+    /// did not finish, or as when sets were made under other settings since.
+    /// `None` when they are unchanged, when no width is selected (nothing is
+    /// made or removed, and the recorded settings stay), or when none are
     /// recorded yet (they are recorded now, and nothing is checked). The
     /// default never checks.
     async fn begin_trickplay_pass(&self) -> Result<Option<TrickplayCheck>, ServiceError> {
