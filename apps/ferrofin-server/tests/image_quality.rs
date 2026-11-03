@@ -1,5 +1,5 @@
-//! The quality a re-encoded image is written at, over the real router and
-//! composition root.
+//! The quality a re-encoded image is written at, and when a stored image is
+//! served without re-encoding, over the real router and composition root.
 //!
 //! Upstream encodes an item, by-name or user image at `quality ?? 100`
 //! (v12.2 `ImageController.GetImageInternal`) and the splashscreen at a fixed
@@ -23,17 +23,24 @@ const ADMIN_PASSWORD: &str = "image-quality-admin-pw";
 const MOVIE: &str = "movies/Crimson Square (1963)/Crimson Square (1963).mkv";
 
 /// Writes a 64×64 gradient PNG, so a JPEG re-encode has detail to quantize.
+/// It is written unfiltered, so a PNG re-encode with the encoder's default
+/// (adaptive) filter does not reproduce the stored bytes.
 fn write_png(path: &Path) {
+    use image::ImageEncoder as _;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+
     std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-    image::RgbImage::from_fn(64, 64, |x, y| {
+    let gradient = image::RgbImage::from_fn(64, 64, |x, y| {
         image::Rgb([
             u8::try_from(x * 4).expect("byte"),
             u8::try_from(y * 4).expect("byte"),
             128,
         ])
-    })
-    .save(path)
-    .expect("png");
+    });
+    let file = std::fs::File::create(path).expect("png file");
+    PngEncoder::new_with_quality(file, CompressionType::Default, FilterType::NoFilter)
+        .write_image(&gradient, 64, 64, image::ExtendedColorType::Rgb8)
+        .expect("png");
 }
 
 /// A booted server that scanned one movie with a `poster.png`, and a session.
@@ -174,6 +181,35 @@ async fn item_images_encode_at_100_and_the_splashscreen_at_90() {
         first_quant_table(&splash)[0],
         3,
         "the splashscreen is encoded at 90"
+    );
+}
+
+/// A size bound the stored image already meets leaves it as it is: with no
+/// fill requested, `HasDefaultOptions`' lifted `int?` fill check passes and
+/// `ProcessImage` serves the stored file (gl-1117).
+#[tokio::test]
+async fn an_image_already_within_its_bounds_is_served_as_stored() {
+    let Fixture {
+        wired: _wired,
+        _temp: temp,
+        router,
+        token,
+        movie,
+    } = fixture().await;
+    let stored =
+        std::fs::read(temp.path().join(MOVIE).with_file_name("poster.png")).expect("stored poster");
+    let (status, poster) = call(
+        &router,
+        "GET",
+        &format!("/Items/{movie}/Images/Primary?maxWidth=2000"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        poster == stored,
+        "a 64-wide poster under maxWidth=2000 is re-encoded"
     );
 }
 

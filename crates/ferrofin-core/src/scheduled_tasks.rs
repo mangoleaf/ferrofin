@@ -59,6 +59,11 @@ pub(crate) fn interval_hours(hours: i64) -> TaskTriggerInfo {
 /// task's first run off the boot critical path.
 const STARTUP_TRIGGER_DELAY: Duration = Duration::from_secs(3);
 
+/// How long [`FerrofinTaskManager::shutdown`] waits for each cancelled run to
+/// stop before recording it `Aborted`: upstream's `task.Wait(2000)` in
+/// `ScheduledTaskWorker.Dispose`.
+const SHUTDOWN_RUN_WAIT: Duration = Duration::from_secs(2);
+
 /// How long after startup an interval task that has **never completed** first
 /// becomes due — upstream's `IntervalTrigger.Start` arms `now.AddHours(1)` when
 /// `lastResult is null`, rather than waiting a whole interval.
@@ -237,8 +242,9 @@ struct Registration {
     triggers_override: Option<Vec<TaskTriggerInfo>>,
     /// The running task's live progress handle (meaningful while `Running`).
     progress: TaskProgress,
-    /// Abort handle for a queued (spawned) run, so `cancel` can stop it.
-    abort: Option<tokio::task::AbortHandle>,
+    /// The queued (spawned) run, so `cancel` can stop it and shutdown can
+    /// wait for it to stop.
+    run: Option<tokio::task::JoinHandle<()>>,
     /// When the current run was claimed (meaningful while `Running`).
     started_at: Option<DateTime<Utc>>,
     /// The running invocation's own time limit: the `MaxRuntimeTicks` of the
@@ -374,6 +380,10 @@ pub struct FerrofinTaskManager {
     /// [`Failed`](TaskCompletionStatus::Failed) is recorded as a `TaskFailed`
     /// dashboard Alert (port of upstream's `TaskCompletedLogger`).
     activity: Arc<Mutex<Option<Arc<dyn ferrofin_traits::activity::ActivityManager>>>>,
+    /// Set by [`shutdown`](Self::shutdown): no run starts after it, and the
+    /// scheduler fires nothing (upstream's disposed worker, its triggers
+    /// disposed). Written and read under the `tasks` lock.
+    shut_down: Arc<AtomicBool>,
 }
 
 /// Capacity of the [`TaskUpdates`] transitions broadcast; a fixed constant,
@@ -640,7 +650,7 @@ impl FerrofinTaskManager {
             last_result,
             triggers_override,
             progress: TaskProgress::default(),
-            abort: None,
+            run: None,
             started_at: None,
             run_max_ticks: None,
             trigger_fires: HashMap::new(),
@@ -852,7 +862,7 @@ impl FerrofinTaskManager {
         if let Some(reg) = guard.get_mut(key) {
             reg.state = TaskState::Idle;
             reg.last_result = Some(result);
-            reg.abort = None;
+            reg.run = None;
             reg.started_at = None;
             reg.run_max_ticks = None;
         }
@@ -1002,10 +1012,14 @@ impl FerrofinTaskManager {
         ));
         let mut guard = lock(&self.tasks);
         if let Some(reg) = guard.get_mut(key) {
-            // The spawned run may already have finished (state back to Idle);
-            // only track the handle while it is still the live run.
+            // Track the handle while it is still the live run. Otherwise the
+            // run either finished (aborting it is a no-op) or was stopped
+            // (cancelled, or the registry shut down) between `claim` and here,
+            // before its handle was stored: abort it so it cannot outlive that.
             if reg.state == TaskState::Running {
-                reg.abort = Some(handle.abort_handle());
+                reg.run = Some(handle);
+            } else {
+                handle.abort();
             }
         }
         Ok(())
@@ -1026,6 +1040,11 @@ impl FerrofinTaskManager {
         if reg.state == TaskState::Running {
             return Err(ServiceError::invalid_input(format!(
                 "scheduled task {key} is already running"
+            )));
+        }
+        if self.shut_down.load(Ordering::Acquire) {
+            return Err(ServiceError::unavailable(format!(
+                "scheduled task {key} cannot start: the server is shutting down"
             )));
         }
         reg.state = TaskState::Running;
@@ -1083,6 +1102,49 @@ impl FerrofinTaskManager {
         self.stop_run(key, TaskCompletionStatus::Cancelled)
     }
 
+    /// Ends the registry with its host: port of `TaskManager.Dispose`, which
+    /// disposes each `ScheduledTaskWorker`. From here on no run starts and the
+    /// scheduler fires nothing (`DisposeTriggers`); each running run is
+    /// cancelled, waited on for at most [`SHUTDOWN_RUN_WAIT`], and recorded as
+    /// [`Aborted`](TaskCompletionStatus::Aborted), which jellyfin-web shows as
+    /// "Aborted by server shutdown".
+    ///
+    /// Requests queued behind a busy task are dropped, where upstream's
+    /// completion path would start them on the workers it is disposing. A run
+    /// that finished on its own while being waited on keeps its own result
+    /// (upstream records Aborted over it).
+    pub async fn shutdown(&self) {
+        let running: Vec<(String, Option<tokio::task::JoinHandle<()>>)> = {
+            let mut guard = lock(&self.tasks);
+            self.shut_down.store(true, Ordering::Release);
+            guard
+                .iter_mut()
+                .filter(|(_, reg)| reg.state == TaskState::Running)
+                .map(|(key, reg)| (key.clone(), reg.run.take()))
+                .collect()
+        };
+        // `claim` refusing is the guarantee; clearing the queue (and the
+        // sweep's early return) keeps those refusals out of the log.
+        lock(&self.busy_queue).clear();
+        // Every run is cancelled before any is waited on, so the runs stop
+        // together rather than one wait after another.
+        for (key, run) in &running {
+            tracing::info!(task = key, "cancelling scheduled task for shutdown");
+            if let Some(run) = run {
+                run.abort();
+            }
+        }
+        for (key, run) in running {
+            // A `run_now` run belongs to its caller: there is nothing to wait on.
+            if let Some(run) = run
+                && tokio::time::timeout(SHUTDOWN_RUN_WAIT, run).await.is_err()
+            {
+                tracing::warn!(task = key, "timed out waiting for scheduled task to stop");
+            }
+            let _ = self.stop_run(&key, TaskCompletionStatus::Aborted);
+        }
+    }
+
     /// Aborts a running task's spawned run, recording `status`, and returns it
     /// to [`Idle`](TaskState::Idle).
     fn stop_run(&self, key: &str, status: TaskCompletionStatus) -> Result<(), ServiceError> {
@@ -1093,8 +1155,8 @@ impl FerrofinTaskManager {
         if reg.state != TaskState::Running {
             return Ok(());
         }
-        if let Some(abort) = reg.abort.take() {
-            abort.abort();
+        if let Some(run) = reg.run.take() {
+            run.abort();
         }
         let start = reg.started_at.take().unwrap_or_else(Utc::now);
         reg.run_max_ticks = None;
@@ -1169,7 +1231,7 @@ impl FerrofinTaskManager {
     ///
     /// Fires each registered task's `StartupTrigger`s after
     /// [`STARTUP_TRIGGER_DELAY`], then evaluates daily/weekly/interval triggers
-    /// every [`SCHEDULER_PERIOD`] and aborts runs that exceed their trigger's
+    /// every [`SCHEDULER_PERIOD`] and cancels runs that exceed their trigger's
     /// `max_runtime_ticks`. Call once from the composition root; a task
     /// registered afterwards fires its own startup trigger from
     /// [`register`](Self::register).
@@ -1212,13 +1274,16 @@ impl FerrofinTaskManager {
         })
     }
 
-    /// One scheduler pass: queue tasks whose triggers are due and abort runs
-    /// past their max runtime.
+    /// One scheduler pass: queue tasks whose triggers are due and cancel runs
+    /// past their max runtime. Does nothing once the registry is shut down.
     fn scheduler_sweep(&self, scheduler_start: DateTime<Utc>, now: DateTime<Utc>) {
         let mut due: Vec<(String, Option<i64>)> = Vec::new();
         let mut overrun: Vec<String> = Vec::new();
         {
             let mut guard = lock(&self.tasks);
+            if self.shut_down.load(Ordering::Acquire) {
+                return;
+            }
             for (key, reg) in guard.iter_mut() {
                 let triggers = reg.effective_triggers();
                 if reg.state == TaskState::Running
@@ -1247,9 +1312,15 @@ impl FerrofinTaskManager {
                 }
             }
         }
+        // Upstream's `CancelAfter(MaxRuntimeTicks)` surfaces in the run as an
+        // `OperationCanceledException`, recorded as Cancelled; Aborted is what
+        // a shutdown records ([`Self::shutdown`]).
         for key in overrun {
-            tracing::warn!(task = key, "scheduled task exceeded max runtime; aborting");
-            let _ = self.stop_run(&key, TaskCompletionStatus::Aborted);
+            tracing::warn!(
+                task = key,
+                "scheduled task exceeded max runtime; cancelling"
+            );
+            let _ = self.stop_run(&key, TaskCompletionStatus::Cancelled);
         }
         for (key, max_ticks) in due {
             tracing::info!(task = key, "trigger fired; queueing scheduled task");
@@ -1554,8 +1625,10 @@ impl ScheduledTask for RefreshLibraryTask {
             .library
             .run_library_scan(trigger, Some(Arc::new(move |percent| sink.report(percent))))
             .await?;
-        // Stopped (the host shutting down) or refused (already shut down):
-        // cancelled, not completed.
+        // Stopped by the library manager's own shutdown or refused (already
+        // shut down): cancelled, not completed. A host shutdown never gets
+        // here: the task registry's `shutdown` aborts this run first and
+        // records it Aborted.
         if !finished {
             progress.stopped();
         }
@@ -3287,7 +3360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_fires_startup_triggers_and_aborts_overruns() {
+    async fn scheduler_fires_startup_triggers_and_cancels_overruns() {
         let mgr = FerrofinTaskManager::new();
         let runs = Arc::new(AtomicU32::new(0));
         mgr.register(Arc::new(StartupTask { runs: runs.clone() }));
@@ -3300,8 +3373,9 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         handle.abort();
 
-        // Overrun abort: a hung run whose trigger caps runtime is aborted by a
-        // sweep once the cap has passed.
+        // Overrun: a hung run whose trigger caps runtime is stopped by a sweep
+        // once the cap has passed, and recorded as Cancelled (upstream's
+        // `CancelAfter` surfaces as `OperationCanceledException`).
         let mgr = FerrofinTaskManager::new();
         let gate = Arc::new(tokio::sync::Notify::new());
         mgr.register(Arc::new(GatedTask { gate }));
@@ -3322,13 +3396,13 @@ mod tests {
         assert_eq!(info.state, TaskState::Idle);
         assert_eq!(
             info.last_execution_result.expect("result").status,
-            TaskCompletionStatus::Aborted
+            TaskCompletionStatus::Cancelled
         );
     }
 
     /// `TaskOptions.MaxRuntimeTicks` belongs to the invocation the trigger
     /// starts: a manual run, or a run started by a trigger with no limit, is
-    /// never aborted because another trigger of the task has one, and a run
+    /// never stopped because another trigger of the task has one, and a run
     /// queued behind a busy task keeps its own trigger's limit.
     #[tokio::test]
     async fn a_runs_time_limit_is_the_firing_triggers_not_the_tasks() {
@@ -3368,16 +3442,108 @@ mod tests {
         assert_eq!(info.state, TaskState::Idle);
         assert_eq!(
             info.last_execution_result.expect("result").status,
-            TaskCompletionStatus::Aborted
+            TaskCompletionStatus::Cancelled
         );
 
-        // A run the unlimited trigger starts is not aborted.
+        // A run the unlimited trigger starts is not stopped.
         mgr.queue_scheduled("gated", "schedule", None)
             .expect("queued");
         settle().await;
         mgr.scheduler_sweep(hour_ago, Utc::now());
         assert_eq!(mgr.get("gated").expect("info").state, TaskState::Running);
         mgr.cancel("gated").expect("cancel");
+    }
+
+    /// `ScheduledTaskWorker.Dispose`: a run the shutdown cuts off is recorded
+    /// as Aborted (jellyfin-web: "Aborted by server shutdown") and kept for
+    /// the next boot; an idle task gets no result; and nothing starts
+    /// afterwards, neither a request nor a due trigger nor one queued behind
+    /// the busy task.
+    #[tokio::test]
+    async fn shutdown_records_a_running_task_as_aborted_and_starts_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("task_results.json");
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_result_store(store.clone());
+        mgr.register(Arc::new(GatedTask {
+            gate: Arc::new(tokio::sync::Notify::new()),
+        }));
+        let runs = Arc::new(AtomicU32::new(0));
+        mgr.register(Arc::new(CountingTask {
+            runs: runs.clone(),
+            fail: false,
+            hidden: false,
+        }));
+        let due_now = TaskTriggerInfo {
+            type_: TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(TICKS_PER_SECOND),
+            ..TaskTriggerInfo::default()
+        };
+        mgr.set_triggers("counting", &[due_now]).expect("set");
+        mgr.queue("gated").expect("queued");
+        mgr.queue_scheduled("gated", "schedule", None)
+            .expect("remembered");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        mgr.shutdown().await;
+
+        let info = mgr.get("gated").expect("info");
+        assert_eq!(info.state, TaskState::Idle);
+        assert_eq!(
+            info.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Aborted
+        );
+        assert!(
+            mgr.get("counting")
+                .expect("info")
+                .last_execution_result
+                .is_none()
+        );
+        assert!(mgr.queue("counting").is_err());
+        mgr.scheduler_sweep(Utc::now() - chrono::Duration::days(1), Utc::now());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(mgr.get("gated").expect("info").state, TaskState::Idle);
+        assert_eq!(mgr.get("counting").expect("info").state, TaskState::Idle);
+
+        let next_boot = FerrofinTaskManager::new();
+        next_boot.set_result_store(store);
+        next_boot.register(Arc::new(GatedTask {
+            gate: Arc::new(tokio::sync::Notify::new()),
+        }));
+        let restored = next_boot
+            .get("gated")
+            .expect("info")
+            .last_execution_result
+            .expect("restored result");
+        assert_eq!(restored.status, TaskCompletionStatus::Aborted);
+    }
+
+    /// A run with no spawned handle (`run_now`, which runs in its caller) is
+    /// recorded as Aborted by shutdown too, as upstream records any running
+    /// worker whatever started it.
+    #[tokio::test]
+    async fn shutdown_records_a_run_now_run_as_aborted() {
+        let mgr = FerrofinTaskManager::new();
+        mgr.register(Arc::new(GatedTask {
+            gate: Arc::new(tokio::sync::Notify::new()),
+        }));
+        let caller = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.run_now("gated").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(mgr.get("gated").expect("info").state, TaskState::Running);
+
+        mgr.shutdown().await;
+
+        let info = mgr.get("gated").expect("info");
+        assert_eq!(info.state, TaskState::Idle);
+        assert_eq!(
+            info.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Aborted
+        );
+        caller.abort();
     }
 
     #[tokio::test]

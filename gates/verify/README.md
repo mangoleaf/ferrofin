@@ -51,7 +51,7 @@ FERROFIN_TOKEN=… gates/verify/scan-behaviour.sh BASE_URL LIBRARY_ID SCRATCH_DI
   folder becomes the scratch series, so it must sit directly under the root and be named
   with the `Ferrofin Verify` prefix (`Ferrofin Verify Show`, say); the script refuses any
   other name, and a folder a real series already occupies (one named otherwise, or with
-  provider ids).
+  provider ids). It writes the series' `tvshow.nfo` there before its first scan.
 - `SERVER_SCRATCH_DIR` is the same folder as the server sees it, when that differs: a
   container or a sandbox that mounts the library somewhere else.
 - `--clip FILE` gives a small real video to copy as the scratch media. By default the
@@ -83,14 +83,14 @@ during the run makes rows fail that did nothing wrong.
 
 ## What it does to the server
 
-It writes only its own scratch files under `SCRATCH_DIR`: one-second clips, their NFOs, a
-1×1 poster and a subtitle sidecar. It edits the metadata of its own scratch items only. On
-exit (a failure or an interrupt included) it deletes every file it created and nothing
-else, lists anything else it finds left in the folder (a file the server's NFO or artwork
-savers wrote there; only once the folder was found empty, so a refusal never lists the
-contents of a folder it was wrongly given), and queues a library refresh so the server
-prunes the scratch items. The token's header file goes with the script's temporary
-directory on every exit, a second Ctrl-C during that refresh included.
+It writes only its own scratch files under `SCRATCH_DIR`: one-second clips, their NFOs (and
+a TV library's `tvshow.nfo`), a 1×1 poster and a subtitle sidecar. It edits the metadata of
+its own scratch items only. On exit (a failure or an interrupt included) it deletes every
+file it created and nothing else, lists anything else it finds left in the folder (a file
+the server's NFO or artwork savers wrote there; only once the folder was found empty, so a
+refusal never lists the contents of a folder it was wrongly given), and queues a library
+refresh so the server prunes the scratch items. The token's header file goes with the
+script's temporary directory on every exit, a second Ctrl-C during that refresh included.
 
 In a TV library one thing stays behind: the scratch folder is the scratch series, and the
 folder is not the script's to delete, so after the run an empty series with its name stays
@@ -107,39 +107,64 @@ the rows would see requests a correct server makes. So every scratch NFO has a t
 plot, a community rating and a critic rating, and the movies, the series and one episode a
 trailer. The field row 7 clears is the official rating, which none of those checks reads.
 
+The series' NFO goes in before the library refresh that precedes the rows, so that refresh
+reads it: a new series at its first refresh, one an earlier run left behind once the NFO is
+more than a minute newer than its last save (the NFO reader's rule). No later scan would. A
+series or season is never refreshed because its folder changed: as upstream, where a
+directory's file-system metadata carries no times, a folder item stores no `DateModified`,
+so `BaseItem.RequiresRefresh` never fires for it. So in a TV library only the episodes are
+ever updated: no file coming or going in a season's or the series' folder refreshes it. The
+series' `DateLastMediaAdded` still follows its newest episode, a column the scan's closing
+pass writes by itself and counts as no update (Jellyfin saves the whole series for it:
+gl-1182).
+
 ## The rows
 
 | # | Scenario | Asserted |
 |---|---|---|
-| 1 | first scan of new items (library refresh) | created = the scratch items, nothing removed, nothing updated (in a TV library, the scratch series an earlier run left behind is refreshed once and not created), one probe per clip, provider requests when the library's remote fetchers are on (none when off); in a TV library, the scratch series has no provider ids |
+| 1 | first scan of new items (library refresh) | created = the scratch items (in a TV library the season and its episodes: the series came before the rows), nothing removed, nothing updated, one probe per clip, provider requests when the library's remote fetchers are on (none when off, and none in a TV library); in a TV library, the scratch series has no provider ids |
 | 2 | rescan, nothing changed | 0 created, updated or removed; 0 probes; 0 provider requests |
 | 3 | touch one file's mtime, rescan | 1 updated, 1 probe, providers per the fetchers |
 | 4 | NFO rewritten more than a minute after the last save | 1 updated, 0 probes, 0 provider requests, the new plot served |
-| 5 | `POST /Library/Media/Updated`: a new file | 1 created, 1 probe; in a TV library the season may update (its folder changed) |
-| 6 | the same webhook: the file deleted | 1 removed, 0 probes, 0 provider requests, gone from `/Items` |
+| 5 | `POST /Library/Media/Updated`: a new file | 1 created, nothing updated, 1 probe |
+| 6 | the same webhook: the file deleted | 1 removed, nothing updated, 0 probes, 0 provider requests, gone from `/Items` |
 | 7 | editor save of Overview and a cleared official rating (no LockData), rescan | nothing updated, 0 probes, 0 provider requests; the edits kept, `LockData` false |
-| 8 | "Search for missing metadata" on the item | the edited Overview kept, the cleared official rating filled (from the NFO) |
+| 8 | "Search for missing metadata" on the item | the edited Overview kept, the cleared official rating filled (from the NFO), unless row 7's editor save rewrote that NFO without it (below): then it stays cleared |
 | 9 | "Replace all metadata", Overview unlocked | the Overview replaced |
 | 10 | Overview in `LockedFields`, "Replace all metadata" | the locked Overview kept, the unlocked rating replaced |
-| 11 | `LockData=true`, a new local poster, the file touched, rescan | the poster discovered; 1 probe, 0 provider requests (unlocked, the touch alone would ask them, as row 3 shows when the fetchers are on) |
+| 11 | `LockData=true`, a new local poster, the file touched, rescan | the poster discovered; 1 updated, 1 probe, 0 provider requests (unlocked, the touch alone would ask them, as row 3 shows when the fetchers are on) |
 | 12 | the locked item's file touched again, rescan | 1 probe, 0 provider requests; name, overview, trailers and rating unchanged |
-| 13 | an episode's edited premiere date and year (TV only), quiet rescan, then a sidecar subtitle | unchanged by the rescan (nothing created or updated, 0 probes, 0 provider requests) and by the re-probe save (1 probe, 0 provider requests). Only fields the episode's NFO does not carry: the re-probe makes the server run the local readers too, so the NFO's own fields (its ratings) are the NFO's again after that save |
+| 13 | an episode's edited premiere date and year (TV only), quiet rescan, then a sidecar subtitle | unchanged by the rescan (nothing created or updated, 0 probes, 0 provider requests) and by the re-probe save (1 updated, 1 probe, 0 provider requests). Only fields the episode's NFO does not carry: the re-probe makes the server run the local readers too, so the NFO's own fields (its ratings) are the NFO's again after that save |
 
 Rows 5 and 6 wait the server's `LibraryMonitorDelay` (60 s by default) before their scans
 run. Row 4 runs after them, to let the NFO rule's minute pass meanwhile.
+
+Whether row 7's editor save writes the NFO the scan reads is the NFO saver's choice, as
+upstream's `ProviderManager.IsSaverEnabledForItem` makes it; the script prints it. With the
+library's metadata savers chosen (the dashboard saves a list, empty unless "Nfo" is ticked),
+the save writes it when "Nfo" is among them. With none chosen (as `run.sh`'s libraries), it
+never does when the server disables the Nfo saver for the item's type, and otherwise does
+when the library saves metadata into media folders or the saver's file already exists. An
+episode's saver file is the episode's own NFO, which the script made, so a TV library made
+like `run.sh`'s rewrites it; a movie's is `movie.nfo`, which nothing made (once written, the
+scan reads it before the movie's own NFO). A rewritten NFO also changes rows 9 and 10: "Replace all
+metadata" runs no local reader for an item a saver will rewrite, so with the fetchers off the
+overview and the rating come back empty there, which both rows accept.
 
 Whether the library's remote fetchers are "on" is read from its saved metadata-downloader
 choices for the scratch items' kinds (a movie; or a series, its seasons and its episodes, as
 the choice is per kind): on when any of them ticks one, off when every one of them saved an
 empty choice. Otherwise it is unknown and the rows do not check provider requests: a kind
 with no saved choice follows the server-wide one. OMDb ticked alone counts as on
-because it now uses a shared API key by default.
+because it now uses a shared API key by default. With the fetchers on, the providers must
+be reachable: a request that fails (an unreachable network, say) leaves the item's refresh
+unrecorded, as upstream does, so every later scan asks again and the quiet rows fail.
 
-In a TV library the rows check for 0 provider requests, whatever the fetchers, on every row
-but the first. An episode's (and a season's) remote lookup starts from its series' provider
-ids, and the scratch series has none. Row 1 fails and stops the run if it gets some: its
-name search can pin a real show, and then no later row could expect 0. Row 1's own requests
-(the new series searching for its match) are not checked when the fetchers are on.
+In a TV library the rows check for 0 provider requests, whatever the fetchers, on every row.
+An episode's (and a season's) remote lookup starts from its series' provider ids, and the
+scratch series has none. A new series searches for its match in the library refresh before
+the rows, which is not checked; row 1 fails and stops the run if the series got provider
+ids there: the name search can pin a real show, and then no later row could expect 0.
 
 ## Output
 
@@ -165,9 +190,13 @@ scans do. They cover:
   fail when a request is missing or stray;
 - OMDb ticked alone ("on" with its shared key), with every scratch NFO checked for the fields the
   enriched checks read;
-- a TV library with its fetchers on (every row but the first expects 0), a stray episode
-  request, a scratch series that matched a real show (the run stops after row 1), and one
-  with only the series fetchers ticked (on, not off);
+- a TV library with its fetchers on (every row expects 0; the new series' search, in the
+  refresh before the rows, is not counted), a stray episode request in row 1 and in a later
+  row, a scratch series that matched a real show (the run stops after row 1), and one with
+  only the series fetchers ticked (on, not off);
+- row 8 under each NFO saver choice: none chosen in a TV library (the edit rewrote the
+  episode's NFO, so a refilled rating fails), chosen without "Nfo" (the rating must be
+  refilled), the server disabling Nfo for episodes, and a movies library with "Nfo" ticked;
 - options with leading zeros;
 - SIGINT mid-run (exit 130), and a second SIGINT during the cleanup.
 
@@ -187,6 +216,26 @@ bats gates/verify/tests
 ```
 
 ## Test record
+
+2026-11-02, a debug build of `release/v1.5.0` (`9d90a9fc`) with this check, each library on
+a fresh server: a new data directory, the library made as `run.sh` makes it (real-time
+monitoring off, metadata and image fetchers off), outbound HTTP to an unreachable proxy.
+
+- **Movies** library: 12 PASS, 1 SKIP, exit 0.
+- **Shows** library: 13 PASS, exit 0. The check as it stood before failed row 1 here
+  (`updated 0 (want = 1)`), and with row 1 corrected, row 8 (`the cleared official rating
+  was not filled`): both expectations predate two parity ports, folder items without a
+  `DateModified` (a changed folder refreshes no series or season) and the NFO saver
+  (an editor save rewrites an episode's existing NFO).
+- The NFO saver's choices, each on a fresh server: a **Shows** library whose savers were
+  chosen with "Nfo" unticked (`MetadataSavers: []`), 13 PASS, row 8 refilling the rating
+  (`PG`); a **Movies** library with "Nfo" ticked, 12 PASS, 1 SKIP, row 8 leaving it cleared
+  and the saver's two `movie.nfo` files listed as left behind.
+- **Shows** library with TheMovieDb ticked for series, seasons and episodes and the network
+  reachable: 13 PASS, exit 0; the one request was the new series' search, in the refresh
+  before the rows. With the network unreachable instead, row 1 fails with `updated 1` and
+  one provider request: the failed search leaves the series' refresh unrecorded, so row 1's
+  scan refreshes it again and asks again.
 
 2026-09-28, a release build of branch `feat/scan-change-detection` with this check. The
 server ran in a `bwrap` sandbox on a disposable reflink copy of the bench corpus config

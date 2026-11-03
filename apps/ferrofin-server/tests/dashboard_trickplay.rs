@@ -171,17 +171,41 @@ async fn scan_extraction_flag_and_live_timing_change_refresh_completion_without_
         1,
         "normal refresh reuses generated data"
     );
+    // The stub writes the same frame every time, so the set's folder tells the
+    // old set from the new one: the swap renames a new folder in.
+    let set = fixture.internal_root().join("2 - 1x1");
+    let inode = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .ok()
+            .map(|meta| std::os::unix::fs::MetadataExt::ino(&meta))
+    };
+    let old_set = inode(&set);
+    assert!(
+        old_set.is_some(),
+        "the first extraction wrote the internal 2 - 1x1 set"
+    );
     fixture.set_behavior("NonBlocking").await;
     fixture.hold();
     let before = fixture.refresh("FullRefresh", true).await;
     fixture.wait_extractions(2).await;
+    // NonBlocking saves while the replacement job is still held, and the old
+    // tiles keep serving until the new ones are swapped in.
     fixture.wait_etag(&before).await;
     assert_eq!(
         fixture.tile(2).await.status(),
-        404,
-        "NonBlocking saves while the replacement job is still held"
+        200,
+        "the old tiles serve while the replacement job is held"
     );
+    assert_eq!(inode(&set), old_set, "the old set is untouched while held");
     fixture.release();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while inode(&set).is_none_or(|ino| Some(ino) == old_set) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the released replacement was never swapped in"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     fixture.wait_tile(2).await;
     fixture.options["ExtractTrickplayImagesDuringLibraryScan"] = json!(false);
     fixture.save_options().await;

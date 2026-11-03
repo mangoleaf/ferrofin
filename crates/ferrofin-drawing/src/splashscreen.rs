@@ -8,15 +8,20 @@
 //!
 //! Like upstream's `canvas.DrawBitmap` with default sampling, the wall is
 //! sampled nearest-neighbour through the matrix.
+//!
+//! A JPEG poster or backdrop is decoded at a reduced DCT scale that still
+//! covers twice its tile ([`decode_resized`]), where upstream decodes it in
+//! full; the tile is the same size either way.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
 use std::rc::Rc;
 
+use ferrofin_model::drawing::ImageDimensions;
 use ferrofin_traits::error::ServiceError;
 use image::{Rgba, RgbaImage, imageops};
 
-use crate::image_encoder::next_valid;
+use crate::image_encoder::{decode_resized, next_valid};
 use crate::limits::ImageMemory;
 
 /// The output frame (`FinalWidth`/`FinalHeight`).
@@ -66,21 +71,8 @@ fn generate_collage(
         scaled
             .entry(path.to_owned())
             .or_insert_with(|| {
-                let image = memory.decode(path).ok()?;
-                let height = image.height().max(1);
-                let width = (u64::from(row_height) * u64::from(image.width()) / u64::from(height))
-                    .clamp(1, u64::from(WALL_WIDTH));
-                Some(Rc::new(
-                    memory
-                        .resize_exact(
-                            &image,
-                            u32::try_from(width).unwrap_or(WALL_WIDTH),
-                            row_height,
-                            imageops::FilterType::Lanczos3,
-                        )
-                        .ok()?
-                        .to_rgba8(),
-                ))
+                let tile = decode_resized(memory, path, |source| tile_size(source, row_height));
+                Some(Rc::new(tile.ok()?.to_rgba8()))
             })
             .clone()
     };
@@ -108,6 +100,20 @@ fn generate_collage(
         }
     }
     Ok(wall)
+}
+
+/// The size an image of size `source` is drawn at in a row `row_height` high:
+/// that height, and the width that keeps its aspect, at most the wall's.
+fn tile_size(source: ImageDimensions, row_height: u32) -> ImageDimensions {
+    let source_width = u64::try_from(source.width).unwrap_or(0);
+    let source_height = u64::try_from(source.height).unwrap_or(0).max(1);
+    let width =
+        (u64::from(row_height) * source_width / source_height).clamp(1, u64::from(WALL_WIDTH));
+    // Both are at most the wall's size, so neither saturates.
+    ImageDimensions::new(
+        i32::try_from(width).unwrap_or(i32::MAX),
+        i32::try_from(row_height).unwrap_or(i32::MAX),
+    )
 }
 
 /// Port of `Transform3D`: each frame pixel's centre is mapped back through the
@@ -172,6 +178,25 @@ fn random_below(bound: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
+
+    /// A tile is the row's height and keeps its source's aspect, at least 1
+    /// and at most the wall wide.
+    #[rstest]
+    #[case::poster(2000, 3000, 240)]
+    #[case::backdrop(3840, 2160, 640)]
+    #[case::wider_than_the_wall(65_535, 1, WALL_WIDTH)]
+    #[case::rounds_to_nothing(1, 65_535, 1)]
+    fn a_tile_keeps_its_aspect_in_a_row(
+        #[case] width: i32,
+        #[case] height: i32,
+        #[case] tile_width: u32,
+    ) {
+        assert_eq!(
+            tile_size(ImageDimensions::new(width, height), 360),
+            ImageDimensions::new(i32::try_from(tile_width).expect("in range"), 360)
+        );
+    }
 
     /// The inverse undoes the matrix: a wall point comes back where it began.
     #[test]

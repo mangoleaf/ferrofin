@@ -598,8 +598,9 @@ async fn open_media_source(
 
 /// `MediaInfoHelper.SetDeviceSpecificData` over every source of an item: the
 /// user's policy and bitrate limit, then one [`apply_stream_decision`] each,
-/// with the track picks applied only to the version `request` names. Returns
-/// each decided source's id with its decision.
+/// with the track picks applied only to the version `request` names, and the
+/// source's attachment URLs ([`set_attachment_delivery_urls`]). Returns each
+/// decided source's id with its decision.
 #[allow(clippy::too_many_arguments)] // mirrors the C# parameter surface
 async fn set_device_specific_data(
     state: &AppState,
@@ -663,8 +664,24 @@ async fn set_device_specific_data(
         if let Some(decision) = decision {
             decisions.push((source.id.clone(), decision));
         }
+        set_attachment_delivery_urls(source, item_id);
     }
     Ok(decisions)
+}
+
+/// The tail of `SetDeviceSpecificData`: every attachment of a negotiated
+/// source is served at `/Videos/{item.Id}/{mediaSource.Id}/Attachments/{Index}`
+/// (`MediaInfoHelper.cs:350-358`), the item id in .NET's default `Guid`
+/// spelling. jellyfin-web hands each font's URL to its subtitle renderer.
+fn set_attachment_delivery_urls(source: &mut MediaSourceInfo, item_id: Uuid) {
+    let source_id = source.id.as_deref().unwrap_or_default();
+    for attachment in &mut source.media_attachments {
+        attachment.delivery_url = Some(format!(
+            "/Videos/{}/{source_id}/Attachments/{}",
+            item_id.as_hyphenated(),
+            attachment.index
+        ));
+    }
 }
 
 /// The media source `UniversalAudioController.GetUniversalAudioStream` acts
