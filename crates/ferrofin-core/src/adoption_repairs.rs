@@ -3433,15 +3433,17 @@ const CONFLICTING_GROUPS: &str = r#"SELECT "ItemId", "UserId" FROM "UserData"
 /// the next one; the groups already harmonized no longer conflict and drop
 /// out of the query.
 ///
-/// This is a one-time pass, like upstream's routine. The scanner's and the
-/// runtime's folds (`rekey_items`, `merge_one`) resolve history per key and
-/// can leave an item's keys disagreeing again later — and so can the boot
-/// repairs that re-key items after [`run_all`] (`run_rehome_local_versions`
-/// and `run_rekey_virtual_seasons`, called from
-/// `apps/ferrofin-server/src/state.rs`, which fold through [`rekey_rows`]).
-/// Every save brings them back into agreement, as upstream's
-/// `SaveUserData` does (`FerrofinUserDataManager::mutate_row`); keeping a fold itself
-/// in agreement is open work item gl-714.
+/// This is a one-time pass, like upstream's routine. Later disagreement is
+/// settled where it arises. Every save brings the user's rows of the item
+/// into agreement, as upstream's `SaveUserData` does
+/// (`FerrofinUserDataManager::mutate_row`). The scanner's and the runtime's
+/// folds (`rekey_items`, `merge_one`), and the boot repair that folds after
+/// [`run_all`] (`run_rehome_local_versions`, through [`rekey_rows`]; the other
+/// re-keying repairs only move items, which leaves their rows as they were),
+/// resolve history per key and then bring each user's rows of the kept item
+/// into agreement with the row its DTO reads (`agree_user_data`). That
+/// follows the item's key order, not this routine's most recent play, so an
+/// explicit unplay under the read key stands.
 ///
 /// Returns the number of rows updated, and logs one summary when it
 /// changed something.
