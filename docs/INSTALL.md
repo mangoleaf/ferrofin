@@ -152,13 +152,16 @@ holds the database, playlists and collections:
 | `/var/lib/jellyfin/root/default/` | `{data_dir}/root/default/` | library definitions |
 | `/var/lib/jellyfin/metadata/` | `{data_dir}/metadata/` | images and downloaded metadata |
 | `/etc/jellyfin/` | `{config_dir}/` | XML configuration |
+| `/var/lib/jellyfin/plugins/configurations/LDAP-Auth.xml` | `{data_dir}/plugins/configurations/` | LDAP-Auth's settings, if Jellyfin used it |
 
 The script reads `data_dir` and `config_dir` from `/etc/ferrofin/config.toml`. The package
 sets only `data_dir`, so `config_dir` is `{data_dir}/config`; `/etc/ferrofin` keeps just
 `config.toml` and stays read-only to the service.
 
 The rest of Jellyfin's `data/` (subtitle and attachment extraction caches, backups, task
-history) is not copied, nor are `plugins/` and `Subtitle Edit/`. `root/default/` holds
+history) is not copied, nor are `plugins/` and `Subtitle Edit/`, except
+`plugins/configurations/LDAP-Auth.xml`, the LDAP-Auth plugin's settings, which Ferrofin's
+LDAP-Auth imports on the first start. `root/default/` holds
 only the library definitions (`.mblink` files naming each media path); media stays where
 it is.
 
