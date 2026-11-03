@@ -1438,11 +1438,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              Images run that finished (recorded in FerrofinMeta, and on the first boot after \
              upgrading), the next run checks every video: a set whose first tile's chroma \
              differs from the setting is regenerated and swapped in the same way, and a width \
-             an earlier run selected and the current one does not is removed once the selected \
-             widths exist. The run is recorded only when every video's sets match, so an \
-             interrupted run, or one that could not replace a set, checks again. Upstream \
-             never replaces images unasked. Deliberate divergence (owner decisions \
-             2026-11-01, D3 and D5, gl-1138).",
+             Ferrofin made sets at and the current settings do not select is removed once the \
+             selected widths exist: one an earlier run selected, or one a library scan or an \
+             item refresh made under settings other than those recorded (recorded before it is \
+             made, which also checks again after a change back). A user-placed grid stays. The \
+             run is recorded only when every video's sets match, so an interrupted run, or one \
+             that could not replace a set, checks again. A run with no width selected is no \
+             checking pass and records nothing (in a library with extraction on it makes and \
+             removes nothing), so the next change still removes the \
+             widths recorded before it. Upstream never replaces images unasked. Deliberate \
+             divergence (owner decisions 2026-11-01, D3 and D5, gl-1138; gl-1178).",
             "Importing a width's folder that has no row counts only its .jpg tiles; upstream \
              counts every file in it, so a stray file there makes the import fail on its image \
              size. Jellyfin bug not ported.",

@@ -86,11 +86,22 @@ const PASS_SETTINGS_KEY: &str = "trickplay_pass_settings";
 struct PassSettings {
     widths: Vec<i32>,
     full_chroma: bool,
-    /// Present while a checking pass started since has not finished: the
-    /// widths such passes ran under, whose sets may already be on disk. The
-    /// next run then checks again, even after a change back.
+    /// Present while sets may be on disk that the recorded settings do not
+    /// describe: the widths of checking passes started since that have not
+    /// finished, and of sets made under other settings outside a checking
+    /// pass (a library scan, an item refresh). The next run then checks
+    /// again, even after a change back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     unfinished: Option<Vec<i32>>,
+}
+
+/// A checking pass's [`TrickplayCheck::settings`]: the settings it records
+/// when it finishes, and the `unfinished` widths it wrote when it began, so a
+/// width recorded as made while it ran stays recorded.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PassCheck {
+    settings: PassSettings,
+    begun: Vec<i32>,
 }
 
 impl PassSettings {
@@ -137,6 +148,9 @@ pub struct FerrofinTrickplayManager {
     /// then finds the first one's tiles and row and skips them, and one
     /// refresh's prune never removes a folder the other has just moved in.
     item_locks: Arc<KeyedLocks>,
+    /// One read-and-write of the recorded pass settings at a time, so a set
+    /// recorded as made while a pass begins or finishes is not lost.
+    pass_settings: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinTrickplayManager {
@@ -250,6 +264,7 @@ impl FerrofinTrickplayManager {
                 tokio::sync::Semaphore::MAX_PERMITS,
             )),
             item_locks: Arc::new(KeyedLocks::new()),
+            pass_settings: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -451,6 +466,9 @@ impl FerrofinTrickplayManager {
         if ctx.save_with_media {
             probe_write_access(&output_dir)?;
         }
+        // A set the recorded settings cannot be told about is not made: the
+        // width fails and the next run tries again.
+        self.record_set_made(width, options).await?;
 
         // Generate: extract thumbnails into a temp dir, pack them into tiles.
         let _slot = self
@@ -1027,8 +1045,9 @@ impl FerrofinTrickplayManager {
             trickplay_dir: &trickplay_dir,
             save_with_media: library_options.save_trickplay_with_media,
         };
-        // On a checking pass, the widths earlier passes made, as this video
-        // narrows them, and the sets on disk before anything is regenerated.
+        // On a checking pass, the widths Ferrofin made sets at (earlier
+        // passes' and those a scan or refresh recorded), as this video narrows
+        // them, and the sets on disk before anything is regenerated.
         let previous: Option<HashSet<i32>> =
             check.zip(ctx.video_stream.as_ref()).map(|(check, stream)| {
                 check
@@ -1111,10 +1130,10 @@ impl FerrofinTrickplayManager {
 
     /// Whether an item's sets match the settings after a checking pass: each
     /// selected width's set, where it has one, at the chroma asked for, and no
-    /// width an earlier pass made left behind. A set that could not be
-    /// replaced (a failed generation, a missing file) keeps the pass from
-    /// being recorded, so the next run checks it again. A width with no set at
-    /// all does not: every run generates a missing width anyway.
+    /// width of `previous` (those Ferrofin made sets at) left behind. A set
+    /// that could not be replaced (a failed generation, a missing file) keeps
+    /// the pass from being recorded, so the next run checks it again. A width
+    /// with no set at all does not: every run generates a missing width anyway.
     async fn sets_match(
         &self,
         item_id: Uuid,
@@ -1153,10 +1172,9 @@ impl FerrofinTrickplayManager {
     /// video is never left without images; [`Self::prune_unexpected_folders`]
     /// then removes their folders. A Replace (`previous` is `None`) removes
     /// every other width, as upstream's prune-first Replace leaves none. A
-    /// checking pass removes only the widths earlier passes made, so a
-    /// user-placed grid stays. A width in no pass's widths stays until a
-    /// Replace: one a library scan made under settings changed again before
-    /// the task's next run, and one kept through a pass that selected no width.
+    /// checking pass removes only the widths Ferrofin made sets at (the
+    /// passes' widths, and those [`Self::record_set_made`] recorded), so a
+    /// user-placed grid stays.
     async fn remove_dropped_widths(
         &self,
         item_id: Uuid,
@@ -1188,7 +1206,45 @@ impl FerrofinTrickplayManager {
     /// cannot be read or written.
     pub async fn record_trickplay_settings_once(&self) -> Result<(), ServiceError> {
         let current = PassSettings::of(&self.trickplay_options().await?);
+        let _settings = self.pass_settings.lock().await;
         self.recorded_pass_settings(&current).await.map(drop)
+    }
+
+    /// Records, before a set of `width` is made under `options`, that a set
+    /// may be on disk the recorded settings do not describe: `width` joins the
+    /// `unfinished` widths unless the recorded settings already cover it (it
+    /// is among their widths, at their chroma) or it is there already. A
+    /// library scan or an item refresh after a settings change thus leaves a
+    /// set the next checking pass removes once its width is dropped, or
+    /// replaces at the chroma asked for, even after a change back. Settings
+    /// this version cannot read already check everything once and remove no
+    /// width, so they are left as they are.
+    async fn record_set_made(
+        &self,
+        width: i32,
+        options: &TrickplayOptions,
+    ) -> Result<(), ServiceError> {
+        let current = PassSettings::of(options);
+        let _settings = self.pass_settings.lock().await;
+        let Some(stored) = self.recorded_pass_settings(&current).await? else {
+            return Ok(());
+        };
+        let Ok(mut last) = serde_json::from_str::<PassSettings>(&stored) else {
+            return Ok(());
+        };
+        let covered = last.widths.contains(&width) && last.full_chroma == current.full_chroma;
+        if covered || last.unfinished.as_ref().is_some_and(|w| w.contains(&width)) {
+            return Ok(());
+        }
+        tracing::debug!(
+            width,
+            "trickplay images made under settings no pass has recorded"
+        );
+        let unfinished = last.unfinished.get_or_insert_default();
+        unfinished.push(width);
+        unfinished.sort_unstable();
+        self.db.meta_set(PASS_SETTINGS_KEY, &last.encode()?).await?;
+        Ok(())
     }
 
     /// The recorded settings of the last finished pass, recording `current`
@@ -1272,9 +1328,16 @@ impl TrickplayManager for FerrofinTrickplayManager {
 
     async fn begin_trickplay_pass(&self) -> Result<Option<TrickplayCheck>, ServiceError> {
         let current = PassSettings::of(&self.trickplay_options().await?);
+        let _settings = self.pass_settings.lock().await;
         let Some(stored) = self.recorded_pass_settings(&current).await? else {
             return Ok(None);
         };
+        // With no width selected a pass makes no set and removes none (a video
+        // keeps its images), so it checks nothing and records nothing: the
+        // next change still removes the widths recorded now.
+        if current.widths.is_empty() {
+            return Ok(None);
+        }
         // A value this version cannot read checks everything once and
         // removes no width.
         let mut last = serde_json::from_str::<PassSettings>(&stored).unwrap_or(PassSettings {
@@ -1300,10 +1363,15 @@ impl TrickplayManager for FerrofinTrickplayManager {
         unfinished.extend(&current.widths);
         unfinished.sort_unstable();
         unfinished.dedup();
+        let begun = unfinished.clone();
         self.db.meta_set(PASS_SETTINGS_KEY, &last.encode()?).await?;
+        let check = PassCheck {
+            settings: current,
+            begun,
+        };
         Ok(Some(TrickplayCheck {
             previous_widths,
-            settings: current.encode()?,
+            settings: serde_json::to_string(&check).map_err(ServiceError::backend_source)?,
         }))
     }
 
@@ -1318,7 +1386,32 @@ impl TrickplayManager for FerrofinTrickplayManager {
     }
 
     async fn finish_trickplay_pass(&self, check: &TrickplayCheck) -> Result<(), ServiceError> {
-        self.db.meta_set(PASS_SETTINGS_KEY, &check.settings).await?;
+        let PassCheck {
+            settings: mut finished,
+            begun,
+        } = serde_json::from_str(&check.settings).map_err(ServiceError::backend_source)?;
+        let _settings = self.pass_settings.lock().await;
+        // Widths recorded as made since the pass began (a scan under settings
+        // changed again meanwhile) stay recorded, so the next change still
+        // removes their sets. A width the pass began with is not told apart:
+        // a set a scan made at it mid-pass at the other chroma waits for the
+        // next settings change to be checked.
+        let made: Vec<i32> = self
+            .db
+            .meta_get(PASS_SETTINGS_KEY)
+            .await?
+            .and_then(|stored| serde_json::from_str::<PassSettings>(&stored).ok())
+            .and_then(|now| now.unfinished)
+            .into_iter()
+            .flatten()
+            .filter(|width| !begun.contains(width))
+            .collect();
+        if !made.is_empty() {
+            finished.unfinished = Some(made);
+        }
+        self.db
+            .meta_set(PASS_SETTINGS_KEY, &finished.encode()?)
+            .await?;
         Ok(())
     }
 
@@ -2822,20 +2915,118 @@ mod tests {
         );
     }
 
-    /// With no width selected, a checking pass removes nothing and counts the
-    /// video as matching, so the pass is recorded.
+    /// One Generate Trickplay Images run over `items`, as the task makes it:
+    /// a checking pass after a settings change, recorded once every item
+    /// matches, and a plain refresh otherwise.
+    async fn run_pass(r: &Rig, items: &[Uuid]) {
+        let check = r.mgr.begin_trickplay_pass().await.expect("begin");
+        let mut complete = true;
+        for item in items {
+            match &check {
+                Some(check) => {
+                    complete &= r
+                        .mgr
+                        .check_trickplay_data(*item, check, &extraction_on())
+                        .await
+                        .expect("check");
+                }
+                None => r
+                    .mgr
+                    .refresh_trickplay_data(*item, false, &extraction_on())
+                    .await
+                    .expect("refresh"),
+            }
+        }
+        if let Some(check) = check
+            && complete
+        {
+            r.mgr.finish_trickplay_pass(&check).await.expect("finish");
+        }
+    }
+
+    /// The stored widths of an item, in order.
+    async fn stored_widths(r: &Rig, item: Uuid) -> Vec<i32> {
+        let mut widths: Vec<i32> = r
+            .mgr
+            .get_trickplay_resolutions(item)
+            .await
+            .expect("rows")
+            .into_keys()
+            .collect();
+        widths.sort_unstable();
+        widths
+    }
+
+    /// A run with no width selected keeps every set and is no checking pass,
+    /// so the widths of the last pass that made sets stay recorded and the
+    /// next change still removes them.
     #[tokio::test]
-    async fn a_checking_pass_with_no_width_selected_keeps_the_images() {
+    async fn a_run_with_no_width_selected_keeps_the_widths_the_next_change_removes() {
         let db = test_db().await;
         let item = Uuid::new_v4();
         let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
         seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        run_pass(&r, &[item]).await;
+
+        r.set_options(options_2x2(&[]));
+        assert_eq!(r.mgr.begin_trickplay_pass().await.expect("begin"), None);
+        run_pass(&r, &[item]).await;
+        assert_eq!(stored_widths(&r, item).await, vec![320], "the images stay");
+
+        r.set_options(options_2x2(&[640]));
+        run_pass(&r, &[item]).await;
+        assert_eq!(stored_widths(&r, item).await, vec![640]);
+    }
+
+    /// A set made outside a checking pass (a library scan, an item refresh)
+    /// under settings other than the recorded ones is recorded as made, so a
+    /// later change removes it; under the recorded settings nothing is
+    /// written.
+    #[tokio::test]
+    async fn a_width_made_outside_a_pass_after_a_change_goes_on_the_next_change() {
+        let db = test_db().await;
+        let (item, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        run_pass(&r, &[item]).await;
+        seed_video(&db, &r, other, Some(HOUR_TICKS), None).await;
+        r.mgr
+            .refresh_trickplay_data(other, false, &extraction_on())
+            .await
+            .expect("scan under the recorded settings");
+        assert_eq!(
+            db.meta_get(super::PASS_SETTINGS_KEY)
+                .await
+                .expect("meta")
+                .as_deref(),
+            Some(r#"{"widths":[320],"full_chroma":false}"#)
+        );
+
+        r.set_options(options_2x2(&[640]));
         r.mgr
             .refresh_trickplay_data(item, false, &extraction_on())
             .await
-            .expect("first");
-        r.mgr.begin_trickplay_pass().await.expect("record");
-        r.set_options(options_2x2(&[]));
+            .expect("scan");
+        assert_eq!(stored_widths(&r, item).await, vec![320, 640]);
+        r.set_options(options_2x2(&[480]));
+        run_pass(&r, &[item, other]).await;
+        assert_eq!(stored_widths(&r, item).await, vec![480]);
+        assert_eq!(stored_widths(&r, other).await, vec![480]);
+        assert_eq!(r.mgr.begin_trickplay_pass().await.expect("begin"), None);
+    }
+
+    /// A set a scan makes while a checking pass runs, under settings changed
+    /// again since the pass began, stays recorded as made when the pass
+    /// finishes.
+    #[tokio::test]
+    async fn a_width_made_while_a_pass_runs_stays_recorded_after_it() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        run_pass(&r, &[item]).await;
+
+        r.set_options(options_2x2(&[640]));
         let check = r
             .mgr
             .begin_trickplay_pass()
@@ -2848,13 +3039,56 @@ mod tests {
                 .await
                 .expect("check")
         );
+        r.set_options(options_2x2(&[480]));
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("scan");
+        assert_eq!(stored_widths(&r, item).await, vec![480, 640]);
+        r.set_options(options_2x2(&[640]));
+        r.mgr.finish_trickplay_pass(&check).await.expect("finish");
+
+        let check = r
+            .mgr
+            .begin_trickplay_pass()
+            .await
+            .expect("begin")
+            .expect("the scan's width is checked");
+        assert_eq!(check.previous_widths, vec![480, 640]);
         assert!(
             r.mgr
-                .get_trickplay_resolutions(item)
+                .check_trickplay_data(item, &check, &extraction_on())
                 .await
-                .expect("rows")
-                .contains_key(&320)
+                .expect("check")
         );
+        r.mgr.finish_trickplay_pass(&check).await.expect("finish");
+        assert_eq!(stored_widths(&r, item).await, vec![640]);
+        assert_eq!(r.mgr.begin_trickplay_pass().await.expect("begin"), None);
+    }
+
+    /// A set a scan makes at another chroma is checked once the settings
+    /// change back, and replaced at the chroma asked for.
+    #[tokio::test]
+    async fn a_set_made_at_another_chroma_is_checked_after_a_change_back() {
+        let db = test_db().await;
+        let (item, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        run_pass(&r, &[item]).await;
+
+        r.set_options(full_chroma_2x2(&[320]));
+        let media = seed_video(&db, &r, other, Some(HOUR_TICKS), None).await;
+        r.mgr
+            .refresh_trickplay_data(other, false, &extraction_on())
+            .await
+            .expect("scan");
+        let tile = set_dir(&r, other, &media, 320).join("0.jpg");
+        assert_eq!(super::jpeg_full_chroma(&tile), Some(true));
+
+        r.set_options(options_2x2(&[320]));
+        run_pass(&r, &[item, other]).await;
+        assert_eq!(super::jpeg_full_chroma(&tile), Some(false));
+        assert_eq!(r.mgr.begin_trickplay_pass().await.expect("begin"), None);
     }
 
     #[test]
