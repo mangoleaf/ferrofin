@@ -1655,7 +1655,7 @@ impl LocalProviderManager {
         /// How far up a path-less item's parents the path is looked for.
         const MAX_PARENT_HOPS: usize = 8;
         let folders = self.virtual_folders.as_ref()?;
-        let folders = folders.get_virtual_folders().await.ok()?;
+        let folders = folders.library_folders().await.ok()?;
         let mut path = entity.path.clone().filter(|p| !p.is_empty());
         let mut parent = entity.parent_id.clone();
         for _ in 0..MAX_PARENT_HOPS {
@@ -1913,7 +1913,7 @@ impl LocalProviderManager {
         let (Some(linked), Some(folders)) = (&self.linked_children, &self.virtual_folders) else {
             return Ok(None);
         };
-        let folders = folders.get_virtual_folders().await?;
+        let folders = folders.library_folders().await?;
         let locate = |row: &BaseItemEntity| {
             if BaseItemKind::from_stored_type_name(&row.type_) == Some(BaseItemKind::BoxSet) {
                 return Found::BoxSet;
@@ -3735,7 +3735,7 @@ impl LocalProviderManager {
         }
         if let Some(folders) = &self.virtual_folders
             && let Some(path) = entity.path.as_deref()
-            && let Ok(list) = folders.get_virtual_folders().await
+            && let Ok(list) = folders.library_folders().await
             // The library owning the path (innermost location, then first by
             // sort name), not whichever the listing names first: the listing
             // comes in the file system's order.
@@ -3775,7 +3775,7 @@ impl LocalProviderManager {
         }
         if let Some(folders) = &self.virtual_folders
             && let Some(path) = entity.path.as_deref()
-            && let Ok(list) = folders.get_virtual_folders().await
+            && let Ok(list) = folders.library_folders().await
             // The library owning the path (innermost location, then first by
             // sort name), not whichever the listing names first: the listing
             // comes in the file system's order.
@@ -6348,8 +6348,8 @@ mod tests {
         assert_eq!(out[0].name.as_deref(), Some("en/US"));
     }
 
-    /// One library whose `TypeOptions` the gate reads. Only
-    /// `get_virtual_folders` is exercised; every mutation is unreachable here.
+    /// One library whose `TypeOptions` the gate reads. Only the snapshot
+    /// (`library_folders`) is exercised; every mutation is unreachable here.
     struct OneLibrary(ferrofin_model::entities_media::VirtualFolderInfo);
 
     #[async_trait]
@@ -6357,7 +6357,13 @@ mod tests {
         async fn get_virtual_folders(
             &self,
         ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, ServiceError> {
-            Ok(vec![self.0.clone()])
+            unreachable!("a per-item lookup reads library_folders (gl-1180)")
+        }
+        async fn library_folders(
+            &self,
+        ) -> Result<Arc<[ferrofin_model::entities_media::VirtualFolderInfo]>, ServiceError>
+        {
+            Ok(Arc::new([self.0.clone()]))
         }
         async fn get_physical_paths(&self) -> Result<Vec<String>, ServiceError> {
             Ok(Vec::new())
@@ -6400,6 +6406,34 @@ mod tests {
         ) -> Result<(), ServiceError> {
             unimplemented!()
         }
+    }
+
+    /// An item with no language of its own and no ancestor chain takes the
+    /// language and country of the library whose location holds its path,
+    /// read from the libraries' snapshot (gl-1180): `OneLibrary` answers only
+    /// `library_folders`.
+    #[tokio::test]
+    async fn an_item_takes_the_language_and_country_of_the_library_holding_its_path() {
+        let manager = LocalProviderManager::default().with_virtual_folders(Arc::new(OneLibrary(
+            ferrofin_model::entities_media::VirtualFolderInfo {
+                name: Some("Films".to_owned()),
+                item_id: Some(Uuid::new_v4().to_string()),
+                locations: vec!["/media/films".to_owned()],
+                library_options: Some(ferrofin_model::configuration::LibraryOptions {
+                    preferred_metadata_language: Some("fr".to_owned()),
+                    metadata_country_code: Some("FR".to_owned()),
+                    ..ferrofin_model::configuration::LibraryOptions::default()
+                }),
+                ..Default::default()
+            },
+        )));
+        let entity = BaseItemEntity {
+            id: Uuid::new_v4().to_string(),
+            path: Some("/media/films/Film (2001)/Film (2001).mkv".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        assert_eq!(manager.preferred_metadata_language(&entity).await, "fr");
+        assert_eq!(manager.preferred_metadata_country_code(&entity).await, "FR");
     }
 
     /// Port check for `ProviderManager.GetRemoteSearchResults`
@@ -9438,8 +9472,8 @@ mod tests {
     // for the Identify dialog.
 
     /// A [`VirtualFolderManager`] serving one library at `item_id` with the
-    /// given saved options. Only `get_virtual_folders` is ever called on the
-    /// remote-search path; the mutating half is never reached.
+    /// given saved options. Only the snapshot (`library_folders`) is ever read
+    /// on the remote-search path; the mutating half is never reached.
     struct FakeLibraries {
         item_id: Uuid,
         options: ferrofin_model::configuration::LibraryOptions,
@@ -9450,12 +9484,20 @@ mod tests {
         async fn get_virtual_folders(
             &self,
         ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, ServiceError> {
-            Ok(vec![ferrofin_model::entities_media::VirtualFolderInfo {
-                name: Some("Music".to_owned()),
-                item_id: Some(self.item_id.to_string()),
-                library_options: Some(self.options.clone()),
-                ..Default::default()
-            }])
+            unreachable!("a per-item lookup reads library_folders (gl-1180)")
+        }
+        async fn library_folders(
+            &self,
+        ) -> Result<Arc<[ferrofin_model::entities_media::VirtualFolderInfo]>, ServiceError>
+        {
+            Ok(Arc::new([
+                ferrofin_model::entities_media::VirtualFolderInfo {
+                    name: Some("Music".to_owned()),
+                    item_id: Some(self.item_id.to_string()),
+                    library_options: Some(self.options.clone()),
+                    ..Default::default()
+                },
+            ]))
         }
         async fn add_virtual_folder(
             &self,
@@ -11070,7 +11112,8 @@ mod tests {
         }
     }
 
-    /// Libraries `(id, locations)`; only `get_virtual_folders` is called.
+    /// Libraries `(id, locations)`; only the snapshot (`library_folders`) is
+    /// read.
     struct Folders(Vec<(Uuid, &'static str)>);
 
     #[async_trait]
@@ -11078,6 +11121,12 @@ mod tests {
         async fn get_virtual_folders(
             &self,
         ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, ServiceError> {
+            unreachable!("a per-item lookup reads library_folders (gl-1180)")
+        }
+        async fn library_folders(
+            &self,
+        ) -> Result<Arc<[ferrofin_model::entities_media::VirtualFolderInfo]>, ServiceError>
+        {
             Ok(self
                 .0
                 .iter()
