@@ -4619,3 +4619,6 @@ mod device_reads;
 /// The session's `NowPlayingItem`, built once per item on the report that
 /// names it, and the session summaries that read it.
 mod now_playing_item;
+
+/// The session DTO members that do not follow the playback state.
+mod session_dto;

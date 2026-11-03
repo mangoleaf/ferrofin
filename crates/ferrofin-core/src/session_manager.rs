@@ -205,6 +205,9 @@ struct SessionInfo {
     server_id: Option<String>,
     has_custom_device_name: bool,
     last_activity_date: DateTime<Utc>,
+    /// When a playback report last checked in (C# `LastPlaybackCheckIn`):
+    /// .NET's `DateTime.MinValue` until the first start or non-automated
+    /// progress report stamps it.
     last_playback_check_in: DateTime<Utc>,
     last_paused_date: Option<DateTime<Utc>>,
     now_playing_item_id: Option<Uuid>,
@@ -861,7 +864,7 @@ impl FerrofinSessionManager {
                     server_id: Some(self.server_id.clone()),
                     has_custom_device_name: has_custom,
                     last_activity_date: now,
-                    last_playback_check_in: now,
+                    last_playback_check_in: ferrofin_model::json::datetime::dotnet_min(),
                     last_paused_date: None,
                     now_playing_item_id: None,
                     now_playing_item: None,
@@ -2888,14 +2891,13 @@ fn session_info_to_dto(session: &SessionInfo) -> SessionInfoDto {
         has_custom_device_name: session.has_custom_device_name,
         server_id: session.server_id.clone(),
         supported_commands: session.capabilities.supported_commands.clone(),
-        // Jellyfin always emits these: a Capabilities object, a default PlayState, and the two
-        // (empty) now-playing queues.
+        // Jellyfin always emits these: a Capabilities object, a default PlayState, and the
+        // (empty) now-playing queue. v12.4's `SessionInfoDto` has no `NowPlayingQueueFullItems`.
         capabilities: Some(crate::device_manager::client_capabilities_to_dto(
             &session.capabilities,
         )),
         play_state: Some(player_state(session)),
         now_playing_queue: Some(Vec::new()),
-        now_playing_queue_full_items: Some(Vec::new()),
         ..SessionInfoDto::default()
     }
 }

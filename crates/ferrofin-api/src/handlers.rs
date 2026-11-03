@@ -1626,8 +1626,11 @@ pub const VERIFIED: &[Verified] = &[
                (SessionManager.GetSessions, ToSessionInfoDto); the NowPlayingItem it copies \
                is built by on_playback_start and on_playback_progress \
                (kept_now_playing_item, now_playing_item → get_item_info; UpdateNowPlayingItem, \
-               GetItemInfo) and cleared by on_playback_stopped (RemoveNowPlayingItem)",
-        date: "2026-10-30",
+               GetItemInfo) and cleared by on_playback_stopped (RemoveNowPlayingItem); \
+               LastPlaybackCheckIn is DateTime.MinValue until update_now_playing stamps it \
+               (SessionInfo.LastPlaybackCheckIn, UpdateNowPlayingItem) and \
+               NowPlayingQueueFullItems is never sent (v12.4's SessionInfoDto has none)",
+        date: "2026-11-02",
         divergences: SESSIONS_DIVERGENCES,
         refs: &[],
     },
@@ -2956,9 +2959,6 @@ const SESSIONS_DIVERGENCES: &[&str] = &[
      and PlaylistItemId, NowViewingItem and UserPrimaryImageTag are never filled, where \
      upstream's UpdateNowPlayingItem, RemoveNowPlayingItem and LogSessionActivity keep them. \
      Fix path: gl-119.",
-    "LastPlaybackCheckIn starts at the session's creation, where upstream's is \
-     0001-01-01 until a playback report; NowPlayingQueueFullItems is sent as [], a member \
-     v12.4's SessionInfoDto no longer has. Fix path: gl-837.",
     "A playback report's own Item is ignored and the NowPlayingItem is always built from the \
      library item; upstream shows a reported Item as sent. Fix path: gl-1062.",
     "A NowPlayingItem whose media source lookup fails is shown without its streams, and one \

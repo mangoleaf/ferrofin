@@ -1177,43 +1177,6 @@ kind = "status"
 issue = 846
 reason = "Deleting a non-subtitle stream answers 204 where upstream answers 400."
 
-# Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have.
-[[entry]]
-request = "AuthenticateUserByName"
-path = "SessionInfo.LastPlaybackCheckIn"
-kind = "value"
-issue = 837
-reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
-
-[[entry]]
-request = "AuthenticateUserByName"
-path = "SessionInfo.NowPlayingQueueFullItems"
-kind = "extra"
-issue = 837
-reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
-
-# The same two session fields in every session list the sweep reads back (GET /Sessions and the setup reads of the session commands).
-[[entry]]
-request = "GetSessions"
-path = "[].LastPlaybackCheckIn"
-kind = "value"
-issue = 837
-reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
-
-[[entry]]
-request = "*/session"
-path = "[].LastPlaybackCheckIn"
-kind = "value"
-issue = 837
-reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
-
-[[entry]]
-request = "*"
-path = "[].NowPlayingQueueFullItems"
-kind = "extra"
-issue = 837
-reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
-
 # Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo).
 [[entry]]
 request = "screen-playback-start/sessions"
