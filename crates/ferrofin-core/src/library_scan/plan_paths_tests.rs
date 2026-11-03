@@ -284,7 +284,7 @@ fn canon(items: Vec<Planned>) -> Vec<(Uuid, Vec<Uuid>, BaseItemEntity)> {
     items
         .into_iter()
         .map(|p| {
-            let mut entity = p.entity;
+            let mut entity = p.entity.to_entity();
             // A directory — a folder's, a disc rip's — and a path-less
             // folder (a season with no folder) are stamped with the resolve
             // time.
@@ -320,7 +320,9 @@ fn filtered(full: &[Planned], paths: &[String], exact: Option<&str>) -> Vec<Plan
                     parts
                         .iter()
                         .filter_map(serde_json::Value::as_str)
-                        .any(|part| crate::item_data::path_is_directory(&p.entity) && kept(part))
+                        .any(|part| {
+                            crate::item_data::path_is_directory(&p.entity.to_entity()) && kept(part)
+                        })
                 })
     };
     let parents: std::collections::HashSet<String> = full
@@ -431,6 +433,18 @@ async fn plan_paths_matches_the_filtered_full_plan() {
             "the fixture plans no {kind}"
         );
     }
+    // Every column a planner sets is one the plan keeps inline
+    // (`PlanEntity`): one it does not would box a whole row for every item
+    // of that shape.
+    let boxed: Vec<_> = full
+        .iter()
+        .filter(|p| p.entity.rest.is_some())
+        .map(|p| (p.entity.type_.clone(), p.entity.path.clone()))
+        .collect();
+    assert!(
+        boxed.is_empty(),
+        "planned with a column PlanEntity lacks: {boxed:?}"
+    );
     assert_group_shapes(&full);
     // A dotted directory name is a name, not a file name with an extension.
     let named = |kind: &str, name: &str| {
