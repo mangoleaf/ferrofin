@@ -1,10 +1,12 @@
-//! The statements a library scan runs for each episode it adds (gl-1084).
+//! The statements a library scan runs for each episode it adds (gl-1084),
+//! and for each one a re-scan finds unchanged (gl-1194).
 //!
 //! The scan refreshes its items one at a time and awaits every statement, so
 //! what one item costs sets the scan's speed once the probes keep up. The
 //! test scans the same series twice, over fresh servers, with a different
-//! number of episodes, and counts the extra statements per extra episode: a
-//! statement the scan runs once, or once per series or season, cancels out.
+//! number of episodes, then scans each library again, and counts the extra
+//! statements per extra episode: a statement the scan runs once, or once per
+//! series or season, cancels out.
 //!
 //! The server is the real composition root over a temp data dir, and the
 //! statements are the `sqlx::query` events recorded inside the scan's
@@ -210,10 +212,18 @@ fn urlencoding(value: &str) -> String {
     out
 }
 
+/// The statements of a library's first scan and of a re-scan that finds it
+/// unchanged.
+struct Scans {
+    first: Vec<String>,
+    rescan: Vec<String>,
+}
+
 /// Boots a server over a temp data dir, adds a TV library holding one series
 /// of `episodes` episodes (no remote fetchers: the scan must not wait on the
-/// network) and scans it; returns the statements the scan ran.
-async fn scan_statements(episodes: usize) -> Vec<String> {
+/// network), scans it, then scans it again; returns the statements each scan
+/// ran.
+async fn scan_statements(episodes: usize) -> Scans {
     let temp = tempfile::tempdir().expect("temp dir");
     std::fs::create_dir_all(temp.path().join("config")).expect("config dir");
     let config = Config {
@@ -272,16 +282,20 @@ async fn scan_statements(episodes: usize) -> Vec<String> {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "library added: {body}");
     take_statements();
-    assert!(
-        wired
-            .state
-            .library
-            .run_library_scan(ScanTrigger::Api, None)
-            .await
-            .expect("scan"),
-        "the scan ran"
-    );
-    let statements = take_statements();
+    let mut scans = [Vec::new(), Vec::new()];
+    for statements in &mut scans {
+        assert!(
+            wired
+                .state
+                .library
+                .run_library_scan(ScanTrigger::Api, None)
+                .await
+                .expect("scan"),
+            "the scan ran"
+        );
+        *statements = take_statements();
+    }
+    let [first, rescan] = scans;
     let (status, page) = send(
         &router,
         &auth_header,
@@ -299,7 +313,7 @@ async fn scan_statements(episodes: usize) -> Vec<String> {
         u64::try_from(episodes).ok(),
         "every episode was added: {page}"
     );
-    statements
+    Scans { first, rescan }
 }
 
 /// The statements of a scan of `few` episodes and of one of `many`, and how
@@ -339,9 +353,15 @@ async fn an_episode_reads_neither_the_library_listing_nor_its_row_twice() {
     record_statements();
     let few = 2;
     let many = 5;
+    let (few_scans, many_scans) = (scan_statements(few).await, scan_statements(many).await);
     let scans = PerEpisode {
-        few: scan_statements(few).await,
-        many: scan_statements(many).await,
+        few: few_scans.first,
+        many: many_scans.first,
+        extra: many - few,
+    };
+    let rescans = PerEpisode {
+        few: few_scans.rescan,
+        many: many_scans.rescan,
         extra: many - few,
     };
     let listing = scans.listing();
@@ -424,4 +444,58 @@ async fn an_episode_reads_neither_the_library_listing_nor_its_row_twice() {
         scans.each(1),
         "an episode writes its ancestors in one statement:\n{listing}"
     );
+
+    a_rescanned_episode_reads_its_cast_in_batches(&rescans);
+}
+
+/// A re-scan finds every episode's cast unchanged (gl-443) and writes none of
+/// it. The people it hands the biography fetch are read a few statements at a
+/// time too (gl-1194), not two per guest: the clean-name match and the
+/// biographies, each one statement up to 256 people.
+fn a_rescanned_episode_reads_its_cast_in_batches(rescans: &PerEpisode) {
+    let relisting = rescans.listing();
+    println!(
+        "{} statements per re-scanned episode",
+        rescans.total_per_episode()
+    );
+    for (step, prefix) in [
+        (
+            "clean-name match",
+            r#"SELECT "CleanName", "Id" FROM "BaseItems""#,
+        ),
+        ("biographies", r#"SELECT "Id", "Overview" FROM "BaseItems""#),
+    ] {
+        assert_eq!(
+            rescans.more(|s| s.starts_with(prefix)),
+            rescans.each(1),
+            "a re-scanned episode's {step} is one statement:\n{relisting}"
+        );
+    }
+    for (step, statement) in [
+        (
+            "clean-name match",
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "CleanName" = ?2 ORDER BY "SortName", "Id" LIMIT 1"#,
+        ),
+        (
+            "biography",
+            r#"SELECT "Overview" FROM "BaseItems" WHERE "Id" = ?1"#,
+        ),
+    ] {
+        assert_eq!(
+            rescans.more(|s| s == statement),
+            0,
+            "a re-scanned episode reads no guest's {step} alone:\n{relisting}"
+        );
+    }
+    for (step, prefix) in [
+        ("credit rewrite", r#"DELETE FROM "PeopleBaseItemMap""#),
+        ("credits", r#"INSERT INTO "PeopleBaseItemMap""#),
+        ("new people", r#"INSERT INTO "Peoples""#),
+    ] {
+        assert_eq!(
+            rescans.more(|s| s.starts_with(prefix)),
+            0,
+            "a re-scanned episode writes no {step}:\n{relisting}"
+        );
+    }
 }

@@ -19,7 +19,6 @@
 //! (owner decision D1 of the settings-page milestone): one saved to
 //! `config.toml` underneath would not apply while it is set.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,15 +27,19 @@ use ferrofin_core::system_manager::LifecycleController;
 use ferrofin_core::user_manager::LoginBackoffSettings;
 use ferrofin_drawing::ImageLimits;
 use ferrofin_mediaencoding::transcoding::TranscodeLimits;
+use ferrofin_model::configuration::ServerConfiguration;
 use ferrofin_model::server_settings::{
     ServerSettingApplies as Applies, ServerSettingDto, ServerSettingGroup as Group,
-    ServerSettingKind, ServerSettingSource as Source, ServerSettingUnit as Unit, ServerSettingsDto,
-    ServerSettingsUpdateDto, ServerSettingsUpdateResultDto,
+    ServerSettingKind, ServerSettingOptionDto, ServerSettingSource as Source, ServerSettingStore,
+    ServerSettingUnit as Unit, ServerSettingsDto, ServerSettingsUpdateDto,
+    ServerSettingsUpdateResultDto,
 };
+use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::PluginManager;
 use ferrofin_traits::server_settings::ServerSettingsManager;
 use serde_json::{Value, json};
+use tracing::Instrument as _;
 
 use crate::config::{self, Cli, Config, Env, LogFormat};
 
@@ -66,6 +69,8 @@ pub enum SettingKind {
     NumberList,
     /// A key, a PIN or a password: shown to admins, never logged.
     Secret,
+    /// One of the row's [`options`](SettingSpec::options).
+    Choice,
 }
 
 impl SettingKind {
@@ -81,8 +86,42 @@ impl SettingKind {
             Self::PathList => (ServerSettingKind::PathList, None, None),
             Self::NumberList => (ServerSettingKind::NumberList, None, None),
             Self::Secret => (ServerSettingKind::Secret, None, None),
+            Self::Choice => (ServerSettingKind::Choice, None, None),
         }
     }
+}
+
+/// One option of a [`SettingKind::Choice`] row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingOption {
+    /// The value it stores, and the one the report gives when it is picked.
+    pub value: &'static str,
+    /// Its readable name.
+    pub label: &'static str,
+    /// What picking it does; empty for none.
+    pub note: &'static str,
+}
+
+/// Where a row's value is stored.
+#[derive(Debug, Clone, Copy)]
+pub enum SettingStore {
+    /// `config.toml`, read at startup (with its flag and its variable, which
+    /// outrank it).
+    ConfigFile,
+    /// The server configuration the Dashboard edits, which applies at once.
+    /// Nothing outranks it: no variable or flag sets such a row.
+    ServerConfiguration(ConfigurationField),
+}
+
+/// How a row stored in the server configuration reads and writes it.
+#[derive(Debug, Clone, Copy)]
+pub struct ConfigurationField {
+    /// The value the report gives, from the configuration. For a
+    /// [`SettingKind::Choice`], the text of the option it fits, or of the
+    /// stored value when it fits none.
+    pub read: fn(&ServerConfiguration) -> Value,
+    /// Puts `value`, one the row's kind takes, into the configuration.
+    pub write: fn(&mut ServerConfiguration, &Value),
 }
 
 /// Whether the settings page may change a setting.
@@ -139,6 +178,14 @@ pub struct SettingSpec {
     pub default: &'static str,
     /// What it does, in one line.
     pub description: &'static str,
+    /// What it does at more length, shown under the description; empty for
+    /// none.
+    pub note: &'static str,
+    /// The options of a [`SettingKind::Choice`] row, in the order the page
+    /// offers them; empty for any other kind.
+    pub options: &'static [SettingOption],
+    /// Where its value is stored.
+    pub store: SettingStore,
     /// The value in use, secrets included (owner decision D3: admins see
     /// them, as on Jellyfin's plugin pages). `null` when unset and the
     /// default applies.
@@ -242,6 +289,9 @@ const ROW: SettingSpec = SettingSpec {
     applies: Applies::Restart,
     default: "",
     description: "",
+    note: "",
+    options: &[],
+    store: SettingStore::ConfigFile,
     running: |_| Value::Null,
     check: |_| Ok(()),
 };
@@ -866,23 +916,29 @@ pub static SETTINGS: &[SettingSpec] = &[
         env_read: EnvRead::NonBlank,
         label: "Log format",
         group: Group::Logging,
+        kind: SettingKind::Choice,
         applies: Applies::ProcessRestart,
         default: "json",
-        description: "Stdout log lines: json, or text for running the server by hand.",
+        description: "How the server writes its log lines to stdout.",
+        // The loader takes either in any case; anything else runs as json,
+        // with a warning (`config::resolve_log_format`), and shows as Custom.
+        options: &[
+            SettingOption {
+                value: "json",
+                label: "JSON",
+                note: "One JSON object per line, for log collectors",
+            },
+            SettingOption {
+                value: "text",
+                label: "Text",
+                note: "Plain lines, for reading by hand",
+            },
+        ],
         running: |c| {
             json!(match c.log_format {
                 LogFormat::Json => "json",
                 LogFormat::Text => "text",
             })
-        },
-        // Anything else is json, with a warning (`config::resolve_log_format`).
-        check: |value| {
-            value
-                .as_str()
-                .map(|format| format.trim().to_ascii_lowercase())
-                .filter(|format| format == "json" || format == "text")
-                .map(drop)
-                .ok_or_else(|| "is json or text".to_owned())
         },
         ..ROW
     },
@@ -1415,7 +1471,7 @@ fn locked_reason(spec: &SettingSpec, source: Source, env: &dyn Env) -> Option<St
                  the server process."
             ))
         }
-        Source::ConfigFile | Source::Default => None,
+        Source::ConfigFile | Source::ServerConfiguration | Source::Default => None,
     };
     match (note, set_by) {
         (Some(note), Some(set_by)) => Some(format!("{note} {set_by}")),
@@ -1441,14 +1497,91 @@ fn file_value(spec: &SettingSpec, file: &Config, in_use: Option<&Value>) -> Opti
 }
 
 /// What the page receives for `spec`. `running` is the configuration in use;
-/// `saved` is `config.toml` as it is now, loaded alone, when it has keys.
+/// `saved` is `config.toml` as it is now, loaded alone, when it has keys;
+/// `configuration` is the server configuration, for a row stored there.
 fn setting(
     spec: &SettingSpec,
     running: &Config,
     env: &dyn Env,
     file_keys: &[String],
     saved: Option<&Config>,
+    configuration: &ServerConfiguration,
 ) -> ServerSettingDto {
+    let (kind, min, max) = spec.kind.to_dto();
+    let mut dto = ServerSettingDto {
+        key: spec.key.to_owned(),
+        label: spec.label.to_owned(),
+        group: spec.group,
+        kind,
+        unit: spec.unit,
+        description: spec.description.to_owned(),
+        note: (!spec.note.is_empty()).then(|| spec.note.to_owned()),
+        env_var: spec.env.map(str::to_owned),
+        flag: spec.flag.map(str::to_owned),
+        default: (!spec.default.is_empty()).then(|| spec.default.to_owned()),
+        value: None,
+        saved_value: None,
+        source: Source::Default,
+        editable: true,
+        locked_reason: None,
+        applies: spec.applies,
+        min,
+        max,
+        options: spec
+            .options
+            .iter()
+            .map(|option| ServerSettingOptionDto {
+                value: option.value.to_owned(),
+                label: option.label.to_owned(),
+                note: (!option.note.is_empty()).then(|| option.note.to_owned()),
+            })
+            .collect(),
+        store: ServerSettingStore::ConfigFile,
+        custom: false,
+    };
+    match spec.store {
+        SettingStore::ConfigFile => from_the_file(spec, running, env, file_keys, saved, &mut dto),
+        SettingStore::ServerConfiguration(field) => {
+            // Nothing outranks the server configuration, and the page may
+            // always change it. A new server's value is its default.
+            let value = (field.read)(configuration);
+            dto.source = if value == (field.read)(&ServerConfiguration::default()) {
+                Source::Default
+            } else {
+                Source::ServerConfiguration
+            };
+            dto.custom = spec.kind == SettingKind::Choice
+                && !value
+                    .as_str()
+                    .is_some_and(|text| fits_an_option(spec, text));
+            dto.value = present(value);
+            dto.store = ServerSettingStore::ServerConfiguration;
+        }
+    }
+    dto
+}
+
+/// Whether `text` is one of `spec`'s options: the same value, ignoring case
+/// and the spaces around it, as the loader reads a choice
+/// (`config::resolve_log_format`).
+fn fits_an_option(spec: &SettingSpec, text: &str) -> bool {
+    spec.options
+        .iter()
+        .any(|option| option.value.eq_ignore_ascii_case(text.trim()))
+}
+
+/// Fills `dto` for `spec`, a row stored in `config.toml`: its value in use,
+/// the file's value when that differs, its source and whether the page may
+/// change it. A choice whose `config.toml` value fits no option reports that
+/// value as written, as Custom: the loader runs the default in its place.
+fn from_the_file(
+    spec: &SettingSpec,
+    running: &Config,
+    env: &dyn Env,
+    file_keys: &[String],
+    saved: Option<&Config>,
+    dto: &mut ServerSettingDto,
+) {
     let source = source(spec, &running.cli, env, file_keys);
     let value = match spec.access {
         SettingAccess::EnvOnly => spec
@@ -1467,26 +1600,23 @@ fn setting(
         })
         .and_then(|saved| file_value(spec, saved, value.as_ref()))
         .filter(|saved| Some(saved) != value.as_ref());
+    // The report read the file's keys a moment ago, so a read that fails now
+    // is the file changing under it: the value then reports as it loads.
+    let custom = (spec.kind == SettingKind::Choice && source == Source::ConfigFile)
+        .then(|| config::config_file_text(&running.config_file, spec.key))
+        .and_then(Result::ok)
+        .flatten()
+        .filter(|text| !fits_an_option(spec, text));
     let locked_reason = locked_reason(spec, source, env);
-    let (kind, min, max) = spec.kind.to_dto();
-    ServerSettingDto {
-        key: spec.key.to_owned(),
-        label: spec.label.to_owned(),
-        group: spec.group,
-        kind,
-        unit: spec.unit,
-        description: spec.description.to_owned(),
-        env_var: spec.env.map(str::to_owned),
-        flag: spec.flag.map(str::to_owned),
-        default: (!spec.default.is_empty()).then(|| spec.default.to_owned()),
-        value,
-        saved_value,
-        source,
-        editable: locked_reason.is_none(),
-        locked_reason,
-        applies: spec.applies,
-        min,
-        max,
+    dto.source = source;
+    dto.editable = locked_reason.is_none();
+    dto.locked_reason = locked_reason;
+    if let Some(text) = custom {
+        dto.value = Some(Value::String(text));
+        dto.custom = true;
+    } else {
+        dto.value = value;
+        dto.saved_value = saved_value;
     }
 }
 
@@ -1499,10 +1629,13 @@ fn no_longer_loads(path: &Path, err: &anyhow::Error) -> ServiceError {
     ))
 }
 
-/// Every setting `running` holds, as the page receives them.
+/// Every one of `rows`, as the page receives them: those stored in
+/// `config.toml` as `running` holds them, the others as `configuration` does.
 fn snapshot(
+    rows: &[SettingSpec],
     running: &Config,
     env: &dyn Env,
+    configuration: &ServerConfiguration,
     restart_pending: bool,
 ) -> Result<ServerSettingsDto, ServiceError> {
     let path = &running.config_file;
@@ -1522,9 +1655,18 @@ fn snapshot(
         config_file: path.display().to_string(),
         config_file_writable: config_file_writable(path),
         restart_pending,
-        settings: SETTINGS
+        settings: rows
             .iter()
-            .map(|spec| setting(spec, running, env, &file_keys, saved.as_ref()))
+            .map(|spec| {
+                setting(
+                    spec,
+                    running,
+                    env,
+                    &file_keys,
+                    saved.as_ref(),
+                    configuration,
+                )
+            })
             .collect(),
     })
 }
@@ -1580,7 +1722,8 @@ static SAVES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The settings manager behind `GET /Ferrofin/Settings` and
 /// `POST /Ferrofin/Settings`: the configuration this server lifetime runs
-/// with, where each value comes from, and saving changes to `config.toml`.
+/// with, where each value comes from, and saving changes to `config.toml` and,
+/// for a row stored there, to the server configuration.
 pub struct FerrofinServerSettings {
     /// The configuration in use, with the flags it was loaded under.
     config: Config,
@@ -1590,24 +1733,33 @@ pub struct FerrofinServerSettings {
     lifecycle: Arc<dyn LifecycleController>,
     /// For the Ferrofin plugin's enabled flag.
     plugins: Arc<dyn PluginManager>,
+    /// The server configuration, which the rows stored there read and save.
+    configuration: Arc<dyn ServerConfigurationManager>,
+    /// The rows it reports and saves: [`SETTINGS`].
+    rows: &'static [SettingSpec],
 }
 
 impl FerrofinServerSettings {
     /// Reports `config`, which the process environment and the flags it
     /// records were loaded into, with `lifecycle`'s restart flag, and saves to
-    /// its `config.toml`, marking a restart pending in `lifecycle`; answers
-    /// only while the Ferrofin plugin is enabled in `plugins`.
+    /// its `config.toml`, marking a restart pending in `lifecycle`; a row
+    /// stored in the server configuration is read from and saved to
+    /// `configuration`. Answers only while the Ferrofin plugin is enabled in
+    /// `plugins`.
     #[must_use]
     pub fn new(
         config: Config,
         lifecycle: Arc<dyn LifecycleController>,
         plugins: Arc<dyn PluginManager>,
+        configuration: Arc<dyn ServerConfigurationManager>,
     ) -> Self {
         Self {
             config,
             env: Arc::new(config::EnvProvider),
             lifecycle,
             plugins,
+            configuration,
+            rows: SETTINGS,
         }
     }
 
@@ -1615,6 +1767,14 @@ impl FerrofinServerSettings {
     #[cfg(test)]
     fn with_env(mut self, env: impl Env + Send + Sync + 'static) -> Self {
         self.env = Arc::new(env);
+        self
+    }
+
+    /// The same, reporting and saving `rows` in place of [`SETTINGS`]: a row
+    /// only the tests register.
+    #[cfg(test)]
+    fn with_rows(mut self, rows: &'static [SettingSpec]) -> Self {
+        self.rows = rows;
         self
     }
 
@@ -1637,12 +1797,22 @@ impl ServerSettingsManager for FerrofinServerSettings {
     async fn snapshot(&self) -> Result<ServerSettingsDto, ServiceError> {
         self.ensure_enabled().await?;
         let restart_pending = self.lifecycle.has_pending_restart();
+        let configuration = self.configuration.configuration().await?;
         let running = self.config.clone();
         let env = Arc::clone(&self.env);
+        let rows = self.rows;
         // Reads config.toml and probes its directory.
-        tokio::task::spawn_blocking(move || snapshot(&running, env.as_ref(), restart_pending))
-            .await
-            .map_err(|err| ServiceError::backend(format!("settings report failed: {err}")))?
+        tokio::task::spawn_blocking(move || {
+            snapshot(
+                rows,
+                &running,
+                env.as_ref(),
+                &configuration,
+                restart_pending,
+            )
+        })
+        .await
+        .map_err(|err| ServiceError::backend(format!("settings report failed: {err}")))?
     }
 
     async fn update(
@@ -1650,53 +1820,128 @@ impl ServerSettingsManager for FerrofinServerSettings {
         update: ServerSettingsUpdateDto,
     ) -> Result<ServerSettingsUpdateResultDto, ServiceError> {
         self.ensure_enabled().await?;
-        let running = self.config.clone();
-        let env = Arc::clone(&self.env);
-        let lifecycle = Arc::clone(&self.lifecycle);
-        let request = tracing::Span::current();
-        // A blocking task, which reads, writes and renames files, and which
-        // runs to its end even when the caller goes away: the lock is never
-        // let go, or the restart left unmarked, part-way through a save.
-        tokio::task::spawn_blocking(move || {
-            let _request = request.entered();
-            save_and_report(&running, env.as_ref(), lifecycle.as_ref(), &update.changes)
-        })
-        .await
-        .map_err(|err| ServiceError::backend(format!("settings save failed: {err}")))?
+        let save = SaveRequest {
+            running: self.config.clone(),
+            env: Arc::clone(&self.env),
+            lifecycle: Arc::clone(&self.lifecycle),
+            configuration: Arc::clone(&self.configuration),
+            rows: self.rows,
+            changes: update.changes,
+        };
+        // A task of its own, which runs to its end even when the caller goes
+        // away: the lock is never let go, or the restart left unmarked,
+        // part-way through a save.
+        tokio::spawn(save.run().instrument(tracing::Span::current()))
+            .await
+            .map_err(|err| ServiceError::backend(format!("settings save failed: {err}")))?
     }
 }
 
-/// One save, under [`SAVES`]: `changes` go to `running`'s `config.toml`
-/// ([`save::save`]) and, when a key changed, `lifecycle` marks the restart and
-/// one line logs the keys. Blocks: call it from a blocking task.
-fn save_and_report(
-    running: &Config,
-    env: &dyn Env,
-    lifecycle: &dyn LifecycleController,
-    changes: &BTreeMap<String, Option<Value>>,
-) -> Result<ServerSettingsUpdateResultDto, ServiceError> {
-    let _one_save_at_a_time = SAVES.blocking_lock();
-    let saved = save::save(running, env, changes)?;
-    if saved.is_empty() {
-        return Ok(ServerSettingsUpdateResultDto::default());
+/// One `POST /Ferrofin/Settings`.
+struct SaveRequest {
+    /// The configuration in use, whose `config.toml` the save edits.
+    running: Config,
+    /// The process environment, whose variables lock the rows they set.
+    env: Arc<dyn Env + Send + Sync>,
+    /// Marks the restart a `config.toml` change needs.
+    lifecycle: Arc<dyn LifecycleController>,
+    /// Saves the rows stored in the server configuration.
+    configuration: Arc<dyn ServerConfigurationManager>,
+    /// The rows a change may name.
+    rows: &'static [SettingSpec],
+    /// What to change.
+    changes: save::Changes,
+}
+
+impl SaveRequest {
+    /// Saves the changes under [`SAVES`], all or nothing. Every change is
+    /// checked first. The new `config.toml` is then written beside the file
+    /// and loaded ([`save::stage`]) before the server configuration is
+    /// updated, and renamed over the file only after that update, so a
+    /// refusal, a file that does not load or a failed update leaves both as
+    /// they were. One case is left: a rename that fails after the update (the
+    /// file was found writable and loaded just before) leaves the server
+    /// configuration's change applied and `config.toml` as it was. A change to
+    /// the server configuration applies at once; one to `config.toml` marks
+    /// the restart, and one line logs the keys.
+    async fn run(self) -> Result<ServerSettingsUpdateResultDto, ServiceError> {
+        let _one_save_at_a_time = SAVES.lock().await;
+        let (stored, filed) = save::split(self.rows, self.changes)?;
+
+        // Reads, writes and loads files; a save of the server configuration
+        // alone never reads `config.toml`, so a broken one cannot stop it.
+        let staged = if filed.is_empty() {
+            None
+        } else {
+            let running = self.running.clone();
+            let env = Arc::clone(&self.env);
+            let rows = self.rows;
+            tokio::task::spawn_blocking(move || save::stage(rows, &running, env.as_ref(), &filed))
+                .await
+                .map_err(|err| ServiceError::backend(format!("settings save failed: {err}")))??
+        };
+
+        // Read just before it is written, so a Dashboard save made while the
+        // file was staged is not written over.
+        let mut applied_now = Vec::new();
+        if !stored.is_empty() {
+            let current = self.configuration.configuration().await?;
+            let (configuration, keys) = save::configure(&current, &stored);
+            if !keys.is_empty() {
+                self.configuration
+                    .update_configuration(&configuration)
+                    .await?;
+                applied_now = keys;
+            }
+        }
+        let saved = match staged {
+            Some(staged) => tokio::task::spawn_blocking(move || staged.commit())
+                .await
+                .map_err(|err| ServiceError::backend(format!("settings save failed: {err}")))??,
+            None => Vec::new(),
+        };
+        Ok(report(
+            &self.running,
+            self.lifecycle.as_ref(),
+            &saved,
+            applied_now,
+        ))
     }
-    lifecycle.mark_restart_required();
+}
+
+/// What a save did: `saved`, the rows whose `config.toml` entry changed, mark
+/// the restart in `lifecycle`; `applied_now`, the keys of the server
+/// configuration that changed, applied at once. One line logs the keys.
+fn report(
+    running: &Config,
+    lifecycle: &dyn LifecycleController,
+    saved: &[&'static SettingSpec],
+    applied_now: Vec<String>,
+) -> ServerSettingsUpdateResultDto {
+    if saved.is_empty() && applied_now.is_empty() {
+        return ServerSettingsUpdateResultDto::default();
+    }
+    if !saved.is_empty() {
+        lifecycle.mark_restart_required();
+    }
     let keys: Vec<String> = saved.iter().map(|spec| spec.key.to_owned()).collect();
     // Key names only: a value may be a key or a password (owner decision D3).
     tracing::info!(
         path = %running.config_file.display(),
         keys = %keys.join(", "),
+        applied_now = %applied_now.join(", "),
         "server settings saved"
     );
-    Ok(ServerSettingsUpdateResultDto {
+    ServerSettingsUpdateResultDto {
+        restart_required: !keys.is_empty(),
         changed: keys,
-        restart_required: true,
         process_restart_required: saved
             .iter()
             .filter(|spec| spec.applies == Applies::ProcessRestart)
             .map(|spec| spec.key.to_owned())
             .collect(),
-    })
+        applied_now,
+    }
 }
 
 mod save;

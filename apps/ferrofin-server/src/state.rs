@@ -2044,25 +2044,25 @@ pub async fn build_app_state(
             db.clone(),
         ),
     );
+    // Where the plugin manager keeps each plugin's state and `config.json`; the
+    // LDAP-Auth import below checks the same directory.
+    let plugin_state_dir = config.config_dir.join("plugins");
     let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> = Arc::new(
-        ferrofin_core::FerrofinPluginManager::new(
-            registered_plugins,
-            config.config_dir.join("plugins"),
-        )
-        .with_offered_items(Arc::clone(&plugin_offered_items))
-        .with_installer(
-            config.data_dir.join("plugins"),
-            Arc::clone(&wasm_validator),
-            Arc::clone(&lifecycle),
-        )
-        .with_download_cap_mb(config.max_plugin_download_mb)
-        // The package repositories live in the server configuration — the single
-        // store upstream keeps them in — so `/Repositories`, `/Packages` and
-        // `/System/Configuration` can never disagree.
-        .with_configuration(Arc::clone(&config_trait))
-        .with_application_version(JELLYFIN_API_VERSION)
-        // A saved configuration is announced in-process (`ConfigurationChanged`).
-        .with_events(Arc::clone(&event_manager)),
+        ferrofin_core::FerrofinPluginManager::new(registered_plugins, plugin_state_dir.clone())
+            .with_offered_items(Arc::clone(&plugin_offered_items))
+            .with_installer(
+                config.data_dir.join("plugins"),
+                Arc::clone(&wasm_validator),
+                Arc::clone(&lifecycle),
+            )
+            .with_download_cap_mb(config.max_plugin_download_mb)
+            // The package repositories live in the server configuration — the single
+            // store upstream keeps them in — so `/Repositories`, `/Packages` and
+            // `/System/Configuration` can never disagree.
+            .with_configuration(Arc::clone(&config_trait))
+            .with_application_version(JELLYFIN_API_VERSION)
+            // A saved configuration is announced in-process (`ConfigurationChanged`).
+            .with_events(Arc::clone(&event_manager)),
     );
     // Jellyfin's five in-tree provider plugins read their settings through
     // `Plugin.Instance.Configuration` at call time, so an admin's save on a
@@ -2174,6 +2174,19 @@ pub async fn build_app_state(
     // authentication and password-reset providers fill its late slots now,
     // before the server takes a request. Every clone of the manager shares them.
     ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, &users_impl);
+    // One-shot, before the server takes a request: an adopted Jellyfin's
+    // LDAP-Auth settings and uid map come across from the plugin's XML, so its
+    // directory users sign in with no admin action (B7).
+    ferrofin_extensions::ldap_auth::adoption::import_adopted_config(
+        &std::path::Path::new(&paths.plugins_path())
+            .join("configurations")
+            .join(ferrofin_extensions::ldap_auth::adoption::CONFIGURATION_FILE_NAME),
+        &plugin_state_dir,
+        plugins.as_ref(),
+        users.as_ref(),
+        extension_cx.external_identities.as_ref(),
+    )
+    .await;
     let intro_skipper_analysis = ferrofin_extensions::intro_skipper::analysis(&extension_cx);
     subscribe_intro_skipper(&event_bus, &intro_skipper_analysis);
     // Register actual loaded producers before the core "Media Segment Scan"
@@ -2827,7 +2840,7 @@ pub async fn build_app_state(
         sessions,
         system,
         app_host_trait,
-        config_trait,
+        Arc::clone(&config_trait),
         providers,
         music,
         similar_items,
@@ -2960,12 +2973,14 @@ pub async fn build_app_state(
 
     // ---- Ferrofin settings -----------------------------------------------
     // `GET /Ferrofin/Settings`: the bootstrap configuration this lifetime runs
-    // with and where each value comes from, while the Ferrofin plugin is
-    // enabled in the plugin manager.
+    // with and where each value comes from, and the settings stored in the
+    // server configuration, while the Ferrofin plugin is enabled in the plugin
+    // manager.
     let state = state.with_server_settings(Arc::new(crate::settings::FerrofinServerSettings::new(
         config.clone(),
         Arc::clone(&lifecycle),
         Arc::clone(&plugins),
+        Arc::clone(&config_trait),
     )));
 
     // ---- SyncPlay ---------------------------------------------------------

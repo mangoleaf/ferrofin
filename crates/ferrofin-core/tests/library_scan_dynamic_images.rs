@@ -7,7 +7,9 @@
 //! Jellyfin runs from `GenresValidator` at the end of library validation.
 //!
 //! Also the scan side of an item refresh (gl-576): a photo album's refresh and
-//! a full-refresh validation run the same providers as custom providers.
+//! a full-refresh validation run the same providers as custom providers. And
+//! a library whose locations changed is a required refresh
+//! (`CollectionFolder.RequiresRefresh`, gl-337), which redraws its tile.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -369,9 +371,16 @@ impl PhotoLibrary {
         let db = Database::connect_in_memory().await.expect("connect");
         db.run_migrations().await.expect("migrate");
         let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        // Wired as the composition root wires it: the item reader is what
+        // the manager compares a library's recorded locations through.
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(
             FerrofinVirtualFolderManager::new(tmp.path().join("root").join("default"))
-                .with_item_store(persistence.clone()),
+                .with_item_store(persistence.clone())
+                .with_items(Arc::clone(&items)),
         );
         vf.add_virtual_folder(
             "Photos",
@@ -385,10 +394,6 @@ impl PhotoLibrary {
         )
         .await
         .expect("add library");
-        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
-            db.clone(),
-            Arc::new(ItemTypeLookup::new()),
-        ));
         let processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
             ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), tmp.path().join("cache")),
         );
@@ -814,6 +819,101 @@ async fn a_librarys_first_default_refresh_redraws_its_tile() {
             .await,
         dimmed(BLUE),
         "a refreshed library's current tile is behind its gate"
+    );
+}
+
+/// gl-337: `CollectionFolder.RequiresRefresh` fires when a library's
+/// recorded locations changed, so a Default scan after a media path is added
+/// or removed runs every provider of the library (`runAllProviders`) and
+/// redraws its tile past the 7-day date gate. A mode `None` scan leaves the
+/// flag; the Default refresh clears it (`BeforeMetadataRefresh`): the next
+/// scan is behind the gate again.
+/// A manager starting over the same unchanged libraries requires nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_library_whose_locations_changed_redraws_its_tile() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let tile = || async {
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await
+    };
+    let library_id =
+        uuid::Uuid::parse_str(&lib.row(BaseItemKind::CollectionFolder, "Photos").await.id)
+            .expect("id");
+    let scan = || async { lib.scanner.scan_all().await.expect("scan") };
+
+    write_photo(&lib.album_dir, BLUE);
+    scan().await;
+    assert_eq!(
+        tile().await,
+        dimmed(RED),
+        "an unchanged library is behind its gate"
+    );
+
+    let extra = lib.tmp.path().join("more photos");
+    std::fs::create_dir_all(&extra).expect("extra location");
+    let extra = MediaPathInfo {
+        path: extra.to_string_lossy().into_owned(),
+    };
+    lib.vf
+        .add_media_path("Photos", &extra)
+        .await
+        .expect("add a location");
+    // `RefreshMetadata` asks no `RequiresRefresh` in a mode `None` pass, and
+    // nothing clears the flag there.
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    lib.scanner.scan_with(None, &none).await.expect("scan");
+    assert_eq!(
+        tile().await,
+        dimmed(RED),
+        "a mode None scan leaves the tile"
+    );
+    scan().await;
+    assert_eq!(
+        tile().await,
+        dimmed(BLUE),
+        "a new location redraws the tile"
+    );
+    let stamped = lib
+        .row(BaseItemKind::CollectionFolder, "Photos")
+        .await
+        .date_last_refreshed;
+    assert!(
+        stamped.is_some(),
+        "the required refresh is saved and stamped"
+    );
+
+    write_photo(&lib.album_dir, RED);
+    scan().await;
+    assert_eq!(
+        tile().await,
+        dimmed(BLUE),
+        "the refresh took the flag: the next scan is behind the gate"
+    );
+
+    lib.vf
+        .remove_media_path("Photos", &extra.path)
+        .await
+        .expect("remove the location");
+    scan().await;
+    assert_eq!(
+        tile().await,
+        dimmed(RED),
+        "a removed location redraws it too"
+    );
+
+    // A restart over the same libraries: the first listing records the
+    // locations again and finds them as they were.
+    let restarted = FerrofinVirtualFolderManager::new(lib.tmp.path().join("root").join("default"))
+        .with_item_store(lib.persistence.clone())
+        .with_items(Arc::clone(&lib.items));
+    restarted.get_virtual_folders().await.expect("list");
+    assert!(
+        !restarted.take_library_requires_refresh(library_id),
+        "unchanged locations require no refresh"
     );
 }
 

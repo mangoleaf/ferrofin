@@ -390,7 +390,7 @@ impl LdapAuthProvider {
     }
 
     /// The link key of an LDAP uid: this provider, no issuer, the uid.
-    fn identity(uid: &str) -> ExternalIdentityKey<'_> {
+    pub(super) fn identity(uid: &str) -> ExternalIdentityKey<'_> {
         ExternalIdentityKey {
             provider_id: PROVIDER_ID,
             issuer: "",

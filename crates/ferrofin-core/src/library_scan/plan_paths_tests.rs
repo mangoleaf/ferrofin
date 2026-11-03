@@ -137,13 +137,16 @@ const MOVIES: &[&str] = &[
 ];
 
 /// The untyped library's files: movies, a series by its `tvshow.nfo`, one by
-/// its season folder, a folder of plain videos (`season.nfo`), and audio.
+/// its season folder, one inside a plain folder, a folder of plain videos
+/// (`season.nfo`), and audio.
 const MIXED: &[&str] = &[
     "Film.mkv",
     "Folder/Other Film (2001).mkv",
     "Folder/pic.jpg",
     "Show/tvshow.nfo",
     "Show/Show S01E01.mkv",
+    "Shows/Nested Show/tvshow.nfo",
+    "Shows/Nested Show/Nested Show S01E01.mkv",
     "Anthology/Season 1/Anthology S01E01.mkv",
     "Anthology/Season 1/Anthology S01E02.mkv",
     "Notes/season.nfo",
@@ -445,6 +448,24 @@ async fn plan_paths_matches_the_filtered_full_plan() {
     );
     let mut paths: Vec<String> = full.iter().filter_map(|p| p.entity.path.clone()).collect();
     let root = tmp.path().to_string_lossy().into_owned();
+    // A series inside a plain folder of the untyped library hangs off the
+    // folder, and what it holds sits below the folder too.
+    let planned = |rel: &str| {
+        let path = format!("{root}/{rel}");
+        full.iter()
+            .find(|p| p.entity.path.as_deref() == Some(path.as_str()))
+            .unwrap_or_else(|| panic!("nothing planned at {rel}"))
+    };
+    let folder = planned("mixed/Shows").id;
+    assert_eq!(
+        planned("mixed/Shows/Nested Show").entity.parent_id,
+        Some(ferrofin_db::store::guid_to_db(folder))
+    );
+    assert!(
+        planned("mixed/Shows/Nested Show/Nested Show S01E01.mkv")
+            .ancestors
+            .contains(&folder)
+    );
     for extra in [
         "movies",
         "movies/Heat (1995)/trailers",

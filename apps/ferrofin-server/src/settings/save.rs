@@ -1,5 +1,7 @@
 //! Saving the settings page's changes to `config.toml`
-//! (`POST /Ferrofin/Settings`, through [`FerrofinServerSettings`]'s `update`).
+//! (`POST /Ferrofin/Settings`, through [`FerrofinServerSettings`]'s `update`),
+//! and to the server configuration for the rows stored there ([`split`],
+//! [`configure`]).
 //!
 //! A save is all or nothing. First every change is checked: its key is a
 //! setting the page may change (not read-only or environment-only, and not
@@ -22,11 +24,15 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use ferrofin_model::configuration::ServerConfiguration;
 use ferrofin_traits::error::ServiceError;
 use serde_json::Value;
 use toml_edit::DocumentMut;
 
-use super::{SETTINGS, SettingKind, SettingSpec, locked_reason, no_longer_loads, source};
+use super::{
+    ConfigurationField, SettingKind, SettingSpec, SettingStore, locked_reason, no_longer_loads,
+    source,
+};
 use crate::config::{self, Cli, Config, Env};
 
 /// The mode of a `config.toml` a save creates: owner-only, since the file may
@@ -34,9 +40,99 @@ use crate::config::{self, Cli, Config, Env};
 #[cfg(unix)]
 const NEW_FILE_MODE: u32 = 0o600;
 
-/// Saves `changes` to `running`'s `config.toml`: a value sets its key, `None`
-/// removes it. Returns the rows whose entry changed, in key order; when none
-/// did, nothing is written.
+/// A change to a row stored in the server configuration: the row, how it is
+/// stored, and its value (`None` for a new server's).
+pub(super) type StoredChange = (&'static SettingSpec, ConfigurationField, Option<Value>);
+
+/// A save's changes by key: a value to set, `None` for the default.
+pub(super) type Changes = BTreeMap<String, Option<Value>>;
+
+/// `changes` split by where their rows are stored: those stored in the server
+/// configuration, each checked, and the rest, which [`stage`] checks (a key
+/// that is no setting among them).
+///
+/// # Errors
+///
+/// [`ServiceError::InvalidInput`] naming the key for a value of a row stored
+/// in the server configuration that is not one of its kind.
+pub(super) fn split(
+    rows: &'static [SettingSpec],
+    changes: Changes,
+) -> Result<(Vec<StoredChange>, Changes), ServiceError> {
+    let mut stored = Vec::new();
+    let mut filed = BTreeMap::new();
+    for (key, value) in changes {
+        match rows.iter().find(|spec| spec.key == key) {
+            Some(
+                spec @ SettingSpec {
+                    store: SettingStore::ServerConfiguration(field),
+                    ..
+                },
+            ) => {
+                // Checked only: the value goes to `write` as sent, not in the
+                // form `to_toml` gives it (a URL trimmed). Every stored row is
+                // a choice, which it takes as it is.
+                if let Some(value) = &value {
+                    to_toml(spec, value)
+                        .map_err(|why| ServiceError::invalid_input(format!("`{key}` {why}")))?;
+                }
+                stored.push((spec, *field, value));
+            }
+            _ => {
+                filed.insert(key, value);
+            }
+        }
+    }
+    Ok((stored, filed))
+}
+
+/// `current` with `changes` applied, and the keys whose value changed, in key
+/// order. `None` puts back a new server's value.
+pub(super) fn configure(
+    current: &ServerConfiguration,
+    changes: &[StoredChange],
+) -> (ServerConfiguration, Vec<String>) {
+    let stock = ServerConfiguration::default();
+    let mut next = current.clone();
+    let mut keys = Vec::new();
+    for (spec, field, value) in changes {
+        let value = value.clone().unwrap_or_else(|| (field.read)(&stock));
+        if (field.read)(&next) != value {
+            (field.write)(&mut next, &value);
+            keys.push(spec.key.to_owned());
+        }
+    }
+    (next, keys)
+}
+
+/// A `config.toml` checked, written beside the file it replaces and loaded, to
+/// be renamed over it ([`commit`](Self::commit)), or removed when dropped.
+pub(super) struct Stage {
+    /// The new file.
+    staged: Staged,
+    /// The file it replaces: `config.toml`, or the file it links to.
+    target: PathBuf,
+    /// `config.toml`, as messages name it.
+    shown: PathBuf,
+    /// The rows whose entry it changes, in key order.
+    edited: Vec<&'static SettingSpec>,
+}
+
+impl Stage {
+    /// Renames the new file over `config.toml`; the rows whose entry changed.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Conflict`] naming the path when the rename fails.
+    pub(super) fn commit(self) -> Result<Vec<&'static SettingSpec>, ServiceError> {
+        self.staged.commit(&self.target, &self.shown)?;
+        Ok(self.edited)
+    }
+}
+
+/// Stages `changes`, to rows of `rows` stored in `config.toml`, as
+/// `running`'s new `config.toml`: a value sets its key, `None` removes it.
+/// `None` when they change nothing, and nothing is written.
 ///
 /// # Errors
 ///
@@ -44,16 +140,17 @@ const NEW_FILE_MODE: u32 = 0o600;
 /// anything is written, and for a file the loader refuses; and
 /// [`ServiceError::Conflict`] naming the path when the file cannot be read,
 /// no longer parses, or cannot be written. Nothing changes on disk either way.
-pub(super) fn save(
+pub(super) fn stage(
+    rows: &'static [SettingSpec],
     running: &Config,
     env: &dyn Env,
-    changes: &BTreeMap<String, Option<Value>>,
-) -> Result<Vec<&'static SettingSpec>, ServiceError> {
+    changes: &Changes,
+) -> Result<Option<Stage>, ServiceError> {
     let shown = running.config_file.as_path();
     let file_keys = config::config_file_keys(shown).map_err(|err| no_longer_loads(shown, &err))?;
     let edits = changes
         .iter()
-        .map(|(key, value)| checked(running, env, &file_keys, key, value.as_ref()))
+        .map(|(key, value)| checked(rows, running, env, &file_keys, key, value.as_ref()))
         .collect::<Result<Vec<_>, _>>()?;
 
     let target = write_target(shown)?;
@@ -65,28 +162,33 @@ pub(super) fn save(
         }
     }
     if edited.is_empty() {
-        return Ok(edited);
+        return Ok(None);
     }
 
     ensure_writable(&target, shown)?;
     let staged = Staged::write(&target, shown, document.to_string().as_bytes())?;
     validate(running, env, &staged.path, shown)?;
-    staged.commit(&target, shown)?;
-    Ok(edited)
+    Ok(Some(Stage {
+        staged,
+        target,
+        shown: shown.to_path_buf(),
+        edited,
+    }))
 }
 
-/// The row of `key` and its `config.toml` value (`None` to remove it), once
-/// the page may change it and `value` is one of its kind.
+/// The row of `key` among `rows` and its `config.toml` value (`None` to
+/// remove it), once the page may change it and `value` is one of its kind.
 fn checked(
+    rows: &'static [SettingSpec],
     running: &Config,
     env: &dyn Env,
     file_keys: &[String],
     key: &str,
     value: Option<&Value>,
 ) -> Result<(&'static SettingSpec, Option<toml_edit::Value>), ServiceError> {
-    let spec = SETTINGS
+    let spec = rows
         .iter()
-        .find(|spec| spec.key == key)
+        .find(|spec| spec.key == key && matches!(spec.store, SettingStore::ConfigFile))
         .ok_or_else(|| ServiceError::invalid_input(format!("`{key}` is not a Ferrofin setting")))?;
     if let Some(reason) = locked_reason(spec, source(spec, &running.cli, env, file_keys), env) {
         return Err(ServiceError::invalid_input(format!(
@@ -143,6 +245,16 @@ fn to_toml(spec: &SettingSpec, value: &Value) -> Result<toml_edit::Value, String
             .and_then(|list| list.iter().map(Value::as_f64).collect::<Option<Vec<_>>>())
             .map(|numbers| toml_edit::Value::Array(numbers.into_iter().collect()))
             .ok_or_else(|| "takes a list of numbers".to_owned())?,
+        // An option by its value, as the report gives it: a value that fits
+        // no option (Custom) stays as it is until the page names another.
+        SettingKind::Choice => value
+            .as_str()
+            .filter(|text| spec.options.iter().any(|option| option.value == *text))
+            .map(toml_edit::Value::from)
+            .ok_or_else(|| {
+                let values: Vec<&str> = spec.options.iter().map(|option| option.value).collect();
+                format!("takes one of {}", values.join(", "))
+            })?,
     };
     (spec.check)(value)?;
     Ok(toml)

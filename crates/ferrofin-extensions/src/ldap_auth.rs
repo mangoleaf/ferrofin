@@ -21,6 +21,9 @@
 //!   provider the extension contributes, listed by `GET /Auth/Providers` and
 //!   `GET /Auth/PasswordResetProviders` while the plugin is enabled and names a
 //!   server;
+//! - [`adoption`] — the one-time import of an adopted Jellyfin's
+//!   `LDAP-Auth.xml`, its uid map included, which turns the plugin on when a
+//!   user's saved authentication provider is LDAP-Auth's (B7, D7);
 //! - `referrals` — following the referrals the user search (at sign-in, in
 //!   a password change and on the settings page), the filter test and the
 //!   admin filter's search meet, with the bind credentials, as upstream's
@@ -31,11 +34,15 @@
 //! - The plugin is **disabled by default**, and `LdapServer` seeds empty
 //!   instead of `ldap-server.contoso.com`, so an unconfigured server is
 //!   detectable (D3). Upstream's provider is always enabled and would try the
-//!   placeholder host on every unknown sign-in.
+//!   placeholder host on every unknown sign-in. An adopted `LDAP-Auth.xml`
+//!   still naming that placeholder is imported with the server empty.
 //! - The configuration has **no `LdapUsers`**: which LDAP uid belongs to which
 //!   user is kept in Ferrofin's external-identity table (D12), so
 //!   `GET /Plugins/{id}/Configuration` does not return it. Upstream's settings
 //!   page never reads or writes it.
+//! - An adopted `LDAP-Auth.xml` is **imported once and never written back**
+//!   ([`adoption`]), and the importer trims each value, so a bind password
+//!   with leading or trailing spaces comes across without them.
 //! - **Timeouts** (D6): connecting gives up after [`CONNECT_TIMEOUT`] and each
 //!   operation after [`OPERATION_TIMEOUT`]; upstream sets none.
 //! - A custom root CA is the **only** trust anchor: the server's certificate
@@ -68,6 +75,7 @@
 //!   it: see `referrals`. Upstream's Novell client connects to a referred
 //!   server in plain LDAP and never stops a referral loop.
 
+pub mod adoption;
 pub mod directory;
 pub mod provider;
 mod referrals;
@@ -1151,7 +1159,7 @@ impl Extension for LdapAuthExtension {
             can_uninstall: false,
             // Upstream's `BasePlugin<T>.ConfigurationFileName`: the assembly
             // name with `.xml`.
-            configuration_file_name: Some("LDAP-Auth.xml".to_owned()),
+            configuration_file_name: Some(adoption::CONFIGURATION_FILE_NAME.to_owned()),
         }
     }
 

@@ -13,12 +13,28 @@ use ferrofin_traits::server_settings::ServerSettingsManager;
 use serde_json::{Value, json};
 use tracing_subscriber::fmt::MakeWriter;
 
-use super::{save, to_toml};
-use crate::config::Config;
-use crate::settings::tests::{DataDir, FakeEnv, load, plugins, sample, spec};
-use crate::settings::{
-    FerrofinServerSettings, SAVES, SETTINGS, SettingAccess, SettingKind, save_and_report,
+use ferrofin_model::configuration::{ImageSavingConvention, ServerConfiguration};
+
+use super::{Stage, stage, to_toml};
+use crate::config::{Config, Env};
+use crate::settings::tests::{
+    DataDir, FakeConfiguration, FakeEnv, STORED_ROW, load, plugins, rows_with_a_stored_one, sample,
+    spec,
 };
+use crate::settings::{
+    FerrofinServerSettings, SAVES, SETTINGS, SettingAccess, SettingKind, SettingSpec,
+};
+
+/// Saves `changes` to `running`'s `config.toml` as a save of only
+/// `config.toml` rows runs: staged, then renamed over the file. The rows
+/// whose entry changed.
+fn save(
+    running: &Config,
+    env: &dyn Env,
+    changes: &BTreeMap<String, Option<Value>>,
+) -> Result<Vec<&'static SettingSpec>, ServiceError> {
+    stage(SETTINGS, running, env, changes)?.map_or_else(|| Ok(Vec::new()), Stage::commit)
+}
 
 /// A `Changes` map from `(key, value)` pairs; a `null` removes the key.
 fn changes(pairs: &[(&str, Value)]) -> BTreeMap<String, Option<Value>> {
@@ -220,7 +236,6 @@ fn every_editable_setting_saves_what_a_hand_written_line_holds() {
         seen += 1;
         let value = match (spec.key, spec.kind) {
             ("log_level", _) => json!("debug"),
-            ("log_format", _) => json!("text"),
             // As `sample`: the value that is not the default.
             (_, SettingKind::Bool) => json!(spec.default != "true"),
             (_, SettingKind::Integer { .. }) => {
@@ -230,6 +245,7 @@ fn every_editable_setting_saves_what_a_hand_written_line_holds() {
             (_, SettingKind::Text | SettingKind::Secret) => json!("sample"),
             (_, SettingKind::Url) => json!("http://sample.invalid"),
             (_, SettingKind::NumberList) => json!([0.5, 1.0]),
+            (_, SettingKind::Choice) => json!(sample(spec).trim_matches('"')),
             (_, SettingKind::Path | SettingKind::PathList) => {
                 panic!("{}: no editable row holds paths", spec.key)
             }
@@ -500,7 +516,7 @@ fn an_invalid_value_leaves_the_file_byte_identical() {
             json!(100_000),
             "whole number from",
         ),
-        ("log_format", json!("xml"), "json or text"),
+        ("log_format", json!("xml"), "takes one of json, text"),
         ("log_level", json!("=not[a]filter"), "RUST_LOG syntax"),
         ("metrics_scan_duration_buckets", json!([]), "empty"),
         (
@@ -547,7 +563,7 @@ fn an_invalid_value_leaves_the_file_byte_identical() {
             json!([]),
             "whole number or \"auto\"",
         ),
-        ("log_format", json!(3), "takes text"),
+        ("log_format", json!(3), "takes one of json, text"),
         (
             "musicbrainz_base_url",
             json!("not a url"),
@@ -827,9 +843,33 @@ fn manager(
         load(data.cli(), &env),
         lifecycle.clone(),
         Arc::clone(&plugins),
+        FakeConfiguration::new(ServerConfiguration::default()),
     )
     .with_env(env);
     (manager, lifecycle, plugins)
+}
+
+/// A manager over `data` and `configuration`, with the row stored in the
+/// server configuration that only the tests register ([`STORED_ROW`]).
+fn stored_manager(
+    data: &DataDir,
+    configuration: Arc<FakeConfiguration>,
+) -> (
+    FerrofinServerSettings,
+    Arc<crate::state::FerrofinLifecycleController>,
+) {
+    let env = FakeEnv::new();
+    let (shutdown, _rx) = tokio::sync::oneshot::channel();
+    let lifecycle = Arc::new(crate::state::FerrofinLifecycleController::new(shutdown));
+    let manager = FerrofinServerSettings::new(
+        load(data.cli(), &env),
+        lifecycle.clone(),
+        plugins(data.path()),
+        configuration,
+    )
+    .with_env(env)
+    .with_rows(rows_with_a_stored_one());
+    (manager, lifecycle)
 }
 
 fn update(pairs: &[(&str, Value)]) -> ServerSettingsUpdateDto {
@@ -841,32 +881,27 @@ fn update(pairs: &[(&str, Value)]) -> ServerSettingsUpdateDto {
 /// B7: a save marks the restart, reports what it changed and what needs the
 /// process restarted (the rows an in-process restart keeps, gl-526), and logs
 /// the key names, never a value.
-#[test]
-fn a_save_marks_a_restart_and_logs_key_names_only() {
+#[tokio::test]
+async fn a_save_marks_a_restart_and_logs_key_names_only() {
     let data = DataDir::new(&[]);
-    let env = FakeEnv::new();
-    let (shutdown, _rx) = tokio::sync::oneshot::channel();
-    let lifecycle = crate::state::FerrofinLifecycleController::new(shutdown);
-    let running = load(data.cli(), &env);
+    let (manager, lifecycle, _plugins) = manager(&data, FakeEnv::new());
 
     let log = Captured::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(log.clone())
         .finish();
-    let result = tracing::subscriber::with_default(subscriber, || {
-        save_and_report(
-            &running,
-            &env,
-            &lifecycle,
-            &changes(&[
-                ("log_level", json!("debug")),
-                ("omdb_api_key", json!("hunter2")),
-                ("scan_probe_concurrency", json!(4)),
-            ]),
-        )
-    })
-    .expect("saved");
+    // The save's task runs on this test's one runtime thread, which logs to
+    // `log`.
+    let _log = tracing::subscriber::set_default(subscriber);
+    let result = manager
+        .update(update(&[
+            ("log_level", json!("debug")),
+            ("omdb_api_key", json!("hunter2")),
+            ("scan_probe_concurrency", json!(4)),
+        ]))
+        .await
+        .expect("saved");
 
     assert_eq!(
         result.changed,
@@ -1015,4 +1050,281 @@ async fn a_save_while_the_plugin_is_disabled_is_not_found() {
         "a disabled plugin wrote the file"
     );
     assert!(!lifecycle.has_pending_restart());
+}
+
+// ---- choices and the server configuration (gl-1174) -----------------------------
+
+/// B10: a choice takes one of its options, by value, and nothing else.
+#[test]
+fn a_choice_takes_only_its_options() {
+    let data = DataDir::new(&[]);
+    let env = FakeEnv::new();
+
+    let err = saved(&data, &env, &[("log_format", json!("xml"))]).expect_err("refused");
+    assert_eq!(refused(err), "`log_format` takes one of json, text");
+    assert!(!data.config_file().exists(), "a refusal wrote the file");
+
+    assert_eq!(
+        saved(&data, &env, &[("log_format", json!("text"))]).expect("saved"),
+        ["log_format"]
+    );
+    assert_eq!(contents(&data), "log_format = \"text\"\n");
+}
+
+/// B10: a value `config.toml` holds that fits no option (Custom) survives a
+/// save that does not name it.
+#[test]
+fn a_custom_choice_survives_a_save_of_other_keys() {
+    let data = DataDir::new(&["log_format = \"xml\"".to_owned()]);
+    let env = FakeEnv::new();
+
+    assert_eq!(
+        saved(&data, &env, &[("db_pool", json!(4))]).expect("saved"),
+        ["db_pool"]
+    );
+    assert_eq!(contents(&data), "log_format = \"xml\"\ndb_pool = 4\n");
+}
+
+/// The files a save leaves beside `config.toml` while it is staged.
+fn staged_files(dir: &Path) -> Vec<String> {
+    leftovers(dir)
+        .into_iter()
+        .filter(|name| name.starts_with(".ferrofin-settings-save."))
+        .collect()
+}
+
+/// B12: a row stored in the server configuration is saved through the
+/// configuration manager and applies at once: no restart, and `config.toml`
+/// is never touched.
+#[tokio::test]
+async fn a_row_stored_in_the_server_configuration_saves_through_it() {
+    let data = DataDir::new(&[]);
+    let configuration = FakeConfiguration::new(ServerConfiguration::default());
+    let (manager, lifecycle) = stored_manager(&data, Arc::clone(&configuration));
+
+    let result = manager
+        .update(update(&[(STORED_ROW.key, json!("Compatible"))]))
+        .await
+        .expect("saved");
+
+    assert_eq!(
+        result,
+        ServerSettingsUpdateResultDto {
+            applied_now: vec![STORED_ROW.key.to_owned()],
+            ..ServerSettingsUpdateResultDto::default()
+        }
+    );
+    assert_eq!(configuration.updates(), 1);
+    assert!(
+        configuration
+            .json()
+            .contains(r#""ImageSavingConvention":"Compatible""#),
+        "{}",
+        configuration.json()
+    );
+    assert!(!lifecycle.has_pending_restart(), "a restart was marked");
+    assert!(!data.config_file().exists(), "config.toml was written");
+
+    let report = manager.snapshot().await.expect("report");
+    let row = report
+        .settings
+        .iter()
+        .find(|setting| setting.key == STORED_ROW.key)
+        .expect("the stored row is reported");
+    assert_eq!(row.value, Some(json!("Compatible")));
+}
+
+/// B12: a save that changes nothing stored leaves the server configuration as
+/// it was, byte for byte, so `GET /System/Configuration` answers what it did:
+/// a stored row named with the value it holds, a save of `config.toml` only,
+/// and `null` on a row at a new server's value.
+#[tokio::test]
+async fn a_save_that_changes_nothing_stored_leaves_the_configuration_byte_identical() {
+    let data = DataDir::new(&[]);
+    let configuration = FakeConfiguration::new(ServerConfiguration::default());
+    let before = configuration.json();
+    let (manager, _lifecycle) = stored_manager(&data, Arc::clone(&configuration));
+
+    for unchanged in [
+        update(&[(STORED_ROW.key, json!("Legacy"))]),
+        update(&[(STORED_ROW.key, Value::Null)]),
+    ] {
+        let result = manager.update(unchanged).await.expect("saved");
+        assert_eq!(result, ServerSettingsUpdateResultDto::default());
+    }
+    let filed = manager
+        .update(update(&[("db_pool", json!(4))]))
+        .await
+        .expect("saved");
+    assert_eq!(filed.changed, ["db_pool"]);
+    assert!(filed.restart_required);
+    assert_eq!(filed.applied_now, Vec::<String>::new());
+
+    assert_eq!(configuration.updates(), 0, "the configuration was saved");
+    assert_eq!(configuration.json(), before);
+}
+
+/// B10, B12: a stored value that fits no option is reported as Custom, as it
+/// is, and stays until a save names its row; `null` then puts a new server's
+/// value back.
+#[tokio::test]
+async fn a_custom_stored_value_stays_until_its_row_is_saved() {
+    let custom = ServerConfiguration {
+        image_saving_convention: ImageSavingConvention::Unrecognized(7),
+        ..ServerConfiguration::default()
+    };
+    let configuration = FakeConfiguration::new(custom);
+    let before = configuration.json();
+    let data = DataDir::new(&[]);
+    let (manager, _lifecycle) = stored_manager(&data, Arc::clone(&configuration));
+
+    manager
+        .update(update(&[("db_pool", json!(4))]))
+        .await
+        .expect("saved");
+    assert_eq!(
+        configuration.json(),
+        before,
+        "another key's save changed it"
+    );
+    let report = manager.snapshot().await.expect("report");
+    let row = report
+        .settings
+        .iter()
+        .find(|setting| setting.key == STORED_ROW.key)
+        .expect("the stored row is reported");
+    assert!(row.custom, "{row:?}");
+    assert_eq!(row.value, Some(json!("7")));
+
+    let result = manager
+        .update(update(&[(STORED_ROW.key, Value::Null)]))
+        .await
+        .expect("saved");
+    assert_eq!(result.applied_now, [STORED_ROW.key]);
+    assert_eq!(
+        configuration.json(),
+        FakeConfiguration::new(ServerConfiguration::default()).json()
+    );
+}
+
+/// A save naming both stores is all or nothing: a refused value in either,
+/// or a server configuration that cannot be saved, leaves `config.toml` and
+/// the configuration as they were; one that passes saves both.
+#[tokio::test]
+async fn a_save_naming_both_stores_is_all_or_nothing() {
+    let data = DataDir::new(&["db_pool = 2".to_owned()]);
+    let configuration = FakeConfiguration::new(ServerConfiguration::default());
+    let before = configuration.json();
+    let (manager, lifecycle) = stored_manager(&data, Arc::clone(&configuration));
+
+    let err = manager
+        .update(update(&[
+            ("db_pool", json!(4)),
+            (STORED_ROW.key, json!("Sideways")),
+        ]))
+        .await
+        .expect_err("refused");
+    assert_eq!(
+        refused(err),
+        "`image_saving_convention` takes one of Legacy, Compatible"
+    );
+    let err = manager
+        .update(update(&[
+            ("db_pool", json!(0)),
+            (STORED_ROW.key, json!("Compatible")),
+        ]))
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+    assert_eq!(configuration.updates(), 0);
+    assert_eq!(configuration.json(), before);
+    assert_eq!(contents(&data), "db_pool = 2");
+    assert!(!lifecycle.has_pending_restart());
+
+    // A configuration that cannot be saved: the staged file goes too.
+    let failing = FakeConfiguration::failing(ServerConfiguration::default());
+    let (manager, lifecycle) = stored_manager(&data, failing);
+    let err = manager
+        .update(update(&[
+            ("db_pool", json!(4)),
+            (STORED_ROW.key, json!("Compatible")),
+        ]))
+        .await
+        .expect_err("the update failed");
+    assert!(matches!(err, ServiceError::Backend(_)), "{err:?}");
+    assert_eq!(contents(&data), "db_pool = 2");
+    assert!(
+        staged_files(data.path()).is_empty(),
+        "a staged file is left"
+    );
+    assert!(!lifecycle.has_pending_restart());
+
+    let (manager, lifecycle) = stored_manager(&data, Arc::clone(&configuration));
+    let result = manager
+        .update(update(&[
+            ("db_pool", json!(4)),
+            (STORED_ROW.key, json!("Compatible")),
+        ]))
+        .await
+        .expect("saved");
+    assert_eq!(result.changed, ["db_pool"]);
+    assert_eq!(result.applied_now, [STORED_ROW.key]);
+    assert!(result.restart_required);
+    assert!(lifecycle.has_pending_restart());
+    assert_eq!(contents(&data), "db_pool = 4\n");
+    assert_eq!(configuration.updates(), 1);
+}
+
+/// B12: a save of the server configuration alone never reads `config.toml`,
+/// so one that no longer parses cannot stop it.
+#[tokio::test]
+async fn a_stored_row_saves_over_a_broken_config_toml() {
+    let data = DataDir::new(&[]);
+    let configuration = FakeConfiguration::new(ServerConfiguration::default());
+    let (manager, lifecycle) = stored_manager(&data, Arc::clone(&configuration));
+    std::fs::write(data.config_file(), "db_pool = [[[").expect("break config.toml");
+
+    let result = manager
+        .update(update(&[(STORED_ROW.key, json!("Compatible"))]))
+        .await
+        .expect("saved");
+
+    assert_eq!(result.applied_now, [STORED_ROW.key]);
+    assert_eq!(configuration.updates(), 1);
+    assert_eq!(contents(&data), "db_pool = [[[");
+    assert!(!lifecycle.has_pending_restart());
+}
+
+/// The server configuration is read only once `config.toml` is staged, just
+/// before it is written, so a Dashboard save made meanwhile is not written
+/// over: a save whose `config.toml` part is refused never reads it.
+#[tokio::test]
+async fn the_server_configuration_is_read_only_once_config_toml_is_staged() {
+    let data = DataDir::new(&[]);
+    let configuration = FakeConfiguration::new(ServerConfiguration::default());
+    let (manager, _lifecycle) = stored_manager(&data, Arc::clone(&configuration));
+
+    let err = manager
+        .update(update(&[
+            ("db_pool", json!(0)),
+            (STORED_ROW.key, json!("Compatible")),
+        ]))
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+    assert_eq!(
+        configuration.reads(),
+        0,
+        "read before config.toml was staged"
+    );
+
+    manager
+        .update(update(&[
+            ("db_pool", json!(4)),
+            (STORED_ROW.key, json!("Compatible")),
+        ]))
+        .await
+        .expect("saved");
+    assert_eq!(configuration.reads(), 1);
+    assert_eq!(configuration.updates(), 1);
 }

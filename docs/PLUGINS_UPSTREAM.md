@@ -20,7 +20,7 @@ Conventions:
 | Intro Skipper | https://github.com/intro-skipper/intro-skipper | `db09359` | 10.11/prerelease | ported |
 | File Transformation | https://github.com/IAmParadox27/jellyfin-plugin-file-transformation | `f4f01c3` | 2.5.10.0 | ported |
 | Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
-| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, its three test routes, sign-in, the admin filter, password changes and resets, and referrals (milestone "LDAP-Auth plugin port") |
+| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, its three test routes, sign-in, the admin filter, password changes and resets, referrals, the adopted settings' import (milestone "LDAP-Auth plugin port") |
 
 ## Per-plugin notes
 
@@ -203,12 +203,14 @@ Conventions:
 - Ferrofin files: `crates/ferrofin-extensions/src/ldap_auth.rs` (the extension, the
   configuration, the `LdapDirectory` seam, the settings page's three tests and their service),
   `ldap_auth/directory.rs` (the `ldap3` client and its rustls configuration),
-  `ldap_auth/provider.rs` (the sign-in provider) and `ldap_auth/referrals.rs` (referral
-  following), vendored assets `crates/ferrofin-extensions/assets/ldapauth/`, the trait seam
-  `crates/ferrofin-traits/src/ldap.rs`, the wire types `crates/ferrofin-model/src/ldap.rs`,
-  and the thin HTTP handler `crates/ferrofin-api/src/handlers/ldap.rs`. The live directory
-  test is `crates/ferrofin-extensions/tests/ldap_directory.rs` (`FERROFIN_LDAP_TESTS=1`,
-  OpenLDAP in docker; CI does not run it).
+  `ldap_auth/provider.rs` (the sign-in, password-change and password-reset provider),
+  `ldap_auth/referrals.rs` (referral following) and `ldap_auth/adoption.rs` (the
+  `LDAP-Auth.xml` import), vendored assets `crates/ferrofin-extensions/assets/ldapauth/`, the
+  trait seam `crates/ferrofin-traits/src/ldap.rs`, the wire types
+  `crates/ferrofin-model/src/ldap.rs`, and the thin HTTP handler
+  `crates/ferrofin-api/src/handlers/ldap.rs`. The live directory test is
+  `crates/ferrofin-extensions/tests/ldap_directory.rs` (`FERROFIN_LDAP_TESTS=1`, OpenLDAP in
+  docker; CI does not run it).
 - Ported so far (v24, `d11c86a`): `LdapPlugin` (GUID, name `LDAP-Auth`, version 24,
   `ConfigurationFileName` `LDAP-Auth.xml`, the settings page under its name),
   `PluginConfiguration` with upstream's defaults, `GetConnectionOptions` and its certificate
@@ -245,8 +247,7 @@ Conventions:
   An entry without the username attribute is a `400`, as upstream's create or rename with a
   null name throws an `ArgumentException`. The provider is enabled only with the plugin and a
   server (D3);
-  upstream's `IsEnabled` is always `true`. Profile images and the `LDAP-Auth.xml` import are
-  later phases of the milestone.
+  upstream's `IsEnabled` is always `true`. Profile images are a later phase of the milestone.
 - Password change (v24, `d11c86a`): `ChangePassword`, which the user manager calls for a user
   whose `AuthenticationProviderId` is LDAP-Auth's (`POST /Users/{userId}/Password`). With
   `AllowPassChange` off it is upstream's `NotImplementedException`, a `500`. Otherwise the user's
@@ -267,6 +268,18 @@ Conventions:
   built-in provider) and `$userName` by the entered name lowercased (`ToLowerInvariant`), both
   ignoring case and unencoded, as upstream; with no URL, upstream's `NotImplementedException`, a
   `500`. It is enabled under the same conditions as sign-in (D3).
+- Adoption (v24, `d11c86a`; owner decision D7): on a boot where LDAP-Auth has no `config.json`
+  yet, an adopted Jellyfin's `{program data}/plugins/configurations/LDAP-Auth.xml`
+  (`BasePlugin<T>.ConfigurationFilePath`, written by .NET's `XmlSerializer`) is read with the
+  server configuration's importer. Every setting comes across, the bind password included
+  (never logged). Each `LdapUsers` entry whose user still exists becomes an external-identity
+  link (`LdapUid` as the subject, `ProfileImageHash` as the avatar hash); an entry for a
+  deleted user is skipped. The plugin is then enabled when any user's
+  `AuthenticationProviderId` is LDAP-Auth's (ignoring case), and otherwise stays off. The file
+  is only read. A missing file is silent; one that cannot be read or parsed, or a write that
+  fails, is a warning, and the next boot tries again (`config.json` is written last, so its
+  presence means the import finished). `scripts/migrate-jellyfin.sh` copies this one file of
+  Jellyfin's `plugins/`.
 - Admin filter (v24, `d11c86a`): the admin block of `Authenticate`. While `LdapAdminFilter` is
   neither empty nor `_disabled_` (ordinal), after the password is checked the bind DN searches,
   on a connection of its own, the subtree of `LdapAdminBaseDn` (the base DN when that is empty)
@@ -416,11 +429,19 @@ Conventions:
   - **Off by default** (owner decision D3): the plugin is disabled in `/Plugins` until an
     administrator enables it, and `LdapServer` seeds empty instead of
     `ldap-server.contoso.com`. Upstream's provider is always enabled and would try the
-    placeholder host on every sign-in of an unknown name.
+    placeholder host on every sign-in of an unknown name. An adopted `LDAP-Auth.xml` whose
+    `LdapServer` is still that placeholder is imported with the server empty, and a warning
+    names `LdapServer`: the plugin is on for its LDAP users but inactive until an
+    administrator sets a server.
   - **No `LdapUsers` in the configuration** (D12): which LDAP uid belongs to which user lives in
     Ferrofin's external-identity table, so `GET /Plugins/{id}/Configuration` does not return
     it, and a `LdapUsers` member posted to it is dropped. Upstream's settings page never reads
     or writes it.
+  - **An adopted `LDAP-Auth.xml` is imported once and never written back.** Upstream reads and
+    writes that file as the plugin's live store; Ferrofin keeps `config.json` and the links
+    table from the import on, so a change made in Ferrofin never reaches the file, which stays
+    as Jellyfin last wrote it. The importer trims each value, as it does `system.xml`'s, so a
+    setting with leading or trailing spaces (a bind password, say) comes across without them.
   - **Timeouts** (D6): opening a connection (the TCP connect and an LDAPS handshake) gives up
     after 5 seconds, and each operation, StartTLS included, after 10 seconds without an
     answer (a search's timer restarts with each entry). Upstream sets none.

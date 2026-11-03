@@ -2410,10 +2410,12 @@ pub trait UserViewManager: Send + Sync {
     /// Port of `UserViewManager.GetLatestItems`: ONE query across every parent
     /// (the root folders the user may open minus `latest_item_excludes`, or
     /// the `parent_id` folder), ordered `DateCreated DESC, SortName DESC, ProductionYear DESC`
-    /// and over-fetched to `limit * 5` rows; a tvshows or music parent takes
-    /// its own per-collection-type query instead
-    /// ([`ItemRepository::get_latest_item_list`] — one Episode, Season or
-    /// Series card per newest series for tvshows, the newest albums for music).
+    /// and over-fetched to `limit * 5` rows. A grouped request whose first
+    /// typed parent is tvshows, music or movies takes that type's own query
+    /// instead, and one with no typed parent the `unknown` merge of the movies
+    /// and tvshows ones ([`ItemRepository::get_latest_item_list`] — one
+    /// Episode, Season or Series card per newest series for tvshows, the newest
+    /// albums for music, the newest row of each presentation key for movies).
     /// The rows are then bucketed by their `LatestItemsIndexContainer` (episode
     /// → series, track → music album, photo → photo album; folders and every
     /// other kind — a `MusicAlbum` included — stand alone) in first-seen order,
@@ -3075,6 +3077,23 @@ pub trait VirtualFolderManager: Send + Sync {
     /// The default is a no-op, for seams with no item store attached.
     async fn prune_orphan_collection_folders(&self) -> Result<usize, ServiceError> {
         Ok(0)
+    }
+
+    /// Takes library `library`'s `CollectionFolder._requiresRefresh`: whether
+    /// the locations or physical folders recorded on its row changed since its
+    /// refresh last began, clearing it as `BeforeMetadataRefresh` does.
+    ///
+    /// Upstream's `CollectionFolder.RequiresRefresh` compares the stored
+    /// `PhysicalLocations` and `PhysicalFolderIds` with the resolved ones, and
+    /// `CreateResolveArgs` sets the flag when they differ. An implementation
+    /// that records new locations on the row before any refresh reads them
+    /// keeps that comparison's answer here. A library refresh in a mode other
+    /// than `None` takes it, once, when it plans the library.
+    ///
+    /// The default has none to take.
+    fn take_library_requires_refresh(&self, library: Uuid) -> bool {
+        let _ = library;
+        false
     }
 
     /// Adds a media path (and its `.mblink` shortcut) to an existing library.

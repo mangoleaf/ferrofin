@@ -26,8 +26,7 @@
 //! ([`super::users::assert_can_update_user`]). The person on-demand metadata
 //! refresh (`RefreshOnDemandIfNeeded`) runs in `items::get_item`, which both
 //! item routes reach. `GET /Items/Latest` ports `GetLatestMedia` (the grouping
-//! lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)),
-//! except the mixed-library arm of the grouped request, not ported yet (gl-383).
+//! lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
 
 use axum::extract::{Path, State};
 use axum::routing::{get, post};

@@ -2219,6 +2219,19 @@ pub(crate) fn config_file_keys(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(top_level_keys(&settings, path)?.into_keys().collect())
 }
 
+/// The value `config.toml` at `path` holds for its top-level `key`, as text
+/// (a number or an on/off as written), as the loader reads it before it
+/// judges it; `None` when the file or the key is missing, or the value is a
+/// list or a table.
+pub(crate) fn config_file_text(path: &Path, key: &str) -> anyhow::Result<Option<String>> {
+    let Some(settings) = read_config_file(path)? else {
+        return Ok(None);
+    };
+    Ok(top_level_keys(&settings, path)?
+        .remove(key)
+        .and_then(|value| value.into_string().ok()))
+}
+
 /// Reads `config.toml` at `path` through the `config` crate, or `None` when
 /// it does not exist. A parse error never quotes the file
 /// ([`without_source_lines`]).

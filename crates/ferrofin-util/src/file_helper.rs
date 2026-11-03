@@ -76,6 +76,9 @@ fn atomic_replace_with_permissions(
             #[cfg(not(unix))]
             {
                 let mut permissions = metadata.permissions();
+                // Not Unix, so this clears only the read-only attribute: the
+                // lint's world-writable risk is the Unix meaning.
+                #[allow(clippy::permissions_set_readonly_false)]
                 permissions.set_readonly(false);
                 file.set_permissions(permissions)?;
             }

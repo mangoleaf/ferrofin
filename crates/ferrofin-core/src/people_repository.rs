@@ -44,7 +44,7 @@ use sqlx::QueryBuilder;
 fn person_sort_name(name: &str) -> String {
     crate::kinds::sort_name_for(BaseItemKind::Person, name)
 }
-use sqlx::Sqlite;
+use sqlx::{Sqlite, SqliteConnection};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
@@ -618,7 +618,7 @@ impl FerrofinPeopleRepository {
     /// has none, or is new); creates the items not stored yet.
     ///
     /// One person at a time this was [`person_item_id_for_write`], then
-    /// [`insert_person_item`], then `person_overview`: three statements or
+    /// [`insert_person_item`], then a biography read: three statements or
     /// more per person. Here it is two reads (one each up to 256 people) and
     /// an insert of the new items in power-of-two runs (gl-1181), plus, as
     /// before, `resolved_person_item_id`'s existence read for a person whose
@@ -644,23 +644,11 @@ impl FerrofinPeopleRepository {
         // The stored items by clean name: the first by `SortName`, `Id`, as
         // `person_item_by_clean_name` reads one. Only with the identity seam
         // wired, as `person_item_id_for_write` looks only then.
-        let mut by_clean: HashMap<String, String> = HashMap::new();
-        if self.identity.is_some() {
-            let mut seen = HashSet::new();
-            let distinct: Vec<&String> = cleans.iter().filter(|c| seen.insert(*c)).collect();
-            for binds in ferrofin_db::padded_in_chunks(&distinct) {
-                let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(
-                    person_items_by_clean_names_sql(binds.len()),
-                ))
-                .bind(PERSON_TYPE_NAME);
-                for clean in binds {
-                    query = query.bind(*clean);
-                }
-                for (clean, id) in query.fetch_all(&mut **tx).await.map_err(db_err)? {
-                    by_clean.entry(clean).or_insert(id);
-                }
-            }
-        }
+        let mut by_clean = if self.identity.is_some() {
+            person_items_by_clean_names(tx, &cleans).await?
+        } else {
+            HashMap::new()
+        };
         // Each person's item when no stored one matches its clean name.
         let mut candidates: Vec<String> = Vec::with_capacity(persons.len());
         for (index, name) in names.iter().enumerate() {
@@ -674,18 +662,7 @@ impl FerrofinPeopleRepository {
             candidates.push(candidate);
         }
         // Which of them are stored, and their biographies.
-        let mut seen = HashSet::new();
-        let ids: Vec<&String> = candidates.iter().filter(|id| seen.insert(*id)).collect();
-        let mut stored: HashMap<String, Option<String>> = HashMap::with_capacity(ids.len());
-        for binds in ferrofin_db::padded_in_chunks(&ids) {
-            let mut query = sqlx::query_as::<_, (String, Option<String>)>(sqlx::AssertSqlSafe(
-                overviews_by_ids_sql(binds.len()),
-            ));
-            for id in binds {
-                query = query.bind(*id);
-            }
-            stored.extend(query.fetch_all(&mut **tx).await.map_err(db_err)?);
-        }
+        let mut stored = overviews_by_ids(tx, &candidates).await?;
         // In list order, as one person at a time: an item created here is
         // stored, and found by clean name, for the persons after it.
         let type_name = stored_type_name(BaseItemKind::Person);
@@ -959,19 +936,6 @@ async fn person_item_by_clean_name<'e>(
     .map_err(db_err)
 }
 
-/// A person item's `Overview`: `None` when the item does not exist,
-/// `Some(None)` when it has no biography.
-async fn person_overview<'e>(
-    executor: impl sqlx::Executor<'e, Database = Sqlite>,
-    item_id: &str,
-) -> Result<Option<Option<String>>, ServiceError> {
-    sqlx::query_scalar(r#"SELECT "Overview" FROM "BaseItems" WHERE "Id" = ?1"#)
-        .bind(item_id)
-        .fetch_optional(executor)
-        .await
-        .map_err(db_err)
-}
-
 /// What `update_people` hands back for one credited person: the item, whether
 /// it still lacks a biography (new people and those scanned before
 /// biographies existed get one fetched), and the credit's artwork and
@@ -1063,6 +1027,53 @@ fn overviews_by_ids_sql(count: usize) -> String {
         r#"SELECT "Id", "Overview" FROM "BaseItems" WHERE "Id" IN ({})"#,
         ferrofin_db::numbered_placeholders(1..=count)
     )
+}
+
+/// The stored `Person` item under each of `cleans` (clean names), keyed by
+/// clean name: the first by `SortName`, `Id`, as [`person_item_by_clean_name`]
+/// reads one, in one statement up to 256 names (gl-1181).
+async fn person_items_by_clean_names(
+    conn: &mut SqliteConnection,
+    cleans: &[String],
+) -> Result<HashMap<String, String>, ServiceError> {
+    let mut seen = HashSet::new();
+    let distinct: Vec<&String> = cleans.iter().filter(|c| seen.insert(*c)).collect();
+    let mut by_clean = HashMap::new();
+    for binds in ferrofin_db::padded_in_chunks(&distinct) {
+        let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(
+            person_items_by_clean_names_sql(binds.len()),
+        ))
+        .bind(PERSON_TYPE_NAME);
+        for clean in binds {
+            query = query.bind(*clean);
+        }
+        for (clean, id) in query.fetch_all(&mut *conn).await.map_err(db_err)? {
+            by_clean.entry(clean).or_insert(id);
+        }
+    }
+    Ok(by_clean)
+}
+
+/// The `Overview` of each stored item among `ids`, keyed by id (`None` when
+/// it has no biography, no entry when it is not stored), in one statement up
+/// to 256 ids (gl-1181).
+async fn overviews_by_ids(
+    conn: &mut SqliteConnection,
+    ids: &[String],
+) -> Result<HashMap<String, Option<String>>, ServiceError> {
+    let mut seen = HashSet::new();
+    let distinct: Vec<&String> = ids.iter().filter(|id| seen.insert(*id)).collect();
+    let mut stored = HashMap::with_capacity(distinct.len());
+    for binds in ferrofin_db::padded_in_chunks(&distinct) {
+        let mut query = sqlx::query_as::<_, (String, Option<String>)>(sqlx::AssertSqlSafe(
+            overviews_by_ids_sql(binds.len()),
+        ));
+        for id in binds {
+            query = query.bind(*id);
+        }
+        stored.extend(query.fetch_all(&mut *conn).await.map_err(db_err)?);
+    }
+    Ok(stored)
 }
 
 /// The `Peoples` id of each of `persons` (distinct by name and type), creating
@@ -1606,35 +1617,61 @@ impl FerrofinPeopleRepository {
     /// ([`person_item_id_for_write`](Self::person_item_id_for_write)) with its
     /// biography state. `None` when one of them has no item yet, which only
     /// the write path creates.
+    ///
+    /// Two reads for the whole cast (one each up to 256 people), the
+    /// clean-name match and the biographies, as the write path reads them
+    /// (gl-1194), not two per person; without the identity seam, only the
+    /// biographies.
     async fn unchanged_people(
         &self,
         credits: &[&PeopleEntity],
         stored: &[StoredCredit],
     ) -> Result<Option<Vec<WrittenPerson>>, ServiceError> {
-        // The unwired seam keys a person's item on its `Peoples` row.
-        let people_ids: HashMap<&(String, String), &str> = stored
-            .iter()
-            .map(|credit| (&credit.key.0, credit.people_id.as_str()))
-            .collect();
-        let mut written = Vec::with_capacity(credits.len());
         let mut seen = HashSet::new();
-        for person in credits {
-            let key = person_key(person);
-            if !seen.insert(key.clone()) {
-                continue;
-            }
-            let item_id = if self.identity.is_some() {
-                person_item_by_clean_name(self.db.pool(), person.name.trim()).await?
-            } else {
-                people_ids.get(&key).map(|id| (*id).to_owned())
-            };
-            let Some(item_id) = item_id else {
+        let persons: Vec<&PeopleEntity> = credits
+            .iter()
+            .copied()
+            .filter(|person| seen.insert(person_key(person)))
+            .collect();
+        if persons.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+        let item_ids: Option<Vec<String>> = if self.identity.is_some() {
+            let cleans: Vec<String> = persons
+                .iter()
+                .map(|person| crate::text_util::get_clean_value(person.name.trim()))
+                .collect();
+            let by_clean = person_items_by_clean_names(&mut conn, &cleans).await?;
+            cleans
+                .iter()
+                .map(|clean| by_clean.get(clean).cloned())
+                .collect()
+        } else {
+            // The unwired seam keys a person's item on its `Peoples` row.
+            let people_ids: HashMap<&(String, String), &str> = stored
+                .iter()
+                .map(|credit| (&credit.key.0, credit.people_id.as_str()))
+                .collect();
+            persons
+                .iter()
+                .map(|person| {
+                    people_ids
+                        .get(&person_key(person))
+                        .map(|id| (*id).to_owned())
+                })
+                .collect()
+        };
+        let Some(item_ids) = item_ids else {
+            return Ok(None);
+        };
+        let overviews = overviews_by_ids(&mut conn, &item_ids).await?;
+        let mut written = Vec::with_capacity(persons.len());
+        for (person, item_id) in persons.iter().zip(&item_ids) {
+            let Some(overview) = overviews.get(item_id) else {
                 return Ok(None);
             };
-            let Some(overview) = person_overview(self.db.pool(), &item_id).await? else {
-                return Ok(None);
-            };
-            written.extend(written_person(&item_id, person, overview.as_deref()));
+            written.extend(written_person(item_id, person, overview.as_deref()));
         }
         Ok(Some(written))
     }
@@ -3342,12 +3379,46 @@ mod tests {
         );
     }
 
+    /// An unchanged update reads each person's stored biography: a person
+    /// who has one is not fetched again, one without is (gl-1194).
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn an_unchanged_update_reads_each_persons_biography(#[case] identity: bool) {
+        let (db, item, repo) = people_lab(identity).await;
+        let credits = [
+            credit("Person A", "Actor", "Hero"),
+            credit("Person B", "Actor", "Villain"),
+        ];
+        let first = repo.update_people(item, &credits).await.expect("first");
+        repo.set_person_metadata(
+            first[0].id,
+            PersonMetadata {
+                overview: Some("A biography.".to_owned()),
+                ..PersonMetadata::default()
+            },
+        )
+        .await
+        .expect("biography");
+        log_people_writes(&db).await;
+
+        let again = repo.update_people(item, &credits).await.expect("again");
+        assert_eq!(people_writes(&db).await, Vec::<String>::new());
+        let needs: Vec<(Uuid, bool)> = again.iter().map(|w| (w.id, w.needs_details)).collect();
+        assert_eq!(needs, [(first[0].id, false), (first[1].id, true)]);
+    }
+
     /// Unchanged credits whose person item has gone (a by-name cleanup, a
     /// hand edit) take the write path, which recreates the item: only a write
-    /// creates one.
+    /// creates one. With the identity seam the clean-name match misses;
+    /// without it, the biography read.
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
     #[tokio::test]
-    async fn unchanged_credits_recreate_a_missing_person_item() {
-        let (db, item, repo) = people_lab(true).await;
+    async fn unchanged_credits_recreate_a_missing_person_item(#[case] identity: bool) {
+        let (db, item, repo) = people_lab(identity).await;
         let credits = [credit("Actor", "Actor", "Hero")];
         let first = repo.update_people(item, &credits).await.expect("first");
         let person = guid_to_db(first[0].id);
@@ -4670,7 +4741,8 @@ mod tests {
 
     /// A cast larger than one statement's rows is written whole and in
     /// credit order (gl-1181): every credit, person and person item, and the
-    /// written people are the cast's items in its order.
+    /// written people are the cast's items in its order. An unchanged
+    /// re-credit reads the same people back (gl-1194).
     #[tokio::test]
     async fn a_large_cast_is_written_whole_and_in_order() {
         let (db, item, repo) = people_lab(true).await;
@@ -4702,6 +4774,19 @@ mod tests {
         }
         assert_eq!(item_names, names);
         assert!(written.iter().all(|person| person.needs_details));
+
+        // Re-credited unchanged, it is read back across the same chunks
+        // (gl-1194): the same people in the same order, nothing written.
+        log_people_writes(&db).await;
+        let again = repo.update_people(item, &cast).await.expect("unchanged");
+        assert_eq!(people_writes(&db).await, Vec::<String>::new());
+        let project = |people: &[ferrofin_traits::persistence::WrittenPerson]| {
+            people
+                .iter()
+                .map(|person| (person.id, person.needs_details))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(project(&again), project(&written));
     }
 
     /// Two spellings of one clean name in one cast share the person item the

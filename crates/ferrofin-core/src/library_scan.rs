@@ -2974,12 +2974,9 @@ enum ItemSaved {
 }
 
 /// The refresh facts of a row the walk does not plan: nothing on disk feeds
-/// its decision.
-///
-/// TODO(parity, open work item — NOT an accepted divergence; gl-337): a
-/// library's own `CollectionFolder.RequiresRefresh` (its folder's write time
-/// and its changed physical locations) does not fire yet; that issue ports
-/// it into `item_requires_refresh`.
+/// its decision. A directory has no `DateModified` (D2), so a library's or the
+/// root's `BaseItem.RequiresRefresh` never fires; a library's locations are
+/// the one fact [`unwalked_refresh_plan`] adds.
 const UNWALKED_FACTS: FileFacts = FileFacts {
     mtime: None,
     probe: ProbeKind::None,
@@ -2990,6 +2987,8 @@ const UNWALKED_FACTS: FileFacts = FileFacts {
     is_shortcut: false,
     is_file_protocol: true,
     is_placeholder: false,
+    path_rebased: false,
+    locations_changed: false,
 };
 
 /// The refresh plan of `row`, a row a library or root refresh reaches
@@ -2998,18 +2997,25 @@ const UNWALKED_FACTS: FileFacts = FileFacts {
 /// `run_all_providers` forces the row's dynamic image as
 /// `MetadataService.GetProviders` does: "Replace all metadata", a full
 /// refresh, or at `Default` or above the row's own first refresh or its
-/// library's elapsed `AutomaticRefreshIntervalDays`.
+/// library's elapsed `AutomaticRefreshIntervalDays`, or its required refresh:
+/// `locations_changed` is `CollectionFolder.RequiresRefresh`'s own arms (the
+/// library's recorded locations changed,
+/// [`VirtualFolderManager::take_library_requires_refresh`]).
 /// [`decide_save`](crate::refresh_plan::decide_save) over it says whether the
 /// pass stamps the row's `DateLastRefreshed`.
 pub(crate) fn unwalked_refresh_plan(
     row: Option<&BaseItemEntity>,
     options: &MetadataRefreshOptions,
     library: Option<&LibraryOptionsModel>,
+    locations_changed: bool,
 ) -> ItemRefreshPlan {
     let stored = row.map(music::stored_state);
     crate::refresh_plan::plan_item_refresh(
         stored.as_ref(),
-        &UNWALKED_FACTS,
+        &FileFacts {
+            locations_changed,
+            ..UNWALKED_FACTS
+        },
         &RefreshRequest {
             options,
             force_save: false,
@@ -10573,6 +10579,11 @@ impl LibraryScanner {
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false)
             }),
+            // The walk plans neither an artist known only by name nor a
+            // library: their overrides' facts are fed where they are planned
+            // (`by_name_artist_facts`, `unwalked_refresh_plan`).
+            path_rebased: false,
+            locations_changed: false,
         }
     }
 
@@ -13571,8 +13582,23 @@ impl LibraryScanner {
                     continue;
                 }
             };
-            let plan =
-                unwalked_refresh_plan(row.as_ref(), options, folder.library_options.as_ref());
+            // `RefreshMetadata` asks `RequiresRefresh` in every mode but
+            // `None`, and `BeforeMetadataRefresh` then clears the flag.
+            let locations_changed = options.metadata_refresh_mode != MetadataRefreshMode::None
+                && self.virtual_folders.take_library_requires_refresh(cf);
+            let plan = unwalked_refresh_plan(
+                row.as_ref(),
+                options,
+                folder.library_options.as_ref(),
+                locations_changed,
+            );
+            if locations_changed {
+                tracing::debug!(
+                    library = %cf,
+                    reason = plan.reason.as_str(),
+                    "the library's locations changed; refreshing it"
+                );
+            }
             let pass = match self
                 .refresh_library_image(
                     items,
@@ -15443,13 +15469,13 @@ impl LibraryScanner {
         let kind = walk.kind;
         // Without a collection type a folder `SeriesResolver` takes (priority
         // Second, before `MovieResolver`) is a series, planned as a tvshows
-        // library's is.
+        // library's is, hanging where the walk puts what it resolves.
         let untyped = matches!(
             walk.collection_type,
             None | Some(CollectionTypeOptions::mixed)
         );
         if untyped && dir != root && !extras_folder && is_untyped_series(dir, &entries, naming) {
-            self.plan_untyped_series(dir, cf, ctx, out);
+            self.plan_untyped_series(dir, cf, walk.parent(cf, ctx), ctx, out);
             return;
         }
         let (walk, album) = if walk.photos && dir != root && !extras_folder {
@@ -15735,6 +15761,9 @@ impl LibraryScanner {
         // soundtrack sitting beside the film belongs to a music library.
         // Without a collection type it is `Audio` (`AudioResolver.cs:94-134`),
         // unless it sits in a movie's own folder, which nothing walks.
+        // TODO(parity, open work item — NOT an accepted divergence; gl-1201):
+        // it hangs off the library, not the plain folder the walk is in; pass
+        // `folder.walk.parent(cf, ctx)`, as `video_row` does.
         if !is_video {
             if folder.untyped && !folder.own_folder {
                 let cf = folder.cf;
@@ -15933,27 +15962,46 @@ impl LibraryScanner {
     /// planned below as a tvshows library's series is — except that its
     /// episodes resolve one by one (`MovieResolver` takes no folder under a
     /// series, `MovieResolver.cs:219-222`), so none is in a mixed folder.
-    fn plan_untyped_series(&self, dir: &str, cf: Uuid, ctx: &PlanCtx<'_>, out: &mut Vec<Planned>) {
+    /// It hangs off `parent`, the plain folder it was found in or the
+    /// library (`Folder.GetNonCachedChildren` resolves a folder's children
+    /// with `ResolvePaths(…, this, …)`), and what it holds sits below that
+    /// folder's `ancestors` too.
+    fn plan_untyped_series(
+        &self,
+        dir: &str,
+        cf: Uuid,
+        (parent, ancestors): (Uuid, Vec<Uuid>),
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
         let name = series_resolver::resolve(ctx.naming, dir)
             .name
             .unwrap_or_else(|| folder_name(dir).unwrap_or_else(|| file_stem(dir)));
-        let Some((series_id, mut series)) =
-            self.base_item(ctx, BaseItemKind::Series, cf, cf, name.clone(), dir, true)
-        else {
+        let Some((series_id, mut series)) = self.base_item(
+            ctx,
+            BaseItemKind::Series,
+            cf,
+            parent,
+            name.clone(),
+            dir,
+            true,
+        ) else {
             return;
         };
         let series_key = self.series_key_for(ctx.key_folders, &series, &[], &[]);
         series.presentation_unique_key = Some(series_key.clone());
+        let first = out.len();
         ctx.emit(
             out,
             Planned {
                 id: series_id,
                 entity: series,
-                ancestors: vec![cf],
+                ancestors: ancestors.clone(),
                 generated_names: Vec::new(),
             },
         );
         self.plan_series(dir, cf, series_id, &name, &series_key, ctx, out);
+        add_ancestors(&mut out[first..], &ancestors);
     }
 
     /// An audio file in an untyped library: `Audio`, in a mixed folder
@@ -16728,14 +16776,7 @@ impl LibraryScanner {
             },
         );
         self.plan_series(dir, cf, series_id, &series_name, &series_key, ctx, out);
-        // What the series holds sits below the folders above it too.
-        for item in &mut out[first..] {
-            for ancestor in &ancestors {
-                if !item.ancestors.contains(ancestor) {
-                    item.ancestors.push(*ancestor);
-                }
-            }
-        }
+        add_ancestors(&mut out[first..], &ancestors);
     }
 
     /// 12.0's `Series.CreatePresentationUniqueKey()` for a scanned series row:
@@ -19486,6 +19527,24 @@ fn holds_tv_nfo(entries: &[FileSystemEntryInfo]) -> bool {
     entries.iter().any(|e| {
         e.name.eq_ignore_ascii_case("tvshow.nfo") || e.name.eq_ignore_ascii_case("season.nfo")
     })
+}
+
+/// Puts `ancestors`, the chain of the folder a series hangs off, into the
+/// ancestors of each of `items` (the series and what it holds) that lacks
+/// them: what a series holds sits below the folders above it too. An owned
+/// extra keeps its own shape, as in [`place_under_location`]: it has no
+/// parent, so no folder is above it.
+fn add_ancestors(items: &mut [Planned], ancestors: &[Uuid]) {
+    for item in items {
+        if item.entity.owner_id.is_some() && item.entity.extra_type.is_some() {
+            continue;
+        }
+        for ancestor in ancestors {
+            if !item.ancestors.contains(ancestor) {
+                item.ancestors.push(*ancestor);
+            }
+        }
+    }
 }
 
 /// Hangs what a library location holds off its `Folder` row (owner
@@ -23750,7 +23809,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            super::unwalked_refresh_plan(Some(&row), &options, Some(&library)).run_all_providers,
+            super::unwalked_refresh_plan(Some(&row), &options, Some(&library), false)
+                .run_all_providers,
             want
         );
     }

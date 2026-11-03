@@ -1284,4 +1284,5 @@ fn the_user_search_filter_is_built_as_upstream_builds_it(
 }
 
 mod admin_filter_tests;
+mod adoption_tests;
 mod password_tests;

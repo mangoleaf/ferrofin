@@ -41,7 +41,7 @@ use ferrofin_providers::metadata_merge::{
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
-use ferrofin_traits::providers::MetadataRefreshOptions;
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use uuid::Uuid;
 
 use super::{
@@ -478,6 +478,8 @@ const ARTIST_FACTS: FileFacts = FileFacts {
     is_shortcut: false,
     is_file_protocol: false,
     is_placeholder: false,
+    path_rebased: false,
+    locations_changed: false,
 };
 
 /// The decision state of a stored row.
@@ -772,6 +774,28 @@ impl LibraryScanner {
         }
     }
 
+    /// The refresh facts of `artist`, an artist known only by name:
+    /// [`ARTIST_FACTS`] and `MusicArtist.RequiresRefresh`'s own arm, whether
+    /// its path moved ([`Self::rebased_artist_path`]).
+    fn by_name_artist_facts(&self, artist: &BaseItemEntity) -> FileFacts {
+        FileFacts {
+            path_rebased: self.rebased_artist_path(artist).is_some(),
+            ..ARTIST_FACTS
+        }
+    }
+
+    /// `MusicArtist.GetRebasedPath` for `artist`, an artist known only by
+    /// name, when it differs from its `Path` (ordinal): the path
+    /// `BeforeMetadataRefresh` moves it to. [`None`] while it is in place, for
+    /// a row with no path, or with no by-name store wired.
+    fn rebased_artist_path(&self, artist: &BaseItemEntity) -> Option<String> {
+        let path = artist.path.as_deref()?;
+        self.by_name
+            .as_ref()?
+            .rebased_path(BaseItemKind::MusicArtist, path)
+            .filter(|rebased| rebased != path)
+    }
+
     /// Upstream's `ArtistsValidator` (`ArtistsValidator.cs:86-91`), after
     /// every library validation: each artist known only by name that is new
     /// or was never refreshed (`isNew || neverRefreshed`; a new row here is
@@ -826,7 +850,7 @@ impl LibraryScanner {
             };
             let plan = crate::refresh_plan::plan_item_refresh(
                 Some(&stored_state(&artist)),
-                &ARTIST_FACTS,
+                &self.by_name_artist_facts(&artist),
                 &request,
                 None,
                 now,
@@ -891,7 +915,7 @@ impl LibraryScanner {
         let server = self.server_metadata_options();
         let plan = crate::refresh_plan::plan_item_refresh(
             Some(&stored_state(&stored)),
-            &ARTIST_FACTS,
+            &self.by_name_artist_facts(&stored),
             &request,
             None,
             Utc::now(),
@@ -1030,6 +1054,21 @@ impl LibraryScanner {
             locked_fields: locked_fields.clone(),
             ..MetadataResult::of(stored.clone())
         };
+        // `MusicArtist.BeforeMetadataRefresh` (`MusicArtist.cs:205-220`): an
+        // artist known only by name moves to its rebased path whenever its
+        // refresh runs providers, is its first or is required — in every mode
+        // but `None`, since a moved path makes it required.
+        if work.kind == MusicKind::ByNameArtist
+            && options.metadata_refresh_mode != MetadataRefreshMode::None
+            && let Some(rebased) = self.rebased_artist_path(&stored)
+        {
+            tracing::debug!(
+                item_id = %work.id,
+                path = %rebased,
+                "the artist's path has changed; moving it"
+            );
+            current.item.path = Some(rebased);
+        }
         if work.aggregate {
             match work.kind {
                 MusicKind::Album => {
@@ -1100,7 +1139,7 @@ impl LibraryScanner {
                 // 794-798`).
                 temp.item.id.clone_from(&stored.id);
                 temp.item.type_.clone_from(&stored.type_);
-                temp.item.path.clone_from(&stored.path);
+                temp.item.path.clone_from(&current.item.path);
                 temp.item
                     .preferred_metadata_language
                     .clone_from(&stored.preferred_metadata_language);
