@@ -64,6 +64,14 @@ impl XmlTvCache {
         }
     }
 
+    /// The directory the cached documents are kept in, where a guide write
+    /// also sets a document's airings aside while it reads them. It may not
+    /// exist yet.
+    #[must_use]
+    pub fn cache_dir(&self) -> PathBuf {
+        self.cache_dir.join(CACHE_SUBDIR)
+    }
+
     /// The cache file for provider `id`. Provider ids are generated as
     /// `Guid.ToString("N")`; anything that is not a GUID is kept out of the
     /// path, as `InvalidateListingsProviderCache` keeps it out.
