@@ -1885,12 +1885,18 @@ pub const VERIFIED: &[Verified] = &[
                refuses the sign-in), the provider's canonical username, the new-user \
                policy, the saved provider id, the disabled, remote and schedule checks, \
                the failure counter and lockout, the device and session limits, token \
-               rotation and session activity. The UserDto and SessionInfoDto \
+               rotation and session activity, and that upstream has no login rate limit. \
+               The UserDto and SessionInfoDto \
                builders are shared with other routes and not compared here",
         date: "2026-11-02",
         divergences: &[
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "Ferrofin's login backoff (owner decisions on gl-1099; upstream has no rate limit): \
+         past login_backoff_attempts failures an account's and a client address's next \
+         attempts wait, from 1 s doubling to login_backoff_max_delay_secs. An address that \
+         would wait longer is answered as a wrong password without its password being \
+         checked; an account only waits. The backoff never disables an account.",
             "An authentication provider reports the user's administrator flag in its result \
          (ProviderAuthenticationResult.administrator) and the user manager applies it \
          (UserManager::apply_external_administrator), never demoting the last administrator: \
@@ -2096,6 +2102,64 @@ pub const VERIFIED: &[Verified] = &[
          CertificatePath and CertificatePassword. Upstream's plain [Authorize] serves them to \
          every signed-in user (owner decision 2026-10-23, widened by gl-1093). encoding stays \
          whole: the player reads it.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/System/Configuration/{key}",
+        upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
+        upstream_method: "UpdateNamedConfiguration",
+        ferrofin: "handlers/config.rs update_named_configuration (normalize_named_configuration: \
+               GetConfigurationType and Deserialize) → save_named_configuration \
+               (BaseConfigurationManager.SaveConfiguration: the validating store, the write, \
+               the live network policy, the listeners, the committed checks for \
+               ApplicationHost.OnConfigurationUpdated) → for livetv \
+               LiveTvManager::create_recording_folders (ferrofin-livetv recording_folders.rs: \
+               RecordingsManager.OnNamedConfigurationUpdated, which the Live TV manager's tuner \
+               and provider saves run too, as upstream's save of livetv does)",
+        date: "2026-10-30",
+        divergences: &[
+            "database is refused with a 400: Ferrofin has no other database provider (owner \
+         decision 2026-10-23).",
+            "livetv's TunerHosts and ListingProviders are the Live TV manager's rows, kept in \
+         the database, so lists in a posted document are stored with it but neither add nor \
+         change a tuner or a provider.",
+            "The save answers once CreateRecordingFolders has finished, where upstream's async \
+         void handler runs alongside it. It still cannot fail the save.",
+            "The first CreateRecordingFolders on a data directory forgets the \
+         MediaLocationsCreated entries that are not recording folders instead of removing \
+         them from their libraries: adoption carries that list over but not the recording \
+         paths, so upstream's rule would delete the library holding the recordings.",
+            "The 400 and 500 bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/Recordings/Folders",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetRecordingFolders",
+        ferrofin: "handlers/live_tv.rs get_recording_folders (resolve_user_opt, then \
+               LiveTvManager.GetRecordingFoldersAsync: FindByPath, IsVisibleStandalone and \
+               GetCollectionFolders over VirtualFolderManager::library_folders) → \
+               ferrofin-livetv recording_folders.rs recording_folders \
+               (RecordingsManager.GetRecordingFolders)",
+        date: "2026-10-30",
+        divergences: &[
+            "No channel's folder is added (GetChannelsInternalAsync with IsRecordingsFolder): \
+         Ferrofin has no channel plugins, by design.",
+            "A request with no user (an API key without userId, or a userId naming no account) \
+         answers an empty list. Upstream reads user.Id and fails with a 500; Jellyfin bug not \
+         ported.",
+            "A location resolves to the libraries holding it from their configured locations, \
+         not through FindByPath's stored Folder row, compared ignoring case. So a new library \
+         is answered before its first scan created that row, and so is a location no scan has \
+         stored under a larger library.",
+            "SortName compares ordinally rather than through OrderBy's culture comparer.",
+            "The 403 (another user's id without elevation) body is Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
