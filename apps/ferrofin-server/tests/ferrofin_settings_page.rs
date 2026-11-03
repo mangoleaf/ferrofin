@@ -226,6 +226,117 @@ async fn the_settings_page_is_listed_served_without_values_and_hidden_with_its_p
     assert!(file.contains("log_format = \"text\""), "{file}");
     assert_eq!(system_configuration().await, before);
 
+    // gl-1139: Preview Size and Image Quality are the dashboard's own
+    // TrickplayOptions. A save from either page shows on the other, at once,
+    // and a hand-entered value is Custom until a save names its row.
+    let post = |uri: &str, body: String| {
+        router.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::AUTHORIZATION, &admin)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("request"),
+        )
+    };
+    let trickplay_rows = || async {
+        let settings = body_json(
+            send("GET", "/Ferrofin/Settings", Some(&admin))
+                .await
+                .expect("settings"),
+        )
+        .await;
+        let row = |key: &str| {
+            settings["Settings"]
+                .as_array()
+                .expect("settings list")
+                .iter()
+                .find(|setting| setting["Key"] == key)
+                .unwrap_or_else(|| panic!("no {key}: {settings}"))
+                .clone()
+        };
+        (
+            row("trickplay_preview_size"),
+            row("trickplay_image_quality"),
+        )
+    };
+    let trickplay_options = || async {
+        serde_json::from_slice::<serde_json::Value>(&system_configuration().await)
+            .expect("configuration json")["TrickplayOptions"]
+            .clone()
+    };
+
+    let (size, quality) = trickplay_rows().await;
+    for row in [&size, &quality] {
+        assert_eq!(row["Store"], "ServerConfiguration", "{row}");
+        assert_eq!(row["Applies"], "Immediately", "{row}");
+        assert_eq!(row["Source"], "Default", "{row}");
+        assert_eq!(row["Group"], "Trickplay", "{row}");
+        assert_eq!(row["Editable"], true, "{row}");
+    }
+    assert_eq!(size["Value"], "320");
+    assert_eq!(quality["Value"], "disk");
+    assert!(trickplay_options().await.get("FullChroma").is_none());
+
+    let saved = post(
+        "/Ferrofin/Settings",
+        r#"{"Changes":{"trickplay_preview_size":"both","trickplay_image_quality":"quality"}}"#
+            .to_owned(),
+    )
+    .await
+    .expect("save");
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved = body_json(saved).await;
+    assert_eq!(
+        saved["AppliedNow"],
+        serde_json::json!(["trickplay_image_quality", "trickplay_preview_size"]),
+        "{saved}"
+    );
+    assert_eq!(saved["RestartRequired"], false, "{saved}");
+    let options = trickplay_options().await;
+    assert_eq!(options["WidthResolutions"], serde_json::json!([320, 640]));
+    assert_eq!(options["Qscale"], 2);
+    assert_eq!(options["FullChroma"], true);
+    let file = std::fs::read_to_string(&config.config_file).expect("config.toml");
+    assert!(!file.contains("trickplay_"), "{file}");
+
+    // The dashboard's Trickplay page saves the whole configuration it fetched.
+    let mut dashboard: serde_json::Value =
+        serde_json::from_slice(&system_configuration().await).expect("configuration json");
+    dashboard["TrickplayOptions"]["WidthResolutions"] = serde_json::json!([640, 320]);
+    let edited = post("/System/Configuration", dashboard.to_string())
+        .await
+        .expect("dashboard save");
+    assert_eq!(edited.status(), StatusCode::NO_CONTENT);
+    let (size, quality) = trickplay_rows().await;
+    assert_eq!(size["Value"], "both", "{size}");
+    assert!(size.get("Custom").is_none(), "{size}");
+    assert_eq!(quality["Value"], "quality", "{quality}");
+
+    dashboard["TrickplayOptions"]["WidthResolutions"] = serde_json::json!([480]);
+    dashboard["TrickplayOptions"]["Qscale"] = serde_json::json!(3);
+    post("/System/Configuration", dashboard.to_string())
+        .await
+        .expect("dashboard save");
+    let (size, quality) = trickplay_rows().await;
+    assert_eq!(size["Value"], "480", "{size}");
+    assert_eq!(size["Custom"], true, "{size}");
+    assert_eq!(quality["Value"], "Qscale 3, 4:4:4", "{quality}");
+    assert_eq!(quality["Custom"], true, "{quality}");
+
+    // Picking an option for one row leaves the other's hand-entered value.
+    post(
+        "/Ferrofin/Settings",
+        r#"{"Changes":{"trickplay_image_quality":"disk"}}"#.to_owned(),
+    )
+    .await
+    .expect("save");
+    let options = trickplay_options().await;
+    assert_eq!(options["WidthResolutions"], serde_json::json!([480]));
+    assert_eq!(options["Qscale"], 4);
+    assert!(options.get("FullChroma").is_none(), "{options}");
+
     // Disabled from the dashboard, the link, the menu entry, the page and
     // its data are gone.
     let plugins = body_json(

@@ -1,18 +1,19 @@
 //! The Ferrofin settings page's server side: [`SETTINGS`], one row per
 //! bootstrap setting (CLI flag, `FERROFIN_*` environment variable,
-//! `config.toml` key), and [`FerrofinServerSettings`], which reports each
+//! `config.toml` key) and per setting stored in the server configuration
+//! (the trickplay rows), and [`FerrofinServerSettings`], which reports each
 //! one's running value and where it comes from over `GET /Ferrofin/Settings`
-//! and saves the page's changes to `config.toml` over `POST /Ferrofin/Settings`
-//! (the `save` module).
+//! and saves the page's changes to `config.toml`, or to the server
+//! configuration, over `POST /Ferrofin/Settings` (the `save` module).
 //!
 //! The table is the one description of the settings that the report, the
 //! page and saving read. Its tests tie it to what the loader reads
-//! ([`Config::load`]): every `config.toml` key has a row and every row's key
-//! is one, every row's variable has a row in `docs/CONFIG.md`, every key
-//! round-trips through `config.toml`, the source a row reports is the layer
-//! the loader applied, every flag is a row's, and the rows that apply only on
-//! a process restart are what an in-process restart keeps
-//! ([`Config::for_restart`]).
+//! ([`Config::load`]): every `config.toml` key has a row and every such row's
+//! key is one, every row's variable (a stored row's label) has a row in
+//! `docs/CONFIG.md`, every key round-trips through `config.toml`, the source
+//! a row reports is the layer the loader applied, every flag is a row's, and
+//! the rows that apply only on a process restart are what an in-process
+//! restart keeps ([`Config::for_restart`]).
 //!
 //! Precedence is the loader's: a flag, else the variable, else `config.toml`,
 //! else the default. A value a flag or a variable sets is locked on the page
@@ -207,6 +208,46 @@ const NO_EXECUTABLE_FROM_THE_WEB: &str = "The web may not choose an executable t
 
 /// The note of the settings read only when the database is created.
 const FIRST_BOOT_ONLY: &str = "Only used when the database is created.";
+
+/// The note of the trickplay rows stored in the server configuration.
+const TRICKPLAY_CHANGE: &str = "A change takes full effect after the next Generate Trickplay \
+                                Images run. That run decodes every video again in the libraries \
+                                with trickplay images on, at below-normal priority: a large \
+                                library can take days.";
+
+/// Preview Size as `WidthResolutions` holds it: `320`, `640` or `both`, in
+/// any order and counting a width once, else the widths themselves (Custom),
+/// or `none`.
+fn trickplay_preview_size(configuration: &ServerConfiguration) -> Value {
+    let mut widths = configuration.trickplay_options.width_resolutions.clone();
+    widths.sort_unstable();
+    widths.dedup();
+    json!(match widths.as_slice() {
+        [320] => "320".to_owned(),
+        [640] => "640".to_owned(),
+        [320, 640] => "both".to_owned(),
+        [] => "none".to_owned(),
+        _ => widths
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    })
+}
+
+/// Image Quality as `Qscale` and the chroma member hold it: `disk` (4:2:0,
+/// `Qscale` 4) or `quality` (4:4:4, `Qscale` 2), else both values (Custom).
+fn trickplay_image_quality(configuration: &ServerConfiguration) -> Value {
+    let options = &configuration.trickplay_options;
+    json!(match (options.full_chroma, options.qscale) {
+        (false, 4) => "disk".to_owned(),
+        (true, 2) => "quality".to_owned(),
+        (full_chroma, qscale) => format!(
+            "Qscale {qscale}, {}",
+            if full_chroma { "4:4:4" } else { "4:2:0" }
+        ),
+    })
+}
 
 /// The note of the OpenTelemetry variables.
 const ENV_ONLY: &str = "OpenTelemetry's standard variable, read from the environment only: \
@@ -552,6 +593,86 @@ pub static SETTINGS: &[SettingSpec] = &[
         ..ROW
     },
     // ---- Trickplay ---------------------------------------------------------
+    // The two rows stored in the server configuration (gl-1139): the same
+    // `TrickplayOptions` the dashboard's Trickplay page edits.
+    SettingSpec {
+        key: "trickplay_preview_size",
+        label: "Preview Size",
+        group: Group::Trickplay,
+        kind: SettingKind::Choice,
+        applies: Applies::Immediately,
+        default: "320",
+        description: "Width of the scrubbing previews, in pixels.",
+        note: TRICKPLAY_CHANGE,
+        options: &[
+            SettingOption {
+                value: "320",
+                label: "320",
+                note: "Fast to fetch, small on 4K screens. One ffmpeg pass per video.",
+            },
+            SettingOption {
+                value: "640",
+                label: "640",
+                note: "Sharper on 4K. Phones and 1080p screens get a large preview too. \
+                       One ffmpeg pass per video, and packing a tile takes about 200 MiB of \
+                       server memory.",
+            },
+            SettingOption {
+                value: "both",
+                label: "Both",
+                note: "Clients pick by screen. Two ffmpeg passes per video, the disk of both \
+                       sizes, and about 200 MiB of server memory to pack a 640 tile.",
+            },
+        ],
+        store: SettingStore::ServerConfiguration(ConfigurationField {
+            read: trickplay_preview_size,
+            write: |configuration, value| {
+                configuration.trickplay_options.width_resolutions = match value.as_str() {
+                    Some("640") => vec![640],
+                    Some("both") => vec![320, 640],
+                    _ => vec![320],
+                };
+            },
+        }),
+        ..ROW
+    },
+    SettingSpec {
+        key: "trickplay_image_quality",
+        label: "Image Quality",
+        group: Group::Trickplay,
+        kind: SettingKind::Choice,
+        applies: Applies::Immediately,
+        default: "disk",
+        description: "How much colour detail the previews keep, and the disk it costs.",
+        note: TRICKPLAY_CHANGE,
+        options: &[
+            SettingOption {
+                value: "disk",
+                label: "Optimize Disk Usage",
+                // Figures: docs/CONFIG.md#trickplay says what was measured.
+                note: "Matches Jellyfin. Blocky colour around edges. \
+                       About 3 MiB per hour of video at 320, 7 at 640.",
+            },
+            SettingOption {
+                value: "quality",
+                label: "Optimize Quality",
+                note: "Full colour detail, except where trickplay's hardware acceleration \
+                       decodes or encodes the video on the GPU: that stays 4:2:0. About 4 MiB \
+                       per hour of video at 320, 12 at 640. As quick to generate.",
+            },
+        ],
+        store: SettingStore::ServerConfiguration(ConfigurationField {
+            read: trickplay_image_quality,
+            write: |configuration, value| {
+                let options = &mut configuration.trickplay_options;
+                (options.full_chroma, options.qscale) = match value.as_str() {
+                    Some("quality") => (true, 2),
+                    _ => (false, 4),
+                };
+            },
+        }),
+        ..ROW
+    },
     SettingSpec {
         key: "trickplay_concurrency",
         env: Some("FERROFIN_TRICKPLAY_CONCURRENCY"),
@@ -1767,14 +1888,6 @@ impl FerrofinServerSettings {
     #[cfg(test)]
     fn with_env(mut self, env: impl Env + Send + Sync + 'static) -> Self {
         self.env = Arc::new(env);
-        self
-    }
-
-    /// The same, reporting and saving `rows` in place of [`SETTINGS`]: a row
-    /// only the tests register.
-    #[cfg(test)]
-    fn with_rows(mut self, rows: &'static [SettingSpec]) -> Self {
-        self.rows = rows;
         self
     }
 

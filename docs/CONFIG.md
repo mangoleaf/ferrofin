@@ -98,8 +98,8 @@ leaves it alone, and a save only takes one of the options.
 A setting can also be stored in the server configuration that the Dashboard edits
 (`GET /System/Configuration`) instead of `config.toml`. Such a setting is marked **Applies at
 once**: Save writes it through the server's configuration and it applies with no restart, no
-variable or flag sets it, and **Reset to default** puts back a new server's value. No setting in
-the table below is stored there yet.
+variable or flag sets it, and **Reset to default** puts back a new server's value. The two
+[trickplay settings](#trickplay) are stored there.
 
 **Reset to default** is active when `config.toml` holds a value or the field holds an edit. On a
 value the file holds, it marks the key, and Save removes it, so the default applies after the
@@ -307,6 +307,49 @@ proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
 | `FERROFIN_ROW_CACHE_TTL_SECS` | `30` | Seconds the per-user access check serves a user's permissions and preferences, and the libraries' rows and options, from memory. Queries scoped to the user's libraries, the home screen's views and every lookup of a library's physical folders read the same cached rows and options. Whether a Live TV tuner is configured, which decides whether Live TV is offered, is cached the same way. As for the auth cache, every change made through the server applies at once, and this only bounds changes made outside it (the database, a library's `options.json`). `5` to `300`. The `config.toml` key is `row_cache_ttl_secs`. |
 | `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` | `300` | Seconds a library scan's directory listings survive unread before they are dropped. The default is Jellyfin's (`DirectoryService.IdleTimeoutMs`). `30` to `3600` (a value outside, `0` included, logs a warning and is clamped). The `config.toml` key is `scan_directory_cache_idle_secs`. |
 | `FERROFIN_TRICKPLAY_CONCURRENCY` | `auto` | How many trickplay images are generated at once (one item and width each: an ffmpeg frame extraction, then tile packing). A library scan generates several at once; the **Generate Trickplay Images** task goes one item at a time but shares this cap when it overlaps a scan. `auto` allows as many as the image-encoding limit: **Parallel image encoding limit** on the dashboard (`ParallelImageEncodingLimit`), else one per CPU. An integer sets a lower cap; `0`, a negative number, or a value above the auto value means `auto`. Each generation is an ffmpeg process with its own memory, and with hardware acceleration its own GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). Packing its tiles then takes server memory: about 60 MiB for a 320 tile, about 200 MiB for a 640 one. Jellyfin generates one at a time; `1` does the same. The `config.toml` key `trickplay_concurrency` takes an integer or `"auto"`. |
+
+## Trickplay
+
+The **Trickplay** tab of the Ferrofin settings page holds two settings stored in the server
+configuration: the `TrickplayOptions` that **Dashboard → Playback → Trickplay** edits. A save on
+either page shows on the other and applies at once, with no restart. No variable, flag,
+`config.toml` key or Helm value sets them. A new install starts on 320 and Optimize Disk Usage,
+Jellyfin's own defaults, and an upgraded or adopted server keeps the values it has, so better
+images are always an admin's choice. The tab's third setting, how many images are generated at
+once, is `FERROFIN_TRICKPLAY_CONCURRENCY` under [Library & database](#library--database).
+
+| Setting | Default | Purpose |
+|---|---|---|
+| Preview Size | 320 | How wide the scrubbing previews are, in pixels: `WidthResolutions` `[320]`, `[640]`, or `[320, 640]` (**Both**, in either order). 320 is fast to fetch but small on a 4K screen. 640 is sharper on 4K, and phones and 1080p screens get a large preview too. Both makes the two, so each client picks by its screen, at two ffmpeg passes per video and the disk of both. Packing a tile takes about 60 MiB of server memory at 320 and about 200 MiB at 640. |
+| Image Quality | Optimize Disk Usage | How much colour detail the previews keep: `Qscale` and the Ferrofin-only `FullChroma`. **Optimize Disk Usage** is Jellyfin's 4:2:0 at `Qscale` 4, with blocky colour around edges; **Optimize Quality** is 4:4:4 at `Qscale` 2, with full colour detail, and takes as long to generate. A video that trickplay's hardware acceleration (**Enable hardware decoding** and **Enable hardware accelerated MJPEG encoding** on the dashboard's Trickplay page) decodes or encodes on the GPU stays 4:2:0, so it costs the disk without the colour; one the GPU neither decodes nor encodes (a source it cannot decode, with a software MJPEG encoder) gets 4:4:4. `FullChroma` is left out of `GET /System/Configuration` while it is off, so the document is Jellyfin's unless an admin picks Optimize Quality. |
+
+A value the dashboard holds that fits no option (a width typed by hand, a `Qscale` changed alone)
+shows as **Custom**, and a save leaves it alone until an admin picks an option for that setting.
+A change takes full effect after the next **Generate Trickplay Images** run, which replaces each
+video's images that no longer match, keeping the old ones until the new ones are in place. That
+run decodes every video again in the libraries with trickplay images on, at below-normal priority,
+so a large library can take days. A hand edit of `Qscale` or JPEG quality on the dashboard is not
+picked up that way and needs **Replace existing trickplay images**, as in Jellyfin. So does
+picking an Image Quality option over a Custom value that differs from it only in `Qscale`.
+
+Disk per hour of video, with the default 10-second interval and 10x10 tiles:
+
+| Width | Optimize Disk Usage | Optimize Quality |
+|---|---|---|
+| 320 | 2.4 to 3.2 MiB | 3.6 to 4.7 MiB |
+| 640 | 6.0 to 7.7 MiB | 10.2 to 13.0 MiB |
+| Both | 320 and 640 together | 320 and 640 together |
+
+Measured with the server's own writer and the release image's jellyfin-ffmpeg 8.1.3, software
+decoding, on 10-minute excerpts of three films scaled to an hour: a 4K HDR HEVC Blu-ray at 2.40:1,
+a 4K HDR AV1 web download at 16:9 (both tone-mapped) and a 1080p SDR HEVC Blu-ray. Another film
+will land somewhere else, and a busier one higher. With **FFmpeg Threads** (`ProcessThreads`) at
+4, a pass at one width over the three excerpts together (30 minutes of video) took about 4 minutes
+on a running server: at 320, Optimize Disk Usage took 238 and 223 seconds and Optimize Quality
+228; at 640, Optimize Disk Usage took 263; and both widths at Optimize Quality took 443 together
+(640 at Optimize Quality was not timed alone). The first pass after the server started (320,
+Optimize Disk Usage) took 358 seconds. FFmpeg Threads defaults to 1, so a stock server's times
+will differ.
 
 ## Observability
 
