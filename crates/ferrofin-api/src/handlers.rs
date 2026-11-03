@@ -944,7 +944,10 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// write that fails, which no operation's response shows;
 /// `progressive-transcode` is who may reach ffmpeg through the stream routes,
 /// whose operations have no row of their own yet, and how many jobs ffmpeg may
-/// run for them and the HLS routes.
+/// run for them and the HLS routes;
+/// `video-stream-copy` is whether a transcode job copies the source video and
+/// what dynamic HDR metadata the copy strips, which the HLS and stream routes
+/// share.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -957,6 +960,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "progressive-transcode",
     "trickplay-extraction",
     "trickplay",
+    "video-stream-copy",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -1490,6 +1494,48 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              from the JSON while off, which writes 4:4:4 tiles, from 4:4:4 frames on the \
              software path (see the trickplay-extraction row), instead of 4:2:0 (owner \
              decision 2026-11-01, D6, gl-1128).",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "video-stream-copy",
+        upstream_file: "MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs",
+        upstream_method: "CanStreamCopyVideo",
+        ferrofin: "Whether a transcode job copies the source video rather than re-encoding it, \
+                   and what dynamic HDR metadata the copy strips. ferrofin-mediaencoding \
+                   encoding_helper/helper.rs can_stream_copy_video (CanStreamCopyVideo) and \
+                   its range block range_type_copy_ok, over EncodingJobInfo \
+                   requested_range_types (GetRequestedRangeTypes); encoding_helper/bitstream.rs \
+                   should_remove_dynamic_hdr_metadata, can_remove_dynamic_hdr_metadata (over \
+                   the EncoderCapabilities seam's supports_bsf_with_option, \
+                   IMediaEncoder.SupportsBitStreamFilterWithOption), is_dovi_removed, \
+                   is_hdr10_plus_removed and the video arms of bit_stream_args \
+                   (ShouldRemoveDynamicHdrMetadata, CanEncoderRemoveDynamicHdrMetadata, \
+                   IsDoviRemoved, IsHdr10PlusRemoved, GetBitStreamArgs), the last three \
+                   over the job's plan, dynamic_hdr_metadata_removal (upstream's, with the \
+                   divergence below, strips_dovi_for_a_client_without_dovi); and the copy's -bsf:v \
+                   gates, video_bit_stream_filters_apply, which apps/ferrofin-server \
+                   planner.rs build_arguments reads (Jellyfin.Api/Controllers/\
+                   DynamicHlsController.cs GetVideoArguments, \
+                   EncodingHelper.GetProgressiveVideoArguments). Which client request leads \
+                   to a transcode job, and the audio copy, are not part of this row",
+        date: "2026-11-03",
+        divergences: &[
+            "Once a client has declared range types, a Dolby Vision stream with a base layer \
+             (every Dolby Vision range type but profile 5's DOVI) copied to a client that \
+             listed neither DOVI nor the stream's own range type has its RPU stripped \
+             (bitstream.rs strips_dovi_for_a_client_without_dovi), where upstream plans no \
+             removal for the base-layer fallbacks (DOVIWithHDR10 to an HDR10 client, \
+             DOVIWithHLG to HLG, DOVIWithSDR to SDR), for HDR10+ beside Dolby Vision, for an \
+             invalid configuration and for profile 7 to a client without HDR10, and copies the \
+             RPU through (a Dolby Vision profile 8.1 AV1 title copied that way did not render \
+             in jellyfin-web); an enhancement-layer player keeps upstream's HDR10+ removal. \
+             Such a copy is refused, and the video transcoded, when ffmpeg has no Dolby Vision \
+             strip filter for the stream's codec or the job's output takes no -bsf:v (a \
+             progressive copy into anything \
+             but MPEG-TS, a source already in Annex B form), and a copy that cannot be refused \
+             (VideoCodec=copy, a user who may not transcode) on an ffmpeg without the filters \
+             gets upstream's arguments. Deliberate divergence (owner decision 2026-10-31, \
+             gl-737).",
         ],
     },
 ];

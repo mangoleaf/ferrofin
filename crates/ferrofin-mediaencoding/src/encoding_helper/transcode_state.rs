@@ -61,6 +61,14 @@ pub trait EncoderCapabilities: Send + Sync {
     fn is_vaapi_device_intel_ihd(&self) -> bool {
         false
     }
+
+    /// Whether a bitstream filter accepts `option`, the Dolby Vision and HDR10+
+    /// removals the stream-copy decision depends on. Port of
+    /// `IMediaEncoder.SupportsBitStreamFilterWithOption`; `false` (the default)
+    /// when nothing was probed, so such a copy transcodes.
+    fn supports_bsf_with_option(&self, _option: super::hw::capabilities::BsfOption) -> bool {
+        false
+    }
 }
 
 /// [`EncoderCapabilities`] that reports no optional encoders available.
