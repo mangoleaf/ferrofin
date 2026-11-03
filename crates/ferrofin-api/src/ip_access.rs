@@ -29,6 +29,20 @@ pub struct ConnectionLocalAddr(pub std::net::SocketAddr);
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResolvedClientAddress(pub(crate) std::net::IpAddr);
 
+/// C# `HttpContext.IsLocal()`: whether the connection was accepted on the
+/// client's own address, as for a request from the server's machine through a
+/// LAN address. `client` is the resolved client address (C# compares
+/// `RemoteIpAddress` after the forwarded headers rewrote it). `false` where
+/// the accept loop recorded no local address.
+pub(crate) fn is_local_connection(
+    extensions: &axum::http::Extensions,
+    client: std::net::IpAddr,
+) -> bool {
+    extensions
+        .get::<ConnectionLocalAddr>()
+        .is_some_and(|local| crate::state::normalize_ip(local.0.ip()) == client)
+}
+
 /// Rejects a request whose peer the network policy excludes.
 ///
 /// Upstream's shape exactly:
@@ -63,11 +77,7 @@ pub async fn ip_access_layer(
     request.extensions_mut().insert(ResolvedClientAddress(ip));
     // Absent where the accept loop could not read the connection's local
     // address (or a router built without it): only loopback is exempt then.
-    let local = request
-        .extensions()
-        .get::<ConnectionLocalAddr>()
-        .map(|local| crate::state::normalize_ip(local.0.ip()));
-    if ip.is_loopback() || local == Some(ip) {
+    if ip.is_loopback() || is_local_connection(request.extensions(), ip) {
         return next.run(request).await;
     }
     let result = state.remote_access_policy(ip);
