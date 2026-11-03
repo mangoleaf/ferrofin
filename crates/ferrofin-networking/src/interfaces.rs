@@ -147,6 +147,8 @@ mod tests {
                 prefixlen: 24,
                 broadcast: None,
             }),
+            #[cfg(windows)]
+            adapter_name: String::new(),
         }
     }
 
