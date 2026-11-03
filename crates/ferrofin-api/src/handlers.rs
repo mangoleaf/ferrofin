@@ -935,6 +935,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// the `/socket` dashboard streams, which no contract operation describes;
 /// `trickplay-extraction` is the ffmpeg run that writes a video's trickplay
 /// frames, which the tile operations serve but no response shows;
+/// `trickplay` is which sets of trickplay images are made, kept and replaced,
+/// shared by the item refresh, the library scan and the Generate Trickplay
+/// Images task;
 /// `scan-failure-isolation` is what the library scan does about a row or a
 /// write that fails, which no operation's response shows;
 /// `progressive-transcode` is who may reach ffmpeg through the stream routes,
@@ -951,6 +954,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "scan-failure-isolation",
     "progressive-transcode",
     "trickplay-extraction",
+    "trickplay",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -1400,6 +1404,51 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              free. The user is the authorization's, as upstream's StartFfMpeg userId is; an \
              API key has none, so it is outside the per-user cap and inside the server-wide \
              one.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "trickplay",
+        upstream_file: "Jellyfin.Server.Implementations/Trickplay/TrickplayManager.cs",
+        upstream_method: "RefreshTrickplayDataAsync",
+        ferrofin: "Which trickplay sets a refresh discovers, imports, keeps, generates, replaces \
+                   and prunes, for an item refresh (Replace included), the library scan and \
+                   the Generate Trickplay Images task. ferrofin-core trickplay_manager.rs \
+                   refresh_media (RefreshTrickplayDataAsync, with CanGenerateTrickplay and \
+                   DiscoverExistingTrickplayAsync), refresh_width \
+                   (RefreshTrickplayDataInternal), create_tiles and move_dir (CreateTiles), \
+                   and scheduled_tasks/library.rs TrickplayImagesTask, compared with \
+                   MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
+                   How ffmpeg extracts the frames, on either path, is the \
+                   trickplay-extraction row's; how many generations run at once is not part \
+                   of this row",
+        date: "2026-11-02",
+        divergences: &[
+            "An explicit Replace does not delete the item's trickplay folder and rows first: \
+             each selected width is generated in the work directory and swapped in, so the old \
+             images serve until then and a failed Replace keeps them, and the rows and folders \
+             of other widths go once every selected width has its row (with no width \
+             selected, nothing is removed, where upstream's Replace empties the folder); with \
+             extraction disabled it prunes first as upstream. A video narrower than two selected \
+             widths generates their one set once. When the row save fails after the swap, the \
+             new tiles stay if the width's stored row names their folder (upstream deletes them, \
+             which would now leave the video without its old set). Deliberate divergence \
+             (owner decision 2026-11-01, D7 of the Trickplay quality milestone, gl-1138).",
+            "After WidthResolutions or FullChroma change since the last Generate Trickplay \
+             Images run that finished (recorded in FerrofinMeta, and on the first boot after \
+             upgrading), the next run checks every video: a set whose first tile's chroma \
+             differs from the setting is regenerated and swapped in the same way, and a width \
+             an earlier run selected and the current one does not is removed once the selected \
+             widths exist. The run is recorded only when every video's sets match, so an \
+             interrupted run, or one that could not replace a set, checks again. Upstream \
+             never replaces images unasked. Deliberate divergence (owner decisions \
+             2026-11-01, D3 and D5, gl-1138).",
+            "Importing a width's folder that has no row counts only its .jpg tiles; upstream \
+             counts every file in it, so a stray file there makes the import fail on its image \
+             size. Jellyfin bug not ported.",
+            "TrickplayOptions has a Ferrofin-only FullChroma member, off by default and absent \
+             from the JSON while off, which writes 4:4:4 tiles, from 4:4:4 frames on the \
+             software path (see the trickplay-extraction row), instead of 4:2:0 (owner \
+             decision 2026-11-01, D6, gl-1128).",
         ],
     },
 ];

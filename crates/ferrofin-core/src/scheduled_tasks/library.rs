@@ -1557,6 +1557,23 @@ impl ScheduledTask for TrickplayImagesTask {
             recursive: true,
             ..InternalItemsQuery::default()
         };
+        // After a settings change this run checks every video's images (a
+        // Ferrofin addition); it is recorded as done only when every item
+        // came through, so an interrupted or failing pass checks again.
+        let check = self
+            .trickplay
+            .begin_trickplay_pass()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "cannot read the trickplay settings of the last pass; generating without checking");
+                None
+            });
+        if check.is_some() {
+            tracing::info!(
+                "trickplay settings changed: replacing every video's images that no longer match"
+            );
+        }
+        let mut complete = true;
         let total = self.library.get_count(&query).await?.max(0);
         let mut done = 0i32;
         let mut start_index = 0i32;
@@ -1581,17 +1598,36 @@ impl ScheduledTask for TrickplayImagesTask {
                 )
                 .and_then(|folder| folder.library_options.clone())
                 .unwrap_or_default();
-                if let Ok(item_id) = Uuid::parse_str(&item.id)
-                    && let Err(e) = self
-                        .trickplay
-                        .refresh_trickplay_data(item_id, false, &options)
-                        .await
-                {
-                    tracing::warn!(item = %item.id, error = %e, "trickplay generation failed");
+                if let Ok(item_id) = Uuid::parse_str(&item.id) {
+                    let refreshed = match &check {
+                        Some(check) => self
+                            .trickplay
+                            .check_trickplay_data(item_id, check, &options)
+                            .await
+                            .map(|matched| complete &= matched),
+                        None => {
+                            self.trickplay
+                                .refresh_trickplay_data(item_id, false, &options)
+                                .await
+                        }
+                    };
+                    if let Err(e) = refreshed {
+                        complete = false;
+                        tracing::warn!(item_id = %item.id, error = %e, "trickplay generation failed");
+                    }
                 }
                 progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
             }
             start_index += PAGE_SIZE;
+        }
+        if let Some(check) = check {
+            if complete {
+                self.trickplay.finish_trickplay_pass(&check).await?;
+            } else {
+                tracing::info!(
+                    "some trickplay images could not be replaced; the next run checks again"
+                );
+            }
         }
         progress.report(100.0);
         Ok(())
@@ -2113,6 +2149,15 @@ mod tests {
         /// `(item, library option "extraction enabled")` per refresh call.
         refreshed: Mutex<Vec<(Uuid, bool)>>,
         after_refresh: Option<(Arc<dyn VirtualFolderManager>, String, LibraryOptions)>,
+        /// What `begin_trickplay_pass` returns, unless it fails.
+        check: Option<ferrofin_traits::trickplay::TrickplayCheck>,
+        begin_fails: bool,
+        /// The item a checking pass cannot bring to match, and whether its
+        /// check fails outright instead.
+        unmatched: Option<(Uuid, bool)>,
+        /// Items checked, then passes finished.
+        checked: Mutex<Vec<Uuid>>,
+        finished: Mutex<Vec<ferrofin_traits::trickplay::TrickplayCheck>>,
     }
 
     #[async_trait]
@@ -2130,6 +2175,36 @@ mod tests {
             if let Some((folders, name, options)) = &self.after_refresh {
                 folders.update_library_options(name, options).await?;
             }
+            Ok(())
+        }
+        async fn begin_trickplay_pass(
+            &self,
+        ) -> Result<Option<ferrofin_traits::trickplay::TrickplayCheck>, ServiceError> {
+            if self.begin_fails {
+                return Err(ServiceError::backend("FerrofinMeta is locked"));
+            }
+            Ok(self.check.clone())
+        }
+        async fn check_trickplay_data(
+            &self,
+            item_id: Uuid,
+            _check: &ferrofin_traits::trickplay::TrickplayCheck,
+            _library_options: &LibraryOptions,
+        ) -> Result<bool, ServiceError> {
+            self.checked.lock().expect("lock").push(item_id);
+            match self.unmatched {
+                Some((unmatched, true)) if unmatched == item_id => {
+                    Err(ServiceError::backend("check failed"))
+                }
+                Some((unmatched, false)) => Ok(unmatched != item_id),
+                _ => Ok(true),
+            }
+        }
+        async fn finish_trickplay_pass(
+            &self,
+            check: &ferrofin_traits::trickplay::TrickplayCheck,
+        ) -> Result<(), ServiceError> {
+            self.finished.lock().expect("lock").push(check.clone());
             Ok(())
         }
         async fn get_trickplay_resolutions(
@@ -3060,8 +3135,9 @@ mod tests {
 
     // -- Generate Trickplay Images -------------------------------------------
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn trickplay_task_refreshes_every_video() {
+    async fn trickplay_task_refreshes_every_video(#[values(false, true)] begin_fails: bool) {
         let db = test_db().await;
         let library = library_manager_over(db.clone());
         let (v1, v2) = (Uuid::from_u128(0x71), Uuid::from_u128(0x72));
@@ -3075,7 +3151,11 @@ mod tests {
         set_path(&db, v1, "/media/movies/a.mkv").await;
         set_path(&db, v2, "/elsewhere/b.mkv").await;
 
-        let trickplay = Arc::new(FakeTrickplay::default());
+        // A pass whose settings cannot be read still generates, unchecked.
+        let trickplay = Arc::new(FakeTrickplay {
+            begin_fails,
+            ..FakeTrickplay::default()
+        });
         let task = TrickplayImagesTask::new(
             library,
             Arc::new(folder_with(
@@ -3098,6 +3178,55 @@ mod tests {
         let mut refreshed = trickplay.refreshed.lock().expect("lock").clone();
         refreshed.sort();
         assert_eq!(refreshed, vec![(v1, true), (v2, false)]);
+        assert!(trickplay.checked.lock().expect("lock").is_empty());
+        assert!(trickplay.finished.lock().expect("lock").is_empty());
+    }
+
+    /// After a settings change every video is checked, and the pass is
+    /// recorded only when every one of them came through.
+    #[rstest::rstest]
+    #[case::all_match(None, 1)]
+    #[case::one_unfinished(Some((Uuid::from_u128(0x72), false)), 0)]
+    #[case::one_failing(Some((Uuid::from_u128(0x71), true)), 0)]
+    #[tokio::test]
+    async fn a_checking_pass_is_recorded_only_when_every_video_matches(
+        #[case] unmatched: Option<(Uuid, bool)>,
+        #[case] recorded: usize,
+    ) {
+        let db = test_db().await;
+        let (v1, v2) = (Uuid::from_u128(0x71), Uuid::from_u128(0x72));
+        for (v, path) in [(v1, "/media/movies/a.mkv"), (v2, "/media/movies/b.mkv")] {
+            seed_item(&db, v, BaseItemKind::Movie).await;
+            set_media_type(&db, v, "Video").await;
+            set_path(&db, v, path).await;
+        }
+        let trickplay = Arc::new(FakeTrickplay {
+            check: Some(ferrofin_traits::trickplay::TrickplayCheck {
+                previous_widths: vec![320],
+                settings: "new".to_owned(),
+            }),
+            unmatched,
+            ..FakeTrickplay::default()
+        });
+        let task = TrickplayImagesTask::new(
+            library_manager_over(db.clone()),
+            Arc::new(folder_with(
+                LibraryOptions {
+                    enable_trickplay_image_extraction: true,
+                    ..LibraryOptions::default()
+                },
+                None,
+                "/media/movies",
+            )),
+            trickplay.clone(),
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        let mut checked = trickplay.checked.lock().expect("lock").clone();
+        checked.sort();
+        assert_eq!(checked, vec![v1, v2]);
+        assert!(trickplay.refreshed.lock().expect("lock").is_empty());
+        assert_eq!(trickplay.finished.lock().expect("lock").len(), recorded);
     }
 
     async fn trickplay_nested_libraries(
