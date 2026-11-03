@@ -15469,13 +15469,13 @@ impl LibraryScanner {
         let kind = walk.kind;
         // Without a collection type a folder `SeriesResolver` takes (priority
         // Second, before `MovieResolver`) is a series, planned as a tvshows
-        // library's is.
+        // library's is, hanging where the walk puts what it resolves.
         let untyped = matches!(
             walk.collection_type,
             None | Some(CollectionTypeOptions::mixed)
         );
         if untyped && dir != root && !extras_folder && is_untyped_series(dir, &entries, naming) {
-            self.plan_untyped_series(dir, cf, ctx, out);
+            self.plan_untyped_series(dir, cf, walk.parent(cf, ctx), ctx, out);
             return;
         }
         let (walk, album) = if walk.photos && dir != root && !extras_folder {
@@ -15761,6 +15761,9 @@ impl LibraryScanner {
         // soundtrack sitting beside the film belongs to a music library.
         // Without a collection type it is `Audio` (`AudioResolver.cs:94-134`),
         // unless it sits in a movie's own folder, which nothing walks.
+        // TODO(parity, open work item — NOT an accepted divergence; gl-1201):
+        // it hangs off the library, not the plain folder the walk is in; pass
+        // `folder.walk.parent(cf, ctx)`, as `video_row` does.
         if !is_video {
             if folder.untyped && !folder.own_folder {
                 let cf = folder.cf;
@@ -15959,27 +15962,46 @@ impl LibraryScanner {
     /// planned below as a tvshows library's series is — except that its
     /// episodes resolve one by one (`MovieResolver` takes no folder under a
     /// series, `MovieResolver.cs:219-222`), so none is in a mixed folder.
-    fn plan_untyped_series(&self, dir: &str, cf: Uuid, ctx: &PlanCtx<'_>, out: &mut Vec<Planned>) {
+    /// It hangs off `parent`, the plain folder it was found in or the
+    /// library (`Folder.GetNonCachedChildren` resolves a folder's children
+    /// with `ResolvePaths(…, this, …)`), and what it holds sits below that
+    /// folder's `ancestors` too.
+    fn plan_untyped_series(
+        &self,
+        dir: &str,
+        cf: Uuid,
+        (parent, ancestors): (Uuid, Vec<Uuid>),
+        ctx: &PlanCtx<'_>,
+        out: &mut Vec<Planned>,
+    ) {
         let name = series_resolver::resolve(ctx.naming, dir)
             .name
             .unwrap_or_else(|| folder_name(dir).unwrap_or_else(|| file_stem(dir)));
-        let Some((series_id, mut series)) =
-            self.base_item(ctx, BaseItemKind::Series, cf, cf, name.clone(), dir, true)
-        else {
+        let Some((series_id, mut series)) = self.base_item(
+            ctx,
+            BaseItemKind::Series,
+            cf,
+            parent,
+            name.clone(),
+            dir,
+            true,
+        ) else {
             return;
         };
         let series_key = self.series_key_for(ctx.key_folders, &series, &[], &[]);
         series.presentation_unique_key = Some(series_key.clone());
+        let first = out.len();
         ctx.emit(
             out,
             Planned {
                 id: series_id,
                 entity: series,
-                ancestors: vec![cf],
+                ancestors: ancestors.clone(),
                 generated_names: Vec::new(),
             },
         );
         self.plan_series(dir, cf, series_id, &name, &series_key, ctx, out);
+        add_ancestors(&mut out[first..], &ancestors);
     }
 
     /// An audio file in an untyped library: `Audio`, in a mixed folder
@@ -16754,14 +16776,7 @@ impl LibraryScanner {
             },
         );
         self.plan_series(dir, cf, series_id, &series_name, &series_key, ctx, out);
-        // What the series holds sits below the folders above it too.
-        for item in &mut out[first..] {
-            for ancestor in &ancestors {
-                if !item.ancestors.contains(ancestor) {
-                    item.ancestors.push(*ancestor);
-                }
-            }
-        }
+        add_ancestors(&mut out[first..], &ancestors);
     }
 
     /// 12.0's `Series.CreatePresentationUniqueKey()` for a scanned series row:
@@ -19512,6 +19527,24 @@ fn holds_tv_nfo(entries: &[FileSystemEntryInfo]) -> bool {
     entries.iter().any(|e| {
         e.name.eq_ignore_ascii_case("tvshow.nfo") || e.name.eq_ignore_ascii_case("season.nfo")
     })
+}
+
+/// Puts `ancestors`, the chain of the folder a series hangs off, into the
+/// ancestors of each of `items` (the series and what it holds) that lacks
+/// them: what a series holds sits below the folders above it too. An owned
+/// extra keeps its own shape, as in [`place_under_location`]: it has no
+/// parent, so no folder is above it.
+fn add_ancestors(items: &mut [Planned], ancestors: &[Uuid]) {
+    for item in items {
+        if item.entity.owner_id.is_some() && item.entity.extra_type.is_some() {
+            continue;
+        }
+        for ancestor in ancestors {
+            if !item.ancestors.contains(ancestor) {
+                item.ancestors.push(*ancestor);
+            }
+        }
+    }
 }
 
 /// Hangs what a library location holds off its `Folder` row (owner
