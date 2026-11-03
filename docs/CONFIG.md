@@ -49,7 +49,11 @@ boots.
 name (`Label`), its tab (`Group`), the value in use and its unit (`Unit`, when it has one), its
 default, and where that value comes from: a flag, a variable, `config.toml` or the default. A
 value `config.toml` holds that is not in use (the file changed since the server started, or a flag
-or variable outranks it) is reported beside it. Each setting also says
+or variable outranks it) is reported beside it. A choice lists its options (`Options`, each with
+its `Value`, `Label` and `Note`) and says when the stored value fits none (`Custom: true`, the
+value as written in `Value`); a setting may carry a longer `Note`; and each says where it is
+stored (`Store`: `ConfigFile`, or `ServerConfiguration` for one the server configuration holds,
+which applies at once, `Applies: Immediately`). Each setting also says
 whether the Ferrofin settings page may change it, and when it may not, why: a flag or a variable
 sets it (change those where the server is started), or it is one the web never changes (the
 directories, the ffmpeg and ffprobe executables, the first-boot seed settings,
@@ -78,11 +82,24 @@ Each setting is edited on one line: its name and description, with its field, it
 **Reset to default** beside them (below them on a narrow screen). The field shows the value
 `config.toml` holds. When it holds none, the field shows the default, muted: as a number box's or
 a text box's placeholder (a described default such as "8, capped at the cores" too), or as a
-checkbox set the way the default sets it. The field is the one for the setting's kind: a checkbox
-for on or off, a number box with the setting's limits, an **Auto** checkbox with a number box for
-a count that can be `auto`, a text box for text, a URL or a path, and a text box with its items
-separated by commas for a list (so a list here cannot hold a path with a comma in it). A secret is
-a plain text box, marked as a secret: administrators see these values.
+checkbox or an option set the way the default sets it. The field is the one for the setting's
+kind: a checkbox for on or off, a number box with the setting's limits, an **Auto** checkbox with
+a number box for a count that can be `auto`, a list of named options for a choice, a text box for
+text, a URL or a path, and a text box with its items separated by commas for a list (so a list
+here cannot hold a path with a comma in it). A secret is a plain text box, marked as a secret:
+administrators see these values. A setting may carry a note longer than its description, shown
+under it.
+
+A choice (`log_format`: JSON or Text) shows the picked option's note below its row. A value
+`config.toml` holds that fits no option (`log_format = "xml"`, which the server runs as JSON with
+a warning) shows as **Custom** and stays as written: a save that does not pick another option
+leaves it alone, and a save only takes one of the options.
+
+A setting can also be stored in the server configuration that the Dashboard edits
+(`GET /System/Configuration`) instead of `config.toml`. Such a setting is marked **Applies at
+once**: Save writes it through the server's configuration and it applies with no restart, no
+variable or flag sets it, and **Reset to default** puts back a new server's value. No setting in
+the table below is stored there yet.
 
 **Reset to default** is active when `config.toml` holds a value or the field holds an edit. On a
 value the file holds, it marks the key, and Save removes it, so the default applies after the
@@ -156,13 +173,16 @@ process, so a change to one applies only when the process restarts.
 
 ### Saving from the web
 
-`POST /Ferrofin/Settings` (administrators only) saves changes to `config.toml`. The body is
+`POST /Ferrofin/Settings` (administrators only) saves changes to `config.toml`, and to the server
+configuration for a setting stored there. The body is
 `{"Changes": {"scan_probe_concurrency": 4, "log_level": null}}`: a value sets the key, and `null`
-removes it, so the setting goes back to its default. The save is all or nothing, and it only
-touches what it names: comments, layout and every other key stay as they were. A removed key's
-line goes, with the comment at its end; the comment lines above it stay. An existing file keeps
-its mode and, where the server may set them, its owner and group; a new one is created `0600` (it
-may hold provider keys); and a linked file stays a link.
+removes it, so the setting goes back to its default (a setting stored in the server configuration
+gets a new server's value back). The save is all or nothing, and it only touches what it names:
+comments, layout and every other key stay as they were, and a save that changes nothing stored in
+the server configuration leaves it, and `GET /System/Configuration`, byte for byte as it was. A
+removed key's line goes, with the comment at its end; the comment lines above it stay. An existing
+file keeps its mode and, where the server may set them, its owner and group; a new one is created
+`0600` (it may hold provider keys); and a linked file stays a link.
 
 Every change is checked before anything is written, and a refused one answers `400` naming the
 key: an unknown key, a setting that may not be changed here (with the reason
@@ -178,9 +198,14 @@ A file or directory that cannot be written answers `409` naming the path, and no
 That includes a read-only `config.toml` (`chmod a-w`), even where the directory would allow the
 rename: the file is yours to lock. It also includes a `config.toml` that is itself a mount (one
 file bound into a container), which cannot be renamed over: mount its directory instead. The
-answer lists the keys saved (`Changed`), whether a restart
-is needed (`RestartRequired`) and which of them need the server process itself restarted
-([above](#when-a-change-applies), `ProcessRestartRequired`), and `GET /System/Info` reports
+new `config.toml` is written and loaded before the server configuration is saved, and renamed into
+place after, so a server configuration that cannot be saved leaves the file as it was too. Only a
+rename that fails after the server configuration was saved (the file was found writable and
+loaded just before) leaves that change applied and `config.toml` as it was. The
+answer lists the `config.toml` keys saved (`Changed`), whether a restart is needed
+(`RestartRequired`, only when one of those changed), which of them need the server process itself
+restarted ([above](#when-a-change-applies), `ProcessRestartRequired`), and the keys stored in the
+server configuration that changed and applied at once (`AppliedNow`). `GET /System/Info` reports
 `HasPendingRestart: true` until the restart. The log names the keys, never their values. Like
 the report, the route answers `404` while the **Ferrofin** plugin is disabled.
 

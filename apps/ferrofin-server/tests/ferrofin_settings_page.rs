@@ -156,6 +156,76 @@ async fn the_settings_page_is_listed_served_without_values_and_hidden_with_its_p
         "{settings}"
     );
 
+    // `log_format` is a choice, stored in `config.toml`, each option with
+    // its note.
+    let log_format = settings["Settings"]
+        .as_array()
+        .expect("settings list")
+        .iter()
+        .find(|setting| setting["Key"] == "log_format")
+        .unwrap_or_else(|| panic!("no log_format: {settings}"))
+        .clone();
+    assert_eq!(log_format["Kind"], "Choice", "{log_format}");
+    assert_eq!(log_format["Store"], "ConfigFile", "{log_format}");
+    assert_eq!(log_format["Value"], "json", "{log_format}");
+    let options: Vec<(&str, &str)> = log_format["Options"]
+        .as_array()
+        .expect("options")
+        .iter()
+        .map(|option| {
+            (
+                option["Value"].as_str().expect("value"),
+                option["Label"].as_str().expect("label"),
+            )
+        })
+        .collect();
+    assert_eq!(options, [("json", "JSON"), ("text", "Text")]);
+    assert!(
+        log_format["Options"]
+            .as_array()
+            .expect("options")
+            .iter()
+            .all(|option| option["Note"].is_string()),
+        "{log_format}"
+    );
+
+    // Saving Text writes it to `config.toml`, needs a restart, applies
+    // nothing at once, and leaves `GET /System/Configuration` byte-identical.
+    let system_configuration = || async {
+        body_bytes(
+            send("GET", "/System/Configuration", Some(&admin))
+                .await
+                .expect("configuration"),
+        )
+        .await
+    };
+    let before = system_configuration().await;
+    let saved = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Ferrofin/Settings")
+                .header(header::AUTHORIZATION, &admin)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"Changes":{"log_format":"text"}}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("save");
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved = body_json(saved).await;
+    assert_eq!(
+        saved["Changed"],
+        serde_json::json!(["log_format"]),
+        "{saved}"
+    );
+    assert_eq!(saved["RestartRequired"], true, "{saved}");
+    assert_eq!(saved["AppliedNow"], serde_json::json!([]), "{saved}");
+    let file = std::fs::read_to_string(&config.config_file).expect("config.toml");
+    assert!(file.contains("log_format = \"text\""), "{file}");
+    assert_eq!(system_configuration().await, before);
+
     // Disabled from the dashboard, the link, the menu entry, the page and
     // its data are gone.
     let plugins = body_json(

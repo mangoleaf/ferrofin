@@ -20,7 +20,7 @@
         form is `novalidate`, so the browser never answers for the server.
     -->
     <div data-role="page" class="page type-interior pluginConfigurationPage ferrofinSettingsPage"
-        data-require="emby-input,emby-button,emby-checkbox">
+        data-require="emby-input,emby-button,emby-checkbox,emby-select">
         <div data-role="content">
             <div class="content-primary">
                 <div class="verticalSection">
@@ -30,9 +30,10 @@
                     <p class="fieldDescription">
                         The server's own settings. A setting the settings file below holds shows its
                         value there; one it does not shows its default, muted. Saving writes the changes
-                        to that file, and they apply when the server restarts. A setting set by an
-                        environment variable or a command-line flag is locked here: it is changed where
-                        the server is started.
+                        to that file, and they apply when the server restarts. A setting marked "Applies
+                        at once" is saved to the server configuration instead, with no restart. A
+                        setting set by an environment variable or a command-line flag is locked here: it
+                        is changed where the server is started.
                     </p>
                 </div>
                 <div class="ferrofinNotice ferrofinRestartPending hide" role="status">
@@ -221,8 +222,14 @@
                 margin: 0;
             }
 
+            .ferrofinSettingsPage .ferrofinField .selectContainer {
+                min-width: 12em;
+                margin: 0;
+            }
+
             /* The field's label names it for a screen reader; the row's heading names it on screen. */
             .ferrofinSettingsPage .ferrofinField .inputLabel,
+            .ferrofinSettingsPage .ferrofinField .selectLabel,
             .ferrofinSettingsPage .ferrofinVisuallyHidden {
                 position: absolute;
                 width: 1px;
@@ -239,6 +246,21 @@
             .ferrofinSettingsPage .ferrofinHint {
                 font-size: 0.85em;
                 opacity: 0.7;
+            }
+
+            /* A note keeps the line breaks it is written with; jellyfin-web's
+               `.fieldDescription` sets `white-space: normal !important`. */
+            .ferrofinSettingsPage .ferrofinSettingNote,
+            .ferrofinSettingsPage .ferrofinOptionNote {
+                white-space: pre-line !important;
+            }
+
+            .ferrofinSettingsPage .ferrofinSettingNote {
+                margin-top: 0.4em;
+            }
+
+            .ferrofinSettingsPage .ferrofinOptionNote {
+                margin: 0.4em 0 0;
             }
 
             .ferrofinSettingsPage .ferrofinSettingHeader {
@@ -343,11 +365,12 @@
                 var SOURCE_NAMES = {
                     ConfigFile: 'config.toml',
                     Environment: 'Environment',
-                    Flag: 'Flag'
+                    Flag: 'Flag',
+                    ServerConfiguration: 'Server configuration'
                 };
                 // The kinds whose field is short; the others hold text, a
                 // path or a list, and get a wide one.
-                var NARROW_KINDS = { Bool: true, Integer: true, CountOrAuto: true };
+                var NARROW_KINDS = { Bool: true, Integer: true, CountOrAuto: true, Choice: true };
                 var RESTART_PENDING = 'A server restart is pending.';
                 // How often the page asks whether a restart has finished, and
                 // how long before it says the server has not come back.
@@ -465,6 +488,19 @@
                     return node;
                 }
 
+                /** The option of a choice whose value is `value`, if one is. */
+                function optionOf(setting, value) {
+                    return (setting.Options || []).filter(function (option) {
+                        return option.Value === value;
+                    })[0];
+                }
+
+                /** A choice's `value` as the page names it: its option's label, else Custom. */
+                function choiceText(setting, value) {
+                    var option = optionOf(setting, value);
+                    return option ? option.Label : 'Custom: ' + scalar(value);
+                }
+
                 /** Whether a default is a bare number, rather than described. */
                 function plainNumber(text) {
                     return /^\d+(\.\d+)?$/.test(text);
@@ -475,6 +511,9 @@
                  * unit, a described one ("8, capped at the cores") as it is.
                  */
                 function defaultText(setting) {
+                    if (setting.Kind === 'Choice') {
+                        return choiceText(setting, setting.Default);
+                    }
                     return plainNumber(setting.Default) && setting.Unit
                         ? setting.Default + ' ' + unitText(setting.Default, setting.Unit)
                         : setting.Default;
@@ -730,9 +769,79 @@
                     };
                 }
 
+                /**
+                 * A select of `setting`'s options, the picked one's note below
+                 * it (`below`). Unset, it shows the default option, muted. A
+                 * stored value that fits no option is a Custom entry, which a
+                 * save leaves as it is until another option is picked.
+                 */
+                function choiceControl(setting, value) {
+                    var unset = value === undefined || value === null;
+                    var picked = unset ? setting.Default : scalar(value);
+                    var select = element('select');
+                    select.setAttribute('is', 'emby-select');
+                    select.setAttribute('label', fieldLabel(setting));
+                    (setting.Options || []).forEach(function (option) {
+                        var node = element('option', null, option.Label);
+                        node.value = option.Value;
+                        select.appendChild(node);
+                    });
+                    if (!unset && setting.Custom) {
+                        var custom = element('option', null, choiceText(setting, picked));
+                        custom.value = picked;
+                        select.appendChild(custom);
+                    }
+                    select.value = picked;
+                    var node = element('div', 'selectContainer');
+                    node.appendChild(select);
+                    var note = element('p', 'fieldDescription ferrofinOptionNote');
+                    function muted(on) {
+                        node.classList.toggle('ferrofinDefaulted', on);
+                    }
+                    function showNote() {
+                        var option = optionOf(setting, select.value);
+                        var text = option ? option.Note || '' : 'Fits no option: kept as it is until another is picked.';
+                        clear(note);
+                        withCode(note, text);
+                        note.classList.toggle('hide', text === '');
+                    }
+                    select.addEventListener('change', function () {
+                        muted(false);
+                        showNote();
+                    });
+                    muted(unset);
+                    showNote();
+                    return {
+                        node: node,
+                        below: note,
+                        read: function () {
+                            return select.value;
+                        },
+                        disable: function (off) {
+                            select.disabled = off;
+                        },
+                        clear: function () {
+                            select.value = setting.Default;
+                            muted(true);
+                            showNote();
+                        },
+                        hold: function () {
+                            var held = select.value;
+                            var wasMuted = node.classList.contains('ferrofinDefaulted');
+                            return function () {
+                                select.value = held;
+                                muted(wasMuted);
+                                showNote();
+                            };
+                        }
+                    };
+                }
+
                 /** The control of `setting`'s kind; a kind it does not know is text. */
                 function controlFor(setting, value) {
                     switch (setting.Kind) {
+                        case 'Choice':
+                            return choiceControl(setting, value);
                         case 'Bool':
                             return boolControl(setting, value);
                         case 'Integer':
@@ -750,21 +859,28 @@
                     }
                 }
 
-                /** Whether `config.toml` holds a value for `setting` now. */
-                function heldInFile(setting, state) {
+                /**
+                 * Whether the store of `setting` holds a value for it now:
+                 * `config.toml`, or the server configuration with another
+                 * value than a new server's.
+                 */
+                function isHeld(setting, state) {
+                    if (setting.Store === 'ServerConfiguration') {
+                        return setting.Source === 'ServerConfiguration';
+                    }
                     return !state.resets[setting.Key] && (setting.SavedValue !== undefined || setting.Source === 'ConfigFile');
                 }
 
                 /**
-                 * What the control of `setting` starts from: the value
-                 * `config.toml` holds, not the one in use, or `null` when it
-                 * holds none, so the field shows the default.
+                 * What the control of `setting` starts from: the value its
+                 * store holds, not the one in use, or `null` when it holds
+                 * none, so the field shows the default.
                  */
                 function editedValue(setting, state) {
                     if (setting.SavedValue !== undefined) {
                         return setting.SavedValue;
                     }
-                    return heldInFile(setting, state) ? setting.Value : null;
+                    return isHeld(setting, state) ? setting.Value : null;
                 }
 
                 /** The last of a list's items, which the unit reads after. */
@@ -774,8 +890,9 @@
 
                 /**
                  * The control of an editable `setting`, its unit and Reset to
-                 * default, which go on one line, and the note a reset shows.
-                 * The field joins `state.fields`, which Save reads.
+                 * default, which go on one line; what goes below the line
+                 * (`below`, a choice's note); and the note a reset shows. The
+                 * field joins `state.fields`, which Save reads.
                  */
                 function renderField(setting, state) {
                     var control = controlFor(setting, editedValue(setting, state));
@@ -800,10 +917,12 @@
                     var reset = button('Reset to default', 'ferrofinReset');
                     node.appendChild(reset);
                     var resetNote = note('settings_backup_restore',
-                        'Saving removes it from `config.toml`, so the default applies after the restart.',
+                        setting.Store === 'ServerConfiguration'
+                            ? 'Saving puts back a new server\'s value, which applies at once.'
+                            : 'Saving removes it from `config.toml`, so the default applies after the restart.',
                         'ferrofinResetNote hide');
 
-                    var held = heldInFile(setting, state);
+                    var held = isHeld(setting, state);
                     var undo = null;
                     var field = {
                         key: setting.Key,
@@ -821,7 +940,7 @@
                             var shown = control.input.value !== '' ? control.input.value : setting.Default || '';
                             unit.textContent = unitText(lastItem(shown), setting.Unit);
                         }
-                        // Reset is for a value `config.toml` holds or an unsaved
+                        // Reset is for a value the store holds or an unsaved
                         // edit; with neither, the field already shows the default.
                         reset.disabled = !field.resetting && !held && !field.edited();
                     }
@@ -846,7 +965,7 @@
                     node.addEventListener('change', sync);
                     sync();
                     state.fields.push(field);
-                    return { node: node, note: resetNote, field: field };
+                    return { node: node, below: control.below || null, note: resetNote, field: field };
                 }
 
                 /**
@@ -894,9 +1013,16 @@
                         (setting.Source === 'Default' && empty(setting.Value))) {
                         node.appendChild(element('span', 'ferrofinUnset', setting.Default ? defaultText(setting) : 'Not set'));
                     } else {
-                        node.appendChild(valueNode(setting.Value, secret, setting.Unit));
+                        node.appendChild(shownValue(setting, setting.Value, secret));
                     }
                     return node;
+                }
+
+                /** `value` of `setting` as text: a choice by its option's label. */
+                function shownValue(setting, value, secret) {
+                    return setting.Kind === 'Choice'
+                        ? element('span', null, choiceText(setting, value))
+                        : valueNode(value, secret, setting.Unit);
                 }
 
                 /**
@@ -915,12 +1041,12 @@
                         body.appendChild(document.createTextNode('Saved: removed, so the default ' + savedNote(setting)));
                     } else {
                         body.appendChild(document.createTextNode('Saved: '));
-                        body.appendChild(valueNode(setting.SavedValue, secret, setting.Unit));
+                        body.appendChild(shownValue(setting, setting.SavedValue, secret));
                         body.appendChild(document.createTextNode(' (' + savedNote(setting) + ')'));
                     }
                     if (setting.Value !== undefined && setting.Value !== null) {
                         body.appendChild(document.createTextNode('; in use now: '));
-                        body.appendChild(valueNode(setting.Value, secret, setting.Unit));
+                        body.appendChild(shownValue(setting, setting.Value, secret));
                     } else if (!removed) {
                         // The report has no value while the default applies.
                         body.appendChild(document.createTextNode('; in use now: the default' +
@@ -952,10 +1078,17 @@
                     if (secret) {
                         header.appendChild(badge('Secret', 'ferrofinBadgeSecret', 'key'));
                     }
+                    // Saved to the server configuration: no restart.
+                    if (setting.Applies === 'Immediately') {
+                        header.appendChild(badge('Applies at once', 'ferrofinBadgeImmediate', 'bolt'));
+                    }
                     text.appendChild(header);
                     text.appendChild(idsLine(setting));
                     if (setting.Description) {
                         text.appendChild(withCode(element('div', 'fieldDescription'), setting.Description));
+                    }
+                    if (setting.Note) {
+                        text.appendChild(withCode(element('div', 'fieldDescription ferrofinSettingNote'), setting.Note));
                     }
                     var line = element('div', 'ferrofinSettingLine');
                     line.appendChild(text);
@@ -966,6 +1099,9 @@
                         rendered = renderField(setting, state);
                         rendered.field.row = row;
                         line.appendChild(rendered.node);
+                        if (rendered.below) {
+                            row.appendChild(rendered.below);
+                        }
                     } else {
                         line.appendChild(lockedValue(setting, secret));
                         if (setting.LockedReason) {
@@ -1404,7 +1540,11 @@
                         remember(state, sent, result);
                         Dashboard.processPluginConfigurationUpdateResult();
                         return load(page, state).then(function () {
-                            page.querySelector('.ferrofinRestartPending').scrollIntoView({ block: 'center' });
+                            // A save to the server configuration alone applied
+                            // at once: there is no restart to point to.
+                            if (result.RestartRequired) {
+                                page.querySelector('.ferrofinRestartPending').scrollIntoView({ block: 'center' });
+                            }
                         });
                     }, function (failure) {
                         return failureText(failure, 'save').then(function (text) {
