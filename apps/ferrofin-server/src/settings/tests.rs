@@ -87,7 +87,8 @@ pub(super) fn sample(spec: &SettingSpec) -> String {
         "log_format" => "\"text\"".to_owned(),
         "wasm_private_http_allow" => "\"*\"".to_owned(),
         _ => match spec.kind {
-            SettingKind::Bool => "true".to_owned(),
+            // The value that is not the default, so setting it changes something.
+            SettingKind::Bool => (spec.default != "true").to_string(),
             // Inside the range and not the default.
             SettingKind::Integer { min, .. } if (min + 1).to_string() == spec.default => {
                 (min + 2).to_string()
@@ -214,13 +215,18 @@ fn every_numeric_row_has_a_range_of_its_own() {
 #[test]
 fn the_value_in_use_stays_inside_each_rows_range() {
     // Out of range, these stop the server: the ports do not fit their number
-    // type, and the database's own limits are checked strictly.
+    // type, and the database's limits and the login backoff's security
+    // settings are checked strictly.
     let refused_at_boot = [
         "port",
         "https_port",
         "db_statement_cache",
         "auth_cache_ttl_secs",
         "row_cache_ttl_secs",
+        "login_backoff_attempts",
+        "login_backoff_max_delay_secs",
+        "login_backoff_window_mins",
+        "login_backoff_max_tracked",
     ];
     let in_use = |key: &str, value: i64| {
         let line = format!("{key} = {value}");

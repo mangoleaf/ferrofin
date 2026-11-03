@@ -221,7 +221,8 @@ fn every_editable_setting_saves_what_a_hand_written_line_holds() {
         let value = match (spec.key, spec.kind) {
             ("log_level", _) => json!("debug"),
             ("log_format", _) => json!("text"),
-            (_, SettingKind::Bool) => json!(true),
+            // As `sample`: the value that is not the default.
+            (_, SettingKind::Bool) => json!(spec.default != "true"),
             (_, SettingKind::Integer { .. }) => {
                 json!(sample(spec).parse::<i64>().expect("a number"))
             }
@@ -969,6 +970,7 @@ async fn saves_at_once_each_land_whole() {
     let changes = SETTINGS
         .iter()
         .filter(|spec| spec.access == SettingAccess::Editable)
+        // A value inside each row's range.
         .filter_map(|spec| match spec.kind {
             SettingKind::Integer { min, max } if max > 1_000 => {
                 Some((spec.key, 100.clamp(min, max)))

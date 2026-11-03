@@ -82,7 +82,10 @@ const DEFAULT_BOOTSTRAP_USERNAME: &str = "MyJellyfinUser";
 
 type LoginLocks = Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>;
 
+mod login_backoff;
 mod user_repository;
+
+pub use login_backoff::LoginBackoffSettings;
 
 /// The concrete user manager.
 ///
@@ -99,6 +102,8 @@ mod user_repository;
 pub struct FerrofinUserManager {
     db: Database,
     login_locks: Arc<LoginLocks>,
+    /// Ferrofin's login backoff, shared by every clone.
+    login_backoff: Arc<login_backoff::LoginBackoff>,
     network: Option<Arc<RwLock<ferrofin_networking::NetworkManager>>>,
     default_provider: DefaultAuthenticationProvider,
     invalid_provider: InvalidAuthProvider,
@@ -373,6 +378,9 @@ impl FerrofinUserManager {
         Self {
             db,
             login_locks: Arc::new(Mutex::new(HashMap::new())),
+            login_backoff: Arc::new(login_backoff::LoginBackoff::new(
+                LoginBackoffSettings::DEFAULT,
+            )),
             network: None,
             default_provider: DefaultAuthenticationProvider::new(),
             invalid_provider: InvalidAuthProvider::new(),
@@ -603,6 +611,44 @@ impl FerrofinUserManager {
             .iter()
             .any(|app| app.id == sent)
             .then_some(sent)
+    }
+
+    /// Admits a login attempt to the login backoff: how long it waits, or
+    /// `None` when its address is refused. Unknown names are paced like known
+    /// ones, folded as the lookup folds them, which keeps the backoff from
+    /// telling the two apart.
+    fn admit_login(
+        &self,
+        user: Option<&UserEntity>,
+        username: &str,
+        remote_endpoint: &str,
+    ) -> Option<(std::time::Duration, login_backoff::Attempt<'_>)> {
+        let user_id = user.map(|user| user.id.as_str());
+        let account = login_backoff::account_key(user_id, username);
+        let who = login_backoff::Who {
+            account: &account,
+            user_id,
+            username,
+            address: (!remote_endpoint.is_empty()).then_some(remote_endpoint),
+        };
+        let admitted = self.login_backoff.admit(&who, std::time::Instant::now());
+        if admitted.is_none() {
+            tracing::debug!(
+                username = ?username,
+                remote_ip = remote_endpoint,
+                reason = "backoff",
+                "login refused by the login backoff"
+            );
+        }
+        admitted
+    }
+
+    /// Sets the login backoff (`login_backoff_*`; [`LoginBackoffSettings::DEFAULT`]
+    /// until the composition root calls this).
+    #[must_use]
+    pub fn with_login_backoff(mut self, settings: LoginBackoffSettings) -> Self {
+        self.login_backoff = Arc::new(login_backoff::LoginBackoff::new(settings));
+        self
     }
 
     /// Attaches the activity-log seam so an account lockout is recorded as a
@@ -1355,6 +1401,17 @@ impl UserManager for FerrofinUserManager {
         }
 
         let user = self.get_user_by_name(username).await?;
+        // Ferrofin's login backoff paces repeated failures before the lock, so
+        // a waiting attempt holds nothing. The attempt is dropped on every way
+        // out but success, which counts as a failure.
+        let Some((wait, attempt)) = self.admit_login(user.as_ref(), username, remote_endpoint)
+        else {
+            // Answered as a wrong password, which every caller already handles.
+            return Ok(None);
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
         // Authentication reads the user before password verification and writes
         // its counters afterwards. A writer transaction alone cannot serialize
         // that whole span. Match C#'s per-user lock and reload inside it.
@@ -1447,6 +1504,7 @@ impl UserManager for FerrofinUserManager {
         }
 
         tracing::info!(user_id = %user.id, username = %user.username, "login succeeded");
+        attempt.succeeded();
         // The writes above touch this user's row only.
         self.user_changed(&user.id);
         Ok(Some(user))
@@ -3425,7 +3483,12 @@ mod tests {
         #[case] locked_at: Option<i64>,
     ) {
         let db = test_db().await;
-        let mgr = FerrofinUserManager::new(db);
+        // Upstream's lockout, not Ferrofin's backoff, whose wait would slow
+        // the final login.
+        let mgr = FerrofinUserManager::new(db).with_login_backoff(LoginBackoffSettings {
+            attempts: 0,
+            ..LoginBackoffSettings::DEFAULT
+        });
         let user = mgr.create_user("sentinel").await.unwrap();
         let uid = Uuid::parse_str(&user.id).unwrap();
         let mut policy = UserPolicy {
@@ -3474,7 +3537,12 @@ mod tests {
         #[case] expected: i64,
     ) {
         let db = test_db().await;
-        let mgr = FerrofinUserManager::new(db);
+        // Upstream's counter, not Ferrofin's backoff, which would refuse most
+        // of these before they count.
+        let mgr = FerrofinUserManager::new(db).with_login_backoff(LoginBackoffSettings {
+            attempts: 0,
+            ..LoginBackoffSettings::DEFAULT
+        });
         let user = mgr.create_user("concurrent").await.unwrap();
         let uid = Uuid::parse_str(&user.id).unwrap();
         mgr.update_policy(
