@@ -13,11 +13,12 @@
 //! Novell's `GetReferralConnection` tries them), searching there as the
 //! referral says. The entries found there join the search's, after those of
 //! the server that referred, and a referral that server sends in turn is
-//! followed the same way, depth first. A referral none of whose URLs connects
-//! and binds, or whose server fails the search, fails the whole search, and
-//! the error names the server (owner decision). Novell throws its
-//! `LdapReferralException` there too, but its search results drop one met
-//! after the last entry they hand out.
+//! followed the same way, depth first. A referral none of whose URLs leads to
+//! a server that takes the bind (the name does not resolve, nothing answers,
+//! TLS fails, the bind DN is refused, or the URL does not parse) is skipped,
+//! and the search logs one warning naming each server skipped and why (owner
+//! decision, gl-1207). A referred server that fails the search fails the whole
+//! search, and the error names the server (owner decision).
 //!
 //! The search a referral continues keeps its attributes; it takes the URL's
 //! DN, filter and scope when the URL names them, else the referred search's,
@@ -34,6 +35,13 @@
 //!   without a port takes the protocol's: 636 for LDAPS, else 389. The bind
 //!   password still goes to whichever server the directory names, as upstream
 //!   sends it.
+//! - **A referral that leads to no server is skipped wherever it arrives.**
+//!   Novell's search results keep the `LdapReferralException` its chase
+//!   throws without counting it as an entry (`BatchOfResults`): one met after
+//!   the last entry is dropped (`ResetVectors`), as Active Directory sends its
+//!   references, one met before another entry is thrown at the next `Next()`,
+//!   and a `referral` result ends the results empty. The order of a search's
+//!   entries and references is not kept here, and upstream logs nothing.
 //! - **A chain stops after [`REFERRAL_HOP_LIMIT`] referrals.** Novell's
 //!   `HopLimit` is 10 too, but its search results restart the count at every
 //!   referral they read, so there a referral loop never ends.
@@ -79,12 +87,32 @@ struct Pending {
     hops: usize,
 }
 
+/// What following one referral came to.
+enum Chased {
+    /// A referred server took the bind and answered.
+    Answered {
+        /// That server, `host:port`.
+        server: String,
+        /// The search it was asked.
+        search: Search,
+        /// Its answer, which may refer further.
+        answer: Result<SearchOutcome, LdapError>,
+    },
+    /// No URL of the referral led to a server that took the bind: why each
+    /// failed, in the order they were tried.
+    NoServer(Vec<LdapError>),
+}
+
 /// Follows every referral in `answer`, the answer of the server `options`
 /// names to `search`, and those the referred servers send in turn. Returns
 /// the entries every server found, the first server's first, then each
 /// referral's, depth first: a referred server's own referrals are followed
 /// before the next referral of the server that sent it. An error `answer`
 /// that is not a referral is returned as it is.
+///
+/// A referral that leads to no server is skipped (owner decision, gl-1207),
+/// and the search then logs one warning naming each server skipped and why,
+/// whether it succeeds or not.
 pub(super) async fn follow(
     directory: &dyn LdapDirectory,
     config: &LdapConfig,
@@ -93,23 +121,47 @@ pub(super) async fn follow(
     attributes: &[&str],
     answer: Result<SearchOutcome, LdapError>,
 ) -> Result<Vec<LdapEntry>, LdapError> {
-    let mut entries = Vec::new();
-    let mut pending = Vec::new();
-    let configured = server_label(&options.server, options.port);
-    take(answer, search, &configured, 0, &mut entries, &mut pending)?;
-    while let Some(referral) = pending.pop() {
-        let (server, search, answer) =
-            chase(directory, config, options, attributes, &referral).await?;
-        take(
-            answer,
-            &search,
-            &server,
-            referral.hops,
-            &mut entries,
-            &mut pending,
-        )?;
+    // Why each skipped referral's URLs failed, each reason once.
+    let mut skipped: Vec<String> = Vec::new();
+    let found = async {
+        let mut entries = Vec::new();
+        let mut pending = Vec::new();
+        let configured = server_label(&options.server, options.port);
+        take(answer, search, &configured, 0, &mut entries, &mut pending)?;
+        while let Some(referral) = pending.pop() {
+            match chase(directory, config, options, attributes, &referral).await? {
+                Chased::Answered {
+                    server,
+                    search,
+                    answer,
+                } => take(
+                    answer,
+                    &search,
+                    &server,
+                    referral.hops,
+                    &mut entries,
+                    &mut pending,
+                )?,
+                Chased::NoServer(failures) => {
+                    for failure in failures.iter().map(ToString::to_string) {
+                        if !skipped.contains(&failure) {
+                            skipped.push(failure);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(entries)
     }
-    Ok(entries)
+    .await;
+    if !skipped.is_empty() {
+        tracing::warn!(
+            referrals = ?skipped.join("; "),
+            "skipped LDAP referrals that lead to no server: their part of the directory was \
+             not searched"
+        );
+    }
+    found
 }
 
 /// Takes `answer`, which `server` gave to `search` after `hops` referrals:
@@ -149,26 +201,35 @@ fn take(
 /// Follows `referral`: connects to the first of its URLs that connects and
 /// takes the bind as the configured bind DN (`LdapAuthHandler`), keeping the
 /// configured TLS (`options`), and searches there. Returns that server, the
-/// search it was asked and its answer, which may refer further.
+/// search it was asked and its answer, which may refer further; or, when no
+/// URL leads to a server that takes the bind, why each failed (Novell's
+/// `GetReferralConnection` fails alike). A referral past the hop limit, one
+/// naming no URL, and a referred server that fails the search are errors.
 async fn chase(
     directory: &dyn LdapDirectory,
     config: &LdapConfig,
     options: &ConnectionOptions,
     attributes: &[&str],
     referral: &Pending,
-) -> Result<(String, Search, Result<SearchOutcome, LdapError>), LdapError> {
+) -> Result<Chased, LdapError> {
     if referral.hops > REFERRAL_HOP_LIMIT {
         return Err(LdapError::ReferralHopLimit {
             server: referral.from.clone(),
         });
     }
-    let mut failure = LdapError::ReferralUrl("the referral names no URL".to_owned());
+    if referral.urls.is_empty() {
+        // RFC 4511 gives every referral at least one URL.
+        return Err(LdapError::ReferralUrl(
+            "the referral names no URL".to_owned(),
+        ));
+    }
+    let mut failures = Vec::new();
     for url in &referral.urls {
         let url = match ReferralUrl::parse(url) {
             Ok(url) => url,
             Err(reason) => {
                 tracing::debug!(error = %reason, "an LDAP referral URL cannot be followed");
-                failure = LdapError::ReferralUrl(reason);
+                failures.push(LdapError::ReferralUrl(reason));
                 continue;
             }
         };
@@ -179,10 +240,10 @@ async fn chase(
             Ok(connection) => connection,
             Err(error) => {
                 tracing::debug!(server = ?server, error = ?error.to_string(), "could not connect to a referred LDAP server");
-                failure = LdapError::ReferralFailed {
+                failures.push(LdapError::ReferralFailed {
                     server,
                     reason: Box::new(error),
-                };
+                });
                 continue;
             }
         };
@@ -195,10 +256,10 @@ async fn chase(
         {
             connection.unbind().await;
             tracing::debug!(server = ?server, error = ?error.to_string(), "a referred LDAP server refused the bind DN");
-            failure = LdapError::ReferralFailed {
+            failures.push(LdapError::ReferralFailed {
                 server,
                 reason: Box::new(error),
-            };
+            });
             continue;
         }
         let search = url.continue_search(&referral.search, referral.continuation);
@@ -207,14 +268,18 @@ async fn chase(
             .await;
         connection.unbind().await;
         return match answer {
-            Ok(_) | Err(LdapError::Referred { .. }) => Ok((server, search, answer)),
+            Ok(_) | Err(LdapError::Referred { .. }) => Ok(Chased::Answered {
+                server,
+                search,
+                answer,
+            }),
             Err(error) => Err(LdapError::ReferralFailed {
                 server,
                 reason: Box::new(error),
             }),
         };
     }
-    Err(failure)
+    Ok(Chased::NoServer(failures))
 }
 
 /// `host:port`, an IPv6 address in brackets, for messages.
