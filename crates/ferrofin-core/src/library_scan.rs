@@ -1690,7 +1690,7 @@ impl<'a> ProbePipeline<'a> {
         let eligible = if encoder.is_some() {
             planned
                 .iter()
-                .map(|p| probe_request(&p.entity).map(|r| r.media_is_audio))
+                .map(|p| probe_request(&p.entity.to_entity()).map(|r| r.media_is_audio))
                 .collect()
         } else {
             Vec::new()
@@ -1805,7 +1805,7 @@ impl<'a> ProbePipeline<'a> {
         while self.next < self.eligible.len().min(self.decided) {
             let index = self.next;
             if self.eligible[index].is_some()
-                && let Some(mut request) = probe_request(&self.planned[index].entity)
+                && let Some(mut request) = probe_request(&self.planned[index].entity.to_entity())
             {
                 let shortcut = self.shortcuts.get(&index);
                 if let Some(target) = shortcut {
@@ -2774,7 +2774,7 @@ fn covered_versions(
 ) {
     let owners: HashMap<Uuid, Uuid> = planned
         .iter()
-        .filter_map(|p| Some((p.id, version_owner(&p.entity)?)))
+        .filter_map(|p| Some((p.id, version_owner(&p.entity.to_entity())?)))
         .collect();
     let (mut down, mut up) = Default::default();
     if owners.is_empty() {
@@ -2946,6 +2946,8 @@ struct ItemPass<'a> {
     index: usize,
     /// The planned item.
     item: &'a Planned,
+    /// The planned item's full row ([`PlanEntity::to_entity`]).
+    entity: &'a BaseItemEntity,
     /// Its stored row as its window read it.
     stored: Stored<'a>,
     /// Its stored image/ancestor/stream rows, `None` when unknown.
@@ -3175,10 +3177,14 @@ fn nfo_file(entity: &BaseItemEntity, policy: FetcherPolicy<'_>) -> Option<LocalM
 }
 
 /// One item the plan pass resolved, ready to persist.
-struct Planned {
+///
+/// The plan holds one per item for the whole scan, so its row is the compact
+/// [`PlanEntity`]; a planner builds the item with a full [`BaseItemEntity`]
+/// (`Planned<BaseItemEntity>`) and the plan compacts it as it takes it in.
+struct Planned<E = PlanEntity> {
     /// The item id (also `entity.id`, kept typed for `set_ancestors`).
     id: Uuid,
-    entity: BaseItemEntity,
+    entity: E,
     /// The ancestor closure (`ParentId` chain up to the collection folder).
     ancestors: Vec<Uuid>,
     /// For an extra, every name `LibraryManager.FindExtras` may have given
@@ -3186,6 +3192,149 @@ struct Planned {
     /// stored name among them is the scan's own and takes `entity.name`
     /// ([`renamed_extra`]). Empty for every other item.
     generated_names: Vec<String>,
+}
+
+/// A planned item's row, as compact as the plan pass can keep it.
+///
+/// The plan holds one per item for the whole scan, so a full
+/// [`BaseItemEntity`] (73 columns, most of them empty until the item's
+/// refresh fills them) made the plan the largest structure in a re-scan's
+/// heap. This keeps every column the planners set inline; any other column
+/// a planner comes to set rides along in `rest`, so nothing is lost even
+/// before it is added here: [`to_entity`](Self::to_entity) gives back
+/// exactly the row the planner built, with any later change to these
+/// columns applied. The per-item work materializes it one stored-row window
+/// or one item at a time.
+#[derive(Clone)]
+struct PlanEntity {
+    id: String,
+    type_: String,
+    name: Option<String>,
+    sort_name: Option<String>,
+    path: Option<String>,
+    parent_id: Option<String>,
+    top_parent_id: Option<String>,
+    owner_id: Option<String>,
+    primary_version_id: Option<String>,
+    season_id: Option<String>,
+    season_name: Option<String>,
+    series_id: Option<String>,
+    series_name: Option<String>,
+    series_presentation_unique_key: Option<String>,
+    presentation_unique_key: Option<String>,
+    media_type: Option<String>,
+    data: Option<String>,
+    album: Option<String>,
+    extra_type: Option<i32>,
+    index_number: Option<i64>,
+    parent_index_number: Option<i64>,
+    production_year: Option<i64>,
+    run_time_ticks: Option<i64>,
+    size: Option<i64>,
+    width: Option<i64>,
+    height: Option<i64>,
+    date_created: Option<DateTime<Utc>>,
+    date_modified: Option<DateTime<Utc>>,
+    is_folder: bool,
+    is_in_mixed_folder: bool,
+    /// The planner's row with the columns above taken out, kept only when
+    /// it set any other column.
+    rest: Option<Box<BaseItemEntity>>,
+}
+
+impl From<BaseItemEntity> for PlanEntity {
+    fn from(mut row: BaseItemEntity) -> Self {
+        use std::mem::take;
+        let mut entity = Self {
+            id: take(&mut row.id),
+            type_: take(&mut row.type_),
+            name: row.name.take(),
+            sort_name: row.sort_name.take(),
+            path: row.path.take(),
+            parent_id: row.parent_id.take(),
+            top_parent_id: row.top_parent_id.take(),
+            owner_id: row.owner_id.take(),
+            primary_version_id: row.primary_version_id.take(),
+            season_id: row.season_id.take(),
+            season_name: row.season_name.take(),
+            series_id: row.series_id.take(),
+            series_name: row.series_name.take(),
+            series_presentation_unique_key: row.series_presentation_unique_key.take(),
+            presentation_unique_key: row.presentation_unique_key.take(),
+            media_type: row.media_type.take(),
+            data: row.data.take(),
+            album: row.album.take(),
+            extra_type: row.extra_type.take(),
+            index_number: row.index_number.take(),
+            parent_index_number: row.parent_index_number.take(),
+            production_year: row.production_year.take(),
+            run_time_ticks: row.run_time_ticks.take(),
+            size: row.size.take(),
+            width: row.width.take(),
+            height: row.height.take(),
+            date_created: row.date_created.take(),
+            date_modified: row.date_modified.take(),
+            is_folder: take(&mut row.is_folder),
+            is_in_mixed_folder: take(&mut row.is_in_mixed_folder),
+            rest: None,
+        };
+        if row != BaseItemEntity::default() {
+            entity.rest = Some(Box::new(row));
+        }
+        entity
+    }
+}
+
+impl PlanEntity {
+    /// The full row: `rest` (or an empty row) with the inline columns put
+    /// back.
+    fn to_entity(&self) -> BaseItemEntity {
+        let mut row = self.rest.as_deref().cloned().unwrap_or_default();
+        row.id.clone_from(&self.id);
+        row.type_.clone_from(&self.type_);
+        row.name.clone_from(&self.name);
+        row.sort_name.clone_from(&self.sort_name);
+        row.path.clone_from(&self.path);
+        row.parent_id.clone_from(&self.parent_id);
+        row.top_parent_id.clone_from(&self.top_parent_id);
+        row.owner_id.clone_from(&self.owner_id);
+        row.primary_version_id.clone_from(&self.primary_version_id);
+        row.season_id.clone_from(&self.season_id);
+        row.season_name.clone_from(&self.season_name);
+        row.series_id.clone_from(&self.series_id);
+        row.series_name.clone_from(&self.series_name);
+        row.series_presentation_unique_key
+            .clone_from(&self.series_presentation_unique_key);
+        row.presentation_unique_key
+            .clone_from(&self.presentation_unique_key);
+        row.media_type.clone_from(&self.media_type);
+        row.data.clone_from(&self.data);
+        row.album.clone_from(&self.album);
+        row.extra_type = self.extra_type;
+        row.index_number = self.index_number;
+        row.parent_index_number = self.parent_index_number;
+        row.production_year = self.production_year;
+        row.run_time_ticks = self.run_time_ticks;
+        row.size = self.size;
+        row.width = self.width;
+        row.height = self.height;
+        row.date_created = self.date_created;
+        row.date_modified = self.date_modified;
+        row.is_folder = self.is_folder;
+        row.is_in_mixed_folder = self.is_in_mixed_folder;
+        row
+    }
+}
+
+impl From<Planned<BaseItemEntity>> for Planned {
+    fn from(item: Planned<BaseItemEntity>) -> Self {
+        Self {
+            id: item.id,
+            entity: item.entity.into(),
+            ancestors: item.ancestors,
+            generated_names: item.generated_names,
+        }
+    }
 }
 
 /// What a scan announces when it stops: the items it created, the existing
@@ -3593,13 +3742,13 @@ impl PlanCtx<'_> {
     /// groups only the loose episodes the scope keeps, so each virtual
     /// season it emits is the season of a kept episode, exactly as the full
     /// plan emits it.
-    fn emit(&self, out: &mut Vec<Planned>, item: Planned) {
+    fn emit(&self, out: &mut Vec<Planned>, item: Planned<BaseItemEntity>) {
         let kept = match (self.scope.roots, item.entity.path.as_deref()) {
             (None, _) | (Some(_), None) => true,
             (Some(_), Some(path)) => self.scope.keeps(path),
         };
         if kept {
-            out.push(item);
+            out.push(item.into());
         }
     }
 }
@@ -6782,6 +6931,9 @@ impl LibraryScanner {
                 }
                 continue;
             }
+            // The full row, for this item's work alone: the plan keeps it
+            // compact ([`PlanEntity`]).
+            let entity = item.entity.to_entity();
             // The row as it stood before this scan: an item is new iff it has
             // none.
             let stored = stored_rows.get(item.id);
@@ -6793,7 +6945,7 @@ impl LibraryScanner {
                 items_added.push(item);
             }
             let plan = stored_rows.plan(scanned).unwrap_or_else(|| {
-                off_runtime(|| self.plan_item(&refresh, None, !is_new, item, None))
+                off_runtime(|| self.plan_item(&refresh, None, !is_new, item, &entity, None))
             });
             // A folder a path-scoped scan carries for context only — one
             // above the items it refreshes — is read, never refreshed or
@@ -6821,7 +6973,7 @@ impl LibraryScanner {
                 continue;
             }
             let released_by = match stored {
-                Stored::Existing(row) => released_from(item.id, row, &item.entity, &version_groups),
+                Stored::Existing(row) => released_from(item.id, row, &entity, &version_groups),
                 _ => None,
             };
             // A locked item's metadata and cast are user-owned: no NFO or
@@ -6834,7 +6986,7 @@ impl LibraryScanner {
             let policy = refresh.policy_for(item);
             // An album or artist whose refresh the music pass completes
             // after the walk leaves it the triggers of that refresh.
-            let music = MusicKind::of_planned(&item.entity);
+            let music = MusicKind::of_planned(&entity);
             let request = *refresh.request_for(item, !is_new);
             let music_pending = music.is_some_and(|kind| {
                 crate::refresh_plan::full_refresh(&plan, &request)
@@ -6843,6 +6995,7 @@ impl LibraryScanner {
             let pass = ItemPass {
                 index: scanned,
                 item,
+                entity: &entity,
                 stored,
                 links: stored_rows.links(item.id),
                 plan,
@@ -6994,7 +7147,7 @@ impl LibraryScanner {
                 && !undecodable
                 && !matches!(saved, ItemSaved::Cancelled)
                 && request.options.metadata_refresh_mode != MetadataRefreshMode::None
-                && crate::dynamic_images::DynamicImageKind::for_entity(&item.entity).is_some_and(
+                && crate::dynamic_images::DynamicImageKind::for_entity(&entity).is_some_and(
                     |kind| kind != crate::dynamic_images::DynamicImageKind::MusicArtist,
                 )
             {
@@ -7015,7 +7168,7 @@ impl LibraryScanner {
                     .push(missing_episodes::MissingEpisodeSeries {
                         id: item.id,
                         library: item.ancestors.first().copied(),
-                        language: tmdb_locale(&item.entity, policy),
+                        language: tmdb_locale(&entity, policy),
                     });
             }
             match saved {
@@ -7654,6 +7807,7 @@ impl LibraryScanner {
         let ItemPass {
             index,
             item,
+            entity: planned_row,
             stored,
             links,
             plan,
@@ -7671,7 +7825,7 @@ impl LibraryScanner {
             // `DateModified` it replaces drifted ([`RefreshContext::redated`]).
             let facts_moved = self
                 .persistence
-                .update_file_facts(&item.entity, state.refresh.date_if_changed(item))
+                .update_file_facts(planned_row, state.refresh.date_if_changed(item))
                 .await?;
             let ancestors_moved = ancestors_changed(links, item);
             if ancestors_moved {
@@ -7689,7 +7843,7 @@ impl LibraryScanner {
         let folders = state.folders;
         let naming = EpisodeNaming {
             absolute: self
-                .remember_display_order(state.art_cache, stored_row.unwrap_or(&item.entity))
+                .remember_display_order(state.art_cache, stored_row.unwrap_or(planned_row))
                 .await,
             library: item
                 .entity
@@ -7741,11 +7895,11 @@ impl LibraryScanner {
             .filter(|_| {
                 !locked
                     && options.metadata_refresh_mode != MetadataRefreshMode::None
-                    && embedded_episode_info_enabled(stored_row.unwrap_or(&item.entity), policy)
+                    && embedded_episode_info_enabled(stored_row.unwrap_or(planned_row), policy)
             })
             .and_then(|info| info.show_name.as_ref())
             .filter(|name| !name.is_empty());
-        let mut entity = item.entity.clone();
+        let mut entity = planned_row.clone();
         // `FindExtras` names a stored extra before its refresh, so the
         // merge below starts from that name and a local reader's title
         // replaces it as it would any stored name. Only the merge's base
@@ -7888,7 +8042,7 @@ impl LibraryScanner {
         // (`SetProviderIdsFromPath`): the item's own before any provider
         // runs.
         let resolved_ids = if matches!(stored, Stored::New) {
-            crate::resolvers::path_provider_ids(&item.entity)
+            crate::resolvers::path_provider_ids(planned_row)
         } else {
             Vec::new()
         };
@@ -8647,6 +8801,7 @@ impl LibraryScanner {
                     window.get(item.id).row(),
                     !matches!(window.get(item.id), Stored::New),
                     item,
+                    &item.entity.to_entity(),
                     window.links(item.id),
                 );
                 // A superseded copy is skipped by the walk: it must not reach
@@ -9038,10 +9193,10 @@ impl LibraryScanner {
         run: ScanRun<'_>,
     ) -> Vec<Uuid> {
         let mut touched = Vec::new();
-        let albums: HashMap<Uuid, &BaseItemEntity> = planned
+        let albums: HashMap<Uuid, &Planned> = planned
             .iter()
             .filter(|p| image_item_kind(&p.entity.type_) == ImageItemKind::MusicAlbum)
-            .map(|p| (p.id, &p.entity))
+            .map(|p| (p.id, p))
             .collect();
         for item in planned {
             if image_item_kind(&item.entity.type_) == ImageItemKind::Audio
@@ -9077,8 +9232,9 @@ impl LibraryScanner {
         for (&id, album) in &albums {
             touched.extend(Box::pin(self.serve_lane(run)).await);
             let images = off_runtime(|| {
-                let mut images = discover_local_images(album, None, &FsDirectoryService::new());
-                self.append_art_dir_images(album, &mut images);
+                let album = album.entity.to_entity();
+                let mut images = discover_local_images(&album, None, &FsDirectoryService::new());
+                self.append_art_dir_images(&album, &mut images);
                 images
             });
             listed.push((id, images));
@@ -10003,11 +10159,11 @@ impl LibraryScanner {
         // The notifier needs whole rows; a chunk at a time keeps the copies
         // small on a first scan of a large library.
         for chunk in added.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let rows: Vec<BaseItemEntity> = chunk.iter().map(|p| p.entity.clone()).collect();
+            let rows: Vec<BaseItemEntity> = chunk.iter().map(|p| p.entity.to_entity()).collect();
             notifier.record_added(&rows);
         }
         for chunk in updated.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let rows: Vec<BaseItemEntity> = chunk.iter().map(|p| p.entity.clone()).collect();
+            let rows: Vec<BaseItemEntity> = chunk.iter().map(|p| p.entity.to_entity()).collect();
             notifier.record_updated(&rows);
         }
         for (library, ids) in removed {
@@ -10598,7 +10754,7 @@ impl LibraryScanner {
 
     /// One planned item's refresh plan ([`plan_item_refresh`]), from its
     /// stored row and links as the window read them and what the filesystem
-    /// says now.
+    /// says now. `entity` is `item`'s full row ([`PlanEntity::to_entity`]).
     ///
     /// [`plan_item_refresh`]: crate::refresh_plan::plan_item_refresh
     fn plan_item(
@@ -10607,6 +10763,7 @@ impl LibraryScanner {
         stored: Option<&BaseItemEntity>,
         exists: bool,
         item: &Planned,
+        entity: &BaseItemEntity,
         links: Option<&StoredItemLinks>,
     ) -> ItemRefreshPlan {
         let policy = refresh.policy_for(item);
@@ -10619,7 +10776,14 @@ impl LibraryScanner {
             is_virtual_item: row.is_virtual_item,
             is_locked: row.is_locked || refresh.locked.contains(&item.id),
         });
-        let facts = Self::file_facts(item, stored, links, refresh.externals.as_ref(), policy);
+        let facts = Self::file_facts(
+            item,
+            entity,
+            stored,
+            links,
+            refresh.externals.as_ref(),
+            policy,
+        );
         let backfill = stored.is_some_and(|row| self.wants_backfill(row, policy));
         let mut plan = crate::refresh_plan::plan_item_refresh(
             state.as_ref(),
@@ -10640,7 +10804,7 @@ impl LibraryScanner {
                 || plan.is_first_refresh
                 || plan.requires_refresh)
             && !state.is_some_and(|state| state.is_locked)
-            && embedded_episode_info_enabled(stored.unwrap_or(&item.entity), policy)
+            && embedded_episode_info_enabled(stored.unwrap_or(entity), policy)
         {
             plan.probe = true;
         }
@@ -10650,15 +10814,15 @@ impl LibraryScanner {
     /// What the filesystem says about `item` now, for its refresh plan: the
     /// planner's stat, the prober that handles it, whether its external
     /// subtitle/audio files still match the stored streams, and the NFO the
-    /// local reader would read.
+    /// local reader would read. `entity` is `item`'s full row.
     fn file_facts(
         item: &Planned,
+        entity: &BaseItemEntity,
         stored: Option<&BaseItemEntity>,
         links: Option<&StoredItemLinks>,
         externals: Option<&ExternalProbeSeam>,
         policy: FetcherPolicy<'_>,
     ) -> FileFacts {
-        let entity = &item.entity;
         let data = crate::item_data::parse_data(entity.data.as_deref());
         let probe = match probe_request(entity) {
             None => ProbeKind::None,
@@ -15983,7 +16147,7 @@ impl LibraryScanner {
         set_resolved_lists(&mut primary.entity, &parts, &versions);
         let (owner, mixed) = (primary.id, primary.entity.is_in_mixed_folder);
         ctx.local_versions.borrow_mut().push((owner, versions));
-        out.push(primary);
+        out.push(primary.into());
         self.plan_parts(&parts, owner, mixed, folder, ctx, out);
         for (first, rest) in &alternates {
             let Some(mut alternate) = self.owned_video(first, folder.walk.kind, folder, ctx) else {
@@ -15994,7 +16158,7 @@ impl LibraryScanner {
             settle_mixed_folder(&mut alternate.entity, mixed, folder.dir, naming);
             set_resolved_lists(&mut alternate.entity, rest, &[]);
             let id = alternate.id;
-            out.push(alternate);
+            out.push(alternate.into());
             self.plan_parts(rest, id, mixed, folder, ctx, out);
         }
     }
@@ -16019,7 +16183,7 @@ impl LibraryScanner {
             part.entity.owner_id = Some(guid_to_db(owner));
             part.entity.is_in_mixed_folder = mixed;
             set_resolved_lists(&mut part.entity, &[], &[]);
-            out.push(part);
+            out.push(part.into());
         }
     }
 
@@ -16038,7 +16202,7 @@ impl LibraryScanner {
         kind: BaseItemKind,
         folder: &MovieFolder<'_>,
         ctx: &PlanCtx<'_>,
-    ) -> Option<Planned> {
+    ) -> Option<Planned<BaseItemEntity>> {
         let parsed = video_resolver::resolve_file(Some(path), ctx.naming, None);
         let movies = folder.walk.collection_type == Some(CollectionTypeOptions::movies);
         let (name, year) = match parsed {
@@ -16063,7 +16227,7 @@ impl LibraryScanner {
         year: Option<i32>,
         folder: &MovieFolder<'_>,
         ctx: &PlanCtx<'_>,
-    ) -> Option<Planned> {
+    ) -> Option<Planned<BaseItemEntity>> {
         let (parent, ancestors) = folder.walk.parent(folder.cf, ctx);
         let (id, mut entity) = self.base_item(ctx, kind, folder.cf, parent, name, path, false)?;
         entity.media_type = Some("Video".to_owned());
@@ -16273,7 +16437,7 @@ impl LibraryScanner {
         folder: &MovieFolder<'_>,
         video: Option<&ferrofin_naming::video::VideoInfo>,
         ctx: &PlanCtx<'_>,
-    ) -> Option<Planned> {
+    ) -> Option<Planned<BaseItemEntity>> {
         let kind = folder.walk.kind;
         let parsed = || {
             video_resolver::resolve_file(Some(path), ctx.naming, None).map_or_else(
@@ -16612,7 +16776,7 @@ impl LibraryScanner {
             ctx.local_versions.borrow_mut().push((id, Vec::new()));
             out.push(Planned {
                 id,
-                entity: primary,
+                entity: primary.into(),
                 ancestors,
                 generated_names: Vec::new(),
             });
@@ -17505,7 +17669,7 @@ impl LibraryScanner {
                 ctx.local_versions
                     .borrow_mut()
                     .push((episode.id, Vec::new()));
-                out.push(episode);
+                out.push(episode.into());
             }
         }
     }
@@ -17559,7 +17723,7 @@ impl LibraryScanner {
         let owner = primary.id;
         let mixed = primary.entity.is_in_mixed_folder;
         ctx.local_versions.borrow_mut().push((owner, versions));
-        out.push(primary);
+        out.push(primary.into());
         self.plan_episode_parts(&parts, owner, mixed, home, ctx, out);
         for (first, rest) in &alternates {
             let Some(mut alternate) = self.episode_row(first, home, ctx) else {
@@ -17570,7 +17734,7 @@ impl LibraryScanner {
             alternate.entity.is_in_mixed_folder = mixed;
             set_resolved_lists(&mut alternate.entity, rest, &[]);
             let id = alternate.id;
-            out.push(alternate);
+            out.push(alternate.into());
             self.plan_episode_parts(rest, id, mixed, home, ctx, out);
         }
     }
@@ -17610,7 +17774,7 @@ impl LibraryScanner {
             set_resolved_lists(&mut entity, &[], &[]);
             out.push(Planned {
                 id,
-                entity,
+                entity: entity.into(),
                 ancestors: ancestors.clone(),
                 generated_names: Vec::new(),
             });
@@ -17620,7 +17784,12 @@ impl LibraryScanner {
     /// One `Episode` row at `path`, parented to its season (or the series
     /// when there is no season folder), carrying `IndexNumber` /
     /// `ParentIndexNumber` from the filename's episode/season numbers.
-    fn episode_row(&self, path: &str, home: EpisodeHome<'_>, ctx: &PlanCtx<'_>) -> Option<Planned> {
+    fn episode_row(
+        &self,
+        path: &str,
+        home: EpisodeHome<'_>,
+        ctx: &PlanCtx<'_>,
+    ) -> Option<Planned<BaseItemEntity>> {
         let info = EpisodeResolver::new(ctx.naming).resolve_simple(
             below_library(path, library_locations(ctx.key_folders)),
             false,
@@ -18685,7 +18854,7 @@ impl LibraryScanner {
         entity.series_name = parsed.series_name.or(series_fallback);
         out.push(Planned {
             id,
-            entity,
+            entity: entity.into(),
             ancestors: vec![cf],
             generated_names: Vec::new(),
         });
@@ -18725,7 +18894,7 @@ impl LibraryScanner {
         entity.production_year = year.map(i64::from);
         out.push(Planned {
             id,
-            entity,
+            entity: entity.into(),
             ancestors: vec![cf],
             generated_names: Vec::new(),
         });
@@ -24638,6 +24807,72 @@ mod tests {
         );
     }
 
+    /// A planned row survives the plan's compaction whole: the inline
+    /// columns, and any other (a refreshed book's metadata, say), which ride
+    /// along in `rest`; a row that set none keeps no `rest`.
+    #[test]
+    fn plan_entity_gives_back_the_planned_row() {
+        use super::{BaseItemEntity, PlanEntity};
+        use chrono::TimeZone as _;
+        let date = chrono::Utc.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap();
+        let inline = BaseItemEntity {
+            id: "a".into(),
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".into(),
+            name: Some("Name".into()),
+            sort_name: Some("name".into()),
+            path: Some("/m/a.mkv".into()),
+            parent_id: Some("p".into()),
+            top_parent_id: Some("t".into()),
+            owner_id: Some("o".into()),
+            primary_version_id: Some("v".into()),
+            season_id: Some("s".into()),
+            season_name: Some("Season 1".into()),
+            series_id: Some("r".into()),
+            series_name: Some("Show".into()),
+            series_presentation_unique_key: Some("k".into()),
+            presentation_unique_key: Some("pk".into()),
+            media_type: Some("Video".into()),
+            data: Some("{}".into()),
+            album: Some("Album".into()),
+            extra_type: Some(3),
+            index_number: Some(4),
+            parent_index_number: Some(5),
+            production_year: Some(2020),
+            run_time_ticks: Some(9),
+            size: Some(6),
+            width: Some(7),
+            height: Some(8),
+            date_created: Some(date),
+            date_modified: Some(date),
+            is_folder: true,
+            is_in_mixed_folder: true,
+            ..BaseItemEntity::default()
+        };
+        let compact = PlanEntity::from(inline.clone());
+        assert!(compact.rest.is_none());
+        assert_eq!(compact.to_entity(), inline);
+
+        let book = BaseItemEntity {
+            overview: Some("Overview".into()),
+            premiere_date: Some(date),
+            community_rating: Some(7.5),
+            is_locked: true,
+            ..inline
+        };
+        let compact = PlanEntity::from(book.clone());
+        assert!(compact.rest.is_some());
+        assert_eq!(compact.to_entity(), book);
+
+        // A change made after the plan took the item in is kept.
+        let mut compact = compact;
+        compact.is_in_mixed_folder = false;
+        compact.owner_id = None;
+        let changed = compact.to_entity();
+        assert!(!changed.is_in_mixed_folder);
+        assert_eq!(changed.owner_id, None);
+        assert_eq!(changed.overview.as_deref(), Some("Overview"));
+    }
+
     /// A row the scan plans owned by another owner, or by none, was released
     /// from the group its stored owner heads — when the walk resolved that
     /// group, or placed the row in a group it resolved; an extra never was in
@@ -24803,7 +25038,7 @@ mod tests {
             .expect("save");
         let planned = [super::Planned {
             id: primary,
-            entity: row(primary, paths[0], None),
+            entity: row(primary, paths[0], None).into(),
             ancestors: Vec::new(),
             generated_names: Vec::new(),
         }];
@@ -25511,7 +25746,8 @@ mod tests {
                 date_modified: mtime.map(time),
                 is_folder: folder,
                 ..Default::default()
-            },
+            }
+            .into(),
             generated_names: Vec::new(),
         };
         let mut refresh = super::RefreshContext::of(super::ScanRun::defaults());
@@ -27483,7 +27719,7 @@ mod tests {
         };
         let planned = |library: uuid::Uuid| super::Planned {
             id: uuid::Uuid::new_v4(),
-            entity: ferrofin_db::entities::base_items::BaseItemEntity::default(),
+            entity: ferrofin_db::entities::base_items::BaseItemEntity::default().into(),
             ancestors: vec![library],
             generated_names: Vec::new(),
         };
@@ -31021,7 +31257,8 @@ mod tests {
             entity: BaseItemEntity {
                 name: Some("Trailer".into()),
                 ..owned_row(shape)
-            },
+            }
+            .into(),
             ancestors: Vec::new(),
             generated_names: if shape == "extra" {
                 ["Trailer", "Trailer 2", "Heat", "Heat (1995)-trailer"]
@@ -31043,7 +31280,7 @@ mod tests {
         for locked in [false, true] {
             let saved = save_with_locks(
                 Some(&base),
-                &planned.entity,
+                &planned.entity.to_entity(),
                 noop,
                 locked,
                 locked_fields,
@@ -31840,7 +32077,8 @@ mod tests {
             entity: BaseItemEntity {
                 path: Some(path.to_owned()),
                 ..BaseItemEntity::default()
-            },
+            }
+            .into(),
             ancestors: Vec::new(),
             generated_names: Vec::new(),
         };
@@ -31882,7 +32120,8 @@ mod tests {
                 primary_version_id: (shape == "alternate").then(|| guid_to_db(id(owner.unwrap()))),
                 extra_type: (shape == "extra").then_some(1),
                 ..BaseItemEntity::default()
-            },
+            }
+            .into(),
             ancestors: Vec::new(),
             generated_names: Vec::new(),
         };
@@ -31954,7 +32193,8 @@ mod tests {
             entity: BaseItemEntity {
                 path: Some(path.to_owned()),
                 ..BaseItemEntity::default()
-            },
+            }
+            .into(),
             ancestors: Vec::new(),
             generated_names: Vec::new(),
         };
@@ -36933,7 +37173,8 @@ mod tests {
                     media_type: Some("Video".into()),
                     path: Some(format!("/movies/{n}.mkv")),
                     ..Default::default()
-                },
+                }
+                .into(),
                 ancestors: Vec::new(),
                 generated_names: Vec::new(),
             }]
@@ -36976,7 +37217,8 @@ mod tests {
                 media_type: Some("Audio".into()),
                 path: Some(format!("/music/{n}.mp3")),
                 ..Default::default()
-            },
+            }
+            .into(),
             ancestors: Vec::new(),
             generated_names: Vec::new(),
         };
@@ -37009,7 +37251,8 @@ mod tests {
                 media_type: Some("Audio".into()),
                 path: Some(format!("/music/{n}.mp3")),
                 ..Default::default()
-            },
+            }
+            .into(),
             ancestors: Vec::new(),
             generated_names: Vec::new(),
         };
@@ -38925,7 +39168,8 @@ mod tests {
                 path: Some(format!("/tv/Show/{id}.mkv")),
                 series_id: series.map(guid_to_db),
                 ..Default::default()
-            },
+            }
+            .into(),
             ancestors: Vec::new(),
             generated_names: Vec::new(),
         }
@@ -38941,7 +39185,7 @@ mod tests {
 
         let db = crate::test_support::test_db().await;
         let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
-        let rows: Vec<_> = planned.iter().map(|p| p.entity.clone()).collect();
+        let rows: Vec<_> = planned.iter().map(|p| p.entity.to_entity()).collect();
         persistence.save_items(&rows).await.expect("rows");
         let images: Vec<_> = planned
             .iter()
@@ -41536,7 +41780,7 @@ mod tests {
         // not plan is not visited.
         let planned = |id: uuid::Uuid, kind: BaseItemKind| super::Planned {
             id,
-            entity: row(id, kind, true, None),
+            entity: row(id, kind, true, None).into(),
             ancestors: Vec::new(),
             generated_names: Vec::new(),
         };
@@ -41726,7 +41970,7 @@ mod tests {
             .into_iter()
             .filter(|p| p.entity.type_.ends_with("Audio.Audio"))
             .map(|p| {
-                let mut entity = p.entity;
+                let mut entity = p.entity.to_entity();
                 let path = entity.path.clone().unwrap_or_default();
                 let guesses = super::ResolverGuesses::take(&mut entity, None, false);
                 (path, guesses.folder_album)
