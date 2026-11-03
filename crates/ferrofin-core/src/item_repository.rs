@@ -2470,6 +2470,60 @@ pub(crate) async fn library_top_parents_by_view(
     Ok(by_view)
 }
 
+/// A [`ViewRow`] and the id it was read for.
+#[derive(sqlx::FromRow)]
+struct IdentifiedViewRow {
+    #[sqlx(rename = "Id")]
+    id: String,
+    #[sqlx(flatten)]
+    row: ViewRow,
+}
+
+/// The `TopParentId`s each `UserView` among `ids` stands for, as
+/// `GetTopParentIdsForQuery` translates a view
+/// ([`FerrofinItemRepository::top_parent_ids_for_query`]): a grouped view the
+/// libraries `user` grouped into it, a view with a `DisplayParentId` or
+/// `ParentId` what that item stands for, a Live TV view itself. A view that
+/// stands for nothing maps to an empty list. Ids that are not views are absent.
+///
+/// For a scope built from a handful of parents: one read of the views' rows,
+/// then only the reads a followed pointer or the grouping arm needs.
+pub(crate) async fn view_top_parent_ids(
+    db: &Database,
+    ids: &[Uuid],
+    user: Option<&UserEntity>,
+) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+    let Some(user_view) = stored_type_name(BaseItemKind::UserView) else {
+        return Ok(HashMap::new());
+    };
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT "Id", "Type", "ParentId", "Path", "Data", "TopParentId",
+           EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = "BaseItems"."Id")
+               AS "_HasLinkedChildren"
+           FROM "BaseItems" WHERE +"Type" = "#,
+    );
+    qb.push_bind(user_view).push(" AND ");
+    push_in_list(&mut qb, r#""Id""#, &to_guid_strings(ids));
+    let rows: Vec<IdentifiedViewRow> = qb
+        .build_query_as()
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)?;
+    let mut by_view = HashMap::with_capacity(rows.len());
+    for IdentifiedViewRow { id, row } in rows {
+        let Ok(id) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        let folders =
+            FerrofinItemRepository::top_parent_ids_for_query(db, id, user, 0, Some(row)).await?;
+        by_view.insert(id, folders.unwrap_or_default());
+    }
+    Ok(by_view)
+}
+
 /// `AdjacentTo` over an ordered result (v12.2 `ApplyAdjacencyFilter`,
 /// `UserViewBuilder.FilterForAdjacency`): the item and its immediate
 /// neighbours, in `items`' order, or nothing when the item is not in `items`.
