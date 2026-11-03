@@ -3066,7 +3066,7 @@ async fn visible_view_rows(
     // `live_tv_enabled_for`. Jellyfin leaves it out of `GetUserViews`
     // otherwise, so it is out of this scope too. The row is looked for
     // first, among the `UserView` rows just read: most databases have none,
-    // and then neither of the gate's two queries needs to run at all.
+    // and then the gate is not asked at all.
     let live_tv_view = match live_tv_view_among(
         rows.iter()
             .map(|(id, type_, path, _)| (id.as_str(), type_.as_str(), path.as_deref())),

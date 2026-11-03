@@ -649,8 +649,9 @@ pub static SETTINGS: &[SettingSpec] = &[
         env_read: EnvRead::NonBlank,
         kind: CACHE_TTL,
         default: "30",
-        description: "Seconds the access check serves users' and libraries' rows from memory; \
-                      only bounds changes made outside the server.",
+        description: "Seconds the access check serves users' and libraries' rows, and whether \
+                      a Live TV tuner is configured, from memory; only bounds changes made \
+                      outside the server.",
         running: |c| json!(c.row_cache_ttl_secs),
         ..ROW
     },
