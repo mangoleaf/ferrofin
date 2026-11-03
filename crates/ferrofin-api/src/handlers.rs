@@ -1257,7 +1257,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         ferrofin: "The write path, plus the read path only where a page's version groups get \
                    their user data. ferrofin-core user_data_manager.rs mutate_row \
                    (SaveUserData with its retired-key update, GetUserData, ResolveUserDataRow), \
-                   save_user_data_with_reason (the UpdateUserItemDataDto SaveUserData), \
+                   with the item's keys from user_data_key_repository.rs load_identities and \
+                   KEY_ROWS_SQL (GetUserDataKeys, from the series a Season or an Episode \
+                   names in SeriesId, else its nearest Series parent, read in the same \
+                   statement as the item), save_user_data_with_reason (the \
+                   UpdateUserItemDataDto SaveUserData), \
                    save_play_state and apply_play_report (UpdatePlayState), \
                    reset_playback_stream_selections (ResetPlaybackStreamSelections), \
                    record_playback_start, set_likes, mark_item_played, mark_item_unplayed, \
@@ -1265,6 +1269,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Session/SessionManager.cs (OnPlaybackStart, \
                    OnPlaybackProgress, UpdatePlaybackSettings, OnPlaybackStopped), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
+                   MediaBrowser.Controller/Entities/TV/Episode.cs and \
+                   MediaBrowser.Controller/Entities/TV/Season.cs (Series, FindSeriesId, \
+                   GetUserDataKeys), \
                    MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
                    Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
                    UpdateUserItemRatingInternal). The version groups: dto_service.rs prefetch's \
