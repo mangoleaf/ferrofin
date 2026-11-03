@@ -1477,6 +1477,25 @@ pub enum AdminFlagOutcome {
     KeptLastAdministrator,
 }
 
+/// How [`UserManager::create_external_user`] sets up a user an outside
+/// authentication provider creates at their first sign-in: what upstream's
+/// LDAP plugin writes onto the new `User` before `UpdateUserAsync`
+/// (jellyfin-plugin-ldapauth v24, `LdapAuthenticationProviderPlugin.Authenticate`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExternalUserSetup {
+    /// Saved as the user's `AuthenticationProviderId`, so their sign-ins go
+    /// to that provider.
+    pub authentication_provider_id: String,
+    /// Saved as the user's `PasswordResetProviderId`.
+    pub password_reset_provider_id: String,
+    /// The `EnableAllFolders` permission.
+    pub enable_all_folders: bool,
+    /// The `EnabledFolders` preference, the library ids as given, stored as
+    /// upstream's `SetPreference` stores them; `None` keeps the new user's
+    /// empty one.
+    pub enabled_folders: Option<Vec<String>>,
+}
+
 /// The state of the server a policy save is checked against: the user's
 /// current policy flags and the counts `UserController.UpdateUserPolicy`
 /// takes over all users.
@@ -1571,6 +1590,57 @@ pub trait UserManager: Send + Sync {
 
     /// Creates a user with the given name and returns the new row.
     async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError>;
+
+    /// Creates a user `name` whose sign-ins belong to an outside
+    /// authentication provider, set up as `setup` says, and returns the new
+    /// row. Upstream's LDAP plugin calls `CreateUserAsync`, sets the provider
+    /// ids and the folder access on the user, then saves it with
+    /// `UpdateUserAsync`.
+    ///
+    /// The concrete manager writes the row and `setup` in one transaction.
+    /// Created first and set up after, the account would for a moment be a
+    /// local one without a password, which the built-in provider signs in
+    /// with an empty password; upstream has that window. It also records the
+    /// "User … has been created" activity entry, as `CreateUserAsync` does.
+    /// The default creates the user and then saves `setup` with
+    /// [`Self::update_policy`], so impls without a store of their own compile
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::InvalidInput`] for a name that is not valid or is
+    /// already taken, or whatever the save surfaces.
+    async fn create_external_user(
+        &self,
+        name: &str,
+        setup: &ExternalUserSetup,
+    ) -> Result<UserEntity, ServiceError> {
+        let user = self.create_user(name).await?;
+        let user_id =
+            Uuid::parse_str(&user.id).map_err(|error| ServiceError::backend(error.to_string()))?;
+        let mut policy = self
+            .get_user_dto(&user, None)
+            .await?
+            .policy
+            .unwrap_or_default();
+        policy
+            .authentication_provider_id
+            .clone_from(&setup.authentication_provider_id);
+        policy
+            .password_reset_provider_id
+            .clone_from(&setup.password_reset_provider_id);
+        policy.enable_all_folders = setup.enable_all_folders;
+        if let Some(folders) = &setup.enabled_folders {
+            policy.enabled_folders = folders
+                .iter()
+                .filter_map(|folder| Uuid::parse_str(folder).ok())
+                .collect();
+        }
+        self.update_policy(user_id, &policy).await?;
+        self.get_user_by_id(user_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("user {user_id}")))
+    }
 
     /// Deletes a user by id.
     async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError>;

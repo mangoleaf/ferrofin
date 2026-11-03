@@ -91,14 +91,16 @@ Four third-party Jellyfin plugins ship as extensions today. Each is a faithful p
 pinned upstream revision; the pins and the full delta live in
 [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md). LDAP-Auth is being ported in phases: so far it
 shows under Dashboard → Plugins, disabled, with upstream's settings page and its connection
-test; directory sign-in follows.
+test, and once enabled with a server it signs directory users in (creating them on their
+first sign-in and following a directory rename). The admin filter, password changes, profile
+images, referrals and the import of an adopted Jellyfin's settings follow.
 
 | Extension | Upstream | Ported rev | What it does |
 |---|---|---|---|
 | **Intro Skipper** | [intro-skipper/intro-skipper](https://github.com/intro-skipper/intro-skipper) | `db09359` | Intro, credits, recap, preview and commercial detection (audio fingerprints, chapters, black frames), exposed as media segments |
 | **File Transformation** | [IAmParadox27/jellyfin-plugin-file-transformation](https://github.com/IAmParadox27/jellyfin-plugin-file-transformation) | `f4f01c3` | Transform-on-serve hook other extensions build on |
 | **Merge Versions** | [danieladov/jellyfin-plugin-mergeversions](https://github.com/danieladov/jellyfin-plugin-mergeversions) | `e6f58d6` | Bulk-merge duplicate movie/episode versions into one item, two 24h tasks |
-| **LDAP-Auth** | [jellyfin/jellyfin-plugin-ldapauth](https://github.com/jellyfin/jellyfin-plugin-ldapauth) | `d11c86a` | Sign users in against an LDAP directory (in progress: the settings page and `POST /Ldap/TestServerBind` so far) |
+| **LDAP-Auth** | [jellyfin/jellyfin-plugin-ldapauth](https://github.com/jellyfin/jellyfin-plugin-ldapauth) | `d11c86a` | Sign users in against an LDAP directory (in progress: the settings page, `POST /Ldap/TestServerBind` and sign-in so far) |
 
 **Accepted divergences** (not bugs — do not "fix" them during an upstream sync): Ferrofin
 models version groups solely through the `PrimaryVersionId` pointer rather than Jellyfin's
@@ -118,9 +120,10 @@ dashboard's Disable toggle turns them off. Its version is the server's release.
 `FERROFIN_DISABLE_EXTENSIONS` leaves it registered: it has nothing to fire inside a benchmark.
 
 Its settings page, the Settings link under Dashboard → Plugins → Ferrofin and the dashboard
-menu's **Ferrofin** entry, lists every setting that route reports, in groups: the value in use,
+menu's **Ferrofin** entry, lists every setting that route reports, in a tab per group: a readable
+name with the `config.toml` key and environment variable below it, the value in use in its unit,
 the default, a badge for where the value comes from (default, `config.toml`, environment or
-flag), the environment variable and flag that set it, and, for a setting the page may not
+flag), the flag that sets it, and, for a setting the page may not
 change, a lock with the reason and where it is changed instead. Secrets are shown to the
 administrator, marked as secrets. A setting the page may change has a control for its kind and
 **Reset to default**: Save posts the changed ones, a refused value shows the server's message next

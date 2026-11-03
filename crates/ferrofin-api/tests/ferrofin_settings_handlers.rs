@@ -19,7 +19,8 @@ use ferrofin_api::test_support::{
 };
 use ferrofin_model::server_settings::{
     ServerSettingApplies, ServerSettingDto, ServerSettingGroup, ServerSettingKind,
-    ServerSettingSource, ServerSettingsDto, ServerSettingsUpdateDto, ServerSettingsUpdateResultDto,
+    ServerSettingSource, ServerSettingUnit, ServerSettingsDto, ServerSettingsUpdateDto,
+    ServerSettingsUpdateResultDto,
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::DisabledPluginManager;
@@ -83,8 +84,10 @@ fn settings() -> ServerSettingsDto {
         settings: vec![
             ServerSettingDto {
                 key: "omdb_api_key".to_owned(),
+                label: "OMDb API key".to_owned(),
                 group: ServerSettingGroup::Providers,
                 kind: ServerSettingKind::Secret,
+                unit: None,
                 description: "OMDb API key override.".to_owned(),
                 env_var: Some("FERROFIN_OMDB_KEY".to_owned()),
                 flag: None,
@@ -100,8 +103,10 @@ fn settings() -> ServerSettingsDto {
             },
             ServerSettingDto {
                 key: "port".to_owned(),
+                label: "HTTP port".to_owned(),
                 group: ServerSettingGroup::Network,
                 kind: ServerSettingKind::Integer,
+                unit: None,
                 description: "HTTP port.".to_owned(),
                 env_var: Some("FERROFIN_PORT".to_owned()),
                 flag: Some("--port".to_owned()),
@@ -114,6 +119,25 @@ fn settings() -> ServerSettingsDto {
                 applies: ServerSettingApplies::Restart,
                 min: Some(0),
                 max: Some(65535),
+            },
+            ServerSettingDto {
+                key: "wasm_subtitle_extract_mb".to_owned(),
+                label: "Subtitle extraction limit".to_owned(),
+                group: ServerSettingGroup::Plugins,
+                kind: ServerSettingKind::Integer,
+                unit: Some(ServerSettingUnit::Mebibytes),
+                description: "Size cap of one subtitle track a plugin extracts.".to_owned(),
+                env_var: Some("FERROFIN_WASM_SUBTITLE_EXTRACT_MB".to_owned()),
+                flag: None,
+                default: Some("10".to_owned()),
+                value: None,
+                saved_value: None,
+                source: ServerSettingSource::Default,
+                editable: true,
+                locked_reason: None,
+                applies: ServerSettingApplies::Restart,
+                min: Some(1),
+                max: Some(128),
             },
         ],
     }
@@ -194,6 +218,12 @@ async fn an_admin_gets_every_setting_secrets_included() {
     assert_eq!(body["Settings"][0]["Value"], SECRET);
     assert_eq!(body["Settings"][1]["Source"], "Flag");
     assert_eq!(body["Settings"][1]["Editable"], false);
+    // Each setting's readable name, and its unit when it has one.
+    assert_eq!(body["Settings"][1]["Label"], "HTTP port");
+    assert!(body["Settings"][1].get("Unit").is_none(), "{body}");
+    assert_eq!(body["Settings"][2]["Label"], "Subtitle extraction limit");
+    assert_eq!(body["Settings"][2]["Unit"], "MiB");
+    assert_eq!(body["Settings"][2]["Group"], "Plugins");
     assert_eq!(fake.calls(), 1);
 }
 

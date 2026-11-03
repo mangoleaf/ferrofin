@@ -865,3 +865,242 @@ async fn a_saved_provider_that_is_enabled_logs_no_warning(#[case] saved: &str) {
         "{text}"
     );
 }
+
+/// Records the activity entries a manager writes.
+#[derive(Default)]
+struct RecordingActivity {
+    entries: Mutex<Vec<ferrofin_traits::activity::ActivityLogCreate>>,
+}
+
+#[async_trait]
+impl ferrofin_traits::activity::ActivityManager for RecordingActivity {
+    async fn get_paged_result(
+        &self,
+        _query: &ferrofin_traits::activity::ActivityLogQuery,
+    ) -> Result<
+        ferrofin_model::querying::QueryResult<ferrofin_model::activity::ActivityLogEntry>,
+        ServiceError,
+    > {
+        Ok(ferrofin_model::querying::QueryResult::default())
+    }
+    async fn create_entry(
+        &self,
+        entry: ferrofin_traits::activity::ActivityLogCreate,
+    ) -> Result<(), ServiceError> {
+        self.entries.lock().unwrap().push(entry);
+        Ok(())
+    }
+    async fn clean(&self, _before: chrono::DateTime<chrono::Utc>) -> Result<u64, ServiceError> {
+        Ok(0)
+    }
+}
+
+/// A user an outside provider creates is its user from the first write, with
+/// the folder access it asked for, and is recorded as created.
+#[tokio::test]
+async fn an_external_user_is_created_already_owned_by_its_provider() {
+    let (mgr, provider) = manager(true, false).await;
+    let activity = Arc::new(RecordingActivity::default());
+    let mgr = mgr.with_activity(activity.clone());
+    let folder = Uuid::from_u128(0xf01d_e125);
+    let setup = ExternalUserSetup {
+        authentication_provider_id: "Tests.External".to_owned(),
+        password_reset_provider_id: "Tests.External.Reset".to_owned(),
+        enable_all_folders: false,
+        enabled_folders: Some(vec![folder.to_string()]),
+    };
+
+    let user = mgr
+        .create_external_user("dana", &setup)
+        .await
+        .expect("create");
+
+    assert_eq!(user.authentication_provider_id, "Tests.External");
+    assert_eq!(user.password_reset_provider_id, "Tests.External.Reset");
+    assert_eq!(user.password, None);
+    let policy = mgr
+        .get_user_dto(&user, None)
+        .await
+        .expect("dto")
+        .policy
+        .expect("policy");
+    assert!(!policy.enable_all_folders);
+    assert_eq!(policy.enabled_folders, [folder]);
+    assert!(!policy.is_administrator);
+    assert!(policy.enable_remote_access, "the other defaults are seeded");
+    {
+        let entries = activity.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].type_, "UserCreated");
+        assert_eq!(entries[0].name, "User dana has been created");
+        assert_eq!(
+            entries[0].user_id,
+            Some(Uuid::parse_str(&user.id).expect("id"))
+        );
+    }
+
+    // An empty password goes to its provider, never the built-in one, which
+    // would sign a user without a password in.
+    assert!(
+        mgr.authenticate_user("dana", "", "127.0.0.1", true)
+            .await
+            .expect("sign in")
+            .is_none()
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let plain = mgr.create_user("erin").await.expect("create");
+    assert_eq!(plain.authentication_provider_id, DEFAULT_AUTH_PROVIDER_ID);
+    assert!(
+        mgr.authenticate_user("erin", "", "127.0.0.1", true)
+            .await
+            .expect("sign in")
+            .is_some(),
+        "a plain new user is that passwordless local account"
+    );
+}
+
+/// Without folders, the new user keeps the seeded empty list; an invalid or
+/// taken name creates nothing.
+#[tokio::test]
+async fn an_external_user_without_folders_or_with_a_bad_name() {
+    let (mgr, _) = manager(true, false).await;
+    let setup = ExternalUserSetup {
+        authentication_provider_id: "Tests.External".to_owned(),
+        password_reset_provider_id: "Tests.External".to_owned(),
+        enable_all_folders: true,
+        enabled_folders: None,
+    };
+    let user = mgr
+        .create_external_user("dana", &setup)
+        .await
+        .expect("create");
+    let policy = mgr
+        .get_user_dto(&user, None)
+        .await
+        .expect("dto")
+        .policy
+        .expect("policy");
+    assert!(policy.enable_all_folders);
+    assert_eq!(policy.enabled_folders, Vec::<Uuid>::new());
+
+    for name in ["DANA", " dana", ""] {
+        assert!(
+            matches!(
+                mgr.create_external_user(name, &setup).await,
+                Err(ServiceError::InvalidInput(_))
+            ),
+            "{name:?}"
+        );
+    }
+    assert_eq!(mgr.get_users().await.expect("users").len(), 1);
+}
+
+/// Delegates everything but `create_external_user` to the real manager.
+struct Delegating(FerrofinUserManager);
+#[async_trait]
+impl UserManager for Delegating {
+    async fn get_users(&self) -> Result<Vec<UserEntity>, ServiceError> {
+        self.0.get_users().await
+    }
+    async fn get_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+        self.0.get_user_ids().await
+    }
+    async fn initialize(&self) -> Result<(), ServiceError> {
+        self.0.initialize().await
+    }
+    async fn get_user_by_id(&self, id: Uuid) -> Result<Option<UserEntity>, ServiceError> {
+        self.0.get_user_by_id(id).await
+    }
+    async fn get_first_user(&self) -> Result<Option<UserEntity>, ServiceError> {
+        self.0.get_first_user().await
+    }
+    async fn get_user_by_name(&self, name: &str) -> Result<Option<UserEntity>, ServiceError> {
+        self.0.get_user_by_name(name).await
+    }
+    async fn rename_user(&self, id: Uuid, old: &str, new: &str) -> Result<(), ServiceError> {
+        self.0.rename_user(id, old, new).await
+    }
+    async fn update_user(&self, user: &UserEntity) -> Result<(), ServiceError> {
+        self.0.update_user(user).await
+    }
+    async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError> {
+        self.0.create_user(name).await
+    }
+    async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError> {
+        self.0.delete_user(user_id).await
+    }
+    async fn reset_password(&self, user_id: Uuid) -> Result<(), ServiceError> {
+        self.0.reset_password(user_id).await
+    }
+    async fn change_password(&self, user_id: Uuid, pw: &str) -> Result<(), ServiceError> {
+        self.0.change_password(user_id, pw).await
+    }
+    async fn authenticate_user(
+        &self,
+        username: &str,
+        password: &str,
+        remote_endpoint: &str,
+        is_user_session: bool,
+    ) -> Result<Option<UserEntity>, ServiceError> {
+        self.0
+            .authenticate_user(username, password, remote_endpoint, is_user_session)
+            .await
+    }
+    async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
+        self.0.get_authentication_providers().await
+    }
+    async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
+        self.0.get_password_reset_providers().await
+    }
+    async fn get_user_dto(
+        &self,
+        user: &UserEntity,
+        server_id: Option<String>,
+    ) -> Result<UserDto, ServiceError> {
+        self.0.get_user_dto(user, server_id).await
+    }
+    async fn update_configuration(
+        &self,
+        user_id: Uuid,
+        config: &UserConfiguration,
+    ) -> Result<(), ServiceError> {
+        self.0.update_configuration(user_id, config).await
+    }
+    async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError> {
+        self.0.update_policy(user_id, policy).await
+    }
+    async fn clear_profile_image(&self, user: &UserEntity) -> Result<(), ServiceError> {
+        self.0.clear_profile_image(user).await
+    }
+}
+
+/// The trait's default, for managers without a store of their own, sets the
+/// user up with a policy save after creating them.
+#[tokio::test]
+async fn the_default_external_user_creation_saves_the_setup() {
+    let (mgr, _) = manager(true, false).await;
+    let users = Delegating(mgr);
+    let folder = Uuid::from_u128(0xf01d_e125);
+    let user = users
+        .create_external_user(
+            "dana",
+            &ExternalUserSetup {
+                authentication_provider_id: "Tests.External".to_owned(),
+                password_reset_provider_id: "Tests.External".to_owned(),
+                enable_all_folders: false,
+                enabled_folders: Some(vec![folder.to_string(), "not a guid".to_owned()]),
+            },
+        )
+        .await
+        .expect("create");
+    assert_eq!(user.authentication_provider_id, "Tests.External");
+    assert_eq!(user.password_reset_provider_id, "Tests.External");
+    let policy = users
+        .get_user_dto(&user, None)
+        .await
+        .expect("dto")
+        .policy
+        .expect("policy");
+    assert!(!policy.enable_all_folders);
+    assert_eq!(policy.enabled_folders, [folder]);
+}

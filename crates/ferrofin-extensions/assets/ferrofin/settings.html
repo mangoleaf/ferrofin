@@ -53,6 +53,7 @@
                     <span class="ferrofinConfigFileLocked hide">(the server cannot write it, so a save will fail)</span>
                 </p>
                 <form class="ferrofinForm hide" novalidate>
+                    <div class="ferrofinTabs" role="tablist"></div>
                     <div class="ferrofinGroups"></div>
                     <button is="emby-button" type="submit" class="raised button-submit block ferrofinSave" disabled>
                         <span>Save</span>
@@ -72,8 +73,33 @@
                 background: rgba(128, 128, 128, 0.15);
             }
 
+            .ferrofinSettingsPage .ferrofinTabs {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0.2em;
+                margin-top: 1.5em;
+                border-bottom: 1px solid rgba(128, 128, 128, 0.35);
+            }
+
+            .ferrofinSettingsPage .ferrofinTab {
+                padding: 0.6em 1em;
+                border: 0;
+                border-bottom: 0.15em solid transparent;
+                background: none;
+                color: inherit;
+                font: inherit;
+                opacity: 0.75;
+                cursor: pointer;
+            }
+
+            .ferrofinSettingsPage .ferrofinTab[aria-selected="true"] {
+                border-bottom-color: currentColor;
+                font-weight: bold;
+                opacity: 1;
+            }
+
             .ferrofinSettingsPage .ferrofinGroup {
-                margin-top: 2em;
+                margin-top: 0.5em;
             }
 
             .ferrofinSettingsPage .ferrofinSetting {
@@ -88,10 +114,15 @@
                 gap: 0.5em;
             }
 
-            .ferrofinSettingsPage .ferrofinSettingKey {
+            .ferrofinSettingsPage .ferrofinSettingName {
                 margin: 0;
-                font-family: monospace;
                 font-size: 1.05em;
+            }
+
+            .ferrofinSettingsPage .ferrofinSettingIds {
+                margin: 0.15em 0 0.3em;
+                font-size: 0.85em;
+                opacity: 0.7;
             }
 
             .ferrofinSettingsPage .ferrofinBadge {
@@ -187,18 +218,10 @@
             (function () {
                 'use strict';
 
-                // The groups and sources the server names, as the page titles
-                // them. A name missing here is shown as the server sends it,
-                // so a new group or source needs no page change (`titled`).
-                var GROUP_TITLES = {
-                    Paths: 'Paths',
-                    Network: 'Network and identity',
-                    Ffmpeg: 'ffmpeg',
-                    Library: 'Library and database',
-                    Observability: 'Observability',
-                    Providers: 'Metadata providers',
-                    Wasm: 'WASM plugins'
-                };
+                // The sources the server names, as the page titles them. A
+                // name missing here is shown as the server sends it, so a new
+                // source needs no page change (`titled`). The tabs are named
+                // as the server names its groups.
                 var SOURCE_NAMES = {
                     Default: 'Default',
                     ConfigFile: 'config.toml',
@@ -271,13 +294,42 @@
                     return String(value);
                 }
 
-                /** A value as the page shows it; a secret's is marked as one. */
-                function valueNode(value, secret) {
+                /** `unit` as it reads after `value`: "1 hour", "2 hours", "1 MiB". */
+                function unitText(value, unit) {
+                    return Number(value) === 1 && /s$/.test(unit) ? unit.slice(0, -1) : unit;
+                }
+
+                /** `node` followed by `unit`, when there is one, as it reads after `value`. */
+                function withUnit(node, value, unit) {
+                    if (!unit) {
+                        return node;
+                    }
+                    var wrapper = element('span');
+                    wrapper.appendChild(node);
+                    wrapper.appendChild(document.createTextNode(' ' + unitText(value, unit)));
+                    return wrapper;
+                }
+
+                /**
+                 * A value as the page shows it, in `unit` when it has one; a
+                 * secret's is marked as one.
+                 */
+                function valueNode(value, secret, unit) {
                     var node = element('span');
                     var items = Array.isArray(value) ? value : [value];
                     if (items.length === 0) {
                         node.appendChild(element('span', 'ferrofinUnset', 'An empty list'));
                         return node;
+                    }
+                    if (unit && items.every(function (item) { return typeof item === 'number'; })) {
+                        // Numbers in a unit read on one line, the unit after the last.
+                        items.forEach(function (item, index) {
+                            if (index > 0) {
+                                node.appendChild(document.createTextNode(', '));
+                            }
+                            node.appendChild(element('code', null, scalar(item)));
+                        });
+                        return withUnit(node, items[items.length - 1], unit);
                     }
                     items.forEach(function (item) {
                         if (item === '') {
@@ -408,8 +460,13 @@
                     };
                 }
 
+                /** A control's label: `text`, then the setting's unit when it has one. */
+                function fieldLabel(setting, text) {
+                    return setting.Unit ? text + ', in ' + setting.Unit : text;
+                }
+
                 function integerControl(setting, value) {
-                    var control = textControl('number', 'Set to', value, String);
+                    var control = textControl('number', fieldLabel(setting, 'Set to'), value, String);
                     control.read = function () {
                         return numberBox(control.input);
                     };
@@ -439,10 +496,10 @@
                 }
 
                 /** An "auto" checkbox and a count. An unset count is auto. */
-                function countOrAutoControl(value) {
+                function countOrAutoControl(setting, value) {
                     var isAuto = value === undefined || value === null || value === 'auto';
                     var auto = checkbox('Auto', isAuto);
-                    var count = textInput('number', 'Set to', isAuto ? '' : inputText(value));
+                    var count = textInput('number', fieldLabel(setting, 'Set to'), isAuto ? '' : inputText(value));
                     var off = false;
                     function sync() {
                         auto.input.disabled = off;
@@ -473,11 +530,11 @@
                         case 'Integer':
                             return integerControl(setting, value);
                         case 'CountOrAuto':
-                            return countOrAutoControl(value);
+                            return countOrAutoControl(setting, value);
                         case 'PathList':
                             return textControl('text', 'Set to (separate them with commas)', value, listItems);
                         case 'NumberList':
-                            return textControl('text', 'Set to (separate them with commas)', value, function (text) {
+                            return textControl('text', fieldLabel(setting, 'Set to') + ' (separate them with commas)', value, function (text) {
                                 return listItems(text).map(number);
                             });
                         default:
@@ -513,6 +570,7 @@
 
                     var field = {
                         key: setting.Key,
+                        group: setting.Group,
                         node: node,
                         read: control.read,
                         saved: JSON.stringify(control.read()),
@@ -535,7 +593,7 @@
                     row.setAttribute('data-key', setting.Key);
 
                     var header = element('div', 'ferrofinSettingHeader');
-                    header.appendChild(element('h4', 'ferrofinSettingKey', setting.Key));
+                    header.appendChild(element('h4', 'ferrofinSettingName', setting.Label || setting.Key));
                     header.appendChild(badge(titled(SOURCE_NAMES, setting.Source), 'ferrofinBadgeSource'));
                     if (secret) {
                         header.appendChild(badge('Secret', 'ferrofinBadgeSecret', 'key'));
@@ -544,6 +602,16 @@
                         header.appendChild(badge('Read-only', 'ferrofinBadgeLocked', 'lock'));
                     }
                     row.appendChild(header);
+
+                    // The `config.toml` key and the variable, small, under the
+                    // name; a variable with no key is its own key.
+                    var ids = element('div', 'ferrofinSettingIds');
+                    ids.appendChild(element('code', null, setting.Key));
+                    if (setting.EnvVar && setting.EnvVar !== setting.Key) {
+                        ids.appendChild(document.createTextNode(' · '));
+                        ids.appendChild(element('code', null, setting.EnvVar));
+                    }
+                    row.appendChild(ids);
 
                     if (setting.Description) {
                         row.appendChild(withCode(element('div', 'fieldDescription'), setting.Description));
@@ -554,11 +622,11 @@
                         fact(facts, 'Value', element('span', 'ferrofinUnset',
                             setting.Default ? 'Not set: the default applies' : 'Not set'));
                     } else {
-                        fact(facts, 'Value', valueNode(setting.Value, secret));
+                        fact(facts, 'Value', valueNode(setting.Value, secret, setting.Unit));
                     }
                     if (setting.SavedValue !== undefined && setting.SavedValue !== null) {
                         var saved = element('span');
-                        saved.appendChild(valueNode(setting.SavedValue, secret));
+                        saved.appendChild(valueNode(setting.SavedValue, secret, setting.Unit));
                         saved.appendChild(element('span', null, ' (' + savedNote(setting) + ')'));
                         fact(facts, 'Saved in config.toml', saved);
                     } else if (state.resets[setting.Key]) {
@@ -566,10 +634,12 @@
                         fact(facts, 'Saved in config.toml', 'Not set: the default ' + savedNote(setting));
                     }
                     if (setting.Default) {
-                        fact(facts, 'Default', setting.Default);
-                    }
-                    if (setting.EnvVar) {
-                        fact(facts, 'Environment variable', element('code', null, setting.EnvVar));
+                        // A default that is a bare number reads in the unit; a
+                        // described one ("8, capped at the cores") as it is.
+                        var plainNumber = /^\d+(\.\d+)?$/.test(setting.Default);
+                        fact(facts, 'Default', plainNumber && setting.Unit
+                            ? setting.Default + ' ' + unitText(setting.Default, setting.Unit)
+                            : setting.Default);
                     }
                     if (setting.Flag) {
                         fact(facts, 'Flag', element('code', null, setting.Flag));
@@ -627,9 +697,47 @@
                     }
                 }
 
+                /** Shows the tab of `group` and hides the others. */
+                function selectTab(page, state, group) {
+                    state.tab = group;
+                    page.querySelectorAll('.ferrofinTab').forEach(function (tab) {
+                        var selected = tab.getAttribute('data-group') === group;
+                        tab.setAttribute('aria-selected', selected ? 'true' : 'false');
+                        tab.tabIndex = selected ? 0 : -1;
+                    });
+                    page.querySelectorAll('.ferrofinGroup').forEach(function (section) {
+                        section.classList.toggle('hide', section.getAttribute('data-group') !== group);
+                    });
+                }
+
+                /** Arrow keys, Home and End move between the tabs, as in a tab list. */
+                function moveTab(page, state, event) {
+                    var tabs = Array.prototype.slice.call(page.querySelectorAll('.ferrofinTab'));
+                    var at = tabs.indexOf(event.target);
+                    var to = {
+                        ArrowLeft: at - 1,
+                        ArrowRight: at + 1,
+                        Home: 0,
+                        End: tabs.length - 1
+                    }[event.key];
+                    if (at === -1 || to === undefined) {
+                        return;
+                    }
+                    event.preventDefault();
+                    var tab = tabs[(to + tabs.length) % tabs.length];
+                    selectTab(page, state, tab.getAttribute('data-group'));
+                    tab.focus();
+                }
+
+                function clearTabs(page) {
+                    clear(page.querySelector('.ferrofinTabs'));
+                    clear(page.querySelector('.ferrofinGroups'));
+                }
+
                 function render(page, state, response) {
+                    var tabs = page.querySelector('.ferrofinTabs');
                     var groups = page.querySelector('.ferrofinGroups');
-                    clear(groups);
+                    clearTabs(page);
                     state.fields = [];
                     page.querySelector('.ferrofinError').classList.add('hide');
                     renderRestartNotice(page, state, response.RestartPending);
@@ -638,19 +746,29 @@
                     page.querySelector('.ferrofinConfigFileLocked').classList.toggle('hide', response.ConfigFileWritable !== false);
                     page.querySelector('.ferrofinForm').classList.remove('hide');
 
-                    // One section per group, in the order the server lists them.
+                    // One tab per group, in the order the server lists them.
                     var sections = Object.create(null);
+                    var order = [];
                     (response.Settings || []).forEach(function (setting) {
                         var section = sections[setting.Group];
                         if (!section) {
+                            var tab = element('button', 'ferrofinTab', setting.Group);
+                            tab.setAttribute('type', 'button');
+                            tab.setAttribute('role', 'tab');
+                            tab.setAttribute('data-group', setting.Group);
+                            tabs.appendChild(tab);
                             section = element('div', 'verticalSection ferrofinGroup');
+                            section.setAttribute('role', 'tabpanel');
+                            section.setAttribute('aria-label', setting.Group);
                             section.setAttribute('data-group', setting.Group);
-                            section.appendChild(element('h3', 'sectionTitle', titled(GROUP_TITLES, setting.Group)));
                             sections[setting.Group] = section;
+                            order.push(setting.Group);
                             groups.appendChild(section);
                         }
                         section.appendChild(renderSetting(setting, state));
                     });
+                    // The tab open before a reload stays open; the first opens by default.
+                    selectTab(page, state, order.indexOf(state.tab) !== -1 ? state.tab : order[0]);
                     updateButtons(page, state);
                 }
 
@@ -665,7 +783,7 @@
                 }
 
                 function showError(page, state, text) {
-                    clear(page.querySelector('.ferrofinGroups'));
+                    clearTabs(page);
                     state.fields = [];
                     page.querySelector('.ferrofinForm').classList.add('hide');
                     page.querySelector('.ferrofinConfigFile').classList.add('hide');
@@ -744,6 +862,8 @@
                     var refusal = note('error', text, 'ferrofinFieldError');
                     refusal.setAttribute('role', 'alert');
                     field.node.appendChild(refusal);
+                    // The setting may be on another tab than the one open.
+                    selectTab(page, state, field.group);
                     field.node.scrollIntoView({ block: 'center' });
                 }
 
@@ -870,19 +990,30 @@
 
                 function bind(page) {
                     // `resets` and `processRestart` hold what this page saved
-                    // since the last restart.
+                    // since the last restart; `tab` is the group whose tab is open.
                     var state = {
                         fields: [],
                         resets: Object.create(null),
                         processRestart: Object.create(null),
                         saving: false,
-                        restarting: false
+                        restarting: false,
+                        tab: null
                     };
                     page.setAttribute('data-ferrofin-bound', 'true');
                     page.addEventListener('pageshow', function () {
                         if (!state.restarting) {
                             load(page, state);
                         }
+                    });
+                    var tabs = page.querySelector('.ferrofinTabs');
+                    tabs.addEventListener('click', function (event) {
+                        var tab = event.target.closest('.ferrofinTab');
+                        if (tab) {
+                            selectTab(page, state, tab.getAttribute('data-group'));
+                        }
+                    });
+                    tabs.addEventListener('keydown', function (event) {
+                        moveTab(page, state, event);
                     });
                     var form = page.querySelector('.ferrofinForm');
                     function changed() {

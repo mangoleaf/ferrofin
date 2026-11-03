@@ -20,7 +20,7 @@ Conventions:
 | Intro Skipper | https://github.com/intro-skipper/intro-skipper | `db09359` | 10.11/prerelease | ported |
 | File Transformation | https://github.com/IAmParadox27/jellyfin-plugin-file-transformation | `f4f01c3` | 2.5.10.0 | ported |
 | Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
-| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page and `TestServerBind` (milestone "LDAP-Auth plugin port") |
+| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, `TestServerBind` and sign-in (milestone "LDAP-Auth plugin port") |
 
 ## Per-plugin notes
 
@@ -201,8 +201,9 @@ Conventions:
 
 ### LDAP-Auth
 - Ferrofin files: `crates/ferrofin-extensions/src/ldap_auth.rs` (the extension, the
-  configuration, the `LdapDirectory` seam, `TestServerBind` and its service) and
-  `ldap_auth/directory.rs` (the `ldap3` client and its rustls configuration), vendored
+  configuration, the `LdapDirectory` seam, `TestServerBind` and its service),
+  `ldap_auth/directory.rs` (the `ldap3` client and its rustls configuration) and
+  `ldap_auth/provider.rs` (the sign-in provider), vendored
   assets `crates/ferrofin-extensions/assets/ldapauth/`, the trait seam
   `crates/ferrofin-traits/src/ldap.rs`, the wire types `crates/ferrofin-model/src/ldap.rs`,
   and the thin HTTP handler `crates/ferrofin-api/src/handlers/ldap.rs`. The live directory
@@ -224,12 +225,76 @@ Conventions:
   given as an IPv6 address works over TLS too: the certificate is checked against the
   address. For a host name, a certificate with no DNS name among its subject alternative
   names is matched by its subject common name, OpenSSL's fallback, which .NET uses on
-  Linux. Sign-in, the filter and user-search tests, password changes, profile images,
-  referrals and the `LDAP-Auth.xml` import are later phases of the milestone.
+  Linux.
+- Sign-in (v24, `d11c86a`): `LdapAuthenticationProviderPlugin.Authenticate`,
+  `LocateLdapUser`, `ConnectToLdap` and `LdapUtils.SanitizeFilter`, as the authentication
+  provider the extension contributes: `Name` `LDAP-Authentication`, stored id
+  `Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin`, so an adopted Jellyfin's
+  LDAP users select it. The bind DN searches the base DN's subtree for `[UsernameAttr,
+  UidAttr]` with `LdapSearchFilter`, its `{username}` replaced ignoring case, or else
+  `(&<filter>(|(<attr>=<name>)…))` over `LdapSearchAttributes` with spaces removed, split on
+  commas (an empty item kept), the name escaped byte for byte as `SanitizeFilter` does; the
+  first entry is used, with upstream's warning when there are more. The user is found by the
+  entry's uid (the external-identity store), else by the username attribute when that user's
+  `AuthenticationProviderId` is LDAP-Auth's, who is then linked; a local account of that name
+  is never taken. The password is checked by binding as the entry on a connection of its own.
+  A new user is created when `CreateUsersFromLdap` is on, with both provider ids,
+  `EnableAllFolders` and, when that is off, `EnabledFolders` as configured (the strings as
+  given, as `SetPreference` stores them), and linked; with it off, upstream's message and a
+  `401`. A returning user follows a directory rename (`RenameUser`, case-sensitive compare).
+  An entry without the username attribute is a `400`, as upstream's create or rename with a
+  null name throws an `ArgumentException`. The provider is enabled only with the plugin and a
+  server (D3);
+  upstream's `IsEnabled` is always `true`. `ChangePassword` with `AllowPassChange` off is
+  upstream's `NotImplementedException`, a `500`. The admin filter, password changes and
+  resets, profile images, referrals and the `LDAP-Auth.xml` import are later phases of the
+  milestone.
 - `POST /Ldap/TestServerBind` is the plugin's own controller, not a contract operation, so it
   is in `handlers::PLUGIN_ROUTES` (matched ignoring case, as the page calls
   `ldap/TestServerBind`) and has no `handlers::VERIFIED` row; this section is its record.
 - Accepted divergences (do NOT "fix" during sync):
+  - **An empty password is refused before any connection.** Novell's client turns it into an
+    anonymous bind, which upstream then refuses as not `Bound` (kept too, at the user's bind);
+    `ldap3` would send it, and a directory may accept an unauthenticated bind (RFC 4513
+    section 5.1.2), which would sign anyone in.
+  - **Only the directory refusing the user's own bind counts as a failed sign-in** (owner
+    decision D4), with no matching entry and creation turned off: each is a `401`, which the
+    user manager counts toward lockout when the name signed in with is an account's (creation
+    turned off only arises for a name that is not). The user's bind counts as refused only for
+    the result codes
+    that refuse credentials: `constraintViolation` (19, a password policy's lockout),
+    `inappropriateAuthentication` (48), `invalidCredentials` (49), `insufficientAccessRights`
+    (50) and `unwillingToPerform` (53). A directory that cannot be reached, does not answer
+    within the D6 timeouts, fails the user's bind with any other code (`busy`, `unavailable`,
+    `other`, …), refuses the configured bind DN, fails the search, or refers it elsewhere with
+    no entry, is a `500` that is not counted, and other users' sign-ins go on. Upstream answers
+    each with an `AuthenticationException`, a counted `401`. Ferrofin's login backoff still
+    counts such an attempt for pacing, as it counts every attempt that does not succeed.
+  - **A name that finds another account's entry is refused** (a counted `401`). When the name
+    signed in with is a Ferrofin user's, the entry the search found must be that user's (by
+    its uid link, or by name). Upstream signs in the user the name named with whichever entry
+    came first, and creates or renames another account on the way, so a person who can make
+    their own entry match another user's name (a `mail` or `displayName` they may edit) could
+    sign in as that user with their own password. The entry's username attribute
+    (`LdapUsernameAttribute`) is still trusted, as upstream trusts it: an entry with no uid link
+    yet whose username attribute names an account LDAP-Auth owns is relinked to that account
+    (upstream's relink after a uid change), so that attribute must be one users cannot edit.
+    TODO(gl-1188): how to close that is an owner decision.
+  - **A relink by name is written only after the password is checked.** Upstream saves it
+    before it binds as the user, so a wrong password still writes it.
+  - **An entry without the uid attribute is not linked.** Upstream stores it with a null
+    `LdapUid`, which no lookup finds, and in doing so drops that user's earlier link and every
+    other null-uid link; its profile-image sync then fails on the null uid. Such a user is
+    found by name at each sign-in, and keeps the link of the uid they had.
+  - **A new user is created with its provider ids and folder access in one transaction**
+    (`UserManager::create_external_user`). Upstream's `CreateUserAsync` commits a local,
+    passwordless user first and sets the provider ids after, a moment in which the built-in
+    provider signs that user in with an empty password. The "User … has been created"
+    activity entry is recorded as `CreateUserAsync` records it.
+  - **A rename at sign-in sends no `UserUpdated` message** to the user's other sessions:
+    Ferrofin pushes it from the `POST /Users` handler, which a provider does not go through,
+    where upstream's `RenameUser` publishes it whoever calls it. TODO(gl-1179): raise it
+    from the user manager, for every caller.
   - **Off by default** (owner decision D3): the plugin is disabled in `/Plugins` until an
     administrator enables it, and `LdapServer` seeds empty instead of
     `ldap-server.contoso.com`. Upstream's provider is always enabled and would try the
