@@ -1467,7 +1467,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/TvShowsController.cs",
         upstream_method: "GetNextUp",
         ferrofin: "handlers/tv_shows.rs get_next_up → ferrofin-core tv_series_manager.rs \
-               (TVSeriesManager) → next_up_service.rs (NextUpService)",
+               (TVSeriesManager) → next_up_service.rs (NextUpService, top_parent_ids → \
+               item_repository.rs view_top_parent_ids)",
         date: "2026-10-19",
         divergences: &[
             "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
