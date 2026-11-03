@@ -2021,7 +2021,9 @@ pub const VERIFIED: &[Verified] = &[
                (AuthenticationManager::id, GetType().FullName), the warning naming the user \
                and the saved id when no enabled provider has it (InvalidAuthProvider then \
                refuses the sign-in), the provider's canonical username, the new-user \
-               policy, the saved provider id, the disabled, remote and schedule checks, \
+               policy (saved with update_policy, which announces UserUpdated: the push, \
+               then the device check, as UpdatePolicyAsync does), the saved provider id, \
+               the disabled, remote and schedule checks, \
                the failure counter and lockout, the device and session limits, token \
                rotation and session activity, and that upstream has no login rate limit. \
                The UserDto and SessionInfoDto \
@@ -2041,7 +2043,10 @@ pub const VERIFIED: &[Verified] = &[
          that sign-in succeeds, the user stays one and a warning is logged. Upstream's LDAP \
          plugin writes the flag itself through UpdateUserAsync, which has no such guard. No \
          built-in provider reports a flag. \
-         Owner decision (2026-11-01).",
+         Owner decision (2026-11-01). Like UpdateUserAsync, applying it announces nothing (no \
+         UserUpdated push, no device check), so an administrator a provider demotes keeps \
+         the devices their policy refuses signed in until a later policy save or rename, as \
+         upstream does (gl-1191 asks the owner whether to keep that).",
             "Every failed login writes the dashboard's AuthenticationFailed entry, where upstream \
          publishes AuthenticationRequestEventArgs only for a wrong password: an exception from \
          AuthenticateUser (an unknown user, a disabled account) or a device or session-limit \
@@ -2354,9 +2359,11 @@ pub const VERIFIED: &[Verified] = &[
                leaves out; policy_validation: UserPolicy's [Required(AllowEmptyStrings = false)] \
                provider ids; load_user: GetUserById's 400 for a nil id) → ferrofin-core \
                user_manager.rs update_policy_guarded (save_policy: UserManager.UpdatePolicyAsync \
-               behind ferrofin-traits policy_update_refusal) → session_manager.rs \
-               revoke_user_tokens; handlers/users.rs refresh_device_access (DeviceAccessHost)",
-        date: "2026-10-29",
+               behind ferrofin-traits policy_update_refusal; announce_user_updated: its \
+               UserUpdatedEventArgs and OnUserUpdated → ferrofin-core user_updated.rs, \
+               UserUpdatedNotifier then DeviceAccessHost) → session_manager.rs \
+               revoke_user_tokens",
+        date: "2026-11-02",
         divergences: &[
             "The three guards (the last administrator, an administrator disabled, the last \
          enabled user) are read inside the transaction that saves, and a newly disabled \
@@ -2364,6 +2371,10 @@ pub const VERIFIED: &[Verified] = &[
          before saving and revokes first, so two concurrent saves could both pass a guard and \
          leave the server without an administrator or an enabled user. Jellyfin bug not \
          ported.",
+            "Because the revocation waits for the guarded save, it comes after the save's \
+         UserUpdated push and device check: a newly disabled user's open sessions hear \
+         UserUpdated just before they are signed out, where upstream's are already gone when \
+         UpdatePolicyAsync publishes. Their end state is the same.",
             "The 400 (nil user id), 403 (a guard refused) and 404 (unknown user) bodies are \
          Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -2431,11 +2442,12 @@ pub const VERIFIED: &[Verified] = &[
                serde default for a missing Configuration; load_user: GetUserById's 400 for a \
                nil id, an API key's userId ?? User.GetUserId() included) → ferrofin-core \
                user_manager.rs rename_user (require_valid_username: ThrowIfInvalidUsername; \
-               move_profile_image_on), update_configuration (one writer transaction, as one \
-               SaveChangesAsync; accepted_cast_receiver_id); handlers/users.rs \
-               notify_user_updated (UserUpdatedNotifier) and refresh_device_access \
-               (DeviceAccessHost), both after a rename only",
-        date: "2026-10-29",
+               move_profile_image_on; announce_user_updated: RenameUser's \
+               UserUpdatedEventArgs and OnUserUpdated → ferrofin-core user_updated.rs, \
+               UserUpdatedNotifier then DeviceAccessHost), update_configuration (one writer \
+               transaction, as one SaveChangesAsync; accepted_cast_receiver_id; announces \
+               nothing)",
+        date: "2026-11-02",
         divergences: &[
             "\"Configuration\": null skips the configuration save, where upstream dereferences \
          the null in UpdateConfigurationAsync and answers 500. Jellyfin bug not ported.",

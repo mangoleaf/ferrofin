@@ -1088,7 +1088,10 @@ async fn public_user_picker_filters_authenticated_devices_after_setup() {
 /// rename (`UserManager.UpdatePolicyAsync` and `RenameUser` raise
 /// `OnUserUpdated`): every device of the user that the saved policy no longer
 /// allows is logged out, and signing in from it again is a security error.
+/// The user manager raises it, so a save that does not come through the
+/// handler signs the device out too (gl-1179).
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // three legs: the handler, a direct save, a rename
 async fn a_policy_save_or_a_rename_signs_out_disallowed_devices() {
     let h = boot().await;
     let router = ferrofin_api::create_router(h.wired.state.clone());
@@ -1136,10 +1139,9 @@ async fn a_policy_save_or_a_rename_signs_out_disallowed_devices() {
         "a denied device is a security error, not bad credentials"
     );
 
-    // The rename leg: a token on a device the stored policy refuses, the
-    // policy written without the save's device check, is signed out by a
-    // rename.
-    assert_eq!(save(open).await, StatusCode::NO_CONTENT);
+    // Saved straight through the user manager, as a sign-in's new-user policy
+    // or an extension saves it.
+    assert_eq!(save(open.clone()).await, StatusCode::NO_CONTENT);
     let (user, _) = login(&router, "device-user", "pw").await;
     let policy: ferrofin_model::users::UserPolicy =
         serde_json::from_value(restricted).expect("policy");
@@ -1148,11 +1150,37 @@ async fn a_policy_save_or_a_rename_signs_out_disallowed_devices() {
         .users
         .update_policy(uuid::Uuid::parse_str(&id).expect("id"), &policy)
         .await
-        .expect("policy saved without the device check");
+        .expect("policy saved");
+    assert_eq!(
+        call(&router, "GET", "/Users/Me", Some(&user), None).await.0,
+        StatusCode::UNAUTHORIZED,
+        "a save outside the handler signs the device out too"
+    );
+
+    // The rename leg. An administrator may use every device, and a provider's
+    // administrator flag announces nothing (upstream's LDAP plugin saves it
+    // with UpdateUserAsync), so a restricted administrator demoted at sign-in
+    // keeps the device the policy refuses (gl-1191) until a rename checks it.
+    assert_eq!(save(open).await, StatusCode::NO_CONTENT);
+    let (user, _) = login(&router, "device-user", "pw").await;
+    let uid = uuid::Uuid::parse_str(&id).expect("id");
+    let users = &h.wired.state.users;
+    let restricted_admin = ferrofin_model::users::UserPolicy {
+        is_administrator: true,
+        ..policy
+    };
+    users
+        .update_policy(uid, &restricted_admin)
+        .await
+        .expect("a restricted administrator");
+    assert!(matches!(
+        users.apply_external_administrator(uid, false).await,
+        Ok(ferrofin_traits::library::AdminFlagOutcome::Applied)
+    ));
     assert_eq!(
         call(&router, "GET", "/Users/Me", Some(&user), None).await.0,
         StatusCode::OK,
-        "nothing has run the device check yet"
+        "the demotion runs no device check"
     );
     assert_eq!(
         call(

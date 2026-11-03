@@ -187,6 +187,38 @@ async fn provider_provisioning_uses_canonical_name_and_new_user_policy() {
     assert_eq!(policy.max_active_sessions, 3);
 }
 
+/// gl-1179: a provider's first sign-in saves the new user's policy with
+/// `update_policy`, which announces `UserUpdated`, as upstream's
+/// `AuthenticateUser` calls `UpdatePolicyAsync` (`UserManager.cs:593`): the
+/// new user is announced once, by the name the provider gave it.
+/// (`user_updated.rs` pins that the save releases its own lock first.)
+#[tokio::test]
+async fn a_provisioning_sign_in_announces_the_new_user() {
+    let (mgr, _) = manager(true, true).await;
+    let bus = crate::event_manager::FerrofinEventManager::new();
+    let mgr = mgr.with_events(Arc::new(bus.clone()));
+    let announced = Arc::new(Mutex::new(Vec::new()));
+    let (reader, sink) = (mgr.clone(), Arc::clone(&announced));
+    bus.subscribe(
+        crate::user_updated::USER_UPDATED_EVENT,
+        Arc::new(move |payload: &str| {
+            let id: Uuid = serde_json::from_str(payload).expect("a user id");
+            let (reader, sink) = (reader.clone(), Arc::clone(&sink));
+            Box::pin(async move {
+                let user = reader.get_user_by_id(id).await?.expect("the new user");
+                sink.lock().unwrap().push(user.username);
+                Ok(())
+            })
+        }),
+    );
+    let user = mgr
+        .authenticate_user("external-alias", "external", "127.0.0.1", true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*announced.lock().unwrap(), [user.username]);
+}
+
 #[tokio::test]
 async fn password_login_uses_live_network_classification_for_remote_policy() {
     let db = crate::test_support::test_db().await;
