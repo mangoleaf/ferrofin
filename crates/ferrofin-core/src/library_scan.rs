@@ -154,17 +154,30 @@ struct ArtworkCache {
     /// ([`tvdb_cache`]).
     episode_tvdb_still: ProviderCache<String, String>,
     /// Item id → the external ids the metadata match yielded, so the image pass
-    /// can key fanart off them (movies: `Tmdb`/`Imdb`) within the same scan.
+    /// can key fanart off them (movies: `Tmdb`/`Imdb`) within the same scan,
+    /// seeded with the ids previous scans recorded. A planned series' are
+    /// read once and kept for the whole scan, as its seasons and episodes
+    /// further on read them ([`keeps_provider_ids`]); every other item's are
+    /// read with its stored-row window and dropped with it
+    /// ([`StoredRows::enter`]).
     item_provider_ids: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// The planned items whose [`item_provider_ids`](Self::item_provider_ids)
+    /// entry stays for the whole scan ([`keeps_provider_ids`]), by stored id.
+    kept_provider_ids: std::collections::HashSet<String>,
     /// Item id → OMDb's poster URL, captured during the metadata pass so the
     /// image pass can use it without a second OMDb request.
     omdb_poster: std::collections::HashMap<String, String>,
     /// Image file path → what a previous scan already probed for that file
-    /// (dimensions, blurhash, and the mtime they were computed from), read
-    /// once for the whole scan. Keyed by PATH rather than by item because
+    /// (dimensions, blurhash, and the mtime they were computed from), and
+    /// what the walk settled since. Keyed by PATH rather than by item because
     /// dimensions and a blurhash are functions of the file alone, so two rows
     /// sharing one `folder.jpg` share the answer. Only a complete probe is
     /// kept ([`remember_probed_image`]): no other can be adopted.
+    ///
+    /// Before the walk it holds the planned albums' rows, for their covers;
+    /// then the stored rows of the items in the current stored-row window,
+    /// each window's replacing the last ([`StoredRows::enter`]), so it never
+    /// holds the whole library.
     stored_images: ProbedImages,
 }
 
@@ -685,8 +698,18 @@ fn series_tmdb_id_of(cache: &ArtworkCache, series_id: &str) -> Option<i64> {
         .or_else(|| recorded_provider_id(cache, series_id, "Tmdb"))
 }
 
+/// Whether the scan keeps `item`'s recorded provider ids for its whole walk:
+/// a series', which its seasons and episodes further on read by the series'
+/// id ([`series_tmdb_id_of`], [`recorded_provider_id`], the OMDb episode
+/// lookup), however many stored-row windows later they come. Every other
+/// item's ids are read only by its own visit.
+fn keeps_provider_ids(item: &Planned) -> bool {
+    item_type_lookup::kind_from_type_name(&item.entity.type_) == Some(BaseItemKind::Series)
+}
+
 /// The numeric `provider` id recorded for item `id` — pre-read from
-/// `BaseItemProviders` at scan start, or settled earlier in this scan.
+/// `BaseItemProviders` (a series' at scan start, any other item's with its
+/// stored-row window), or settled earlier in this scan.
 fn recorded_provider_id(cache: &ArtworkCache, id: &str, provider: &str) -> Option<i64> {
     cache
         .item_provider_ids
@@ -3864,7 +3887,10 @@ impl ScanWork<'_> {
 /// `Data` and lock state later), but holding every row of a 60k-item library
 /// at once is the memory spike this scan is meant to avoid. Following the plan
 /// order keeps at most one window of whole rows alive: the old window is
-/// dropped before the next one is read.
+/// dropped before the next one is read. The same goes for what the walk
+/// reads besides each item's rows, its recorded provider ids and stored
+/// image probes: they are read with the window and replace the previous
+/// window's in the scan's cache when the walk enters it ([`Self::enter`]).
 #[derive(Default)]
 struct StoredRows {
     /// The plan index the current window starts at.
@@ -3888,6 +3914,14 @@ struct StoredRows {
     /// The refresh plan of each item in the current window, by its plan
     /// index minus [`start`](Self::start).
     plans: Vec<ItemRefreshPlan>,
+    /// The provider ids previous scans recorded for the window's items, by
+    /// stored id, but for those kept for the whole scan
+    /// ([`keeps_provider_ids`]); moved into the scan's cache when the walk
+    /// enters the window ([`enter`](Self::enter)).
+    provider_ids: HashMap<String, Vec<(String, String)>>,
+    /// What previous scans probed for the window's items' image files; moved
+    /// into the scan's cache when the walk enters the window.
+    images: Vec<StoredImageMetadata>,
     /// The next window, read early to keep the probe look-ahead fed across
     /// the window boundary. Its rows were read before this window's saves,
     /// which touch other items only: a repeated id is refreshed once, at its
@@ -3911,6 +3945,27 @@ impl StoredRows {
     /// read the next one before visiting plan index `index`.
     fn needs_read(&self, index: usize) -> bool {
         index >= self.end
+    }
+
+    /// Makes this window's prereads the scan's: its items' recorded provider
+    /// ids replace those of the items walked before it (the kept ones stay,
+    /// [`keeps_provider_ids`]), and its items' stored image probes replace
+    /// the image cache, which drops what the walk settled before it too.
+    ///
+    /// Only the item's own visit reads its provider ids (a season or an
+    /// episode reads its series', which are kept), and the walk writes an
+    /// item's ids only at its own visit, so the ids are the same as when they
+    /// were read for the whole scan up front. An image path shared with an
+    /// item outside the window that has no current probe of its own is
+    /// probed again; the result is the same, as it is a function of the file.
+    fn enter(&mut self, cache: &mut ArtworkCache) {
+        let kept = &cache.kept_provider_ids;
+        cache.item_provider_ids.retain(|id, _| kept.contains(id));
+        cache
+            .item_provider_ids
+            .extend(std::mem::take(&mut self.provider_ids));
+        cache.stored_images.clear();
+        remember_stored_images(&mut cache.stored_images, std::mem::take(&mut self.images));
     }
 
     /// The refresh plan of plan index `index`, which must be in the current
@@ -6681,6 +6736,7 @@ impl LibraryScanner {
                 &mut stored_rows,
                 &mut probes,
                 &refresh,
+                &mut art_cache,
             ))
             .await;
             probes.begin_item(scanned);
@@ -7297,8 +7353,9 @@ impl LibraryScanner {
 
     /// Between two items: the item refreshes waiting in `run`'s lane run
     /// now, and what they touched is read again before this scan acts on it
-    /// — the stored rows from item `scanned` on (the window restarts there),
-    /// and the ids, series keys and image rows this scan cached for them
+    /// — the stored rows from item `scanned` on (the window restarts there,
+    /// and its provider ids and image probes with it), and the series' ids
+    /// and keys this scan cached for them
     /// ([`reread_touched`](Self::reread_touched)). Returns the ids they
     /// touched.
     async fn serve_lane_between_items(
@@ -7326,39 +7383,47 @@ impl LibraryScanner {
     }
 
     /// After a lane refresh touched the items `touched`: what this scan
-    /// cached about them is read again — their provider ids (an Identify
-    /// replaced them; a first-pass save of the old ones would put them
-    /// back), their image rows, a touched album's cover and a touched
-    /// series' presentation key (its episodes further on take it) — and
-    /// every lookup this scan resolved for them is dropped: a series' TMDB
-    /// and TVDB match, its seasons' TMDB details (the names, overviews and
-    /// stills of the episodes further on), an episode's TVDB still and an
-    /// item's OMDb poster, so what follows resolves by the ids now stored.
-    /// The stored rows themselves are read again by the caller, which
-    /// restarts its window at the current item. (`track_albums` is the
-    /// plan's structure, which no refresh changes.)
+    /// cached about them is read again — a kept series' provider ids (an
+    /// Identify replaced them; a first-pass save of the old ones would put
+    /// them back), a touched album's cover and a touched series'
+    /// presentation key (its episodes further on take it) — and every lookup
+    /// this scan resolved for them is dropped: a series' TMDB and TVDB
+    /// match, its seasons' TMDB details (the names, overviews and stills of
+    /// the episodes further on), an episode's TVDB still and an item's OMDb
+    /// poster, so what follows resolves by the ids now stored. The stored
+    /// rows themselves are read again by the caller, which restarts its
+    /// window at the current item, and with them every other item's
+    /// provider ids and every item's image probes ([`StoredRows::enter`]).
+    /// (`track_albums` is the plan's structure, which no refresh changes.)
     async fn reread_touched(
         &self,
         touched: &[Uuid],
         cache: &mut ArtworkCache,
         series_keys: &mut HashMap<Uuid, String>,
     ) {
-        match self.persistence.provider_ids_for_items(touched).await {
-            Ok(mut ids) => {
-                for id in touched {
-                    let key = guid_to_db(*id);
-                    match ids.remove(id) {
-                        Some(stored) => {
-                            cache.item_provider_ids.insert(key, stored);
-                        }
-                        None => {
-                            cache.item_provider_ids.remove(&key);
+        let kept: Vec<Uuid> = touched
+            .iter()
+            .copied()
+            .filter(|id| cache.kept_provider_ids.contains(&guid_to_db(*id)))
+            .collect();
+        if !kept.is_empty() {
+            match self.persistence.provider_ids_for_items(&kept).await {
+                Ok(mut ids) => {
+                    for id in &kept {
+                        let key = guid_to_db(*id);
+                        match ids.remove(id) {
+                            Some(stored) => {
+                                cache.item_provider_ids.insert(key, stored);
+                            }
+                            None => {
+                                cache.item_provider_ids.remove(&key);
+                            }
                         }
                     }
                 }
-            }
-            Err(err) => {
-                tracing::warn!(%err, "could not re-read the provider ids a refresh touched");
+                Err(err) => {
+                    tracing::warn!(%err, "could not re-read the provider ids a refresh touched");
+                }
             }
         }
         let keys: std::collections::HashSet<String> =
@@ -7392,10 +7457,6 @@ impl LibraryScanner {
                     cache.album_covers.insert(album, cover);
                 }
             }
-        }
-        match self.persistence.image_metadata_for_items(touched).await {
-            Ok(stored) => remember_stored_images(&mut cache.stored_images, stored),
-            Err(err) => tracing::warn!(%err, "could not re-read the images a refresh touched"),
         }
         let series: Vec<Uuid> = touched
             .iter()
@@ -7503,7 +7564,8 @@ impl LibraryScanner {
     }
 
     /// Keeps the stored-row window (see `StoredRows`) over item `scanned`,
-    /// and the probe look-ahead fed past its end.
+    /// with its prereads in `cache` ([`StoredRows::enter`]), and the probe
+    /// look-ahead fed past its end.
     async fn advance_stored_window(
         &self,
         planned: &[Planned],
@@ -7511,6 +7573,7 @@ impl LibraryScanner {
         stored_rows: &mut StoredRows,
         probes: &mut ProbePipeline<'_>,
         refresh: &RefreshContext<'_>,
+        cache: &mut ArtworkCache,
     ) {
         if stored_rows.needs_read(scanned) {
             if let Some(ahead) = stored_rows.ahead.take() {
@@ -7524,6 +7587,7 @@ impl LibraryScanner {
                     stored_rows.plans.iter().map(|plan| plan.probe),
                 );
             }
+            stored_rows.enter(cache);
         }
         // The probe look-ahead has run out of decided items before the end of
         // this window: read and decide the next window now, so the probes
@@ -8532,7 +8596,9 @@ impl LibraryScanner {
     /// of whole rows is alive at a time. When the batch read fails, the window
     /// is re-read one row at a time, so only the rows that cannot be read are
     /// left unread (see [`Stored::Unread`]). The items' image, ancestor and
-    /// external-stream rows are read for the same window.
+    /// external-stream rows are read for the same window, and so are their
+    /// recorded provider ids and stored image probes
+    /// ([`read_window_prereads`](Self::read_window_prereads)).
     ///
     /// Without an item repository no row can be read, so the item store is
     /// asked per item whether it exists — the check this read replaced, kept
@@ -8554,6 +8620,8 @@ impl LibraryScanner {
         window.undecodable.clear();
         let ids: Vec<Uuid> = planned[start..end].iter().map(|p| p.id).collect();
         self.read_window_rows(&ids, window).await;
+        self.read_window_prereads(&planned[start..end], &ids, window)
+            .await;
         window.links = match self.persistence.scan_stored_links(&ids).await {
             Ok(links) => links,
             Err(err) => {
@@ -8654,6 +8722,54 @@ impl LibraryScanner {
                 );
             }
         }
+    }
+
+    /// The prereads half of [`read_stored_window`](Self::read_stored_window):
+    /// the provider ids previous scans recorded for the window's items (but
+    /// the ones kept for the whole scan, read up front) and their stored
+    /// image probes. Each replaced a per-item query, and each is one
+    /// statement per window, as both reads batch their ids by the window's
+    /// size ([`BATCH_BIND_CHUNK`](ferrofin_db::BATCH_BIND_CHUNK)).
+    ///
+    /// C# resolves each item through `info.GetProviderId` before it ever
+    /// searches by title; without the recorded ids a re-scan re-guesses every
+    /// title from scratch, and could match a different record than last time.
+    /// The image probes make [`image_metadata_is_current`] answerable without
+    /// a read per item: C# gets the same for free, as its `BaseItem.ImageInfos`
+    /// are in memory when `LibraryManager.UpdateImagesAsync` runs
+    /// `ImageNeedsRefresh`, whereas Ferrofin's image rows live only in the
+    /// database.
+    async fn read_window_prereads(&self, items: &[Planned], ids: &[Uuid], window: &mut StoredRows) {
+        let read: Vec<Uuid> = items
+            .iter()
+            .filter(|item| !keeps_provider_ids(item))
+            .map(|item| item.id)
+            .collect();
+        window.provider_ids = if read.is_empty() {
+            HashMap::new()
+        } else {
+            match self.persistence.provider_ids_for_items(&read).await {
+                Ok(recorded) => recorded
+                    .into_iter()
+                    .map(|(id, ids)| (guid_to_db(id), ids))
+                    .collect(),
+                Err(err) => {
+                    tracing::warn!(%err, "could not preload a window's recorded provider ids");
+                    HashMap::new()
+                }
+            }
+        };
+        window.images = if ids.is_empty() {
+            Vec::new()
+        } else {
+            match self.persistence.image_metadata_for_items(ids).await {
+                Ok(stored) => stored,
+                Err(err) => {
+                    tracing::warn!(%err, "could not preload a window's stored image metadata");
+                    Vec::new()
+                }
+            }
+        };
     }
 
     /// Whether writing `people` would change the credits stored for
@@ -8837,7 +8953,11 @@ impl LibraryScanner {
         Ok(chapters)
     }
 
-    /// The batches every item in the walk reads from, gathered once up front.
+    /// The batches the walk reads across items, gathered once up front: the
+    /// series' recorded provider ids, the albums' artwork and the locked-item
+    /// set. What only an item's own visit reads, its recorded provider ids and
+    /// stored image probes, is read with its stored-row window instead
+    /// ([`read_window_prereads`](Self::read_window_prereads)).
     ///
     /// Each of these replaced a per-item query, so they are the difference
     /// between one read per scan and one per row. They run BEFORE the loop, so
@@ -8872,8 +8992,10 @@ impl LibraryScanner {
             episode_tvdb_still: tvdb_cache(tvdb_duration),
             ..ArtworkCache::default()
         });
-        self.preload_provider_ids(planned, &mut art_cache).await;
-        self.preload_image_metadata(planned, &mut art_cache).await;
+        // The rest of the plan's provider ids and image probes are read a
+        // stored-row window at a time, with its rows (`read_window_prereads`).
+        self.preload_kept_provider_ids(planned, &mut art_cache)
+            .await;
         let touched = self
             .preload_album_artwork(planned, &mut art_cache, run)
             .await;
@@ -8883,14 +9005,19 @@ impl LibraryScanner {
         (art_cache, locked_items, touched)
     }
 
-    /// Seeds the scan's provider-id cache with the ids previous scans recorded,
-    /// in ONE query for the whole run.
-    ///
-    /// C# resolves each item through `info.GetProviderId` before it ever
-    /// searches by title; without this a re-scan re-guesses every title from
-    /// scratch, and could match a different record than last time.
-    async fn preload_provider_ids(&self, planned: &[Planned], art_cache: &mut ArtworkCache) {
-        let ids: Vec<Uuid> = planned.iter().map(|p| p.id).collect();
+    /// Seeds the scan's provider-id cache with the ids previous scans recorded
+    /// for the items whose ids other items read ([`keeps_provider_ids`]), in
+    /// one read for the whole run, and marks them kept for it.
+    async fn preload_kept_provider_ids(&self, planned: &[Planned], art_cache: &mut ArtworkCache) {
+        let ids: Vec<Uuid> = planned
+            .iter()
+            .filter(|item| keeps_provider_ids(item))
+            .map(|item| item.id)
+            .collect();
+        art_cache.kept_provider_ids = ids.iter().map(|id| guid_to_db(*id)).collect();
+        if ids.is_empty() {
+            return;
+        }
         match self.persistence.provider_ids_for_items(&ids).await {
             Ok(existing) => {
                 for (id, ids) in existing {
@@ -8898,27 +9025,6 @@ impl LibraryScanner {
                 }
             }
             Err(err) => tracing::warn!(%err, "could not preload recorded provider ids"),
-        }
-    }
-
-    /// Seeds the scan's image cache with what previous scans already probed,
-    /// in ONE query for the whole run.
-    ///
-    /// This is what makes [`image_metadata_is_current`] answerable without a
-    /// read per item. C# gets the same information for free — its
-    /// `BaseItem.ImageInfos` are already in memory when
-    /// `LibraryManager.UpdateImagesAsync` runs `ImageNeedsRefresh` — whereas
-    /// Ferrofin's image rows live only in the database, so the scan reads them
-    /// back up front, in the same one-read-per-scan shape as the locked-item
-    /// and episode-text prereads.
-    async fn preload_image_metadata(&self, planned: &[Planned], art_cache: &mut ArtworkCache) {
-        if planned.is_empty() {
-            return;
-        }
-        let ids: Vec<Uuid> = planned.iter().map(|p| p.id).collect();
-        match self.persistence.image_metadata_for_items(&ids).await {
-            Ok(stored) => remember_stored_images(&mut art_cache.stored_images, stored),
-            Err(err) => tracing::warn!(%err, "could not preload stored image metadata"),
         }
     }
 
@@ -8946,6 +9052,20 @@ impl LibraryScanner {
                     .find(|id| albums.contains_key(id))
             {
                 cache.track_albums.insert(item.id, *album);
+            }
+        }
+        // What previous scans probed for the albums' images, for their covers
+        // below: an album stores its shared cover as its own Primary. The
+        // rest of the plan's probes are read a stored-row window at a time
+        // (`read_window_prereads`), and the walk's first window replaces
+        // these.
+        let album_ids: Vec<Uuid> = albums.keys().copied().collect();
+        if !album_ids.is_empty() {
+            match self.persistence.image_metadata_for_items(&album_ids).await {
+                Ok(stored) => remember_stored_images(&mut cache.stored_images, stored),
+                Err(err) => {
+                    tracing::warn!(%err, "could not preload the albums' stored image metadata");
+                }
             }
         }
         let has_primary =
@@ -23559,7 +23679,8 @@ fn probe_is_complete(width: i32, height: i32, blur_hash: Option<&str>) -> bool {
 /// This is the Ferrofin shape of C#'s `LibraryManager.UpdateImagesAsync`
 /// selecting only the `ImageNeedsRefresh` images: upstream's `BaseItem` already
 /// holds the previous values in memory, so it simply leaves the untouched ones
-/// alone. Here they come from the scan's one-query image preread.
+/// alone. Here they come from the scan's image preread, read with each
+/// stored-row window ([`ArtworkCache::stored_images`]).
 fn adopt_stored_image_metadata(images: &mut [ItemImageInfo], stored: &ProbedImages) {
     if stored.is_empty() {
         return;
@@ -38767,6 +38888,255 @@ mod tests {
         );
     }
 
+    /// The image file a planned item of [`preread_scanner`] stores as its
+    /// probed Primary.
+    fn stored_poster(id: uuid::Uuid) -> String {
+        format!("/tv/Show/{id}.jpg")
+    }
+
+    /// A Primary at `path` with a complete stored probe, one the scan can
+    /// adopt.
+    fn probed_primary(path: String) -> ferrofin_traits::options::ItemImageInfo {
+        ferrofin_traits::options::ItemImageInfo {
+            path,
+            image_type: ferrofin_model::entities::ImageType::Primary,
+            date_modified: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp"),
+            width: 10,
+            height: 15,
+            blur_hash: Some("LEHV6nWB2yk8".to_owned()),
+        }
+    }
+
+    /// The plan entry of an item of `kind` with id `id` (and its row), under
+    /// `series` when given. Its path only names it: nothing is on disk.
+    fn planned_row(
+        id: uuid::Uuid,
+        kind: ferrofin_model::data::BaseItemKind,
+        series: Option<uuid::Uuid>,
+    ) -> super::Planned {
+        use ferrofin_db::store::guid_to_db;
+        super::Planned {
+            id,
+            entity: ferrofin_db::entities::base_items::BaseItemEntity {
+                id: guid_to_db(id),
+                type_: crate::item_type_lookup::stored_type_name(kind)
+                    .expect("type")
+                    .to_owned(),
+                path: Some(format!("/tv/Show/{id}.mkv")),
+                series_id: series.map(guid_to_db),
+                ..Default::default()
+            },
+            ancestors: Vec::new(),
+            generated_names: Vec::new(),
+        }
+    }
+
+    /// A scanner over a fresh store holding `planned`'s rows, each with a
+    /// probed Primary ([`stored_poster`]).
+    async fn preread_scanner(
+        tmp: &std::path::Path,
+        planned: &[super::Planned],
+    ) -> (LibraryScanner, Arc<FerrofinItemPersistenceService>) {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let rows: Vec<_> = planned.iter().map(|p| p.entity.clone()).collect();
+        persistence.save_items(&rows).await.expect("rows");
+        let images: Vec<_> = planned
+            .iter()
+            .map(|p| (p.id, vec![probed_primary(stored_poster(p.id))]))
+            .collect();
+        persistence
+            .save_items_images(&images)
+            .await
+            .expect("images");
+        let vf = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
+            Arc::new(crate::item_repository::FerrofinItemRepository::new(
+                db,
+                Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+            ));
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(items);
+        (scanner, persistence)
+    }
+
+    /// A scanner over a store holding a series and `BATCH_BIND_CHUNK` + 5
+    /// of its episodes, each with a recorded provider id (the series' `Tmdb`
+    /// 1399, episode `n`'s `Tvdb` `n`) and a probed Primary
+    /// ([`stored_poster`]), and their plan: two stored-row windows, the
+    /// series first.
+    async fn two_windows_of_episodes(
+        tmp: &std::path::Path,
+    ) -> (LibraryScanner, Vec<super::Planned>) {
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+        let series = uuid::Uuid::from_u128(1);
+        let mut planned = vec![planned_row(series, BaseItemKind::Series, None)];
+        planned.extend((1..=ferrofin_db::BATCH_BIND_CHUNK + 5).map(|n| {
+            let id = uuid::Uuid::from_u128(1000 + u128::try_from(n).expect("n"));
+            planned_row(id, BaseItemKind::Episode, Some(series))
+        }));
+        let (scanner, persistence) = preread_scanner(tmp, &planned).await;
+        for (n, item) in planned.iter().enumerate() {
+            let (key, value) = if n == 0 {
+                ("Tmdb", "1399".to_owned())
+            } else {
+                ("Tvdb", n.to_string())
+            };
+            persistence
+                .save_provider_id(item.id, key, &value)
+                .await
+                .expect("provider id");
+        }
+        (scanner, planned)
+    }
+
+    // A planned item's recorded provider ids and stored image probes are read
+    // by its own visit, a series' ids by its seasons and episodes too, and an
+    // album's probes by the cover pass before the walk. So only those are
+    // read before the walk; every other item's are read with its stored-row
+    // window, never the whole library's at once (gl-234).
+    #[tokio::test]
+    async fn the_scan_prereads_only_what_items_further_on_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (scanner, planned) = two_windows_of_episodes(tmp.path()).await;
+
+        let (cache, _, _) = scanner
+            .scan_prereads(&planned, super::ScanRun::defaults())
+            .await;
+        let series = ferrofin_db::store::guid_to_db(planned[0].id);
+        assert_eq!(
+            (
+                cache.item_provider_ids.len(),
+                cache.item_provider_ids.contains_key(&series)
+            ),
+            (1, true),
+            "only the series' ids, which its episodes read, of {} planned items",
+            planned.len()
+        );
+        assert_eq!(
+            cache.stored_images.len(),
+            0,
+            "no item's image probes: the plan holds no album"
+        );
+    }
+
+    // An album's cover is adopted before the walk from the probe its own row
+    // stores: so the albums' probes are read up front, and only theirs, not
+    // their tracks' (gl-234).
+    #[tokio::test]
+    async fn the_albums_stored_probes_are_read_before_the_walk() {
+        use ferrofin_model::data::BaseItemKind;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let album = uuid::Uuid::from_u128(1);
+        let track = uuid::Uuid::from_u128(2);
+        let planned = vec![
+            planned_row(album, BaseItemKind::MusicAlbum, None),
+            planned_row(track, BaseItemKind::Audio, None),
+        ];
+        let (scanner, _) = preread_scanner(tmp.path(), &planned).await;
+
+        let (cache, _, _) = scanner
+            .scan_prereads(&planned, super::ScanRun::defaults())
+            .await;
+        assert!(
+            cache.stored_images.contains_key(&stored_poster(album)),
+            "the album's stored probe, for its cover"
+        );
+        assert_eq!(cache.stored_images.len(), 1, "not the track's");
+    }
+
+    // Entering a stored-row window replaces the previous window's recorded
+    // provider ids and image probes in the scan's cache, what the walk
+    // settled for them included, and keeps the series' ids: an episode in
+    // the second window still resolves by its series' recorded id. The first
+    // window is read on entry, the second ahead of it, as the probe
+    // look-ahead does, and waits until the walk enters it (gl-234).
+    #[tokio::test]
+    async fn a_windows_prereads_replace_the_previous_windows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (scanner, planned) = two_windows_of_episodes(tmp.path()).await;
+        let run = super::ScanRun::defaults();
+        let (mut cache, _, _) = scanner.scan_prereads(&planned, run).await;
+        let refresh = super::RefreshContext::of(run);
+        let mut probes = scanner.probe_pipeline(&planned, run);
+        let mut window = super::StoredRows::default();
+        let key = |n: usize| ferrofin_db::store::guid_to_db(planned[n].id);
+        let tvdb = |value: &str| vec![("Tvdb".to_owned(), value.to_owned())];
+        let poster = |n: usize| stored_poster(planned[n].id);
+        let chunk = ferrofin_db::BATCH_BIND_CHUNK;
+
+        scanner
+            .advance_stored_window(&planned, 0, &mut window, &mut probes, &refresh, &mut cache)
+            .await;
+        assert_eq!(
+            cache.item_provider_ids.len(),
+            chunk,
+            "the series' ids and the first window's episodes'"
+        );
+        assert_eq!(cache.item_provider_ids.get(&key(1)), Some(&tvdb("1")));
+        assert!(!cache.item_provider_ids.contains_key(&key(chunk)));
+        assert_eq!(cache.stored_images.len(), chunk);
+        assert!(cache.stored_images.contains_key(&poster(1)));
+        assert!(!cache.stored_images.contains_key(&poster(chunk)));
+        // What the walk settles for an item of the window.
+        cache.item_provider_ids.insert(key(2), tvdb("settled"));
+
+        let mut ahead = Box::new(super::StoredRows {
+            end: window.end,
+            ..super::StoredRows::default()
+        });
+        scanner
+            .read_stored_window(&planned, &mut ahead, &refresh)
+            .await;
+        window.ahead = Some(ahead);
+        assert!(
+            !cache.item_provider_ids.contains_key(&key(chunk))
+                && !cache.stored_images.contains_key(&poster(chunk)),
+            "the window read ahead waits until the walk enters it"
+        );
+        assert_eq!(cache.item_provider_ids.get(&key(2)), Some(&tvdb("settled")));
+
+        scanner
+            .advance_stored_window(
+                &planned,
+                chunk,
+                &mut window,
+                &mut probes,
+                &refresh,
+                &mut cache,
+            )
+            .await;
+        assert_eq!(window.start, chunk, "the window read ahead is entered");
+        assert_eq!(
+            cache.item_provider_ids.len(),
+            1 + planned.len() - chunk,
+            "the series' ids and the second window's episodes'"
+        );
+        assert!(!cache.item_provider_ids.contains_key(&key(1)));
+        assert!(!cache.item_provider_ids.contains_key(&key(2)));
+        assert_eq!(
+            cache.item_provider_ids.get(&key(chunk)),
+            Some(&tvdb(&chunk.to_string()))
+        );
+        assert_eq!(
+            super::recorded_provider_id(&cache, &key(0), "Tmdb"),
+            Some(1399),
+            "an episode of the second window resolves by its series' recorded id"
+        );
+        assert_eq!(cache.stored_images.len(), planned.len() - chunk);
+        assert!(!cache.stored_images.contains_key(&poster(1)));
+        assert!(cache.stored_images.contains_key(&poster(chunk)));
+    }
+
     #[tokio::test]
     async fn scan_creates_movie_rows_with_parent_and_ancestors() {
         let tmp = tempfile::tempdir().unwrap();
@@ -42989,6 +43359,45 @@ mod tests {
         assert_eq!(rescanned.width, cold.width);
         assert_eq!(rescanned.height, cold.height);
         assert_eq!(rescanned.blur_hash, cold.blur_hash);
+    }
+
+    // The same past one stored-row window: the probes a rescan adopts are read
+    // with each window (gl-234), and the items of every window find theirs, so
+    // a rescan of a library larger than a window decodes no poster either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rescan_past_one_stored_row_window_decodes_no_poster() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fx = poster_fixture(tmp.path(), 8, 12).await;
+        let movies = ferrofin_db::BATCH_BIND_CHUNK + 5;
+        for i in 1..movies {
+            let dir = tmp
+                .path()
+                .join("movies")
+                .join(format!("Movie {i:04} (2000)"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("Movie {i:04} (2000).mkv")), b"").unwrap();
+            write_poster(&dir.join("poster.jpg"), 8, 12);
+        }
+
+        fx.scanner.scan_all().await.unwrap();
+        let cold = fx.dimensions.swap(0, Ordering::Relaxed);
+        fx.blur_hashes.store(0, Ordering::Relaxed);
+        assert!(
+            cold >= movies,
+            "the first scan probes every poster ({cold})"
+        );
+
+        fx.scanner.scan_all().await.unwrap();
+        assert_eq!(
+            (
+                fx.dimensions.load(Ordering::Relaxed),
+                fx.blur_hashes.load(Ordering::Relaxed)
+            ),
+            (0, 0),
+            "no unchanged poster of either window is decoded again"
+        );
     }
 
     // The other half of `ImageNeedsRefresh`: a poster the user replaced has an
