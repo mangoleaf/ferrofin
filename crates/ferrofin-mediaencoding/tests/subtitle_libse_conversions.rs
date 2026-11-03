@@ -9,6 +9,14 @@
 //! the WebVTT writer only through `webvtt`, and an SSA or ASS source asked for its own
 //! format (or SSA asked for ASS) is served verbatim.
 //!
+//! The SubRip loader fixtures (`frames.srt`, `frame_edges.srt`, `repairs.srt`,
+//! `unnumbered.srt`) were fetched from a live Jellyfin 12.4 server instead, as
+//! sidecars of a movie (`Stream.{format}`, `subrip` for the SubRip writer;
+//! `?copyTimestamps=true` for the `preserve` variant). 12.4 pins the same libse and
+//! converts the same way as 12.2. Jellyfin lists only a sidecar ffprobe can open,
+//! and ffprobe gives up on an SRT whose first timing line is malformed, so
+//! `repairs.srt` starts with a well-formed cue.
+//!
 //! JSON is compared as parsed values: .NET's `Utf8JsonWriter` escapes `<`, `>`, `&`,
 //! `'`, `"`, `+` and every non-ASCII character as `\uXXXX`, and `serde_json` writes
 //! them as they are, which decodes to the same strings. Jellyfin 10.11's writer
@@ -154,6 +162,11 @@ fn first_difference(actual: &str, expected: &str) -> String {
 #[case::name_prefixes_before_two_italic_lines("colons.srt", "plain", 0, 0, false)]
 #[case::dotnet_digit_and_letter_classes("charclass.srt", "plain", 0, 0, false)]
 #[case::webvtt_cue_settings_styles_and_a_fractional_timestamp_map("cues.vtt", "plain", 0, 0, false)]
+#[case::two_digit_fractions_read_as_frames("frames.srt", "plain", 0, 0, false)]
+#[case::malformed_time_codes_and_text_libse_repairs("repairs.srt", "plain", 0, 0, false)]
+#[case::a_missing_number_line_and_a_stray_line("unnumbered.srt", "plain", 0, 0, false)]
+#[case::frames_on_a_negative_and_an_out_of_range_time("frame_edges.srt", "plain", 0, 0, false)]
+#[case::frames_on_a_negative_time_preserving_timestamps("frame_edges.srt", "preserve", 0, 0, true)]
 #[tokio::test]
 async fn conversion_matches_jellyfin_byte_for_byte(
     #[case] input: &str,
@@ -176,7 +189,7 @@ async fn conversion_matches_jellyfin_byte_for_byte(
     }
     assert!(
         mismatches.is_empty(),
-        "differs from Jellyfin 12.2:\n{}",
+        "differs from Jellyfin:\n{}",
         mismatches.join("\n")
     );
 }

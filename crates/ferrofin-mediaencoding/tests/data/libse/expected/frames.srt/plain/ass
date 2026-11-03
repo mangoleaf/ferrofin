@@ -1,0 +1,16 @@
+[Script Info]
+; This is an Advanced Sub Station Alpha v4+ script.
+Title: untitled
+ScriptType: v4.00+
+PlayDepth: 0
+ScaledBorderAndShadow: Yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,1,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.50,0:00:02.83,Default,,0,0,0,,Two-digit fractions are frames
+Dialogue: 0,0:00:03.00,0:00:05.00,Default,,0,0,0,,read at 23.976 fps
+Dialogue: 0,0:00:06.00,0:00:06.04,Default,,0,0,0,,and never past 999 ms

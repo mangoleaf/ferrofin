@@ -1,0 +1,12 @@
+1
+00:00:00,417 --> 00:00:00,834
+well-formed, so ffprobe opens the file
+
+2
+00:00:00,000 --> 00:00:02,834
+a negative start read as frames
+
+3
+00:00:00,000 --> 00:00:00,000
+past 99:59:59.999, so read as zero
+
