@@ -20,7 +20,7 @@ Conventions:
 | Intro Skipper | https://github.com/intro-skipper/intro-skipper | `db09359` | 10.11/prerelease | ported |
 | File Transformation | https://github.com/IAmParadox27/jellyfin-plugin-file-transformation | `f4f01c3` | 2.5.10.0 | ported |
 | Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
-| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, its three test routes, sign-in and the admin filter (milestone "LDAP-Auth plugin port") |
+| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, its three test routes, sign-in, the admin filter, password changes and resets (milestone "LDAP-Auth plugin port") |
 
 ## Per-plugin notes
 
@@ -245,9 +245,26 @@ Conventions:
   An entry without the username attribute is a `400`, as upstream's create or rename with a
   null name throws an `ArgumentException`. The provider is enabled only with the plugin and a
   server (D3);
-  upstream's `IsEnabled` is always `true`. `ChangePassword` with `AllowPassChange` off is
-  upstream's `NotImplementedException`, a `500`. Password changes and resets, profile
-  images, referrals and the `LDAP-Auth.xml` import are later phases of the milestone.
+  upstream's `IsEnabled` is always `true`. Profile images, referrals and the `LDAP-Auth.xml`
+  import are later phases of the milestone.
+- Password change (v24, `d11c86a`): `ChangePassword`, which the user manager calls for a user
+  whose `AuthenticationProviderId` is LDAP-Auth's (`POST /Users/{userId}/Password`). With
+  `AllowPassChange` off it is upstream's `NotImplementedException`, a `500`. Otherwise the user's
+  entry is found by their Ferrofin name as sign-in finds it (`LocateLdapUser`; no entry is
+  upstream's `401`), then the bind DN, on a connection of its own, reads the root DSE's
+  `supportedExtension`: with `1.3.6.1.4.1.4203.1.11.1` it sends the RFC 3062 password modify
+  operation for the entry's DN without the old password; else it replaces `LdapPasswordAttribute`
+  with the new password; with that empty too, upstream's `InvalidOperationException` (`Password
+  attribute is not set`, a `500`). The bind DN must be allowed to set users' passwords.
+- Password reset (v24, `d11c86a`): the same provider is the password-reset provider
+  (`IPasswordResetProvider`, registered through `Extension::password_reset_providers` under the
+  same name and id), so the users it creates, whose `PasswordResetProviderId` is its id, have
+  their forgotten-password requests sent to it. `StartForgotPasswordProcess` answers `PinCode`
+  with `PinFile` set to `PasswordResetUrl`, `$userId` replaced by the user's id (or the entered
+  name's `GetMD5` when it names no account; the user manager sends such a request to the
+  built-in provider) and `$userName` by the entered name lowercased (`ToLowerInvariant`), both
+  ignoring case and unencoded, as upstream; with no URL, upstream's `NotImplementedException`, a
+  `500`. It is enabled under the same conditions as sign-in (D3).
 - Admin filter (v24, `d11c86a`): the admin block of `Authenticate`. While `LdapAdminFilter` is
   neither empty nor `_disabled_` (ordinal), after the password is checked the bind DN searches,
   on a connection of its own, the subtree of `LdapAdminBaseDn` (the base DN when that is empty)
@@ -317,6 +334,23 @@ Conventions:
   - **A filter the directory client cannot parse** is reported as `User Filter: Filter Error`
     (or `Admin Filter: …`): `ldap3` gives no reason. Upstream pulls Novell's parser message out of
     the exception text with a regex.
+  - **A blank new password is refused** (owner decision D11) with a `400`, before any
+    connection, so the directory is not touched. That is what a reset (`ResetPassword: true`)
+    sends. Upstream passes it on: its `PasswordModifyOperation` then omits the new password, and
+    RFC 3062 has the directory generate a random one that nobody learns. Blank means empty or
+    white space, as the user manager reads it for administrators.
+  - **A password change whose directory cannot be reached, or refuses the bind DN, is a `500`**,
+    as at sign-in (D4). Upstream's `ConnectToLdap` throws `AuthenticationException`, a `401`.
+    The connection is closed after the change; upstream's is never disposed.
+  - **A password change writes only to the user's own entry.** The entry the user's name finds
+    must belong to them (by its uid link, or by name for an account LDAP-Auth owns), as at
+    sign-in; otherwise the change is a `401` and nothing is written. Upstream writes to whichever
+    entry matched first, so a person who can make their own entry match another user's name (a
+    `mail` they may edit) would have that user's new password set on their own entry. The name
+    leg trusts the username attribute, as sign-in does (TODO(gl-1188)).
+  - **No PIN is ever this provider's to redeem**: `RedeemPasswordResetPin` answers no match.
+    Upstream throws `NotImplementedException`, which stops the redemption before a later
+    provider could redeem its own.
   - **Search references are not followed yet** by the filter test or the admin filter's search,
     which read only the entries the directory sent: TODO(gl-1148). Upstream follows them with
     the bind credentials (`LdapAuthHandler`). Until then an administrator whose entry (or group)
