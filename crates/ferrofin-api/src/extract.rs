@@ -200,10 +200,67 @@ impl ProblemDetails {
         })
     }
 
+    /// A 400 for a body that leaves out a C# `required` member of `type_name`
+    /// (the DTO's full name, `Jellyfin.Api.Models.…`). System.Text.Json refuses
+    /// such a body while deserializing, before any validation attribute runs,
+    /// so the complaint is keyed `$`.
+    #[must_use]
+    pub fn missing_required_member(type_name: &str, member: &str) -> Self {
+        Self::validation(
+            "$",
+            format!(
+                "JSON deserialization for type '{type_name}' was missing required properties \
+                 including: '{member}'."
+            ),
+        )
+    }
+
     /// The rejection for an absent, blank or `null` body.
     #[must_use]
     fn empty_body() -> Self {
         Self::validation("", NON_EMPTY_REQUIRED)
+    }
+}
+
+/// A C# `[Required] public required string` body member as bound, before the
+/// checks ASP.NET makes ahead of the action ([`Self::require`]). Declare the
+/// field `#[serde(default)]`, so a member the body leaves out stays
+/// [`Self::Missing`].
+#[derive(Debug, Default)]
+pub(crate) enum RequiredString {
+    /// The body left the member out.
+    #[default]
+    Missing,
+    /// The member as sent: `None` for `null`.
+    Sent(Option<String>),
+}
+
+impl<'de> serde::Deserialize<'de> for RequiredString {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Option::<String>::deserialize(deserializer).map(Self::Sent)
+    }
+}
+
+impl RequiredString {
+    /// The value as sent, untrimmed, or the 400 ASP.NET answers instead.
+    /// `type_name` is the DTO's full C# name and `member` the member's.
+    ///
+    /// - Left out: System.Text.Json refuses the body
+    ///   ([`ProblemDetails::missing_required_member`]).
+    /// - `null`, empty or whitespace (`string.IsNullOrWhiteSpace`): `[Required]`
+    ///   refuses it, keyed by the member alone.
+    pub(crate) fn require(self, type_name: &str, member: &str) -> Result<String, ProblemDetails> {
+        match self {
+            Self::Missing => Err(ProblemDetails::missing_required_member(type_name, member)),
+            Self::Sent(value) => value
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    ProblemDetails::member_validation(
+                        member,
+                        format!("The {member} field is required."),
+                    )
+                }),
+        }
     }
 }
 

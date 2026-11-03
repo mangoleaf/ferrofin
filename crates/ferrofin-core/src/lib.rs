@@ -266,6 +266,7 @@ mod user_data_retention_repository;
 pub mod user_entity_ext;
 pub mod user_manager;
 pub mod user_root_folder;
+pub mod user_updated;
 pub mod user_view_manager;
 pub mod user_view_repository;
 pub mod video_versions;

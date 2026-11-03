@@ -209,14 +209,6 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
         item_id: Uuid,
         streams: &[MediaStreamInfoEntity],
     ) -> Result<(), ServiceError> {
-        let insert_sql = format!(
-            r#"INSERT INTO "MediaStreamInfos" ({STREAM_COLUMNS}) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?)"#
-        );
-
-        let insert_sql: std::sync::Arc<str> = insert_sql.into();
         let item_id_db = guid_to_db(item_id);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "MediaStreamInfos" WHERE "ItemId" = ?1"#)
@@ -224,59 +216,69 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        for s in streams {
-            sqlx::query(sqlx::AssertSqlSafe(insert_sql.clone()))
-                .bind(&item_id_db)
-                .bind(s.stream_index)
-                .bind(&s.aspect_ratio)
-                .bind(s.average_frame_rate)
-                .bind(s.bit_depth)
-                .bind(s.bit_rate)
-                .bind(s.bl_present_flag)
-                .bind(&s.channel_layout)
-                .bind(s.channels)
-                .bind(&s.codec)
-                .bind(&s.codec_tag)
-                .bind(&s.codec_time_base)
-                .bind(&s.color_primaries)
-                .bind(&s.color_space)
-                .bind(&s.color_transfer)
-                .bind(&s.comment)
-                .bind(s.dv_bl_signal_compatibility_id)
-                .bind(s.dv_level)
-                .bind(s.dv_profile)
-                .bind(s.dv_version_major)
-                .bind(s.dv_version_minor)
-                .bind(s.el_present_flag)
-                .bind(s.hdr10_plus_present_flag)
-                .bind(s.height)
-                .bind(s.is_anamorphic)
-                .bind(s.is_avc)
-                .bind(s.is_default)
-                .bind(s.is_external)
-                .bind(s.is_forced)
-                .bind(s.is_hearing_impaired)
-                .bind(s.is_interlaced)
-                .bind(s.is_original)
-                .bind(&s.key_frames)
-                .bind(&s.language)
-                .bind(s.level)
-                .bind(&s.nal_length_size)
-                .bind(&s.path)
-                .bind(&s.pixel_format)
-                .bind(&s.profile)
-                .bind(s.real_frame_rate)
-                .bind(s.ref_frames)
-                .bind(s.rotation)
-                .bind(s.rpu_present_flag)
-                .bind(s.sample_rate)
-                .bind(s.stream_type)
-                .bind(&s.time_base)
-                .bind(&s.title)
-                .bind(s.width)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
+        // Many rows per statement (gl-1181): a scan saves every item's
+        // streams, one awaited statement per stream otherwise.
+        let columns = STREAM_COLUMNS.split(',').count();
+        for chunk in
+            ferrofin_db::power_of_two_chunks(streams, ferrofin_db::BATCH_BIND_CHUNK / columns)
+        {
+            let sql = format!(
+                r#"INSERT INTO "MediaStreamInfos" ({STREAM_COLUMNS}) VALUES {}"#,
+                ferrofin_db::values_rows(chunk.len(), columns)
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for s in chunk {
+                query = query
+                    .bind(&item_id_db)
+                    .bind(s.stream_index)
+                    .bind(&s.aspect_ratio)
+                    .bind(s.average_frame_rate)
+                    .bind(s.bit_depth)
+                    .bind(s.bit_rate)
+                    .bind(s.bl_present_flag)
+                    .bind(&s.channel_layout)
+                    .bind(s.channels)
+                    .bind(&s.codec)
+                    .bind(&s.codec_tag)
+                    .bind(&s.codec_time_base)
+                    .bind(&s.color_primaries)
+                    .bind(&s.color_space)
+                    .bind(&s.color_transfer)
+                    .bind(&s.comment)
+                    .bind(s.dv_bl_signal_compatibility_id)
+                    .bind(s.dv_level)
+                    .bind(s.dv_profile)
+                    .bind(s.dv_version_major)
+                    .bind(s.dv_version_minor)
+                    .bind(s.el_present_flag)
+                    .bind(s.hdr10_plus_present_flag)
+                    .bind(s.height)
+                    .bind(s.is_anamorphic)
+                    .bind(s.is_avc)
+                    .bind(s.is_default)
+                    .bind(s.is_external)
+                    .bind(s.is_forced)
+                    .bind(s.is_hearing_impaired)
+                    .bind(s.is_interlaced)
+                    .bind(s.is_original)
+                    .bind(&s.key_frames)
+                    .bind(&s.language)
+                    .bind(s.level)
+                    .bind(&s.nal_length_size)
+                    .bind(&s.path)
+                    .bind(&s.pixel_format)
+                    .bind(&s.profile)
+                    .bind(s.real_frame_rate)
+                    .bind(s.ref_frames)
+                    .bind(s.rotation)
+                    .bind(s.rpu_present_flag)
+                    .bind(s.sample_rate)
+                    .bind(s.stream_type)
+                    .bind(&s.time_base)
+                    .bind(&s.title)
+                    .bind(s.width);
+            }
+            query.execute(&mut *tx).await.map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())
@@ -344,6 +346,35 @@ mod tests {
             title: None,
             width: None,
         }
+    }
+
+    /// More streams than one statement's rows are saved whole, each with its
+    /// own values (gl-1181).
+    #[tokio::test]
+    async fn many_streams_are_saved_whole_and_in_order() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinMediaStreamRepository::new(db);
+        let languages: Vec<String> = (0..25).map(|i| format!("l{i:02}")).collect();
+        let streams: Vec<MediaStreamInfoEntity> = (0..25)
+            .map(|i| stream(i, 2, Some(&languages[usize::try_from(i).expect("index")])))
+            .collect();
+        repo.save_media_streams(item, &streams).await.expect("save");
+        let got: Vec<(i64, Option<String>)> = repo
+            .get_media_streams(&MediaStreamQuery {
+                item_id: item,
+                stream_type: None,
+                index: None,
+            })
+            .await
+            .expect("all")
+            .into_iter()
+            .map(|s| (s.stream_index, s.language))
+            .collect();
+        let expected: Vec<(i64, Option<String>)> =
+            (0..25).zip(languages.into_iter().map(Some)).collect();
+        assert_eq!(got, expected);
     }
 
     #[tokio::test]

@@ -1553,7 +1553,10 @@ pub trait UserManager: Send + Sync {
     /// Gets a user row by name, or `None`.
     async fn get_user_by_name(&self, name: &str) -> Result<Option<UserEntity>, ServiceError>;
 
-    /// Renames a user.
+    /// Renames a user. The concrete manager then announces the rename, as
+    /// upstream's `RenameUser` publishes `UserUpdatedEventArgs`: the user's
+    /// sessions are sent `UserUpdated` and their devices re-checked, whoever
+    /// called.
     async fn rename_user(
         &self,
         user_id: Uuid,
@@ -1765,7 +1768,9 @@ pub trait UserManager: Send + Sync {
         config: &UserConfiguration,
     ) -> Result<(), ServiceError>;
 
-    /// Updates a user's policy (stopgap; prefer [`Self::update_user`]).
+    /// Updates a user's policy (stopgap; prefer [`Self::update_user`]). The
+    /// concrete manager announces every save, as upstream's
+    /// `UpdatePolicyAsync` does, like [`Self::rename_user`].
     async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError>;
 
     /// Saves a policy as `POST /Users/{userId}/Policy` does: the save
@@ -1782,7 +1787,8 @@ pub trait UserManager: Send + Sync {
     ///
     /// [`ServiceError::NotFound`] for an unknown user,
     /// [`ServiceError::Forbidden`] with the guard's message when a guard
-    /// refuses, or whatever the save surfaces.
+    /// refuses, or whatever the save surfaces. The concrete manager announces
+    /// a save that passes, as [`Self::update_policy`] does.
     async fn update_policy_guarded(
         &self,
         user_id: Uuid,
@@ -1846,7 +1852,9 @@ pub trait UserManager: Send + Sync {
     /// # Errors
     ///
     /// [`ServiceError::NotFound`] for an unknown user, or whatever the save
-    /// surfaces.
+    /// surfaces. The concrete manager announces nothing, as upstream's LDAP
+    /// plugin saves the flag with `UpdateUserAsync`; this default saves
+    /// through [`Self::update_policy`], which an implementation may announce.
     async fn apply_external_administrator(
         &self,
         user_id: Uuid,

@@ -63,9 +63,10 @@ disabled.
 That plugin's settings page shows the report: open it from the plugin's Settings link or the
 dashboard menu's **Ferrofin** entry. It lists the settings in nine tabs (Network, Library,
 Trickplay, Images, Providers, Performance, Logging, Plugins, System), the first open. Each setting
-is headed by a readable name, with its `config.toml` key and variable on a small line below, and
-shows its value in its unit, its default, source and flag, and the reason for any it may not
-change; secrets are marked as secrets. Disabling the plugin hides the page and the menu entry.
+is headed by a readable name, with its `config.toml` key, variable, flag and default on a small
+line below, then its description. A badge beside the name says what sets it, when anything does
+(`config.toml`, a variable or a flag), and secrets are marked as secrets. Disabling the plugin
+hides the page and the menu entry.
 
 ### Editing settings from the dashboard
 
@@ -73,22 +74,43 @@ The same page edits the settings it may change, and saves them to `config.toml`:
 names at the top, chosen as [above](#configuration). When the server cannot write that file the
 page says so beside its name, and a save fails with a message naming it.
 
-Each editable setting has a control for its kind: a checkbox for on or off, a number box with the
-setting's limits, an **Auto** checkbox with a number box for a count that can be `auto`, a text
-box for text, a URL or a path, and a text box with its items separated by commas for a list (so a
-list here cannot hold a path with a comma in it). A secret is a plain text box, marked as a
-secret: administrators see these values.
+Each setting is edited on one line: its name and description, with its field, its unit and
+**Reset to default** beside them (below them on a narrow screen). The field shows the value
+`config.toml` holds. When it holds none, the field shows the default, muted: as a number box's or
+a text box's placeholder (a described default such as "8, capped at the cores" too), or as a
+checkbox set the way the default sets it. The field is the one for the setting's kind: a checkbox
+for on or off, a number box with the setting's limits, an **Auto** checkbox with a number box for
+a count that can be `auto`, a text box for text, a URL or a path, and a text box with its items
+separated by commas for a list (so a list here cannot hold a path with a comma in it). A secret is
+a plain text box, marked as a secret: administrators see these values.
 
-**Save** sends only the settings changed ([`POST /Ferrofin/Settings`](#saving-from-the-web)). The
-server checks them, not the browser, and a refused change shows the server's message next to the
-setting it names, or at the top of the page when it names none, such as a file that cannot be
-written. Nothing is saved then, and every edit stays on the page to correct. **Reset to default**
-marks a setting `config.toml` holds, and Save removes its key, so the default applies after the
-restart. Restarting with edits not yet saved asks first, since it drops them.
+**Reset to default** is active when `config.toml` holds a value or the field holds an edit. On a
+value the file holds, it marks the key, and Save removes it, so the default applies after the
+restart (**Undo reset** takes the mark back); on an edit alone, it drops the edit.
 
-Flags and variables outrank `config.toml`, so a setting one of them sets has no control. The page
-shows it locked, with a note naming the flag or variable and where that is changed. These have no
-control whatever sets them, each with its reason on the page:
+A search box and three filters sit above the tabs:
+
+- the search matches a setting's name, description, `config.toml` key, variable and flag,
+  ignoring case, and each word typed must match. It lists the matches of every tab, each under
+  its tab's name;
+- **Changed** lists, from every tab, the settings something sets (a flag, a variable or
+  `config.toml`) and those holding an edit not saved yet;
+- **Needs restart** lists, from every tab, the settings whose saved value a restart will put in
+  use: one `config.toml` holds that is not in use yet, or one a save removed. A setting a flag or
+  a variable sets is left out, since the flag or variable still outranks the file after a restart;
+- **Hide read-only** leaves out the settings the page may not change, on a tab and in a list.
+
+Opening a tab ends a search, **Changed** and **Needs restart**. Each tab shows how many edits it
+holds that are not saved yet, and **Save** sends the changed settings of every tab at once
+([`POST /Ferrofin/Settings`](#saving-from-the-web)). The server checks them, not the browser, and
+a refused change shows the server's message next to the setting it names, with its tab marked and
+opened (a search, **Changed** or **Needs restart** stays as it is), or at the top of the page when
+it names none, such as a file that cannot be written. Nothing is saved then, and every edit stays
+on the page to correct. Restarting with edits not yet saved asks first, since it drops them.
+
+Flags and variables outrank `config.toml`, so a setting one of them sets has no field: the page
+shows its value as text with a lock, and a note naming the flag or variable and where that is
+changed. These have no field whatever sets them, each with its reason on the page:
 
 - the directories (`data_dir`, `config_dir`, `cache_dir`, `web_dir`): changing one from the web
   could point the server at other files;
@@ -106,8 +128,8 @@ control whatever sets them, each with its reason on the page:
   notes say to set them by hand in `config.toml`, or with their variable or flag);
 - the OpenTelemetry variables, which `config.toml` has no key for.
 
-A saved change [applies at the next restart](#when-a-change-applies). After a save the page shows
-the new value beside the one in use, marked as saved, and a **Restart now** button beside the
+A saved change [applies at the next restart](#when-a-change-applies). After a save the line below
+the setting shows the saved value and the one in use, and a **Restart now** button sits beside the
 pending-restart notice. It runs the in-process restart, waits for the server to answer again and
 shows the values now in effect. The settings the in-process restart keeps (`log_level`,
 `log_format`, `metrics_scan_duration_buckets`) say so on their row before and after saving, and

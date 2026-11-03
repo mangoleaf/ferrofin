@@ -28,10 +28,11 @@
                         <h2 class="sectionTitle">Ferrofin</h2>
                     </div>
                     <p class="fieldDescription">
-                        The server's own settings: the value each one has now, its default, and where
-                        that value comes from. Saving writes the changes to the settings file below, and
-                        they apply when the server restarts. A setting set by an environment variable or
-                        a command-line flag is changed where the server is started.
+                        The server's own settings. A setting the settings file below holds shows its
+                        value there; one it does not shows its default, muted. Saving writes the changes
+                        to that file, and they apply when the server restarts. A setting set by an
+                        environment variable or a command-line flag is locked here: it is changed where
+                        the server is started.
                     </p>
                 </div>
                 <div class="ferrofinNotice ferrofinRestartPending hide" role="status">
@@ -53,7 +54,34 @@
                     <span class="ferrofinConfigFileLocked hide">(the server cannot write it, so a save will fail)</span>
                 </p>
                 <form class="ferrofinForm hide" novalidate>
+                    <div class="ferrofinFinder">
+                        <div class="inputContainer">
+                            <input is="emby-input" type="search" class="ferrofinSearch" label="Search settings"
+                                autocomplete="off" spellcheck="false" />
+                        </div>
+                        <div class="ferrofinFilters" role="group" aria-label="Filters">
+                            <div class="checkboxContainer">
+                                <label>
+                                    <input is="emby-checkbox" type="checkbox" class="ferrofinFilterChanged" />
+                                    <span>Changed</span>
+                                </label>
+                            </div>
+                            <div class="checkboxContainer">
+                                <label>
+                                    <input is="emby-checkbox" type="checkbox" class="ferrofinFilterRestart" />
+                                    <span>Needs restart</span>
+                                </label>
+                            </div>
+                            <div class="checkboxContainer">
+                                <label>
+                                    <input is="emby-checkbox" type="checkbox" class="ferrofinFilterLocked" />
+                                    <span>Hide read-only</span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
                     <div class="ferrofinTabs" role="tablist"></div>
+                    <p class="ferrofinNoMatch fieldDescription hide" role="status"></p>
                     <div class="ferrofinGroups"></div>
                     <button is="emby-button" type="submit" class="raised button-submit block ferrofinSave" disabled>
                         <span>Save</span>
@@ -73,11 +101,34 @@
                 background: rgba(128, 128, 128, 0.15);
             }
 
+            .ferrofinSettingsPage .ferrofinFinder {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: flex-end;
+                gap: 0.5em 1.5em;
+                margin-top: 1.5em;
+            }
+
+            .ferrofinSettingsPage .ferrofinFinder .inputContainer {
+                flex: 1 1 18em;
+                margin: 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinFilters {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0 1.2em;
+            }
+
+            .ferrofinSettingsPage .ferrofinFilters .checkboxContainer {
+                margin: 0;
+            }
+
             .ferrofinSettingsPage .ferrofinTabs {
                 display: flex;
                 flex-wrap: wrap;
                 gap: 0.2em;
-                margin-top: 1.5em;
+                margin-top: 1em;
                 border-bottom: 1px solid rgba(128, 128, 128, 0.35);
             }
 
@@ -98,13 +149,96 @@
                 opacity: 1;
             }
 
+            .ferrofinSettingsPage .ferrofinTabCount {
+                margin-left: 0.4em;
+                padding: 0 0.45em;
+                border-radius: 1em;
+                background: rgba(128, 128, 128, 0.35);
+                font-size: 0.8em;
+                font-weight: bold;
+            }
+
+            .ferrofinSettingsPage .ferrofinTabRefused,
+            .ferrofinSettingsPage .ferrofinFieldError {
+                color: #e04b4b;
+            }
+
+            .ferrofinSettingsPage .ferrofinTabMark {
+                margin-left: 0.3em;
+                vertical-align: text-bottom;
+            }
+
             .ferrofinSettingsPage .ferrofinGroup {
                 margin-top: 0.5em;
+            }
+
+            .ferrofinSettingsPage .ferrofinGroupTitle {
+                margin: 1.2em 0 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinNoMatch {
+                margin: 1.5em 0;
             }
 
             .ferrofinSettingsPage .ferrofinSetting {
                 padding: 0.9em 0;
                 border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+            }
+
+            /* The name and description, with the value beside them, wrapping below on a narrow screen. */
+            .ferrofinSettingsPage .ferrofinSettingLine {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 0.5em 1.5em;
+            }
+
+            .ferrofinSettingsPage .ferrofinSettingText {
+                flex: 1 1 22em;
+                min-width: 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinField,
+            .ferrofinSettingsPage .ferrofinLocked,
+            .ferrofinSettingsPage .ferrofinCountOrAuto {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 0.5em 0.8em;
+            }
+
+            .ferrofinSettingsPage .ferrofinField .inputContainer {
+                width: 9em;
+                margin: 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinFieldWide .inputContainer {
+                width: 22em;
+                max-width: 100%;
+            }
+
+            .ferrofinSettingsPage .ferrofinField .checkboxContainer {
+                margin: 0;
+            }
+
+            /* The field's label names it for a screen reader; the row's heading names it on screen. */
+            .ferrofinSettingsPage .ferrofinField .inputLabel,
+            .ferrofinSettingsPage .ferrofinVisuallyHidden {
+                position: absolute;
+                width: 1px;
+                height: 1px;
+                overflow: hidden;
+                clip: rect(0 0 0 0);
+                white-space: nowrap;
+            }
+
+            .ferrofinSettingsPage .ferrofinDefaulted {
+                opacity: 0.6;
+            }
+
+            .ferrofinSettingsPage .ferrofinHint {
+                font-size: 0.85em;
+                opacity: 0.7;
             }
 
             .ferrofinSettingsPage .ferrofinSettingHeader {
@@ -148,22 +282,6 @@
                 font-size: 1.1em;
             }
 
-            .ferrofinSettingsPage .ferrofinFacts {
-                display: grid;
-                grid-template-columns: max-content 1fr;
-                gap: 0.3em 1em;
-                margin: 0.6em 0 0;
-            }
-
-            .ferrofinSettingsPage .ferrofinFacts dt {
-                opacity: 0.7;
-            }
-
-            .ferrofinSettingsPage .ferrofinFacts dd {
-                margin: 0;
-                overflow-wrap: anywhere;
-            }
-
             .ferrofinSettingsPage code {
                 font-family: monospace;
                 overflow-wrap: anywhere;
@@ -191,22 +309,21 @@
                 margin: 0.6em 0 0;
             }
 
-            .ferrofinSettingsPage .ferrofinField {
-                margin-top: 0.9em;
+            .ferrofinSettingsPage .ferrofinReset {
+                margin: 0;
             }
 
-            .ferrofinSettingsPage .ferrofinField .inputContainer,
-            .ferrofinSettingsPage .ferrofinField .checkboxContainer {
-                margin-bottom: 0.5em;
+            .ferrofinSettingsPage .ferrofinReset:disabled {
+                opacity: 0.4;
+                cursor: default;
             }
 
-            .ferrofinSettingsPage .ferrofinReset,
             .ferrofinSettingsPage .ferrofinRestartNow {
                 margin: 0.5em 0 0;
             }
 
-            .ferrofinSettingsPage .ferrofinFieldError {
-                color: #e04b4b;
+            .ferrofinSettingsPage .ferrofinLockedReason {
+                margin: 0.4em 0 0;
             }
 
             .ferrofinSettingsPage .ferrofinSave {
@@ -220,14 +337,17 @@
 
                 // The sources the server names, as the page titles them. A
                 // name missing here is shown as the server sends it, so a new
-                // source needs no page change (`titled`). The tabs are named
-                // as the server names its groups.
+                // source needs no page change (`titled`). The default has no
+                // badge: an unset setting shows its default instead. The tabs
+                // are named as the server names its groups.
                 var SOURCE_NAMES = {
-                    Default: 'Default',
                     ConfigFile: 'config.toml',
                     Environment: 'Environment',
                     Flag: 'Flag'
                 };
+                // The kinds whose field is short; the others hold text, a
+                // path or a list, and get a wide one.
+                var NARROW_KINDS = { Bool: true, Integer: true, CountOrAuto: true };
                 var RESTART_PENDING = 'A server restart is pending.';
                 // How often the page asks whether a restart has finished, and
                 // how long before it says the server has not come back.
@@ -345,15 +465,19 @@
                     return node;
                 }
 
-                function fact(list, label, content) {
-                    list.appendChild(element('dt', null, label));
-                    var dd = element('dd');
-                    if (typeof content === 'string') {
-                        dd.textContent = content;
-                    } else {
-                        dd.appendChild(content);
-                    }
-                    list.appendChild(dd);
+                /** Whether a default is a bare number, rather than described. */
+                function plainNumber(text) {
+                    return /^\d+(\.\d+)?$/.test(text);
+                }
+
+                /**
+                 * The default as the page shows it: a bare number in the
+                 * unit, a described one ("8, capped at the cores") as it is.
+                 */
+                function defaultText(setting) {
+                    return plainNumber(setting.Default) && setting.Unit
+                        ? setting.Default + ' ' + unitText(setting.Default, setting.Unit)
+                        : setting.Default;
                 }
 
                 function note(iconName, text, className) {
@@ -374,9 +498,9 @@
                     return setting.Applies === 'ProcessRestart' ? 'applies after a full process restart' : 'applies after restart';
                 }
 
-                /** A button that jellyfin-web upgrades once it is in the document. */
+                /** A flat button that jellyfin-web upgrades once it is in the document. */
                 function button(text, className) {
-                    var node = element('button', 'raised ' + className);
+                    var node = element('button', 'button-flat ' + className);
                     node.setAttribute('is', 'emby-button');
                     node.setAttribute('type', 'button');
                     node.appendChild(element('span', null, text));
@@ -445,9 +569,18 @@
                     });
                 }
 
-                /** A control is its `node`, the value it would save (`read`) and `disable`. */
-                function textControl(type, label, value, parse) {
-                    var field = textInput(type, label, inputText(value));
+                /**
+                 * A control is its `node`, the value it would save (`read`),
+                 * `disable`, `clear`, which puts it back to showing the
+                 * default, and `hold`, which returns a function that puts back
+                 * what it shows now. A text field shows the default as its
+                 * placeholder, muted, while it is empty.
+                 */
+                function textControl(type, setting, value, parse) {
+                    var field = textInput(type, fieldLabel(setting), inputText(value));
+                    if (setting.Default) {
+                        field.input.setAttribute('placeholder', setting.Default);
+                    }
                     return {
                         node: field.node,
                         input: field.input,
@@ -456,17 +589,52 @@
                         },
                         disable: function (off) {
                             field.input.disabled = off;
+                        },
+                        clear: function () {
+                            field.input.value = '';
+                        },
+                        hold: function () {
+                            var text = field.input.value;
+                            return function () {
+                                field.input.value = text;
+                            };
                         }
                     };
                 }
 
-                /** A control's label: `text`, then the setting's unit when it has one. */
-                function fieldLabel(setting, text) {
-                    return setting.Unit ? text + ', in ' + setting.Unit : text;
+                /**
+                 * A field's label, for a screen reader (the row's heading
+                 * names it on screen): the setting's name, then its unit.
+                 */
+                function fieldLabel(setting) {
+                    var name = setting.Label || setting.Key;
+                    return setting.Unit ? name + ', in ' + setting.Unit : name;
+                }
+
+                /**
+                 * A checkbox of `setting` that shows a default, muted, until
+                 * it is changed: `muted(on)` marks it so, and `muted()` says
+                 * whether it is. A screen reader hears the setting's name with
+                 * the `label` shown.
+                 */
+                function defaultCheckbox(setting, label, checked, unset) {
+                    var box = checkbox(label, checked);
+                    box.input.setAttribute('aria-label', (setting.Label || setting.Key) + ': ' + label);
+                    box.muted = function (on) {
+                        if (on !== undefined) {
+                            box.node.classList.toggle('ferrofinDefaulted', on);
+                        }
+                        return box.node.classList.contains('ferrofinDefaulted');
+                    };
+                    box.muted(unset);
+                    box.input.addEventListener('change', function () {
+                        box.muted(false);
+                    });
+                    return box;
                 }
 
                 function integerControl(setting, value) {
-                    var control = textControl('number', fieldLabel(setting, 'Set to'), value, String);
+                    var control = textControl('number', setting, value, String);
                     control.read = function () {
                         return numberBox(control.input);
                     };
@@ -480,10 +648,19 @@
                     return control;
                 }
 
-                /** On or off; a setting with no known value shows the one in use. */
+                /** Whether an on/off setting is on by default. */
+                function defaultOn(setting) {
+                    if (setting.Default === 'true' || setting.Default === 'false') {
+                        return setting.Default === 'true';
+                    }
+                    // A described default is the value in use while nothing sets it.
+                    return setting.Source === 'Default' && setting.Value === true;
+                }
+
+                /** On or off; an unset one shows its default, muted. */
                 function boolControl(setting, value) {
-                    var known = value === undefined || value === null ? setting.Value : value;
-                    var box = checkbox('On', known === true);
+                    var unset = value === undefined || value === null;
+                    var box = defaultCheckbox(setting, 'On', unset ? defaultOn(setting) : value === true, unset);
                     return {
                         node: box.node,
                         read: function () {
@@ -491,15 +668,28 @@
                         },
                         disable: function (off) {
                             box.input.disabled = off;
+                        },
+                        clear: function () {
+                            box.input.checked = defaultOn(setting);
+                            box.muted(true);
+                        },
+                        hold: function () {
+                            var checked = box.input.checked;
+                            var muted = box.muted();
+                            return function () {
+                                box.input.checked = checked;
+                                box.muted(muted);
+                            };
                         }
                     };
                 }
 
-                /** An "auto" checkbox and a count. An unset count is auto. */
+                /** An "auto" checkbox and a count. An unset count is auto, its default, muted. */
                 function countOrAutoControl(setting, value) {
-                    var isAuto = value === undefined || value === null || value === 'auto';
-                    var auto = checkbox('Auto', isAuto);
-                    var count = textInput('number', fieldLabel(setting, 'Set to'), isAuto ? '' : inputText(value));
+                    var unset = value === undefined || value === null;
+                    var isAuto = unset || value === 'auto';
+                    var auto = defaultCheckbox(setting, 'Auto', isAuto, unset);
+                    var count = textInput('number', fieldLabel(setting), isAuto ? '' : inputText(value));
                     var off = false;
                     function sync() {
                         auto.input.disabled = off;
@@ -507,17 +697,35 @@
                     }
                     auto.input.addEventListener('change', sync);
                     sync();
-                    var node = element('div');
+                    var node = element('div', 'ferrofinCountOrAuto');
                     node.appendChild(auto.node);
                     node.appendChild(count.node);
                     return {
                         node: node,
+                        input: count.input,
                         read: function () {
                             return auto.input.checked ? 'auto' : numberBox(count.input);
                         },
                         disable: function (disabled) {
                             off = disabled;
                             sync();
+                        },
+                        clear: function () {
+                            auto.input.checked = true;
+                            auto.muted(true);
+                            count.input.value = '';
+                            sync();
+                        },
+                        hold: function () {
+                            var checked = auto.input.checked;
+                            var muted = auto.muted();
+                            var text = count.input.value;
+                            return function () {
+                                auto.input.checked = checked;
+                                auto.muted(muted);
+                                count.input.value = text;
+                                sync();
+                            };
                         }
                     };
                 }
@@ -532,131 +740,264 @@
                         case 'CountOrAuto':
                             return countOrAutoControl(setting, value);
                         case 'PathList':
-                            return textControl('text', 'Set to (separate them with commas)', value, listItems);
+                            return textControl('text', setting, value, listItems);
                         case 'NumberList':
-                            return textControl('text', fieldLabel(setting, 'Set to') + ' (separate them with commas)', value, function (text) {
+                            return textControl('text', setting, value, function (text) {
                                 return listItems(text).map(number);
                             });
                         default:
-                            return textControl('text', 'Set to', value, String);
+                            return textControl('text', setting, value, String);
                     }
                 }
 
-                /** What the control of `setting` starts from: the file's value, not the one in use. */
+                /** Whether `config.toml` holds a value for `setting` now. */
+                function heldInFile(setting, state) {
+                    return !state.resets[setting.Key] && (setting.SavedValue !== undefined || setting.Source === 'ConfigFile');
+                }
+
+                /**
+                 * What the control of `setting` starts from: the value
+                 * `config.toml` holds, not the one in use, or `null` when it
+                 * holds none, so the field shows the default.
+                 */
                 function editedValue(setting, state) {
                     if (setting.SavedValue !== undefined) {
                         return setting.SavedValue;
                     }
-                    return state.resets[setting.Key] ? null : setting.Value;
+                    return heldInFile(setting, state) ? setting.Value : null;
+                }
+
+                /** The last of a list's items, which the unit reads after. */
+                function lastItem(text) {
+                    return String(text).split(',').pop().trim();
                 }
 
                 /**
-                 * The control, Reset to default and the notes of an editable
-                 * `setting`. The field joins `state.fields`, which Save reads.
+                 * The control of an editable `setting`, its unit and Reset to
+                 * default, which go on one line, and the note a reset shows.
+                 * The field joins `state.fields`, which Save reads.
                  */
                 function renderField(setting, state) {
                     var control = controlFor(setting, editedValue(setting, state));
                     var node = element('div', 'ferrofinField');
+                    // A described default ("8, capped at the cores") needs room
+                    // as the placeholder of a number box too.
+                    var described = Boolean(setting.Default) && !plainNumber(setting.Default);
+                    if (NARROW_KINDS[setting.Kind] !== true || (described && setting.Kind === 'Integer')) {
+                        node.classList.add('ferrofinFieldWide');
+                    }
                     node.appendChild(control.node);
 
-                    // Only a key in `config.toml` has anything to remove.
+                    // The unit reads after the number shown: the field's, else the default.
+                    var unit = null;
+                    if (setting.Unit && control.input) {
+                        unit = element('span', 'ferrofinUnit');
+                        node.appendChild(unit);
+                    }
+                    if (setting.Kind === 'PathList' || setting.Kind === 'NumberList') {
+                        node.appendChild(element('span', 'ferrofinHint', 'separated by commas'));
+                    }
                     var reset = button('Reset to default', 'ferrofinReset');
-                    reset.disabled = setting.Source !== 'ConfigFile';
                     node.appendChild(reset);
                     var resetNote = note('settings_backup_restore',
                         'Saving removes it from `config.toml`, so the default applies after the restart.',
                         'ferrofinResetNote hide');
-                    node.appendChild(resetNote);
 
+                    var held = heldInFile(setting, state);
+                    var undo = null;
                     var field = {
                         key: setting.Key,
                         group: setting.Group,
-                        node: node,
+                        row: null,
                         read: control.read,
                         saved: JSON.stringify(control.read()),
-                        resetting: false
+                        resetting: false,
+                        edited: function () {
+                            return JSON.stringify(control.read()) !== field.saved;
+                        }
                     };
+                    function sync() {
+                        if (unit) {
+                            var shown = control.input.value !== '' ? control.input.value : setting.Default || '';
+                            unit.textContent = unitText(lastItem(shown), setting.Unit);
+                        }
+                        // Reset is for a value `config.toml` holds or an unsaved
+                        // edit; with neither, the field already shows the default.
+                        reset.disabled = !field.resetting && !held && !field.edited();
+                    }
                     reset.addEventListener('click', function () {
-                        field.resetting = !field.resetting;
+                        if (field.resetting) {
+                            field.resetting = false;
+                            undo();
+                        } else if (held) {
+                            field.resetting = true;
+                            undo = control.hold();
+                            control.clear();
+                        } else {
+                            // Only an unsaved edit to drop: the default shows again.
+                            control.clear();
+                        }
                         control.disable(field.resetting);
                         reset.querySelector('span').textContent = field.resetting ? 'Undo reset' : 'Reset to default';
                         resetNote.classList.toggle('hide', !field.resetting);
                         node.dispatchEvent(new Event('change', { bubbles: true }));
                     });
+                    node.addEventListener('input', sync);
+                    node.addEventListener('change', sync);
+                    sync();
                     state.fields.push(field);
+                    return { node: node, note: resetNote, field: field };
+                }
+
+                /**
+                 * The small line under the name: the `config.toml` key, the
+                 * variable (one with no key is its own key), the flag and the
+                 * default.
+                 */
+                function idsLine(setting) {
+                    var parts = [element('code', null, setting.Key)];
+                    if (setting.EnvVar && setting.EnvVar !== setting.Key) {
+                        parts.push(element('code', null, setting.EnvVar));
+                    }
+                    if (setting.Flag) {
+                        parts.push(element('code', null, setting.Flag));
+                    }
+                    if (setting.Default) {
+                        parts.push(element('span', null, 'default: ' + defaultText(setting)));
+                    }
+                    var ids = element('div', 'ferrofinSettingIds');
+                    parts.forEach(function (part, index) {
+                        if (index > 0) {
+                            ids.appendChild(document.createTextNode(' · '));
+                        }
+                        ids.appendChild(part);
+                    });
+                    return ids;
+                }
+
+                /** Whether `value` holds nothing: none, an empty text or an empty list. */
+                function empty(value) {
+                    return value === undefined || value === null || value === '' ||
+                        (Array.isArray(value) && value.length === 0);
+                }
+
+                /**
+                 * A locked setting's value, as text with a lock: a variable, a
+                 * flag or the server sets it. An empty one nothing sets shows
+                 * the default instead.
+                 */
+                function lockedValue(setting, secret) {
+                    var node = element('div', 'ferrofinLocked');
+                    node.appendChild(icon('lock'));
+                    node.appendChild(element('span', 'ferrofinVisuallyHidden', 'Read-only: '));
+                    if (setting.Value === undefined || setting.Value === null ||
+                        (setting.Source === 'Default' && empty(setting.Value))) {
+                        node.appendChild(element('span', 'ferrofinUnset', setting.Default ? defaultText(setting) : 'Not set'));
+                    } else {
+                        node.appendChild(valueNode(setting.Value, secret, setting.Unit));
+                    }
                     return node;
                 }
 
+                /**
+                 * What `config.toml` holds that is not in use yet, and the
+                 * value in use beside it: a saved value, or a key a save
+                 * removed. `null` when there is neither.
+                 */
+                function savedLine(setting, state, secret) {
+                    var removed = setting.SavedValue === undefined && state.resets[setting.Key];
+                    if (setting.SavedValue === undefined && !removed) {
+                        return null;
+                    }
+                    var body = element('span');
+                    if (removed) {
+                        // The report cannot show a removed key: it has no value.
+                        body.appendChild(document.createTextNode('Saved: removed, so the default ' + savedNote(setting)));
+                    } else {
+                        body.appendChild(document.createTextNode('Saved: '));
+                        body.appendChild(valueNode(setting.SavedValue, secret, setting.Unit));
+                        body.appendChild(document.createTextNode(' (' + savedNote(setting) + ')'));
+                    }
+                    if (setting.Value !== undefined && setting.Value !== null) {
+                        body.appendChild(document.createTextNode('; in use now: '));
+                        body.appendChild(valueNode(setting.Value, secret, setting.Unit));
+                    } else if (!removed) {
+                        // The report has no value while the default applies.
+                        body.appendChild(document.createTextNode('; in use now: the default' +
+                            (setting.Default ? ' (' + defaultText(setting) + ')' : '')));
+                    }
+                    var node = element('p', 'ferrofinNote fieldDescription ferrofinSaved');
+                    node.appendChild(icon('save'));
+                    node.appendChild(body);
+                    return node;
+                }
+
+                /**
+                 * One setting's row: its name, the small line and the
+                 * description, with its field (or its locked value) beside
+                 * them, and its notes below. The row joins `state.rows`, which
+                 * the search and the filters read.
+                 */
                 function renderSetting(setting, state) {
                     var secret = setting.Kind === 'Secret';
                     var row = element('div', 'ferrofinSetting');
                     row.setAttribute('data-key', setting.Key);
 
+                    var text = element('div', 'ferrofinSettingText');
                     var header = element('div', 'ferrofinSettingHeader');
                     header.appendChild(element('h4', 'ferrofinSettingName', setting.Label || setting.Key));
-                    header.appendChild(badge(titled(SOURCE_NAMES, setting.Source), 'ferrofinBadgeSource'));
+                    if (setting.Source !== 'Default') {
+                        header.appendChild(badge(titled(SOURCE_NAMES, setting.Source), 'ferrofinBadgeSource'));
+                    }
                     if (secret) {
                         header.appendChild(badge('Secret', 'ferrofinBadgeSecret', 'key'));
                     }
-                    if (!setting.Editable) {
-                        header.appendChild(badge('Read-only', 'ferrofinBadgeLocked', 'lock'));
-                    }
-                    row.appendChild(header);
-
-                    // The `config.toml` key and the variable, small, under the
-                    // name; a variable with no key is its own key.
-                    var ids = element('div', 'ferrofinSettingIds');
-                    ids.appendChild(element('code', null, setting.Key));
-                    if (setting.EnvVar && setting.EnvVar !== setting.Key) {
-                        ids.appendChild(document.createTextNode(' · '));
-                        ids.appendChild(element('code', null, setting.EnvVar));
-                    }
-                    row.appendChild(ids);
-
+                    text.appendChild(header);
+                    text.appendChild(idsLine(setting));
                     if (setting.Description) {
-                        row.appendChild(withCode(element('div', 'fieldDescription'), setting.Description));
+                        text.appendChild(withCode(element('div', 'fieldDescription'), setting.Description));
                     }
+                    var line = element('div', 'ferrofinSettingLine');
+                    line.appendChild(text);
+                    row.appendChild(line);
 
-                    var facts = element('dl', 'ferrofinFacts');
-                    if (setting.Value === undefined || setting.Value === null) {
-                        fact(facts, 'Value', element('span', 'ferrofinUnset',
-                            setting.Default ? 'Not set: the default applies' : 'Not set'));
-                    } else {
-                        fact(facts, 'Value', valueNode(setting.Value, secret, setting.Unit));
-                    }
-                    if (setting.SavedValue !== undefined && setting.SavedValue !== null) {
-                        var saved = element('span');
-                        saved.appendChild(valueNode(setting.SavedValue, secret, setting.Unit));
-                        saved.appendChild(element('span', null, ' (' + savedNote(setting) + ')'));
-                        fact(facts, 'Saved in config.toml', saved);
-                    } else if (state.resets[setting.Key]) {
-                        // The report cannot show a removed key: it has no value.
-                        fact(facts, 'Saved in config.toml', 'Not set: the default ' + savedNote(setting));
-                    }
-                    if (setting.Default) {
-                        // A default that is a bare number reads in the unit; a
-                        // described one ("8, capped at the cores") as it is.
-                        var plainNumber = /^\d+(\.\d+)?$/.test(setting.Default);
-                        fact(facts, 'Default', plainNumber && setting.Unit
-                            ? setting.Default + ' ' + unitText(setting.Default, setting.Unit)
-                            : setting.Default);
-                    }
-                    if (setting.Flag) {
-                        fact(facts, 'Flag', element('code', null, setting.Flag));
-                    }
-                    row.appendChild(facts);
-
+                    var rendered = null;
                     if (setting.Editable) {
-                        row.appendChild(renderField(setting, state));
+                        rendered = renderField(setting, state);
+                        rendered.field.row = row;
+                        line.appendChild(rendered.node);
+                    } else {
+                        line.appendChild(lockedValue(setting, secret));
+                        if (setting.LockedReason) {
+                            row.appendChild(withCode(element('p', 'fieldDescription ferrofinLockedReason'), setting.LockedReason));
+                        }
                     }
-                    if (!setting.Editable && setting.LockedReason) {
-                        row.appendChild(note('lock', setting.LockedReason, 'ferrofinLockedReason'));
+                    var saved = savedLine(setting, state, secret);
+                    if (saved) {
+                        row.appendChild(saved);
+                    }
+                    if (rendered) {
+                        row.appendChild(rendered.note);
                     }
                     if (setting.Applies === 'ProcessRestart') {
                         row.appendChild(note('restart_alt',
                             'Needs a full process restart: the dashboard\'s restart keeps the value the process started with.',
                             'ferrofinProcessRestart'));
                     }
+                    state.rows.push({
+                        setting: setting,
+                        group: setting.Group,
+                        node: row,
+                        field: rendered && rendered.field,
+                        // What the search reads, in lower case.
+                        text: [
+                            setting.Label || '',
+                            setting.Description || '',
+                            setting.Key || '',
+                            setting.EnvVar || '',
+                            setting.Flag || ''
+                        ].join('\n').toLowerCase()
+                    });
                     return row;
                 }
 
@@ -666,11 +1007,38 @@
                     state.fields.forEach(function (field) {
                         if (field.resetting) {
                             changed[field.key] = null;
-                        } else if (JSON.stringify(field.read()) !== field.saved) {
+                        } else if (field.edited()) {
                             changed[field.key] = field.read();
                         }
                     });
                     return changed;
+                }
+
+                /** Each tab's count of unsaved edits, and the mark of a refusal on it. */
+                function updateTabs(page, state) {
+                    var counts = Object.create(null);
+                    state.fields.forEach(function (field) {
+                        if (field.resetting || field.edited()) {
+                            counts[field.group] = (counts[field.group] || 0) + 1;
+                        }
+                    });
+                    page.querySelectorAll('.ferrofinTab').forEach(function (tab) {
+                        var group = tab.getAttribute('data-group');
+                        var count = counts[group] || 0;
+                        var refused = tab.classList.contains('ferrofinTabRefused');
+                        var shown = tab.querySelector('.ferrofinTabCount');
+                        shown.textContent = String(count);
+                        shown.classList.toggle('hide', count === 0);
+                        tab.querySelector('.ferrofinTabMark').classList.toggle('hide', !refused);
+                        var label = group;
+                        if (count > 0) {
+                            label += ', ' + count + (count === 1 ? ' unsaved edit' : ' unsaved edits');
+                        }
+                        if (refused) {
+                            label += ', a change refused';
+                        }
+                        tab.setAttribute('aria-label', label);
+                    });
                 }
 
                 /** A save and a restart never overlap: either one holds both buttons. */
@@ -697,17 +1065,110 @@
                     }
                 }
 
-                /** Shows the tab of `group` and hides the others. */
+                /** What the search box and the filters ask for. */
+                function finder(page) {
+                    return {
+                        terms: page.querySelector('.ferrofinSearch').value.toLowerCase().split(/\s+/).filter(Boolean),
+                        changed: page.querySelector('.ferrofinFilterChanged').checked,
+                        restart: page.querySelector('.ferrofinFilterRestart').checked,
+                        hideLocked: page.querySelector('.ferrofinFilterLocked').checked
+                    };
+                }
+
+                /** Whether `find` lists the matches of every tab, rather than the open tab. */
+                function finding(find) {
+                    return find.terms.length > 0 || find.changed || find.restart;
+                }
+
+                /**
+                 * Changed: something sets a value (a variable, a flag or
+                 * `config.toml`, whether or not it is in use yet), or the row
+                 * holds an unsaved edit.
+                 */
+                function isChanged(row) {
+                    var setting = row.setting;
+                    return setting.Source !== 'Default' || setting.SavedValue !== undefined ||
+                        Boolean(row.field && (row.field.resetting || row.field.edited()));
+                }
+
+                /**
+                 * Needs restart: `config.toml` holds a value not in use yet, or
+                 * a save removed one still in use. A variable or a flag
+                 * outranks the file across a restart too.
+                 */
+                function awaitsRestart(state, setting) {
+                    if (setting.Source === 'Environment' || setting.Source === 'Flag') {
+                        return false;
+                    }
+                    return setting.SavedValue !== undefined || Boolean(state.resets[setting.Key]);
+                }
+
+                /** Whether `row` shows under `find`. A refused change always does, to be corrected. */
+                function matches(state, row, find) {
+                    if (row.node.querySelector('.ferrofinFieldError')) {
+                        return true;
+                    }
+                    if (find.hideLocked && !row.setting.Editable) {
+                        return false;
+                    }
+                    if (find.changed && !isChanged(row)) {
+                        return false;
+                    }
+                    if (find.restart && !awaitsRestart(state, row.setting)) {
+                        return false;
+                    }
+                    return find.terms.every(function (term) {
+                        return row.text.indexOf(term) !== -1;
+                    });
+                }
+
+                /**
+                 * Shows what the tabs, the search and the filters ask for. A
+                 * search, Changed or Needs restart lists the matches of every
+                 * tab under its tab's name; otherwise the open tab shows. Hide
+                 * read-only narrows either.
+                 */
+                function applyView(page, state) {
+                    var find = finder(page);
+                    var across = finding(find);
+                    var shown = Object.create(null);
+                    state.rows.forEach(function (row) {
+                        var visible = matches(state, row, find);
+                        row.node.classList.toggle('hide', !visible);
+                        if (visible) {
+                            shown[row.group] = true;
+                        }
+                    });
+                    var any = false;
+                    page.querySelectorAll('.ferrofinGroup').forEach(function (section) {
+                        var group = section.getAttribute('data-group');
+                        var open = across ? shown[group] === true : group === state.tab;
+                        section.classList.toggle('hide', !open);
+                        section.querySelector('.ferrofinGroupTitle').classList.toggle('hide', !across);
+                        any = any || (open && shown[group] === true);
+                    });
+                    page.querySelectorAll('.ferrofinTab').forEach(function (tab) {
+                        var current = tab.getAttribute('data-group') === state.tab;
+                        tab.setAttribute('aria-selected', !across && current ? 'true' : 'false');
+                        tab.tabIndex = current ? 0 : -1;
+                    });
+                    var noMatch = page.querySelector('.ferrofinNoMatch');
+                    if (state.rows.length === 0) {
+                        noMatch.textContent = 'The server reports no settings.';
+                    } else {
+                        // Only Hide read-only can empty the open tab.
+                        noMatch.textContent = across ? 'No setting matches.' : 'Every setting on this tab is read-only.';
+                    }
+                    noMatch.classList.toggle('hide', any);
+                }
+
+                /** Opens the tab of `group`, ending a search or a filter that lists every tab. */
                 function selectTab(page, state, group) {
                     state.tab = group;
-                    page.querySelectorAll('.ferrofinTab').forEach(function (tab) {
-                        var selected = tab.getAttribute('data-group') === group;
-                        tab.setAttribute('aria-selected', selected ? 'true' : 'false');
-                        tab.tabIndex = selected ? 0 : -1;
-                    });
-                    page.querySelectorAll('.ferrofinGroup').forEach(function (section) {
-                        section.classList.toggle('hide', section.getAttribute('data-group') !== group);
-                    });
+                    page.querySelector('.ferrofinSearch').value = '';
+                    page.querySelector('.ferrofinFilterChanged').checked = false;
+                    page.querySelector('.ferrofinFilterRestart').checked = false;
+                    applyView(page, state);
                 }
 
                 /** Arrow keys, Home and End move between the tabs, as in a tab list. */
@@ -734,11 +1195,26 @@
                     clear(page.querySelector('.ferrofinGroups'));
                 }
 
+                /** A tab: its group's name, its count of unsaved edits, and a mark for a refusal. */
+                function tabFor(group) {
+                    var tab = element('button', 'ferrofinTab');
+                    tab.setAttribute('type', 'button');
+                    tab.setAttribute('role', 'tab');
+                    tab.setAttribute('data-group', group);
+                    tab.appendChild(element('span', null, group));
+                    tab.appendChild(element('span', 'ferrofinTabCount hide'));
+                    var mark = icon('error');
+                    mark.classList.add('ferrofinTabMark', 'hide');
+                    tab.appendChild(mark);
+                    return tab;
+                }
+
                 function render(page, state, response) {
                     var tabs = page.querySelector('.ferrofinTabs');
                     var groups = page.querySelector('.ferrofinGroups');
                     clearTabs(page);
                     state.fields = [];
+                    state.rows = [];
                     page.querySelector('.ferrofinError').classList.add('hide');
                     renderRestartNotice(page, state, response.RestartPending);
                     page.querySelector('.ferrofinConfigFilePath').textContent = response.ConfigFile || '';
@@ -752,23 +1228,26 @@
                     (response.Settings || []).forEach(function (setting) {
                         var section = sections[setting.Group];
                         if (!section) {
-                            var tab = element('button', 'ferrofinTab', setting.Group);
-                            tab.setAttribute('type', 'button');
-                            tab.setAttribute('role', 'tab');
-                            tab.setAttribute('data-group', setting.Group);
-                            tabs.appendChild(tab);
+                            tabs.appendChild(tabFor(setting.Group));
                             section = element('div', 'verticalSection ferrofinGroup');
                             section.setAttribute('role', 'tabpanel');
                             section.setAttribute('aria-label', setting.Group);
                             section.setAttribute('data-group', setting.Group);
+                            // Shown while a search lists every tab's matches.
+                            section.appendChild(element('h3', 'ferrofinGroupTitle hide', setting.Group));
                             sections[setting.Group] = section;
                             order.push(setting.Group);
                             groups.appendChild(section);
                         }
                         section.appendChild(renderSetting(setting, state));
                     });
-                    // The tab open before a reload stays open; the first opens by default.
-                    selectTab(page, state, order.indexOf(state.tab) !== -1 ? state.tab : order[0]);
+                    // The tab open before a reload stays open, and so do the
+                    // search and the filters; the first tab opens by default.
+                    if (order.indexOf(state.tab) === -1) {
+                        state.tab = order[0];
+                    }
+                    applyView(page, state);
+                    updateTabs(page, state);
                     updateButtons(page, state);
                 }
 
@@ -785,6 +1264,7 @@
                 function showError(page, state, text) {
                     clearTabs(page);
                     state.fields = [];
+                    state.rows = [];
                     page.querySelector('.ferrofinForm').classList.add('hide');
                     page.querySelector('.ferrofinConfigFile').classList.add('hide');
                     page.querySelector('.ferrofinRestartPending').classList.add('hide');
@@ -861,10 +1341,20 @@
                     }
                     var refusal = note('error', text, 'ferrofinFieldError');
                     refusal.setAttribute('role', 'alert');
-                    field.node.appendChild(refusal);
-                    // The setting may be on another tab than the one open.
-                    selectTab(page, state, field.group);
-                    field.node.scrollIntoView({ block: 'center' });
+                    field.row.appendChild(refusal);
+                    // The setting may be on another tab than the one open: its
+                    // tab is marked, and opens unless a search lists every tab.
+                    page.querySelectorAll('.ferrofinTab').forEach(function (tab) {
+                        if (tab.getAttribute('data-group') === field.group) {
+                            tab.classList.add('ferrofinTabRefused');
+                        }
+                    });
+                    if (!finding(finder(page))) {
+                        state.tab = field.group;
+                    }
+                    applyView(page, state);
+                    updateTabs(page, state);
+                    field.row.scrollIntoView({ block: 'center' });
                 }
 
                 /** Keeps what a save did that the report cannot show until the restart. */
@@ -895,6 +1385,12 @@
                     page.querySelectorAll('.ferrofinFieldError').forEach(function (refusal) {
                         refusal.parentNode.removeChild(refusal);
                     });
+                    page.querySelectorAll('.ferrofinTabRefused').forEach(function (tab) {
+                        tab.classList.remove('ferrofinTabRefused');
+                    });
+                    // A row shown only for its refusal follows the filters again.
+                    applyView(page, state);
+                    updateTabs(page, state);
                     state.saving = true;
                     updateButtons(page, state);
                     Dashboard.showLoadingMsg();
@@ -990,9 +1486,12 @@
 
                 function bind(page) {
                     // `resets` and `processRestart` hold what this page saved
-                    // since the last restart; `tab` is the group whose tab is open.
+                    // since the last restart; `tab` is the group whose tab is
+                    // open; `rows` are the settings shown, `fields` the
+                    // editable ones.
                     var state = {
                         fields: [],
+                        rows: [],
                         resets: Object.create(null),
                         processRestart: Object.create(null),
                         saving: false,
@@ -1015,8 +1514,24 @@
                     tabs.addEventListener('keydown', function (event) {
                         moveTab(page, state, event);
                     });
+                    // The search and the filters apply as they change; an edit
+                    // never hides the row it is made in.
+                    var find = page.querySelector('.ferrofinFinder');
+                    find.addEventListener('input', function () {
+                        applyView(page, state);
+                    });
+                    find.addEventListener('change', function () {
+                        applyView(page, state);
+                    });
+                    page.querySelector('.ferrofinSearch').addEventListener('keydown', function (event) {
+                        // Enter searches; it does not save.
+                        if (event.key === 'Enter') {
+                            event.preventDefault();
+                        }
+                    });
                     var form = page.querySelector('.ferrofinForm');
                     function changed() {
+                        updateTabs(page, state);
                         updateButtons(page, state);
                     }
                     form.addEventListener('input', changed);

@@ -62,7 +62,7 @@ use crate::auth::{
     is_administrator_identity,
 };
 use crate::error::ApiError;
-use crate::extract::{JsonBody, ProblemDetails, Query};
+use crate::extract::{JsonBody, ProblemDetails, Query, RequiredString};
 use crate::handlers::items::user_uuid;
 use crate::panic_boundary::ERROR_BODY;
 use crate::state::AppState;
@@ -123,18 +123,19 @@ struct UpdateUserPassword {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ForgotPasswordDto {
-    /// The username whose password should be reset.
+    /// The username whose password should be reset (upstream's
+    /// `[Required] public required string`).
     #[serde(default)]
-    entered_username: String,
+    entered_username: RequiredString,
 }
 
 /// The `POST /Users/ForgotPassword/Pin` request body.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ForgotPasswordPinDto {
-    /// The entered pin.
+    /// The entered pin (upstream's `[Required] public required string`).
     #[serde(default)]
-    pin: String,
+    pin: RequiredString,
 }
 
 /// Query parameters carrying an optional `userId` (the update, password and
@@ -672,30 +673,6 @@ async fn delete_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Pushes a `UserUpdated` message carrying the refreshed [`UserDto`] to the
-/// user's sessions (port of `UserUpdatedNotifier`, the consumer of the
-/// `UserUpdatedEventArgs` that only `UserManager.RenameUser` and
-/// `UpdatePolicyAsync` publish: a rename and a policy save). Best-effort: a
-/// delivery failure must not fail the mutating request.
-async fn notify_user_updated(state: &AppState, user_id: Uuid) {
-    let Ok(user) = load_user(state, user_id).await else {
-        return;
-    };
-    let Ok(dto) = state.users.get_user_dto(&user, None).await else {
-        return;
-    };
-    if let Ok(data) = serde_json::to_string(&dto) {
-        let _ = state
-            .sessions
-            .send_message_to_user_sessions(
-                &[user_id],
-                ferrofin_model::session::SessionMessageType::UserUpdated,
-                &data,
-            )
-            .await;
-    }
-}
-
 /// `POST /Users/New` — create a user.
 ///
 /// Port of `UserController.CreateUserByName`: creates the user, sets the initial
@@ -771,17 +748,14 @@ async fn update_user(
     // C# renames whenever `updateUser.Name` differs from the stored name, so a
     // missing or null name reaches `RenameUser` too, and its
     // `ThrowIfInvalidUsername` refuses it (400) as it refuses a blank one.
+    // The user manager announces the rename (`UserUpdated`, then the device
+    // check) before it returns, so ahead of the configuration save.
     let new_name = body.name.as_deref().unwrap_or_default();
     if new_name != user.username {
         state
             .users
             .rename_user(user_id, &user.username, new_name)
             .await?;
-        // `RenameUser` publishes `UserUpdated` before it raises
-        // `OnUserUpdated` for the device check, ahead of the configuration
-        // save.
-        notify_user_updated(&state, user_id).await;
-        refresh_device_access(&state, user_id).await;
     }
     // A body without `Configuration` binds `UserDto`'s constructor default, so
     // the save resets the user's settings as upstream's does; `null` (a 500
@@ -792,66 +766,16 @@ async fn update_user(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Port of `DeviceAccessHost.OnUserUpdated`, registered since Jellyfin 12.1:
-/// `UserManager.RenameUser` and `UpdatePolicyAsync` raise `OnUserUpdated`, and
-/// the host then logs out every device of the user that the saved policy no
-/// longer allows ([`update_device_access`]). A configuration save raises no
-/// such event.
-///
-/// The change it follows is already saved, so a failure is logged and not
-/// answered, as upstream's handler catches and logs it.
-async fn refresh_device_access(state: &AppState, user_id: Uuid) {
-    let refreshed = async {
-        let user = load_user(state, user_id).await?;
-        update_device_access(state, &user).await
-    }
-    .await;
-    if let Err(error) = refreshed {
-        tracing::error!(user_id = %user_id, %error, "error updating device access for user");
-    }
-}
-
-/// `DeviceAccessHost.UpdateDeviceAccess`: unless the user may use every device
-/// (`EnableAllDevices`), logs out (`Logout(Device)`) each of their devices
-/// `CanAccessDevice` refuses.
-async fn update_device_access(state: &AppState, user: &UserEntity) -> Result<(), ApiError> {
-    if user_policy(state, user)
-        .await?
-        .is_some_and(|p| p.enable_all_devices)
-    {
-        return Ok(());
-    }
-    let devices = state
-        .devices
-        .get_devices(&ferrofin_traits::devices::DeviceQuery {
-            user_id: Some(user_uuid(user)?),
-            ..Default::default()
-        })
-        .await?
-        .items;
-    // Empty IDs are explicitly skipped by upstream's event handler.
-    for device in &devices {
-        if !device.device_id.is_empty()
-            && !state
-                .devices
-                .can_access_device(user, &device.device_id)
-                .await?
-        {
-            state.sessions.logout_device(device).await?;
-        }
-    }
-    Ok(())
-}
-
 /// `POST /Users/{userId}/Policy` — update a user's policy.
 ///
 /// Port of `UserController.UpdateUserPolicy`, including the guards: the last
 /// administrator may not be demoted, an administrator may not be disabled, and
 /// the last enabled user may not be disabled. The guards are read inside the
 /// save's transaction ([`UserManager::update_policy_guarded`]), so concurrent
-/// saves cannot both pass one. On a successful disable, the user's tokens are
-/// revoked, and after every save the devices the saved policy no longer allows
-/// are logged out (Jellyfin 12.1's `DeviceAccessHost`).
+/// saves cannot both pass one. The save itself announces `UserUpdated`, which
+/// pushes the user's DTO to their sessions and logs out the devices the saved
+/// policy no longer allows (Jellyfin 12.1's `DeviceAccessHost`). On a
+/// successful disable, the user's tokens are revoked after that.
 ///
 /// [`UserManager::update_policy_guarded`]: ferrofin_traits::library::UserManager::update_policy_guarded
 #[utoipa::path(
@@ -881,7 +805,9 @@ async fn update_user_policy(
     // The guards run inside the save's transaction (`update_policy_guarded`),
     // so the tokens of a user it disabled go once it committed. Upstream
     // revokes first, which is the same once its guards have passed; here a
-    // refused or failed save logs nobody out.
+    // refused or failed save logs nobody out. The save's `UserUpdated` push
+    // and device check have run by then, so a newly disabled user's open
+    // sessions hear `UserUpdated` just before they are signed out.
     let saved = state
         .users
         .update_policy_guarded(user_id, &new_policy)
@@ -889,10 +815,6 @@ async fn update_user_policy(
     if saved.newly_disabled {
         state.sessions.revoke_user_tokens(user_id, "").await?;
     }
-    // `UpdatePolicyAsync` publishes `UserUpdated` before it raises
-    // `OnUserUpdated` for the device check.
-    notify_user_updated(&state, user_id).await;
-    refresh_device_access(&state, user_id).await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -1046,24 +968,50 @@ async fn log_password_changed(state: &AppState, user_id: Uuid, username: &str) {
 /// to the account's saved password-reset provider
 /// (`UserManager.StartForgotPasswordProcess`), the built-in PIN file for most.
 /// Every caller gets the same answer, whether the name exists or not.
+///
+/// A missing or blank `EnteredUsername` is a `400` before anything else runs.
+/// The request is local when its connection was accepted on the client's own
+/// address (`HttpContext.IsLocal()`) or the client is on the local network.
+/// A request from elsewhere is logged at warn with the client's address.
 #[utoipa::path(
     post,
     path = "/Users/ForgotPassword",
-    responses((status = 200, description = "Forgot-password process started", body = ForgotPasswordResult)),
+    responses(
+        (status = 200, description = "Forgot-password process started", body = ForgotPasswordResult),
+        (status = 400, description = "A missing or blank EnteredUsername")
+    ),
     tag = "ferrofin"
 )]
 async fn forgot_password(
     State(state): State<AppState>,
     parts: Parts,
     JsonBody(body): JsonBody<ForgotPasswordDto>,
-) -> Result<Json<ForgotPasswordResult>, ApiError> {
-    let local = state.is_in_local_network(state.client_address(&parts));
+) -> Result<Response, ApiError> {
+    let entered_username = match body.entered_username.require(
+        "Jellyfin.Api.Models.UserDtos.ForgotPasswordDto",
+        "EnteredUsername",
+    ) {
+        Ok(name) => name,
+        Err(problem) => return Ok(problem.into_response()),
+    };
+    let ip = state.client_address(&parts);
+    let local = crate::ip_access::is_local_connection(&parts.extensions, ip)
+        || state.is_in_local_network(ip);
+    if !local {
+        // One line per remote request with no volume guard, as upstream's, and
+        // as the IP gate logs each request it refuses.
+        tracing::warn!(
+            remote_ip = %ip,
+            "password reset process initiated from outside the local network"
+        );
+    }
     Ok(Json(
         state
             .users
-            .start_forgot_password_process(&body.entered_username, local)
+            .start_forgot_password_process(&entered_username, local)
             .await?,
-    ))
+    )
+    .into_response())
 }
 
 /// `POST /Users/ForgotPassword/Pin` — redeem a recovery PIN.
@@ -1072,20 +1020,30 @@ async fn forgot_password(
 /// offered the PIN in turn (`UserManager.RedeemPasswordResetPin`). With the
 /// built-in provider the PIN is case-sensitive with its dashes ignored, the
 /// password becomes the PIN as entered, and the file is consumed only once the
-/// password is saved. No provider redeeming it is a `404`.
+/// password is saved. No provider redeeming it is a `404`, and a missing or
+/// blank `Pin` is a `400` before any provider is asked.
 #[utoipa::path(
     post,
     path = "/Users/ForgotPassword/Pin",
-    responses((status = 200, description = "Pin redemption result", body = PinRedeemResult)),
+    responses(
+        (status = 200, description = "Pin redemption result", body = PinRedeemResult),
+        (status = 400, description = "A missing or blank Pin"),
+        (status = 404, description = "No provider redeemed the PIN")
+    ),
     tag = "ferrofin"
 )]
 async fn forgot_password_pin(
     State(state): State<AppState>,
     JsonBody(body): JsonBody<ForgotPasswordPinDto>,
-) -> Result<Json<PinRedeemResult>, ApiError> {
-    Ok(Json(
-        state.users.redeem_password_reset_pin(&body.pin).await?,
-    ))
+) -> Result<Response, ApiError> {
+    let pin = match body
+        .pin
+        .require("Jellyfin.Api.Models.UserDtos.ForgotPasswordPinDto", "Pin")
+    {
+        Ok(pin) => pin,
+        Err(problem) => return Ok(problem.into_response()),
+    };
+    Ok(Json(state.users.redeem_password_reset_pin(&pin).await?).into_response())
 }
 
 /// `GET /Users/Me` — the authenticated caller's user record.
