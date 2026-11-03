@@ -454,27 +454,74 @@ async fn the_urls_of_a_referral_are_alternatives_tried_in_order() {
     assert_eq!(calls.unbinds, 3, "the refused connection is closed too");
 }
 
+/// A referral none of whose URLs leads to a server that takes the bind is
+/// skipped (owner decision, gl-1207): the entries the other servers hold
+/// stand, the referrals after it are still followed, and one warning names
+/// the server and why. Novell's search results drop such a referral when it
+/// comes after the last entry, as Active Directory sends its references.
 #[rstest]
 #[case::cannot_connect(
     Server::unreachable(LdapError::Connect("connection refused".to_owned())),
     "the referral to down.example:3890 failed: connection refused"
 )]
+#[case::fails_tls(
+    Server::unreachable(LdapError::StartTls(
+        "the certificate is not valid for down.example".to_owned()
+    )),
+    "the referral to down.example:3890 failed: the certificate is not valid for down.example"
+)]
 #[case::refuses_the_bind_dn(
     Server::refusing(LdapError::Result { code: 49, message: String::new() }),
     "the referral to down.example:3890 failed: Invalid Credentials"
 )]
-#[case::fails_the_search(
-    Server::failing(PARTNERS_DN, LdapError::Result {
-        code: 32,
-        message: "no such entry".to_owned(),
-    }),
-    "the referral to down.example:3890 failed: No Such Object: no such entry"
+#[case::does_not_answer_the_bind(
+    Server::refusing(LdapError::Timeout),
+    "the referral to down.example:3890 failed: the directory did not answer within 10 seconds"
 )]
 #[tokio::test]
-async fn a_referral_that_cannot_be_followed_fails_the_search_naming_the_server(
-    #[case] referred: Server,
-    #[case] message: &str,
+async fn a_referral_that_leads_to_no_server_is_skipped_with_a_warning(
+    #[case] down: Server,
+    #[case] reason: &str,
 ) {
+    let logs = CapturedLogs::default();
+    let _guard = logs.subscribe();
+    let network = Network::of([
+        (
+            "dc1.example",
+            Server::answering(
+                BASE_DN,
+                found(
+                    &[ADA_DN],
+                    &[
+                        &["ldap://down.example:3890/ou=partners,dc=example,dc=org"],
+                        &["ldap://dc2.example/ou=partners,dc=example,dc=org"],
+                    ],
+                ),
+            ),
+        ),
+        ("down.example", down),
+        (
+            "dc2.example",
+            Server::answering(PARTNERS_DN, found(&[GRACE_DN], &[])),
+        ),
+    ]);
+    assert_eq!(
+        search(&network, &config()).await,
+        Ok(vec![ADA_DN.to_owned(), GRACE_DN.to_owned()])
+    );
+    assert_eq!(
+        network.calls().servers(),
+        ["dc1.example", "down.example", "dc2.example"]
+    );
+    assert_eq!(logs.count("WARN", SKIPPED), 1, "one warning");
+    assert_eq!(logs.count("WARN", reason), 1, "naming the server and why");
+}
+
+/// A referred server that takes the bind but fails the search fails the
+/// whole search, naming that server: it was reached, so its part of the tree
+/// is not just out of reach.
+#[tokio::test]
+async fn a_referred_server_that_fails_the_search_fails_it_naming_the_server() {
     let network = Network::of([
         (
             "dc1.example",
@@ -486,7 +533,16 @@ async fn a_referral_that_cannot_be_followed_fails_the_search_naming_the_server(
                 ),
             ),
         ),
-        ("down.example", referred),
+        (
+            "down.example",
+            Server::failing(
+                PARTNERS_DN,
+                LdapError::Result {
+                    code: 32,
+                    message: "no such entry".to_owned(),
+                },
+            ),
+        ),
     ]);
     let error = search(&network, &config()).await.expect_err("fails");
     assert!(
@@ -494,36 +550,274 @@ async fn a_referral_that_cannot_be_followed_fails_the_search_naming_the_server(
             if server == "down.example:3890"),
         "{error:?}"
     );
-    assert_eq!(error.to_string(), message);
+    assert_eq!(
+        error.to_string(),
+        "the referral to down.example:3890 failed: No Such Object: no such entry"
+    );
 }
 
+/// A reference to `dc2.example`'s partners.
+const TO_DC2: &str = "ldap://dc2.example/ou=partners,dc=example,dc=org";
+
+/// A search that skipped a referral and then fails still warns once about
+/// the skipped one: a referred server fails the search, or the hop limit
+/// stops a loop.
+#[rstest]
+#[case::a_referred_server_fails_the_search(Server::failing(
+    PARTNERS_DN,
+    LdapError::Result { code: 32, message: String::new() }
+))]
+#[case::the_hop_limit_stops_a_loop(Server::failing(PARTNERS_DN, referred(&[TO_DC2])))]
 #[tokio::test]
-async fn a_referral_to_a_host_that_does_not_resolve_fails_the_search() {
+async fn a_search_that_fails_after_skipping_a_referral_warns_about_it(#[case] dc2: Server) {
+    let logs = CapturedLogs::default();
+    let _guard = logs.subscribe();
+    let network = Network::of([
+        (
+            "dc1.example",
+            Server::answering(
+                BASE_DN,
+                found(
+                    &[ADA_DN],
+                    &[
+                        &["ldap://gone.example/ou=gone,dc=example,dc=org"],
+                        &[TO_DC2],
+                    ],
+                ),
+            ),
+        ),
+        ("dc2.example", dc2),
+    ]);
+    let error = search(&network, &config()).await.expect_err("fails");
+    assert!(
+        matches!(
+            error,
+            BoundSearchError::Search(
+                LdapError::ReferralFailed { .. } | LdapError::ReferralHopLimit { .. }
+            )
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        logs.line("WARN", SKIPPED),
+        logs.line(
+            "WARN",
+            "the referral to gone.example:389 failed: gone.example does not resolve"
+        ),
+        "one warning, naming the skipped server"
+    );
+}
+
+/// A `referral` result is skipped alike: the server that sent it holds none
+/// of the search's base, so the search finds nothing, as Novell's search
+/// results end empty when they cannot follow one.
+#[tokio::test]
+async fn a_referral_result_to_a_host_that_does_not_resolve_finds_nothing() {
+    let logs = CapturedLogs::default();
+    let _guard = logs.subscribe();
     let network = Network::of([(
         "dc1.example",
         Server::failing(BASE_DN, referred(&["ldap://gone.example/"])),
     )]);
+    assert_eq!(search(&network, &config()).await, Ok(Vec::new()));
     assert_eq!(
-        search(&network, &config()).await,
-        Err(BoundSearchError::Search(LdapError::ReferralFailed {
-            server: "gone.example:389".to_owned(),
-            reason: Box::new(LdapError::Connect(
-                "gone.example does not resolve".to_owned()
-            )),
-        }))
+        logs.count(
+            "WARN",
+            "the referral to gone.example:389 failed: gone.example does not resolve"
+        ),
+        1
     );
 }
 
-/// How many lines the subscriber wrote at `level` that contain `text`.
+/// The references Active Directory sends after the entries of a subtree
+/// search at the domain root, to names a server outside the domain's DNS
+/// cannot resolve: the search keeps the domain's entries, and one warning
+/// per search names every server skipped, a referred server's own included.
+#[tokio::test]
+async fn one_warning_per_search_names_every_server_skipped() {
+    let logs = CapturedLogs::default();
+    let _guard = logs.subscribe();
+    let network = Network::of([
+        (
+            "dc1.example",
+            Server::answering(
+                BASE_DN,
+                found(
+                    &[ADA_DN],
+                    &[
+                        &["ldap://ForestDnsZones.example.org/DC=ForestDnsZones,DC=example,DC=org"],
+                        &["ldap://dc2.example/ou=partners,dc=example,dc=org"],
+                        &["ldap://DomainDnsZones.example.org/DC=DomainDnsZones,DC=example,DC=org"],
+                        &["ldap://example.org/CN=Configuration,DC=example,DC=org"],
+                    ],
+                ),
+            ),
+        ),
+        (
+            "dc2.example",
+            Server::answering(
+                PARTNERS_DN,
+                found(
+                    &[GRACE_DN],
+                    &[
+                        &["ldap://gone.example/ou=gone,ou=partners,dc=example,dc=org"],
+                        // The same server again: named once.
+                        &["ldap://example.org/CN=Configuration,DC=example,DC=org"],
+                    ],
+                ),
+            ),
+        ),
+    ]);
+    assert_eq!(
+        search(&network, &config()).await,
+        Ok(vec![ADA_DN.to_owned(), GRACE_DN.to_owned()])
+    );
+    assert_eq!(logs.count("WARN", SKIPPED), 1, "one warning per search");
+    let warning = logs.line("WARN", SKIPPED);
+    for server in [
+        "ForestDnsZones.example.org:389",
+        "gone.example:389",
+        "DomainDnsZones.example.org:389",
+        "example.org:389",
+    ] {
+        assert_eq!(
+            warning
+                .matches(&format!("the referral to {server} failed"))
+                .count(),
+            1,
+            "{server} named once: {warning}"
+        );
+    }
+
+    // Each of the filter test's two searches warns once; it counts the
+    // entries the servers that answered hold.
+    let config = LdapConfig {
+        ldap_admin_filter: "(uid=ada)".to_owned(),
+        ..config()
+    };
+    assert_eq!(
+        test_ldap_filters(&network, &config).await,
+        LdapTestAnswer::Ok(LdapFilterResponse {
+            users: 2,
+            admins: 2,
+            is_subset: true,
+        })
+    );
+    assert_eq!(logs.count("WARN", SKIPPED), 3);
+}
+
+/// Every URL of a referral fails: it is skipped, and the warning names each
+/// server tried.
+#[tokio::test]
+async fn a_referral_whose_every_url_fails_is_skipped_naming_each_server() {
+    let logs = CapturedLogs::default();
+    let _guard = logs.subscribe();
+    let network = Network::of([
+        (
+            "dc1.example",
+            Server::answering(
+                BASE_DN,
+                found(
+                    &[ADA_DN],
+                    &[&[
+                        "ldap://down.example/ou=partners,dc=example,dc=org",
+                        "ldap://refusing.example/ou=partners,dc=example,dc=org",
+                    ]],
+                ),
+            ),
+        ),
+        (
+            "down.example",
+            Server::unreachable(LdapError::Connect("refused".to_owned())),
+        ),
+        (
+            "refusing.example",
+            Server::refusing(LdapError::Result {
+                code: 49,
+                message: String::new(),
+            }),
+        ),
+    ]);
+    assert_eq!(
+        search(&network, &config()).await,
+        Ok(vec![ADA_DN.to_owned()])
+    );
+    let warning = logs.line("WARN", SKIPPED);
+    assert!(
+        warning.contains("the referral to down.example:389 failed: refused"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("the referral to refusing.example:389 failed: Invalid Credentials"),
+        "{warning}"
+    );
+}
+
+/// The user search finds a user the configured server holds while the
+/// references beside it lead nowhere.
+#[tokio::test]
+async fn the_user_search_finds_a_user_beside_a_skipped_reference() {
+    let network = Network::of([(
+        "dc1.example",
+        Server::answering(
+            BASE_DN,
+            found(
+                &[ADA_DN],
+                &[&["ldap://ForestDnsZones.example.org/DC=ForestDnsZones,DC=example,DC=org"]],
+            ),
+        ),
+    )]);
+    assert_eq!(
+        ldap_user_search(&network, &config(), "ada").await,
+        LdapTestAnswer::Ok(UserSearchResponse {
+            located_dn: Some(ADA_DN.to_owned()),
+        })
+    );
+}
+
+/// What the warning for skipped referrals begins with.
+const SKIPPED: &str = "skipped LDAP referrals that lead to no server";
+
+/// What a subscriber at `debug` for this crate wrote, in plain text.
 #[derive(Clone, Default)]
 struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
 impl CapturedLogs {
-    fn count(&self, level: &str, text: &str) -> usize {
+    /// Makes this the thread's subscriber until the guard drops.
+    fn subscribe(&self) -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .with_env_filter("ferrofin_extensions=debug")
+                .finish(),
+        )
+    }
+
+    /// The lines written at `level` that contain `text`.
+    fn lines(&self, level: &str, text: &str) -> Vec<String> {
         String::from_utf8_lossy(&self.0.lock().expect("logs"))
             .lines()
             .filter(|line| line.split_whitespace().nth(1) == Some(level) && line.contains(text))
-            .count()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// How many lines were written at `level` that contain `text`.
+    fn count(&self, level: &str, text: &str) -> usize {
+        self.lines(level, text).len()
+    }
+
+    /// The one line written at `level` that contains `text`.
+    fn line(&self, level: &str, text: &str) -> String {
+        let lines = self.lines(level, text);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        lines.into_iter().next().unwrap_or_default()
+    }
+
+    /// Everything written.
+    fn all(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("logs")).into_owned()
     }
 }
 
@@ -549,13 +843,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
 #[tokio::test]
 async fn the_hop_limit_stops_a_referral_loop_with_a_clear_log_line() {
     let logs = CapturedLogs::default();
-    let _guard = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_ansi(false)
-            .with_env_filter("ferrofin_extensions=debug")
-            .finish(),
-    );
+    let _guard = logs.subscribe();
     let network = Network::of([
         (
             "dc1.example",
@@ -716,22 +1004,28 @@ async fn a_referral_keeps_skipping_certificate_checks_only_when_configured() {
     );
 }
 
+/// A URL that does not parse is an alternative that fails, as Novell's
+/// `GetReferralConnection` skips one; a referral with no other URL is
+/// skipped, and neither the warning nor any other line quotes the URL.
 #[tokio::test]
 async fn a_url_that_cannot_be_followed_is_skipped_and_never_quoted() {
     const SECRET_URL: &str = "http://reader:hunter2@dc2.example/";
+    let logs = CapturedLogs::default();
+    let _guard = logs.subscribe();
     let alone = Network::of([(
         "dc1.example",
-        Server::answering(BASE_DN, found(&[], &[&[SECRET_URL]])),
+        Server::answering(BASE_DN, found(&[ADA_DN], &[&[SECRET_URL]])),
     )]);
-    let error = search(&alone, &config()).await.expect_err("fails");
+    assert_eq!(search(&alone, &config()).await, Ok(vec![ADA_DN.to_owned()]));
     assert_eq!(
-        error,
-        BoundSearchError::Search(LdapError::ReferralUrl(
-            "it is not an ldap:// or ldaps:// URL".to_owned()
-        ))
+        logs.count(
+            "WARN",
+            "the directory referred the search to a URL that cannot be followed: it is not an \
+             ldap:// or ldaps:// URL"
+        ),
+        1
     );
-    assert!(!error.to_string().contains("hunter2"), "{error}");
-    assert!(!format!("{error:?}").contains("hunter2"), "{error:?}");
+    assert!(!logs.all().contains("hunter2"), "{}", logs.all());
 
     let with_another = Network::of([
         (
