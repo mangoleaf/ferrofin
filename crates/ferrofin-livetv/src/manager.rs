@@ -5150,6 +5150,79 @@ impl FerrofinLiveTvManager {
         Ok(())
     }
 
+    /// Whether a series timer's fan-out should cancel this airing rather than
+    /// record it.
+    ///
+    /// Port of `DefaultLiveTvService.ShouldCancelTimerForSeriesTimer` (v12.4
+    /// DefaultLiveTvService.cs:644-669): the schedule arms
+    /// ([`series_timer_schedule_cancels`]) first, then
+    /// `seriesTimer.SkipEpisodesInLibrary && IsProgramAlreadyInLibrary(timer)`,
+    /// so the library is asked only about an airing the schedule would record.
+    /// The `IsManual` arm stays the caller's.
+    async fn should_cancel_timer_for_series_timer(
+        &self,
+        series: &SeriesTimerInfoDto,
+        program: &GuideProgramRow,
+        timer: &TimerInfoDto,
+    ) -> Result<bool, ServiceError> {
+        if series_timer_schedule_cancels(series, program, timer) {
+            return Ok(true);
+        }
+        Ok(series.skip_episodes_in_library && self.is_program_already_in_library(program).await?)
+    }
+
+    /// Whether the library already holds the episode this airing shows.
+    ///
+    /// Port of `DefaultLiveTvService.IsProgramAlreadyInLibrary` (v12.4
+    /// DefaultLiveTvService.cs:964-1000). The timer's `Name`, `SeasonNumber`,
+    /// `EpisodeNumber` and `EpisodeTitle` are the programme's
+    /// (`CopyProgramInfoToTimerInfo`), so the guide row is read directly. The
+    /// series are found by exact name (`Name = program.Name`, a `CleanName`
+    /// match; a blank title drops the name filter and matches every series, as
+    /// upstream's whitespace check does), and an episode counts only when it is
+    /// not virtual and sits under one of them with the airing's season and
+    /// episode numbers. Upstream also enters on an episode title alone, but then
+    /// runs only the series lookup and answers false, so an airing without both
+    /// numbers is answered false here without querying.
+    ///
+    /// With no item store attached (unit tests), there is no library to hold
+    /// the episode, and the answer is false.
+    async fn is_program_already_in_library(
+        &self,
+        program: &GuideProgramRow,
+    ) -> Result<bool, ServiceError> {
+        let (Some(season), Some(episode)) = (program.season_number, program.episode_number) else {
+            return Ok(false);
+        };
+        let Some(store) = self.item_store.get() else {
+            return Ok(false);
+        };
+        let series_ids = store
+            .items
+            .get_item_ids(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Series],
+                name: Some(program.title.clone()),
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        if series_ids.is_empty() {
+            return Ok(false);
+        }
+        let episodes = store
+            .items
+            .get_item_ids(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Episode],
+                parent_index_number: Some(season),
+                index_number: Some(episode),
+                ancestor_ids: series_ids,
+                is_virtual_item: Some(false),
+                limit: Some(1),
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        Ok(!episodes.is_empty())
+    }
+
     /// Port of `DefaultLiveTvService.UpdateTimersForSeriesTimer` (v12.2
     /// DefaultLiveTvService.cs:709-804): expand the series timer over the guide,
     /// add a timer for every future airing it should record, refresh the ones
@@ -5175,7 +5248,10 @@ impl FerrofinLiveTvManager {
             };
             match existing {
                 None => {
-                    if should_cancel_timer_for_series_timer(&stored.dto, &program, &timer) {
+                    if self
+                        .should_cancel_timer_for_series_timer(&stored.dto, &program, &timer)
+                        .await?
+                    {
                         timer.status = RecordingStatus::Cancelled;
                     } else {
                         enabled.push((
@@ -5200,7 +5276,9 @@ impl FerrofinLiveTvManager {
                     let is_manual =
                         crate::dvr_repository::timer_is_manual(&self.db, &existing_id).await?;
                     if !is_manual
-                        && should_cancel_timer_for_series_timer(&stored.dto, &program, &timer)
+                        && self
+                            .should_cancel_timer_for_series_timer(&stored.dto, &program, &timer)
+                            .await?
                     {
                         existing.status = RecordingStatus::Cancelled;
                     } else if !is_manual {
@@ -6919,25 +6997,15 @@ fn sort_series_timers(
     }
 }
 
-/// Whether a series timer's fan-out should cancel this airing rather than record
-/// it.
+/// The schedule arms of a series timer's cancel decision: whether the airing is
+/// outside the timer's time of day, a repeat it skips, or on another channel.
 ///
-/// Port of `DefaultLiveTvService.ShouldCancelTimerForSeriesTimer` (v10.11.8
-/// DefaultLiveTvService.cs:644-669). The `IsManual` arm is the caller's — a
-/// hand-created timer is never cancelled, and only the caller knows whether the
-/// stored row carries that flag.
-///
-/// TODO(work item, not a deferral): upstream's last arm is
-/// `seriesTimer.SkipEpisodesInLibrary && IsProgramAlreadyInLibrary(timer)`
-/// (DefaultLiveTvService.cs:668, :961-1000), which asks the library whether the
-/// episode is already on disk. `FerrofinLiveTvManager` holds no item repository,
-/// so porting it means adding that seam (an `Arc<dyn ItemRepository>` `OnceLock`
-/// alongside `dto`, wired in `apps/ferrofin-server`) and then querying Series by
-/// name + season/episode. Until then this arm never fires. It can only differ on
-/// a guide that carries season+episode numbers or an episode title
-/// (`IsProgramAlreadyInLibrary` returns false without them), which the XMLTV
-/// parity fixture does not.
-fn should_cancel_timer_for_series_timer(
+/// The first arms of `DefaultLiveTvService.ShouldCancelTimerForSeriesTimer`
+/// (v12.4 DefaultLiveTvService.cs:644-666). The `IsManual` arm is the caller's —
+/// a hand-created timer is never cancelled, and only the caller knows whether
+/// the stored row carries that flag — and the last arm, which asks the library,
+/// is [`FerrofinLiveTvManager::should_cancel_timer_for_series_timer`]'s.
+fn series_timer_schedule_cancels(
     series: &SeriesTimerInfoDto,
     program: &GuideProgramRow,
     timer: &TimerInfoDto,
@@ -11279,6 +11347,165 @@ mod tests {
             [RecordingStatus::New; 3],
             "clearing it again brings the swept showings back"
         );
+    }
+
+    /// A series timer that skips episodes already in the library cancels the
+    /// airing of an episode the library holds, and only that one.
+    ///
+    /// Port of the last arm of `DefaultLiveTvService.ShouldCancelTimerForSeriesTimer`
+    /// and of `IsProgramAlreadyInLibrary` (v12.4
+    /// src/Jellyfin.LiveTv/DefaultLiveTvService.cs:668, :964-1000): a series
+    /// named like the programme, holding a non-virtual episode with the
+    /// airing's season and episode numbers. A virtual (missing) episode, the
+    /// same numbers under another series, and an airing with an episode number
+    /// and title but no season all still record. Turning the setting off brings the
+    /// cancelled airing back, and on again cancels it, so both the new-timer
+    /// and the existing-timer arms ask the library.
+    #[tokio::test]
+    async fn a_series_timer_skips_the_episodes_already_in_the_library() {
+        let lab = item_lab(M3U, Some(library_episodes_guide())).await;
+        lab.mgr.refresh_guide().await.expect("refresh");
+        stock_series_library(&lab.persistence).await;
+
+        let airings = airings_of(&lab.mgr, "Recurring").await;
+        assert_eq!(airings.len(), 4, "the four airings are in the guide");
+        let mut body = defaults_for(&lab.mgr, &airings[0]).await;
+        body.record_any_time = true;
+        body.record_new_only = false;
+        body.skip_episodes_in_library = true;
+        let st_id = lab.mgr.create_series_timer(body).await.expect("create st");
+
+        let statuses = |timers: Vec<TimerInfoDto>| {
+            let mut by_start = timers;
+            by_start.sort_by_key(|t| t.base.start_date);
+            by_start.into_iter().map(|t| t.status).collect::<Vec<_>>()
+        };
+        let skipping = [
+            RecordingStatus::Cancelled,
+            RecordingStatus::New,
+            RecordingStatus::New,
+            RecordingStatus::New,
+        ];
+        assert_eq!(
+            statuses(lab.mgr.get_timers().await.expect("timers")),
+            skipping,
+            "only S1E1, which the library holds, is skipped"
+        );
+
+        let mut stored = lab
+            .mgr
+            .get_series_timer(&st_id)
+            .await
+            .expect("get st")
+            .expect("st row");
+        stored.skip_episodes_in_library = false;
+        lab.mgr
+            .update_series_timer(&st_id, stored.clone())
+            .await
+            .expect("skip off");
+        assert_eq!(
+            statuses(lab.mgr.get_timers().await.expect("timers")),
+            [RecordingStatus::New; 4],
+            "without SkipEpisodesInLibrary every airing records"
+        );
+
+        stored.skip_episodes_in_library = true;
+        lab.mgr
+            .update_series_timer(&st_id, stored)
+            .await
+            .expect("skip on");
+        assert_eq!(
+            statuses(lab.mgr.get_timers().await.expect("timers")),
+            skipping,
+            "an existing timer is cancelled again once the setting is back on"
+        );
+    }
+
+    /// The guide [`a_series_timer_skips_the_episodes_already_in_the_library`]
+    /// records from: four airings of `Recurring` on `one.tv`, a day apart.
+    fn library_episodes_guide() -> String {
+        use std::fmt::Write as _;
+        let now = Utc::now();
+        let mut xml = String::from(
+            "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>",
+        );
+        for (from, numbers) in [
+            // S1E1: in the library.
+            (60, "<episode-num system=\"xmltv_ns\">0.0.</episode-num>"),
+            // S1E2: the library has it only as a virtual (missing) episode.
+            (1500, "<episode-num system=\"xmltv_ns\">0.1.</episode-num>"),
+            // S2E3: only another series has an S2E3.
+            (2940, "<episode-num system=\"xmltv_ns\">1.2.</episode-num>"),
+            // An episode number and title but no season: upstream needs both
+            // numbers, so the library's S1E5 does not count.
+            (
+                4380,
+                "<sub-title>Pilot</sub-title><episode-num system=\"xmltv_ns\">.4.</episode-num>",
+            ),
+        ] {
+            let start = (now + chrono::Duration::minutes(from)).format("%Y%m%d%H%M%S");
+            let stop = (now + chrono::Duration::minutes(from + 60)).format("%Y%m%d%H%M%S");
+            let _ = write!(
+                xml,
+                "<programme start=\"{start} +0000\" stop=\"{stop} +0000\" channel=\"one.tv\">\
+                 <title>Recurring</title>{numbers}<category>Drama</category></programme>"
+            );
+        }
+        xml.push_str("</tv>");
+        xml
+    }
+
+    /// The library [`a_series_timer_skips_the_episodes_already_in_the_library`]
+    /// checks against: the series `Recurring` with S1E1, a virtual S1E2 and
+    /// S1E5, and the series `Elsewhere` with S2E3.
+    async fn stock_series_library(
+        persistence: &Arc<dyn ferrofin_traits::persistence::ItemPersistenceService>,
+    ) {
+        use ferrofin_db::store::guid_to_db;
+        let id = |n: u128| Uuid::from_u128(0x5e71_0000_0000_0000_0000_0000_0000_0000 | n);
+        let (series, other) = (id(1), id(2));
+        let row = |item: Uuid, type_: &str, name: &str| BaseItemEntity {
+            id: guid_to_db(item),
+            type_: format!("MediaBrowser.Controller.Entities.TV.{type_}"),
+            name: Some(name.to_owned()),
+            ..BaseItemEntity::default()
+        };
+        let episode =
+            |item: Uuid, parent: Uuid, season: i64, number: i64, virtual_: bool| BaseItemEntity {
+                parent_id: Some(guid_to_db(parent)),
+                parent_index_number: Some(season),
+                index_number: Some(number),
+                is_virtual_item: virtual_,
+                ..row(item, "Episode", "Episode")
+            };
+        persistence
+            .save_items(&[
+                BaseItemEntity {
+                    is_folder: true,
+                    ..row(series, "Series", "Recurring")
+                },
+                BaseItemEntity {
+                    is_folder: true,
+                    ..row(other, "Series", "Elsewhere")
+                },
+                episode(id(3), series, 1, 1, false),
+                episode(id(4), series, 1, 2, true),
+                episode(id(5), other, 2, 3, false),
+                episode(id(6), series, 1, 5, false),
+            ])
+            .await
+            .expect("library");
+        for (item, parent) in [
+            (id(3), series),
+            (id(4), series),
+            (id(5), other),
+            (id(6), series),
+        ] {
+            persistence
+                .set_ancestors(item, &[parent])
+                .await
+                .expect("ancestors");
+        }
     }
 
     /// A future airing of the series guide, and a timer factory on its channel.
