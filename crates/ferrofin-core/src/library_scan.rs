@@ -8241,6 +8241,14 @@ impl LibraryScanner {
         // are gone: a cut-short pass counts as a failed image provider, and
         // the item's refresh is not stamped, so the next one repeats it.
         failures += failed + u32::from(cut_short);
+        // TODO(parity, open work item — NOT an accepted divergence; gl-1211):
+        // an image measured again because its file moved (same type and path,
+        // a new size, blurhash or date) counts here like a changed image set,
+        // so the item is saved and its `ImageUpdate` savers run. Upstream's
+        // `UpdateImagesAsync` over a current child writes only the image rows
+        // (`SaveImagesAsync`). Un-defer path: tell a measurement-only change
+        // apart, write its rows, and leave `changed` and the saver update
+        // type to a changed set (keeping the season gate below in step).
         let images_changed = artwork
             .as_deref()
             .is_some_and(|images| images_changed(images, links.map(|l| l.images.as_slice())));
@@ -10410,6 +10418,11 @@ impl LibraryScanner {
     /// DTO layer can surface Width/Height and ImageBlurHashes. Dimensions are read once and
     /// reused for the blurhash. Best-effort per image; a no-op when no processor is wired
     /// (unit tests) or a decode fails (the image stays browsable with 0×0 / no hash).
+    ///
+    /// The file read is the expanded path, as upstream's `ItemImageInfo.Path`
+    /// is once the row is read (`ExpandVirtualPath`): a kept row an adopted
+    /// database stores as `%MetadataPath%/…` keeps that form, and is measured
+    /// from the file it names.
     async fn fill_image_metadata(&self, images: &mut [ItemImageInfo]) {
         let Some(processor) = self.image_processor.as_ref() else {
             return;
@@ -10421,12 +10434,13 @@ impl LibraryScanner {
             if image_metadata_is_complete(image) {
                 continue;
             }
-            let Ok(dims) = processor.get_image_dimensions(&image.path).await else {
+            let path = self.virtual_paths.expand_cow(&image.path);
+            let Ok(dims) = processor.get_image_dimensions(&path).await else {
                 continue;
             };
             image.width = dims.width;
             image.height = dims.height;
-            if let Ok(hash) = processor.get_image_blur_hash_sized(&image.path, dims).await {
+            if let Ok(hash) = processor.get_image_blur_hash_sized(&path, dims).await {
                 image.blur_hash = Some(hash);
             }
         }
@@ -18830,6 +18844,13 @@ struct ArtworkPass<'a> {
 /// is not a local file at all). Upstream's `ValidateImages` removes only the
 /// images whose files are gone; it never drops one just because no local
 /// provider re-supplied it this time.
+///
+/// A kept local image is also compared with its file, as upstream compares
+/// it: `Folder.ValidateChildrenInternal` runs `UpdateImagesAsync` over every
+/// unchanged current child, and a saved one reaches it through
+/// `RunMetadataSavers` (`ImageNeedsRefresh`, [`kept_image`]). The files are
+/// read off the runtime workers ([`off_runtime`]), and only when a kept row
+/// is a local file.
 fn keep_stored_images(
     images: &mut Vec<ItemImageInfo>,
     stored: Option<&[ItemImageInfo]>,
@@ -18839,24 +18860,72 @@ fn keep_stored_images(
         return;
     };
     let found: std::collections::HashSet<ImageType> = images.iter().map(|i| i.image_type).collect();
-    images.extend(
-        stored
-            .iter()
-            .filter(|image| !found.contains(&image.image_type))
-            // An adopted Jellyfin row stores `%MetadataPath%`-style tokens;
-            // `ValidateImages` checks the expanded path (`BaseItem.cs`
-            // `File.Exists` over `ExpandVirtualPath`), and so does this.
-            // A path still carrying a virtual-path token after expansion (a
-            // scanner not wired with `with_virtual_paths`) can't be checked, so
-            // it is kept rather than dropped as missing.
-            .filter(|image| {
-                let expanded = virtual_paths.expand(&image.path);
-                !image.is_local_file()
-                    || has_virtual_path_token(&expanded)
-                    || Path::new(&expanded).exists()
-            })
-            .cloned(),
-    );
+    let candidates: Vec<&ItemImageInfo> = stored
+        .iter()
+        .filter(|image| !found.contains(&image.image_type))
+        .collect();
+    if candidates.iter().any(|image| image.is_local_file()) {
+        off_runtime(|| {
+            images.extend(
+                candidates
+                    .into_iter()
+                    .filter_map(|image| kept_image(image, virtual_paths)),
+            );
+        });
+    } else {
+        images.extend(candidates.into_iter().cloned());
+    }
+}
+
+/// `image` as [`keep_stored_images`] keeps it, or `None` when its file is gone.
+///
+/// An adopted Jellyfin row stores `%MetadataPath%`-style tokens;
+/// `ValidateImages` checks the expanded path (`BaseItem.cs` `File.Exists`
+/// over `ExpandVirtualPath`), and so does this. A path still carrying a
+/// virtual-path token after expansion (a scanner not wired with
+/// `with_virtual_paths`) can't be checked, so it is kept as stored rather
+/// than dropped as missing. A remote image (not a local file) is kept as
+/// stored too.
+///
+/// A kept local file is compared with its last write time
+/// ([`image_metadata_is_current`], the local half of `ImageNeedsRefresh`).
+/// When the stored row no longer describes it, the row takes the file's date
+/// and drops its size and blurhash, so [`LibraryScanner::fill_image_metadata`]
+/// measures it again (`UpdateImagesAsync`); a row that does stays as stored,
+/// so a rescan of an unchanged file decodes and writes nothing. A file whose
+/// last write time cannot be read is left as stored, as `ImageNeedsRefresh`
+/// answers no when `GetLastWriteTimeUtc` throws.
+fn kept_image(
+    image: &ItemImageInfo,
+    virtual_paths: &crate::virtual_paths::VirtualPathExpander,
+) -> Option<ItemImageInfo> {
+    if !image.is_local_file() {
+        return Some(image.clone());
+    }
+    let expanded = virtual_paths.expand_cow(&image.path);
+    if has_virtual_path_token(&expanded) {
+        return Some(image.clone());
+    }
+    let meta = std::fs::metadata(&*expanded).ok()?;
+    let mut kept = image.clone();
+    if let Ok(modified) = meta.modified() {
+        let modified = DateTime::<Utc>::from(modified);
+        // The row's own probe, its blurhash moved out rather than copied.
+        let probe = ProbedImage {
+            width: kept.width,
+            height: kept.height,
+            blur_hash: kept.blur_hash.take(),
+            date_modified: kept.date_modified,
+        };
+        if image_metadata_is_current(&probe, modified) {
+            kept.blur_hash = probe.blur_hash;
+        } else {
+            kept.date_modified = modified;
+            kept.width = 0;
+            kept.height = 0;
+        }
+    }
+    Some(kept)
 }
 
 /// Whether `path` still holds an unexpanded `%AppDataPath%`/`%MetadataPath%`
@@ -30400,13 +30469,15 @@ mod tests {
         let dir = meta.join("library").join("ab");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("poster.jpg"), b"x").unwrap();
+        let written = super::file_date_modified(&dir.join("poster.jpg"));
+        // Measured from the file as it is now, so it is kept as stored.
         let image = |path: &str, image_type| ItemImageInfo {
             path: path.to_owned(),
             image_type,
-            date_modified: chrono::Utc::now(),
-            width: 0,
-            height: 0,
-            blur_hash: None,
+            date_modified: written,
+            width: 2,
+            height: 3,
+            blur_hash: Some("hash".to_owned()),
         };
         let stored = [
             image("%MetadataPath%/library/ab/poster.jpg", ImageType::Primary),
@@ -30431,6 +30502,99 @@ mod tests {
             &crate::virtual_paths::VirtualPathExpander::default(),
         );
         assert_eq!(images, stored.to_vec(), "unexpanded token paths are kept");
+    }
+
+    /// gl-1126: a kept local image is compared with its file, as
+    /// `ImageNeedsRefresh` compares a scanned child's images. A row more
+    /// than a second from the file's last write time, or missing its size or
+    /// blurhash, takes the file's date and loses its size and blurhash, so
+    /// the image pass measures it again; one that agrees is kept as stored,
+    /// and so are a remote row and a path that cannot be expanded. A token
+    /// path is read through its expansion and stored in its token form.
+    #[test]
+    fn a_kept_image_is_compared_with_its_file() {
+        use chrono::TimeZone as _;
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+            tmp.path(),
+            "log",
+            "config",
+            "cache",
+            "web",
+        ));
+        let meta = tmp.path().join("metadata");
+        paths.set_internal_metadata_path(Some(meta.to_str().unwrap()));
+        let expander = crate::virtual_paths::VirtualPathExpander::from_paths(paths);
+        let dir = meta.join("library").join("ab");
+        std::fs::create_dir_all(&dir).unwrap();
+        let written = chrono::Utc
+            .with_ymd_and_hms(2020, 1, 2, 3, 4, 5)
+            .single()
+            .unwrap();
+        for name in ["primary.jpg", "backdrop.jpg", "logo.jpg", "thumb.jpg"] {
+            let file = dir.join(name);
+            std::fs::write(&file, b"x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(written.into())
+                .unwrap();
+        }
+        let file = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let image = |path: String, image_type, date_modified| ItemImageInfo {
+            path,
+            image_type,
+            date_modified,
+            width: 2,
+            height: 3,
+            blur_hash: Some("hash".to_owned()),
+        };
+        let stale = written - chrono::Duration::milliseconds(1001);
+        let within = written + chrono::Duration::milliseconds(1000);
+        let stored = [
+            image(file("primary.jpg"), ImageType::Primary, within),
+            image(file("backdrop.jpg"), ImageType::Backdrop, stale),
+            image(
+                "%MetadataPath%/library/ab/logo.jpg".to_owned(),
+                ImageType::Logo,
+                stale,
+            ),
+            ItemImageInfo {
+                width: 0,
+                ..image(file("thumb.jpg"), ImageType::Thumb, written)
+            },
+            image(
+                "https://image.example/banner.jpg".to_owned(),
+                ImageType::Banner,
+                stale,
+            ),
+            image(file("art.jpg"), ImageType::Art, written),
+        ];
+        let remeasured = |image: &ItemImageInfo| ItemImageInfo {
+            date_modified: written,
+            width: 0,
+            height: 0,
+            blur_hash: None,
+            ..image.clone()
+        };
+
+        let mut images = Vec::new();
+        super::keep_stored_images(&mut images, Some(&stored), &expander);
+
+        assert_eq!(
+            images,
+            vec![
+                stored[0].clone(),
+                remeasured(&stored[1]),
+                remeasured(&stored[2]),
+                remeasured(&stored[3]),
+                stored[4].clone(),
+            ],
+            "current and remote rows as stored, the rest measured again, the gone one dropped"
+        );
     }
 
     /// The D2 backfill heuristics as a remote-metadata trigger, by the
