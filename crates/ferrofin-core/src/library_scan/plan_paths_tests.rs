@@ -894,6 +894,53 @@ async fn plan_follows_linked_folders_and_stops_at_a_loop() {
     );
 }
 
+/// A file Live TV is writing stays out of the plan until the capture ends, and
+/// is planned like any other file then. The set is read per listing: a capture
+/// that starts during a pass is seen by the listings after it, which is all a
+/// file it created can be in.
+#[tokio::test]
+async fn a_file_being_recorded_stays_out_of_the_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dvr = tmp.path().join("dvr");
+    touch(&dvr, "Evening News - 2026-10-30.ts");
+    touch(&dvr, "Morning News - 2026-10-30.ts");
+    let recording = dvr
+        .join("Evening News - 2026-10-30.ts")
+        .display()
+        .to_string();
+    let paths = Arc::new(Mutex::new(vec![recording.clone()]));
+    let read = Arc::clone(&paths);
+    let folders = vec![library(1, None, &dvr)];
+    let scanner = scanner(tmp.path(), Arc::new(CountingFs::default()))
+        .await
+        .with_recording_paths(Arc::new(move || read.lock().unwrap().clone()));
+    let planned = |scanner: &LibraryScanner| -> Vec<String> {
+        scanner
+            .plan_in(
+                &folders,
+                &folders,
+                PlanScope::ALL,
+                super::DateAdded::default(),
+                None,
+                None,
+            )
+            .items
+            .iter()
+            .filter_map(|p| p.entity.path.clone())
+            .filter(|path| path.contains("News"))
+            .collect()
+    };
+
+    let during = planned(&scanner);
+    assert_eq!(during.len(), 1, "{during:?}");
+    assert!(!during.contains(&recording), "{during:?}");
+
+    paths.lock().unwrap().clear();
+    let after = planned(&scanner);
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert!(after.contains(&recording), "{after:?}");
+}
+
 /// `DotIgnoreIgnoreRule` (`LibraryManager.IgnoreFile`): a `.ignore` file hides
 /// what lies beneath its folder from the plan, everything when it is empty
 /// and otherwise what its gitignore lines match. The plan records the hidden
