@@ -24,7 +24,9 @@
 //!   plus [`Uuid::simple`] (32-char lowercase hex, identical to .NET `"N"`).
 //! - The filesystem reads the pipeline needs (`File.Exists`, `GetLastWriteTimeUtc`)
 //!   sit behind the small [`FileMeta`] seam so tests use a fake and the real
-//!   `std::fs` stat stays out of the parity/coverage numbers.
+//!   `std::fs` stat stays out of the parity/coverage numbers. Its calls block,
+//!   so the processor makes them on the blocking pool, never on the runtime
+//!   worker serving the request.
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::fmt::Write as _;
@@ -83,6 +85,11 @@ const DOTNET_EPOCH_UNIX_OFFSET_SECS: i64 = 62_135_596_800;
 /// `File.Exists(path)` and `IFileSystem.GetLastWriteTimeUtc(path)`; keeping them
 /// behind a trait means the real `std::fs` stat stays out of the parity and
 /// coverage numbers and unit tests stay hermetic.
+///
+/// Both methods may block, for as long as a stat on a cold or hung network
+/// share takes. [`ImageProcessor`] only calls them through
+/// [`tokio::task::spawn_blocking`], so an implementation never needs to be
+/// async.
 pub trait FileMeta: Send + Sync {
     /// Whether a file exists at `path`. Port of `File.Exists`.
     fn exists(&self, path: &str) -> bool;
@@ -128,8 +135,9 @@ pub struct ImageProcessor<F = StdFileMeta> {
     /// The base image-cache directory (`IServerApplicationPaths.ImageCachePath`).
     image_cache_path: DirectoryPath,
 
-    /// The filesystem-metadata seam (`File.Exists` / `GetLastWriteTimeUtc`).
-    file_meta: F,
+    /// The filesystem-metadata seam (`File.Exists` / `GetLastWriteTimeUtc`),
+    /// shared with the blocking-pool tasks that call it.
+    file_meta: Arc<F>,
 
     /// The cache-invalidation version stamped into every cache key. Defaults to
     /// [`DEFAULT_CACHE_VERSION`]; a configurable setting so a host can force a
@@ -149,7 +157,7 @@ impl ImageProcessor<StdFileMeta> {
                 std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
             )),
             image_cache_path: image_cache_path.into(),
-            file_meta: StdFileMeta,
+            file_meta: Arc::new(StdFileMeta),
             cache_version: DEFAULT_CACHE_VERSION,
         }
     }
@@ -170,7 +178,7 @@ impl<F: FileMeta> ImageProcessor<F> {
                 std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
             )),
             image_cache_path: image_cache_path.into(),
-            file_meta,
+            file_meta: Arc::new(file_meta),
             cache_version: DEFAULT_CACHE_VERSION,
         }
     }
@@ -577,10 +585,12 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
         let supported = Self::supported_image(&original_image_path, date_modified);
         original_image_path = supported.0;
 
-        // Original file doesn't exist, or original file is gif.
-        if !self.file_meta.exists(&original_image_path)
-            || mime_type.eq_ignore_ascii_case(GIF_MIME_TYPE)
-        {
+        // Original file is gif, or original file doesn't exist. Either way the
+        // original is served, so the GIF test goes first and a GIF costs no stat.
+        if mime_type.eq_ignore_ascii_case(GIF_MIME_TYPE) || {
+            let path = original_image_path.clone();
+            !self.stat(move |meta| meta.exists(&path)).await?
+        } {
             return Ok(ProcessedImage {
                 path: original_image_path,
                 mime_type: Some(mime_type),
@@ -673,7 +683,23 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
     }
 }
 
-impl<F: FileMeta> ImageProcessor<F> {
+impl<F: FileMeta + 'static> ImageProcessor<F> {
+    /// Runs `call` against the [`FileMeta`] seam on the blocking pool, so a stat
+    /// that hangs (a cold or unreachable network share) parks a blocking-pool
+    /// thread rather than the runtime worker, and every other request scheduled
+    /// on that worker. `tokio::fs`, which serves the image afterwards, does the
+    /// same. Fails only when `call` panicked or the runtime shutting down
+    /// cancelled it.
+    async fn stat<T: Send + 'static>(
+        &self,
+        call: impl FnOnce(&F) -> T + Send + 'static,
+    ) -> Result<T, ServiceError> {
+        let meta = Arc::clone(&self.file_meta);
+        tokio::task::spawn_blocking(move || call(&meta))
+            .await
+            .map_err(ServiceError::backend_source)
+    }
+
     /// The cache-write half of [`process_image`](ImageProcessorTrait::process_image),
     /// factored out so its fallible I/O is a single `?`-chain the pipeline wraps.
     ///
@@ -691,7 +717,18 @@ impl<F: FileMeta> ImageProcessor<F> {
         options: &ImageProcessingOptions,
         output_format: ImageFormat,
     ) -> Result<Option<ProcessedImage>, ServiceError> {
-        if !self.file_meta.exists(cache_file_path) {
+        // `File.Exists(cacheFilePath)`, and on a hit the
+        // `GetLastWriteTimeUtc(cacheFilePath)` the C# returns: one blocking-pool
+        // hop for the two.
+        let cached = {
+            let path = cache_file_path.to_owned();
+            self.stat(move |meta| meta.exists(&path).then(|| meta.last_write_time_utc(&path)))
+                .await?
+        };
+        // `None` is a cache miss: encode, then read the new file's time.
+        let date_written = if let Some(date_written) = cached {
+            date_written
+        } else {
             let permit = Arc::clone(&self.encoding_slots)
                 .acquire_owned()
                 .await
@@ -723,12 +760,15 @@ impl<F: FileMeta> ImageProcessor<F> {
             if result_path.eq_ignore_ascii_case(original_image_path) {
                 return Ok(None);
             }
-        }
+            let path = cache_file_path.to_owned();
+            self.stat(move |meta| meta.last_write_time_utc(&path))
+                .await?
+        };
 
         Ok(Some(ProcessedImage {
             path: cache_file_path.to_owned(),
             mime_type: Some(output_format.mime_type().to_owned()),
-            date_modified: self.file_meta.last_write_time_utc(cache_file_path),
+            date_modified: date_written,
         }))
     }
 }
@@ -1651,5 +1691,110 @@ mod tests {
             .unwrap();
             assert_eq!(encoder.calls.load(Ordering::SeqCst), limit + 1);
         }
+    }
+
+    /// A [`FileMeta`] whose `held`-th call (counting `exists` and
+    /// `last_write_time_utc` together) blocks its thread, as a stat on a hung
+    /// network share does, until the test releases it. The release comes from a
+    /// task on the same current-thread runtime, so it can only arrive in time
+    /// when the stat runs off the runtime's one worker.
+    struct HeldFs {
+        inner: FakeFs,
+        held: usize,
+        calls: AtomicUsize,
+        entered: Arc<tokio::sync::Notify>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        released: std::sync::atomic::AtomicBool,
+    }
+
+    impl HeldFs {
+        fn new(inner: FakeFs, held: usize, release: std::sync::mpsc::Receiver<()>) -> Self {
+            Self {
+                inner,
+                held,
+                calls: AtomicUsize::new(0),
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Mutex::new(release),
+                released: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// Blocks the `held`-th call until the release, or for at most 30
+        /// seconds: on a runtime worker the release can never come in time, and
+        /// the test fails instead of hanging.
+        fn maybe_hold(&self) {
+            if self.calls.fetch_add(1, Ordering::SeqCst) != self.held {
+                return;
+            }
+            self.entered.notify_one();
+            let rx = self.release.lock().expect("lock");
+            if rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok() {
+                self.released.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl FileMeta for HeldFs {
+        fn exists(&self, path: &str) -> bool {
+            self.maybe_hold();
+            self.inner.exists(path)
+        }
+
+        fn last_write_time_utc(&self, path: &str) -> DateTime<Utc> {
+            self.maybe_hold();
+            self.inner.last_write_time_utc(path)
+        }
+    }
+
+    /// gl-1216: every stat `process_image` makes runs off the runtime worker.
+    /// Each case holds one of them on its thread; the request's runtime (a
+    /// single worker) must stay free to run the task that releases it.
+    #[rstest::rstest]
+    #[case::original_exists(0)]
+    #[case::cache_exists(1)]
+    #[case::cache_written_time(2)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_stats_run_off_the_runtime_worker(#[case] held: usize) {
+        let cache = TempDir::new().expect("cache");
+        let encoder = Arc::new(CountingEncoder {
+            work: None,
+            calls: AtomicUsize::new(0),
+            return_original: None,
+        });
+        let (release, rx) = std::sync::mpsc::channel();
+        let fs = HeldFs::new(FakeFs::with(&["/input.jpg"]), held, rx);
+        let entered = Arc::clone(&fs.entered);
+        let processor = Arc::new(ImageProcessor::with_file_meta(
+            encoder.clone(),
+            cache.path().to_path_buf(),
+            fs,
+        ));
+        let task = tokio::spawn({
+            let processor = Arc::clone(&processor);
+            async move {
+                processor
+                    .process_image(&ImageProcessingOptions {
+                        image: ItemImageInfo {
+                            path: "/input.jpg".into(),
+                            ..Default::default()
+                        },
+                        width: Some(100),
+                        ..Default::default()
+                    })
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        release.send(()).expect("the held stat is waiting");
+        let processed = task.await.expect("join").expect("process");
+
+        assert!(
+            processor.file_meta.released.load(Ordering::SeqCst),
+            "stat {held} ran on the runtime worker and blocked it"
+        );
+        assert!(processed.path.contains("resized-images"));
+        assert_eq!(encoder.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(processor.file_meta.calls.load(Ordering::SeqCst), 3);
     }
 }

@@ -159,6 +159,11 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     selected checks nothing, and the next change still removes the old widths. A `Qscale` or JPEG
     quality edited by hand still needs a Replace, as in Jellyfin. Upgrading records the
     current settings and replaces nothing.
+  - **Departure from Jellyfin: trickplay sizes are listed largest first.** An item's
+    `Trickplay` field lists its preview sizes from the widest down, in the same order every
+    time; Jellyfin lists them smallest first in practice. With Preview Size set to Both, apps
+    that use the first size listed (Wholphin, and the Jellyfin Android TV and Android apps)
+    then show the sharper 640 previews. jellyfin-web picks a size by screen width either way.
   - **Accepted divergence (a fix, not a gap):** Jellyfin passes every 3D scaler unquoted
     (`-vf {3}`), and those graphs contain spaces, so the command line is split apart and
     no 3D layout gets chapter or thumbnail images. Ferrofin quotes the filter graph.
