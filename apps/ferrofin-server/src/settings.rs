@@ -677,7 +677,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "trickplay_concurrency",
         env: Some("FERROFIN_TRICKPLAY_CONCURRENCY"),
         env_read: EnvRead::NonBlank,
-        label: "Concurrent trickplay images",
+        label: "Concurrent trickplay videos",
         group: Group::Trickplay,
         kind: SettingKind::CountOrAuto,
         default: "auto",
