@@ -895,6 +895,307 @@ async fn a_name_that_finds_another_accounts_entry_is_refused() {
     assert_eq!(harness.user("bob").await.map(|u| u.id), Some(bob_user.id));
 }
 
+/// A second person's entry that shares Ada's `cn`, with a uid of its own.
+const ADA2_DN: &str = "uid=ada2,ou=people,dc=example,dc=org";
+const ADA2_PASSWORD: &str = "ada2-secret";
+
+fn ada2() -> LdapEntry {
+    entry(ADA2_DN, &[("uid", "ada2"), ("cn", "Ada Lovelace")])
+}
+
+/// Named by `cn`, with Ada signed in once: her account "Ada Lovelace" is
+/// linked to her uid, and a second entry with the same `cn` can bind.
+async fn ada_linked_by_cn() -> (Harness, UserEntity) {
+    let harness = Harness::new(&LdapConfig {
+        ldap_username_attribute: "cn".to_owned(),
+        ..config()
+    })
+    .await;
+    harness
+        .directory
+        .state()
+        .accounts
+        .insert(ADA2_DN.to_owned(), ADA2_PASSWORD.to_owned());
+    let user = harness
+        .sign_in("ada", ADA_PASSWORD)
+        .await
+        .expect("sign in")
+        .expect("created");
+    assert_eq!(user.username, "Ada Lovelace");
+    (harness, user)
+}
+
+/// The search for the uid an account is linked to answers `entries`.
+fn uid_search_answers(harness: &Harness, uid: &str, entries: Vec<LdapEntry>) {
+    harness.directory.state().by_filter.insert(
+        format!("(uid={uid})"),
+        SearchOutcome {
+            entries,
+            references: Vec::new(),
+        },
+    );
+}
+
+#[tokio::test]
+async fn an_entry_sharing_a_linked_accounts_name_is_refused_while_that_uid_exists() {
+    const SHARED_NAME: &str = "an account linked to another directory entry";
+    let logs = CapturedLogs::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .with_env_filter("ferrofin_extensions=debug")
+            .finish(),
+    );
+    let (harness, ada_user) = ada_linked_by_cn().await;
+    // Her entry still holds her uid; the second entry is found by its own.
+    uid_search_answers(&harness, "ada", vec![ada()]);
+    harness.answer(vec![ada2()]);
+
+    // A wrong password is refused at the bind, before the uid is looked up,
+    // and warns nothing. A name that is no account's is the manager's error.
+    harness.directory.clear_calls();
+    assert!(matches!(
+        harness.sign_in("ada2", "wrong").await,
+        Err(ServiceError::Unauthorized(_))
+    ));
+    assert!(
+        harness
+            .directory
+            .state()
+            .searches
+            .iter()
+            .all(|(_, _, filter, _)| filter != "(uid=ada)")
+    );
+    assert!(matches!(
+        harness.sign_in("ada2", ADA2_PASSWORD).await,
+        Err(ServiceError::Unauthorized(_))
+    ));
+    assert_eq!(
+        harness
+            .sign_in("Ada Lovelace", ADA2_PASSWORD)
+            .await
+            .expect("sign in"),
+        None
+    );
+    assert_eq!(logs.count("WARN", SHARED_NAME), 2);
+    let links = harness.links().await;
+    assert_eq!(links.len(), 1);
+    assert_eq!(
+        (links[0].subject.as_str(), links[0].user_id),
+        ("ada", id_of(&ada_user)),
+        "Ada's link is untouched"
+    );
+    // Signed in with the account's name, the refusal counts against it, as a
+    // name that finds another account's entry does.
+    assert_eq!(
+        harness
+            .user("Ada Lovelace")
+            .await
+            .expect("ada")
+            .invalid_login_attempt_count,
+        1
+    );
+
+    harness.answer(vec![ada()]);
+    let again = harness
+        .sign_in("ada", ADA_PASSWORD)
+        .await
+        .expect("sign in")
+        .expect("signed in");
+    assert_eq!(again.id, ada_user.id);
+}
+
+#[tokio::test]
+async fn a_linked_account_is_relinked_by_name_once_its_uid_is_gone_from_the_directory() {
+    let (harness, ada_user) = ada_linked_by_cn().await;
+    // The directory gave Ada a new uid (upstream's relink case): the search
+    // for the old one finds nothing.
+    uid_search_answers(&harness, "ada", Vec::new());
+    harness.answer(vec![ada2()]);
+    harness.directory.clear_calls();
+
+    let user = harness
+        .sign_in("ada2", ADA2_PASSWORD)
+        .await
+        .expect("sign in")
+        .expect("signed in");
+    assert_eq!(user.id, ada_user.id);
+    assert_eq!(harness.link("ada").await, None);
+    assert_eq!(
+        harness.link("ada2").await.map(|link| link.user_id),
+        Some(id_of(&ada_user)),
+        "relinked to the new uid"
+    );
+    // The old uid is looked up as the bind DN, in the base DN's subtree.
+    assert!(harness.directory.state().searches.contains(&(
+        BASE_DN.to_owned(),
+        SearchScope::Subtree,
+        "(uid=ada)".to_owned(),
+        vec![NO_ATTRIBUTES.to_owned()],
+    )));
+}
+
+/// An entry whose own uid is linked to an account since moved to another
+/// provider (gl-1230: that link is ignored) and whose `cn` names Ada's
+/// account: the by-name relink is still refused while Ada's uid is in the
+/// directory (gl-1229), and takes the link over once it is gone.
+#[rstest]
+#[case::linked_uid_still_in_the_directory(true)]
+#[case::linked_uid_gone(false)]
+#[tokio::test]
+async fn a_moved_accounts_uid_link_does_not_decide_the_relink_by_name(#[case] ada_exists: bool) {
+    const DEFAULT_PROVIDER: &str =
+        "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider";
+    let (harness, ada_user) = ada_linked_by_cn().await;
+    let moved = harness
+        .existing_user("ada2-local", DEFAULT_PROVIDER, "local-secret")
+        .await;
+    harness
+        .identities
+        .link(id_of(&moved), LdapAuthProvider::identity("ada2"), None)
+        .await
+        .expect("link");
+    uid_search_answers(
+        &harness,
+        "ada",
+        if ada_exists { vec![ada()] } else { Vec::new() },
+    );
+    harness.answer(vec![ada2()]);
+
+    let outcome = harness.sign_in("ada2", ADA2_PASSWORD).await;
+    if ada_exists {
+        assert!(
+            matches!(outcome, Err(ServiceError::Unauthorized(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            harness.link("ada").await.map(|link| link.user_id),
+            Some(id_of(&ada_user)),
+            "Ada's link is untouched"
+        );
+        assert_eq!(
+            harness.link("ada2").await.map(|link| link.user_id),
+            Some(id_of(&moved)),
+            "the moved account's link is ignored, not removed"
+        );
+    } else {
+        let user = outcome.expect("sign in").expect("signed in");
+        assert_eq!(user.id, ada_user.id);
+        assert_eq!(harness.link("ada").await, None);
+        assert_eq!(
+            harness.link("ada2").await.map(|link| link.user_id),
+            Some(id_of(&ada_user)),
+            "the relink takes the moved account's link over"
+        );
+    }
+    assert_eq!(
+        harness
+            .user("ada2-local")
+            .await
+            .expect("moved")
+            .authentication_provider_id,
+        DEFAULT_PROVIDER
+    );
+}
+
+#[tokio::test]
+async fn an_entry_the_linked_uid_still_finds_is_relinked_as_the_same_person() {
+    let (harness, ada_user) = ada_linked_by_cn().await;
+    // Her uid changed only in case: the directory's match on the old one
+    // finds her own entry, which the link no longer finds byte for byte.
+    let renamed = entry(ADA_DN, &[("uid", "Ada"), ("cn", "Ada Lovelace")]);
+    uid_search_answers(&harness, "ada", vec![renamed.clone()]);
+    harness.answer(vec![renamed]);
+
+    let user = harness
+        .sign_in("ada", ADA_PASSWORD)
+        .await
+        .expect("sign in")
+        .expect("signed in");
+    assert_eq!(user.id, ada_user.id);
+    assert_eq!(
+        harness.link("Ada").await.map(|link| link.user_id),
+        Some(id_of(&ada_user))
+    );
+    assert_eq!(harness.link("ada").await, None);
+}
+
+#[tokio::test]
+async fn with_no_uid_attribute_configured_the_name_decides_as_upstream() {
+    let (harness, ada_user) = ada_linked_by_cn().await;
+    harness
+        .configure(&LdapConfig {
+            ldap_username_attribute: "cn".to_owned(),
+            ldap_uid_attribute: String::new(),
+            ..config()
+        })
+        .await;
+    harness.answer(vec![ada2()]);
+    harness.directory.clear_calls();
+
+    let user = harness
+        .sign_in("Ada Lovelace", ADA2_PASSWORD)
+        .await
+        .expect("sign in")
+        .expect("signed in");
+    assert_eq!(user.id, ada_user.id);
+    assert!(
+        harness
+            .directory
+            .state()
+            .searches
+            .iter()
+            .all(|(_, _, filter, _)| filter != "(=ada)"),
+        "no filter without an attribute is sent"
+    );
+    assert_eq!(
+        harness.link("ada").await.map(|link| link.user_id),
+        Some(id_of(&ada_user)),
+        "an entry without a uid links nothing"
+    );
+}
+
+#[rstest]
+#[case::times_out(LdapError::Timeout)]
+#[case::fails(LdapError::Result { code: 1, message: String::new() })]
+#[tokio::test]
+async fn a_failed_lookup_of_the_linked_uid_is_a_server_error_and_relinks_nothing(
+    #[case] failure: LdapError,
+) {
+    let (harness, ada_user) = ada_linked_by_cn().await;
+    harness
+        .directory
+        .state()
+        .failing_filters
+        .insert("(uid=ada)".to_owned(), failure);
+    harness.answer(vec![ada2()]);
+
+    for name in ["ada2", "Ada Lovelace"] {
+        assert!(
+            matches!(
+                harness.sign_in(name, ADA2_PASSWORD).await,
+                Err(ServiceError::Backend(_))
+            ),
+            "{name}: a server error"
+        );
+    }
+    assert_eq!(
+        harness.link("ada").await.map(|link| link.user_id),
+        Some(id_of(&ada_user))
+    );
+    assert_eq!(harness.links().await.len(), 1);
+    assert_eq!(
+        harness
+            .user("Ada Lovelace")
+            .await
+            .expect("ada")
+            .invalid_login_attempt_count,
+        0,
+        "not counted (D4)"
+    );
+}
+
 #[tokio::test]
 async fn an_entry_without_the_uid_attribute_is_not_linked_and_found_by_name() {
     let harness = Harness::new(&LdapConfig {
