@@ -261,8 +261,8 @@ two tiers, and no third:
 
 - **Compiled-in extensions** are Jellyfin plugins ported into this repository, reviewed
   like any other code and shipped inside the binary. They get full power *because* they
-  went through review. Intro Skipper, File Transformation, and Merge Versions are ported
-  today. They surface through the normal `/Plugins` API: dashboard entries, settings pages,
+  went through review. Intro Skipper, File Transformation, Merge Versions and LDAP-Auth are
+  ported today. They surface through the normal `/Plugins` API: dashboard entries, settings pages,
   enable/disable.
 - **Sandboxed WASM plugins** are how code this repository has never seen gets installed:
   drop a `.wasm` component into `{data_dir}/plugins/` (or install from a configured plugin
