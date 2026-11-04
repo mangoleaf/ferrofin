@@ -46,10 +46,11 @@
 //!   returned first, so an entry another person can edit to match the name
 //!   would let them sign in as that user. The entry's username attribute is
 //!   still trusted, as upstream trusts it: an entry with no uid link yet whose
-//!   username attribute names an account LDAP-Auth owns is relinked to it, so
-//!   that attribute must be one users cannot edit: where users can write it,
-//!   one with no account linked to their uid yet can take any LDAP-owned
-//!   account, whatever its rights, with their own password. The uid
+//!   username attribute names an account LDAP-Auth owns is relinked to it
+//!   (unless the next divergence refuses it), so that attribute must be one
+//!   users cannot edit: where users can write it, one with no account linked
+//!   to their uid yet can take any LDAP-owned account not linked to a uid the
+//!   directory still has, whatever its rights, with their own password. The uid
 //!   attribute is trusted the same way: a user who can write their own can
 //!   point it at a linked user's uid, and signs in to that account, renamed
 //!   to their own username attribute. Kept as upstream by owner decision
@@ -58,6 +59,17 @@
 //!   directory administrator editing the entry standing in for a user; the
 //!   uid route is read from the code. Whether that triggers the revisit is
 //!   the owner's call.
+//! - **An account is never relinked by name while its own uid is still in
+//!   the directory** (owner decision, gl-1229). When the account an entry's
+//!   username attribute names is linked to another uid, the bind DN searches
+//!   the base DN for that uid: an entry other than the signing-in one makes
+//!   the sign-in a `401`, and a password change too, with a warning. No such
+//!   entry is upstream's relink after a uid change, and so is a configuration
+//!   with no uid attribute; a failed search is a server error (D4). Upstream
+//!   relinks whatever the account's link, so two entries sharing a username
+//!   attribute (a `cn` two people share) take one account from each other.
+//!   An account with no link is still relinked by name, so for those the
+//!   attribute must be unique as well as not user-editable.
 //! - **A link is written only after the password is checked.** Upstream
 //!   records a relink by name before it binds as the user.
 //! - **An entry without the uid attribute is not linked.** Upstream stores a
@@ -277,6 +289,11 @@ fn search_failure(
 /// another account.
 const OTHER_ACCOUNTS_ENTRY: &str =
     "The LDAP entry this user's name finds belongs to another account; no password was changed.";
+
+/// The `401` for an entry whose username attribute names an account linked
+/// to another entry that still exists.
+const ANOTHER_PERSONS_ACCOUNT: &str =
+    "The LDAP entry's name is that of an account linked to another directory entry.";
 
 /// Upstream's `ChangePassword` sends a blank password as it is, and RFC 3062
 /// then has the directory set a random one nobody learns (D11).
@@ -532,7 +549,10 @@ impl LdapAuthProvider {
     /// The Ferrofin user the entry belongs to, upstream's two lookups: the one
     /// its uid is linked to, else the user named as the entry's username
     /// attribute when LDAP-Auth owns them (`AuthenticationProviderId`), which
-    /// then needs linking. A local account with that name is not taken.
+    /// then needs linking. A local account with that name is not taken. A user
+    /// found by name is the entry's only once
+    /// [`refuse_another_persons_account`](Self::refuse_another_persons_account)
+    /// passes.
     async fn find_user(
         &self,
         uid: &str,
@@ -561,6 +581,71 @@ impl LdapAuthProvider {
                 user,
                 needs_link: true,
             }))
+    }
+
+    /// Before `entry` is taken by name for `user` ([`find_user`](Self::find_user)'s
+    /// `needs_link`): refuses (a `401`) when `user` is linked to another uid
+    /// that still finds an entry other than `entry`, since the name then
+    /// belongs to another person. The bind DN searches the base DN's subtree
+    /// for `(<LdapUidAttribute>=<uid>)`, following referrals. No entry, or
+    /// only `entry` itself (its uid changed only in case, say), is upstream's
+    /// relink after a uid change; a user with no link, or a configuration
+    /// with no uid attribute, which tells no entry apart by uid, is relinked
+    /// as upstream does; a directory that fails the search is `failure`'s
+    /// server error (D4). See the module's divergences.
+    async fn refuse_another_persons_account(
+        &self,
+        config: &LdapConfig,
+        entry: &LdapEntry,
+        user: &UserEntity,
+        failure: fn(&str, &LdapError) -> ServiceError,
+    ) -> Result<(), ServiceError> {
+        if config.ldap_uid_attribute.is_empty() {
+            return Ok(());
+        }
+        let user_id =
+            Uuid::parse_str(&user.id).map_err(|error| ServiceError::backend(error.to_string()))?;
+        // Rare (a by-name match), so the provider's links are read whole
+        // rather than through a lookup by user the store does not have.
+        let Some(link) = self
+            .identities
+            .list(PROVIDER_ID)
+            .await?
+            .into_iter()
+            .find(|link| link.user_id == user_id && !link.subject.is_empty())
+        else {
+            return Ok(());
+        };
+        let filter = format!(
+            "({}={})",
+            config.ldap_uid_attribute,
+            sanitize_filter(&link.subject)
+        );
+        let found = search_as_bind_dn(
+            self.directory.as_ref(),
+            config,
+            &config.ldap_base_dn,
+            &filter,
+            &[NO_ATTRIBUTES],
+        )
+        .await
+        .map_err(|error| {
+            search_failure(&error, "look up the uid the account is linked to", failure)
+        })?;
+        if let Some(other) = found.iter().find(|other| other.dn != entry.dn) {
+            // An administrator must make the username attribute unique, or
+            // this entry never signs in.
+            tracing::warn!(
+                user_id = %user.id,
+                dn = ?entry.dn,
+                linked_uid = ?link.subject,
+                linked_dn = ?other.dn,
+                "the LDAP entry's username attribute names an account linked to another \
+                 directory entry that still exists; the entry is not taken for that account"
+            );
+            return Err(ServiceError::unauthorized(ANOTHER_PERSONS_ACCOUNT));
+        }
+        Ok(())
     }
 }
 
@@ -625,6 +710,10 @@ impl AuthenticationManager for LdapAuthProvider {
         }
 
         self.bind_as_user(&config, &entry.dn, password).await?;
+        if let Some(found) = found.as_ref().filter(|found| found.needs_link) {
+            self.refuse_another_persons_account(&config, &entry, &found.user, outage)
+                .await?;
+        }
         let administrator = self
             .administrator(&config, &entry, ldap_username.as_deref())
             .await?;
@@ -745,17 +834,21 @@ impl AuthenticationManager for LdapAuthProvider {
         // Only the user's own entry: see the module's divergences.
         let uid = attribute_text(&entry, &config.ldap_uid_attribute).unwrap_or_default();
         let ldap_username = attribute_text(&entry, &config.ldap_username_attribute);
-        if self
+        let found = self
             .find_user(&uid, ldap_username.as_deref())
             .await?
-            .is_none_or(|found| found.user.id != user.id)
-        {
+            .filter(|found| found.user.id == user.id);
+        let Some(found) = found else {
             tracing::debug!(
                 user_id = %user.id,
                 dn = ?entry.dn,
                 "the LDAP entry the user's name found belongs to another account"
             );
             return Err(ServiceError::unauthorized(OTHER_ACCOUNTS_ENTRY));
+        };
+        if found.needs_link {
+            self.refuse_another_persons_account(&config, &entry, &found.user, change_failure)
+                .await?;
         }
         let options = ConnectionOptions::from_config(&config);
         let mut connection = self

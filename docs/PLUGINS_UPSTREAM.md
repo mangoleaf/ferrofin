@@ -509,7 +509,8 @@ Conventions:
     sign in as that user with their own password. The entry's username attribute
     (`LdapUsernameAttribute`) is still trusted, as upstream trusts it: an entry with no uid link
     yet whose username attribute names an account LDAP-Auth owns is relinked to that account
-    (upstream's relink after a uid change), so that attribute must be one users cannot edit.
+    (upstream's relink after a uid change; see the next item for an account linked to a uid the
+    directory still has), so that attribute must be one users cannot edit.
     In a directory where users can write their own username attribute (OpenLDAP's common
     `by self write`), a user with no account linked to their uid yet can set it to an
     LDAP-owned account's name and sign in to that account with their own password, whatever its
@@ -523,6 +524,23 @@ Conventions:
     proven a security issue). The username-attribute route was then reproduced live against
     OpenLDAP, the directory administrator editing the entry standing in for a user; the uid route
     is read from the code, not run. Whether that triggers the revisit is the owner's call.
+  - **An account is never relinked by name while its own uid is still in the directory**
+    (owner decision, gl-1229). When the account an entry's username attribute names is already
+    linked to another uid, the bind DN searches the base DN's subtree for
+    `(<LdapUidAttribute>=<that uid>)`, following referrals, after the entry's own password
+    binds. An entry other than the signing-in one means the name belongs to another person: the
+    sign-in is a `401` (counted when the name signed in with is the account's) and the server
+    logs a warning naming both entries; a password change for the account is a `401` the same
+    way, and nothing is written. No entry means the uid really changed (upstream's relink
+    case), and the entry is relinked; so is it when the search finds only the signing-in entry
+    itself (its uid changed only in case), and when no `LdapUidAttribute` is configured, which
+    leaves nothing to tell entries apart by. A directory that fails that search is a `500`, never
+    a relink (D4). Upstream relinks whatever link the account has, so two entries sharing a
+    username attribute (with upstream's default `cn`, two people of the same name) take one
+    account from each other at each sign-in, with its libraries, history and, while the admin
+    filter is on, administrator flag. An account with no link at all is still relinked by name
+    as upstream does, so for accounts not linked yet the username attribute must be unique as
+    well as one users cannot edit.
   - **A relink by name is written only after the password is checked.** Upstream saves it
     before it binds as the user, so a wrong password still writes it.
   - **An entry without the uid attribute is not linked.** Upstream stores it with a null

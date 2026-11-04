@@ -354,6 +354,35 @@ async fn a_password_change_writes_only_to_the_users_own_entry() {
 }
 
 #[tokio::test]
+async fn a_password_change_never_writes_to_another_entry_with_the_users_name() {
+    let (harness, ada_user) = ada_linked_by_cn().await;
+    harness
+        .configure(&LdapConfig {
+            ldap_username_attribute: "cn".to_owned(),
+            ..changes_allowed()
+        })
+        .await;
+    // Her name now finds the second entry first, while her own still holds
+    // her uid.
+    uid_search_answers(&harness, "ada", vec![ada()]);
+    harness.answer(vec![ada2(), ada()]);
+    harness.directory.clear_calls();
+
+    assert!(matches!(
+        harness
+            .users
+            .change_password(id_of(&ada_user), NEW_PASSWORD)
+            .await,
+        Err(ServiceError::Unauthorized(_))
+    ));
+    assert_eq!(
+        harness.directory.state().writes,
+        Vec::<(String, String, String)>::new()
+    );
+    assert_eq!(harness.link("ada2").await, None, "nothing relinked");
+}
+
+#[tokio::test]
 async fn a_write_connection_that_cannot_be_opened_is_a_server_error() {
     let harness = Harness::new(&changes_allowed()).await;
     let ada = harness.ada().await;
