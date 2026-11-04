@@ -233,6 +233,10 @@ ferrofin:
     # Image downloads refuse private/LAN addresses, a Live TV tuner's host
     # aside. List the LAN hosts or networks that serve your artwork:
     # FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW: "nas.lan,192.168.1.0/24"
+    # OpenSubtitles download links refuse private/LAN addresses too, with a list
+    # of their own (the image list does not apply). Only a LAN mirror of the
+    # download host needs it:
+    # FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW: "subtitles.lan"
 
     # The most jobs re-encoding a stream the server runs at once, and one user
     # runs at once. Past either cap the user's idle job on the same device is

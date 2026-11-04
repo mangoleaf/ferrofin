@@ -23,284 +23,43 @@
 //! server's [`ImageDestinations`](crate::destination::ImageDestinations) let
 //! it, and the URL's suffix names the type only when no redirect happened.
 //! Upstream's client follows redirects anywhere, so a playlist's logo URL
-//! could read an internal service through the server.
+//! could read an internal service through the server. The follow-and-vet loop
+//! is [`GuardedHttp`], which subtitle links go through too (gl-1160).
 
-use crate::destination::{
-    self, ConfiguredImageDestinations, DestinationPolicy, DestinationRefused, PublicOnlyResolver,
-};
-use crate::rate_limit::{
-    BodyError, CappedBody, CountedBody as _, LimitedRequest as _, RateLimiter, request_limits,
-};
+use crate::destination::ConfiguredImageDestinations;
+use crate::guarded_http::{FetchKind, Fetched, GuardedHttp, SendError};
+use crate::rate_limit::{BodyError, CappedBody, CountedBody as _, request_limits};
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::ops::RangeInclusive;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt as _;
 use uuid::Uuid;
 
-/// Image/CDN quotas are independent of metadata API quotas. Share a gate by
-/// origin across download callers, never one gate across unrelated hosts.
-///
-/// `label` is only the provider the caller's downloads are counted under
-/// (`ferrofin_metadata_provider_requests_total{provider}`): `image` for
-/// artwork, `opensubtitles` for a subtitle file. It never picks the gate:
-/// every caller of one origin shares its pacing and cooldowns whatever it is
-/// counted as (METRICS.md rule 6).
-pub(crate) fn limiter_for(url: &str, label: &'static str) -> RateLimiter {
-    static LIMITERS: OnceLock<Mutex<HashMap<String, RateLimiter>>> = OnceLock::new();
-    let origin = reqwest::Url::parse(url)
-        .map(|url| url.origin().ascii_serialization())
-        .unwrap_or_default();
-    LIMITERS
-        .get_or_init(Mutex::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(origin)
-        .or_insert_with_key(|origin| RateLimiter::new(origin.clone()))
-        .counted_as(label)
+/// Image downloads, for their limiter and log lines.
+pub(crate) static IMAGE_FETCH: FetchKind = FetchKind::new(
+    crate::metrics::IMAGE,
+    "remote image",
+    "image downloads",
+    "image_private_http_allow (FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW) lists it or it is a Live TV \
+     tuner's host",
+    None,
+);
+
+/// The process's image-download clients: the server's
+/// [`set_image_destinations`](crate::destination::set_image_destinations), read at
+/// each check, and the environment's proxy.
+fn image_http() -> &'static GuardedHttp {
+    static SHARED: OnceLock<GuardedHttp> = OnceLock::new();
+    SHARED.get_or_init(|| {
+        GuardedHttp::with_environment_proxy(Arc::new(ConfiguredImageDestinations), &IMAGE_FETCH)
+    })
 }
 
-/// Most redirects one download follows: reqwest's default policy
-/// (`redirect::Policy::default()`), which downloads went by until they followed
-/// redirects themselves, to vet each hop.
-const MAX_REDIRECTS: usize = 10;
-
-/// Why [`ImageHttp::send`] has no response.
-#[derive(Debug)]
-pub(crate) enum SendError {
-    /// A destination the policy refuses: a private address nothing exempts.
-    Refused,
-    /// The request through the origin's limiter failed
-    /// ([`RequestError`](crate::rate_limit::RequestError): a transport
-    /// failure or a cooldown).
-    Request,
-    /// No request could be made: a URL that does not parse, a redirect to
-    /// another scheme or past [`MAX_REDIRECTS`], a name a proxy would resolve
-    /// that the server cannot, or a client that could not be built.
-    Failed,
-}
-
-/// A response, and whether a redirect led to it.
-pub(crate) struct Fetched {
-    response: reqwest::Response,
-    redirected: bool,
-}
-
-/// The clients image downloads go through, and the destinations they refuse
-/// ([`DestinationPolicy`]). Each request and each redirect hop is vetted
-/// before it is sent; redirects are followed here, not by the client, so that
-/// none goes unvetted.
-pub(crate) struct ImageHttp {
-    /// Direct connections, with no proxy: every name it resolves goes through
-    /// [`PublicOnlyResolver`], so the address it connects to is one the policy
-    /// was asked about, even if the name's answer changed since the check (DNS
-    /// rebinding). `None` when it could not be built: every download then
-    /// fails, rather than going out unguarded.
-    vetted: Option<reqwest::Client>,
-    /// Set when the environment configures a proxy
-    /// ([`destination::environment_proxy`]): the client that goes through it.
-    /// The proxy resolves names itself, out of the resolver's sight, so a name
-    /// is checked on the server's own answer before each request and pinned
-    /// to it for the hosts the proxy settings exclude.
-    proxied: Option<reqwest::Client>,
-    policy: Arc<dyn DestinationPolicy>,
-}
-
-impl ImageHttp {
-    /// The process's: the server's
-    /// [`set_image_destinations`](destination::set_image_destinations), read
-    /// at each check, and the environment's proxy.
-    pub(crate) fn shared() -> &'static Self {
-        static SHARED: OnceLock<ImageHttp> = OnceLock::new();
-        SHARED.get_or_init(|| {
-            Self::new(
-                Arc::new(ConfiguredImageDestinations),
-                destination::environment_proxy(|name| std::env::var_os(name)),
-            )
-        })
-    }
-
-    /// Clients refusing what `policy` refuses, through the environment's
-    /// proxy when `proxy`.
-    fn new(policy: Arc<dyn DestinationPolicy>, proxy: bool) -> Self {
-        let vetted = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .dns_resolver(Arc::new(PublicOnlyResolver::new(Arc::clone(&policy))))
-            .build()
-            .ok();
-        let proxied = proxy.then(|| {
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .ok()
-        });
-        Self {
-            vetted,
-            proxied: proxied.flatten(),
-            policy,
-        }
-    }
-
-    /// GETs `url` through its origin's limiter, following redirects up to
-    /// [`MAX_REDIRECTS`] and vetting the destination of each.
-    pub(crate) async fn send(&self, url: &str) -> Result<Fetched, SendError> {
-        let limiter = limiter_for(url, crate::metrics::IMAGE);
-        let mut current = reqwest::Url::parse(url).map_err(|_| SendError::Failed)?;
-        let mut redirects = 0;
-        loop {
-            let client = self.client_for(&current).await?;
-            let response = client
-                .get(current.clone())
-                .send_limited(&limiter)
-                .await
-                .map_err(|_| SendError::Request)?;
-            let Some(next) = redirect_target(&response, &current) else {
-                if crate::rate_limit::is_redirect_to_follow(&response) {
-                    // The limiter took it for a hop to follow.
-                    return Err(unsent("a redirect whose Location cannot be followed"));
-                }
-                return Ok(Fetched {
-                    response,
-                    redirected: redirects > 0,
-                });
-            };
-            if redirects == MAX_REDIRECTS {
-                return Err(unsent("too many redirects"));
-            }
-            redirects += 1;
-            current = next;
-        }
-    }
-
-    /// The client to send a request for `url` with, once its destination
-    /// passed the policy.
-    async fn client_for(&self, url: &reqwest::Url) -> Result<reqwest::Client, SendError> {
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(unsent("a URL with a scheme other than http or https"));
-        }
-        let host = url.host_str().ok_or_else(|| unsent("a URL with no host"))?;
-        // An address literal reaches no resolver, so it is vetted here.
-        if let Ok(address) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
-            if self.policy.refuses(host, address).await {
-                refused(host, address);
-                return Err(SendError::Refused);
-            }
-            return self
-                .proxied
-                .as_ref()
-                .or(self.vetted.as_ref())
-                .cloned()
-                .ok_or_else(|| unsent("the HTTP client could not be built"));
-        }
-        // A name is vetted here too, so that a refusal is told apart from a
-        // connection failure; the vetted client's resolver vets it again when
-        // it connects. One that does not resolve, or not within the request
-        // timeout, goes on to fail the way it always did, as a connection
-        // failure, unless a proxy would resolve it.
-        let port = url.port_or_known_default().unwrap_or_default();
-        let lookup = destination::resolve_vetted(self.policy.as_ref(), host, port);
-        let vetted = match tokio::time::timeout(request_limits().timeout, lookup).await {
-            Ok(Ok(addresses)) => Some(addresses),
-            Ok(Err(DestinationRefused::Private { host, address })) => {
-                refused(&host, address);
-                return Err(SendError::Refused);
-            }
-            Ok(Err(_)) | Err(_) => None,
-        };
-        if self.proxied.is_none() {
-            return self
-                .vetted
-                .clone()
-                .ok_or_else(|| unsent("the HTTP client could not be built"));
-        }
-        // Through the proxy, or straight to the vetted addresses for a host
-        // the proxy settings exclude.
-        let Some(addresses) = vetted else {
-            unresolvable_behind_a_proxy(host);
-            return Err(unsent("a host the server cannot resolve, behind a proxy"));
-        };
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(host, &addresses)
-            .build()
-            .map_err(|_| unsent("the HTTP client could not be built"))
-    }
-}
-
-#[cfg(test)]
-impl ImageHttp {
-    /// Clients that refuse nothing, for a test serving its images on
-    /// loopback.
-    fn open() -> Self {
-        let nothing: fn(IpAddr) -> bool = |_| false;
-        Self::new(Arc::new(nothing), false)
-    }
-}
-
-/// Where a redirect response sends the request next: the statuses reqwest's
-/// own policy follows (301, 302, 303, 307, 308), with a `Location` that
-/// resolves against `current`. `None` for any other response, which is the
-/// answer.
-fn redirect_target(response: &reqwest::Response, current: &reqwest::Url) -> Option<reqwest::Url> {
-    if !crate::rate_limit::REDIRECT_STATUSES.contains(&response.status()) {
-        return None;
-    }
-    let location = response.headers().get(reqwest::header::LOCATION)?;
-    // UTF-8, not just visible ASCII, as reqwest's own policy reads it.
-    current
-        .join(std::str::from_utf8(location.as_bytes()).ok()?)
-        .ok()
-}
-
-/// A request that could not be sent, or a redirect that could not be
-/// followed: a failure of the provider, counted as the limiter counts one
-/// (reqwest's own redirect errors used to come back through it), and logged
-/// at `debug`, since a library can hold any number.
-fn unsent(reason: &'static str) -> SendError {
-    crate::rate_limit::note_request_failure();
-    tracing::debug!(reason, "remote image not downloaded");
-    SendError::Failed
-}
-
-/// Logs, once per process at `warn`, that behind a proxy a host the server
-/// cannot resolve is not sent: it could not be checked.
-fn unresolvable_behind_a_proxy(host: &str) {
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        tracing::warn!(
-            %host,
-            "remote image not downloaded: behind an HTTP proxy, image downloads go only to \
-             hosts the server can resolve itself, to check their address; further ones are \
-             logged at debug"
-        );
-    }
-}
-
-/// Logs a refused destination: the first of the process at `warn`, naming the
-/// setting that allows it, the rest at `debug`, since a playlist or a library
-/// can hold any number of them.
-fn refused(host: &str, address: IpAddr) {
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if WARNED.swap(true, Ordering::Relaxed) {
-        tracing::debug!(%host, %address, "remote image refused: private address");
-    } else {
-        tracing::warn!(
-            %host,
-            %address,
-            "remote image refused: the host is at a private address, which image downloads \
-             may not reach unless image_private_http_allow (FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW) \
-             lists it or it is a Live TV tuner's host; further refusals are logged at debug"
-        );
-    }
-}
-
-/// GETs `url` for an image download: [`ImageHttp::send`] on the process's
+/// GETs `url` for an image download: [`GuardedHttp::send`] on the process's
 /// clients.
 pub(crate) async fn send(url: &str) -> Result<Fetched, SendError> {
-    ImageHttp::shared().send(url).await
+    image_http().send(url).await
 }
 
 use ferrofin_model::net::mime_types;
@@ -347,7 +106,7 @@ impl From<SendError> for ImageFetchError {
     fn from(error: SendError) -> Self {
         match error {
             SendError::Refused => Self::Refused,
-            SendError::Request | SendError::Failed => Self::Unavailable,
+            SendError::Request(_) | SendError::Failed(_) => Self::Unavailable,
         }
     }
 }
@@ -410,16 +169,11 @@ impl RemoteImage {
 /// the status, the media type resolved the way the C# does
 /// ([`resolve_content_type`]), the declared length, and then the first bytes.
 pub(crate) async fn open_image(url: &str) -> Result<RemoteImage, ImageFetchError> {
-    open_image_capped(
-        ImageHttp::shared(),
-        url,
-        request_limits().download_max_bytes,
-    )
-    .await
+    open_image_capped(image_http(), url, request_limits().download_max_bytes).await
 }
 
 async fn open_image_capped(
-    http: &ImageHttp,
+    http: &GuardedHttp,
     url: &str,
     limit: u64,
 ) -> Result<RemoteImage, ImageFetchError> {
@@ -533,20 +287,6 @@ mod tests {
     use super::{non_image_reason, resolve_content_type};
     use rstest::rstest;
 
-    /// The label never picks the gate: an artwork download and a subtitle
-    /// download from one origin share its pacing and cooldowns, each counted
-    /// under its own provider; another origin has a gate of its own.
-    #[test]
-    fn two_labels_on_one_origin_share_one_gate() {
-        let artwork = super::limiter_for("https://cdn.example/poster.jpg", crate::metrics::IMAGE);
-        let subtitle = super::limiter_for("https://cdn.example/file.srt", "opensubtitles");
-        let other = super::limiter_for("https://elsewhere.example/poster.jpg", "image");
-        assert!(artwork.shares_gate_with(&subtitle));
-        assert!(!artwork.shares_gate_with(&other));
-        assert_eq!(artwork.metric_label(), "image");
-        assert_eq!(subtitle.metric_label(), "opensubtitles");
-    }
-
     #[rstest]
     // The response's own type wins, parameters stripped by the caller.
     #[case(Some("image/png"), "https://x/poster.jpg", false, "image/png")]
@@ -625,7 +365,7 @@ mod body_tests {
     async fn fetch(response: Vec<u8>, path: &str) -> Result<Vec<u8>, ImageFetchError> {
         let server = MockServer::start_raw(vec![response]).await;
         let url = format!("{}{path}", server.base_url);
-        open_image_capped(&ImageHttp::open(), &url, LIMIT as u64)
+        open_image_capped(&GuardedHttp::open(&IMAGE_FETCH), &url, LIMIT as u64)
             .await?
             .into_bytes()
             .await
@@ -947,12 +687,12 @@ mod quota_tests {
         )
         .await;
         let other = MockServer::always("image").await;
-        let http = ImageHttp::open();
+        let http = GuardedHttp::open(&IMAGE_FETCH);
         assert!(http.send(&blocked.base_url).await.is_ok());
         assert!(matches!(
             http.send(&format!("{}/another-cover?probe=1", blocked.base_url))
                 .await,
-            Err(SendError::Request)
+            Err(SendError::Request(_))
         ));
         assert!(
             blocked.query_values("/another-cover", "probe").is_empty(),
@@ -967,8 +707,12 @@ mod quota_tests {
 #[cfg(test)]
 mod destination_tests {
     use super::*;
+    use crate::destination::{self, DestinationPolicy};
+    use crate::guarded_http::MAX_REDIRECTS;
     use crate::mock_http::MockServer;
     use rstest::rstest;
+    use std::net::IpAddr;
+    use std::sync::atomic::Ordering;
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\n rest of a png";
     const PNG_HEADER: &str = "Content-Type: image/png\r\n";
@@ -983,8 +727,8 @@ mod destination_tests {
         }
     }
 
-    fn guarded(allowed_host: &'static str) -> ImageHttp {
-        ImageHttp::new(Arc::new(PrivateBut(allowed_host)), false)
+    fn guarded(allowed_host: &'static str) -> GuardedHttp {
+        GuardedHttp::new(Arc::new(PrivateBut(allowed_host)), false, &IMAGE_FETCH)
     }
 
     fn redirect(location: &str) -> Vec<u8> {
@@ -1004,7 +748,11 @@ mod destination_tests {
     #[tokio::test]
     async fn a_private_address_is_refused_unsent() {
         let server = MockServer::start_raw(vec![MockServer::raw_ok(PNG_HEADER, PNG)]).await;
-        let http = ImageHttp::new(Arc::new(destination::ImageDestinations::default()), false);
+        let http = GuardedHttp::new(
+            Arc::new(destination::ImageDestinations::default()),
+            false,
+            &IMAGE_FETCH,
+        );
         let err = open_image_capped(&http, &format!("{}/a.png", server.base_url), 1024)
             .await
             .err()
@@ -1046,7 +794,7 @@ mod destination_tests {
         let untyped = MockServer::raw_ok("Content-Type: application/octet-stream\r\n", PNG);
         let direct = MockServer::start_raw(vec![untyped.clone()]).await;
         let image = open_image_capped(
-            &ImageHttp::open(),
+            &GuardedHttp::open(&IMAGE_FETCH),
             &format!("{}/a.png", direct.base_url),
             1024,
         )
@@ -1056,7 +804,7 @@ mod destination_tests {
 
         let server = MockServer::start_raw(vec![redirect("/blob"), untyped]).await;
         let err = open_image_capped(
-            &ImageHttp::open(),
+            &GuardedHttp::open(&IMAGE_FETCH),
             &format!("{}/a.png", server.base_url),
             1024,
         )
@@ -1079,7 +827,7 @@ mod destination_tests {
             MockServer::raw_ok(PNG_HEADER, PNG),
         ])
         .await;
-        let image = open_image_capped(&ImageHttp::open(), &server.base_url, 1024)
+        let image = open_image_capped(&GuardedHttp::open(&IMAGE_FETCH), &server.base_url, 1024)
             .await
             .expect("an image");
         assert_eq!(image.content_type(), "image/png");
@@ -1092,7 +840,7 @@ mod destination_tests {
         let mut moved = b"HTTP/1.1 302 Found\r\nLocation: /caf\xc3\xa9.png\r\n".to_vec();
         moved.extend_from_slice(b"Content-Length: 0\r\nConnection: close\r\n\r\n");
         let server = MockServer::start_raw(vec![moved, MockServer::raw_ok(PNG_HEADER, PNG)]).await;
-        let image = open_image_capped(&ImageHttp::open(), &server.base_url, 1024)
+        let image = open_image_capped(&GuardedHttp::open(&IMAGE_FETCH), &server.base_url, 1024)
             .await
             .expect("followed");
         assert_eq!(image.content_type(), "image/png");
@@ -1111,7 +859,7 @@ mod destination_tests {
     ) {
         let server = MockServer::start_raw(vec![redirect(location)]).await;
         let (outcome, failures) = crate::rate_limit::count_request_failures(open_image_capped(
-            &ImageHttp::open(),
+            &GuardedHttp::open(&IMAGE_FETCH),
             &server.base_url,
             1024,
         ))
@@ -1133,7 +881,7 @@ mod destination_tests {
     async fn through_a_proxy_a_destination_is_checked_before_it_is_sent() {
         let server = MockServer::start_raw(vec![MockServer::raw_ok(PNG_HEADER, PNG)]).await;
         let at = |host: &str| format!("http://{host}:{}/a.png", port(&server));
-        let proxied = |allowed| ImageHttp::new(Arc::new(PrivateBut(allowed)), true);
+        let proxied = |allowed| GuardedHttp::new(Arc::new(PrivateBut(allowed)), true, &IMAGE_FETCH);
 
         let image = open_image_capped(&proxied("localhost"), &at("localhost"), 1024)
             .await
@@ -1199,12 +947,13 @@ mod destination_tests {
             .await
             .expect("localhost")
             .len();
-        let http = ImageHttp::new(
+        let http = GuardedHttp::new(
             Arc::new(Rebinding {
                 allowed,
                 checks: std::sync::atomic::AtomicUsize::new(0),
             }),
             false,
+            &IMAGE_FETCH,
         );
         let url = format!("http://localhost:{}/a.png", port(&server));
         let err = open_image_capped(&http, &url, 1024)
