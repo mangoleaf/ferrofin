@@ -593,6 +593,17 @@ kind = "value"
 issue = 832
 reason = "The HLS ffmpeg arguments lack upstream's -map_metadata -1 -map_chapters -1 and -max_delay 5000000."
 
+# Owner decision 2026-11-04, an accepted divergence: the transcode output name keys on the output shape.
+# The playlist is not JSON, so `$` accepts the whole live playlist body, not only the segment names.
+# The request carries an oracle_trap: a run whose Jellyfin stalls on it lists this entry under
+# "matched nothing", which is not a reason to delete it.
+[[entry]]
+request = "GetLiveHlsStream"
+path = "$"
+kind = "value"
+issue = 860
+reason = "Transcode output names hash the output shape (tracks, codecs, bitrates, subtitles), not upstream's MD5 of MediaPath-UserAgent-DeviceId-PlaySessionId, so the live playlist names other segment files."
+
 # Owner decision 2026-10-24, a Jellyfin bug not ported: with no parent, upstream answers empty lists.
 [[entry]]
 request = "GetQueryFiltersLegacy"

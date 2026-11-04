@@ -21,10 +21,11 @@ version = 1
 # issues (gl-619); add new filings here.
 
 # ── filed from the replay of release/v1.4.0 at 37fad687 (2026-10-24) ────────────────────────────────
-# Neither difference is in ledger.toml; this run's Jellyfin answered both requests. Both carry an
-# oracle_trap, so a run whose Jellyfin stalls on them compares nothing and lists these entries under
-# "matched nothing": that is not a reason to delete them. The path `$` is the whole non-JSON body, so any
-# other difference in these two responses is labelled with the same issue; it still fails the run.
+# The difference is not in ledger.toml; this run's Jellyfin answered the request. It carries an
+# oracle_trap, so a run whose Jellyfin stalls on it compares nothing and lists this entry under
+# "matched nothing": that is not a reason to delete it. The path `$` is the whole non-JSON body, so any
+# other difference in this response is labelled with the same issue; it still fails the run.
+# (gl-860, the other difference filed from this run, is now an accepted divergence in ledger.toml.)
 
 # gl-832: HLS jobs lack upstream's -max_delay 5000000, so the first video segment's PCR starts at ffmpeg's
 # 0.7 s default (Jellyfin: 5 s) and its PTS/DTS at 1.4 s (Jellyfin: 10 s).
@@ -33,11 +34,3 @@ request = "GetHlsVideoSegment"
 path = "$"
 kind = "value"
 issue = 832
-
-# gl-860: HLS segment names are a 16-hex DefaultHasher id, not upstream's MD5 of
-# MediaPath-UserAgent-DeviceId-PlaySessionId, so the live playlist names another segment file.
-[[filed]]
-request = "GetLiveHlsStream"
-path = "$"
-kind = "value"
-issue = 860

@@ -2704,12 +2704,17 @@ fn push_split(args: &mut Vec<String>, fragment: &str) {
     args.extend(fragment.split_whitespace().map(str::to_owned));
 }
 
-/// The deterministic output id for `request` (the `StreamingHelpers` hash).
+/// The deterministic output id for `request`: a hash over the fields that
+/// identify one transcode job — item, source, session, device, live stream,
+/// and the output shape (codecs, playback permissions, stream-copy vetoes,
+/// bitrates, tracks, subtitles, container, audio/video). A
+/// re-request with the same tuple reuses the same `.m3u8`/segment files.
 ///
-/// Port of the `StreamingHelpers` output-name derivation: a stable hash over the
-/// fields that identify one transcode job — item, source, session, device, and
-/// the output shape (container + audio/video). A re-request with the same tuple
-/// reuses the same `.m3u8`/segment files.
+/// Diverges from upstream on purpose (owner decision 2026-11-04, gl-860):
+/// `StreamingHelpers.GetOutputFilePath` names the job
+/// `MD5("{MediaPath}-{UserAgent}-{DeviceId}-{PlaySessionId}")`, so a
+/// same-session request of another shape reuses the old job's segments. No
+/// client depends on the name; keep the shape in the key.
 fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool) -> String {
     use std::hash::{Hash as _, Hasher as _};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
