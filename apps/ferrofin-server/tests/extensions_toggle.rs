@@ -90,7 +90,7 @@ async fn disabling_extensions_removes_their_plugins_and_tasks() {
             wired
                 .plugins
                 .iter()
-                .any(|p| p.id == FERROFIN_SETTINGS && p.name == "Ferrofin"),
+                .any(|p| p.id == FERROFIN_SETTINGS && p.name == "Ferrofin Settings"),
             "extensions {position}: /Plugins must list Ferrofin"
         );
         assert!(

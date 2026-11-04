@@ -1,12 +1,12 @@
-//! The **Ferrofin** extension: the server's own settings, where the dashboard
+//! The **Ferrofin Settings** extension: the server's own settings, where the dashboard
 //! shows the bootstrap configuration (CLI flags, `FERROFIN_*` environment
 //! variables, `config.toml`).
 //!
 //! Unlike the other extensions it ports no Jellyfin plugin, so it is the one
 //! [`disable_extensions`](crate::registered_extensions) leaves in place: it
 //! contributes no tasks, hooks or providers, only a `/Plugins` entry and its
-//! settings page (Dashboard → Plugins → Ferrofin, and the dashboard menu's
-//! Ferrofin entry), which the dashboard's Disable toggle still turns off. The
+//! settings page (Dashboard → Plugins → Ferrofin Settings, and the dashboard
+//! menu's Ferrofin Settings entry), which the dashboard's Disable toggle still turns off. The
 //! page lists every setting `GET /Ferrofin/Settings` reports, edits the ones
 //! that route marks editable, saves them with `POST /Ferrofin/Settings`, and
 //! restarts the server to apply them. The settings themselves live in the
@@ -39,7 +39,9 @@ impl Extension for FerrofinSettingsExtension {
     fn descriptor(&self) -> PluginDescriptor {
         PluginDescriptor {
             id: EXTENSION_ID,
-            name: "Ferrofin".to_owned(),
+            // The dashboard's Plugins list and menu show this name; the
+            // page keeps its own, `Ferrofin`, which its address carries.
+            name: "Ferrofin Settings".to_owned(),
             version: plugin_version(ferrofin_health::build_version()),
             description: "Ferrofin's own settings: paths, network, ffmpeg, library scans, \
                           logging, metadata providers and WASM plugins, as set by command-line \
@@ -104,11 +106,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_descriptor_names_ferrofin_under_its_fixed_id() {
+    fn the_descriptor_names_ferrofin_settings_under_its_fixed_id() {
         let descriptor = FerrofinSettingsExtension.descriptor();
         assert_eq!(descriptor.id, EXTENSION_ID);
         assert_eq!(FerrofinSettingsExtension.id(), EXTENSION_ID);
-        assert_eq!(descriptor.name, "Ferrofin");
+        assert_eq!(descriptor.name, "Ferrofin Settings");
         assert_eq!(
             descriptor.version,
             plugin_version(ferrofin_health::build_version())
@@ -261,15 +263,49 @@ mod tests {
         assert!(html.contains("ferrofinLocked"), "{html}");
         assert!(html.contains("icon('lock')"), "{html}");
         assert!(html.contains("setting.LockedReason"), "{html}");
-        // A search box and three filters above the tabs, across every tab.
+        // The tabs in a pane on the left, moved along with the arrow keys
+        // either way (a row on a narrow screen); a search box and two
+        // filters beside them, across every tab, its matches under their
+        // tab's name with a count and the tabs without one dimmed. A restart
+        // is announced above the settings as a warning, not filtered for
+        // (owner, 2026-11-03).
+        assert!(html.contains(r#"aria-orientation="vertical""#), "{html}");
+        for marker in [
+            "class=\"ferrofinShell\"",
+            "ArrowUp:",
+            "ArrowDown:",
+            "ferrofinGroupCount",
+            "ferrofinTabMatchless",
+            "ferrofinWarning ferrofinRestartPending",
+        ] {
+            assert!(html.contains(marker), "{marker}");
+        }
         for class in [
             "ferrofinSearch",
             "ferrofinFilterChanged",
-            "ferrofinFilterRestart",
             "ferrofinFilterLocked",
         ] {
             assert!(html.contains(&format!("class=\"{class}\"")), "{class}");
         }
+        assert!(!html.contains("ferrofinFilterRestart"), "{html}");
+        assert!(
+            html.contains("A restart is required to apply the changed settings."),
+            "{html}"
+        );
+        assert!(
+            html.contains("state.restartText = required ? RESTART_REQUIRED : RESTART_PENDING;"),
+            "{html}"
+        );
+        // Restart now is hidden while only settings a full process restart
+        // applies wait: the in-process restart cannot apply them.
+        assert!(
+            html.contains("setting.Applies === 'ProcessRestart'"),
+            "{html}"
+        );
+        assert!(
+            html.contains(".ferrofinRestartNow').classList.toggle('hide', !restartable)"),
+            "{html}"
+        );
         // The search reads the name, the description, the key, the variable
         // and the flag.
         for member in [

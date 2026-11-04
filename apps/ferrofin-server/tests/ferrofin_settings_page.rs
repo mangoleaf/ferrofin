@@ -35,11 +35,12 @@ async fn body_json(response: Response) -> serde_json::Value {
 
 /// Whether `pages` (a `GET /web/ConfigurationPages` answer) holds the
 /// Ferrofin settings page, tagged with the plugin's id and labelled with its
-/// name, as jellyfin-web matches and shows it.
+/// name, as jellyfin-web matches and shows it. The page keeps the name its
+/// address carries, `configurationpage?name=Ferrofin`.
 fn lists_the_settings_page(pages: &serde_json::Value) -> bool {
     pages.as_array().expect("page list").iter().any(|page| {
         page["Name"] == "Ferrofin"
-            && page["DisplayName"] == "Ferrofin"
+            && page["DisplayName"] == "Ferrofin Settings"
             && page["PluginId"].as_str().map(|id| id.replace('-', ""))
                 == Some(EXTENSION_ID.simple().to_string())
     })
@@ -349,7 +350,7 @@ async fn the_settings_page_is_listed_served_without_values_and_hidden_with_its_p
         .as_array()
         .expect("plugin list")
         .iter()
-        .find(|plugin| plugin["Name"] == "Ferrofin")
+        .find(|plugin| plugin["Name"] == "Ferrofin Settings")
         .and_then(|plugin| plugin["Version"].as_str())
         .unwrap_or_else(|| panic!("Ferrofin missing from /Plugins: {plugins}"))
         .to_owned();

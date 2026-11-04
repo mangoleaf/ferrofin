@@ -1,9 +1,10 @@
 # Configuration
 
-Every runtime setting below is listed in jellyfin-web under **Dashboard → Plugins → Ferrofin →
-Settings** ([Seeing what is set](#seeing-what-is-set)). That page edits the ones it may change and
-saves them to `config.toml` ([Editing settings from the dashboard](#editing-settings-from-the-dashboard)),
-the last of the three places below; the first two are set where the server is started.
+Every runtime setting below is listed in jellyfin-web under **Dashboard → Plugins → Ferrofin
+Settings → Settings** ([Seeing what is set](#seeing-what-is-set)). That page edits the ones it may
+change and saves them to `config.toml` ([Editing settings from the
+dashboard](#editing-settings-from-the-dashboard)), the last of the three places below; the first two
+are set where the server is started.
 
 Ferrofin is configured three ways, **highest precedence first**:
 
@@ -61,12 +62,13 @@ directories, the ffmpeg and ffprobe executables, the first-boot seed settings,
 jellyfin-web's own Networking and General pages cover. Secrets (the provider keys, the TheTVDB
 PIN, the seed admin password) are reported in plain text, as Jellyfin's plugin settings are, and
 never logged. The route belongs
-to the **Ferrofin** plugin under Dashboard → Plugins and answers `404` while that plugin is
+to the **Ferrofin Settings** plugin under Dashboard → Plugins and answers `404` while that plugin is
 disabled.
 
 That plugin's settings page shows the report: open it from the plugin's Settings link or the
-dashboard menu's **Ferrofin** entry. It lists the settings in nine tabs (Network, Library,
-Trickplay, Images, Providers, Performance, Logging, Plugins, System), the first open. Each setting
+dashboard menu's **Ferrofin Settings** entry. It lists the settings in nine tabs (Network, Library,
+Trickplay, Images, Providers, Performance, Logging, Plugins, System), the first open, in a pane
+on the left (a row above the settings on a narrow screen). Each setting
 is headed by a readable name, with its `config.toml` key, variable, flag and default on a small
 line below, then its description. A badge beside the name says what sets it, when anything does
 (`config.toml`, a variable or a flag), and secrets are marked as secrets. Disabling the plugin
@@ -105,23 +107,20 @@ variable or flag sets it, and **Reset to default** puts back a new server's valu
 value the file holds, it marks the key, and Save removes it, so the default applies after the
 restart (**Undo reset** takes the mark back); on an edit alone, it drops the edit.
 
-A search box and three filters sit above the tabs:
+A search box and two filters sit above the settings, beside the tabs:
 
 - the search matches a setting's name, description, `config.toml` key, variable and flag,
-  ignoring case, and each word typed must match. It lists the matches of every tab, each under
-  its tab's name;
+  ignoring case, and each word typed must match. It lists the matches of every tab, each tab's
+  under its name with their count, and dims the tabs with none (so does **Changed**);
 - **Changed** lists, from every tab, the settings something sets (a flag, a variable or
   `config.toml`) and those holding an edit not saved yet;
-- **Needs restart** lists, from every tab, the settings whose saved value a restart will put in
-  use: one `config.toml` holds that is not in use yet, or one a save removed. A setting a flag or
-  a variable sets is left out, since the flag or variable still outranks the file after a restart;
 - **Hide read-only** leaves out the settings the page may not change, on a tab and in a list.
 
-Opening a tab ends a search, **Changed** and **Needs restart**. Each tab shows how many edits it
+Opening a tab ends a search and **Changed**. Each tab shows how many edits it
 holds that are not saved yet, and **Save** sends the changed settings of every tab at once
 ([`POST /Ferrofin/Settings`](#saving-from-the-web)). The server checks them, not the browser, and
 a refused change shows the server's message next to the setting it names, with its tab marked and
-opened (a search, **Changed** or **Needs restart** stays as it is), or at the top of the page when
+opened (a search or **Changed** stays as it is), or at the top of the page when
 it names none, such as a file that cannot be written. Nothing is saved then, and every edit stays
 on the page to correct. Restarting with edits not yet saved asks first, since it drops them.
 
@@ -146,12 +145,15 @@ changed. These have no field whatever sets them, each with its reason on the pag
 - the OpenTelemetry variables, which `config.toml` has no key for.
 
 A saved change [applies at the next restart](#when-a-change-applies). After a save the line below
-the setting shows the saved value and the one in use, and a **Restart now** button sits beside the
-pending-restart notice. It runs the in-process restart, waits for the server to answer again and
+the setting shows the saved value and the one in use, and a warning at the top of the page says that
+a restart is required to apply the changed settings (it shows too while `config.toml` holds a value
+edited by hand that is not in use yet). Its **Restart now** button runs the in-process restart, as
+**Dashboard → Restart** does (`POST /System/Restart`), waits for the server to answer again and
 shows the values now in effect. The settings the in-process restart keeps (`log_level`,
-`log_format`, `metrics_scan_duration_buckets`) say so on their row before and after saving, and
-the notice lists any just saved: they need a full process restart, so restart the container or
-service.
+`log_format`, `metrics_scan_duration_buckets`) say so on their row before and after saving, and the
+warning lists any waiting: they need a full process restart, so restart the container or service.
+Once the restart has run and only those still wait, the warning has no **Restart now**, which
+cannot apply them.
 
 ### When a change applies
 
@@ -207,7 +209,7 @@ answer lists the `config.toml` keys saved (`Changed`), whether a restart is need
 restarted ([above](#when-a-change-applies), `ProcessRestartRequired`), and the keys stored in the
 server configuration that changed and applied at once (`AppliedNow`). `GET /System/Info` reports
 `HasPendingRestart: true` until the restart. The log names the keys, never their values. Like
-the report, the route answers `404` while the **Ferrofin** plugin is disabled.
+the report, the route answers `404` while the **Ferrofin Settings** plugin is disabled.
 
 ## Paths
 
@@ -439,7 +441,7 @@ not replace the account needed for subtitle downloads.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FERROFIN_DISABLE_EXTENSIONS` | `false` | Register none of the compiled-in extensions (Intro Skipper, File Transformation, Merge Versions, LDAP-Auth): their plugins, scheduled tasks and event hooks are gone. Meant for measurement, so a benchmark compares Ferrofin with a Jellyfin that has no plugins installed. The **Ferrofin** plugin stays: it is the server's own settings, with no task or hook. Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`. |
+| `FERROFIN_DISABLE_EXTENSIONS` | `false` | Register none of the compiled-in extensions (Intro Skipper, File Transformation, Merge Versions, LDAP-Auth): their plugins, scheduled tasks and event hooks are gone. Meant for measurement, so a benchmark compares Ferrofin with a Jellyfin that has no plugins installed. The **Ferrofin Settings** plugin stays: it is the server's own settings, with no task or hook. Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`. |
 
 ## WASM plugins (Tier 1b)
 

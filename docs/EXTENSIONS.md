@@ -64,8 +64,8 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
 - **Vendored settings pages.** The upstream plugin's HTML settings page is committed into
   `crates/ferrofin-extensions/assets/<name>/` at build time, so normal builds are hermetic
   (no network fetch). Refresh with `FERROFIN_REFRESH_PLUGIN_ASSETS=1 cargo build -p ferrofin-extensions`.
-  The Ferrofin extension's own page is the exception: it is authored here
-  ([below](#the-ferrofin-extension)).
+  The Ferrofin Settings extension's own page is the exception: it is authored here
+  ([below](#the-ferrofin-settings-extension)).
 - **Authentication providers join sign-in late.** The user manager is built before the
   extensions, so the composition root hands it every extension's `auth_providers` once
   they are wired (`register_auth_providers`). Sign-in consults them after the built-in
@@ -161,29 +161,29 @@ proven against OpenLDAP only: Active Directory has not been tested.
 > with their own password. Choose attributes only administrators can write, or restrict
 > self-writes to them.
 
-### The Ferrofin extension
+### The Ferrofin Settings extension
 
-Beside the ports, one extension is Ferrofin's own: **Ferrofin**
+Beside the ports, one extension is Ferrofin's own: **Ferrofin Settings**
 (`crates/ferrofin-extensions/src/ferrofin_settings.rs`). It ports no plugin and has no tasks,
 hooks or providers; it gives the server's own settings (`GET` and `POST /Ferrofin/Settings`, see
 [`CONFIG.md`](CONFIG.md#seeing-what-is-set)) a plugin identity and an enabled flag, so the
 dashboard's Disable toggle turns them off. Its version is the server's release.
 `FERROFIN_DISABLE_EXTENSIONS` leaves it registered: it has nothing to fire inside a benchmark.
 
-Its settings page, the Settings link under Dashboard → Plugins → Ferrofin and the dashboard
-menu's **Ferrofin** entry, lists every setting that route reports, in a tab per group, with a
-search box and filters (changed, needs restart, hide read-only) above the tabs. Each setting has a
-readable name with the `config.toml` key, environment variable, flag and default below it, a badge
-for what sets it (`config.toml`, environment or flag) when anything does, and, for a setting the
-page may not change, its value as text with a lock, the reason and where it is changed instead.
-Secrets are shown to the administrator, marked as secrets. A setting the page may change is edited
-on one line: a field for its kind showing the default, muted, when nothing sets it, its unit and
-**Reset to default**. Each tab counts its unsaved edits; Save posts the changed ones of every tab,
-a refused value shows the server's message next to it, and **Restart now** applies them
-([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)).
-The page holds no setting itself, since `GET /web/ConfigurationPage` is anonymous: its script reads
-them from the admin-only route and sets every string as text, never as HTML. Disabling the plugin
-removes the page and the menu entry.
+Its settings page, the Settings link under Dashboard → Plugins → Ferrofin Settings and the dashboard
+menu's **Ferrofin Settings** entry, lists every setting that route reports, in a tab per group in a
+pane on the left, with a search box across every tab and filters (changed, hide read-only) beside
+the tabs. Each setting has a readable name with the `config.toml` key, environment variable, flag
+and default below it, a badge for what sets it (`config.toml`, environment or flag) when anything
+does, and, for a setting the page may not change, its value as text with a lock, the reason and
+where it is changed instead. Secrets are shown to the administrator, marked as secrets. A setting
+the page may change is edited on one line: a field for its kind showing the default, muted, when
+nothing sets it, its unit and **Reset to default**. Each tab counts its unsaved edits; Save posts
+the changed ones of every tab, a refused value shows the server's message next to it, and **Restart
+now** applies them ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)). The page holds no
+setting itself, since `GET /web/ConfigurationPage` is anonymous: its script reads them from the
+admin-only route and sets every string as text, never as HTML. Disabling the plugin removes the page
+and the menu entry.
 
 The extension is first-party, so it has no row or pin in
 [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md): its page
