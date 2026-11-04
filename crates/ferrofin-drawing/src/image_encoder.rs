@@ -288,7 +288,10 @@ impl ImageCrateEncoder {
     ///
     /// Optimized coding costs a second entropy pass over the image. Skia pays it
     /// on every JPEG Jellyfin writes, and it halves what this server stores and
-    /// serves, so Ferrofin pays it too.
+    /// serves, so Ferrofin pays it too. With it, `jpeg-encoder` codes each
+    /// component in a scan of its own (Skia interleaves them in one), a layout
+    /// every decoder must read but the `image` crate's misreads, so this crate
+    /// reads such files back through `jpeg-decoder` ([`crate::split_scans`]).
     ///
     /// The output is still not byte-identical to Skia's — no two independent
     /// JPEG writers are — but the two now agree on subsampling, quantization and
@@ -2268,6 +2271,45 @@ mod tests {
             diff < 2.0,
             "mean difference {diff} levels from the full decode"
         );
+    }
+
+    /// gl-1213: a JPEG this encoder wrote (4:2:0, one scan per component)
+    /// keeps its colours when an image request reads it back. A thumbnail at
+    /// half its size decodes it in full; the `image` crate's decoder came back
+    /// green there.
+    #[tokio::test]
+    async fn a_jpeg_this_encoder_wrote_reads_back_with_its_colours() {
+        let dir = TempDir::new().expect("tempdir");
+        let photo = smooth_photo(160, 120);
+        let input = out_path(&dir, "written.jpg");
+        let bytes =
+            ImageCrateEncoder::encode_jpeg(&DynamicImage::ImageRgb8(photo.clone()), &input, 90)
+                .expect("encode");
+        std::fs::write(&input, bytes).expect("write");
+        let output = out_path(&dir, "thumb.png");
+        let options = ImageProcessingOptions {
+            max_width: Some(80),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        ImageCrateEncoder::new()
+            .encode_image(
+                &input,
+                Utc::now(),
+                &output,
+                false,
+                None,
+                90,
+                &options,
+                ImageFormat::Png,
+            )
+            .await
+            .expect("encode");
+        let thumb = image::open(&output).expect("decodes").to_rgb8();
+        let expected = imageops::resize(&photo, 80, 60, imageops::FilterType::Lanczos3);
+        assert_eq!(thumb.dimensions(), (80, 60));
+        let diff = mean_abs_diff(thumb.as_raw(), expected.as_raw());
+        assert!(diff < 2.0, "mean difference {diff} levels from the photo");
     }
 
     /// gl-1015: the scaled decode plans its size in stored orientation and
