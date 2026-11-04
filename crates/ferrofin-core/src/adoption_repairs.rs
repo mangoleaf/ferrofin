@@ -2258,41 +2258,61 @@ fn remove_orphaned_folders(folders: &[PathBuf]) -> usize {
 /// The items `CleanupItemsFromDeletedLibraries` deletes: those whose
 /// `TopParentId` names no stored item and none of `folders`, each with its
 /// stored path.
+///
+/// Two passes over the items in one read transaction, so both see the same
+/// rows: the stored ids first, then the items whose top parent is not among
+/// them. Holding every item's id, top parent and path text to decide was
+/// about 8 MiB at 28,000 items, at the top of the adoption boot's memory.
 async fn items_from_deleted_libraries(
     db: &Database,
     folders: &[VirtualFolderInfo],
 ) -> Result<Vec<(Uuid, Option<String>)>, ServiceError> {
-    let rows: Vec<(String, Option<String>, Option<String>)> =
-        sqlx::query_as(r#"SELECT "Id", "TopParentId", "Path" FROM "BaseItems""#)
-            .fetch_all(db.pool())
-            .await
-            .map_err(db_err)?;
-    let stored: BTreeSet<Uuid> = rows
+    use futures_util::TryStreamExt;
+    let mut tx = db.pool().begin().await.map_err(db_err)?;
+    let mut stored: BTreeSet<Uuid> = folders
         .iter()
-        .filter_map(|(id, _, _)| Uuid::parse_str(id).ok())
-        .chain(
-            folders
-                .iter()
-                .filter_map(|folder| Uuid::parse_str(folder.item_id.as_deref()?).ok()),
-        )
+        .filter_map(|folder| Uuid::parse_str(folder.item_id.as_deref()?).ok())
         .collect();
-    Ok(rows
-        .into_iter()
-        .filter_map(|(id, top, path)| {
-            let top = Uuid::parse_str(top.as_deref()?).ok()?;
-            let id = Uuid::parse_str(&id).ok()?;
+    {
+        let mut ids =
+            sqlx::query_scalar::<_, String>(r#"SELECT "Id" FROM "BaseItems""#).fetch(&mut *tx);
+        while let Some(id) = ids.try_next().await.map_err(db_err)? {
+            stored.extend(Uuid::parse_str(&id).ok());
+        }
+    }
+    let mut orphaned = Vec::new();
+    {
+        let mut rows = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+            r#"SELECT "Id", "TopParentId", "Path" FROM "BaseItems""#,
+        )
+        .fetch(&mut *tx);
+        while let Some((id, top, path)) = rows.try_next().await.map_err(db_err)? {
+            let Some(top) = top.as_deref().and_then(|top| Uuid::parse_str(top).ok()) else {
+                continue;
+            };
+            let Ok(id) = Uuid::parse_str(&id) else {
+                continue;
+            };
             if stored.contains(&top) {
-                return None;
+                continue;
             }
             tracing::debug!(item_id = %id, path = ?path, top_parent_id = %top, "removing item: its library is gone");
-            Some((id, path))
-        })
-        .collect())
+            orphaned.push((id, path));
+        }
+    }
+    tx.commit().await.map_err(db_err)?;
+    Ok(orphaned)
 }
 
 /// The items `CleanupStaleFileEntries` deletes from the stored ones, with
 /// `folders` the library definitions on disk: see [`sweep_missing_items`].
 /// The file checks run on the blocking pool.
+///
+/// Every file-backed item is held for the checks, so each is held small: its
+/// id parsed as the rows stream in (an id that does not parse is never
+/// checked) and its stored path, expanded only when it is checked. Holding
+/// the id text and an expanded copy of every path beside the stored one was
+/// about 9 MiB at 24,000 items, at the top of the adoption boot's memory.
 async fn stale_file_items(
     db: &Database,
     folders: &[VirtualFolderInfo],
@@ -2300,28 +2320,35 @@ async fn stale_file_items(
     internal_metadata: &str,
     user_views: &str,
 ) -> Result<Vec<(Uuid, Option<String>)>, ServiceError> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        r#"SELECT "Id", "Path" FROM "BaseItems"
-           WHERE "Path" IS NOT NULL AND "Path" <> '' AND NOT "IsFolder" AND NOT "IsVirtualItem""#,
-    )
-    .fetch_all(db.pool())
-    .await
-    .map_err(db_err)?;
+    use futures_util::TryStreamExt;
+    let mut rows: Vec<(Uuid, String)> = Vec::new();
+    {
+        let mut stored = sqlx::query_as::<_, (String, String)>(
+            r#"SELECT "Id", "Path" FROM "BaseItems"
+               WHERE "Path" IS NOT NULL AND "Path" <> '' AND NOT "IsFolder" AND NOT "IsVirtualItem""#,
+        )
+        .fetch(db.pool());
+        while let Some((id, path)) = stored.try_next().await.map_err(db_err)? {
+            if let Ok(id) = Uuid::parse_str(&id) {
+                rows.push((id, path));
+            }
+        }
+    }
     let in_missing_libraries = items_in_missing_libraries(db, folders, paths, user_views).await?;
     let locations: Vec<String> = folders
         .iter()
         .flat_map(|folder| folder.locations.iter().cloned())
         .collect();
-    let rows: Vec<(String, String, String)> = rows
-        .into_iter()
-        .map(|(id, stored)| {
-            let path = paths.expand(&stored);
-            (id, stored, path)
-        })
-        .collect();
     let internal_metadata = upper_invariant(internal_metadata);
+    let paths = paths.clone();
     tokio::task::spawn_blocking(move || {
-        stale_among(&rows, &locations, &internal_metadata, &in_missing_libraries)
+        stale_among(
+            &rows,
+            &paths,
+            &locations,
+            &internal_metadata,
+            &in_missing_libraries,
+        )
     })
     .await
     .map_err(|err| ServiceError::Backend(format!("checking items for missing files: {err}")))
@@ -2335,11 +2362,13 @@ fn lists_an_entry<T>(mut entries: impl Iterator<Item = std::io::Result<T>>) -> b
     matches!(entries.next(), Some(Ok(_)))
 }
 
-/// [`stale_file_items`]' decision over `rows` (`Id`, stored path, expanded
-/// path): the library `locations`, the upper-cased internal metadata
-/// directory, and the items under a library whose definition is gone.
+/// [`stale_file_items`]' decision over `rows` (id, stored path, which
+/// `paths` expands): the library `locations`, the upper-cased internal
+/// metadata directory, and the items under a library whose definition is
+/// gone.
 fn stale_among(
-    rows: &[(String, String, String)],
+    rows: &[(Uuid, String)],
+    paths: &VirtualPathExpander,
     locations: &[String],
     internal_metadata: &str,
     in_missing_libraries: &BTreeSet<Uuid>,
@@ -2362,7 +2391,7 @@ fn stale_among(
     let (mut skipped_unrooted, mut skipped_missing_library, mut unreadable) =
         (0usize, 0usize, 0usize);
     tracing::info!(total = rows.len(), "checking items for missing files");
-    for (checked, (id, stored, path)) in rows.iter().enumerate() {
+    for (checked, (item, stored)) in rows.iter().enumerate() {
         if checked > 0 && checked % FILE_CHECK_PROGRESS_STEP == 0 {
             tracing::debug!(
                 checked,
@@ -2371,9 +2400,9 @@ fn stale_among(
                 "checking for missing files"
             );
         }
-        let Ok(item) = Uuid::parse_str(id) else {
-            continue;
-        };
+        let item = *item;
+        let path = paths.expand_cow(stored);
+        let path = path.as_ref();
         let folded = upper_invariant(path);
         if folded.starts_with(internal_metadata) {
             continue;
@@ -2559,13 +2588,19 @@ fn same_folder(a: &str, b: &str) -> bool {
 }
 
 /// The stored videos of [`GROUPED_KINDS`] that are no extra and whose `Data`
-/// names a path list `key` (`LocalAlternateVersions`, `AdditionalParts`).
+/// path list `key` (`LocalAlternateVersions`, `AdditionalParts`) holds an
+/// entry. Jellyfin 10.11 writes both lists, empty, into every video's
+/// `Data`, so the list is tested in SQL: reading the `Data` of every video
+/// to find the few with versions held megabytes through the boot (each pass
+/// about 8 MiB at 10,500 videos). A `Data` that is not JSON yields no paths
+/// ([`data_paths`]) and is left out.
 async fn listing_videos(db: &Database, key: &str) -> Result<Vec<GroupRow>, ServiceError> {
     let types = grouped_type_names();
     let rows: Vec<GroupRow> = sqlx::query_as(
         r#"SELECT "Id", "Type", "Path", "Data" FROM "BaseItems"
            WHERE "Type" IN (?1, ?2, ?3, ?4) AND "ExtraType" IS NULL AND "Path" IS NOT NULL
              AND "Data" IS NOT NULL AND instr("Data", ?5) > 0
+             AND json_array_length(CASE WHEN json_valid("Data") THEN "Data" END, ?6) > 0
            ORDER BY "Id""#,
     )
     .bind(types[0])
@@ -2573,6 +2608,7 @@ async fn listing_videos(db: &Database, key: &str) -> Result<Vec<GroupRow>, Servi
     .bind(types[2])
     .bind(types[3])
     .bind(format!("\"{key}\""))
+    .bind(format!("$.{key}"))
     .fetch_all(db.pool())
     .await
     .map_err(db_err)?;
@@ -4091,6 +4127,46 @@ mod tests {
         seed_user_data(db, user, adopted, true, None).await;
 
         [adopted, part, older]
+    }
+
+    /// A 10.11 `Data` carries both path lists on every video, almost always
+    /// empty: only the videos whose list holds an entry are read, so the
+    /// boot repair does not hold every video's `Data` to find its few
+    /// versions. A `Data` that is not JSON is skipped, as before, without
+    /// failing the query.
+    #[tokio::test]
+    async fn only_videos_whose_list_holds_an_entry_are_listed() {
+        let db = test_db().await;
+        let [versions, empty, parts, broken] = [0x11, 0x12, 0x13, 0x14].map(Uuid::from_u128);
+        for (id, data) in [
+            (
+                versions,
+                r#"{"AdditionalParts":[],"LocalAlternateVersions":["/m/A/A - 4K.mkv"]}"#,
+            ),
+            (
+                empty,
+                r#"{"AdditionalParts":[],"LocalAlternateVersions":[]}"#,
+            ),
+            (
+                parts,
+                r#"{"AdditionalParts":["/m/B/B - part2.mkv"],"LocalAlternateVersions":[]}"#,
+            ),
+            (broken, r#"{"LocalAlternateVersions":["/m/C/C - 4K.mkv"]"#),
+        ] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_path(&db, id, &format!("/m/{id}.mkv")).await;
+            set_data(&db, id, data).await;
+        }
+        let [parts_key, versions_key] = crate::item_data::RESOLVED_VIDEO_PATH_LISTS;
+        let listed = |rows: Vec<GroupRow>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        assert_eq!(
+            listed(listing_videos(&db, versions_key).await.unwrap()),
+            vec![guid_to_db(versions)]
+        );
+        assert_eq!(
+            listed(listing_videos(&db, parts_key).await.unwrap()),
+            vec![guid_to_db(parts)]
+        );
     }
 
     /// The bench's adopted Jellyfin 10.11 shape: a movie's local version is
