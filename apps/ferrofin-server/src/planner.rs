@@ -2201,8 +2201,12 @@ impl FerrofinStreamStatePlanner {
             push_split(&mut args, "-flags -global_header");
         }
 
-        if progressive && state.video_stream.is_some() {
+        // Every HLS job strips them (`GetCommandLineArguments`), the progressive
+        // video one too; progressive audio keeps its tags.
+        if !progressive || state.video_stream.is_some() {
             push_split(&mut args, "-map_metadata -1 -map_chapters -1");
+        }
+        if progressive && state.video_stream.is_some() {
             if copying_video && state.run_time_ticks.is_none() {
                 push_split(&mut args, "-fflags +genpts");
             }
@@ -2464,8 +2468,7 @@ impl FerrofinStreamStatePlanner {
         // applies to both copied and encoded streams, including audio-only HLS.
         push_split(&mut args, "-max_muxing_queue_size");
         args.push(options.max_muxing_queue_size.max(128).to_string());
-        push_split(&mut args, "-f");
-        args.push("hls".to_owned());
+        push_split(&mut args, "-f hls -max_delay 5000000");
         push_split(&mut args, "-hls_time");
         args.push(state.segment_length_secs.to_string());
         push_split(&mut args, "-hls_playlist_type");
@@ -2701,12 +2704,17 @@ fn push_split(args: &mut Vec<String>, fragment: &str) {
     args.extend(fragment.split_whitespace().map(str::to_owned));
 }
 
-/// The deterministic output id for `request` (the `StreamingHelpers` hash).
+/// The deterministic output id for `request`: a hash over the fields that
+/// identify one transcode job — item, source, session, device, live stream,
+/// and the output shape (codecs, playback permissions, stream-copy vetoes,
+/// bitrates, tracks, subtitles, container, audio/video). A
+/// re-request with the same tuple reuses the same `.m3u8`/segment files.
 ///
-/// Port of the `StreamingHelpers` output-name derivation: a stable hash over the
-/// fields that identify one transcode job — item, source, session, device, and
-/// the output shape (container + audio/video). A re-request with the same tuple
-/// reuses the same `.m3u8`/segment files.
+/// Diverges from upstream on purpose (owner decision 2026-11-04, gl-860):
+/// `StreamingHelpers.GetOutputFilePath` names the job
+/// `MD5("{MediaPath}-{UserAgent}-{DeviceId}-{PlaySessionId}")`, so a
+/// same-session request of another shape reuses the old job's segments. No
+/// client depends on the name; keep the shape in the key.
 fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool) -> String {
     use std::hash::{Hash as _, Hasher as _};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -3539,6 +3547,8 @@ mod tests {
         let args = plan.arguments.join(" ");
         assert!(args.contains("-c:a libmp3lame"), "{args}");
         assert!(args.contains("-b:a 128000"), "{args}");
+        // `GetProgressiveAudioFullCommandLine` keeps the source's tags.
+        assert!(!args.contains("-map_metadata"), "{args}");
 
         // The audio HLS segments of the same request encode to the same cap.
         let hls = p.plan(&req, true, None, PlaylistKind::Vod).await.unwrap();
@@ -6632,6 +6642,46 @@ mod tests {
                     plan.arguments
                 );
             }
+        }
+    }
+
+    /// `DynamicHlsController.GetCommandLineArguments` puts
+    /// `-map_metadata -1 -map_chapters -1` ahead of `-threads` and
+    /// `-max_delay 5000000` right after `-f hls` on every HLS job, audio and
+    /// video, VOD and event alike.
+    #[tokio::test]
+    async fn every_hls_job_strips_metadata_and_sets_max_delay() {
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        for (is_audio, kind) in [
+            (false, PlaylistKind::Vod),
+            (false, PlaylistKind::Event),
+            (true, PlaylistKind::Vod),
+        ] {
+            let args = p
+                .plan(&request("abc"), is_audio, Some(0), kind)
+                .await
+                .unwrap()
+                .arguments;
+            let at = |pair: [&str; 2]| args.windows(2).position(|w| w == pair);
+            let strip = at(["-map_metadata", "-1"]);
+            assert!(strip.is_some(), "{args:?}");
+            assert_eq!(
+                at(["-map_chapters", "-1"]),
+                strip.map(|i| i + 2),
+                "{args:?}"
+            );
+            assert!(
+                strip < args.iter().position(|a| a == "-threads"),
+                "{args:?}"
+            );
+            assert!(
+                args.windows(4)
+                    .any(|w| w == ["-f", "hls", "-max_delay", "5000000"]),
+                "{args:?}"
+            );
         }
     }
 
