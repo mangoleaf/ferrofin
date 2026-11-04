@@ -25,6 +25,7 @@ use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageError, ImageReader};
 
 use crate::error::DrawingError;
+use crate::split_scans;
 
 /// Bytes in a MiB, the unit of the memory settings.
 const MIB: u64 = 1024 * 1024;
@@ -219,7 +220,14 @@ impl ImageMemory {
     /// [`ServiceError::NotFound`]; an undecodable one, or one over the limits,
     /// is [`ServiceError::InvalidInput`] (the port of Skia's
     /// `InvalidDataException`/`return null` fallbacks).
+    ///
+    /// A sequential JPEG coded in more than one scan is decoded by
+    /// `jpeg-decoder`, because the `image` crate's decoder gets its colours
+    /// wrong ([`crate::split_scans`]).
     pub(crate) fn decode(&self, path: &str) -> Result<DynamicImage, ServiceError> {
+        if let Some((image, _)) = split_scans::decode(path, &self.limits) {
+            return Ok(image);
+        }
         let decoder = self.decoder(path)?;
         DynamicImage::from_decoder(decoder).map_err(|e| undecodable(path, &e))
     }
@@ -229,6 +237,10 @@ impl ImageMemory {
     /// the pixels stand as the photo was taken. A file whose orientation
     /// cannot be read is taken as stored.
     pub(crate) fn decode_oriented(&self, path: &str) -> Result<DynamicImage, ServiceError> {
+        if let Some((mut image, orientation)) = split_scans::decode(path, &self.limits) {
+            image.apply_orientation(orientation);
+            return Ok(image);
+        }
         let mut decoder = self.decoder(path)?;
         let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
         let mut image = DynamicImage::from_decoder(decoder).map_err(|e| undecodable(path, &e))?;
@@ -655,6 +667,104 @@ mod tests {
             match result {
                 Err(ServiceError::InvalidInput(message)) => {
                     assert!(message.contains(setting), "{message}");
+                }
+                other => panic!("expected a limit error, got {other:?}"),
+            }
+        }
+    }
+
+    /// gl-1213: the 64x64 JPEG the bug was found with, as Ferrofin's own encoder
+    /// wrote it: baseline, 4:2:0, one scan per component (`jpeg-encoder` with
+    /// optimized Huffman tables), a white image with edges faded to grey.
+    const SPLIT_SCAN_JPEG: &[u8] = include_bytes!("../tests/fixtures/split_scans_420.jpg");
+
+    /// Every channel of `pixel` within 2 levels of `expected`.
+    fn near(pixel: [u8; 3], expected: [u8; 3]) -> bool {
+        pixel.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 2)
+    }
+
+    /// Both decodes of the JPEG at `path`, as RGB.
+    fn both_decodes(path: &Path) -> [image::RgbImage; 2] {
+        let path = path.to_str().expect("utf8");
+        let memory = ImageMemory::new(ImageLimits::default());
+        [memory.decode(path), memory.decode_oriented(path)]
+            .map(|decoded| decoded.expect("decodes").to_rgb8())
+    }
+
+    /// gl-1213: libjpeg, ffmpeg and `jpeg-decoder` read the reported file as
+    /// grey corners around a white middle. zune-jpeg 0.5.15 left its chroma
+    /// planes at 0 and returned `(0, 182, 0)` and `(76, 255, 28)`.
+    #[test]
+    fn the_reported_split_scan_jpeg_decodes_to_its_colours() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("split.jpg");
+        std::fs::write(&path, SPLIT_SCAN_JPEG).expect("write");
+        for image in both_decodes(&path) {
+            assert_eq!(image.dimensions(), (64, 64));
+            let corner = image.get_pixel(0, 0).0;
+            let middle = image.get_pixel(32, 32).0;
+            assert!(near(corner, [47, 47, 47]), "corner {corner:?}");
+            assert!(near(middle, [255, 255, 255]), "middle {middle:?}");
+        }
+    }
+
+    /// gl-1213: a JPEG coded in one scan per component, the way `jpeg-encoder`
+    /// writes every JPEG with optimized Huffman tables (and libjpeg's `cjpeg`
+    /// from a scan script), decodes to its colours at every row. With
+    /// subsampled chroma zune-jpeg 0.5.15 lost the whole chroma planes; at
+    /// 4:4:4 it lost the last row of chroma blocks.
+    #[rstest]
+    #[case::subsampled_chroma(jpeg_encoder::SamplingFactor::F_2_2)]
+    #[case::full_chroma(jpeg_encoder::SamplingFactor::F_1_1)]
+    fn a_jpeg_coded_in_one_scan_per_component_decodes_to_its_colours(
+        #[case] sampling: jpeg_encoder::SamplingFactor,
+    ) {
+        // A grey ramp, darker at the top: neutral chroma, so every chroma
+        // block codes to the same symbol and its scan is a few bytes long.
+        let ramp = image::RgbImage::from_fn(64, 48, |_, y| {
+            let level = u8::try_from(40 + y * 4).expect("under 256");
+            image::Rgb([level, level, level])
+        });
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("split.jpg");
+        let mut encoder = jpeg_encoder::Encoder::new_file(&path, 90).expect("create");
+        encoder.set_sampling_factor(sampling);
+        encoder.set_optimized_huffman_tables(true);
+        encoder
+            .encode(ramp.as_raw(), 64, 48, jpeg_encoder::ColorType::Rgb)
+            .expect("encode");
+        for image in both_decodes(&path) {
+            for (x, y, pixel) in image.enumerate_pixels() {
+                let expected = ramp.get_pixel(x, y).0;
+                assert!(
+                    pixel
+                        .0
+                        .iter()
+                        .zip(expected)
+                        .all(|(a, b)| a.abs_diff(b) <= 4),
+                    "({x}, {y}) is {:?}, written as {expected:?}",
+                    pixel.0
+                );
+            }
+        }
+    }
+
+    /// gl-1213: a JPEG coded in one scan per component that is over the limits
+    /// is refused with the limit, as every other file is.
+    #[test]
+    fn a_split_scan_jpeg_over_the_limits_is_refused_with_the_limit() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("split.jpg");
+        std::fs::write(&path, SPLIT_SCAN_JPEG).expect("write");
+        let path = path.to_str().expect("utf8");
+        let memory = ImageMemory::new(ImageLimits {
+            max_pixels: 64 * 64 - 1,
+            ..ImageLimits::default()
+        });
+        for result in [memory.decode(path), memory.decode_oriented(path)] {
+            match result {
+                Err(ServiceError::InvalidInput(message)) => {
+                    assert!(message.contains("image_decode_max_megapixels"), "{message}");
                 }
                 other => panic!("expected a limit error, got {other:?}"),
             }

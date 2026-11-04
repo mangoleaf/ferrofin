@@ -108,7 +108,7 @@ variable or flag sets it, and **Reset to default** puts back a new server's valu
 value the file holds, it marks the key, and Save removes it, so the default applies after the
 restart (**Undo reset** takes the mark back); on an edit alone, it drops the edit.
 
-A search box and two filters sit above the settings, beside the tabs:
+A search box and two filters sit above the tabs, since they reach every tab:
 
 - the search matches a setting's name, description, `config.toml` key, variable and flag,
   ignoring case, and each word typed must match. It lists the matches of every tab, each tab's

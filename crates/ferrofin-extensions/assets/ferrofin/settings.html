@@ -24,16 +24,15 @@
         <div data-role="content">
             <div class="content-primary">
                 <div class="verticalSection">
-                    <div class="sectionTitleContainer flex align-items-center">
+                    <div class="sectionTitleContainer ferrofinTitle">
                         <h2 class="sectionTitle">Ferrofin Settings</h2>
+                        <p class="ferrofinConfigFile hide">
+                            Settings file: <code class="ferrofinConfigFilePath"></code>
+                            <span class="ferrofinConfigFileLocked hide">(the server cannot write it, so a save will fail)</span>
+                        </p>
                     </div>
                     <p class="fieldDescription">
-                        The server's own settings. A setting the settings file below holds shows its
-                        value there; one it does not shows its default, muted. Saving writes the changes
-                        to that file, and they apply when the server restarts. A setting marked "Applies
-                        at once" is saved to the server configuration instead, with no restart. A
-                        setting set by an environment variable or a command-line flag is locked here: it
-                        is changed where the server is started.
+                        Saved changes apply after a restart, except those marked "Applies at once".
                     </p>
                 </div>
                 <div class="ferrofinNotice ferrofinWarning ferrofinRestartPending hide" role="status">
@@ -50,36 +49,33 @@
                     <span class="material-icons error" aria-hidden="true"></span>
                     <span class="ferrofinErrorText"></span>
                 </div>
-                <p class="ferrofinConfigFile hide">
-                    Settings file: <code class="ferrofinConfigFilePath"></code>
-                    <span class="ferrofinConfigFileLocked hide">(the server cannot write it, so a save will fail)</span>
-                </p>
                 <form class="ferrofinForm hide" novalidate>
-                    <!-- The tabs in a pane on the left, the search and the settings beside them. -->
+                    <!-- The search and the filters over every tab, then the tabs in a pane on the left
+                         with the settings beside them. -->
+                    <div class="ferrofinFinder">
+                        <div class="inputContainer">
+                            <input is="emby-input" type="search" class="ferrofinSearch"
+                                label="Search settings" autocomplete="off" spellcheck="false" />
+                        </div>
+                        <div class="ferrofinFilters" role="group" aria-label="Filters">
+                            <div class="checkboxContainer">
+                                <label>
+                                    <input is="emby-checkbox" type="checkbox" class="ferrofinFilterChanged" />
+                                    <span>Changed</span>
+                                </label>
+                            </div>
+                            <div class="checkboxContainer">
+                                <label>
+                                    <input is="emby-checkbox" type="checkbox" class="ferrofinFilterLocked" />
+                                    <span>Hide read-only</span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
                     <div class="ferrofinShell">
                         <div class="ferrofinTabs" role="tablist" aria-orientation="vertical"
                             aria-label="Setting groups"></div>
                         <div class="ferrofinMain">
-                            <div class="ferrofinFinder">
-                                <div class="inputContainer">
-                                    <input is="emby-input" type="search" class="ferrofinSearch"
-                                        label="Search settings" autocomplete="off" spellcheck="false" />
-                                </div>
-                                <div class="ferrofinFilters" role="group" aria-label="Filters">
-                                    <div class="checkboxContainer">
-                                        <label>
-                                            <input is="emby-checkbox" type="checkbox" class="ferrofinFilterChanged" />
-                                            <span>Changed</span>
-                                        </label>
-                                    </div>
-                                    <div class="checkboxContainer">
-                                        <label>
-                                            <input is="emby-checkbox" type="checkbox" class="ferrofinFilterLocked" />
-                                            <span>Hide read-only</span>
-                                        </label>
-                                    </div>
-                                </div>
-                            </div>
                             <p class="ferrofinNoMatch fieldDescription hide" role="status"></p>
                             <div class="ferrofinGroups"></div>
                         </div>
@@ -92,6 +88,31 @@
         </div>
 
         <style>
+            /* jellyfin-web caps every form at 54em, which the tab pane would
+               leave the settings too little of. The page's content (the title,
+               the notices and the form) is capped at 80em instead. */
+            .ferrofinSettingsPage .content-primary {
+                max-width: 80em;
+            }
+
+            .ferrofinSettingsPage .ferrofinForm {
+                max-width: none;
+            }
+
+            /* The settings file beside the page's title, wrapping below it on a narrow screen. */
+            .ferrofinSettingsPage .ferrofinTitle {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: baseline;
+                gap: 0 1.2em;
+            }
+
+            .ferrofinSettingsPage .ferrofinConfigFile {
+                margin: 0;
+                font-size: 0.9em;
+                opacity: 0.8;
+            }
+
             .ferrofinSettingsPage .ferrofinNotice {
                 display: flex;
                 align-items: flex-start;
@@ -133,7 +154,7 @@
             }
 
             .ferrofinSettingsPage .ferrofinFinder .inputContainer {
-                flex: 1 1 18em;
+                flex: 0 1 30em;
                 margin: 0;
             }
 
