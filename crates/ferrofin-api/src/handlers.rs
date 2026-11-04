@@ -939,7 +939,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// frames, which the tile operations serve but no response shows;
 /// `trickplay` is which sets of trickplay images are made, kept and replaced,
 /// shared by the item refresh, the library scan and the Generate Trickplay
-/// Images task;
+/// Images task, and the order a media source's widths are listed in
+/// `BaseItemDto.Trickplay`;
 /// `scan-failure-isolation` is what the library scan does about a row or a
 /// write that fails, which no operation's response shows;
 /// `progressive-transcode` is who may reach ffmpeg through the stream routes,
@@ -1163,8 +1164,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A session list that cannot be built is logged and skipped and the subscription stays; \
              upstream logs it and drops the connection's subscription.",
             "A session's NowPlayingItem map members (ImageTags, ProviderIds, ImageBlurHashes, \
-             Trickplay, RequiredHttpHeaders) are written in hash order, as on every item \
-             endpoint, not upstream's insertion order.",
+             RequiredHttpHeaders, and Trickplay's media source ids) are written in hash order, \
+             as on every item endpoint, not upstream's insertion order; Trickplay lists each \
+             source's widths largest first, as the trickplay row says.",
             "A *Start whose Data is missing, has no second field or holds a field that does not \
              parse as a whole number still subscribes, at jellyfin-web's 1500 ms when the period \
              is at fault, where upstream's Start throws and makes no subscription.",
@@ -1460,8 +1462,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
                    How ffmpeg extracts the frames, on either path, is the \
                    trickplay-extraction row's; how many generations run at once is not part \
-                   of this row",
-        date: "2026-11-02",
+                   of this row. Also the order a media source's widths are listed in \
+                   BaseItemDto.Trickplay: trickplay_manager.rs resolutions_for, \
+                   get_trickplay_manifest and get_trickplay_manifest_batch \
+                   (GetTrickplayResolutions, GetTrickplayManifest), dto_service.rs \
+                   to_trickplay_manifest and ferrofin-model dto/base_item.rs \
+                   serialize_trickplay_largest_first, compared with \
+                   Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field); \
+                   which media sources the manifest lists is not part of this row: it lists \
+                   only the item's own, where upstream lists every local version (gl-1235)",
+        date: "2026-11-03",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \
@@ -1494,6 +1504,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              from the JSON while off, which writes 4:4:4 tiles, from 4:4:4 frames on the \
              software path (see the trickplay-extraction row), instead of 4:2:0 (owner \
              decision 2026-11-01, D6, gl-1128).",
+            "BaseItemDto.Trickplay lists each media source's widths largest first, every \
+             time; upstream lists them in the order SQLite returns the rows, smallest first in \
+             practice. Clients that show the first width listed (Wholphin, the Android TV and \
+             Android apps) then get the sharpest set; jellyfin-web picks by screen size. \
+             Deliberate divergence (owner decision 2026-11-03, gl-1226).",
         ],
     },
     VerifiedSubsystem {
