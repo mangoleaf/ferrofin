@@ -1,5 +1,7 @@
 //! Port of `FileHelper.cs` — create-or-truncate a file at a path, plus the
-//! directory-writability probe the extraction paths pre-flight with.
+//! directory-writability probe the extraction paths pre-flight with — and the
+//! atomic and private (`0600` on Unix) writes Ferrofin's config, state and
+//! backup files go through.
 
 use std::io;
 use std::path::Path;
@@ -18,7 +20,65 @@ use std::path::Path;
 /// Returns a filesystem error without truncating the destination.
 pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
-    atomic_replace_with(path, |file| file.write_all(contents))
+    atomic_write_with(path, |file| file.write_all(contents))
+}
+
+/// [`atomic_write`] with the contents written by `write`, for contents that
+/// come from a stream (a file restored from a backup archive).
+///
+/// The result is private (`0600` on Unix), whatever mode a file it replaces
+/// had.
+///
+/// # Errors
+///
+/// Returns the error `write` or the filesystem raised, without truncating the
+/// destination.
+pub fn atomic_write_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
+    atomic_replace_with_permissions(path, true, write)
+}
+
+/// Creates, or truncates, a private file at `path` and opens it for writing:
+/// `0600` on Unix whether the file is new or already there, for a file that
+/// holds secrets but is written in place (a backup archive, which holds the
+/// configuration tree). On other platforms it is [`std::fs::File::create`].
+///
+/// # Errors
+///
+/// Returns the error from opening the file, or from narrowing the mode of one
+/// already there (on Unix, a file another user owns).
+pub fn create_private(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    private_mode(&mut options);
+    let file = options.open(path)?;
+    // The creation mode applies only to a new file: one already there keeps
+    // its own until narrowed here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if file.metadata()?.permissions().mode() & 0o777 != PRIVATE_MODE {
+            file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_MODE))?;
+        }
+    }
+    Ok(file)
+}
+
+/// The mode of a private file: owner read and write only.
+#[cfg(unix)]
+const PRIVATE_MODE: u32 = 0o600;
+
+/// Makes `options` create its file private (`0600` on Unix; a no-op elsewhere).
+fn private_mode(options: &mut std::fs::OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(PRIVATE_MODE);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
 }
 
 /// Replaces media-adjacent artwork atomically with ordinary file permissions.
@@ -31,13 +91,6 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
 pub fn atomic_write_media(path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
     atomic_replace_with_permissions(path, false, |file| file.write_all(contents))
-}
-
-fn atomic_replace_with(
-    path: &Path,
-    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
-) -> io::Result<()> {
-    atomic_replace_with_permissions(path, true, write)
 }
 
 fn atomic_replace_with_permissions(
@@ -53,12 +106,8 @@ fn atomic_replace_with_permissions(
     let temporary = parent.join(format!(".ferrofin-config-{}", uuid::Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        if private {
-            options.mode(0o600);
-        }
+    if private {
+        private_mode(&mut options);
     }
     let mut file = options.open(&temporary)?;
     let result = (|| {
@@ -161,13 +210,43 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// gl-1233: a private file is `0600` whether it is new or replaces, or
+    /// truncates, one with the umask mode.
+    #[cfg(unix)]
+    #[test]
+    fn private_files_are_owner_only_new_or_not() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let dir = temp_dir().join(format!("ferrofin-private-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("archive.zip");
+        create_private(&path).unwrap().write_all(b"new").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        create_private(&path).unwrap().write_all(b"again").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"again", "truncated");
+
+        let restored = dir.join("config.json");
+        std::fs::write(&restored, b"old").unwrap();
+        std::fs::set_permissions(&restored, std::fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write_with(&restored, |file| {
+            std::io::copy(&mut &b"streamed"[..], file).map(drop)
+        })
+        .unwrap();
+        assert_eq!(mode(&restored), 0o600);
+        assert_eq!(std::fs::read(&restored).unwrap(), b"streamed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn atomic_write_preserves_previous_file_when_a_write_fails() {
         use std::io::Write as _;
         let dir = temp_dir().join(format!("ferrofin-atomic-{}", uuid::Uuid::new_v4()));
         let path = dir.join("settings.json");
         atomic_write(&path, b"original").unwrap();
-        let result = atomic_replace_with(&path, |file| {
+        let result = atomic_write_with(&path, |file| {
             file.write_all(b"incomplete")?;
             Err(io::Error::other("disk full"))
         });
