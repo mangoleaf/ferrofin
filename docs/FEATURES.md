@@ -190,6 +190,17 @@ Wired and working, with a documented limitation or lighter verification:
   Save writes them to the server configuration and they apply at once, Reset puts back a new
   server's value, and a value typed on the dashboard that fits no option shows as Custom
   ([`CONFIG.md`](CONFIG.md#trickplay)). Disabling the Ferrofin Settings plugin hides the page.
+- **LDAP sign-in** — Jellyfin's LDAP-Auth plugin (v24), compiled in and off until an
+  administrator enables it under Dashboard → Plugins ([`EXTENSIONS.md`](EXTENSIONS.md#ldap-auth)).
+  Directory users sign in from any client with their directory password: accounts created on
+  first sign-in, renames followed, the administrator flag kept in step with an LDAP filter,
+  password changes written to the directory, reset links, profile pictures, referrals, and an
+  adopted Jellyfin's LDAP-Auth settings and users carried over. Compared against the plugin's C#,
+  and run against OpenLDAP from jellyfin-web, a client library and a data directory adopted from
+  Jellyfin 12.4 with the plugin. **Active Directory has not been tested.** The accepted
+  divergences (off by default, an outage not counted toward lockout, the last administrator
+  never demoted, timeouts, a blank reset refused, among others) are listed in
+  [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md#ldap-auth).
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote

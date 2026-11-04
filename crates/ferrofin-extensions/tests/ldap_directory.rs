@@ -12,8 +12,7 @@
 //! the target directory. Two servers start: one that takes any client, and one
 //! that demands a client certificate; the referral case starts two more, one
 //! referring to the other and to a name that does not resolve. Without
-//! `FERROFIN_LDAP_TESTS=1` the test says so and passes. Later phases of the
-//! LDAP-Auth port add their cases here.
+//! `FERROFIN_LDAP_TESTS=1` the test says so and passes.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -47,6 +46,8 @@ use rcgen::{
 };
 
 /// The image the directories run from: Alpine's OpenLDAP.
+/// `contrib/ldap-test-directory/directory.sh` builds the same tag from the
+/// same Dockerfile: keep the two in step.
 const IMAGE: &str = "ferrofin-ldap-test:alpine3.22-openldap";
 const DOCKERFILE: &str = "FROM alpine:3.22\n\
      RUN apk add --no-cache openldap openldap-back-mdb openldap-clients\n";
@@ -661,8 +662,9 @@ impl WithClientCertificate for LdapConfig {
     }
 }
 
-/// The seam's other operations, which later phases build on: search with
-/// attributes, modify, the RFC 3062 password modify and the root DSE.
+/// The seam's other operations, which sign-in, the password change and the
+/// picture sync use: search with attributes, modify, the RFC 3062 password
+/// modify and the root DSE.
 async fn directory_operations(plain: &LdapConfig) {
     let options = ConnectionOptions::from_config(plain);
     assert_eq!(options.verification, CertificateVerification::System);

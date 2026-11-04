@@ -316,6 +316,10 @@ runs it:
 FERROFIN_WASM_GUEST_TESTS=1 cargo test -p ferrofin-wasm --test wasm_hello_guest
 ```
 
+To check LDAP-Auth on a running server by hand, from jellyfin-web or a native client,
+`contrib/ldap-test-directory/directory.sh up` starts a seeded directory and prints the
+settings to enter (its README lists the steps).
+
 ### Performance is measured per release, not per PR — the v3 benchmark is in `gates/bench/`
 **Suite v3 exists and is the tool to use** (v2, formerly `suite/`, was scrapped by owner
 decision on 2026-09-02 for policing itself instead of answering questions; do not

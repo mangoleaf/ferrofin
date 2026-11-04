@@ -90,17 +90,67 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
 
 Four third-party Jellyfin plugins ship as extensions today. Each is a faithful port of a
 pinned upstream revision; the pins and the full delta live in
-[`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md). LDAP-Auth is being ported in phases: so far it
-shows under Dashboard → Plugins, disabled, with upstream's settings page and its connection,
-filter and user-search tests, and once enabled with a server it signs directory users in
-(creating them on their first sign-in, following a directory rename, and keeping their
-administrator flag in step with the admin filter), following the referrals its searches meet.
-Their password changes reach the directory, and a forgotten password sends them to the
-configured reset page. An adopted Jellyfin's LDAP-Auth settings and uid map are imported once
-on the first start, and the plugin is turned on when a user's saved authentication provider is
-LDAP-Auth's. With profile-image sync on, a new user's picture comes from the directory (binary,
-Base64 or a URL), and the "LDAP - Synchronize profile images" task keeps every LDAP user's
-current.
+[`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md). LDAP-Auth, the one that changes how users sign
+in, is described in [LDAP-Auth](#ldap-auth) below.
+
+| Extension | Upstream | Ported rev | What it does |
+|---|---|---|---|
+| **Intro Skipper** | [intro-skipper/intro-skipper](https://github.com/intro-skipper/intro-skipper) | `db09359` | Intro, credits, recap, preview and commercial detection (audio fingerprints, chapters, black frames), exposed as media segments |
+| **File Transformation** | [IAmParadox27/jellyfin-plugin-file-transformation](https://github.com/IAmParadox27/jellyfin-plugin-file-transformation) | `f4f01c3` | Transform-on-serve hook other extensions build on |
+| **Merge Versions** | [danieladov/jellyfin-plugin-mergeversions](https://github.com/danieladov/jellyfin-plugin-mergeversions) | `e6f58d6` | Bulk-merge duplicate movie/episode versions into one item, two 24h tasks |
+| **LDAP-Auth** | [jellyfin/jellyfin-plugin-ldapauth](https://github.com/jellyfin/jellyfin-plugin-ldapauth) | `d11c86a` | Sign users in against an LDAP directory: accounts created on first sign-in, the admin filter, password changes and reset links, profile pictures, referrals, and an adopted Jellyfin's settings imported |
+
+**Accepted divergences** (not bugs — do not "fix" them during an upstream sync): Ferrofin
+models version groups solely through the `PrimaryVersionId` pointer rather than Jellyfin's
+internal `OwnerId`/`LinkedAlternateVersions` machinery, which is representation, not API
+surface. Intro Skipper fingerprints with `ffmpeg -f chromaprint` (jellyfin-ffmpeg is built with
+that muxer), falling back to `fpcalc`; without either, the analyzers that need no fingerprint
+(chapters, black frames) still run. The precise per-plugin list is in
+[`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md).
+
+### LDAP-Auth
+
+LDAP-Auth signs users in with their directory username and password, from any client, with
+nothing to change on the client. It is **off by default**: an administrator enables it under
+Dashboard → Plugins, opens its Settings (upstream's own page), enters the server, bind user
+and base DN, and presses "Save and Test LDAP Server Settings". From then on:
+
+- A directory user's first sign-in creates their account when "Enable User Creation" is on,
+  with the library access chosen on that page; with it off, they are refused. A local account
+  that already has their name is never taken over.
+- A returning user is matched by their LDAP uid, so a rename in the directory renames them
+  here. Their administrator flag follows `LDAP Admin Filter` at each sign-in, except that the
+  filter never demotes the last administrator: that user stays one and the server logs a
+  warning.
+- With "Allow Password Change" on, a password change is written to the directory (the bind
+  user must be allowed to set users' passwords). A blank password, which is what an
+  administrator's reset sends, is refused. "Forgot password" shows an LDAP user the
+  `Password Reset Url`, with `$userName` and `$userId` in it filled in.
+- With profile image synchronization on, a new user's picture comes from the directory, and
+  the "LDAP - Synchronize profile images" task keeps every LDAP user's current.
+- Searches follow the directory's referrals as the bind user, over the same TLS as the
+  configured connection.
+
+A directory that cannot be reached fails a sign-in with a server error after at most 5 seconds
+to connect or 10 seconds for each step, and that failure does not count toward the user's
+lockout. Local accounts keep signing in meanwhile. LDAP sign-ins with a name that is not an
+account's name (a uid or a mail, or a first sign-in) take turns, as on Jellyfin, so during an
+outage each of those waits for the ones before it. An empty password is refused before anything
+is sent to the directory. Disabling the plugin removes its provider and makes its users'
+sign-ins fail; their accounts stay. Settings apply as soon as they are saved, whatever the note
+at the top of the page says.
+
+An adopted Jellyfin's `plugins/configurations/LDAP-Auth.xml` is imported on the first start,
+with its uid map, and the plugin is turned on only when a user's saved authentication provider
+is LDAP-Auth's ([INSTALL.md](INSTALL.md) lists the file to copy). A file that cannot be read is
+a warning, and the next start tries again. The file itself is never changed, and changes made in
+Ferrofin never reach it. Adoption is one-way: the database Ferrofin migrates may not open under
+Jellyfin again, and going back means restoring `jellyfin.db.pre-ferrofin`, the copy taken before
+the first change ([INSTALL.md](INSTALL.md)).
+
+To try it, [`contrib/ldap-test-directory/`](../contrib/ldap-test-directory/README.md) starts a
+throwaway OpenLDAP directory with test users and prints the settings to enter. It has been
+proven against OpenLDAP only: Active Directory has not been tested.
 
 > **Warning:** LDAP-Auth's username and uid attributes must be ones users cannot change on
 > their own entry. As upstream, a directory user is matched to an existing LDAP-Auth account by
@@ -110,21 +160,6 @@ current.
 > them can set it to another LDAP user's value and sign in to that account, whatever its rights,
 > with their own password. Choose attributes only administrators can write, or restrict
 > self-writes to them.
-
-| Extension | Upstream | Ported rev | What it does |
-|---|---|---|---|
-| **Intro Skipper** | [intro-skipper/intro-skipper](https://github.com/intro-skipper/intro-skipper) | `db09359` | Intro, credits, recap, preview and commercial detection (audio fingerprints, chapters, black frames), exposed as media segments |
-| **File Transformation** | [IAmParadox27/jellyfin-plugin-file-transformation](https://github.com/IAmParadox27/jellyfin-plugin-file-transformation) | `f4f01c3` | Transform-on-serve hook other extensions build on |
-| **Merge Versions** | [danieladov/jellyfin-plugin-mergeversions](https://github.com/danieladov/jellyfin-plugin-mergeversions) | `e6f58d6` | Bulk-merge duplicate movie/episode versions into one item, two 24h tasks |
-| **LDAP-Auth** | [jellyfin/jellyfin-plugin-ldapauth](https://github.com/jellyfin/jellyfin-plugin-ldapauth) | `d11c86a` | Sign users in against an LDAP directory (in progress: the settings page and its three `POST /Ldap/*` tests, sign-in, the admin filter, password changes and resets, referrals, the adopted settings' import, and profile images so far) |
-
-**Accepted divergences** (not bugs — do not "fix" them during an upstream sync): Ferrofin
-models version groups solely through the `PrimaryVersionId` pointer rather than Jellyfin's
-internal `OwnerId`/`LinkedAlternateVersions` machinery, which is representation, not API
-surface. Intro Skipper fingerprints with `ffmpeg -f chromaprint` (jellyfin-ffmpeg is built with
-that muxer), falling back to `fpcalc`; without either, the analyzers that need no fingerprint
-(chapters, black frames) still run. The precise per-plugin list is in
-[`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md).
 
 ### The Ferrofin Settings extension
 

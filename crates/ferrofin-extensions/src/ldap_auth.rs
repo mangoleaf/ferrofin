@@ -2,7 +2,7 @@
 //! [`jellyfin-plugin-ldapauth`](https://github.com/jellyfin/jellyfin-plugin-ldapauth)
 //! (GUID `958aad66-3784-4d2a-b89a-a7b6fab6e25c`), faithful to v24 (`d11c86a`).
 //!
-//! Ported surface so far, grouped here so the whole plugin lives in one place:
+//! The ported surface, grouped here so the whole plugin lives in one place:
 //! - [`LdapAuthExtension`] — the `/Plugins` presentation, the plugin
 //!   configuration ([`LdapConfig`], upstream `PluginConfiguration`) and the
 //!   vendored upstream settings page;
