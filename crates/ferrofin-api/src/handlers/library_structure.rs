@@ -541,12 +541,18 @@ struct UpdateLibraryOptionsBody {
 /// projected string can never succeed. Parsing also makes the route
 /// format-agnostic the way C#'s `Guid` lookup is. `Name` is still honored when
 /// supplied; a request matching no library (by either) is a `404`.
+///
+/// **Missing options.** A body without `LibraryOptions` (or with `null`) is a
+/// `400` and writes nothing. Upstream fails the same request after its lookup,
+/// with a 500 from the `request.LibraryOptions!` dereference; the 400 names the
+/// field the client has to send (the route's `VERIFIED` row).
 #[utoipa::path(
     post,
     path = "/Library/VirtualFolders/LibraryOptions",
     request_body = UpdateLibraryOptionsBody,
     responses(
         (status = 204, description = "Library updated"),
+        (status = 400, description = "LibraryOptions missing or null"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -556,7 +562,6 @@ async fn update_library_options(
     FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     JsonBody(body): JsonBody<UpdateLibraryOptionsBody>,
 ) -> Result<StatusCode, ApiError> {
-    let options = body.library_options.unwrap_or_default();
     // No name: resolve the library by its CollectionFolder id (what jellyfin-web
     // posts). Match the projected `ItemId` against the persisted virtual folders.
     let name = if let Some(name) = body.name.filter(|n| !n.trim().is_empty()) {
@@ -574,6 +579,12 @@ async fn update_library_options(
             .and_then(|f| f.name)
             .ok_or_else(|| ApiError::NotFound(format!("library {id}")))?
     };
+    // After the lookup, as upstream's `request.LibraryOptions!` dereference: a
+    // missing or null `LibraryOptions` is refused and nothing is written, never
+    // replaced by the defaults (which would wipe every setting and `PathInfos`).
+    let options = body
+        .library_options
+        .ok_or_else(|| ApiError::BadRequest("LibraryOptions must not be null".to_owned()))?;
     state
         .virtual_folders
         .update_library_options(&name, &options)
