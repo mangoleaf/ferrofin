@@ -324,12 +324,6 @@ mod tests {
         async fn delete_trickplay_data(&self, _id: Uuid) -> Result<(), ServiceError> {
             Ok(())
         }
-        async fn get_trickplay_manifest(
-            &self,
-            _id: Uuid,
-        ) -> Result<HashMap<String, HashMap<i32, TrickplayInfoEntity>>, ServiceError> {
-            Ok(HashMap::new())
-        }
         async fn get_hls_playlist(
             &self,
             _id: Uuid,

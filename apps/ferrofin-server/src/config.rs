@@ -159,6 +159,7 @@ struct FileConfig {
     image_download_max_mb: Option<u32>,
     image_negative_cache_ttl_secs: Option<u64>,
     image_private_http_allow: Option<String>,
+    subtitle_private_http_allow: Option<String>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     ffmpeg_img_extract_perf_tradeoff: Option<bool>,
@@ -499,6 +500,17 @@ pub struct Config {
     /// those warns and allows nothing. Read with
     /// [`image_private_allow_list`](Self::image_private_allow_list).
     pub image_private_http_allow: Option<String>,
+
+    /// The private hosts and networks the OpenSubtitles download link may
+    /// reach, in the same form as
+    /// [`image_private_http_allow`](Self::image_private_http_allow), which
+    /// does not apply to it (owner decision 2026-11-03, gl-1160). `None` = no
+    /// private address. Resolved `FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW` env >
+    /// `subtitle_private_http_allow` in `config.toml` > none; blank is unset,
+    /// and an entry that is not a host, an address or a network warns and
+    /// allows nothing. Read with
+    /// [`subtitle_private_allow_list`](Self::subtitle_private_allow_list).
+    pub subtitle_private_http_allow: Option<String>,
 
     /// Explicit `ffmpeg` executable path. `None` falls back to `system.json`
     /// then `$PATH` during discovery.
@@ -1170,7 +1182,18 @@ impl Config {
             image_resize_budget_mb,
             image_download_max_mb,
             image_negative_cache_ttl_secs,
-            image_private_http_allow: resolve_private_allow(env, file.image_private_http_allow),
+            image_private_http_allow: resolve_private_allow(
+                env,
+                "FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW",
+                "image_private_http_allow",
+                file.image_private_http_allow,
+            ),
+            subtitle_private_http_allow: resolve_private_allow(
+                env,
+                "FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW",
+                "subtitle_private_http_allow",
+                file.subtitle_private_http_allow,
+            ),
             ffmpeg_path,
             ffprobe_path,
             max_transcodes,
@@ -1486,10 +1509,15 @@ impl Config {
     /// refused entries left out: the loader warned about them.
     #[must_use]
     pub fn image_private_allow_list(&self) -> ferrofin_providers::destination::PrivateAllowList {
-        self.image_private_http_allow
-            .as_deref()
-            .map(|raw| ferrofin_providers::destination::PrivateAllowList::parse(raw).0)
-            .unwrap_or_default()
+        private_allow_list(self.image_private_http_allow.as_deref())
+    }
+
+    /// The private hosts and networks the OpenSubtitles download link may
+    /// reach ([`subtitle_private_http_allow`](Self::subtitle_private_http_allow)),
+    /// its refused entries left out: the loader warned about them.
+    #[must_use]
+    pub fn subtitle_private_allow_list(&self) -> ferrofin_providers::destination::PrivateAllowList {
+        private_allow_list(self.subtitle_private_http_allow.as_deref())
     }
 
     /// TheTVDB's token max age ([`tvdb_token_days`](Self::tvdb_token_days)):
@@ -1628,6 +1656,7 @@ impl Config {
             image_download_max_mb: RequestLimits::DEFAULT_DOWNLOAD_MAX_MB,
             image_negative_cache_ttl_secs: DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS,
             image_private_http_allow: None,
+            subtitle_private_http_allow: None,
             ffmpeg_path: None,
             ffprobe_path: None,
             ffmpeg_img_extract_perf_tradeoff: false,
@@ -1865,22 +1894,32 @@ where
     clamped
 }
 
-/// Resolves `image_private_http_allow`: the `FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW`
-/// env var when it is not blank, else `config.toml`'s, else none. Each entry
-/// the list refuses warns ([`Env::warn`]) and allows nothing; the rest apply.
-fn resolve_private_allow(env: &dyn Env, file: Option<String>) -> Option<String> {
+/// Resolves a private allow-list (`image_private_http_allow`,
+/// `subtitle_private_http_allow`): the `var` env var when it is not blank,
+/// else `config.toml`'s `key`, else none. Each entry the list refuses warns
+/// ([`Env::warn`]) and allows nothing; the rest apply.
+fn resolve_private_allow(
+    env: &dyn Env,
+    var: &str,
+    key: &str,
+    file: Option<String>,
+) -> Option<String> {
     let raw = env
-        .var("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW")
+        .var(var)
         .filter(|raw| !raw.trim().is_empty())
         .or(file)
         .filter(|raw| !raw.trim().is_empty())?;
     for (entry, reason) in ferrofin_providers::destination::PrivateAllowList::parse(&raw).1 {
-        env.warn(format!(
-            "FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW / image_private_http_allow: `{entry}` {reason}; \
-             it is ignored"
-        ));
+        env.warn(format!("{var} / {key}: `{entry}` {reason}; it is ignored"));
     }
     Some(raw)
+}
+
+/// A resolved private allow-list, its refused entries left out; empty when
+/// unset.
+fn private_allow_list(raw: Option<&str>) -> ferrofin_providers::destination::PrivateAllowList {
+    raw.map(|raw| ferrofin_providers::destination::PrivateAllowList::parse(raw).0)
+        .unwrap_or_default()
 }
 
 /// Resolves the stdout log format: the `FERROFIN_LOG_FORMAT` env var when it
@@ -3246,6 +3285,69 @@ mod tests {
         );
         assert_eq!(
             cfg.image_private_allow_list(),
+            PrivateAllowList::parse("10.0.0.0/8").0,
+            "the rest applies"
+        );
+    }
+
+    /// The subtitle link's own allow-list (gl-1160): resolved as the image
+    /// list is, and independent of it both ways.
+    #[test]
+    fn the_subtitle_private_allow_list_is_its_own() {
+        use ferrofin_providers::destination::PrivateAllowList;
+        let lan: std::net::IpAddr = "192.168.1.20".parse().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "subtitle_private_http_allow = \"mirror.lan\"\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.subtitle_private_http_allow, None, "nothing by default");
+        assert!(cfg.subtitle_private_allow_list().is_empty());
+
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert!(cfg.subtitle_private_allow_list().allows("mirror.lan", lan));
+        assert!(cfg.image_private_allow_list().is_empty(), "not the images'");
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW", "192.168.1.0/24")
+            .with("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW", "10.0.0.0/8");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert_eq!(
+            cfg.subtitle_private_http_allow.as_deref(),
+            Some("192.168.1.0/24"),
+            "the variable beats the file"
+        );
+        assert!(
+            !cfg.subtitle_private_allow_list()
+                .allows("x", "10.0.0.1".parse().unwrap()),
+            "the image list does not apply"
+        );
+
+        let env = FakeEnv::new().with("FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW", "  ");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(
+            cfg.subtitle_private_http_allow.as_deref(),
+            Some("mirror.lan"),
+            "a blank variable is unset"
+        );
+
+        let env = FakeEnv::new().with("FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW", "*, 10.0.0.0/8");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.load_warnings.len(), 1, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("`*`")
+                && cfg.load_warnings[0].contains("FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW")
+                && cfg.load_warnings[0].contains("subtitle_private_http_allow"),
+            "{}",
+            cfg.load_warnings[0]
+        );
+        assert_eq!(
+            cfg.subtitle_private_allow_list(),
             PrivateAllowList::parse("10.0.0.0/8").0,
             "the rest applies"
         );

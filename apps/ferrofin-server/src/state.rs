@@ -2055,7 +2055,11 @@ pub async fn build_app_state(
     audiodb_client.attach_plugin_manager(Arc::clone(&plugins));
     studios_client.attach_plugin_manager(Arc::clone(&plugins));
 
-    let mut opensubtitles = ferrofin_providers::OpenSubtitlesProvider::new(Arc::clone(&plugins));
+    // The download link OpenSubtitles answers with refuses private addresses
+    // but those its own allow-list names (gl-1160); the image list does not
+    // apply to it.
+    let mut opensubtitles = ferrofin_providers::OpenSubtitlesProvider::new(Arc::clone(&plugins))
+        .with_link_destinations(config.subtitle_private_allow_list());
     if let Some(endpoint) = &config.provider_endpoints.opensubtitles {
         opensubtitles = opensubtitles.with_base_url(endpoint);
     }

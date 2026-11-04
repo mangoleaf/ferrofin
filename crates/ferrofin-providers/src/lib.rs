@@ -17,6 +17,7 @@ pub mod episode;
 pub mod error;
 pub mod external_ids;
 pub mod fanart;
+mod guarded_http;
 mod image_download;
 pub mod image_policy;
 pub mod image_save;

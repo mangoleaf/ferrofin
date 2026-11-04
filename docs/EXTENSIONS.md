@@ -159,7 +159,10 @@ proven against OpenLDAP only: Active Directory has not been tested.
 > directories let users edit their own `cn`, such as OpenLDAP's common `by self write`), one of
 > them can set it to another LDAP user's value and sign in to that account, whatever its rights,
 > with their own password. Choose attributes only administrators can write, or restrict
-> self-writes to them.
+> self-writes to them. An account already linked to a uid the directory still has is never
+> taken by name (a Ferrofin divergence), but one not linked yet is, so the username attribute
+> must also be unique: two entries sharing a `cn` would otherwise share the account until it is
+> linked.
 
 ### The Ferrofin Settings extension
 

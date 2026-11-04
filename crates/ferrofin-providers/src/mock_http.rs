@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 /// unless the server's policy lets them reach it (gl-1096), so binding one
 /// lets them: a test serving images here needs nothing else. A test of the
 /// refusal itself gives its client its own policy
-/// (`image_download::ImageHttp::new`).
+/// (`guarded_http::GuardedHttp::new`).
 async fn bind() -> TcpListener {
     crate::destination::test_support::allow_loopback_images();
     TcpListener::bind("127.0.0.1:0").await.expect("bind mock")

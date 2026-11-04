@@ -1216,6 +1216,8 @@ impl Harness {
             // The mock serves its images on loopback, which image downloads refuse
             // unless the allow-list names it.
             image_private_http_allow: Some("127.0.0.1".to_owned()),
+            // Its subtitle links too, which have their own list (gl-1160).
+            subtitle_private_http_allow: Some("127.0.0.1".to_owned()),
             ..Config::test_stub(temp.path())
         };
         let (server, base, config) = boot::spawn_server(&client, make_config).await;

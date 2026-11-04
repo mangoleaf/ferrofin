@@ -1567,6 +1567,7 @@ dependencies = [
  "bitflags",
  "chrono",
  "ferrofin-util",
+ "indexmap",
  "rstest",
  "secrecy",
  "serde",
