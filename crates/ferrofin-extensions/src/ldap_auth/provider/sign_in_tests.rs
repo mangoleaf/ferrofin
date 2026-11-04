@@ -1036,6 +1036,69 @@ async fn a_linked_account_is_relinked_by_name_once_its_uid_is_gone_from_the_dire
     )));
 }
 
+/// An entry whose own uid is linked to an account since moved to another
+/// provider (gl-1230: that link is ignored) and whose `cn` names Ada's
+/// account: the by-name relink is still refused while Ada's uid is in the
+/// directory (gl-1229), and takes the link over once it is gone.
+#[rstest]
+#[case::linked_uid_still_in_the_directory(true)]
+#[case::linked_uid_gone(false)]
+#[tokio::test]
+async fn a_moved_accounts_uid_link_does_not_decide_the_relink_by_name(#[case] ada_exists: bool) {
+    const DEFAULT_PROVIDER: &str =
+        "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider";
+    let (harness, ada_user) = ada_linked_by_cn().await;
+    let moved = harness
+        .existing_user("ada2-local", DEFAULT_PROVIDER, "local-secret")
+        .await;
+    harness
+        .identities
+        .link(id_of(&moved), LdapAuthProvider::identity("ada2"), None)
+        .await
+        .expect("link");
+    uid_search_answers(
+        &harness,
+        "ada",
+        if ada_exists { vec![ada()] } else { Vec::new() },
+    );
+    harness.answer(vec![ada2()]);
+
+    let outcome = harness.sign_in("ada2", ADA2_PASSWORD).await;
+    if ada_exists {
+        assert!(
+            matches!(outcome, Err(ServiceError::Unauthorized(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            harness.link("ada").await.map(|link| link.user_id),
+            Some(id_of(&ada_user)),
+            "Ada's link is untouched"
+        );
+        assert_eq!(
+            harness.link("ada2").await.map(|link| link.user_id),
+            Some(id_of(&moved)),
+            "the moved account's link is ignored, not removed"
+        );
+    } else {
+        let user = outcome.expect("sign in").expect("signed in");
+        assert_eq!(user.id, ada_user.id);
+        assert_eq!(harness.link("ada").await, None);
+        assert_eq!(
+            harness.link("ada2").await.map(|link| link.user_id),
+            Some(id_of(&ada_user)),
+            "the relink takes the moved account's link over"
+        );
+    }
+    assert_eq!(
+        harness
+            .user("ada2-local")
+            .await
+            .expect("moved")
+            .authentication_provider_id,
+        DEFAULT_PROVIDER
+    );
+}
+
 #[tokio::test]
 async fn an_entry_the_linked_uid_still_finds_is_relinked_as_the_same_person() {
     let (harness, ada_user) = ada_linked_by_cn().await;
