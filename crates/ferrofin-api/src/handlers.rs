@@ -1468,8 +1468,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    and prunes, for an item refresh (Replace included), the library scan and \
                    the Generate Trickplay Images task. ferrofin-core trickplay_manager.rs \
                    refresh_media (RefreshTrickplayDataAsync, with CanGenerateTrickplay and \
-                   DiscoverExistingTrickplayAsync), refresh_width \
-                   (RefreshTrickplayDataInternal), create_tiles and move_dir (CreateTiles), \
+                   DiscoverExistingTrickplayAsync), refresh_widths, prepare_width, \
+                   generate_sets and tile_and_save (RefreshTrickplayDataInternal), \
+                   create_tiles and move_dir (CreateTiles), \
                    and scheduled_tasks/library.rs TrickplayImagesTask, compared with \
                    MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
                    How ffmpeg extracts the frames, on either path, is the \
@@ -1526,6 +1527,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              video's sets together; upstream takes _resourcePool per width, under which a queued \
              video's first width would go before an earlier video's second. Order only: the \
              widths made, and the checks before each, are unchanged (gl-1227).",
+            "A video's widths are each checked first (skipped, imported, or to generate, \
+             with the write-access probe and the set recorded as made), and then the widths \
+             to generate are extracted by one extract_trickplay_frame_sets call, which the \
+             ffmpeg extractor makes from one decode (see the trickplay-extraction row), and \
+             tiled and saved one by one; upstream checks, extracts, tiles and saves each width \
+             before it checks the next. A width that fails, in its checks or in the run, is \
+             logged and leaves the other widths as upstream's catch does. Order and the \
+             number of decodes only: the widths made, and each width's checks, frames and \
+             tiles, are unchanged (gl-1228).",
         ],
     },
     VerifiedSubsystem {

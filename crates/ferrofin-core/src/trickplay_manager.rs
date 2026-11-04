@@ -30,6 +30,12 @@
 //!   (upstream never replaces images unasked). The settings of the last
 //!   finished pass are kept in `FerrofinMeta`, so passes with nothing changed
 //!   read no tiles.
+//! - A video's widths are each checked first (skipped, imported, or to
+//!   generate), and the widths to generate are then extracted by one
+//!   [`TrickplayFrameExtractor::extract_trickplay_frame_sets`] call, which the
+//!   ffmpeg extractor makes from one decode, in one generation slot; upstream
+//!   checks and extracts each width in turn, decoding the video once per
+//!   width (gl-1227, gl-1228).
 //!
 //! The manifest key mirrors C#: trickplay is keyed by *media-source id*, and the
 //! primary media source of an item is the item's own id in the dashless
@@ -56,7 +62,9 @@ use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::drawing::ImageEncoder;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::VirtualFolderManager;
-use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor};
+use ferrofin_traits::media_encoding::{
+    TrickplayExtraction, TrickplayFrameExtractor, TrickplayOutput,
+};
 use ferrofin_traits::options::ImageCollageOptions;
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::system::{MediaLocation, PathManager};
@@ -139,8 +147,9 @@ pub struct FerrofinTrickplayManager {
     live_tv: Option<std::sync::Weak<dyn ferrofin_traits::stubs::LiveTvManager>>,
     virtual_folders: Arc<std::sync::OnceLock<Arc<dyn VirtualFolderManager>>>,
     /// Bounds how many items extract and tile at once, across scans and the
-    /// scheduled task. An item holds one slot across all of its widths that
-    /// generate, so its sets are made together (gl-1227).
+    /// scheduled task. An item holds one slot across the run that extracts
+    /// all of its widths that generate and their tiling, so its sets are made
+    /// together (gl-1227, gl-1228).
     /// Upstream holds a lock of 1 (`TrickplayManager._resourcePool`), taken
     /// per width; Ferrofin sizes it from `FERROFIN_TRICKPLAY_CONCURRENCY`
     /// instead.
@@ -200,6 +209,19 @@ struct WidthRefreshContext<'a> {
     /// Whether `trickplay_dir` is beside the media (`SaveTrickplayWithMedia`),
     /// so generation probes it for write access first.
     save_with_media: bool,
+}
+
+/// A width of a video that needs its set generated, as
+/// [`FerrofinTrickplayManager::prepare_width`] found it.
+struct PendingSet {
+    /// The selected trickplay width.
+    width: i32,
+    /// The width the set is made at: `width`, or the video's when narrower.
+    actual_width: i32,
+    /// The video's width, when it narrowed `width`.
+    narrower: Option<i64>,
+    /// The folder the set's tiles are moved into.
+    output_dir: PathBuf,
 }
 
 impl FerrofinTrickplayManager {
@@ -404,24 +426,22 @@ impl FerrofinTrickplayManager {
         Some(path)
     }
 
-    /// Port of `RefreshTrickplayDataInternal` for one configured width: skip or
-    /// import existing tiles, otherwise extract frames and pack tiles.
-    ///
-    /// `slot` is the video's generation slot: the first width that generates
-    /// takes it, and the video's later widths reuse it.
-    async fn refresh_width(
+    /// The checks of `RefreshTrickplayDataInternal` for one configured width,
+    /// before its frames are extracted: skip or import existing tiles, and
+    /// otherwise return the set to generate, once the folder beside the media
+    /// is known to be writable and the set is recorded as made.
+    async fn prepare_width(
         &self,
         ctx: &WidthRefreshContext<'_>,
         replace: bool,
         width: i32,
         options: &TrickplayOptions,
-        slot: &mut Option<tokio::sync::OwnedSemaphorePermit>,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Option<PendingSet>, ServiceError> {
         // Source checks these only inside per-width work: they do not bypass
         // discovery or the outer disabled/replace cleanup.
         if !Path::new(ctx.media_path).is_file() {
             tracing::warn!(item = %ctx.item_id, path = ctx.media_path, "trickplay media file not found");
-            return Ok(());
+            return Ok(None);
         }
         if Path::new(ctx.media_path)
             .parent()
@@ -429,7 +449,7 @@ impl FerrofinTrickplayManager {
             .is_some_and(|name| name.eq_ignore_ascii_case("backdrops"))
         {
             tracing::debug!(item = %ctx.item_id, path = ctx.media_path, "ignoring backdrop media");
-            return Ok(());
+            return Ok(None);
         }
         // CanGenerateTrickplay counts all streams, but the pinned per-width
         // body dereferences mediaSource.VideoStream.Width. An audio-only source
@@ -441,7 +461,7 @@ impl FerrofinTrickplayManager {
         };
         let (actual_width, narrower) = generated_width(width, video_stream);
         if actual_width <= 0 {
-            return Ok(());
+            return Ok(None);
         }
 
         let output_dir = Path::new(ctx.trickplay_dir).join(format!(
@@ -459,11 +479,11 @@ impl FerrofinTrickplayManager {
                     .contains_key(&actual_width)
                 {
                     tracing::debug!(item = %ctx.item_id, "found existing trickplay files");
-                    return Ok(());
+                    return Ok(None);
                 }
-                return self
-                    .import_tiles(ctx.item_id, width, options, &existing_files)
-                    .await;
+                self.import_tiles(ctx.item_id, width, options, &existing_files)
+                    .await?;
+                return Ok(None);
             }
         }
 
@@ -476,82 +496,143 @@ impl FerrofinTrickplayManager {
         // A set the recorded settings cannot be told about is not made: the
         // width fails and the next run tries again.
         self.record_set_made(width, options).await?;
-
-        // Generate: extract thumbnails into a temp dir, pack them into tiles.
-        if slot.is_none() {
-            *slot = Some(
-                Arc::clone(&self.generation_slots)
-                    .acquire_owned()
-                    .await
-                    .map_err(ServiceError::backend_source)?,
-            );
-        }
-        // Upstream warns "video width is smaller than trickplay setting"
-        // before its existing-tiles check, so once per pass over every narrow
-        // video. Using the video's width is the intended outcome, so it is a
-        // field of the one line a generation logs (`video_width` present
-        // when the setting was narrowed).
-        tracing::info!(
-            width = actual_width,
-            trickplay_width = width,
-            video_width = narrower,
-            path = ctx.media_path,
-            item = %ctx.item_id,
-            "creating trickplay files"
-        );
-        // `MediaEncoder.ExtractVideoImagesOnIntervalAccelerated`: under the
-        // server's temp directory, which "Clean Cache Directory" sweeps.
-        let frames_dir = self
-            .temp_directory()
-            .join(Uuid::new_v4().simple().to_string());
-        let _frames_cleanup = TemporaryTrickplayDirectory(frames_dir.clone());
-        let result = self
-            .extract_and_tile(ctx, actual_width, options, &frames_dir, &output_dir)
-            .await;
-        if result.is_err() && ctx.save_with_media {
-            // Drop the probed width folder when nothing was written into it;
-            // a non-empty or already removed folder makes this a no-op, and
-            // `prune_unexpected_folders` sweeps any row-less folder afterwards.
-            let _ = std::fs::remove_dir(&output_dir);
-        }
-        result
+        Ok(Some(PendingSet {
+            width,
+            actual_width,
+            narrower,
+            output_dir,
+        }))
     }
 
-    /// Runs the frame extraction plus [`Self::create_tiles`], saving the
-    /// resulting info row; on a save failure the freshly written tiles are
+    /// Generates `sets`, the widths of one video that [`Self::prepare_width`]
+    /// found need it: one [`TrickplayFrameExtractor::extract_trickplay_frame_sets`]
+    /// call extracts every width's frames, so the ffmpeg extractor decodes
+    /// the video once for all of them (gl-1228; upstream extracts each width
+    /// with a run of its own), then each width's tiles are packed and saved.
+    /// Returns each set's outcome in order; one width's failure costs only
+    /// that width.
+    ///
+    /// The video's generation slot is taken first and held until its last
+    /// set is saved (gl-1227).
+    async fn generate_sets(
+        &self,
+        ctx: &WidthRefreshContext<'_>,
+        sets: &[PendingSet],
+        options: &TrickplayOptions,
+    ) -> Vec<Result<(), ServiceError>> {
+        if sets.is_empty() {
+            return Vec::new();
+        }
+        let _slot = match Arc::clone(&self.generation_slots).acquire_owned().await {
+            Ok(slot) => slot,
+            Err(e) => {
+                return sets
+                    .iter()
+                    .map(|set| {
+                        drop_probed_folder(ctx, set);
+                        Err(ServiceError::backend(format!("no generation slot: {e}")))
+                    })
+                    .collect();
+            }
+        };
+        for set in sets {
+            // Upstream warns "video width is smaller than trickplay setting"
+            // before its existing-tiles check, so once per pass over every
+            // narrow video. Using the video's width is the intended outcome,
+            // so it is a field of the one line a generation logs
+            // (`video_width` present when the setting was narrowed).
+            tracing::info!(
+                width = set.actual_width,
+                trickplay_width = set.width,
+                video_width = set.narrower,
+                path = ctx.media_path,
+                item = %ctx.item_id,
+                "creating trickplay files"
+            );
+        }
+        // `MediaEncoder.ExtractVideoImagesOnIntervalAccelerated`: under the
+        // server's temp directory, which "Clean Cache Directory" sweeps, one
+        // directory per width.
+        let frames_dirs: Vec<String> = sets
+            .iter()
+            .map(|_| {
+                self.temp_directory()
+                    .join(Uuid::new_v4().simple().to_string())
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        // Each width's frames go once its tiles are packed, and every width's
+        // if the future is dropped.
+        let mut frames_cleanup: Vec<Option<TemporaryTrickplayDirectory>> = frames_dirs
+            .iter()
+            .map(|dir| Some(TemporaryTrickplayDirectory(PathBuf::from(dir))))
+            .collect();
+        let outputs: Vec<TrickplayOutput<'_>> = sets
+            .iter()
+            .zip(&frames_dirs)
+            .map(|(set, dir)| TrickplayOutput {
+                max_width: set.actual_width,
+                output_dir: dir,
+            })
+            .collect();
+        let first = outputs[0];
+        let request = TrickplayExtraction {
+            input_path: ctx.media_path,
+            video_stream: ctx.video_stream.as_ref(),
+            media_streams: &ctx.media_streams,
+            interval_ms: options.interval,
+            max_width: first.max_width,
+            qscale: options.qscale,
+            threads: options.process_threads,
+            priority: options.process_priority,
+            output_dir: first.output_dir,
+            allow_hw_accel: options.enable_hw_acceleration,
+            enable_hw_encoding: options.enable_hw_encoding,
+            keyframe_only: options.enable_key_frame_only_extraction,
+            full_chroma: options.full_chroma,
+        };
+        let mut extracted = self
+            .frame_extractor
+            .extract_trickplay_frame_sets(&request, &outputs)
+            .await
+            .into_iter();
+
+        let mut results = Vec::with_capacity(sets.len());
+        for (set, frames) in sets.iter().zip(&mut frames_cleanup) {
+            let images = extracted.next().unwrap_or_else(|| {
+                Err(ServiceError::backend(
+                    "the frame extractor returned fewer sets than asked for",
+                ))
+            });
+            let result = match images {
+                Ok(images) => self.tile_and_save(ctx, set, options, &images).await,
+                Err(e) => Err(e),
+            };
+            drop(frames.take());
+            if result.is_err() {
+                drop_probed_folder(ctx, set);
+            }
+            results.push(result);
+        }
+        results
+    }
+
+    /// Packs a width's extracted `images` with [`Self::create_tiles`] and saves
+    /// the resulting info row; on a save failure the freshly written tiles are
     /// removed so no files stay behind without a row (mirroring the C#),
     /// unless they replaced a set whose row names their folder (or the rows
     /// cannot be read): that set is already gone, and the row still points at
     /// the new tiles, whose timing it may describe until the next save.
-    async fn extract_and_tile(
+    async fn tile_and_save(
         &self,
         ctx: &WidthRefreshContext<'_>,
-        actual_width: i32,
+        set: &PendingSet,
         options: &TrickplayOptions,
-        frames_dir: &Path,
-        output_dir: &Path,
+        images: &[String],
     ) -> Result<(), ServiceError> {
-        let images = self
-            .frame_extractor
-            .extract_trickplay_frames(&TrickplayExtraction {
-                input_path: ctx.media_path,
-                video_stream: ctx.video_stream.as_ref(),
-                media_streams: &ctx.media_streams,
-                interval_ms: options.interval,
-                max_width: actual_width,
-                qscale: options.qscale,
-                threads: options.process_threads,
-                priority: options.process_priority,
-                output_dir: &frames_dir.to_string_lossy(),
-                allow_hw_accel: options.enable_hw_acceleration,
-                enable_hw_encoding: options.enable_hw_encoding,
-                keyframe_only: options.enable_key_frame_only_extraction,
-                full_chroma: options.full_chroma,
-            })
-            .await?;
-
         let mut info = self
-            .create_tiles(&images, actual_width, options, output_dir)
+            .create_tiles(images, set.actual_width, options, &set.output_dir)
             .await?;
         info.item_id = guid_to_db(ctx.item_id);
 
@@ -561,14 +642,15 @@ impl FerrofinTrickplayManager {
             let orphaned = self
                 .resolutions_for(ctx.item_id)
                 .await
-                .is_ok_and(|rows| !row_names_folder(&rows, actual_width, options));
+                .is_ok_and(|rows| !row_names_folder(&rows, set.actual_width, options));
             if orphaned {
-                let _ = std::fs::remove_dir_all(output_dir);
+                let _ = std::fs::remove_dir_all(&set.output_dir);
             }
             return Err(e);
         }
         tracing::info!(
             path = ctx.media_path,
+            width = set.actual_width,
             "finished creation of trickplay files"
         );
         Ok(())
@@ -984,8 +1066,8 @@ impl FerrofinTrickplayManager {
     ) -> Result<bool, ServiceError> {
         // Held across discovery, the existing-tiles checks, generation and
         // the prune, as upstream's `_resourcePool` is held across the first
-        // three; a generation slot bounds the ffmpeg work, held per video from
-        // its first width that generates to its last width.
+        // three; a generation slot bounds the ffmpeg work, held per video
+        // across the one run that extracts its widths and their tiling.
         let lock = self.item_locks.get(&item_id.to_string());
         let _item = lock.lock().await;
         let has_streams = !media_streams.is_empty();
@@ -1099,11 +1181,12 @@ impl FerrofinTrickplayManager {
     /// video. `rows` are the sets on disk on a checking pass (empty
     /// otherwise): one at another chroma is regenerated and swapped in.
     ///
-    /// The video holds one generation slot from its first width that
-    /// generates until its last width is done, so a scan's backlog of
-    /// videos waiting for a slot gets each video's sets together rather than
-    /// every video's first width before any second width. Upstream takes its
-    /// `_resourcePool` per width (gl-1227).
+    /// Each width is checked first ([`Self::prepare_width`]: skipped,
+    /// imported, or to generate), then the widths to generate are made
+    /// together by [`Self::generate_sets`], from one decode and in one
+    /// generation slot, so a scan's backlog of videos waiting for a slot gets
+    /// each video's sets together. Upstream checks and generates one width at
+    /// a time, taking its `_resourcePool` per width (gl-1227, gl-1228).
     async fn refresh_widths(
         &self,
         ctx: &WidthRefreshContext<'_>,
@@ -1112,7 +1195,7 @@ impl FerrofinTrickplayManager {
         options: &TrickplayOptions,
     ) -> HashSet<i32> {
         let mut generated = HashSet::new();
-        let mut slot = None;
+        let mut pending = Vec::new();
         for width in &options.width_resolutions {
             if *width <= 0 {
                 continue;
@@ -1136,11 +1219,23 @@ impl FerrofinTrickplayManager {
                     });
             // Per-width failures are logged and do not abort the remaining
             // resolutions (the C# catch-and-log).
-            if let Err(e) = self
-                .refresh_width(ctx, replace_width, *width, options, &mut slot)
+            match self
+                .prepare_width(ctx, replace_width, *width, options)
                 .await
             {
-                tracing::error!(item_id = %ctx.item_id, width, "error creating trickplay images: {e}");
+                Ok(Some(set)) => pending.push(set),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(item_id = %ctx.item_id, width, "error creating trickplay images: {e}");
+                }
+            }
+        }
+        if !pending.is_empty() {
+            let results = self.generate_sets(ctx, &pending, options).await;
+            for (set, result) in pending.iter().zip(results) {
+                if let Err(e) = result {
+                    tracing::error!(item_id = %ctx.item_id, width = set.width, "error creating trickplay images: {e}");
+                }
             }
         }
         generated
@@ -1861,6 +1956,17 @@ fn chroma_mismatch(trickplay_dir: &str, row: &TrickplayInfoEntity, full_chroma: 
     found != full_chroma
 }
 
+/// After `set` failed, drops the width folder
+/// [`FerrofinTrickplayManager::prepare_width`] probed beside the media when
+/// nothing was written into it; a non-empty or already removed folder makes
+/// this a no-op, and `prune_unexpected_folders` sweeps any row-less folder
+/// afterwards.
+fn drop_probed_folder(ctx: &WidthRefreshContext<'_>, set: &PendingSet) {
+    if ctx.save_with_media {
+        let _ = std::fs::remove_dir(&set.output_dir);
+    }
+}
+
 /// Whether `dir` exists and directly contains at least one `.jpg` file
 /// (C# `HasTrickplayTiles`).
 fn has_tiles(dir: &Path) -> bool {
@@ -2057,7 +2163,7 @@ fn move_content(src: &Path, dst: &Path) -> Result<(), ServiceError> {
 #[cfg(test)]
 mod tests {
     use ferrofin_model::entities_media::MediaStream;
-    use ferrofin_traits::media_encoding::TrickplayExtraction;
+    use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayOutput};
 
     use ferrofin_db::entities::playback::TrickplayInfoEntity;
     use ferrofin_db::store::guid_to_db;
@@ -2256,6 +2362,15 @@ mod tests {
         fail: std::sync::atomic::AtomicBool,
         /// Every extraction's `(input_path, max_width)`, in the order they ran.
         order: Mutex<Vec<(String, i32)>>,
+        /// The widths of each `extract_trickplay_frame_sets` call, in order:
+        /// one entry per decode the ffmpeg extractor would make.
+        sets: Mutex<Vec<Vec<i32>>>,
+        /// Widths whose own extraction fails, as one width of a shared run
+        /// that fell back to a run per width might.
+        fail_widths: Mutex<Vec<i32>>,
+        /// Returns one result fewer than asked for, as a broken extractor
+        /// might.
+        short_sets: std::sync::atomic::AtomicBool,
     }
 
     impl FakeExtractor {
@@ -2273,7 +2388,15 @@ mod tests {
                 hold: None,
                 fail: std::sync::atomic::AtomicBool::new(false),
                 order: Mutex::new(Vec::new()),
+                sets: Mutex::new(Vec::new()),
+                fail_widths: Mutex::new(Vec::new()),
+                short_sets: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        /// The widths of each `extract_trickplay_frame_sets` call so far.
+        fn sets(&self) -> Vec<Vec<i32>> {
+            self.sets.lock().expect("lock").clone()
         }
 
         fn calls(&self) -> usize {
@@ -2308,7 +2431,13 @@ mod tests {
             *self.last_full_chroma.lock().expect("lock") = Some(request.full_chroma);
             *self.last_stream.lock().expect("lock") = request.video_stream.cloned();
             *self.last_streams.lock().expect("lock") = request.media_streams.to_vec();
-            if self.fail.load(Ordering::SeqCst) {
+            if self.fail.load(Ordering::SeqCst)
+                || self
+                    .fail_widths
+                    .lock()
+                    .expect("lock")
+                    .contains(&request.max_width)
+            {
                 return Err(ServiceError::backend("extraction failed"));
             }
             let output_dir = request.output_dir;
@@ -2329,6 +2458,34 @@ mod tests {
                 release.notified().await;
             }
             Ok(paths)
+        }
+
+        /// Records the call's widths, then makes each width on its own, as
+        /// the trait's default does.
+        async fn extract_trickplay_frame_sets(
+            &self,
+            request: &TrickplayExtraction<'_>,
+            outputs: &[TrickplayOutput<'_>],
+        ) -> Vec<Result<Vec<String>, ServiceError>> {
+            self.sets
+                .lock()
+                .expect("lock")
+                .push(outputs.iter().map(|output| output.max_width).collect());
+            // One decode writes every width's frames as it goes, so each
+            // width's directory holds frames before any width is done.
+            for output in outputs {
+                std::fs::create_dir_all(output.output_dir).expect("frames dir");
+                std::fs::write(Path::new(output.output_dir).join("partial.jpg"), b"")
+                    .expect("partial frame");
+            }
+            let mut sets = Vec::with_capacity(outputs.len());
+            for output in outputs {
+                sets.push(self.extract_trickplay_frames(&output.of(request)).await);
+            }
+            if self.short_sets.load(Ordering::SeqCst) {
+                sets.pop();
+            }
+            sets
         }
     }
 
@@ -3423,11 +3580,205 @@ mod tests {
             .await
             .expect("replace");
         assert_eq!(r.extractor.calls(), 3, "one Replace for both widths");
+        assert_eq!(
+            r.extractor.sets(),
+            vec![vec![300]; 3],
+            "and one width a run"
+        );
         let rows = r.mgr.get_trickplay_resolutions(item).await.expect("rows");
         assert_eq!(rows.keys().copied().collect::<Vec<_>>(), vec![300]);
         assert_eq!(
             super::jpeg_full_chroma(&set_dir(&r, item, &media, 300).join("0.jpg")),
             Some(true)
+        );
+    }
+
+    /// The widths a refresh generates go to the extractor in one call, so
+    /// the ffmpeg extractor decodes the video once for all of them (gl-1228):
+    /// a width with its set and row is skipped and one with tiles but no row
+    /// is imported, as before, and neither is in the call.
+    #[tokio::test]
+    async fn one_run_makes_only_the_widths_that_need_generating() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("first");
+        let imported = set_dir(&r, item, &media, 480);
+        std::fs::create_dir_all(&imported).expect("tiles without a row");
+        image::RgbImage::new(960, 540)
+            .save(imported.join("0.jpg"))
+            .expect("tile");
+        let placed = std::fs::read(imported.join("0.jpg")).expect("placed tile");
+
+        r.set_options(options_2x2(&[320, 480, 640, 1280]));
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        assert_eq!(
+            r.extractor.sets(),
+            vec![vec![320], vec![640, 1280]],
+            "the missing widths, together"
+        );
+        let rows = r.mgr.get_trickplay_resolutions(item).await.expect("rows");
+        let mut widths: Vec<i32> = rows.keys().copied().collect();
+        widths.sort_unstable();
+        assert_eq!(widths, vec![320, 480, 640, 1280]);
+        assert_eq!(
+            std::fs::read(imported.join("0.jpg")).expect("tile"),
+            placed,
+            "480 was taken as it is"
+        );
+        assert_eq!(rows[&1280].thumbnail_count, 4, "1280 was generated");
+        for width in [640, 1280] {
+            assert!(set_dir(&r, item, &media, width).join("0.jpg").is_file());
+        }
+
+        // A Replace makes every selected width again, in one run.
+        r.mgr
+            .refresh_trickplay_data(item, true, &extraction_on())
+            .await
+            .expect("replace");
+        assert_eq!(r.extractor.sets().last(), Some(&vec![320, 480, 640, 1280]));
+    }
+
+    /// One width of the run failing (the extractor's per-width fallback after
+    /// a failed shared run) costs only that width: the others are tiled and
+    /// saved, the failed width's folder probed beside the media goes, and the
+    /// next refresh asks again for the failed width alone.
+    #[rstest::rstest]
+    #[case::internal(false)]
+    #[case::beside_media(true)]
+    #[tokio::test]
+    async fn a_width_that_fails_in_the_run_keeps_the_others(#[case] save_with_media: bool) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320, 640]), FakeExtractor::new(4, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let library = LibraryOptions {
+            save_trickplay_with_media: save_with_media,
+            ..extraction_on()
+        };
+        let dir = |width: i32| {
+            PathBuf::from(r.pm.trickplay_directory(
+                item,
+                MediaLocation::of_file(&media),
+                save_with_media,
+            ))
+            .join(format!("{width} - 2x2"))
+        };
+        r.extractor.fail_widths.lock().expect("lock").push(640);
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &library)
+            .await
+            .expect("a failed width is logged, not returned");
+
+        assert_eq!(r.extractor.sets(), vec![vec![320, 640]]);
+        let rows = r.mgr.get_trickplay_resolutions(item).await.expect("rows");
+        assert_eq!(rows.keys().copied().collect::<Vec<_>>(), vec![320]);
+        assert!(dir(320).join("0.jpg").is_file());
+        // The failed width's probed folder goes with it, or with the prune
+        // that follows every refresh.
+        assert!(!dir(640).exists(), "no folder is left for the failed width");
+        let temp = r.mgr.temp_directory();
+        assert!(
+            !temp.exists() || std::fs::read_dir(&temp).expect("temp").next().is_none(),
+            "every width's frames are cleaned up"
+        );
+
+        r.extractor.fail_widths.lock().expect("lock").clear();
+        r.mgr
+            .refresh_trickplay_data(item, false, &library)
+            .await
+            .expect("retry");
+        assert_eq!(r.extractor.sets(), vec![vec![320, 640], vec![640]]);
+        assert_eq!(
+            r.mgr
+                .get_trickplay_resolutions(item)
+                .await
+                .expect("rows")
+                .len(),
+            2
+        );
+    }
+
+    /// A width whose media folder cannot be written fails before the run and
+    /// is left out of it; the other widths are still made together.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unwritable_width_folder_is_left_out_of_the_run() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(
+            &db,
+            options_2x2(&[320, 640, 1280]),
+            FakeExtractor::new(4, 180),
+        );
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let library = LibraryOptions {
+            save_trickplay_with_media: true,
+            ..extraction_on()
+        };
+        let beside =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true));
+        let locked = beside.join("640 - 2x2");
+        std::fs::create_dir_all(&locked).expect("width folder");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
+            .expect("read-only");
+        if std::fs::File::create(locked.join(".probe")).is_ok() {
+            // Running as root: nothing is unwritable, so nothing to check.
+            return;
+        }
+
+        let refreshed = r.mgr.refresh_trickplay_data(item, false, &library).await;
+        // The prune may have removed the empty folder already.
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755));
+        refreshed.expect("refresh");
+        assert_eq!(r.extractor.sets(), vec![vec![320, 1280]]);
+        let rows = r.mgr.get_trickplay_resolutions(item).await.expect("rows");
+        let mut widths: Vec<i32> = rows.keys().copied().collect();
+        widths.sort_unstable();
+        assert_eq!(widths, vec![320, 1280], "the others are made, 640 is not");
+        for width in [320, 1280] {
+            assert!(
+                beside
+                    .join(format!("{width} - 2x2"))
+                    .join("0.jpg")
+                    .is_file()
+            );
+        }
+    }
+
+    /// An extractor that answers fewer widths than it was asked for fails the
+    /// widths it left out, and only those.
+    #[tokio::test]
+    async fn a_width_the_extractor_did_not_answer_fails_alone() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320, 640]), FakeExtractor::new(4, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        r.extractor.short_sets.store(true, Ordering::SeqCst);
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        let rows = r.mgr.get_trickplay_resolutions(item).await.expect("rows");
+        assert_eq!(rows.keys().copied().collect::<Vec<_>>(), vec![320]);
+        assert!(!set_dir(&r, item, &media, 640).exists());
+        let temp = r.mgr.temp_directory();
+        assert!(
+            !temp.exists() || std::fs::read_dir(&temp).expect("temp").next().is_none(),
+            "the unanswered width's frames are cleaned up too"
         );
     }
 
@@ -4252,15 +4603,23 @@ mod tests {
         b.unwrap().expect("second item");
     }
 
+    /// With two widths, the run is held after the first width's frames, while
+    /// the second width's directory already holds frames of its own: both
+    /// go.
+    #[rstest::rstest]
+    #[case::one_width(&[320])]
+    #[case::two_widths(&[320, 640])]
     #[tokio::test]
-    async fn cancelling_a_running_scan_removes_its_partially_written_frame_directory() {
+    async fn cancelling_a_running_scan_removes_its_partially_written_frame_directory(
+        #[case] widths: &[i32],
+    ) {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let mut extractor = FakeExtractor::new(2, 180);
         extractor.hold = Some((entered.clone(), release));
         let db = test_db().await;
         let item = Uuid::new_v4();
-        let r = rig(&db, options_2x2(&[320]), extractor);
+        let r = rig(&db, options_2x2(widths), extractor);
         seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
         let manager = r.mgr.clone();
         let work = tokio::spawn(async move {
@@ -4279,6 +4638,11 @@ mod tests {
         assert!(
             !directory.exists(),
             "source finally cleanup runs when the future is dropped"
+        );
+        let temp = r.mgr.temp_directory();
+        assert!(
+            !temp.exists() || std::fs::read_dir(&temp).expect("temp").next().is_none(),
+            "no width's frames are left in the temp directory"
         );
         assert!(
             r.mgr
