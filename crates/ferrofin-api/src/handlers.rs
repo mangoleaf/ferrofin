@@ -1471,7 +1471,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field); \
                    which media sources the manifest lists is not part of this row: it lists \
                    only the item's own, where upstream lists every local version (gl-1235)",
-        date: "2026-11-03",
+        date: "2026-11-04",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \
@@ -1509,6 +1509,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              practice. Clients that show the first width listed (Wholphin, the Android TV and \
              Android apps) then get the sharpest set; jellyfin-web picks by screen size. \
              Deliberate divergence (owner decision 2026-11-03, gl-1226).",
+            "A video holds one generation slot from its first width that generates until its \
+             last width is done, so videos queued for a slot (a library scan's backlog) get each \
+             video's sets together; upstream takes _resourcePool per width, under which a queued \
+             video's first width would go before an earlier video's second. Order only: the \
+             widths made, and the checks before each, are unchanged (gl-1227).",
         ],
     },
     VerifiedSubsystem {

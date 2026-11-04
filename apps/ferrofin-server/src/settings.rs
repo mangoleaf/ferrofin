@@ -681,7 +681,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         group: Group::Trickplay,
         kind: SettingKind::CountOrAuto,
         default: "auto",
-        description: "Trickplay images generated at once, or auto for the image-encoding limit.",
+        description: "Videos generating trickplay images at once, or auto for the image-encoding limit.",
         running: |c| json!(c.trickplay_concurrency),
         ..ROW
     },
