@@ -446,6 +446,11 @@ fn a_read_only_setting_is_refused_with_its_reason() {
             json!("192.168.0.0/16"),
             "an admin session",
         ),
+        (
+            "subtitle_private_http_allow",
+            json!("192.168.0.0/16"),
+            "an admin session",
+        ),
         ("admin_password", json!("hunter2"), "database is created"),
         ("data_dir", json!("/tmp"), "other files"),
         ("disable_extensions", json!(true), "measurement switch"),

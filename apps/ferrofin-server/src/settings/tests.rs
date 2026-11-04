@@ -350,6 +350,7 @@ const TABS: &[(Group, &[&str])] = &[
             "studios_repo_url",
             "provider_timeout_seconds",
             "provider_max_wait_seconds",
+            "subtitle_private_http_allow",
         ],
     ),
     (
@@ -854,6 +855,10 @@ fn read_only_settings_carry_their_note_whatever_sets_them() {
         (
             "image_private_http_allow",
             "Lets image downloads reach the LAN",
+        ),
+        (
+            "subtitle_private_http_allow",
+            "Lets OpenSubtitles download links reach the LAN",
         ),
         // Owner decision D2: jellyfin-web's own pages cover these.
         (

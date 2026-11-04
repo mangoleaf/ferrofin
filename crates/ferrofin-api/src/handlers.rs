@@ -1212,8 +1212,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/BaseItemExtensions.cs (SetImagePath) and \
                    Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto). Also the \
                    download of a remote image: ferrofin-providers image_download.rs \
-                   open_image (ImageHttp::send, which follows and vets each redirect; \
-                   destination.rs ImageDestinations), provider_manager.rs \
+                   open_image (guarded_http.rs GuardedHttp::send, which follows and vets each \
+                   redirect; destination.rs ImageDestinations), provider_manager.rs \
                    cached_remote_image, compared with \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
