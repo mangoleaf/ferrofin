@@ -8,16 +8,18 @@ chain, legacy LinkedChildren entries) are written into the stopped 10.11.8 fixtu
 inherited by every later one, except that the 12.0 lineage (12.0, 12.1-from-12,
 12.2-from-12, 12.2-from-121, 12.3-from-122, 12.4-from-123) starts without the dangling
 chain, which Jellyfin 12.0 cannot migrate (NO_ORPHAN_CLEANUP); for those, the oracle
-release's own result (preservation.ORACLE) is the expectation on every path.
+release's own result (preservation.ORACLE) is the expectation on every path. A fixture in LAYOUTS
+is written by Jellyfin in another directory layout than its image's /config (Debian's).
 """
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import json
 import hashlib
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 
@@ -45,6 +47,7 @@ VERSIONS = (
     ("jellyfin-12.4-from-123", "12.4", "jellyfin-12.3-from-122"),
     ("jellyfin-12.4-from-10", "12.4", "jellyfin-10.11.8"),
     ("jellyfin-12.4-fresh", "12.4", None),
+    ("jellyfin-12.4-debian", "12.4", None),
 )
 # Releases whose own migration cannot start on the seeded dangling chain; their copy
 # drops it first, and every fixture built from them inherits that (drop_dangling_chain).
@@ -54,7 +57,18 @@ NO_ORPHAN_CLEANUP = {"12.0"}
 # these carry no seeds: they are validated live by gates/adoption/run.sh (its FIXTURE_TABLE), which
 # proves the fresh-install EF id set and schema adopt, not by the seed-driven preservation
 # matrix (run_matrix), which has nothing to compare and skips them.
-FRESH_INSTALL = {"jellyfin-12.2-fresh", "jellyfin-12.3-fresh", "jellyfin-12.4-fresh"}
+FRESH_INSTALL = {"jellyfin-12.2-fresh", "jellyfin-12.3-fresh", "jellyfin-12.4-fresh", "jellyfin-12.4-debian"}
+# Where a Debian package keeps Jellyfin's program data, configuration, cache and logs, apart (the
+# image keeps the first two in /config).
+DEBIAN = {"data": "/var/lib/jellyfin", "config": "/etc/jellyfin", "cache": "/var/cache/jellyfin",
+          "log": "/var/log/jellyfin"}
+# Fixtures Jellyfin writes in another layout than its image's, {fixture: layout}: a first run whose
+# stored absolute paths name that layout's directories. On the host the fixture directory is still
+# the program data, with the configuration in config/ and the logs in log/ (mounted apart), so every
+# reader of <fixture>/data/jellyfin.db is unchanged. synthetic-ready.json records the layout, and
+# gates/adoption/run.sh adopts such a fixture into Ferrofin's own directories, as a package
+# migration does, so the boot repair has those paths to point at the copies.
+LAYOUTS = {"jellyfin-12.4-debian": DEBIAN}
 
 
 def carries_chain(name):
@@ -81,12 +95,44 @@ def save(path, data):
         json.dump(data, output, indent=2, sort_keys=True)
 
 
+def mounts(config, cache, layout=None):
+    """The docker arguments that give Jellyfin `config` as its program data and `cache` as its
+    cache: at the image's /config and /cache, or at `layout`'s directories (LAYOUTS), with the
+    configuration and logs in config/ and log/ of `config`."""
+    if not layout:
+        return ["-v", f"{config}:/config", "-v", f"{cache}:/cache"]
+    for folder in ("config", "log"):
+        # Made here: docker would make a missing mount source itself, owned by root.
+        (config / folder).mkdir(exist_ok=True)
+    return ["-v", f"{config}:{layout['data']}", "-v", f"{config / 'config'}:{layout['config']}",
+            "-v", f"{cache}:{layout['cache']}", "-v", f"{config / 'log'}:{layout['log']}",
+            "-e", f"JELLYFIN_DATA_DIR={layout['data']}", "-e", f"JELLYFIN_CONFIG_DIR={layout['config']}",
+            "-e", f"JELLYFIN_CACHE_DIR={layout['cache']}", "-e", f"XDG_CACHE_HOME={layout['cache']}",
+            "-e", f"JELLYFIN_LOG_DIR={layout['log']}"]
+
+
+def require_layout(db, layout):
+    """Fail the build unless Jellyfin stored its paths in `layout`: the root folder under its
+    program data and every profile image under its configuration directory. A Jellyfin that kept
+    its image's /config would leave a fixture with no move to test."""
+    with closing(sqlite3.connect(Path(db).resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+        roots = [path for (path,) in conn.execute(
+            'SELECT "Path" FROM "BaseItems" WHERE "Type" = \'MediaBrowser.Controller.Entities.AggregateFolder\'')]
+        profiles = [path for (path,) in conn.execute('SELECT "Path" FROM "ImageInfos"')]
+    if roots != [layout["data"] + "/root"]:
+        raise CheckError(f"the fixture's root folder is {roots}, not under {layout['data']}: its layout was not used")
+    if not profiles or any(not path.startswith(layout["config"] + "/users/") for path in profiles):
+        raise CheckError(f"the fixture's profile images are not all under {layout['config']}: its layout was not used")
+
+
 @contextmanager
-def server(image, config, media, name, port, ferrofin=False):
+def server(image, config, media, name, port, ferrofin=False, layout=None):
+    if ferrofin and layout:
+        raise ValueError("a layout is Jellyfin's; Ferrofin boots in its image's /config")
     cache = config.parent / (config.name + "-cache")
     cache.mkdir(exist_ok=True)
     command = ["docker", "run", "-d", "--name", name, "--user", f"{os.getuid()}:{os.getgid()}",
-               "-p", f"127.0.0.1:{port}:8096", "-v", f"{config}:/config", "-v", f"{cache}:/cache",
+               "-p", f"127.0.0.1:{port}:8096", *mounts(config, cache, layout),
                "-v", f"{media}:/media:ro", "-e", "HTTP_PROXY=http://127.0.0.1:9",
                "-e", "HTTPS_PROXY=http://127.0.0.1:9", "-e", "NO_PROXY=127.0.0.1,localhost"]
     if ferrofin:
@@ -100,7 +146,8 @@ def server(image, config, media, name, port, ferrofin=False):
         subprocess.run(["docker", "stop", "-t", "60", name], check=True, stdout=subprocess.DEVNULL)
         with open(config.parent / (config.name + ".server.log"), "w") as output:
             subprocess.run(["docker", "logs", name], stdout=output, stderr=subprocess.STDOUT, check=True)
-        subprocess.run(["docker", "rm", name], check=True, stdout=subprocess.DEVNULL)
+        # -v: the anonymous volumes of the image's VOLUMEs no mount covered (a layout's /config).
+        subprocess.run(["docker", "rm", "-v", name], check=True, stdout=subprocess.DEVNULL)
 
 
 def build(root, only, port):
@@ -128,7 +175,9 @@ def build(root, only, port):
             # Idempotent, so an interrupted build that resumes here drops it again.
             drop_dangling_chain(config / "data/jellyfin.db",
                                 json.loads((config / "synthetic.json").read_text())["seeds"])
-        with server("jellyfin/jellyfin:" + version, config, root / "media", "synthetic-builder", port) as api:
+        layout = LAYOUTS.get(name)
+        with server("jellyfin/jellyfin:" + version, config, root / "media", "synthetic-builder", port,
+                    layout=layout) as api:
             if (config / "synthetic.json").exists():
                 manifest = json.loads((config / "synthetic.json").read_text())
                 api = api.login(USERS[0])
@@ -171,7 +220,11 @@ def build(root, only, port):
                                      f"history {state['history']}; the run's expectation is wrong")
             save(config / "seeds.json", state)
         require_populated(config / "data/jellyfin.db", SEEDED_ONLY if name in FRESH_INSTALL else ())
-        save(config / "synthetic-ready.json", {"fixture": name, "version": version, "recipe": recipe()})
+        ready = {"fixture": name, "version": version, "recipe": recipe()}
+        if layout:
+            require_layout(config / "data/jellyfin.db", layout)
+            ready["layout"] = layout
+        save(config / "synthetic-ready.json", ready)
         print(name + " built and validated", flush=True)
 
 

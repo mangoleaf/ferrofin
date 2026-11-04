@@ -1,7 +1,7 @@
 name: Adoption
 
-# The full synthetic adoption validation (gates/adoption/README.md): gates/adoption/run.sh (seventeen Jellyfin
-# paths, including the fresh-install 12.2, 12.3 and 12.4 rows) and the synthetic preservation matrix
+# The full synthetic adoption validation (gates/adoption/README.md): gates/adoption/run.sh (eighteen Jellyfin
+# paths, including the fresh-install 12.2, 12.3 and 12.4 rows and a 12.4 first run adopted into other directories) and the synthetic preservation matrix
 # (fourteen paths; the seedless fresh-install rows are validated by run.sh alone), against an image built from this
 # commit. A green run on the frozen release commit is the release's adoption evidence
 # (RELEASE.md, "Validate adoption"). Every push to a release branch queues it; a patch
