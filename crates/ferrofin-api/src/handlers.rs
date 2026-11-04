@@ -1378,7 +1378,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              the item for a user, and neither the policy nor the version. A channel takes the \
              same check, as PlaybackInfo does. A DVR recording has no row here, so it takes \
              Live TV access, IsVisibleStandalone over its entity, the libraries holding its \
-             file and then its channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
+             file (found as GetCollectionFolders finds them, ignoring case) and then its \
+             channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
              now share and GET /LiveTv/Recordings lists by; upstream's recording is a library \
              item, whose library holds it. On the routes upstream leaves anonymous, no \
              credential, a token that names nobody and an API key stay so, which binds a \
@@ -2453,12 +2454,13 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetRecordings",
         ferrofin: "handlers/live_tv.rs get_recordings (items.rs resolve_user_opt, \
                program_dto_options; ListedRecordingVisibility → recording_visible_given, \
-               holding_libraries, libraries_allow) → ferrofin-livetv manager.rs \
+               holding_libraries over ferrofin-model entities_media.rs libraries_holding, \
+               libraries_allow) → ferrofin-livetv manager.rs \
                get_recordings_matching (dvr_repository.rs recording_rows, \
                visible_recording_rows, remove_fields, recording_dtos, \
                add_info_to_recording_dtos) (RequestHelpers.GetUserId, \
                LiveTvManager.GetRecordingsAsync, GetEmbyRecordingsAsync, \
-               GetRecordingFoldersAsync, RemoveFields)",
+               GetRecordingFoldersAsync, LibraryManager.GetCollectionFolders, RemoveFields)",
         date: "2026-11-02",
         divergences: &[
             "Recordings are the rows of Ferrofin's DVR table, not library items under the \
