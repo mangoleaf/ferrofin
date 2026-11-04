@@ -298,15 +298,6 @@ impl TrickplayManager for CannedTrickplay {
     async fn delete_trickplay_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
         Ok(())
     }
-    async fn get_trickplay_manifest(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<
-        HashMap<String, HashMap<i32, ferrofin_db::entities::playback::TrickplayInfoEntity>>,
-        ServiceError,
-    > {
-        Ok(HashMap::new())
-    }
     async fn get_hls_playlist(
         &self,
         _item_id: Uuid,

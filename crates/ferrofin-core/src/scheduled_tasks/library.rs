@@ -2233,21 +2233,6 @@ mod tests {
         async fn delete_trickplay_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
             unimplemented!("fake")
         }
-        async fn get_trickplay_manifest(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<
-            std::collections::HashMap<
-                String,
-                std::collections::HashMap<
-                    i32,
-                    ferrofin_db::entities::playback::TrickplayInfoEntity,
-                >,
-            >,
-            ServiceError,
-        > {
-            unimplemented!("fake")
-        }
         async fn get_hls_playlist(
             &self,
             _item_id: Uuid,

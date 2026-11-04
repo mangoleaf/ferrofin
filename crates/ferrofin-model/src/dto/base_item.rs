@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -403,14 +404,16 @@ pub struct BaseItemDto {
     /// Gets or sets the chapters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chapters: Option<Vec<ChapterInfo>>,
-    /// Gets or sets the trickplay manifest.
+    /// Gets or sets the trickplay manifest: media source id → (tile width →
+    /// info), the sources in the order `MediaSources` lists them.
     // Each media source's widths are written largest first; see
     // serialize_trickplay_largest_first.
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "serialize_trickplay_largest_first"
     )]
-    pub trickplay: Option<HashMap<String, HashMap<i32, TrickplayInfoDto>>>,
+    #[schema(value_type = Option<HashMap<String, HashMap<i32, TrickplayInfoDto>>>)]
+    pub trickplay: Option<TrickplayManifest>,
     /// Gets or sets the location type.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default, deserialize_with = "crate::json::value::nullable")]
@@ -617,6 +620,10 @@ impl IHasProviderIds for BaseItemDto {
     }
 }
 
+/// [`BaseItemDto::trickplay`]: media source id → (tile width → info). Ordered,
+/// so the sources serialize in the order they were added.
+pub type TrickplayManifest = IndexMap<String, HashMap<i32, TrickplayInfoDto>>;
+
 /// Writes [`BaseItemDto::trickplay`] with each media source's widths largest
 /// first. A `HashMap` alone would list them in a different order on each
 /// response, and clients that show the first width listed (Wholphin, the
@@ -626,11 +633,12 @@ impl IHasProviderIds for BaseItemDto {
 /// SQLite returns them, smallest first in practice: those clients then get
 /// the sharpest set (owner decision 2026-11-03, gl-1226). jellyfin-web picks
 /// a width by screen size and is unaffected.
-// ponytail: the media source ids keep the map's order; clients look a source
-// up by id. Listing every version, in GetMediaSources order, is gl-1235.
+///
+/// The media sources keep the map's order, which the DTO service builds in
+/// `GetMediaSources` order, as upstream's `GetTrickplayManifest` adds them.
 #[allow(clippy::ref_option)] // serde's `serialize_with` passes `&Option<_>`
 fn serialize_trickplay_largest_first<S: serde::Serializer>(
-    manifest: &Option<HashMap<String, HashMap<i32, TrickplayInfoDto>>>,
+    manifest: &Option<TrickplayManifest>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     struct LargestFirst<'a>(&'a HashMap<i32, TrickplayInfoDto>);

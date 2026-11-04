@@ -1462,16 +1462,22 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
                    How ffmpeg extracts the frames, on either path, is the \
                    trickplay-extraction row's; how many generations run at once is not part \
-                   of this row. Also the order a media source's widths are listed in \
-                   BaseItemDto.Trickplay: trickplay_manager.rs resolutions_for, \
-                   get_trickplay_manifest and get_trickplay_manifest_batch \
-                   (GetTrickplayResolutions, GetTrickplayManifest), dto_service.rs \
-                   to_trickplay_manifest and ferrofin-model dto/base_item.rs \
+                   of this row. Also BaseItemDto.Trickplay: which media sources it lists \
+                   and in what order, and the order of each source's widths. \
+                   trickplay_manager.rs resolutions_for and \
+                   get_trickplay_resolutions_batch (GetTrickplayResolutions), \
+                   dto_service.rs trickplay_manifests and to_trickplay_manifest \
+                   (GetTrickplayManifest: every source of GetMediaSources(false) but the \
+                   IsRemote ones, through video_versions.rs local_media_source_ids over \
+                   items_for_media_sources, GetAllItemsForMediaSources, in \
+                   order_media_sources' order, and unfiltered by the user, as upstream), \
+                   media_source_manager.rs is_remote_shortcut (GetVersionInfo's shortcut \
+                   arm) and ferrofin-model dto/base_item.rs TrickplayManifest and \
                    serialize_trickplay_largest_first, compared with \
-                   Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field); \
-                   which media sources the manifest lists is not part of this row: it lists \
-                   only the item's own, where upstream lists every local version (gl-1235)",
-        date: "2026-11-03",
+                   Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (GetMediaSources) and \
+                   MediaBrowser.Controller/Entities/Video.cs (GetAllItemsForMediaSources)",
+        date: "2026-11-04",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \

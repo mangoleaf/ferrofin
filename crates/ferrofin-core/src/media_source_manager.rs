@@ -778,8 +778,7 @@ impl FerrofinMediaSourceManager {
         // `Video3DFormat` (`BaseItem.GetVersionInfo`, `BaseItem.cs:1231-1237`),
         // read off `Data` — `VideoFile` when it names none, `Video.VideoType`'s
         // default; audio/other sources leave them unset.
-        let format = (item.media_type.as_deref() == Some("Video"))
-            .then(|| crate::item_data::video_format(item.data.as_deref()));
+        let format = source_video_format(item);
 
         // User-agnostic audio fallback: the default-flagged audio stream,
         // else the first. `SetDefaultAudioAndSubtitleStreamIndices` overwrites
@@ -855,30 +854,68 @@ impl FerrofinMediaSourceManager {
 /// on the local file protocol is never followed — a `.strm` could otherwise
 /// name any file the server can read — so the source keeps the `.strm` path.
 fn apply_remote_shortcut(source: &mut MediaSourceInfo, item: &BaseItemEntity) {
-    if item.media_type.as_deref() != Some("Video") {
-        return;
-    }
-    let data = crate::item_data::parse_data(item.data.as_deref());
-    if data.get("IsShortcut").and_then(serde_json::Value::as_bool) != Some(true) {
-        return;
-    }
-    let Some(target) = crate::item_data::read_data_string(&data, "ShortcutPath")
-        .filter(|target| !target.is_empty())
-    else {
+    let Some(remote) = remote_shortcut(item) else {
         return;
     };
-    let protocol = crate::shortcut::path_protocol(&target);
-    if protocol == MediaProtocol::File {
-        return;
-    }
     source.is_remote = true;
-    source.path = Some(target);
-    source.protocol = protocol;
-    if let Some(container) =
-        crate::item_data::read_data_string(&data, "Container").filter(|c| !c.is_empty())
-    {
+    source.path = Some(remote.target);
+    source.protocol = remote.protocol;
+    if let Some(container) = remote.container {
         source.container = Some(container);
     }
+}
+
+/// The `VideoType`, `IsoType` and `Video3DFormat` `item`'s media source
+/// reports (`BaseItem.GetVersionInfo`, `BaseItem.cs:1231-1237`): a video's, read
+/// off `Data`; `None` for audio and other items.
+pub(crate) fn source_video_format(item: &BaseItemEntity) -> Option<crate::item_data::VideoFormat> {
+    (item.media_type.as_deref() == Some("Video"))
+        .then(|| crate::item_data::video_format(item.data.as_deref()))
+}
+
+/// Whether `item`'s media source is remote (`MediaSourceInfo.IsRemote`): a
+/// video `.strm` whose `ShortcutPath` names a remote target
+/// ([`apply_remote_shortcut`]).
+pub(crate) fn is_remote_shortcut(item: &BaseItemEntity) -> bool {
+    remote_shortcut(item).is_some()
+}
+
+/// The remote target a video `.strm` is served from.
+struct RemoteShortcut {
+    target: String,
+    protocol: MediaProtocol,
+    /// The container the remote probe stored, if any.
+    container: Option<String>,
+}
+
+/// `item`'s [`RemoteShortcut`], when it is a video `.strm` naming a target
+/// off the local file protocol. A `Data` blob that never names `IsShortcut`
+/// is not parsed.
+fn remote_shortcut(item: &BaseItemEntity) -> Option<RemoteShortcut> {
+    if item.media_type.as_deref() != Some("Video") {
+        return None;
+    }
+    let text = item
+        .data
+        .as_deref()
+        .filter(|t| t.contains("\"IsShortcut\""))?;
+    let data = crate::item_data::parse_data(Some(text));
+    if data.get("IsShortcut").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let target = crate::item_data::read_data_string(&data, "ShortcutPath")
+        .filter(|target| !target.is_empty())?;
+    let protocol = crate::shortcut::path_protocol(&target);
+    if protocol == MediaProtocol::File {
+        return None;
+    }
+    let container =
+        crate::item_data::read_data_string(&data, "Container").filter(|c| !c.is_empty());
+    Some(RemoteShortcut {
+        target,
+        protocol,
+        container,
+    })
 }
 
 /// Refreshes the item at a path with the remote content probe enabled.

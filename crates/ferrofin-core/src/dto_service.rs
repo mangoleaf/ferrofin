@@ -173,12 +173,14 @@ struct Prefetched {
     clean_values: HashMap<String, String>,
     /// Chapters per item id (populated only when the `Chapters` field is requested).
     chapters: HashMap<Uuid, Vec<ferrofin_model::entities_media::ChapterInfo>>,
-    /// Trickplay manifest per item id (populated only when the `Trickplay` field
-    /// is requested).
-    trickplay: HashMap<
-        Uuid,
-        HashMap<String, HashMap<i32, ferrofin_db::entities::playback::TrickplayInfoEntity>>,
-    >,
+    /// The trickplay rows of every media source a page video lists, by source
+    /// (item) id, width by width (populated only when the `Trickplay` field is
+    /// requested). A version on several page videos' lists is read once.
+    trickplay: HashMap<Uuid, HashMap<i32, ferrofin_db::entities::playback::TrickplayInfoEntity>>,
+    /// Each page video's local media source ids, in `GetMediaSources` order
+    /// ([`crate::video_versions::VersionRows::local_media_source_ids`]): the
+    /// sources its `Trickplay` manifest lists (populated with `trickplay`).
+    trickplay_sources: HashMap<Uuid, Vec<Uuid>>,
     /// Direct-child counts per folder item id (populated only when the
     /// `ChildCount` field is requested and a user is present).
     child_counts: HashMap<Uuid, i32>,
@@ -3158,10 +3160,16 @@ impl FerrofinDtoService {
             }
 
             if options.contains_field(ItemFields::Trickplay) {
-                // Jellyfin emits {} when requested but there is no manifest.
-                let manifest = take_or_clone(&mut prefetched.trickplay, &item_id, repeated)
-                    .unwrap_or_default();
-                dto.trickplay = Some(to_trickplay_manifest(&manifest));
+                // `TrickplayManager.GetTrickplayManifest`: every local source
+                // with rows, in source order. Jellyfin emits {} when requested
+                // but there is no manifest.
+                // The prefetch lists every page video; the fallback (its own
+                // source) is never taken.
+                let sources = prefetched
+                    .trickplay_sources
+                    .get(&item_id)
+                    .map_or_else(|| std::slice::from_ref(&item_id), Vec::as_slice);
+                dto.trickplay = Some(to_trickplay_manifest(sources, &prefetched.trickplay));
             }
         }
 
@@ -3828,19 +3836,23 @@ fn attach_order(
     ordered
 }
 
-/// Maps the trickplay-manager manifest of stored rows onto the DTO's
-/// `mediaSourceId → (width → TrickplayInfoDto)` map.
+/// The DTO's `mediaSourceId → (width → TrickplayInfoDto)` manifest
+/// (`TrickplayManager.GetTrickplayManifest`, `TrickplayManager.cs:741-758`):
+/// each of `sources` that has stored rows, in that order, keyed by its
+/// dashless id (`MediaSourceInfo.Id`).
 fn to_trickplay_manifest(
-    manifest: &HashMap<String, HashMap<i32, ferrofin_db::entities::playback::TrickplayInfoEntity>>,
-) -> HashMap<String, HashMap<i32, TrickplayInfoDto>> {
-    manifest
+    sources: &[Uuid],
+    rows: &HashMap<Uuid, HashMap<i32, ferrofin_db::entities::playback::TrickplayInfoEntity>>,
+) -> ferrofin_model::dto::TrickplayManifest {
+    sources
         .iter()
-        .map(|(source_id, by_width)| {
+        .filter_map(|source| {
+            let by_width = rows.get(source).filter(|rows| !rows.is_empty())?;
             let widths = by_width
                 .iter()
                 .map(|(width, info)| (*width, to_trickplay_dto(info)))
                 .collect();
-            (source_id.clone(), widths)
+            Some((source.simple().to_string(), widths))
         })
         .collect()
 }
@@ -4292,6 +4304,59 @@ impl FerrofinDtoService {
             }
         }
         Ok(out)
+    }
+
+    /// The trickplay half of the prefetch: each page video's local media
+    /// source ids, in `GetMediaSources` order, and the stored rows of every
+    /// one of them, read in one batch. `TrickplayManager.GetTrickplayManifest`
+    /// (`TrickplayManager.cs:741-758`) lists every source of
+    /// `item.GetMediaSources(false)` but the remote ones, so a version a
+    /// client plays finds its previews on the DTO of the video it browsed.
+    ///
+    /// `versions` is the group read the page made for its `MediaSources`, when
+    /// it made one; otherwise the page's videos' groups are read here, one
+    /// query for a page with no versions on it.
+    async fn trickplay_manifests(
+        &self,
+        items: &[BaseItemEntity],
+        versions: Option<&crate::video_versions::VersionRows>,
+    ) -> Result<
+        (
+            HashMap<Uuid, HashMap<i32, ferrofin_db::entities::playback::TrickplayInfoEntity>>,
+            HashMap<Uuid, Vec<Uuid>>,
+        ),
+        ServiceError,
+    > {
+        let videos: Vec<&BaseItemEntity> = items
+            .iter()
+            .filter(|i| kinds::is_video(row_kind(i)))
+            .collect();
+        if videos.is_empty() {
+            return Ok((HashMap::new(), HashMap::new()));
+        }
+        let read;
+        let versions = if let Some(versions) = versions {
+            versions
+        } else {
+            read = crate::video_versions::VersionRows::load(
+                &DtoVersionReader {
+                    db: &self.db,
+                    media_sources: self.media_sources.as_ref(),
+                },
+                &videos,
+            )
+            .await?;
+            &read
+        };
+        let sources: HashMap<Uuid, Vec<Uuid>> = videos
+            .iter()
+            .map(|video| (row_id(video), versions.local_media_source_ids(video)))
+            .collect();
+        let mut ids: Vec<Uuid> = sources.values().flatten().copied().collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let rows = self.trickplay.get_trickplay_resolutions_batch(&ids).await?;
+        Ok((rows, sources))
     }
 
     /// Bulk-loads every relation `build_dto` reads for `items` — one query per
@@ -4954,12 +5019,11 @@ impl FerrofinDtoService {
         } else {
             HashMap::new()
         };
-        let trickplay = if options.contains_field(ItemFields::Trickplay) && !media_ids.is_empty() {
-            self.trickplay
-                .get_trickplay_manifest_batch(&media_ids)
+        let (trickplay, trickplay_sources) = if options.contains_field(ItemFields::Trickplay) {
+            self.trickplay_manifests(items, want_sources.then_some(&versions))
                 .await?
         } else {
-            HashMap::new()
+            (HashMap::new(), HashMap::new())
         };
         // Child counts for the page's folders in one batch (C# prefetches the
         // same way before `AttachUserSpecificInfo`, which is user-gated).
@@ -5203,6 +5267,7 @@ impl FerrofinDtoService {
             clean_values,
             chapters,
             trickplay,
+            trickplay_sources,
             child_counts,
             linked_child_counts,
             played_counts,
@@ -6709,6 +6774,155 @@ mod tests {
             ]
         );
         assert_eq!(listed(1), [(p, "Movie".to_owned()), (a, "4K".to_owned())]);
+    }
+
+    /// The media source ids `dto`'s serialized `Trickplay` lists, in wire
+    /// order, of those in `candidates`.
+    fn trickplay_keys(dto: &BaseItemDto, candidates: &[Uuid]) -> Vec<Uuid> {
+        let json = serde_json::to_string(dto).unwrap();
+        let start = json.find("\"Trickplay\":{").expect("a Trickplay manifest");
+        let manifest = &json[start..];
+        let mut found: Vec<(usize, Uuid)> = candidates
+            .iter()
+            .filter_map(|id| {
+                manifest
+                    .find(&format!("\"{}\":{{", id.simple()))
+                    .map(|at| (at, *id))
+            })
+            .collect();
+        found.sort_unstable();
+        found.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// `BaseItemDto.Trickplay` lists every version that has trickplay rows,
+    /// keyed by its media source id and in `GetMediaSources` order
+    /// (`TrickplayManager.GetTrickplayManifest` over
+    /// `item.GetMediaSources(false)`, `TrickplayManager.cs:741-758`): the
+    /// queried video's own source first, 2D before 3D, a remote `.strm`
+    /// version left out, from its own DTO too. Asked from the primary, from a
+    /// local version, from a linked one and from the remote one, on the page
+    /// path and the single-item path, with and without `MediaSources`.
+    #[tokio::test]
+    async fn trickplay_lists_every_local_version_in_media_source_order() {
+        let db = test_db().await;
+        let (primary, local, remote, linked) = (
+            Uuid::from_u128(0x1235_0001),
+            Uuid::from_u128(0x1235_0002),
+            Uuid::from_u128(0x1235_0003),
+            Uuid::from_u128(0x1235_0004),
+        );
+        for id in [primary, local, remote, linked] {
+            seed_named_item(&db, id, BaseItemKind::Movie, "Movie").await;
+        }
+        let mut row = fetch_item(&db, primary).await;
+        row.path = Some("/Movies/Movie/Movie.mkv".to_owned());
+        row.media_type = Some("Video".to_owned());
+        row.data = Some(
+            r#"{"LocalAlternateVersions":["/Movies/Movie/Movie - 4K.mkv","/Movies/Movie/Movie - web.strm"]}"#
+                .to_owned(),
+        );
+        crate::test_support::save_item(&db, &row).await;
+        let mut row = fetch_item(&db, local).await;
+        row.path = Some("/Movies/Movie/Movie - 4K.mkv".to_owned());
+        row.media_type = Some("Video".to_owned());
+        row.owner_id = Some(guid_to_db(primary));
+        crate::test_support::save_item(&db, &row).await;
+        let mut row = fetch_item(&db, remote).await;
+        row.path = Some("/Movies/Movie/Movie - web.strm".to_owned());
+        row.media_type = Some("Video".to_owned());
+        row.owner_id = Some(guid_to_db(primary));
+        row.data = Some(
+            r#"{"IsShortcut":true,"ShortcutPath":"http://example.invalid/movie.mkv"}"#.to_owned(),
+        );
+        crate::test_support::save_item(&db, &row).await;
+        // Merged in from another folder, and 3D, so it sorts after the 2D local
+        // version although `GetAllItemsForMediaSources` lists it first.
+        let mut row = fetch_item(&db, linked).await;
+        row.path = Some("/Movies/Other/Other.mkv".to_owned());
+        row.media_type = Some("Video".to_owned());
+        row.data = Some(r#"{"Video3DFormat":"HalfSideBySide"}"#.to_owned());
+        crate::test_support::save_item(&db, &row).await;
+        for version in [local, remote, linked] {
+            link_alternate_version(&db, version, primary).await;
+        }
+        let svc = service_with_trickplay(
+            db.clone(),
+            FakeSources {
+                stored_alternates: Some(db.clone()),
+                ..FakeSources::default()
+            },
+            TrickplayRows([primary, local, remote, linked].into_iter().collect()),
+        );
+        let all = [primary, local, remote, linked];
+        for fields in [
+            vec![ItemFields::Trickplay],
+            vec![ItemFields::Trickplay, ItemFields::MediaSources],
+        ] {
+            let options = DtoOptions {
+                fields: fields.clone(),
+                ..DtoOptions::default()
+            };
+            let page = [
+                fetch_item(&db, primary).await,
+                fetch_item(&db, local).await,
+                fetch_item(&db, linked).await,
+                fetch_item(&db, remote).await,
+            ];
+            let dtos = svc
+                .get_base_item_dtos(&page, &options, None, None, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                trickplay_keys(&dtos[0], &all),
+                [primary, local, linked],
+                "{fields:?}"
+            );
+            assert_eq!(
+                trickplay_keys(&dtos[1], &all),
+                [local, primary, linked],
+                "{fields:?}"
+            );
+            assert_eq!(
+                trickplay_keys(&dtos[2], &all),
+                [linked, primary, local],
+                "{fields:?}"
+            );
+            assert_eq!(
+                trickplay_keys(&dtos[3], &all),
+                [primary, local, linked],
+                "{fields:?}"
+            );
+            // The single-item path builds the same manifest.
+            let single = svc
+                .get_base_item_dto(&page[1], &options, None, None)
+                .await
+                .unwrap();
+            assert_eq!(trickplay_keys(&single, &all), [local, primary, linked]);
+        }
+    }
+
+    /// A video whose sources have no trickplay rows still gets `"Trickplay":
+    /// {}` when the field is asked for, as Jellyfin answers.
+    #[tokio::test]
+    async fn trickplay_without_rows_is_an_empty_manifest() {
+        let db = test_db().await;
+        let id = Uuid::new_v4();
+        seed_named_item(&db, id, BaseItemKind::Movie, "Movie").await;
+        let svc = service_with_trickplay(
+            db.clone(),
+            FakeSources::default(),
+            TrickplayRows(std::collections::HashSet::new()),
+        );
+        let options = DtoOptions {
+            fields: vec![ItemFields::Trickplay],
+            ..DtoOptions::default()
+        };
+        let dtos = svc
+            .get_base_item_dtos(&[fetch_item(&db, id).await], &options, None, None, true)
+            .await
+            .unwrap();
+        let json = serde_json::to_string(&dtos[0]).unwrap();
+        assert!(json.contains("\"Trickplay\":{}"), "{json}");
     }
 
     /// A version off the page that the user is part-way through, played after
@@ -8248,7 +8462,7 @@ mod tests {
         }
     }
 
-    /// A [`TrickplayManager`] fake — one canned 1080/320 manifest per item.
+    /// A [`TrickplayManager`] fake — one canned 320-wide row per item.
     #[derive(Default)]
     struct FakeTrickplay;
 
@@ -8264,9 +8478,22 @@ mod tests {
         }
         async fn get_trickplay_resolutions(
             &self,
-            _item_id: Uuid,
+            item_id: Uuid,
         ) -> Result<HashMap<i32, TrickplayInfoEntity>, ServiceError> {
-            Ok(HashMap::new())
+            // Non-empty, so a page that drops an item's manifest shows.
+            Ok(HashMap::from([(
+                320,
+                TrickplayInfoEntity {
+                    item_id: item_id.to_string(),
+                    width: 320,
+                    height: 180,
+                    tile_width: 10,
+                    tile_height: 10,
+                    thumbnail_count: 100,
+                    interval: 10000,
+                    bandwidth: 1000,
+                },
+            )]))
         }
         async fn get_trickplay_items(
             &self,
@@ -8284,29 +8511,80 @@ mod tests {
         async fn delete_trickplay_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
             Ok(())
         }
-        async fn get_trickplay_manifest(
+        async fn get_hls_playlist(
+            &self,
+            _item_id: Uuid,
+            _width: i32,
+            _api_key: Option<&str>,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
+        async fn get_trickplay_tile_path(
+            &self,
+            _item_id: Uuid,
+            _width: i32,
+            _index: i32,
+        ) -> Result<Option<String>, ServiceError> {
+            Ok(None)
+        }
+    }
+
+    /// A [`TrickplayManager`] fake whose listed items each have one stored
+    /// 320-wide trickplay row, as the real manager reads them.
+    struct TrickplayRows(std::collections::HashSet<Uuid>);
+
+    impl TrickplayRows {
+        fn rows(&self, item_id: Uuid) -> HashMap<i32, TrickplayInfoEntity> {
+            if !self.0.contains(&item_id) {
+                return HashMap::new();
+            }
+            HashMap::from([(
+                320,
+                TrickplayInfoEntity {
+                    item_id: guid_to_db(item_id),
+                    width: 320,
+                    height: 180,
+                    tile_width: 10,
+                    tile_height: 10,
+                    thumbnail_count: 100,
+                    interval: 10000,
+                    bandwidth: 1000,
+                },
+            )])
+        }
+    }
+
+    #[async_trait]
+    impl TrickplayManager for TrickplayRows {
+        async fn refresh_trickplay_data(
+            &self,
+            _item_id: Uuid,
+            _replace: bool,
+            _library_options: &ferrofin_model::configuration::LibraryOptions,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn get_trickplay_resolutions(
             &self,
             item_id: Uuid,
-        ) -> Result<HashMap<String, HashMap<i32, TrickplayInfoEntity>>, ServiceError> {
-            // Non-empty: against an EMPTY map `.remove()` and `.get().cloned()`
-            // are indistinguishable, so an empty manifest would let a wrong
-            // `repeated` flag on the trickplay read pass unnoticed.
-            Ok(HashMap::from([(
-                "1080".to_owned(),
-                HashMap::from([(
-                    320,
-                    TrickplayInfoEntity {
-                        item_id: item_id.to_string(),
-                        width: 320,
-                        height: 180,
-                        tile_width: 10,
-                        tile_height: 10,
-                        thumbnail_count: 100,
-                        interval: 10000,
-                        bandwidth: 1000,
-                    },
-                )]),
-            )]))
+        ) -> Result<HashMap<i32, TrickplayInfoEntity>, ServiceError> {
+            Ok(self.rows(item_id))
+        }
+        async fn get_trickplay_items(
+            &self,
+            _limit: i32,
+            _offset: i32,
+        ) -> Result<Vec<TrickplayInfoEntity>, ServiceError> {
+            Ok(vec![])
+        }
+        async fn save_trickplay_info(
+            &self,
+            _info: &TrickplayInfoEntity,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn delete_trickplay_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
+            Ok(())
         }
         async fn get_hls_playlist(
             &self,
@@ -8324,6 +8602,25 @@ mod tests {
         ) -> Result<Option<String>, ServiceError> {
             Ok(None)
         }
+    }
+
+    /// [`service_with_sources`] with a trickplay manager the caller shapes.
+    fn service_with_trickplay(
+        db: Database,
+        sources: FakeSources,
+        trickplay: TrickplayRows,
+    ) -> FerrofinDtoService {
+        FerrofinDtoService::new(
+            db,
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            Arc::new(FakeUserData),
+            Arc::new(FakeCounts::default()),
+            Arc::new(FakeImages),
+            Arc::new(sources),
+            Arc::new(FakeChapters),
+            Arc::new(trickplay),
+        )
     }
 
     /// Builds a DTO service over `db` wired to the fakes, with an optional custom
@@ -10170,12 +10467,14 @@ mod tests {
         // prefetched relation maps are read once per OCCURRENCE, so the
         // page-build must not hand the first occurrence the only copy and
         // leave the second one bare (`take_or_clone`'s `repeated` guard).
-        // All FIVE maps `take_or_clone` drains are covered — images, user_data,
-        // provider_ids, chapters, trickplay — because the whole risk of the
-        // change is "was the right flag threaded to each site", and each site
-        // must be caught individually. Against an EMPTY map `.remove()` and
+        // All four maps `take_or_clone` drains are covered — images, user_data,
+        // provider_ids, chapters — because the whole risk of the change is
+        // "was the right flag threaded to each site", and each site must be
+        // caught individually. Against an EMPTY map `.remove()` and
         // `.get().cloned()` are indistinguishable, so every map here is
         // deliberately populated (the fakes return non-empty trickplay/streams).
+        // The trickplay rows are keyed by media source and shared, never
+        // drained; the second occurrence must still get its manifest.
         let db = test_db().await;
         let id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
