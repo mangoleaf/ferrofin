@@ -172,7 +172,7 @@ dashboard's Disable toggle turns them off. Its version is the server's release.
 
 Its settings page, the Settings link under Dashboard → Plugins → Ferrofin Settings and the dashboard
 menu's **Ferrofin Settings** entry, lists every setting that route reports, in a tab per group in a
-pane on the left, with a search box across every tab and filters (changed, hide read-only) beside
+pane on the left, with a search box across every tab and filters (changed, hide read-only) above
 the tabs. Each setting has a readable name with the `config.toml` key, environment variable, flag
 and default below it, a badge for what sets it (`config.toml`, environment or flag) when anything
 does, and, for a setting the page may not change, its value as text with a lock, the reason and

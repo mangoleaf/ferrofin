@@ -265,11 +265,22 @@ mod tests {
         assert!(html.contains("setting.LockedReason"), "{html}");
         // The tabs in a pane on the left, moved along with the arrow keys
         // either way (a row on a narrow screen); a search box and two
-        // filters beside them, across every tab, its matches under their
+        // filters above them, across every tab, its matches under their
         // tab's name with a count and the tabs without one dimmed. A restart
         // is announced above the settings as a warning, not filtered for
-        // (owner, 2026-11-03).
+        // (owner, 2026-11-03). The settings file is named beside the title.
         assert!(html.contains(r#"aria-orientation="vertical""#), "{html}");
+        let at = |marker: &str| html.find(marker).unwrap_or_else(|| panic!("{marker}"));
+        assert!(
+            at("class=\"ferrofinFinder\"") < at("class=\"ferrofinShell\""),
+            "the search and the filters sit above the tabs"
+        );
+        assert!(
+            at("class=\"sectionTitle\"") < at("class=\"ferrofinConfigFile hide\"")
+                && at("class=\"ferrofinConfigFile hide\"")
+                    < at("ferrofinWarning ferrofinRestartPending"),
+            "the settings file is named beside the title"
+        );
         for marker in [
             "class=\"ferrofinShell\"",
             "ArrowUp:",

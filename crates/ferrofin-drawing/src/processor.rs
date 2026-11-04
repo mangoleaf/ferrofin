@@ -1642,10 +1642,8 @@ mod tests {
                 processor_with(encoder.clone(), &cache, FakeFs::with(&["/input.jpg"]))
                     .with_encoding_limit(limit),
             );
-            let mut tasks = Vec::new();
-            for _ in 0..=limit {
-                let processor = Arc::clone(&processor);
-                tasks.push(tokio::spawn(async move {
+            let request = |processor: Arc<ImageProcessor<FakeFs>>| {
+                tokio::spawn(async move {
                     processor
                         .process_image(&ImageProcessingOptions {
                             image: ItemImageInfo {
@@ -1656,8 +1654,15 @@ mod tests {
                             ..Default::default()
                         })
                         .await
-                }));
-            }
+                })
+            };
+            // Fill every slot before the extra request starts. Each request
+            // stats on the blocking pool before it takes a slot, so requests
+            // spawned together take the slots in no fixed order, and the one
+            // aborted below could be the queued one rather than an encode.
+            let mut tasks: Vec<_> = (0..limit)
+                .map(|_| request(Arc::clone(&processor)))
+                .collect();
             tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 work.entered.acquire_many(u32::try_from(limit).unwrap()),
@@ -1666,6 +1671,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .forget();
+            tasks.push(request(Arc::clone(&processor)));
             let first = tasks.remove(0);
             first.abort();
             let _ = first.await;
