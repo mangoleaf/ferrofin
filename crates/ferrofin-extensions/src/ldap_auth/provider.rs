@@ -60,6 +60,15 @@
 //!   the owner's call.
 //! - **A link is written only after the password is checked.** Upstream
 //!   records a relink by name before it binds as the user.
+//! - **A uid link to an account LDAP-Auth no longer owns is ignored**
+//!   (gl-1230), as the lookup by name ignores such an account. Upstream
+//!   follows the link whatever the account's `AuthenticationProviderId`, and
+//!   the user manager then switches the account back to LDAP-Auth, undoing an
+//!   administrator's move to another provider and its local password. The
+//!   link is kept, so moving the account back to LDAP-Auth finds it again,
+//!   unless a sign-in has meanwhile linked the entry to another account (one
+//!   it created, or an LDAP-Auth account named as the entry's username
+//!   attribute), which takes the link over.
 //! - **An entry without the uid attribute is not linked.** Upstream stores a
 //!   null `LdapUid`, which no lookup finds, and in doing so drops the user's
 //!   earlier link and every other null-uid link. Such a user is found by name
@@ -531,8 +540,10 @@ impl LdapAuthProvider {
 
     /// The Ferrofin user the entry belongs to, upstream's two lookups: the one
     /// its uid is linked to, else the user named as the entry's username
-    /// attribute when LDAP-Auth owns them (`AuthenticationProviderId`), which
-    /// then needs linking. A local account with that name is not taken.
+    /// attribute, which then needs linking. Both take only a user LDAP-Auth
+    /// owns (`AuthenticationProviderId`): a local account with that name is
+    /// not taken, and a link to an account since moved to another provider is
+    /// ignored but kept (see the module's divergences).
     async fn find_user(
         &self,
         uid: &str,
@@ -540,6 +551,7 @@ impl LdapAuthProvider {
     ) -> Result<Option<FoundUser>, ServiceError> {
         if let Some(link) = self.identities.find(Self::identity(uid)).await?
             && let Some(user) = self.users.get_user_by_id(link.user_id).await?
+            && owned(&user)
         {
             return Ok(Some(FoundUser {
                 user,
@@ -553,15 +565,19 @@ impl LdapAuthProvider {
             .users
             .get_user_by_name(name)
             .await?
-            .filter(|user| {
-                user.authentication_provider_id
-                    .eq_ignore_ascii_case(PROVIDER_ID)
-            })
+            .filter(owned)
             .map(|user| FoundUser {
                 user,
                 needs_link: true,
             }))
     }
+}
+
+/// Whether LDAP-Auth owns `user`: their `AuthenticationProviderId` is its id,
+/// ignoring case as upstream's `OrdinalIgnoreCase` compare does.
+fn owned(user: &UserEntity) -> bool {
+    user.authentication_provider_id
+        .eq_ignore_ascii_case(PROVIDER_ID)
 }
 
 /// The error for a directory entry without the username attribute: upstream

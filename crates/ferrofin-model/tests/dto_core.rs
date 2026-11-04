@@ -284,3 +284,41 @@ fn media_source_info_round_trips() {
     let back: MediaSourceInfo = serde_json::from_str(&json).unwrap();
     assert_eq!(info, back);
 }
+
+/// gl-1226 (owner decision 2026-11-03): each media source's trickplay widths
+/// serialize largest first, every time. Clients such as Wholphin and the
+/// Android TV app show the first width listed. The width of 1080 catches a
+/// sort on the keys as strings.
+#[test]
+fn base_item_trickplay_widths_serialize_largest_first() {
+    use ferrofin_model::dto::{BaseItemDto, TrickplayInfoDto};
+    use std::collections::HashMap;
+
+    // Each new HashMap draws its own hash keys, so twenty maps would show a
+    // random order at least once.
+    for _ in 0..20 {
+        let widths: HashMap<i32, TrickplayInfoDto> = [320, 1080, 640]
+            .into_iter()
+            .map(|width| {
+                let info = TrickplayInfoDto {
+                    width,
+                    ..TrickplayInfoDto::default()
+                };
+                (width, info)
+            })
+            .collect();
+        let dto = BaseItemDto {
+            trickplay: Some(HashMap::from([("abc".to_owned(), widths)])),
+            ..BaseItemDto::default()
+        };
+
+        let json = serde_json::to_string(&dto).unwrap();
+        let at = |key: &str| json.find(key).unwrap();
+        assert!(
+            at(r#""1080":"#) < at(r#""640":"#) && at(r#""640":"#) < at(r#""320":"#),
+            "{json}"
+        );
+        let back: BaseItemDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.trickplay, dto.trickplay);
+    }
+}

@@ -242,9 +242,10 @@ Conventions:
   `(&<filter>(|(<attr>=<name>)…))` over `LdapSearchAttributes` with spaces removed, split on
   commas (an empty item kept), the name escaped byte for byte as `SanitizeFilter` does; the
   first entry is used, with upstream's warning when there are more. The user is found by the
-  entry's uid (the external-identity store), else by the username attribute when that user's
-  `AuthenticationProviderId` is LDAP-Auth's, who is then linked; a local account of that name
-  is never taken. The password is checked by binding as the entry on a connection of its own.
+  entry's uid (the external-identity store), else by the username attribute, who is then
+  linked; either way only when that user's `AuthenticationProviderId` is LDAP-Auth's, so a
+  local account of that name is never taken (see the divergence on uid links below). The
+  password is checked by binding as the entry on a connection of its own.
   A new user is created when `CreateUsersFromLdap` is on, with both provider ids,
   `EnableAllFolders` and, when that is off, `EnabledFolders` as configured (the strings as
   given, as `SetPreference` stores them), and linked; with it off, upstream's message and a
@@ -443,6 +444,19 @@ Conventions:
     `mail` they may edit) would have that user's new password set on their own entry. The match
     trusts the username and uid attributes, as sign-in does, so where users can write them a new
     password can still reach the wrong entry (kept as upstream by owner decision, gl-1188).
+  - **A uid link to an account LDAP-Auth no longer owns is ignored** (gl-1230), as the lookup by
+    name ignores such an account. Upstream's
+    `GetUserById(GetLdapUser(ldapUid).LinkedJellyfinUserId)` follows the link whatever the account's
+    `AuthenticationProviderId`, and Jellyfin's `AuthenticateUser` then rewrites that id to the
+    provider that succeeded. So when an administrator moves a linked user to the default provider (a
+    local break-glass administrator, say), or an adopted `LdapUsers` still lists such a user, a
+    sign-in with another name for the entry (its uid or mail) that the directory accepts switches
+    the account back to LDAP-Auth, and its local password stops working. Here the sign-in goes on as
+    if no link existed: the lookup by name, then creation (which refuses a second account of the
+    same name) or upstream's creation-off `401`. The link is kept, not removed, so moving the
+    account back to LDAP-Auth finds it again, unless a sign-in has meanwhile linked the entry to
+    another account (one it created, or an LDAP-Auth account named as the entry's username
+    attribute), which takes the link over.
   - **No PIN is ever this provider's to redeem**: `RedeemPasswordResetPin` answers no match.
     Upstream throws `NotImplementedException`, which stops the redemption before a later
     provider could redeem its own.

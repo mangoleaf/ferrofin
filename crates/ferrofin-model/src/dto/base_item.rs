@@ -404,7 +404,12 @@ pub struct BaseItemDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chapters: Option<Vec<ChapterInfo>>,
     /// Gets or sets the trickplay manifest.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    // Each media source's widths are written largest first; see
+    // serialize_trickplay_largest_first.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_trickplay_largest_first"
+    )]
     pub trickplay: Option<HashMap<String, HashMap<i32, TrickplayInfoDto>>>,
     /// Gets or sets the location type.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -609,6 +614,42 @@ impl IHasProviderIds for BaseItemDto {
 
     fn provider_ids_opt_mut(&mut self) -> &mut Option<HashMap<String, String>> {
         &mut self.provider_ids
+    }
+}
+
+/// Writes [`BaseItemDto::trickplay`] with each media source's widths largest
+/// first. A `HashMap` alone would list them in a different order on each
+/// response, and clients that show the first width listed (Wholphin, the
+/// Android TV and Android apps) would get a random preview size.
+///
+/// Divergence from Jellyfin, whose `DtoService` copies the rows in the order
+/// SQLite returns them, smallest first in practice: those clients then get
+/// the sharpest set (owner decision 2026-11-03, gl-1226). jellyfin-web picks
+/// a width by screen size and is unaffected.
+// ponytail: the media source ids keep the map's order; clients look a source
+// up by id. Listing every version, in GetMediaSources order, is gl-1235.
+#[allow(clippy::ref_option)] // serde's `serialize_with` passes `&Option<_>`
+fn serialize_trickplay_largest_first<S: serde::Serializer>(
+    manifest: &Option<HashMap<String, HashMap<i32, TrickplayInfoDto>>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    struct LargestFirst<'a>(&'a HashMap<i32, TrickplayInfoDto>);
+
+    impl Serialize for LargestFirst<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut widths: Vec<_> = self.0.iter().collect();
+            widths.sort_unstable_by(|a, b| b.0.cmp(a.0));
+            serializer.collect_map(widths)
+        }
+    }
+
+    match manifest {
+        Some(by_source) => serializer.collect_map(
+            by_source
+                .iter()
+                .map(|(source_id, widths)| (source_id, LargestFirst(widths))),
+        ),
+        None => serializer.serialize_none(),
     }
 }
 

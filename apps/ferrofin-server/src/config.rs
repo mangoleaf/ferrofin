@@ -694,10 +694,11 @@ pub struct Config {
     /// `config.toml` > default; must be within [`CACHE_TTL_RANGE_SECS`].
     pub row_cache_ttl_secs: Option<u32>,
 
-    /// How many trickplay generations (one item width each, an ffmpeg frame
-    /// extraction plus tile packing) run at once. A library scan runs several;
-    /// the scheduled task runs one but shares the cap. `None` = `auto`: as many as the shared image-encoding
-    /// pool allows (`ParallelImageEncodingLimit`, else the usable cores).
+    /// How many items generate trickplay at once (each one's widths in turn,
+    /// an ffmpeg frame extraction plus tile packing per width). A library scan
+    /// runs several; the scheduled task runs one but shares the cap. `None` =
+    /// `auto`: as many as the shared image-encoding pool allows
+    /// (`ParallelImageEncodingLimit`, else the usable cores).
     /// Jellyfin runs one at a time; `1` restores that. Zero, negative, and
     /// values above the auto value also mean auto (applied in `state.rs`).
     /// Resolved `FERROFIN_TRICKPLAY_CONCURRENCY` env (integer or `auto`) >
