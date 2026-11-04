@@ -677,11 +677,11 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "trickplay_concurrency",
         env: Some("FERROFIN_TRICKPLAY_CONCURRENCY"),
         env_read: EnvRead::NonBlank,
-        label: "Concurrent trickplay images",
+        label: "Concurrent trickplay videos",
         group: Group::Trickplay,
         kind: SettingKind::CountOrAuto,
         default: "auto",
-        description: "Trickplay images generated at once, or auto for the image-encoding limit.",
+        description: "Videos generating trickplay images at once, or auto for the image-encoding limit.",
         running: |c| json!(c.trickplay_concurrency),
         ..ROW
     },

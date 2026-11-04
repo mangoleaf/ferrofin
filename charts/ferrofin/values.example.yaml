@@ -199,9 +199,10 @@ ferrofin:
     # Each connection of the pool keeps its own, about 16 KiB a statement, so a
     # larger value costs memory on every connection.
     # FERROFIN_DB_STATEMENT_CACHE: "200"
-    # How many trickplay images are generated at once (default: auto, up to the
-    # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
-    # hardware acceleration holds GPU memory; "1" matches Jellyfin.
+    # How many videos generate trickplay images at once, each one's widths in
+    # turn (default: auto, up to the image-encoding limit, one per CPU). Each
+    # generation is an ffmpeg process, and with hardware acceleration holds GPU
+    # memory; "1" matches Jellyfin.
     # FERROFIN_TRICKPLAY_CONCURRENCY: "1"
     # Trade frame quality for speed when extracting chapter images, video
     # thumbnails and embedded pictures: keyframes only, no 24-frame sampling

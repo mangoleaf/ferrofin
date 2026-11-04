@@ -139,10 +139,12 @@ pub struct FerrofinTrickplayManager {
     image_encoder: Arc<dyn ImageEncoder>,
     live_tv: Option<std::sync::Weak<dyn ferrofin_traits::stubs::LiveTvManager>>,
     virtual_folders: Arc<std::sync::OnceLock<Arc<dyn VirtualFolderManager>>>,
-    /// Bounds how many item widths extract and tile at once, across scans and
-    /// the scheduled task.
-    /// Upstream holds a lock of 1 (`TrickplayManager._resourcePool`); Ferrofin
-    /// sizes it from `FERROFIN_TRICKPLAY_CONCURRENCY` instead.
+    /// Bounds how many items extract and tile at once, across scans and the
+    /// scheduled task. An item holds one slot across all of its widths that
+    /// generate, so its sets are made together (gl-1227).
+    /// Upstream holds a lock of 1 (`TrickplayManager._resourcePool`), taken
+    /// per width; Ferrofin sizes it from `FERROFIN_TRICKPLAY_CONCURRENCY`
+    /// instead.
     generation_slots: Arc<tokio::sync::Semaphore>,
     /// One refresh or move of an item's trickplay at a time, keyed by item id.
     /// Upstream's lock of 1 also gave this: a second refresh of the item waits,
@@ -269,8 +271,9 @@ impl FerrofinTrickplayManager {
         }
     }
 
-    /// Caps how many trickplay generations (one item width each) run at once.
-    /// Unset, only the frame extractor's shared image-encoding pool bounds them.
+    /// Caps how many items generate trickplay at once (each one's widths in
+    /// turn, in one slot). Unset, only the frame extractor's shared
+    /// image-encoding pool bounds them.
     #[must_use]
     pub fn with_generation_concurrency(mut self, slots: usize) -> Self {
         self.generation_slots = Arc::new(tokio::sync::Semaphore::new(slots.max(1)));
@@ -404,12 +407,16 @@ impl FerrofinTrickplayManager {
 
     /// Port of `RefreshTrickplayDataInternal` for one configured width: skip or
     /// import existing tiles, otherwise extract frames and pack tiles.
+    ///
+    /// `slot` is the video's generation slot: the first width that generates
+    /// takes it, and the video's later widths reuse it.
     async fn refresh_width(
         &self,
         ctx: &WidthRefreshContext<'_>,
         replace: bool,
         width: i32,
         options: &TrickplayOptions,
+        slot: &mut Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<(), ServiceError> {
         // Source checks these only inside per-width work: they do not bypass
         // discovery or the outer disabled/replace cleanup.
@@ -472,11 +479,14 @@ impl FerrofinTrickplayManager {
         self.record_set_made(width, options).await?;
 
         // Generate: extract thumbnails into a temp dir, pack them into tiles.
-        let _slot = self
-            .generation_slots
-            .acquire()
-            .await
-            .map_err(ServiceError::backend_source)?;
+        if slot.is_none() {
+            *slot = Some(
+                Arc::clone(&self.generation_slots)
+                    .acquire_owned()
+                    .await
+                    .map_err(ServiceError::backend_source)?,
+            );
+        }
         // Upstream warns "video width is smaller than trickplay setting"
         // before its existing-tiles check, so once per pass over every narrow
         // video. Using the video's width is the intended outcome, so it is a
@@ -975,7 +985,8 @@ impl FerrofinTrickplayManager {
     ) -> Result<bool, ServiceError> {
         // Held across discovery, the existing-tiles checks, generation and
         // the prune, as upstream's `_resourcePool` is held across the first
-        // three; the generation slots below bound only the ffmpeg work.
+        // three; a generation slot bounds the ffmpeg work, held per video from
+        // its first width that generates to its last width.
         let lock = self.item_locks.get(&item_id.to_string());
         let _item = lock.lock().await;
         let has_streams = !media_streams.is_empty();
@@ -1088,6 +1099,12 @@ impl FerrofinTrickplayManager {
     /// Refreshes each selected width, returning the widths generated for this
     /// video. `rows` are the sets on disk on a checking pass (empty
     /// otherwise): one at another chroma is regenerated and swapped in.
+    ///
+    /// The video holds one generation slot from its first width that
+    /// generates until its last width is done, so a scan's backlog of
+    /// videos waiting for a slot gets each video's sets together rather than
+    /// every video's first width before any second width. Upstream takes its
+    /// `_resourcePool` per width (gl-1227).
     async fn refresh_widths(
         &self,
         ctx: &WidthRefreshContext<'_>,
@@ -1096,6 +1113,7 @@ impl FerrofinTrickplayManager {
         options: &TrickplayOptions,
     ) -> HashSet<i32> {
         let mut generated = HashSet::new();
+        let mut slot = None;
         for width in &options.width_resolutions {
             if *width <= 0 {
                 continue;
@@ -1120,7 +1138,7 @@ impl FerrofinTrickplayManager {
             // Per-width failures are logged and do not abort the remaining
             // resolutions (the C# catch-and-log).
             if let Err(e) = self
-                .refresh_width(ctx, replace_width, *width, options)
+                .refresh_width(ctx, replace_width, *width, options, &mut slot)
                 .await
             {
                 tracing::error!(item_id = %ctx.item_id, width, "error creating trickplay images: {e}");
@@ -2214,6 +2232,8 @@ mod tests {
         hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
         /// Fails every extraction while set, as a broken file or ffmpeg would.
         fail: std::sync::atomic::AtomicBool,
+        /// Every extraction's `(input_path, max_width)`, in the order they ran.
+        order: Mutex<Vec<(String, i32)>>,
     }
 
     impl FakeExtractor {
@@ -2230,6 +2250,7 @@ mod tests {
                 last_output: Mutex::new(None),
                 hold: None,
                 fail: std::sync::atomic::AtomicBool::new(false),
+                order: Mutex::new(Vec::new()),
             }
         }
 
@@ -2255,6 +2276,10 @@ mod tests {
             request: &TrickplayExtraction<'_>,
         ) -> Result<Vec<String>, ServiceError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.order
+                .lock()
+                .expect("lock")
+                .push((request.input_path.to_owned(), request.max_width));
             *self.last_request.lock().expect("lock") =
                 Some((request.interval_ms, request.max_width));
             *self.last_priority.lock().expect("lock") = Some(request.priority);
@@ -4067,6 +4092,62 @@ mod tests {
         a.await.unwrap().expect("first refresh");
         b.await.unwrap().expect("second refresh");
         assert_eq!(r.extractor.calls(), 2);
+    }
+
+    /// With several widths selected, a video makes all of its sets in one
+    /// generation slot before the next queued video starts (gl-1227): a slot
+    /// per width let every queued video's first width go before any second
+    /// width, so a scan backlog made every 320 set before any 640 set.
+    #[tokio::test]
+    async fn a_video_makes_every_width_before_the_next_video_takes_the_slot() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut extractor = FakeExtractor::new(2, 180);
+        extractor.hold = Some((entered.clone(), release.clone()));
+        let db = test_db().await;
+        let (one, two) = (Uuid::new_v4(), Uuid::new_v4());
+        let r = rig(&db, options_2x2(&[320, 640]), extractor);
+        let one_path = seed_video(&db, &r, one, Some(HOUR_TICKS), None).await;
+        let two_path = seed_video(&db, &r, two, Some(HOUR_TICKS), None).await;
+        let manager = r.mgr.clone().with_generation_concurrency(1);
+        let refresh = |item| {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .refresh_trickplay_data(item, false, &extraction_on())
+                    .await
+            })
+        };
+        let first = refresh(one);
+        entered.notified().await;
+        let second = refresh(two);
+        // Let the second video reach the slot and queue for it while the
+        // first video's 320 set is being made.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), entered.notified())
+                .await
+                .is_err(),
+            "the second video waits for the single slot"
+        );
+        for _ in 0..3 {
+            release.notify_one();
+            entered.notified().await;
+        }
+        release.notify_one();
+        first.await.unwrap().expect("first video");
+        second.await.unwrap().expect("second video");
+
+        let order = r.extractor.order.lock().expect("lock").clone();
+        assert_eq!(
+            order,
+            vec![
+                (one_path.clone(), 320),
+                (one_path, 640),
+                (two_path.clone(), 320),
+                (two_path, 640),
+            ],
+            "each video's widths are made together, in the slot it took"
+        );
     }
 
     /// Two refreshes of one item at once (a scan's spawned trickplay job and
