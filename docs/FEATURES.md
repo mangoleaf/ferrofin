@@ -176,20 +176,20 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
 Wired and working, with a documented limitation or lighter verification:
 
 - **Ferrofin settings page** — Ferrofin's own, with no Jellyfin counterpart, so checked in
-  jellyfin-web only. Dashboard → Plugins → **Ferrofin** → Settings, or the dashboard menu's
-  Ferrofin entry, lists every Ferrofin setting in nine tabs, with a search across them and filters
-  for changed settings, those needing a restart and read-only ones. Each has a readable name with
-  its key, variable, flag and default below, what sets it (`config.toml`, environment variable or
-  flag), and, for each one the page may not change, its value with a lock, why and where it is
-  changed instead. Secrets are shown to administrators, marked as secrets. The rest are edited
-  there, each on one line with its default shown while unset: Save writes the changes of every
-  tab to `config.toml`, a refused value shows the server's message next to it, Reset to default
-  removes the key, and Restart now applies them, all but the few that need a full process restart,
-  which say so ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)). The Trickplay tab's
-  Preview Size and Image Quality are the dashboard's own `TrickplayOptions` instead: Save writes
-  them to the server configuration and they apply at once, Reset puts back a new server's value,
-  and a value typed on the dashboard that fits no option shows as Custom
-  ([`CONFIG.md`](CONFIG.md#trickplay)). Disabling the Ferrofin plugin hides the page.
+  jellyfin-web only. Dashboard → Plugins → **Ferrofin Settings** → Settings, or the dashboard menu's
+  Ferrofin Settings entry, lists every Ferrofin setting in nine tabs in a pane on the left, with a
+  search across them, grouped by tab, and filters for changed settings and read-only ones. Each has
+  a readable name with its key, variable, flag and default below, what sets it (`config.toml`,
+  environment variable or flag), and, for each one the page may not change, its value with a lock,
+  why and where it is changed instead. Secrets are shown to administrators, marked as secrets. The
+  rest are edited there, each on one line with its default shown while unset: Save writes the
+  changes of every tab to `config.toml`, a refused value shows the server's message next to it,
+  Reset to default removes the key, and Restart now applies them, all but the few that need a full
+  process restart, which say so ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)). The
+  Trickplay tab's Preview Size and Image Quality are the dashboard's own `TrickplayOptions` instead:
+  Save writes them to the server configuration and they apply at once, Reset puts back a new
+  server's value, and a value typed on the dashboard that fits no option shows as Custom
+  ([`CONFIG.md`](CONFIG.md#trickplay)). Disabling the Ferrofin Settings plugin hides the page.
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote

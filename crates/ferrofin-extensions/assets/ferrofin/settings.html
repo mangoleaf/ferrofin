@@ -2,12 +2,12 @@
 <html lang="en">
 
 <head>
-    <title>Ferrofin</title>
+    <title>Ferrofin Settings</title>
 </head>
 
 <body>
     <!--
-        The Ferrofin plugin's settings page, authored in this repository (not
+        The Ferrofin Settings plugin's page, authored in this repository (not
         vendored from a Jellyfin plugin). jellyfin-web keeps only the
         `data-role="page"` element and runs the scripts inside it, so the
         styles and the script live in it too.
@@ -25,7 +25,7 @@
             <div class="content-primary">
                 <div class="verticalSection">
                     <div class="sectionTitleContainer flex align-items-center">
-                        <h2 class="sectionTitle">Ferrofin</h2>
+                        <h2 class="sectionTitle">Ferrofin Settings</h2>
                     </div>
                     <p class="fieldDescription">
                         The server's own settings. A setting the settings file below holds shows its
@@ -36,7 +36,7 @@
                         is changed where the server is started.
                     </p>
                 </div>
-                <div class="ferrofinNotice ferrofinRestartPending hide" role="status">
+                <div class="ferrofinNotice ferrofinWarning ferrofinRestartPending hide" role="status">
                     <span class="material-icons restart_alt" aria-hidden="true"></span>
                     <div class="ferrofinRestartBody">
                         <div class="ferrofinRestartText"></div>
@@ -55,35 +55,35 @@
                     <span class="ferrofinConfigFileLocked hide">(the server cannot write it, so a save will fail)</span>
                 </p>
                 <form class="ferrofinForm hide" novalidate>
-                    <div class="ferrofinFinder">
-                        <div class="inputContainer">
-                            <input is="emby-input" type="search" class="ferrofinSearch" label="Search settings"
-                                autocomplete="off" spellcheck="false" />
-                        </div>
-                        <div class="ferrofinFilters" role="group" aria-label="Filters">
-                            <div class="checkboxContainer">
-                                <label>
-                                    <input is="emby-checkbox" type="checkbox" class="ferrofinFilterChanged" />
-                                    <span>Changed</span>
-                                </label>
+                    <!-- The tabs in a pane on the left, the search and the settings beside them. -->
+                    <div class="ferrofinShell">
+                        <div class="ferrofinTabs" role="tablist" aria-orientation="vertical"
+                            aria-label="Setting groups"></div>
+                        <div class="ferrofinMain">
+                            <div class="ferrofinFinder">
+                                <div class="inputContainer">
+                                    <input is="emby-input" type="search" class="ferrofinSearch"
+                                        label="Search settings" autocomplete="off" spellcheck="false" />
+                                </div>
+                                <div class="ferrofinFilters" role="group" aria-label="Filters">
+                                    <div class="checkboxContainer">
+                                        <label>
+                                            <input is="emby-checkbox" type="checkbox" class="ferrofinFilterChanged" />
+                                            <span>Changed</span>
+                                        </label>
+                                    </div>
+                                    <div class="checkboxContainer">
+                                        <label>
+                                            <input is="emby-checkbox" type="checkbox" class="ferrofinFilterLocked" />
+                                            <span>Hide read-only</span>
+                                        </label>
+                                    </div>
+                                </div>
                             </div>
-                            <div class="checkboxContainer">
-                                <label>
-                                    <input is="emby-checkbox" type="checkbox" class="ferrofinFilterRestart" />
-                                    <span>Needs restart</span>
-                                </label>
-                            </div>
-                            <div class="checkboxContainer">
-                                <label>
-                                    <input is="emby-checkbox" type="checkbox" class="ferrofinFilterLocked" />
-                                    <span>Hide read-only</span>
-                                </label>
-                            </div>
+                            <p class="ferrofinNoMatch fieldDescription hide" role="status"></p>
+                            <div class="ferrofinGroups"></div>
                         </div>
                     </div>
-                    <div class="ferrofinTabs" role="tablist"></div>
-                    <p class="ferrofinNoMatch fieldDescription hide" role="status"></p>
-                    <div class="ferrofinGroups"></div>
                     <button is="emby-button" type="submit" class="raised button-submit block ferrofinSave" disabled>
                         <span>Save</span>
                     </button>
@@ -102,12 +102,34 @@
                 background: rgba(128, 128, 128, 0.15);
             }
 
+            /* A restart is needed for saved changes: a warning, as on Intro Skipper's page. */
+            .ferrofinSettingsPage .ferrofinWarning {
+                border: 1px solid rgba(232, 168, 54, 0.45);
+                background: rgba(232, 168, 54, 0.1);
+            }
+
+            .ferrofinSettingsPage .ferrofinWarning > .material-icons {
+                color: #e8a836;
+            }
+
+            /* The tabs in a pane on the left, as Intro Skipper's page has them; a
+               row above the settings on a narrow screen. */
+            .ferrofinSettingsPage .ferrofinShell {
+                display: grid;
+                grid-template-columns: 12em minmax(0, 1fr);
+                gap: 0 2em;
+                margin-top: 1.5em;
+            }
+
+            .ferrofinSettingsPage .ferrofinMain {
+                min-width: 0;
+            }
+
             .ferrofinSettingsPage .ferrofinFinder {
                 display: flex;
                 flex-wrap: wrap;
                 align-items: flex-end;
                 gap: 0.5em 1.5em;
-                margin-top: 1.5em;
             }
 
             .ferrofinSettingsPage .ferrofinFinder .inputContainer {
@@ -127,27 +149,66 @@
 
             .ferrofinSettingsPage .ferrofinTabs {
                 display: flex;
-                flex-wrap: wrap;
-                gap: 0.2em;
-                margin-top: 1em;
-                border-bottom: 1px solid rgba(128, 128, 128, 0.35);
+                flex-direction: column;
+                gap: 0.15em;
+                padding-right: 0.5em;
+                border-right: 1px solid rgba(128, 128, 128, 0.35);
             }
 
             .ferrofinSettingsPage .ferrofinTab {
+                display: flex;
+                align-items: center;
+                width: 100%;
                 padding: 0.6em 1em;
                 border: 0;
-                border-bottom: 0.15em solid transparent;
+                border-radius: 0.3em;
                 background: none;
                 color: inherit;
                 font: inherit;
-                opacity: 0.75;
+                text-align: left;
+                opacity: 0.8;
                 cursor: pointer;
             }
 
+            .ferrofinSettingsPage .ferrofinTab:hover {
+                background: rgba(128, 128, 128, 0.12);
+                opacity: 1;
+            }
+
             .ferrofinSettingsPage .ferrofinTab[aria-selected="true"] {
-                border-bottom-color: currentColor;
+                background: color-mix(in srgb, var(--jf-palette-primary-main, #00a4dc) 15%, transparent);
+                color: var(--jf-palette-primary-main, #00a4dc);
                 font-weight: bold;
                 opacity: 1;
+            }
+
+            .ferrofinSettingsPage .ferrofinTabName {
+                flex: 1 1 auto;
+            }
+
+            /* While a search or a filter lists every tab, a tab with no match. */
+            .ferrofinSettingsPage .ferrofinTab.ferrofinTabMatchless {
+                opacity: 0.4;
+            }
+
+            @media (max-width: 48em) {
+                .ferrofinSettingsPage .ferrofinShell {
+                    grid-template-columns: minmax(0, 1fr);
+                }
+
+                .ferrofinSettingsPage .ferrofinTabs {
+                    flex-direction: row;
+                    overflow-x: auto;
+                    margin-bottom: 1em;
+                    padding: 0 0 0.3em;
+                    border-right: 0;
+                    border-bottom: 1px solid rgba(128, 128, 128, 0.35);
+                }
+
+                .ferrofinSettingsPage .ferrofinTab {
+                    width: auto;
+                    white-space: nowrap;
+                }
             }
 
             .ferrofinSettingsPage .ferrofinTabCount {
@@ -159,7 +220,8 @@
                 font-weight: bold;
             }
 
-            .ferrofinSettingsPage .ferrofinTabRefused,
+            /* Red wins over the open tab's accent: a refusal opens its tab. */
+            .ferrofinSettingsPage .ferrofinTab.ferrofinTabRefused,
             .ferrofinSettingsPage .ferrofinFieldError {
                 color: #e04b4b;
             }
@@ -173,8 +235,21 @@
                 margin-top: 0.5em;
             }
 
+            /* A tab's name over its matches while a search lists every tab. */
             .ferrofinSettingsPage .ferrofinGroupTitle {
-                margin: 1.2em 0 0;
+                display: flex;
+                align-items: baseline;
+                gap: 0.6em;
+                margin: 1.5em 0 0;
+                padding-bottom: 0.3em;
+                border-bottom: 1px solid rgba(128, 128, 128, 0.35);
+                color: var(--jf-palette-primary-main, #00a4dc);
+            }
+
+            .ferrofinSettingsPage .ferrofinGroupCount {
+                font-size: 0.75em;
+                font-weight: normal;
+                opacity: 0.8;
             }
 
             .ferrofinSettingsPage .ferrofinNoMatch {
@@ -371,6 +446,9 @@
                 // The kinds whose field is short; the others hold text, a
                 // path or a list, and get a wide one.
                 var NARROW_KINDS = { Bool: true, Integer: true, CountOrAuto: true, Choice: true };
+                // A save of this page's settings waits for a restart; or the
+                // server waits for one for another reason (a plugin install).
+                var RESTART_REQUIRED = 'A restart is required to apply the changed settings.';
                 var RESTART_PENDING = 'A server restart is pending.';
                 // How often the page asks whether a restart has finished, and
                 // how long before it says the server has not come back.
@@ -1184,16 +1262,40 @@
                     page.querySelector('.ferrofinRestartNow').disabled = busy;
                 }
 
-                /** The restart notice: the keys it cannot apply, and Restart now. */
-                function renderRestartNotice(page, state, pending) {
+                /**
+                 * The restart notice: shown while the server has a restart
+                 * pending or `config.toml` holds a value not in use yet (a
+                 * save, or an edit by hand), saying which; the keys only a
+                 * full process restart applies; and Restart now, unless only
+                 * such keys wait, which the in-process restart cannot apply.
+                 */
+                function renderRestartNotice(page, state, pending, settings) {
                     if (!pending) {
                         state.resets = Object.create(null);
                         state.processRestart = Object.create(null);
                     }
-                    page.querySelector('.ferrofinRestartPending').classList.toggle('hide', !pending);
-                    page.querySelector('.ferrofinRestartText').textContent = RESTART_PENDING;
+                    var processKeys = Object.create(null);
+                    Object.keys(state.processRestart).forEach(function (key) {
+                        processKeys[key] = true;
+                    });
+                    var required = false;
+                    var restartable = pending;
+                    settings.forEach(function (setting) {
+                        if (awaitsRestart(state, setting)) {
+                            required = true;
+                            if (setting.Applies === 'ProcessRestart') {
+                                processKeys[setting.Key] = true;
+                            } else {
+                                restartable = true;
+                            }
+                        }
+                    });
+                    state.restartText = required ? RESTART_REQUIRED : RESTART_PENDING;
+                    page.querySelector('.ferrofinRestartPending').classList.toggle('hide', !pending && !required);
+                    page.querySelector('.ferrofinRestartNow').classList.toggle('hide', !restartable);
+                    page.querySelector('.ferrofinRestartText').textContent = state.restartText;
                     var list = page.querySelector('.ferrofinProcessRestartKeys');
-                    var keys = Object.keys(state.processRestart).sort();
+                    var keys = Object.keys(processKeys).sort();
                     clear(list);
                     list.classList.toggle('hide', keys.length === 0);
                     if (keys.length > 0) {
@@ -1206,14 +1308,13 @@
                     return {
                         terms: page.querySelector('.ferrofinSearch').value.toLowerCase().split(/\s+/).filter(Boolean),
                         changed: page.querySelector('.ferrofinFilterChanged').checked,
-                        restart: page.querySelector('.ferrofinFilterRestart').checked,
                         hideLocked: page.querySelector('.ferrofinFilterLocked').checked
                     };
                 }
 
                 /** Whether `find` lists the matches of every tab, rather than the open tab. */
                 function finding(find) {
-                    return find.terms.length > 0 || find.changed || find.restart;
+                    return find.terms.length > 0 || find.changed;
                 }
 
                 /**
@@ -1228,9 +1329,10 @@
                 }
 
                 /**
-                 * Needs restart: `config.toml` holds a value not in use yet, or
-                 * a save removed one still in use. A variable or a flag
-                 * outranks the file across a restart too.
+                 * Whether a restart applies a saved change to `setting`:
+                 * `config.toml` holds a value not in use yet, or a save removed
+                 * one still in use. A variable or a flag outranks the file
+                 * across a restart too.
                  */
                 function awaitsRestart(state, setting) {
                     if (setting.Source === 'Environment' || setting.Source === 'Flag') {
@@ -1240,7 +1342,7 @@
                 }
 
                 /** Whether `row` shows under `find`. A refused change always does, to be corrected. */
-                function matches(state, row, find) {
+                function matches(row, find) {
                     if (row.node.querySelector('.ferrofinFieldError')) {
                         return true;
                     }
@@ -1250,9 +1352,6 @@
                     if (find.changed && !isChanged(row)) {
                         return false;
                     }
-                    if (find.restart && !awaitsRestart(state, row.setting)) {
-                        return false;
-                    }
                     return find.terms.every(function (term) {
                         return row.text.indexOf(term) !== -1;
                     });
@@ -1260,32 +1359,37 @@
 
                 /**
                  * Shows what the tabs, the search and the filters ask for. A
-                 * search, Changed or Needs restart lists the matches of every
-                 * tab under its tab's name; otherwise the open tab shows. Hide
-                 * read-only narrows either.
+                 * search or Changed lists the matches of every tab under its
+                 * tab's name, with their count, and dims the tabs with none;
+                 * otherwise the open tab shows. Hide read-only narrows either.
                  */
                 function applyView(page, state) {
                     var find = finder(page);
                     var across = finding(find);
                     var shown = Object.create(null);
                     state.rows.forEach(function (row) {
-                        var visible = matches(state, row, find);
+                        var visible = matches(row, find);
                         row.node.classList.toggle('hide', !visible);
                         if (visible) {
-                            shown[row.group] = true;
+                            shown[row.group] = (shown[row.group] || 0) + 1;
                         }
                     });
                     var any = false;
                     page.querySelectorAll('.ferrofinGroup').forEach(function (section) {
                         var group = section.getAttribute('data-group');
-                        var open = across ? shown[group] === true : group === state.tab;
+                        var count = shown[group] || 0;
+                        var open = across ? count > 0 : group === state.tab;
                         section.classList.toggle('hide', !open);
                         section.querySelector('.ferrofinGroupTitle').classList.toggle('hide', !across);
-                        any = any || (open && shown[group] === true);
+                        section.querySelector('.ferrofinGroupCount').textContent =
+                            count + (count === 1 ? ' setting' : ' settings');
+                        any = any || (open && count > 0);
                     });
                     page.querySelectorAll('.ferrofinTab').forEach(function (tab) {
-                        var current = tab.getAttribute('data-group') === state.tab;
+                        var group = tab.getAttribute('data-group');
+                        var current = group === state.tab;
                         tab.setAttribute('aria-selected', !across && current ? 'true' : 'false');
+                        tab.classList.toggle('ferrofinTabMatchless', across && !shown[group]);
                         tab.tabIndex = current ? 0 : -1;
                     });
                     var noMatch = page.querySelector('.ferrofinNoMatch');
@@ -1303,15 +1407,20 @@
                     state.tab = group;
                     page.querySelector('.ferrofinSearch').value = '';
                     page.querySelector('.ferrofinFilterChanged').checked = false;
-                    page.querySelector('.ferrofinFilterRestart').checked = false;
                     applyView(page, state);
                 }
 
-                /** Arrow keys, Home and End move between the tabs, as in a tab list. */
+                /**
+                 * The arrow keys, Home and End move between the tabs, as in a
+                 * tab list: up and down in the pane, left and right in the row
+                 * a narrow screen shows.
+                 */
                 function moveTab(page, state, event) {
                     var tabs = Array.prototype.slice.call(page.querySelectorAll('.ferrofinTab'));
                     var at = tabs.indexOf(event.target);
                     var to = {
+                        ArrowUp: at - 1,
+                        ArrowDown: at + 1,
                         ArrowLeft: at - 1,
                         ArrowRight: at + 1,
                         Home: 0,
@@ -1337,7 +1446,7 @@
                     tab.setAttribute('type', 'button');
                     tab.setAttribute('role', 'tab');
                     tab.setAttribute('data-group', group);
-                    tab.appendChild(element('span', null, group));
+                    tab.appendChild(element('span', 'ferrofinTabName', group));
                     tab.appendChild(element('span', 'ferrofinTabCount hide'));
                     var mark = icon('error');
                     mark.classList.add('ferrofinTabMark', 'hide');
@@ -1352,7 +1461,7 @@
                     state.fields = [];
                     state.rows = [];
                     page.querySelector('.ferrofinError').classList.add('hide');
-                    renderRestartNotice(page, state, response.RestartPending);
+                    renderRestartNotice(page, state, response.RestartPending, response.Settings || []);
                     page.querySelector('.ferrofinConfigFilePath').textContent = response.ConfigFile || '';
                     page.querySelector('.ferrofinConfigFile').classList.toggle('hide', !response.ConfigFile);
                     page.querySelector('.ferrofinConfigFileLocked').classList.toggle('hide', response.ConfigFileWritable !== false);
@@ -1369,8 +1478,12 @@
                             section.setAttribute('role', 'tabpanel');
                             section.setAttribute('aria-label', setting.Group);
                             section.setAttribute('data-group', setting.Group);
-                            // Shown while a search lists every tab's matches.
-                            section.appendChild(element('h3', 'ferrofinGroupTitle hide', setting.Group));
+                            // Shown, with the count of its matches, while a
+                            // search lists every tab's matches.
+                            var title = element('h3', 'ferrofinGroupTitle hide');
+                            title.appendChild(element('span', null, setting.Group));
+                            title.appendChild(element('span', 'ferrofinGroupCount'));
+                            section.appendChild(title);
                             sections[setting.Group] = section;
                             order.push(setting.Group);
                             groups.appendChild(section);
@@ -1426,7 +1539,7 @@
                         case 403:
                             return Promise.resolve('Only administrators can ' + action + ' the Ferrofin settings.');
                         case 404:
-                            return Promise.resolve('The Ferrofin plugin is disabled. Enable it under Dashboard → Plugins to ' + action + ' its settings.');
+                            return Promise.resolve('The Ferrofin Settings plugin is disabled. Enable it under Dashboard → Plugins to ' + action + ' its settings.');
                         default: {
                             var prefix = 'Could not ' + verb + ' the Ferrofin settings (HTTP ' + failure.status + ')';
                             return failure.json().then(function (body) {
@@ -1596,7 +1709,7 @@
                 function endRestart(page, state, text) {
                     state.restarting = false;
                     updateButtons(page, state);
-                    page.querySelector('.ferrofinRestartText').textContent = RESTART_PENDING;
+                    page.querySelector('.ferrofinRestartText').textContent = state.restartText;
                     showNotice(page, text);
                 }
 
@@ -1636,6 +1749,7 @@
                         processRestart: Object.create(null),
                         saving: false,
                         restarting: false,
+                        restartText: RESTART_PENDING,
                         tab: null
                     };
                     page.setAttribute('data-ferrofin-bound', 'true');
