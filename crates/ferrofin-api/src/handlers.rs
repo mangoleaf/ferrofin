@@ -1046,7 +1046,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    extract_trickplay_frames, plan, build_trickplay_args, SwTonemap and run on the \
                    software path, and build_accelerated_trickplay_args with \
                    supports_keyframe_only_decode, display_corrected_height, frame_matrix and \
-                   mjpeg_quality on the hardware one, compared with \
+                   mjpeg_quality on the hardware one, and extract_trickplay_frame_sets, \
+                   extract_together and combined_args for several widths of one video, \
+                   compared with \
                    ExtractVideoImagesOnIntervalAccelerated and \
                    ExtractVideoImagesOnIntervalInternal and, in \
                    MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs, \
@@ -1056,7 +1058,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    GetMjpegEncoder as the trickplay job calls them. The vendor filter chains \
                    themselves are the transcode ports in encoding_helper/hw and are not part of \
                    this row",
-        date: "2026-11-02",
+        date: "2026-11-03",
         divergences: &[
             "The fps= sampler is emitted for every stream, where upstream's GetFramerateParam \
              emits none for a stream ffprobe read no frame rate for, or one whose rate is not \
@@ -1106,6 +1108,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              path keeps the stored height. Jellyfin bugs, deliberately not ported.",
             "The caller owns the frame directory, which the extractor clears before a retry, \
              where upstream extracts each run into a fresh temporary directory.",
+            "Several widths of one video are made by one ffmpeg run, which decodes the video \
+             once, where RefreshTrickplayDataAsync calls ExtractVideoImagesOnIntervalAccelerated \
+             once per width (gl-1228): the filters every width's graph starts with run once and \
+             are split, and each width's remaining filters, encoder and image sequence follow on \
+             a branch of its own, so each width's frames are those its own run makes (compared \
+             byte for byte on the software path and on NVENC). A shared run that fails, after \
+             its standard-way retry when it was keyframe-only, falls back to one run per width, \
+             and one width is always its own run. VAAPI and QSV keep one run per width, as their \
+             split would share hardware frames ahead of the GPU scaler, which is not verified on \
+             Intel or AMD hardware: open work (gl-1237).",
             "The argument line is logged at debug, not information, because it is logged once \
              per video and width (docs/conventions/LOGGING.md), and a run stopped for writing \
              no new frame logs no lines of its own: its reason is in the error the caller \

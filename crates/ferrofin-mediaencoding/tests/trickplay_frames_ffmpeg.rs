@@ -24,7 +24,9 @@ use ferrofin_mediaencoding::{
 };
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::entities_media::MediaStream;
-use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor as _};
+use ferrofin_traits::media_encoding::{
+    TrickplayExtraction, TrickplayFrameExtractor as _, TrickplayOutput,
+};
 
 /// The version of the `ffmpeg` on `PATH`, probed the way the composition root
 /// probes it.
@@ -654,6 +656,173 @@ async fn an_hdr10_source_is_tone_mapped_to_its_sdr_colours(#[case] full_chroma: 
             off <= COLOUR_TOLERANCE,
             "{frame}: decoded {got:?}, tone-mapped reference {want:?} (off by {off})"
         );
+    }
+}
+
+/// The real transcoder, recording each run's arguments and whether it
+/// succeeded, so a test can tell a shared run from its per-width fallback.
+#[derive(Default)]
+struct RecordedRuns {
+    inner: TokioTranscoder,
+    runs: std::sync::Mutex<Vec<(String, bool)>>,
+}
+
+#[async_trait::async_trait]
+impl ferrofin_mediaencoding::Transcoder for RecordedRuns {
+    async fn get_process_output(
+        &self,
+        path: &str,
+        arguments: &str,
+        read_stderr: bool,
+        test_key: Option<&str>,
+        env: &[(String, String)],
+    ) -> Result<ferrofin_mediaencoding::encoder::ProcessOutput, String> {
+        let output = self
+            .inner
+            .get_process_output(path, arguments, read_stderr, test_key, env)
+            .await;
+        let success = output.as_ref().is_ok_and(|o| o.success);
+        self.runs
+            .lock()
+            .expect("runs lock")
+            .push((arguments.to_owned(), success));
+        output
+    }
+
+    async fn get_process_exit_code(&self, path: &str, arguments: &str) -> bool {
+        self.inner.get_process_exit_code(path, arguments).await
+    }
+}
+
+/// The bytes of every frame in `frames`, in order.
+fn frame_bytes(frames: &[String]) -> Vec<Vec<u8>> {
+    frames
+        .iter()
+        .map(|frame| std::fs::read(frame).expect("read frame"))
+        .collect()
+}
+
+/// Several widths made by one run come out byte for byte as each width's own
+/// run makes them (gl-1228): the shared filters and each branch's are the
+/// width's own graph, in its order. On every software graph shape: a
+/// progressive source, an interlaced one (deinterlaced once, sampled on each
+/// branch), full chroma, keyframe-only, and an HDR10 source tone-mapped
+/// behind each scale or, with full chroma, once ahead of them (with
+/// jellyfin-ffmpeg's `tonemapx` only).
+#[rstest::rstest]
+#[case::progressive(false, false, false, false)]
+#[case::interlaced(true, false, false, false)]
+#[case::full_chroma(false, true, false, false)]
+#[case::keyframe_only(false, false, true, false)]
+#[case::hdr(false, false, false, true)]
+#[case::hdr_full_chroma(false, true, false, true)]
+#[tokio::test]
+async fn several_widths_from_one_decode_match_their_own_runs(
+    #[case] interlaced: bool,
+    #[case] full_chroma: bool,
+    #[case] keyframe_only: bool,
+    #[case] hdr: bool,
+) {
+    if !ffmpeg_gate() {
+        return;
+    }
+    if hdr && !has_tonemapx() {
+        eprintln!("skipping: ffmpeg has no tonemapx (jellyfin-ffmpeg has it)");
+        return;
+    }
+    let Some(version) = probed_ffmpeg_version() else {
+        eprintln!("skipping: the ffmpeg version could not be probed");
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (clip, stream) = if hdr {
+        let clip = tmp.path().join("hdr10.mkv");
+        make_hdr10_bars_clip(&clip);
+        let stream = MediaStream {
+            codec: Some("ffv1".to_owned()),
+            pixel_format: Some("yuv420p10le".to_owned()),
+            color_transfer: Some("smpte2084".to_owned()),
+            color_primaries: Some("bt2020".to_owned()),
+            color_space: Some("bt2020nc".to_owned()),
+            ..bars_stream()
+        };
+        (clip, stream)
+    } else {
+        let clip = tmp.path().join("clip.mp4");
+        make_clip(&clip);
+        (clip, clip_stream())
+    };
+    let stream = MediaStream {
+        is_interlaced: interlaced,
+        ..stream
+    };
+    let caps = ferrofin_mediaencoding::FfmpegCapabilities::builder()
+        .filters(hdr.then_some("tonemapx"))
+        .ffmpeg_version(version)
+        .build();
+    let transcoder = Arc::new(RecordedRuns::default());
+    let extractor =
+        TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", Some(version))
+            .with_hardware(Arc::new(caps), Arc::new(DefaultEncoding));
+    let clip = clip.to_string_lossy();
+    let request = TrickplayExtraction {
+        full_chroma,
+        keyframe_only,
+        ..extraction(&clip, &stream, "/unused")
+    };
+    let widths = [32, 48, 64];
+    let dir = |kind: &str, width: i32| {
+        tmp.path()
+            .join(format!("{kind}{width}"))
+            .to_string_lossy()
+            .into_owned()
+    };
+    let shared_dirs: Vec<String> = widths.iter().map(|w| dir("shared", *w)).collect();
+    let outputs: Vec<TrickplayOutput<'_>> = widths
+        .iter()
+        .zip(&shared_dirs)
+        .map(|(max_width, output_dir)| TrickplayOutput {
+            max_width: *max_width,
+            output_dir,
+        })
+        .collect();
+
+    let shared = extractor
+        .extract_trickplay_frame_sets(&request, &outputs)
+        .await;
+    // One run made them all, not a fallback to a run per width. A
+    // keyframe-only run may be retried the standard way first, as one run
+    // too: this clip's single keyframe makes the system ffmpeg's MJPEG
+    // encoder refuse the keyframe-only frame, as it does a width's own run.
+    {
+        let runs = transcoder.runs.lock().expect("runs lock");
+        assert!(
+            runs.iter().all(|(args, _)| args.contains("split=3")),
+            "{runs:?}"
+        );
+        assert!(runs.last().is_some_and(|(_, success)| *success), "{runs:?}");
+        assert!(runs.len() <= if keyframe_only { 2 } else { 1 }, "{runs:?}");
+    }
+
+    for (output, set) in outputs.iter().zip(shared) {
+        let set = set.expect("the shared run makes every width");
+        let own_dir = dir("own", output.max_width);
+        let own = extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                max_width: output.max_width,
+                output_dir: &own_dir,
+                ..request
+            })
+            .await
+            .expect("the width's own run");
+        assert_eq!(set.len(), own.len(), "width {}", output.max_width);
+        assert!(
+            frame_bytes(&set) == frame_bytes(&own),
+            "width {}: the shared run's frames differ from the width's own",
+            output.max_width
+        );
+        let (width, _) = image::image_dimensions(&set[0]).expect("frame size");
+        assert_eq!(i32::try_from(width).ok(), Some(output.max_width));
     }
 }
 

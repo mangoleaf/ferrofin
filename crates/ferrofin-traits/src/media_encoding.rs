@@ -272,6 +272,53 @@ pub trait TrickplayFrameExtractor: Send + Sync {
         &self,
         request: &TrickplayExtraction<'_>,
     ) -> Result<Vec<String>, ServiceError>;
+
+    /// Extracts the frames of several widths of one video: `request` with its
+    /// `max_width` and `output_dir` taken from each of `outputs` in turn,
+    /// returning each output's frames (or its error) in the order given.
+    ///
+    /// Upstream makes each width with a run of its own, which decodes the
+    /// video once per width. An extractor may make them all from one decode
+    /// instead, as the ffmpeg one does, provided each width's frames are the
+    /// ones its own run would make. This default runs
+    /// [`Self::extract_trickplay_frames`] once per output.
+    async fn extract_trickplay_frame_sets(
+        &self,
+        request: &TrickplayExtraction<'_>,
+        outputs: &[TrickplayOutput<'_>],
+    ) -> Vec<Result<Vec<String>, ServiceError>> {
+        let mut sets = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            sets.push(self.extract_trickplay_frames(&output.of(request)).await);
+        }
+        sets
+    }
+}
+
+/// One width of a [`TrickplayFrameExtractor::extract_trickplay_frame_sets`]
+/// call: the width bound and the directory its frames are written to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrickplayOutput<'a> {
+    /// The thumbnail width bound in pixels, as
+    /// [`TrickplayExtraction::max_width`].
+    pub max_width: i32,
+    /// Where this width's numbered JPEGs are written, as
+    /// [`TrickplayExtraction::output_dir`]: a directory of its own, which no
+    /// other output of the call shares.
+    pub output_dir: &'a str,
+}
+
+impl<'a> TrickplayOutput<'a> {
+    /// `request` with this output's width and directory: the single-width
+    /// extraction that makes this output's frames on its own.
+    #[must_use]
+    pub fn of(&self, request: &TrickplayExtraction<'a>) -> TrickplayExtraction<'a> {
+        TrickplayExtraction {
+            max_width: self.max_width,
+            output_dir: self.output_dir,
+            ..*request
+        }
+    }
 }
 
 /// One trickplay extraction run, as the extractor reads it.
