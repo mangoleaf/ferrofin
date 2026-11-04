@@ -18,7 +18,9 @@ libraries: since 2026-10-14 every fixture is [synthetic](#the-fixtures-are-synth
 paths, 12.2 included, **passed** both `run.sh` and `synthetic.py run` on synthetic fixtures on
 **2026-10-17**; the synthetic results follow the table. All seventeen paths passed `run.sh` on
 **2026-10-29**, and the fourteen seeded paths also passed `synthetic.py run`; the three fresh
-installs are `run.sh`'s alone ([record](#2026-10-29-jellyfin-123-and-124-routes-gl-874)).
+installs are `run.sh`'s alone ([record](#2026-10-29-jellyfin-123-and-124-routes-gl-874)). All
+eighteen, the [moved row](#the-moved-row) included, passed `run.sh` on **2026-11-04**
+([record](#2026-11-04-the-moved-row-gl-1236)).
 
 Each test booted Ferrofin on a fresh copy of a Jellyfin database. The 10.11.8 fixture was the
 original snapshot; the others were produced by booting the corresponding Jellyfin releases on
@@ -43,6 +45,7 @@ copies, as shown below.
 | 12.4.0 | 10.11.8 → 12.4.0 | 107 | `12.2.0` | PASS (synthetic) |
 | 12.4.0 | 10.11.8 → 12.0.0 → 12.1.0 → 12.2.0 → 12.3.0 → 12.4.0 | 109 | `12.2.0` | PASS (synthetic) |
 | 12.4.0 | Fresh 12.4 install (not upgraded) | 105 | `12.2.0` | PASS (synthetic, `run.sh`) |
+| 12.4.0 | Fresh 12.4 install in a Debian package's directories, adopted into Ferrofin's ([moved row](#the-moved-row)) | 105 | `12.2.0` | PASS (synthetic, `run.sh`) |
 
 The gate in `crates/ferrofin-db/src/database.rs` matches migration **ID sets**, not just
 their counts or a version string. Releases sharing a set share the logged generation.
@@ -270,6 +273,31 @@ gates session (`make run-adoption`) and compared answers with its adoption oracl
 - A boot on a fresh copy of `jellyfin-12.4-from-123` logs "adopted an existing Jellyfin database in
   place" with generation `12.2.0` and the `jellyfin.db.pre-ferrofin` backup, and `GET
   /System/Info/Public` answers `"Version": "12.4.0"`.
+
+### 2026-11-04 the moved row (gl-1236)
+
+The whole fixture set was built fresh by `build-fixtures.sh` at this change's recipe (13 minutes,
+beside an image build). `jellyfin-12.4-debian` took 21 s of it, recorded 105 EF ids, the same id set
+as `jellyfin-12.2-fresh`, and the same fresh-install schema; its stored root folder, library folders,
+artwork and chapter images name `/var/lib/jellyfin` and its seven profile images `/etc/jellyfin`.
+
+Image `ferrofin:v1.4.1-649-c96b0874`, built from `c96b0874` (`release/v1.5.0` plus this change),
+local image ID `sha256:13d6a236da3853caefe684176e74310f363bb89a678d66c3b53af5658f74c4fb`, in a
+local gates session (`make run-adoption`, 6 min 7 s):
+
+- `run.sh`: **PASS** on all 21 rows (18 paths, the two messy copies and the scale row), 0 failed, 0
+  skipped. The moved row passes every check at all three stages, the program-data move check
+  included, and takes 17 s on its own.
+- With the boot repair disabled (an image whose `rebase_program_data_paths` plans the rewrite and
+  writes nothing, built only for this run), the moved row **FAILS**, and the program-data move
+  check fails at every stage (7, 6 and 6 failures). After adoption it names 8 `BaseItems.Path` (the
+  user root and the seven library folders; the boot re-paths the aggregate root on its own), 17
+  `BaseItemImageInfos.Path`, 80 `Chapters.ImagePath` and 7 `ImageInfos.Path` still under the old
+  directories although the copy holds the files, 4 of 4 library Primary images and 7 of 7 profile
+  images answering 404, and no `jellyfin.db.pre-program-data-move`. The later stages repeat all but the snapshot, which only the
+  first checks for, except that after the scan one `BaseItems.Path` is left, the user root's. The
+  smoke comparison (the movie poster probe answers 404), the table digests (80 chapter rows) and,
+  after the scan, the metadata check fail with it.
 
 ## What the live suite checks
 
