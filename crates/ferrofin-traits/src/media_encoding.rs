@@ -473,10 +473,38 @@ pub trait SubtitleEncoder: Send + Sync {
         &self,
         media_source: &MediaSourceInfo,
     ) -> Result<(), ServiceError>;
+
+    /// A text subtitle track cut to `start_time_ticks`, for a stream that
+    /// starts there and embeds it, in the format of the file the track is
+    /// read from (`GetReadableFile`).
+    ///
+    /// Ferrofin's own: what a seeked progressive stream embeds where ffmpeg
+    /// cannot cut the sidecar itself (gl-1199). The cues are `FilterEvents`'s
+    /// from the start position, moved to start there, less one that ended
+    /// exactly at it. [`get_subtitles`](Self::get_subtitles) serves a track
+    /// already in the requested format as it is, uncut, so it cannot give
+    /// this.
+    async fn get_trimmed_subtitles(
+        &self,
+        subtitle_stream: &MediaStream,
+        media_source: &MediaSourceInfo,
+        start_time_ticks: i64,
+    ) -> Result<TrimmedSubtitle, ServiceError>;
 }
 
 /// Compile-time assertion that [`SubtitleEncoder`] is object-safe.
 fn _assert_object_safe_subtitle_encoder(_: &dyn SubtitleEncoder) {}
+
+/// A text subtitle track cut to a start position
+/// ([`SubtitleEncoder::get_trimmed_subtitles`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrimmedSubtitle {
+    /// The format it is written in, as a file extension: `srt`, `ass`, `ssa`
+    /// or `vtt`.
+    pub format: String,
+    /// The subtitle file, in UTF-8.
+    pub data: Vec<u8>,
+}
 
 /// An extracted attachment: its metadata plus the extracted bytes.
 ///

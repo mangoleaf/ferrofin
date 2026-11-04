@@ -199,6 +199,7 @@ fn state(output_path: &Path, session: &str, streams: Streams) -> EncodingJobInfo
         input_container: None,
         is_input_video: streams.video.is_some(),
         subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
+        trimmed_subtitle_path: None,
         run_time_ticks: None,
         transcoding_type: TranscodingJobType::Hls,
         supported_video_codecs: Vec::new(),

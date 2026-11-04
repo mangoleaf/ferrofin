@@ -21,12 +21,13 @@ use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::IsoType;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::{MediaProtocol, subtitle_format};
+use ferrofin_traits::media_encoding::TrimmedSubtitle;
 
 use crate::encoder::{get_input_argument, quote};
 use crate::encoding_helper::helper;
 use crate::keyed_locks::KeyedLocks;
 
-use super::model::{Subtitle, TimeCode};
+use super::model::{Paragraph, Subtitle, TimeCode};
 use super::parser::{SubtitleEditParser, SubtitleParser};
 use super::{json_writer, srt, ssa, ttml, vtt};
 
@@ -383,6 +384,69 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             .ok_or_else(|| format!("Unsupported format: {output_format}"))?;
 
         Ok(writer.write(&subtitle).into_bytes())
+    }
+
+    /// A text subtitle track cut to `start_time_ticks`, in the format of its
+    /// readable file, for a stream that starts there and embeds it (gl-1199).
+    ///
+    /// Ferrofin's own, built from the ported steps: the readable file
+    /// ([`get_readable_file`](Self::get_readable_file): the sidecar itself, or
+    /// the SubRip ffmpeg made of one the parser cannot read), read as UTF-8
+    /// ([`get_subtitle_stream`](Self::get_subtitle_stream); a sidecar in a
+    /// legacy character set is converted, where ffmpeg reading it itself
+    /// assumes UTF-8), its cues from the
+    /// start position ([`filter_events`], moved to start there), written back
+    /// in that format. [`get_subtitles`](Self::get_subtitles) returns a track
+    /// already in the requested format uncut, as upstream's `GetSubtitles`
+    /// does.
+    ///
+    /// Divergence, the one the embed's output trim makes from ffmpeg 5.1
+    /// (`embedded_sidecar_trim_arguments`): a cue that ended exactly at the
+    /// start goes too. `FilterEvents` keeps it with no length, which shows
+    /// nothing, but MP4's `mov_text` would stretch it to the next cue.
+    ///
+    /// A start after the last cue leaves none. SubRip has no header, and
+    /// ffmpeg refuses a SubRip file without a cue ("Invalid data found when
+    /// processing input", 4.4.2 and 9.0.2), which would fail the whole
+    /// stream, so that copy holds one cue with no text at 0: ffmpeg reads it
+    /// as no subtitle, and the embedded track is empty, as the output trim
+    /// leaves it from 5.1. ASS, SSA and WebVTT keep their header and open
+    /// with no cue.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error message when the readable file cannot be resolved,
+    /// read or parsed, or its format has no writer (a bitmap track).
+    pub async fn get_trimmed_subtitles(
+        &self,
+        media_source: &MediaSourceInfo,
+        subtitle_stream: &MediaStream,
+        start_time_ticks: i64,
+    ) -> Result<TrimmedSubtitle, String> {
+        let info = self
+            .get_readable_file(media_source, subtitle_stream)
+            .await?;
+        let writer = Writer::for_format(&info.format)
+            .ok_or_else(|| format!("Unsupported format: {}", info.format))?;
+        let stream = self.get_subtitle_stream(&info).await?;
+
+        let guard = self.locks.get(&info.path);
+        let _held = guard.lock().await;
+        let mut subtitle = self.parser.parse(stream.bytes(), &info.format)?;
+        subtitle.paragraphs.retain(|p| {
+            !(p.start_time.ticks() < start_time_ticks && p.end_time.ticks() <= start_time_ticks)
+        });
+        filter_events(&mut subtitle, start_time_ticks, 0, false);
+        if subtitle.paragraphs.is_empty() && writer == Writer::SubRip {
+            let mut blank = Paragraph::new(String::new(), TimeCode::default(), TimeCode::default());
+            blank.number = 1;
+            subtitle.paragraphs.push(blank);
+        }
+
+        Ok(TrimmedSubtitle {
+            data: writer.write(&subtitle).into_bytes(),
+            format: info.format,
+        })
     }
 
     /// Reads a subtitle stream, converting a non-UTF-8 file to UTF-8 in memory.

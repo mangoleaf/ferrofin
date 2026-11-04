@@ -185,6 +185,7 @@ fn state(output_path: &Path, wait_for: &Path, segment_container: &str) -> Encodi
         input_container: None,
         is_input_video: true,
         subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
+        trimmed_subtitle_path: None,
         run_time_ticks: None,
         transcoding_type: TranscodingJobType::Hls,
         supported_video_codecs: Vec::new(),

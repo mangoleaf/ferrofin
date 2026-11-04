@@ -608,6 +608,247 @@ fn filter_events_rebase_keeps_the_sub_millisecond_part_of_the_offset() {
     assert_eq!(s.paragraphs[0].start_time.ticks(), 9_987_655);
 }
 
+// -- get_trimmed_subtitles: a sidecar cut to a seeked embed's start ---------
+
+/// An external subtitle sidecar at `path`, as the scanner lists it.
+fn sidecar(codec: &str, path: &str) -> MediaStream {
+    MediaStream {
+        stream_type: MediaStreamType::Subtitle,
+        index: 2,
+        codec: Some(codec.to_owned()),
+        is_external: true,
+        path: Some(path.to_owned()),
+        ..MediaStream::default()
+    }
+}
+
+/// An encoder whose files are `files`.
+fn encoder_over(files: &[(&str, &[u8])]) -> SubtitleEncoder<SubtitleEditParser, RecordingIo> {
+    let io = RecordingIo::default();
+    io.files.lock().unwrap().extend(
+        files
+            .iter()
+            .map(|(path, bytes)| ((*path).to_owned(), bytes.to_vec())),
+    );
+    SubtitleEncoder::new(SubtitleEditParser::new(), io)
+}
+
+/// Nine seconds, in ticks.
+const NINE_SECONDS: i64 = 90_000_000;
+
+/// A seeked embed's copy of a SubRip sidecar (gl-1199) keeps the cues
+/// `FilterEvents` keeps from the start, moved to start there: the one on
+/// screen from 0 for the time it has left, the later ones by their distance
+/// from the start. The cue over before the start goes, and so does the one
+/// that ended exactly at it, which `FilterEvents` would keep with no length.
+/// A Windows-1252 file comes out as UTF-8, in the sidecar's own format.
+#[tokio::test]
+async fn get_trimmed_subtitles_cuts_a_subrip_sidecar_to_the_start() {
+    let srt = "1\r\n00:00:03,500 --> 00:00:08,000\r\nover before the start\r\n\r\n\
+               2\r\n00:00:07,000 --> 00:00:09,000\r\nends at the start\r\n\r\n\
+               3\r\n00:00:08,500 --> 00:00:11,000\r\non screen at the start, caf\u{e9}\r\n\r\n\
+               4\r\n00:00:12,000 --> 00:00:14,000\r\nafter the start\r\n\r\n";
+    let (cp1252, _, _) = encoding_rs::WINDOWS_1252.encode(srt);
+    let encoder = encoder_over(&[("/media/movie.en.srt", &cp1252)]);
+
+    let trimmed = encoder
+        .get_trimmed_subtitles(
+            &MediaSourceInfo::default(),
+            &sidecar("subrip", "/media/movie.en.srt"),
+            NINE_SECONDS,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(trimmed.format, "srt");
+    let text = String::from_utf8(trimmed.data).unwrap();
+    let cues: Vec<&str> = text
+        .lines()
+        .filter(|line| line.contains("-->") || line.contains("start"))
+        .collect();
+    assert_eq!(
+        cues,
+        [
+            "00:00:00,000 --> 00:00:02,000",
+            "on screen at the start, caf\u{e9}",
+            "00:00:03,000 --> 00:00:05,000",
+            "after the start",
+        ],
+        "{text}"
+    );
+}
+
+/// An ASS sidecar keeps its script: its styles, and each cue's style, are
+/// what the copy carries, only the times move.
+#[tokio::test]
+async fn get_trimmed_subtitles_keeps_an_ass_sidecars_styles() {
+    let ass = "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 360\n\n\
+               [V4+ Styles]\n\
+               Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, \
+               BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, \
+               BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+               Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,\
+               100,0,0,1,2,0,2,10,10,10,1\n\
+               Style: Sign,Georgia,28,&H0000FFFF,&H000000FF,&H00000000,&H00000000,1,0,0,0,100,\
+               100,0,0,1,2,0,8,10,10,10,1\n\n\
+               [Events]\n\
+               Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+               Dialogue: 0,0:00:03.50,0:00:08.00,Default,,0,0,0,,over before the start\n\
+               Dialogue: 0,0:00:08.50,0:00:11.00,Sign,,0,0,0,,{\\pos(320,40)}a sign\n";
+    let encoder = encoder_over(&[("/media/movie.en.ass", ass.as_bytes())]);
+
+    let trimmed = encoder
+        .get_trimmed_subtitles(
+            &MediaSourceInfo::default(),
+            &sidecar("ass", "/media/movie.en.ass"),
+            NINE_SECONDS,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(trimmed.format, "ass");
+    let text = String::from_utf8(trimmed.data).unwrap();
+    assert!(text.contains("Style: Sign,Georgia,28,"), "{text}");
+    let events: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("Dialogue:"))
+        .collect();
+    assert_eq!(
+        events,
+        ["Dialogue: 0,0:00:00.00,0:00:02.00,Sign,,0,0,0,,{\\pos(320,40)}a sign"],
+        "{text}"
+    );
+}
+
+/// A start after the last cue leaves none. ffmpeg refuses a SubRip file
+/// with no cue and would fail the stream, so the copy holds one cue with no
+/// text at 0, which ffmpeg opens and reads as no subtitle.
+#[tokio::test]
+async fn get_trimmed_subtitles_past_the_last_cue_keeps_a_subrip_ffmpeg_opens() {
+    let srt = "1\n00:00:03,500 --> 00:00:08,000\nover before the start\n\n";
+    let encoder = encoder_over(&[("/media/movie.en.srt", srt.as_bytes())]);
+
+    let trimmed = encoder
+        .get_trimmed_subtitles(
+            &MediaSourceInfo::default(),
+            &sidecar("subrip", "/media/movie.en.srt"),
+            NINE_SECONDS,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(trimmed.format, "srt");
+    assert_eq!(
+        String::from_utf8(trimmed.data).unwrap(),
+        "1\n00:00:00,000 --> 00:00:00,000\n\n"
+    );
+}
+
+/// Formats with a header open with no cue, so they keep none.
+#[tokio::test]
+async fn get_trimmed_subtitles_past_the_last_cue_leaves_a_webvtt_empty() {
+    let vtt = "WEBVTT\n\n00:00:03.500 --> 00:00:08.000\nover before the start\n";
+    let encoder = encoder_over(&[("/media/movie.en.vtt", vtt.as_bytes())]);
+
+    let trimmed = encoder
+        .get_trimmed_subtitles(
+            &MediaSourceInfo::default(),
+            &sidecar("webvtt", "/media/movie.en.vtt"),
+            NINE_SECONDS,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(trimmed.format, "vtt");
+    let text = String::from_utf8(trimmed.data).unwrap();
+    assert!(text.starts_with("WEBVTT"), "{text}");
+    assert!(!text.contains("-->"), "{text}");
+}
+
+/// A text format the parser cannot read is the SubRip ffmpeg makes of it
+/// (`GetReadableFile`), cut like any other; an `.mks` track is its
+/// extraction. Each readable file is made by one ffmpeg run, into the
+/// subtitle cache (pre-filled here, as the run would leave it).
+#[rstest::rstest]
+#[case::converted_by_ffmpeg(
+    "sami",
+    "/media/movie.en.smi",
+    "srt",
+    "1\n00:00:08,500 --> 00:00:11,000\non screen\n\n"
+)]
+#[case::mks_track(
+    "ass",
+    "/media/movie.en.mks",
+    "ass",
+    "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\n\
+     Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, \
+     BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, \
+     BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+     Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,\
+     100,0,0,1,2,0,2,10,10,10,1\n\n[Events]\n\
+     Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+     Dialogue: 0,0:00:08.50,0:00:11.00,Default,,0,0,0,,on screen\n"
+)]
+#[tokio::test]
+async fn get_trimmed_subtitles_cuts_the_readable_file(
+    #[case] codec: &str,
+    #[case] path: &str,
+    #[case] format: &str,
+    #[case] readable: &str,
+) {
+    const SOURCE: &str = "0f2c8d1e111122223333444455556666";
+    let recorder = std::sync::Arc::new(RecordingIo::default());
+    recorder.files.lock().unwrap().extend([
+        (path.to_owned(), b"unused".to_vec()),
+        (
+            format!("/cache/{SOURCE}/2.{format}"),
+            readable.as_bytes().to_vec(),
+        ),
+    ]);
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+    let source = MediaSourceInfo {
+        id: Some(SOURCE.to_owned()),
+        path: Some("/media/movie.mkv".to_owned()),
+        media_streams: vec![sidecar(codec, path)],
+        ..MediaSourceInfo::default()
+    };
+
+    let trimmed = encoder
+        .get_trimmed_subtitles(&source, &sidecar(codec, path), NINE_SECONDS)
+        .await
+        .unwrap();
+
+    assert_eq!(trimmed.format, format);
+    let text = String::from_utf8(trimmed.data).unwrap();
+    assert!(text.contains("on screen"), "{text}");
+    assert!(
+        text.contains("00:00:00,000 --> 00:00:02,000") || text.contains("0:00:00.00,0:00:02.00"),
+        "cut to the start: {text}"
+    );
+    assert_eq!(
+        recorder.calls().len(),
+        1,
+        "one ffmpeg run made the readable file"
+    );
+}
+
+/// A bitmap track has no writer to cut it with.
+#[tokio::test]
+async fn get_trimmed_subtitles_refuses_a_bitmap_sidecar() {
+    let encoder = encoder_over(&[("/media/movie.en.sup", b"PG")]);
+
+    let error = encoder
+        .get_trimmed_subtitles(
+            &MediaSourceInfo::default(),
+            &sidecar("PGSSUB", "/media/movie.en.sup"),
+            NINE_SECONDS,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("Unsupported format"), "{error}");
+}
+
 // -- extract_all_extractable_subtitles: failure handling --------------------
 
 /// A variant of `RecordingIo` that can be configured to fail or produce

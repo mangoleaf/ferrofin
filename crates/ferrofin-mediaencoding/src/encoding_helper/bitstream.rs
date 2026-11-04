@@ -462,6 +462,13 @@ pub fn audio_bit_stream_arguments(
 /// (its `duration` option and `DURATION` constant arrived after 5.0).
 const MIN_FFMPEG_SETTS_DURATION: FfmpegVersion = FfmpegVersion::new(5, 1);
 
+/// The external subtitle track `state` embeds into its output, if any.
+fn embedded_sidecar(state: &EncodingJobInfo) -> Option<&MediaStream> {
+    state.subtitle_stream.as_ref().filter(|sub| {
+        state.subtitle_delivery_method == SubtitleDeliveryMethod::Embed && sub.is_external
+    })
+}
+
 /// The output options that trim an embedded external subtitle to the start
 /// of a seeked stream, for the embedded track (`s:0`). `None` when the media
 /// file is not seeked (`seeked`: its `-ss` is past 0), the subtitle is not an
@@ -490,13 +497,18 @@ const MIN_FFMPEG_SETTS_DURATION: FfmpegVersion = FfmpegVersion::new(5, 1);
 /// version that cannot be read counts as the oldest supported: `-copypriorss`
 /// then drops those cues of a copied track.
 ///
-/// TODO(gl-1199): before ffmpeg 5.1 a cue on screen at the start is dropped
-/// rather than started at 0, and before 5.0 a track converted to another codec
-/// (`subtitleCodec`) is still shifted, since `-copypriorss` only reaches stream
-/// copy. A converted bitmap sidecar, which such an ffmpeg reads from its
-/// start, shifts it by the start position less its first cue's time. Fix path:
-/// convert the sidecar with the server's subtitle encoder from the start
-/// position (`FilterEvents`) and add that file unseeked.
+/// Before 5.1 a text sidecar does not reach these options: the server cuts it
+/// to the start itself, as `FilterEvents` does, and the job reads that copy
+/// unseeked ([`embedded_sidecar_needs_trimmed_copy`], gl-1199). They still
+/// serve a text sidecar whose copy could not be made (the planner logs why) and
+/// a bitmap one. TODO(gl-1221): before 5.0 a bitmap sidecar converted to
+/// another codec (`subtitleCodec`) still moves every stream later, by the start
+/// position less its first display set's time (it is read from its start),
+/// since `-copypriorss` only reaches stream copy (ffmpeg 4.4.2: from 9 s past a
+/// box at 3.5-8 s, PGS converted to `dvdsub` started the video 5.5 s late). Fix
+/// path: drop the display sets before the start before ffmpeg converts them,
+/// from the sidecar's own timing (the `.sup` segment headers, the `.idx`
+/// timestamps, which gl-1215 reads too), on the clock gl-1214 decides.
 ///
 /// A bitmap sidecar is read from its start on every ffmpeg (gl-1200), so every
 /// display set before the start reaches these options. TODO(gl-1215): its
@@ -517,12 +529,11 @@ pub fn embedded_sidecar_trim_arguments(
     seeked: bool,
     ffmpeg_version: Option<FfmpegVersion>,
 ) -> Option<&'static str> {
-    let embeds_sidecar = state.subtitle_delivery_method == SubtitleDeliveryMethod::Embed
-        && state
-            .subtitle_stream
-            .as_ref()
-            .is_some_and(|sub| sub.is_external);
-    if !seeked || !embeds_sidecar || state.copies_timestamps() {
+    if !seeked
+        || embedded_sidecar(state).is_none()
+        || state.copies_timestamps()
+        || state.trimmed_subtitle_path.is_some()
+    {
         return None;
     }
     let at_least = |minimum| ffmpeg_version.is_some_and(|version| version >= minimum);
@@ -533,6 +544,38 @@ pub fn embedded_sidecar_trim_arguments(
     } else {
         "-copypriorss:s:0 0"
     })
+}
+
+/// Whether a seeked stream embeds its external text sidecar from a copy the
+/// server cuts to the start, rather than from the sidecar seeked like the
+/// media file and trimmed on the output side
+/// ([`embedded_sidecar_trim_arguments`]). `seeked` as there.
+///
+/// Before ffmpeg 5.1, or with a version that cannot be read, the output trim
+/// cannot cut the sidecar as upstream's `SubtitleEncoder.FilterEvents` cuts
+/// one it serves from a start position: it drops the cue on screen at the
+/// start instead of starting it at 0, and before 5.0, for a track converted
+/// to another codec (`subtitleCodec`), it drops nothing, since `-copypriorss`
+/// only reaches stream copy, and every stream starts late by the time since
+/// the last cue before the start (ffmpeg 4.4.2: from 8.2 s past a cue at
+/// 3.5-8 s, converted to ASS, the video started 4.7 s late; gl-1199). There
+/// the server's own subtitle encoder cuts the sidecar with `FilterEvents`
+/// instead, and the job reads that copy, not seeked
+/// ([`EncodingJobInfo::trimmed_subtitle_path`]). Measured on 4.4.2 from 8.2
+/// and 9 s, copied, converted to ASS and to `mov_text`: every stream started
+/// on time, and the cue on screen at the start showed from 0. From 5.1 the
+/// output trim already cuts as `FilterEvents` does and the sidecar is read as
+/// it is. A bitmap sidecar has no text for the encoder to cut.
+#[must_use]
+pub fn embedded_sidecar_needs_trimmed_copy(
+    state: &EncodingJobInfo,
+    seeked: bool,
+    ffmpeg_version: Option<FfmpegVersion>,
+) -> bool {
+    seeked
+        && embedded_sidecar(state).is_some_and(MediaStream::is_text_subtitle_stream)
+        && !state.copies_timestamps()
+        && ffmpeg_version.is_none_or(|version| version < MIN_FFMPEG_SETTS_DURATION)
 }
 
 #[cfg(test)]
@@ -586,6 +629,7 @@ mod tests {
             input_container: None,
             is_input_video: true,
             subtitle_delivery_method: ferrofin_model::dlna::enums::SubtitleDeliveryMethod::Encode,
+            trimmed_subtitle_path: None,
             run_time_ticks: Some(1),
             transcoding_type: ferrofin_traits::media_encoding::TranscodingJobType::Progressive,
             supported_video_codecs: Vec::new(),
@@ -1131,6 +1175,7 @@ mod tests {
             input_container: Some(input_container.to_owned()),
             is_input_video: true,
             subtitle_delivery_method: ferrofin_model::dlna::enums::SubtitleDeliveryMethod::Encode,
+            trimmed_subtitle_path: None,
             run_time_ticks: Some(6_000_000_000),
             transcoding_type: job_type,
             supported_video_codecs: Vec::new(),
@@ -1330,5 +1375,94 @@ mod tests {
             embedded_sidecar_trim_arguments(&state, true, Some(FfmpegVersion::new(9, 0))),
             expected
         );
+    }
+
+    /// An external `.sup` sidecar.
+    fn bitmap_sidecar() -> MediaStream {
+        MediaStream {
+            codec: Some("PGSSUB".to_owned()),
+            path: Some("/media/movie.en.sup".to_owned()),
+            ..subtitle(true)
+        }
+    }
+
+    /// Before ffmpeg 5.1, or with a version that cannot be read, a seeked
+    /// stream embeds a text sidecar from a copy the server cut to the start
+    /// (gl-1199): the output trim there drops the cue on screen at the start,
+    /// and before 5.0 shifts every stream for a converted track. Not from 5.1,
+    /// whose trim cuts as `FilterEvents` does; not without a seek, for a track
+    /// in the media file, a bitmap sidecar, another delivery method, or a job
+    /// that copies timestamps.
+    #[rstest]
+    #[case::on_5_0(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((5, 0)), true)]
+    #[case::before_5_0(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((4, 4)), true)]
+    #[case::unknown_version(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, None, true)]
+    #[case::from_5_1(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((5, 1)), false)]
+    #[case::current(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((9, 0)), false)]
+    #[case::not_seeked(
+        false,
+        Some(subtitle(true)),
+        SubtitleDeliveryMethod::Embed,
+        None,
+        false
+    )]
+    #[case::internal_track(
+        true,
+        Some(subtitle(false)),
+        SubtitleDeliveryMethod::Embed,
+        None,
+        false
+    )]
+    #[case::bitmap(
+        true,
+        Some(bitmap_sidecar()),
+        SubtitleDeliveryMethod::Embed,
+        None,
+        false
+    )]
+    #[case::burned_in(
+        true,
+        Some(subtitle(true)),
+        SubtitleDeliveryMethod::Encode,
+        None,
+        false
+    )]
+    #[case::no_subtitle(true, None, SubtitleDeliveryMethod::Embed, None, false)]
+    fn a_seeked_text_sidecar_is_cut_by_the_server_before_ffmpeg_5_1(
+        #[case] seeked: bool,
+        #[case] sub: Option<MediaStream>,
+        #[case] method: SubtitleDeliveryMethod,
+        #[case] version: Option<(i32, i32)>,
+        #[case] expected: bool,
+    ) {
+        let state = embed_state(sub, method);
+        let version = version.map(|(major, minor)| FfmpegVersion::new(major, minor));
+        assert_eq!(
+            embedded_sidecar_needs_trimmed_copy(&state, seeked, version),
+            expected
+        );
+    }
+
+    /// Nor does a job copying timestamps get the copy: its clock keeps the
+    /// cues before the start positive.
+    #[test]
+    fn copied_timestamps_read_the_sidecar_itself() {
+        let mut state = embed_state(Some(subtitle(true)), SubtitleDeliveryMethod::Embed);
+        state.base_request.copy_timestamps = true;
+        state.run_time_ticks = Some(6_000_000_000);
+        assert!(!embedded_sidecar_needs_trimmed_copy(&state, true, None));
+    }
+
+    /// The copy the server cut starts at the start, so the output trim adds
+    /// nothing for it.
+    #[rstest]
+    #[case::on_5_0(Some((5, 0)))]
+    #[case::before_5_0(Some((4, 4)))]
+    #[case::unknown_version(None)]
+    fn a_trimmed_copy_needs_no_output_trim(#[case] version: Option<(i32, i32)>) {
+        let mut state = embed_state(Some(subtitle(true)), SubtitleDeliveryMethod::Embed);
+        state.trimmed_subtitle_path = Some("/cache/transcodes/abc-stream.90000000.srt".into());
+        let version = version.map(|(major, minor)| FfmpegVersion::new(major, minor));
+        assert_eq!(embedded_sidecar_trim_arguments(&state, true, version), None);
     }
 }
