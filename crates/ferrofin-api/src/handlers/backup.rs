@@ -14,6 +14,17 @@
 //!   tree before the database is opened ([`apply_pending_restore`]), exactly as
 //!   Jellyfin's `ScheduleRestoreAndRestartServer` does. Restoring in-process
 //!   would overwrite an open SQLite file.
+//!
+//! One divergence beyond upstream: an archive is private (`0600` on Unix), and
+//! so is every file a restore puts back under the configuration tree, new or
+//! replaced. Upstream's `BackupService` writes the archive with
+//! `File.OpenWrite` (the umask mode), and Jellyfin writes its configuration
+//! files with the umask mode, so nothing it archives or restores is narrower.
+//! Ferrofin writes the configuration tree `0600`, since it holds plugin
+//! secrets (LDAP-Auth's bind password), and a backup must not undo that
+//! (gl-1233). The other trees keep the umask mode, as do the database, its
+//! snapshot and its restored file, whose on-disk mode Ferrofin does not narrow
+//! either.
 
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -772,7 +783,10 @@ fn write_archive(
     manifest: &BackupManifest,
     snapshot: Option<&Path>,
 ) -> std::io::Result<()> {
-    let file = std::fs::File::create(path)?;
+    // Private (`0600` on Unix): the archive holds the configuration tree,
+    // plugin secrets included. Upstream's `File.OpenWrite` takes the umask
+    // mode. The rename into place keeps the mode.
+    let file = ferrofin_util::file_helper::create_private(path)?;
     let mut zip = zip::ZipWriter::new(file);
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
@@ -1011,14 +1025,15 @@ fn restore_archive(archive_path: &Path, roots: &TreeRoots) -> std::io::Result<()
                 std::fs::rename(&tmp, &roots.database)?;
                 continue;
             }
-            let dest = if enclosed == Path::new(TASK_RESULTS_ENTRY) {
-                roots.task_results.clone()
-            } else if let Some((root, rest)) = roots
-                .trees()
-                .into_iter()
-                .find_map(|(prefix, root)| enclosed.strip_prefix(prefix).ok().map(|r| (root, r)))
-            {
-                root.join(rest)
+            let (dest, private) = if enclosed == Path::new(TASK_RESULTS_ENTRY) {
+                (roots.task_results.clone(), false)
+            } else if let Some((prefix, root, rest)) = roots.trees().find_map(|(prefix, root)| {
+                enclosed
+                    .strip_prefix(prefix)
+                    .ok()
+                    .map(|rest| (prefix, root, rest))
+            }) {
+                (root.join(rest), prefix == "config")
             } else {
                 continue;
             };
@@ -1028,8 +1043,19 @@ fn restore_archive(archive_path: &Path, roots: &TreeRoots) -> std::io::Result<()
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut out = std::fs::File::create(&dest)?;
-            std::io::copy(&mut entry, &mut out)?;
+            if private {
+                // The configuration tree goes back private (`0600` on Unix),
+                // as Ferrofin writes it: it holds plugin secrets. A file
+                // already there is replaced, so it does not keep its mode, and
+                // a link in its place is replaced too, as every Ferrofin
+                // config save through `atomic_write` does.
+                ferrofin_util::file_helper::atomic_write_with(&dest, |out| {
+                    std::io::copy(&mut entry, out).map(drop)
+                })?;
+            } else {
+                let mut out = std::fs::File::create(&dest)?;
+                std::io::copy(&mut entry, &mut out)?;
+            }
         }
     }
     Ok(())
@@ -2301,6 +2327,85 @@ mod tests {
         let path = dir.join(".snapshot-test.db");
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    /// gl-1233: an archive holds the configuration tree, plugin secrets
+    /// included (LDAP-Auth's bind password sits in a `0600` `config.json`), so
+    /// the archive is private, not the umask mode. A restore puts the
+    /// configuration tree back private, a new file or one already there, as
+    /// Ferrofin writes it; the library root, which is not secret, keeps the
+    /// umask mode.
+    #[cfg(unix)]
+    #[test]
+    fn archives_and_restored_configuration_are_private() {
+        use super::{restore_archive, write_backup};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let program_data = tmp.path().join("program");
+        let roots = small_roots(&program_data);
+        let secret = "config/plugins/ldap/config.json";
+        let library = "root/default/Movies/options.json";
+        for rel in [secret, library] {
+            let path = program_data.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, rel).unwrap();
+        }
+        std::fs::set_permissions(
+            program_data.join(secret),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let now = "2024-05-06T07:08:09Z".parse().unwrap();
+        let manifest = write_backup(
+            &tmp.path().join("backups"),
+            &roots,
+            no_database(),
+            now,
+            None,
+        )
+        .unwrap();
+        let archive = std::path::PathBuf::from(&manifest.path);
+        assert_eq!(mode(&archive), 0o600, "the archive is private");
+
+        // A fresh data directory, then one whose configuration is already
+        // there with the umask mode.
+        let fresh = tmp.path().join("fresh");
+        let existing = tmp.path().join("existing");
+        let existing_roots = small_roots(&existing);
+        std::fs::create_dir_all(existing.join("config/plugins/ldap")).unwrap();
+        std::fs::write(existing.join(secret), b"old").unwrap();
+        std::fs::set_permissions(
+            existing.join(secret),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        let fresh_roots =
+            TreeRoots::defaults(&fresh, &fresh.join("config"), &fresh.join("ferrofin.db"));
+        for (dir, restore_roots) in [(&fresh, fresh_roots), (&existing, existing_roots)] {
+            restore_archive(&archive, &restore_roots).unwrap();
+            for rel in [secret, "config/system.json"] {
+                assert_eq!(mode(&dir.join(rel)), 0o600, "{}", dir.join(rel).display());
+            }
+            assert_eq!(std::fs::read(dir.join(secret)).unwrap(), secret.as_bytes());
+            // What a file created with the umask gets: the library root's.
+            let reference = dir.join("reference");
+            std::fs::File::create(&reference).unwrap();
+            assert_eq!(mode(&dir.join(library)), mode(&reference));
+            assert_eq!(
+                std::fs::read(dir.join(library)).unwrap(),
+                library.as_bytes()
+            );
+            let stray: Vec<_> = std::fs::read_dir(dir.join("config"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .filter(|n| n.to_string_lossy().starts_with(".ferrofin-config-"))
+                .collect();
+            assert!(stray.is_empty(), "temporary files left: {stray:?}");
+        }
     }
 
     /// With a `MetadataPath` elsewhere, `CreateBackupAsync` also archives the
