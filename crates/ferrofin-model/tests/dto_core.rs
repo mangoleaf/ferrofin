@@ -291,7 +291,7 @@ fn media_source_info_round_trips() {
 /// sort on the keys as strings.
 #[test]
 fn base_item_trickplay_widths_serialize_largest_first() {
-    use ferrofin_model::dto::{BaseItemDto, TrickplayInfoDto};
+    use ferrofin_model::dto::{BaseItemDto, TrickplayInfoDto, TrickplayManifest};
     use std::collections::HashMap;
 
     // Each new HashMap draws its own hash keys, so twenty maps would show a
@@ -308,7 +308,7 @@ fn base_item_trickplay_widths_serialize_largest_first() {
             })
             .collect();
         let dto = BaseItemDto {
-            trickplay: Some(HashMap::from([("abc".to_owned(), widths)])),
+            trickplay: Some(TrickplayManifest::from([("abc".to_owned(), widths)])),
             ..BaseItemDto::default()
         };
 
@@ -321,4 +321,42 @@ fn base_item_trickplay_widths_serialize_largest_first() {
         let back: BaseItemDto = serde_json::from_str(&json).unwrap();
         assert_eq!(back.trickplay, dto.trickplay);
     }
+}
+
+/// gl-1235: the media sources of a trickplay manifest serialize in the order
+/// the DTO service added them (`GetMediaSources` order, the queried video's
+/// own source first), not in hash or key order, and read back in it.
+#[test]
+fn base_item_trickplay_sources_keep_their_order() {
+    use ferrofin_model::dto::{BaseItemDto, TrickplayInfoDto, TrickplayManifest};
+    use std::collections::HashMap;
+
+    let sources = ["c3", "a1", "b2"];
+    let manifest: TrickplayManifest = sources
+        .iter()
+        .map(|id| {
+            let info = TrickplayInfoDto {
+                width: 320,
+                ..TrickplayInfoDto::default()
+            };
+            ((*id).to_owned(), HashMap::from([(320, info)]))
+        })
+        .collect();
+    let dto = BaseItemDto {
+        trickplay: Some(manifest),
+        ..BaseItemDto::default()
+    };
+
+    let json = serde_json::to_string(&dto).unwrap();
+    let at = |id: &str| json.find(&format!("\"{id}\":{{")).unwrap();
+    assert!(at("c3") < at("a1") && at("a1") < at("b2"), "{json}");
+    let back: BaseItemDto = serde_json::from_str(&json).unwrap();
+    let keys: Vec<&str> = back
+        .trickplay
+        .as_ref()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, sources);
 }

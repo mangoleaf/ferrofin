@@ -33,7 +33,7 @@ mod trickplay_info_dto;
 mod user_dto;
 mod user_item_data_dto;
 
-pub use base_item::BaseItemDto;
+pub use base_item::{BaseItemDto, TrickplayManifest};
 pub use base_item_person::BaseItemPerson;
 pub use client_capabilities_dto::ClientCapabilitiesDto;
 pub use config_image_types::ConfigImageTypes;

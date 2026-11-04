@@ -2192,12 +2192,6 @@ impl TrickplayManager for FakeTrickplay {
     async fn delete_trickplay_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_trickplay_manifest(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<HashMap<String, HashMap<i32, TrickplayInfoEntity>>, ServiceError> {
-        unimplemented!("fake")
-    }
     async fn get_hls_playlist(
         &self,
         _item_id: Uuid,

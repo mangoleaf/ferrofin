@@ -360,12 +360,6 @@ mod tests {
             self.trickplay.lock().unwrap().push(item_id);
             Ok(())
         }
-        async fn get_trickplay_manifest(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<HashMap<String, HashMap<i32, TrickplayInfoEntity>>, ServiceError> {
-            Ok(HashMap::new())
-        }
         async fn get_hls_playlist(
             &self,
             _item_id: Uuid,

@@ -8,7 +8,11 @@
 //! - Stored trickplay metadata is a persistence concern, so it surfaces as the
 //!   [`TrickplayInfoEntity`]
 //!   row (the C# `TrickplayInfo` EF entity). Maps keyed by width use `i32`
-//!   keys; the manifest keys by media-source id.
+//!   keys.
+//! - `GetTrickplayManifest(BaseItem)` walks the item's media sources, which
+//!   are other items' rows, so the DTO service builds the manifest over the
+//!   version group it already reads, from
+//!   [`TrickplayManager::get_trickplay_resolutions_batch`].
 //! - `IReadOnlyList`/`Dictionary` become `Vec`/`HashMap`.
 //! - The image-tiling / directory-layout helpers (`CreateTiles`,
 //!   `GetTrickplayDirectory`, `GetTrickplayTilePathAsync`,
@@ -139,24 +143,23 @@ pub trait TrickplayManager: Send + Sync {
     /// Deletes all trickplay data for an item.
     async fn delete_trickplay_data(&self, item_id: Uuid) -> Result<(), ServiceError>;
 
-    /// Gets the full trickplay manifest for an item: media-source id → (tile
-    /// width → info).
-    async fn get_trickplay_manifest(
-        &self,
-        item_id: Uuid,
-    ) -> Result<HashMap<String, HashMap<i32, TrickplayInfoEntity>>, ServiceError>;
-
-    /// Batch form of [`Self::get_trickplay_manifest`] for a page, keyed by item.
-    /// The default loops the single-item form; the concrete manager overrides it
-    /// with one query for list DTO projection.
-    async fn get_trickplay_manifest_batch(
+    /// Batch form of [`Self::get_trickplay_resolutions`], keyed by item; an
+    /// item with no trickplay rows is left out. A media source's id is the id
+    /// of the item it comes from, so the DTO service builds
+    /// `BaseItemDto.Trickplay` (upstream's `GetTrickplayManifest`, which asks
+    /// `GetTrickplayResolutions` once per media source) from one call over
+    /// every source a page lists. The default loops the single-item form; the
+    /// concrete manager overrides it with one query.
+    async fn get_trickplay_resolutions_batch(
         &self,
         item_ids: &[Uuid],
-    ) -> Result<HashMap<Uuid, HashMap<String, HashMap<i32, TrickplayInfoEntity>>>, ServiceError>
-    {
+    ) -> Result<HashMap<Uuid, HashMap<i32, TrickplayInfoEntity>>, ServiceError> {
         let mut map = HashMap::with_capacity(item_ids.len());
         for &id in item_ids {
-            map.insert(id, self.get_trickplay_manifest(id).await?);
+            let resolutions = self.get_trickplay_resolutions(id).await?;
+            if !resolutions.is_empty() {
+                map.insert(id, resolutions);
+            }
         }
         Ok(map)
     }
