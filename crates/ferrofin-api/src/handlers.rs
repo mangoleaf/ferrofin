@@ -3093,7 +3093,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LibraryStructureController.cs",
         upstream_method: "UpdateLibraryOptions",
         ferrofin: "handlers/library_structure.rs update_library_options (Name, else Id resolved \
-               against the listing's parsed ItemId; 404 for neither) → after_structure_change \
+               against the listing's parsed ItemId; 404 for neither; then 400 for a missing or \
+               null LibraryOptions, before any write) → after_structure_change \
                (LibraryMonitor::restart) → ferrofin-core virtual_folder_manager.rs \
                update_library_options (CollectionFolder.UpdateLibraryOptions: create_shortcut and \
                remove_content_type_overrides for each path not already in PathInfos, then \
@@ -3105,15 +3106,17 @@ pub const VERIFIED: &[Verified] = &[
          toggle or a new location is watched at once; upstream's UpdateLibraryOptions does not \
          touch the monitor, so the dashboard's real-time monitoring checkbox applies only at the \
          next library scan. Jellyfin bug not ported.",
-            "A body without LibraryOptions (or with null) saves the default options and answers \
-         204; upstream dereferences request.LibraryOptions and answers 500 having written \
-         nothing. Fix path: gl-1204.",
+            "A body without LibraryOptions (or with null) is a 400, \
+         {\"error\":\"bad request: LibraryOptions must not be null\"}, after the library lookup \
+         and before any write; upstream's request.LibraryOptions! dereference throws a \
+         NullReferenceException at the same point, a 500 having written nothing. A 400 names \
+         the field the client must send; a 500 says the server failed.",
             "A body with no Id and no Name is a 404; upstream's GetItemById(Guid.Empty) throws \
          ArgumentException, a 400. A new PathInfo with an empty Path writes an empty shortcut \
          and answers 204; upstream's CreateShortcut throws before anything is saved, a 400. Fix \
          path: gl-1206.",
             "A Name in the body is accepted and wins over Id; UpdateLibraryOptionsDto has no Name.",
-            "The 404 body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
