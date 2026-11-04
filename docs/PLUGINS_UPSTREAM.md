@@ -20,7 +20,7 @@ Conventions:
 | Intro Skipper | https://github.com/intro-skipper/intro-skipper | `db09359` | 10.11/prerelease | ported |
 | File Transformation | https://github.com/IAmParadox27/jellyfin-plugin-file-transformation | `f4f01c3` | 2.5.10.0 | ported |
 | Merge Versions | https://github.com/danieladov/jellyfin-plugin-mergeversions | `e6f58d6` | 12.0.0 | ported |
-| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | in progress: plugin, settings page, its three test routes, sign-in, the admin filter, password changes and resets, referrals, the adopted settings' import, and profile images with their sync task (milestone "LDAP-Auth plugin port") |
+| LDAP-Auth | https://github.com/jellyfin/jellyfin-plugin-ldapauth | `d11c86a` | 24 | ported |
 
 ## Per-plugin notes
 
@@ -213,9 +213,11 @@ Conventions:
   `crates/ferrofin-model/src/ldap.rs`, and the thin HTTP handler
   `crates/ferrofin-api/src/handlers/ldap.rs`. The live directory test is
   `crates/ferrofin-extensions/tests/ldap_directory.rs` (`FERROFIN_LDAP_TESTS=1`, OpenLDAP in
-  docker; CI does not run it).
-- Ported so far (v24, `d11c86a`): `LdapPlugin` (GUID, name `LDAP-Auth`, version 24,
-  `ConfigurationFileName` `LDAP-Auth.xml`, the settings page under its name),
+  docker; CI does not run it), and `contrib/ldap-test-directory/` starts a seeded directory to
+  try a running server against by hand.
+- Plugin, configuration and connection test (v24, `d11c86a`): `LdapPlugin` (GUID, name
+  `LDAP-Auth`, version 24, `ConfigurationFileName` `LDAP-Auth.xml`, the settings page under
+  its name),
   `PluginConfiguration` with upstream's defaults, `GetConnectionOptions` and its certificate
   callbacks, and `LdapController.TestServerBind` with
   `LdapAuthenticationProviderPlugin.TestServerBind`: the body is saved into the
@@ -364,31 +366,56 @@ Conventions:
   `handlers::VERIFIED` row; this section is their record. All three are administrators only
   (`RequiresElevation`), answer `404` while the plugin is disabled, and refuse a body that does
   not bind with ASP.NET's validation problem.
+- Verified live (gl-1150, 2026-11-03), on a running server against OpenLDAP 2.6.8 in two
+  containers from `contrib/ldap-test-directory/` (a directory and a partners directory it
+  refers searches to): the connection test over plain LDAP, LDAPS and StartTLS with a custom
+  root CA; sign-in through jellyfin-web 12.4's login form and through
+  `jellyfin-apiclient-python`, the library Jellyfin MPV Shim signs in with; the settings
+  page's three tests pressed in jellyfin-web; creation on and off; a rename and a uid change in
+  the directory; the admin filter with the last-administrator rule; a password change by the
+  RFC 3062 operation, a blank one refused; the reset URL; pictures at creation and from the
+  task; a referral followed in all three modes, with no bind sent before TLS; an empty password
+  with no connection made; the plugin disabled; and a directory paused, unroutable and closed.
+  Adoption was checked on copies of the data directory of a stock Jellyfin 12.4 that had installed
+  LDAP-Auth v24 from the official repository and created its LDAP users: they signed in to the
+  same accounts, the plugin stayed off for one with no LDAP users, and a malformed
+  `LDAP-Auth.xml` was a warning until it was corrected. Client certificates and the
+  `memberUid` admin-filter mode are covered by the `ldap_directory` test, not by this pass.
+  **Not tested:** Active Directory (and with it a forest's referrals, the `memberOf` filters AD
+  setups use, and AD's own password-change rules), and a native client app.
 - Accepted divergences (do NOT "fix" during sync):
   - **An empty password is refused before any connection.** Novell's client turns it into an
     anonymous bind, which upstream then refuses as not `Bound` (kept too, at the user's bind);
     `ldap3` would send it, and a directory may accept an unauthenticated bind (RFC 4513
     section 5.1.2), which would sign anyone in.
   - **Only the directory refusing the user's own bind counts as a failed sign-in** (owner
-    decision D4), with no matching entry and creation turned off: each is a `401`, which the
+    decision D4: a directory outage is not a wrong password, and must not lock users out of
+    their accounts), with no matching entry and creation turned off: each is a `401`, which the
     user manager counts toward lockout when the name signed in with is an account's (creation
     turned off only arises for a name that is not). The user's bind counts as refused only for
-    the result codes
-    that refuse credentials: `constraintViolation` (19, a password policy's lockout),
-    `inappropriateAuthentication` (48), `invalidCredentials` (49), `insufficientAccessRights`
-    (50) and `unwillingToPerform` (53). A directory that cannot be reached, does not answer
-    within the D6 timeouts, fails the user's bind with any other code (`busy`, `unavailable`,
-    `other`, …), refuses the configured bind DN, or fails the user search or the admin
-    filter's search (a referred server failing it, a referral loop, the referral budget and a
-    referral naming no URL included), is a `500` that is not counted, and other users' sign-ins
-    go on. Upstream answers each with an `AuthenticationException`, a counted `401` (`Error
-    completing LDAP login while applying admin filter.` for the admin filter's search).
+    the result codes that refuse credentials: `constraintViolation` (19, a password policy's
+    lockout), `inappropriateAuthentication` (48), `invalidCredentials` (49),
+    `insufficientAccessRights` (50) and `unwillingToPerform` (53). A directory that cannot be
+    reached, does not answer within the D6 timeouts, fails the user's bind with any other code
+    (`busy`, `unavailable`, `other`, …), refuses the configured bind DN, or fails the user
+    search or the admin filter's search (a referred server failing it, a referral loop, the
+    referral budget and a referral naming no URL included), is a `500` that is not counted. A
+    local account signs in meanwhile, and an LDAP sign-in with an account's name fails after its
+    own timeout without waiting for other accounts' sign-ins. Sign-ins with a name that is no
+    account's (a uid or a mail, or a first sign-in) take turns, as upstream's do
+    (`AuthenticateUser` locks `user?.Id ?? Guid.Empty`): during an outage each waits for those
+    before it, so the second of two waits about twice the timeout (19.8 s measured with the
+    directory paused). Upstream sets no timeout, so there they wait for as long as the directory
+    does not answer. Whether to key that lock differently is an open owner decision (gl-1223).
+    Upstream answers each of those failures with an `AuthenticationException`, a counted `401`
+    (`Error completing LDAP login while applying admin filter.` for the admin filter's search).
     Ferrofin's login backoff still counts such an attempt for pacing, as it counts every attempt
     that does not succeed.
-  - **The admin filter never demotes the last administrator** (owner decision D5): removed
-    from the directory's administrators while no other administrator exists, the user signs in,
-    stays one, and the server logs a warning. With two or more the filter demotes as upstream
-    does. The user manager reads the count in the transaction that writes the flag.
+  - **The admin filter never demotes the last administrator** (owner decision D5: there must
+    always be at least one administrator): removed from the directory's administrators while no
+    other administrator exists, the user signs in, stays one, and the server logs a warning.
+    With two or more the filter demotes as upstream does. The user manager reads the count in
+    the transaction that writes the flag.
   - **An entry without the username attribute is a `400` while the admin filter is on**, as it
     is when the user is created or renamed. Upstream's `SanitizeFilter` throws a
     `NullReferenceException` on the null name first, a `500`.
@@ -514,10 +541,13 @@ Conventions:
     `LdapServer` is still that placeholder is imported with the server empty, and a warning
     names `LdapServer`: the plugin is on for its LDAP users but inactive until an
     administrator sets a server.
-  - **No `LdapUsers` in the configuration** (D12): which LDAP uid belongs to which user lives in
-    Ferrofin's external-identity table, so `GET /Plugins/{id}/Configuration` does not return
-    it, and a `LdapUsers` member posted to it is dropped. Upstream's settings page never reads
-    or writes it.
+  - **No `LdapUsers` in the configuration** (D12: one store of external identities, which the
+    OIDC sign-in planned next is to share, that links an identity to at most one user, writes
+    each link in a transaction so concurrent first sign-ins cannot lose one, and removes a
+    user's links with the user): which LDAP uid belongs to which user lives in Ferrofin's
+    external-identity table, so `GET /Plugins/{id}/Configuration` does not return it, and a
+    `LdapUsers` member posted to it is dropped. Upstream's settings page never reads or writes
+    it.
   - **An adopted `LDAP-Auth.xml` is imported once and never written back.** Upstream reads and
     writes that file as the plugin's live store; Ferrofin keeps `config.json` and the links
     table from the import on, so a change made in Ferrofin never reaches the file, which stays
@@ -525,7 +555,9 @@ Conventions:
     setting with leading or trailing spaces (a bind password, say) comes across without them.
   - **Timeouts** (D6): opening a connection (the TCP connect and an LDAPS handshake) gives up
     after 5 seconds, and each operation, StartTLS included, after 10 seconds without an
-    answer (a search's timer restarts with each entry). Upstream sets none.
+    answer (a search's timer restarts with each entry). Upstream sets none, so a directory that
+    stops answering holds a sign-in, and every unknown-name sign-in queued behind it, for as long
+    as it does not answer.
   - **A custom root CA is the only trust anchor**: the server's certificate must chain to a
     certificate in that file, or be one of the file's certificates itself (a self-signed
     server certificate given as the root CA, which webpki alone refuses when it is marked as a
