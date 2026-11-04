@@ -769,6 +769,96 @@ async fn a_local_account_with_the_same_name_is_never_taken_over() {
     );
 }
 
+/// gl-1230: an administrator moves a linked LDAP user to the default provider
+/// and gives them a local password. Their uid link stays, and a sign-in with
+/// another name for the same entry must neither take the account nor switch
+/// it back to LDAP-Auth.
+#[rstest]
+#[case::creation_on(true)]
+#[case::creation_off(false)]
+#[tokio::test]
+async fn a_uid_link_to_an_account_moved_to_another_provider_is_ignored(#[case] creation: bool) {
+    const DEFAULT_PROVIDER: &str =
+        "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider";
+    // Created with creation on, whatever the case runs with afterwards.
+    let harness = Harness::new(&config()).await;
+    let user = harness
+        .sign_in("ada", ADA_PASSWORD)
+        .await
+        .expect("sign in")
+        .expect("created");
+    harness
+        .configure(&LdapConfig {
+            create_users_from_ldap: creation,
+            ..config()
+        })
+        .await;
+    let id = id_of(&user);
+    let mut policy = harness.policy(&user).await;
+    DEFAULT_PROVIDER.clone_into(&mut policy.authentication_provider_id);
+    harness
+        .users
+        .update_policy(id, &policy)
+        .await
+        .expect("policy");
+    harness
+        .users
+        .change_password(id, "local-secret")
+        .await
+        .expect("password");
+
+    // Her mail is no account's name, so every provider is asked; the
+    // directory takes her password, but the account is no longer LDAP-Auth's.
+    // As for any local account of her name: no second "ada" is created, and
+    // with creation off the sign-in is refused as for a new directory user.
+    let outcome = harness.sign_in("ada@example.org", ADA_PASSWORD).await;
+    if creation {
+        assert!(
+            matches!(outcome, Err(ServiceError::InvalidInput(_))),
+            "{outcome:?}"
+        );
+    } else {
+        assert!(
+            matches!(outcome, Err(ServiceError::Unauthorized(_))),
+            "{outcome:?}"
+        );
+    }
+    let after = harness.user("ada").await.expect("user");
+    assert_eq!(after.id, user.id);
+    assert_eq!(
+        after.authentication_provider_id, DEFAULT_PROVIDER,
+        "the administrator's move stands"
+    );
+    assert!(
+        harness
+            .sign_in("ada", "local-secret")
+            .await
+            .expect("sign in")
+            .is_some(),
+        "the local password still works"
+    );
+    assert_eq!(
+        harness.link("ada").await.map(|link| link.user_id),
+        Some(id),
+        "the link is ignored, not removed"
+    );
+
+    // Moved back to LDAP-Auth, the link finds her again.
+    let mut policy = harness.policy(&after).await;
+    PROVIDER_ID.clone_into(&mut policy.authentication_provider_id);
+    harness
+        .users
+        .update_policy(id, &policy)
+        .await
+        .expect("policy");
+    let again = harness
+        .sign_in("ada@example.org", ADA_PASSWORD)
+        .await
+        .expect("sign in")
+        .expect("signed in");
+    assert_eq!(again.id, user.id);
+}
+
 #[tokio::test]
 async fn a_name_that_finds_another_accounts_entry_is_refused() {
     let harness = Harness::new(&config()).await;
