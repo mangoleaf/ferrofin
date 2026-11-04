@@ -807,6 +807,7 @@ mod tests {
         let limits = crate::connection_limits::ConnectionLimits {
             keep_alive: Duration::from_secs(10),
             request_headers: Duration::from_millis(100),
+            ..crate::connection_limits::KESTREL_LIMITS
         };
         let serving = crate::Serving::start_with_limits(
             vec![crate::listen::ServedListener::Tls(listener)],
