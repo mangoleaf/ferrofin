@@ -39,7 +39,7 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::{BaseItemDto, NameIdPair, SortOrder};
 use ferrofin_model::entities::ImageType;
-use ferrofin_model::entities_media::VirtualFolderInfo;
+use ferrofin_model::entities_media::{VirtualFolderInfo, libraries_holding};
 use ferrofin_model::live_tv::{
     ChannelMappingOptionsDto, GuideInfo, ItemSortBy, ListingsProviderInfo, LiveTvInfo,
     SeriesTimerInfoDto, TimerInfoDto, TunerChannelMapping, TunerHostInfo,
@@ -1282,16 +1282,12 @@ async fn recording_visible_given(
 }
 
 /// The libraries among `folders` whose locations hold the file at `path`,
-/// sorted and once each.
+/// sorted and once each. A location holds a path as upstream's
+/// `GetCollectionFolders` compares them (`OrdinalIgnoreCase`), the rule every
+/// other library lookup here shares.
 fn holding_libraries(folders: &[VirtualFolderInfo], path: &str) -> Vec<Uuid> {
-    let mut holders: Vec<Uuid> = folders
-        .iter()
-        .filter(|folder| {
-            folder
-                .locations
-                .iter()
-                .any(|location| std::path::Path::new(path).starts_with(location))
-        })
+    let mut holders: Vec<Uuid> = libraries_holding(folders, path)
+        .into_iter()
         .filter_map(|folder| Uuid::parse_str(folder.item_id.as_deref()?).ok())
         .collect();
     holders.sort_unstable();
@@ -2286,6 +2282,30 @@ mod tests {
         }
         // One rec, other rec, movies, rec + rec/show, and no library.
         assert_eq!(library.0.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    /// A library holds a recording's file whichever case either is spelled
+    /// in, and a separator ends the location: upstream's `GetCollectionFolders`
+    /// comparison (`OrdinalIgnoreCase`).
+    #[test]
+    fn holding_libraries_ignore_case_and_stop_at_a_separator() {
+        let (tv, shows) = (Uuid::new_v4(), Uuid::new_v4());
+        let folder = |location: &str, id: Uuid| VirtualFolderInfo {
+            locations: vec![location.to_owned()],
+            item_id: Some(id.simple().to_string()),
+            ..VirtualFolderInfo::default()
+        };
+        let folders = [folder("/Media/TV/", tv), folder("/media/tv/shows", shows)];
+        let mut both = vec![tv, shows];
+        both.sort_unstable();
+        for (path, expected) in [
+            ("/media/tv/recordings/a.ts", vec![tv]),
+            ("/MEDIA/TV/Shows/b.ts", both),
+            ("/media/tvshows/c.ts", vec![]),
+            ("/elsewhere/d.ts", vec![]),
+        ] {
+            assert_eq!(holding_libraries(&folders, path), expected, "{path}");
+        }
     }
 
     #[tokio::test]

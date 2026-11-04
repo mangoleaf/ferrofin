@@ -3479,6 +3479,57 @@ async fn the_recordings_list_keeps_to_what_the_user_may_open() {
     assert_eq!((sorted(ids), total), (everything, 5));
 }
 
+/// A recording's file is held by a library whose location is spelled in
+/// another case, as upstream compares physical locations (`OrdinalIgnoreCase`,
+/// `LibraryManager.GetCollectionFoldersInternal`) and as every other library
+/// lookup here does. On a case-insensitive mount the two spellings are one
+/// directory, so a user who may not open the library may not open, stream,
+/// list or delete the recording through its DVR id either.
+#[tokio::test]
+async fn a_recording_in_a_library_spelled_in_another_case_keeps_to_that_library() {
+    let f = fixture().await;
+    let channel = uuid::Uuid::from_u128(0xdead);
+    let open = stored_recording(&f, "recordings", "open", channel).await;
+    // "Hidden" is the library at `more`.
+    let kept_out = stored_recording(&f, "MORE", "kept-out", channel).await;
+    set_policy(&f, &f.viewer_id, |policy| {
+        policy["EnableLiveTvManagement"] = json!(true);
+    })
+    .await;
+
+    for route in [
+        format!("/LiveTv/Recordings/{kept_out}"),
+        format!("/Videos/{kept_out}/stream?static=true"),
+    ] {
+        assert_eq!(
+            call(&f.router, "GET", &route, Some(&f.viewer), None)
+                .await
+                .0,
+            StatusCode::NOT_FOUND,
+            "{route}"
+        );
+        assert_eq!(
+            call(&f.router, "GET", &route, Some(&f.admin), None).await.0,
+            StatusCode::OK,
+            "{route}"
+        );
+    }
+    let (ids, total) = listed_recordings(&f, "", &f.viewer).await;
+    assert_eq!((ids, total), (vec![open], 1));
+    let uri = format!("/LiveTv/Recordings/{kept_out}");
+    assert_eq!(
+        call(&f.router, "DELETE", &uri, Some(&f.viewer), None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&f.router, "GET", &uri, Some(&f.admin), None).await.0,
+        StatusCode::OK,
+        "the refused delete left the recording"
+    );
+}
+
 /// A channel is a row with no path, so the library list does not reach it. Its
 /// rule is `PlaybackInfo`'s, whose answer the stream route repeats: rating and
 /// tag rules hide it, and "Live TV access" does not, there or here.
