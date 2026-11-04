@@ -11,6 +11,7 @@ pub mod photo_provider;
 pub mod processor;
 mod scaled_jpeg;
 mod splashscreen;
+mod split_scans;
 
 pub use error::DrawingError;
 pub use image_encoder::ImageCrateEncoder;
