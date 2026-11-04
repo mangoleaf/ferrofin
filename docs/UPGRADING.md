@@ -64,6 +64,15 @@ Back up the data directory first, as for any major upgrade.
   the old library, so
   [stop the old pod first](#kubernetes-stop-the-old-pod-first-for-heavy-migrations), or check
   such a user afterwards.
+- **Moving the program-data directory** (adopting Jellyfin into a different path, or changing
+  `data_dir`): the first start rewrites the stored paths whose files moved, after a
+  `<database>.pre-program-data-move` snapshot. Copy every file before that start, and stop the old
+  server first: rows it saves after the pass keep the old directory.
+- **Live TV, on a database adopted from Jellyfin:** each recording folder is now a library, and it
+  is removed when its path changes or its directory is missing during a pass (a share not yet
+  mounted at startup counts as missing). Do not save the Live TV settings on the old pod during a
+  rolling update: it writes back Jellyfin's list of the locations it made libraries for, and the new
+  pod's next pass can then remove those libraries. Wait until the old pod has gone, or stop it first.
 
 **If scripts or other API clients use the server**
 
@@ -88,6 +97,14 @@ Back up the data directory first, as for any major upgrade.
   `POST /Environment/ValidatePath` with `ValidateWritable` answers `500` for a read-only directory
   and `404` for a file.
 
+- A client that uploads slower than 240 B/s once 5 s have passed gets `500` and a closed
+  connection, and one that takes a response slower than that is disconnected, both as on Jellyfin.
+  A reverse proxy's own timeouts are unaffected.
+- New backup archives are readable by the server's user only (`0600`). A job that copies
+  `data/backups/` off the host as another user or group (a sidecar, a cron job, rclone) can no
+  longer read them: run it as the server's user, or have it read with that user's rights. Archives
+  already there keep their mode; `chmod 600` them to make them private.
+
 **Monitoring and reverse proxies**
 
 - `/health` and `/metrics` now follow `EnableRemoteAccess` and the remote IP filter, and answer
@@ -96,15 +113,31 @@ Back up the data directory first, as for any major upgrade.
   allow it in the remote IP filter; with remote access off the filter is not read, so add it to
   `LocalNetworkSubnets` along with your LAN subnets. Or point the uptime check at `/health/ready`,
   which is not filtered. Kubernetes probes are unaffected.
+- **Add your reverse proxy to Known proxies.** Repeated failed logins now wait, per account and per
+  address. Behind a proxy that is not in **Known proxies**, every client shares the proxy's address,
+  so one guesser's failures make every login through it wait and can get them refused as wrong
+  passwords. `FERROFIN_LOGIN_BACKOFF=false` turns the backoff off.
+- A server that fetches OpenSubtitles downloads from a LAN mirror lists it in
+  `FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW`. Behind an HTTP proxy the server must resolve the download
+  host itself.
 - Idle connections are closed after 130 s, as in Jellyfin. Keep a reverse proxy's idle upstream
   timeout below that (nginx `keepalive_timeout` under `upstream`, Traefik's or HAProxy's idle
   timeouts).
 
 **Libraries**
 
-- Photos edited in place on an earlier version keep their old size and blur hash until they
-  refresh. Refresh them, or the library, with **Replace all metadata** or **Search for missing
-  metadata**.
+- The first library scan after upgrading measures again, once, every kept image whose stored date
+  is more than a second from its file's last write time, or that has no size or blur hash: photo
+  rows stored by earlier versions (dated 1970) and adopted Jellyfin artwork whose files were copied
+  without their modification times. Expect that scan to take longer on a large photo library, and
+  clients to fetch the re-dated images again. Photos edited in place on an earlier version need no
+  manual refresh.
+- Trickplay, chapter images and screen-grabbed posters made by earlier versions keep their old
+  colours until they are made again. Refresh an item's metadata with **Replace existing trickplay
+  images** (or **Replace existing images** for a grabbed poster), or delete its trickplay folder.
+  After an admin changes the trickplay widths or `FullChroma`, the next Generate Trickplay Images
+  run (daily at 3 am) re-decodes every video whose images no longer match: on a large library that
+  takes long, is safe to interrupt, and continues on the next run.
 - Live TV logos and guide images must be `http` or `https` URLs. A server path or a `file:` URL is
   ignored, and an image stored from one stops being served at the upgrade (its record goes at the
   next guide refresh, or when the programme next changes). Serve local logos over HTTP, or set them
@@ -122,14 +155,39 @@ Back up the data directory first, as for any major upgrade.
 
 - Read the startup log's warnings. Remove `FERROFIN_WS_MIN_STREAM_PERIOD_MS` and
   `websocket_min_stream_period_ms`, which are no longer read, and rename any `config.toml` key the
-  log names.
+  log names. Every numeric setting now has its own range
+  ([CONFIG.md](CONFIG.md)): a value outside it in `config.toml` or the environment is clamped at
+  startup with an `is outside … using …` warning, and nothing stops the server. This changes a
+  running server where `shutdown_timeout_secs = 0` is now 5 seconds, a `0` on either
+  directory-cache limit now boots clamped instead of refusing to start, and the image limits'
+  floors and resize ceiling moved.
 - On a server that has made a collection, the first boot rebuilds the Collections library as
   Jellyfin has it, under a new id that users' access moves to. It first copies the database to
   `<database>.pre-collections-library`, which is safe to delete once the server runs well. That copy
   is not a way back to Jellyfin: that is `jellyfin.db.pre-ferrofin`.
+- **WASM analyzer plugins:** each plugin's first pass after the upgrade counts every item at or
+  before its old watermark as offered, so items the old rule had passed over (added with old file
+  times) stay unoffered. To have a plugin analyze those, uninstall it and install it again, which
+  also removes its settings and stored data.
 - Every image tag changes once, so clients download each image again the first time they show it.
 - The first **Refresh People** run creates the person items a credit lacks and looks each one up,
   which takes a while on a database with many such credits.
+
+**LDAP-Auth (new in this release; off by default)**
+
+- A directory with two entries that share the username attribute (two people with the same `cn`)
+  refuses the second one's sign-in, where it used to take over the first person's account. The log
+  warns about it. Make the attribute unique, or choose another. Check also that users cannot write
+  their own `LdapUsernameAttribute` or `LdapUidAttribute`: where they can, one user can sign in to
+  another's account, as on Jellyfin.
+- Profile pictures given as a URL on a private address (an intranet avatar server) are refused
+  unless `FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW` lists that host. Jellyfin fetched them from anywhere.
+- Coming from Jellyfin with LDAP-Auth: the first start imports the plugin's settings and turns it
+  on for its LDAP users. On Kubernetes, if an admin enables or disables a plugin on the old pod
+  during the rolling update, enable LDAP-Auth again under Dashboard → Plugins.
+- Active Directory: use a base DN below the partitions (the users' OU). A domain-root base DN with
+  StartTLS or LDAPS fails sign-in where the DC certificate does not carry a referred partition's
+  name, and a search that meets more than 10 referrals fails with an error naming the server.
 
 ## 1.4.0 — Live TV sources and guides follow Jellyfin more closely
 
