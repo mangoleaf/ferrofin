@@ -109,6 +109,23 @@ class TableDigests(unittest.TestCase):
         self.sql("UPDATE Chapters SET ItemId = 'not-a-guid'")
         self.assertEqual(len(self.failures()), 1)
 
+    def test_a_moved_baseline_names_an_owned_item_by_its_path_after_the_move(self):
+        # An owned item is identified by its path; on a database adopted into other directories
+        # (program_data_move.py) the boot repair rewrites that path, so the baseline names it by
+        # where the move puts it.
+        host = Path(self.db).parent / "copy"
+        host.mkdir()
+        (host / "extra.mkv").write_bytes(b"x")
+        self.sql(f"INSERT INTO BaseItems VALUES ('{GUID}', '/old/extra.mkv', '{USER}');"
+                 f"UPDATE Chapters SET ItemId = '{GUID}'")
+        moves = [("/old", "/new", str(host))]
+        self.before = digests.snapshot(self.db, moves=moves)
+        unmoved = digests.snapshot(self.db)
+        self.sql(f"UPDATE BaseItems SET Path = '/new/extra.mkv' WHERE Id = '{GUID}'")
+        self.assertEqual(self.failures(), [])
+        self.assertEqual(digests.compare(unmoved, digests.snapshot(self.db, unmoved)),
+                         ["Chapters row path:/old/extra.mkv/x is gone"])
+
     def test_timestamp_spelling_is_one_instant_0007(self):
         self.sql("UPDATE ActivityLogs SET DateCreated = '2026-01-02T03:04:05.5Z'")
         self.before = digests.snapshot(self.db)
