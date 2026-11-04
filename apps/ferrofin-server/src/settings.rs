@@ -677,7 +677,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         key: "trickplay_concurrency",
         env: Some("FERROFIN_TRICKPLAY_CONCURRENCY"),
         env_read: EnvRead::NonBlank,
-        label: "Concurrent trickplay images",
+        label: "Concurrent trickplay videos",
         group: Group::Trickplay,
         kind: SettingKind::CountOrAuto,
         default: "auto",
@@ -914,6 +914,26 @@ pub static SETTINGS: &[SettingSpec] = &[
         default: "60",
         description: "Longest pacing or quota wait before a metadata lookup is skipped.",
         running: |c| json!(c.provider_max_wait_seconds),
+        ..ROW
+    },
+    SettingSpec {
+        key: "subtitle_private_http_allow",
+        env: Some("FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW"),
+        env_read: EnvRead::NonBlank,
+        label: "Private hosts for subtitle downloads",
+        group: Group::Providers,
+        // As image_private_http_allow (owner decision D5): letting the server
+        // reach private addresses takes host access, not just an admin
+        // session.
+        access: SettingAccess::ReadOnly(
+            "Lets OpenSubtitles download links reach the LAN, loopback and cloud-metadata \
+             addresses it lists. Set it by hand in config.toml (subtitle_private_http_allow) or \
+             FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW, so an admin session alone cannot grant it.",
+        ),
+        default: "no private address",
+        description: "Private hosts, addresses and CIDR networks an OpenSubtitles download link \
+                      may reach, comma-separated; the image list does not apply to it.",
+        running: |c| json!(c.subtitle_private_http_allow),
         ..ROW
     },
     // ---- Performance -------------------------------------------------------

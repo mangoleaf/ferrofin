@@ -334,6 +334,8 @@ async fn saved_locales_change_provider_requests_without_restarting() {
         // The mock serves its images on loopback, which image downloads refuse
         // unless the allow-list names it.
         image_private_http_allow: Some("127.0.0.1".to_owned()),
+        // Its subtitle links too, which have their own list (gl-1160).
+        subtitle_private_http_allow: Some("127.0.0.1".to_owned()),
         ..Config::test_stub(tmp.path())
     })
     .await;

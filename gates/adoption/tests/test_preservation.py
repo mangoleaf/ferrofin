@@ -987,7 +987,7 @@ class SeededAdoptionTest(unittest.TestCase):
         versions = {name: version for name, version, _ in VERSIONS}
         # The 12.2, 12.3 and 12.4 upgrade routes derive from their contract parents (12.3 on the
         # fullest 12.2 route, 12.4 on that 12.3 one); each fresh install (FRESH_INSTALL) is a
-        # first run of its release with no parent.
+        # first run of its release with no parent, the Debian-layout one included.
         self.assertEqual({name: paths[name] for name in paths
                           if name.startswith(('jellyfin-12.2', 'jellyfin-12.3', 'jellyfin-12.4'))
                           and name not in FRESH_INSTALL},
@@ -997,7 +997,12 @@ class SeededAdoptionTest(unittest.TestCase):
                           'jellyfin-12.4-from-123': 'jellyfin-12.3-from-122', 'jellyfin-12.4-from-10': 'jellyfin-10.11.8'})
         self.assertEqual({name: (versions[name], paths[name]) for name in FRESH_INSTALL},
                          {'jellyfin-12.2-fresh': ('12.2', None), 'jellyfin-12.3-fresh': ('12.3', None),
-                          'jellyfin-12.4-fresh': ('12.4', None)})
+                          'jellyfin-12.4-fresh': ('12.4', None), 'jellyfin-12.4-debian': ('12.4', None)})
+        # Only the Debian-layout fixture is written in another layout, and it is a first run.
+        from synthetic import DEBIAN, LAYOUTS
+        self.assertEqual(LAYOUTS, {'jellyfin-12.4-debian': DEBIAN})
+        self.assertEqual(DEBIAN, {'data': '/var/lib/jellyfin', 'config': '/etc/jellyfin',
+                                  'cache': '/var/cache/jellyfin', 'log': '/var/log/jellyfin'})
         names = [name for name, _, _ in VERSIONS]
         self.assertTrue(all(names.index(parent) < names.index(name) for name, parent in paths.items() if parent))
         # The seeds' oracle and the real upgrade from 10.11 are the latest release's.
@@ -1034,10 +1039,18 @@ class FreshInstallBuildTest(unittest.TestCase):
                 patch.object(self.synthetic, "wait_for_live_members") as wait_for_live_members, \
                 patch.object(self.synthetic, "seed_database") as seed_database, \
                 patch.object(self.synthetic, "require_populated") as require_populated, \
+                patch.object(self.synthetic, "require_layout") as require_layout, \
                 patch("preservation.snapshot", return_value={}), \
                 patch("preservation.validate"):
             self.synthetic.build(self.root, fresh, 0)
         config = self.root / fresh
+        layout = self.synthetic.LAYOUTS.get(fresh)
+        # Jellyfin runs in the fixture's layout, which the build then checks it used.
+        self.assertEqual(server.call_args.kwargs, {"layout": layout})
+        if layout:
+            require_layout.assert_called_once_with(config / "data/jellyfin.db", layout)
+        else:
+            require_layout.assert_not_called()
         seed.assert_called_once()                       # seeded through its release's API
         seed_database.assert_not_called()               # but none of the aged stopped-DB states
         # 12.x keeps linked children in their own table, so the 10.11 wait would never end;
@@ -1049,6 +1062,64 @@ class FreshInstallBuildTest(unittest.TestCase):
         ready = json.loads((config / "synthetic-ready.json").read_text())
         self.assertEqual(ready["fixture"], fresh)  # still a completed, usable fixture
         self.assertEqual(ready["version"], version)
+        self.assertEqual(ready.get("layout"), layout)  # what run.sh reads (adoption_fixture_layout)
+
+
+class LayoutTest(unittest.TestCase):
+    """synthetic.mounts and require_layout: Jellyfin given another layout, and the proof it used it."""
+
+    def setUp(self):
+        import synthetic
+        self.synthetic = synthetic
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def test_the_image_layout_mounts_config_and_cache_only(self):
+        config, cache = self.root / "f", self.root / "f-cache"
+        self.assertEqual(self.synthetic.mounts(config, cache), ["-v", f"{config}:/config", "-v", f"{cache}:/cache"])
+
+    def test_a_layout_mounts_each_directory_apart_and_names_it_to_jellyfin(self):
+        config, cache = self.root / "f", self.root / "f-cache"
+        config.mkdir()
+        args = self.synthetic.mounts(config, cache, self.synthetic.DEBIAN)
+        volumes = [args[i + 1] for i, arg in enumerate(args) if arg == "-v"]
+        env = [args[i + 1] for i, arg in enumerate(args) if arg == "-e"]
+        self.assertEqual(volumes, [f"{config}:/var/lib/jellyfin", f"{config}/config:/etc/jellyfin",
+                                   f"{cache}:/var/cache/jellyfin", f"{config}/log:/var/log/jellyfin"])
+        self.assertEqual(env, ["JELLYFIN_DATA_DIR=/var/lib/jellyfin", "JELLYFIN_CONFIG_DIR=/etc/jellyfin",
+                               "JELLYFIN_CACHE_DIR=/var/cache/jellyfin", "XDG_CACHE_HOME=/var/cache/jellyfin",
+                               "JELLYFIN_LOG_DIR=/var/log/jellyfin"])
+        # The mount sources exist before docker runs, so docker does not make them as root.
+        self.assertTrue((config / "config").is_dir() and (config / "log").is_dir())
+        self.assertNotIn("/config", [volume.split(":")[1] for volume in volumes])
+
+    def test_ferrofin_never_boots_in_a_layout(self):
+        with self.assertRaises(ValueError):
+            with self.synthetic.server("img", self.root / "f", self.root / "m", "n", 0, ferrofin=True,
+                                       layout=self.synthetic.DEBIAN):
+                pass
+
+    def database(self, root, profiles):
+        db = self.root / "jellyfin.db"
+        db.unlink(missing_ok=True)
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.executescript('CREATE TABLE BaseItems (Type TEXT, Path TEXT); CREATE TABLE ImageInfos (Path TEXT);')
+            conn.execute("INSERT INTO BaseItems VALUES ('MediaBrowser.Controller.Entities.AggregateFolder', ?)", (root,))
+            conn.executemany("INSERT INTO ImageInfos VALUES (?)", [(path,) for path in profiles])
+        return db
+
+    def test_a_fixture_written_in_its_layout_passes(self):
+        db = self.database("/var/lib/jellyfin/root", ["/etc/jellyfin/users/a/profile.png"])
+        self.synthetic.require_layout(db, self.synthetic.DEBIAN)
+
+    def test_a_fixture_written_in_the_image_layout_fails(self):
+        for root, profiles in (("/config/root", ["/etc/jellyfin/users/a/profile.png"]),
+                               ("/var/lib/jellyfin/root", ["/config/config/users/a/profile.png"]),
+                               ("/var/lib/jellyfin/root", [])):
+            with self.subTest(root=root, profiles=profiles):
+                with self.assertRaisesRegex(CheckError, "layout was not used"):
+                    self.synthetic.require_layout(self.database(root, profiles), self.synthetic.DEBIAN)
 
 
 if __name__ == '__main__':

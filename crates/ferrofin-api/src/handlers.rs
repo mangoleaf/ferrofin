@@ -1224,8 +1224,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Controller/Entities/BaseItemExtensions.cs (SetImagePath) and \
                    Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto). Also the \
                    download of a remote image: ferrofin-providers image_download.rs \
-                   open_image (ImageHttp::send, which follows and vets each redirect; \
-                   destination.rs ImageDestinations), provider_manager.rs \
+                   open_image (guarded_http.rs GuardedHttp::send, which follows and vets each \
+                   redirect; destination.rs ImageDestinations), provider_manager.rs \
                    cached_remote_image, compared with \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage), \
                    Jellyfin.Server/Startup.cs (the NamedClient.Default handler) and \
@@ -1392,7 +1392,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              the item for a user, and neither the policy nor the version. A channel takes the \
              same check, as PlaybackInfo does. A DVR recording has no row here, so it takes \
              Live TV access, IsVisibleStandalone over its entity, the libraries holding its \
-             file and then its channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
+             file (found as GetCollectionFolders finds them, ignoring case) and then its \
+             channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
              now share and GET /LiveTv/Recordings lists by; upstream's recording is a library \
              item, whose library holds it. On the routes upstream leaves anonymous, no \
              credential, a token that names nobody and an API key stay so, which binds a \
@@ -1475,15 +1476,21 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    MediaBrowser.Providers/Trickplay/TrickplayImagesTask.cs (ExecuteAsync). \
                    How ffmpeg extracts the frames, on either path, is the \
                    trickplay-extraction row's; how many generations run at once is not part \
-                   of this row. Also the order a media source's widths are listed in \
-                   BaseItemDto.Trickplay: trickplay_manager.rs resolutions_for, \
-                   get_trickplay_manifest and get_trickplay_manifest_batch \
-                   (GetTrickplayResolutions, GetTrickplayManifest), dto_service.rs \
-                   to_trickplay_manifest and ferrofin-model dto/base_item.rs \
+                   of this row. Also BaseItemDto.Trickplay: which media sources it lists \
+                   and in what order, and the order of each source's widths. \
+                   trickplay_manager.rs resolutions_for and \
+                   get_trickplay_resolutions_batch (GetTrickplayResolutions), \
+                   dto_service.rs trickplay_manifests and to_trickplay_manifest \
+                   (GetTrickplayManifest: every source of GetMediaSources(false) but the \
+                   IsRemote ones, through video_versions.rs local_media_source_ids over \
+                   items_for_media_sources, GetAllItemsForMediaSources, in \
+                   order_media_sources' order, and unfiltered by the user, as upstream), \
+                   media_source_manager.rs is_remote_shortcut (GetVersionInfo's shortcut \
+                   arm) and ferrofin-model dto/base_item.rs TrickplayManifest and \
                    serialize_trickplay_largest_first, compared with \
-                   Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field); \
-                   which media sources the manifest lists is not part of this row: it lists \
-                   only the item's own, where upstream lists every local version (gl-1235)",
+                   Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (GetMediaSources) and \
+                   MediaBrowser.Controller/Entities/Video.cs (GetAllItemsForMediaSources)",
         date: "2026-11-04",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
@@ -2495,12 +2502,13 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetRecordings",
         ferrofin: "handlers/live_tv.rs get_recordings (items.rs resolve_user_opt, \
                program_dto_options; ListedRecordingVisibility → recording_visible_given, \
-               holding_libraries, libraries_allow) → ferrofin-livetv manager.rs \
+               holding_libraries over ferrofin-model entities_media.rs libraries_holding, \
+               libraries_allow) → ferrofin-livetv manager.rs \
                get_recordings_matching (dvr_repository.rs recording_rows, \
                visible_recording_rows, remove_fields, recording_dtos, \
                add_info_to_recording_dtos) (RequestHelpers.GetUserId, \
                LiveTvManager.GetRecordingsAsync, GetEmbyRecordingsAsync, \
-               GetRecordingFoldersAsync, RemoveFields)",
+               GetRecordingFoldersAsync, LibraryManager.GetCollectionFolders, RemoveFields)",
         date: "2026-11-02",
         divergences: &[
             "Recordings are the rows of Ferrofin's DVR table, not library items under the \

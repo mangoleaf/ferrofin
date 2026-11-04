@@ -4,7 +4,8 @@
 //! artwork, a metadata provider's image, a WASM plugin's request) must not
 //! make the server a way into the networks it sits on: its own `/metrics`, a
 //! router or NAS page, a cloud metadata service. This module holds the one
-//! guard for that, used by the image downloads and by the WASM plugin host:
+//! guard for that, used by the image downloads, the OpenSubtitles download
+//! link and the WASM plugin host:
 //! [`is_private_address`] names the ranges, a [`DestinationPolicy`] decides
 //! which of them a fetch may still reach, and [`PublicOnlyResolver`] applies
 //! the policy to every name a client resolves.
@@ -15,6 +16,9 @@
 //! row of `ferrofin_api::handlers::VERIFIED_SUBSYSTEMS`: image downloads
 //! refuse private addresses unless the admin lists them ([`PrivateAllowList`])
 //! or they are a configured Live TV tuner's host ([`ImageDestinations`]).
+//! The OpenSubtitles download link has its own list,
+//! `subtitle_private_http_allow` (owner decision 2026-11-03, gl-1160): the
+//! image list does not apply to it.
 
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -266,11 +270,12 @@ pub fn url_host(url: &str) -> Option<String> {
         .map(normalized_host)
 }
 
-/// The private hosts and networks an admin lets image downloads reach
-/// (`image_private_http_allow`): host names, matched exactly in any case,
-/// and addresses or networks in CIDR form (`192.168.1.20`, `10.0.0.0/8`,
-/// `fd00::/8`). An address listed this way is allowed whatever name led to
-/// it; a host name, at whatever address it resolves to.
+/// The private hosts and networks an admin lets a kind of download reach
+/// (`image_private_http_allow`, `subtitle_private_http_allow`): host names,
+/// matched exactly in any case, and addresses or networks in CIDR form
+/// (`192.168.1.20`, `10.0.0.0/8`, `fd00::/8`). An address listed this way
+/// is allowed whatever name led to it; a host name, at whatever address it
+/// resolves to.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrivateAllowList {
     hosts: Vec<String>,
@@ -340,6 +345,15 @@ impl PrivateAllowList {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.hosts.is_empty() && self.networks.is_empty()
+    }
+}
+
+/// The list alone as a policy: every private address it does not list is
+/// refused (the subtitle links', which no tuner exempts).
+#[async_trait]
+impl DestinationPolicy for PrivateAllowList {
+    async fn refuses(&self, host: &str, address: IpAddr) -> bool {
+        is_private_address(address) && !self.allows(host, address)
     }
 }
 
@@ -625,6 +639,26 @@ mod tests {
         assert!(listed.refuses("router.lan", lan).await, "a name for it");
         assert!(listed.refuses("localhost", loopback).await);
         assert!(!listed.refuses("example.com", public).await);
+    }
+
+    /// The subtitle links' policy is the list alone: no tuner exempts a
+    /// host, and an empty list refuses every private address.
+    #[tokio::test]
+    async fn an_allow_list_alone_refuses_every_private_address_it_does_not_list() {
+        let lan: IpAddr = "192.168.1.50".parse().expect("address");
+        let public: IpAddr = "93.184.216.34".parse().expect("address");
+        let nothing = PrivateAllowList::default();
+        assert!(nothing.refuses("tvh.lan", lan).await);
+        assert!(!nothing.refuses("example.com", public).await);
+        let listed = PrivateAllowList::parse("mirror.lan, 10.0.0.0/8").0;
+        assert!(!listed.refuses("mirror.lan", lan).await, "a listed host");
+        assert!(
+            !listed
+                .refuses("x", "10.1.2.3".parse().expect("address"))
+                .await,
+            "a listed network"
+        );
+        assert!(listed.refuses("tvh.lan", lan).await);
     }
 
     /// The image downloads read the configured policy. (Every policy a test

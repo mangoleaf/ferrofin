@@ -18,7 +18,9 @@ libraries: since 2026-10-14 every fixture is [synthetic](#the-fixtures-are-synth
 paths, 12.2 included, **passed** both `run.sh` and `synthetic.py run` on synthetic fixtures on
 **2026-10-17**; the synthetic results follow the table. All seventeen paths passed `run.sh` on
 **2026-10-29**, and the fourteen seeded paths also passed `synthetic.py run`; the three fresh
-installs are `run.sh`'s alone ([record](#2026-10-29-jellyfin-123-and-124-routes-gl-874)).
+installs are `run.sh`'s alone ([record](#2026-10-29-jellyfin-123-and-124-routes-gl-874)). All
+eighteen, the [moved row](#the-moved-row) included, passed `run.sh` on **2026-11-04**
+([record](#2026-11-04-the-moved-row-gl-1236)).
 
 Each test booted Ferrofin on a fresh copy of a Jellyfin database. The 10.11.8 fixture was the
 original snapshot; the others were produced by booting the corresponding Jellyfin releases on
@@ -43,6 +45,7 @@ copies, as shown below.
 | 12.4.0 | 10.11.8 → 12.4.0 | 107 | `12.2.0` | PASS (synthetic) |
 | 12.4.0 | 10.11.8 → 12.0.0 → 12.1.0 → 12.2.0 → 12.3.0 → 12.4.0 | 109 | `12.2.0` | PASS (synthetic) |
 | 12.4.0 | Fresh 12.4 install (not upgraded) | 105 | `12.2.0` | PASS (synthetic, `run.sh`) |
+| 12.4.0 | Fresh 12.4 install in a Debian package's directories, adopted into Ferrofin's ([moved row](#the-moved-row)) | 105 | `12.2.0` | PASS (synthetic, `run.sh`) |
 
 The gate in `crates/ferrofin-db/src/database.rs` matches migration **ID sets**, not just
 their counts or a version string. Releases sharing a set share the logged generation.
@@ -271,6 +274,31 @@ gates session (`make run-adoption`) and compared answers with its adoption oracl
   place" with generation `12.2.0` and the `jellyfin.db.pre-ferrofin` backup, and `GET
   /System/Info/Public` answers `"Version": "12.4.0"`.
 
+### 2026-11-04 the moved row (gl-1236)
+
+The whole fixture set was built fresh by `build-fixtures.sh` at this change's recipe (13 minutes,
+beside an image build). `jellyfin-12.4-debian` took 21 s of it, recorded 105 EF ids, the same id set
+as `jellyfin-12.2-fresh`, and the same fresh-install schema; its stored root folder, library folders,
+artwork and chapter images name `/var/lib/jellyfin` and its seven profile images `/etc/jellyfin`.
+
+Image `ferrofin:v1.4.1-649-c96b0874`, built from `c96b0874` (`release/v1.5.0` plus this change),
+local image ID `sha256:13d6a236da3853caefe684176e74310f363bb89a678d66c3b53af5658f74c4fb`, in a
+local gates session (`make run-adoption`, 6 min 7 s):
+
+- `run.sh`: **PASS** on all 21 rows (18 paths, the two messy copies and the scale row), 0 failed, 0
+  skipped. The moved row passes every check at all three stages, the program-data move check
+  included, and takes 17 s on its own.
+- With the boot repair disabled (an image whose `rebase_program_data_paths` plans the rewrite and
+  writes nothing, built only for this run), the moved row **FAILS**, and the program-data move
+  check fails at every stage (7, 6 and 6 failures). After adoption it names 8 `BaseItems.Path` (the
+  user root and the seven library folders; the boot re-paths the aggregate root on its own), 17
+  `BaseItemImageInfos.Path`, 80 `Chapters.ImagePath` and 7 `ImageInfos.Path` still under the old
+  directories although the copy holds the files, 4 of 4 library Primary images and 7 of 7 profile
+  images answering 404, and no `jellyfin.db.pre-program-data-move`. The later stages repeat all but the snapshot, which only the
+  first checks for, except that after the scan one `BaseItems.Path` is left, the user root's. The
+  smoke comparison (the movie poster probe answers 404), the table digests (80 chapter rows) and,
+  after the scan, the metadata check fail with it.
+
 ## What the live suite checks
 
 1. The boot log names the expected generation, reports completed database migrations and
@@ -301,12 +329,16 @@ gates session (`make run-adoption`) and compared answers with its adoption oracl
    database and movie/episode API responses, including watched flags and progress.
 7. Every row of the Jellyfin-owned tables no other check covers survives each stage, bar
    the rewrites listed under the table digests below.
-8. After the seventeen paths, two **messy** fixtures are adopted (see [Messy rows](#messy-rows)):
+8. After the eighteen paths, two **messy** fixtures are adopted (see [Messy rows](#messy-rows)):
    each shape of rows real databases carry ends as Jellyfin 12.4 left it, or as a divergence
    written down.
 9. Last, a **scale** fixture of 40,000 items is adopted (see [Scale fixture](#scale-fixture)):
    every cloned item and the rows that hang off it survive, and the run records the migration
    time, peak memory, disk high-water mark and the cost of the `foreign_key_check`.
+10. On the [moved row](#the-moved-row), whose database Jellyfin wrote in other directories than
+    the ones Ferrofin boots in, each stage also checks that the stored paths point at the copies,
+    that the libraries keep their rows and ids, and that their artwork and the profile images are
+    served.
 
 The table digests (`table_digests.py`) hash every row of those tables whole, keyed by its
 primary key, and take the baseline from each fixture copy before Ferrofin starts. A row that
@@ -327,6 +359,7 @@ stops seeing, so add one only with a migration or server behaviour to point at:
 | a `Devices` row's `Id`, `AccessToken`, `IsActive` and `DateCreated` (as an instant, since 0007 rewrites it) are compared, except on the `DeviceId`s the harness logs in from (`synthetic-login-*`, `account-login-*`) | authenticating again from a device replaces its row with a new id, token, activation and creation date, as Jellyfin does; the harness does this only from its own `DeviceId`s, so on every other device a reset token or a deactivated device fails. `run.sh` logs in from none and compares them all |
 | rows that share a key are a multiset, not one row | `(UserId, DeviceId)` is not unique, so losing or changing one of two devices for the same user and device must still fail |
 | rows of a user that does not exist are not in the baseline of the user-keyed tables | 0044 deletes them |
+| on the [moved row](#the-moved-row), a path under an old directory is recorded as its place in the copy when the copy holds the file | the boot repair `rebase_program_data_paths` rewrites it (`docs/INSTALL.md`); a path left behind, or rewritten without its file, still fails |
 
 The metadata baseline is captured from each fixture copy **before Ferrofin starts**.
 It checks overview, original title, tagline, community/critic ratings, official rating,
@@ -447,6 +480,51 @@ python3 gates/bench/report.py --serve      # run.sh's page as `adoption` ($FERRO
 The `Adoption` workflow uploads the two pages as the `adoption-report` (`run.sh`) and
 `adoption-matrix-report` artifacts on every run, pass or fail (the whole work directory is still
 uploaded as `adoption-work` on a failure, with each fixture build's server log).
+
+## The moved row
+
+Every other row boots Ferrofin with its data directory where Jellyfin left it, `/config`, so a
+stored absolute path stays right by coincidence. A real Debian package migration changes it:
+`scripts/migrate-jellyfin.sh` copies `/var/lib/jellyfin` into `/var/lib/ferrofin` and
+`/etc/jellyfin` into `/etc/ferrofin`, while the database still names the old directories for the
+library folders (`BaseItems.Path` of the root, the user root and each `CollectionFolder`), the
+artwork and chapter images under the metadata directory, and the profile images under the old
+configuration directory. The item ids still match, because Jellyfin derives those of items under
+program data from the path relative to it. The boot repair (`rebase_program_data_paths`) points
+each path whose file the copy holds at the copy and leaves the others alone
+([`docs/INSTALL.md`](../../docs/INSTALL.md#check-paths-start-and-verify-adoption)). Jellyfin has
+no such repair and leaves those paths stale after a move, so it cannot be the oracle for them: the
+expectation is that documented rule.
+
+`jellyfin-12.4-debian` is a first run of Jellyfin 12.4 seeded like `jellyfin-12.4-fresh`, but
+with its program data at `/var/lib/jellyfin`, its configuration at `/etc/jellyfin`, its cache at
+`/var/cache/jellyfin` and its logs at `/var/log/jellyfin` (`synthetic.py` `LAYOUTS`; the build
+checks that the stored root folder and profile images name them, and records the layout in
+`synthetic-ready.json`). `run.sh` copies it whole, moves its `config/` out beside the copy, and
+boots Ferrofin with `FERROFIN_DATA_DIR=/var/lib/ferrofin`, `FERROFIN_CONFIG_DIR=/etc/ferrofin`
+and `FERROFIN_CACHE_DIR=/var/cache/ferrofin` (`ADOPTION_MOVED_*` in `lib.sh`); the old
+directories are not mounted. Its smoke answers the fresh-install oracle like the other first
+runs (no probe names a stored path). Before the first boot, `program_data_move.py snapshot`
+records every stored path under an old directory (`BaseItems.Path`, `BaseItemImageInfos.Path`,
+`Chapters.ImagePath`, `MediaStreamInfos.Path`, `ImageInfos.Path`) with what it must read after
+the move, the libraries by name, which have a Primary image, and the users with a profile image;
+it refuses a fixture that would move no library folder, image or profile image. After adoption,
+after the restart and after the scan, `program_data_move.py check` fails when:
+
+- a recorded path does not read its place in the copy (or, for a file the copy lacks, what it was),
+  or a row written since names an old directory although the copy holds its file;
+- a `CollectionFolder` row was added or lost, or its `Data` still names an old directory
+  (`PhysicalLocationsList`, which the boot's virtual-folder sync rewrites);
+- `/Library/VirtualFolders` lists a library with another id than its `CollectionFolder` row, leaves
+  one out, or lists a location under an old directory (the smoke comparison ignores this route);
+- a library's Primary image or a user's profile image is not served or does not decode;
+- the first boot left no `jellyfin.db.pre-program-data-move` snapshot, or a later stage took,
+  rewrote or removed any `jellyfin.db.pre-*` snapshot.
+
+The second boot's repair check (check 4) catches a second rewrite, whose log line
+("rewrote stored paths under a previous program-data directory") `ADOPTION_REPAIR_RE` matches. The
+table digests take their baseline with the same expectation (`table_digests.py snapshot --moved`),
+so the chapter image paths compare at their new place.
 
 ## Messy rows
 
@@ -620,6 +698,7 @@ $FIXTURES/
   jellyfin-12.4-from-123/      built: jellyfin/jellyfin:12.4 on 12.3-from-122
   jellyfin-12.4-from-10/       built: jellyfin/jellyfin:12.4 on 10.11.8
   jellyfin-12.4-fresh/         built: jellyfin/jellyfin:12.4 seeded from scratch (a first run)
+  jellyfin-12.4-debian/        built: the same in a Debian package's directories (the moved row)
   oracle/smoke-jellyfin-12.{1,2,4}.txt  built: each release's own smoke answers (12.4's on 12.4-from-123, the default)
   oracle/smoke-jellyfin-12.{2,4}-fresh.txt  built: Jellyfin 12.2's and 12.4's answers on their fresh-install library
   oracle/user.txt              built: the account those answers were probed as
@@ -711,7 +790,14 @@ written divergence names a seeded shape, a derived lineage and a whole state.
 density, determinism, an unknown foreign key refused, a failed build cleaned up), the survival
 check, the disk requirement, the sampler's high-water marks and the cgroup lookup with
 substituted files, the boot-log timing and the record that names what it could not measure.
-`tests/test_adoption_report.py` checks the recorder (a new run forgets the last, bad verdicts refused, a
+`tests/test_program_data_move.py` checks the [moved row](#the-moved-row)'s expectation (a path
+moves only where the copy holds its file, a directory matches whole components and the longest
+wins), the refusal of a fixture that moves nothing, and each failure on a scratch database and a
+local HTTP server: paths left where Jellyfin wrote them (the gl-1165 class, with no repair
+snapshot), a path rewritten without its file, a row written since under an old directory, a
+library added or lost, a stale `Data`, a wrong `/Library/VirtualFolders`, artwork not served,
+and a snapshot taken or rewritten after the first boot; and that the table digests expect the
+moved paths. `tests/test_adoption_report.py` checks the recorder (a new run forgets the last, bad verdicts refused, a
 line cut off by a killed run ignored), the verdict rules (a row that passed with a failed check is
 failed; a fixture that began and never finished is `INCOMPLETE`; a run that ran nothing says so),
 every section of the page, that run text cannot inject markup, that the page is self-contained,

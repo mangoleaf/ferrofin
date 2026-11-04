@@ -9,6 +9,8 @@
 #   jellyfin-12.0/  12.1-from-10/  12.1-from-12/  12.2-from-10/  12.2-from-12/  12.2-from-121/
 #   jellyfin-12.3-from-122/  12.3-from-10/  12.4-from-123/  12.4-from-10/
 #   jellyfin-12.2-fresh/  12.3-fresh/  12.4-fresh/   that release seeded from scratch (a first run, not upgraded)
+#   jellyfin-12.4-debian/             12.4 seeded from scratch in a Debian package's layout (/var/lib/jellyfin,
+#                                  /etc/jellyfin; synthetic.py LAYOUTS), which run.sh adopts into other directories
 # Then, next to them:
 #   oracle/smoke-jellyfin-12.1.txt smoke.sh against Jellyfin 12.1 on a throwaway copy of 12.1-from-12
 #   oracle/smoke-jellyfin-12.2.txt smoke.sh against Jellyfin 12.2 on a throwaway copy of 12.2-from-121
@@ -41,7 +43,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=gates/adoption/lib.sh
 . "$HERE/lib.sh"
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}
-while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,38p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
+while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,40p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
 [ -n "$FIXTURES" ] || FIXTURES=$(adoption_fixtures_dir build-fixtures) || exit 2
 gates_require_local "$FIXTURES" || exit 2
 mkdir -p "$FIXTURES"; FIXTURES=$(cd "$FIXTURES" && pwd)
@@ -70,7 +72,8 @@ MEDIA=(-v "$FIXTURES/media:/media:ro")
 # counterpart's count), with the WAL folded in so read-only readers see it all.
 for spec in 10.11.8:68 10.11.9:68 10.11.10:71 10.11.11:71 12.0:102 12.1-from-10:104 12.1-from-12:105 \
             12.2-from-10:107 12.2-from-12:108 12.2-from-121:109 12.2-fresh:105 \
-            12.3-from-122:109 12.3-from-10:107 12.3-fresh:105 12.4-from-123:109 12.4-from-10:107 12.4-fresh:105; do
+            12.3-from-122:109 12.3-from-10:107 12.3-fresh:105 12.4-from-123:109 12.4-from-10:107 12.4-fresh:105 \
+            12.4-debian:105; do
   db=$FIXTURES/jellyfin-${spec%:*}/data/jellyfin.db
   [ -f "$db" ] || { echo "jellyfin-${spec%:*} has no data/jellyfin.db" >&2; exit 1; }
   sqlite3 "$db" 'PRAGMA wal_checkpoint(TRUNCATE);' >/dev/null
@@ -82,7 +85,7 @@ done
 # new generation, which the database gate must learn before these fixtures can test it.
 ef_ids() { sqlite3 -readonly "$1" 'SELECT MigrationId FROM __EFMigrationsHistory ORDER BY 1'; }
 for pair in 12.3-from-122:12.2-from-121 12.3-from-10:12.2-from-10 12.3-fresh:12.2-fresh \
-            12.4-from-123:12.2-from-121 12.4-from-10:12.2-from-10 12.4-fresh:12.2-fresh; do
+            12.4-from-123:12.2-from-121 12.4-from-10:12.2-from-10 12.4-fresh:12.2-fresh 12.4-debian:12.2-fresh; do
   diff -q <(ef_ids "$FIXTURES/jellyfin-${pair%:*}/data/jellyfin.db") <(ef_ids "$FIXTURES/jellyfin-${pair#*:}/data/jellyfin.db") >/dev/null \
     || { echo "jellyfin-${pair%:*} has other EF history ids than jellyfin-${pair#*:}: a new generation" >&2; exit 1; }
 done
@@ -161,8 +164,8 @@ if [ -d "$FIXTURES/jellyfin-12.2-from-121" ]; then
 fi
 if [ -d "$FIXTURES/jellyfin-12.2-fresh" ]; then
   # A first run lacks one index the upgraded routes carry (crates/ferrofin-db's fresh-install
-  # cases), so 12.3's and 12.4's fresh installs are diffed against 12.2's.
-  for other in jellyfin-12.3-fresh jellyfin-12.4-fresh; do
+  # cases), so 12.3's and 12.4's fresh installs (the Debian-layout one too) are diffed against 12.2's.
+  for other in jellyfin-12.3-fresh jellyfin-12.4-fresh jellyfin-12.4-debian; do
     [ -d "$FIXTURES/$other" ] || continue
     same_schema "$other" jellyfin-12.2-fresh <(dump_schema "$FIXTURES/jellyfin-12.2-fresh")
   done

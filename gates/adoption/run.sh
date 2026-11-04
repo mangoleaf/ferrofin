@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # gates/adoption/run.sh [--fixtures DIR] [--image IMAGE] [--only NAME] [--user USERNAME] [--oracle 12.1|12.2|12.4]
 #
-# Adopts every Jellyfin release Ferrofin claims to support, 17 paths: 10.11.8, 10.11.9, 10.11.10,
+# Adopts every Jellyfin release Ferrofin claims to support, 18 paths: 10.11.8, 10.11.9, 10.11.10,
 # 10.11.11, 12.0, 12.1 via both upgrade routes, 12.2 via all three (from 10.11, 12.0, 12.1), 12.3
-# from 10.11 and from 12.2, 12.4 from 10.11 and from 12.3, and a fresh install (not upgraded from
-# 10.11) of each of 12.2, 12.3 and 12.4, through one image, on a FRESH copy of each pristine
-# fixture under DIR, and checks each one
+# from 10.11 and from 12.2, 12.4 from 10.11 and from 12.3, a fresh install (not upgraded from
+# 10.11) of each of 12.2, 12.3 and 12.4, and a fresh 12.4 install in a Debian package's layout,
+# through one image, on a FRESH copy of each pristine fixture under DIR, and checks each one
 # the same way:
 #   1. the boot log names the expected generation, applies every migration, logs no ERROR;
 #   2. smoke.sh answers match the oracle release's own answers on the same library
@@ -21,6 +21,13 @@
 #   6. watch history survives each stage for every user (DB + HTTP).
 #   7. every row of the Jellyfin-owned tables no other check covers (table_digests.py) survives
 #      each stage, bar the rewrites the migration chain makes by design.
+#   8. a fixture Jellyfin wrote in another layout (the Debian one: /var/lib/jellyfin, /etc/jellyfin)
+#      is adopted into Ferrofin's own directories, as a package migration does (ADOPTION_MOVED_* in
+#      lib.sh), and at each stage program_data_move.py checks that every stored path whose file the
+#      copy holds names the copy and the others are untouched, that the libraries keep their rows and
+#      ids (/Library/VirtualFolders included), that their artwork and the profile images are served,
+#      and that the repair's database snapshot was taken once. Checks 5 to 7 hold there too, the
+#      table digests expecting those paths at their new place.
 # After those, the "messy" fixtures (messy.py: rows of a deleted user, an extra with a dangling
 # owner, duplicate paths) are adopted too, each shape held to the end state Jellyfin 12.4 gave it,
 # and the table digests (check 7) checked beside them. --only NAME also selects a messy fixture,
@@ -53,7 +60,7 @@ ORACLE_VERSION=${ADOPTION_ORACLE:-12.4}
 while [ $# -gt 0 ]; do case $1 in
   --fixtures) FIXTURES=$2; shift 2;; --image) IMAGE=$2; shift 2;; --only) ONLY=$2; shift 2;; --user) USER_NAME=$2; shift 2;;
   --oracle) ORACLE_VERSION=$2; shift 2;;
-  -h|--help) sed -n 2,45p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
+  -h|--help) sed -n 2,52p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
 case $ORACLE_VERSION in 12.1|12.2|12.4) ;; *) echo "run: --oracle must be 12.1, 12.2 or 12.4, not '$ORACLE_VERSION'" >&2; exit 2;; esac
 [ -n "$FIXTURES" ] || FIXTURES=$(adoption_fixtures_dir run) || exit 2
 [ -d "$FIXTURES" ] || { echo "run: $FIXTURES missing — run gates/adoption/build-fixtures.sh first" >&2; exit 2; }
@@ -174,6 +181,7 @@ FIXTURE_TABLE=(
   "12.2.0|jellyfin-12.4-from-123|18075"
   "12.2.0|jellyfin-12.4-from-10|18074"
   "12.2.0|jellyfin-12.4-fresh|18073"
+  "12.2.0|jellyfin-12.4-debian|18072"
 )
 wait_ready() { local port=$1; for _ in $(seq 1 300); do curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0; sleep 2; done; return 1; }
 # wait_up <container> <port> [seconds]: ready, or failed as soon as the container has exited (a server
@@ -224,18 +232,34 @@ metadata_check() {
     printf 'PASS tables %s\n' "$stage" > "$log"
   fi
   mark "$stage" "table digests"
+  [ "${#moved[@]}" = 0 ] || move_check "$stage"
+}
+# move_check <stage>: check 8 on a moved row. The first call records the database snapshots, which
+# every later stage must leave as they were.
+move_check() {
+  local result log=$dst.move-${1// /-}.log
+  if ! result=$(python3 "$HERE/program_data_move.py" check "$dst/data/jellyfin.db" "$dst.move.json" \
+      --base-url "http://127.0.0.1:$port" --snapshots "$dst.move-snapshots.json" 2>&1); then
+    printf '%s\n' "${result:-check failed}" > "$log"
+    why+=("program-data move $1: $(wc -l <<<"${result:-check failed}") failure(s), first: $(head -n 1 <<<"${result:-check failed}"); all in $log")
+  else
+    printf 'PASS program-data move %s\n' "$1" > "$log"
+  fi
+  mark "$1" "program-data move (stored paths, libraries, artwork, snapshot)"
 }
 failed=0
+moved=()   # a moved row's --moved arguments (check 8); metadata_check runs that check when it is set
 for spec in "${FIXTURE_TABLE[@]}"; do
   IFS='|' read -r expected src port <<<"$spec"
   [ -z "$ONLY" ] || [ "$ONLY" = "$src" ] || [ "$ONLY" = "$expected" ] || continue
   [ -d "$FIXTURES/$src" ] || { fixture_line path SKIP "$expected" "$src" "fixture missing"; continue; }
   # A first-run install is a distinct, clean library (no aged seeds), so it answers the
-  # fresh-install oracle (FRESH_ORACLE); every other row answers the shared ORACLE_VERSION
-  # oracle. Either way it is Jellyfin's own answers on the row's library, compared against
-  # Ferrofin's after adoption; `against` names that release in the checks and their reasons.
+  # fresh-install oracle (FRESH_ORACLE), and so does the Debian-layout one, a first run too; every
+  # other row answers the shared ORACLE_VERSION oracle. Either way it is Jellyfin's own answers on
+  # the row's library, compared against Ferrofin's after adoption; `against` names that release in
+  # the checks and their reasons. The probes name no stored path, so a moved row compares unchanged.
   case $src in
-    jellyfin-*-fresh) oracle=$FRESH_ORACLE against=$FRESH_VERSION;;
+    jellyfin-*-fresh|jellyfin-*-debian) oracle=$FRESH_ORACLE against=$FRESH_VERSION;;
     *) oracle=$ORACLE against=$ORACLE_VERSION;;
   esac
   [ -f "$oracle" ] || { fixture_line path SKIP "$expected" "$src" "oracle ${oracle##*/} missing — run build-fixtures.sh"; continue; }
@@ -247,8 +271,29 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   # their release's own scan (synthetic.py scans every fixture it derives), so a 10.11 path
   # compares /Persons, and the whole smoke once more, after the scan stage.
   case $expected in 10.11.*) after_scan='/Persons\?';; *) after_scan=;; esac
-  docker rm -f "$name" >/dev/null 2>&1; rm -rf "$dst" "$dst-cache"; mkdir -p "$WORK"
+  docker rm -f "$name" >/dev/null 2>&1; rm -rf "$dst" "$dst-cache" "$dst-etc" "$dst".move-*; mkdir -p "$WORK"
+  # A fixture Jellyfin wrote in another layout (check 8) boots in Ferrofin's own directories, its
+  # configuration moved out of the data directory, the way scripts/migrate-jellyfin.sh copies it.
+  if ! layout=$(adoption_fixture_layout "$FIXTURES/$src" 2>&1); then
+    fixture_line path FAIL "$expected" "$src" "$layout"; failed=1; continue
+  fi
+  case $src in *-debian) [ -n "$layout" ] || { fixture_line path FAIL "$expected" "$src" "fixture has no layout: rebuild it"; failed=1; continue; };; esac
   cp -a "$FIXTURES/$src" "$dst"; mkdir -p "$dst-cache"
+  boot=(-e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache -v "$dst:/config" -v "$dst-cache:/cache")
+  moved=()
+  if [ -n "$layout" ]; then
+    read -r from_data from_config <<<"$layout"
+    if ! mv "$dst/config" "$dst-etc"; then fixture_line path FAIL "$expected" "$src" "fixture has no config/"; failed=1; continue; fi
+    boot=(-e "FERROFIN_DATA_DIR=$ADOPTION_MOVED_DATA" -e "FERROFIN_CONFIG_DIR=$ADOPTION_MOVED_CONFIG"
+          -e "FERROFIN_CACHE_DIR=$ADOPTION_MOVED_CACHE" -v "$dst:$ADOPTION_MOVED_DATA"
+          -v "$dst-etc:$ADOPTION_MOVED_CONFIG" -v "$dst-cache:$ADOPTION_MOVED_CACHE")
+    moved=(--moved "$from_data" "$ADOPTION_MOVED_DATA" "$dst" --moved "$from_config" "$ADOPTION_MOVED_CONFIG" "$dst-etc")
+    if ! baseline=$(python3 "$HERE/program_data_move.py" snapshot "$dst/data/jellyfin.db" "$dst.move.json" "${moved[@]}" 2>&1); then
+      fixture_line path FAIL "$expected" "$src" "program-data move baseline: ${baseline:-check failed}"
+      failed=1
+      continue
+    fi
+  fi
   if ! baseline=$(python3 "$HERE/metadata.py" snapshot "$dst/data/jellyfin.db" "$dst.metadata.json" 2>&1); then
     fixture_line path FAIL "$expected" "$src" "metadata baseline: $baseline"
     failed=1
@@ -259,7 +304,7 @@ for spec in "${FIXTURE_TABLE[@]}"; do
     failed=1
     continue
   fi
-  if ! baseline=$(python3 "$HERE/table_digests.py" snapshot "$dst/data/jellyfin.db" "$dst.tables.json" 2>&1); then
+  if ! baseline=$(python3 "$HERE/table_digests.py" snapshot "$dst/data/jellyfin.db" "$dst.tables.json" "${moved[@]}" 2>&1); then
     fixture_line path FAIL "$expected" "$src" "table baseline: ${baseline:-check failed}"
     failed=1
     continue
@@ -267,11 +312,10 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   # Provider failure must not erase adopted metadata. An unreachable local
   # proxy keeps providers from refilling lost values or depending on live keys.
   # HTTP probes run from the host; cached artwork and media stay available.
-  docker run -d --name "$name" --user "$(id -u):$(id -g)" -p "127.0.0.1:$port:8096" \
-    -e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache \
+  docker run -d --name "$name" --user "$(id -u):$(id -g)" -p "127.0.0.1:$port:8096" "${boot[@]}" \
     -e HTTP_PROXY=http://127.0.0.1:9 -e HTTPS_PROXY=http://127.0.0.1:9 \
     -e ALL_PROXY=http://127.0.0.1:9 -e NO_PROXY=127.0.0.1,localhost \
-    -v "$dst:/config" -v "$dst-cache:/cache" "${MEDIA[@]}" "$IMAGE" >/dev/null
+    "${MEDIA[@]}" "$IMAGE" >/dev/null
   why=(); mark_from=0
   wait_ready "$port" || why+=("never became ready")
   mark "after adoption" "ready"
@@ -314,7 +358,7 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   docker logs "$name" > "$dst.server.log" 2>&1; docker rm -f "$name" >/dev/null
   attach_tables "$dst" "$src"
   fixture_line path "$verdict" "$expected" "$src" "$(IFS='; '; echo "${why[*]:-}")"
-  if [ "$verdict" = PASS ]; then rm -rf "$dst" "$dst-cache" "$dst".*; else failed=1; fi
+  if [ "$verdict" = PASS ]; then rm -rf "$dst" "$dst-cache" "$dst-etc" "$dst".*; else failed=1; fi
 done
 # The messy fixtures (messy.py): a clean fixture plus the rows of shapes long-lived databases
 # carry and no API can produce (nine shapes: rows of a deleted user, an extra whose owner is gone,

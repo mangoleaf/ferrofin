@@ -199,9 +199,10 @@ ferrofin:
     # Each connection of the pool keeps its own, about 16 KiB a statement, so a
     # larger value costs memory on every connection.
     # FERROFIN_DB_STATEMENT_CACHE: "200"
-    # How many trickplay images are generated at once (default: auto, up to the
-    # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
-    # hardware acceleration holds GPU memory; "1" matches Jellyfin.
+    # How many videos generate trickplay images at once, each one's widths in
+    # turn (default: auto, up to the image-encoding limit, one per CPU). Each
+    # generation is an ffmpeg process, and with hardware acceleration holds GPU
+    # memory; "1" matches Jellyfin.
     # FERROFIN_TRICKPLAY_CONCURRENCY: "1"
     # Trade frame quality for speed when extracting chapter images, video
     # thumbnails and embedded pictures: keyframes only, no 24-frame sampling
@@ -233,6 +234,10 @@ ferrofin:
     # Image downloads refuse private/LAN addresses, a Live TV tuner's host
     # aside. List the LAN hosts or networks that serve your artwork:
     # FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW: "nas.lan,192.168.1.0/24"
+    # OpenSubtitles download links refuse private/LAN addresses too, with a list
+    # of their own (the image list does not apply). Only a LAN mirror of the
+    # download host needs it:
+    # FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW: "subtitles.lan"
 
     # The most jobs re-encoding a stream the server runs at once, and one user
     # runs at once. Past either cap the user's idle job on the same device is

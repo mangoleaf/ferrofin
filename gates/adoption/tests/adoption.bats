@@ -390,10 +390,10 @@ print(*sorted({c.value for c in ast.walk(fn) if isinstance(c, ast.Constant) and 
            jellyfin-12.4-from-123 jellyfin-12.4-from-10; do
     grep -q "\"12.2.0|$f|[0-9]*\"" "$ADOPTION/run.sh"
   done
-  # seventeen paths, each on its own port
+  # eighteen paths (the Debian-layout one included), each on its own port
   run bash -c "grep -oE '^  \"[0-9.]+\\|jellyfin-[^|]+\\|[0-9]+\"' \"\$1\" | cut -d'|' -f3 | sort | uniq -d" _ "$ADOPTION/run.sh"
   [ -z "$output" ]
-  [ "$(grep -E '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh" | grep -vc -e '-messy|' -e '-scale|')" -eq 17 ]
+  [ "$(grep -E '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh" | grep -vc -e '-messy|' -e '-scale|')" -eq 18 ]
   # and the two messy copies and the scale copy, on ports of their own (the uniqueness check above covers them too)
   [ "$(grep -cE '^  "[0-9.]+\|jellyfin-[^|]*-messy\|' "$ADOPTION/run.sh")" -eq 2 ]
   [ "$(grep -cE '^  "[0-9.]+\|jellyfin-[^|]*-scale\|' "$ADOPTION/run.sh")" -eq 1 ]
@@ -422,6 +422,72 @@ print(*sorted({c.value for c in ast.walk(fn) if isinstance(c, ast.Constant) and 
   grep -qF "\"\$image\"" "$ADOPTION/build-fixtures.sh"
 }
 
+@test "run.sh, build-fixtures.sh and synthetic.py carry a 12.4 first run in a Debian package's layout, adopted into Ferrofin's" {
+  # Jellyfin writes it in /var/lib/jellyfin and /etc/jellyfin (synthetic.py LAYOUTS), and run.sh boots
+  # Ferrofin on it in /var/lib/ferrofin and /etc/ferrofin, so every stored path names a directory
+  # that is gone: the move a Debian migration makes (scripts/migrate-jellyfin.sh).
+  grep -q '"12.2.0|jellyfin-12.4-debian|[0-9]*"' "$ADOPTION/run.sh"
+  grep -qF '("jellyfin-12.4-debian", "12.4", None)' "$ADOPTION/synthetic.py"
+  grep -qF 'LAYOUTS = {"jellyfin-12.4-debian": DEBIAN}' "$ADOPTION/synthetic.py"
+  grep -q '12.4-debian:105' "$ADOPTION/build-fixtures.sh"
+  grep -q '12.4-debian:12.2-fresh' "$ADOPTION/build-fixtures.sh"
+  [ "$ADOPTION_MOVED_DATA" = /var/lib/ferrofin ] && [ "$ADOPTION_MOVED_CONFIG" = /etc/ferrofin ]
+  # the configuration directory moves out of the data directory, and Ferrofin is told both
+  # shellcheck disable=SC2016 # the script's literal source lines, not expansions
+  grep -qF 'mv "$dst/config" "$dst-etc"' "$ADOPTION/run.sh"
+  # shellcheck disable=SC2016
+  grep -qF 'boot=(-e "FERROFIN_DATA_DIR=$ADOPTION_MOVED_DATA" -e "FERROFIN_CONFIG_DIR=$ADOPTION_MOVED_CONFIG"' "$ADOPTION/run.sh"
+  # shellcheck disable=SC2016
+  grep -qF -- '-v "$dst:$ADOPTION_MOVED_DATA"' "$ADOPTION/run.sh"
+  # shellcheck disable=SC2016
+  grep -qF -- '-v "$dst-etc:$ADOPTION_MOVED_CONFIG"' "$ADOPTION/run.sh"
+  # the move's baselines are taken before the container starts, and checked at every stage
+  move=$(grep -nF 'program_data_move.py" snapshot' "$ADOPTION/run.sh" | head -n 1 | cut -d: -f1)
+  # shellcheck disable=SC2016
+  tables=$(grep -nF 'table_digests.py" snapshot "$dst/data/jellyfin.db" "$dst.tables.json" "${moved[@]}"' "$ADOPTION/run.sh" | cut -d: -f1)
+  start=$(grep -nF 'docker run -d' "$ADOPTION/run.sh" | head -n 1 | cut -d: -f1)
+  [ -n "$move" ] && [ -n "$tables" ] && [ "$move" -lt "$start" ] && [ "$tables" -lt "$start" ]
+  # shellcheck disable=SC2016
+  grep -qF '[ "${#moved[@]}" = 0 ] || move_check "$stage"' "$ADOPTION/run.sh"
+}
+
+@test "adoption_fixture_layout: a fixture's two directories, nothing without one, a refusal for a broken one" {
+  mkdir f
+  run adoption_fixture_layout f
+  [ "$status" -eq 0 ] && [ -z "$output" ]
+  echo '{"fixture": "f"}' > f/synthetic-ready.json
+  run adoption_fixture_layout f
+  [ "$status" -eq 0 ] && [ -z "$output" ]
+  echo '{"layout": {"data": "/var/lib/jellyfin", "config": "/etc/jellyfin", "cache": "/c", "log": "/l"}}' > f/synthetic-ready.json
+  run adoption_fixture_layout f
+  [ "$status" -eq 0 ] && [ "$output" = "/var/lib/jellyfin /etc/jellyfin" ]
+  for bad in '{"layout": {"data": "/var/lib/jellyfin"}}' '{"layout": {"data": "relative", "config": "/etc/jellyfin"}}' \
+             '{"layout": {"data": "/a b", "config": "/etc/jellyfin"}}' 'not json'; do
+    echo "$bad" > f/synthetic-ready.json
+    run --separate-stderr adoption_fixture_layout f
+    [ "$status" -eq 2 ] && [ -z "$output" ]
+    [ "$stderr" = "f: synthetic-ready.json has an unreadable layout" ]
+  done
+}
+
+@test "run.sh: a Debian-layout row without its layout fails, naming it, before it starts a container" {
+  fake_docker; mkdir -p fixtures/oracle fixtures/media fixtures/jellyfin-12.4-debian/data
+  smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120; smoke fixtures/oracle/smoke-jellyfin-12.4-fresh.txt 120
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-debian
+  [ "$status" -eq 1 ]
+  [[ "${lines[0]}" == FAIL*12.2.0*jellyfin-12.4-debian*"fixture has no layout: rebuild it" ]]
+  echo '{"layout": {"data": "/var/lib/jellyfin"}}' > fixtures/jellyfin-12.4-debian/synthetic-ready.json
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-debian
+  [ "$status" -eq 1 ]
+  [[ "${lines[0]}" == FAIL*12.2.0*jellyfin-12.4-debian*"synthetic-ready.json has an unreadable layout" ]]
+  [[ "$output" != *"unexpected docker"* ]]
+}
+
+@test "program-data move: stored paths, libraries, artwork and snapshots against the documented move" {
+  run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_program_data_move.py
+  [ "$status" -eq 0 ]
+}
+
 @test "run.sh: a fresh-install row answers the oracle release's fresh-install oracle, and is skipped, named, without it" {
   # The shared oracle present (so the run starts) but the fresh-install oracle absent: the
   # fresh row alone is skipped and named, not compared against the wrong oracle. Every fresh
@@ -430,7 +496,9 @@ print(*sorted({c.value for c in ast.walk(fn) if isinstance(c, ast.Constant) and 
   smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
   smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
   smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120
-  for fresh in jellyfin-12.2-fresh jellyfin-12.3-fresh; do
+  mkdir -p fixtures/jellyfin-12.4-debian/data
+  # the Debian-layout row is a first run of 12.4 too
+  for fresh in jellyfin-12.2-fresh jellyfin-12.3-fresh jellyfin-12.4-debian; do
     run "$ADOPTION/run.sh" --fixtures fixtures --image any --only "$fresh"
     [ "$status" -eq 0 ]
     [[ "${lines[0]}" == SKIP*12.2.0*"$fresh"*"smoke-jellyfin-12.4-fresh.txt missing"* ]]
@@ -567,7 +635,8 @@ built_fixtures() { # every fixture built at the current recipe, carrying its rel
   recipe=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import synthetic; print(synthetic.recipe())' "$ADOPTION")
   for f in 10.11.8:68 10.11.9:68 10.11.10:71 10.11.11:71 12.0:102 12.1-from-10:104 12.1-from-12:105 \
            12.2-from-10:107 12.2-from-12:108 12.2-from-121:109 12.2-fresh:105 \
-           12.3-from-122:109 12.3-from-10:107 12.3-fresh:105 12.4-from-123:109 12.4-from-10:107 12.4-fresh:105; do
+           12.3-from-122:109 12.3-from-10:107 12.3-fresh:105 12.4-from-123:109 12.4-from-10:107 12.4-fresh:105 \
+           12.4-debian:105; do
     mkdir -p "fixtures/jellyfin-${f%:*}/data"
     printf '{"fixture": "jellyfin-%s", "recipe": "%s"}' "${f%:*}" "$recipe" > "fixtures/jellyfin-${f%:*}/synthetic-ready.json"
     sqlite3 "fixtures/jellyfin-${f%:*}/data/jellyfin.db" "CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT);
@@ -608,7 +677,7 @@ EOS
 
 @test "build-fixtures.sh: a 12.3 or 12.4 fixture whose ids are not its 12.2 counterpart's fails the build" {
   # The right count with one id swapped: a set the database gate would take for a new generation.
-  for f in 12.3-fresh:12.2-fresh 12.4-from-10:12.2-from-10 12.4-from-123:12.2-from-121; do
+  for f in 12.3-fresh:12.2-fresh 12.4-from-10:12.2-from-10 12.4-from-123:12.2-from-121 12.4-debian:12.2-fresh; do
     rm -rf fixtures; built_fixtures
     sqlite3 "fixtures/jellyfin-${f%:*}/data/jellyfin.db" "UPDATE __EFMigrationsHistory SET MigrationId = 'SomethingNew' WHERE MigrationId = '1'"
     run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
@@ -642,6 +711,7 @@ EOS
   [[ "$output" == *"jellyfin-12.4-from-10: schema DIFFERS from jellyfin-12.2-schema.sql"* ]]
   [[ "$output" == *"jellyfin-12.3-fresh: same schema as jellyfin-12.2-fresh"* ]]
   [[ "$output" == *"jellyfin-12.4-fresh: schema DIFFERS from jellyfin-12.2-fresh"* ]]
+  [[ "$output" == *"jellyfin-12.4-debian: same schema as jellyfin-12.2-fresh"* ]]
   # 12.3's and 12.4's own dumps are written beside 12.2's
   cmp fixtures/jellyfin-12.3-schema.sql fixtures/jellyfin-12.2-schema.sql
   cmp fixtures/jellyfin-12.4-schema.sql fixtures/jellyfin-12.2-schema.sql

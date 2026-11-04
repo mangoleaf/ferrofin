@@ -37,10 +37,11 @@
 //!   checks and extracts each width in turn, decoding the video once per
 //!   width (gl-1227, gl-1228).
 //!
-//! The manifest key mirrors C#: trickplay is keyed by *media-source id*, and the
-//! primary media source of an item is the item's own id in the dashless
-//! `ToString("N")` form, so [`Self::get_trickplay_manifest`] nests the
-//! resolutions under that string (the same one `MediaSources[].Id` carries).
+//! Trickplay rows are keyed by *media-source id*, as in C#: a media source is
+//! an item of the video's version group, and its id is that item's id (the
+//! dashless `ToString("N")` form `MediaSources[].Id` carries). The DTO service
+//! builds `BaseItemDto.Trickplay` over the group from
+//! [`TrickplayManager::get_trickplay_resolutions_batch`].
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -1590,32 +1591,16 @@ impl TrickplayManager for FerrofinTrickplayManager {
         Ok(())
     }
 
-    async fn get_trickplay_manifest(
-        &self,
-        item_id: Uuid,
-    ) -> Result<HashMap<String, HashMap<i32, TrickplayInfoEntity>>, ServiceError> {
-        let resolutions = self.resolutions_for(item_id).await?;
-        let mut manifest = HashMap::new();
-        if !resolutions.is_empty() {
-            // The primary media source of an item is the item itself, reported
-            // by the media-source manager as the dashless id (C# `ToString("N")`).
-            manifest.insert(item_id.simple().to_string(), resolutions);
-        }
-        Ok(manifest)
-    }
-
-    async fn get_trickplay_manifest_batch(
+    async fn get_trickplay_resolutions_batch(
         &self,
         item_ids: &[Uuid],
-    ) -> Result<HashMap<Uuid, HashMap<String, HashMap<i32, TrickplayInfoEntity>>>, ServiceError>
-    {
-        let mut out: HashMap<Uuid, HashMap<String, HashMap<i32, TrickplayInfoEntity>>> =
+    ) -> Result<HashMap<Uuid, HashMap<i32, TrickplayInfoEntity>>, ServiceError> {
+        let mut out: HashMap<Uuid, HashMap<i32, TrickplayInfoEntity>> =
             HashMap::with_capacity(item_ids.len());
         if item_ids.is_empty() {
             return Ok(out);
         }
-        // One query for the page's resolutions, grouped into a per-item manifest
-        // (media-source id = the item's own id, as the single-item form does).
+        // One query for every media source the page lists, grouped by item.
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let ph = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
@@ -1628,14 +1613,7 @@ impl TrickplayManager for FerrofinTrickplayManager {
             }
             for row in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 if let Ok(id) = Uuid::parse_str(&row.item_id) {
-                    // Key the inner manifest with the same dashless media-source
-                    // id the single-item form emits, independent of the stored
-                    // (uppercase-hyphenated) column format.
-                    out.entry(id)
-                        .or_default()
-                        .entry(id.simple().to_string())
-                        .or_default()
-                        .insert(row.width, row);
+                    out.entry(id).or_default().insert(row.width, row);
                 }
             }
         }
@@ -2656,10 +2634,17 @@ mod tests {
         assert_eq!(res.len(), 2);
         assert_eq!(res[&320].bandwidth, 999_999);
 
-        // Manifest nests resolutions under the media-source (item) id.
-        let manifest = r.mgr.get_trickplay_manifest(item).await.expect("manifest");
-        assert_eq!(manifest.len(), 1);
-        assert_eq!(manifest[&item.simple().to_string()].len(), 2);
+        // The batch form reads the same rows, keyed by item, and leaves out
+        // an item that has none.
+        let other = Uuid::new_v4();
+        let batch = r
+            .mgr
+            .get_trickplay_resolutions_batch(&[item, other])
+            .await
+            .expect("batch");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[&item].len(), 2);
+        assert_eq!(batch[&item][&320].bandwidth, 999_999);
 
         let page = r.mgr.get_trickplay_items(10, 0).await.expect("items");
         assert_eq!(page.len(), 2);
@@ -4314,7 +4299,10 @@ mod tests {
         assert_eq!((info.interval, info.thumbnail_count), (7_000, 9));
         assert!(info.bandwidth > 0);
         assert!(
-            r.mgr.get_trickplay_manifest(item).await.unwrap()[&item.simple().to_string()]
+            r.mgr
+                .get_trickplay_resolutions_batch(&[item])
+                .await
+                .unwrap()[&item]
                 .contains_key(&640)
         );
         assert!(
