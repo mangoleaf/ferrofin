@@ -22,6 +22,9 @@
 //! lossless, arithmetic coding, not a JPEG at all), a target too large for any
 //! reduction, or a decode error yields `None`, and the caller decodes through
 //! the `image` crate as before.
+//!
+//! [`ScalableJpeg::decode_full`] decodes at full size instead, for the files
+//! the `image` crate's decoder gets wrong ([`crate::split_scans`]).
 
 use std::fs::File;
 use std::io::BufReader;
@@ -34,7 +37,8 @@ use crate::limits::ImageLimits;
 
 /// The numerators of the reduced DCT scales `jpeg-decoder` implements, in
 /// eighths, smallest first: 1/8, 1/4 and 1/2. 8/8 is the full decode, which the
-/// `image` crate already does.
+/// `image` crate does for every file but those [`crate::split_scans`] routes
+/// here.
 const REDUCED_SCALES: [u32; 3] = [1, 2, 4];
 
 /// A JPEG whose header has been read and that can be decoded at a reduced scale.
@@ -130,19 +134,13 @@ impl ScalableJpeg {
                 return None;
             }
         }
-        // A panic in the decoder (its worker threads, or a malformed file it
-        // does not guard against) falls back like an error: the full decode
-        // then answers for the file as it did before. The panic hook still
-        // reports it.
-        let decoded =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.decoder.decode()));
-        let pixels = match decoded {
-            Ok(Ok(pixels)) => pixels,
-            Ok(Err(error)) => {
+        let pixels = match self.decode_pixels() {
+            Ok(pixels) => pixels,
+            Err(DecodeFailure::Error(error)) => {
                 tracing::debug!(path = %self.path, %error, "scaled JPEG decode failed; decoding at full size");
                 return None;
             }
-            Err(_) => {
+            Err(DecodeFailure::Panic) => {
                 tracing::debug!(path = %self.path, "scaled JPEG decoder panicked; decoding at full size");
                 return None;
             }
@@ -150,6 +148,45 @@ impl ScalableJpeg {
         if expected_orientation.is_some_and(|planned| planned != exif_orientation(&self.decoder)) {
             return None;
         }
+        self.image(width, height, pixels)
+    }
+
+    /// Decodes at full size, with the EXIF orientation of every segment the
+    /// decode read, or `None` when the decode fails.
+    pub(crate) fn decode_full(mut self) -> Option<(DynamicImage, Orientation)> {
+        let pixels = match self.decode_pixels() {
+            Ok(pixels) => pixels,
+            Err(DecodeFailure::Error(error)) => {
+                tracing::debug!(path = %self.path, %error, "jpeg-decoder full decode failed; decoding through the image crate");
+                return None;
+            }
+            Err(DecodeFailure::Panic) => {
+                tracing::debug!(path = %self.path, "jpeg-decoder panicked; decoding through the image crate");
+                return None;
+            }
+        };
+        let orientation = exif_orientation(&self.decoder);
+        let image = self.image(self.width, self.height, pixels)?;
+        Some((image, orientation))
+    }
+
+    /// Runs the decode at the scale set, if any. A panic in the decoder (its
+    /// worker threads, or a malformed file it does not guard against) is a
+    /// [`DecodeFailure::Panic`], so the caller falls back as on an error: the
+    /// `image` crate then answers for the file as it did before. The panic
+    /// hook still reports it.
+    fn decode_pixels(&mut self) -> Result<Vec<u8>, DecodeFailure> {
+        let decoded =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.decoder.decode()));
+        match decoded {
+            Ok(result) => result.map_err(DecodeFailure::Error),
+            Err(_) => Err(DecodeFailure::Panic),
+        }
+    }
+
+    /// The decoded `pixels` as a `width`×`height` image of the decoder's
+    /// format, the colour type the `image` crate decodes the file to.
+    fn image(&self, width: u32, height: u32, pixels: Vec<u8>) -> Option<DynamicImage> {
         match self.decoder.info()?.pixel_format {
             PixelFormat::RGB24 => {
                 RgbImage::from_raw(width, height, pixels).map(DynamicImage::ImageRgb8)
@@ -160,6 +197,14 @@ impl ScalableJpeg {
             PixelFormat::L16 | PixelFormat::CMYK32 => None,
         }
     }
+}
+
+/// Why [`ScalableJpeg::decode_pixels`] produced no pixels.
+enum DecodeFailure {
+    /// The decoder returned an error.
+    Error(jpeg_decoder::Error),
+    /// The decoder panicked.
+    Panic,
 }
 
 /// The EXIF orientation of the segments `decoder` has read so far, the same
@@ -389,6 +434,38 @@ mod tests {
             open(&plain).expect("opens").orientation(),
             Orientation::NoTransforms
         );
+    }
+
+    /// gl-1213: a JPEG coded in one scan per component, which the full decode
+    /// hands to [`ScalableJpeg::decode_full`], keeps its EXIF orientation: the
+    /// oriented decode stands it upright, the plain one leaves it as stored.
+    #[test]
+    fn a_split_scan_jpeg_decodes_upright() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("phone.jpg");
+        // Stored landscape, red on the left and blue on the right; EXIF 6
+        // turns it a quarter clockwise, so upright red is on top.
+        let stored = RgbImage::from_fn(32, 16, |x, _| {
+            image::Rgb(if x < 16 { [220, 30, 30] } else { [30, 30, 220] })
+        });
+        let mut encoder = jpeg_encoder::Encoder::new_file(&path, 90).expect("create");
+        encoder.set_optimized_huffman_tables(true);
+        encoder
+            .add_exif_metadata(&ORIENTATION_6_EXIF)
+            .expect("exif");
+        encoder
+            .encode(stored.as_raw(), 32, 16, jpeg_encoder::ColorType::Rgb)
+            .expect("encode");
+        let path = path.to_str().expect("utf-8");
+        let memory = crate::limits::ImageMemory::new(ImageLimits::default());
+
+        let as_stored = memory.decode(path).expect("decodes").to_rgb8();
+        assert_eq!(as_stored.dimensions(), (32, 16));
+        let upright = memory.decode_oriented(path).expect("decodes").to_rgb8();
+        assert_eq!(upright.dimensions(), (16, 32));
+        let [top, bottom] = [upright.get_pixel(8, 4).0, upright.get_pixel(8, 28).0];
+        assert!(top[0] > 180 && top[2] < 80, "top {top:?}");
+        assert!(bottom[2] > 180 && bottom[0] < 80, "bottom {bottom:?}");
     }
 
     /// A decode that finds another orientation than the one the target was
