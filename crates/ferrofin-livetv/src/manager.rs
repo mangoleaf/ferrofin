@@ -65,7 +65,7 @@ use crate::projection::{
 };
 use crate::schedules_direct::{SchedulesDirect, SdChannel, SdProgram};
 use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
-use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, read_xmltv_where};
+use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, read_xmltv_each};
 use crate::xmltv_cache::XmlTvDocument;
 
 /// SQLite's conservative default bind-parameter limit (`SQLITE_MAX_VARIABLE_NUMBER`
@@ -1020,8 +1020,9 @@ impl Drop for FiringClaim {
     }
 }
 
-/// Reads an XMLTV document from its file on the blocking pool, keeping the
-/// programmes `keep` accepts, and hands the document back with the result.
+/// Reads an XMLTV document's channels, and whether it is readable, from its
+/// file on the blocking pool, and hands the document back with the result.
+/// Every programme's children are read past, unbuilt.
 ///
 /// A large IPTV guide is hundreds of megabytes and takes seconds to parse, and
 /// a guide refresh reads each document twice (channels here, then the bound
@@ -1032,24 +1033,25 @@ impl Drop for FiringClaim {
 async fn parse_guide(
     document: XmlTvDocument,
     language: Option<String>,
-    keep: impl FnMut(&XmltvProgramme) -> bool + Send + 'static,
 ) -> Result<(XmlTvDocument, Xmltv), ServiceError> {
     tokio::task::spawn_blocking(move || {
-        let guide = read_document(&document, language.as_deref(), keep);
+        let guide = read_document(&document, language.as_deref(), |_| false, |_| {});
         (document, guide)
     })
     .await
     .map_err(|e| ServiceError::Backend(format!("XMLTV parse task failed: {e}")))
 }
 
-/// Reads `document` from its start, keeping the programmes `keep` accepts.
+/// Reads `document` from its start, handing each programme `keep` accepts on
+/// its start tag to `each` ([`read_xmltv_each`]).
 fn read_document(
     document: &XmlTvDocument,
     language: Option<&str>,
     keep: impl FnMut(&XmltvProgramme) -> bool,
+    each: impl FnMut(XmltvProgramme),
 ) -> Xmltv {
     match document.reader() {
-        Ok(reader) => read_xmltv_where(reader, language, keep),
+        Ok(reader) => read_xmltv_each(reader, language, keep, each),
         Err(e) => Xmltv {
             error: Some(format!("the XMLTV document could not be read: {e}")),
             ..Xmltv::default()
@@ -1079,7 +1081,7 @@ async fn spool_guide(
     document: XmlTvDocument,
     dir: PathBuf,
     language: Option<String>,
-    mut keep: impl FnMut(&XmltvProgramme) -> bool + Send + 'static,
+    keep: impl FnMut(&XmltvProgramme) -> bool + Send + 'static,
 ) -> Result<(std::fs::File, Option<String>), ServiceError> {
     use std::io::{Seek as _, Write as _};
     let spool_error = |e| ServiceError::from(LiveTvError::io("set the guide's airings aside", e));
@@ -1089,14 +1091,13 @@ async fn spool_guide(
             .map_err(spool_error)?;
         let mut out = std::io::BufWriter::new(spool);
         let mut failed = None;
-        let guide = read_document(&document, language.as_deref(), |prog| {
-            if failed.is_none() && keep(prog) {
-                failed = serde_json::to_writer(&mut out, prog)
+        let guide = read_document(&document, language.as_deref(), keep, |prog| {
+            if failed.is_none() {
+                failed = serde_json::to_writer(&mut out, &prog)
                     .map_err(std::io::Error::from)
                     .and_then(|()| out.write_all(b"\n"))
                     .err();
             }
-            false
         });
         drop(document);
         if let Some(e) = failed {
@@ -2166,8 +2167,8 @@ impl FerrofinLiveTvManager {
                 .collect());
         }
         let document = self.xmltv.get_xml(info).await?;
-        // The channels only: every airing is dropped as soon as it is read.
-        let (_, guide) = parse_guide(document, self.guide_language(info), |_| false).await?;
+        // The channels only: every airing's children are read past, unbuilt.
+        let (_, guide) = parse_guide(document, self.guide_language(info)).await?;
         // Upstream's `GetChannels` throws on a bad document, so the mapping
         // dialog shows an error instead of "no channels".
         if let Some(e) = guide.error {
@@ -2586,9 +2587,9 @@ impl FerrofinLiveTvManager {
             // `Err` below.
             Ok(document) => {
                 // The channels and whether the document is readable; every
-                // airing is dropped as it is read.
+                // airing's children are read past, unbuilt.
                 let (document, probe) =
-                    parse_guide(document, self.guide_language(provider), |_| false).await?;
+                    parse_guide(document, self.guide_language(provider)).await?;
                 if let Some(e) = &probe.error {
                     tracing::warn!(
                         listings_provider = provider.id.as_deref().unwrap_or_default(),
