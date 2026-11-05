@@ -1563,7 +1563,8 @@ impl FerrofinLiveTvManager {
             return Ok(());
         };
         let view_id = self.live_tv_view_id().await;
-        let rows = crate::guide_repository::channel_rows(&self.db).await?;
+        let rows =
+            crate::guide_repository::channel_rows(&self.db, &LiveTvChannelQuery::default()).await?;
         // The channel items already stored, read ONCE: the merge below needs
         // them (the C# loads each item before assigning to it) and so does
         // `CleanDatabase`.
@@ -3289,9 +3290,11 @@ impl LiveTvManager for FerrofinLiveTvManager {
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
         // Port of `LiveTvManager.GetInternalChannels` + the controller's
         // projection. The generic item repository upstream runs this over SQL;
-        // the channel lineup is small (a tuner's M3U), so Ferrofin filters and
-        // sorts the loaded rows instead — identical results, one query.
-        let mut rows: Vec<ChannelRow> = crate::guide_repository::channel_rows(&self.db).await?;
+        // Ferrofin filters and sorts the loaded lineup instead — identical
+        // results, one query. An IPTV lineup can run to thousands of channels,
+        // so the read derives only the guide kinds this query filters on.
+        let mut rows: Vec<ChannelRow> =
+            crate::guide_repository::channel_rows(&self.db, query).await?;
 
         // Favourite/like filters and favourite-first sorting read the user's
         // channel user-data (C# pushes the same predicates into SQL).
@@ -7475,6 +7478,7 @@ fn db_err(e: sqlx::Error) -> ServiceError {
 
 #[cfg(test)]
 mod tests {
+    mod channel_list;
     mod guide_mirror;
     mod recording_folders;
     mod schedules_direct;
@@ -8087,7 +8091,7 @@ mod tests {
         // Read back through the repository, not inline SQL (the SQL-boundary
         // ratchet): `channel_rows` is the lineup in stored order, and
         // `channel_stream_source` is the per-channel tuner facts.
-        let rows = crate::guide_repository::channel_rows(&mgr.db)
+        let rows = crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default())
             .await
             .expect("channels");
         // The DRM row is dropped, and the identity is `hdhr_{GuideNumber}` —
@@ -13959,7 +13963,7 @@ mod tests {
             .expect("ids");
         assert!(found.is_empty(), "{found:?}");
         assert_eq!(
-            crate::guide_repository::channel_rows(&mgr.db)
+            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default())
                 .await
                 .expect("channels")
                 .len(),
@@ -14011,7 +14015,7 @@ mod tests {
         .await
         .expect("provider");
         mgr.refresh_guide().await.expect("refresh");
-        let before = crate::guide_repository::channel_rows(&mgr.db)
+        let before = crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default())
             .await
             .expect("channels");
         assert_eq!(before.len(), 2);
@@ -14029,7 +14033,7 @@ mod tests {
         );
         mgr.refresh_guide().await.expect("refresh2");
 
-        let after = crate::guide_repository::channel_rows(&mgr.db)
+        let after = crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default())
             .await
             .expect("channels2");
         assert_eq!(after.len(), 1);
@@ -14114,7 +14118,7 @@ mod tests {
         mgr.refresh_guide().await.expect("refresh2");
         assert_eq!(count().await, programs_after);
         assert_eq!(
-            crate::guide_repository::channel_rows(&mgr.db)
+            crate::guide_repository::channel_rows(&mgr.db, &LiveTvChannelQuery::default())
                 .await
                 .expect("channels")
                 .len(),

@@ -58,6 +58,10 @@ pub struct ChannelRow {
     pub image_url: Option<String>,
     /// Whether the guide airs a movie on this channel (upstream
     /// `LiveTvChannel.IsMovie`, aggregated from the programmes at refresh).
+    ///
+    /// This and the two kinds below are derived only by
+    /// [`crate::guide_repository::channel_rows`], and only for the kinds its
+    /// query filters on; everywhere else they read `false`.
     #[sqlx(default)]
     pub is_movie: bool,
     /// Whether the guide airs a series episode on this channel.
@@ -194,11 +198,12 @@ pub fn filter_channel_rows(
 /// prepends `(IsFavoriteOrLiked, Desc)`, and `(SortName, Asc)` is appended
 /// unless already requested.
 ///
-/// Sort keys the channel cache has no column for keep the lineup order (the
-/// appended `SortName` still breaks ties); `IsFavoriteOrLiked` sorts on the
-/// `IsFavorite` bit, exactly like the item repository's `translate_query`.
+/// Any other key (`DatePlayed`, `PlayCount`, …) compares equal, so the
+/// appended `SortName` decides; upstream's `OrderMapper` sorts on them, and
+/// gl-1354 tracks porting them. `IsFavoriteOrLiked` sorts on the `IsFavorite`
+/// bit, exactly like the item repository's `translate_query`.
 pub fn sort_channel_rows(
-    rows: &mut [ChannelRow],
+    rows: &mut Vec<ChannelRow>,
     query: &ferrofin_traits::stubs::LiveTvChannelQuery,
     user_data: &ChannelUserData,
 ) {
@@ -217,19 +222,27 @@ pub fn sort_channel_rows(
     if !order.iter().any(|(s, _)| *s == ItemSortBy::SortName) {
         order.push((ItemSortBy::SortName, SortOrder::Ascending));
     }
-    let is_favorite = |row: &ChannelRow| user_data.get(&row.id).is_some_and(|d| d.0);
-    rows.sort_by(|a, b| {
+    // Each row's keys are built once: rebuilding the padded sort name on both
+    // sides of every comparison dominated the sort of a large lineup.
+    let mut keyed: Vec<(String, String, bool, ChannelRow)> = rows
+        .drain(..)
+        .map(|row| {
+            (
+                channel_sort_name(row.number.as_deref(), &row.name).to_lowercase(),
+                row.name.to_lowercase(),
+                user_data.get(&row.id).is_some_and(|d| d.0),
+                row,
+            )
+        })
+        .collect();
+    keyed.sort_by(|(a_key, a_name, a_fav, a), (b_key, b_name, b_fav, b)| {
         for (sort, direction) in &order {
             let ordering = match sort {
-                ItemSortBy::SortName | ItemSortBy::Default => {
-                    channel_sort_name(a.number.as_deref(), &a.name)
-                        .to_lowercase()
-                        .cmp(&channel_sort_name(b.number.as_deref(), &b.name).to_lowercase())
-                }
+                ItemSortBy::SortName | ItemSortBy::Default => a_key.cmp(b_key),
                 // Upstream maps `ItemSortBy.Name` to `CleanName` — the plain
                 // display name, not the number-padded channel sort key.
-                ItemSortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                ItemSortBy::IsFavoriteOrLiked => is_favorite(a).cmp(&is_favorite(b)),
+                ItemSortBy::Name => a_name.cmp(b_name),
+                ItemSortBy::IsFavoriteOrLiked => a_fav.cmp(b_fav),
                 ItemSortBy::DateCreated => a.date_created.cmp(&b.date_created),
                 _ => std::cmp::Ordering::Equal,
             };
@@ -243,6 +256,7 @@ pub fn sort_channel_rows(
         }
         std::cmp::Ordering::Equal
     });
+    rows.extend(keyed.into_iter().map(|(.., row)| row));
 }
 
 /// `LiveTvChannel.MediaType`: radio channels are audio, everything else video.
@@ -1309,6 +1323,85 @@ mod tests {
         // title sorts as ASCII and interleaves with the rest of the library
         // instead of landing after it under SQLite's BINARY collation.
         assert_eq!(item_sort_name("Café Größe"), "cafe grosse");
+    }
+
+    /// Every key the lineup sorts on, in both directions, with favourite-first
+    /// and the appended `SortName`; ties keep the stored order.
+    #[test]
+    fn the_lineup_sorts_on_each_requested_key() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+        use ferrofin_traits::stubs::LiveTvChannelQuery;
+
+        let row = |id: &str, number: Option<&str>, name: &str, created: &str| ChannelRow {
+            id: id.to_owned(),
+            tvg_id: String::new(),
+            external_id: String::new(),
+            name: name.to_owned(),
+            number: number.map(str::to_owned),
+            channel_type: "Tv".to_owned(),
+            date_created: Some(created.to_owned()),
+            image_url: None,
+            is_movie: false,
+            is_series: false,
+            is_kids: false,
+        };
+        // `e` and `c` share the sort key "0000000002.00000-alpha".
+        let lineup = vec![
+            row("e", Some("2.0"), "ALPHA", "2026-01-02"),
+            row("a", Some("10"), "bravo", "2026-01-03"),
+            row("b", Some("2"), "Charlie", "2026-01-01"),
+            row("c", Some("2"), "alpha", "2026-01-02"),
+            row("d", None, "Delta", "2026-01-01"),
+        ];
+        let favourites: ChannelUserData = [("c".to_owned(), (true, None))].into();
+        let sorted = |sort_by: &[ItemSortBy], order: Option<SortOrder>, favourite_first: bool| {
+            let mut rows = lineup.clone();
+            let query = LiveTvChannelQuery {
+                sort_by: sort_by.to_vec(),
+                sort_order: order,
+                enable_favorite_sorting: favourite_first,
+                ..LiveTvChannelQuery::default()
+            };
+            sort_channel_rows(&mut rows, &query, &favourites);
+            rows.into_iter().map(|r| r.id).collect::<Vec<_>>()
+        };
+        let desc = Some(SortOrder::Descending);
+        assert_eq!(sorted(&[], None, false), ["d", "e", "c", "b", "a"]);
+        assert_eq!(
+            sorted(&[ItemSortBy::Default], desc, false),
+            ["a", "b", "e", "c", "d"]
+        );
+        assert_eq!(
+            sorted(&[ItemSortBy::SortName], desc, false),
+            ["a", "b", "e", "c", "d"]
+        );
+        assert_eq!(
+            sorted(&[ItemSortBy::Name], None, false),
+            ["e", "c", "a", "b", "d"]
+        );
+        assert_eq!(
+            sorted(&[ItemSortBy::Name], desc, false),
+            ["d", "b", "a", "e", "c"]
+        );
+        assert_eq!(
+            sorted(&[ItemSortBy::DateCreated], None, false),
+            ["d", "b", "e", "c", "a"]
+        );
+        assert_eq!(
+            sorted(&[ItemSortBy::DateCreated], desc, false),
+            ["a", "e", "c", "d", "b"]
+        );
+        assert_eq!(sorted(&[], None, true), ["c", "d", "e", "b", "a"]);
+        assert_eq!(
+            sorted(&[ItemSortBy::Name], desc, true),
+            ["c", "d", "b", "a", "e"]
+        );
+        // A key the lineup has no column for leaves it to `SortName`.
+        assert_eq!(
+            sorted(&[ItemSortBy::DatePlayed], desc, false),
+            ["d", "e", "c", "b", "a"]
+        );
     }
 
     #[test]
