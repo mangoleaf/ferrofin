@@ -19,7 +19,7 @@ use ferrofin_model::querying::{QueryFiltersLegacy, QueryResult};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ItemRepository, ItemWithCounts, PlaylistItemsWithAccess};
-use ferrofin_traits::stubs::LiveTvManager as _;
+use ferrofin_traits::stubs::{LiveTvChannelQuery, LiveTvManager as _};
 use uuid::Uuid;
 
 use super::{ArtServices, M3U, guide_day, item_lab_reading_through};
@@ -384,9 +384,10 @@ async fn a_logo_that_is_no_url_leaves_no_row_and_takes_the_stored_one(
     )
     .await;
     lab.mgr.refresh_guide().await.expect("first refresh");
-    let channels = crate::guide_repository::channel_rows(&lab.mgr.db)
-        .await
-        .expect("channels");
+    let channels =
+        crate::guide_repository::channel_rows(&lab.mgr.db, &LiveTvChannelQuery::default())
+            .await
+            .expect("channels");
     assert_eq!(channels.len(), 1);
     assert_eq!(channels[0].image_url.as_deref(), Some(logo));
     let channel = Uuid::parse_str(&channels[0].id).expect("guid");
