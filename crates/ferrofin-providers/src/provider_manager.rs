@@ -3272,7 +3272,9 @@ impl LocalProviderManager {
             {
                 continue;
             }
-            match self.write_automatic_image(item_id, kind, &download.bytes, &download.content_type)
+            match self
+                .write_automatic_image(item_id, kind, download.bytes, &download.content_type)
+                .await
             {
                 Ok(image) => {
                     images.push(image);
@@ -3284,11 +3286,11 @@ impl LocalProviderManager {
         saved
     }
 
-    fn write_automatic_image(
+    async fn write_automatic_image(
         &self,
         item_id: Uuid,
         kind: ImageType,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         mime: &str,
     ) -> Result<ItemImageInfo, ServiceError> {
         let index = if kind == ImageType::Backdrop {
@@ -3307,6 +3309,7 @@ impl LocalProviderManager {
             None
         };
         self.write_image_file(item_id, bytes, mime, kind, index)
+            .await
     }
 
     async fn refresh_plugin_images(
@@ -3343,7 +3346,7 @@ impl LocalProviderManager {
                 continue;
             };
             let mime = mime_types::get_mime_type(&format!("image.{ext}"));
-            match self.write_automatic_image(item_id, kind, &bytes, mime) {
+            match self.write_automatic_image(item_id, kind, bytes, mime).await {
                 Ok(image) => {
                     images.push(image);
                     saved = true;
@@ -3354,10 +3357,10 @@ impl LocalProviderManager {
         saved
     }
 
-    fn write_image_file(
+    async fn write_image_file(
         &self,
         item_id: Uuid,
-        content: &[u8],
+        content: impl Into<Vec<u8>>,
         mime_type: &str,
         image_type: ImageType,
         image_index: Option<i32>,
@@ -3376,21 +3379,27 @@ impl LocalProviderManager {
         let item_dir = meta_root.join(ferrofin_db::store::guid_to_db(item_id));
         let stem = image_file_stem(image_type, image_index);
         let dest = item_dir.join(format!("{stem}.{ext}"));
-        std::fs::create_dir_all(&item_dir).map_err(|e| {
-            ProvidersError::io(format!("create image dir {}", item_dir.display()), e)
-        })?;
-        ferrofin_util::file_helper::atomic_write(&dest, content)
-            .map_err(|e| ProvidersError::io(format!("write image {}", dest.display()), e))?;
-        for other in ["jpg", "jpeg", "png", "webp", "gif"] {
-            if other != ext {
-                let _ = std::fs::remove_file(item_dir.join(format!("{stem}.{other}")));
+        let content: Vec<u8> = content.into();
+        // `atomic_write` fsyncs: keep the disk work off the async workers.
+        let (dest, modified) = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&item_dir).map_err(|e| {
+                ProvidersError::io(format!("create image dir {}", item_dir.display()), e)
+            })?;
+            ferrofin_util::file_helper::atomic_write(&dest, &content)
+                .map_err(|e| ProvidersError::io(format!("write image {}", dest.display()), e))?;
+            for other in ["jpg", "jpeg", "png", "webp", "gif"] {
+                if other != ext {
+                    let _ = std::fs::remove_file(item_dir.join(format!("{stem}.{other}")));
+                }
             }
-        }
+            let modified = std::fs::metadata(&dest).and_then(|info| info.modified());
+            Ok::<_, ServiceError>((dest, modified))
+        })
+        .await
+        .map_err(|error| ServiceError::backend(error.to_string()))??;
         // `SetImagePath(…, FileInfo)`: the file's own modification time, so
         // the dynamic image providers' date gate sees an upload as current.
-        let date_modified = std::fs::metadata(&dest)
-            .and_then(|info| info.modified())
-            .map_or_else(|_| Utc::now(), chrono::DateTime::from);
+        let date_modified = modified.map_or_else(|_| Utc::now(), chrono::DateTime::from);
         Ok(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type,
@@ -5048,8 +5057,9 @@ impl ProviderManager for LocalProviderManager {
             0
         };
         let write_index = image_upload_file_index(image_type, index, &current)?;
-        let mut image =
-            self.write_image_file(item_id, content, mime_type, image_type, write_index)?;
+        let mut image = self
+            .write_image_file(item_id, content, mime_type, image_type, write_index)
+            .await?;
         let mut cleanup = None;
         if let (Some(saver), Some(items)) = (&self.image_saver, &self.items)
             && let Some(row) = items.retrieve_item(item_id).await?
@@ -10381,8 +10391,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn image_upload_backdrop_append_does_not_overwrite_a_referenced_file() {
+    #[tokio::test]
+    async fn image_upload_backdrop_append_does_not_overwrite_a_referenced_file() {
         use super::image_upload_file_index;
         let directory = tempfile::tempdir().unwrap();
         let item_id = Uuid::from_u128(0x9020);
@@ -10400,12 +10410,14 @@ mod tests {
                 ImageType::Backdrop,
                 Some(1),
             )
+            .await
             .unwrap();
         let index =
             image_upload_file_index(ImageType::Backdrop, 1, std::slice::from_ref(&existing))
                 .unwrap();
         let appended = manager
             .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, index)
+            .await
             .unwrap();
         assert_ne!(appended.path, existing.path);
         assert_eq!(std::fs::read(&existing.path).unwrap(), b"earlier");
@@ -10416,6 +10428,7 @@ mod tests {
         let index = image_upload_file_index(ImageType::Backdrop, 2, &current).unwrap();
         let identical = manager
             .write_image_file(item_id, b"earlier", "image/png", ImageType::Backdrop, index)
+            .await
             .unwrap();
         assert!(identical.path.strip_suffix("backdrop3.png").is_some());
         assert_eq!(std::fs::read(existing.path).unwrap(), b"earlier");
@@ -10424,8 +10437,8 @@ mod tests {
     /// `SetImagePath(…, FileInfo)`: an upload records its file's own
     /// modification time, so the dynamic image providers' date gate sees an
     /// upload left in the internal folder as current (gl-590).
-    #[test]
-    fn image_upload_records_the_file_modification_time() {
+    #[tokio::test]
+    async fn image_upload_records_the_file_modification_time() {
         let directory = tempfile::tempdir().unwrap();
         let manager = LocalProviderManager::default().with_image_store(
             Arc::new(RecordingStore::default()),
@@ -10439,6 +10452,7 @@ mod tests {
                 ImageType::Primary,
                 None,
             )
+            .await
             .unwrap();
         let modified = std::fs::metadata(&image.path).unwrap().modified().unwrap();
         assert_eq!(
@@ -10447,8 +10461,43 @@ mod tests {
         );
     }
 
+    /// The fsync'd image write runs on the blocking pool, not on the runtime
+    /// thread awaiting it (gl-1269): while the pool's only thread is held, the
+    /// write cannot finish.
     #[test]
-    fn image_upload_backdrop_replacement_preserves_a_case_only_path_change() {
+    fn image_write_runs_on_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let manager = LocalProviderManager::default().with_image_store(
+                Arc::new(RecordingStore::default()),
+                directory.path().to_path_buf(),
+            );
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || held.recv());
+            let mut write = std::pin::pin!(manager.write_image_file(
+                Uuid::from_u128(0x9591),
+                b"art",
+                "image/png",
+                ImageType::Primary,
+                None,
+            ));
+            let early =
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut write).await;
+            assert!(early.is_err(), "the write ran on the runtime thread");
+            release.send(()).unwrap();
+            let image = write.await.unwrap();
+            assert_eq!(std::fs::read(image.path).unwrap(), b"art");
+            blocker.await.unwrap().unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn image_upload_backdrop_replacement_preserves_a_case_only_path_change() {
         let directory = tempfile::tempdir().unwrap();
         let item_id = Uuid::from_u128(0x9022);
         let manager = LocalProviderManager::default().with_image_store(
@@ -10457,6 +10506,7 @@ mod tests {
         );
         let replacement = manager
             .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(0))
+            .await
             .unwrap();
         let previous_path = std::path::Path::new(&replacement.path).with_file_name("BACKDROP.PNG");
         std::fs::write(&previous_path, b"earlier").unwrap();
@@ -10480,8 +10530,8 @@ mod tests {
 
     /// A failed deletion of the replaced internal backdrop is reported, while
     /// an already-missing file is not.
-    #[test]
-    fn replaced_backdrop_deletion_failures_are_returned() {
+    #[tokio::test]
+    async fn replaced_backdrop_deletion_failures_are_returned() {
         let directory = tempfile::tempdir().unwrap();
         let item_id = Uuid::from_u128(0x9023);
         let manager = LocalProviderManager::default().with_image_store(
@@ -10490,6 +10540,7 @@ mod tests {
         );
         let replacement = manager
             .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(0))
+            .await
             .unwrap();
         let previous_path = std::path::Path::new(&replacement.path).with_file_name("old.jpg");
         let previous = ItemImageInfo {
@@ -10519,8 +10570,8 @@ mod tests {
         assert!(error.to_string().contains("remove replaced image"));
     }
 
-    #[test]
-    fn image_upload_backdrop_replacement_preserves_another_slots_case_alias() {
+    #[tokio::test]
+    async fn image_upload_backdrop_replacement_preserves_another_slots_case_alias() {
         let directory = tempfile::tempdir().unwrap();
         let item_id = Uuid::from_u128(0x9023);
         let manager = LocalProviderManager::default().with_image_store(
@@ -10535,6 +10586,7 @@ mod tests {
                 ImageType::Backdrop,
                 Some(1),
             )
+            .await
             .unwrap();
         let replacement = manager
             .write_image_file(
@@ -10544,6 +10596,7 @@ mod tests {
                 ImageType::Backdrop,
                 Some(2),
             )
+            .await
             .unwrap();
         let alias = ItemImageInfo {
             path: std::path::Path::new(&previous.path)
@@ -10561,8 +10614,8 @@ mod tests {
         assert_eq!(std::fs::read(replacement.path).unwrap(), b"replacement");
     }
 
-    #[test]
-    fn image_upload_backdrop_replacement_cleans_only_owned_unshared_files() {
+    #[tokio::test]
+    async fn image_upload_backdrop_replacement_cleans_only_owned_unshared_files() {
         let directory = tempfile::tempdir().unwrap();
         let item_id = Uuid::from_u128(0x9021);
         let manager = LocalProviderManager::default().with_image_store(
@@ -10577,9 +10630,11 @@ mod tests {
                 ImageType::Backdrop,
                 Some(1),
             )
+            .await
             .unwrap();
         let replacement = manager
             .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(2))
+            .await
             .unwrap();
         manager
             .remove_replaced_internal_file(
