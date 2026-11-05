@@ -379,6 +379,14 @@ const CHANNEL_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
 /// its first-seen `DateCreated` (upstream stamps it only on a NEW
 /// `LiveTvProgram`; a pre-migration NULL heals to the refresh instant via the
 /// COALESCE), while everything else is the listing's current word.
+///
+/// An airing listed again unchanged is left as it is. `GuideManager.GetProgram`
+/// saves an existing programme only when its listing moved (v12.4
+/// GuideManager.cs:490-675). Without the guard, a refresh would rewrite every
+/// row of a guide that barely changed, index entries included, inside the
+/// write that holds the database's one writer. The guard compares every
+/// column the `SET` takes from the listing (unqualified names are the stored
+/// row), and a NULL `DateCreated` still heals.
 const PROGRAM_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
                     "DateCreated"=COALESCE("FerrofinLiveTvPrograms"."DateCreated", excluded."DateCreated"),
                     "ChannelId"=excluded."ChannelId","StartDate"=excluded."StartDate",
@@ -393,7 +401,22 @@ const PROGRAM_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
                     "IsSports"=excluded."IsSports","ExternalId"=excluded."ExternalId",
                     "IsLive"=excluded."IsLive","ExternalSeriesId"=excluded."ExternalSeriesId",
                     "SeasonNumber"=excluded."SeasonNumber","EpisodeNumber"=excluded."EpisodeNumber",
-                    "ShowId"=excluded."ShowId""#;
+                    "ShowId"=excluded."ShowId"
+                WHERE "DateCreated" IS NULL
+                   OR ("ChannelId","StartDate","EndDate","Title","EpisodeTitle","Overview",
+                       "Genres","ImageUrl","ProductionYear","EpisodeNum","IsNew","IsPremiere",
+                       "IsRepeat","OfficialRating","IsMovie","IsSeries","IsNews","IsKids",
+                       "IsSports","ExternalId","IsLive","ExternalSeriesId","SeasonNumber",
+                       "EpisodeNumber","ShowId")
+               IS NOT (excluded."ChannelId",excluded."StartDate",excluded."EndDate",
+                       excluded."Title",excluded."EpisodeTitle",excluded."Overview",
+                       excluded."Genres",excluded."ImageUrl",excluded."ProductionYear",
+                       excluded."EpisodeNum",excluded."IsNew",excluded."IsPremiere",
+                       excluded."IsRepeat",excluded."OfficialRating",excluded."IsMovie",
+                       excluded."IsSeries",excluded."IsNews",excluded."IsKids",
+                       excluded."IsSports",excluded."ExternalId",excluded."IsLive",
+                       excluded."ExternalSeriesId",excluded."SeasonNumber",
+                       excluded."EpisodeNumber",excluded."ShowId")"#;
 
 /// The on-disk locations the Live TV engine reads and writes.
 ///
@@ -12862,7 +12885,7 @@ mod tests {
             );
         }
         mgr.refresh_guide().await.expect("refresh");
-        crate::guide_repository::test_support::pin_program_dates(&mgr.db, first)
+        crate::guide_repository::test_support::pin_program_dates(&mgr.db, Some(first))
             .await
             .expect("pin");
 
@@ -12954,6 +12977,134 @@ mod tests {
                 .expect("airings"),
             before
         );
+    }
+
+    /// An airing a refresh lists again unchanged keeps its row untouched, so
+    /// re-reading a guide that barely moved does not rewrite every airing on
+    /// the database's one writer. A changed listing is still written, and an
+    /// airing stored before `DateCreated` existed still takes the write's
+    /// instant.
+    #[tokio::test]
+    async fn a_guide_write_rewrites_only_the_airings_that_changed() {
+        use super::{CategoryClasses, GuideWrite, XmltvProgramme, xmltv_program_rows};
+        use crate::guide_repository::test_support::{
+            channel_ids, pin_program_dates, program_dates, program_rows, total_changes,
+        };
+
+        /// Writes `airing` in a guide write of its own, answering how many
+        /// rows that write changed.
+        async fn write(
+            mgr: &FerrofinLiveTvManager,
+            airing: &XmltvProgramme,
+            by_epg_channel: &HashMap<String, Vec<(String, String)>>,
+        ) -> i64 {
+            let classes = CategoryClasses::from_provider(&ListingsProviderInfo::default());
+            let mut write = GuideWrite::begin(&mgr.db).await.expect("begin");
+            let before = total_changes(&mut write.tx).await.expect("changes");
+            let mut rows: Vec<_> = xmltv_program_rows(airing, by_epg_channel, &classes).collect();
+            write.upsert(&mut rows).await.expect("upsert");
+            let changed = total_changes(&mut write.tx).await.expect("changes") - before;
+            write.finish(&[]).await.expect("finish");
+            changed
+        }
+
+        let mgr = manager_with_relative_guide().await;
+        let channel = channel_ids(&mgr.db).await.expect("channels").remove(0);
+        let by_epg_channel =
+            HashMap::from([("one.tv".to_owned(), vec![(channel, "external".to_owned())])]);
+        let mut airing = XmltvProgramme {
+            channel_id: "one.tv".to_owned(),
+            start: chrono::DateTime::parse_from_rfc3339("2030-01-01T06:00:00+00:00").ok(),
+            title: "Rerun".to_owned(),
+            ..XmltvProgramme::default()
+        };
+
+        assert_eq!(
+            write(&mgr, &airing, &by_epg_channel).await,
+            1,
+            "a new airing"
+        );
+        assert_eq!(
+            write(&mgr, &airing, &by_epg_channel).await,
+            0,
+            "an airing listed again unchanged is not rewritten"
+        );
+
+        airing.desc = Some("Now with a description".to_owned());
+        assert_eq!(
+            write(&mgr, &airing, &by_epg_channel).await,
+            1,
+            "a changed airing"
+        );
+        let overview = |rows: Vec<crate::projection::ProgramRow>| {
+            rows.into_iter()
+                .find(|row| row.title == "Rerun")
+                .and_then(|row| row.overview)
+        };
+        assert_eq!(
+            overview(program_rows(&mgr.db).await.expect("airings")).as_deref(),
+            Some("Now with a description")
+        );
+
+        pin_program_dates(&mgr.db, None).await.expect("unpin");
+        assert_eq!(
+            write(&mgr, &airing, &by_epg_channel).await,
+            1,
+            "an airing without a DateCreated takes the write's instant"
+        );
+        let date = program_dates(&mgr.db)
+            .await
+            .expect("airings")
+            .into_iter()
+            .find(|(title, _, _)| title == "Rerun")
+            .and_then(|(_, _, date)| date);
+        assert!(date.is_some(), "the NULL DateCreated healed");
+    }
+
+    /// The upsert's unchanged-row guard compares, pairwise, exactly the
+    /// columns its `SET` takes from the listing, so a column added to one
+    /// cannot be missed by the other.
+    #[test]
+    fn the_programme_upsert_guard_compares_every_column_it_sets() {
+        let (set, guard) = super::PROGRAM_UPSERT_CONFLICT
+            .split_once(" WHERE ")
+            .expect("a guard");
+        let assigned: Vec<&str> = set
+            .split("=excluded.")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').nth(1))
+            .collect();
+        let (stored, listed) = guard
+            .split_once(" IS NOT ")
+            .expect("a row-value comparison");
+        let names = |tuple: &str, prefix: &str| -> Vec<String> {
+            let inner = tuple.rsplit('(').next().unwrap_or_default();
+            inner
+                .split(')')
+                .next()
+                .unwrap_or_default()
+                .split(',')
+                .map(|name| {
+                    let name = name.trim();
+                    name.strip_prefix(prefix)
+                        .unwrap_or(name)
+                        .trim_matches('"')
+                        .to_owned()
+                })
+                .collect()
+        };
+        assert_eq!(assigned.len(), 25, "{assigned:?}");
+        // Every other assignment copies its own column from the listing; the
+        // one left over is `DateCreated`'s COALESCE.
+        for name in &assigned {
+            assert!(
+                set.contains(&format!("\"{name}\"=excluded.\"{name}\"")),
+                "{name}"
+            );
+        }
+        assert_eq!(set.matches("\"=").count(), assigned.len() + 1, "{set}");
+        assert_eq!(names(stored, ""), assigned);
+        assert_eq!(names(listed, "excluded."), assigned);
     }
 
     /// The spool is read back a batch at a time, and a line that is not an
