@@ -49,16 +49,16 @@ fn transcode_marker_exists(path: &Path) -> bool {
 fn conflicting_transcode_marker(path: &Path) -> std::io::Result<Option<PathBuf>> {
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
-        let child = entry.path();
         // The entry's own type comes with the listing; only a symlink needs a
         // `stat` to learn what it points at. `is_dir()` on every entry stat'ed
         // each segment file of every live transcode, on every HLS request.
+        // The child path is built only where it is used, for the same reason.
         let is_dir = match entry.file_type() {
             Ok(kind) if !kind.is_symlink() => kind.is_dir(),
-            _ => child.is_dir(),
+            _ => entry.path().is_dir(),
         };
         if is_dir {
-            if let Some(conflict) = conflicting_transcode_marker(&child)? {
+            if let Some(conflict) = conflicting_transcode_marker(&entry.path())? {
                 return Ok(Some(conflict));
             }
         } else {
@@ -67,7 +67,7 @@ fn conflicting_transcode_marker(path: &Path) -> std::io::Result<Option<PathBuf>>
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with(".jellyfin-") && !name.eq_ignore_ascii_case(".jellyfin-transcode") {
-                return Ok(Some(child));
+                return Ok(Some(entry.path()));
             }
         }
     }
