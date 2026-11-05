@@ -68,8 +68,10 @@ pub struct ImageParentRow {
 
 /// A handle to Ferrofin's SQLite database, wrapping two connection pools: a
 /// multi-connection **reader** pool ([`Database::pool`]) and a
-/// single-connection **writer** pool ([`Database::writer`]), plus a private
-/// one-connection pool for [`Database::snapshot_to`].
+/// single-connection **writer** pool ([`Database::writer`]), plus private
+/// one-connection pools for [`Database::snapshot_to`] and for the WAL
+/// checkpoints, which a background task runs so that no commit on the writer
+/// waits for one.
 ///
 /// SQLite under WAL serves many concurrent readers but exactly one writer at a
 /// time. Funnelling every write through a 1-connection pool turns would-be
@@ -88,6 +90,13 @@ pub struct Database {
     /// a long `VACUUM INTO` holds neither the writer nor a reader slot and
     /// [`Database::close`] still waits for it.
     snapshotter: SqlitePool,
+    /// One connection, opened on first use, for the WAL checkpoints the
+    /// writer's commits leave to [`crate::wal_checkpoints::run`], so no write
+    /// waits on a checkpoint's syncs.
+    pub(crate) checkpointer: SqlitePool,
+    /// What the writer's WAL hook, the checkpoint task and
+    /// [`Database::truncate_wal`] share.
+    pub(crate) checkpoints: Arc<crate::wal_checkpoints::WalCheckpoints>,
     /// One snapshot or one vacuum-and-checkpoint pass at a time
     /// ([`Database::try_maintenance_turn`]), shared by every clone.
     maintenance: Arc<tokio::sync::Mutex<()>>,
@@ -232,20 +241,26 @@ impl Database {
             .await?;
         // Reader and writer are the SAME 1-connection pool: a second pool
         // would open its own, empty in-memory database.
+        // An in-memory database has no WAL, so nothing checkpoints on it.
         let writer = pool.clone();
         let snapshotter = pool.clone();
+        let checkpointer = pool.clone();
         Ok(Self {
             pool,
             writer,
             snapshotter,
+            checkpointer,
+            checkpoints: Arc::default(),
             maintenance: Arc::default(),
             rows: Arc::new(crate::row_cache::RowCache::new()),
             file_path: None,
         })
     }
 
-    /// Builds the reader, writer and snapshot pools from fully-formed connect
-    /// options.
+    /// Builds the reader, writer, snapshot and checkpoint pools from
+    /// fully-formed connect options, and spawns the checkpoint task
+    /// ([`crate::wal_checkpoints::run`]) the writer's commits hand their
+    /// checkpoints to.
     ///
     /// `pool_size` `None` selects [`default_pool_size`] for the reader pool;
     /// the writer pool is always exactly one connection (SQLite allows one
@@ -262,14 +277,30 @@ impl Database {
         let snapshotter = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_lazy_with(read_options.clone());
+        let checkpointer = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(read_options.clone());
+        let checkpoints = Arc::new(crate::wal_checkpoints::WalCheckpoints::default());
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect_with(read_options)
             .await?;
+        // Every writer connection hands its automatic checkpoints to the task.
+        // The callback owns `checkpoints` for the pool's life, which is what
+        // keeps the hook's context alive under every connection.
+        let take_over = Arc::clone(&checkpoints);
         let writer = SqlitePoolOptions::new()
             .max_connections(1)
+            .after_connect(move |conn, _| {
+                let checkpoints = Arc::clone(&take_over);
+                Box::pin(async move { checkpoints.take_over(conn).await })
+            })
             .connect_with(write_options)
             .await?;
+        tokio::spawn(tracing::Instrument::instrument(
+            crate::wal_checkpoints::run(checkpointer.clone(), Arc::clone(&checkpoints)),
+            tracing::info_span!(parent: None, "wal_checkpoints"),
+        ));
         // One-time at startup: the reader pool size is the concurrent-read thread
         // count (each sqlx SQLite connection owns a dedicated OS thread), the
         // single operational knob behind read throughput.
@@ -282,6 +313,8 @@ impl Database {
             pool,
             writer,
             snapshotter,
+            checkpointer,
+            checkpoints,
             maintenance: Arc::default(),
             rows: Arc::new(crate::row_cache::RowCache::new()),
             file_path,
@@ -1069,6 +1102,44 @@ impl Database {
         self.pool.close().await;
         self.writer.close().await;
         self.snapshotter.close().await;
+        // After the writer, whose commits start checkpoints. It waits for a
+        // running one, and the checkpoint task ends with it.
+        self.checkpointer.close().await;
+    }
+
+    /// Folds the whole write-ahead log back into the database file and empties
+    /// it (`PRAGMA wal_checkpoint(TRUNCATE)`), as the optimization task does
+    /// after its vacuum.
+    ///
+    /// It takes its turn with the checkpoint task, so it waits for a
+    /// checkpoint the writer's commits started, however long that takes,
+    /// instead of answering busy against it: SQLite never waits for another
+    /// connection's checkpoint, and the `VACUUM` of a database larger than the
+    /// checkpoint threshold starts one. It runs on the writer, so writes queue
+    /// behind it in the pool rather than inside SQLite, where a transaction
+    /// that read before it writes would fail busy at once. Like any truncating
+    /// checkpoint, it waits through the busy timeout for every reader to step
+    /// off the log. When they do not in time, SQLite folds back what it can and
+    /// leaves the log in place; that is logged, not an error.
+    ///
+    /// # Errors
+    /// Returns the error when the writer cannot be acquired or the checkpoint
+    /// fails.
+    pub async fn truncate_wal(&self) -> Result<()> {
+        let _turn = self.checkpoints.turn.lock().await;
+        // (busy, frames in the log, frames checkpointed)
+        let (busy, log, checkpointed): (i64, i64, i64) =
+            sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_one(&self.writer)
+                .await?;
+        if busy != 0 {
+            tracing::warn!(
+                log_frames = log,
+                checkpointed_frames = checkpointed,
+                "the write-ahead log was still in use, so it was not emptied"
+            );
+        }
+        Ok(())
     }
 
     /// Whether [`Database::close`] has run.
