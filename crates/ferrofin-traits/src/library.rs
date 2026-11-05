@@ -2640,6 +2640,22 @@ pub trait MediaSourceManager: Send + Sync {
         user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError>;
 
+    /// [`Self::get_static_media_sources`] for an item the caller has already
+    /// read, as upstream's `GetStaticMediaSources(BaseItem item, …)` takes
+    /// it, so an implementation need not read its row again. The default
+    /// reads the sources by the row's id.
+    async fn get_static_media_sources_for(
+        &self,
+        item: &BaseItemEntity,
+        enable_path_substitution: bool,
+        user_id: Option<Uuid>,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        let id = Uuid::parse_str(&item.id)
+            .map_err(|_| ServiceError::invalid_input("the item's id is not a GUID"))?;
+        self.get_static_media_sources(id, enable_path_substitution, user_id)
+            .await
+    }
+
     /// Opens a live stream and returns its media source.
     async fn open_live_stream(
         &self,
@@ -2693,8 +2709,9 @@ pub trait MediaSourceManager: Send + Sync {
     }
 
     /// The media source a playback report names: the open live stream
-    /// `live_stream_id` names when it is non-empty, else the item's source
-    /// whose id is `media_source_id`, or `None` when no source has that id.
+    /// `live_stream_id` names when it is non-empty, else the source of `item`
+    /// (a row the caller has read) whose id is `media_source_id`, or `None`
+    /// when no source has that id.
     ///
     /// Port of `MediaSourceManager.GetMediaSource(item, mediaSourceId,
     /// liveStreamId, enablePathSubstitution)`. Unlike
@@ -2702,7 +2719,7 @@ pub trait MediaSourceManager: Send + Sync {
     /// source, never the first one. Upstream searches
     /// `GetPlaybackMediaSources(item, null, false, …)`. With no user and no
     /// probe, that is the static and channel sources, sorted. This searches
-    /// the userless [`Self::get_static_media_sources`], which holds the same
+    /// the userless [`Self::get_static_media_sources_for`], which holds the same
     /// sources. Only the order differs, and a search by id does not depend on
     /// it. The id is compared with [`MediaSourceInfo::id_matches`], so a guid
     /// in any spelling matches, where upstream compares the strings ignoring
@@ -2714,7 +2731,7 @@ pub trait MediaSourceManager: Send + Sync {
     /// upstream's `GetLiveStream` throws too, and a storage failure.
     async fn get_media_source(
         &self,
-        item_id: Uuid,
+        item: &BaseItemEntity,
         media_source_id: &str,
         live_stream_id: Option<&str>,
         enable_path_substitution: bool,
@@ -2723,7 +2740,7 @@ pub trait MediaSourceManager: Send + Sync {
             return self.get_live_stream(live_stream_id).await.map(Some);
         }
         Ok(self
-            .get_static_media_sources(item_id, enable_path_substitution, None)
+            .get_static_media_sources_for(item, enable_path_substitution, None)
             .await?
             .into_iter()
             .find(|source| source.id_matches(media_source_id)))

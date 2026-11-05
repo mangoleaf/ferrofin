@@ -186,6 +186,47 @@ impl NowPlaying {
     }
 }
 
+/// What a session shows as playing (C# `SessionInfo.NowPlayingItem`): the
+/// library item a start or progress report named, as that report read its
+/// row, and the item built from it.
+///
+/// Upstream's report builds the item before it returns. Here the first
+/// listing of the sessions that shows it builds it
+/// ([`FerrofinSessionManager::shown_now_playing_item`]), listings at the same
+/// moment share that one build, and later ones copy it, so a report builds
+/// nothing and a session nobody lists costs no build at all (gl-1242, an
+/// accepted divergence the owner chose on 2026-11-04). The item's own fields
+/// are the report's row; what the build reads beside it (the media source's
+/// streams, images, chapters) is what the first listing finds.
+struct NowPlayingItem {
+    report: NowPlaying,
+    row: BaseItemEntity,
+    /// The built item, once a listing has built it: `None` when the build
+    /// failed.
+    built: tokio::sync::OnceCell<Option<Arc<BaseItemDto>>>,
+}
+
+impl NowPlayingItem {
+    /// The item `report` names, whose row the report read, not built yet.
+    fn new(row: BaseItemEntity, report: NowPlaying) -> Arc<Self> {
+        Arc::new(Self {
+            report,
+            row,
+            built: tokio::sync::OnceCell::new(),
+        })
+    }
+
+    fn item_id(&self) -> Uuid {
+        self.report.item_id
+    }
+
+    /// Whether its build ran and failed: the session shows no item until a
+    /// report names the item again.
+    fn failed(&self) -> bool {
+        matches!(self.built.get(), Some(None))
+    }
+}
+
 /// The in-memory session-state object the C# `SessionInfo` domain class becomes.
 ///
 /// Deliberately **not** in `ferrofin-traits` (its reads surface the wire
@@ -212,12 +253,12 @@ struct SessionInfo {
     last_playback_check_in: DateTime<Utc>,
     last_paused_date: Option<DateTime<Utc>>,
     now_playing_item_id: Option<Uuid>,
-    /// The item the session shows as playing (C# `SessionInfo.NowPlayingItem`),
-    /// built by [`FerrofinSessionManager::now_playing_item`] on the report that
-    /// first names the item and kept while reports name it again
-    /// (`UpdateNowPlayingItem`). Cleared on stop (`RemoveNowPlayingItem`).
-    /// `None` while nothing plays or when the item could not be built.
-    now_playing_item: Option<Arc<BaseItemDto>>,
+    /// The item the session shows as playing (C# `SessionInfo.NowPlayingItem`):
+    /// set by the report that first names the item, kept while reports name it
+    /// again (`UpdateNowPlayingItem`), and built by the first listing that
+    /// shows it ([`NowPlayingItem`]). Cleared on stop (`RemoveNowPlayingItem`).
+    /// `None` while nothing plays.
+    now_playing_item: Option<Arc<NowPlayingItem>>,
     /// The session's `PlayState` (C# `SessionInfo.PlayState`): what the last
     /// start or progress report said (`UpdateNowPlayingItem`), reset on stop
     /// (`RemoveNowPlayingItem`). The idle stop reports its `MediaSourceId`, and
@@ -253,23 +294,22 @@ impl SessionInfo {
     /// `SessionManager.UpdateNowPlayingItem`, which both `OnPlaybackStart` and
     /// `OnPlaybackProgress` call). A session recreated mid-playback gets its
     /// now-playing item back from the first progress report, since clients
-    /// never resend the start. `now_playing` is the reported item's id when the
-    /// library knows it, with the `NowPlayingItem` to show for it, else `None`
-    /// (C# leaves `NowPlayingItem` null for an item it cannot resolve).
+    /// never resend the start. `now_playing` is the reported item when the
+    /// library knows it, else `None` (C# leaves `NowPlayingItem` null for an
+    /// item it cannot resolve).
     /// The report's play state replaces the session's whole `PlayState`, as
     /// upstream copies each member, so a report without a live stream clears
     /// it; a report without a media source gets the item's own id (C#
     /// `info.MediaSourceId = info.ItemId.ToString("N")`).
     fn update_now_playing(
         &mut self,
-        now_playing: Option<(Uuid, Option<Arc<BaseItemDto>>)>,
+        now_playing: Option<Arc<NowPlayingItem>>,
         info: &PlaybackProgressInfo,
         update_check_in: bool,
     ) {
         let now = Utc::now();
-        let (item_id, item) = now_playing.unzip();
-        self.now_playing_item_id = item_id;
-        self.now_playing_item = item.flatten();
+        self.now_playing_item_id = now_playing.as_ref().map(|item| item.item_id());
+        self.now_playing_item = now_playing;
         self.last_activity_date = now;
         if update_check_in {
             self.last_playback_check_in = now;
@@ -342,17 +382,18 @@ struct PlaybackSession {
     device_name: Option<String>,
     application_version: Option<String>,
     /// The item the session shows as playing, shared with the session.
-    now_playing_item: Option<Arc<BaseItemDto>>,
+    now_playing_item: Option<Arc<NowPlayingItem>>,
 }
 
 impl PlaybackSession {
     /// The item the session already shows, when a report names it again: C#
     /// `UpdateNowPlayingItem` keeps it (`info.Item = current`) and builds
-    /// nothing.
-    fn kept_now_playing_item(&self, item_id: Uuid) -> Option<Arc<BaseItemDto>> {
+    /// nothing. One whose build failed is not kept: the report replaces it, so
+    /// the next listing builds the item again, as upstream's next report does.
+    fn kept_now_playing_item(&self, item_id: Uuid) -> Option<Arc<NowPlayingItem>> {
         self.now_playing_item
             .as_ref()
-            .filter(|item| item.id == item_id)
+            .filter(|item| item.item_id() == item_id && !item.failed())
             .cloned()
     }
 
@@ -1497,13 +1538,11 @@ impl FerrofinSessionManager {
     /// streams. `RunTimeTicks` is the source's runtime when a source was found,
     /// else the item's.
     ///
-    /// As upstream, it runs on the start or progress report that first names
-    /// the item, and the session keeps the result
-    /// ([`SessionInfo::now_playing_item`]) while later reports name the item
-    /// again. A lookup that fails costs the item its streams, and a failed
-    /// build the whole item, and the report still succeeds, so the user's
-    /// progress is saved. The next report naming the item builds it again.
-    /// Upstream fails the report.
+    /// It runs once per item a report names, on the first listing that shows
+    /// it ([`Self::shown_now_playing_item`]); upstream runs it on the report.
+    /// A lookup that fails costs the item its streams, and a failed build the
+    /// whole item, until a report names the item again. Upstream fails the
+    /// report.
     async fn now_playing_item(
         &self,
         item: &BaseItemEntity,
@@ -1522,7 +1561,7 @@ impl FerrofinSessionManager {
                 .map_or_else(|| item_id.simple().to_string(), str::to_owned);
             match sources
                 .get_media_source(
-                    item_id,
+                    item,
                     &media_source_id,
                     now_playing.live_stream_id.as_deref(),
                     false,
@@ -1546,6 +1585,21 @@ impl FerrofinSessionManager {
             .as_ref()
             .map_or(item.run_time_ticks, |source| source.run_time_ticks);
         Some(info)
+    }
+
+    /// The `NowPlayingItem` a session shows for `playing`, built by the first
+    /// call and copied by the later ones; calls at the same moment share the
+    /// one build. `None` when the build failed.
+    async fn shown_now_playing_item(&self, playing: &NowPlayingItem) -> Option<Arc<BaseItemDto>> {
+        playing
+            .built
+            .get_or_init(|| async {
+                self.now_playing_item(&playing.row, &playing.report)
+                    .await
+                    .map(Arc::new)
+            })
+            .await
+            .clone()
     }
 
     /// Port of C# `SessionManager.GetItemInfo`: the item as a session shows it,
@@ -1708,33 +1762,6 @@ impl SessionManager for FerrofinSessionManager {
         } else {
             self.library_manager.get_item_by_id(info.item_id).await?
         };
-        let now_playing = match &item {
-            Some(row) => {
-                let shown = match session.kept_now_playing_item(info.item_id) {
-                    Some(kept) => Some(kept),
-                    None => self
-                        .now_playing_item(row, &NowPlaying::of(info))
-                        .await
-                        .map(Arc::new),
-                };
-                Some((info.item_id, shown))
-            }
-            None => None,
-        };
-
-        // Record the now-playing item + mark automatic progress started.
-        {
-            let mut sessions = self.sessions.lock().await;
-            if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
-                s.update_now_playing(now_playing, info, true);
-                s.is_playing = true;
-                // `if (info.PlayMethod != PlayMethod.Transcode) ClearTranscodingInfo(session.DeviceId)`.
-                if info.play_method != PlayMethod::Transcode {
-                    let device_id = s.device_id.clone();
-                    set_device_transcoding_info(&mut sessions, &device_id, None);
-                }
-            }
-        }
 
         // C# `OnPlaybackStart`: "User {0} started playback of '{1}' ({2} {3})",
         // logged here so every route that reports a start logs it once.
@@ -1752,11 +1779,33 @@ impl SessionManager for FerrofinSessionManager {
             );
         }
 
+        // The row moves into the now-playing item, which a listing builds.
+        let is_library_item = item.is_some();
+        let now_playing = item.map(|row| {
+            session
+                .kept_now_playing_item(info.item_id)
+                .unwrap_or_else(|| NowPlayingItem::new(row, NowPlaying::of(info)))
+        });
+
+        // Record the now-playing item + mark automatic progress started.
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
+                s.update_now_playing(now_playing, info, true);
+                s.is_playing = true;
+                // `if (info.PlayMethod != PlayMethod.Transcode) ClearTranscodingInfo(session.DeviceId)`.
+                if info.play_method != PlayMethod::Transcode {
+                    let device_id = s.device_id.clone();
+                    set_device_transcoding_info(&mut sessions, &device_id, None);
+                }
+            }
+        }
+
         // Record the start on every session user's data (C# OnPlaybackStart:
         // PlayCount++ and the LastPlayedDate stamp Next Up filters on); the
         // user-data manager announces the save to the user's devices. Only for
         // a library item: C# `if (libraryItem is not null)`.
-        if item.is_some() {
+        if is_library_item {
             let progress_item = self
                 .progress_item(info.item_id, info.media_source_id.as_deref())
                 .await?;
@@ -1797,23 +1846,17 @@ impl SessionManager for FerrofinSessionManager {
         }
 
         // C# `GetNowPlayingItem` and `info.Item = current`: the item the
-        // session already shows is neither looked up nor built again, so a
-        // steady stream of reports costs no query.
+        // session already shows is not looked up again, so a steady stream of
+        // reports costs no query.
         let now_playing = if info.item_id.is_nil() {
             None
         } else if let Some(kept) = session.kept_now_playing_item(info.item_id) {
-            Some((info.item_id, Some(kept)))
+            Some(kept)
         } else {
-            match self.library_manager.get_item_by_id(info.item_id).await? {
-                Some(row) => {
-                    let shown = self
-                        .now_playing_item(&row, &NowPlaying::of(info))
-                        .await
-                        .map(Arc::new);
-                    Some((info.item_id, shown))
-                }
-                None => None,
-            }
+            self.library_manager
+                .get_item_by_id(info.item_id)
+                .await?
+                .map(|row| NowPlayingItem::new(row, NowPlaying::of(info)))
         };
         let is_library_item = now_playing.is_some();
         {
@@ -2463,16 +2506,21 @@ impl SessionManager for FerrofinSessionManager {
         }
 
         // C# `ToSessionInfoDto`: `NowPlayingItem = sessionInfo.NowPlayingItem`,
-        // the item the playback reports built and the session keeps, and
-        // `NowViewingItem`, the one `ReportNowViewingItem` built.
-        let mut dtos: Vec<SessionInfoDto> = result
-            .into_iter()
-            .map(|(mut dto, (playing, viewing))| {
-                dto.now_playing_item = playing.as_deref().cloned();
-                dto.now_viewing_item = viewing.as_deref().cloned();
-                dto
-            })
-            .collect();
+        // the item the playback reports named, built by the first listing and
+        // kept by the session, and `NowViewingItem`, the one
+        // `ReportNowViewingItem` built.
+        let mut dtos: Vec<SessionInfoDto> = Vec::with_capacity(result.len());
+        for (mut dto, (playing, viewing)) in result {
+            if let Some(playing) = playing {
+                dto.now_playing_item = self
+                    .shown_now_playing_item(&playing)
+                    .await
+                    .as_deref()
+                    .cloned();
+            }
+            dto.now_viewing_item = viewing.as_deref().cloned();
+            dtos.push(dto);
+        }
 
         // Newest activity first (C# `OrderByDescending(LastActivityDate)`).
         dtos.sort_by_key(|s| std::cmp::Reverse(s.last_activity_date));
@@ -2485,7 +2533,15 @@ impl SessionManager for FerrofinSessionManager {
             .values()
             .map(|session| SessionSummary {
                 user_id: session.user_id,
-                now_playing_item_id: session.now_playing_item.as_ref().map(|item| item.id),
+                // The reported item, built or not; one whose build failed shows
+                // no item, as the listing does. An item whose build would fail
+                // shows here until a listing has tried it, where a build on the
+                // report would have shown none.
+                now_playing_item_id: session
+                    .now_playing_item
+                    .as_ref()
+                    .filter(|item| !item.failed())
+                    .map(|item| item.item_id()),
                 play_method: session.play_state.play_method,
                 is_transcoding: session.transcoding_info.is_some(),
             })
@@ -2948,8 +3004,8 @@ fn session_info_to_dto(session: &SessionInfo) -> SessionInfoDto {
 }
 
 /// The now-playing and now-viewing items a listed session shows, copied out
-/// of the pool after its lock is released.
-type SessionItems = (Option<Arc<BaseItemDto>>, Option<Arc<BaseItemDto>>);
+/// of the pool so they are built and copied after its lock is released.
+type SessionItems = (Option<Arc<NowPlayingItem>>, Option<Arc<BaseItemDto>>);
 
 /// C# `ReportTranscodingInfo(deviceId, info)`, which `ClearTranscodingInfo`
 /// calls with `null`: the first of `Sessions`, ordered by `LastActivityDate`

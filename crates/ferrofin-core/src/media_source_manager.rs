@@ -1864,6 +1864,24 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             .await
     }
 
+    async fn get_static_media_sources_for(
+        &self,
+        item: &BaseItemEntity,
+        enable_path_substitution: bool,
+        user_id: Option<Uuid>,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        let item_id = Uuid::parse_str(&item.id)
+            .map_err(|_| ServiceError::invalid_input("the item's id is not a GUID"))?;
+        self.static_sources(
+            item_id,
+            Some(item.clone()),
+            enable_path_substitution,
+            user_id,
+            None,
+        )
+        .await
+    }
+
     async fn open_live_stream(
         &self,
         request: &LiveStreamRequest,
@@ -3479,6 +3497,40 @@ mod tests {
         assert_eq!(estimated_video_bitrate(1280), Some(8_000_000));
         assert_eq!(estimated_video_bitrate(720), Some(2_000_000));
         assert_eq!(estimated_video_bitrate(320), None);
+    }
+
+    /// A report's media source is resolved from the row the caller read
+    /// (upstream's `GetMediaSource(BaseItem item, …)`), not from a second
+    /// read of it: the source follows the row it is given (gl-1242).
+    #[tokio::test]
+    async fn a_reported_media_source_is_found_on_the_row_given() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x103);
+        seed_item(&db, id, BaseItemKind::Movie).await;
+        let mut row = crate::test_support::fetch_item(&db, id).await;
+        row.path = Some("/media/as-read.mkv".to_owned());
+        let mgr = manager(&db);
+        let own = id.simple().to_string();
+
+        let found = mgr
+            .get_media_source(&row, &own, None, false)
+            .await
+            .expect("lookup")
+            .expect("the item's own source");
+        assert_eq!(found.id.as_deref(), Some(own.as_str()));
+        assert_eq!(found.path.as_deref(), Some("/media/as-read.mkv"));
+        assert!(
+            mgr.get_media_source(
+                &row,
+                &Uuid::from_u128(0x104).simple().to_string(),
+                None,
+                false
+            )
+            .await
+            .expect("lookup")
+            .is_none(),
+            "an id naming no source is no source"
+        );
     }
 
     #[tokio::test]

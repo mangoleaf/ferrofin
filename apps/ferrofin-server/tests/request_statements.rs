@@ -32,6 +32,9 @@
 //!   carries it, so the repository's scope resolution, the folder listing
 //!   and the box set's display order work from it: the parent's row is read
 //!   once, as upstream's controller reads it once (`GetParentItem`).
+//! - `POST /Sessions/Playing`, then `GET /Sessions` twice (gl-1242). The start
+//!   report builds no `NowPlayingItem`: the first listing builds it, from the
+//!   row the report read, and the second copies it.
 
 use std::sync::Mutex;
 
@@ -63,6 +66,9 @@ const LIVE_TV_SPAN: &str = "gl1154_live_tv_views_request";
 /// The span the recorded browses of a parent run in.
 const PARENT_SPAN: &str = "gl1153_parent_browse_request";
 
+/// The span the recorded playback start reports run in.
+const PLAYING_SPAN: &str = "gl1242_playing_request";
+
 /// The statements recorded inside each test's span, in order, tagged with the
 /// span: `cargo test` runs a binary's tests on threads of one process.
 static STATEMENTS: Mutex<Vec<(&'static str, String)>> = Mutex::new(Vec::new());
@@ -81,9 +87,15 @@ where
         }
         let Some(span) = ctx.event_scope(event).and_then(|mut scope| {
             scope.find_map(|span| {
-                [VIEWS_SPAN, VERSIONS_SPAN, LIVE_TV_SPAN, PARENT_SPAN]
-                    .into_iter()
-                    .find(|name| span.name() == *name)
+                [
+                    VIEWS_SPAN,
+                    VERSIONS_SPAN,
+                    LIVE_TV_SPAN,
+                    PARENT_SPAN,
+                    PLAYING_SPAN,
+                ]
+                .into_iter()
+                .find(|name| span.name() == *name)
             })
         }) else {
             return;
@@ -727,4 +739,127 @@ async fn a_dashboard_toggle_reaches_the_next_request(
             "Enabled = {enabled} reaches the next request"
         );
     }
+}
+
+#[tokio::test]
+async fn a_playback_start_leaves_the_now_playing_item_to_the_first_read() {
+    record_statements();
+    let harness = boot(&["Film Alpha (1999)/Film Alpha (1999).mkv"]).await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let (status, films) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!("/Items?userId={user_id}&recursive=true&includeItemTypes=Movie"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "films: {films}");
+    let film = films["Items"][0]["Id"]
+        .as_str()
+        .expect("the film")
+        .to_owned();
+
+    // The bench's playback screen body (gates/bench/screens.js).
+    let report = serde_json::json!({
+        "PositionTicks": 0, "ItemId": film, "MediaSourceId": film, "PlaySessionId": "ps-1",
+        "PlayMethod": "DirectPlay", "CanSeek": true, "IsPaused": false, "IsMuted": false,
+        "VolumeLevel": 100, "RepeatMode": "RepeatNone",
+    });
+    let start = playing_statements(
+        &router,
+        &auth_header,
+        "POST",
+        "/Sessions/Playing",
+        Some(report),
+    )
+    .await;
+    assert_eq!(
+        build_reads(&start),
+        Vec::<&str>::new(),
+        "the start report builds no NowPlayingItem: {start:#?}"
+    );
+    assert!(
+        row_reads_by_id(&start) >= 1,
+        "the report reads the item's row: {start:#?}"
+    );
+
+    // The first read builds it: the media source's streams and the item's
+    // own tables, from the row the report read, so the row is not read again.
+    let first = playing_statements(&router, &auth_header, "GET", "/Sessions", None).await;
+    assert_eq!(
+        build_reads(&first),
+        [
+            "AttachmentStreamInfos",
+            "BaseItemImageInfos",
+            "Chapters",
+            "MediaStreamInfos",
+            "TrickplayInfos"
+        ],
+        "{first:#?}"
+    );
+    assert_eq!(
+        row_reads_by_id(&first),
+        0,
+        "the item's row is not read again: {first:#?}"
+    );
+
+    // A later read copies the item it built.
+    let second = playing_statements(&router, &auth_header, "GET", "/Sessions", None).await;
+    assert_eq!(build_reads(&second), Vec::<&str>::new(), "{second:#?}");
+    let (status, sessions) = send(&router, &auth_header, "GET", "/Sessions", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let shown = sessions
+        .as_array()
+        .and_then(|list| list.iter().find_map(|s| s["NowPlayingItem"]["Id"].as_str()))
+        .expect("a session shows the film");
+    assert_eq!(shown, film);
+}
+
+/// Sends a request inside [`PLAYING_SPAN`] and returns its statements.
+async fn playing_statements(
+    router: &axum::Router,
+    auth_header: &str,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> Vec<String> {
+    clear_statements(PLAYING_SPAN);
+    let (status, response) = send(router, auth_header, method, uri, body)
+        .instrument(tracing::info_span!(PLAYING_SPAN))
+        .await;
+    assert!(status.is_success(), "{method} {uri}: {status} {response}");
+    statements_in(PLAYING_SPAN)
+}
+
+/// The tables a `NowPlayingItem` build reads that nothing else in these
+/// requests does, sorted.
+fn build_reads(statements: &[String]) -> Vec<&'static str> {
+    let tables = [
+        "MediaStreamInfos",
+        "AttachmentStreamInfos",
+        "BaseItemImageInfos",
+        "Chapters",
+        "TrickplayInfos",
+    ];
+    statements
+        .iter()
+        .filter_map(|statement| {
+            tables
+                .into_iter()
+                .find(|table| statement.starts_with(&format!(r#"SELECT * FROM "{table}""#)))
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// How many of `statements` read one item's whole row by id
+/// (`get_item_by_id`, `retrieve_item`).
+fn row_reads_by_id(statements: &[String]) -> usize {
+    statements
+        .iter()
+        .filter(|statement| statement.contains(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#))
+        .count()
 }

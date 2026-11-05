@@ -1,9 +1,10 @@
-//! A session's `NowPlayingItem` is built once per item, on the report that
-//! names it, and kept until another item plays or playback stops (C#
-//! `SessionManager.UpdateNowPlayingItem`: `current is null ||
-//! !info.ItemId.Equals(current.Id)`, and `RemoveNowPlayingItem`). Listing the
-//! sessions copies the stored item and builds nothing. The session summaries
-//! read the same stored item.
+//! A session's `NowPlayingItem` is built once per item and kept until another
+//! item plays or playback stops (C# `SessionManager.UpdateNowPlayingItem`:
+//! `current is null || !info.ItemId.Equals(current.Id)`, and
+//! `RemoveNowPlayingItem`). The report that names the item builds nothing: the
+//! first listing of the sessions builds it, from the row the report read, and
+//! later listings copy it (gl-1242). The session summaries read the reported
+//! item's id and build nothing.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,7 +34,8 @@ use crate::user_data_manager::FerrofinUserDataManager;
 use crate::user_manager::FerrofinUserManager;
 
 /// A DTO service that counts its builds and answers with the bare item (id
-/// and name). `fail_next` makes the next build fail.
+/// and name), yielding once first so concurrent listings overlap. `fail_next`
+/// makes the next build fail.
 #[derive(Default)]
 struct CountingDtoService {
     builds: AtomicUsize,
@@ -66,6 +68,7 @@ impl DtoService for CountingDtoService {
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         self.builds.fetch_add(1, Ordering::SeqCst);
+        tokio::task::yield_now().await;
         if self.fail_next.swap(false, Ordering::SeqCst) {
             return Err(ServiceError::backend("the build failed"));
         }
@@ -212,14 +215,15 @@ async fn the_now_playing_item_is_built_once_per_item_and_kept_until_stop() {
     let second = fixture.item("Second").await;
 
     fixture.start(first).await;
-    assert_eq!(fixture.builds(), 1, "the start report builds the item");
+    assert_eq!(fixture.builds(), 0, "the start report builds nothing");
+    assert_eq!(fixture.summarised().await, Some(first));
+    assert_eq!(fixture.builds(), 0, "the summaries build nothing");
 
-    // Listing copies the stored item: no read builds one.
+    // The first listing builds the item; the later ones copy it.
     for _ in 0..3 {
         assert_eq!(fixture.shown().await, Some((first, "First".to_owned())));
     }
-    assert_eq!(fixture.summarised().await, Some(first));
-    assert_eq!(fixture.builds(), 1, "a read builds nothing");
+    assert_eq!(fixture.builds(), 1, "only the first read builds the item");
 
     // C# `info.Item = current`: a report naming the shown item again keeps
     // it, so an edit made while it plays shows once another item plays.
@@ -229,10 +233,12 @@ async fn the_now_playing_item_is_built_once_per_item_and_kept_until_stop() {
     assert_eq!(fixture.shown().await, Some((first, "First".to_owned())));
     assert_eq!(fixture.builds(), 1, "the same item is not built again");
 
-    // A report naming another item builds that one.
+    // A report naming another item replaces it, and the next read builds
+    // that one.
     fixture.progress(second).await;
-    assert_eq!(fixture.builds(), 2);
+    assert_eq!(fixture.builds(), 1);
     assert_eq!(fixture.shown().await, Some((second, "Second".to_owned())));
+    assert_eq!(fixture.builds(), 2);
     assert_eq!(fixture.summarised().await, Some(second));
 
     // C# `RemoveNowPlayingItem`: a stop clears it.
@@ -242,8 +248,30 @@ async fn the_now_playing_item_is_built_once_per_item_and_kept_until_stop() {
 
     // The edited item, played again, is built afresh.
     fixture.start(first).await;
-    assert_eq!(fixture.builds(), 3);
     assert_eq!(fixture.shown().await, Some((first, "Renamed".to_owned())));
+    assert_eq!(fixture.builds(), 3);
+
+    // The item is built from the row the report read: an edit made between
+    // the report and the first read shows once another item plays, as it
+    // would had the report built it.
+    fixture.stop(first).await;
+    fixture.start(second).await;
+    fixture.rename(second, "Edited").await;
+    assert_eq!(fixture.shown().await, Some((second, "Second".to_owned())));
+}
+
+/// Listings at the same moment share one build: the second waits for the
+/// first's instead of building the item again.
+#[tokio::test]
+async fn listings_at_the_same_moment_share_one_build() {
+    let fixture = Fixture::new().await;
+    let item = fixture.item("Film").await;
+    fixture.start(item).await;
+
+    let (first, second) = tokio::join!(fixture.shown(), fixture.shown());
+    assert_eq!(first, Some((item, "Film".to_owned())));
+    assert_eq!(second, first);
+    assert_eq!(fixture.builds(), 1);
 }
 
 /// Every other way playback ends clears the shown item too: a report naming
@@ -271,23 +299,29 @@ async fn an_unknown_item_and_the_idle_stop_clear_the_shown_item() {
 }
 
 /// A build that fails leaves the session showing no item while it still
-/// plays (the maintenance guard holds), and the next report naming the item
-/// builds it again, as upstream's next report does after its own failed one.
+/// plays (the maintenance guard holds), and later reads do not retry it. The
+/// next report naming the item lets the next read build it again, as
+/// upstream's next report does after its own failed one.
 #[tokio::test]
-async fn a_failed_build_shows_no_item_and_the_next_report_builds_it() {
+async fn a_failed_build_shows_no_item_until_the_next_report_names_it() {
     let fixture = Fixture::new().await;
     let item = fixture.item("Film").await;
 
     fixture.dtos.fail_next.store(true, Ordering::SeqCst);
     fixture.start(item).await;
-    assert_eq!(fixture.builds(), 1);
     assert_eq!(fixture.shown().await, None);
+    assert_eq!(fixture.shown().await, None);
+    assert_eq!(
+        fixture.builds(),
+        1,
+        "a failed build is not retried by a read"
+    );
     assert_eq!(fixture.summarised().await, None);
     assert!(fixture.mgr.has_active_playback().await.expect("probe"));
 
     fixture.progress(item).await;
-    assert_eq!(fixture.builds(), 2);
     assert_eq!(fixture.shown().await, Some((item, "Film".to_owned())));
+    assert_eq!(fixture.builds(), 2);
     assert_eq!(fixture.summarised().await, Some(item));
 }
 
