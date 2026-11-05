@@ -30,6 +30,7 @@ use ferrofin_model::tasks::{
 };
 
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::localization::LocalizationManager;
 use tracing::Instrument as _;
 
 pub mod application;
@@ -168,14 +169,39 @@ pub trait ScheduledTask: Send + Sync {
     /// Used as the registry map key and echoed into [`TaskInfo::key`]/`id`.
     fn key(&self) -> &str;
 
-    /// The task's human-readable display name.
+    /// The task's human-readable display name, or its localization key when
+    /// [`is_localized`](ScheduledTask::is_localized).
     fn name(&self) -> &str;
 
-    /// A one-line description of what the task does.
+    /// A one-line description of what the task does, or its localization key
+    /// when [`is_localized`](ScheduledTask::is_localized).
     fn description(&self) -> &str;
 
-    /// The category the task is grouped under in the UI.
+    /// The category the task is grouped under in the UI, or its localization
+    /// key when [`is_localized`](ScheduledTask::is_localized).
     fn category(&self) -> &str;
+
+    /// Whether [`name`](ScheduledTask::name),
+    /// [`description`](ScheduledTask::description) and
+    /// [`category`](ScheduledTask::category) are keys into the core
+    /// localization dictionaries rather than display text.
+    ///
+    /// The registry then shows each in the ambient UI culture, as upstream's
+    /// core tasks return `_localization.GetLocalizedString("<key>")`. Defaults
+    /// to `false`: extension and WASM tasks show their own strings, as
+    /// upstream plugins localize themselves, and so do the two core tasks
+    /// upstream leaves as literals (`RefreshGuide`,
+    /// `TmdbRefreshUpcomingEpisodes`).
+    fn is_localized(&self) -> bool {
+        false
+    }
+
+    /// The value formatted into a localized description's `{0}`, as
+    /// upstream's `string.Format(GetLocalizedString(key), value)`. Only
+    /// `CleanLogFiles` has one.
+    fn description_argument(&self) -> Option<String> {
+        None
+    }
 
     /// Whether the task is hidden from the normal task listing.
     ///
@@ -308,22 +334,62 @@ impl Registration {
     /// MD5 of the task type's name (see
     /// [`task_id_for_key`](ferrofin_traits::tasks::task_id_for_key)), which is
     /// what every client addresses the task by.
-    fn to_info(&self) -> TaskInfo {
+    fn to_info(&self, localization: &dyn LocalizationManager) -> TaskInfo {
         let key = self.task.key().to_string();
-        TaskInfo {
-            name: Some(self.task.name().to_string()),
+        let mut info = TaskInfo {
             state: self.state,
             current_progress_percentage: (self.state == TaskState::Running)
                 .then(|| self.progress.current()),
             id: Some(self.id.clone()),
             last_execution_result: self.last_result.clone(),
             triggers: self.effective_triggers(),
-            description: Some(self.task.description().to_string()),
-            category: Some(self.task.category().to_string()),
             is_hidden: self.task.is_hidden(),
             key: Some(key),
-        }
+            ..TaskInfo::default()
+        };
+        self.show_text(&mut info, localization);
+        info
     }
+
+    /// Sets `info`'s name, description and category in the ambient UI culture.
+    fn show_text(&self, info: &mut TaskInfo, localization: &dyn LocalizationManager) {
+        let task = self.task.as_ref();
+        let mut description = shown(task, task.description(), localization);
+        if let Some(value) = task.description_argument() {
+            description = description.replace("{0}", &value);
+        }
+        info.name = Some(shown(task, task.name(), localization));
+        info.description = Some(description);
+        info.category = Some(shown(task, task.category(), localization));
+    }
+}
+
+/// A task's `text` as it is shown: a core task's localization key in the
+/// ambient UI culture (upstream's `GetLocalizedString(key)`, which falls back
+/// to the server culture, then `en-US`, then the key), any other task's string
+/// as it is.
+fn shown(task: &dyn ScheduledTask, text: &str, localization: &dyn LocalizationManager) -> String {
+    if task.is_localized() {
+        localization.get_localized_string(text)
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Orders tasks by name as C#'s `OrderBy(o => o.Name)` does: a stable sort
+/// with `Comparer<string>.Default`, the current culture's compare.
+fn sort_by_name(infos: &mut [TaskInfo]) {
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture()).ok();
+    infos.sort_by(|a, b| {
+        let (a, b) = (
+            a.name.as_deref().unwrap_or_default(),
+            b.name.as_deref().unwrap_or_default(),
+        );
+        comparer
+            .as_ref()
+            .map_or_else(|| a.cmp(b), |comparer| comparer.compare(a, b))
+    });
 }
 
 /// A run requested while its task was busy: the task key, the trigger tag
@@ -380,6 +446,10 @@ pub struct FerrofinTaskManager {
     /// [`Failed`](TaskCompletionStatus::Failed) is recorded as a `TaskFailed`
     /// dashboard Alert (port of upstream's `TaskCompletedLogger`).
     activity: Arc<Mutex<Option<Arc<dyn ferrofin_traits::activity::ActivityManager>>>>,
+    /// The localizer that shows the core tasks' text
+    /// ([`ScheduledTask::is_localized`]); `None` uses the embedded
+    /// dictionaries with an `en-US` server culture.
+    localization: Arc<Mutex<Option<Arc<dyn ferrofin_traits::localization::LocalizationManager>>>>,
     /// Set by [`shutdown`](Self::shutdown): no run starts after it, and the
     /// scheduler fires nothing (upstream's disposed worker, its triggers
     /// disposed). Written and read under the `tasks` lock.
@@ -542,9 +612,26 @@ impl FerrofinTaskManager {
         if self.updates.transitions.receiver_count() == 0 {
             return;
         }
-        let mut snapshot: Vec<_> = tasks.values().map(Registration::to_info).collect();
-        snapshot.sort_by(|a, b| a.name.cmp(&b.name));
-        let _ = self.updates.transitions.send(snapshot);
+        let _ = self.updates.transitions.send(self.snapshot(tasks));
+    }
+
+    /// Every registered task, ordered by name, in the ambient UI culture.
+    fn snapshot(&self, tasks: &HashMap<String, Registration>) -> Vec<TaskInfo> {
+        let localization = self.localizer();
+        let mut snapshot: Vec<_> = tasks
+            .values()
+            .map(|reg| reg.to_info(localization.as_ref()))
+            .collect();
+        sort_by_name(&mut snapshot);
+        snapshot
+    }
+
+    /// The attached localizer, or the embedded dictionaries with an `en-US`
+    /// server culture when none is.
+    fn localizer(&self) -> Arc<dyn LocalizationManager> {
+        lock(&self.localization).clone().unwrap_or_else(|| {
+            Arc::new(crate::localization_manager::LocalizationManager::default())
+        })
     }
 
     /// Creates an empty task registry.
@@ -728,6 +815,7 @@ impl FerrofinTaskManager {
         is_hidden: Option<bool>,
         is_enabled: Option<bool>,
     ) -> Vec<TaskInfo> {
+        let localization = self.localizer();
         let guard = lock(&self.tasks);
         let mut infos: Vec<TaskInfo> = guard
             .values()
@@ -738,29 +826,20 @@ impl FerrofinTaskManager {
                 is_hidden.is_none_or(|want| want == reg.task.is_hidden())
                     && is_enabled.is_none_or(|want| want == reg.task.is_enabled())
             })
-            .map(Registration::to_info)
+            .map(|reg| reg.to_info(localization.as_ref()))
             .collect();
         drop(guard);
-        // ORDINAL, where C#'s `OrderBy(o => o.Name)` is `Comparer<string>
-        // .Default` — `string.CompareTo`, i.e. a CurrentCulture compare. The two
-        // agree on all twenty of 10.11.8's task names (verified against the live
-        // wire order on both servers, byte for byte), because every one of them
-        // is ASCII and starts with an upper-case letter. They would NOT agree on
-        // a name whose first letter is lower-case (culture interleaves
-        // "audio…"/"Backup…", ordinal puts every upper-case name first), nor on
-        // names differing only by punctuation or diacritics, which a culture
-        // compare weights at a lower level than letters. Porting the culture
-        // comparator means an ICU collation dependency; this is a named, still
-        // open difference, not an accepted one, and it becomes visible the
-        // moment a task name breaks the ASCII/capitalised pattern.
-        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        sort_by_name(&mut infos);
         infos
     }
 
     /// Gets a single task's info by key, if registered.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<TaskInfo> {
-        lock(&self.tasks).get(key).map(Registration::to_info)
+        let localization = self.localizer();
+        lock(&self.tasks)
+            .get(key)
+            .map(|reg| reg.to_info(localization.as_ref()))
     }
 
     /// Resolves a wire task id (`ScheduledTaskWorker.Id`) to the registry key.
@@ -810,6 +889,16 @@ impl FerrofinTaskManager {
         activity: Arc<dyn ferrofin_traits::activity::ActivityManager>,
     ) {
         *lock(&self.activity) = Some(activity);
+    }
+
+    /// Attaches the localizer the core tasks' names, descriptions and
+    /// categories are shown through, so the server's live `UICulture` applies
+    /// outside a request.
+    pub fn set_localization_manager(
+        &self,
+        localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
+    ) {
+        *lock(&self.localization) = Some(localization);
     }
 
     /// Writes the `TaskFailed` activity entry for a failed run (best-effort,
@@ -1080,7 +1169,8 @@ impl FerrofinTaskManager {
                 start_time_utc: start,
                 end_time_utc: Utc::now(),
                 status,
-                name: Some(task.name().to_string()),
+                // Upstream's `ScheduledTaskWorker.Name`, read as the run ends.
+                name: Some(shown(task.as_ref(), task.name(), self.localizer().as_ref())),
                 key: Some(key.to_string()),
                 id: Some(self.id_for_key(key)),
                 error_message,
@@ -1148,6 +1238,7 @@ impl FerrofinTaskManager {
     /// Aborts a running task's spawned run, recording `status`, and returns it
     /// to [`Idle`](TaskState::Idle).
     fn stop_run(&self, key: &str, status: TaskCompletionStatus) -> Result<(), ServiceError> {
+        let localization = self.localizer();
         let mut guard = lock(&self.tasks);
         let reg = guard
             .get_mut(key)
@@ -1165,7 +1256,11 @@ impl FerrofinTaskManager {
             start_time_utc: start,
             end_time_utc: Utc::now(),
             status,
-            name: Some(reg.task.name().to_string()),
+            name: Some(shown(
+                reg.task.as_ref(),
+                reg.task.name(),
+                localization.as_ref(),
+            )),
             key: Some(key.to_string()),
             id: Some(reg.id.clone()),
             error_message: None,
@@ -1590,13 +1685,16 @@ impl ScheduledTask for RefreshLibraryTask {
         "RefreshLibrary"
     }
     fn name(&self) -> &str {
-        "Scan Media Library"
+        "TaskRefreshLibrary"
     }
     fn description(&self) -> &str {
-        "Scans your media library for new files and refreshes metadata."
+        "TaskRefreshLibraryDescription"
     }
     fn category(&self) -> &str {
-        "Library"
+        library::LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![TaskTriggerInfo {
@@ -1649,13 +1747,24 @@ impl ferrofin_traits::tasks::TaskManager for FerrofinTaskManager {
         let guard = lock(&self.tasks);
         let updates = self.updates.transitions.subscribe();
         let progress = self.updates.progress.subscribe();
-        let mut snapshot: Vec<_> = guard.values().map(Registration::to_info).collect();
-        snapshot.sort_by(|a, b| a.name.cmp(&b.name));
         Some(ferrofin_traits::tasks::TaskSubscription {
-            snapshot,
+            snapshot: self.snapshot(&guard),
             updates,
             progress,
         })
+    }
+
+    fn localize_tasks(&self, mut tasks: Vec<TaskInfo>) -> Vec<TaskInfo> {
+        let localization = self.localizer();
+        let guard = lock(&self.tasks);
+        for info in &mut tasks {
+            if let Some(reg) = info.key.as_deref().and_then(|key| guard.get(key)) {
+                reg.show_text(info, localization.as_ref());
+            }
+        }
+        drop(guard);
+        sort_by_name(&mut tasks);
+        tasks
     }
 
     async fn get_tasks(&self) -> Result<Vec<TaskInfo>, ServiceError> {
@@ -1958,6 +2067,103 @@ mod tests {
             sorted.sort_unstable();
             sorted
         });
+    }
+
+    /// A core task whose name is the localization key it is registered under.
+    struct KeyedTask(&'static str);
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for KeyedTask {
+        fn key(&self) -> &str {
+            self.0
+        }
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "no such phrase"
+        }
+        fn category(&self) -> &str {
+            "TasksMaintenanceCategory"
+        }
+        fn is_localized(&self) -> bool {
+            true
+        }
+        async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    fn names(list: &[ferrofin_model::tasks::TaskInfo]) -> Vec<&str> {
+        list.iter().filter_map(|t| t.name.as_deref()).collect()
+    }
+
+    /// Outside any request there is no ambient UI culture, so a core task is
+    /// listed in the server's `UICulture`, as upstream's
+    /// `GetLocalizedString` falls back to it; a phrase missing from the
+    /// dictionaries is shown as it is.
+    #[test]
+    fn outside_a_request_core_tasks_use_the_server_culture() {
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_localization_manager(Arc::new(
+            crate::localization_manager::LocalizationManager::new("US").with_ui_culture("de"),
+        ));
+        mgr.register(Arc::new(KeyedTask("TaskCleanActivityLog")));
+        let info = mgr.get("TaskCleanActivityLog").expect("registered");
+        assert_eq!(info.name.as_deref(), Some("Aktivitätsverlauf bereinigen"));
+        assert_eq!(info.category.as_deref(), Some("Wartung"));
+        assert_eq!(info.description.as_deref(), Some("no such phrase"));
+    }
+
+    /// C#'s `OrderBy(o => o.Name)` compares in the current culture, which an
+    /// ordinal sort gets wrong once a name leaves ASCII: ordinal puts "Écran"
+    /// after "Zebra".
+    #[tokio::test]
+    async fn tasks_are_ordered_by_a_culture_compare() {
+        let mgr = FerrofinTaskManager::new();
+        for (key, name) in [("z", "Zebra"), ("e", "Écran"), ("a", "Apple")] {
+            mgr.register(Arc::new(MetaTask {
+                key,
+                name,
+                hidden: false,
+                configurable: false,
+                enabled: true,
+            }));
+        }
+        let list =
+            ferrofin_util::current_culture::scope("en-US".to_owned(), async { mgr.list() }).await;
+        assert_eq!(names(&list), vec!["Apple", "Écran", "Zebra"]);
+    }
+
+    /// A transition snapshot published under one culture is re-localized, and
+    /// re-ordered, in the culture of the socket that sends it. The two tasks
+    /// change places between German and English.
+    #[tokio::test]
+    async fn localize_tasks_redoes_a_snapshot_in_the_ambient_culture() {
+        use ferrofin_traits::tasks::TaskManager as _;
+        async fn in_culture<T>(culture: &str, work: impl std::future::Future<Output = T>) -> T {
+            ferrofin_util::current_culture::scope_with_ui(
+                culture.to_owned(),
+                Some(culture.to_owned()),
+                work,
+            )
+            .await
+        }
+        let mgr = FerrofinTaskManager::new();
+        mgr.register(Arc::new(KeyedTask("TaskDownloadMissingSubtitles")));
+        mgr.register(Arc::new(KeyedTask("TaskOptimizeDatabase")));
+        let german = in_culture("de", async { mgr.list() }).await;
+        assert_eq!(
+            names(&german),
+            vec!["Datenbank optimieren", "Fehlende Untertitel herunterladen"]
+        );
+        let english = in_culture("en-US", async { mgr.localize_tasks(german) }).await;
+        assert_eq!(
+            names(&english),
+            vec!["Download missing subtitles", "Optimize database"]
+        );
+        assert_eq!(english[0].category.as_deref(), Some("Maintenance"));
     }
 
     /// The C# applies `isHidden`/`isEnabled` only inside

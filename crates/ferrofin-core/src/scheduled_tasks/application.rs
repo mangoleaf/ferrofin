@@ -19,8 +19,8 @@ use ferrofin_traits::plugins::PluginManager;
 
 use super::{ScheduledTask, TaskProgress, interval_hours};
 
-/// The upstream Application category display string (`TasksApplicationCategory`).
-const APPLICATION: &str = "Application";
+/// The upstream Application category's localization key.
+const APPLICATION: &str = "TasksApplicationCategory";
 
 /// The share of the run's progress spent fetching the catalog, before any
 /// install starts (upstream reports 10 after the package fetch and spreads the
@@ -69,13 +69,16 @@ impl ScheduledTask for PluginUpdateTask {
     }
 
     fn name(&self) -> &str {
-        "Update Plugins"
+        "TaskUpdatePlugins"
     }
     fn description(&self) -> &str {
-        "Downloads and installs updates for plugins that are configured to update automatically."
+        "TaskUpdatePluginsDescription"
     }
     fn category(&self) -> &str {
         APPLICATION
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![
@@ -258,13 +261,10 @@ mod tests {
     fn metadata_matches_upstream() {
         let (task, _) = task(Vec::new(), false);
         assert_eq!(task.key(), "PluginUpdates");
-        assert_eq!(task.name(), "Update Plugins");
-        assert_eq!(task.category(), "Application");
-        assert_eq!(
-            task.description(),
-            "Downloads and installs updates for plugins that are configured to update \
-             automatically."
-        );
+        assert!(task.is_localized());
+        assert_eq!(task.name(), "TaskUpdatePlugins");
+        assert_eq!(task.category(), "TasksApplicationCategory");
+        assert_eq!(task.description(), "TaskUpdatePluginsDescription");
         assert!(!task.is_hidden());
         let triggers = task.default_triggers();
         assert_eq!(triggers.len(), 2);

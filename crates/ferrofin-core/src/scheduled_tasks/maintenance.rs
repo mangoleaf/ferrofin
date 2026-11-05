@@ -1,9 +1,8 @@
 //! The Maintenance-category scheduled tasks.
 //!
-//! Faithful ports of the upstream maintenance `IScheduledTask`s (names, keys,
-//! categories, descriptions and default triggers match
-//! `Emby.Server.Implementations/ScheduledTasks/Tasks/*` and the en-US
-//! localization strings):
+//! Faithful ports of the upstream maintenance `IScheduledTask`s (keys, default
+//! triggers and the localization keys of their names, categories and
+//! descriptions match `Emby.Server.Implementations/ScheduledTasks/Tasks/*`):
 //!
 //! - [`CleanActivityLogTask`] — `CleanActivityLogTask` (`CleanActivityLog`)
 //! - [`DeleteCacheFileTask`] — `DeleteCacheFileTask` (`DeleteCacheFiles`)
@@ -43,8 +42,8 @@ const TICKS_PER_SECOND: i64 = 10_000_000;
 /// Ticks per hour, for trigger intervals.
 const TICKS_PER_HOUR: i64 = 3600 * TICKS_PER_SECOND;
 
-/// The upstream Maintenance category display string (`TasksMaintenanceCategory`).
-const MAINTENANCE: &str = "Maintenance";
+/// The upstream Maintenance category's localization key.
+const MAINTENANCE: &str = "TasksMaintenanceCategory";
 
 /// An interval trigger firing every `hours` hours.
 fn interval_hours(hours: i64) -> TaskTriggerInfo {
@@ -216,13 +215,16 @@ impl ScheduledTask for CleanActivityLogTask {
     }
 
     fn name(&self) -> &str {
-        "Clean Activity Log"
+        "TaskCleanActivityLog"
     }
     fn description(&self) -> &str {
-        "Deletes activity log entries older than the configured age."
+        "TaskCleanActivityLogDescription"
     }
     fn category(&self) -> &str {
         MAINTENANCE
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         let retention_days = self
@@ -277,13 +279,16 @@ impl ScheduledTask for DeleteCacheFileTask {
     }
 
     fn name(&self) -> &str {
-        "Clean Cache Directory"
+        "TaskCleanCache"
     }
     fn description(&self) -> &str {
-        "Deletes cache files no longer needed by the system."
+        "TaskCleanCacheDescription"
     }
     fn category(&self) -> &str {
         MAINTENANCE
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(24)]
@@ -318,20 +323,20 @@ impl ScheduledTask for DeleteCacheFileTask {
 /// Port of `DeleteLogFileTask`.
 pub struct DeleteLogFileTask {
     config: Arc<dyn ServerConfigurationManager>,
-    /// The description, formatted with the boot-time retention (the C# formats
-    /// `TaskCleanLogsDescription` with the live value on every read; a `&str`
-    /// return makes that a construction-time snapshot here).
-    description: String,
+    /// The retention formatted into the description, read at boot (the C#
+    /// formats `TaskCleanLogsDescription` with the live value on every read;
+    /// the sync accessor cannot read the async configuration seam).
+    retention_days: i32,
 }
 
 impl DeleteLogFileTask {
     /// Builds the task over the config seam; `retention_days` (the boot-time
-    /// `log_file_retention_days`) is embedded in the description string.
+    /// `log_file_retention_days`) is formatted into the description.
     #[must_use]
     pub fn new(config: Arc<dyn ServerConfigurationManager>, retention_days: i32) -> Self {
         Self {
             config,
-            description: format!("Deletes log files that are more than {retention_days} days old."),
+            retention_days,
         }
     }
 }
@@ -349,13 +354,19 @@ impl ScheduledTask for DeleteLogFileTask {
     }
 
     fn name(&self) -> &str {
-        "Clean Log Directory"
+        "TaskCleanLogs"
     }
     fn description(&self) -> &str {
-        &self.description
+        "TaskCleanLogsDescription"
+    }
+    fn description_argument(&self) -> Option<String> {
+        Some(self.retention_days.to_string())
     }
     fn category(&self) -> &str {
         MAINTENANCE
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(24)]
@@ -416,13 +427,16 @@ impl ScheduledTask for DeleteTranscodeFileTask {
     }
 
     fn name(&self) -> &str {
-        "Clean Transcode Directory"
+        "TaskCleanTranscode"
     }
     fn description(&self) -> &str {
-        "Deletes transcode files more than one day old."
+        "TaskCleanTranscodeDescription"
     }
     fn category(&self) -> &str {
         MAINTENANCE
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![startup(), interval_hours(24)]
@@ -498,15 +512,16 @@ impl ScheduledTask for OptimizeDatabaseTask {
     }
 
     fn name(&self) -> &str {
-        "Optimize database"
+        "TaskOptimizeDatabase"
     }
     fn description(&self) -> &str {
-        "Compacts database and truncates free space. Running this task after scanning the \
-         library or doing other changes that imply database modifications might improve \
-         performance."
+        "TaskOptimizeDatabaseDescription"
     }
     fn category(&self) -> &str {
         MAINTENANCE
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(6)]
@@ -583,14 +598,16 @@ impl ScheduledTask for CleanupUserDataTask {
         "CleanupUserDataTask"
     }
     fn name(&self) -> &str {
-        "User data cleanup task"
+        "CleanupUserDataTask"
     }
     fn description(&self) -> &str {
-        "Cleans all user data (Watch state, favorite status etc) from media that is no longer \
-         present for at least 90 days."
+        "CleanupUserDataTaskDescription"
     }
     fn category(&self) -> &str {
         MAINTENANCE
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         let detached: i64 =
@@ -643,13 +660,16 @@ impl ScheduledTask for MoveTrickplayImagesTask {
         "MoveTrickplayImages"
     }
     fn name(&self) -> &str {
-        "Migrate Trickplay Image Location"
+        "TaskMoveTrickplayImages"
     }
     fn description(&self) -> &str {
-        "Moves existing trickplay files according to the library settings."
+        "TaskMoveTrickplayImagesDescription"
     }
     fn category(&self) -> &str {
         MAINTENANCE
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         use ferrofin_traits::trickplay::TrickplayManager as _;
@@ -1027,7 +1047,7 @@ mod tests {
         });
         let task = CleanActivityLogTask::new(config, activity.clone());
         assert_eq!(task.key(), "CleanActivityLog");
-        assert_eq!(task.category(), "Maintenance");
+        assert_eq!(task.category(), "TasksMaintenanceCategory");
         let default_triggers = task.default_triggers();
         assert!(default_triggers.is_empty(), "{default_triggers:?}");
 
@@ -1104,9 +1124,29 @@ mod tests {
         backdate(&managed, 40);
         let fresh = touch(&logs, "ferrofin-today.log");
 
-        let task = DeleteLogFileTask::new(config, 3);
+        let task = Arc::new(DeleteLogFileTask::new(config, 3));
         assert_eq!(task.key(), "CleanLogFiles");
-        assert!(task.description().contains("3 days"));
+        // `string.Format(GetLocalizedString("TaskCleanLogsDescription"), days)`.
+        let registry = crate::scheduled_tasks::FerrofinTaskManager::new();
+        registry.register(task.clone());
+        assert_eq!(
+            registry
+                .get("CleanLogFiles")
+                .expect("registered")
+                .description
+                .as_deref(),
+            Some("Deletes log files that are more than 3 days old.")
+        );
+        let german = ferrofin_util::current_culture::scope_with_ui(
+            "de".to_owned(),
+            Some("de".to_owned()),
+            async { registry.get("CleanLogFiles").expect("registered") },
+        )
+        .await;
+        assert_eq!(
+            german.description.as_deref(),
+            Some("Lösche Log-Dateien, die älter als 3 Tage sind.")
+        );
         task.execute(&TaskProgress::default()).await.expect("run");
 
         assert!(!old.exists(), "old log should be deleted");
@@ -1300,7 +1340,7 @@ mod tests {
 
         let task = MoveTrickplayImagesTask::new(trickplay);
         assert_eq!(task.key(), "MoveTrickplayImages");
-        assert_eq!(task.name(), "Migrate Trickplay Image Location");
+        assert_eq!(task.name(), "TaskMoveTrickplayImages");
         let default_triggers = task.default_triggers();
         assert!(default_triggers.is_empty(), "{default_triggers:?}");
 
