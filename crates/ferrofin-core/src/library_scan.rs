@@ -220,10 +220,9 @@ enum SeasonLookup {
 /// item id, the season number and the TMDB language.
 type SeasonKey = (String, i32, Option<String>);
 
-/// How long a TMDB response is kept after it was fetched:
-/// `TmdbClientManager.CacheDurationInHours` (`TmdbClientManager.cs:26`), the
-/// absolute expiration it caches every response under (`:771-780`).
-const TMDB_CACHE_DURATION: std::time::Duration = std::time::Duration::from_hours(1);
+/// How long a TMDB response is kept after it was fetched
+/// ([`ferrofin_providers::tmdb::CACHE_DURATION`]).
+const TMDB_CACHE_DURATION: std::time::Duration = ferrofin_providers::tmdb::CACHE_DURATION;
 
 /// The weight of TMDB responses kept at most:
 /// `TmdbClientManager.CacheSizeLimit` (`TmdbClientManager.cs:28-30,48`),
