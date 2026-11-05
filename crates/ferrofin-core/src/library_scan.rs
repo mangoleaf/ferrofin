@@ -612,8 +612,6 @@ struct EnrichedView {
     has_critic_rating: bool,
     /// At least one remote trailer in `Data`.
     has_trailers: bool,
-    /// A real title rather than the resolver's file-stem placeholder.
-    titled: bool,
 }
 
 impl EnrichedView {
@@ -624,14 +622,15 @@ impl EnrichedView {
             has_community_rating: row.community_rating.is_some(),
             has_critic_rating: row.critic_rating.is_some(),
             has_trailers: !crate::item_data::read_remote_trailers(row.data.as_deref()).is_empty(),
-            titled: row.name.is_some()
-                && !name_is_placeholder(row.name.as_deref(), row.path.as_deref()),
         }
     }
 
-    /// The episode gate: a real title and a synopsis are already there.
-    fn episode_complete(self) -> bool {
-        self.titled && self.has_overview
+    /// The episode gate over the episode `row` this is the view of: a synopsis
+    /// and a real title rather than the resolver's placeholder name are
+    /// already there. The title is tested last, and only here: it can run
+    /// the naming regexes.
+    fn episode_complete(self, row: &BaseItemEntity) -> bool {
+        self.has_overview && !name_is_placeholder(row.name.as_deref(), row.path.as_deref())
     }
 
     /// OMDb's gate: nothing left for it to fill.
@@ -10938,14 +10937,14 @@ impl LibraryScanner {
         let omdb_on = omdb_enabled && policy.metadata_enabled(short, fetcher_names::OMDB);
         if tvdb_on && (tvdb_first || !the_moviedb) {
             return if short == "Episode" {
-                !view.episode_complete()
+                !view.episode_complete(stored)
             } else {
                 !view.has_overview
             };
         }
         if the_moviedb {
             return if short == "Episode" {
-                !view.episode_complete()
+                !view.episode_complete(stored)
             } else {
                 let wants_rating = omdb_on && !view.has_critic_rating;
                 !view.has_overview || wants_rating || !view.has_trailers
@@ -17676,7 +17675,8 @@ impl LibraryScanner {
             Some((video, true)) => self.plan_episode_group(&video, home, ctx, out),
             Some((_, false)) => {}
             None => {
-                let Some(mut episode) = self.episode_row(path, home, ctx) else {
+                let named = lone_episode_name(path, ctx);
+                let Some(mut episode) = self.episode_row(path, named, home, ctx) else {
                     return;
                 };
                 set_resolved_lists(&mut episode.entity, &[], &[]);
@@ -17729,7 +17729,8 @@ impl LibraryScanner {
                     .then(|| (first.path.clone(), playable(rest)))
             })
             .collect();
-        let Some(mut primary) = self.episode_row(&video.files[0].path, home, ctx) else {
+        let named = (video.name.clone(), video.year);
+        let Some(mut primary) = self.episode_row(&video.files[0].path, named, home, ctx) else {
             return;
         };
         let versions: Vec<String> = alternates.iter().map(|(first, _)| first.clone()).collect();
@@ -17740,7 +17741,7 @@ impl LibraryScanner {
         out.push(primary.into());
         self.plan_episode_parts(&parts, owner, mixed, home, ctx, out);
         for (first, rest) in &alternates {
-            let Some(mut alternate) = self.episode_row(first, home, ctx) else {
+            let Some(mut alternate) = self.episode_row(first, (None, None), home, ctx) else {
                 continue;
             };
             alternate.entity.owner_id = Some(guid_to_db(owner));
@@ -17798,9 +17799,13 @@ impl LibraryScanner {
     /// One `Episode` row at `path`, parented to its season (or the series
     /// when there is no season folder), carrying `IndexNumber` /
     /// `ParentIndexNumber` from the filename's episode/season numbers.
+    /// `(name, year)` is what the resolver named and dated it; a missing or
+    /// empty name is the file's (`ResolverHelper.EnsureName`), which is all
+    /// `EpisodeResolver` gives a file it resolves alone.
     fn episode_row(
         &self,
         path: &str,
+        (name, year): (Option<String>, Option<i32>),
         home: EpisodeHome<'_>,
         ctx: &PlanCtx<'_>,
     ) -> Option<Planned<BaseItemEntity>> {
@@ -17814,10 +17819,12 @@ impl LibraryScanner {
             BaseItemKind::Episode,
             home.cf,
             parent,
-            file_stem(path),
+            name.filter(|name| !name.is_empty())
+                .unwrap_or_else(|| file_stem(path)),
             path,
             false,
         )?;
+        entity.production_year = year.map(i64::from);
         entity.media_type = Some("Video".to_owned());
         entity.is_in_mixed_folder = Path::new(path)
             .parent()
@@ -20249,6 +20256,24 @@ fn note_episode_folder(dir: &str, entries: &[FileSystemEntryInfo], ctx: &PlanCtx
             groups: grouped.then_some(groups),
         },
     );
+}
+
+/// The name and year of the episode file at `path` that is in no stack or
+/// version group: in a folder `ResolveVideos<Episode>` resolves
+/// ([`note_episode_folder`]) its parsed name and year (`parseName: true`,
+/// `Name = video.Name`, `ProductionYear = video.Year`,
+/// `MovieResolver.cs:234,305-306`); else none, leaving it the file name
+/// `EpisodeResolver` gives it (an untyped library's series).
+fn lone_episode_name(path: &str, ctx: &PlanCtx<'_>) -> (Option<String>, Option<i32>) {
+    let resolved = Path::new(path)
+        .parent()
+        .and_then(Path::to_str)
+        .is_some_and(|dir| ctx.episode_folders.borrow().contains_key(dir));
+    if !resolved {
+        return (None, None);
+    }
+    let parsed = video_resolver::parse_name(&file_stem(path), ctx.naming);
+    (Some(parsed.name), parsed.year)
 }
 
 /// The stack or version group the episode file at `path` is in, if its
@@ -23122,14 +23147,14 @@ fn apply_tvdb_series(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbSe
     }
 }
 
-/// Whether the row's name is still the resolver's file-stem placeholder rather
-/// than a real title.
+/// Whether the row's name is still the resolver's placeholder rather than a
+/// real title.
 ///
 /// A provider title outranks the placeholder (upstream
 /// `MetadataService.MergeBaseItemData` runs with `replaceData=true` on a
-/// standard scan, so the provider replaces the stem the resolver stamped), but
+/// standard scan, so the provider replaces the name the resolver stamped), but
 /// an NFO `<title>` still wins: `apply_nfo` ran first and changed the name away
-/// from the stem, which is exactly what this detects.
+/// from the resolver's, which is exactly what this detects.
 ///
 /// Shared by every episode provider so the two cannot disagree about what a
 /// placeholder is — a disagreement would show up as one provider silently
@@ -23139,26 +23164,42 @@ fn apply_tvdb_series(entity: &mut BaseItemEntity, d: &ferrofin_providers::TvdbSe
 /// blank name AND a path used to fall through to `"" == file_stem(path)`
 /// (false) and keep its blank name. A blank name is a placeholder by any
 /// reading, so it now matches first.
-fn name_is_file_stem_placeholder(entity: &BaseItemEntity) -> bool {
+fn name_is_resolver_placeholder(entity: &BaseItemEntity) -> bool {
     name_is_placeholder(entity.name.as_deref(), entity.path.as_deref())
 }
 
-/// [`name_is_file_stem_placeholder`] over the two fields it reads, so the
-/// episode gate's `EnrichedView` can use the identical rule.
+/// [`name_is_resolver_placeholder`] over the two fields it reads, so the
+/// episode gate's `EnrichedView` can use the identical rule. A resolver's name
+/// for the file at `path` is its file name (`EpisodeResolver`'s, and every
+/// episode's before the scan took the parsed name), the parsed name
+/// `ResolveVideos<Episode>` gives a lone episode ([`lone_episode_name`]), or
+/// the stack name a stacking rule cuts from a stack's first file.
 fn name_is_placeholder(name: Option<&str>, path: Option<&str>) -> bool {
     match (name, path) {
         (None | Some(""), _) => true,
-        (Some(name), Some(path)) => name == file_stem(path),
+        (Some(name), Some(path)) => {
+            let stem = file_stem(path);
+            // Each of them is cut from the file name, so a title that is not
+            // part of it is real without running a regex.
+            stem.contains(name)
+                && (name == stem
+                    || name == video_resolver::parse_name(&stem, &PATH_NAMING).name
+                    || PATH_NAMING
+                        .video_file_stacking_rules
+                        .iter()
+                        .filter_map(|rule| rule.match_input(entry_name(path)))
+                        .any(|stack| stack.stack_name == name))
+        }
         _ => false,
     }
 }
 
 /// Applies a provider's episode title to the row, replacing the resolver's
-/// file-stem placeholder. The derived sort name follows the new title, as
+/// placeholder name. The derived sort name follows the new title, as
 /// `apply_nfo` does. A blank title, or a row already carrying a real title,
 /// is left alone.
 fn apply_episode_title(entity: &mut BaseItemEntity, title: Option<&str>) {
-    if !name_is_file_stem_placeholder(entity) {
+    if !name_is_resolver_placeholder(entity) {
         return;
     }
     if let Some(title) = title.map(str::trim).filter(|s| !s.is_empty()) {
@@ -23169,7 +23210,7 @@ fn apply_episode_title(entity: &mut BaseItemEntity, title: Option<&str>) {
 
 /// Applies matched TheTVDB **episode** fields to the row (fill-if-empty for
 /// everything except the title, where the provider outranks the resolver's
-/// filename placeholder).
+/// placeholder name).
 fn apply_tvdb_episode(
     entity: &mut BaseItemEntity,
     d: &ferrofin_providers::TvdbEpisodeDetails,
@@ -30476,7 +30517,7 @@ mod tests {
             placeholder.sort_name.as_deref(),
             Some("001 - 0001 - Winter Is Coming")
         );
-        // A name that differs from the stem (an NFO <title>) → kept.
+        // A name that is not the resolver's (an NFO <title>) → kept.
         let mut named = BaseItemEntity {
             name: Some("The Real Title".into()),
             path: Some("/tv/GoT/Season 1/GoT.S01E01.1080p.Bluray.mkv".into()),
@@ -30774,7 +30815,7 @@ mod tests {
     }"#;
 
     /// Builds a scanner wired to a fake TMDB, plus the episode row the scan
-    /// would have planned (name = the file stem, no overview).
+    /// would have planned (name = the resolver's, no overview).
     async fn tmdb_episode_fixture(
         base_url: &str,
         tmp: &std::path::Path,
@@ -31031,6 +31072,12 @@ mod tests {
         assert!(!tmdb_only.wants_backfill(&series(Some("x"), trailers.clone()), policy));
         assert!(tmdb_only.wants_backfill(&episode("GoT S01E01", Some("x")), policy));
         assert!(!tmdb_only.wants_backfill(&episode("Pilot", Some("x")), policy));
+        // An episode still named by the resolver's parsed name is untitled too.
+        let parsed = BaseItemEntity {
+            path: Some("/tv/GoT/Season 1/GoT.S01E01.1080p.WEB-DL.mkv".into()),
+            ..episode("GoT.S01E01", Some("x"))
+        };
+        assert!(tmdb_only.wants_backfill(&parsed, policy));
         // With no saved order TheMovieDb answers first, so its gates apply
         // even with TVDB wired.
         assert!(with_tvdb.wants_backfill(&series(Some("x"), None), policy));
@@ -31046,6 +31093,43 @@ mod tests {
         assert!(!with_tvdb.wants_backfill(&episode("Pilot", Some("x")), tvdb_policy));
     }
 
+    /// Every name the resolver gives an episode file is a placeholder a
+    /// provider title replaces: the file name (`EpisodeResolver`, and rows
+    /// scanned before the parsed name), the parsed name of a lone episode
+    /// (`ResolveVideos<Episode>`, an airing named after its show among them)
+    /// and a stack's name. A real title is not, even one inside the file name.
+    #[rstest::rstest]
+    #[case::file_name(
+        "Show.S01E05.1080p.WEB-DL",
+        "Show/Season 1/Show.S01E05.1080p.WEB-DL.mkv",
+        true
+    )]
+    #[case::parsed_name("Show.S01E05", "Show/Season 1/Show.S01E05.1080p.WEB-DL.mkv", true)]
+    #[case::airing_named_after_its_show(
+        "Show",
+        "Show (1975)/Season 49/Show (1975) - 2024-03-31 06 00 00 - Guest A.ts",
+        true
+    )]
+    #[case::stack_name("Show - S01E03", "Show/Season 1/Show - S01E03 - part1.mkv", true)]
+    #[case::blank("", "Show/Season 1/Show - S01E03.mkv", true)]
+    #[case::title_inside_the_file_name(
+        "Guest A",
+        "Show (1975)/Season 49/Show (1975) - 2024-03-31 06 00 00 - Guest A.ts",
+        false
+    )]
+    #[case::title("Winter Is Coming", "GoT/Season 1/GoT S01E01.mkv", false)]
+    fn resolver_names_are_episode_placeholders(
+        #[case] name: &str,
+        #[case] path: &str,
+        #[case] placeholder: bool,
+    ) {
+        let path = format!("/tv/{path}");
+        assert_eq!(
+            super::name_is_placeholder(Some(name), Some(&path)),
+            placeholder
+        );
+    }
+
     // The regression this whole change exists for: on a library migrated from
     // Jellyfin, TheMovieDb is the only metadata fetcher saved for `Episode`, so
     // TMDB must title the episode itself. Before the fix TMDB had no Episode
@@ -31055,7 +31139,7 @@ mod tests {
         let (base, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
         let tmp = tempfile::tempdir().unwrap();
         let (scanner, mut cache, mut episode) = tmdb_episode_fixture(&base, tmp.path()).await;
-        // The scan takes the resolver's file-stem name off the row before any
+        // The scan takes the resolver's name off the row before any
         // provider runs (`ResolverGuesses::take`).
         episode.name = None;
 
@@ -34861,7 +34945,7 @@ mod tests {
         let people = Arc::new(crate::people_repository::FerrofinPeopleRepository::new(
             db.clone(),
         ));
-        // No TMDB wired: the episode row lands with its file-stem name and no
+        // No TMDB wired: the episode row lands with the resolver's name and no
         // overview, exactly as a library scanned before the provider existed.
         LibraryScanner::new(
             vf.clone(),
@@ -36931,7 +37015,7 @@ mod tests {
         let scanner = scanner.with_tvdb(Arc::new(
             ferrofin_providers::TvdbClient::new().with_base_url("http://127.0.0.1:1"),
         ));
-        // The scan takes the resolver's file-stem name off the row before any
+        // The scan takes the resolver's name off the row before any
         // provider runs (`ResolverGuesses::take`).
         episode.name = None;
 

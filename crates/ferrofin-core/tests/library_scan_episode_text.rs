@@ -1,7 +1,7 @@
 //! What the episode providers' re-scan gate reads, end to end through a scan.
 //!
 //! `Planned.entity` is rebuilt from the filesystem on every scan, so its `Name`
-//! is always the file stem and its `Overview` always `None`. The gate that
+//! is always the resolver's and its `Overview` always `None`. The gate that
 //! stops every episode re-fetching its metadata on every scan therefore has to
 //! consult the **stored** row. The scan reads stored rows one window of the
 //! plan at a time (`ItemRepository::retrieve_items`) and hands each episode's
