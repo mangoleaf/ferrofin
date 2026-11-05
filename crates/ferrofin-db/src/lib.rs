@@ -21,6 +21,7 @@ pub mod row_cache;
 mod sqlite_casing;
 pub mod sqlite_random;
 pub mod store;
+mod wal_checkpoints;
 
 pub use database::{
     AdoptionState, DEFAULT_STATEMENT_CACHE_CAPACITY, Database, ImageParentRow,

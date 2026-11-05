@@ -29,6 +29,11 @@
 //! submission order, so a start/stop update can never overtake the insert that
 //! creates its row. A full queue drops the event with a warning rather than
 //! blocking playback, which is the trait's standing contract.
+//!
+//! The checkpoint has since left the writer for a connection of its own
+//! (`ferrofin_db`'s WAL checkpoint task), so no write waits for its syncs any
+//! more. The queue still keeps these writes off the request path, one commit
+//! per batch.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

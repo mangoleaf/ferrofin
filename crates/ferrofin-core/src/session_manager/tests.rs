@@ -75,8 +75,8 @@ impl ServerConfigurationManager for FixedConfig {
 }
 
 /// A DTO service for the tests that do not look at a `NowPlayingItem`: a
-/// playback report naming a library item still builds one, which is the bare
-/// item (its id and name). [`RecordingDtoService`] serves the tests that look.
+/// listing of a session playing a library item still builds one, which is the
+/// bare item (its id and name). [`RecordingDtoService`] serves the tests that look.
 struct UnusedDtoService;
 
 #[async_trait]
@@ -1695,8 +1695,8 @@ async fn progress_remembers_the_reported_audio_and_subtitle_tracks() {
 }
 
 /// A media-source manager that records every `close_live_stream` id. A
-/// playback report's `NowPlayingItem` build also looks up its media source,
-/// which finds none here.
+/// listing's `NowPlayingItem` build also looks up its media source, which
+/// finds none here.
 struct RecordingMediaSources {
     closed: Mutex<Vec<String>>,
 }
@@ -4620,8 +4620,8 @@ async fn the_now_playing_item_shows_the_reported_media_source(
 /// creates the session reads it.
 mod device_reads;
 
-/// The session's `NowPlayingItem`, built once per item on the report that
-/// names it, and the session summaries that read it.
+/// The session's `NowPlayingItem`, built once per item by the first listing
+/// after the report that names it, and the session summaries that read it.
 mod now_playing_item;
 
 /// The session's play state, queue, transcoding info and now-viewing item.

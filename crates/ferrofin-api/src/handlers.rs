@@ -1194,6 +1194,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "A *Start whose Data is missing, has no second field or holds a field that does not \
              parse as a whole number still subscribes, at jellyfin-web's 1500 ms when the period \
              is at fault, where upstream's Start throws and makes no subscription.",
+            NOW_PLAYING_ITEM_BUILT_ON_READ,
         ],
     },
     VerifiedSubsystem {
@@ -1814,10 +1815,12 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/session.rs get_sessions (items.rs effective_user_id) → \
                ferrofin-core session_manager.rs get_sessions (shared_device_control_for, \
                retain_accessible_session_devices, to_dto → session_info_to_dto) \
-               (SessionManager.GetSessions, ToSessionInfoDto); the NowPlayingItem it copies \
-               is built by on_playback_start and on_playback_progress \
-               (kept_now_playing_item, now_playing_item → get_item_info; UpdateNowPlayingItem, \
-               GetItemInfo) and cleared by on_playback_stopped (RemoveNowPlayingItem); the \
+               (SessionManager.GetSessions, ToSessionInfoDto); the NowPlayingItem it shows is \
+               the item on_playback_start and on_playback_progress name (kept_now_playing_item, \
+               NowPlayingItem::new on the report's row; UpdateNowPlayingItem), built by the \
+               first listing and then copied (shown_now_playing_item → now_playing_item → \
+               MediaSourceManager::get_media_source on that row, get_item_info; GetMediaSource, \
+               GetItemInfo), and cleared by on_playback_stopped (RemoveNowPlayingItem); the \
                PlayState and PlaylistItemId are the last report's (update_now_playing; \
                UpdateNowPlayingItem, MediaSourceId the item's own when none is reported), the \
                stop keeps a reported NowPlayingQueue and resets the PlayState \
@@ -1833,7 +1836,7 @@ pub const VERIFIED: &[Verified] = &[
                LastPlaybackCheckIn is DateTime.MinValue until update_now_playing stamps it \
                (SessionInfo.LastPlaybackCheckIn, UpdateNowPlayingItem) and \
                NowPlayingQueueFullItems is never sent (v12.4's SessionInfoDto has none)",
-        date: "2026-11-02",
+        date: "2026-11-04",
         divergences: SESSIONS_DIVERGENCES,
         refs: &[],
     },
@@ -1846,11 +1849,12 @@ pub const VERIFIED: &[Verified] = &[
                ValidatePlayMethod over AppState::hls get_transcoding_job, \
                TranscodeManager.GetTranscodingJob; current_session_id: RequestHelpers.GetSessionId) \
                → ferrofin-core session_manager.rs on_playback_start (SessionManager.OnPlaybackStart: \
-               update_live_stream_session_mapping, update_now_playing for UpdateNowPlayingItem, \
-               the ClearTranscodingInfo of a report that does not transcode, record_playback_start \
-               per session user on progress_item for GetProgressItem, the log line, the \
-               PlaybackStart event) → playback_activity.rs (PlaybackStartLogger)",
-        date: "2026-11-02",
+               update_live_stream_session_mapping, update_now_playing for UpdateNowPlayingItem \
+               with the NowPlayingItem kept or named on the row it read, the ClearTranscodingInfo \
+               of a report that does not transcode, record_playback_start per session user on \
+               progress_item for GetProgressItem, the log line, the PlaybackStart event) → \
+               playback_activity.rs (PlaybackStartLogger)",
+        date: "2026-11-04",
         divergences: PLAYBACK_START_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -1876,12 +1880,12 @@ pub const VERIFIED: &[Verified] = &[
                TranscodeManager.OnPlaybackProgress runs off the PlaybackProgress event, here \
                before the report reaches the session manager) → \
                ferrofin-core session_manager.rs on_playback_progress \
-               (SessionManager.OnPlaybackProgress: kept_now_playing_item or the library item for \
-               GetNowPlayingItem, update_now_playing with the check-in only when not automated, \
+               (SessionManager.OnPlaybackProgress: kept_now_playing_item or the library item's row \
+               for GetNowPlayingItem, update_now_playing with the check-in only when not automated, \
                the ClearTranscodingInfo of a report that does not transcode, update_play_progress \
                per session user for OnPlaybackProgress(user, item, info), \
                update_live_stream_session_mapping, the PlaybackProgress event)",
-        date: "2026-11-02",
+        date: "2026-11-04",
         divergences: PLAYBACK_PROGRESS_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -3639,6 +3643,7 @@ const NO_USER_USER_DATA_FILTER_DIVERGENCE: &str = "A user-data filter (`isFavori
 const PLAYBACK_START_DIVERGENCES: &[&str] = &[
     "A report's own Item is ignored: the session's NowPlayingItem and the activity entry \
      come from the library item. Fix path: gl-1062.",
+    NOW_PLAYING_ITEM_BUILT_ON_READ,
     "SessionInfo.StartAutomaticProgress is not run, so the session's position does not \
      advance between reports. Fix path: gl-803.",
     "The activity entry is written in English, not the server's UI culture. Fix path: gl-429.",
@@ -3650,6 +3655,7 @@ const PLAYBACK_START_DIVERGENCES: &[&str] = &[
 const PLAYBACK_PROGRESS_DIVERGENCES: &[&str] = &[
     "A report's own Item is ignored: the session's NowPlayingItem comes from the library \
      item. Fix path: gl-1062.",
+    NOW_PLAYING_ITEM_BUILT_ON_READ,
     "SessionInfo.StartAutomaticProgress is not re-armed by a report, so no automated progress \
      follows it. Fix path: gl-803.",
     "The 400 bodies (a body or query member that does not bind) are Ferrofin's error shape. \
@@ -3671,14 +3677,24 @@ const PLAYBACK_STOP_DIVERGENCES: &[&str] = &[
      Ferrofin's error shape. Fix path: gl-666.",
 ];
 
+/// Where a session's `NowPlayingItem` is built (owner decision 2026-11-04,
+/// gl-1242): shared by the playback reports, `GET /Sessions` and the Sessions
+/// stream.
+const NOW_PLAYING_ITEM_BUILT_ON_READ: &str = "A playback report keeps the item it names, as its \
+     row read, and the first GET /Sessions, Sessions stream push or SyncPlay group creation \
+     that shows it builds the NowPlayingItem, which later ones copy; upstream builds it before the report returns. The \
+     item's own fields are those of the row the report read, and its streams, images and \
+     chapters are those the first listing finds. Owner decision (gl-1242, 2026-11-04).";
+
 /// The accepted divergences of `GET /Sessions`.
 const SESSIONS_DIVERGENCES: &[&str] = &[
     "A playback report's own Item is ignored and the NowPlayingItem is always built from the \
      library item; upstream shows a reported Item as sent. Fix path: gl-1062.",
+    NOW_PLAYING_ITEM_BUILT_ON_READ,
     "A NowPlayingItem whose media source lookup fails is shown without its streams, and one \
-     whose build fails is not shown, while the report itself succeeds and saves the user's \
-     progress; the next report naming the item builds it again. Upstream fails the report, \
-     which keeps the session's previous NowPlayingItem.",
+     whose build fails is not shown, while the report itself has succeeded and saved the \
+     user's progress; the first listing after the next report naming the item builds it \
+     again. Upstream fails the report, which keeps the session's previous NowPlayingItem.",
     "A non-administrator's response carries the hardware accelerator blanked, and only that \
      response; upstream blanks it on the stored session's TranscodingInfo, so every later \
      reader, an administrator included, sees it blanked until the next transcoding report \
