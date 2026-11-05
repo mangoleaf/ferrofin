@@ -957,7 +957,7 @@ pub static SETTINGS: &[SettingSpec] = &[
         group: Group::Performance,
         kind: STATEMENT_CACHE,
         unit: Some(Unit::Items),
-        default: "200",
+        default: "150",
         description: "Prepared statements each SQLite connection keeps.",
         running: |c| json!(c.db_statement_cache),
         ..ROW

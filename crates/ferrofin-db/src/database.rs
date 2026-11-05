@@ -721,7 +721,7 @@ impl Database {
         ids: &[String],
     ) -> Result<Vec<(String, String, String)>> {
         let mut out = Vec::new();
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+        for chunk in crate::padded_in_chunks(ids) {
             let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
@@ -748,7 +748,7 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn item_data_blobs(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+        for chunk in crate::padded_in_chunks(ids) {
             let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Data" FROM "BaseItems"
@@ -776,7 +776,7 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn item_studios(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+        for chunk in crate::padded_in_chunks(ids) {
             let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Studios" FROM "BaseItems"
@@ -804,7 +804,7 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn item_original_languages(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+        for chunk in crate::padded_in_chunks(ids) {
             let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "OriginalLanguage" FROM "BaseItems"
@@ -836,7 +836,7 @@ impl Database {
         primary_ids: &[String],
     ) -> Result<Vec<(String, i64)>> {
         let mut out = Vec::new();
-        for chunk in primary_ids.chunks(crate::BATCH_BIND_CHUNK) {
+        for chunk in crate::padded_in_chunks(primary_ids) {
             let placeholders = crate::numbered_placeholders(1..=chunk.len());
             // The seeded placeholder row is excluded exactly as the full-row
             // read (`get_items_by_primary_version_batch`) excludes it.
@@ -868,7 +868,7 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn image_parent_rows(&self, ids: &[String]) -> Result<Vec<ImageParentRow>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+        for chunk in crate::padded_in_chunks(ids) {
             let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Type", "ParentId", "OwnerId", "SeriesId", "SeasonId",
@@ -923,7 +923,7 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn photo_album_names(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+        for chunk in crate::padded_in_chunks(ids) {
             let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Name" FROM "BaseItems"
@@ -950,7 +950,7 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn playlist_owners(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+        for chunk in crate::padded_in_chunks(ids) {
             let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "PlaylistId", "OwnerUserId" FROM "FerrofinPlaylists"
@@ -2223,13 +2223,17 @@ async fn log_dangling_row_cleanup(conn: &mut sqlx::SqliteConnection) -> Result<(
 }
 
 /// How many prepared statements each pooled connection keeps when the
-/// composition root does not say (`db_statement_cache`; owner decision,
-/// gl-1071). sqlx's own default is 100, and a browse of a small library ran 120
-/// to 190 distinct statements on one connection, largely because every size of
-/// an `IN (…)` list is its own text: at 100 the cache evicted statements still in
-/// use, and on a repeat browse about one execution in ten prepared again a
-/// statement the cache had dropped. 200 holds that working set.
-pub const DEFAULT_STATEMENT_CACHE_CAPACITY: usize = 200;
+/// composition root does not say (`db_statement_cache`; owner decisions,
+/// gl-1071 and gl-1243). sqlx's own default is 100, which evicted statements
+/// still in use: every size of an `IN (…)` list was its own text. Each
+/// connection keeps its own statements, so every slot costs memory on each
+/// connection of the pool: before the lists were padded, 200 held 30 to 36 MiB
+/// more than 100 on the bench library. With the lists padded
+/// ([`crate::padded_in_list`]) a browse of that library runs 146 distinct read
+/// statements instead of 465, and 150 holds them all, for 6 to 13 MiB more than
+/// 100: a repeat browse prepares none on a connection, against 724 at 200
+/// without the padding.
+pub const DEFAULT_STATEMENT_CACHE_CAPACITY: usize = 150;
 
 /// The `auto` reader-pool size: **usable-core count** — the min of the CPU
 /// affinity mask (`available_parallelism`) and the cgroup CFS quota.

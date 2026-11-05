@@ -87,7 +87,7 @@ pub async fn channel_rows_by_ids(
     // One bind per id, so the page has to be chunked: a recursive `/Items` page
     // can name thousands of items and a channel only has to be one of them for
     // this lookup to run.
-    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ferrofin_db::padded_in_chunks(ids) {
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
             r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
                   0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
@@ -160,7 +160,7 @@ pub async fn program_rows_by_ids(
     ids: &[Uuid],
 ) -> Result<std::collections::HashMap<Uuid, ProgramRow>, ServiceError> {
     let mut out = std::collections::HashMap::new();
-    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ferrofin_db::padded_in_chunks(ids) {
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(PROGRAM_SELECT);
         qb.push(r#" WHERE p."Id" IN ("#);
         let mut separated = qb.separated(", ");
@@ -671,8 +671,16 @@ pub mod test_support {
         db: &Database,
         channel_id: &str,
     ) -> Result<Vec<String>, ServiceError> {
+        plan_of(db, super::channel_program_rows_query(channel_id)).await
+    }
+
+    /// The `EXPLAIN QUERY PLAN` details of the statement `qb` builds, with
+    /// its binds, in plan order.
+    pub async fn plan_of(
+        db: &Database,
+        mut qb: sqlx::QueryBuilder<sqlx::Sqlite>,
+    ) -> Result<Vec<String>, ServiceError> {
         use sqlx::Execute as _;
-        let mut qb = super::channel_program_rows_query(channel_id);
         let mut query = qb.build();
         let args = query
             .take_arguments()

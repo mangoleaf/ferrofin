@@ -6754,7 +6754,7 @@ fn push_program_filters(
         push_separator(qb, &mut first);
         qb.push(r#"p."Id" IN ("#);
         let mut list = qb.separated(",");
-        for id in &query.item_ids {
+        for id in ferrofin_db::padded_in_list(&query.item_ids) {
             list.push_bind(guid_to_db(*id));
         }
         qb.push(")");
@@ -6764,7 +6764,7 @@ fn push_program_filters(
         push_separator(qb, &mut first);
         qb.push(r#"p."ChannelId" IN ("#);
         let mut list = qb.separated(",");
-        for id in &query.channel_ids {
+        for id in ferrofin_db::padded_in_list(&query.channel_ids) {
             list.push_bind(guid_to_db(*id));
         }
         qb.push(")");
@@ -6859,7 +6859,7 @@ fn push_program_filters(
             r#"EXISTS (SELECT 1 FROM json_each(p."Genres") WHERE ferrofin_clean_value("value") IN ("#,
         );
         let mut list = qb.separated(",");
-        for genre in &query.genres {
+        for genre in ferrofin_db::padded_in_list(&query.genres) {
             list.push_bind(ferrofin_util::string_extensions::get_clean_value(genre));
         }
         qb.push("))");
@@ -11108,6 +11108,45 @@ mod tests {
             .into_iter()
             .filter_map(|item| item.name)
             .collect()
+    }
+
+    /// The guide's programme query, a time window over a page of channels,
+    /// reads programmes off the `(ChannelId, StartDate)` index, and plans
+    /// alike at every length its padded channel list takes (gl-1243): the
+    /// list's length must not move it to another index.
+    #[tokio::test]
+    async fn the_program_query_plans_alike_at_every_padded_channel_count() {
+        let mgr = manager_with_relative_guide().await;
+        let now = Utc::now();
+        let mut plans = Vec::new();
+        for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_u128 << k) {
+            let query = InternalItemsQuery {
+                channel_ids: (1..=n).map(Uuid::from_u128).collect(),
+                min_end_date: Some(now),
+                max_start_date: Some(now + chrono::Duration::hours(4)),
+                order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
+                limit: Some(100),
+                ..InternalItemsQuery::default()
+            };
+            let mut qb = sqlx::QueryBuilder::new(super::PROGRAM_SELECT);
+            super::push_program_filters(&mut qb, &query, now);
+            super::push_program_order(&mut qb, &query.order_by);
+            super::push_program_paging(&mut qb, query.limit, 0);
+            let plan = crate::guide_repository::test_support::plan_of(&mgr.db, qb)
+                .await
+                .expect("plan");
+            plans.push((n, plan));
+        }
+        assert!(
+            plans[0].1.iter().any(|d| d.starts_with(
+                "SEARCH p USING INDEX FerrofinIX_LiveTvPrograms_ChannelId_StartDate (ChannelId=?"
+            )),
+            "programmes by channel, then start date: {:?}",
+            plans[0].1
+        );
+        for (n, plan) in &plans[1..] {
+            assert_eq!(plan, &plans[0].1, "{n} channels against 2");
+        }
     }
 
     #[tokio::test]

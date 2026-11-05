@@ -110,6 +110,7 @@ impl FerrofinNextUpService {
         if ids.is_empty() {
             return Ok(map);
         }
+        let ids = ferrofin_db::padded_in_list(ids);
         let mut sql = String::from(r#"SELECT * FROM "BaseItems" WHERE "Id" IN ("#);
         push_key_placeholders(&mut sql, ids.len());
         sql.push(')');
@@ -304,12 +305,13 @@ impl NextUpService for FerrofinNextUpService {
 
         // Series (by presentation key) whose most-recently-played episode within
         // the requested libraries is at/after the cutoff, newest first.
+        let top_parents = ferrofin_db::padded_in_list(&top_parents);
         let sql = next_up_series_keys_sql(top_parents.len(), filter.limit.is_some());
         let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
             .bind(&user.id)
             .bind(episode_type)
             .bind(PLACEHOLDER_ID);
-        for id in &top_parents {
+        for id in top_parents {
             query = query.bind(guid_to_db(*id));
         }
         query = query.bind(datetime_to_db(date_cutoff));
@@ -795,7 +797,7 @@ fn push_series_keys(qb: &mut QueryBuilder<Sqlite>, series_keys: &[String]) {
         qb.push("NULL");
     } else {
         let mut keys = qb.separated(", ");
-        for key in series_keys {
+        for key in ferrofin_db::padded_in_list(series_keys) {
             keys.push_bind(key.clone());
         }
     }

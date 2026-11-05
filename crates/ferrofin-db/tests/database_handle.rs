@@ -344,21 +344,48 @@ async fn statements_cached_after(conn: &mut sqlx::SqliteConnection, n: usize) ->
     sqlx::Connection::cached_statements_size(conn)
 }
 
-/// Each pooled connection, reader and writer, keeps 200 prepared statements
-/// by default: sqlx's own 100 is fewer than one browse of the library
-/// prepares on a connection, so it re-prepared statements it had evicted.
+/// Each pooled connection, reader and writer, keeps 150 prepared statements
+/// by default: with the `IN (…)` lists padded, that holds all of what a browse
+/// of the library prepares on a connection, at less memory than 200 (gl-1243).
 #[tokio::test]
-async fn pooled_connections_keep_200_statements_by_default() {
-    assert_eq!(ferrofin_db::DEFAULT_STATEMENT_CACHE_CAPACITY, 200);
+async fn pooled_connections_keep_150_statements_by_default() {
+    assert_eq!(ferrofin_db::DEFAULT_STATEMENT_CACHE_CAPACITY, 150);
     let dir = tempfile::tempdir().expect("tempdir");
     let url = format!("sqlite://{}", dir.path().join("cache.db").display());
     let db = Database::connect_sized(&url, Some(1))
         .await
         .expect("file connect");
     let mut reader = db.pool().acquire().await.expect("reader");
-    assert_eq!(statements_cached_after(&mut reader, 300).await, 200);
+    assert_eq!(statements_cached_after(&mut reader, 300).await, 150);
     let mut writer = db.writer().acquire().await.expect("writer");
-    assert_eq!(statements_cached_after(&mut writer, 300).await, 200);
+    assert_eq!(statements_cached_after(&mut writer, 300).await, 150);
+}
+
+/// An `IN (…)` read prepares one statement per padded list length (1, 2, 4,
+/// 8, 16 and 32 for lists of 1 to 20 ids), not one per length (gl-1243), and
+/// the id the padding repeats still returns its row once.
+#[tokio::test]
+async fn an_in_list_read_prepares_one_statement_per_padded_length() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let url = format!("sqlite://{}", dir.path().join("lists.db").display());
+    let db = Database::connect_sized(&url, Some(1))
+        .await
+        .expect("file connect");
+    let cached = async |db: &Database| {
+        let reader = db.pool().acquire().await.expect("reader");
+        sqlx::Connection::cached_statements_size(&*reader)
+    };
+    let before = cached(&db).await;
+    for n in 1..=20 {
+        // Ids no row has, then the seeded placeholder row, which pads the list.
+        let mut ids: Vec<String> = (1..n)
+            .map(|i| format!("{i:08}-0000-0000-0000-000000000000"))
+            .collect();
+        ids.push(ferrofin_db::PLACEHOLDER_ITEM_ID.to_owned());
+        let rows = db.image_parent_rows(&ids).await.expect("read");
+        assert_eq!(rows.len(), 1, "{n} ids: the repeated id's row, once");
+    }
+    assert_eq!(cached(&db).await - before, 6);
 }
 
 /// A configured statement cache reaches the reader and the writer pools.
@@ -366,11 +393,11 @@ async fn pooled_connections_keep_200_statements_by_default() {
 async fn pooled_connections_keep_the_configured_statement_cache() {
     let dir = tempfile::tempdir().expect("tempdir");
     let url = format!("sqlite://{}", dir.path().join("cache.db").display());
-    let db = Database::connect_tuned(&url, Some(1), Some(150))
+    let db = Database::connect_tuned(&url, Some(1), Some(120))
         .await
         .expect("file connect");
     let mut reader = db.pool().acquire().await.expect("reader");
-    assert_eq!(statements_cached_after(&mut reader, 300).await, 150);
+    assert_eq!(statements_cached_after(&mut reader, 300).await, 120);
     let mut writer = db.writer().acquire().await.expect("writer");
-    assert_eq!(statements_cached_after(&mut writer, 300).await, 150);
+    assert_eq!(statements_cached_after(&mut writer, 300).await, 120);
 }

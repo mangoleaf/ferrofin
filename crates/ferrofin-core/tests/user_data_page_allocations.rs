@@ -83,7 +83,7 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// Items on the page: one full read chunk of ids (`BATCH_BIND_CHUNK`).
+/// Items on the page: 500 ids, a long unpaged page (two padded read chunks).
 const ITEMS: usize = 500;
 
 /// The TMDB id every movie on the page carries, which leads its keys.

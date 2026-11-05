@@ -29,14 +29,17 @@ pub use database::{
     inspect_migration_history, schema_head,
 };
 
-/// How many ids one `IN (…)` query binds at a time, and the most parameters
-/// one multi-row insert binds: stays far below SQLite's conservative
-/// 999-host-variable floor (`SQLITE_MAX_VARIABLE_NUMBER` on old builds), so
-/// every batched lookup chunks its ids by this.
+/// How many ids one unpadded `IN (…)` query binds at a time, and the most
+/// parameters one multi-row insert binds: stays far below SQLite's conservative
+/// 999-host-variable floor (`SQLITE_MAX_VARIABLE_NUMBER` on old builds). The
+/// request-path reads pad their lists instead and chunk by [`PADDED_LIST_MAX`].
 pub const BATCH_BIND_CHUNK: usize = 500;
 
 /// The placeholder item row the initial migration seeds (C# `PlaceholderId`),
 /// in its stored GUID form; every real query excludes it.
 pub const PLACEHOLDER_ITEM_ID: &str = "00000000-0000-0000-0000-000000000001";
 pub use error::{DbError, Result};
-pub use placeholders::{numbered_placeholders, padded_in_chunks, power_of_two_chunks, values_rows};
+pub use placeholders::{
+    PADDED_LIST_MAX, numbered_placeholders, padded_in_chunks, padded_in_list, power_of_two_chunks,
+    values_rows,
+};

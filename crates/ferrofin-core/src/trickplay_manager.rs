@@ -1601,7 +1601,7 @@ impl TrickplayManager for FerrofinTrickplayManager {
             return Ok(out);
         }
         // One query for every media source the page lists, grouped by item.
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(item_ids) {
             let ph = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT * FROM "TrickplayInfos" WHERE "ItemId" IN ({ph})

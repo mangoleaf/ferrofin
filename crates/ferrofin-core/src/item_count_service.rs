@@ -392,7 +392,7 @@ impl FerrofinItemCountService {
             .collect();
 
         let mut by_name: HashMap<String, HashMap<String, i32>> = HashMap::new();
-        for chunk in distinct_names.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(&distinct_names) {
             let sql = people_name_counts_sql(chunk.len(), type_names.len());
 
             let mut query = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql));
@@ -463,7 +463,7 @@ impl FerrofinItemCountService {
             .collect();
 
         let mut by_year: HashMap<i64, HashMap<String, i32>> = HashMap::new();
-        for chunk in distinct_years.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(&distinct_years) {
             let sql = production_year_counts_sql(chunk.len(), type_names.len());
             let mut query = sqlx::query_as::<_, (i64, String, i64)>(sqlx::AssertSqlSafe(sql));
             for year in chunk {
@@ -507,7 +507,7 @@ impl FerrofinItemCountService {
         access_filter: &InternalItemsQuery,
     ) -> Result<HashMap<String, TaggedSeriesEpisodes>, ServiceError> {
         let mut out = HashMap::new();
-        for chunk in cleans.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in cleans.chunks(ferrofin_db::PADDED_LIST_MAX) {
             let mut qb = tagged_series_episodes_query(chunk, value_types, access_filter);
             for (clean, of_tagged, tagged_of_tagged) in qb
                 .build_query_as::<(String, i64, i64)>()
@@ -619,7 +619,7 @@ impl ItemCountService for FerrofinItemCountService {
         owner_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, ExtraCounts>, ServiceError> {
         let mut counts = HashMap::new();
-        for chunk in owner_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(owner_ids) {
             let sql = extra_counts_sql(chunk.len());
             let mut query = sqlx::query_as::<_, (String, i64, i64)>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
@@ -829,7 +829,7 @@ impl ItemCountService for FerrofinItemCountService {
             .into_iter()
             .collect();
         let mut by_clean: HashMap<String, HashMap<String, i32>> = HashMap::new();
-        for chunk in distinct_cleans.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(&distinct_cleans) {
             let sql = item_value_counts_sql(chunk.len(), type_names.len(), value_types);
 
             let mut query = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql));
@@ -1191,7 +1191,7 @@ impl ItemCountService for FerrofinItemCountService {
         // limit (32,766). `restrict_count_query` adds only the parental binds,
         // about four per tag in the user's tag policy plus a few tens, so a
         // chunk overflows only past ~8,000 tags on one user.
-        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(&ids) {
             let n = chunk.len();
             for (sql, into) in [
                 (
@@ -1205,7 +1205,7 @@ impl ItemCountService for FerrofinItemCountService {
                 (linked_count_sql(n, has_user), &mut linked),
             ] {
                 let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
-                for id in chunk {
+                for id in &chunk {
                     query = query.bind(id.as_str());
                 }
                 // Every statement reads the child as `bi`, so the parental and
@@ -1283,7 +1283,7 @@ impl ItemCountService for FerrofinItemCountService {
         let ids: Vec<String> = parent_ids.iter().copied().map(guid_to_db).collect();
         let mut grouped: HashMap<String, i64> = HashMap::new();
         // Chunked: an unpaged page can hold more parents than SQLite's bind limit.
-        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(&ids) {
             let mut sql = String::from(
                 r#"SELECT "ParentId", COUNT(*) FROM "LinkedChildren" WHERE "ParentId" IN ("#,
             );
@@ -1334,7 +1334,7 @@ impl FerrofinItemCountService {
         members.sort_unstable();
         members.dedup();
         let mut keys_by_member: HashMap<String, Vec<String>> = HashMap::new();
-        for chunk in members.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(&members) {
             for child_of in [ChildOf::Parent, ChildOf::Season] {
                 let sql = merged_children_sql(
                     child_of,
@@ -1344,7 +1344,7 @@ impl FerrofinItemCountService {
                 );
                 let mut query =
                     sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(sql));
-                for id in chunk {
+                for id in &chunk {
                     query = query.bind(id.as_str());
                 }
                 let mut query = restrict_count_query(query, access_filter, None)?;
@@ -1891,18 +1891,15 @@ mod tests {
                 local_trailers: 0
             }
         );
-        let sql = format!("EXPLAIN QUERY PLAN {}", extra_counts_sql(1));
-        let plan = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(sql))
-            .bind(guid_to_db(owner))
-            .fetch_all(db.pool())
-            .await
-            .unwrap();
-        assert!(
-            plan.iter().any(|r| r
-                .3
-                .contains("SEARCH BaseItems USING INDEX IX_BaseItems_OwnerId")),
-            "{plan:?}"
-        );
+        // At every length a padded list takes (gl-1243).
+        for n in (0..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+            let plan = query_plan(&db, &extra_counts_sql(n), n).await;
+            assert!(
+                plan.iter()
+                    .any(|d| d.contains("SEARCH BaseItems USING INDEX IX_BaseItems_OwnerId")),
+                "{n} owners: {plan:?}"
+            );
+        }
         db.close().await;
         assert!(svc.get_extra_counts_batch(&[owner]).await.is_err());
     }
@@ -3840,14 +3837,15 @@ mod tests {
         }
     }
 
-    /// The by-name count path chunks its `IN` list at 500. Seeding 501 distinct
-    /// by-name rows crosses that boundary in the count query
-    /// (`distinct_cleans.chunks`); an off-by-one there silently drops the
-    /// tail's counts.
+    /// The by-name count path reads its names in padded chunks of
+    /// [`ferrofin_db::PADDED_LIST_MAX`]. Seeding one more distinct by-name row
+    /// than that crosses a chunk boundary in the count query; an off-by-one
+    /// there silently drops the tail's counts. Which names land in the tail
+    /// chunk is up to a `HashSet`, so every genre is checked.
     #[tokio::test]
     async fn name_item_counts_span_the_chunk_boundary() {
-        /// One past the 500-item `IN`-chunk size used by the by-name count path.
-        const N: u128 = 501;
+        /// One past the padded `IN`-chunk size of the by-name count path.
+        const N: u128 = ferrofin_db::PADDED_LIST_MAX as u128 + 1;
 
         let db = test_db().await;
         let service = svc(&db);
@@ -3880,9 +3878,6 @@ mod tests {
         for (i, id) in genre_ids.iter().enumerate() {
             assert_eq!(counts[id].movie_count, 1, "genre #{i} counted");
         }
-        // Explicitly pin the elements straddling the 500-item chunk edge.
-        assert_eq!(counts[&genre_ids[499]].movie_count, 1);
-        assert_eq!(counts[&genre_ids[500]].movie_count, 1);
     }
 
     #[tokio::test]
@@ -4486,45 +4481,50 @@ mod tests {
     async fn the_child_counts_seek_their_grouped_column() {
         let db = test_db().await;
         let by_key = "USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)";
-        for has_user in [false, true] {
-            for include_virtual in [true, false] {
-                for (child_of, count_index, merged_index) in [
-                    (
-                        ChildOf::Parent,
-                        "COVERING INDEX FerrofinIX_BaseItems_ChildCount (ParentId=?)",
-                        "INDEX IX_BaseItems_ParentId (ParentId=?)",
-                    ),
-                    (
-                        ChildOf::Season,
-                        "INDEX IX_BaseItems_SeasonId (SeasonId=?)",
-                        "INDEX IX_BaseItems_SeasonId (SeasonId=?)",
-                    ),
-                ] {
-                    for (sql, index) in [
+        // At every length a padded list takes (gl-1243).
+        for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+            for has_user in [false, true] {
+                for include_virtual in [true, false] {
+                    for (child_of, count_index, merged_index) in [
                         (
-                            child_count_sql(child_of, 2, has_user, include_virtual),
-                            count_index,
+                            ChildOf::Parent,
+                            "COVERING INDEX FerrofinIX_BaseItems_ChildCount (ParentId=?)",
+                            "INDEX IX_BaseItems_ParentId (ParentId=?)",
                         ),
                         (
-                            merged_children_sql(child_of, 2, has_user, include_virtual),
-                            merged_index,
+                            ChildOf::Season,
+                            "INDEX IX_BaseItems_SeasonId (SeasonId=?)",
+                            "INDEX IX_BaseItems_SeasonId (SeasonId=?)",
                         ),
                     ] {
-                        let plan = query_plan(&db, &sql, 2).await;
-                        assert_eq!(plan[0], format!("SEARCH bi USING {index}"), "{sql}");
-                        assert!(
-                            plan[1..].iter().all(|step| step.contains(by_key)
-                                || step.starts_with("CORRELATED")),
-                            "{plan:?}"
-                        );
+                        for (sql, index) in [
+                            (
+                                child_count_sql(child_of, n, has_user, include_virtual),
+                                count_index,
+                            ),
+                            (
+                                merged_children_sql(child_of, n, has_user, include_virtual),
+                                merged_index,
+                            ),
+                        ] {
+                            let plan = query_plan(&db, &sql, n).await;
+                            assert_eq!(plan[0], format!("SEARCH bi USING {index}"), "{sql}");
+                            assert!(
+                                plan[1..]
+                                    .iter()
+                                    .all(|step| step.contains(by_key)
+                                        || step.starts_with("CORRELATED")),
+                                "{plan:?}"
+                            );
+                        }
                     }
                 }
+                let plan = query_plan(&db, &linked_count_sql(n, has_user), n).await;
+                assert!(plan[0].starts_with("SEARCH lc USING"), "{plan:?}");
+                assert!(plan[0].ends_with("(ParentId=?)"), "{plan:?}");
+                assert_eq!(plan[1], format!("SEARCH bi {by_key}"), "{plan:?}");
+                assert!(!plan.iter().any(|step| step.contains("SCAN")), "{plan:?}");
             }
-            let plan = query_plan(&db, &linked_count_sql(2, has_user), 2).await;
-            assert!(plan[0].starts_with("SEARCH lc USING"), "{plan:?}");
-            assert!(plan[0].ends_with("(ParentId=?)"), "{plan:?}");
-            assert_eq!(plan[1], format!("SEARCH bi {by_key}"), "{plan:?}");
-            assert!(!plan.iter().any(|step| step.contains("SCAN")), "{plan:?}");
         }
     }
 
@@ -4774,31 +4774,36 @@ mod tests {
     async fn by_name_count_aggregates_seek_from_the_name_side() {
         let db = test_db().await;
 
-        let people = people_name_counts_sql(3, 2);
-        let plan = query_plan(&db, &people, 5).await;
-        let outer = plan.first().expect("a plan step");
-        assert!(
-            outer.contains("Peoples") && outer.contains("IX_Peoples_Name"),
-            "person counts must seek Peoples by Name first, got: {plan:?}"
-        );
-        assert!(
-            plan.iter()
-                .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
-            "person counts must reach BaseItems by id, got: {plan:?}"
-        );
+        // At every length a padded name list takes (gl-1243).
+        for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+            let people = people_name_counts_sql(n, 2);
+            let plan = query_plan(&db, &people, n + 2).await;
+            let outer = plan.first().expect("a plan step");
+            assert!(
+                outer.contains("Peoples") && outer.contains("IX_Peoples_Name"),
+                "{n} names: person counts must seek Peoples by Name first, got: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
+                "{n} names: person counts must reach BaseItems by id, got: {plan:?}"
+            );
 
-        let values = item_value_counts_sql(3, 2, &[ItemValueType::Genre]);
-        let plan = query_plan(&db, &values, 5).await;
-        let outer = plan.first().expect("a plan step");
-        assert!(
-            outer.starts_with("SCAN iv ") || outer.starts_with("SEARCH iv ") || outer == "SCAN iv",
-            "value counts must start at ItemValues, got: {plan:?}"
-        );
-        assert!(
-            plan.iter()
-                .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
-            "value counts must reach BaseItems by id, got: {plan:?}"
-        );
+            let values = item_value_counts_sql(n, 2, &[ItemValueType::Genre]);
+            let plan = query_plan(&db, &values, n + 2).await;
+            let outer = plan.first().expect("a plan step");
+            assert!(
+                outer.starts_with("SCAN iv ")
+                    || outer.starts_with("SEARCH iv ")
+                    || outer == "SCAN iv",
+                "{n} names: value counts must start at ItemValues, got: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
+                "{n} names: value counts must reach BaseItems by id, got: {plan:?}"
+            );
+        }
     }
 
     /// The folder leaf-count aggregate must be driven by the page's folder ids,
