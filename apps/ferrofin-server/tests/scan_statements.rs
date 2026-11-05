@@ -445,6 +445,16 @@ async fn an_episode_reads_neither_the_library_listing_nor_its_row_twice() {
         "an episode writes its ancestors in one statement:\n{listing}"
     );
 
+    // The parental score reads the rows above an episode only when the item
+    // scored before it did not hold them (gl-1252): every episode after a
+    // season's first shares the chain that one read, on a re-scan too.
+    let reach = |s: &str| s.contains("WITH RECURSIVE reach(");
+    assert_eq!(
+        (scans.more(reach), rescans.more(reach)),
+        (0, 0),
+        "an episode reads no parent chain the one before it held:\n{listing}"
+    );
+
     a_rescanned_episode_reads_its_cast_in_batches(&rescans);
 }
 

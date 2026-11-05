@@ -49,6 +49,10 @@ pub struct ItemVisibility {
     /// once-per-scan test.
     #[cfg(test)]
     library_loads: std::sync::atomic::AtomicUsize,
+    /// How many times a hierarchy walk read rows, for the scan's
+    /// once-per-parent test.
+    #[cfg(test)]
+    hierarchy_reads: std::sync::atomic::AtomicUsize,
 }
 
 /// The library rows and each library's options that visibility and rating
@@ -76,6 +80,8 @@ impl ItemVisibility {
             paths: crate::virtual_paths::VirtualPathExpander::identity(),
             #[cfg(test)]
             library_loads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            hierarchy_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -83,6 +89,13 @@ impl ItemVisibility {
     #[cfg(test)]
     pub(crate) fn library_loads(&self) -> usize {
         self.library_loads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many times a hierarchy walk read rows ([`repository::reachable`]).
+    #[cfg(test)]
+    pub(crate) fn hierarchy_reads(&self) -> usize {
+        self.hierarchy_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Expands the portable data and metadata paths stored in adopted databases.
@@ -467,9 +480,17 @@ impl ItemVisibility {
     /// [`Self::update_rating_scores`] over `libraries` read earlier with
     /// [`Self::rating_libraries`], so a batch job that scores one item at a
     /// time (the library scan) reads the libraries and their options once.
-    /// Each call still reads the items' own parent chain, so an ancestor saved
-    /// since `libraries` was read is seen; the library rows themselves are the
-    /// snapshot `libraries` took, as the scan's library policy is.
+    /// The library rows are the snapshot `libraries` took, as the scan's
+    /// library policy is.
+    ///
+    /// `ancestors` carries the rows above the items from one call to the
+    /// next (gl-1252): a call reads only the part of its items' chain that
+    /// `ancestors` lacks, then keeps the rows above its own items and nothing
+    /// else, so the episodes of a season, scored one after another, read
+    /// their chain once. An item is never above itself, so a job that saves
+    /// each parent before scoring its children reads every parent after its
+    /// save. A caller empties `ancestors` when a row in it may have been
+    /// written since; an error empties it too.
     ///
     /// # Errors
     /// Returns storage errors or an error for a cyclic hierarchy.
@@ -477,8 +498,10 @@ impl ItemVisibility {
         &self,
         items: &mut [BaseItemEntity],
         libraries: &RatingLibraries,
+        ancestors: &mut Vec<BaseItemEntity>,
     ) -> Result<(), ServiceError> {
-        self.update_rating_scores_with(items, Some(libraries)).await
+        self.update_rating_scores_with(items, Some((libraries, ancestors)))
+            .await
     }
 
     /// Reads the library rows, each library's options and its stored
@@ -541,26 +564,35 @@ impl ItemVisibility {
     async fn update_rating_scores_with(
         &self,
         items: &mut [BaseItemEntity],
-        libraries: Option<&RatingLibraries>,
+        batch: Option<(&RatingLibraries, &mut Vec<BaseItemEntity>)>,
     ) -> Result<(), ServiceError> {
         if items.is_empty() {
             return Ok(());
         }
         let read;
-        let libraries = if let Some(libraries) = libraries {
-            libraries
+        let mut unkept = Vec::new();
+        let (libraries, ancestors) = if let Some(batch) = batch {
+            batch
         } else {
             read = self.rating_libraries().await?;
-            &read
+            (&read, &mut unkept)
         };
+        // Taken while the context borrows them; the rows above `items` go back.
+        let mut known = std::mem::take(ancestors);
         // Scored over the rows as passed in, then written: the context borrows them.
-        let scores = {
-            let context = self.load(items, None, &libraries.set).await?;
-            items
+        let (scores, (kept, fresh)) = {
+            let context = self
+                .load_known(items.iter(), &known, None, &libraries.set)
+                .await?;
+            let scores = items
                 .iter()
                 .map(|item| context.rating_score(context.row(item)))
-                .collect::<Result<Vec<_>, ServiceError>>()?
+                .collect::<Result<Vec<_>, ServiceError>>()?;
+            (scores, context.into_ancestors(items))
         };
+        known.retain(|row| kept.contains(&row_id(row)));
+        known.extend(fresh);
+        *ancestors = known;
         for (item, score) in items.iter_mut().zip(scores) {
             item.unrated_type = Some(
                 crate::kinds::unrated_item(kind(item), uuid(item.channel_id.as_deref()).is_some())
@@ -651,6 +683,9 @@ impl ItemVisibility {
             }
             // The whole chain above `wanted` in one read. A reference it could not follow (a
             // missing row) is asked for once more, by itself, in the next round.
+            #[cfg(test)]
+            self.hierarchy_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             for row in
                 repository::reachable(&self.db, &wanted.into_iter().collect::<Vec<_>>()).await?
             {
@@ -848,6 +883,36 @@ impl Context<'_> {
     /// The context's row for `item`'s id, path expanded; `item` itself when it has none.
     fn row<'r>(&'r self, item: &'r BaseItemEntity) -> &'r BaseItemEntity {
         self.get(&row_id(item)).unwrap_or(item)
+    }
+
+    /// The rows above `items` by the references [`ItemVisibility::load_hierarchy`] follows, short
+    /// of the library set's: the ids of those borrowed from the caller's `known` rows, and those
+    /// this context owns.
+    fn into_ancestors(mut self, items: &[BaseItemEntity]) -> (HashSet<Uuid>, Vec<BaseItemEntity>) {
+        let mut seen: HashSet<Uuid> = items
+            .iter()
+            .chain(&self.libraries.rows)
+            .chain(&self.libraries.ancestors)
+            .map(row_id)
+            .collect();
+        let mut next: Vec<Uuid> = items.iter().flat_map(references).collect();
+        let (mut borrowed, mut owned) = (HashSet::new(), Vec::new());
+        while let Some(id) = next.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(row) = self.rows.remove(&id) else {
+                continue;
+            };
+            next.extend(references(&row));
+            match row {
+                Cow::Borrowed(_) => {
+                    borrowed.insert(id);
+                }
+                Cow::Owned(row) => owned.push(row),
+            }
+        }
+        (borrowed, owned)
     }
 
     fn preference(&self, kind: PreferenceKind) -> &[String] {
@@ -1951,6 +2016,160 @@ mod tests {
             .unwrap();
         assert_eq!(child.inherited_parental_rating_value, None);
         assert_eq!(child.inherited_parental_rating_sub_value, None);
+    }
+
+    /// A library holding a series rated PG for Canada, one season of it and three episodes:
+    /// `[library, series, season, episode, episode, episode]` (gl-1252).
+    async fn rated_season(f: &Fixture) -> [BaseItemEntity; 6] {
+        let library = f
+            .item(70, BaseItemKind::CollectionFolder, Some("/shows"), None)
+            .await;
+        let mut series = f
+            .item(71, BaseItemKind::Series, Some("/shows/a"), Some(&library))
+            .await;
+        series.official_rating = Some("PG".into());
+        series.preferred_metadata_country_code = Some("CA".into());
+        f.save(&series).await;
+        let mut season = f
+            .item(72, BaseItemKind::Season, Some("/shows/a/s1"), Some(&series))
+            .await;
+        season.series_id = Some(series.id.clone());
+        f.save(&season).await;
+        let mut episodes = Vec::new();
+        for id in 73..76 {
+            let path = format!("/shows/a/s1/{id}.mkv");
+            let mut episode = f
+                .item(id, BaseItemKind::Episode, Some(&path), Some(&season))
+                .await;
+            episode.season_id = Some(season.id.clone());
+            episode.series_id = Some(series.id.clone());
+            f.save(&episode).await;
+            episodes.push(episode);
+        }
+        let [first, second, third] = <[BaseItemEntity; 3]>::try_from(episodes).expect("three");
+        [library, series, season, first, second, third]
+    }
+
+    /// Each row's stored parental score and sub-score.
+    fn scores(rows: &[BaseItemEntity]) -> Vec<(Option<i64>, Option<i64>)> {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.inherited_parental_rating_value,
+                    row.inherited_parental_rating_sub_value,
+                )
+            })
+            .collect()
+    }
+
+    /// The batch scorer reads the rows above a season's episodes once, scores each as the one-off
+    /// scorer does, and carries only the rows above the item it scored last (gl-1252).
+    #[tokio::test]
+    async fn batch_scores_carry_only_the_chain_above_the_last_item() {
+        let f = Fixture::new().await;
+        let [library, series, season, episodes @ ..] = rated_season(&f).await;
+        let movie = f
+            .item(
+                76,
+                BaseItemKind::Movie,
+                Some("/shows/b.mkv"),
+                Some(&library),
+            )
+            .await;
+
+        let libraries = f.service.rating_libraries().await.expect("libraries");
+        let mut ancestors = Vec::new();
+        let before = f.service.hierarchy_reads();
+        let mut batch = episodes.clone();
+        for episode in &mut batch {
+            f.service
+                .update_rating_scores_in(std::slice::from_mut(episode), &libraries, &mut ancestors)
+                .await
+                .expect("batch score");
+        }
+        assert_eq!(
+            f.service.hierarchy_reads() - before,
+            1,
+            "one read for the season"
+        );
+        let mut held: Vec<_> = ancestors.iter().map(row_id).collect();
+        held.sort();
+        assert_eq!(
+            held,
+            [row_id(&series), row_id(&season)],
+            "the library set's rows stay out"
+        );
+        let mut single = episodes;
+        f.service
+            .update_rating_scores(&mut single)
+            .await
+            .expect("single score");
+        assert_eq!(scores(&batch), [(Some(8), Some(1)); 3]);
+        assert_eq!(scores(&batch), scores(&single));
+        let before = f.service.hierarchy_reads();
+        let mut movie = movie;
+        f.service
+            .update_rating_scores_in(std::slice::from_mut(&mut movie), &libraries, &mut ancestors)
+            .await
+            .expect("movie score");
+        assert_eq!(
+            f.service.hierarchy_reads(),
+            before,
+            "the library is in the set"
+        );
+        assert!(
+            ancestors.is_empty(),
+            "the series' chain is not above the movie"
+        );
+    }
+
+    /// A parent the batch scorer carries is scored and saved again: it leaves the carry with its
+    /// own scoring, so its next child reads the saved row (gl-1252).
+    #[tokio::test]
+    async fn a_carried_parent_scored_again_is_read_after_its_save() {
+        let f = Fixture::new().await;
+        let [_, mut series, _, mut first, mut second, _] = rated_season(&f).await;
+        let libraries = f.service.rating_libraries().await.expect("libraries");
+        let mut ancestors = Vec::new();
+        f.service
+            .update_rating_scores_in(std::slice::from_mut(&mut first), &libraries, &mut ancestors)
+            .await
+            .expect("first score");
+        assert_eq!(scores(std::slice::from_ref(&first)), [(Some(8), Some(1))]);
+        assert!(ancestors.iter().any(|row| row_id(row) == row_id(&series)));
+        series.official_rating = Some("18A".into());
+        f.service
+            .update_rating_scores_in(
+                std::slice::from_mut(&mut series),
+                &libraries,
+                &mut ancestors,
+            )
+            .await
+            .expect("series score");
+        assert!(
+            ancestors.iter().all(|row| row_id(row) != row_id(&series)),
+            "an item is never carried above itself"
+        );
+        f.save(&series).await;
+        let mut fresh = second.clone();
+        f.service
+            .update_rating_scores_in(
+                std::slice::from_mut(&mut second),
+                &libraries,
+                &mut ancestors,
+            )
+            .await
+            .expect("second score");
+        f.service
+            .update_rating_scores(std::slice::from_mut(&mut fresh))
+            .await
+            .expect("fresh score");
+        assert_ne!(scores(std::slice::from_ref(&second)), [(Some(8), Some(1))]);
+        assert_eq!(
+            scores(std::slice::from_ref(&second)),
+            scores(std::slice::from_ref(&fresh)),
+            "the saved rating, as a fresh read scores it"
+        );
     }
 
     #[tokio::test]
