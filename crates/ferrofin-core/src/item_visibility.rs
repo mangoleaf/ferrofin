@@ -53,6 +53,9 @@ pub struct ItemVisibility {
     /// once-per-parent test.
     #[cfg(test)]
     hierarchy_reads: std::sync::atomic::AtomicUsize,
+    /// How many rows those reads returned.
+    #[cfg(test)]
+    hierarchy_rows: std::sync::atomic::AtomicUsize,
 }
 
 /// The library rows and each library's options that visibility and rating
@@ -82,6 +85,8 @@ impl ItemVisibility {
             library_loads: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             hierarchy_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            hierarchy_rows: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -95,6 +100,13 @@ impl ItemVisibility {
     #[cfg(test)]
     pub(crate) fn hierarchy_reads(&self) -> usize {
         self.hierarchy_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many rows the hierarchy walks read.
+    #[cfg(test)]
+    pub(crate) fn hierarchy_rows(&self) -> usize {
+        self.hierarchy_rows
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -632,19 +644,36 @@ impl ItemVisibility {
         .map(str::to_owned))
     }
 
-    /// `playlist_links` also reads playlists' members, which only a
-    /// rating-limited user's `HasParentalAllowedChild` needs.
+    /// Reads `wanted` and everything `rows` and those rows refer to up the hierarchy, and box
+    /// sets' members, into `rows` and `links`. `examined` holds the rows whose references were
+    /// already followed, so a later call reads only what its own `wanted` adds.
     async fn load_hierarchy(
         &self,
         rows: &mut HashMap<Uuid, Cow<'_, BaseItemEntity>>,
-        playlist_links: bool,
-    ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
-        let mut examined = HashSet::new();
-        let mut requested: HashSet<Uuid> = rows.keys().copied().collect();
-        let mut links: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        links: &mut HashMap<Uuid, Vec<Uuid>>,
+        examined: &mut HashSet<Uuid>,
+        mut wanted: HashSet<Uuid>,
+    ) -> Result<(), ServiceError> {
+        let mut requested: HashSet<Uuid> = rows.keys().chain(&wanted).copied().collect();
         // Each round batches all new references, including nested collections.
         // Missing references are remembered, so they cannot cause repeated reads.
         loop {
+            if !wanted.is_empty() {
+                // The whole chain above `wanted` in one read. A reference it could not follow (a
+                // missing row) is asked for once more, by itself, in the next round.
+                #[cfg(test)]
+                self.hierarchy_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                for row in
+                    repository::reachable(&self.db, &wanted.drain().collect::<Vec<_>>()).await?
+                {
+                    #[cfg(test)]
+                    self.hierarchy_rows
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // What the caller passed (an item with unsaved changes, the cached libraries) wins.
+                    rows.entry(row_id(&row)).or_insert(Cow::Owned(row));
+                }
+            }
             let fresh: Vec<_> = rows
                 .keys()
                 .filter(|id| !examined.contains(*id))
@@ -655,11 +684,7 @@ impl ItemVisibility {
             }
             let containers: Vec<_> = fresh
                 .iter()
-                .filter(|id| match kind(&rows[id]) {
-                    BaseItemKind::BoxSet => true,
-                    BaseItemKind::Playlist => playlist_links,
-                    _ => false,
-                })
+                .filter(|id| kind(&rows[id]) == BaseItemKind::BoxSet)
                 .copied()
                 .collect();
             for (parent, child) in repository::linked_children(&self.db, &containers).await? {
@@ -667,7 +692,6 @@ impl ItemVisibility {
                     links.entry(parent).or_default().push(child);
                 }
             }
-            let mut wanted = HashSet::new();
             for id in fresh {
                 examined.insert(id);
                 let row = &rows[&id];
@@ -678,22 +702,92 @@ impl ItemVisibility {
                     }
                 }
             }
-            if wanted.is_empty() {
-                break;
-            }
-            // The whole chain above `wanted` in one read. A reference it could not follow (a
-            // missing row) is asked for once more, by itself, in the next round.
-            #[cfg(test)]
-            self.hierarchy_reads
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            for row in
-                repository::reachable(&self.db, &wanted.into_iter().collect::<Vec<_>>()).await?
-            {
-                // What the caller passed (an item with unsaved changes, the cached libraries) wins.
-                rows.entry(row_id(&row)).or_insert(Cow::Owned(row));
+        }
+        Ok(())
+    }
+
+    /// Every reader sees the expanded path; a borrowed row is copied only when it changes.
+    fn expand_paths(&self, rows: &mut HashMap<Uuid, Cow<'_, BaseItemEntity>>) {
+        for row in rows.values_mut() {
+            let expanded = match row.path.as_deref().map(|path| self.paths.expand_cow(path)) {
+                Some(Cow::Owned(path)) => Some(path),
+                _ => None,
+            };
+            if let Some(path) = expanded {
+                row.to_mut().path = Some(path);
             }
         }
-        Ok(links)
+    }
+
+    /// The member half of `Playlist.HasParentalAllowedChild` (v12.4 `Playlist.cs:261-271`) for
+    /// each of `playlists`: no member, or one passing `IsParentalAllowed(user, true)`. Only a
+    /// rating-limited user asks it. The member ids are read at once; the members and the chains
+    /// above them in doubling batches (1, 2, 4, …) across the playlists still undecided, as
+    /// `linkedItems.Any` stops at the first allowed one, so the common playlist reads one member
+    /// rather than all of them (gl-1261). A link to a missing item is no member, as in
+    /// `GetLinkedChildren`. Members are taken in the order `LinkedChildren` returns them; the
+    /// answer does not depend on it. A member that fails its check (a cyclic chain) is that
+    /// playlist's answer, returned only when a check asks for it, as the check that asked one
+    /// member at a time did.
+    async fn parental_members(
+        &self,
+        context: &mut Context<'_>,
+        examined: &mut HashSet<Uuid>,
+        playlists: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        let mut members: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        for (parent, child) in repository::linked_children(&self.db, playlists).await? {
+            if let (Some(parent), Some(child)) = (uuid(Some(&parent)), uuid(Some(&child))) {
+                members.entry(parent).or_default().push(child);
+            }
+        }
+        // Each undecided playlist, the first of its members not checked yet, and whether one of
+        // those checked exists.
+        let mut pending: Vec<(Uuid, usize, bool)> =
+            playlists.iter().map(|id| (*id, 0, false)).collect();
+        let mut size = 1;
+        while !pending.is_empty() {
+            let batch = |id: &Uuid, start: usize| {
+                let ids = members.get(id).map_or(&[][..], Vec::as_slice);
+                &ids[start.min(ids.len())..(start + size).min(ids.len())]
+            };
+            let wanted = pending
+                .iter()
+                .flat_map(|(id, start, _)| batch(id, *start))
+                .filter(|id| !context.rows.contains_key(*id))
+                .copied()
+                .collect();
+            self.load_hierarchy(&mut context.rows, &mut context.links, examined, wanted)
+                .await?;
+            self.expand_paths(&mut context.rows);
+            let mut next = Vec::new();
+            for (id, start, mut found) in pending {
+                // An error stays this playlist's answer, for a check that asks it.
+                let mut answer = None;
+                for member in batch(&id, start).iter().filter_map(|m| context.get(m)) {
+                    found = true;
+                    match context.parental(member, true) {
+                        Ok(false) => {}
+                        decided => {
+                            answer = Some(decided);
+                            break;
+                        }
+                    }
+                }
+                let end = start + size;
+                if answer.is_none() && end >= members.get(&id).map_or(0, Vec::len) {
+                    answer = Some(Ok(!found));
+                }
+                match answer {
+                    Some(answer) => {
+                        context.parental_members.insert(id, answer);
+                    }
+                    None => next.push((id, end, found)),
+                }
+            }
+            (pending, size) = (next, size * 2);
+        }
+        Ok(())
     }
 
     /// The context that evaluates `items` over `libraries` (from [`Self::rating_libraries`]).
@@ -734,22 +828,10 @@ impl ItemVisibility {
         for row in known.iter().chain(&libraries.ancestors) {
             rows.entry(row_id(row)).or_insert(Cow::Borrowed(row));
         }
-        let links = self
-            .load_hierarchy(
-                &mut rows,
-                user.is_some_and(|user| user.max_parental_rating_score.is_some()),
-            )
+        let (mut links, mut examined) = (HashMap::new(), HashSet::new());
+        self.load_hierarchy(&mut rows, &mut links, &mut examined, HashSet::new())
             .await?;
-        // Every reader sees the expanded path; a borrowed row is copied only when it changes.
-        for row in rows.values_mut() {
-            let expanded = match row.path.as_deref().map(|path| self.paths.expand_cow(path)) {
-                Some(Cow::Owned(path)) => Some(path),
-                _ => None,
-            };
-            if let Some(path) = expanded {
-                row.to_mut().path = Some(path);
-            }
-        }
+        self.expand_paths(&mut rows);
         // Each library's list, expanded once for every path match of this context. A caller's
         // copy of a library row stands in for the set's here as in `rows`, so a list is taken
         // from the set only for the `Data` it was parsed from.
@@ -790,7 +872,7 @@ impl ItemVisibility {
                 }
             }
         }
-        Ok(Context {
+        let mut context = Context {
             service: self,
             user,
             rows,
@@ -798,6 +880,7 @@ impl ItemVisibility {
             links,
             libraries,
             playlists,
+            parental_members: HashMap::new(),
             permissions: permissions.into_iter().collect(),
             preferences: preferences
                 .into_iter()
@@ -811,7 +894,12 @@ impl ItemVisibility {
                     )
                 })
                 .collect(),
-        })
+        };
+        if user.is_some_and(|user| user.max_parental_rating_score.is_some()) {
+            self.parental_members(&mut context, &mut examined, &playlist_ids)
+                .await?;
+        }
+        Ok(context)
     }
 }
 
@@ -836,6 +924,9 @@ struct Context<'a> {
     /// The library set the rows above were read with; its `options` are each library's.
     libraries: &'a LibrarySet,
     playlists: HashMap<Uuid, bool>,
+    /// For a rating-limited user, each playlist's member test from
+    /// [`ItemVisibility::parental_members`].
+    parental_members: HashMap<Uuid, Result<bool, ServiceError>>,
     permissions: HashMap<i32, bool>,
     preferences: HashMap<i32, Vec<String>>,
 }
@@ -1147,9 +1238,11 @@ impl Context<'_> {
         Ok(true)
     }
 
-    /// `Playlist.HasParentalAllowedChild` (v12.2 Playlist.cs:261-271): a
+    /// `Playlist.HasParentalAllowedChild` (v12.4 Playlist.cs:261-271): a
     /// rating-limited user sees a playlist only when it has no members or one
-    /// of them passes `IsParentalAllowed(user, true)`.
+    /// of them passes `IsParentalAllowed(user, true)`. A playlist's answer comes
+    /// from [`ItemVisibility::parental_members`]; a box set's members are all read
+    /// already, for its library check.
     fn has_parental_allowed_child(
         &self,
         item: &BaseItemEntity,
@@ -1157,6 +1250,17 @@ impl Context<'_> {
     ) -> Result<bool, ServiceError> {
         if user.max_parental_rating_score.is_none() {
             return Ok(true);
+        }
+        if kind(item) == BaseItemKind::Playlist {
+            return match self.parental_members.get(&row_id(item)) {
+                Some(Ok(allowed)) => Ok(*allowed),
+                Some(Err(ServiceError::Backend(why))) => Err(ServiceError::backend(why.clone())),
+                Some(Err(other)) => Err(ServiceError::backend(other.to_string())),
+                None => Err(ServiceError::backend(format!(
+                    "members of playlist {} not read",
+                    row_id(item)
+                ))),
+            };
         }
         let mut members = self
             .links
@@ -2494,6 +2598,118 @@ mod tests {
             .await
             .expect("admin");
         assert_eq!(hidden(&f).await, HashSet::new(), "Jellyfin's answer");
+    }
+
+    /// A rating-limited user's `HasParentalAllowedChild` reads a playlist's members in doubling
+    /// batches and stops at the first allowed one, with `linkedItems.Any`'s answer: a playlist
+    /// whose first member is allowed reads that member alone, one whose only allowed member comes
+    /// last still finds it, and one with none stays hidden (gl-1261).
+    #[tokio::test]
+    async fn playlist_members_are_read_until_one_is_allowed() {
+        let mut f = Fixture::new().await;
+        let library = f
+            .item(120, BaseItemKind::CollectionFolder, Some("/library"), None)
+            .await;
+        let mut movies = Vec::new();
+        for id in 121..=129 {
+            let mut movie = f
+                .item(
+                    id,
+                    BaseItemKind::Movie,
+                    Some(&format!("/library/{id}")),
+                    Some(&library),
+                )
+                .await;
+            movie.official_rating = Some(if id == 121 { "G" } else { "R" }.to_owned());
+            f.save(&movie).await;
+            movies.push(movie);
+        }
+        let (allowed, rated) = movies.split_first().expect("movies");
+        let playlist = async |f: &Fixture, id: u128, members: &[&BaseItemEntity]| {
+            let mut row = f
+                .item(
+                    id,
+                    BaseItemKind::Playlist,
+                    Some(&format!("/server/data/playlists/{id}")),
+                    None,
+                )
+                .await;
+            row.data = Some(serde_json::json!({"OwnerUserId": f.user.id}).to_string());
+            f.save(&row).await;
+            for member in members {
+                crate::FerrofinLinkedChildrenService::new(f.db.clone())
+                    .upsert_linked_child(row_id(&row), row_id(member), 0)
+                    .await
+                    .expect("link");
+            }
+            row
+        };
+        let first = playlist(
+            &f,
+            130,
+            &std::iter::once(allowed).chain(rated).collect::<Vec<_>>(),
+        )
+        .await;
+        let last = playlist(&f, 131, &rated.iter().chain([allowed]).collect::<Vec<_>>()).await;
+        let none = playlist(&f, 132, &rated.iter().collect::<Vec<_>>()).await;
+        f.user.max_parental_rating_score = Some(13);
+
+        let before = f.service.hierarchy_rows();
+        assert!(f.visible(&first).await, "the first member is allowed");
+        assert_eq!(
+            f.service.hierarchy_rows() - before,
+            2,
+            "that member and the library above it, not the other eight"
+        );
+        assert!(f.visible(&last).await, "the last member is allowed");
+        assert!(!f.visible(&none).await, "no member is allowed");
+        let hidden = f.service.hidden_playlists(&f.user, &[]).await.unwrap();
+        assert_eq!(hidden, vec![row_id(&none)], "one rule for the listing");
+    }
+
+    /// A member whose chain is cyclic fails only the playlist checks that ask for it: another
+    /// user's private playlist holding it is hidden by its owner test, as it was when members
+    /// were checked one at a time, and the listing goes on; the user's own fails (gl-1261).
+    #[tokio::test]
+    async fn a_cyclic_member_fails_only_the_playlist_that_asks() {
+        let mut f = Fixture::new().await;
+        let mut first = f.item(140, BaseItemKind::Folder, None, None).await;
+        let second = f.item(141, BaseItemKind::Folder, None, Some(&first)).await;
+        first.parent_id = Some(second.id.clone());
+        f.save(&first).await;
+        let movie = f
+            .item(142, BaseItemKind::Movie, Some("/cycle/142"), Some(&second))
+            .await;
+        let playlist = async |f: &Fixture, id: u128, owner: Uuid| {
+            let mut row = f
+                .item(
+                    id,
+                    BaseItemKind::Playlist,
+                    Some(&format!("/server/data/playlists/{id}")),
+                    None,
+                )
+                .await;
+            row.data = Some(serde_json::json!({"OwnerUserId": owner}).to_string());
+            f.save(&row).await;
+            crate::FerrofinLinkedChildrenService::new(f.db.clone())
+                .upsert_linked_child(row_id(&row), row_id(&movie), 0)
+                .await
+                .expect("link");
+            row
+        };
+        let private = playlist(&f, 143, Uuid::from_u128(999)).await;
+        f.user.max_parental_rating_score = Some(13);
+        assert_eq!(
+            f.service.hidden_playlists(&f.user, &[]).await.unwrap(),
+            vec![row_id(&private)]
+        );
+        let own = playlist(&f, 144, Uuid::parse_str(&f.user.id).expect("user id")).await;
+        assert!(
+            f.service
+                .visible(std::slice::from_ref(&own), &f.user, true)
+                .await
+                .is_err()
+        );
     }
 
     /// `playlist_policy` is `Playlist.IsVisible` minus the owner/share test,
