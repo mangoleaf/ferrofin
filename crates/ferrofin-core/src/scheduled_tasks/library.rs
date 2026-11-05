@@ -591,10 +591,9 @@ impl ChapterImagesTask {
     async fn refresh_video(
         &self,
         video: &BaseItemEntity,
+        item_id: Uuid,
         extract: bool,
     ) -> Result<bool, ServiceError> {
-        let item_id = Uuid::parse_str(&video.id)
-            .map_err(|error| ServiceError::invalid_input(error.to_string()))?;
         let mut chapters = self.chapters.get_chapters(item_id).await?;
         let outcome = self
             .extractor
@@ -746,6 +745,12 @@ impl ScheduledTask for ChapterImagesTask {
                 let Some(path) = video.path.as_deref().filter(|path| !path.is_empty()) else {
                     continue;
                 };
+                // Neither Jellyfin nor Ferrofin writes a non-GUID id, so only a
+                // damaged row reaches this: skip it, or it fails every run.
+                let Ok(item_id) = Uuid::parse_str(&video.id) else {
+                    tracing::warn!(item_id = %video.id, path, "skipping a video whose id is not a GUID");
+                    continue;
+                };
                 let modified =
                     crate::chapter_image_extractor::date_modified_ticks(video.date_modified);
                 let history_key = format!("{path}{modified}").to_lowercase();
@@ -753,7 +758,7 @@ impl ScheduledTask for ChapterImagesTask {
                 // errors: those fail the run and blocklist nothing. Only an
                 // attempted extraction can fail, so a key is never appended twice.
                 let success = self
-                    .refresh_video(video, !failed.contains(&history_key))
+                    .refresh_video(video, item_id, !failed.contains(&history_key))
                     .await?;
                 if !success {
                     append_failure_history(&fail_history_path, &history_key)?;
@@ -4336,6 +4341,21 @@ mod tests {
 
         let reads = chapters.reads.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(reads, files.len(), "every video was reconciled");
+        drop(media);
+    }
+
+    #[tokio::test]
+    async fn chapter_task_skips_a_video_whose_id_is_not_a_guid() {
+        let (media, movie, chapters, task) = chapter_task_fixture(false).await;
+        let mut damaged = task.library.get_item_by_id(movie).await.unwrap().unwrap();
+        damaged.id = "not-a-guid".to_owned();
+        task.library.create_items(&[damaged], None).await.unwrap();
+
+        task.execute(&TaskProgress::default())
+            .await
+            .expect("one damaged row does not fail the run");
+        let reads = chapters.reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reads, 1, "the valid video was still reconciled");
         drop(media);
     }
 
