@@ -537,17 +537,18 @@ impl ScheduledTask for OptimizeDatabaseTask {
             return Ok(());
         };
         tracing::info!("optimizing and vacuuming the database");
-        for (statement, pct) in [
-            ("PRAGMA optimize", 25.0),
-            ("VACUUM", 75.0),
-            ("PRAGMA wal_checkpoint(TRUNCATE)", 100.0),
-        ] {
+        for (statement, pct) in [("PRAGMA optimize", 25.0), ("VACUUM", 75.0)] {
             sqlx::query(statement)
                 .execute(self.db.writer())
                 .await
                 .map_err(db_err)?;
             progress.report(pct);
         }
+        // `PRAGMA wal_checkpoint(TRUNCATE)`, in turn with the background
+        // checkpoints: the vacuum's commit has just started one, which the
+        // truncation would otherwise answer busy against.
+        self.db.truncate_wal().await.map_err(ServiceError::from)?;
+        progress.report(100.0);
         Ok(())
     }
 }
