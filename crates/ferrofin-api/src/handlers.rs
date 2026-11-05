@@ -2509,16 +2509,18 @@ pub const VERIFIED: &[Verified] = &[
                holding_libraries over ferrofin-model entities_media.rs libraries_holding, \
                libraries_allow) → ferrofin-livetv manager.rs \
                get_recordings_matching (dvr_repository.rs recording_rows, \
-               visible_recording_rows, remove_fields, recording_dtos, \
-               add_info_to_recording_dtos) (RequestHelpers.GetUserId, \
+               recording_file_is_gone, visible_recording_rows, remove_fields, \
+               recording_dtos, add_info_to_recording_dtos) (RequestHelpers.GetUserId, \
                LiveTvManager.GetRecordingsAsync, GetEmbyRecordingsAsync, \
                GetRecordingFoldersAsync, LibraryManager.GetCollectionFolders, RemoveFields)",
-        date: "2026-11-02",
+        date: "2026-11-05",
         divergences: &[
             "Recordings are the rows of Ferrofin's DVR table, not library items under the \
          recording folders, so the list differs wherever the two models do: an id is the \
          row's, not the library item's; a recording file with no row (one from an adopted \
-         Jellyfin database, or a partial file) is not listed; channelId, status, seriesTimerId \
+         Jellyfin database, or a partial file) is not listed; a finished recording whose file \
+         has gone from a folder that is still there leaves the list at once, where upstream \
+         lists the library item until a scan removes it; channelId, status, seriesTimerId \
          and isNews filter the rows, where upstream ignores them; isMovie, isSeries, isKids \
          and isSports match the programme's flags, either way, where upstream matches the \
          Movie and Episode kinds and, for true only, the Sports, Kids, Children and Family \

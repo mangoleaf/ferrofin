@@ -1500,6 +1500,7 @@ dependencies = [
  "ferrofin-traits",
  "ferrofin-util",
  "flate2",
+ "futures-util",
  "icu_collator",
  "quick-xml",
  "regex",
