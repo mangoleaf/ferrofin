@@ -1965,10 +1965,7 @@ impl FerrofinLiveTvManager {
     ///   (`CopyProgramInfoToTimerInfo`), are saved and re-armed
     ///   (`TimerManager.Update`).
     async fn refresh_timers(&self) -> Result<(), ServiceError> {
-        for timer in self.all_timers().await? {
-            if timer.status == RecordingStatus::Completed {
-                continue;
-            }
+        for timer in self.get_timers().await? {
             let Some(id) = timer.base.id.filter(|id| !id.is_empty()) else {
                 continue;
             };
@@ -3754,7 +3751,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // page, so a programme reached through `/Items` carries its
         // `TimerId`/`SeriesTimerId` exactly as one reached through
         // `/LiveTv/Programs` does.
-        let timers: Vec<TimerInfoDto> = self.get_timers().await?;
+        let timers = self
+            .scheduled_timers_for(dtos.iter().filter_map(|dto| rows.get(&dto.id)))
+            .await?;
         if timers.is_empty() {
             return Ok(());
         }
@@ -4034,16 +4033,18 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
-        // Port of `DefaultLiveTvService.GetTimersAsync` (v10.11.8
+        // Port of `DefaultLiveTvService.GetTimersAsync` (v12.4
         // DefaultLiveTvService.cs:392-403): a COMPLETED timer is not a scheduled
         // recording any more and is excluded from every list read. The row stays
-        // (the recording it made points at it); only this view drops it.
-        Ok(self
-            .all_timers()
-            .await?
-            .into_iter()
-            .filter(|t| t.status != RecordingStatus::Completed)
-            .collect())
+        // (the recording it made points at it, and upstream's timers.json keeps
+        // it too); only this view drops it, in the query, so completed rows are
+        // never parsed.
+        self.json_list(
+            "FerrofinLiveTvTimers",
+            r#"SELECT "Id", "Data" FROM "FerrofinLiveTvTimers"
+               WHERE "Status" <> 'Completed' ORDER BY "StartDate", rowid"#,
+        )
+        .await
     }
 
     async fn get_timer(&self, id: &str) -> Result<Option<TimerInfoDto>, ServiceError> {
@@ -4827,7 +4828,7 @@ impl FerrofinLiveTvManager {
             return Ok(());
         }
         // One timer read for the page (upstream lazily loads the list once).
-        let timers: Vec<TimerInfoDto> = self.get_timers().await?;
+        let timers = self.scheduled_timers_for(rows.iter()).await?;
         if timers.is_empty() {
             return Ok(());
         }
@@ -4835,6 +4836,27 @@ impl FerrofinLiveTvManager {
             Self::apply_recording_info(dto, row, &timers);
         }
         Ok(())
+    }
+
+    /// The `GetTimersAsync` timers (every one but the `Completed`) whose
+    /// `ProgramId` is one of these programmes' `ExternalId`s: all that
+    /// [`Self::apply_recording_info`] can match on the page, in the same
+    /// `StartDate` order, so its first match is upstream's `FirstOrDefault`.
+    async fn scheduled_timers_for(
+        &self,
+        rows: impl Iterator<Item = &GuideProgramRow>,
+    ) -> Result<Vec<TimerInfoDto>, ServiceError> {
+        let ids: Vec<&str> = rows.filter_map(|row| row.external_id.as_deref()).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(
+            crate::dvr_repository::scheduled_timers_for_programs(&self.db, &ids)
+                .await?
+                .into_iter()
+                .filter_map(|(id, data)| self.parse_stored_row("FerrofinLiveTvTimers", &id, &data))
+                .collect(),
+        )
     }
 
     /// [`Self::add_recording_info`]'s per-programme body, over an
@@ -5155,7 +5177,7 @@ impl FerrofinLiveTvManager {
 
     /// Every stored timer, whatever its status — C# `TimerManager.GetAll()`,
     /// which is what the restart path re-arms from. The trait's `get_timers`
-    /// is the FILTERED view on top of this.
+    /// reads the same table, in the same order, minus the `Completed` rows.
     async fn all_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
         self.json_list(
             "FerrofinLiveTvTimers",
@@ -13343,6 +13365,75 @@ mod tests {
             .expect("after");
         assert_eq!(after.timer_id, None);
         assert_eq!(after.status, None);
+    }
+
+    /// gl-1256: a programme page parses only the timers it can link, the
+    /// scheduled (not `Completed`) ones for its own programmes. The other
+    /// rows are corrupt here, so any read of them would be recorded as a row
+    /// that does not parse. The page's timer still links whatever the case of
+    /// its `ProgramId` (upstream's `OrdinalIgnoreCase`).
+    #[tokio::test]
+    async fn program_dtos_parse_only_the_pages_scheduled_timers() {
+        use ferrofin_model::live_tv::{BaseTimerInfoDto, RecordingStatus, TimerInfoDto};
+        let mgr = manager_with_relative_guide().await;
+        let rows = mgr
+            .query_program_rows(&InternalItemsQuery::default(), chrono::Utc::now())
+            .await
+            .expect("rows");
+        let target = rows
+            .iter()
+            .find(|r| r.title == "Now Playing")
+            .expect("now playing row");
+        let external_id = target.external_id.clone().expect("external id");
+        let upper = external_id.to_ascii_uppercase();
+        assert_ne!(upper, external_id, "the case-folding path is exercised");
+        let channel_id = Uuid::parse_str(&target.channel_id).expect("guid");
+        let timer = |id: &str, program_id: &str, status| TimerInfoDto {
+            status,
+            base: BaseTimerInfoDto {
+                id: Some(id.to_owned()),
+                channel_id,
+                program_id: Some(program_id.to_owned()),
+                start_date: chrono::Utc::now() + chrono::Duration::hours(6),
+                end_date: chrono::Utc::now() + chrono::Duration::hours(7),
+                ..BaseTimerInfoDto::default()
+            },
+            ..TimerInfoDto::default()
+        };
+        mgr.persist_timer(&timer("scheduled", &upper, RecordingStatus::New))
+            .await
+            .expect("scheduled");
+        for (id, program_id, status) in [
+            ("done", external_id.as_str(), RecordingStatus::Completed),
+            ("elsewhere", "not-on-this-page", RecordingStatus::New),
+        ] {
+            mgr.persist_timer(&timer(id, program_id, status))
+                .await
+                .expect("stored");
+            crate::dvr_repository::test_support::corrupt_timer_data(&mgr.db, id)
+                .await
+                .expect("corrupt");
+        }
+
+        let programs = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("programs");
+        let linked = programs
+            .items
+            .iter()
+            .find(|p| p.name.as_deref() == Some("Now Playing"))
+            .expect("linked");
+        assert_eq!(linked.timer_id.as_deref(), Some("scheduled"));
+        assert_eq!(linked.status.as_deref(), Some("New"));
+        let parsed_broken = mgr
+            .unparseable_rows
+            .lock()
+            .expect("unparseable rows")
+            .get("FerrofinLiveTvTimers")
+            .cloned()
+            .unwrap_or_default();
+        assert!(parsed_broken.is_empty(), "{parsed_broken:?}");
     }
 
     /// Countries come off the shared fetcher and cache under the manager's own
