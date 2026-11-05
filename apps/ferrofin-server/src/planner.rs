@@ -701,6 +701,24 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         names
     }
 
+    async fn hls_output(
+        &self,
+        request: &HlsStreamRequest,
+        is_audio: bool,
+    ) -> Result<(PathBuf, String), ServiceError> {
+        // `plan`'s non-progressive branch: the output container is the
+        // segment container, and the playlist is `{output_id}.m3u8`.
+        let segment_container = requested_segment_container(request);
+        let transcode_root = PathBuf::from(
+            ferrofin_traits::system::prepare_transcode_path_off_runtime(self.paths.clone()).await?,
+        );
+        let playlist_path = transcode_root.join(format!(
+            "{}.m3u8",
+            output_id(request, &segment_container, is_audio)
+        ));
+        Ok((playlist_path, segment_container))
+    }
+
     // The plan is the linear `GetStreamingState` → `GetCommandLineArguments`
     // orchestration: five clearly-labelled steps (resolve source, copy-vs-
     // transcode, populate state, build args, return). Splitting it would only
@@ -828,11 +846,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         // 3s segments, doubling both the playlist and the number of segment
         // requests a client makes over a film.
         let requested_segment_length = request.segment_length.filter(|&secs| secs > 0);
-        let segment_container = request
-            .segment_container
-            .clone()
-            .filter(|c| !c.is_empty())
-            .unwrap_or_else(|| DEFAULT_SEGMENT_CONTAINER.to_owned());
+        let segment_container = requested_segment_container(request);
 
         // ---- (2) COPY-vs-TRANSCODE per stream -------------------------------
         // The client sends the video/audio codecs as a comma-delimited,
@@ -2760,6 +2774,15 @@ fn output_id(request: &HlsStreamRequest, segment_container: &str, is_audio: bool
     format!("{:016x}", hasher.finish())
 }
 
+/// The request's `SegmentContainer`, `ts` when absent or empty.
+fn requested_segment_container(request: &HlsStreamRequest) -> String {
+    request
+        .segment_container
+        .clone()
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| DEFAULT_SEGMENT_CONTAINER.to_owned())
+}
+
 /// The on-disk path of segment `index` for `playlist` (`GetSegmentPath`).
 fn segment_path(playlist: &std::path::Path, index: i32, extension: &str) -> PathBuf {
     let folder = playlist.parent().map_or_else(PathBuf::new, PathBuf::from);
@@ -3165,6 +3188,32 @@ mod tests {
             current_runtime_ticks: segment * 3 * TICKS_PER_SECOND,
             ..request
         }
+    }
+
+    /// The segment and live-playlist routes find an existing file through
+    /// `hls_output` without planning, so it must name the file `plan` would.
+    #[rstest]
+    #[case(None, false, PlaylistKind::Vod)]
+    #[case(Some(""), false, PlaylistKind::Event)]
+    #[case(Some("mp4"), false, PlaylistKind::Vod)]
+    #[case(Some("mp4"), false, PlaylistKind::Event)]
+    #[case(Some("ts"), true, PlaylistKind::Vod)]
+    #[tokio::test]
+    async fn hls_output_names_the_planned_playlist(
+        #[case] container: Option<&str>,
+        #[case] is_audio: bool,
+        #[case] kind: PlaylistKind,
+    ) {
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        let mut req = request("abc");
+        req.segment_container = container.map(str::to_owned);
+        let plan = p.plan(&req, is_audio, Some(3), kind).await.unwrap();
+        let (playlist_path, segment_container) = p.hls_output(&req, is_audio).await.unwrap();
+        assert_eq!(playlist_path, plan.playlist_path);
+        assert_eq!(segment_container, plan.segment_container);
     }
 
     /// A planner with actual persisted encoding configuration and owned paths.

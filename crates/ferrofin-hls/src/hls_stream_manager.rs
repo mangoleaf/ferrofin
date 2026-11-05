@@ -147,9 +147,23 @@ pub trait StreamStatePlanner: Send + Sync {
         kind: PlaylistKind,
     ) -> Result<TranscodePlan, ServiceError>;
 
+    /// The `playlist_path` and `segment_container` that [`plan`](Self::plan)
+    /// returns for `request` with this `is_audio` and a `Vod` or `Event` kind,
+    /// from the request alone: no media-source resolution, no arguments. The
+    /// segment and live-playlist routes look for a file ffmpeg already wrote
+    /// with these, and plan only when a transcode may have to start.
+    ///
+    /// # Errors
+    /// The transcode directory cannot be prepared.
+    async fn hls_output(
+        &self,
+        request: &HlsStreamRequest,
+        is_audio: bool,
+    ) -> Result<(PathBuf, String), ServiceError>;
+
     /// The item, series and library names the transcode logs show for
     /// `item_id`. Asked only when a transcode actually starts, never by
-    /// [`plan`](Self::plan): every segment request plans, and resolving the
+    /// [`plan`](Self::plan): every segment request that starts a transcode plans, and resolving the
     /// library walks every configured library. Best-effort; the default is
     /// empty.
     async fn display_names(&self, _item_id: uuid::Uuid) -> TranscodeDisplayNames {
@@ -518,6 +532,18 @@ where
         Some(file)
     }
 
+    /// The plan of a transcode starting at segment `segment_id`.
+    async fn segment_plan(
+        &self,
+        request: &HlsStreamRequest,
+        is_audio: bool,
+        segment_id: i32,
+    ) -> Result<TranscodePlan, ServiceError> {
+        self.planner
+            .plan(request, is_audio, Some(segment_id), PlaylistKind::Vod)
+            .await
+    }
+
     /// Starts (or reuses) the transcode for `request` and resolves segment
     /// `segment_id` on disk. Port of `GetDynamicSegment`.
     #[allow(clippy::too_many_lines)]
@@ -536,13 +562,12 @@ where
             return Box::pin(self.resolve_init_segment(request, is_audio)).await;
         }
 
-        let plan = self
-            .planner
-            .plan(request, is_audio, Some(segment_id), PlaylistKind::Vod)
-            .await?;
-        let playlist_path = plan.playlist_path.clone();
+        // Upstream resolves the whole streaming state first; the fast path below
+        // needs only where the job writes, so the plan waits for a missing
+        // segment (gl-1254).
+        let (playlist_path, segment_container) = self.planner.hls_output(request, is_audio).await?;
         let playlist_key = playlist_path.to_string_lossy().into_owned();
-        let ext = segment_extension(&plan.segment_container);
+        let ext = segment_extension(&segment_container);
         let segment_path = segment_file(&playlist_path, segment_id, ext);
         // These are the exact durations the playlist placed in the URL, also
         // for variable keyframe-based remux segments. Missing query values stay 0.
@@ -583,6 +608,12 @@ where
         ) {
             return Ok(file);
         }
+
+        // Planned only once a transcode may start: the fast paths and a wait on
+        // the running job need just where it writes. Before the eviction, so a
+        // plan that fails leaves the running job alone, as upstream resolves
+        // the state before `KillTranscodingJobs`.
+        let mut plan = None;
 
         // A transcode may already be running for this playlist. Only ONE ffmpeg
         // may own a given `{stem}{n}.ts` set: a second one started for a seek
@@ -630,8 +661,15 @@ where
             // `DynamicHlsController` kills the old job with `closeLiveStream:
             // false` — the restart below re-opens ffmpeg on the SAME live stream,
             // so releasing the tuner here would make it read a closed source.
+            plan = Some(self.segment_plan(request, is_audio, segment_id).await?);
             self.manager.kill_and_remove(&handle, false, false).await;
         }
+        let plan = match plan {
+            Some(plan) => plan,
+            None => self.segment_plan(request, is_audio, segment_id).await?,
+        };
+        debug_assert_eq!(plan.playlist_path, playlist_path);
+        debug_assert_eq!(plan.segment_container, segment_container);
 
         // A source that keeps killing ffmpeg (flaky network storage, a file
         // shorter than its metadata claims) must not turn every client segment
@@ -931,11 +969,9 @@ where
         // rewriting the fMP4 init URI. A playlist left by an earlier VOD job
         // for the same session/output is served as-is (same upstream
         // behaviour: the file exists, so nothing starts).
-        let plan = self
-            .planner
-            .plan(request, false, Some(0), PlaylistKind::Event)
-            .await?;
-        let playlist_path = plan.playlist_path.clone();
+        // Planned only to start the job: a reload of a playlist ffmpeg is
+        // writing needs just its path (gl-1254).
+        let (playlist_path, segment_container) = self.planner.hls_output(request, false).await?;
         let playlist_key = playlist_path.to_string_lossy().into_owned();
         // ffmpeg's stderr goes to the server log directory (upstream's
         // `LogDirectoryPath`), so every diagnostic below points the operator at
@@ -976,6 +1012,12 @@ where
                         log_dir.display()
                     )));
                 }
+                let plan = self
+                    .planner
+                    .plan(request, false, Some(0), PlaylistKind::Event)
+                    .await?;
+                debug_assert_eq!(plan.playlist_path, playlist_path);
+                debug_assert_eq!(plan.segment_container, segment_container);
                 let state = self.labelled(&plan.state, request.item_id).await;
                 let start = StartFfMpegRequest {
                     program: &self.ffmpeg_path,
@@ -1033,7 +1075,7 @@ where
         Ok(live_playlist_text(
             &text,
             &playlist_path,
-            &plan.segment_container,
+            &segment_container,
         ))
     }
 
@@ -1618,6 +1660,14 @@ mod tests {
             })
         }
 
+        async fn hls_output(
+            &self,
+            _request: &HlsStreamRequest,
+            _is_audio: bool,
+        ) -> Result<(PathBuf, String), ServiceError> {
+            Ok((self.dir.join("out.m3u8"), self.segment_container.clone()))
+        }
+
         async fn display_names(&self, _item_id: uuid::Uuid) -> TranscodeDisplayNames {
             self.labels
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1956,10 +2006,12 @@ mod tests {
             "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.020000,\nout0.ts\n#EXT-X-ENDLIST\n",
         )
         .unwrap();
-        let (mgr, _, spawns) = manager_full(tmp.path(), FakeScript::default(), "ts");
+        let (mgr, plans, spawns) = manager_full(tmp.path(), FakeScript::default(), "ts");
         let pl = mgr.live_playlist(&req()).await.unwrap();
         assert!(pl.contains("#EXT-X-TARGETDURATION:1\n"), "got: {pl}");
         assert!(spawns.requests.lock().unwrap().is_empty());
+        // Every reload of a running live playlist lands here: no plan.
+        assert!(plans.lock().unwrap().is_empty(), "planned a reload");
     }
 
     /// fMP4: the bare init URI ffmpeg writes is routed under `hls/{stem}/`,
@@ -2334,9 +2386,37 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // Pre-create the segment so the fast path (no spawn) is taken.
         std::fs::write(tmp.path().join("out0.ts"), b"seg").unwrap();
-        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+        let (mgr, plans) = manager_with(tmp.path(), FakeScript::default(), "ts");
         let served = mgr.dynamic_segment(&req(), 0, false).await.unwrap();
         assert!(served.path.ends_with("out0.ts"));
+        // A segment on disk needs no plan: that is a media-source resolution
+        // and an argument build on every segment a client fetches (gl-1254).
+        assert!(plans.lock().unwrap().is_empty(), "planned on the fast path");
+    }
+
+    /// A request just ahead of a running job waits for it, and a wait starts
+    /// nothing, so it plans nothing either (gl-1254).
+    #[tokio::test]
+    async fn waiting_on_the_running_job_plans_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        };
+        let (mgr, plans) = manager_with(tmp.path(), script, "ts");
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        assert_eq!(plans.lock().unwrap().len(), 1, "the start plans");
+
+        let next = tmp.path().join("out1.ts");
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            std::fs::write(next, b"seg").unwrap();
+        });
+        let served = mgr.dynamic_segment(&req(), 1, false).await.unwrap();
+        writer.await.unwrap();
+        assert!(served.path.ends_with("out1.ts"));
+        assert_eq!(plans.lock().unwrap().len(), 1, "the wait planned");
     }
 
     #[tokio::test]
