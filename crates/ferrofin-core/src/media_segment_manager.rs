@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::db_error::db_err;
 use crate::item_type_lookup::kind_from_type_name;
 use crate::kinds::{is_audio, is_video};
+use crate::media_segment_repository;
 
 #[derive(Default)]
 struct MutationState {
@@ -186,20 +187,26 @@ impl FerrofinMediaSegmentManager {
             |provider| media_segment_provider_id(provider.name()),
         )
     }
-    async fn clear_provider_namespaces(
+    async fn replace_provider_namespaces(
         &self,
         item: Uuid,
         identifier: &str,
         type_filter: Option<MediaSegmentType>,
+        segments: &[MediaSegmentDto],
     ) -> Result<(), ServiceError> {
         let ids = self.provider(identifier).map_or_else(
             || vec![identifier.to_owned()],
             |provider| Self::namespaces(provider.as_ref()),
         );
-        for id in ids {
-            self.clear_provider(item, &id, type_filter).await?;
-        }
-        Ok(())
+        media_segment_repository::replace_rows(
+            &self.db,
+            item,
+            &ids,
+            type_filter,
+            &self.provider_id(identifier),
+            segments,
+        )
+        .await
     }
     async fn delete_stored(
         &self,
@@ -248,34 +255,25 @@ impl FerrofinMediaSegmentManager {
         segment: &MediaSegmentDto,
         provider_id: &str,
     ) -> Result<MediaSegmentDto, ServiceError> {
-        if segment.end_ticks < segment.start_ticks {
-            return Err(ServiceError::invalid_input(
-                "segment end precedes its start",
-            ));
-        }
         let id = if segment.id.is_nil() {
             Uuid::new_v4()
         } else {
             segment.id
         };
-        sqlx::query(
-            r#"INSERT INTO "MediaSegments"
-               ("Id", "EndTicks", "ItemId", "SegmentProviderId", "StartTicks", "Type")
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
-        )
-        .bind(guid_to_db(id))
-        .bind(segment.end_ticks)
-        .bind(guid_to_db(segment.item_id))
-        .bind(provider_id)
-        .bind(segment.start_ticks)
-        .bind(segment.type_.json_value())
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
-        Ok(MediaSegmentDto {
+        let stored = MediaSegmentDto {
             id,
             ..segment.clone()
-        })
+        };
+        media_segment_repository::replace_rows(
+            &self.db,
+            stored.item_id,
+            &[],
+            None,
+            provider_id,
+            std::slice::from_ref(&stored),
+        )
+        .await?;
+        Ok(stored)
     }
     async fn clear_stored(&self, item: Uuid) -> Result<(), ServiceError> {
         sqlx::query(r#"DELETE FROM "MediaSegments" WHERE "ItemId" = ?1"#)
@@ -283,27 +281,6 @@ impl FerrofinMediaSegmentManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
-        Ok(())
-    }
-    async fn clear_provider(
-        &self,
-        item: Uuid,
-        provider_id: &str,
-        type_filter: Option<MediaSegmentType>,
-    ) -> Result<(), ServiceError> {
-        let mut sql = String::from(
-            r#"DELETE FROM "MediaSegments" WHERE "ItemId" = ?1 AND "SegmentProviderId" = ?2"#,
-        );
-        if type_filter.is_some() {
-            sql.push_str(r#" AND "Type" = ?3"#);
-        }
-        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(guid_to_db(item))
-            .bind(provider_id.to_owned());
-        if let Some(kind) = type_filter {
-            query = query.bind(kind.json_value());
-        }
-        query.execute(self.db.writer()).await.map_err(db_err)?;
         Ok(())
     }
     async fn run_provider(
@@ -354,16 +331,23 @@ impl FerrofinMediaSegmentManager {
             return Ok(());
         }
         Self::changed(&mut revisions, item);
-        for namespace in Self::namespaces(provider) {
-            self.clear_provider(item, &namespace, None).await?;
-        }
-        let id = media_segment_provider_id(provider.name());
-        for mut segment in segments {
-            segment.item_id = item;
-            segment.id = Uuid::nil();
-            self.create_stored(&segment, &id).await?;
-        }
-        Ok(())
+        let segments: Vec<_> = segments
+            .into_iter()
+            .map(|segment| MediaSegmentDto {
+                id: Uuid::new_v4(),
+                item_id: item,
+                ..segment
+            })
+            .collect();
+        media_segment_repository::replace_rows(
+            &self.db,
+            item,
+            &Self::namespaces(provider),
+            None,
+            &media_segment_provider_id(provider.name()),
+            &segments,
+        )
+        .await
     }
 }
 #[async_trait]
@@ -494,7 +478,7 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
     ) -> Result<(), ServiceError> {
         let mut revisions = self.mutations.lock().await;
         Self::changed(&mut revisions, item);
-        self.clear_provider_namespaces(item, provider_id, types)
+        self.replace_provider_namespaces(item, provider_id, types, &[])
             .await
     }
     async fn delete_all_provider_segments(
@@ -561,13 +545,8 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
         )
         .await?;
         Self::changed(&mut revisions, item);
-        self.clear_provider_namespaces(item, identifier, type_filter)
-            .await?;
-        let id = self.provider_id(identifier);
-        for segment in &segments {
-            self.create_stored(segment, &id).await?;
-        }
-        Ok(())
+        self.replace_provider_namespaces(item, identifier, type_filter, &segments)
+            .await
     }
     async fn replace_loaded_producer_segments(
         &self,
@@ -609,12 +588,15 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
             )
             .await?;
         Self::changed(&mut revisions, item);
-        for namespace in Self::namespaces(provider.as_ref()) {
-            self.clear_provider(item, &namespace, None).await?;
-        }
-        for segment in &segments {
-            self.create_stored(segment, &provider_id).await?;
-        }
+        media_segment_repository::replace_rows(
+            &self.db,
+            item,
+            &Self::namespaces(provider.as_ref()),
+            None,
+            &provider_id,
+            &segments,
+        )
+        .await?;
         self.register_segment_provider(provider);
         Ok(())
     }
@@ -644,12 +626,19 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
         self.publish_source(segment.item_id, identifier, &mutation)
             .await?;
         Self::changed(&mut revisions, segment.item_id);
-        if segment.type_ != MediaSegmentType::Commercial {
-            self.clear_provider_namespaces(segment.item_id, identifier, Some(segment.type_))
-                .await?;
+        if segment.type_ == MediaSegmentType::Commercial {
+            return self
+                .create_stored(&segment, &self.provider_id(identifier))
+                .await;
         }
-        self.create_stored(&segment, &self.provider_id(identifier))
-            .await
+        self.replace_provider_namespaces(
+            segment.item_id,
+            identifier,
+            Some(segment.type_),
+            std::slice::from_ref(&segment),
+        )
+        .await?;
+        Ok(segment)
     }
     async fn delete_producer_segment(
         &self,
@@ -897,6 +886,72 @@ mod tests {
 
         mgr.delete_segments(item).await.expect("delete all");
         assert!(!mgr.has_segments(item).await.expect("empty again"));
+    }
+
+    #[tokio::test]
+    async fn a_replacement_that_fails_part_way_keeps_the_previous_rows() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Episode).await;
+        let mgr = FerrofinMediaSegmentManager::new(db.clone(), library_manager_over(db.clone()));
+        let intro = mgr
+            .create_segment(&segment(item, MediaSegmentType::Intro, 0, 100), "prov")
+            .await
+            .unwrap();
+        // Another provider's row: reusing its id makes the replacement's last INSERT fail.
+        let taken = mgr
+            .create_segment(&segment(item, MediaSegmentType::Outro, 900, 1000), "other")
+            .await
+            .unwrap();
+        let clash = MediaSegmentDto {
+            id: taken.id,
+            ..segment(item, MediaSegmentType::Intro, 10, 110)
+        };
+        let stored = || async {
+            let mut ids: Vec<_> = mgr
+                .get_segments(item, None, false)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|segment| segment.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        let mut before = vec![intro.id, taken.id];
+        before.sort();
+
+        let replacement = [
+            segment(item, MediaSegmentType::Intro, 5, 105),
+            clash.clone(),
+        ];
+        assert!(
+            mgr.replace_producer_segments(item, "prov", None, &replacement)
+                .await
+                .is_err()
+        );
+        assert_eq!(stored().await, before, "replace_producer_segments");
+
+        assert!(mgr.create_producer_segment(&clash, "prov").await.is_err());
+        assert_eq!(stored().await, before, "create_producer_segment");
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fake = provider("Fake", 0, 200, &events);
+        mgr.register_segment_provider(fake.clone());
+        mgr.run_segment_providers(item, false).await.unwrap();
+        let ran = stored().await;
+        assert_eq!(ran.len(), 3);
+        // An invalid segment from a provider run is refused before its old rows go.
+        *fake.output.lock().unwrap() = vec![segment(item, MediaSegmentType::Intro, 300, 299)];
+        mgr.run_segment_providers(item, false).await.unwrap();
+        assert_eq!(stored().await, ran, "run_provider");
+
+        assert!(
+            mgr.replace_loaded_producer_segments(item, fake.clone(), &replacement)
+                .await
+                .is_err()
+        );
+        assert_eq!(stored().await, ran, "replace_loaded_producer_segments");
     }
 
     #[tokio::test]

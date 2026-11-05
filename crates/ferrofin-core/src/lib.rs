@@ -220,6 +220,7 @@ pub mod lyric_manager;
 pub mod media_attachment_repository;
 pub mod media_info_resolver;
 pub mod media_segment_manager;
+mod media_segment_repository;
 pub mod media_source_manager;
 pub mod media_stream_repository;
 mod media_stream_selector;
