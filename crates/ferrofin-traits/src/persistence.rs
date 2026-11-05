@@ -373,6 +373,25 @@ pub trait ItemRepository: Send + Sync {
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// [`Self::get_item_list`]'s rows, in its order, carrying only what a
+    /// season's episode filter and the aired-order sort read: `Id`, `Type`,
+    /// `ParentId`, `SeasonId`, `ChannelId`, `Path`, `IndexNumber`,
+    /// `ParentIndexNumber`, `PremiereDate`, `PresentationUniqueKey`, and `Data`
+    /// where it names an `Airs*` member. A repository may leave every other
+    /// column at its default; this default returns the full rows.
+    ///
+    /// A series' episode listing reads all of its rows to place one season's,
+    /// then [`Self::retrieve_items`] the full rows of those it lists.
+    ///
+    /// # Errors
+    /// Propagates the repository failure.
+    async fn get_episode_order_rows(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_item_list(filter).await
+    }
+
     /// Returns `(Id, CleanName)` for every row matching the query, in the same
     /// order — and under the same predicates, ordering and paging — as
     /// [`Self::get_item_list`].

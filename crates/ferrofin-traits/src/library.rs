@@ -628,6 +628,20 @@ pub trait LibraryManager: Send + Sync {
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// [`Self::get_item_list`]'s rows with only the columns a season's episode
+    /// filter and the aired-order sort read
+    /// ([`ItemRepository::get_episode_order_rows`](crate::persistence::ItemRepository::get_episode_order_rows));
+    /// this default returns the full rows.
+    ///
+    /// # Errors
+    /// Propagates the repository failure.
+    async fn get_episode_order_rows(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_item_list(query).await
+    }
+
     /// Returns the latest item rows for the given collection type.
     async fn get_latest_item_list(
         &self,

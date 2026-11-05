@@ -736,9 +736,11 @@ async fn get_episodes(
     };
     // Fetch visible rows in source SortName order. Parse aired metadata once, then
     // apply the same in-memory comparator used by NextUp before filtering/paging.
+    // The selection reads a few columns of every row; the page's full rows are
+    // read after it (gl-1259).
     let rows = state
         .library
-        .get_item_list(&InternalItemsQuery {
+        .get_episode_order_rows(&InternalItemsQuery {
             user: user.clone(),
             series_presentation_unique_key: Some(series_key),
             include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
@@ -895,29 +897,45 @@ async fn get_episodes(
             episodes.clear();
         }
     }
-    if query.sort_by == Some(ItemSortBy::Random) {
+    let mut ids: Vec<_> = episodes
+        .iter()
+        .filter_map(|episode| Uuid::parse_str(&episode.id).ok())
+        .collect();
+    if query.sort_by == Some(ItemSortBy::Random) && !ids.is_empty() {
         // Use the repository's existing randomized item order after source filters.
-        let ids: Vec<_> = episodes
-            .iter()
-            .filter_map(|episode| Uuid::parse_str(&episode.id).ok())
-            .collect();
-        if !ids.is_empty() {
-            let rows = state
-                .library
-                .get_item_list(&InternalItemsQuery {
-                    user: user.clone(),
-                    item_ids: ids,
-                    include_item_types: vec![BaseItemKind::Episode],
-                    order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
-                    dto_options: Arc::clone(&options),
-                    ..Default::default()
-                })
-                .await?;
-            episodes = rows;
-        }
+        ids = state
+            .library
+            .get_item_ids(&InternalItemsQuery {
+                user: user.clone(),
+                item_ids: ids,
+                include_item_types: vec![BaseItemKind::Episode],
+                order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
+                dto_options: Arc::clone(&options),
+                ..Default::default()
+            })
+            .await?;
     }
-    let total = i32::try_from(episodes.len()).unwrap_or(i32::MAX);
-    let page = paginate(episodes, query.start_index, query.limit);
+    let total = i32::try_from(ids.len()).unwrap_or(i32::MAX);
+    let ids = paginate(ids, query.start_index, query.limit);
+    // The page's full rows, by id alone: the listing above already applied
+    // the user's access and the source filters.
+    let mut full: std::collections::HashMap<_, _> = if ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        state
+            .library
+            .get_item_list(&InternalItemsQuery {
+                item_ids: ids.clone(),
+                include_item_types: vec![BaseItemKind::Episode],
+                dto_options: Arc::clone(&options),
+                ..Default::default()
+            })
+            .await?
+            .into_iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
+            .collect()
+    };
+    let page: Vec<_> = ids.iter().filter_map(|id| full.remove(id)).collect();
     let dtos = state
         .dto
         .get_base_item_dtos(&page, &options, user.as_deref(), None, true)
@@ -1034,18 +1052,14 @@ fn season_is_missing(user: Option<&UserEntity>, requested: Option<bool>) -> Opti
 }
 
 /// Applies C#'s `ApplyPaging`: skip `start_index`, then take `limit`.
-fn paginate(
-    items: Vec<BaseItemEntity>,
-    start_index: Option<i32>,
-    limit: Option<i32>,
-) -> Vec<BaseItemEntity> {
+fn paginate<T>(items: Vec<T>, start_index: Option<i32>, limit: Option<i32>) -> Vec<T> {
     if start_index.is_none() && limit.is_none() {
         return items;
     }
     let start = start_index
         .and_then(|s| usize::try_from(s).ok())
         .unwrap_or(0);
-    let mut page: Vec<BaseItemEntity> = items.into_iter().skip(start).collect();
+    let mut page: Vec<T> = items.into_iter().skip(start).collect();
     if let Some(limit) = limit
         && limit >= 0
     {
