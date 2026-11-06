@@ -364,6 +364,7 @@ const TABS: &[(Group, &[&str])] = &[
             "max_transcodes",
             "max_transcodes_per_user",
             "playback_metrics_queue",
+            "session_idle_hours",
         ],
     ),
     (
