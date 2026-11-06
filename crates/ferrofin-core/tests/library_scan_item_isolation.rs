@@ -28,6 +28,9 @@ use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_traits::events::EventManager;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::persistence::ItemRepository;
+use ferrofin_traits::providers::{
+    DynamicMetadataLookup, DynamicMetadataProvider, DynamicMetadataResult,
+};
 use rstest::rstest;
 
 /// A shows library and a movies library on one database, scanned the way the
@@ -45,6 +48,11 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_sources(Vec::new()).await
+    }
+
+    /// With `sources` registered as remote metadata providers.
+    async fn with_sources(sources: Vec<Arc<dyn DynamicMetadataProvider>>) -> Self {
         let tmp = tempfile::tempdir().expect("tmp");
         let shows = tmp.path().join("shows");
         let movies = tmp.path().join("movies");
@@ -106,7 +114,8 @@ impl Fixture {
             .with_localization(Arc::new(LocalizationManager::new("US")))
             .with_rating_resolver(visibility)
             .with_events(events as Arc<dyn EventManager>)
-            .with_change_notifier(Arc::clone(&notifier));
+            .with_change_notifier(Arc::clone(&notifier))
+            .with_dynamic_providers(sources);
         Self {
             _tmp: tmp,
             db,
@@ -507,6 +516,75 @@ async fn an_undecodable_parent_is_asked_for_once_per_scan() {
         1,
         "{warned:?}"
     );
+}
+
+/// A remote metadata source that answers every episode.
+struct EpisodeDb;
+
+#[async_trait::async_trait]
+impl DynamicMetadataProvider for EpisodeDb {
+    fn name(&self) -> &'static str {
+        "EpisodeDb"
+    }
+
+    async fn lookup(
+        &self,
+        item: &DynamicMetadataLookup,
+    ) -> Result<Option<DynamicMetadataResult>, ferrofin_traits::error::ServiceError> {
+        Ok((item.kind == "Episode").then(|| DynamicMetadataResult {
+            overview: Some("From EpisodeDb.".to_owned()),
+            ..DynamicMetadataResult::default()
+        }))
+    }
+}
+
+// A child's metadata locale walks its parents (`GetPreferredMetadataLanguage`),
+// which end at a row that cannot be read as at one that is not there: its
+// children still get their remote metadata and the stamp that keeps the next
+// scan from asking again, and the row is warned about once, not per child.
+#[rstest]
+#[case::series("Series")]
+#[case::season("Season")]
+#[tokio::test]
+async fn children_of_an_undecodable_parent_get_remote_metadata(#[case] kind: &str) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let fx = Fixture::with_sources(vec![Arc::new(EpisodeDb)]).await;
+    fx.episode("Corrupt", 1);
+    fx.scanner.scan_all().await.expect("first scan");
+    fx.corrupt(kind, "Corrupt").await;
+    let new_episodes = [fx.episode("Corrupt", 2), fx.episode("Corrupt", 3)];
+
+    let warnings = Warnings::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+    fx.scanner.scan_all().await.expect("rescan");
+
+    let warned = warnings.0.lock().expect("warnings").clone();
+    assert!(
+        !warned.iter().any(|message| message.contains("locale")),
+        "{warned:?}"
+    );
+    assert_eq!(
+        warned
+            .iter()
+            .filter(|message| {
+                message.contains("could not read a parent row")
+                    || message.contains("could not read series display order")
+            })
+            .count(),
+        1,
+        "{warned:?}"
+    );
+    for path in &new_episodes {
+        let overview: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Overview" FROM "BaseItems" WHERE "Path" = ?1"#)
+                .bind(path.to_string_lossy().into_owned())
+                .fetch_one(fx.db.pool())
+                .await
+                .expect("overview");
+        assert_eq!(overview.as_deref(), Some("From EpisodeDb."), "{path:?}");
+        assert!(fx.refreshed(path).await.is_some(), "{path:?} is stamped");
+    }
 }
 
 // A write that fails for one new item skips that item alone. It is neither

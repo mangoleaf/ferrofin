@@ -1002,25 +1002,34 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    refresh of an item or folder ends with that item's own failure) \
                    ← parent_row (a failed read counts as \
                    no row, once per pass) ← sync_series_name (FindSeriesName), \
-                   sync_season_name, remember_series_folder; apply_parental_rating_score and \
+                   sync_season_name, remember_series_folder, locale_parent (GetParents, \
+                   GetCollectionFolders, read by resolve_metadata_locale); \
+                   apply_parental_rating_score and \
                    inherit_stored_rating; keep_stored_series_key. Compared with \
                    MediaBrowser.Controller/LibraryTaskScheduler/\
                    LimitedConcurrencyLibraryScheduler.cs (ProcessItem), \
                    MediaBrowser.Controller/Entities/Folder.cs (RunTasks, \
                    RefreshChildMetadata), \
-                   MediaBrowser.Controller/Entities/BaseItem.cs (RefreshMetadata), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (RefreshMetadata, \
+                   GetPreferredMetadataLanguage, GetPreferredMetadataCountryCode, GetParents), \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (RefreshItem), \
                    MediaBrowser.Providers/Manager/MetadataService.cs (RefreshMetadata), \
                    MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
                    MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
-        date: "2026-10-30",
+        date: "2026-11-06",
         divergences: &[
             "An item whose parent chain cannot be read is scored from its own rating and \
              country, an ancestor's custom rating not counting, else takes the score stored on \
              its parent, and the children of an undecodable series keep the series key stored \
              on its row. Upstream has no such row to fall back from: the read would throw into \
              the per-child catch and the item would not refresh.",
+            "A child whose parent row cannot be read takes its metadata language and country \
+             as if its parents ended there, from the collection folder, the library or the \
+             server, and one whose collection folder row cannot be read from the library or \
+             the server, so an override on the unreadable row or above it goes unused and the \
+             child is fetched, and stamped, in that locale, where upstream's read of such a \
+             row would throw into the per-child catch and the item would not refresh.",
             "A stored item that fails after its row was saved has its DateLastRefreshed \
              cleared, so the next scan retries it as a first refresh where upstream, which \
              saves the row after the providers and the probe, retries it because the row kept \

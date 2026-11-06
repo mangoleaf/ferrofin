@@ -568,6 +568,9 @@ impl LibraryScanner {
             return;
         }
         let mut skipped = super::SkippedItems::default();
+        // The pass's parent reads for the metadata locale: an unreadable
+        // parent is warned about once, not once per album under it.
+        let mut locales = Box::<super::ArtworkCache>::default();
         for kind in [MusicKind::Artist, MusicKind::Album, MusicKind::ByNameArtist] {
             for item in work.iter().filter(|w| w.kind == kind) {
                 let album_gain = album_gains.get(&item.id).copied();
@@ -593,9 +596,14 @@ impl LibraryScanner {
                 // One item that cannot be read or written is skipped: the
                 // items after it still refresh, and it keeps what made it
                 // due for the next scan.
-                if let Err(err) =
-                    Box::pin(self.refresh_music_item(item, album_gain, run.cancel, &mut skipped))
-                        .await
+                if let Err(err) = Box::pin(self.refresh_music_item(
+                    item,
+                    album_gain,
+                    run.cancel,
+                    &mut skipped,
+                    &mut locales,
+                ))
+                .await
                 {
                     skipped.note(item.id, &err);
                 }
@@ -829,6 +837,7 @@ impl LibraryScanner {
         };
         let now = Utc::now();
         let mut skipped = super::SkippedItems::default();
+        let mut locales = Box::<super::ArtworkCache>::default();
         for id in fresh {
             if run.cancel.is_cancelled() {
                 break;
@@ -867,8 +876,14 @@ impl LibraryScanner {
                 owns_stamp: true,
                 owns_save: true,
             };
-            if let Err(err) =
-                Box::pin(self.refresh_music_item(&work, None, run.cancel, &mut skipped)).await
+            if let Err(err) = Box::pin(self.refresh_music_item(
+                &work,
+                None,
+                run.cancel,
+                &mut skipped,
+                &mut locales,
+            ))
+            .await
             {
                 skipped.note(id, &err);
             }
@@ -938,7 +953,14 @@ impl LibraryScanner {
             owns_save: true,
         };
         let mut skipped = super::SkippedItems::default();
-        let saved = Box::pin(self.refresh_music_item(&work, None, run.cancel, &mut skipped)).await;
+        let saved = Box::pin(self.refresh_music_item(
+            &work,
+            None,
+            run.cancel,
+            &mut skipped,
+            &mut Box::<super::ArtworkCache>::default(),
+        ))
+        .await;
         skipped.report("artist refresh");
         let saved = saved?;
         Ok(match saved {
@@ -978,6 +1000,7 @@ impl LibraryScanner {
         album_gain: Option<f64>,
         cancel: &ScanCancel,
         skipped: &mut super::SkippedItems,
+        locales: &mut super::ArtworkCache,
     ) -> Result<Option<bool>, ServiceError> {
         use ferrofin_providers::rate_limit::count_request_failures;
         let Some(items) = &self.item_repository else {
@@ -994,13 +1017,8 @@ impl LibraryScanner {
             ..Default::default()
         };
         let locale = self
-            .resolve_metadata_locale(
-                &stored,
-                &lookup,
-                work.policy,
-                &mut super::ArtworkCache::default(),
-            )
-            .await?;
+            .resolve_metadata_locale(&stored, &lookup, work.policy, locales)
+            .await;
         let resolved_work = MusicRefresh {
             policy: FetcherPolicy {
                 effective_locale: Some(&locale),

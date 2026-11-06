@@ -11621,22 +11621,13 @@ impl LibraryScanner {
             return RemoteMetadata::default();
         }
         let mut lookup = lookup.clone();
-        match self
+        let locale = self
             .resolve_metadata_locale(entity, &lookup, policy, cache)
-            .await
-        {
-            Ok(locale) => {
-                cache
-                    .resolved_locales
-                    .insert(entity.id.clone(), locale.clone());
-                lookup.locale = Some(locale);
-            }
-            Err(err) => {
-                tracing::warn!(%err, item_id = entity.id, "could not resolve metadata locale");
-                ferrofin_providers::rate_limit::note_request_failure();
-                return RemoteMetadata::default();
-            }
-        }
+            .await;
+        cache
+            .resolved_locales
+            .insert(entity.id.clone(), locale.clone());
+        lookup.locale = Some(locale);
         let lookup = &lookup;
         let preferred_language = lookup.metadata_language(policy);
         let mut fold = RemoteFold::new(known_ids, &preferred_language);
@@ -11679,8 +11670,11 @@ impl LibraryScanner {
     /// [`Stored::Undecodable`]) counts as none, so the child keeps its own
     /// values (`series is null ? SeriesName`, `FindSeriesName`), and is asked
     /// for once per pass: every child of the row would otherwise read it and
-    /// warn, and all a transient error costs is this pass's names, which the
-    /// next scan puts right.
+    /// warn. A transient error costs this pass's names, which the next scan
+    /// puts right. It also costs any metadata locale the row or its parents
+    /// override, which no later scan puts right: the children refreshed this
+    /// pass are fetched, and stamped, in the collection folder's, the
+    /// library's or the server's, as for a parent that is not there.
     async fn parent_row(&self, id: &str, cache: &mut ArtworkCache) -> Option<BaseItemEntity> {
         let items = self.item_repository.as_ref()?;
         let parsed = parse_id(id)?;
@@ -11838,13 +11832,15 @@ impl LibraryScanner {
 
     /// `BaseItem.GetPreferredMetadataLanguage/CountryCode`: own override,
     /// nearest parent, collection folder, library options, then server defaults.
+    /// The parent walk ends at a row that fails to read as at one that is not
+    /// there ([`parent_row`](Self::parent_row)).
     async fn resolve_metadata_locale(
         &self,
         row: &BaseItemEntity,
         lookup: &ResolverGuesses,
         policy: FetcherPolicy<'_>,
         cache: &mut ArtworkCache,
-    ) -> Result<(String, String), ServiceError> {
+    ) -> (String, String) {
         let mut language = lookup.own_language.clone();
         let mut country = lookup.own_country.clone();
         let mut next = row.parent_id.clone();
@@ -11853,7 +11849,7 @@ impl LibraryScanner {
             if !visited.insert(id.clone()) {
                 break;
             }
-            let parent = self.locale_parent(&id, cache).await?;
+            let parent = self.locale_parent(&id, cache).await;
             language = language.or(parent.language);
             country = country.or(parent.country);
             next = parent.parent;
@@ -11861,40 +11857,32 @@ impl LibraryScanner {
         if let Some(id) = policy.collection_folder
             && (language.is_none() || country.is_none())
         {
-            let collection = self.locale_parent(&guid_to_db(id), cache).await?;
+            let collection = self.locale_parent(&guid_to_db(id), cache).await;
             language = language.or(collection.language);
             country = country.or(collection.country);
         }
-        Ok((
+        (
             language.unwrap_or_else(|| policy.metadata_language()),
             country
                 .unwrap_or_else(|| policy.country_code())
                 .to_ascii_uppercase(),
-        ))
+        )
     }
 
-    async fn locale_parent(
-        &self,
-        id: &str,
-        cache: &mut ArtworkCache,
-    ) -> Result<LocaleParent, ServiceError> {
+    async fn locale_parent(&self, id: &str, cache: &mut ArtworkCache) -> LocaleParent {
         if let Some(parent) = cache.locale_parents.get(id) {
-            return Ok(parent.clone());
+            return parent.clone();
         }
-        let parent = if let Some(items) = &self.item_repository
-            && let Some(id) = parse_id(id)
-            && let Some(row) = items.retrieve_item(id).await?
-        {
-            LocaleParent {
+        let parent = self
+            .parent_row(id, cache)
+            .await
+            .map_or_else(LocaleParent::default, |row| LocaleParent {
                 parent: row.parent_id,
                 language: own_language(row.preferred_metadata_language.as_deref()),
                 country: own_language(row.preferred_metadata_country_code.as_deref()),
-            }
-        } else {
-            LocaleParent::default()
-        };
+            });
         cache.locale_parents.insert(id.to_owned(), parent.clone());
-        Ok(parent)
+        parent
     }
 
     /// The photo embedded-information pass — port of `Emby.Photos.PhotoProvider`.
@@ -12728,7 +12716,7 @@ impl LibraryScanner {
         server_locale: &(String, String),
         folders: &[ferrofin_model::entities_media::VirtualFolderInfo],
         cache: &mut ArtworkCache,
-    ) -> Result<Option<String>, ServiceError> {
+    ) -> Option<String> {
         let fallback = BaseItemEntity::default();
         let row = row.unwrap_or(&fallback);
         let lookup = ResolverGuesses {
@@ -12755,11 +12743,8 @@ impl LibraryScanner {
                 },
                 cache,
             )
-            .await?;
-        Ok(ferrofin_providers::tmdb::normalize_language(
-            Some(&locale.0),
-            Some(&locale.1),
-        ))
+            .await;
+        ferrofin_providers::tmdb::normalize_language(Some(&locale.0), Some(&locale.1))
     }
 
     /// Enriches credited people: downloads each one's TMDB profile image as their
@@ -12867,21 +12852,14 @@ impl LibraryScanner {
                 if lock.is_some_and(|lock| lock.row.is_locked) {
                     continue;
                 }
-                let language = match self
+                let language = self
                     .person_metadata_language(
                         lock.map(|lock| &lock.row),
                         &server_locale,
                         folders,
                         &mut locale_cache,
                     )
-                    .await
-                {
-                    Ok(language) => language,
-                    Err(error) => {
-                        tracing::warn!(%error, person = %id, "could not resolve person metadata locale");
-                        continue;
-                    }
-                };
+                    .await;
                 let Some(details) = tmdb
                     .person_details_for_language(tmdb_id, language.as_deref())
                     .await
@@ -14508,17 +14486,8 @@ impl LibraryScanner {
                 own_country: own_language(entity.preferred_metadata_country_code.as_deref()),
                 ..Default::default()
             };
-            match self
-                .resolve_metadata_locale(entity, &lookup, policy, cache)
+            self.resolve_metadata_locale(entity, &lookup, policy, cache)
                 .await
-            {
-                Ok(locale) => locale,
-                Err(err) => {
-                    tracing::warn!(%err, item_id = entity.id, "could not resolve artwork locale");
-                    ferrofin_providers::rate_limit::note_request_failure();
-                    return Vec::new();
-                }
-            }
         };
         let policy = FetcherPolicy {
             effective_locale: Some(&locale),
@@ -27580,7 +27549,7 @@ mod tests {
         let vf = Arc::new(FerrofinVirtualFolderManager::new(tmp.path().join("views")));
         let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
             .with_items(Arc::new(crate::FerrofinItemRepository::new(
-                db,
+                db.clone(),
                 Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
             )));
         let options = LibraryOptions {
@@ -27608,24 +27577,21 @@ mod tests {
         assert_eq!(
             scanner
                 .resolve_metadata_locale(&row, &own, policy, &mut cache)
-                .await
-                .unwrap(),
+                .await,
             ("pt".into(), "BR".into())
         );
         let lookup = ResolverGuesses::default();
         assert_eq!(
             scanner
                 .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
-                .await
-                .unwrap(),
+                .await,
             ("de".into(), "AT".into())
         );
         let row = BaseItemEntity::default();
         assert_eq!(
             scanner
                 .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
-                .await
-                .unwrap(),
+                .await,
             ("it".into(), "IT".into())
         );
         let policy = FetcherPolicy {
@@ -27635,8 +27601,7 @@ mod tests {
         assert_eq!(
             scanner
                 .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
-                .await
-                .unwrap(),
+                .await,
             ("fr".into(), "FR".into())
         );
         let blank = LibraryOptions {
@@ -27649,11 +27614,43 @@ mod tests {
             assert_eq!(
                 scanner
                     .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
-                    .await
-                    .unwrap(),
+                    .await,
                 ("ja".into(), "JP".into())
             );
         }
+        // A parent whose row fails to read ends the walk as one that is not
+        // there: the collection folder's locale (read above), and the row is
+        // not asked for again this pass.
+        db.close().await;
+        let unread = ferrofin_db::store::guid_to_db(uuid::Uuid::from_u128(73));
+        let row = BaseItemEntity {
+            parent_id: Some(unread.clone()),
+            ..Default::default()
+        };
+        let policy = FetcherPolicy {
+            collection_folder: Some(collection),
+            ..policy
+        };
+        assert_eq!(
+            scanner
+                .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
+                .await,
+            ("it".into(), "IT".into())
+        );
+        assert!(cache.unread_parents.contains(&unread));
+        assert!(cache.locale_parents.contains_key(&unread));
+        // So does a collection folder row that fails to read: the library's.
+        assert_eq!(
+            scanner
+                .resolve_metadata_locale(
+                    &BaseItemEntity::default(),
+                    &lookup,
+                    policy,
+                    &mut ArtworkCache::default()
+                )
+                .await,
+            ("fr".into(), "FR".into())
+        );
     }
 
     /// `MatchesPreferredLanguage`: the language subtags compare, and an
