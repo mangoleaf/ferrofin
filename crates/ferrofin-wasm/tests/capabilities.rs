@@ -527,11 +527,12 @@ fn get_state_sees_every_change_to_the_file() {
     assert_eq!(get_state(Some(&path), "other"), Some(b"x".to_vec()));
 }
 
-/// A `set-state` builds on the file, never on the map `get-state` kept: a
-/// change the stamp cannot show is written back, not undone, and a file
-/// corrupted behind an unchanged stamp is still refused.
+/// A `set-state` builds on what the file holds, not on the map `get-state`
+/// kept behind an unchanged stamp: a change the stamp cannot show is
+/// written back, not undone, and a file corrupted behind an unchanged stamp
+/// is still refused.
 #[test]
-fn set_state_reads_the_file_not_the_kept_map() {
+fn set_state_sees_a_change_the_stamp_cannot_show() {
     use ferrofin_wasm::capabilities::{get_state, set_state};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plugin.state.json");
