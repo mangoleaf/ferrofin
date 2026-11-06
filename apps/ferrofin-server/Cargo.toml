@@ -68,7 +68,7 @@ opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
-# state.rs storage test: the virtual-folder fake that counts full listings.
+# state.rs storage test, planner.rs label test: the virtual-folder fake that counts full listings.
 ferrofin-api = { workspace = true, features = ["test-util"] }
 # live_tv_artwork, item_visibility: date the guide fixture, whose window follows the clock.
 chrono.workspace = true

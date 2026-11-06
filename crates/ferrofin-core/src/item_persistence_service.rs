@@ -4235,27 +4235,35 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         if guid_to_db(id) == PLACEHOLDER_ID || is_owned_video(item) {
             return Ok(());
         }
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        // Usually nothing is detached, so ask a reader and leave the writer
+        // free. The caller committed this item's keys first: history detached
+        // after this read was detached after its destination was saved, which
+        // the recovery sweep after a scan places (`reattach_all_user_data`;
+        // for a refresh or a guide refresh, the next scan's), as it places
+        // history detached just after this call returns.
         let detached: bool = sqlx::query_scalar(
             r#"SELECT EXISTS(SELECT 1 FROM "UserData" WHERE "ItemId" = ?1)
                 OR EXISTS(SELECT 1 FROM "FerrofinUserDataRetentionSnapshots")"#,
         )
         .bind(PLACEHOLDER_ID)
-        .fetch_one(&mut *tx)
+        .fetch_one(self.db.pool())
         .await
         .map_err(db_err)?;
-        if detached {
-            for identity in
-                crate::user_data_key_repository::load_identities(&mut tx, &[guid_to_db(id)]).await?
-            {
-                reattach_user_data_keys(
-                    &mut tx,
-                    &identity.id,
-                    &identity.keys,
-                    &identity.retention_keys,
-                )
-                .await?;
-            }
+        if !detached {
+            return Ok(());
+        }
+        // The reattach reads what is still detached under the writer.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        for identity in
+            crate::user_data_key_repository::load_identities(&mut tx, &[guid_to_db(id)]).await?
+        {
+            reattach_user_data_keys(
+                &mut tx,
+                &identity.id,
+                &identity.keys,
+                &identity.retention_keys,
+            )
+            .await?;
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())
@@ -7822,6 +7830,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(owners, vec![guid_to_db(item)]);
+    }
+
+    /// With nothing detached, a save's reattach takes no writer: it finishes
+    /// while another writer holds the database. History a writer detached just
+    /// before is still seen through the reader pool, and reattached.
+    #[tokio::test]
+    async fn retention_reattach_takes_no_writer_when_nothing_is_detached() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A file database: an in-memory one reads through its writer too.
+        let url = format!("sqlite://{}", tmp.path().join("reattach.db").display());
+        let db = ferrofin_db::Database::connect(&url).await.expect("connect");
+        db.run_migrations().await.expect("migrations apply");
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let (old, new, user) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for item in [old, new] {
+            seed_item(&db, item, BaseItemKind::Movie).await;
+            svc.save_provider_id(item, "Tmdb", "retained-movie")
+                .await
+                .unwrap();
+        }
+        let new_row = crate::test_support::fetch_item(&db, new).await;
+
+        let held = db
+            .writer()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .expect("hold the writer");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            svc.reattach_user_data(&new_row),
+        )
+        .await
+        .expect("a reattach with nothing detached waited for the writer")
+        .unwrap();
+        held.rollback().await.expect("release the writer");
+
+        crate::test_support::seed_named_user(&db, user, "retained").await;
+        crate::test_support::seed_user_data(&db, user, old, true, None).await;
+        sqlx::query(r#"UPDATE "UserData" SET "CustomDataKey" = 'retained-movie'"#)
+            .execute(db.writer())
+            .await
+            .unwrap();
+        svc.delete_items(&[old]).await.unwrap();
+        svc.reattach_user_data(&new_row).await.unwrap();
+        let owners: Vec<String> = sqlx::query_scalar(r#"SELECT DISTINCT "ItemId" FROM "UserData""#)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(owners, vec![guid_to_db(new)]);
     }
 
     #[tokio::test]

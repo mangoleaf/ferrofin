@@ -11,16 +11,19 @@
 //! Jellyfin's exact param names.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::http::Method;
+use opentelemetry::StringValue;
 
-/// The per-route label values (all prometheus-net-parity).
+/// The per-route label values (all prometheus-net-parity), reference-counted so
+/// a request's labels share them instead of copying.
 #[derive(Debug, Clone)]
 struct RouteMeta {
-    controller: String,
-    action: String,
+    controller: StringValue,
+    action: StringValue,
     /// The Jellyfin-form endpoint label: the spec path with no leading slash.
-    endpoint: String,
+    endpoint: StringValue,
 }
 
 /// A `(method, MatchedPath) → (controller, action, endpoint)` lookup built from
@@ -30,7 +33,8 @@ struct RouteMeta {
 /// raw matched path for `endpoint`, matching prometheus-net's convention.
 #[derive(Debug, Clone, Default)]
 pub struct RouteLabels {
-    map: HashMap<(Method, String), RouteMeta>,
+    /// By method, then by `MatchedPath`, so a lookup borrows the path.
+    map: HashMap<Method, HashMap<Box<str>, RouteMeta>>,
 }
 
 impl RouteLabels {
@@ -45,7 +49,7 @@ impl RouteLabels {
     /// lookup — every request then gets empty labels rather than failing.
     #[must_use]
     pub fn from_openapi_spec(spec_json: &str, normalize: impl Fn(&str) -> String) -> Self {
-        let mut map = HashMap::new();
+        let mut map: HashMap<Method, HashMap<Box<str>, RouteMeta>> = HashMap::new();
         let Ok(spec) = serde_json::from_str::<serde_json::Value>(spec_json) else {
             return Self { map };
         };
@@ -55,8 +59,8 @@ impl RouteLabels {
         for (path, item) in paths {
             // Key by the axum template (== `MatchedPath`); store the spec path
             // sans leading slash as the Jellyfin-form endpoint label value.
-            let key = normalize(path);
-            let endpoint = path.strip_prefix('/').unwrap_or(path).to_owned();
+            let key: Box<str> = normalize(path).into();
+            let endpoint = shared(path.strip_prefix('/').unwrap_or(path));
             let Some(methods) = item.as_object() else {
                 continue;
             };
@@ -69,18 +73,16 @@ impl RouteLabels {
                     .and_then(serde_json::Value::as_array)
                     .and_then(|t| t.first())
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
+                    .unwrap_or_default();
                 let action = op
                     .get("operationId")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                map.insert(
-                    (method, key.clone()),
+                    .unwrap_or_default();
+                map.entry(method).or_default().insert(
+                    key.clone(),
                     RouteMeta {
-                        controller,
-                        action,
+                        controller: shared(controller),
+                        action: shared(action),
                         endpoint: endpoint.clone(),
                     },
                 );
@@ -90,21 +92,24 @@ impl RouteLabels {
     }
 
     /// Looks up the `(controller, action, endpoint)` labels for a matched
-    /// `(method, matched_path)`. Returns `None` when the route is not a contract
-    /// operation — the caller then emits empty controller/action and uses the
-    /// raw matched path as `endpoint`.
+    /// `(method, matched_path)`, as shared values whose clones allocate nothing.
+    /// Returns `None` when the route is not a contract operation — the caller
+    /// then emits empty controller/action and uses the raw matched path as
+    /// `endpoint`.
     #[must_use]
-    pub fn lookup(&self, method: &Method, matched_path: &str) -> Option<(&str, &str, &str)> {
-        self.map
-            .get(&(method.clone(), matched_path.to_owned()))
-            .map(|m| {
-                (
-                    m.controller.as_str(),
-                    m.action.as_str(),
-                    m.endpoint.as_str(),
-                )
-            })
+    pub fn lookup(
+        &self,
+        method: &Method,
+        matched_path: &str,
+    ) -> Option<(StringValue, StringValue, StringValue)> {
+        let m = self.map.get(method)?.get(matched_path)?;
+        Some((m.controller.clone(), m.action.clone(), m.endpoint.clone()))
     }
+}
+
+/// A label value that every request on the route shares by reference count.
+fn shared(value: &str) -> StringValue {
+    Arc::<str>::from(value).into()
 }
 
 /// Parses an OpenAPI verb key (`"get"`, `"post"`, …) into an [`Method`],
@@ -139,6 +144,15 @@ mod tests {
         }
     }"#;
 
+    /// The `(controller, action, endpoint)` label values a lookup answers.
+    fn found(
+        controller: &'static str,
+        action: &'static str,
+        endpoint: &'static str,
+    ) -> (StringValue, StringValue, StringValue) {
+        (controller.into(), action.into(), endpoint.into())
+    }
+
     #[test]
     fn builds_and_looks_up_controller_action_endpoint() {
         // Identity normalizer for the test — real wiring passes the axum transform.
@@ -146,11 +160,11 @@ mod tests {
         // endpoint is the spec path with the leading slash stripped (Jellyfin form).
         assert_eq!(
             labels.lookup(&Method::GET, "/Items/{itemId}"),
-            Some(("Items", "GetItem", "Items/{itemId}"))
+            Some(found("Items", "GetItem", "Items/{itemId}"))
         );
         assert_eq!(
             labels.lookup(&Method::POST, "/Users/{userId}/Items"),
-            Some(("UserLibrary", "MarkPlayed", "Users/{userId}/Items"))
+            Some(found("UserLibrary", "MarkPlayed", "Users/{userId}/Items"))
         );
     }
 
