@@ -4146,7 +4146,13 @@ impl FerrofinDtoService {
             return Ok(vec![parent_id]);
         }
         if movies_or_shows {
-            return crate::item_repository::grouped_libraries(&self.db, user, view_type).await;
+            return crate::item_repository::grouped_libraries(
+                &self.db,
+                &self.virtual_paths,
+                user,
+                view_type,
+            )
+            .await;
         }
         Ok(Vec::new())
     }

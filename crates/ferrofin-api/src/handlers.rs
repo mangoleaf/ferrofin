@@ -1363,7 +1363,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    CollectionFolder.IsVisible, BoxSet.IsVisibleStandalone, \
                    Playlist.IsVisibleStandalone) and user_view_manager.rs \
                    get_user_root_children (Folder.GetChildren, \
-                   UserRootFolder.GetEligibleChildrenForRecursiveChildren); handlers/items.rs \
+                   UserRootFolder.GetEligibleChildrenForRecursiveChildren); item_repository.rs \
+                   visible_view_rows → library_enabled under scope_to_user_libraries, \
+                   root_folder_top_parents and grouped_libraries (GetChildren(user, true) in \
+                   AddUserToQuery's GetUserViews, UserViewManager.HasVisibleItem and \
+                   GetTopParentIdsForQuery's grouping arm), reading a library's options at its \
+                   Path expanded as BaseItemMapper.Map expands it \
+                   (CollectionFolder.GetLibraryOptions, compared 2026-11-05); handlers/items.rs \
                    require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
                    routes that take a scope (ItemsController.GetItems, \
                    LibraryManager.AddUserToQuery); handlers/streaming.rs \
