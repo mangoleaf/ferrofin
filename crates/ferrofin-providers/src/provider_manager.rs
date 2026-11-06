@@ -2216,10 +2216,15 @@ impl LocalProviderManager {
         })
     }
 
-    /// Every episode provider for a path-less episode — `TmdbEpisodeProvider`,
-    /// `OmdbEpisodeProvider` and the TVDB plugin's `TvdbEpisodeProvider`, those
-    /// the library has enabled, in its provider order — as
-    /// `ExecuteRemoteProviders` folds them (`MetadataService.cs:955-1025`).
+    /// Every episode provider for an episode with no file of its own —
+    /// `TmdbEpisodeProvider`, `OmdbEpisodeProvider` and the TVDB plugin's
+    /// `TvdbEpisodeProvider`, those the library has enabled, in its provider
+    /// order — as `ExecuteRemoteProviders` folds them
+    /// (`MetadataService.cs:955-1025`).
+    ///
+    /// A missing episode (no path) gets no answer from TheMovieDb or OMDb, so
+    /// only TheTVDB is asked ([`answers_for_episode`]); one with a remote path,
+    /// or a path outside every library, is asked of all three.
     ///
     /// Each provider resolves by the parent series' ids alone, never by its
     /// name: TheMovieDb by the series' `Tmdb` id (`TmdbEpisodeProvider.cs:
@@ -2256,7 +2261,7 @@ impl LocalProviderManager {
         let mut sources: Vec<&'static str> = self
             .metadata_fetchers("Episode")
             .into_iter()
-            .filter(|name| fetch.metadata && enabled(name))
+            .filter(|name| fetch.metadata && enabled(name) && answers_for_episode(row, name))
             .collect();
         sources
             .sort_by_key(|name| metadata_fetcher_rank(library, global.as_ref(), "Episode", name));
@@ -4529,6 +4534,17 @@ fn short_kind(entity: &BaseItemEntity) -> &str {
 /// before any option is read ([`channel_fetcher_override`]).
 fn channel_gate(entity: &BaseItemEntity) -> Option<bool> {
     channel_fetcher_override(short_kind(entity), entity.channel_id.as_deref())
+}
+
+/// Whether episode provider `name` answers for the episode `row`: TheMovieDb's
+/// and OMDb's return an empty result for a missing episode (`IsMissingEpisode`,
+/// `LocationType.Virtual`: no path; `TmdbEpisodeProvider.cs:86-90`,
+/// `OmdbEpisodeProvider.cs:52-56`), TheTVDB's answers every episode. A
+/// channel's path-less item is `Remote`, but [`channel_gate`] has already
+/// turned every fetcher off for one (Ferrofin has no channel plugins, gl-298).
+fn answers_for_episode(row: &BaseItemEntity, name: &str) -> bool {
+    row.path.as_deref().is_some_and(|path| !path.is_empty())
+        || ![fetcher_names::TMDB, fetcher_names::OMDB].contains(&name)
 }
 
 /// The pure `(kind, name, year)` extraction for a movie/series row, shared by
@@ -12457,7 +12473,7 @@ mod tests {
         assert!(season.people.written.lock().expect("lock").is_empty());
     }
 
-    // ── a path-less episode: every episode provider ─────────────────────────
+    // ── an episode with no file of its own: its episode providers ──────────
 
     /// TheMovieDb's season listing with episode 2, and the episode's own
     /// request (its external ids and one guest star).
@@ -12532,7 +12548,7 @@ mod tests {
     /// What a path-less episode's refresh needs: episode 2 of season 1 under a
     /// series whose stored ids are `series_ids`, in a library saved with
     /// `options`, the stores it writes to, and a manager over `base` with all
-    /// three episode providers wired.
+    /// three episode providers wired. `stored` may give it a path ([`remote`]).
     struct VirtualEpisode {
         episode_id: Uuid,
         store: Arc<RecordingStore>,
@@ -12621,17 +12637,79 @@ mod tests {
         }
     }
 
-    /// A path-less episode refreshes through every episode provider the
-    /// library ticks, in its fetcher order, as the scan's episode does: the
-    /// first answer wins a field (title, synopsis, air date), a later one fills
-    /// what is still empty (OMDb's rating), the ids all gather on the row, and
-    /// each credited provider's credits are folded. Every provider resolves by
-    /// the series' ids — never a search.
+    /// A remote path: `LocationType.Remote`, so no missing episode.
+    const REMOTE_PATH: &str = "https://media.invalid/Show/S01E02.mkv";
+
+    /// Gives the episode [`REMOTE_PATH`], so every episode provider answers
+    /// for it.
+    fn remote(row: &mut BaseItemEntity) {
+        row.path = Some(REMOTE_PATH.to_owned());
+    }
+
+    /// A missing episode (no path: `IsMissingEpisode`) is asked of TheTVDB
+    /// alone: `TmdbEpisodeProvider` and `OmdbEpisodeProvider` return an empty
+    /// result for one (`TmdbEpisodeProvider.cs:86-90`,
+    /// `OmdbEpisodeProvider.cs:52-56`), so neither TheMovieDb nor OMDb is
+    /// requested, and the refresh is still stamped, in a library or not. An
+    /// episode with a remote path, or a path outside every library, is no
+    /// missing episode: all three are asked.
+    #[rstest::rstest]
+    #[case::no_path(None, true, false)]
+    #[case::empty_path(Some(""), true, false)]
+    #[case::no_path_outside_every_library(None, false, false)]
+    #[case::remote_path(Some(REMOTE_PATH), true, true)]
+    #[case::outside_every_library(Some("/elsewhere/Show/S01E02.mkv"), false, true)]
+    #[tokio::test]
+    async fn only_a_missing_episode_skips_tmdb_and_omdb(
+        #[case] path: Option<&str>,
+        #[case] in_library: bool,
+        #[case] asks_tmdb_and_omdb: bool,
+    ) {
+        let (base, log) = spawn_episode_providers(false);
+        let episode = VirtualEpisode::new(
+            &base,
+            &[("Tmdb", "1399"), ("Tvdb", "121361"), ("Imdb", "tt0000001")],
+            ferrofin_model::configuration::LibraryOptions::default(),
+            |row| {
+                row.path = path.map(str::to_owned);
+                if !in_library {
+                    row.top_parent_id = None;
+                }
+            },
+        );
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        let asked = log.lock().expect("log").clone();
+        for provider in ["/tmdb/", "/omdb/"] {
+            assert_eq!(
+                asked.iter().any(|l| l.contains(provider)),
+                asks_tmdb_and_omdb,
+                "{provider}: {asked:?}"
+            );
+        }
+        assert!(asked.iter().any(|l| l.contains("/tvdb/")), "{asked:?}");
+        let row = episode.saved().expect("a full refresh saves");
+        if !asks_tmdb_and_omdb {
+            assert_eq!(row.name.as_deref(), Some("TVDB Episode"));
+        }
+        assert!(row.date_last_refreshed.is_some());
+    }
+
+    /// An episode with no file of its own that is no missing episode (a
+    /// remote path) refreshes through every episode provider the library
+    /// ticks, in its fetcher order, as the scan's episode does: the first
+    /// answer wins a field (title, synopsis, air date), a later one fills what
+    /// is still empty (OMDb's rating), the ids all gather on the row, and each
+    /// credited provider's credits are folded. Every provider resolves by the
+    /// series' ids — never a search.
     #[rstest::rstest]
     #[case::tmdb_first(&[crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::OMDB], "TMDB Episode", "TMDB synopsis.", "2011-04-24", "tt0002002")]
     #[case::tvdb_first(&[crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::OMDB], "TVDB Episode", "TVDB synopsis.", "2011-04-23", "tt0005002")]
     #[tokio::test]
-    async fn a_virtual_episode_runs_every_episode_provider_in_the_librarys_order(
+    async fn a_remote_episode_runs_every_episode_provider_in_the_librarys_order(
         #[case] order: &[&str],
         #[case] name: &str,
         #[case] overview: &str,
@@ -12643,7 +12721,7 @@ mod tests {
             &base,
             &[("Tmdb", "1399"), ("Tvdb", "121361"), ("Imdb", "tt0000001")],
             episode_fetchers(order),
-            |_| {},
+            remote,
         );
         episode
             .mgr
@@ -12701,13 +12779,13 @@ mod tests {
     /// ids for a provider spares it the request. OMDb reads the episode's own
     /// `Imdb` id from TheMovieDb's answer (it ran first).
     #[tokio::test]
-    async fn a_virtual_episode_asks_only_the_providers_it_has_ids_for() {
+    async fn a_remote_episode_asks_only_the_providers_it_has_ids_for() {
         let (base, log) = spawn_episode_providers(false);
         let episode = VirtualEpisode::new(
             &base,
             &[("Imdb", "tt0000001")],
             episode_fetchers(&[crate::library_options::fetcher_names::OMDB]),
-            |_| {},
+            remote,
         );
         episode
             .mgr
@@ -12733,7 +12811,10 @@ mod tests {
             &base,
             &[],
             ferrofin_model::configuration::LibraryOptions::default(),
-            |row| row.overview = Some("Stored.".to_owned()),
+            |row| {
+                remote(row);
+                row.overview = Some("Stored.".to_owned());
+            },
         );
         none.mgr
             .refresh_full_item(none.episode_id, &search_missing())
@@ -12750,7 +12831,7 @@ mod tests {
     /// both written (each provider answers with its own list), and a `Cast`
     /// lock keeps the stored ones.
     #[tokio::test]
-    async fn a_virtual_episodes_credits_are_written_and_a_cast_lock_keeps_them() {
+    async fn a_remote_episodes_credits_are_written_and_a_cast_lock_keeps_them() {
         let (base, _log) = spawn_episode_providers(false);
         let episode = VirtualEpisode::new(
             &base,
@@ -12759,7 +12840,7 @@ mod tests {
                 crate::library_options::fetcher_names::TMDB,
                 crate::library_options::fetcher_names::TVDB,
             ]),
-            |_| {},
+            remote,
         );
         episode
             .mgr
@@ -12775,7 +12856,7 @@ mod tests {
             &base,
             &[("Tmdb", "1399")],
             ferrofin_model::configuration::LibraryOptions::default(),
-            |_| {},
+            remote,
         );
         let store = Arc::new(RecordingStore {
             locked: HashMap::from([(locked.episode_id, vec![MetadataField::Cast])]),
@@ -12802,7 +12883,7 @@ mod tests {
     /// its language: with French preferred, TheTVDB's French synopsis is the
     /// episode's although OMDb's English plot ran (and was taken) first.
     #[tokio::test]
-    async fn a_virtual_episodes_preferred_language_beats_an_english_fallback() {
+    async fn a_remote_episodes_preferred_language_beats_an_english_fallback() {
         let (base, _log) = spawn_episode_providers(false);
         let episode = VirtualEpisode::new(
             &base,
@@ -12814,7 +12895,7 @@ mod tests {
                     crate::library_options::fetcher_names::TVDB,
                 ])
             },
-            |_| {},
+            remote,
         );
         episode
             .mgr
@@ -12828,13 +12909,16 @@ mod tests {
     /// Every provider failing under "Replace all metadata" erases nothing and
     /// leaves the refresh unstamped, as for a season.
     #[tokio::test]
-    async fn failing_virtual_episode_providers_never_clear_the_episode() {
+    async fn failing_remote_episode_providers_never_clear_the_episode() {
         let (base, _log) = spawn_episode_providers(true);
         let episode = VirtualEpisode::new(
             &base,
             &[("Tmdb", "1399"), ("Tvdb", "121361"), ("Imdb", "tt0000001")],
             ferrofin_model::configuration::LibraryOptions::default(),
-            |row| row.overview = Some("Stored.".to_owned()),
+            |row| {
+                remote(row);
+                row.overview = Some("Stored.".to_owned());
+            },
         );
         let replace_all = Opts {
             replace_all_metadata: true,
