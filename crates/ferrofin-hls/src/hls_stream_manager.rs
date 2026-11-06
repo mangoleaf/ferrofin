@@ -736,8 +736,8 @@ where
             let failures = self.record_restart_failure(&playlist_key);
             Err(ServiceError::backend(format!(
                 "transcode exited before producing segment {segment_id} \
-                 (consecutive failures: {failures}); see {}",
-                playlist_path.with_extension("log").display()
+                 (consecutive failures: {failures}); see the FFmpeg.* logs in {}",
+                self.paths.log_directory_path()
             )))
         }
     }
@@ -752,6 +752,7 @@ where
     /// nothing, and "the start segment exists" proves the init is complete and
     /// closed. This gates on the latter — upstream's `WaitForPath = segment 0`
     /// for `segmentId == -1` — and never sleeps on a size-stability poll.
+    #[allow(clippy::too_many_lines)]
     async fn resolve_init_segment(
         &self,
         request: &HlsStreamRequest,
@@ -811,7 +812,11 @@ where
         let lock = self.playlist_lock(&playlist_key);
         let _guard = lock.lock().await;
 
+        // Only the request that starts a job counts it in the restart breaker,
+        // so a job this one merely waited on is never counted twice.
+        let mut started = false;
         if !start_segment.exists() {
+            let mut delivered = false;
             if let Some(handle) = self
                 .manager
                 .get_transcoding_job_by_path(&playlist_key, TranscodingJobType::Hls)
@@ -826,11 +831,17 @@ where
                 let _rg = self
                     .manager
                     .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
-                let _ = self
+                delivered = self
                     .manager
                     .wait_for_segment(&handle, &plan.playlist_path, start)
                     .await;
-            } else {
+                if !delivered {
+                    // The job exited without it: drop it and start afresh, as a
+                    // segment request does, or every retry waits on the dead job.
+                    self.manager.kill_and_remove(&handle, false, false).await;
+                }
+            }
+            if !delivered {
                 if self.restart_breaker_open(&playlist_key) {
                     return Err(ServiceError::backend(format!(
                         "transcode for this stream died {RESTART_FAILURE_LIMIT}+ times in a row \
@@ -864,11 +875,12 @@ where
                 {
                     return Err(self.failed_start(&playlist_key, e));
                 }
-                self.clear_restart_failures(&playlist_key);
+                started = true;
             }
         }
 
         if init_is_complete(&init_path, &start_segment) {
+            self.clear_restart_failures(&playlist_key);
             let mut file = served(&init_path, ext);
             file.progress = self.manager.segment_progress(
                 &plan.playlist_path.to_string_lossy(),
@@ -879,9 +891,19 @@ where
             );
             Ok(file)
         } else {
-            Err(ServiceError::NotFound(
-                "fmp4 init segment did not materialise".to_owned(),
-            ))
+            // A 5xx, not a 404, as for a segment: hls.js gives up on a 404'd
+            // init, while a server error makes it retry with backoff.
+            let failures = if started {
+                let count = self.record_restart_failure(&playlist_key);
+                format!(" (consecutive failures: {count})")
+            } else {
+                String::new()
+            };
+            Err(ServiceError::backend(format!(
+                "transcode did not produce the fmp4 init segment{failures}; \
+                 see the FFmpeg.* logs in {}",
+                self.paths.log_directory_path()
+            )))
         }
     }
 
@@ -2117,6 +2139,119 @@ mod tests {
         let (mgr, _) = manager_with(tmp.path(), script, "ts");
         let err = mgr.dynamic_segment(&req(), 5, false).await.unwrap_err();
         assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+    }
+
+    /// The consecutive dead transcodes recorded for the test playlist.
+    fn restart_failures(mgr: &Mgr, dir: &Path) -> u32 {
+        let key = dir.join("out.m3u8").to_string_lossy().into_owned();
+        mgr.restart_failures
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map_or(0, |(count, _)| *count)
+    }
+
+    #[tokio::test]
+    async fn a_dead_init_transcode_is_a_backend_error_that_feeds_the_breaker() {
+        let tmp = tempfile::tempdir().unwrap();
+        // ffmpeg exits 0 without writing the init or its start segment (a cold
+        // NFS read). fMP4 is every HEVC/AV1 transcode and the init is its first
+        // request, so the init path must count the dead job like a segment.
+        let script = FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, _, spawns) = manager_full(tmp.path(), script, "mp4");
+        let init_req = HlsStreamRequest {
+            segment_container: Some("mp4".to_owned()),
+            ..req()
+        };
+
+        // Each retry replaces the dead job with a fresh transcode and counts it.
+        for attempt in 1..=RESTART_FAILURE_LIMIT {
+            let err = mgr.dynamic_segment(&init_req, -1, false).await.unwrap_err();
+            assert_eq!(restart_failures(&mgr, tmp.path()), attempt, "{err:?}");
+            assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+        }
+        let spawned = spawns.requests.lock().unwrap().len();
+        assert_eq!(spawned, RESTART_FAILURE_LIMIT as usize);
+
+        // Breaker open: the next init request fails fast with no new spawn.
+        let err = mgr.dynamic_segment(&init_req, -1, false).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+        assert_eq!(spawns.requests.lock().unwrap().len(), spawned);
+    }
+
+    #[tokio::test]
+    async fn an_init_waiting_on_a_dead_job_counts_only_its_own_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, _, spawns) = manager_full(tmp.path(), script, "mp4");
+        let init_req = HlsStreamRequest {
+            segment_container: Some("mp4".to_owned()),
+            ..req()
+        };
+
+        // The segment request starts the job, which dies; it counts it.
+        let err = mgr.dynamic_segment(&init_req, 0, false).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+        assert_eq!(restart_failures(&mgr, tmp.path()), 1);
+
+        // The init request finds that dead job, which it must not count again:
+        // it replaces it with a fresh transcode and counts that one.
+        let err = mgr.dynamic_segment(&init_req, -1, false).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+        assert_eq!(spawns.requests.lock().unwrap().len(), 2);
+        assert_eq!(restart_failures(&mgr, tmp.path()), 2);
+    }
+
+    #[tokio::test]
+    async fn an_init_that_materialises_clears_the_breaker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out0.mp4".to_owned()],
+            extra_files: vec!["out-1.mp4".to_owned(), "out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, _) = manager_with(tmp.path(), script, "mp4");
+        let key = tmp.path().join("out.m3u8").to_string_lossy().into_owned();
+        for _ in 1..RESTART_FAILURE_LIMIT {
+            mgr.record_restart_failure(&key);
+        }
+        let init_req = HlsStreamRequest {
+            segment_container: Some("mp4".to_owned()),
+            ..req()
+        };
+
+        mgr.dynamic_segment(&init_req, -1, false).await.unwrap();
+
+        // The failures before it are no longer consecutive.
+        assert_eq!(restart_failures(&mgr, tmp.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_init_beside_its_start_segment_is_a_backend_error_left_uncounted() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A later job recreated the init empty at its header and died, while an
+        // earlier job's start segment stays on disk. No job of this request's.
+        std::fs::write(tmp.path().join("out0.mp4"), b"seg").unwrap();
+        std::fs::write(tmp.path().join("out-1.mp4"), b"").unwrap();
+        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "mp4");
+        let init_req = HlsStreamRequest {
+            segment_container: Some("mp4".to_owned()),
+            ..req()
+        };
+
+        let err = mgr.dynamic_segment(&init_req, -1, false).await.unwrap_err();
+
+        assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+        assert_eq!(restart_failures(&mgr, tmp.path()), 0);
     }
 
     #[tokio::test]
