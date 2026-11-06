@@ -2056,12 +2056,12 @@ impl FerrofinLiveTvManager {
     /// `stored_row` (`None` for a timer not stored yet), and arms it again
     /// when it changed or has no arm.
     ///
-    /// `_timerManager.Update(timer)` → `AddOrUpdateSystemTimer`, for every
-    /// live timer whether or not the guide changed it: re-arming is the
-    /// backstop for an arm that was lost, and a timer whose showing is under
-    /// way fires again at once, which `on_timer_fired` turns away when it is
-    /// already recording. An unchanged timer that still has an arm keeps
-    /// it: re-arming would aim at the same moment, and it keeps a read
+    /// Upstream re-arms every live timer whether or not the guide changed it
+    /// (`_timerManager.Update(timer)` → `AddOrUpdateSystemTimer`). Re-arming
+    /// is the backstop for an arm that was lost, and a timer whose showing is
+    /// under way fires again at once, which `on_timer_fired` turns away when
+    /// it is already recording. Here an unchanged timer that still has an arm
+    /// keeps it: re-arming would aim at the same moment, and it keeps a read
     /// retry's backoff (`retry_unread_timer`) instead of firing at once.
     async fn save_and_rearm(
         &self,
@@ -5890,11 +5890,11 @@ impl FerrofinLiveTvManager {
             return;
         }
         // `Skipping RecordStream because it's already in progress.` A timer
-        // re-armed while its capture is starting fires again (each guide
-        // refresh re-arms every live timer, `RefreshTimers`), and the capture
-        // registers itself only after several awaits; the claim, held until
-        // `record_stream` returns, makes the check and that registration one
-        // step, so a showing is never captured twice.
+        // re-armed while its capture is starting fires again (a fired timer
+        // has no arm, so a guide refresh re-arms it, `save_and_rearm`), and
+        // the capture registers itself only after several awaits; the claim,
+        // held until `record_stream` returns, makes the check and that
+        // registration one step, so a showing is never captured twice.
         let Some(_firing) = FiringClaim::take(&self.firing, &timer_id) else {
             tracing::info!(timer_id, "live tv: that recording is already in progress");
             return;
@@ -15246,10 +15246,10 @@ mod tests {
         .expect("test timed out");
     }
 
-    /// A fire of a timer whose capture another fire is still starting (a guide
-    /// refresh re-arms every live timer, so one under way fires again) stands
-    /// down before it opens anything, as upstream's "already in progress" skip
-    /// does; once that fire is done, the timer captures again.
+    /// A fire of a timer whose capture another fire is still starting (a fired
+    /// timer has no arm, so a guide refresh re-arms it and it fires again)
+    /// stands down before it opens anything, as upstream's "already in
+    /// progress" skip does; once that fire is done, the timer captures again.
     #[tokio::test]
     async fn a_second_fire_while_the_capture_starts_stands_down() {
         tokio::time::timeout(std::time::Duration::from_secs(60), async {
