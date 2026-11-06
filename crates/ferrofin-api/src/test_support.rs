@@ -2607,6 +2607,8 @@ pub struct FakeVirtualFolders {
     folders: std::sync::Mutex<Vec<ferrofin_model::entities_media::VirtualFolderInfo>>,
     /// When set, every method fails with a backend error.
     fail: bool,
+    /// How many full listings (`get_virtual_folders`) were asked for.
+    listings: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeVirtualFolders {
@@ -2620,8 +2622,8 @@ impl FakeVirtualFolders {
     #[must_use]
     pub fn seeded(folders: Vec<ferrofin_model::entities_media::VirtualFolderInfo>) -> Self {
         Self {
-            fail: false,
             folders: std::sync::Mutex::new(folders),
+            ..Self::default()
         }
     }
 
@@ -2630,8 +2632,15 @@ impl FakeVirtualFolders {
     pub fn failing() -> Self {
         Self {
             fail: true,
-            folders: std::sync::Mutex::new(Vec::new()),
+            ..Self::default()
         }
+    }
+
+    /// How many full listings (`get_virtual_folders`) were asked for; the
+    /// snapshot (`library_folders`) is not counted.
+    #[must_use]
+    pub fn listings(&self) -> usize {
+        self.listings.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The `ItemId` this fake projects for `name`.
@@ -2681,7 +2690,16 @@ impl VirtualFolderManager for FakeVirtualFolders {
         &self,
     ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, ServiceError> {
         self.guard()?;
+        self.listings
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(self.folders.lock().expect("lock").clone())
+    }
+
+    async fn library_folders(
+        &self,
+    ) -> Result<Arc<[ferrofin_model::entities_media::VirtualFolderInfo]>, ServiceError> {
+        self.guard()?;
+        Ok(self.folders.lock().expect("lock").as_slice().into())
     }
 
     async fn add_virtual_folder(
