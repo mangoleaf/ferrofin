@@ -39,6 +39,8 @@ ferrofin-db.workspace = true
 # (`destination::PrivateAllowList`).
 ferrofin-networking.workspace = true
 async-trait.workspace = true
+# `join_all`: a search and an image listing ask their providers together.
+futures-util.workspace = true
 reqwest.workspace = true
 secrecy.workspace = true
 serde.workspace = true

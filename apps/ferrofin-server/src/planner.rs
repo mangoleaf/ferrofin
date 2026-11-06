@@ -265,6 +265,25 @@ impl FerrofinStreamStatePlanner {
         self
     }
 
+    /// The name of the library whose location holds `item` (its `TopParentId`
+    /// is that location's folder; a row an older scan wrote names the
+    /// library), for the transcode logs. Read from the snapshot: the full
+    /// listing re-reads every library from disk.
+    async fn library_name(
+        &self,
+        item: &ferrofin_db::entities::base_items::BaseItemEntity,
+    ) -> Option<String> {
+        let folders = self.virtual_folders.as_ref()?;
+        let folders = folders.library_folders().await.ok()?;
+        ferrofin_model::entities_media::owning_library(
+            &folders,
+            item.top_parent_id.as_deref(),
+            item.path.as_deref(),
+        )?
+        .name
+        .clone()
+    }
+
     /// The effective [`EncodingOptions`] for this planner, read from the persisted
     /// named `encoding` config (falling back to [`EncodingOptions::default`] when
     /// unset or unreadable, and saying so). This is what carries the user's
@@ -672,7 +691,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
     /// Resolves the human-readable names for the playing item — its own title,
     /// its series (episodes), and its library — for the transcode logs.
     /// Best-effort by design: any miss leaves the field empty. Asked only when
-    /// a job starts: the library lookup walks every configured library.
+    /// a job starts: it reads the item from the database.
     async fn display_names(
         &self,
         item_id: uuid::Uuid,
@@ -686,18 +705,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
         };
         names.item_name = item.name.clone();
         names.series_name = item.series_name.clone();
-        // The library whose location holds the item (its `TopParentId` is
-        // that location's folder; a row an older scan wrote names the library).
-        if let Some(folders) = &self.virtual_folders
-            && let Ok(folders) = folders.get_virtual_folders().await
-        {
-            names.library_name = ferrofin_model::entities_media::owning_library(
-                &folders,
-                item.top_parent_id.as_deref(),
-                item.path.as_deref(),
-            )
-            .and_then(|folder| folder.name.clone());
-        }
+        names.library_name = self.library_name(&item).await;
         names
     }
 
@@ -3214,6 +3222,32 @@ mod tests {
         let (playlist_path, segment_container) = p.hls_output(&req, is_audio).await.unwrap();
         assert_eq!(playlist_path, plan.playlist_path);
         assert_eq!(segment_container, plan.segment_container);
+    }
+
+    /// A starting transcode's log label names the library from the snapshot
+    /// (`library_folders`), not from the full listing, which re-reads every
+    /// library from disk on each call.
+    #[tokio::test]
+    async fn the_library_label_reads_the_library_snapshot() {
+        let folders = Arc::new(ferrofin_api::test_support::FakeVirtualFolders::seeded(
+            vec![ferrofin_model::entities_media::VirtualFolderInfo {
+                name: Some("Movies".to_owned()),
+                locations: vec!["/media".to_owned()],
+                item_id: Some(Uuid::new_v4().simple().to_string()),
+                ..Default::default()
+            }],
+        ));
+        let p = planner(Vec::new()).with_virtual_folders(folders.clone());
+        let item = ferrofin_db::entities::base_items::BaseItemEntity {
+            path: Some("/media/movie.mkv".to_owned()),
+            ..ferrofin_api::test_support::minimal_base_item(
+                Uuid::new_v4(),
+                "Movie",
+                "MediaBrowser.Controller.Entities.Movies.Movie",
+            )
+        };
+        assert_eq!(p.library_name(&item).await.as_deref(), Some("Movies"));
+        assert_eq!(folders.listings(), 0, "a full listing was asked for");
     }
 
     /// A planner with actual persisted encoding configuration and owned paths.

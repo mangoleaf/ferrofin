@@ -43,6 +43,11 @@
 //! - The user's views with the Live TV view and the user's playlists view
 //!   (gl-1322). Both rows are in the listing of view rows the read takes, so a
 //!   warm read looks neither up by id; a row deleted since is made again.
+//! - `GET /Items?Fields=ProviderIds`, `GET /Items/{id}` and
+//!   `GET /Items?Fields=ExternalUrls` as a user (gl-1323). The DTO's provider
+//!   ids and the key of the user data the user never wrote come from the
+//!   page's `BaseItemProviders` rows, read once, as upstream's both come from
+//!   the item's `Provider` navigation.
 
 use std::sync::Mutex;
 
@@ -82,6 +87,9 @@ const SESSIONS_SPAN: &str = "gl1265_sessions_request";
 /// run in.
 const VIEW_ROWS_SPAN: &str = "gl1322_view_rows_read";
 
+/// The span the recorded item reads with provider ids run in.
+const PROVIDERS_SPAN: &str = "gl1323_provider_ids_request";
+
 /// The statements recorded inside each test's span, in order, tagged with the
 /// span: `cargo test` runs a binary's tests on threads of one process.
 static STATEMENTS: Mutex<Vec<(&'static str, String)>> = Mutex::new(Vec::new());
@@ -108,6 +116,7 @@ where
                     PLAYING_SPAN,
                     SESSIONS_SPAN,
                     VIEW_ROWS_SPAN,
+                    PROVIDERS_SPAN,
                 ]
                 .into_iter()
                 .find(|name| span.name() == *name)
@@ -1121,4 +1130,60 @@ async fn add_tuner_and_playlist(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "playlist created: {body}");
+}
+
+/// A page showing provider ids, a movie's own page, and a page showing only
+/// its links each read the page's `BaseItemProviders` rows once (gl-1323).
+/// The DTO's `ProviderIds` and the key of the user data the user never wrote
+/// come from the same rows. The key takes a provider id only where upstream's
+/// row was read with them (`.Include(e => e.Provider)`: `ApplyNavigations` for
+/// `ItemFields.ProviderIds`, and `RetrieveItem`). So `ExternalUrls` alone reads
+/// them for the links, and the key stays the movie's id.
+#[tokio::test]
+async fn an_item_page_reads_its_provider_ids_once() {
+    record_statements();
+    let harness = boot(&["Heat (1995) [tmdbid-949]/Heat (1995).mkv"]).await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let list = |fields: &str| {
+        format!("/Items?userId={user_id}&recursive=true&includeItemTypes=Movie&fields={fields}")
+    };
+    let (status, films) = send(&router, &auth_header, "GET", &list("ProviderIds"), None).await;
+    assert_eq!(status, StatusCode::OK, "films: {films}");
+    let film = films["Items"][0]["Id"]
+        .as_str()
+        .expect("the film")
+        .to_owned();
+    // `Guid.ToString()`: the key a never-written row is keyed by without
+    // provider ids.
+    let film_key = uuid::Uuid::parse_str(&film).expect("guid").to_string();
+
+    for (uri, tmdb, key) in [
+        (list("ProviderIds"), Some("949"), "949"),
+        (
+            format!("/Items/{film}?userId={user_id}"),
+            Some("949"),
+            "949",
+        ),
+        (list("ExternalUrls"), None, film_key.as_str()),
+    ] {
+        clear_statements(PROVIDERS_SPAN);
+        let (status, body) = send(&router, &auth_header, "GET", &uri, None)
+            .instrument(tracing::info_span!(PROVIDERS_SPAN))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let dto = body.get("Items").map_or(&body, |items| &items[0]);
+        assert_eq!(dto["Id"], film.as_str(), "{uri}: {body}");
+        assert_eq!(dto["ProviderIds"]["Tmdb"].as_str(), tmdb, "{uri}: {body}");
+        assert_eq!(dto["UserData"]["Key"], key, "{uri}: {body}");
+        let statements = statements_in(PROVIDERS_SPAN);
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|s| s.contains(r#"FROM "BaseItemProviders""#))
+                .count(),
+            1,
+            "{uri} reads the provider ids once: {statements:#?}"
+        );
+    }
 }

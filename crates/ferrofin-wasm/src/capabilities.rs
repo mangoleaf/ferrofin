@@ -995,25 +995,38 @@ fn from_hex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Reads a plugin's state map from disk; `None` when the file is missing,
-/// unreadable or corrupt, which READS treat as empty. Writes go through
-/// [`read_state_for_write`] instead.
-fn read_state(path: &std::path::Path) -> Option<std::collections::BTreeMap<String, String>> {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+/// Reads a plugin's state map from disk, with the CRC-32 of the bytes it
+/// was parsed from; `None` when the file is missing, unreadable or corrupt,
+/// which READS treat as empty. Writes go through [`read_state_for_write`]
+/// instead.
+fn read_state(path: &std::path::Path) -> Option<(std::collections::BTreeMap<String, String>, u32)> {
+    let bytes = std::fs::read(path).ok()?;
+    let map = serde_json::from_slice(&bytes).ok()?;
+    Some((map, crc32fast::hash(&bytes)))
 }
 
 /// Reads the state map for a WRITE: only a genuinely-absent file may read
 /// as empty — any other failure (permissions, fd exhaustion, torn write)
 /// must ERROR, or a transient fault would silently wipe the plugin's
-/// state on the rewrite and report success.
+/// state on the rewrite and report success. `kept`, the map last read
+/// from or written to the file, stands in for parsing it while the file
+/// holds the bytes that map came from.
 fn read_state_for_write(
     path: &std::path::Path,
+    kept: Option<KeptState>,
 ) -> Result<std::collections::BTreeMap<String, String>, String> {
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|e| format!("plugin state file is corrupt; refusing to overwrite: {e}")),
+        Ok(bytes) => {
+            if let Some(kept) = kept
+                && kept.crc == crc32fast::hash(&bytes)
+            {
+                return Ok(kept.map);
+            }
+            // A kept map that did not match was dropped with the `if let`,
+            // so it and the parsed one are never held at once.
+            serde_json::from_slice(&bytes)
+                .map_err(|e| format!("plugin state file is corrupt; refusing to overwrite: {e}"))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(std::collections::BTreeMap::new()),
         Err(e) => Err(format!("reading plugin state: {e}")),
     }
@@ -1034,14 +1047,14 @@ pub fn get_state(path: Option<&std::path::Path>, key: &str) -> Option<Vec<u8>> {
         // Missing (an uninstall removes it), or no modified time to check a
         // kept map against: read it and keep nothing.
         *kept = None;
-        return from_hex(read_state(path)?.get(key)?);
+        return from_hex(read_state(path)?.0.get(key)?);
     };
     if kept.as_ref().is_none_or(|old| old.stamp != stamp) {
         // Drop the stale map first, so it and the new one are never held at
         // once. An unreadable or corrupt file is not kept: it reads as empty
         // now and is read again next time.
         *kept = None;
-        *kept = read_state(path).map(|map| KeptState { stamp, map });
+        *kept = read_state(path).map(|(map, crc)| KeptState { stamp, crc, map });
     }
     from_hex(kept.as_ref()?.map.get(key)?)
 }
@@ -1091,6 +1104,11 @@ impl StateStamp {
 /// A state map as read from, or last written to, the file with `stamp`.
 struct KeptState {
     stamp: StateStamp,
+    /// The CRC-32 of the file bytes `map` was parsed from or serialised to.
+    /// A write builds on `map` only while the file's bytes have this CRC (an
+    /// equal CRC is taken as equal bytes), so it still sees a change the
+    /// stamp cannot show.
+    crc: u32,
     map: std::collections::BTreeMap<String, String>,
 }
 
@@ -1138,8 +1156,9 @@ pub fn set_state_capped(
     let mut kept = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let map = state_after_set(path, key, value, total_cap)?;
+    let map = state_after_set(path, &mut kept, key, value, total_cap)?;
     let bytes = serde_json::to_vec(&map).map_err(|e| format!("serialize state: {e}"))?;
+    let crc = crc32fast::hash(&bytes);
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("write state: {e}"))?;
     // Stamped before the rename, which keeps length, modified time and
@@ -1147,9 +1166,9 @@ pub fn set_state_capped(
     // its own over it straight after.
     let stamp = StateStamp::of(&tmp);
     std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))?;
-    // Keep what was just written: the next read needs no parse, and a
+    // Keep what was just written: the next read or write needs no parse, and a
     // rewrite inside one modified-time tick cannot pass for the old file.
-    *kept = stamp.map(|stamp| KeptState { stamp, map });
+    *kept = stamp.map(|stamp| KeptState { stamp, crc, map });
     Ok(())
 }
 
@@ -1157,9 +1176,13 @@ pub fn set_state_capped(
 /// same caps as [`set_state_capped`] — WITHOUT writing. `create-collection`
 /// pre-flights its ledger append through this, so a cap refusal happens
 /// before the collection exists rather than after (which would orphan an
-/// unowned, unmanageable collection).
+/// unowned, unmanageable collection). Past the key and value caps it takes
+/// the map kept for the file out of `kept` (the pre-flight, which holds no
+/// slot lock, passes none), so a write refused at the total cap or failing
+/// on disk keeps nothing and the next call reads the file.
 fn state_after_set(
     path: &std::path::Path,
+    kept: &mut Option<KeptState>,
     key: &str,
     value: Option<Vec<u8>>,
     total_cap: usize,
@@ -1172,7 +1195,7 @@ fn state_after_set(
     {
         return Err(format!("state value exceeds {STATE_VALUE_MAX} bytes"));
     }
-    let mut map = read_state_for_write(path)?;
+    let mut map = read_state_for_write(path, kept.take())?;
     match value {
         Some(v) => {
             map.insert(key.to_owned(), to_hex(&v));
@@ -1328,7 +1351,7 @@ pub fn create_collection(
     let mut prospective = owned_collections(state_path);
     prospective.push(Uuid::nil().to_string());
     let bytes = serde_json::to_vec(&prospective).map_err(|e| format!("ledger: {e}"))?;
-    state_after_set(p, OWNED_COLLECTIONS_KEY, Some(bytes), total_cap)?;
+    state_after_set(p, &mut None, OWNED_COLLECTIONS_KEY, Some(bytes), total_cap)?;
     let options = ferrofin_traits::collections::CollectionCreationOptions {
         name: name.to_owned(),
         parent_id: None,
@@ -1515,5 +1538,70 @@ mod tests {
             matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
             "nothing was sent"
         );
+    }
+
+    /// Puts `key` into the map kept for `path` and nowhere else, so a write
+    /// that builds on the kept map shows it and one that parses the file
+    /// does not.
+    fn mark_kept_map(path: &std::path::Path, key: &str) {
+        super::state_slot(path)
+            .lock()
+            .expect("slot")
+            .as_mut()
+            .expect("a kept map")
+            .map
+            .insert(key.to_owned(), "6b".to_owned());
+    }
+
+    fn read(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).expect("read")
+    }
+
+    /// A `set-state` builds on the map kept for the file while the file
+    /// holds the bytes that map came from, instead of reading and parsing
+    /// the whole file again: for a map a write just made, and for one a
+    /// `get-state` read from the file.
+    #[test]
+    fn set_state_builds_on_the_kept_map_while_the_file_is_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin.state.json");
+        super::set_state(Some(&path), "a", Some(b"1".to_vec())).expect("set a");
+        mark_kept_map(&path, "kept");
+        super::set_state(Some(&path), "b", Some(b"2".to_vec())).expect("set b");
+        assert_eq!(read(&path), r#"{"a":"31","b":"32","kept":"6b"}"#);
+
+        std::fs::write(&path, br#"{"c":"33"}"#).expect("rewrite");
+        assert_eq!(super::get_state(Some(&path), "c"), Some(b"3".to_vec()));
+        mark_kept_map(&path, "kept");
+        super::set_state(Some(&path), "d", Some(b"4".to_vec())).expect("set d");
+        assert_eq!(read(&path), r#"{"c":"33","d":"34","kept":"6b"}"#);
+    }
+
+    /// A write refused at the key or value cap reads nothing and leaves the
+    /// kept map in place; one refused at the total cap keeps nothing, so the
+    /// next write reads the file; and with the file removed, a write starts
+    /// from an empty map, not from the kept one.
+    #[test]
+    fn set_state_keeps_the_kept_map_only_while_it_matches_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plugin.state.json");
+        super::set_state(Some(&path), "a", Some(b"1".to_vec())).expect("set a");
+        mark_kept_map(&path, "m1");
+        let long_key = "k".repeat(super::STATE_KEY_MAX + 1);
+        super::set_state(Some(&path), &long_key, None).expect_err("key cap");
+        let big = vec![0; super::STATE_VALUE_MAX + 1];
+        super::set_state(Some(&path), "v", Some(big)).expect_err("value cap");
+        super::set_state(Some(&path), "b", Some(b"2".to_vec())).expect("set b");
+        assert_eq!(read(&path), r#"{"a":"31","b":"32","m1":"6b"}"#);
+
+        mark_kept_map(&path, "m2");
+        super::set_state_capped(Some(&path), "c", Some(vec![0; 64]), 16).expect_err("total cap");
+        super::set_state(Some(&path), "d", Some(b"4".to_vec())).expect("set d");
+        assert_eq!(read(&path), r#"{"a":"31","b":"32","d":"34","m1":"6b"}"#);
+
+        mark_kept_map(&path, "m3");
+        std::fs::remove_file(&path).expect("remove");
+        super::set_state(Some(&path), "e", Some(b"5".to_vec())).expect("set e");
+        assert_eq!(read(&path), r#"{"e":"35"}"#);
     }
 }

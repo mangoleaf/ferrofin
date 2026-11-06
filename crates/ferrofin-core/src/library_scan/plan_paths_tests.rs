@@ -1030,3 +1030,49 @@ async fn dot_ignore_files_hide_paths_from_the_plan() {
         );
     }
 }
+
+/// A `.ignore` is checked for changes once per listing (gl-1328), so an edit
+/// made during a pass decides the listings after it, as upstream's check per
+/// entry does.
+#[tokio::test]
+async fn a_dot_ignore_edited_during_a_pass_decides_the_listings_after_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let movies = tmp.path().join("movies");
+    touch(&movies, "Heat (1995)/Heat (1995).mkv");
+    let file = movies.join(".ignore");
+    std::fs::write(&file, "drafts/\n").unwrap();
+    let listings = AtomicUsize::new(0);
+    let folders = vec![library(1, Some(CollectionTypeOptions::movies), &movies)];
+    // The hook runs in every listing before its entries are filtered: the
+    // edit lands after the library root's listing, before its folder's.
+    let scanner = scanner(tmp.path(), Arc::new(CountingFs::default()))
+        .await
+        .with_recording_paths(Arc::new(move || {
+            if listings.fetch_add(1, Ordering::Relaxed) == 1 {
+                std::fs::write(&file, "*.mkv\n").unwrap();
+            }
+            Vec::new()
+        }));
+    let plan = scanner.plan_in(
+        &folders,
+        &folders,
+        PlanScope::ALL,
+        super::DateAdded::default(),
+        None,
+        None,
+    );
+    let heat = format!("{}/Heat (1995)/Heat (1995).mkv", movies.display());
+    assert!(
+        plan.excluded.contains(&heat),
+        "the edit is not seen: {:?}",
+        plan.excluded
+    );
+    assert!(
+        plan.items
+            .iter()
+            .all(|p| p.entity.path.as_deref() != Some(heat.as_str())),
+        "{heat} planned"
+    );
+}
