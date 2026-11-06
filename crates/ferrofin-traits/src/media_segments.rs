@@ -132,7 +132,10 @@ pub trait MediaSegmentProvider: Send + Sync {
     async fn cleanup(&self, _item_id: Uuid) -> Result<(), ServiceError> {
         Ok(())
     }
-    /// Save producer output separately from the served segment rows.
+    /// Save producer output separately from the served segment rows. The
+    /// manager also calls it to put back the snapshot [`Self::cached_segments`]
+    /// read before a publication whose served rows then failed to change, so a
+    /// provider that overrides [`Self::mutate_cache`] overrides this too.
     async fn cache_segments(
         &self,
         _item_id: Uuid,

@@ -2049,19 +2049,36 @@ impl FerrofinLiveTvManager {
         };
         let before = timer.clone();
         copy_program_into_timer(&program, &mut timer);
-        let changed = timer != before;
+        self.save_and_rearm(Some(&before), &timer).await
+    }
+
+    /// Saves a timer a guide pass has decided on when it differs from
+    /// `stored_row` (`None` for a timer not stored yet), and arms it again
+    /// when it changed or has no arm.
+    ///
+    /// Upstream re-arms every live timer whether or not the guide changed it
+    /// (`_timerManager.Update(timer)` → `AddOrUpdateSystemTimer`). Re-arming
+    /// is the backstop for an arm that was lost, and a timer whose showing is
+    /// under way fires again at once, which `on_timer_fired` turns away when
+    /// it is already recording. Here an unchanged timer that still has an arm
+    /// keeps it: re-arming would aim at the same moment, and it keeps a read
+    /// retry's backoff (`retry_unread_timer`) instead of firing at once.
+    async fn save_and_rearm(
+        &self,
+        stored_row: Option<&TimerInfoDto>,
+        timer: &TimerInfoDto,
+    ) -> Result<(), ServiceError> {
+        let changed = stored_row != Some(timer);
         if changed {
-            self.persist_timer(&timer).await?;
+            self.persist_timer(timer).await?;
         }
-        // `_timerManager.Update(timer)` → `AddOrUpdateSystemTimer`, for every
-        // live timer whether or not the guide changed it: re-arming is the
-        // backstop for an arm that was lost, and a timer whose showing is under
-        // way fires again at once, which `on_timer_fired` turns away when it is
-        // already recording. An unchanged timer that still has an arm keeps
-        // it: re-arming would aim at the same moment, and it keeps a read
-        // retry's backoff (`retry_unread_timer`) instead of firing at once.
-        if changed || !self.armed_timers_lock().contains_key(id) {
-            self.arm_timer(&timer);
+        let armed = timer
+            .base
+            .id
+            .as_deref()
+            .is_some_and(|id| self.armed_timers_lock().contains_key(id));
+        if changed || !armed {
+            self.arm_timer(timer);
         }
         Ok(())
     }
@@ -4759,12 +4776,8 @@ impl FerrofinLiveTvManager {
         query: &InternalItemsQuery,
         now: DateTime<Utc>,
     ) -> Result<Vec<GuideProgramRow>, ServiceError> {
-        let start_index = query.start_index.unwrap_or(0);
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(PROGRAM_SELECT);
-        push_program_filters(&mut qb, query, now);
-        push_program_order(&mut qb, &query.order_by);
-        push_program_paging(&mut qb, query.limit, start_index);
-        qb.build_query_as()
+        program_rows_query(query, now)
+            .build_query_as()
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)
@@ -5452,6 +5465,15 @@ impl FerrofinLiveTvManager {
     /// add a timer for every future airing it should record, refresh the ones
     /// that already exist, and — when asked — drop the pending ones it no longer
     /// matches.
+    ///
+    /// Upstream saves and re-arms every timer it touches
+    /// (`_timerManager.Add`/`Update`), and its duplicate sweep saves each
+    /// cancelled repeat a second time. Here each timer is saved once, with
+    /// the sweep's verdict, and only when it differs from its stored row; it
+    /// is re-armed when it changed or has no arm, as
+    /// [`refresh_timer`](Self::refresh_timer) does. The guide refresh runs
+    /// this for every series timer, and saving the same rows again would
+    /// rewrite and re-arm every showing each time (gl-1292).
     async fn update_timers_for_series_timer(
         &self,
         stored: &StoredSeriesTimer,
@@ -5463,6 +5485,9 @@ impl FerrofinLiveTvManager {
         // `enabledTimersForSeries` — the timers this pass left recordable, which
         // is what the duplicate-showing sweep below runs over.
         let mut enabled: Vec<EnabledShowing> = Vec::new();
+        // Each timer the pass decided on, beside its stored row (`None` for a
+        // new one), saved once the duplicate sweep has had its say.
+        let mut decided: Vec<(Option<TimerInfoDto>, TimerInfoDto)> = Vec::new();
         for (program, mut timer) in candidates {
             let id = timer.base.id.clone().unwrap_or_default();
             all_ids.push(id.clone());
@@ -5484,8 +5509,7 @@ impl FerrofinLiveTvManager {
                             timer.clone(),
                         ));
                     }
-                    self.persist_timer(&timer).await?;
-                    self.arm_timer(&timer);
+                    decided.push((None, timer));
                 }
                 Some(mut existing) => {
                     let existing_id = existing.base.id.clone().unwrap_or_default();
@@ -5496,6 +5520,7 @@ impl FerrofinLiveTvManager {
                     {
                         continue;
                     }
+                    let stored_row = existing.clone();
                     update_existing_timer_with_new_metadata(&mut existing, &timer);
                     let is_manual =
                         crate::dvr_repository::timer_is_manual(&self.db, &existing_id).await?;
@@ -5527,8 +5552,7 @@ impl FerrofinLiveTvManager {
                             existing.clone(),
                         ));
                     }
-                    self.persist_timer(&existing).await?;
-                    self.arm_timer(&existing);
+                    decided.push((Some(stored_row), existing));
                 }
             }
         }
@@ -5538,11 +5562,15 @@ impl FerrofinLiveTvManager {
         // for a series timer that skips episodes already in the library
         // (v12.2 DefaultLiveTvService.cs:776-779, jellyfin/jellyfin PR 16220).
         if stored.dto.skip_episodes_in_library {
-            for mut loser in duplicate_showings_to_cancel(&enabled) {
-                loser.status = RecordingStatus::Cancelled;
-                self.persist_timer(&loser).await?;
-                self.arm_timer(&loser);
+            for loser in duplicate_showings_to_cancel(&enabled) {
+                let found = decided.iter_mut().find(|(_, t)| t.base.id == loser.base.id);
+                if let Some((_, timer)) = found {
+                    timer.status = RecordingStatus::Cancelled;
+                }
             }
+        }
+        for (stored_row, timer) in &decided {
+            self.save_and_rearm(stored_row.as_ref(), timer).await?;
         }
 
         if delete_invalid_timers {
@@ -5575,24 +5603,10 @@ impl FerrofinLiveTvManager {
         &self,
         stored: &StoredSeriesTimer,
     ) -> Result<Vec<(GuideProgramRow, TimerInfoDto)>, ServiceError> {
-        let series_id = stored
-            .series_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let mut query = InternalItemsQuery {
-            min_end_date: Some(Utc::now()),
-            external_series_id: series_id.map(str::to_owned),
-            order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
-            ..InternalItemsQuery::default()
-        };
-        if series_id.is_none() {
-            query.name.clone_from(&stored.dto.base.name);
-        }
-        if !stored.dto.record_any_channel {
-            query.channel_ids = vec![stored.dto.base.channel_id];
-        }
-        let rows = self.query_program_rows(&query, Utc::now()).await?;
+        let now = Utc::now();
+        let rows = self
+            .query_program_rows(&series_programs_query(stored, now), now)
+            .await?;
         // C# `tempChannelCache`: one channel lookup per distinct channel, not one
         // per airing — a series timer over a week's guide walks the same one or
         // two channels dozens of times.
@@ -5659,6 +5673,11 @@ impl FerrofinLiveTvManager {
     ///
     /// Takes the shared base DTO so the single-timer and series-timer paths can
     /// both ask (`GetProgramInfoFromCache` serves both upstream).
+    ///
+    /// By the listing provider's id this is `GetProgramInfoFromCache(programId)`
+    /// (v12.4 DefaultLiveTvService.cs:604-614): a programme's own id is derived
+    /// from it (`GetInternalProgramId`), so it is one keyed read, whatever
+    /// channel the timer names.
     async fn program_row_for_timer(
         &self,
         timer: &ferrofin_model::live_tv::BaseTimerInfoDto,
@@ -5679,24 +5698,7 @@ impl FerrofinLiveTvManager {
         else {
             return Ok(None);
         };
-        // The listing provider's id is not the row's key, so fall back to the
-        // channel's guide and match on it (upstream's cache lookup does the
-        // same by external id).
-        Ok(self
-            .query_program_rows(
-                &InternalItemsQuery {
-                    channel_ids: vec![timer.channel_id],
-                    ..InternalItemsQuery::default()
-                },
-                Utc::now(),
-            )
-            .await?
-            .into_iter()
-            .find(|row| {
-                row.external_id
-                    .as_deref()
-                    .is_some_and(|id| id.eq_ignore_ascii_case(external))
-            }))
+        self.program_row(internal_program_id(external)).await
     }
 
     /// Arms (or re-arms) the system timer behind one recording timer.
@@ -5888,11 +5890,11 @@ impl FerrofinLiveTvManager {
             return;
         }
         // `Skipping RecordStream because it's already in progress.` A timer
-        // re-armed while its capture is starting fires again (each guide
-        // refresh re-arms every live timer, `RefreshTimers`), and the capture
-        // registers itself only after several awaits; the claim, held until
-        // `record_stream` returns, makes the check and that registration one
-        // step, so a showing is never captured twice.
+        // re-armed while its capture is starting fires again (a fired timer
+        // has no arm, so a guide refresh re-arms it, `save_and_rearm`), and
+        // the capture registers itself only after several awaits; the claim,
+        // held until `record_stream` returns, makes the check and that
+        // registration one step, so a showing is never captured twice.
         let Some(_firing) = FiringClaim::take(&self.firing, &timer_id) else {
             tracing::info!(timer_id, "live tv: that recording is already in progress");
             return;
@@ -6787,6 +6789,41 @@ impl FerrofinLiveTvManager {
         self.forget_row_state(id);
         Ok(())
     }
+}
+
+/// The guide query a series timer's fan-out runs (`GetTimersForSeries`): the
+/// airings not over yet, by the listings series id or, when the listings
+/// carry none, by title, on the series timer's channel unless it records any
+/// channel.
+fn series_programs_query(stored: &StoredSeriesTimer, now: DateTime<Utc>) -> InternalItemsQuery {
+    let series_id = stored
+        .series_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let mut query = InternalItemsQuery {
+        min_end_date: Some(now),
+        external_series_id: series_id.map(str::to_owned),
+        order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
+        ..InternalItemsQuery::default()
+    };
+    if series_id.is_none() {
+        query.name.clone_from(&stored.dto.base.name);
+    }
+    if !stored.dto.record_any_channel {
+        query.channel_ids = vec![stored.dto.base.channel_id];
+    }
+    query
+}
+
+/// The statement [`FerrofinLiveTvManager::query_program_rows`] runs for
+/// `query`: [`PROGRAM_SELECT`] with its filters, order and page.
+fn program_rows_query(query: &InternalItemsQuery, now: DateTime<Utc>) -> QueryBuilder<Sqlite> {
+    let mut qb = QueryBuilder::new(PROGRAM_SELECT);
+    push_program_filters(&mut qb, query, now);
+    push_program_order(&mut qb, &query.order_by);
+    push_program_paging(&mut qb, query.limit, query.start_index.unwrap_or(0));
+    qb
 }
 
 /// Emits `WHERE` for the first predicate of a query and `AND` for each one
@@ -11289,6 +11326,98 @@ mod tests {
         }
     }
 
+    /// A timer that names its programme only by the listing provider's id finds
+    /// it as `GetProgramInfoFromCache(programId)` does: one keyed read of the id
+    /// `GetInternalProgramId` derives, whatever the listing id's case and
+    /// with no channel named, not a read of the channel's whole guide
+    /// (gl-1293).
+    #[tokio::test]
+    async fn a_timer_finds_its_programme_by_the_listing_id_alone() {
+        let mgr = manager_with_series_guide().await;
+        let airing = airings_of(&mgr, "Recurring")
+            .await
+            .pop()
+            .expect("an airing");
+        let external = airing.external_id.clone().expect("a listing id");
+        let shouted = external.to_uppercase();
+        assert_ne!(shouted, external, "the listing id has letters to fold");
+        let timer = ferrofin_model::live_tv::BaseTimerInfoDto {
+            program_id: Some("not-a-guid".to_owned()),
+            external_program_id: Some(shouted),
+            ..ferrofin_model::live_tv::BaseTimerInfoDto::default()
+        };
+        let found = mgr.program_row_for_timer(&timer).await.expect("lookup");
+        assert_eq!(found.map(|row| row.id), Some(airing.id.clone()));
+        let unknown = ferrofin_model::live_tv::BaseTimerInfoDto {
+            external_program_id: Some(format!("{external}-gone")),
+            ..timer
+        };
+        let found = mgr.program_row_for_timer(&unknown).await.expect("lookup");
+        assert!(
+            found.is_none(),
+            "a listing id the guide lacks finds nothing"
+        );
+
+        let query = InternalItemsQuery {
+            item_ids: vec![super::internal_program_id(&external)],
+            ..InternalItemsQuery::default()
+        };
+        let plan = crate::guide_repository::test_support::plan(
+            &mgr.db,
+            super::program_rows_query(&query, Utc::now()),
+        )
+        .await
+        .expect("plan");
+        assert!(
+            plan.iter().any(|d| d
+                .starts_with("SEARCH p USING INDEX sqlite_autoindex_FerrofinLiveTvPrograms")
+                && d.ends_with("(Id=?)")),
+            "the programme by its key: {plan:?}"
+        );
+    }
+
+    /// A series timer's fan-out reads only its own channel's airings, off the
+    /// `(ChannelId, StartDate)` index, whether it matches on the listings
+    /// series id or on the title. So a series timer that does not record any
+    /// channel (upstream's default) never walks the guide for its unindexed
+    /// `ExternalSeriesId` or its cleaned title (gl-1293).
+    #[tokio::test]
+    async fn a_series_fan_out_reads_its_channel_off_the_channel_index() {
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, future).await)
+            .await
+            .expect("create st");
+        let mut stored = mgr
+            .stored_series_timer(&st_id)
+            .await
+            .expect("read")
+            .expect("stored series timer");
+        assert!(!stored.dto.record_any_channel);
+        for series_id in [None, Some("EP0001".to_owned())] {
+            stored.series_id.clone_from(&series_id);
+            let now = Utc::now();
+            let query = super::series_programs_query(&stored, now);
+            let plan = crate::guide_repository::test_support::plan(
+                &mgr.db,
+                super::program_rows_query(&query, now),
+            )
+            .await
+            .expect("plan");
+            assert!(
+                plan.iter().any(|d| d.starts_with(
+                    "SEARCH p USING INDEX FerrofinIX_LiveTvPrograms_ChannelId_StartDate (ChannelId=?"
+                )),
+                "series id {series_id:?}: {plan:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn program_query_orders_by_start_date_and_scopes_to_channels() {
         let mgr = manager_with_relative_guide().await;
@@ -12105,6 +12234,108 @@ mod tests {
                 .iter()
                 .all(|t| t.series_timer_id.as_deref() == Some(st_id.as_str())),
             "and every timer it re-made still belongs to the series timer"
+        );
+    }
+
+    /// Every guide refresh re-expands every series timer, so a fan-out over a
+    /// guide that has not moved must leave each showing as it is. Nothing is
+    /// rewritten and no arm is replaced, as `refresh_timer` treats an
+    /// unchanged timer (gl-898). That includes a repeat the duplicate sweep
+    /// cancels, which the pass first puts back to `New`. A showing that lost
+    /// its arm is armed again, and one the fan-out changes is written once and
+    /// re-armed (gl-1292).
+    #[tokio::test]
+    async fn a_fan_out_over_an_unchanged_guide_rewrites_and_rearms_nothing() {
+        /// The rows the test database's one connection has written so far.
+        async fn writes(mgr: &FerrofinLiveTvManager) -> i64 {
+            let mut conn = mgr.db.writer().acquire().await.expect("connection");
+            crate::guide_repository::test_support::total_changes(&mut conn)
+                .await
+                .expect("changes")
+        }
+        /// The series timer's showings' statuses, earliest first.
+        async fn statuses(mgr: &FerrofinLiveTvManager) -> Vec<RecordingStatus> {
+            let mut timers = mgr.get_timers().await.expect("timers");
+            timers.sort_by_key(|t| t.base.start_date);
+            timers.iter().map(|t| t.status).collect()
+        }
+
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, future).await)
+            .await
+            .expect("create st");
+        let created = statuses(&mgr).await;
+        assert_eq!(
+            created,
+            [
+                RecordingStatus::New,
+                RecordingStatus::Cancelled,
+                RecordingStatus::Cancelled
+            ],
+            "the first showing records and its repeats are duplicates"
+        );
+        let mut timers = mgr.get_timers().await.expect("timers");
+        timers.sort_by_key(|t| t.base.start_date);
+        let recorded = timers[0].base.id.clone().expect("id");
+        let arm = Arc::clone(&mgr.armed_timers_lock()[&recorded]);
+        let mut stored = mgr
+            .stored_series_timer(&st_id)
+            .await
+            .expect("read")
+            .expect("stored series timer");
+
+        let before = writes(&mgr).await;
+        mgr.update_timers_for_series_timer(&stored, false, true)
+            .await
+            .expect("fan-out");
+        assert_eq!(
+            writes(&mgr).await - before,
+            0,
+            "an unchanged showing is not rewritten"
+        );
+        assert!(
+            Arc::ptr_eq(&arm, &mgr.armed_timers_lock()[&recorded]),
+            "and keeps its arm"
+        );
+        assert_eq!(statuses(&mgr).await, created);
+
+        mgr.disarm_timer(&recorded);
+        mgr.update_timers_for_series_timer(&stored, false, true)
+            .await
+            .expect("fan-out");
+        assert!(
+            mgr.armed_timers_lock().contains_key(&recorded),
+            "a showing that lost its arm is armed again"
+        );
+
+        stored.dto.base.pre_padding_seconds += 60;
+        let arm = Arc::clone(&mgr.armed_timers_lock()[&recorded]);
+        let before = writes(&mgr).await;
+        mgr.update_timers_for_series_timer(&stored, true, true)
+            .await
+            .expect("fan-out");
+        assert_eq!(
+            writes(&mgr).await - before,
+            3,
+            "each showing the series timer's new padding changes is written once"
+        );
+        assert!(
+            !Arc::ptr_eq(&arm, &mgr.armed_timers_lock()[&recorded]),
+            "and the one to record is re-armed"
+        );
+        assert_eq!(statuses(&mgr).await, created);
+        assert!(
+            mgr.get_timers()
+                .await
+                .expect("timers")
+                .iter()
+                .all(|t| t.base.pre_padding_seconds == stored.dto.base.pre_padding_seconds)
         );
     }
 
@@ -15015,10 +15246,10 @@ mod tests {
         .expect("test timed out");
     }
 
-    /// A fire of a timer whose capture another fire is still starting (a guide
-    /// refresh re-arms every live timer, so one under way fires again) stands
-    /// down before it opens anything, as upstream's "already in progress" skip
-    /// does; once that fire is done, the timer captures again.
+    /// A fire of a timer whose capture another fire is still starting (a fired
+    /// timer has no arm, so a guide refresh re-arms it and it fires again)
+    /// stands down before it opens anything, as upstream's "already in
+    /// progress" skip does; once that fire is done, the timer captures again.
     #[tokio::test]
     async fn a_second_fire_while_the_capture_starts_stands_down() {
         tokio::time::timeout(std::time::Duration::from_secs(60), async {

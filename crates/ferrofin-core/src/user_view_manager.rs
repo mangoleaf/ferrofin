@@ -771,17 +771,20 @@ impl FerrofinUserViewManager {
     /// and the canonical row does not — the `isNew` branch of `GetNamedView`
     /// (LibraryManager.cs:3054-3075): `Path = {InternalMetadataPath}/views/{id
     /// N}`, `Name = folder.Name`, `ViewType = playlists`, `UserId`,
-    /// `DisplayParentId = folder.Id`. Idempotent; a no-op without an item
+    /// `DisplayParentId = folder.Id`. The row is looked for among `listed`,
+    /// the view rows the caller has just read, which hold it when it exists.
+    /// Returns whether a row was written. Idempotent; a no-op without an item
     /// store and a metadata path.
     async fn ensure_user_playlists_view(
         &self,
         user_id: Uuid,
         user: Option<&UserEntity>,
         visible_items: &mut HashMap<BaseItemKind, bool>,
-    ) -> Result<(), ServiceError> {
+        listed: &[BaseItemEntity],
+    ) -> Result<bool, ServiceError> {
         let (Some(persistence), Some(metadata_path)) = (&self.persistence, &self.metadata_path)
         else {
-            return Ok(());
+            return Ok(false);
         };
         let folders = self
             .items
@@ -793,6 +796,7 @@ impl FerrofinUserViewManager {
                 ..Default::default()
             })
             .await?;
+        let mut written = false;
         for folder in folders {
             let Ok(parent) = Uuid::parse_str(&folder.id) else {
                 continue;
@@ -800,7 +804,8 @@ impl FerrofinUserViewManager {
             let Some(id) = self.user_named_view_id(user_id, parent, "playlists") else {
                 continue;
             };
-            if persistence.item_exists(id).await? {
+            let stored_id = ferrofin_db::store::guid_to_db(id);
+            if listed.iter().any(|row| row.id == stored_id) {
                 continue;
             }
             // 12.2: the folder is skipped before `GetNamedView`, so a user
@@ -826,7 +831,7 @@ impl FerrofinUserViewManager {
                 "UserId": user_id.simple().to_string(),
             });
             let entity = BaseItemEntity {
-                id: ferrofin_db::store::guid_to_db(id),
+                id: stored_id,
                 type_: item_type_lookup::stored_type_name(BaseItemKind::UserView)
                     .unwrap_or_default()
                     .to_owned(),
@@ -842,8 +847,9 @@ impl FerrofinUserViewManager {
             persistence
                 .save_items(std::slice::from_ref(&entity))
                 .await?;
+            written = true;
         }
-        Ok(())
+        Ok(written)
     }
 
     /// The deterministic Live TV `UserView` item id — `GetNewItemId(path +
@@ -858,8 +864,9 @@ impl FerrofinUserViewManager {
     }
 
     /// Upserts the Live TV `UserView` row (and its directory) when Live TV is
-    /// available to this user (idempotent). No-op without an item store, a
-    /// metadata path and a database wired.
+    /// available to this user (idempotent), looking for it among `listed`, the
+    /// view rows the caller has just read. Returns whether a row was written.
+    /// No-op without an item store, a metadata path and a database wired.
     ///
     /// Port of the Live TV arm of `UserViewManager.GetUserViews`
     /// (UserViewManager.cs:128-133): when the user is in
@@ -869,28 +876,40 @@ impl FerrofinUserViewManager {
     /// `GetNamedView` (LibraryManager.cs:2856-2898) CREATES the directory and
     /// the row on first read. Ferrofin only ever read such a row, so the view
     /// never existed and `/UserViews` served one fewer view than Jellyfin.
-    async fn ensure_live_tv_view(&self, user_id: Uuid) -> Result<(), ServiceError> {
+    async fn ensure_live_tv_view(
+        &self,
+        user_id: Uuid,
+        listed: &[BaseItemEntity],
+    ) -> Result<bool, ServiceError> {
         let Some(db) = &self.db else {
-            return Ok(());
+            return Ok(false);
         };
         // The C# `GetEnabledUsers()` guard: a user without Live TV access never
         // materializes the view.
         if !user_entity_ext::live_tv_enabled_for(db, &ferrofin_db::store::guid_to_db(user_id))
             .await?
         {
-            return Ok(());
+            return Ok(false);
         }
-        self.provision_live_tv_view().await.map(|_| ())
+        Ok(self
+            .provision_live_tv_view(Some(listed))
+            .await?
+            .is_some_and(|(_, written)| written))
     }
 
-    /// Provisions the Live TV `UserView` row (and its directory) if absent and
-    /// returns its id — the user-less half of [`Self::ensure_live_tv_view`].
+    /// Provisions the Live TV `UserView` row (and its directory) if absent —
+    /// the user-less half of [`Self::ensure_live_tv_view`].
     ///
     /// This is what `LiveTvManager.GetInternalLiveTvFolder()` does: it takes no
     /// user, because the folder is the parent every channel ITEM is stored
     /// under, and item rows exist whether or not a given user may see them.
-    /// `None` means the manager has no item store or metadata path wired.
-    async fn provision_live_tv_view(&self) -> Result<Option<Uuid>, ServiceError> {
+    /// `None` means the manager has no item store or metadata path wired;
+    /// otherwise the id and whether a row was written. With `listed`, the view
+    /// rows the caller has read, the row is looked for there instead of by id.
+    async fn provision_live_tv_view(
+        &self,
+        listed: Option<&[BaseItemEntity]>,
+    ) -> Result<Option<(Uuid, bool)>, ServiceError> {
         let (Some(persistence), Some(metadata_path)) = (&self.persistence, &self.metadata_path)
         else {
             return Ok(None);
@@ -907,14 +926,22 @@ impl FerrofinUserViewManager {
             || LIVE_TV_VIEW_NAME.to_owned(),
             |localization| localization.get_server_localized_string("HeaderLiveTV"),
         );
-        if let Some(mut row) = self.items.retrieve_item(id).await? {
-            if row.name.as_deref() != Some(name.as_str()) {
+        let stored = match listed {
+            Some(rows) => {
+                let stored_id = ferrofin_db::store::guid_to_db(id);
+                rows.iter().find(|row| row.id == stored_id).cloned()
+            }
+            None => self.items.retrieve_item(id).await?,
+        };
+        if let Some(mut row) = stored {
+            let renamed = row.name.as_deref() != Some(name.as_str());
+            if renamed {
                 row.sort_name = Some(ferrofin_util::sort_name::forced_sort_key(&name));
                 row.forced_sort_name = Some(name.clone());
                 row.name = Some(name);
                 persistence.save_items(std::slice::from_ref(&row)).await?;
             }
-            return Ok(Some(id));
+            return Ok(Some((id, renamed)));
         }
         // C# `Directory.CreateDirectory(path)` inside `GetNamedView`.
         tokio::fs::create_dir_all(&view_path)
@@ -948,7 +975,7 @@ impl FerrofinUserViewManager {
         persistence
             .save_items(std::slice::from_ref(&entity))
             .await?;
-        Ok(Some(id))
+        Ok(Some((id, true)))
     }
 
     /// One-shot boot repair: folds every 10.11-era `UserView` whose id was
@@ -987,27 +1014,33 @@ impl UserViewManager for FerrofinUserViewManager {
         user_id: Uuid,
         include_hidden: bool,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // Upstream materializes the Live TV view on read, from inside
-        // `GetUserViews` itself (UserViewManager.cs:128-133).
-        self.ensure_live_tv_view(user_id).await?;
         // The user's top-level views are the library collection folders. Per-user
         // access filtering (which libraries the user may see) rides on the
         // InternalItemsQuery.user field in the full pipeline; the base set is every
         // collection folder / user view, name-sorted.
-        // The playlists arm of `GetUserViews` (UserViewManager.cs:63-79): a
-        // playlists library is user-specific, so its view is
-        // `GetNamedView(user, folder.Name, folder.Id, playlists)` — derived,
-        // created on demand, never listed from the table.
         let user = self.user_entity(user_id).await?;
         let mut visible_items = HashMap::new();
-        self.ensure_user_playlists_view(user_id, user.as_ref(), &mut visible_items)
-            .await?;
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::CollectionFolder, BaseItemKind::UserView],
             order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
             ..Default::default()
         };
-        let views = self.items.get_item_list(&query).await?;
+        let mut views = self.items.get_item_list(&query).await?;
+        // Upstream materializes the Live TV view on read, from inside
+        // `GetUserViews` itself (UserViewManager.cs:128-133), and the playlists
+        // arm (UserViewManager.cs:63-79): a playlists library is user-specific,
+        // so its view is `GetNamedView(user, folder.Name, folder.Id,
+        // playlists)` — derived, created on demand, never listed from the
+        // table. `GetNamedView` looks each row up in its item cache; here a row
+        // that exists is among the rows just listed, so only a read that writes
+        // one lists them again (gl-1322).
+        let live_tv_written = self.ensure_live_tv_view(user_id, &views).await?;
+        let playlists_written = self
+            .ensure_user_playlists_view(user_id, user.as_ref(), &mut visible_items, &views)
+            .await?;
+        if live_tv_written || playlists_written {
+            views = self.items.get_item_list(&query).await?;
+        }
         let views: Vec<_> = self
             .only_canonical_user_views(user_id, views)
             .into_iter()
@@ -1053,7 +1086,7 @@ impl UserViewManager for FerrofinUserViewManager {
     }
 
     async fn get_internal_live_tv_folder_id(&self) -> Result<Option<Uuid>, ServiceError> {
-        self.provision_live_tv_view().await
+        Ok(self.provision_live_tv_view(None).await?.map(|(id, _)| id))
     }
 
     async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
@@ -4863,6 +4896,56 @@ mod tests {
         let row = crate::test_support::fetch_item(&db, id).await;
         let french = Some("TV en direct".to_owned());
         assert_eq!(names(row), (french.clone(), french));
+    }
+
+    /// gl-1322: a views read finds the Live TV row among the view rows it
+    /// lists, so the read that renames it after a language change lists the
+    /// new name, as upstream's `GetNamedView` returns the item it renamed.
+    #[tokio::test]
+    async fn the_views_read_that_renames_the_live_tv_view_lists_the_new_name() {
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0x5111);
+        seed_user(&db, user_id).await;
+        let mut tx = db.writer().begin().await.expect("begin");
+        crate::user_entity_ext::seed_defaults(&mut tx, &guid_to_db(user_id))
+            .await
+            .expect("permissions");
+        tx.commit().await.expect("commit");
+        db.upsert_live_tv_tuner_host("t1", "http://tuner", "m3u", "{}")
+            .await
+            .expect("tuner");
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Arc::new(DashboardConfiguration::default());
+        config.0.lock().unwrap().enable_folder_view = false;
+        let localization = Arc::new(
+            crate::LocalizationManager::new("US").with_ui_culture_source({
+                let config = Arc::clone(&config);
+                move || config.0.lock().unwrap().ui_culture.clone()
+            }),
+        );
+        let manager = manager(&db)
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
+            .with_metadata_path(tmp.path().join("metadata"))
+            .with_database(db.clone())
+            .with_dashboard_configuration(config.clone(), localization);
+        let names = |views: Vec<BaseItemEntity>| {
+            views
+                .into_iter()
+                .filter_map(|v| v.name)
+                .collect::<Vec<String>>()
+        };
+
+        assert_eq!(
+            names(manager.get_user_views(user_id).await.expect("views")),
+            ["Live TV"],
+            "the read that makes the row lists it"
+        );
+        config.0.lock().unwrap().ui_culture = "fr".to_owned();
+        assert_eq!(
+            names(manager.get_user_views(user_id).await.expect("views")),
+            ["TV en direct"],
+            "the read that renames the row lists the new name"
+        );
     }
 
     // One live sequence verifies identity across toggle, localization and hidden preferences.
