@@ -1971,33 +1971,22 @@ impl SessionManager for FerrofinSessionManager {
         // The save's outcome is kept, not returned at once: the live stream is
         // released and the stop published whatever it was. Upstream skips the
         // release when the save throws; releasing anyway closes that leak.
-        let saved = match library_item {
-            Ok(Some(_)) if !info.failed => self.save_stopped_play_state(&session, info).await,
-            // No library item, or the playback failed: nothing to save.
-            Ok(_) => Ok(()),
-            Err(error) => Err(error),
+        let (stopped_item, saved) = match library_item {
+            Ok(Some(item)) if !info.failed => (
+                Some(item),
+                self.save_stopped_play_state(&session, info).await,
+            ),
+            // No library item, or the playback failed: nothing to save, but a
+            // failed playback's item is still named below.
+            Ok(item) => (item, Ok(())),
+            Err(error) => (None, Err(error)),
         };
 
         // C# `OnPlaybackStopped`: "User {0} stopped playback of '{1}' at {2}ms
-        // ({3} {4})", for a stop whose item resolves. `position_ms` is left out
-        // when the client sent no position (upstream writes "unknown"; a numeric
-        // field cannot). The lookup only names the item in this line, so its
-        // failure must not fail the stop report.
-        let stopped_item = if info.item_id.is_nil() {
-            None
-        } else {
-            match self.library_manager.get_item_by_id(info.item_id).await {
-                Ok(item) => item,
-                Err(error) => {
-                    tracing::debug!(
-                        item_id = %info.item_id,
-                        %error,
-                        "playback stop: item lookup failed"
-                    );
-                    None
-                }
-            }
-        };
+        // ({3} {4})", for a stop whose item resolves, named from the row read
+        // above (upstream builds `info.Item` from its one `libraryItem`).
+        // `position_ms` is left out when the client sent no position (upstream
+        // writes "unknown"; a numeric field cannot).
         if let Some(item) = stopped_item {
             info!(
                 user = session.user_name.as_deref(),
