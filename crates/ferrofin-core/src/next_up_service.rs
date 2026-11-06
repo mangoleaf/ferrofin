@@ -79,6 +79,9 @@ use crate::tv_series_manager::airs_numbers;
 #[derive(Clone)]
 pub struct FerrofinNextUpService {
     db: Database,
+    /// Expands a library row stored tokenised before its options are read
+    /// (see [`FerrofinNextUpService::with_virtual_paths`]).
+    virtual_paths: crate::virtual_paths::VirtualPathExpander,
 }
 
 impl std::fmt::Debug for FerrofinNextUpService {
@@ -92,7 +95,22 @@ impl FerrofinNextUpService {
     /// Creates a next-up service over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+        }
+    }
+
+    /// Installs the server's [`VirtualPathExpander`](crate::virtual_paths::VirtualPathExpander),
+    /// so a grouped view's libraries are read at their real paths, as the
+    /// item queries read them.
+    #[must_use]
+    pub fn with_virtual_paths(
+        mut self,
+        virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    ) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
     }
 
     /// The stored `Type` name for episodes, or an error if the lookup lacks it.
@@ -163,7 +181,8 @@ impl FerrofinNextUpService {
             .filter(|id| !by_library.contains_key(id))
             .copied()
             .collect();
-        let by_view = view_top_parent_ids(&self.db, &others, Some(user)).await?;
+        let by_view =
+            view_top_parent_ids(&self.db, &self.virtual_paths, &others, Some(user)).await?;
         let mut out = Vec::with_capacity(parents.len());
         for id in parents {
             match by_library.get(id).or_else(|| by_view.get(id)) {

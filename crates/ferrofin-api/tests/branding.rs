@@ -556,6 +556,39 @@ async fn splashscreen_delete_no_location_is_204() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
+/// `GetSplashscreen` and `DeleteCustomSplashscreen` test `SplashscreenLocation`
+/// with `File.Exists`, which is false for a directory: GET falls back to
+/// `{DataPath}/splashscreen.png` and DELETE leaves the directory and the
+/// recorded location alone, as for a missing file.
+#[tokio::test]
+async fn a_splashscreen_location_that_is_not_a_file_is_ignored() {
+    let dir = std::env::temp_dir().join(format!("ferrofin-splash-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("splashscreen.png"), b"default-bytes").expect("splash");
+    for location in [dir.clone(), dir.join("missing.png")] {
+        let location = location.to_string_lossy().into_owned();
+        let mut branding = default_branding();
+        branding.splashscreen_enabled = true;
+        branding.splashscreen_location = Some(location.clone());
+        let config = make_config(branding, &dir.to_string_lossy());
+
+        let (status, _, body) =
+            get_as(config.clone(), &Caller::Anonymous, "/Branding/Splashscreen").await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (StatusCode::OK, &b"default-bytes"[..]),
+            "{location}"
+        );
+
+        let (status, _) = send(config.clone(), "DELETE", "/Branding/Splashscreen", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{location}");
+        let recorded = config.get_branding().await.expect("branding");
+        assert_eq!(recorded.splashscreen_location, Some(location));
+    }
+    assert!(dir.is_dir());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Drives one GET as `caller`, returning the status, headers and body.
 async fn get_as(
     config: Arc<StubConfig>,
