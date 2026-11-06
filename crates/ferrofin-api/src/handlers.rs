@@ -944,8 +944,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// `scan-failure-isolation` is what the library scan does about a row or a
 /// write that fails, which no operation's response shows;
 /// `progressive-transcode` is who may reach ffmpeg through the stream routes,
-/// whose operations have no row of their own yet, and how many jobs ffmpeg may
-/// run for them and the HLS routes;
+/// whose operations have no row of their own yet, when the progressive body
+/// they answer with ends, and how many jobs ffmpeg may run for them and the
+/// HLS routes;
 /// `video-stream-copy` is whether a transcode job copies the source video and
 /// what dynamic HDR metadata the copy strips, which the HLS and stream routes
 /// share.
@@ -1430,17 +1431,21 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         upstream_file: "Jellyfin.Api/Controllers/VideosController.cs",
         upstream_method: "GetVideoStream",
         ferrofin: "Which GET and HEAD requests on the /Videos and /Audio stream routes reach \
-                   ffmpeg, and who may send them; the query parameters of those operations are \
-                   not part of this row. handlers/streaming.rs stream_route_container (the \
-                   stream.{container} literal, in any case, as ASP.NET matches it), \
-                   static_or_transcode and serve_static_source (the static branches of \
-                   VideosController.GetVideoStream and AudioHelper.GetAudioStream: open live \
-                   stream, remote source, other protocol, file, and for video alone the \
-                   disc-folder exception) and handlers/hls.rs transcode_stream_fallback \
+                   ffmpeg, who may send them, and when the progressive body they answer with \
+                   ends; the query parameters of those operations are not part of this row. \
+                   handlers/streaming.rs stream_route_container (the stream.{container} \
+                   literal, in any case, as ASP.NET matches it), static_or_transcode and \
+                   serve_static_source (the static branches of VideosController.GetVideoStream \
+                   and AudioHelper.GetAudioStream: open live stream, remote source, other \
+                   protocol, file, and for video alone the disc-folder exception) and \
+                   handlers/hls.rs transcode_stream_fallback \
                    (FileStreamResponseHelpers.GetTranscodedFile, which answers a HEAD before \
                    ffmpeg), which the transcode branch of /Audio/{itemId}/universal also \
-                   reaches (UniversalAudioController, [Authorize]); the default policy is \
-                   auth.rs RequireAuth (DefaultAuthorizationHandler). Also the admission of a \
+                   reaches (UniversalAudioController, [Authorize]), with the body it answers \
+                   with, streaming.rs serve_growing_transcode \
+                   (MediaBrowser.Controller/Streaming/ProgressiveFileStream.cs StopReading, \
+                   compared 2026-11-05); the default policy is auth.rs RequireAuth \
+                   (DefaultAuthorizationHandler). Also the admission of a \
                    job on those routes and the HLS ones: ferrofin-mediaencoding \
                    transcoding/manager.rs start_ffmpeg, compared with \
                    MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs (StartFfMpeg, \
