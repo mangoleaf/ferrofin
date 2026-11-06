@@ -24,7 +24,7 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 /// [`atomic_write`] with the contents written by `write`, for contents that
-/// come from a stream (a file restored from a backup archive).
+/// come from a stream.
 ///
 /// The result is private (`0600` on Unix), whatever mode a file it replaces
 /// had.
@@ -43,7 +43,8 @@ pub fn atomic_write_with(
 /// Creates, or truncates, a private file at `path` and opens it for writing:
 /// `0600` on Unix whether the file is new or already there, for a file that
 /// holds secrets but is written in place (a backup archive, which holds the
-/// configuration tree). On other platforms it is [`std::fs::File::create`].
+/// configuration tree, or a restored configuration file before it moves into
+/// place). On other platforms it is [`std::fs::File::create`].
 ///
 /// # Errors
 ///
