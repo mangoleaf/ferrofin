@@ -30,9 +30,38 @@ type PublishedSource = (Arc<dyn MediaSegmentProvider>, Vec<MediaSegmentDto>);
 
 #[derive(Default)]
 struct MutationState {
-    revisions: std::collections::HashMap<Uuid, u64>,
+    // Only items a `run_provider` is extracting for, each run holding the `Arc` behind the
+    // `Weak`: a write no run watches records nothing, so the map stays that small (gl-1316).
+    revisions: std::collections::HashMap<Uuid, (std::sync::Weak<()>, u64)>,
     // A provider-wide erase also changes cache-only items without SQL rows to enumerate.
     epoch: u64,
+}
+impl MutationState {
+    /// Starts a run's watch on `item`: its handle, and the revision it compares at commit.
+    fn watch(&mut self, item: Uuid) -> (Arc<()>, (u64, u64)) {
+        let (watchers, revision) = self.revisions.entry(item).or_default();
+        let run = watchers.upgrade().unwrap_or_else(|| {
+            let run = Arc::new(());
+            *watchers = Arc::downgrade(&run);
+            run
+        });
+        (run, (self.epoch, *revision))
+    }
+    /// Ends `run`'s watch on `item` and returns the revision now. The entry goes
+    /// with the last run watching it; an aborted run's goes with the item's next
+    /// write or run.
+    fn unwatch(&mut self, item: Uuid, run: Arc<()>) -> (u64, u64) {
+        drop(run);
+        // Unreachable while `run` was live; were it reached, `u64::MAX` reads as superseded.
+        let Some((watchers, revision)) = self.revisions.get(&item) else {
+            return (self.epoch, u64::MAX);
+        };
+        let revision = *revision;
+        if watchers.strong_count() == 0 {
+            self.revisions.remove(&item);
+        }
+        (self.epoch, revision)
+    }
 }
 
 /// Persists segments and runs registered producers under their owning library's policy.
@@ -150,8 +179,14 @@ impl FerrofinMediaSegmentManager {
             .collect()
     }
     fn changed(revisions: &mut MutationState, item: Uuid) {
-        let revision = revisions.revisions.entry(item).or_default();
-        *revision = revision.wrapping_add(1);
+        let Some((watchers, revision)) = revisions.revisions.get_mut(&item) else {
+            return;
+        };
+        if watchers.strong_count() == 0 {
+            revisions.revisions.remove(&item);
+        } else {
+            *revision = revision.wrapping_add(1);
+        }
     }
     /// Publishes `mutation` to the snapshot of the producer `provider_id`
     /// names, when one is registered, and returns that producer with its
@@ -326,33 +361,25 @@ impl FerrofinMediaSegmentManager {
         provider: &dyn MediaSegmentProvider,
         overwrite: bool,
     ) -> Result<(), ServiceError> {
-        let (previous, revision) = {
-            let revisions = self.mutations.lock().await;
+        let (previous, (run, revision)) = {
+            let mut revisions = self.mutations.lock().await;
             let previous = if overwrite {
                 Vec::new()
             } else {
                 self.provider_rows(item, provider).await?
             };
-            (
-                previous,
-                (
-                    revisions.epoch,
-                    revisions.revisions.get(&item).copied().unwrap_or_default(),
-                ),
-            )
+            (previous, revisions.watch(item))
         };
         let segments = provider
             .get_segments(&MediaSegmentGenerationRequest {
                 item_id: item,
                 existing_segments: previous.clone(),
             })
-            .await?;
+            .await;
         let mut revisions = self.mutations.lock().await;
-        if (
-            revisions.epoch,
-            revisions.revisions.get(&item).copied().unwrap_or_default(),
-        ) != revision
-        {
+        let current = revisions.unwatch(item, run);
+        let segments = segments?;
+        if current != revision {
             tracing::debug!(item_id=%item, provider=provider.name(), "ignoring extraction superseded by a segment mutation");
             return Ok(());
         }
@@ -1840,6 +1867,133 @@ mod tests {
         assert!(
             !manager.has_segments(item).await.unwrap(),
             "bulk erasing cache-only output invalidates an extraction with no served rows"
+        );
+    }
+
+    async fn watched_items(manager: &FerrofinMediaSegmentManager) -> usize {
+        manager.mutations.lock().await.revisions.len()
+    }
+
+    #[tokio::test]
+    async fn revisions_are_kept_only_while_an_extraction_watches_the_item() {
+        use std::sync::{Arc, Mutex};
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Episode).await;
+        let manager = Arc::new(FerrofinMediaSegmentManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+        ));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut producer = provider("Producer", 0, 0, &events);
+        let pause = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        Arc::get_mut(&mut producer).unwrap().pause = Some(pause.clone());
+        manager.register_segment_provider(producer);
+        manager
+            .create_segment(&segment(item, MediaSegmentType::Outro, 500, 600), "manual")
+            .await
+            .unwrap();
+        assert_eq!(watched_items(&manager).await, 0, "a write no run watches");
+
+        let running = manager.clone();
+        let task = tokio::spawn(async move { running.run_segment_providers(item, false).await });
+        pause.0.notified().await;
+        assert_eq!(watched_items(&manager).await, 1, "a run watches its item");
+        pause.1.notify_one();
+        assert_eq!(task.await.unwrap().unwrap(), 1);
+        assert_eq!(watched_items(&manager).await, 0, "a finished run");
+
+        for clear_by_write in [false, true] {
+            let running = manager.clone();
+            let task =
+                tokio::spawn(async move { running.run_segment_providers(item, false).await });
+            pause.0.notified().await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(watched_items(&manager).await, 1, "an aborted run's entry");
+            if clear_by_write {
+                manager
+                    .create_segment(&segment(item, MediaSegmentType::Recap, 700, 800), "manual")
+                    .await
+                    .unwrap();
+            } else {
+                let running = manager.clone();
+                let task =
+                    tokio::spawn(async move { running.run_segment_providers(item, false).await });
+                pause.0.notified().await;
+                pause.1.notify_one();
+                task.await.unwrap().unwrap();
+            }
+            assert_eq!(
+                watched_items(&manager).await,
+                0,
+                "the item's next write or run clears an aborted run's entry"
+            );
+        }
+        assert_eq!(
+            manager.get_segments(item, None, false).await.unwrap().len(),
+            3
+        );
+
+        let failing = FerrofinMediaSegmentManager::new(db.clone(), library_manager_over(db));
+        let mut broken = provider("Broken", 0, 0, &events);
+        Arc::get_mut(&mut broken).unwrap().fail = true;
+        failing.register_segment_provider(broken);
+        assert_eq!(failing.run_segment_providers(item, false).await.unwrap(), 1);
+        assert_eq!(watched_items(&failing).await, 0, "a failed extraction");
+    }
+
+    #[tokio::test]
+    async fn concurrent_extractions_of_one_item_share_its_entry_until_both_finish() {
+        use std::sync::{Arc, Mutex};
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Episode).await;
+        let manager = Arc::new(FerrofinMediaSegmentManager::new(
+            db.clone(),
+            library_manager_over(db),
+        ));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut producer = provider("Producer", 0, 0, &events);
+        let pause = Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+        Arc::get_mut(&mut producer).unwrap().pause = Some(pause.clone());
+        manager.register_segment_provider(producer);
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let running = manager.clone();
+            runs.push(tokio::spawn(async move {
+                running.run_segment_providers(item, false).await
+            }));
+            // `Notify` keeps one permit: take each run's before starting the next.
+            pause.0.notified().await;
+        }
+        assert_eq!(
+            watched_items(&manager).await,
+            1,
+            "both runs share one entry"
+        );
+        let edited = manager
+            .create_segment(&segment(item, MediaSegmentType::Outro, 500, 600), "manual")
+            .await
+            .unwrap();
+        pause.1.notify_one();
+        while !runs.iter().any(tokio::task::JoinHandle::is_finished) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            watched_items(&manager).await,
+            1,
+            "the other run still watches"
+        );
+        pause.1.notify_one();
+        for run in runs {
+            assert_eq!(run.await.unwrap().unwrap(), 1);
+        }
+        assert_eq!(watched_items(&manager).await, 0, "both runs finished");
+        assert_eq!(
+            manager.get_segments(item, None, false).await.unwrap(),
+            [edited],
+            "the write superseded both extractions"
         );
     }
 
