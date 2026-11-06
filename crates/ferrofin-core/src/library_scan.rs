@@ -3833,6 +3833,35 @@ pub(crate) fn dead_by_name_queries() -> [InternalItemsQuery; 2] {
 /// an equal share of the last 4 % of a scan's progress.
 const POST_SCAN_PASSES: u32 = 12;
 
+/// The `albums` whose stored Primary is still the cover `covers` holds for
+/// them, from one read of their image rows. A failed read is logged and
+/// counts as none: each album then has its cover published again, as an
+/// album whose rows could not be read always had.
+async fn albums_keeping_their_cover(
+    items: &dyn ItemRepository,
+    albums: &[Uuid],
+    covers: &HashMap<Uuid, ItemImageInfo>,
+) -> std::collections::HashSet<Uuid> {
+    let stored = items
+        .get_image_infos_batch(albums)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "could not read the albums' stored artwork to check their covers");
+            HashMap::new()
+        });
+    stored
+        .into_iter()
+        .filter(|(id, images)| {
+            covers.get(id).is_some_and(|cover| {
+                images
+                    .iter()
+                    .any(|image| image.image_type == ImageType::Primary && image.path == cover.path)
+            })
+        })
+        .map(|(id, _)| id)
+        .collect()
+}
+
 /// How many items the splashscreen draws its posters (and, separately, its
 /// thumbs or backdrops) from: `GetItemsWithImageType`'s `Limit = 30`.
 const SPLASHSCREEN_IMAGE_LIMIT: i32 = 30;
@@ -9496,26 +9525,47 @@ impl LibraryScanner {
         let Some(items) = &self.item_repository else {
             return;
         };
-        let albums: std::collections::HashSet<Uuid> = cache
+        let mut albums: Vec<Uuid> = cache
             .track_albums
             .values()
             .chain(cache.album_covers.keys())
             .copied()
             .collect();
-        for id in albums {
-            // Between two albums: the lane's refreshes run (every album
-            // below is read back from the database, so nothing is stale).
-            Box::pin(self.serve_lane(run)).await;
-            // Unchanged albums already supplied covers during the item walk.
-            // Avoid re-reading every track's images on each routine rescan.
-            if !cache.albums_needing_backfill.contains(&id)
-                && let Some(cover) = cache.album_covers.get(&id)
-                && let Ok(images) = items.get_image_infos(id).await
-                && images
-                    .iter()
-                    .any(|image| image.image_type == ImageType::Primary && image.path == cover.path)
-            {
-                continue;
+        albums.sort_unstable();
+        albums.dedup();
+        // Unchanged albums already supplied covers during the item walk.
+        // Avoid re-reading every track's images on each routine rescan.
+        let unchanged = |id: &Uuid| {
+            !cache.albums_needing_backfill.contains(id) && cache.album_covers.contains_key(id)
+        };
+        // The unchanged albums still storing that cover, from one read of
+        // their image rows.
+        let mut keeping: Option<std::collections::HashSet<Uuid>> = None;
+        for (index, &id) in albums.iter().enumerate() {
+            // Between two albums: the lane's refreshes run. A refresh served
+            // here may have rewritten the rows read for the albums still to
+            // come, so they are read again: none is judged by rows it rewrote.
+            if !Box::pin(self.serve_lane(run)).await.is_empty() {
+                keeping = None;
+            }
+            if unchanged(&id) {
+                if keeping.is_none() {
+                    let rest: Vec<Uuid> = albums[index..]
+                        .iter()
+                        .copied()
+                        .filter(|id| unchanged(id))
+                        .collect();
+                    keeping = Some(
+                        albums_keeping_their_cover(items.as_ref(), &rest, &cache.album_covers)
+                            .await,
+                    );
+                }
+                if keeping
+                    .as_ref()
+                    .is_some_and(|keeping| keeping.contains(&id))
+                {
+                    continue;
+                }
             }
             self.inherit_album_cover(id, items.as_ref()).await;
         }
