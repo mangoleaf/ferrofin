@@ -111,6 +111,7 @@ async fn tracks_requests_and_satisfies_parity_name_set() {
     );
     assert_dropped_request_left_in_progress(&out);
     assert_extension_method_is_other(&out);
+    assert_http_series(&out);
     // Unmatched request rendered with empty-string labels (prometheus-net convention).
     assert!(
         out.contains(r#"endpoint="""#) && out.contains(r#"code="404""#),
@@ -184,6 +185,36 @@ fn assert_extension_method_is_other(out: &str) {
         "a non-standard method leaked into the method label:\n{out}"
     );
 }
+
+/// Every `http_*` series this traffic leaves, label for label, with each value
+/// that does not depend on timing: how the labels are built must never change
+/// what a scrape shows.
+fn assert_http_series(out: &str) {
+    let mut series: Vec<&str> = out
+        .lines()
+        .filter(|l| {
+            l.starts_with("http_requests_received_total{")
+                || l.starts_with("http_requests_in_progress{")
+                || l.starts_with("http_request_duration_seconds_count{")
+        })
+        .collect();
+    series.sort_unstable();
+    assert_eq!(series, EXPECTED_HTTP_SERIES, "\n{out}");
+}
+
+/// The series [`assert_http_series`] expects, sorted.
+const EXPECTED_HTTP_SERIES: &[&str] = &[
+    r#"http_request_duration_seconds_count{action="",code="404",controller="",endpoint="",method="GET",page=""} 1"#,
+    r#"http_request_duration_seconds_count{action="",code="405",controller="",endpoint="/Items/{itemId}",method="_OTHER",page=""} 1"#,
+    r#"http_request_duration_seconds_count{action="GetItem",code="200",controller="Items",endpoint="Items/{itemId}",method="GET",page=""} 1"#,
+    r#"http_requests_in_progress{action="",controller="",endpoint="",method="GET",page=""} 0"#,
+    r#"http_requests_in_progress{action="",controller="",endpoint="/Items/{itemId}",method="_OTHER",page=""} 0"#,
+    r#"http_requests_in_progress{action="",controller="",endpoint="/hang",method="GET",page=""} 0"#,
+    r#"http_requests_in_progress{action="GetItem",controller="Items",endpoint="Items/{itemId}",method="GET",page=""} 0"#,
+    r#"http_requests_received_total{action="",code="404",controller="",endpoint="",method="GET",page=""} 1"#,
+    r#"http_requests_received_total{action="",code="405",controller="",endpoint="/Items/{itemId}",method="_OTHER",page=""} 1"#,
+    r#"http_requests_received_total{action="GetItem",code="200",controller="Items",endpoint="Items/{itemId}",method="GET",page=""} 1"#,
+];
 
 /// The Jellyfin (prometheus-net) metric names whose concept exists in Rust and
 /// that Ferrofin therefore ports 1:1. Kept in sync with
