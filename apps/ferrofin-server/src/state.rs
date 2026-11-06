@@ -252,11 +252,14 @@ struct VirtualFolderStorage(Arc<dyn ferrofin_traits::library::VirtualFolderManag
 #[async_trait::async_trait]
 impl ferrofin_core::system_manager::LibraryStorageProvider for VirtualFolderStorage {
     async fn libraries(&self) -> Vec<(uuid::Uuid, String, Vec<String>)> {
-        self.0
-            .get_virtual_folders()
+        // The snapshot, not `get_virtual_folders`: only the ids, names and
+        // locations are reported, and the full listing re-reads every library.
+        let mut libraries: Vec<_> = self
+            .0
+            .library_folders()
             .await
             .unwrap_or_default()
-            .into_iter()
+            .iter()
             // C# `SystemManager.GetSystemStorageInfo` filters
             // `.Where(e => !string.IsNullOrWhiteSpace(e.ItemId))` before parsing
             // the guid ("this should not be null but for some users it is"), so
@@ -269,9 +272,17 @@ impl ferrofin_core::system_manager::LibraryStorageProvider for VirtualFolderStor
                     .map(str::trim)
                     .filter(|s| !s.is_empty())?;
                 let id = uuid::Uuid::parse_str(id).ok()?;
-                Some((id, vf.name.unwrap_or_default(), vf.locations))
+                Some((
+                    id,
+                    vf.name.clone().unwrap_or_default(),
+                    vf.locations.clone(),
+                ))
             })
-            .collect()
+            .collect();
+        ferrofin_core::virtual_folder_manager::sort_locations_in_current_culture(
+            libraries.iter_mut().map(|(_, _, locations)| locations),
+        );
+        libraries
     }
 }
 
@@ -3448,6 +3459,46 @@ async fn load_server_id(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use ferrofin_core::system_manager::LibraryStorageProvider as _;
+
+    /// The storage page lists the libraries from the snapshot, not the full
+    /// listing that re-reads every library from disk, and still orders each
+    /// library's locations in the current culture, as `GetVirtualFolders` does.
+    #[tokio::test]
+    async fn storage_lists_the_library_snapshot_in_culture_order() {
+        let id = uuid::Uuid::new_v4();
+        let folders = Arc::new(ferrofin_api::test_support::FakeVirtualFolders::seeded(
+            vec![
+                ferrofin_model::entities_media::VirtualFolderInfo {
+                    name: Some("Movies".to_owned()),
+                    locations: vec!["/media/B".to_owned(), "/media/a".to_owned()],
+                    item_id: Some(id.simple().to_string()),
+                    ..Default::default()
+                },
+                // No id: dropped, as upstream filters a blank `ItemId`.
+                ferrofin_model::entities_media::VirtualFolderInfo {
+                    name: Some("Broken".to_owned()),
+                    locations: vec!["/media/c".to_owned()],
+                    ..Default::default()
+                },
+            ],
+        ));
+        let libraries = super::VirtualFolderStorage(folders.clone())
+            .libraries()
+            .await;
+        assert_eq!(folders.listings(), 0, "a full listing was asked for");
+        assert_eq!(
+            libraries,
+            vec![(
+                id,
+                "Movies".to_owned(),
+                vec!["/media/a".to_owned(), "/media/B".to_owned()]
+            )]
+        );
+    }
+
     /// The hosts that exempt a tuner's own artwork from the image downloads'
     /// private-address refusal (gl-1096).
     #[test]

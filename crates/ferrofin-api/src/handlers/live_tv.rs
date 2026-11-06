@@ -1105,7 +1105,7 @@ async fn get_recordings(
         Some(user) => Some(ListedRecordingVisibility {
             state: &state,
             user,
-            folders: state.virtual_folders.get_virtual_folders().await?,
+            folders: state.virtual_folders.library_folders().await?,
             answers: std::sync::Mutex::default(),
         }),
         None => None,
@@ -1133,7 +1133,7 @@ async fn get_recordings(
 struct ListedRecordingVisibility<'a> {
     state: &'a AppState,
     user: &'a UserEntity,
-    folders: Vec<VirtualFolderInfo>,
+    folders: Arc<[VirtualFolderInfo]>,
     answers: std::sync::Mutex<HashMap<RecordingVisibilityKey, bool>>,
 }
 
@@ -1244,7 +1244,7 @@ pub(crate) async fn recording_visible(
     user: &UserEntity,
 ) -> Result<bool, ApiError> {
     let holders = match recording.path.as_deref() {
-        Some(path) => holding_libraries(&state.virtual_folders.get_virtual_folders().await?, path),
+        Some(path) => holding_libraries(&state.virtual_folders.library_folders().await?, path),
         None => Vec::new(),
     };
     Ok(recording_visible_given(state, recording, &holders, user).await?)
@@ -2257,7 +2257,7 @@ mod tests {
         let listing = ListedRecordingVisibility {
             state: &state,
             user: &user,
-            folders: vec![folder("/rec"), folder("/movies"), folder("/rec/show")],
+            folders: vec![folder("/rec"), folder("/movies"), folder("/rec/show")].into(),
             answers: std::sync::Mutex::default(),
         };
         let (one, other) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
@@ -2284,6 +2284,51 @@ mod tests {
         }
         // One rec, other rec, movies, rec + rec/show, and no library.
         assert_eq!(library.0.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    /// The recordings list and the by-id rule take the libraries' locations
+    /// from the snapshot (`library_folders`), not from the full listing, which
+    /// re-reads every library from disk on each call.
+    #[tokio::test]
+    async fn recording_visibility_reads_the_library_snapshot() {
+        let folders = Arc::new(crate::test_support::FakeVirtualFolders::seeded(vec![
+            VirtualFolderInfo {
+                locations: vec!["/rec".to_owned()],
+                item_id: Some(Uuid::new_v4().simple().to_string()),
+                ..VirtualFolderInfo::default()
+            },
+        ]));
+        let state = crate::test_support::authed_state_with_library_and_monitor(
+            Arc::new(crate::test_support::CountingRefusals::default()),
+            Arc::new(ferrofin_traits::stubs::NoopLibraryMonitor),
+        )
+        .with_virtual_folders(folders.clone())
+        .with_live_tv(Arc::new(FakeLiveTv::default()));
+        let user = Arc::new(crate::test_support::sample_user());
+        let auth = RequireLiveTvAccess(AuthorizationInfo {
+            user: Some(Arc::clone(&user)),
+            ..AuthorizationInfo::default()
+        });
+        let listed = get_recordings(
+            State(state.clone()),
+            auth,
+            Query(RecordingsQuery::default()),
+        )
+        .await
+        .expect("recordings");
+        assert!(listed.0.items.is_empty(), "{:?}", listed.0.items);
+        let recording = BaseItemEntity {
+            path: Some("/rec/a.ts".to_owned()),
+            ..crate::test_support::minimal_base_item(
+                Uuid::new_v4(),
+                "/rec/a.ts",
+                "MediaBrowser.Controller.Entities.Video",
+            )
+        };
+        recording_visible(&state, recording, &user)
+            .await
+            .expect("recording rule");
+        assert_eq!(folders.listings(), 0, "a full listing was asked for");
     }
 
     /// A library holds a recording's file whichever case either is spelled
@@ -3140,7 +3185,7 @@ mod tests {
         async fn get_recordings(
             &self,
         ) -> Result<QueryResult<BaseItemDto>, ferrofin_traits::error::ServiceError> {
-            unimplemented!()
+            Ok(QueryResult::default())
         }
         async fn get_recording(
             &self,
