@@ -239,6 +239,9 @@ pub struct FerrofinItemCountService {
     /// The `IsVisible` evaluator the count's library scope asks about
     /// playlists and box sets (see [`FerrofinItemCountService::with_visibility`]).
     visibility: crate::item_repository::VisibilitySlot,
+    /// Expands a library row stored tokenised before its options are read
+    /// (see [`FerrofinItemCountService::with_virtual_paths`]).
+    virtual_paths: crate::virtual_paths::VirtualPathExpander,
 }
 
 impl std::fmt::Debug for FerrofinItemCountService {
@@ -256,7 +259,20 @@ impl FerrofinItemCountService {
             db,
             roots: None,
             visibility: crate::item_repository::VisibilitySlot::default(),
+            virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
         }
+    }
+
+    /// Installs the server's [`VirtualPathExpander`](crate::virtual_paths::VirtualPathExpander),
+    /// so the count's library scope reads a library stored as
+    /// `%MetadataPath%/…` at its real path, as the item queries do.
+    #[must_use]
+    pub fn with_virtual_paths(
+        mut self,
+        virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    ) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
     }
 
     /// Installs the slot the composition root fills with the server's
@@ -280,6 +296,23 @@ impl FerrofinItemCountService {
     pub fn with_root_ids(mut self, roots: RootFolderIds) -> Self {
         self.roots = Some(roots);
         self
+    }
+
+    /// `AddUserToQuery`'s library scope for `filter`
+    /// ([`crate::item_repository::scope_to_user_libraries`]), as the item
+    /// queries apply it.
+    async fn scope_to_user_libraries(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        let visibility = crate::item_repository::bound_visibility(&self.visibility);
+        crate::item_repository::scope_to_user_libraries(
+            &self.db,
+            &self.virtual_paths,
+            visibility.as_deref(),
+            filter,
+        )
+        .await
     }
 
     /// The countable leaves (`IsCountableLeaf`: neither a folder nor virtual)
@@ -647,13 +680,7 @@ impl ItemCountService for FerrofinItemCountService {
         // see one library must be counted over that library, not the server.
         // Without it `/Items/Counts` handed a restricted account the whole
         // catalogue's totals — numbers it could not then browse to.
-        let visibility = crate::item_repository::bound_visibility(&self.visibility);
-        let scoped = crate::item_repository::scope_to_user_libraries(
-            &self.db,
-            visibility.as_deref(),
-            filter,
-        )
-        .await?;
+        let scoped = self.scope_to_user_libraries(filter).await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         let descendants =
             crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
@@ -675,13 +702,7 @@ impl ItemCountService for FerrofinItemCountService {
         // (type, count) rows — instead of materializing every matching full row
         // (all ~60 columns) and counting them in Rust, which dominated this
         // endpoint's CPU on a large library.
-        let visibility = crate::item_repository::bound_visibility(&self.visibility);
-        let scoped = crate::item_repository::scope_to_user_libraries(
-            &self.db,
-            visibility.as_deref(),
-            filter,
-        )
-        .await?;
+        let scoped = self.scope_to_user_libraries(filter).await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         let descendants =
             crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
@@ -760,13 +781,7 @@ impl ItemCountService for FerrofinItemCountService {
         // `AddUserToQuery` for a user, so the counts cover the libraries that
         // user may open; with no user (an API key) they cover the server.
         // The preferences come resolved with it.
-        let visibility = crate::item_repository::bound_visibility(&self.visibility);
-        let scoped = crate::item_repository::scope_to_user_libraries(
-            &self.db,
-            visibility.as_deref(),
-            access_filter,
-        )
-        .await?;
+        let scoped = self.scope_to_user_libraries(access_filter).await?;
         let access_filter = scoped.as_ref().unwrap_or(access_filter);
 
         // People live in `PeopleBaseItemMap`/`Peoples`, not `ItemValues`, so a Person's

@@ -313,6 +313,10 @@ pub async fn record_direct(
                 match body.next_chunk().await {
                     Ok(Some(chunk)) => {
                         if chunk.is_empty() {
+                            // Yield, as the shared-stream copy does, so a body
+                            // that only ever returns empty chunks cannot hold
+                            // this worker until the deadline.
+                            tokio::task::yield_now().await;
                             continue;
                         }
                         output.write_all(&chunk).await.map_err(|e| {
@@ -782,7 +786,7 @@ mod tests {
     use ferrofin_model::media_info::MediaProtocol;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn timer(name: &str) -> TimerRecordingInfo {
         TimerRecordingInfo {
@@ -1083,6 +1087,86 @@ mod tests {
         .expect("record");
         let size = tokio::fs::metadata(&target).await.expect("recording").len();
         assert!(size > 0, "the endless tuner must have produced something");
+    }
+
+    /// A tuner whose body answers every read at once with no bytes: never
+    /// pending, never ended.
+    struct EmptyChunkTuner {
+        reads: Arc<AtomicUsize>,
+    }
+
+    struct EmptyChunkBody {
+        reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::stream::TunerStreamBody for EmptyChunkBody {
+        async fn next_chunk(
+            &mut self,
+        ) -> Result<Option<Vec<u8>>, ferrofin_traits::error::ServiceError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(Vec::new()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::stream::TunerStreamSource for EmptyChunkTuner {
+        async fn open(
+            &self,
+            _url: &str,
+            _headers: &std::collections::HashMap<String, String>,
+        ) -> Result<Box<dyn crate::stream::TunerStreamBody>, ferrofin_traits::error::ServiceError>
+        {
+            Ok(Box::new(EmptyChunkBody {
+                reads: Arc::clone(&self.reads),
+            }))
+        }
+
+        async fn content_type(
+            &self,
+            _url: &str,
+            _headers: &std::collections::HashMap<String, String>,
+        ) -> Option<String> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn a_direct_recording_fed_empty_chunks_yields_to_its_cancel() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("Empty.ts");
+        let reads = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        // This test runtime has one thread, so the cancel lands only if the
+        // copy loop yields once it has started reading.
+        let (seen, stopper) = (Arc::clone(&reads), Arc::clone(&cancel));
+        tokio::spawn(async move {
+            while seen.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+            stopper.store(true, Ordering::SeqCst);
+        });
+
+        record_direct(
+            &EmptyChunkTuner {
+                reads: Arc::clone(&reads),
+            },
+            &RecordingInput::Url {
+                url: "http://tuner/live".to_owned(),
+                headers: std::collections::HashMap::new(),
+            },
+            &target,
+            std::time::Duration::from_secs(2),
+            &cancel,
+        )
+        .await
+        .expect("record");
+
+        let reads = reads.load(Ordering::SeqCst);
+        assert!(
+            reads < 100,
+            "{reads} empty reads went by before the cancel got a turn"
+        );
     }
 
     #[test]
