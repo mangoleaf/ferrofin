@@ -1106,7 +1106,8 @@ where
         let path = self
             .resolve_in_transcode_dir(file_name, require_m3u8)
             .await?;
-        if !path.exists() {
+        // `Path::exists` off the runtime worker: `false` on any error, as before.
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Err(ServiceError::invalid_input("invalid segment"));
         }
         // Refresh the owning job's keep-alive timer (OnTranscodeBeginRequest on
@@ -2665,6 +2666,56 @@ mod tests {
             release_tx.send(()).unwrap();
             hog.await.unwrap();
             let served = mgr.resolve_transcode_file("abc0.ts", false).await.unwrap();
+            assert!(served.path.ends_with("abc0.ts"));
+        });
+    }
+
+    /// The legacy routes' existence check runs on the blocking pool too, never
+    /// as an inline `stat` on a runtime worker (gl-1325): with the pool's only
+    /// thread taken again as soon as the directory is prepared, the request
+    /// cannot finish, which an inline check would ignore.
+    #[test]
+    fn serving_a_segment_checks_the_file_on_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("abc0.ts"), b"seg").unwrap();
+            let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+
+            // Hold the pool's only thread, so the directory preparation queues.
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_first, first_rx) = std::sync::mpsc::channel::<()>();
+            let first = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                first_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+            let serve = mgr.resolve_transcode_file("abc0.ts", false);
+            tokio::pin!(serve);
+            let queued = tokio::time::timeout(std::time::Duration::from_millis(10), &mut serve);
+            assert!(queued.await.is_err(), "served before the directory was prepared");
+
+            // A second task queued behind the preparation takes the thread next.
+            let (release_second, second_rx) = std::sync::mpsc::channel::<()>();
+            let second = tokio::task::spawn_blocking(move || {
+                second_rx.recv().ok();
+            });
+            release_first.send(()).unwrap();
+            let starved =
+                tokio::time::timeout(std::time::Duration::from_millis(250), &mut serve).await;
+            assert!(
+                starved.is_err(),
+                "the segment was served with the blocking pool taken, so the existence check ran inline"
+            );
+
+            release_second.send(()).unwrap();
+            first.await.unwrap();
+            second.await.unwrap();
+            let served = serve.await.unwrap();
             assert!(served.path.ends_with("abc0.ts"));
         });
     }
