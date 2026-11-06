@@ -94,10 +94,12 @@ use crate::item_type_lookup::kind_from_type_name;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowRead {
     /// `RetrieveItem`: one row by id, provider ids always included
-    /// (`BaseItemRepository.cs:825-829`); projected as `GetBaseItemDto`.
+    /// (v12.4 `BaseItemRepository.Querying.cs:568-574`); projected as
+    /// `GetBaseItemDto`.
     ById,
     /// A list query: provider ids only for `ItemFields.ProviderIds`
-    /// (`ApplyNavigations`, :442-445); projected as `GetBaseItemDtos`.
+    /// (`ApplyNavigations`, v12.4 `BaseItemRepository.QueryBuilding.cs:257-260`);
+    /// projected as `GetBaseItemDtos`.
     List,
     /// A playlist's or box set's members: `Folder.ResolveLinkedChildren` with
     /// every field (v12.2 Folder.cs:1819-1873), or a box set's per-member
@@ -3952,8 +3954,9 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         //
         // `retrieved_by_id: true` — this is the projection of a row the caller
         // fetched by id, and C# `BaseItemRepository.RetrieveItem` unconditionally
-        // `.Include(e => e.Provider)`s (BaseItemRepository.cs:825-829) where a
-        // list query only does so for `ItemFields.ProviderIds` (:442-445). That
+        // `.Include(e => e.Provider)`s (v12.4 `BaseItemRepository.Querying.cs:569`)
+        // where a list query only does so for `ItemFields.ProviderIds`
+        // (`ApplyNavigations`, `BaseItemRepository.QueryBuilding.cs:257-260`). That
         // difference is observable: it decides whether a movie's `UserData.Key`
         // is its IMDb id or its guid.
         self.project(
@@ -4472,8 +4475,10 @@ impl FerrofinDtoService {
                 // Provider ids participate in that derivation only when the
                 // row's own query hydrated them — `.Include(e => e.Provider)`
                 // runs for `ItemFields.ProviderIds`
-                // (`BaseItemRepository.ApplyNavigations`, :442-445) and
-                // unconditionally in `RetrieveItem` (:825-829). Measured on
+                // (`ApplyNavigations`, v12.4
+                // `BaseItemRepository.QueryBuilding.cs:257-260`) and
+                // unconditionally in `RetrieveItem`
+                // (`BaseItemRepository.Querying.cs:569`). Measured on
                 // 10.11.8: the same movie's key is its guid in a plain list and
                 // `tt0111161` with `Fields=ProviderIds` or by id.
                 let hydrate_providers =

@@ -1074,13 +1074,14 @@ pub trait RemoteSearchProvider: Send + Sync {
     ///
     /// `GetMetadataProvidersInternal` sorts remote providers by the library's
     /// configured `MetadataFetcherOrder` and then `.ThenBy(GetDefaultOrder)`
-    /// (`ProviderManager.cs:459` / `:506`), where `GetDefaultOrder` is the
-    /// provider's `IHasOrder.Order` if it declares one and **50** if it does
-    /// not — "after items that want to be first (~0) but before items that
-    /// want to be last (~100)", in upstream's own words. The default here is
-    /// that same 50, so a provider that declares nothing sorts exactly where a
-    /// non-`IHasOrder` C# provider sorts. Ties keep registration order, since
-    /// `slice::sort_by_key` is stable and so is LINQ's `OrderBy`/`ThenBy`.
+    /// (in `GetOrCreateOrderedProviders`, v12.4 `ProviderManager.cs:539` /
+    /// `:630`), where `GetDefaultOrder` is the provider's `IHasOrder.Order`
+    /// if it declares one and **50** if it does not — "after items that want
+    /// to be first (~0) but before items that want to be last (~100)", in
+    /// upstream's own words. The default here is that same 50, so a provider
+    /// that declares nothing sorts exactly where a non-`IHasOrder` C# provider
+    /// sorts. Ties keep registration order, since `slice::sort_by_key` is
+    /// stable and so is LINQ's `OrderBy`/`ThenBy`.
     fn default_order(&self) -> i32 {
         50
     }
@@ -1201,11 +1202,11 @@ pub struct LocalProviderManager {
     /// from a library's `TypeOptions`. `GetMetadataProvidersInternal` falls
     /// back to `globalMetadataOptions.MetadataFetcherOrder` whenever the
     /// library saved no `TypeOptions` entry for the kind
-    /// (`ProviderManager.cs:445`), so without this an admin's server-wide
-    /// fetcher order is silently ignored. Read live, like the language and
-    /// country readers above, so a `POST /System/Configuration` applies
-    /// without a restart. Absent → an empty global array, i.e. no
-    /// server-wide ranking.
+    /// (`GetOrCreateOrderedProviders`, v12.4 `ProviderManager.cs:525`), so
+    /// without this an admin's server-wide fetcher order is silently ignored.
+    /// Read live, like the language and country readers above, so a
+    /// `POST /System/Configuration` applies without a restart. Absent → an
+    /// empty global array, i.e. no server-wide ranking.
     metadata_options: Option<Arc<dyn Fn() -> Vec<MetadataOptions> + Send + Sync>>,
 }
 
@@ -1417,8 +1418,8 @@ impl LocalProviderManager {
 
     /// Attaches `ServerConfiguration.MetadataCountryCode`, the fallback a
     /// remote search applies to a blank `SearchInfo.MetadataCountryCode`
-    /// (C# `ProviderManager.GetRemoteSearchResults`, v10.11.8
-    /// `MediaBrowser.Providers/Manager/ProviderManager.cs:841-844`). Read live
+    /// (C# `ProviderManager.GetRemoteSearchResults`, v12.4
+    /// `MediaBrowser.Providers/Manager/ProviderManager.cs:974-977`). Read live
     /// so changing the setting takes effect without a restart.
     #[must_use]
     pub fn with_metadata_country(
@@ -1452,7 +1453,7 @@ impl LocalProviderManager {
     /// Attaches a reader for the server configuration's `MetadataOptions`
     /// array, so the remote-search provider ordering can fall back to the
     /// SERVER-WIDE `MetadataFetcherOrder` for a kind the library did not
-    /// customise (`ProviderManager.cs:445`).
+    /// customise (`GetOrCreateOrderedProviders`, v12.4 `ProviderManager.cs:525`).
     ///
     /// The closure is called once per search and read live, so a
     /// `POST /System/Configuration` applies without a restart. Without it the
@@ -5227,8 +5228,8 @@ impl ProviderManager for LocalProviderManager {
         &self,
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
-        // Port of `ProviderManager.GetRemoteSearchResults` (v10.11.8
-        // `MediaBrowser.Providers/Manager/ProviderManager.cs:787-844`).
+        // Port of `ProviderManager.GetRemoteSearchResults` (v12.4
+        // `MediaBrowser.Providers/Manager/ProviderManager.cs:920-1020`).
         //
         // The reference item decides the gate: `ItemId` set → the real row and
         // ITS library's `LibraryOptions` (its "Metadata downloaders"
@@ -5252,9 +5253,9 @@ impl ProviderManager for LocalProviderManager {
             Some(entity) => short_kind(entity).to_owned(),
             None => format!("{:?}", request.item_kind),
         };
-        // `CanRefreshMetadata` (`ProviderManager.cs:462`): `includeDisabled`
-        // short-circuits to true before every other test, and a LOCKED
-        // reference item drops every non-local provider outright.
+        // `CanRefreshMetadata` (`ProviderManager.cs:571`): `includeDisabled`
+        // short-circuits to true before the locked and fetcher tests, and a
+        // LOCKED reference item drops every non-local provider outright.
         let locked = reference.as_ref().is_some_and(|e| e.is_locked);
         let global = self.global_metadata_options_for(&kind);
         let channel = reference.as_ref().and_then(channel_gate);
@@ -5284,17 +5285,18 @@ impl ProviderManager for LocalProviderManager {
             })
             .collect();
         // `.OrderBy(GetConfiguredOrder(metadataFetcherOrder, i.Name))` then
-        // `.ThenBy(GetDefaultOrder)` (`ProviderManager.cs:455-459`), where
+        // `.ThenBy(GetDefaultOrder)` (`GetOrCreateOrderedProviders`,
+        // `ProviderManager.cs:529-539`), where
         //   metadataFetcherOrder = typeOptions?.MetadataFetcherOrder
-        //                          ?? globalMetadataOptions.MetadataFetcherOrder  (:445)
+        //                          ?? globalMetadataOptions.MetadataFetcherOrder  (:525)
         // Both halves matter and both used to be missing here. The `??` fires
         // on a MISSING library `TypeOptions` entry only, which is why
         // `metadata_fetcher_order` returns an Option: a saved-but-empty order
         // list means "this library ranks nothing" and must not re-inherit the
         // server-wide one. `GetConfiguredOrder` gives an unranked provider
-        // `int.MaxValue` (:502), so it sorts after every ranked one, and the
+        // `int.MaxValue` (:627), so it sorts after every ranked one, and the
         // `GetDefaultOrder` tie-break is the provider's own `IHasOrder.Order`
-        // (50 when it declares none, :506) — NOT registration order, which is
+        // (50 when it declares none, :638) — NOT registration order, which is
         // what the bare stable sort used to substitute for it. Ties on both
         // keys still keep registration order: `sort_by_key` is stable, as
         // LINQ's `OrderBy`/`ThenBy` are.
@@ -5311,7 +5313,7 @@ impl ProviderManager for LocalProviderManager {
         });
 
         // `searchInfo.SearchInfo.MetadataLanguage`/`MetadataCountryCode` default
-        // from the SERVER configuration when blank (ProviderManager.cs:836-844)
+        // from the SERVER configuration when blank (`ProviderManager.cs:969-977`)
         // — the library's own preference is deliberately not consulted here.
         let mut request = request.clone();
         if request
@@ -5379,7 +5381,7 @@ impl ProviderManager for LocalProviderManager {
         is_new_library: bool,
     ) -> Result<ferrofin_model::configuration::LibraryOptionsResultDto, ServiceError> {
         // The server-wide `MetadataOptions` order the fetchers a new library
-        // is shown (`GetPluginSummary` reads them, `ProviderManager.cs:670`).
+        // is shown (`GetPluginSummary` reads them, v12.4 `ProviderManager.cs:672`).
         let global = self
             .metadata_options
             .as_ref()
@@ -5394,7 +5396,7 @@ impl ProviderManager for LocalProviderManager {
     }
 
     async fn get_metadata_options(&self, item_id: Uuid) -> Result<MetadataOptions, ServiceError> {
-        // `ProviderManager.GetMetadataOptions(BaseItem item)` (`:652`):
+        // `ProviderManager.GetMetadataOptions(BaseItem item)` (v12.4 `:785-786`):
         // `GetMetadataOptionsForType(item.GetType().Name) ?? new MetadataOptions()`
         // — the server-wide entry for the item's own type, and a default
         // (all-empty) one when the configuration names none. An unresolvable
@@ -6486,8 +6488,8 @@ mod tests {
     }
 
     /// Port check for `ProviderManager.GetRemoteSearchResults`
-    /// (`ProviderManager.cs:787`) → `GetMetadataProvidersInternal` →
-    /// `CanRefreshMetadata` (`:462`) → `BaseItemManager.IsMetadataFetcherEnabled`.
+    /// (v12.4 `ProviderManager.cs:920`) → `GetMetadataProvidersInternal` →
+    /// `CanRefreshMetadata` (`:571`) → `BaseItemManager.IsMetadataFetcherEnabled`.
     ///
     /// An Identify search SCOPED to an item resolves that item's library and
     /// drops every remote fetcher the library's "Metadata downloaders" list
@@ -6495,7 +6497,7 @@ mod tests {
     /// `LibraryOptions`, where nothing is unticked, so it keeps the provider —
     /// which is why the two only diverge once `ItemId` is sent.
     /// `GetMetadataProvidersInternal`'s ordering, both halves
-    /// (`ProviderManager.cs:442-459`):
+    /// (`GetOrCreateOrderedProviders`, v12.4 `ProviderManager.cs:525-539`):
     ///   metadataFetcherOrder = typeOptions?.MetadataFetcherOrder
     ///                          ?? globalMetadataOptions.MetadataFetcherOrder
     ///   .OrderBy(GetConfiguredOrder(...)).ThenBy(GetDefaultOrder)
@@ -6747,7 +6749,7 @@ mod tests {
         assert_eq!(mgr.remote_search(&unscoped).await.unwrap().len(), 1);
 
         // `IncludeDisabledProviders` short-circuits `CanRefreshMetadata`
-        // (`ProviderManager.cs:474`) before the fetcher list is consulted.
+        // (`ProviderManager.cs:583`) before the fetcher list is consulted.
         let mut forced = scoped.clone();
         forced.include_disabled_providers = true;
         assert_eq!(mgr.remote_search(&forced).await.unwrap().len(), 1);
@@ -6770,7 +6772,7 @@ mod tests {
         );
 
         // A LOCKED reference item drops every remote provider outright
-        // ("If locked only allow local providers", `ProviderManager.cs:478`).
+        // ("If locked only allow local providers", `ProviderManager.cs:588`).
         entity.is_locked = true;
         let mut locked_rows = HashMap::new();
         locked_rows.insert(artist_id, entity);
@@ -7264,7 +7266,7 @@ mod tests {
         assert_eq!(opts, MetadataOptions::default());
     }
 
-    /// `ProviderManager.GetMetadataOptions(item)` (`:652`) is
+    /// `ProviderManager.GetMetadataOptions(item)` (v12.4 `ProviderManager.cs:785-786`) is
     /// `GetMetadataOptionsForType(item.GetType().Name) ?? new MetadataOptions()`
     /// — the SERVER-WIDE entry for the item's OWN type. It used to return the
     /// default unconditionally, which made the server-wide options invisible.
@@ -9643,8 +9645,8 @@ mod tests {
     // C# `ProviderManager.GetRemoteSearchResults` resolves `ItemId` to a
     // reference item, reads THAT library's options and runs every candidate
     // fetcher through `CanRefreshMetadata` before any request goes out
-    // (v10.11.8 `MediaBrowser.Providers/Manager/ProviderManager.cs:801-830`,
-    // `:462-491`). Ferrofin used to filter on `supports(kind)` alone, so
+    // (v12.4 `MediaBrowser.Providers/Manager/ProviderManager.cs:920-967`,
+    // `:571-615`). Ferrofin used to filter on `supports(kind)` alone, so
     // clearing a library's "Metadata downloaders" checkboxes changed nothing
     // for the Identify dialog.
 
@@ -9913,7 +9915,7 @@ mod tests {
     async fn remote_search_defaults_blank_language_and_country_from_server_config() {
         // `ProviderManager.GetRemoteSearchResults` fills a blank
         // `SearchInfo.MetadataLanguage` / `MetadataCountryCode` from the SERVER
-        // configuration before dispatching (ProviderManager.cs:836-844).
+        // configuration before dispatching (v12.4 `ProviderManager.cs:969-977`).
         let provider = Arc::new(CapturingProvider {
             seen: std::sync::Mutex::new(None),
         });
