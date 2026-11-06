@@ -63,9 +63,10 @@ pub struct FerrofinDeviceManager {
     /// the same population as the persisted `Devices` table, at a few hundred
     /// bytes each — so this is not a leak that outruns the database.
     capabilities: Arc<RwLock<HashMap<String, ClientCapabilities>>>,
-    /// The shared token-resolution cache — a deleted device's token is dropped
-    /// from it and an update clears it, so a deleted/rewritten token can never
-    /// be served from cache (revocation is immediate, not TTL-bounded).
+    /// The shared token-resolution cache — a created or deleted device's token
+    /// is dropped from it and an update clears it, so a deleted/rewritten token
+    /// can never be served from cache (revocation is immediate, not
+    /// TTL-bounded).
     auth_cache: Arc<crate::auth_cache::AuthCache>,
 }
 
@@ -347,6 +348,9 @@ impl DeviceManager for FerrofinDeviceManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        // A token cached as matching nothing must resolve to this device on the
+        // next request.
+        self.auth_cache.invalidate_token(&device.access_token);
 
         sqlx::query_as::<_, DeviceEntity>(
             r#"SELECT * FROM "Devices" WHERE "AccessToken" = ?1 ORDER BY "Id" DESC LIMIT 1"#,

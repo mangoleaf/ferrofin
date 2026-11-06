@@ -8,9 +8,11 @@
 //! `revoke_user_tokens` was called.
 //!
 //! Each case signs the same user in on two devices and asserts which of the two
-//! tokens still works afterwards. The last case is the policy save's device
-//! check (Jellyfin 12.1's `DeviceAccessHost`), which signs out a device the
-//! saved policy no longer allows.
+//! tokens still works afterwards. One case is the policy save's device check
+//! (Jellyfin 12.1's `DeviceAccessHost`), which signs out a device the saved
+//! policy no longer allows. The last two cover the cache's other writers: a
+//! same-device sign-in replacing its predecessor, and an API key deleted while
+//! its resolution is cached.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -410,4 +412,75 @@ async fn a_policy_that_no_longer_allows_a_device_signs_that_device_out() {
         "the device the policy dropped is signed out"
     );
     assert_eq!(device_ids_of(&s).await, vec![DEVICE_A.to_owned()]);
+}
+
+/// Signing in again on the same device replaces that device's token: the
+/// predecessor is refused on the next request, while the user's other device
+/// keeps working.
+#[tokio::test]
+async fn a_same_device_sign_in_revokes_only_its_predecessor() {
+    let s = signed_in_twice().await;
+    let renewed = login(&s.router, USER_NAME, USER_PASSWORD, DEVICE_A).await;
+    assert_ne!(renewed, s.token_a);
+    assert_eq!(
+        me_status(&s.router, &s.token_a, DEVICE_A).await,
+        StatusCode::UNAUTHORIZED,
+        "the predecessor token is revoked"
+    );
+    assert_eq!(
+        me_status(&s.router, &renewed, DEVICE_A).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        me_status(&s.router, &s.token_b, DEVICE_B).await,
+        StatusCode::OK
+    );
+}
+
+/// An API key keeps working while it exists (the second use is a cache hit)
+/// and is refused on the first request after `DELETE /Auth/Keys/{key}`: the
+/// server's API-key manager must share the authorization context's cache.
+#[tokio::test]
+async fn deleting_an_api_key_revokes_its_cached_resolution_at_once() {
+    let s = signed_in_twice().await;
+    let admin_call = |method: &'static str, uri: &'static str| {
+        call_as(&s.router, method, uri, Some(&s.admin), ADMIN_DEVICE, None)
+    };
+    assert_eq!(
+        admin_call("POST", "/Auth/Keys?app=automation").await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (status, body) = admin_call("GET", "/Auth/Keys").await;
+    assert_eq!(status, StatusCode::OK);
+    let keys: serde_json::Value = serde_json::from_slice(&body).expect("keys json");
+    let key = keys["Items"][0]["AccessToken"]
+        .as_str()
+        .expect("key token")
+        .to_owned();
+    // `/Sessions` needs an authenticated caller even before the startup
+    // wizard completes (`/System/Info` does not).
+    let with_key = format!("/Sessions?ApiKey={key}");
+    let (status, _) = call_as(&s.router, "GET", "/Sessions", None, "automation", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "no key, no access");
+    for _ in 0..2 {
+        let (status, _) = call_as(&s.router, "GET", &with_key, None, "automation", None).await;
+        assert_eq!(status, StatusCode::OK, "the key authenticates");
+    }
+
+    let (status, _) = call_as(
+        &s.router,
+        "DELETE",
+        &format!("/Auth/Keys/{key}"),
+        Some(&s.admin),
+        ADMIN_DEVICE,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = call_as(&s.router, "GET", &with_key, None, "automation", None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a deleted key is refused at once"
+    );
 }

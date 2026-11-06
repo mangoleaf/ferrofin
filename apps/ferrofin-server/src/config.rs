@@ -688,7 +688,8 @@ pub struct Config {
     pub scan_directory_cache_idle_secs: Option<u32>,
 
     /// How long, in seconds, a resolved access token (its device, user and
-    /// policy) may be served from the auth cache. `None` = 30 s
+    /// policy, an API key's name, or the rejection of a token that matched
+    /// nothing) may be served from the auth cache. `None` = 30 s
     /// (`AUTH_CACHE_TTL`). Every change made through the server takes effect
     /// at once; this only bounds how long one made outside it, in the database
     /// itself, goes unseen. Resolved `FERROFIN_AUTH_CACHE_TTL_SECS` env >
