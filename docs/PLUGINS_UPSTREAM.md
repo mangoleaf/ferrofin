@@ -116,6 +116,13 @@ Conventions:
   season's entries depend only on its series' items, so its seasons are
   queued exactly as the whole queue has them (given the series link every
   scanned season and episode row carries).
+- **File checks** (implementation only, the behaviour is the same): upstream's
+  `VerifyQueueAsync` checks every queued file with `File.Exists` on every pass.
+  Here a season's files are checked only when the pass can act on its items:
+  some mode still to analyse, or `ReanalyzeSettledSeasons` on. Otherwise every
+  mode stops at `HasUncachedAnalysisWork` and nothing is published or
+  recorded, so which files exist changes nothing; only the debug line naming a
+  missing file is not written.
 
 ### File Transformation
 - Ferrofin files: `crates/ferrofin-extensions/src/file_transformation.rs`,
