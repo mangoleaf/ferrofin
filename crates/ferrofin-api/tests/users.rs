@@ -1634,6 +1634,67 @@ async fn delete_user_writes_a_user_deleted_activity_entry() {
     );
 }
 
+/// An [`ActivityManager`](ferrofin_traits::activity::ActivityManager) whose
+/// every write fails, as a full disk or a locked database makes it.
+struct FailingActivity;
+
+#[async_trait]
+impl ferrofin_traits::activity::ActivityManager for FailingActivity {
+    async fn get_paged_result(
+        &self,
+        _query: &ferrofin_traits::activity::ActivityLogQuery,
+    ) -> Result<QueryResult<ferrofin_model::activity::ActivityLogEntry>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn create_entry(
+        &self,
+        _entry: ferrofin_traits::activity::ActivityLogCreate,
+    ) -> Result<(), ServiceError> {
+        Err(ServiceError::backend("database is locked"))
+    }
+    async fn clean(&self, _before: chrono::DateTime<chrono::Utc>) -> Result<u64, ServiceError> {
+        Ok(0)
+    }
+}
+
+/// A failed activity write does not fail the request, but it is logged with
+/// the entry's type: the audit row is lost, and the log is the only trace.
+#[tokio::test]
+async fn a_failed_activity_write_is_logged_not_returned() {
+    let router = create_router(state_with_activity(
+        Arc::new(MemUsers::default()),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(FailingActivity),
+    ));
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish(),
+    );
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/Users/{BOB_ID}"))
+                .header("X-Emby-Token", "t")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let logged = log.take();
+    assert!(
+        logged.contains("WARN")
+            && logged.contains("UserDeleted")
+            && logged.contains("database is locked"),
+        "{logged}"
+    );
+}
+
 /// A [`PlaylistManager`](ferrofin_traits::collections::PlaylistManager) that
 /// records each `remove_playlists` call with whether the user was already
 /// deleted then; every other method is unused here.

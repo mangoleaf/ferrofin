@@ -2630,8 +2630,16 @@ pub async fn build_app_state(
                         // *before* publishing AuthenticationSucceeded, so the two
                         // rows land in that order. A spawned write always lost that
                         // race and showed the dashboard's login pair backwards.
+                        // A failed write is logged here at warn rather than returned
+                        // to the bus, which logs at error: logins set its volume.
                         Box::pin(async move {
-                            let _ = activity.create_entry(entry).await;
+                            if let Err(error) = activity.create_entry(entry).await {
+                                tracing::warn!(
+                                    %error,
+                                    activity_type = type_,
+                                    "could not write the activity entry"
+                                );
+                            }
                             Ok(())
                         })
                     }),
