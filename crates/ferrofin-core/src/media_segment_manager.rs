@@ -24,6 +24,10 @@ use crate::item_type_lookup::kind_from_type_name;
 use crate::kinds::{is_audio, is_video};
 use crate::media_segment_repository;
 
+/// A producer whose snapshot a write published to, with its snapshot from
+/// before the write.
+type PublishedSource = (Arc<dyn MediaSegmentProvider>, Vec<MediaSegmentDto>);
+
 #[derive(Default)]
 struct MutationState {
     revisions: std::collections::HashMap<Uuid, u64>,
@@ -149,17 +153,50 @@ impl FerrofinMediaSegmentManager {
         let revision = revisions.revisions.entry(item).or_default();
         *revision = revision.wrapping_add(1);
     }
+    /// Publishes `mutation` to the snapshot of the producer `provider_id`
+    /// names, when one is registered, and returns that producer with its
+    /// snapshot from before, for [`Self::restore_source`].
     async fn publish_source(
         &self,
         item: Uuid,
         provider_id: &str,
         mutation: &MediaSegmentCacheMutation,
-    ) -> Result<(), ServiceError> {
-        if let Some(provider) = self.provider(provider_id) {
-            let existing = self.provider_rows(item, provider.as_ref()).await?;
-            provider.mutate_cache(item, &existing, mutation).await?;
+    ) -> Result<Option<PublishedSource>, ServiceError> {
+        let Some(provider) = self.provider(provider_id) else {
+            return Ok(None);
+        };
+        let previous = self.publish_to(item, provider.as_ref(), mutation).await?;
+        Ok(Some((provider, previous)))
+    }
+    /// Publishes `mutation` to `provider`'s snapshot and returns the snapshot
+    /// from before it.
+    async fn publish_to(
+        &self,
+        item: Uuid,
+        provider: &dyn MediaSegmentProvider,
+        mutation: &MediaSegmentCacheMutation,
+    ) -> Result<Vec<MediaSegmentDto>, ServiceError> {
+        let existing = self.provider_rows(item, provider).await?;
+        let previous = provider.cached_segments(item, &existing).await?;
+        provider.mutate_cache(item, &existing, mutation).await?;
+        Ok(previous)
+    }
+    /// Returns `written`, the served-row write that followed a publication.
+    /// When it failed, first puts back the producer's snapshot from before
+    /// the publication, so the producer does not report a write its rows
+    /// never took (gl-1356); a restore that fails too is logged.
+    async fn restore_source<T>(
+        item: Uuid,
+        source: Option<PublishedSource>,
+        written: Result<T, ServiceError>,
+    ) -> Result<T, ServiceError> {
+        if written.is_err()
+            && let Some((provider, previous)) = source
+            && let Err(restore_error) = provider.cache_segments(item, &previous).await
+        {
+            tracing::warn!(item_id = %item, provider = provider.name(), %restore_error, "could not restore the producer snapshot after its served rows failed to change");
         }
-        Ok(())
+        written
     }
     fn loaded_provider(
         &self,
@@ -535,18 +572,21 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
             })
             .collect();
         let mut revisions = self.mutations.lock().await;
-        self.publish_source(
-            item,
-            identifier,
-            &MediaSegmentCacheMutation::Replace {
-                type_filter,
-                segments: segments.clone(),
-            },
-        )
-        .await?;
+        let source = self
+            .publish_source(
+                item,
+                identifier,
+                &MediaSegmentCacheMutation::Replace {
+                    type_filter,
+                    segments: segments.clone(),
+                },
+            )
+            .await?;
         Self::changed(&mut revisions, item);
-        self.replace_provider_namespaces(item, identifier, type_filter, &segments)
-            .await
+        let written = self
+            .replace_provider_namespaces(item, identifier, type_filter, &segments)
+            .await;
+        Self::restore_source(item, source, written).await
     }
     async fn replace_loaded_producer_segments(
         &self,
@@ -576,11 +616,10 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
             })
             .collect();
         let mut revisions = self.mutations.lock().await;
-        let existing = self.provider_rows(item, provider.as_ref()).await?;
-        provider
-            .mutate_cache(
+        let previous = self
+            .publish_to(
                 item,
-                &existing,
+                provider.as_ref(),
                 &MediaSegmentCacheMutation::Replace {
                     type_filter: None,
                     segments: segments.clone(),
@@ -588,7 +627,7 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
             )
             .await?;
         Self::changed(&mut revisions, item);
-        media_segment_repository::replace_rows(
+        let written = media_segment_repository::replace_rows(
             &self.db,
             item,
             &Self::namespaces(provider.as_ref()),
@@ -596,7 +635,8 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
             &provider_id,
             &segments,
         )
-        .await?;
+        .await;
+        Self::restore_source(item, Some((provider.clone(), previous)), written).await?;
         self.register_segment_provider(provider);
         Ok(())
     }
@@ -622,23 +662,24 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
                 segments: vec![segment.clone()],
             }
         };
+        let item = segment.item_id;
         let mut revisions = self.mutations.lock().await;
-        self.publish_source(segment.item_id, identifier, &mutation)
-            .await?;
-        Self::changed(&mut revisions, segment.item_id);
-        if segment.type_ == MediaSegmentType::Commercial {
-            return self
-                .create_stored(&segment, &self.provider_id(identifier))
-                .await;
-        }
-        self.replace_provider_namespaces(
-            segment.item_id,
-            identifier,
-            Some(segment.type_),
-            std::slice::from_ref(&segment),
-        )
-        .await?;
-        Ok(segment)
+        let source = self.publish_source(item, identifier, &mutation).await?;
+        Self::changed(&mut revisions, item);
+        let written = if segment.type_ == MediaSegmentType::Commercial {
+            self.create_stored(&segment, &self.provider_id(identifier))
+                .await
+        } else {
+            self.replace_provider_namespaces(
+                item,
+                identifier,
+                Some(segment.type_),
+                std::slice::from_ref(&segment),
+            )
+            .await
+            .map(|()| segment)
+        };
+        Self::restore_source(item, source, written).await
     }
     async fn delete_producer_segment(
         &self,
@@ -667,18 +708,10 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
                 segments: Vec::new(),
             }
         };
-        let previous_source = self.get_producer_segments(item, identifier).await?;
-        self.publish_source(item, identifier, &mutation).await?;
+        let source = self.publish_source(item, identifier, &mutation).await?;
         Self::changed(&mut revisions, item);
-        if let Err(error) = self.delete_stored(segment_id).await {
-            if let Some(provider) = self.provider(identifier)
-                && let Err(restore_error) = provider.cache_segments(item, &previous_source).await
-            {
-                tracing::warn!(item_id=%item, provider=provider.name(), %restore_error, "could not restore producer timestamp after served-row deletion failed");
-            }
-            return Err(error);
-        }
-        Ok(())
+        let written = self.delete_stored(segment_id).await.map(drop);
+        Self::restore_source(item, source, written).await
     }
     async fn delete_all_producer_segments(
         &self,
@@ -1032,6 +1065,14 @@ mod tests {
                 pause.1.notified().await;
             }
             Ok(output)
+        }
+        async fn cache_segments(
+            &self,
+            _item: Uuid,
+            segments: &[MediaSegmentDto],
+        ) -> Result<(), ferrofin_traits::error::ServiceError> {
+            *self.output.lock().unwrap() = segments.to_vec();
+            Ok(())
         }
         async fn cached_segments(
             &self,
@@ -1584,6 +1625,104 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "bulk producer erase reaches cache-only output after its served rows are gone"
+        );
+    }
+
+    /// A producer write whose served rows fail after its snapshot was
+    /// published puts the previous snapshot back, as a deletion does, so the
+    /// producer does not report a write the rows never took (gl-1356).
+    #[tokio::test]
+    async fn a_producer_write_whose_rows_fail_restores_the_previous_snapshot() {
+        use std::sync::{Arc, Mutex};
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Episode).await;
+        let manager = FerrofinMediaSegmentManager::new(db.clone(), library_manager_over(db));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let producer = provider("Producer", 0, 0, &events);
+        manager.register_segment_provider(producer.clone());
+        manager
+            .create_producer_segment(
+                &segment(item, MediaSegmentType::Intro, 0, 100),
+                "legacy:Producer",
+            )
+            .await
+            .unwrap();
+        // Another provider's row: reusing its id makes the producer's row write fail.
+        let taken = manager
+            .create_segment(&segment(item, MediaSegmentType::Outro, 900, 1000), "other")
+            .await
+            .unwrap();
+        let clash = MediaSegmentDto {
+            id: taken.id,
+            ..segment(item, MediaSegmentType::Intro, 10, 110)
+        };
+        let snapshot = manager
+            .get_producer_segments(item, "legacy:Producer")
+            .await
+            .unwrap();
+        let rows = manager.get_segments(item, None, false).await.unwrap();
+        let snapshot_now = || async {
+            manager
+                .get_producer_segments(item, "legacy:Producer")
+                .await
+                .unwrap()
+        };
+
+        assert!(
+            manager
+                .replace_producer_segments(
+                    item,
+                    "legacy:Producer",
+                    None,
+                    std::slice::from_ref(&clash)
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(snapshot_now().await, snapshot, "replace_producer_segments");
+        assert!(
+            manager
+                .create_producer_segment(&clash, "legacy:Producer")
+                .await
+                .is_err()
+        );
+        assert_eq!(snapshot_now().await, snapshot, "create_producer_segment");
+        // A commercial is appended and stored by its own insert.
+        let commercial = MediaSegmentDto {
+            type_: MediaSegmentType::Commercial,
+            ..clash.clone()
+        };
+        assert!(
+            manager
+                .create_producer_segment(&commercial, "legacy:Producer")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            snapshot_now().await,
+            snapshot,
+            "create_producer_segment, a commercial"
+        );
+        assert!(
+            manager
+                .replace_loaded_producer_segments(
+                    item,
+                    producer.clone(),
+                    std::slice::from_ref(&clash)
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            snapshot_now().await,
+            snapshot,
+            "replace_loaded_producer_segments"
+        );
+        assert_eq!(
+            manager.get_segments(item, None, false).await.unwrap(),
+            rows,
+            "the served rows keep the old set"
         );
     }
 
