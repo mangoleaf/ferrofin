@@ -250,6 +250,10 @@ impl ScheduledTask for CleanActivityLogTask {
 // Clean Cache Directory
 // ---------------------------------------------------------------------------
 
+/// How long a cache file outlives its last write before "Clean Cache
+/// Directory" deletes it (C# `DateTime.UtcNow.AddDays(-30)`).
+pub(crate) const CACHE_FILE_MAX_AGE: std::time::Duration = std::time::Duration::from_hours(30 * 24);
+
 /// "Clean Cache Directory" — deletes cache files no longer needed by the
 /// system. Port of `DeleteCacheFileTask`: cache files older than 30 days, temp
 /// files ([`ServerApplicationPaths::temp_path`], `{cache}/temp`) older than 1
@@ -299,7 +303,7 @@ impl ScheduledTask for DeleteCacheFileTask {
         let progress = progress.clone();
         let deleted = run_sweep(move || {
             let now = SystemTime::now();
-            let month_old = now - std::time::Duration::from_hours(30 * 24);
+            let month_old = now - CACHE_FILE_MAX_AGE;
             let day_old = now - std::time::Duration::from_hours(24);
             // The temp subtree gets the shorter retention; exclude it from the
             // 30-day cache pass so its files are judged by the 1-day cutoff.
