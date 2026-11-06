@@ -1312,6 +1312,7 @@ name = "ferrofin-common"
 version = "0.4.1"
 dependencies = [
  "pbkdf2",
+ "rand 0.10.3",
  "regex",
  "rstest",
  "sha1 0.11.0",
