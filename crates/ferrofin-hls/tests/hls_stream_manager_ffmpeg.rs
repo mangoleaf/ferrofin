@@ -271,6 +271,15 @@ impl StreamStatePlanner for FfmpegPlanner {
             is_hdr10_plus_removed: false,
         })
     }
+
+    async fn hls_output(
+        &self,
+        _request: &HlsStreamRequest,
+        _is_audio: bool,
+    ) -> Result<(PathBuf, String), ServiceError> {
+        let seg_ext = if self.fmp4 { "mp4" } else { "ts" };
+        Ok((self.dir.join("out.m3u8"), seg_ext.to_owned()))
+    }
 }
 
 /// The concrete manager type this test composes (real transcoder + real registry).
