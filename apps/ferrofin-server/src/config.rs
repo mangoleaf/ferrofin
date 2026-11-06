@@ -173,6 +173,7 @@ struct FileConfig {
     admin_password: Option<String>,
     db_pool: Option<DbPoolFileValue>,
     db_statement_cache: Option<u32>,
+    item_values_write_chunk: Option<u32>,
     enable_metrics: Option<bool>,
     disable_extensions: Option<bool>,
     detect_network_change: Option<bool>,
@@ -580,6 +581,16 @@ pub struct Config {
     /// `FERROFIN_DB_STATEMENT_CACHE` env > `db_statement_cache` in
     /// `config.toml` > default; must be within [`STATEMENT_CACHE_RANGE`].
     pub db_statement_cache: Option<u32>,
+
+    /// How many items' genre, studio, tag and artist links (`ItemValues`) one
+    /// database transaction rewrites when an edit saves many items at once (a
+    /// lock over a folder's descendants, a series' tags onto its episodes).
+    /// Smaller holds the single writer for shorter stretches; `1` writes each
+    /// item's links in a transaction of its own. Resolved `FERROFIN_ITEM_VALUES_WRITE_CHUNK` env >
+    /// `item_values_write_chunk` in `config.toml` >
+    /// [`ferrofin_core::library_manager::DEFAULT_ITEM_VALUES_WRITE_CHUNK`],
+    /// clamped to [`ITEM_VALUES_WRITE_CHUNK_RANGE`] with a warning.
+    pub item_values_write_chunk: u32,
 
     /// Bootstrap override for the metrics endpoint toggle. `Some(true)`/`Some(false)`
     /// force it on/off regardless of the persisted `ServerConfiguration.EnableMetrics`;
@@ -1151,6 +1162,15 @@ impl Config {
 
         let db_pool = resolve_db_pool(env, file.db_pool)?;
         let db_statement_cache = resolve_statement_cache(env, file.db_statement_cache)?;
+        let item_values_write_chunk = resolve_clamped(
+            env,
+            "FERROFIN_ITEM_VALUES_WRITE_CHUNK",
+            "item_values_write_chunk",
+            file.item_values_write_chunk,
+            ferrofin_core::library_manager::DEFAULT_ITEM_VALUES_WRITE_CHUNK,
+            ITEM_VALUES_WRITE_CHUNK_RANGE,
+            "items",
+        );
 
         let mut config = Self {
             data_dir,
@@ -1214,6 +1234,7 @@ impl Config {
             admin_password,
             db_pool,
             db_statement_cache,
+            item_values_write_chunk,
             enable_metrics: parse_bool_var(env, "FERROFIN_ENABLE_METRICS").or(file.enable_metrics),
             disable_extensions: parse_bool_var(env, "FERROFIN_DISABLE_EXTENSIONS")
                 .or(file.disable_extensions)
@@ -1672,6 +1693,8 @@ impl Config {
             admin_password: String::new(),
             db_pool: None,
             db_statement_cache: None,
+            item_values_write_chunk:
+                ferrofin_core::library_manager::DEFAULT_ITEM_VALUES_WRITE_CHUNK,
             enable_metrics: None,
             disable_extensions: false,
             detect_network_change: true,
@@ -1765,6 +1788,12 @@ pub const SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE: RangeInclusive<u32> = 30..=3_600
 /// The events the playback-metrics write queue holds
 /// (`playback_metrics_queue`).
 pub const PLAYBACK_METRICS_QUEUE_RANGE: RangeInclusive<u32> = 64..=65_536;
+
+/// The items whose `ItemValues` one writer transaction of a batched item save
+/// rewrites (`item_values_write_chunk`; owner decision, gl-1320): from 1, a
+/// transaction per item's links, to 5000, about 2.5 s of writer hold at the debug
+/// build's measured 0.5 ms per item, well inside the 30 s other writers wait.
+pub const ITEM_VALUES_WRITE_CHUNK_RANGE: RangeInclusive<u32> = 1..=5_000;
 
 /// The seconds between process-metric samples (`metrics_sample_interval`).
 pub const METRICS_SAMPLE_INTERVAL_RANGE: RangeInclusive<u32> = 1..=300;
@@ -3733,6 +3762,46 @@ mod tests {
         assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
     }
 
+    /// gl-1320: the item-values write chunk defaults to the library
+    /// manager's 500, the file sets it, the variable beats the file, and a
+    /// value outside 1 to 5000 is clamped with a warning naming the setting.
+    #[test]
+    fn item_values_write_chunk_defaults_env_beats_file_and_clamps() {
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(unset.item_values_write_chunk, 500);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "item_values_write_chunk = 50\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(cfg.item_values_write_chunk, 50);
+
+        let env = FakeEnv::new().with("FERROFIN_ITEM_VALUES_WRITE_CHUNK", "1");
+        assert_eq!(
+            Config::load_from(cli.clone(), &env)
+                .unwrap()
+                .item_values_write_chunk,
+            1
+        );
+
+        for (value, clamped) in [("0", 1), ("5001", 5_000)] {
+            let env = FakeEnv::new().with("FERROFIN_ITEM_VALUES_WRITE_CHUNK", value);
+            let cfg = Config::load_from(cli.clone(), &env).unwrap();
+            assert_eq!(cfg.item_values_write_chunk, clamped, "{value}");
+            assert_eq!(cfg.load_warnings.len(), 1, "{:?}", cfg.load_warnings);
+            assert!(
+                cfg.load_warnings[0].contains("FERROFIN_ITEM_VALUES_WRITE_CHUNK"),
+                "{:?}",
+                cfg.load_warnings
+            );
+        }
+    }
+
     #[test]
     fn db_pool_file_accepts_auto_and_rejects_garbage() {
         let dir = tempfile::tempdir().unwrap();
@@ -4434,6 +4503,11 @@ row_cache_ttl_secs = 10
                 "playback_metrics_queue",
                 count(ferrofin_core::playback_metrics::DEFAULT_QUEUE_DEPTH),
                 PLAYBACK_METRICS_QUEUE_RANGE,
+            ),
+            (
+                "item_values_write_chunk",
+                ferrofin_core::library_manager::DEFAULT_ITEM_VALUES_WRITE_CHUNK,
+                ITEM_VALUES_WRITE_CHUNK_RANGE,
             ),
             (
                 "shutdown_timeout_secs",

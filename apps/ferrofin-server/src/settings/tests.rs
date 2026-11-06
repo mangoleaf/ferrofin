@@ -358,6 +358,7 @@ const TABS: &[(Group, &[&str])] = &[
         &[
             "db_pool",
             "db_statement_cache",
+            "item_values_write_chunk",
             "auth_cache_ttl_secs",
             "row_cache_ttl_secs",
             "max_transcodes",
@@ -1181,6 +1182,15 @@ fn the_statement_cache_row_shows_the_database_default() {
     assert_eq!(
         spec("db_statement_cache").default,
         ferrofin_db::DEFAULT_STATEMENT_CACHE_CAPACITY.to_string()
+    );
+}
+
+/// The item-values write chunk row shows the library manager's default.
+#[test]
+fn the_item_values_write_chunk_row_shows_the_library_default() {
+    assert_eq!(
+        spec("item_values_write_chunk").default,
+        ferrofin_core::library_manager::DEFAULT_ITEM_VALUES_WRITE_CHUNK.to_string()
     );
 }
 

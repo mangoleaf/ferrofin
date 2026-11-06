@@ -963,6 +963,21 @@ pub static SETTINGS: &[SettingSpec] = &[
         ..ROW
     },
     SettingSpec {
+        key: "item_values_write_chunk",
+        env: Some("FERROFIN_ITEM_VALUES_WRITE_CHUNK"),
+        env_read: PARSED_U32,
+        label: "Item link write batch",
+        group: Group::Performance,
+        kind: whole_numbers(config::ITEM_VALUES_WRITE_CHUNK_RANGE),
+        unit: Some(Unit::Items),
+        default: "500",
+        description: "Items whose genre, studio, tag and artist links one database transaction \
+                      rewrites when an edit saves many at once; smaller holds the database \
+                      writer for shorter stretches.",
+        running: |c| json!(c.item_values_write_chunk),
+        ..ROW
+    },
+    SettingSpec {
         key: "auth_cache_ttl_secs",
         env: Some("FERROFIN_AUTH_CACHE_TTL_SECS"),
         env_read: EnvRead::NonBlank,

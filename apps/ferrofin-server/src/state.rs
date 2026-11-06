@@ -1749,7 +1749,9 @@ pub async fn build_app_state(
         .with_app_paths(Arc::clone(&paths))
         // Every delete removes the deleted rows' metadata folders and
         // extracted data first.
-        .with_item_data_cleanup(Arc::clone(&item_data_cleanup)),
+        .with_item_data_cleanup(Arc::clone(&item_data_cleanup))
+        // How many items' links one transaction of a batched save rewrites.
+        .with_item_values_write_chunk(config.item_values_write_chunk as usize),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // Marking a series, season, box set or folder played marks the items

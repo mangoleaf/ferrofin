@@ -70,9 +70,10 @@ const PLACEHOLDER_ITEM_ID: Uuid = Uuid::from_u128(1);
 /// [`FerrofinLibraryManager::update_items`] rewrites, unless the composition
 /// root sets another ([`FerrofinLibraryManager::with_item_values_write_chunk`]).
 /// Upstream's `UpdateItemsAsync` writes a whole batch in one transaction
-/// (`UpdateOrInsertItems`), but its metadata-edit cascades save item by item,
-/// which `1` reproduces; the chunk bounds how long a large cascade (a lock
-/// over every descendant of a folder) holds the single writer.
+/// (`UpdateOrInsertItems`), but its metadata-edit cascades save item by item;
+/// `1` writes each item's links in its own transaction as those saves do. The
+/// chunk bounds how long a large cascade (a lock over every descendant of a
+/// folder) holds the single writer.
 pub const DEFAULT_ITEM_VALUES_WRITE_CHUNK: u32 = 500;
 
 /// The concrete library manager.

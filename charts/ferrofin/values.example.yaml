@@ -199,6 +199,11 @@ ferrofin:
     # Each connection of the pool keeps its own, so a larger value costs memory
     # on every connection: 150 held 6-13 MiB more than 100 on an 8-core server.
     # FERROFIN_DB_STATEMENT_CACHE: "150"
+    # Items whose genre, studio, tag and artist links one database transaction
+    # rewrites when a metadata edit saves many at once (1-5000, default 500). A
+    # smaller value holds the database writer for shorter stretches; "1" writes
+    # each item's links on their own, as Jellyfin's per-item saves do.
+    # FERROFIN_ITEM_VALUES_WRITE_CHUNK: "500"
     # How many videos generate trickplay images at once, each one's widths in
     # turn (default: auto, up to the image-encoding limit, one per CPU). Each
     # generation is an ffmpeg process, and with hardware acceleration holds GPU
