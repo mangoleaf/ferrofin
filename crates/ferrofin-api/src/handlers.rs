@@ -1814,8 +1814,12 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetSessions",
         ferrofin: "handlers/session.rs get_sessions (items.rs effective_user_id) → \
                ferrofin-core session_manager.rs get_sessions (shared_device_control_for, \
-               retain_accessible_session_devices, to_dto → session_info_to_dto) \
-               (SessionManager.GetSessions, ToSessionInfoDto); the NowPlayingItem it shows is \
+               retain_accessible_session_devices → device_manager.rs can_access_devices, \
+               to_dto → session_info_to_dto) (SessionManager.GetSessions, CanAccessDevice, \
+               ToSessionInfoDto), the users' permissions and EnabledDevices read from the policy \
+               cache (user_entity_ext.rs cached_permission, cached_preference; the User \
+               upstream holds) and a controllableByUserId naming the caller answered from the \
+               caller's row; the NowPlayingItem it shows is \
                the item on_playback_start and on_playback_progress name (kept_now_playing_item, \
                NowPlayingItem::new on the report's row; UpdateNowPlayingItem), built by the \
                first listing and then copied (shown_now_playing_item → now_playing_item → \
@@ -1836,7 +1840,7 @@ pub const VERIFIED: &[Verified] = &[
                LastPlaybackCheckIn is DateTime.MinValue until update_now_playing stamps it \
                (SessionInfo.LastPlaybackCheckIn, UpdateNowPlayingItem) and \
                NowPlayingQueueFullItems is never sent (v12.4's SessionInfoDto has none)",
-        date: "2026-11-04",
+        date: "2026-11-05",
         divergences: SESSIONS_DIVERGENCES,
         refs: &[],
     },

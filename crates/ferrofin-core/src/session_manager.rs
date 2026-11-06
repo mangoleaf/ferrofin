@@ -94,7 +94,7 @@ use ferrofin_traits::session::{
 use ferrofin_traits::session_bus::SessionMessageBus;
 
 use crate::db_error::db_err;
-use crate::user_entity_ext::has_permission;
+use crate::user_entity_ext::{cached_permission, has_permission};
 
 /// How long a user's `LastActivityDate` stands before session activity
 /// stamps it again (`SessionManager.cs:265`, `TotalSeconds > 60`). Upstream
@@ -1516,14 +1516,23 @@ impl FerrofinSessionManager {
 
     /// The filter belongs to the requested user, which may differ from an
     /// administrator/API-key caller. A missing user yields no cast targets.
-    async fn shared_device_control_for(&self, id: Uuid) -> Result<Option<bool>, ServiceError> {
-        let Some(user) = self.user_manager.get_user_by_id(id).await? else {
-            return Ok(None);
+    /// `known` is that user's row when the caller already read it.
+    async fn shared_device_control_for(
+        &self,
+        id: Uuid,
+        known: Option<&UserEntity>,
+    ) -> Result<Option<bool>, ServiceError> {
+        let stored_id = match known {
+            Some(user) => user.id.clone(),
+            None => match self.user_manager.get_user_by_id(id).await? {
+                Some(user) => user.id,
+                None => return Ok(None),
+            },
         };
         Ok(Some(
-            has_permission(
-                self.db.pool(),
-                &user.id,
+            cached_permission(
+                &self.db,
+                &stored_id,
                 PermissionKind::EnableSharedDeviceControl,
             )
             .await?,
@@ -2259,8 +2268,8 @@ impl SessionManager for FerrofinSessionManager {
             return Ok(());
         }
         if let Some(user) = self.user_manager.get_user_by_id(controller.user_id).await?
-            && has_permission(
-                self.db.pool(),
+            && cached_permission(
+                &self.db,
                 &user.id,
                 PermissionKind::EnableRemoteControlOfOtherUsers,
             )
@@ -2420,19 +2429,21 @@ impl SessionManager for FerrofinSessionManager {
         };
         let (user_can_control_others, user_is_admin) = match &caller {
             Some(user) => (
-                has_permission(
-                    self.db.pool(),
+                cached_permission(
+                    &self.db,
                     &user.id,
                     PermissionKind::EnableRemoteControlOfOtherUsers,
                 )
                 .await?,
-                has_permission(self.db.pool(), &user.id, PermissionKind::IsAdministrator).await?,
+                cached_permission(&self.db, &user.id, PermissionKind::IsAdministrator).await?,
             ),
             None => (is_api_key, is_api_key),
         };
         let controllable_user_to_check = controllable_user_to_check.filter(|id| !id.is_nil());
         let shared_device_control = if let Some(id) = controllable_user_to_check {
-            let Some(allowed) = self.shared_device_control_for(id).await? else {
+            // A client asks for its own cast targets: the caller's row is the one to read.
+            let caller_named = caller.as_ref().filter(|_| id == user_id);
+            let Some(allowed) = self.shared_device_control_for(id, caller_named).await? else {
                 return Ok(Vec::new());
             };
             allowed
