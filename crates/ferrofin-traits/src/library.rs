@@ -2161,6 +2161,27 @@ pub trait UserDataManager: Send + Sync {
         self.get_user_data_dtos(&ids, user_id).await
     }
 
+    /// [`Self::get_user_data_dtos_for_rows`] with the provider ids hydrated
+    /// (`include_provider_ids: true`) from `providers`, the `BaseItemProviders`
+    /// rows the caller has already read for the page: each item's
+    /// `(ProviderId, ProviderValue)` pairs in the order the table returned
+    /// them. The DTO service reads them for `ProviderIds`/`ExternalUrls`
+    /// anyway, so the page reads the table once.
+    ///
+    /// The map may hold items whose kind keys no user data by provider; they
+    /// are ignored as the derivation ignores them. The default reads the rows
+    /// again through the hydrating form, so fakes and impls that have not
+    /// overridden it answer as before.
+    async fn get_user_data_dtos_for_rows_with_providers(
+        &self,
+        items: &[BaseItemEntity],
+        user_id: Uuid,
+        providers: &std::collections::HashMap<Uuid, Vec<(String, String)>>,
+    ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        let _ = providers;
+        self.get_user_data_dtos_for_rows(items, user_id, true).await
+    }
+
     /// Sets — or clears, when `likes` is `None` — a user's like flag for an item,
     /// returning the refreshed data DTO.
     ///
