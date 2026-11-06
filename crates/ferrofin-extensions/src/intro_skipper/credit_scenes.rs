@@ -1209,7 +1209,7 @@ mod tests {
             ..IntroSkipperConfig::default()
         };
         configure(&mut config);
-        let queued = task.queue(&config).await.expect("queue");
+        let queued = task.queue(&config, None).await.expect("queue");
         let entry = QueuedEpisode {
             duration: credits_start + 1800.0,
             credits_fingerprint_start: credits_start,
@@ -1568,7 +1568,7 @@ mod tests {
             }
             let parsed: IntroSkipperConfig = serde_json::from_str(config).expect("config");
             let window_start =
-                task.queue(&parsed).await.expect("queue")[0].1[1].credits_fingerprint_start;
+                task.queue(&parsed, None).await.expect("queue")[0].1[1].credits_fingerprint_start;
             (scanned, credits, window_start)
         };
         // A failed scan stores nothing and stops nothing; the user's credits

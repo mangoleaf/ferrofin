@@ -92,7 +92,13 @@ Conventions:
     publishing what detection stored, as upstream's scan runs it.
   - **Support bundle:** the version line also names Ferrofin's; the ffmpeg
     checks run when the bundle is asked for (upstream: at start); the bundle
-    names the Chromaprint backend.
+    names the Chromaprint backend. The queue counts come from the last
+    whole-library queue (the scheduled pass, Clean Intro Skipper Cache, Clear
+    excluded). An automatic analysis or a season rescan queues only its
+    seasons (below), so a bundle asked for after one builds the whole queue
+    once, without ffprobe, and counts it then; upstream counts every
+    analysis's queue, so the two differ only when the library changed after
+    the last automatic analysis.
   - **Task keys:** the detection task was `IntroSkipper.Detect` before D6; the
     task manager adopts what was saved under that key.
 - **Memory** (implementation only, the behaviour is the same): upstream
@@ -102,7 +108,14 @@ Conventions:
   place each item in its library, then library by library to queue it. The
   items, their libraries and their order are the same, so the queue is the
   same. Rows that tie on all four sort keys keep whatever order SQLite's plan
-  gives them; neither the snapshot nor the whole list promises one.
+  gives them; neither the snapshot nor the whole list promises one. An
+  automatic analysis or a season rescan, which upstream gives the whole queue
+  and then filters to its seasons, reads only those seasons' series and
+  movies (each episode's ancestors hold its series) and probes only the items
+  it analyses: the ids it reads keep the whole snapshot's order, and a
+  season's entries depend only on its series' items, so its seasons are
+  queued exactly as the whole queue has them (given the series link every
+  scanned season and episode row carries).
 
 ### File Transformation
 - Ferrofin files: `crates/ferrofin-extensions/src/file_transformation.rs`,

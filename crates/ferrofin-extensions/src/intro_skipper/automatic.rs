@@ -43,10 +43,13 @@ pub struct Runtime {
     automatic: Mutex<Automatic>,
     /// `WarningManager`'s flags (`PluginWarning`).
     warnings: AtomicU8,
-    /// `TotalQueued` / `TotalSeasons`: the last queue's analysable entries
-    /// and seasons.
+    /// `TotalQueued` / `TotalSeasons`: the last whole queue's analysable
+    /// entries and seasons.
     pub(super) queued: AtomicUsize,
     pub(super) seasons: AtomicUsize,
+    /// A queue for some seasons only was built since `queued`/`seasons` were
+    /// counted: the support bundle counts the whole queue again.
+    pub(super) counts_stale: AtomicBool,
     /// The parsed configuration (`Plugin.Configuration`), read once and again
     /// after each save. A tokio lock held across the read, so a save landing
     /// mid-read still ends with the cache empty, never stale.
@@ -280,12 +283,8 @@ impl DetectSegmentsTask {
         // `AnalyzeItemsAsync(seasonsToAnalyze)`: an empty set is nothing to do.
         if !seasons.is_empty() {
             let config = self.load_config().await;
-            match self.queue(&config).await {
+            match self.queue(&config, Some(&seasons)).await {
                 Ok(queue) => {
-                    let queue: queue::Queue = queue
-                        .into_iter()
-                        .filter(|(season, _)| seasons.contains(season))
-                        .collect();
                     self.analyze_queue(&queue, &config, &TaskProgress::default())
                         .await;
                 }
@@ -370,6 +369,70 @@ mod tests {
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
         assert!(queued(&h.task).0.is_empty());
         assert!(!h.task.running.load(Ordering::SeqCst));
+    }
+
+    /// gl-1272: the automatic run queues only the changed seasons' series, so
+    /// another series' episode is not probed (`ProbeAudioDuration` on). The
+    /// support bundle then counts the whole library itself, without ffprobe.
+    #[tokio::test]
+    async fn an_automatic_run_probes_only_the_changed_seasons() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let h = harness(&TWO_EPISODES, true, r#"{"ProbeAudioDuration":true}"#, true).await;
+        let media = h
+            .task
+            .virtual_folders
+            .get_virtual_folders()
+            .await
+            .expect("folders")[0]
+            .locations[0]
+            .clone();
+        let guid = |n: u128| ferrofin_db::store::guid_to_db(Uuid::from_u128(n));
+        h.persistence
+            .save_items(&[ferrofin_db::entities::base_items::BaseItemEntity {
+                id: guid(0xB1),
+                type_: ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Episode)
+                    .expect("type")
+                    .to_owned(),
+                path: Some(format!("{media}/other/s01e01.mkv")),
+                run_time_ticks: Some(1_800 * 10_000_000),
+                season_id: Some(guid(0xB2)),
+                series_id: Some(guid(0xB3)),
+                series_name: Some("Other".to_owned()),
+                parent_index_number: Some(1),
+                index_number: Some(1),
+                ..Default::default()
+            }])
+            .await
+            .expect("another series");
+        let ffmpeg = Arc::new(crate::ffmpeg::FakeFfmpeg::default());
+        let task = DetectSegmentsTask {
+            ffmpeg: Arc::clone(&ffmpeg) as Arc<dyn crate::ffmpeg::FfmpegService>,
+            ..h.task.clone()
+        };
+        task.runtime
+            .automatic
+            .lock()
+            .expect("lock")
+            .seasons
+            .insert(SEASON);
+
+        task.run_automatic().await;
+
+        assert!(task.runtime.counts_stale.load(Ordering::Relaxed));
+        let probed = ffmpeg.take_probes();
+        assert_eq!(probed.len(), 2, "{probed:?}");
+        assert!(probed.iter().all(|path| !path.contains("/other/")));
+        let bundle = IntroSkipperAnalysis::support_bundle(&task).await;
+        assert!(
+            bundle.starts_with("* Queue contents: 3 episodes, 2 seasons\n"),
+            "{bundle}"
+        );
+        assert_eq!(
+            ffmpeg.take_probes(),
+            Vec::<String>::new(),
+            "the recount probes nothing"
+        );
+        assert!(!task.runtime.counts_stale.load(Ordering::Relaxed));
     }
 
     /// `OnSettingsChanged` → `AnalyzeAgain`: the next pass analyses what the

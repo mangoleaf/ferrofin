@@ -84,17 +84,31 @@ pub(crate) mod tests {
     /// throughout; over this fake it fails instead. Every other method,
     /// defaulted ones included, forwards to the real repository: a method
     /// added to [`ItemRepository`] must be forwarded here too, or tests over
-    /// this fake run its default body instead of the real one.
-    pub(crate) struct OnePageAtATime(pub(crate) Arc<dyn ItemRepository>);
+    /// this fake run its default body instead of the real one. The ids of
+    /// the rows its list reads return are logged, in order.
+    pub(crate) struct OnePageAtATime(
+        pub(crate) Arc<dyn ItemRepository>,
+        pub(crate) std::sync::Mutex<Vec<String>>,
+    );
 
-    fn one_page(rows: Vec<BaseItemEntity>) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        if rows.len() > PAGE {
-            return Err(ServiceError::backend(format!(
-                "{} rows in one read: page the walk",
-                rows.len()
-            )));
+    impl OnePageAtATime {
+        /// Over `items`, nothing read yet.
+        pub(crate) fn new(items: Arc<dyn ItemRepository>) -> Self {
+            Self(items, std::sync::Mutex::default())
         }
-        Ok(rows)
+
+        fn one_page(&self, rows: Vec<BaseItemEntity>) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            if rows.len() > PAGE {
+                return Err(ServiceError::backend(format!(
+                    "{} rows in one read: page the walk",
+                    rows.len()
+                )));
+            }
+            if let Ok(mut read) = self.1.lock() {
+                read.extend(rows.iter().map(|row| row.id.clone()));
+            }
+            Ok(rows)
+        }
     }
 
     #[async_trait]
@@ -103,7 +117,7 @@ pub(crate) mod tests {
             self.0.retrieve_item(id).await
         }
         async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
-            one_page(self.0.retrieve_items(ids).await?)
+            self.one_page(self.0.retrieve_items(ids).await?)
         }
         async fn visible_library_ids(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
             self.0.visible_library_ids(user).await
@@ -133,7 +147,7 @@ pub(crate) mod tests {
             &self,
             filter: &InternalItemsQuery,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-            one_page(self.0.get_item_list(filter).await?)
+            self.one_page(self.0.get_item_list(filter).await?)
         }
         async fn get_latest_item_list(
             &self,
