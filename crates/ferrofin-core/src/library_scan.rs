@@ -56,7 +56,7 @@ use ferrofin_providers::metadata_merge::{
 };
 use ferrofin_providers::{
     EpisodeLocalImageProvider, FsDirectoryService, ImageItem, ImageItemKind, LocalImageProvider,
-    RemoteImage, TmdbClient, TmdbDetails, TmdbKind,
+    RemoteImage, TmdbClient, TmdbDetails, TmdbImage, TmdbKind,
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::filesystem::FileSystem;
@@ -157,6 +157,16 @@ struct ArtworkCache {
     /// long as the plugin keeps the episode record it came from
     /// ([`tvdb_cache`]).
     episode_tvdb_still: ProviderCache<String, String>,
+    /// The item the walk refreshes after the current one, when it is a new
+    /// episode whose image pass runs the remote providers. Set by the walk
+    /// before each item, taken by the current episode's image pass
+    /// ([`LibraryScanner::prefetch_next_episode_images`]).
+    next_episode: Option<NextEpisode>,
+    /// The next episode's TMDB `/images` request, started by the current
+    /// episode's image pass so it runs while that pass downloads its stills,
+    /// with the failed requests it counted. Only the pass asking exactly this
+    /// request takes it ([`episode_images`]).
+    episode_images: Option<(EpisodeImagesKey, EarlyEpisodeImages)>,
     /// Item id → the external ids the metadata match yielded, so the image pass
     /// can key fanart off them (movies: `Tmdb`/`Imdb`) within the same scan,
     /// seeded with the ids previous scans recorded. A planned series' are
@@ -223,6 +233,22 @@ enum SeasonLookup {
 /// The key [`ArtworkCache::season_details`] keeps a season under: the series
 /// item id, the season number and the TMDB language.
 type SeasonKey = (String, i32, Option<String>);
+
+/// One TMDB `/tv/{id}/season/{n}/episode/{m}/images` request: the series'
+/// TMDB id, the season and episode numbers and the TMDB language.
+type EpisodeImagesKey = (i64, i32, i32, Option<String>);
+
+/// An episode `/images` request started early: its answer and the failed
+/// requests it counted ([`ArtworkCache::episode_images`]).
+type EarlyEpisodeImages = AbortOnDrop<(Vec<TmdbImage>, u32)>;
+
+/// The walk's next item, as [`ArtworkCache::next_episode`] keeps it.
+struct NextEpisode {
+    /// Its planned row.
+    entity: BaseItemEntity,
+    /// Which remote images its refresh fetches (never `None`).
+    fetch: ImageFetch,
+}
 
 /// How long a TMDB response is kept after it was fetched
 /// ([`ferrofin_providers::tmdb::CACHE_DURATION`]).
@@ -699,6 +725,33 @@ fn series_tmdb_id_of(cache: &ArtworkCache, series_id: &str) -> Option<i64> {
                 .ok()
         })
         .or_else(|| recorded_provider_id(cache, series_id, "Tmdb"))
+}
+
+/// TMDB's `/images` list for one episode: the answer the previous episode's
+/// image pass started early when it is for exactly this request
+/// ([`ArtworkCache::episode_images`]), else asked now. The early request's
+/// failures count into this item's refresh, as if it had asked itself.
+async fn episode_images(
+    tmdb: &TmdbClient,
+    cache: &mut ArtworkCache,
+    key: &EpisodeImagesKey,
+) -> Vec<TmdbImage> {
+    if cache
+        .episode_images
+        .as_ref()
+        .is_some_and(|(started, _)| started == key)
+        && let Some((_, mut task)) = cache.episode_images.take()
+        // A task that did not finish (aborted or panicked) is asked again.
+        && let Ok((images, failures)) = (&mut task.0).await
+    {
+        for _ in 0..failures {
+            ferrofin_providers::rate_limit::note_request_failure();
+        }
+        return images;
+    }
+    let (series, season, episode, language) = key;
+    tmdb.episode_images(*series, *season, *episode, language.as_deref())
+        .await
 }
 
 /// Whether the scan keeps `item`'s recorded provider ids for its whole walk:
@@ -6999,6 +7052,8 @@ impl LibraryScanner {
                 crate::refresh_plan::full_refresh(&plan, &request)
                     || self.music_fetch(kind, &plan, policy, locked).any()
             });
+            art_cache.next_episode =
+                self.next_episode_for_images(&planned, scanned + 1, &stored_rows, &refresh);
             let pass = ItemPass {
                 index: scanned,
                 item,
@@ -7594,6 +7649,9 @@ impl LibraryScanner {
             .season_details
             .retain(|(series, _, _), _| !keys.contains(series));
         cache.episode_tvdb_still.retain(|id, _| !keys.contains(id));
+        // An episode request started early was keyed by the ids before it.
+        cache.next_episode = None;
+        cache.episode_images = None;
         cache.omdb_poster.retain(|id, _| !keys.contains(id));
         cache.season_names.retain(|id, _| !keys.contains(id));
         cache.series_names.retain(|id, _| !keys.contains(id));
@@ -14631,6 +14689,101 @@ impl LibraryScanner {
         }
     }
 
+    /// The walk's item at `index`, when it is a new episode whose refresh runs
+    /// the remote image providers: the one whose TMDB `/images` request the
+    /// current episode's image pass may start early
+    /// ([`prefetch_next_episode_images`](Self::prefetch_next_episode_images)).
+    /// A stored episode is left out: its row, not the plan, carries what
+    /// that request is built from.
+    fn next_episode_for_images(
+        &self,
+        planned: &[Planned],
+        index: usize,
+        stored_rows: &StoredRows,
+        refresh: &RefreshContext<'_>,
+    ) -> Option<NextEpisode> {
+        self.tmdb.as_ref()?;
+        let item = planned.get(index)?;
+        if item.entity.type_.rsplit('.').next() != Some("Episode")
+            || refresh.superseded.contains(&index)
+            || !matches!(stored_rows.get(item.id), Stored::New)
+        {
+            return None;
+        }
+        let fetch = stored_rows.plan(index)?.remote_images;
+        (fetch != ImageFetch::None).then(|| NextEpisode {
+            entity: item.entity.to_entity(),
+            fetch,
+        })
+    }
+
+    /// Starts the walk's next episode's TMDB `/images` request
+    /// ([`ArtworkCache::next_episode`]) through the same client, and so the
+    /// same rate limiter, so it runs while this episode downloads its stills
+    /// instead of after. `key` is this episode's request.
+    ///
+    /// Only when that episode's own pass will ask exactly that request: it is
+    /// in the same series and folder with the same locale of its own, so it
+    /// resolves this language under this library's fetchers, and no local
+    /// still fills its Primary, which would skip its remote step. Its pass
+    /// takes the answer only on an exact match ([`episode_images`]).
+    // shortcut: an NFO that renumbers the next episode or gives it a
+    // language, or an embedded or plugin image ranked before TheMovieDb that
+    // fills its Primary, wastes the one request started early; predicting
+    // those needs that episode's refresh.
+    fn prefetch_next_episode_images(
+        &self,
+        entity: &BaseItemEntity,
+        key: &EpisodeImagesKey,
+        cache: &mut ArtworkCache,
+    ) {
+        let Some(NextEpisode {
+            entity: next,
+            fetch,
+        }) = cache.next_episode.take()
+        else {
+            return;
+        };
+        let own = |row: &BaseItemEntity| {
+            (
+                own_language(row.preferred_metadata_language.as_deref()),
+                own_language(row.preferred_metadata_country_code.as_deref()),
+            )
+        };
+        if next.series_id != entity.series_id
+            || next.parent_id != entity.parent_id
+            || own(&next) != own(entity)
+        {
+            return;
+        }
+        let (Some(season), Some(episode), Some(tmdb)) = (
+            next.parent_index_number.and_then(|n| i32::try_from(n).ok()),
+            next.index_number.and_then(|n| i32::try_from(n).ok()),
+            self.tmdb.clone(),
+        ) else {
+            return;
+        };
+        if fetch != ImageFetch::All
+            && cache
+                .discover_local_images(&next)
+                .iter()
+                .any(|image| image.image_type == ImageType::Primary)
+        {
+            return;
+        }
+        let (series, language) = (key.0, key.3.clone());
+        let task = tokio::spawn(tracing::Instrument::in_current_span(async move {
+            ferrofin_providers::rate_limit::count_request_failures(tmdb.episode_images(
+                series,
+                season,
+                episode,
+                language.as_deref(),
+            ))
+            .await
+        }));
+        cache.episode_images = Some(((series, season, episode, key.3.clone()), AbortOnDrop(task)));
+    }
+
     /// The selected season and episode image providers use complete image
     /// listings, preserving candidate dimensions for the acquisition policy.
     // The pass's inputs, each used once; a struct would only rename them.
@@ -14685,9 +14838,11 @@ impl LibraryScanner {
                 entity.index_number.and_then(|n| i32::try_from(n).ok()),
             ) {
                 (Some(series), Some(season), Some(episode)) => {
+                    let key = (series, season, episode, language.clone());
+                    let images = episode_images(tmdb, cache, &key).await;
+                    self.prefetch_next_episode_images(entity, &key, cache);
                     ferrofin_providers::tmdb::ordered_download_images(
-                        tmdb.episode_images(series, season, episode, language.as_deref())
-                            .await,
+                        images,
                         language.as_deref().unwrap_or("en"),
                     )
                 }
@@ -24175,6 +24330,8 @@ mod trickplay;
 
 #[cfg(test)]
 mod directory_cache_tests;
+#[cfg(test)]
+mod episode_images_tests;
 #[cfg(test)]
 mod person_image_tests;
 #[cfg(test)]
