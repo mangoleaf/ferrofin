@@ -1209,9 +1209,10 @@ mod tests {
     fn paged_service(db: &Database) -> MergeVersionsService {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
-        let items: Arc<dyn ItemRepository> = Arc::new(crate::library_pages::tests::OnePageAtATime(
-            Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
-        ));
+        let items: Arc<dyn ItemRepository> =
+            Arc::new(crate::library_pages::tests::OnePageAtATime::new(Arc::new(
+                FerrofinItemRepository::new(db.clone(), lookup),
+            )));
         let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
         let library = Arc::new(FerrofinLibraryManager::new(
             items.clone(),
