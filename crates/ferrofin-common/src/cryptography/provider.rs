@@ -178,7 +178,11 @@ impl CryptoProvider for CryptographyProvider {
 }
 
 /// Length-checked constant-time byte comparison (mirrors `SequenceEqual`).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+///
+/// Unequal lengths return `false` at once, so only the contents of
+/// equal-length inputs are compared in constant time.
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -200,6 +204,17 @@ mod tests {
             let _ = write!(s, "{b:02x}");
             s
         })
+    }
+
+    #[rstest::rstest]
+    #[case::equal(b"abc", b"abc", true)]
+    #[case::last_byte(b"abc", b"abd", false)]
+    #[case::shorter(b"ab", b"abc", false)]
+    #[case::longer(b"abcd", b"abc", false)]
+    #[case::both_empty(b"", b"", true)]
+    #[case::one_empty(b"", b"a", false)]
+    fn constant_time_eq_is_plain_equality(#[case] a: &[u8], #[case] b: &[u8], #[case] equal: bool) {
+        assert_eq!(constant_time_eq(a, b), equal);
     }
 
     // RFC 6070 known-answer vectors for PBKDF2-HMAC-SHA1 (dkLen=20). These lock
