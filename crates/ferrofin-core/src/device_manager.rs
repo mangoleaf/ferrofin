@@ -12,13 +12,8 @@
 //! - The `DeviceOptionsUpdated` event is dropped (event wiring is out of scope).
 //! - `GetDeviceOptions` returns the [`DeviceOptionsEntity`] row (the trait's
 //!   documented stopgap pending a ported `DeviceOptionsDto`).
-//!
-//! One divergence (owner decision on gl-1267, 2026-11-05):
-//! [`DeviceManager::forget_capabilities`] drops the capabilities of devices
-//! with no `Devices` row whose idle sessions the session manager ended.
-//! Upstream never prunes `_capabilitiesMap`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -50,10 +45,10 @@ pub struct FerrofinDeviceManager {
     /// Transient per-device reported capabilities (device id → capabilities),
     /// mirroring the C# `_capabilitiesMap` `ConcurrentDictionary`.
     ///
-    /// `delete_device` keeps the entry, matching upstream (C# `DeleteDevice`
-    /// drops the device from `_devices`, never from `_capabilitiesMap`),
-    /// because two behaviours still read this map after the `Devices` row is
-    /// gone:
+    /// Entries are **never removed**, including by `delete_device` —
+    /// deliberately, matching upstream (C# `DeleteDevice` drops the device from
+    /// `_devices`, never from `_capabilitiesMap`), because two behaviours still
+    /// read this map after the `Devices` row is gone:
     /// - [`Self::access_allows`] lets a restricted user reach a device that
     ///   reported `SupportsPersistentIdentifier: false`. Forgetting the entry
     ///   falls back to the default (`true`, as C# `new ClientCapabilities()`)
@@ -65,17 +60,9 @@ pub struct FerrofinDeviceManager {
     ///   `/Sessions/Capabilities/Full`.
     ///
     /// The key is the request's `DeviceId` header, which needs no `Devices`
-    /// row, so nothing bounds the map by itself: a client may send a new id on
-    /// every request. Upstream never prunes it; here the session manager's
-    /// idle sweep removes the entry of a session it ended
-    /// ([`DeviceManager::forget_capabilities`]) when no `Devices` row and no
-    /// other session has that id (gl-1267). An entry whose session ended any
-    /// other way stays, as upstream, so the map still grows by one per fresh
-    /// `DeviceId` on two paths (gl-1376): an API key's socket, which has no
-    /// `Devices` row, closing; and a signed-in device whose row a logout, a
-    /// device deletion or a token revocation removes
-    /// ([`DeviceManager::delete_device`]), whether its session ends then or
-    /// a closed socket or the sweep already ended it while the row stood.
+    /// row, so the map grows by one entry per device id that ever reported
+    /// capabilities until the server restarts, as upstream's does (the owner
+    /// kept upstream's unpruned map, gl-1267, 2026-11-06).
     capabilities: Arc<RwLock<HashMap<String, ClientCapabilities>>>,
     /// The shared token-resolution cache — cleared on every device mutation so
     /// a deleted/rewritten token can never be served from cache (revocation is
@@ -400,29 +387,6 @@ impl DeviceManager for FerrofinDeviceManager {
             Some(id) => self.capabilities_for(id),
             None => ClientCapabilities::default(),
         })
-    }
-
-    async fn forget_capabilities(&self, device_ids: &[String]) -> Result<(), ServiceError> {
-        if device_ids.is_empty() {
-            return Ok(());
-        }
-        let registered: HashSet<String> = self
-            .query_devices(&DeviceQuery::default())
-            .await?
-            .items
-            .into_iter()
-            .map(|device| device.device_id)
-            .collect();
-        let mut capabilities = self
-            .capabilities
-            .write()
-            .expect("capabilities lock poisoned");
-        for device_id in device_ids {
-            if !registered.contains(device_id) {
-                capabilities.remove(device_id);
-            }
-        }
-        Ok(())
     }
 
     async fn get_device(&self, id: &str) -> Result<Option<DeviceInfoDto>, ServiceError> {

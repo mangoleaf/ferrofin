@@ -2491,9 +2491,8 @@ async fn the_sessions_live_stream_follows_the_reports() {
 /// `OnSessionStarted` → `ReportCapabilities(info, _deviceManager.GetCapabilities
 /// (deviceId), saveCapabilities: false)`. This is what makes ending a session on
 /// socket close safe: the client stays remote-controllable without having to
-/// re-post `/Sessions/Capabilities/Full`, and it is why ending a session keeps
-/// the device manager's capabilities entry (only the idle sweep drops one no
-/// `Devices` row and no other session uses: `idle_eviction`).
+/// re-post `/Sessions/Capabilities/Full`, and it is why ending a session, the
+/// idle sweep's included, keeps the device manager's capabilities entry.
 #[tokio::test]
 async fn a_recreated_session_inherits_the_devices_capabilities() {
     use ferrofin_traits::session::SessionEvent;
@@ -4634,7 +4633,7 @@ mod device_reads;
 mod now_playing_item;
 
 /// The idle-session sweep: socketless sessions that play nothing end after
-/// the idle window, and their unused capabilities go.
+/// the idle window, and their devices' capabilities stay.
 mod idle_eviction;
 
 /// The session's play state, queue, transcoding info and now-viewing item.

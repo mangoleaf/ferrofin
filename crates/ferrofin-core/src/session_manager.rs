@@ -46,12 +46,11 @@
 //!   [`FerrofinSessionManager::evict_idle_sessions`], which the one-minute loop
 //!   runs: a session with no live socket, nothing playing and no request for
 //!   longer than the `session_idle_hours` setting ends through the
-//!   socket-close path, and the capabilities of its device are forgotten when
-//!   no `Devices` row and no other session has its id. Upstream keeps a
-//!   socketless session until the server restarts (`/Sessions` filters the
-//!   stale ones by `activeWithinSeconds`, and `_capabilitiesMap` is never
-//!   pruned), so a client that sends a new `DeviceId` on every run grew the
-//!   pool, and the device manager's capabilities map, without bound.
+//!   socket-close path. Upstream keeps a socketless session until the server
+//!   restarts (`/Sessions` filters the stale ones by `activeWithinSeconds`),
+//!   so a client that sends a new `DeviceId` on every run grew the pool
+//!   without bound. The device manager's capabilities map stays unpruned, as
+//!   upstream's `_capabilitiesMap` (owner decision, 2026-11-06).
 //! - **Exceptions → `Result<_, ServiceError>`**: `SecurityException` /
 //!   `AuthenticationException` → [`ServiceError::Unauthorized`]; a missing
 //!   session / user → [`ServiceError::NotFound`]; bad arguments →
@@ -756,10 +755,9 @@ impl FerrofinSessionManager {
     /// Ends every session that has no live socket, plays nothing and made no
     /// request for longer than `window` before `now`, through the path a
     /// closed socket takes ([`SessionManager::close_if_needed`]: `SessionEnded`
-    /// and its activity-log entry). Then forgets the capabilities of each
-    /// ended session's device that no remaining session uses and no `Devices`
-    /// row has ([`DeviceManager::forget_capabilities`]). Ferrofin only:
-    /// upstream never ends a socketless session (see the module docs).
+    /// and its activity-log entry). The device's capabilities are kept, so a
+    /// returning client's new session inherits them. Ferrofin only: upstream
+    /// never ends a socketless session (see the module docs).
     pub async fn evict_idle_sessions(&self, window: chrono::TimeDelta, now: DateTime<Utc>) {
         let is_idle = |s: &SessionInfo| {
             s.now_playing_item_id.is_none()
@@ -774,23 +772,19 @@ impl FerrofinSessionManager {
                 .map(|(key, _)| key.clone())
                 .collect()
         };
-        if candidates.is_empty() {
-            return;
-        }
-        let mut ended_devices = Vec::new();
         for key in candidates {
             // Checked again just before it ends, since ending each earlier
             // one awaits its `SessionEnded` consumers: a request or a socket
             // since the snapshot keeps the session. This narrows the race
             // with a returning client to the close itself, which only makes
             // its next request start the session again.
-            let Some((session_id, device_id)) = self
+            let Some(session_id) = self
                 .sessions
                 .lock()
                 .await
                 .get(&key)
                 .filter(|s| is_idle(s))
-                .map(|s| (s.id.clone(), s.device_id.clone()))
+                .map(|s| s.id.clone())
             else {
                 continue;
             };
@@ -798,26 +792,6 @@ impl FerrofinSessionManager {
             if let Err(err) = self.close_if_needed(&session_id).await {
                 warn!(session_id, %err, "error ending an idle session");
             }
-            ended_devices.push(device_id);
-        }
-        // Not atomic with the forget below: a client returning to one of these
-        // devices meanwhile keeps its own copy of the capabilities, and the
-        // entry comes back with its next report. A failed forget is not
-        // retried; the entries stay until a restart, as upstream keeps them.
-        let unused: Vec<String> = {
-            let sessions = self.sessions.lock().await;
-            let in_use: std::collections::HashSet<&str> =
-                sessions.values().map(|s| s.device_id.as_str()).collect();
-            let mut unused: Vec<String> = ended_devices
-                .into_iter()
-                .filter(|device_id| !in_use.contains(device_id.as_str()))
-                .collect();
-            unused.sort_unstable();
-            unused.dedup();
-            unused
-        };
-        if let Err(err) = self.device_manager.forget_capabilities(&unused).await {
-            warn!(%err, devices = unused.len(), "could not forget idle devices' capabilities");
         }
     }
 

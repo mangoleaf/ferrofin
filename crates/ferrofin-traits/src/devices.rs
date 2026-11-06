@@ -70,12 +70,6 @@ pub trait DeviceManager: Send + Sync {
         device_id: Option<&str>,
     ) -> Result<ClientCapabilities, ServiceError>;
 
-    /// Forgets the recorded capabilities of each of `device_ids` that no
-    /// `Devices` row has. Ferrofin only: upstream never forgets them, and the
-    /// session manager calls this for the devices of the idle sessions it
-    /// ended that no other session uses.
-    async fn forget_capabilities(&self, device_ids: &[String]) -> Result<(), ServiceError>;
-
     /// Gets the device info DTO for a device id, or `None`.
     async fn get_device(&self, id: &str) -> Result<Option<DeviceInfoDto>, ServiceError>;
 
