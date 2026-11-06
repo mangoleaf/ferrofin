@@ -62,6 +62,45 @@ struct FolderChildRow {
     linked: bool,
 }
 
+/// A row of [`QueryShape::EpisodeOrder`], which
+/// [`ItemRepository::get_episode_order_rows`] hands back as a
+/// [`BaseItemEntity`] with every other column at its default.
+#[derive(sqlx::FromRow)]
+#[sqlx(rename_all = "PascalCase")]
+struct EpisodeOrderRow {
+    id: String,
+    #[sqlx(rename = "Type")]
+    type_: String,
+    parent_id: Option<String>,
+    season_id: Option<String>,
+    channel_id: Option<String>,
+    path: Option<String>,
+    index_number: Option<i64>,
+    parent_index_number: Option<i64>,
+    premiere_date: Option<DateTime<Utc>>,
+    presentation_unique_key: Option<String>,
+    data: Option<String>,
+}
+
+impl From<EpisodeOrderRow> for BaseItemEntity {
+    fn from(row: EpisodeOrderRow) -> Self {
+        Self {
+            id: row.id,
+            type_: row.type_,
+            parent_id: row.parent_id,
+            season_id: row.season_id,
+            channel_id: row.channel_id,
+            path: row.path,
+            index_number: row.index_number,
+            parent_index_number: row.parent_index_number,
+            premiere_date: row.premiere_date,
+            presentation_unique_key: row.presentation_unique_key,
+            data: row.data,
+            ..Self::default()
+        }
+    }
+}
+
 /// The concrete item repository.
 ///
 /// Holds a cheaply-cloneable [`Database`] handle plus the shared
@@ -1456,8 +1495,8 @@ impl FerrofinItemRepository {
             .resolve_views_with_parent(filter, parent.as_ref())
             .await?;
         let filter = resolved.as_ref().unwrap_or(filter);
-        // The window is whole rows whatever the shape: every caller asks for
-        // `FullRows`, the one shape this function's row type can carry.
+        // The window is whole rows whatever the shape: a `FullRows` caller
+        // needs them, and an `EpisodeOrder` caller reads a subset of them.
         if let Some(window) = self.adjacent_ids_resolved(filter).await? {
             return Ok(sql_page(self.rows_in_order(&window).await?, filter));
         }
@@ -1517,11 +1556,20 @@ impl FerrofinItemRepository {
         shape: QueryShape,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         let mut qb = build_query(filter, shape);
-        let rows = qb
-            .build_query_as::<BaseItemEntity>()
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
+        let rows = if shape == QueryShape::EpisodeOrder {
+            qb.build_query_as::<EpisodeOrderRow>()
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?
+                .into_iter()
+                .map(BaseItemEntity::from)
+                .collect()
+        } else {
+            qb.build_query_as::<BaseItemEntity>()
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?
+        };
         Ok(self.mapped_rows(rows))
     }
 
@@ -3793,6 +3841,18 @@ impl ItemRepository for FerrofinItemRepository {
         let prepared = grouped_by_metadata_key(filter);
         self.fetch_rows(prepared.as_ref().unwrap_or(filter), QueryShape::FullRows)
             .await
+    }
+
+    async fn get_episode_order_rows(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let prepared = grouped_by_metadata_key(filter);
+        self.fetch_rows(
+            prepared.as_ref().unwrap_or(filter),
+            QueryShape::EpisodeOrder,
+        )
+        .await
     }
 
     async fn get_folder_children(

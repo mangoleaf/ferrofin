@@ -139,7 +139,23 @@ pub enum QueryShape {
     /// Select `bi."Type", COUNT(*)` grouped by type — the per-type counts in one
     /// query, without materializing every matching row. No `ORDER BY` / paging.
     TypeCounts,
+    /// Select the columns of [`EPISODE_ORDER_SELECT`]: the rows and order of
+    /// [`QueryShape::FullRows`], with only the columns a season's episode
+    /// filter and the aired-order sort read.
+    EpisodeOrder,
 }
+
+/// The [`QueryShape::EpisodeOrder`] projection: what `FilterEpisodesBySeason`
+/// and `AiredEpisodeOrderComparer` read of an episode or season row. `Data` is
+/// read only for its `Airs*` members, so a blob that spells no `"Airs` key
+/// literally is left out: both parsers read all three as absent from it,
+/// valid or not. (A key written with a `\u` escape would be missed; no
+/// writer, serde_json or System.Text.Json, escapes a letter.)
+const EPISODE_ORDER_SELECT: &str = r#"SELECT bi."Id", bi."Type", bi."ParentId", bi."SeasonId",
+    bi."ChannelId", bi."Path", bi."IndexNumber", bi."ParentIndexNumber", bi."PremiereDate",
+    bi."PresentationUniqueKey",
+    CASE WHEN instr(bi."Data", '"Airs') > 0 THEN bi."Data" END AS "Data"
+    FROM "BaseItems" AS bi WHERE "#;
 
 /// Whether this query collapses merged versions into one row — C#
 /// `BaseItemRepository.EnableGroupByPresentationUniqueKey`.
@@ -245,8 +261,9 @@ pub(crate) fn build_folder_children_query(
 ///
 /// The returned [`QueryBuilder`] is ready to `.build_query_as()` /
 /// `.build_query_scalar()`. Ordering and paging are appended for
-/// [`QueryShape::FullRows`], [`QueryShape::IdsOnly`] and
-/// [`QueryShape::IdAndCleanName`]; the count shapes stop after the `WHERE`
+/// [`QueryShape::FullRows`], [`QueryShape::IdsOnly`],
+/// [`QueryShape::IdAndCleanName`] and [`QueryShape::EpisodeOrder`]; the count
+/// shapes stop after the `WHERE`
 /// clause.
 #[must_use]
 pub fn build_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryBuilder<Sqlite> {
@@ -271,6 +288,7 @@ pub fn build_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryBuild
             r#"SELECT COUNT(*) FROM "BaseItems" AS bi WHERE "#
         }
         QueryShape::TypeCounts => r#"SELECT bi."Type", COUNT(*) FROM "BaseItems" AS bi WHERE "#,
+        QueryShape::EpisodeOrder => EPISODE_ORDER_SELECT,
     };
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(projection);
 
@@ -293,7 +311,10 @@ pub fn build_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryBuild
         QueryShape::TypeCounts => {
             qb.push(r#" GROUP BY bi."Type""#);
         }
-        QueryShape::FullRows | QueryShape::IdsOnly | QueryShape::IdAndCleanName => {
+        QueryShape::FullRows
+        | QueryShape::IdsOnly
+        | QueryShape::IdAndCleanName
+        | QueryShape::EpisodeOrder => {
             append_order_by(&mut qb, filter);
             append_paging(&mut qb, filter);
         }
@@ -1751,6 +1772,7 @@ fn build_box_set_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryB
             r#"SELECT bi."Id", bi."CleanName" FROM "BaseItems" bi WHERE "#
         }
         QueryShape::GroupedCount => r#"SELECT COUNT(*) FROM "BaseItems" bi WHERE "#,
+        QueryShape::EpisodeOrder => EPISODE_ORDER_SELECT,
         QueryShape::Count | QueryShape::TypeCounts => unreachable!("raw count shapes do not group"),
     });
     qb.push(r#"bi."Id" IN (SELECT "Id" FROM collapsed_ids)"#);
