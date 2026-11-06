@@ -945,3 +945,91 @@ async fn task_progress_is_throttled_and_transitions_are_forced() {
     assert_eq!(tasks.progress.receiver_count(), 0, "unsubscribed");
     assert_eq!(tasks.transitions.receiver_count(), 0);
 }
+
+/// A task manager whose one task is named after the UI culture it is listed
+/// in, so a frame shows which culture the socket built it under.
+struct CultureTasks {
+    transitions: broadcast::Sender<Vec<TaskInfo>>,
+    progress: broadcast::Sender<()>,
+}
+
+fn culture_named_task() -> Vec<TaskInfo> {
+    vec![TaskInfo {
+        name: ferrofin_util::current_culture::ambient_ui_culture(),
+        ..TaskInfo::default()
+    }]
+}
+
+#[async_trait::async_trait]
+impl TaskManager for CultureTasks {
+    fn subscribe_task_updates(&self) -> Option<TaskSubscription> {
+        Some(TaskSubscription {
+            snapshot: culture_named_task(),
+            updates: self.transitions.subscribe(),
+            progress: self.progress.subscribe(),
+        })
+    }
+    fn localize_tasks(&self, _tasks: Vec<TaskInfo>) -> Vec<TaskInfo> {
+        culture_named_task()
+    }
+    async fn get_tasks(&self) -> Result<Vec<TaskInfo>, ServiceError> {
+        Ok(culture_named_task())
+    }
+    async fn get_task(&self, _task_id: &str) -> Result<Option<TaskInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn start_task(&self, _task_id: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn cancel_task(&self, _task_id: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_triggers(
+        &self,
+        _task_id: &str,
+        _triggers: &[TaskTriggerInfo],
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// The socket keeps its upgrade request's UI culture for every frame it
+/// builds, as upstream's `BasePeriodicWebSocketListener` applies the
+/// connection's request culture (`ApplyRequestCulture`) before each
+/// `GetDataToSend`: the subscribe snapshot, and a transition snapshot another
+/// run published, which the task manager re-localizes in the socket's culture.
+#[tokio::test]
+async fn the_task_stream_answers_in_the_upgrade_requests_culture() {
+    let tasks = Arc::new(CultureTasks {
+        transitions: broadcast::channel(8).0,
+        progress: broadcast::channel(8).0,
+    });
+    let state = ferrofin_api::test_support::fake_state_with_streams(
+        Arc::new(TokenAuth { admin: true }),
+        Arc::new(ferrofin_api::test_support::FakeConfig),
+        StreamingSessions::new(Vec::new()),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::clone(&tasks) as Arc<dyn TaskManager>,
+    )
+    .with_request_culture("de")
+    .expect("a valid culture");
+    let mut socket = connect(state).await;
+    socket
+        .send(Message::text(
+            r#"{"MessageType":"ScheduledTasksInfoStart","Data":"0,1500"}"#,
+        ))
+        .await
+        .expect("subscribe");
+    let snapshot = next_json(&mut socket).await;
+    assert_eq!(snapshot["Data"][0]["Name"], "de", "{snapshot}");
+
+    tasks
+        .transitions
+        .send(vec![TaskInfo {
+            name: Some("published in another culture".to_owned()),
+            ..TaskInfo::default()
+        }])
+        .expect("a subscribed socket");
+    let transition = next_json(&mut socket).await;
+    assert_eq!(transition["Data"][0]["Name"], "de", "{transition}");
+}

@@ -10,6 +10,7 @@ description = "Pure Chromaprint fingerprint comparison for intro/credits detecti
 workspace = true
 
 [dependencies]
+indexmap.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
