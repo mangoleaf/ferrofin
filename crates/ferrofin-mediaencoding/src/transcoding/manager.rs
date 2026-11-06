@@ -903,14 +903,21 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// Runs the progress pump and due throttle timers until the manager drops.
     ///
     /// A weak reference prevents this composition task from retaining all jobs
-    /// after server shutdown.
+    /// after server shutdown. A tick that panics is logged and ends alone
+    /// (`survive_panic`): the next tick runs as usual.
     pub async fn run_transcode_controls(manager: std::sync::Weak<Self>) {
+        let mut failing = false;
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let Some(manager) = manager.upgrade() else {
                 return;
             };
-            manager.update_transcoding_jobs().await;
+            survive_panic(
+                "transcode_controls",
+                &mut failing,
+                manager.update_transcoding_jobs(),
+            )
+            .await;
         }
     }
 
@@ -1521,10 +1528,16 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 
     /// Runs [`Self::reap_idle_jobs`] forever, sweeping every `interval`. The
     /// composition root spawns this once next to the manager.
+    ///
+    /// A sweep that panics is logged and ends alone (`survive_panic`): the
+    /// jobs it had not reached are still registered, so the next sweep reaps
+    /// them. The job it was tearing down is already out of the registry and
+    /// is not retried.
     pub async fn run_idle_reaper(self: std::sync::Arc<Self>, interval: Duration) {
+        let mut failing = false;
         loop {
             tokio::time::sleep(interval).await;
-            self.reap_idle_jobs().await;
+            survive_panic("transcode_idle_reaper", &mut failing, self.reap_idle_jobs()).await;
         }
     }
 
@@ -1679,6 +1692,35 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             })
             .and_then(|j| j.running.as_ref())
             .map(f)
+    }
+}
+
+/// Runs one pass of the singleton loop `task`, so that a panic ends the pass
+/// and not the loop, whose next tick is the retry (LOGGING.md §7).
+///
+/// `failing` carries the loop's streak: the first panic logs at `error`, the
+/// ones straight after it at `debug` (a poisoned lock would otherwise repeat
+/// it every tick, beside the panic hook's own line), and the first pass to
+/// finish after them at `info`.
+async fn survive_panic(task: &'static str, failing: &mut bool, pass: impl Future) {
+    match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(pass)).await {
+        Ok(_) => {
+            if std::mem::take(failing) {
+                tracing::info!(task, "transcode loop recovered: a pass finished again");
+            }
+        }
+        Err(payload) => {
+            let panic = ferrofin_util::panic::message(payload.as_ref());
+            if std::mem::replace(failing, true) {
+                tracing::debug!(task, panic, "transcode loop pass panicked again");
+            } else {
+                tracing::error!(
+                    task,
+                    panic,
+                    "transcode loop pass panicked; the loop goes on at its next tick"
+                );
+            }
+        }
     }
 }
 
@@ -2256,6 +2298,109 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    /// A reporter whose first `panics` teardowns panic, as a fault part-way
+    /// through a sweep would, and which records the paths of the rest.
+    #[derive(Default)]
+    struct FaultyReporter {
+        panics: std::sync::atomic::AtomicUsize,
+        killed: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl SessionReporter for FaultyReporter {
+        async fn report_started(
+            &self,
+            _job: &TranscodingJobHandle,
+            _info: ferrofin_model::session::TranscodingInfo,
+        ) {
+        }
+        async fn on_job_failed_to_start(&self, _job: &TranscodingJobHandle) {}
+        async fn report_progress(
+            &self,
+            _job: &TranscodingJobHandle,
+            _progress: TranscodingProgress,
+        ) {
+        }
+        async fn on_job_killed(
+            &self,
+            job: &TranscodingJobHandle,
+            _delete_files: bool,
+            _close_live_stream: bool,
+        ) {
+            use std::sync::atomic::Ordering;
+            if self
+                .panics
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                panic!("teardown of {} failed", job.path);
+            }
+            self.killed.lock().unwrap().push(job.path.clone());
+        }
+    }
+
+    /// A sweep that panics ends that sweep only: the reaper logs it with its
+    /// `task` and sweeps again at the next tick, reaping the jobs the panic cut
+    /// it off from. A second panic in a row is not logged above `debug`, and
+    /// the first sweep to finish after them says so at `info`.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_sweep_is_logged_and_the_reaper_sweeps_again_next_tick() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let reporter = Arc::new(FaultyReporter {
+            panics: 2.into(),
+            ..FaultyReporter::default()
+        });
+        let m = Arc::new(TranscodeManagerImpl::new(Arc::clone(&reporter)));
+        for (session, path) in [
+            ("s1", "/t/a.m3u8"),
+            ("s2", "/t/b.m3u8"),
+            ("s3", "/t/c.m3u8"),
+        ] {
+            m.register_job(handle(session, path, TranscodingJobType::Hls, "dev1"));
+        }
+        for job in m.jobs.lock().unwrap().iter_mut() {
+            job.ping_timeout_ms = -1;
+        }
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        let reaper =
+            tokio::spawn(Arc::clone(&m).run_idle_reaper(std::time::Duration::from_secs(10)));
+        // Each sweep reaches one job: the first two panic in its teardown.
+        for _ in 0..60 {
+            if m.active_job_count() == 0 && !reporter.killed.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        drop(guard);
+
+        assert!(!reaper.is_finished(), "the reaper ended at its first panic");
+        reaper.abort();
+        assert_eq!(*reporter.killed.lock().unwrap(), ["/t/c.m3u8"]);
+        assert_eq!(m.active_job_count(), 0);
+        let reaper_lines = |level| -> Vec<String> {
+            logs.lines_at(level)
+                .into_iter()
+                .filter(|line| line.contains("task=\"transcode_idle_reaper\""))
+                .collect()
+        };
+        let errors = reaper_lines("ERROR");
+        assert!(
+            errors.len() == 1 && errors[0].contains("teardown of /t/a.m3u8 failed"),
+            "{errors:#?}"
+        );
+        let repeats = reaper_lines("DEBUG");
+        assert!(
+            repeats.len() == 1 && repeats[0].contains("teardown of /t/b.m3u8 failed"),
+            "{repeats:#?}"
+        );
+        let recovered = reaper_lines("INFO");
+        assert_eq!(recovered.len(), 1, "{recovered:#?}");
     }
 }
 
@@ -3310,6 +3455,8 @@ pub(super) mod throttle_tests {
         events: Mutex<Vec<Vec<u8>>>,
         fail_write: AtomicBool,
         exited: AtomicBool,
+        /// How many more progress reads panic.
+        panics: AtomicUsize,
     }
     struct ControlledChild(Arc<ChildState>);
     #[async_trait]
@@ -3330,6 +3477,16 @@ pub(super) mod throttle_tests {
             Ok(())
         }
         fn progress(&self) -> Option<FfmpegProgress> {
+            if self
+                .0
+                .panics
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                panic!("reading ffmpeg progress failed");
+            }
             *self.0.progress.lock().unwrap()
         }
         async fn write_stdin(&self, bytes: &[u8]) -> Result<(), String> {
@@ -3805,6 +3962,59 @@ pub(super) mod throttle_tests {
             .filter(|line| line.contains("cannot read the encoding configuration"))
             .count();
         assert_eq!(repeats, 2);
+    }
+
+    /// A tick that panics ends that tick only: the controls loop logs it with
+    /// its `task` and pumps the job's progress at the next one.
+    #[tokio::test]
+    async fn a_panicking_tick_is_logged_and_the_controls_loop_carries_on() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let (_directory, manager, child, handle) = fixture(None).await;
+        encoded(&child, 200);
+        child.panics.store(1, Ordering::SeqCst);
+        tokio::time::pause();
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        let controls = tokio::spawn(TranscodeManagerImpl::run_transcode_controls(
+            Arc::downgrade(&manager),
+        ));
+        for _ in 0..10 {
+            if progress(&manager, &handle)
+                .lock()
+                .unwrap()
+                .encoded
+                .framerate
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        drop(guard);
+
+        assert!(
+            !controls.is_finished(),
+            "the controls loop ended at its first panic"
+        );
+        controls.abort();
+        assert_eq!(
+            progress(&manager, &handle)
+                .lock()
+                .unwrap()
+                .encoded
+                .framerate,
+            Some(25.0)
+        );
+        let errors: Vec<_> = logs
+            .lines_at("ERROR")
+            .into_iter()
+            .filter(|line| line.contains("task=\"transcode_controls\""))
+            .collect();
+        assert!(
+            errors.len() == 1 && errors[0].contains("reading ffmpeg progress failed"),
+            "{errors:#?}"
+        );
     }
 
     #[tokio::test]
