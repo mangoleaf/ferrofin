@@ -4424,6 +4424,22 @@ impl FerrofinDtoService {
         let want_external_urls = options.contains_field(ItemFields::ExternalUrls);
         let want_provider_ids =
             options.contains_field(ItemFields::ProviderIds) || want_external_urls;
+        // A season/episode's links come from its series' ids, and its
+        // `SeriesStudio` from the same series rows, so the distinct series on
+        // the page are collected once, and only when one of those fields is
+        // asked for.
+        let mut series_ids: Vec<Uuid> = Vec::new();
+        let want_series_studio = options.contains_field(ItemFields::SeriesStudio);
+        if want_external_urls || want_series_studio {
+            series_ids = items
+                .iter()
+                .filter(|i| matches!(row_kind(i), BaseItemKind::Season | BaseItemKind::Episode))
+                .filter_map(|i| i.series_id.as_deref())
+                .filter_map(|id| Uuid::parse_str(id).ok())
+                .collect();
+            series_ids.sort_unstable();
+            series_ids.dedup();
+        }
         // User-data and the page's credits are independent; run them concurrently.
         // Images wait for the credits, because the cast's by-name Person rows
         // want images too and both id sets go in ONE `BaseItemImageInfos` read
@@ -4432,9 +4448,18 @@ impl FerrofinDtoService {
         // The page's provider ids are read first, in the user-data branch:
         // a hydrated row's user-data key derives from the same rows the DTO's
         // `ProviderIds` and `ExternalUrls` show, so the page reads them once.
+        // The series' ids the links are built from come in the same read
+        // (gl-1390); the key ignores them, as it takes the series' from its
+        // own walk whatever the fields.
         let user_data_fut = async {
             let providers = if want_provider_ids {
-                self.load_provider_ids_batch(&ids).await?
+                let series: &[Uuid] = if want_external_urls { &series_ids } else { &[] };
+                let mut wanted: Vec<Uuid> = ids.iter().chain(series).copied().collect();
+                // An id bound twice (a series also on the page, a repeated
+                // playlist entry) would repeat its pairs across two chunks.
+                wanted.sort_unstable();
+                wanted.dedup();
+                self.load_provider_ids_batch(&wanted).await?
             } else {
                 HashMap::new()
             };
@@ -4805,28 +4830,15 @@ impl FerrofinDtoService {
         // read while projecting that item — it cannot be drained by its own.
         let alt_referenced: std::collections::HashSet<Uuid> = versions.ids().collect();
         let provider_ids = provider_id_maps(provider_rows);
-        // A season/episode's links come from its series' ids, so collect the
-        // distinct series on the page and read their ids in the same batched
-        // way (one extra query for a page of episodes, none otherwise).
         let mut series_display_order: HashMap<Uuid, String> = HashMap::new();
-        // `SeriesStudio` reads the same set of series rows, so the id list is
-        // built once and each half runs only when its own field was asked for
-        // — a page with neither field costs no query at all.
-        let mut series_ids: Vec<Uuid> = Vec::new();
-        let want_series_studio = options.contains_field(ItemFields::SeriesStudio);
-        if want_external_urls || want_series_studio {
-            series_ids = items
-                .iter()
-                .filter(|i| matches!(row_kind(i), BaseItemKind::Season | BaseItemKind::Episode))
-                .filter_map(|i| i.series_id.as_deref())
-                .filter_map(|id| Uuid::parse_str(id).ok())
-                .collect();
-            series_ids.sort_unstable();
-            series_ids.dedup();
-        }
+        // The series' ids were read with the page's own; copied apart, since
+        // projecting a series on the page takes its entry out of `provider_ids`.
         let series_provider_ids = if want_external_urls {
             series_display_order = self.load_series_display_order(&series_ids).await?;
-            provider_id_maps(self.load_provider_ids_batch(&series_ids).await?)
+            series_ids
+                .iter()
+                .filter_map(|id| Some((*id, provider_ids.get(id)?.clone())))
+                .collect()
         } else {
             HashMap::new()
         };

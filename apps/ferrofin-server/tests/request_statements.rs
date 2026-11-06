@@ -48,6 +48,11 @@
 //!   ids and the key of the user data the user never wrote come from the
 //!   page's `BaseItemProviders` rows, read once, as upstream's both come from
 //!   the item's `Provider` navigation.
+//! - A series' episodes and seasons with `ExternalUrls` (gl-1390): with and
+//!   without user data, with `ProviderIds`, an episode's own page, and a page
+//!   listing the series too, in both orders. The links come from the series'
+//!   provider ids as well as the items' own, and both are read in one
+//!   `BaseItemProviders` query.
 //! - An unscoped `GET /Items?Recursive=true` (gl-1283). Its scope, the user's
 //!   libraries, views and playlists folder, comes from the cached library set,
 //!   as upstream holds them in memory: a warm listing reads none of those rows.
@@ -93,6 +98,9 @@ const VIEW_ROWS_SPAN: &str = "gl1322_view_rows_read";
 /// The span the recorded item reads with provider ids run in.
 const PROVIDERS_SPAN: &str = "gl1323_provider_ids_request";
 
+/// The span the recorded episode listings with links run in.
+const SERIES_PROVIDERS_SPAN: &str = "gl1390_series_provider_ids_request";
+
 /// The span the recorded unscoped listing runs in.
 const UNSCOPED_SPAN: &str = "gl1283_unscoped_listing_request";
 
@@ -123,6 +131,7 @@ where
                     SESSIONS_SPAN,
                     VIEW_ROWS_SPAN,
                     PROVIDERS_SPAN,
+                    SERIES_PROVIDERS_SPAN,
                     UNSCOPED_SPAN,
                 ]
                 .into_iter()
@@ -357,6 +366,59 @@ async fn sign_in_and_scan(harness: &Harness, router: &axum::Router) -> (String, 
         "the scan ran"
     );
     (auth_header, user_id)
+}
+
+/// Adds a shows library holding one episode of a series named with its Tmdb
+/// and Tvdb ids, with no remote fetchers, and scans it; returns the series' id.
+async fn scan_a_show(
+    harness: &Harness,
+    router: &axum::Router,
+    auth_header: &str,
+    user_id: &str,
+) -> String {
+    let shows = std::path::Path::new(&harness.movies_dir).with_file_name("shows");
+    let episode = shows.join("Show (2008) [tmdbid-1396] [tvdbid-81189]/Season 01/Show S01E01.mkv");
+    std::fs::create_dir_all(episode.parent().expect("season dir")).expect("season dir");
+    std::fs::write(&episode, [0u8; 1024]).expect("episode file");
+    let (status, body) = send(
+        router,
+        auth_header,
+        "POST",
+        &format!(
+            "/Library/VirtualFolders?name=Shows&collectionType=tvshows&paths={}&refreshLibrary=false",
+            urlencoding(&shows.to_string_lossy())
+        ),
+        Some(serde_json::json!({"LibraryOptions": {"TypeOptions": [
+            {"Type": "Series", "MetadataFetchers": [], "ImageFetchers": []},
+            {"Type": "Season", "MetadataFetchers": [], "ImageFetchers": []},
+            {"Type": "Episode", "MetadataFetchers": [], "ImageFetchers": []}
+        ]}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "library added: {body}");
+    assert!(
+        harness
+            .wired
+            .state
+            .library
+            .run_library_scan(ScanTrigger::Api, None)
+            .await
+            .expect("scan"),
+        "the scan ran"
+    );
+    let (status, series) = send(
+        router,
+        auth_header,
+        "GET",
+        &format!("/Items?userId={user_id}&includeItemTypes=Series&recursive=true"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "series: {series}");
+    series["Items"][0]["Id"]
+        .as_str()
+        .expect("the series")
+        .to_owned()
 }
 
 #[tokio::test]
@@ -1238,6 +1300,112 @@ async fn an_item_page_reads_its_provider_ids_once() {
                 .count(),
             1,
             "{uri} reads the provider ids once: {statements:#?}"
+        );
+    }
+}
+
+/// A series' episodes and seasons with `ExternalUrls` read the series'
+/// provider ids, which their links are built from, in the same
+/// `BaseItemProviders` query as their own (gl-1390): with or without user
+/// data, with `ProviderIds`, on the episode's own page, and on a page that
+/// lists the series too. The user-data key still derives from the series'
+/// ids, as without the field.
+#[tokio::test]
+async fn an_episode_page_reads_its_series_provider_ids_with_its_own() {
+    record_statements();
+    let harness = boot(&["Heat (1995)/Heat (1995).mkv"]).await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let series = scan_a_show(&harness, &router, &auth_header, &user_id).await;
+    let series = series.as_str();
+    let shows = |path: &str, query: &str| format!("/Shows/{series}/{path}?userId={user_id}{query}");
+    let (status, plain) = send(&router, &auth_header, "GET", &shows("Episodes", ""), None).await;
+    assert_eq!(status, StatusCode::OK, "episodes: {plain}");
+    let episode = plain["Items"][0]["Id"].as_str().expect("the episode");
+    // The series' Tvdb id, then the season's (and the episode's) number.
+    let episode_key = Some("81189001001");
+    assert_eq!(plain["Items"][0]["UserData"]["Key"].as_str(), episode_key);
+    let episode_link = "https://www.themoviedb.org/tv/1396/season/1/episode/1";
+    let season_link = "https://www.themoviedb.org/tv/1396/season/1";
+    let mixed = |order: &str| {
+        format!(
+            "/Items?userId={user_id}&recursive=true&includeItemTypes=Series,Episode\
+             &fields=ProviderIds,ExternalUrls&sortBy=SortName&sortOrder={order}"
+        )
+    };
+
+    // (uri, the kind checked, its link, its key). `ProviderIds` and the
+    // item's own page hand the page's rows, the series' with them, to the
+    // user-data key; a page holding the series too projects it first in one
+    // of the two orders.
+    for (uri, kind, link, key) in [
+        (
+            shows("Episodes", "&fields=ExternalUrls"),
+            "Episode",
+            episode_link,
+            episode_key,
+        ),
+        (
+            shows("Episodes", "&fields=ExternalUrls&enableUserData=false"),
+            "Episode",
+            episode_link,
+            None,
+        ),
+        (
+            shows("Episodes", "&fields=ProviderIds,ExternalUrls"),
+            "Episode",
+            episode_link,
+            episode_key,
+        ),
+        (
+            format!("/Items/{episode}?userId={user_id}"),
+            "Episode",
+            episode_link,
+            episode_key,
+        ),
+        (
+            shows("Seasons", "&fields=ExternalUrls"),
+            "Season",
+            season_link,
+            Some("81189001"),
+        ),
+        (mixed("Ascending"), "Episode", episode_link, episode_key),
+        (mixed("Descending"), "Episode", episode_link, episode_key),
+    ] {
+        clear_statements(SERIES_PROVIDERS_SPAN);
+        let (status, body) = send(&router, &auth_header, "GET", &uri, None)
+            .instrument(tracing::info_span!(SERIES_PROVIDERS_SPAN))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let dtos = body["Items"]
+            .as_array()
+            .map_or_else(|| vec![&body], |items| items.iter().collect());
+        let dto = dtos
+            .iter()
+            .find(|dto| dto["Type"] == kind)
+            .unwrap_or_else(|| panic!("{uri}: a {kind}: {body}"));
+        assert!(
+            dto["ExternalUrls"]
+                .as_array()
+                .is_some_and(|links| links.iter().any(|found| found["Url"] == link)),
+            "{uri}: the series' Tmdb id builds the link: {body}"
+        );
+        assert_eq!(dto["UserData"]["Key"].as_str(), key, "{uri}: {body}");
+        if uri.contains("includeItemTypes=Series") {
+            let listed = dtos
+                .iter()
+                .find(|dto| dto["Type"] == "Series")
+                .unwrap_or_else(|| panic!("{uri}: the series is listed: {body}"));
+            assert_eq!(listed["ProviderIds"]["Tmdb"], "1396", "{uri}: {body}");
+        }
+        let statements = statements_in(SERIES_PROVIDERS_SPAN);
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|s| s.contains(r#"FROM "BaseItemProviders""#))
+                .count(),
+            1,
+            "{uri} runs one BaseItemProviders IN-query: {statements:#?}"
         );
     }
 }
