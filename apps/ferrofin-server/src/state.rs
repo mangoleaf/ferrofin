@@ -451,7 +451,8 @@ pub async fn build_app_state(
     let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> = Arc::new(
         FerrofinItemCountService::new(db.clone())
             .with_root_ids(root_folder_ids)
-            .with_visibility(Arc::clone(&scope_visibility)),
+            .with_visibility(Arc::clone(&scope_visibility))
+            .with_virtual_paths(virtual_paths.clone()),
     );
     let item_persistence_impl = Arc::new(
         FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(virtual_paths.clone()),
@@ -583,7 +584,7 @@ pub async fn build_app_state(
     let linked_children_service: Arc<dyn ferrofin_traits::persistence::LinkedChildrenService> =
         Arc::new(FerrofinLinkedChildrenService::new(db.clone()));
     let next_up_service: Arc<dyn ferrofin_traits::persistence::NextUpService> =
-        Arc::new(FerrofinNextUpService::new(db.clone()));
+        Arc::new(FerrofinNextUpService::new(db.clone()).with_virtual_paths(virtual_paths.clone()));
 
     let image_encoding_limit = parallel_image_encoding_limit(
         server_config.parallel_image_encoding_limit,
