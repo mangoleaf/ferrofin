@@ -148,8 +148,6 @@ fn add_streams(writer: &mut NfoWriter, item: &NfoBaseItem, streams: &[MediaStrea
             ("bitrate", stream.bit_rate),
             ("width", stream.width),
             ("height", stream.height),
-            ("channels", stream.channels),
-            ("samplingrate", stream.sample_rate),
         ] {
             if let Some(value) = value {
                 writer.element(name, &value.to_string());
@@ -163,12 +161,16 @@ fn add_streams(writer: &mut NfoWriter, item: &NfoBaseItem, streams: &[MediaStrea
             writer.element("aspect", aspect);
             writer.element("aspectratio", aspect);
         }
+        // `MediaStream.ReferenceFrameRate` compares and prints the `float` the row holds widened.
+        #[allow(clippy::cast_possible_truncation)]
+        let narrow = |rate: f64| rate as f32;
         if let Some(rate) = stream
             .average_frame_rate
+            .map(narrow)
             .filter(|rate| *rate < 1000.0)
-            .or(stream.real_frame_rate)
+            .or_else(|| stream.real_frame_rate.map(narrow))
         {
-            writer.element("framerate", &rate.to_string());
+            writer.element("framerate", &super::invariant_f32(rate));
         }
         if let Some(language) = stream.language.as_deref().filter(|value| !value.is_empty()) {
             let language: String = language.chars().filter(|c| !matches!(c, '\x00'..='\x08'|'\x0b'|'\x0c'|'\x0e'..='\x1f'|'\x7f'..='\u{9f}'|'\u{feff}'|'\u{fffe}'|'\u{ffff}')).collect();
@@ -182,6 +184,14 @@ fn add_streams(writer: &mut NfoWriter, item: &NfoBaseItem, streams: &[MediaStrea
                 "progressive"
             },
         );
+        for (name, value) in [
+            ("channels", stream.channels),
+            ("samplingrate", stream.sample_rate),
+        ] {
+            if let Some(value) = value {
+                writer.element(name, &value.to_string());
+            }
+        }
         writer.element("default", if stream.is_default { "True" } else { "False" });
         writer.element("forced", if stream.is_forced { "True" } else { "False" });
         if stream.is_original {
@@ -518,6 +528,139 @@ mod tests {
         ] {
             assert!(xml.contains(tag), "{tag}: {xml}");
         }
+    }
+
+    /// `AddMediaInfo` element order, with `channels`/`samplingrate` after
+    /// `scantype`, and `ReferenceFrameRate` printed as the `float` upstream holds:
+    /// the row keeps `f64::from(f32)` (`media_source_manager`), whose own
+    /// digits would print as `23.976024627685547`.
+    #[test]
+    fn stream_details_follow_add_media_info_order_and_float_frame_rate() {
+        let item = NfoBaseItem {
+            kind: NfoItemKind::Movie,
+            run_time_ticks: Some(615_000_000),
+            ..Default::default()
+        };
+        let video = MediaStreamInfoEntity {
+            stream_type: 1,
+            codec: Some("h264".into()),
+            width: Some(1920),
+            height: Some(1080),
+            average_frame_rate: Some(f64::from(24_000_f32 / 1_001_f32)),
+            ..Default::default()
+        };
+        let audio = MediaStreamInfoEntity {
+            stream_index: 1,
+            stream_type: 0,
+            codec: Some("aac".into()),
+            bit_rate: Some(128_000),
+            language: Some("eng".into()),
+            channels: Some(6),
+            sample_rate: Some(48_000),
+            is_default: true,
+            ..Default::default()
+        };
+        let mut writer = NfoWriter {
+            buf: String::new(),
+            depth: 0,
+        };
+        add_streams(&mut writer, &item, &[video, audio]);
+        assert_eq!(
+            writer.finish(),
+            "<fileinfo>
+  <streamdetails>
+    <video>
+      <codec>h264</codec>
+      <micodec>h264</micodec>
+      <width>1920</width>
+      <height>1080</height>
+      <framerate>23.976025</framerate>
+      <scantype>progressive</scantype>
+      <default>False</default>
+      <forced>False</forced>
+      <duration>1</duration>
+      <durationinseconds>61</durationinseconds>
+    </video>
+    <audio>
+      <codec>aac</codec>
+      <micodec>aac</micodec>
+      <bitrate>128000</bitrate>
+      <language>eng</language>
+      <scantype>progressive</scantype>
+      <channels>6</channels>
+      <samplingrate>48000</samplingrate>
+      <default>True</default>
+      <forced>False</forced>
+    </audio>
+  </streamdetails>
+</fileinfo>
+"
+        );
+    }
+
+    /// The parser is the oracle: the fields only `<fileinfo>` feeds (which the
+    /// `save_*` round trip in `tests/xbmc_nfo_savers.rs` has to zero) come back
+    /// from a document completed with the item's stream rows.
+    #[test]
+    fn file_info_block_round_trips_through_the_parser() {
+        use crate::xbmc::{StaticExternalIds, base_parser::NoDirectoryService, fetch_movie};
+        use ferrofin_model::entities::Video3DFormat;
+        let config = crate::xbmc::config::NfoConfiguration::default();
+        let result = MetadataResult {
+            item: NfoBaseItem {
+                kind: NfoItemKind::Movie,
+                name: Some("Movie".into()),
+                run_time_ticks: Some(615_000_000),
+                video_3d_format: Some(Video3DFormat::HalfSideBySide),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let streams = [
+            MediaStreamInfoEntity {
+                stream_type: 1,
+                codec: Some("h264".into()),
+                width: Some(1920),
+                height: Some(1080),
+                ..Default::default()
+            },
+            MediaStreamInfoEntity {
+                stream_index: 1,
+                stream_type: 2,
+                codec: Some("subrip".into()),
+                language: Some("eng".into()),
+                ..Default::default()
+            },
+        ];
+        let xml = complete_document(
+            super::super::save_movie(&result, &config),
+            DocumentExtras {
+                item: &result.item,
+                images: &[],
+                image_substitutions: &[],
+                streams: &streams,
+                user: None,
+                save_images: false,
+                existing: None,
+            },
+        )
+        .unwrap();
+        let mut parsed = crate::xbmc::new_result(NfoItemKind::Movie);
+        fetch_movie(
+            &mut parsed,
+            "movie.nfo",
+            &xml,
+            &config,
+            &StaticExternalIds::default(),
+            &NoDirectoryService,
+        )
+        .unwrap();
+        let item = parsed.item;
+        assert_eq!((item.width, item.height), (Some(1920), Some(1080)), "{xml}");
+        assert_eq!(item.video_3d_format, Some(Video3DFormat::HalfSideBySide));
+        assert!(item.has_subtitles, "{xml}");
+        // `<durationinseconds>` is read last and wins over `<runtime>`'s minutes.
+        assert_eq!(item.run_time_ticks, Some(610_000_000), "{xml}");
     }
 
     #[test]
