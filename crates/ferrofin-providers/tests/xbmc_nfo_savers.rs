@@ -5,10 +5,13 @@
 //! parsed item back with the matching saver, re-parse the serialized document,
 //! and assert the second parse equals the first on every field the saver emits.
 //!
-//! The saver deliberately defers the media-info (`<fileinfo>`) block — which
-//! needs `IHasMediaSources`, absent from [`NfoBaseItem`] — and the image/user
-//! data blocks (off by default in First-Light). Those source-only fields
-//! (`width`, `height`, `video_3d_format`, `has_subtitles`), plus the parser-only
+//! The `save_*` serializers write the item's own fields only. `NfoSaver` then
+//! appends, when they apply, the media-info (`<fileinfo>`, video kinds), image
+//! (`SaveImagePathsInNfo`) and user-data (a configured user) blocks from the
+//! item's media-stream rows, image rows and user data (`complete_document`,
+//! whose tests cover `<fileinfo>`, `<durationinseconds>` included, and parse it
+//! back). The parser fields only `<fileinfo>` fills (`width`, `height`,
+//! `video_3d_format`, `has_subtitles`), plus the parser-only
 //! `<sortname>`/`airs_dayofweek`/`airs_time` reads that have no saver tag, are
 //! zeroed on both sides before comparison. Everything else must survive the
 //! round trip byte-equivalently at the model level.
@@ -32,17 +35,19 @@ fn read_fixture(test_data_path: &str) -> String {
         .unwrap_or_else(|e| panic!("read fixture {name}: {e}"))
 }
 
-/// Clears the fields the saver defers (media-info + parser-only reads), so a
-/// parsed item can be compared against its serialize→reparse image.
+/// Clears the fields `save_*` cannot carry (the `<fileinfo>` reads and the
+/// parser-only reads), so a parsed item can be compared against its
+/// serialize→reparse image.
 fn project_round_trippable(item: &mut NfoBaseItem) {
-    // Media-info (<fileinfo>) block is deferred (no media streams on the item).
+    // `<fileinfo>` is written from the media-stream rows, not from these fields.
     item.width = None;
     item.height = None;
     item.video_3d_format = None;
     item.has_subtitles = false;
     // <runtime> carries only whole minutes, and the parser may seed run time from
-    // the deferred <fileinfo> <durationinseconds>; sub-minute precision cannot
-    // survive, so runtime is compared out of band (see runtime_saves_whole_minutes).
+    // a fixture's <fileinfo> <durationinseconds>; sub-minute precision cannot
+    // survive `save_*`. The seconds come back through `<fileinfo>`, which
+    // `file_info_block_round_trips_through_the_parser` (saver/runtime.rs) checks.
     item.run_time_ticks = None;
     // Parser reads with no corresponding saver tag.
     item.sort_name = None;

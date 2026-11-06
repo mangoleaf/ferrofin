@@ -1555,15 +1555,19 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         file_path: &Path,
         job_type: TranscodingJobType,
     ) -> Option<TranscodeRequestGuard<'_, S, C>> {
-        let stem = file_path.file_stem()?.to_string_lossy().into_owned();
+        // A case-insensitive prefix test on the raw bytes: it runs once per
+        // live job on every legacy segment request, so the test allocates
+        // nothing.
+        let stem = file_path.file_stem()?.as_encoded_bytes();
         let owner = {
             let jobs = self.jobs.lock().expect("jobs lock poisoned");
             jobs.iter()
                 .filter(|j| j.handle.job_type == job_type)
                 .find(|j| {
                     Path::new(&j.handle.path).file_stem().is_some_and(|s| {
-                        stem.to_ascii_lowercase()
-                            .starts_with(&s.to_string_lossy().to_ascii_lowercase())
+                        let s = s.as_encoded_bytes();
+                        stem.get(..s.len())
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(s))
                     })
                 })
                 .map(|j| j.handle.path.clone())
@@ -2990,9 +2994,20 @@ mod start_ffmpeg_tests {
             m.begin_request_guard_for_file(&playlist, TranscodingJobType::Hls)
                 .is_some()
         );
-        // ...an unrelated stem does not, and neither does the wrong job type.
+        // ...so does a segment named in another case (upstream finds the
+        // playlist by its id, `OrdinalIgnoreCase`)...
+        assert!(
+            m.begin_request_guard_for_file(&out_dir.join("A1B2C37.ts"), TranscodingJobType::Hls)
+                .is_some()
+        );
+        // ...an unrelated stem does not, nor one shorter than the playlist's,
+        // and neither does the wrong job type.
         assert!(
             m.begin_request_guard_for_file(&out_dir.join("deadbeef0.ts"), TranscodingJobType::Hls)
+                .is_none()
+        );
+        assert!(
+            m.begin_request_guard_for_file(&out_dir.join("a1b2.ts"), TranscodingJobType::Hls)
                 .is_none()
         );
         assert!(
