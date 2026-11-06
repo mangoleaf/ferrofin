@@ -294,10 +294,7 @@ async fn container_identity(
     db: &Database,
     paths: &Arc<dyn ServerApplicationPaths>,
 ) -> Result<(crate::item_type_lookup::IdDerivation, Option<Uuid>), ServiceError> {
-    let stored = db
-        .meta_get("item_id_derivation")
-        .await
-        .map_err(|e| ServiceError::Backend(e.to_string()))?;
+    let stored = db.meta_get("item_id_derivation").await?;
     let mode = crate::item_type_lookup::IdDerivation::from_meta(
         stored.as_deref(),
         Some(paths.program_data_path()),

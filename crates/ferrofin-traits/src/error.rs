@@ -134,6 +134,17 @@ impl ServiceError {
     }
 }
 
+/// Wraps a `sqlx` error as a [`ServiceError::Db`], keeping it as the source.
+///
+/// The one `sqlx` → [`ServiceError`] conversion for every crate that runs
+/// `ferrofin-db` queries (`ferrofin-core`, `ferrofin-livetv`, …), for
+/// `.map_err(db_err)`. A [`ferrofin_db::Result`] needs no helper: `?`
+/// converts it.
+#[must_use]
+pub fn db_err(err: sqlx::Error) -> ServiceError {
+    ServiceError::Db(err.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::ServiceError;
@@ -194,5 +205,17 @@ mod tests {
         // …and keeps its `#[source]` cause reachable through the chain.
         assert_eq!(err.source().unwrap().to_string(), "missing file");
         assert!(matches!(err, ServiceError::BackendSource(_)));
+    }
+
+    #[test]
+    fn db_err_keeps_the_sqlx_error_as_the_source() {
+        use std::error::Error as _;
+
+        let err = super::db_err(sqlx::Error::PoolClosed);
+        assert!(err.source().is_some());
+        assert!(matches!(
+            err,
+            ServiceError::Db(ferrofin_db::DbError::Sqlx(sqlx::Error::PoolClosed))
+        ));
     }
 }

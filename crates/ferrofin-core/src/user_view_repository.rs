@@ -97,10 +97,7 @@ pub async fn consolidate_localized_user_views(
     mode: &IdDerivation,
     metadata_path: &Path,
 ) -> Result<u64, ServiceError> {
-    let done = db
-        .meta_get(USER_VIEWS_CONSOLIDATED_META_KEY)
-        .await
-        .map_err(|e| ServiceError::Backend(e.to_string()))?;
+    let done = db.meta_get(USER_VIEWS_CONSOLIDATED_META_KEY).await?;
     if done.as_deref() == Some("1") {
         return Ok(0);
     }

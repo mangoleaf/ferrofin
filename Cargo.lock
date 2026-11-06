@@ -1722,6 +1722,7 @@ dependencies = [
  "ferrofin-util",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
  "uuid",
