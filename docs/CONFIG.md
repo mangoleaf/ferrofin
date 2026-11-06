@@ -311,7 +311,7 @@ proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
 | `FERROFIN_AUTH_CACHE_TTL_SECS` | `30` | Seconds a resolved access token (its device, user and policy, or an API key's name, or the rejection of a token that matched nothing) is served from memory before the database is read again. Every change made through the server applies at once; this only bounds how long a change made outside it, in the database itself, goes unseen. `5` to `300`. The `config.toml` key is `auth_cache_ttl_secs`. |
 | `FERROFIN_ROW_CACHE_TTL_SECS` | `30` | Seconds the per-user access check serves a user's permissions and preferences, and the libraries' rows and options, from memory. Queries scoped to the user's libraries, the home screen's views and every lookup of a library's physical folders read the same cached rows and options. Whether a Live TV tuner is configured, which decides whether Live TV is offered, is cached the same way. As for the auth cache, every change made through the server applies at once, and this only bounds changes made outside it (the database, a library's `options.json`). `5` to `300`. The `config.toml` key is `row_cache_ttl_secs`. |
 | `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` | `300` | Seconds a library scan's directory listings survive unread before they are dropped. The default is Jellyfin's (`DirectoryService.IdleTimeoutMs`). `30` to `3600` (a value outside, `0` included, logs a warning and is clamped). The `config.toml` key is `scan_directory_cache_idle_secs`. |
-| `FERROFIN_TRICKPLAY_CONCURRENCY` | `auto` | How many videos generate trickplay images at once (each one's selected widths in turn: for each, an ffmpeg frame extraction, then tile packing). A video keeps its place until all of its widths are made, so with **Both** selected a scan makes each video's 320 and 640 sets together. A library scan generates several at once; the **Generate Trickplay Images** task goes one item at a time but shares this cap when it overlaps a scan. `auto` allows as many as the image-encoding limit: **Parallel image encoding limit** on the dashboard (`ParallelImageEncodingLimit`), else one per CPU. An integer sets a lower cap; `0`, a negative number, or a value above the auto value means `auto`. Each generation is an ffmpeg process with its own memory, and with hardware acceleration its own GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). Packing its tiles then takes server memory: about 60 MiB for a 320 tile, about 200 MiB for a 640 one. Jellyfin generates one at a time; `1` does the same. The `config.toml` key `trickplay_concurrency` takes an integer or `"auto"`. |
+| `FERROFIN_TRICKPLAY_CONCURRENCY` | `auto` | How many videos generate trickplay images at once (each one's selected widths in turn: for each, an ffmpeg frame extraction, then tile packing). A video keeps its place until all of its widths are made, so with **Both** selected a scan makes each video's 320 and 640 sets together. A library scan generates several at once; the **Generate Trickplay Images** task goes one item at a time but shares this cap when it overlaps a scan. `auto` allows as many as the image-encoding limit: **Parallel image encoding limit** on the dashboard (`ParallelImageEncodingLimit`), else one per CPU. An integer sets a lower cap; `0`, a negative number, or a value above the auto value means `auto`. Each generation is an ffmpeg process with its own memory, and with hardware acceleration its own GPU memory (about 1 GiB for a 4K HEVC video on an NVIDIA GPU). Packing its tiles then takes about 60 MiB of server memory at the default tile grid, at 320 or 640, because a wider set packs fewer previews into each tile ([Trickplay](#trickplay)). Jellyfin generates one at a time; `1` does the same. The `config.toml` key `trickplay_concurrency` takes an integer or `"auto"`. |
 
 ## Trickplay
 
@@ -325,7 +325,7 @@ images at once, is `FERROFIN_TRICKPLAY_CONCURRENCY` under [Library & database](#
 
 | Setting | Default | Purpose |
 |---|---|---|
-| Preview Size | 320 | How wide the scrubbing previews are, in pixels: `WidthResolutions` `[320]`, `[640]`, or `[320, 640]` (**Both**, in either order). 320 is fast to fetch but small on a 4K screen. 640 is sharper on 4K, and phones and 1080p screens get a large preview too. Both makes the two, so each client picks by its screen, at two ffmpeg passes per video and the disk of both. Packing a tile takes about 60 MiB of server memory at 320 and about 200 MiB at 640. |
+| Preview Size | 320 | How wide the scrubbing previews are, in pixels: `WidthResolutions` `[320]`, `[640]`, or `[320, 640]` (**Both**, in either order). 320 is fast to fetch but small on a 4K screen. 640 is sharper on 4K, and phones and 1080p screens get a large preview too. Both makes the two, so each client picks by its screen, at two ffmpeg passes per video and the disk of both. Packing a tile takes about 60 MiB of server memory at either width, at the default tile grid. |
 | Image Quality | Optimize Disk Usage | How much colour detail the previews keep: `Qscale` and the Ferrofin-only `FullChroma`. **Optimize Disk Usage** is Jellyfin's 4:2:0 at `Qscale` 4, with blocky colour around edges; **Optimize Quality** is 4:4:4 at `Qscale` 2, with full colour detail, and takes as long to generate. A video that trickplay's hardware acceleration (**Enable hardware decoding** and **Enable hardware accelerated MJPEG encoding** on the dashboard's Trickplay page) decodes or encodes on the GPU stays 4:2:0, so it costs the disk without the colour; one the GPU neither decodes nor encodes (a source it cannot decode, with a software MJPEG encoder) gets 4:4:4. `FullChroma` is left out of `GET /System/Configuration` while it is off, so the document is Jellyfin's unless an admin picks Optimize Quality. |
 
 A value the dashboard holds that fits no option (a width typed by hand, a `Qscale` changed alone)
@@ -337,7 +337,21 @@ so a large library can take days. A hand edit of `Qscale` or JPEG quality on the
 picked up that way and needs **Replace existing trickplay images**, as in Jellyfin. So does
 picking an Image Quality option over a Custom value that differs from it only in `Qscale`.
 
-Disk per hour of video, with the default 10-second interval and 10x10 tiles:
+Wider sets get a smaller tile grid, so a tile holds no more pixels than a 320 tile (until the grid
+is down to 1 x 1). **Tile width** and **Tile height** on the dashboard's Trickplay page
+(`TileWidth`, `TileHeight`, 10 x 10 by default) are the grid at 320 and below. Above 320, each is
+multiplied by 320 / width, rounded down, at least 1: at the default, 480 gets 6 x 6, 640 gets 5 x 5
+and 1280 gets 2 x 2. A client decodes a whole tile to show one preview, and a 640 tile at 10 x 10
+is 6400 x 3600, about 92 MB decoded: more than a client may keep in its image cache. Wholphin was
+seen decoding it again on every scrub, showing a black box meanwhile. Each tile now covers less
+video, so a client fetches more of them, for about the same bytes in all. Jellyfin uses the
+configured grid at every width. The next **Generate Trickplay Images** run replaces a set made at
+another grid (by an earlier version, or by Jellyfin) with one at the new grid, so the first run
+after upgrading decodes again every video with a set wider than 320.
+
+Disk per hour of video, with the default 10-second interval and tile grid. The grid does not
+change the bytes: re-packing real 640 tiles from 10 x 10 into 5 x 5 changed their size by less
+than 0.1 %.
 
 | Width | Optimize Disk Usage | Optimize Quality |
 |---|---|---|

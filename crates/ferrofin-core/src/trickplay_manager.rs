@@ -467,6 +467,7 @@ impl FerrofinTrickplayManager {
         if actual_width <= 0 {
             return Ok(None);
         }
+        let options = &options_at_width(options, actual_width);
 
         let output_dir = Path::new(ctx.trickplay_dir).join(format!(
             "{actual_width} - {}x{}",
@@ -640,6 +641,7 @@ impl FerrofinTrickplayManager {
         images: &[String],
         rows: &mut HashMap<i32, TrickplayInfoEntity>,
     ) -> Result<(), ServiceError> {
+        let options = &options_at_width(options, set.actual_width);
         let mut info = self
             .create_tiles(images, set.actual_width, options, &set.output_dir)
             .await?;
@@ -757,7 +759,8 @@ impl FerrofinTrickplayManager {
     /// Port of the "Import tiles" branch of `RefreshTrickplayDataInternal`:
     /// adopts on-disk tile files without a DB row, computing height/bandwidth
     /// from the files themselves. As in the C#, the row stores the *requested*
-    /// width and the configured interval/tile grid. Returns the saved row.
+    /// width and the configured interval; its tile grid is `options`', the
+    /// grid at the folder's width ([`options_at_width`]). Returns the saved row.
     async fn import_tiles(
         &self,
         item_id: Uuid,
@@ -1919,6 +1922,35 @@ fn jpeg_full_chroma(path: &Path) -> Option<bool> {
             0xDA | 0xD9 => return None,
             _ => file.seek_relative(i64::from(length) - 2).ok()?,
         }
+    }
+}
+
+/// Jellyfin's default trickplay width, the thumbnail width its default 10 × 10
+/// tile grid is sized for.
+const GRID_REFERENCE_WIDTH: i32 = 320;
+
+/// The options a set `width` px wide is made at: the configured tile grid at
+/// [`GRID_REFERENCE_WIDTH`] or narrower, and above it each axis scaled by
+/// `GRID_REFERENCE_WIDTH / width`, rounded down, at least 1 and never more than
+/// configured. So a tile holds no more pixels than a 320 tile at the configured
+/// grid, until an axis is down to 1.
+///
+/// Departure from Jellyfin, which packs every width into the configured grid
+/// (owner decision 2026-11-05, gl-1400): clients decode a whole tile to show
+/// one thumbnail, and a 640 tile at 10 × 10 is 6400 × 3600 (about 92 MB
+/// decoded), which Wholphin was seen decoding again on every scrub.
+fn options_at_width(options: &TrickplayOptions, width: i32) -> TrickplayOptions {
+    let scale = |configured: i32| {
+        if width <= GRID_REFERENCE_WIDTH {
+            return configured;
+        }
+        let scaled = i64::from(configured) * i64::from(GRID_REFERENCE_WIDTH) / i64::from(width);
+        i32::try_from(scaled.max(1)).map_or(configured, |scaled| scaled.min(configured))
+    };
+    TrickplayOptions {
+        tile_width: scale(options.tile_width),
+        tile_height: scale(options.tile_height),
+        ..options.clone()
     }
 }
 
@@ -3084,10 +3116,13 @@ mod tests {
         assert!(set_dir(&r, item, &media, 320).join("0.jpg").is_file());
     }
 
-    /// The folder of an item's internal set at `width` on the 2×2 grid.
+    /// The folder of an item's internal set at `width` under `options_2x2`,
+    /// at that width's grid.
     fn set_dir(r: &Rig, item: Uuid, media: &str, width: i32) -> PathBuf {
-        PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(media), false))
-            .join(format!("{width} - 2x2"))
+        let grid = super::options_at_width(&options_2x2(&[]), width);
+        PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(media), false)).join(
+            format!("{width} - {}x{}", grid.tile_width, grid.tile_height),
+        )
     }
 
     /// `options_2x2` with chroma sampled as often as luma.
@@ -3805,7 +3840,8 @@ mod tests {
         };
         let beside =
             PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true));
-        let locked = beside.join("640 - 2x2");
+        // Wider sets get a smaller grid (gl-1400): 2x2 at 320 is 1x1 at 640.
+        let locked = beside.join("640 - 1x1");
         std::fs::create_dir_all(&locked).expect("width folder");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
             .expect("read-only");
@@ -3823,13 +3859,8 @@ mod tests {
         let mut widths: Vec<i32> = rows.keys().copied().collect();
         widths.sort_unstable();
         assert_eq!(widths, vec![320, 1280], "the others are made, 640 is not");
-        for width in [320, 1280] {
-            assert!(
-                beside
-                    .join(format!("{width} - 2x2"))
-                    .join("0.jpg")
-                    .is_file()
-            );
+        for grid in ["320 - 2x2", "1280 - 1x1"] {
+            assert!(beside.join(grid).join("0.jpg").is_file());
         }
     }
 
@@ -3895,6 +3926,110 @@ mod tests {
         );
         assert_eq!(row.height, 180, "tile height / grid rows");
         assert!(row.bandwidth > 0);
+    }
+
+    /// gl-1400: a set wider than 320 gets the grid that keeps its tile no
+    /// larger than a 320 tile at the configured grid, never a larger one.
+    #[rstest::rstest]
+    #[case::reference(320, (10, 10), (10, 10))]
+    #[case::narrower_keeps_configured(160, (10, 10), (10, 10))]
+    #[case::just_over(321, (10, 10), (9, 9))]
+    #[case::w480(480, (10, 10), (6, 6))]
+    #[case::w640(640, (10, 10), (5, 5))]
+    #[case::w1280(1280, (10, 10), (2, 2))]
+    #[case::non_square(640, (8, 3), (4, 1))]
+    #[case::never_below_one(4000, (10, 10), (1, 1))]
+    #[case::one_by_one(640, (1, 1), (1, 1))]
+    fn grid_scales_down_with_width(
+        #[case] width: i32,
+        #[case] configured: (i32, i32),
+        #[case] expected: (i32, i32),
+    ) {
+        let options = TrickplayOptions {
+            tile_width: configured.0,
+            tile_height: configured.1,
+            ..TrickplayOptions::default()
+        };
+        let scaled = super::options_at_width(&options, width);
+        assert_eq!((scaled.tile_width, scaled.tile_height), expected);
+    }
+
+    /// gl-1400: a 640 set is made at half the configured grid, and a refresh
+    /// without Replace swaps a set made at the full grid for it and removes
+    /// the old folder.
+    #[tokio::test]
+    async fn a_wider_set_is_made_at_a_smaller_grid_and_replaces_one_at_the_full_grid() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let options = TrickplayOptions {
+            width_resolutions: vec![640],
+            tile_width: 4,
+            tile_height: 4,
+            interval: 10_000,
+            ..TrickplayOptions::default()
+        };
+        let r = rig(&db, options, FakeExtractor::new(4, 360));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let root =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false));
+        let old = root.join("640 - 4x4");
+        std::fs::create_dir_all(&old).expect("old grid");
+        image::RgbImage::new(2560, 1440)
+            .save(old.join("0.jpg"))
+            .expect("old tile");
+        r.mgr
+            .save_trickplay_info(&TrickplayInfoEntity {
+                tile_width: 4,
+                tile_height: 4,
+                height: 360,
+                ..info(item, 640)
+            })
+            .await
+            .expect("old row");
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        let row = &r.mgr.get_trickplay_resolutions(item).await.expect("res")[&640];
+        assert_eq!((row.tile_width, row.tile_height), (2, 2));
+        assert!(root.join("640 - 2x2/0.jpg").is_file(), "new grid's tiles");
+        assert!(!old.exists(), "the full-grid set is removed");
+    }
+
+    /// gl-1400: a video narrower than the selected width gets the grid of the
+    /// width its set is made at, not the selected one: 1280 selected on a
+    /// 640-wide video is a 640 set at 640's grid.
+    #[tokio::test]
+    async fn a_narrow_video_gets_the_grid_of_its_own_width() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let options = TrickplayOptions {
+            width_resolutions: vec![1280],
+            tile_width: 4,
+            tile_height: 4,
+            interval: 10_000,
+            ..TrickplayOptions::default()
+        };
+        let r = rig(&db, options, FakeExtractor::new(4, 360));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), Some(640)).await;
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        let rows = r.mgr.get_trickplay_resolutions(item).await.expect("res");
+        let row = &rows[&640];
+        assert_eq!(
+            (row.tile_width, row.tile_height),
+            (2, 2),
+            "640's grid, not 1280's 1x1"
+        );
+        let root =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false));
+        assert!(root.join("640 - 2x2/0.jpg").is_file());
     }
 
     #[tokio::test]
