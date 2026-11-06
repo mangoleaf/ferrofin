@@ -3497,7 +3497,9 @@ struct PlanCtx<'a> {
     /// the walk's own [`LibraryScanner::list`] of the folder takes one
     /// instead of listing it again.
     prelisted: std::cell::RefCell<HashMap<String, Vec<FileSystemEntryInfo>>>,
-    /// The pass's `.ignore` lookups, cached for its length.
+    /// The pass's `.ignore` lookups, cached for its length; each `.ignore`
+    /// is checked for changes once per listing, except one that hides
+    /// everything.
     dot_ignore: std::cell::RefCell<crate::dot_ignore::DotIgnoreRule>,
     /// Each resolved primary's local alternate version paths
     /// ([`PlanOutput::local_versions`]).
@@ -15465,6 +15467,7 @@ impl LibraryScanner {
                 // `DotIgnoreIgnoreRule` (`.ignore` files). Every listing of the
                 // walk comes through here, `FindExtras`' own filter included.
                 let mut dot_ignore = ctx.dot_ignore.borrow_mut();
+                dot_ignore.begin_listing();
                 // Read after the listing: a capture registers before it
                 // creates its file, so a file listed here is never missed.
                 let recording = self.recording_paths.as_ref().map(|read| read());
