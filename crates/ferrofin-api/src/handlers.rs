@@ -2232,14 +2232,15 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/branding.rs get_splashscreen (only tag and format are bound; \
                !SplashscreenEnabled is a 404 unless the caller is an administrator; \
                resolve_splashscreen_path: SplashscreenLocation when that file exists, else \
-               {DataPath}/splashscreen.png, else a 404) → handlers/images.rs \
+               {DataPath}/splashscreen.png, else a 404; is_file is File.Exists, false for a \
+               directory, stat'd through tokio::fs) → handlers/images.rs \
                ImageQuery::splashscreen (no sizes, quality 90, and none of the DLNA \
                headers, as GetSplashscreen passes GetImageResult none) → serve_image_file \
                (GetImageResult: ProcessImage on every request, so a format the client's \
                output formats do not list is re-encoded) → ferrofin-drawing processor.rs \
                process_image. Measured on 12.4 with a BMP and a PNG splashscreen, as an \
                administrator: plain and If-Modified-Since",
-        date: "2026-11-03",
+        date: "2026-11-05",
         divergences: &[
             "Age, Last-Modified on a 304 and the If-Modified-Since check count from the \
          splashscreen file's modification time. Upstream's ItemImageInfo carries no \
