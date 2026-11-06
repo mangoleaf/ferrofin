@@ -1473,13 +1473,15 @@ const PROGRESSIVE_BUFFER_BYTES: usize = 81_920;
 
 /// How long a progressive read waits before looking for more bytes, in
 /// milliseconds (C# `ProgressiveFileStream`'s `Task.Delay(50)`).
-const PROGRESSIVE_POLL_MS: u64 = 50;
+pub(crate) const PROGRESSIVE_POLL_MS: u64 = 50;
 
 /// How long a progressive read tolerates a file that stops growing before it
 /// reports end-of-stream, in milliseconds (C# `ProgressiveFileStream`'s
 /// `timeoutMs = 30000`). A live stream ends when the viewer stops watching, but
-/// a stalled tuner must not hold the connection open for ever.
-const PROGRESSIVE_TIMEOUT_MS: u64 = 30_000;
+/// a stalled tuner must not hold the connection open for ever. A progressive
+/// transcode output with no job behind it waits as long
+/// ([`serve_growing_transcode`](crate::handlers::streaming::serve_growing_transcode)).
+pub(crate) const PROGRESSIVE_TIMEOUT_MS: u64 = 30_000;
 
 /// How many buffers the progressive reader may run ahead of the client.
 ///

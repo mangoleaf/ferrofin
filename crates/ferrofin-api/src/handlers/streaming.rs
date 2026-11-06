@@ -597,14 +597,18 @@ pub(crate) fn track_transcode_body(
     ))
 }
 
-/// Reads a progressive output while ffmpeg is still extending it.
-/// An empty read waits 50ms while the producing process lives, as upstream's
-/// ProgressiveFileStream does. A body termination releases its request mark.
+/// Reads a progressive output while ffmpeg is still extending it, as upstream's
+/// `ProgressiveFileStream` does: an empty read polls every 50 ms and ends the
+/// body, with a job, once its process has exited; with no job behind the file
+/// (`observer` is `None`), once that read has waited 30 s. A body termination
+/// releases its request mark.
 pub(crate) async fn serve_growing_transcode(
     path: &str,
     request: Request,
     observer: Option<std::sync::Arc<dyn ferrofin_traits::media_encoding::TranscodeStreamProgress>>,
 ) -> Result<Response, ApiError> {
+    use crate::handlers::live_tv::{PROGRESSIVE_POLL_MS, PROGRESSIVE_TIMEOUT_MS};
+    use std::time::Duration;
     use tokio::io::AsyncReadExt as _;
     let completion = ResponseCompletion(observer);
     if request.method() == axum::http::Method::HEAD {
@@ -625,17 +629,23 @@ pub(crate) async fn serve_growing_transcode(
                 return None;
             }
             let mut buffer = vec![0; 32_768];
+            let read_began = tokio::time::Instant::now();
             loop {
                 match file.read(&mut buffer).await {
-                    Ok(0)
-                        if completion
-                            .0
-                            .as_ref()
-                            .is_some_and(|observer| !observer.has_exited()) =>
-                    {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok(0) => {
+                        // `StopReading`: `_job?.HasExited ?? elapsed >= _timeoutMs`.
+                        let stop = match &completion.0 {
+                            Some(observer) => observer.has_exited(),
+                            None => {
+                                read_began.elapsed()
+                                    >= Duration::from_millis(PROGRESSIVE_TIMEOUT_MS)
+                            }
+                        };
+                        if stop {
+                            return None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(PROGRESSIVE_POLL_MS)).await;
                     }
-                    Ok(0) => return None,
                     Ok(length) => {
                         buffer.truncate(length);
                         if let Some(observer) = &completion.0 {
@@ -840,6 +850,69 @@ mod transcode_body_tests {
         assert!(body.next().await.is_none());
         assert_eq!(observer.bytes.load(Ordering::SeqCst), 11);
         assert!(observer.completed.load(Ordering::SeqCst));
+    }
+
+    /// `ProgressiveFileStream` with a null job: an empty read keeps polling
+    /// until bytes arrive or 30 s have passed since that read began.
+    #[tokio::test(start_paused = true)]
+    async fn growing_output_without_a_job_waits_out_the_read_timeout() {
+        use futures_util::StreamExt as _;
+        use std::io::Write as _;
+        use tokio::time::{Duration, Instant, sleep};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stream.ts");
+        std::fs::write(&path, b"").unwrap();
+        let response =
+            serve_growing_transcode(path.to_str().unwrap(), Request::new(Body::empty()), None)
+                .await
+                .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        let appended = path.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(29)).await;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(appended)
+                .unwrap()
+                .write_all(b"late")
+                .unwrap();
+        });
+        assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"late");
+        let read_began = Instant::now();
+        let end = tokio::time::timeout(Duration::from_secs(60), body.next()).await;
+        assert!(matches!(end, Ok(None)), "the body did not end");
+        let waited = read_began.elapsed();
+        assert!(
+            (Duration::from_secs(30)..Duration::from_secs(31)).contains(&waited),
+            "{waited:?}"
+        );
+    }
+
+    /// The timeout is the null job's alone: a running job's output is waited
+    /// for however long its process lives.
+    #[tokio::test(start_paused = true)]
+    async fn growing_output_of_a_running_job_never_times_out() {
+        use futures_util::StreamExt as _;
+        use tokio::time::{Duration, timeout};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stream.ts");
+        std::fs::write(&path, b"").unwrap();
+        let observer = Arc::new(Observer::default());
+        let response = serve_growing_transcode(
+            path.to_str().unwrap(),
+            Request::new(Body::empty()),
+            Some(observer.clone()),
+        )
+        .await
+        .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        assert!(
+            timeout(Duration::from_secs(120), body.next())
+                .await
+                .is_err()
+        );
+        observer.exited.store(true, Ordering::SeqCst);
+        assert!(body.next().await.is_none());
     }
 
     #[tokio::test]
