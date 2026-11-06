@@ -658,20 +658,32 @@ impl FerrofinItemRepository {
         }
         // Keep the existing consumer for other sort fields. Its broader
         // comparator parity is a separate query review, not this display flag.
-        let matching = InternalItemsQuery {
-            user: filter.user.clone(),
-            user_preferences_loaded: true,
-            item_ids: rows
-                .iter()
-                .filter_map(|row| Uuid::parse_str(&row.id).ok())
-                .collect(),
-            order_by: filter.order_by.clone(),
-            group_by_presentation_unique_key: false,
-            include_owned_items: true,
-            ..Default::default()
-        };
-        self.fetch_rows_resolved(&matching, QueryShape::FullRows)
+        self.sql_ordered_folder_children(rows, filter).await
+    }
+
+    /// `rows` in the SQL order of `filter.order_by` under the user's query
+    /// scope, less the rows that scope does not return. The rows are already
+    /// loaded, so SQL returns only their ids and no row is decoded a second
+    /// time (gl-1260).
+    async fn sql_ordered_folder_children(
+        &self,
+        rows: Vec<BaseItemEntity>,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let matching = folder_sql_order_query(&rows, filter);
+        let order: Vec<String> = build_query(&matching, QueryShape::IdsOnly)
+            .build_query_scalar::<String>()
+            .fetch_all(self.db.pool())
             .await
+            .map_err(db_err)?;
+        let mut rows: HashMap<Uuid, BaseItemEntity> = rows
+            .into_iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
+            .collect();
+        Ok(order
+            .iter()
+            .filter_map(|id| rows.remove(&Uuid::parse_str(id).ok()?))
+            .collect())
     }
 
     /// The in-memory GetResult whitelist. Ordinary query translation has
@@ -2639,6 +2651,27 @@ pub(crate) fn adjacent_window<T>(items: Vec<T>, is_item: impl Fn(&T) -> bool) ->
         .skip(start)
         .take(index + 2 - start)
         .collect()
+}
+
+/// The statement [`FerrofinItemRepository::sql_ordered_folder_children`]
+/// takes its order from: `rows`' ids under `filter`'s user scope, sorted by
+/// `filter.order_by`.
+fn folder_sql_order_query(
+    rows: &[BaseItemEntity],
+    filter: &InternalItemsQuery,
+) -> InternalItemsQuery {
+    InternalItemsQuery {
+        user: filter.user.clone(),
+        user_preferences_loaded: true,
+        item_ids: rows
+            .iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect(),
+        order_by: filter.order_by.clone(),
+        group_by_presentation_unique_key: false,
+        include_owned_items: true,
+        ..Default::default()
+    }
 }
 
 /// Pages an in-memory result as `UserViewBuilder.SortAndPage` does:
@@ -15639,3 +15672,7 @@ mod linked_library_scope_tests;
 #[cfg(test)]
 #[path = "item_repository/folder_sort_key_tests.rs"]
 mod folder_sort_key_tests;
+
+#[cfg(test)]
+#[path = "item_repository/folder_sql_order_tests.rs"]
+mod folder_sql_order_tests;
