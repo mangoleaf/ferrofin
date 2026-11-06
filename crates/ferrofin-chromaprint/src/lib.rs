@@ -15,15 +15,17 @@
 //!
 //! 1. Build an inverted index (`point → last index`) for each fingerprint.
 //! 2. For every left point, look for a right point within `±inverted_index_shift`
-//!    of its value; each hit yields a candidate index *shift* (`rhs_i − lhs_i`).
+//!    of its value; each hit yields a candidate index *shift* (`rhs_i − lhs_i`),
+//!    kept in the order upstream's .NET collections enumerate them.
 //! 3. For each candidate shift, XOR the two fingerprints at that alignment and
 //!    keep the positions whose bitwise difference is `≤ max_bit_diff` bits.
 //! 4. The longest run of kept positions whose gaps are `≤ max_time_skip` seconds
 //!    is that shift's shared region.
 //! 5. Across all shifts, select the longest region (intro/credits) or the
-//!    earliest (recap); snap a start within 5 s to 0.
+//!    earliest (recap), the first candidate on a tie; snap a start within 5 s
+//!    to 0.
 
-use std::collections::HashMap;
+use indexmap::{IndexMap, IndexSet};
 
 /// Seconds of audio each Chromaprint point represents.
 ///
@@ -103,12 +105,14 @@ fn point_time(i: usize) -> f64 {
     i as f64 * SAMPLE_DURATION
 }
 
-/// Builds the inverted index `point value → last index it appears at`.
+/// Builds the inverted index `point value → last index it appears at`, in
+/// the order the points first appear (a .NET `Dictionary` with no removals
+/// enumerates in insertion order, and an update keeps a key in place).
 ///
 /// Port of `CreateInvertedIndex`.
 #[must_use]
-pub fn create_inverted_index(fingerprint: &[u32]) -> HashMap<u32, usize> {
-    let mut index = HashMap::with_capacity(fingerprint.len());
+pub fn create_inverted_index(fingerprint: &[u32]) -> IndexMap<u32, usize> {
+    let mut index = IndexMap::with_capacity(fingerprint.len());
     for (i, &point) in fingerprint.iter().enumerate() {
         index.insert(point, i);
     }
@@ -116,7 +120,8 @@ pub fn create_inverted_index(fingerprint: &[u32]) -> HashMap<u32, usize> {
 }
 
 /// Finds every shared time-range candidate between two fingerprints, as parallel
-/// `(lhs, rhs)` range lists (one pair per productive index shift).
+/// `(lhs, rhs)` range lists (one pair per productive index shift), in
+/// upstream's candidate order.
 ///
 /// Port of `SearchInvertedIndex`.
 #[must_use]
@@ -130,8 +135,9 @@ pub fn search_inverted_index(
 
     // Candidate index shifts: for each left point, if the right episode has a
     // point within ±inverted_index_shift of its value, the two align at
-    // `rhs_i − lhs_i`.
-    let mut shifts = std::collections::HashSet::new();
+    // `rhs_i − lhs_i`. Kept in insertion order, as upstream's `HashSet`
+    // enumerates them: the order decides which of two equal regions wins.
+    let mut shifts = IndexSet::new();
     for (&point, &lhs_i) in &lhs_index {
         for delta in -cfg.inverted_index_shift..=cfg.inverted_index_shift {
             let modified = point.wrapping_add_signed(delta);
@@ -245,33 +251,45 @@ pub fn compare_episodes(
     cfg: &CompareConfig,
 ) -> (Option<TimeRange>, Option<TimeRange>) {
     let (lhs_ranges, rhs_ranges) = search_inverted_index(lhs, rhs, cfg);
-    if lhs_ranges.is_empty() {
+    let Some((mut l, mut r)) = select_region(&lhs_ranges, &rhs_ranges, mode) else {
         return (None, None);
-    }
-    let (mut l, mut r) = select_region(&lhs_ranges, &rhs_ranges, mode);
+    };
     snap_start(&mut l);
     snap_start(&mut r);
     (Some(l), Some(r))
 }
 
-/// Picks the winning `(lhs, rhs)` pair: the longest region for intro/credits, the
-/// earliest for recap. The two lists are parallel (index = shift), so the same
-/// index is chosen for both.
+/// Picks the winning `(lhs, rhs)` pair (`SelectSharedRegion`), `None` when
+/// there is no candidate. Recap takes the earliest left region and the right
+/// region of the same shift (`GetEarliestTimeRange`); intro and credits take
+/// each side's longest region on its own, since `GetLongestTimeRange` sorts
+/// the two lists separately. A tie goes to the first candidate.
 fn select_region(
     lhs: &[TimeRange],
     rhs: &[TimeRange],
     mode: AnalysisMode,
-) -> (TimeRange, TimeRange) {
-    let pick = (0..lhs.len().min(rhs.len())).max_by(|&a, &b| {
-        match mode {
-            // Earliest start wins for recap → reverse the start comparison.
-            AnalysisMode::Recap => lhs[b].start.total_cmp(&lhs[a].start),
-            // Longest duration wins otherwise.
-            _ => lhs[a].duration().total_cmp(&lhs[b].duration()),
+) -> Option<(TimeRange, TimeRange)> {
+    match mode {
+        AnalysisMode::Recap => (0..lhs.len().min(rhs.len()))
+            .reduce(|e, i| if lhs[i].start < lhs[e].start { i } else { e })
+            .map(|i| (lhs[i], rhs[i])),
+        _ => longest(lhs).zip(longest(rhs)),
+    }
+}
+
+/// The longest range, the first one on a tie: the head of upstream's
+/// longest-first `List.Sort`. That sort is .NET's introsort, which keeps the
+/// first of equal ranges at the head only up to 16 ranges, so past that an
+/// exact tie can resolve to another of them upstream. Porting
+/// `ArraySortHelper`'s introsort would match it; open work (gl-1350).
+fn longest(ranges: &[TimeRange]) -> Option<TimeRange> {
+    ranges.iter().copied().reduce(|best, r| {
+        if r.duration() > best.duration() {
+            r
+        } else {
+            best
         }
-    });
-    let i = pick.unwrap_or(0);
-    (lhs[i], rhs[i])
+    })
 }
 
 /// Snaps a region starting within 5 s of the episode start to exactly 0.
@@ -315,6 +333,15 @@ mod tests {
         let idx = create_inverted_index(&[7, 7, 9]);
         assert_eq!(idx[&7], 1); // last index of value 7
         assert_eq!(idx[&9], 2);
+    }
+
+    /// `TestIndexGeneration`'s fingerprint, in the order a .NET `Dictionary`
+    /// enumerates it: each point where it first appears, with its last index.
+    #[test]
+    fn inverted_index_enumerates_in_first_appearance_order() {
+        let idx = create_inverted_index(&[1, 2, 3, 1, 5, 77, 42, 2]);
+        let entries: Vec<(u32, usize)> = idx.into_iter().collect();
+        assert_eq!(entries, [(1, 3), (2, 7), (3, 2), (5, 4), (77, 5), (42, 6)]);
     }
 
     #[test]
@@ -382,6 +409,119 @@ mod tests {
             &CompareConfig::default(),
         );
         assert!(la.is_none());
+    }
+
+    /// Eight 40-point blocks of distinct pseudo-random points, laid out in
+    /// order in `lhs` and reversed in `rhs`, so block `k` aligns at shift
+    /// `(7 − 2k) · 40`: one candidate shift per block.
+    fn reversed_blocks() -> (Vec<u32>, Vec<u32>) {
+        let block = |k: u32| -> Vec<u32> {
+            (0..40u32)
+                .map(|i| (k * 40 + i + 1).wrapping_mul(0x9E37_79B9).rotate_left(13))
+                .collect()
+        };
+        let lhs = (0..8).flat_map(block).collect();
+        let rhs = (0..8).rev().flat_map(block).collect();
+        (lhs, rhs)
+    }
+
+    /// The candidates come back in upstream's order, whatever the hash seeds:
+    /// .NET's `Dictionary` and `HashSet` enumerate in insertion order, so the
+    /// shifts follow the left points' first appearance (here block 0 first),
+    /// not their value.
+    #[test]
+    fn candidate_regions_come_in_the_left_points_order() {
+        let (lhs, rhs) = reversed_blocks();
+        let cfg = CompareConfig {
+            min_region_duration: 3.0,
+            ..CompareConfig::default()
+        };
+        for _ in 0..20 {
+            let (ranges, _) = search_inverted_index(&lhs, &rhs, &cfg);
+            let starts: Vec<f64> = ranges.iter().map(|r| r.start).collect();
+            let expected: Vec<f64> = (0..8).map(|k| point_time(k * 40)).collect();
+            assert_eq!(starts, expected);
+        }
+    }
+
+    /// `SelectSharedRegion_Introduction_PicksLongestRegion`.
+    #[test]
+    fn introduction_picks_the_longest_region() {
+        let (lhs, rhs) = two_shared_regions();
+        let (l, _) = select_region(&lhs, &rhs, AnalysisMode::Introduction).expect("a region");
+        assert_eq!(l, TimeRange::new(40.0, 65.0));
+    }
+
+    /// `SelectSharedRegion_Recap_PicksEarliestRegion`.
+    #[test]
+    fn recap_picks_the_earliest_region() {
+        let (lhs, rhs) = two_shared_regions();
+        let picked = select_region(&lhs, &rhs, AnalysisMode::Recap);
+        assert_eq!(
+            picked,
+            Some((TimeRange::new(10.0, 16.0), TimeRange::new(11.0, 17.0)))
+        );
+    }
+
+    /// `SelectSharedRegion_Recap_ReturnsInvalidSegments_WhenRangesAreEmpty`,
+    /// for every mode.
+    #[rstest::rstest]
+    fn no_candidate_selects_no_region(
+        #[values(AnalysisMode::Recap, AnalysisMode::Introduction, AnalysisMode::Credits)]
+        mode: AnalysisMode,
+    ) {
+        assert_eq!(select_region(&[], &[], mode), None);
+    }
+
+    /// Upstream's `TwoSharedRegions` fixture.
+    fn two_shared_regions() -> (Vec<TimeRange>, Vec<TimeRange>) {
+        (
+            vec![TimeRange::new(10.0, 16.0), TimeRange::new(40.0, 65.0)],
+            vec![TimeRange::new(11.0, 17.0), TimeRange::new(41.0, 66.0)],
+        )
+    }
+
+    /// Equal candidates resolve to the first, as `GetEarliestTimeRange`'s
+    /// strict `<` and `GetLongestTimeRange`'s sort keep it.
+    #[rstest::rstest]
+    #[case::recap_earliest(AnalysisMode::Recap, (10.0, 16.0), (11.0, 17.0))]
+    #[case::introduction_longest(AnalysisMode::Introduction, (20.0, 40.0), (21.0, 41.0))]
+    #[case::credits_longest(AnalysisMode::Credits, (20.0, 40.0), (21.0, 41.0))]
+    fn a_tie_goes_to_the_first_candidate(
+        #[case] mode: AnalysisMode,
+        #[case] lhs: (f64, f64),
+        #[case] rhs: (f64, f64),
+    ) {
+        let lhs_ranges = [
+            TimeRange::new(20.0, 40.0),
+            TimeRange::new(10.0, 16.0),
+            TimeRange::new(50.0, 70.0),
+            TimeRange::new(10.0, 20.0),
+        ];
+        let rhs_ranges = [
+            TimeRange::new(21.0, 41.0),
+            TimeRange::new(11.0, 17.0),
+            TimeRange::new(51.0, 71.0),
+            TimeRange::new(11.0, 21.0),
+        ];
+        let picked = select_region(&lhs_ranges, &rhs_ranges, mode);
+        assert_eq!(
+            picked,
+            Some((TimeRange::new(lhs.0, lhs.1), TimeRange::new(rhs.0, rhs.1)))
+        );
+    }
+
+    /// `GetLongestTimeRange` sorts the two lists separately, so each side
+    /// gets its own longest region, even from different shifts.
+    #[test]
+    fn each_side_gets_its_own_longest_region() {
+        let lhs = [TimeRange::new(20.0, 40.0), TimeRange::new(50.0, 69.0)];
+        let rhs = [TimeRange::new(21.0, 40.0), TimeRange::new(51.0, 71.0)];
+        let picked = select_region(&lhs, &rhs, AnalysisMode::Introduction);
+        assert_eq!(
+            picked,
+            Some((TimeRange::new(20.0, 40.0), TimeRange::new(51.0, 71.0)))
+        );
     }
 
     #[test]
