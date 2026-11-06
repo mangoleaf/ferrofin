@@ -55,7 +55,8 @@ pub(super) enum EpisodeState {
     UserProvided,
 }
 
-/// A verified queue entry with its per-mode states (`QueuedEpisode.IsAnalyzed`).
+/// A queue entry from `verify_queue`, with its per-mode states
+/// (`QueuedEpisode.IsAnalyzed`).
 #[derive(Debug, Clone)]
 pub(super) struct Item {
     /// The queue entry.
@@ -653,8 +654,10 @@ impl DetectSegmentsTask {
         analyzed_total
     }
 
-    /// `VerifyQueueAsync`: items whose file is gone are dropped, and each
-    /// item's per-mode state is read back from one snapshot of the season.
+    /// `VerifyQueueAsync`: each item's per-mode state is read back from one
+    /// snapshot of the season, and items whose file is gone are dropped when
+    /// the pass can act on them: a mode still to analyse, or settled
+    /// reanalysis on.
     async fn verify_queue(
         &self,
         entries: Vec<QueuedEpisode>,
@@ -680,27 +683,44 @@ impl DetectSegmentsTask {
             .collect();
         let ids: Vec<Uuid> = entries.iter().map(|e| e.episode_id).collect();
         let segments = self.actions.segments_of(&ids).await?;
-        let mut verified = Vec::with_capacity(entries.len());
-        for entry in entries {
-            if !tokio::fs::try_exists(&entry.path).await.unwrap_or(false) {
+        let items: Vec<Item> = entries
+            .into_iter()
+            .map(|entry| {
+                let of_item = segments
+                    .get(&entry.episode_id)
+                    .map_or(&[][..], Vec::as_slice);
+                let mut item = Item::new(entry);
+                derive_states(
+                    &mut item,
+                    of_item,
+                    modes,
+                    states,
+                    &hash_matches,
+                    analyze_again,
+                );
+                item
+            })
+            .collect();
+        // gl-1326: with no mode left to analyse and no settled reanalysis,
+        // the season's pass uses no item, so which files exist changes
+        // nothing; skip the `stat` per file a network library pays for.
+        if !config.reanalyze_settled_seasons
+            && !modes.iter().any(|&mode| has_uncached_work(&items, mode))
+        {
+            return Ok(items);
+        }
+        let mut verified = Vec::with_capacity(items.len());
+        for item in items {
+            if !tokio::fs::try_exists(&item.entry.path)
+                .await
+                .unwrap_or(false)
+            {
                 tracing::debug!(
-                    item = entry.name,
+                    item = item.entry.name,
                     "intro skipper: skipping, the file is gone"
                 );
                 continue;
             }
-            let of_item = segments
-                .get(&entry.episode_id)
-                .map_or(&[][..], Vec::as_slice);
-            let mut item = Item::new(entry);
-            derive_states(
-                &mut item,
-                of_item,
-                modes,
-                states,
-                &hash_matches,
-                analyze_again,
-            );
             verified.push(item);
         }
         Ok(verified)
@@ -1490,6 +1510,48 @@ mod tests {
         let hash_matches = HashMap::from([(Mode::Introduction, true)]);
         derive_states(&mut other, &[], &modes, &states, &hash_matches, false);
         assert_eq!(other.get(Mode::Introduction), EpisodeState::NotAnalyzed);
+    }
+
+    /// gl-1326: with nothing left to analyse and no settled reanalysis, a
+    /// season's verified items are not used, so `verify_queue` checks no
+    /// files. Otherwise an item whose file is gone is still dropped.
+    #[rstest::rstest]
+    #[case::fully_analysed("{}", false, 2)]
+    #[case::settled_reanalysis(r#"{"ReanalyzeSettledSeasons":true}"#, false, 1)]
+    #[case::analyse_again("{}", true, 1)]
+    #[tokio::test]
+    async fn verify_queue_checks_files_only_for_a_season_with_work(
+        #[case] config: &str,
+        #[case] analyze_again: bool,
+        #[case] verified: usize,
+    ) {
+        use crate::intro_skipper::tests::{TWO_EPISODES, harness};
+        use ferrofin_core::ScheduledTask as _;
+        let h = harness(&TWO_EPISODES, true, config, true).await;
+        h.task
+            .execute(&TaskProgress::default())
+            .await
+            .expect("analyse");
+        let config = h.task.load_config().await;
+        let (season, entries) = h
+            .task
+            .queue(&config, None)
+            .await
+            .expect("queue")
+            .pop()
+            .expect("one season");
+        std::fs::remove_file(&entries[1].path).expect("remove a file");
+        let states = h.task.actions.season_states(season).await.expect("states");
+        h.task
+            .runtime
+            .analyze_again
+            .store(analyze_again, Ordering::SeqCst);
+        let items = h
+            .task
+            .verify_queue(entries, &modes(&config), &states, &config, true)
+            .await
+            .expect("verify");
+        assert_eq!(items.len(), verified);
     }
 
     /// `AdjustIntroEndBasedOnSilenceAsync`: the first silence that overlaps

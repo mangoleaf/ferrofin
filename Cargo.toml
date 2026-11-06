@@ -241,7 +241,9 @@ bitflags = "2.13.2"
 # CRC-32 (reflected zlib polynomial) for the HDHomeRun control protocol's packet
 # checksum — a port of `MediaBrowser.Common/Crc32.cs`, whose own tests pin
 # 0x414fa339 for "The quick brown fox...". Already in the lock file as a
-# transitive dependency of flate2/zip, so it adds no new compilation.
+# transitive dependency of flate2/zip, so it adds no new compilation. The WASM
+# host also uses it to tell whether a plugin's state file still holds the bytes
+# its kept map came from.
 crc32fast = "1.5.2"
 regex = "1"
 percent-encoding = "2.3.2"

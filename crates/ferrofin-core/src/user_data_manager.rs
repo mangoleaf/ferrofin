@@ -1934,26 +1934,6 @@ impl UserDataManager for FerrofinUserDataManager {
         user_id: Uuid,
         include_provider_ids: bool,
     ) -> Result<HashMap<Uuid, UserItemDataDto>, ServiceError> {
-        let ids: Vec<Uuid> = items
-            .iter()
-            .filter_map(|item| Uuid::parse_str(&item.id).ok())
-            .collect();
-        let mut stored = self.stored_user_data_rows(&ids, user_id).await?;
-        let children: Vec<&BaseItemEntity> = items
-            .iter()
-            .filter(|item| {
-                matches!(
-                    kind_from_type_name(&item.type_),
-                    Some(BaseItemKind::Season | BaseItemKind::Episode)
-                )
-            })
-            .collect();
-        let series_keys = if children.is_empty() {
-            HashMap::new()
-        } else {
-            let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
-            crate::user_data_key_repository::load_child_series_keys(&mut conn, &children).await?
-        };
         let providers = if include_provider_ids {
             let mut wanted: Vec<Uuid> = items
                 .iter()
@@ -1970,35 +1950,18 @@ impl UserDataManager for FerrofinUserDataManager {
         } else {
             HashMap::new()
         };
-        let mut map = HashMap::with_capacity(items.len());
-        for item in items {
-            let Ok(id) = Uuid::parse_str(&item.id) else {
-                continue;
-            };
-            // A page may list an item twice (a playlist's repeated entry):
-            // its first occurrence already took the rows, so resolve each id
-            // once, as upstream's `GetUserDataBatch` reads its grouped rows
-            // without removing them.
-            if map.contains_key(&id) {
-                continue;
-            }
-            let candidates = stored.remove(&id).unwrap_or_default();
-            // `ResolveUserDataRow` answers with an only row whatever the
-            // item's keys are, so they are derived only to choose between
-            // rows, or to key the row of an item the user never wrote.
-            let dto = match <[UserDataEntity; 1]>::try_from(candidates) {
-                Ok([row]) => to_dto(row, id),
-                Err(candidates) => {
-                    let current = row_data_keys(item, id, &providers, &series_keys);
-                    match Self::preferred_row(candidates, &current) {
-                        Some(row) => to_dto(row, id),
-                        None => unwritten_dto(id, current.into_iter().next().unwrap_or_default()),
-                    }
-                }
-            };
-            map.insert(id, dto);
-        }
-        Ok(map)
+        self.user_data_dtos_for_rows(items, user_id, &providers)
+            .await
+    }
+
+    async fn get_user_data_dtos_for_rows_with_providers(
+        &self,
+        items: &[BaseItemEntity],
+        user_id: Uuid,
+        providers: &HashMap<Uuid, Vec<(String, String)>>,
+    ) -> Result<HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        self.user_data_dtos_for_rows(items, user_id, providers)
+            .await
     }
 
     async fn get_user_data_batch(
@@ -2238,6 +2201,66 @@ impl UserDataManager for FerrofinUserDataManager {
 }
 
 impl FerrofinUserDataManager {
+    /// The row-aware page read behind both `get_user_data_dtos_for_rows`
+    /// forms. `providers` holds the provider ids the keys may derive from:
+    /// empty unless the rows were hydrated with them.
+    async fn user_data_dtos_for_rows(
+        &self,
+        items: &[BaseItemEntity],
+        user_id: Uuid,
+        providers: &HashMap<Uuid, Vec<(String, String)>>,
+    ) -> Result<HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        let ids: Vec<Uuid> = items
+            .iter()
+            .filter_map(|item| Uuid::parse_str(&item.id).ok())
+            .collect();
+        let mut stored = self.stored_user_data_rows(&ids, user_id).await?;
+        let children: Vec<&BaseItemEntity> = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    kind_from_type_name(&item.type_),
+                    Some(BaseItemKind::Season | BaseItemKind::Episode)
+                )
+            })
+            .collect();
+        let series_keys = if children.is_empty() {
+            HashMap::new()
+        } else {
+            let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+            crate::user_data_key_repository::load_child_series_keys(&mut conn, &children).await?
+        };
+        let mut map = HashMap::with_capacity(items.len());
+        for item in items {
+            let Ok(id) = Uuid::parse_str(&item.id) else {
+                continue;
+            };
+            // A page may list an item twice (a playlist's repeated entry):
+            // its first occurrence already took the rows, so resolve each id
+            // once, as upstream's `GetUserDataBatch` reads its grouped rows
+            // without removing them.
+            if map.contains_key(&id) {
+                continue;
+            }
+            let candidates = stored.remove(&id).unwrap_or_default();
+            // `ResolveUserDataRow` answers with an only row whatever the
+            // item's keys are, so they are derived only to choose between
+            // rows, or to key the row of an item the user never wrote.
+            let dto = match <[UserDataEntity; 1]>::try_from(candidates) {
+                Ok([row]) => to_dto(row, id),
+                Err(candidates) => {
+                    let current = row_data_keys(item, id, providers, &series_keys);
+                    match Self::preferred_row(candidates, &current) {
+                        Some(row) => to_dto(row, id),
+                        None => unwritten_dto(id, current.into_iter().next().unwrap_or_default()),
+                    }
+                }
+            };
+            map.insert(id, dto);
+        }
+        Ok(map)
+    }
+
     /// The `BaseItemProviders` rows for `ids`, keyed by item id — one chunked
     /// `IN` read instead of the per-item query the write path makes.
     async fn provider_ids_batch(
@@ -3745,6 +3768,80 @@ mod tests {
             .await
             .expect("by id");
         assert_eq!(by_id[&movie].key, "tt0111161");
+    }
+
+    /// The DTO service hands over the page's provider rows, read for every
+    /// page item, and gets the keys the hydrating read derives from its own
+    /// read: an episode's own entry is ignored, as its keys come from its
+    /// series. An empty map keys as the unhydrated read does.
+    #[tokio::test]
+    async fn handed_provider_rows_key_as_the_hydrating_read_does() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let (movie, series, episode) = (
+            Uuid::from_u128(0xF511),
+            Uuid::from_u128(0xF512),
+            Uuid::from_u128(0xF513),
+        );
+        seed_user(&db, user).await;
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        seed_provider_id(&db, movie, "Imdb", "tt0111161").await;
+        seed_provider_id(&db, movie, "Tmdb", "278").await;
+        seed_named_item(&db, series, BaseItemKind::Series, "Show").await;
+        seed_provider_id(&db, series, "Tvdb", "78874").await;
+        seed_named_item(&db, episode, BaseItemKind::Episode, "Ep").await;
+        seed_provider_id(&db, episode, "Imdb", "tt0579539").await;
+        sqlx::query(
+            r#"UPDATE "BaseItems"
+               SET "SeriesId" = ?2, "ParentIndexNumber" = 1, "IndexNumber" = 2
+               WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(episode))
+        .bind(guid_to_db(series))
+        .execute(db.writer())
+        .await
+        .expect("link episode to series");
+        let mut rows = Vec::new();
+        for id in [movie, series, episode] {
+            rows.push(fetch_item(&db, id).await);
+        }
+        let mgr = FerrofinUserDataManager::new(db, config());
+        let keys = |map: &HashMap<Uuid, UserItemDataDto>| {
+            [movie, series, episode].map(|id| map[&id].key.clone())
+        };
+
+        let page_rows = mgr
+            .provider_ids_batch(&[movie, series, episode])
+            .await
+            .expect("provider rows");
+        let handed = mgr
+            .get_user_data_dtos_for_rows_with_providers(&rows, user, &page_rows)
+            .await
+            .expect("handed");
+        let hydrated = mgr
+            .get_user_data_dtos_for_rows(&rows, user, true)
+            .await
+            .expect("hydrated");
+        assert_eq!(keys(&handed), keys(&hydrated));
+        assert_eq!(
+            keys(&handed),
+            [
+                "278".to_owned(),
+                "78874".to_owned(),
+                "78874001002".to_owned()
+            ]
+        );
+
+        let none = mgr
+            .get_user_data_dtos_for_rows_with_providers(&rows, user, &HashMap::new())
+            .await
+            .expect("none");
+        let plain = mgr
+            .get_user_data_dtos_for_rows(&rows, user, false)
+            .await
+            .expect("plain");
+        assert_eq!(keys(&none), keys(&plain));
+        assert_eq!(keys(&none)[0], movie.to_string());
     }
 
     /// A stored row reports the first matching current key, including the

@@ -1627,6 +1627,7 @@ dependencies = [
  "ferrofin-networking",
  "ferrofin-traits",
  "ferrofin-util",
+ "futures-util",
  "opentelemetry",
  "opentelemetry_sdk",
  "quick-xml",
@@ -1756,6 +1757,7 @@ version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
+ "crc32fast",
  "ferrofin-core",
  "ferrofin-db",
  "ferrofin-model",
