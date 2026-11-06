@@ -164,7 +164,7 @@ pub trait StreamStatePlanner: Send + Sync {
     /// The item, series and library names the transcode logs show for
     /// `item_id`. Asked only when a transcode actually starts, never by
     /// [`plan`](Self::plan): every segment request that starts a transcode plans, and resolving the
-    /// library walks every configured library. Best-effort; the default is
+    /// names reads the item from the database. Best-effort; the default is
     /// empty.
     async fn display_names(&self, _item_id: uuid::Uuid) -> TranscodeDisplayNames {
         TranscodeDisplayNames::default()
@@ -2381,7 +2381,7 @@ mod tests {
         assert_eq!(labels(), 1, "the start names its job");
 
         // The segment is on disk now: serving it again starts nothing, so it
-        // must not resolve names (a library walk) either.
+        // must not resolve names (a database read) either.
         mgr.dynamic_segment(&req(), 0, false).await.unwrap();
         mgr.variant_playlist(&req(), false).await.unwrap();
         assert_eq!(

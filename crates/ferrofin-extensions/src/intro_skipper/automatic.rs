@@ -15,28 +15,60 @@ use std::time::Duration;
 
 use ferrofin_core::TaskProgress;
 use ferrofin_model::data::BaseItemKind;
+use ferrofin_traits::error::ServiceError;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use super::{DetectSegmentsTask, EXTENSION_ID, ReleaseOnDrop, queue};
+use super::{DetectSegmentsTask, EXTENSION_ID, queue};
 
 /// The wait after an item is added (`OnItemChanged`, `UpdateReason == 0`).
 const ADDED_DELAY: Duration = Duration::from_secs(120);
 /// The wait after an item is updated, a library scan ends, or a run ended with
 /// more queued (`StartTimer`'s default).
 const UPDATED_DELAY: Duration = Duration::from_secs(60);
-/// How often a run waiting for the one-pass latch looks again: the wait is
-/// a whole analysis pass (minutes), so a second's lag is noise.
-// TODO: wake waiters through a `tokio::sync::Notify` on release instead of
-// polling, if latch waits ever matter (many queued runs, or tests).
-const LATCH_POLL: Duration = Duration::from_secs(1);
+
+/// `ScheduledTaskSemaphore`: one analysis pass at a time. Waiters take it in
+/// turn as it is released, and a permit releases it when dropped, so an
+/// aborted (cancelled) run cannot leave it held.
+#[derive(Debug, Clone)]
+pub(super) struct Latch(Arc<Semaphore>);
+
+impl Default for Latch {
+    fn default() -> Self {
+        Self(Arc::new(Semaphore::new(1)))
+    }
+}
+
+impl Latch {
+    /// `IsBusy`.
+    pub(super) fn is_busy(&self) -> bool {
+        self.0.available_permits() == 0
+    }
+
+    /// `TryAcquireAsync`: the latch, unless a pass holds it.
+    pub(super) fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.0).try_acquire_owned().ok()
+    }
+
+    /// `AcquireAsync`: waits for the latch.
+    ///
+    /// # Errors
+    /// The semaphore was closed, which nothing does.
+    pub(super) async fn acquire(&self) -> Result<OwnedSemaphorePermit, ServiceError> {
+        Arc::clone(&self.0)
+            .acquire_owned()
+            .await
+            .map_err(|err| ServiceError::backend(format!("intro skipper latch: {err}")))
+    }
+}
 
 /// The Intro Skipper's run state, shared by every handle on it (the plugin's
 /// statics and `Plugin.Instance` flags).
 #[derive(Debug, Default)]
 pub struct Runtime {
     /// `ScheduledTaskSemaphore`: one analysis at a time.
-    pub(super) running: Arc<AtomicBool>,
+    pub(super) running: Latch,
     /// `Plugin.AnalyzeAgain`: the settings changed since the last pass, so
     /// the next one analyses again what earlier ones recorded.
     pub(super) analyze_again: AtomicBool,
@@ -110,15 +142,6 @@ impl Automatic {
 }
 
 impl DetectSegmentsTask {
-    /// Waits for the one-pass latch (`ScheduledTaskSemaphore.AcquireAsync`);
-    /// held until the returned guard drops.
-    pub(super) async fn acquire_latch(&self) -> ReleaseOnDrop {
-        while self.running.swap(true, Ordering::SeqCst) {
-            tokio::time::sleep(LATCH_POLL).await;
-        }
-        ReleaseOnDrop(Arc::clone(&self.running))
-    }
-
     /// `CancelAutomaticTaskAsync`: stops the automatic run, if one is going,
     /// and waits for it to let go of the latch.
     pub(super) async fn cancel_automatic(&self) {
@@ -264,7 +287,13 @@ impl DetectSegmentsTask {
     /// `PerformAnalysisAsync`: analyse the queued seasons under the latch,
     /// and again later when more was queued meanwhile.
     async fn run_automatic(&self) {
-        let _latch = self.acquire_latch().await;
+        let _latch = match self.running.acquire().await {
+            Ok(latch) => latch,
+            Err(err) => {
+                tracing::warn!(%err, "intro skipper: automatic analysis not run");
+                return;
+            }
+        };
         // The plugin may have been turned off during the wait.
         if !self.enabled().await {
             return;
@@ -368,7 +397,7 @@ mod tests {
         assert!(h.calls.load(Ordering::SeqCst) > 0);
         assert_eq!(intros_of(&h.segments, EP_A).await.len(), 1);
         assert!(queued(&h.task).0.is_empty());
-        assert!(!h.task.running.load(Ordering::SeqCst));
+        assert!(!h.task.running.is_busy());
     }
 
     /// gl-1272: the automatic run queues only the changed seasons' series, so
@@ -474,7 +503,7 @@ mod tests {
         let stuck = {
             let task = h.task.clone();
             tokio::spawn(async move {
-                let _latch = task.acquire_latch().await;
+                let _latch = task.running.acquire().await.expect("latch");
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             })
         };
@@ -488,6 +517,26 @@ mod tests {
         .expect("not stuck behind the automatic run")
         .expect("run");
         assert!(h.calls.load(Ordering::SeqCst) > 0);
+    }
+
+    /// gl-1327: a run waiting for the latch takes it as soon as it is
+    /// released (`SemaphoreSlim.WaitAsync`), not at its next look, so a
+    /// `ScanSeason` arriving then cannot overtake it.
+    #[tokio::test]
+    async fn a_waiting_run_takes_the_latch_on_release() {
+        let h = harness(&TWO_EPISODES, true, "{}", true).await;
+        let held = h.task.running.acquire().await.expect("latch");
+        let task = h.task.clone();
+        let waiting = tokio::spawn(async move { drop(task.running.acquire().await) });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiting.is_finished(), "waits while the latch is held");
+        drop(held);
+        assert!(h.task.running.is_busy(), "handed to the waiter");
+        assert!(h.task.running.try_acquire().is_none(), "not overtaken");
+        tokio::time::timeout(Duration::from_millis(500), waiting)
+            .await
+            .expect("woken on release")
+            .expect("join");
     }
 
     /// `StartTimer` while a run is going: no new wait, the run goes again

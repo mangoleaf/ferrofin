@@ -1379,6 +1379,7 @@ fn mount_web(
         .route("/", get(|| async { Redirect::permanent("/web/") }))
         .layer(axum::middleware::from_fn(redirect_bare_web))
         .layer(transform_layer)
+        .layer(axum::middleware::from_fn(no_cache_web_index))
         // Jellyfin's `UseResponseCompression()` sits above BOTH its API and its
         // static-file middleware, and jellyfin-web's bundles are the payloads
         // that gain most from it. `nest_service` mounts a service the API
@@ -1448,6 +1449,38 @@ fn web_file_mime(path: &str) -> &'static str {
         "svg" => "image/svg+xml",
         _ => "text/plain; charset=utf-8",
     }
+}
+
+/// Sends `/web`'s `index.html` with `Cache-Control: no-cache`, as Jellyfin's
+/// static-file `OnPrepareResponse` does (`Jellyfin.Server/Startup.cs`), so a
+/// browser revalidates the page instead of running a heuristically cached copy
+/// after an upgrade. A directory request is an `index.html` request.
+///
+/// Upstream sets it on every status its static-file middleware answers with
+/// (`200`, `206`, `304`, `412`, `416`), never on a miss that falls through.
+async fn no_cache_web_index(req: Request, next: Next) -> Response {
+    let index = req
+        .uri()
+        .path()
+        .strip_prefix("/web/")
+        .is_some_and(|rel| matches!(rel.rsplit('/').next(), Some("" | "index.html")));
+    let mut response = next.run(req).await;
+    let status = response.status();
+    if index
+        && (status.is_success()
+            || matches!(
+                status,
+                axum::http::StatusCode::NOT_MODIFIED
+                    | axum::http::StatusCode::PRECONDITION_FAILED
+                    | axum::http::StatusCode::RANGE_NOT_SATISFIABLE
+            ))
+    {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+    }
+    response
 }
 
 /// Redirects the exact path `/web` (no trailing slash) to `/web/`, so
@@ -1875,6 +1908,97 @@ mod tests {
             "HELLO WORLD\n".repeat(LINES),
             "the transformed text must survive compression unchanged"
         );
+    }
+
+    /// `index.html` goes out with `Cache-Control: no-cache` on every status
+    /// Jellyfin's static-file middleware answers it with (measured on 12.4), so
+    /// a browser revalidates the page after an upgrade instead of running a
+    /// cached one that names chunks the new bundle no longer has. Other files
+    /// and misses carry no `Cache-Control`, as upstream.
+    #[rstest::rstest]
+    #[case::directory("/web/", None, StatusCode::OK, true)]
+    #[case::file("/web/index.html", None, StatusCode::OK, true)]
+    #[case::range("/web/index.html", Some(("range", "bytes=0-3")), StatusCode::PARTIAL_CONTENT, true)]
+    #[case::bad_range(
+        "/web/index.html",
+        Some(("range", "bytes=9999-")),
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        true
+    )]
+    #[case::precondition(
+        "/web/index.html",
+        Some(("if-match", "\"other\"")),
+        StatusCode::PRECONDITION_FAILED,
+        true
+    )]
+    #[case::asset("/web/bundle.js", None, StatusCode::OK, false)]
+    #[case::nested("/web/sub/index.html", None, StatusCode::OK, true)]
+    #[case::missing("/web/nope/index.html", None, StatusCode::NOT_FOUND, false)]
+    #[tokio::test]
+    async fn web_index_is_sent_no_cache(
+        #[case] uri: &str,
+        #[case] header: Option<(&str, &str)>,
+        #[case] status: StatusCode,
+        #[case] no_cache: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
+        std::fs::write(dir.path().join("bundle.js"), "//js").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/index.html"), "<!doctype html>").unwrap();
+        let app = mount_web(Router::new(), dir.path(), transformations(dir.path()));
+
+        let mut request = Request::builder().uri(uri);
+        if let Some((name, value)) = header {
+            request = request.header(name, value);
+        }
+        let response = app
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .map(axum::http::HeaderValue::as_bytes),
+            no_cache.then_some(&b"no-cache"[..]),
+        );
+    }
+
+    /// The `no-cache` page survives revalidation (a `304`) and the File
+    /// Transformation pipeline, which upstream also serves through
+    /// `OnPrepareResponse`.
+    #[tokio::test]
+    async fn web_index_stays_no_cache_when_revalidated_or_transformed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<body></body>").unwrap();
+        let service = transformations(dir.path());
+        let app = mount_web(Router::new(), dir.path(), Arc::clone(&service));
+        let get = |headers: &[(&str, &str)]| {
+            let mut request = Request::builder().uri("/web/");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            app.clone().oneshot(request.body(Body::empty()).unwrap())
+        };
+
+        let first = get(&[]).await.unwrap();
+        let etag = first.headers()["etag"].to_str().unwrap().to_owned();
+        let revalidated = get(&[("if-none-match", etag.as_str())]).await.unwrap();
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated.headers()["cache-control"], "no-cache");
+
+        service
+            .add_transformation(uuid::Uuid::from_u128(12), "index.html", Arc::new(Upper))
+            .await;
+        let transformed = get(&[]).await.unwrap();
+        assert_eq!(transformed.status(), StatusCode::OK);
+        assert_eq!(transformed.headers()["cache-control"], "no-cache");
+        let body = axum::body::to_bytes(transformed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"<BODY></BODY>");
     }
 
     #[tokio::test]
