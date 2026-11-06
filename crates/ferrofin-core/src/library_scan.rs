@@ -1491,6 +1491,15 @@ impl ExternalProbeSeam {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`LibraryScanner::append_art_dir_images`] listed an
+    /// item's art folders on this thread, for the tests that pin how often a
+    /// scan does. A plain `#[tokio::test]` runs the scan on the test's own
+    /// thread; a `multi_thread` runtime could list where this cannot see it.
+    static ART_DIR_LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Runs blocking filesystem work (a plan pass, a window's file checks, a
 /// trickplay refresh's folder probes) on this worker after handing the
 /// worker's other tasks to the rest of the runtime (`block_in_place`), so
@@ -13401,7 +13410,13 @@ impl LibraryScanner {
         {
             artwork::prune_old_backdrops_in(&written_art_dirs(&root.resolve(), entity), &images);
         }
-        self.append_art_dir_images(entity, &mut images);
+        // The art folders again, for what the providers wrote there. Without a
+        // remote fetch only the extractors run, and they add what they write
+        // to `images`, so the first listing stands unless a cancel cut them
+        // short.
+        if remote || cut_short {
+            self.append_art_dir_images(entity, &mut images);
+        }
         // An album's Primary is stored as its shared, content-addressed cover
         // (what `finish_album_artwork` publishes after the walk). Storing the
         // source file here instead made the two passes rewrite each other's
@@ -14377,6 +14392,8 @@ impl LibraryScanner {
         let Some(meta_root) = &self.metadata_dir else {
             return;
         };
+        #[cfg(test)]
+        ART_DIR_LISTINGS.with(|listings| listings.set(listings.get() + 1));
         // Snapshot the types discovery produced up front, so several art-dir
         // files of one type (backdrop.jpg, backdrop1.jpg, …) all append.
         let discovered: std::collections::HashSet<ImageType> =
@@ -14384,31 +14401,35 @@ impl LibraryScanner {
         // The item's own folder first. The legacy folder adds only the types
         // the own folder has none of, so art present in both lists once.
         let mut found = std::collections::HashSet::new();
-        for dir in written_art_dirs(&meta_root.resolve(), entity) {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            let mut here = std::collections::HashSet::new();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Some(image_type) = parse_art_file_stem(&path) else {
+        // Folder listings and a file time per image: off the runtime workers,
+        // which a slow metadata share would otherwise stall.
+        off_runtime(|| {
+            for dir in written_art_dirs(&meta_root.resolve(), entity) {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
                     continue;
                 };
-                if discovered.contains(&image_type) || found.contains(&image_type) {
-                    continue;
+                let mut here = std::collections::HashSet::new();
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Some(image_type) = parse_art_file_stem(&path) else {
+                        continue;
+                    };
+                    if discovered.contains(&image_type) || found.contains(&image_type) {
+                        continue;
+                    }
+                    here.insert(image_type);
+                    images.push(ItemImageInfo {
+                        path: path.to_string_lossy().into_owned(),
+                        image_type,
+                        date_modified: file_date_modified(&path),
+                        width: 0,
+                        height: 0,
+                        blur_hash: None,
+                    });
                 }
-                here.insert(image_type);
-                images.push(ItemImageInfo {
-                    path: path.to_string_lossy().into_owned(),
-                    image_type,
-                    date_modified: file_date_modified(&path),
-                    width: 0,
-                    height: 0,
-                    blur_hash: None,
-                });
+                found.extend(here);
             }
-            found.extend(here);
-        }
+        });
     }
 
     /// Resolve the selected provider's complete candidate list and acquire
@@ -24369,6 +24390,8 @@ mod playlists;
 mod provider_cache;
 mod trickplay;
 
+#[cfg(test)]
+mod art_dir_images_tests;
 #[cfg(test)]
 mod directory_cache_tests;
 #[cfg(test)]
