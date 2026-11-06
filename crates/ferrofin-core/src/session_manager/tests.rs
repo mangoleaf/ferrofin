@@ -4632,5 +4632,8 @@ mod now_playing_item;
 /// The session's play state, queue, transcoding info and now-viewing item.
 mod play_state;
 
+/// What a playback report reads from the library.
+mod report_reads;
+
 /// The session DTO members that do not follow the playback state.
 mod session_dto;
