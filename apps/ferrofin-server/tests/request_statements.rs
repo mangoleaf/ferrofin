@@ -40,6 +40,9 @@
 //!   checks come from the policy cache, as upstream reads them from the user
 //!   it holds, and the caller's row is read once; a policy saved through the
 //!   API reaches the very next listing.
+//! - An unscoped `GET /Items?Recursive=true` (gl-1283). Its scope, the user's
+//!   libraries, views and playlists folder, comes from the cached library set,
+//!   as upstream holds them in memory: a warm listing reads none of those rows.
 
 use std::sync::Mutex;
 
@@ -75,6 +78,9 @@ const PLAYING_SPAN: &str = "gl1242_playing_request";
 /// The span the recorded session listings run in.
 const SESSIONS_SPAN: &str = "gl1265_sessions_request";
 
+/// The span the recorded unscoped listing runs in.
+const UNSCOPED_SPAN: &str = "gl1283_unscoped_listing_request";
+
 /// The statements recorded inside each test's span, in order, tagged with the
 /// span: `cargo test` runs a binary's tests on threads of one process.
 static STATEMENTS: Mutex<Vec<(&'static str, String)>> = Mutex::new(Vec::new());
@@ -100,6 +106,7 @@ where
                     PARENT_SPAN,
                     PLAYING_SPAN,
                     SESSIONS_SPAN,
+                    UNSCOPED_SPAN,
                 ]
                 .into_iter()
                 .find(|name| span.name() == *name)
@@ -396,6 +403,53 @@ async fn a_warm_views_request_reads_no_library_row_again() {
     );
 
     a_dashboard_toggle_reaches_the_next_request(&harness, &router, &auth_header, &user_id).await;
+}
+
+/// An unscoped `GET /Items?Recursive=true&IncludeItemTypes=Movie` (gl-1283):
+/// `AddUserToQuery` scopes it to the user's views, the libraries, the
+/// playlists folder and the `UserView` rows, which upstream holds in memory.
+/// The library set the visibility check caches holds all of them, so a warm
+/// listing reads none of their rows again.
+#[tokio::test]
+async fn a_warm_unscoped_listing_reads_no_library_or_view_row_again() {
+    record_statements();
+    let harness = boot(&[
+        "Film Alpha (1999)/Film Alpha (1999).mkv",
+        "Film Beta (2004)/Film Beta (2004).mkv",
+    ])
+    .await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let uri = format!("/Items?Recursive=true&IncludeItemTypes=Movie&userId={user_id}");
+
+    let (status, warm) = send(&router, &auth_header, "GET", &uri, None).await;
+    assert_eq!(status, StatusCode::OK, "listing: {warm}");
+    assert_eq!(warm["TotalRecordCount"], 2, "{warm}");
+    assert!(
+        harness.db.cached_libraries().is_some(),
+        "a listing leaves the library set cached"
+    );
+    clear_statements(UNSCOPED_SPAN);
+    let (status, page) = send(&router, &auth_header, "GET", &uri, None)
+        .instrument(tracing::info_span!(UNSCOPED_SPAN))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page, warm, "the recorded request answers as the warm one");
+    let statements = statements_in(UNSCOPED_SPAN);
+    let listing = statements.join("\n");
+    assert!(
+        statements
+            .iter()
+            .any(|s| s.contains(r#"bi."TopParentId" IN ("#)),
+        "the scoped listing is recorded:\n{listing}"
+    );
+    assert!(
+        !statements
+            .iter()
+            .any(|s| s.contains(r#"FROM "BaseItems" WHERE "Type" IN ("#)),
+        "the scope's libraries, views and playlists folder come from the cached \
+         library set:\n{listing}"
+    );
 }
 
 /// A movie with two versions on a library browse, the runtime-sorted edge

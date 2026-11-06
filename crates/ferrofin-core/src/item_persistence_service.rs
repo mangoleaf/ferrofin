@@ -615,19 +615,27 @@ pub(crate) async fn playlists_folder_by_type(
 }
 
 /// After a committed write to item rows: keeps the library set the visibility check caches
-/// (`ferrofin_db::row_cache`) current. Writing a row that is, or becomes, a library drops it.
-fn note_written(db: &Database, ids: &[String], library: bool) {
-    if library {
+/// (`ferrofin_db::row_cache`) current. Writing a row that is, or becomes, one the set holds drops
+/// it.
+fn note_written(db: &Database, ids: &[String], in_set: bool) {
+    if in_set {
         db.invalidate_libraries();
     } else {
         db.note_items_written(ids.iter().map(String::as_str));
     }
 }
 
-/// Whether `item` is a library row (`CollectionFolder`).
-fn is_library(item: &BaseItemEntity) -> bool {
-    Some(item.type_.as_str())
-        == crate::item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
+/// Whether `item` is a row of a kind the library set holds: a library (`CollectionFolder`), a
+/// view or the playlists folder.
+fn in_library_set(item: &BaseItemEntity) -> bool {
+    [
+        BaseItemKind::CollectionFolder,
+        BaseItemKind::UserView,
+        BaseItemKind::PlaylistsFolder,
+        BaseItemKind::ManualPlaylistsFolder,
+    ]
+    .into_iter()
+    .any(|kind| Some(item.type_.as_str()) == crate::item_type_lookup::stored_type_name(kind))
 }
 
 /// Inserts one of the two root folders (`AggregateFolder`/`UserRootFolder`) —
@@ -1731,7 +1739,11 @@ impl FerrofinItemPersistenceService {
         } else {
             query.execute(self.db.writer()).await.map_err(db_err)?;
         }
-        note_written(&self.db, std::slice::from_ref(&item.id), is_library(item));
+        note_written(
+            &self.db,
+            std::slice::from_ref(&item.id),
+            in_library_set(item),
+        );
         if scan {
             self.push_name_to_children(item).await?;
         }
@@ -3670,7 +3682,11 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
-        note_written(&self.db, std::slice::from_ref(&item.id), is_library(item));
+        note_written(
+            &self.db,
+            std::slice::from_ref(&item.id),
+            in_library_set(item),
+        );
         Ok(written.rows_affected() > 0)
     }
 
