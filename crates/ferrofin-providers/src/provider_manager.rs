@@ -1085,7 +1085,8 @@ pub trait RemoteSearchProvider: Send + Sync {
     /// [`ItemLookupInfo`](ferrofin_model::providers::ItemLookupInfo)
     /// (`search_info`) plus the
     /// type-specific fields (album artists, song infos, …) a kind's C#
-    /// `GetSearchResults` overload reads.
+    /// `GetSearchResults` overload reads. It runs alongside the search's other
+    /// providers, in no particular order.
     ///
     /// # Errors
     ///
@@ -3088,6 +3089,9 @@ impl LocalProviderManager {
             provider_ids: ids.to_vec(),
         };
         let mut saved = false;
+        // One provider at a time, as `ItemImageProvider.RefreshImages`: each
+        // reads `images` as the earlier ones left it, to skip a provider whose
+        // slots are filled and to stop downloading at each type's limit.
         for (name, dynamic) in sources {
             if let Some(provider) = dynamic {
                 saved |= self
@@ -3904,22 +3908,31 @@ impl LocalProviderManager {
         let global = self.global_metadata_options_for(kind);
         let preferred = self.preferred_metadata_language(entity).await;
         let channel = channel_gate(entity);
+        let sources: Vec<RemoteImageSource> = sources
+            .into_iter()
+            .filter(|source| {
+                query.include_disabled_providers
+                    || (entity.extra_type.is_none()
+                        && channel.unwrap_or_else(|| {
+                            image_fetcher_enabled(
+                                library.as_ref(),
+                                global.as_ref(),
+                                kind,
+                                source.name(),
+                            )
+                        }))
+            })
+            .collect();
+        // `Task.WhenAll` over the providers' `GetImages`: they are asked
+        // together, and their blocks are joined in provider order below.
+        let fetched = futures_util::future::join_all(
+            sources
+                .iter()
+                .map(|&source| self.images_from(source, entity, ids)),
+        )
+        .await;
         let mut results = Vec::new();
-        for source in sources {
-            if !query.include_disabled_providers
-                && (entity.extra_type.is_some()
-                    || !channel.unwrap_or_else(|| {
-                        image_fetcher_enabled(
-                            library.as_ref(),
-                            global.as_ref(),
-                            kind,
-                            source.name(),
-                        )
-                    }))
-            {
-                continue;
-            }
-            let mut images = self.images_from(source, entity, ids).await;
+        for (source, mut images) in sources.into_iter().zip(fetched) {
             if matches!(
                 source,
                 RemoteImageSource::TmdbTitle(_)
@@ -5313,10 +5326,19 @@ impl ProviderManager for LocalProviderManager {
             request.search_info.metadata_country_code = Some(self.server_country());
         }
 
+        // Upstream awaits each provider in turn (v12.4 `ProviderManager.cs:981`),
+        // but no search reads another's results: they run together here and
+        // merge in provider order, which gives the same list.
+        let fetched = futures_util::future::join_all(
+            providers
+                .iter()
+                .map(|provider| provider.get_search_results(&request)),
+        )
+        .await;
         let mut result_list: Vec<RemoteSearchResult> = Vec::new();
 
-        for provider in providers {
-            let results = match provider.get_search_results(&request).await {
+        for (provider, results) in providers.into_iter().zip(fetched) {
+            let results = match results {
                 Ok(results) => results,
                 Err(error) => {
                     // C#: `_logger.LogError(ex, "Provider {ProviderName} failed
@@ -6864,6 +6886,86 @@ mod tests {
         );
         // The first provider that produced the surviving entry wins its name.
         assert_eq!(out[0].search_provider_name.as_deref(), Some("A"));
+    }
+
+    /// A Movie provider that answers once every provider sharing its barrier
+    /// has been asked, `delay` later.
+    struct BarrierProvider {
+        name: &'static str,
+        barrier: Arc<tokio::sync::Barrier>,
+        delay: Duration,
+        results: Vec<RemoteSearchResult>,
+    }
+
+    #[async_trait]
+    impl RemoteSearchProvider for BarrierProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn supports(&self, item_kind: BaseItemKind) -> bool {
+            item_kind == BaseItemKind::Movie
+        }
+
+        async fn get_search_results(
+            &self,
+            _request: &RemoteSearchRequest,
+        ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
+            self.barrier.wait().await;
+            tokio::time::sleep(self.delay).await;
+            Ok(self.results.clone())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remote_search_asks_the_providers_together_and_merges_in_provider_order() {
+        // Neither provider answers until both were asked, so a search asking
+        // them one after another never returns. A, first in order, answers
+        // last: the merge still runs in provider order, so the shared film
+        // keeps A's stamp and comes before B's own film.
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let a = Arc::new(BarrierProvider {
+            name: "A",
+            barrier: Arc::clone(&barrier),
+            delay: Duration::from_secs(1),
+            results: vec![result_with("Inception", &[("Tmdb", "27205")], None)],
+        });
+        let b = Arc::new(BarrierProvider {
+            name: "B",
+            barrier,
+            delay: Duration::ZERO,
+            results: vec![
+                result_with("Tenet", &[("Tmdb", "577922")], None),
+                result_with(
+                    "Inception",
+                    &[("Tmdb", "27205"), ("Imdb", "tt1375666")],
+                    Some("http://img/incep.jpg"),
+                ),
+            ],
+        });
+        let mgr = LocalProviderManager::default().with_remote_search_providers(vec![
+            a as Arc<dyn RemoteSearchProvider>,
+            b as Arc<dyn RemoteSearchProvider>,
+        ]);
+
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            mgr.remote_search(&request(BaseItemKind::Movie)),
+        )
+        .await
+        .expect("the providers were asked one after another")
+        .unwrap();
+        let shape: Vec<(&str, &str)> = out
+            .iter()
+            .map(|r| {
+                (
+                    r.name.as_deref().unwrap_or_default(),
+                    r.search_provider_name.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert_eq!(shape, [("Inception", "A"), ("Tenet", "B")]);
+        assert_eq!(out[0].provider_ids.as_ref().unwrap()["Imdb"], "tt1375666");
     }
 
     #[tokio::test]
@@ -8707,6 +8809,46 @@ mod tests {
         assert!(
             available_remote_images.is_empty(),
             "{available_remote_images:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_images_ask_the_providers_together() {
+        // Neither server answers until both were asked, so a listing asking
+        // the providers one after another never returns.
+        let gate = Arc::new(tokio::sync::watch::channel(0).0);
+        let fanart = crate::mock_http::MockServer::gated(FANART_MUSIC, Arc::clone(&gate), 2).await;
+        let audiodb = crate::mock_http::MockServer::gated(AUDIODB_ARTIST, gate, 2).await;
+        let (item_id, mgr) = image_manager(
+            "Audio.MusicArtist",
+            "Miles Davis",
+            &[("MusicBrainzArtist", "artist-mbid")],
+            Arc::new(crate::tmdb::TmdbClient::new()),
+            |mgr| {
+                mgr.with_fanart(Arc::new(
+                    crate::fanart::FanartClient::new(None).with_base_url(&fanart.base_url),
+                ))
+                .with_audiodb(Arc::new(
+                    crate::audiodb::AudioDbClient::with_base_url(&audiodb.base_url),
+                ))
+            },
+        );
+
+        let all = tokio::time::timeout(
+            Duration::from_secs(5),
+            mgr.get_available_remote_images(item_id, &RemoteImageQuery::default()),
+        )
+        .await
+        .expect("the image providers were asked one after another")
+        .unwrap();
+        let by_provider: Vec<&str> = all
+            .iter()
+            .map(|i| i.provider_name.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            by_provider,
+            ["FanArt", "FanArt", "TheAudioDB", "TheAudioDB", "TheAudioDB"],
+            "each provider's block, in provider order"
         );
     }
 

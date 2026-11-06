@@ -1145,7 +1145,6 @@ impl FerrofinSimilarItemsManager {
         user: &UserAccess,
         recommendation_type: RecommendationType,
         item_limit: i32,
-        dto_options: &DtoOptions,
     ) -> Result<Option<SimilarItemsRecommendation>, ServiceError> {
         let Ok(seed_id) = Uuid::parse_str(&seed.id) else {
             return Ok(None);
@@ -1156,7 +1155,6 @@ impl FerrofinSimilarItemsManager {
         // providers never take part, so a category never fans out to TMDB
         // once per baseline — and hands it the user, so the movie provider's
         // unplayed/access filter applies here too.
-        let _ = dto_options;
         let request = LocalRequest {
             seed,
             seed_id,
@@ -1198,12 +1196,11 @@ impl FerrofinSimilarItemsManager {
         user: &UserAccess,
         recommendation_type: RecommendationType,
         item_limit: i32,
-        dto_options: &DtoOptions,
     ) -> Result<Vec<SimilarItemsRecommendation>, ServiceError> {
         let mut out = Vec::new();
         for seed in seeds {
             if let Some(rec) = self
-                .similar_category(&seed, user, recommendation_type, item_limit, dto_options)
+                .similar_category(&seed, user, recommendation_type, item_limit)
                 .await?
             {
                 out.push(rec);
@@ -1468,7 +1465,10 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
         parent_id: Uuid,
         category_limit: i32,
         item_limit: i32,
-        dto_options: &DtoOptions,
+        // Upstream sets it on its item queries, where it only picks the columns
+        // the repository loads; rows here are read whole and the caller builds
+        // the DTOs with it.
+        _dto_options: &DtoOptions,
     ) -> Result<Vec<SimilarItemsRecommendation>, ServiceError> {
         // Recommendations are built from the user's watch state (recently-played +
         // liked movies, and the directors/actors of those). With no user, or an
@@ -1526,7 +1526,6 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
                 &access,
                 RecommendationType::SimilarToRecentlyPlayed,
                 item_limit,
-                dto_options,
             )
             .await?;
         let similar_to_liked = self
@@ -1535,7 +1534,6 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
                 &access,
                 RecommendationType::SimilarToLikedItem,
                 item_limit,
-                dto_options,
             )
             .await?;
         let mut directors = PersonCursor::new(

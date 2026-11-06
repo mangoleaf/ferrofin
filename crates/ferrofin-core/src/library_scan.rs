@@ -14388,12 +14388,6 @@ impl LibraryScanner {
         }
     }
 
-    /// Appends rows for art files already sitting in the item's metadata art
-    /// dir (`{meta}/library/{id}` — user uploads and previously downloaded
-    /// artwork) whose image type discovery did not produce, so an uploaded
-    /// image of any type survives the scan's image rewrite. Types discovery
-    /// did produce are left alone (media-adjacent files outrank the metadata
-    /// dir, matching Jellyfin's local-image precedence).
     /// `ItemImageProvider.RemoveImages` (`ItemImageProvider.cs:74-103`, run
     /// by `MetadataService.cs:112-118` for `RemoveOldMetadata` with
     /// `ReplaceAllImages`): deletes the item's images that live in its own
@@ -14448,6 +14442,12 @@ impl LibraryScanner {
         }
     }
 
+    /// Appends rows for art files already sitting in the item's metadata art
+    /// dir (`{meta}/library/{id}` — user uploads and previously downloaded
+    /// artwork) whose image type discovery did not produce, so an uploaded
+    /// image of any type survives the scan's image rewrite. Types discovery
+    /// did produce are left alone (media-adjacent files outrank the metadata
+    /// dir, matching Jellyfin's local-image precedence).
     fn append_art_dir_images(&self, entity: &BaseItemEntity, images: &mut Vec<ItemImageInfo>) {
         let Some(meta_root) = &self.metadata_dir else {
             return;
