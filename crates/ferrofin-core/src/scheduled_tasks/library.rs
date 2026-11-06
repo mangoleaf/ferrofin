@@ -594,16 +594,28 @@ impl ChapterImagesTask {
         }
     }
 
+    /// Reconciles one video's chapters and images, with its stored `streams`
+    /// as read for its page.
     async fn refresh_video(
         &self,
         video: &BaseItemEntity,
         item_id: Uuid,
+        streams: &[ferrofin_db::entities::base_items::MediaStreamInfoEntity],
         extract: bool,
     ) -> Result<bool, ServiceError> {
+        // Read just before the refresh, as upstream does: a scan may rewrite
+        // a video's chapters while the run works through the page, and the
+        // save and the prune below must not undo that.
         let mut chapters = self.chapters.get_chapters(item_id).await?;
         let outcome = self
             .extractor
-            .refresh(video, &mut chapters, extract, &crate::ScanCancel::default())
+            .refresh(
+                video,
+                &mut chapters,
+                Some(streams),
+                extract,
+                &crate::ScanCancel::default(),
+            )
             .await?;
         if outcome.changed {
             // ChapterManager.SaveChapters retains only markers inside runtime.
@@ -748,6 +760,15 @@ impl ScheduledTask for ChapterImagesTask {
             if videos.is_empty() {
                 break;
             }
+            // The page's streams in one read rather than one per video
+            // (gl-1279); like the page's rows, they are not written back.
+            // The filter is the loop's skips below.
+            let ids: Vec<Uuid> = videos
+                .iter()
+                .filter(|video| video.path.as_deref().is_some_and(|path| !path.is_empty()))
+                .filter_map(|video| Uuid::parse_str(&video.id).ok())
+                .collect();
+            let streams = self.extractor.streams_batch(&ids).await?;
             for video in &videos {
                 progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
                 done += 1;
@@ -767,7 +788,12 @@ impl ScheduledTask for ChapterImagesTask {
                 // errors: those fail the run and blocklist nothing. Only an
                 // attempted extraction can fail, so a key is never appended twice.
                 let success = self
-                    .refresh_video(video, item_id, !failed.contains(&history_key))
+                    .refresh_video(
+                        video,
+                        item_id,
+                        streams.get(&item_id).map_or(&[], Vec::as_slice),
+                        !failed.contains(&history_key),
+                    )
                     .await?;
                 if !success {
                     append_failure_history(&fail_history_path, &history_key)?;
@@ -2013,8 +2039,25 @@ mod tests {
         }
     }
 
-    /// A [`MediaStreamRepository`] fake serving canned stream rows.
-    struct FakeStreams(Vec<MediaStreamInfoEntity>);
+    /// A [`MediaStreamRepository`] fake serving canned stream rows, recording
+    /// how they are read.
+    struct FakeStreams {
+        rows: Vec<MediaStreamInfoEntity>,
+        /// How many single-item reads were made.
+        single_reads: std::sync::atomic::AtomicUsize,
+        /// The ids of each batch read.
+        batches: Mutex<Vec<Vec<Uuid>>>,
+    }
+
+    impl FakeStreams {
+        fn new(rows: Vec<MediaStreamInfoEntity>) -> Self {
+            Self {
+                rows,
+                single_reads: std::sync::atomic::AtomicUsize::new(0),
+                batches: Mutex::new(Vec::new()),
+            }
+        }
+    }
 
     #[async_trait]
     impl MediaStreamRepository for FakeStreams {
@@ -2022,8 +2065,10 @@ mod tests {
             &self,
             filter: &MediaStreamQuery,
         ) -> Result<Vec<MediaStreamInfoEntity>, ServiceError> {
+            self.single_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self
-                .0
+                .rows
                 .iter()
                 .filter(|s| {
                     filter
@@ -2032,6 +2077,15 @@ mod tests {
                 })
                 .cloned()
                 .collect())
+        }
+        /// Every canned row for each id.
+        async fn get_media_streams_batch(
+            &self,
+            item_ids: &[Uuid],
+        ) -> Result<std::collections::HashMap<Uuid, Vec<MediaStreamInfoEntity>>, ServiceError>
+        {
+            self.batches.lock().expect("lock").push(item_ids.to_vec());
+            Ok(item_ids.iter().map(|id| (*id, self.rows.clone())).collect())
         }
         async fn get_media_stream_languages(
             &self,
@@ -3030,7 +3084,7 @@ mod tests {
 
         // A German audio track satisfies "ger" via skip-if-audio-matches;
         // "eng" has nothing and must be searched + downloaded.
-        let streams = FakeStreams(vec![MediaStreamInfoEntity {
+        let streams = FakeStreams::new(vec![MediaStreamInfoEntity {
             item_id: movie.to_string(),
             stream_index: 0,
             stream_type: media_stream_type_disc(StreamTypeEnum::Audio),
@@ -3095,7 +3149,7 @@ mod tests {
             )),
             Arc::new(crate::subtitle_downloader::SubtitleDownloader::new(
                 &(subtitles.clone() as Arc<dyn SubtitleManager>),
-                Arc::new(FakeStreams(Vec::new())),
+                Arc::new(FakeStreams::new(Vec::new())),
             )),
         );
         task.execute(&TaskProgress::default()).await.expect("run");
@@ -4287,6 +4341,22 @@ mod tests {
         Arc<FakeChapters>,
         ChapterImagesTask,
     ) {
+        let (media, movie, chapters, _streams, task) =
+            chapter_task_parts(fail_extract, files).await;
+        (media, movie, chapters, task)
+    }
+
+    /// [`chapter_task_fixture_for`], with the streams fake the task reads.
+    async fn chapter_task_parts(
+        fail_extract: bool,
+        files: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        Uuid,
+        Arc<FakeChapters>,
+        Arc<FakeStreams>,
+        ChapterImagesTask,
+    ) {
         let db = test_db().await;
         let media = tempfile::tempdir().expect("tempdir");
         let library: Arc<dyn LibraryManager> =
@@ -4314,13 +4384,13 @@ mod tests {
             reads: std::sync::atomic::AtomicUsize::new(0),
             stalled: tokio::sync::Notify::new(),
         });
-        let streams = FakeStreams(vec![MediaStreamInfoEntity {
+        let streams = Arc::new(FakeStreams::new(vec![MediaStreamInfoEntity {
             item_id: movie.to_string(),
             stream_index: 0,
             stream_type: media_stream_type_disc(StreamTypeEnum::Video),
             codec: Some("h264".to_owned()),
             ..MediaStreamInfoEntity::default()
-        }]);
+        }]));
         let app_paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
             media.path().join("data"),
             media.path().join("logs"),
@@ -4340,7 +4410,7 @@ mod tests {
         ));
         let extractor = Arc::new(crate::chapter_image_extractor::ChapterImageExtractor::new(
             Arc::clone(&folders),
-            Arc::new(streams),
+            Arc::clone(&streams) as Arc<dyn MediaStreamRepository>,
             Arc::new(FakeEncoder { fail_extract }),
             path_manager,
         ));
@@ -4351,18 +4421,34 @@ mod tests {
             extractor,
             app_paths,
         );
-        (media, movie, chapters, task)
+        (media, movie, chapters, streams, task)
     }
 
     #[tokio::test]
     async fn chapter_images_page_past_the_first_page() {
         let files: Vec<String> = (0..past_one_page()).map(|n| format!("{n}.mkv")).collect();
         let names: Vec<&str> = files.iter().map(String::as_str).collect();
-        let (media, _movie, chapters, task) = chapter_task_fixture_for(false, &names).await;
+        let (media, _movie, chapters, streams, task) = chapter_task_parts(false, &names).await;
         task.execute(&TaskProgress::default()).await.expect("run");
 
         let reads = chapters.reads.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(reads, files.len(), "every video was reconciled");
+        // Each page's streams in one read (gl-1279), none per video.
+        let batches: Vec<usize> = streams
+            .batches
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(Vec::len)
+            .collect();
+        let page = usize::try_from(PAGE_SIZE).expect("page size");
+        assert_eq!(batches, [page, files.len() - page]);
+        assert_eq!(
+            streams
+                .single_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
         drop(media);
     }
 
@@ -4381,7 +4467,9 @@ mod tests {
         drop(media);
     }
 
-    #[tokio::test]
+    // A multi-thread runtime, so the extractor's file work runs through
+    // `block_in_place`.
+    #[tokio::test(flavor = "multi_thread")]
     async fn chapter_images_are_extracted_and_stored() {
         let (media, _movie, chapters, task) = chapter_task_fixture(false).await;
         assert_eq!(task.key(), "RefreshChapterImages");

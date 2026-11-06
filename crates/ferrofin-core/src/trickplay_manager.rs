@@ -72,6 +72,7 @@ use ferrofin_traits::system::{MediaLocation, PathManager};
 use ferrofin_traits::trickplay::{TrickplayCheck, TrickplayManager};
 
 use crate::db_error::db_err;
+use crate::library_scan::off_runtime;
 use crate::media_source_manager::stream_to_dto;
 
 /// The number of 100-nanosecond ticks per millisecond
@@ -178,7 +179,7 @@ struct TemporaryTrickplayDirectory(PathBuf);
 
 impl Drop for TemporaryTrickplayDirectory {
     fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_dir_all(&self.0)
+        if let Err(error) = off_runtime(|| std::fs::remove_dir_all(&self.0))
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(directory = %self.0.display(), %error, "cannot remove trickplay temporary directory");
@@ -430,17 +431,19 @@ impl FerrofinTrickplayManager {
     /// The checks of `RefreshTrickplayDataInternal` for one configured width,
     /// before its frames are extracted: skip or import existing tiles, and
     /// otherwise return the set to generate, once the folder beside the media
-    /// is known to be writable and the set is recorded as made.
+    /// is known to be writable and the set is recorded as made. `rows` are the
+    /// item's stored rows, which an import adds to.
     async fn prepare_width(
         &self,
         ctx: &WidthRefreshContext<'_>,
         replace: bool,
         width: i32,
         options: &TrickplayOptions,
+        rows: &mut HashMap<i32, TrickplayInfoEntity>,
     ) -> Result<Option<PendingSet>, ServiceError> {
         // Source checks these only inside per-width work: they do not bypass
         // discovery or the outer disabled/replace cleanup.
-        if !Path::new(ctx.media_path).is_file() {
+        if !off_runtime(|| Path::new(ctx.media_path).is_file()) {
             tracing::warn!(item = %ctx.item_id, path = ctx.media_path, "trickplay media file not found");
             return Ok(None);
         }
@@ -472,19 +475,21 @@ impl FerrofinTrickplayManager {
 
         // Import existing trickplay tiles.
         if !replace {
-            let existing_files = jpg_files_sorted(&output_dir);
-            if !existing_files.is_empty() {
-                if self
-                    .resolutions_for(ctx.item_id)
-                    .await?
-                    .contains_key(&actual_width)
-                {
+            // A stored width only needs a tile there; importing needs them all.
+            if rows.contains_key(&actual_width) {
+                if off_runtime(|| has_tiles(&output_dir)) {
                     tracing::debug!(item = %ctx.item_id, "found existing trickplay files");
                     return Ok(None);
                 }
-                self.import_tiles(ctx.item_id, width, options, &existing_files)
-                    .await?;
-                return Ok(None);
+            } else {
+                let existing_files = off_runtime(|| jpg_files_sorted(&output_dir));
+                if !existing_files.is_empty() {
+                    let info = self
+                        .import_tiles(ctx.item_id, width, options, &existing_files)
+                        .await?;
+                    rows.insert(width, info);
+                    return Ok(None);
+                }
             }
         }
 
@@ -492,7 +497,7 @@ impl FerrofinTrickplayManager {
         // (`TrickplayManager.cs:482-488`), so an unwritable media folder fails
         // before any ffmpeg work rather than when the packed tiles are moved.
         if ctx.save_with_media {
-            probe_write_access(&output_dir)?;
+            off_runtime(|| probe_write_access(&output_dir))?;
         }
         // A set the recorded settings cannot be told about is not made: the
         // width fails and the next run tries again.
@@ -514,12 +519,13 @@ impl FerrofinTrickplayManager {
     /// that width.
     ///
     /// The video's generation slot is taken first and held until its last
-    /// set is saved (gl-1227).
+    /// set is saved (gl-1227). Each saved set's row goes into `rows`.
     async fn generate_sets(
         &self,
         ctx: &WidthRefreshContext<'_>,
         sets: &[PendingSet],
         options: &TrickplayOptions,
+        rows: &mut HashMap<i32, TrickplayInfoEntity>,
     ) -> Vec<Result<(), ServiceError>> {
         if sets.is_empty() {
             return Vec::new();
@@ -607,7 +613,7 @@ impl FerrofinTrickplayManager {
                 ))
             });
             let result = match images {
-                Ok(images) => self.tile_and_save(ctx, set, options, &images).await,
+                Ok(images) => self.tile_and_save(ctx, set, options, &images, rows).await,
                 Err(e) => Err(e),
             };
             drop(frames.take());
@@ -622,15 +628,17 @@ impl FerrofinTrickplayManager {
     /// Packs a width's extracted `images` with [`Self::create_tiles`] and saves
     /// the resulting info row; on a save failure the freshly written tiles are
     /// removed so no files stay behind without a row (mirroring the C#),
-    /// unless they replaced a set whose row names their folder (or the rows
-    /// cannot be read): that set is already gone, and the row still points at
-    /// the new tiles, whose timing it may describe until the next save.
+    /// unless they replaced a set whose row in `rows` names their folder: that
+    /// set is already gone, and the row still points at the new tiles, whose
+    /// timing it may describe until the next save. A saved row goes into
+    /// `rows`.
     async fn tile_and_save(
         &self,
         ctx: &WidthRefreshContext<'_>,
         set: &PendingSet,
         options: &TrickplayOptions,
         images: &[String],
+        rows: &mut HashMap<i32, TrickplayInfoEntity>,
     ) -> Result<(), ServiceError> {
         let mut info = self
             .create_tiles(images, set.actual_width, options, &set.output_dir)
@@ -640,15 +648,12 @@ impl FerrofinTrickplayManager {
         if let Err(e) = self.save_trickplay_info(&info).await {
             // Make sure no files stay in metadata folders when the info row
             // wasn't saved.
-            let orphaned = self
-                .resolutions_for(ctx.item_id)
-                .await
-                .is_ok_and(|rows| !row_names_folder(&rows, set.actual_width, options));
-            if orphaned {
-                let _ = std::fs::remove_dir_all(&set.output_dir);
+            if !row_names_folder(rows, set.actual_width, options) {
+                let _ = off_runtime(|| std::fs::remove_dir_all(&set.output_dir));
             }
             return Err(e);
         }
+        rows.insert(info.width, info);
         tracing::info!(
             path = ctx.media_path,
             width = set.actual_width,
@@ -677,7 +682,7 @@ impl FerrofinTrickplayManager {
         let work_dir = self
             .temp_directory()
             .join(format!("trickplay_{}", Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&work_dir)
+        off_runtime(|| std::fs::create_dir_all(&work_dir))
             .map_err(|e| ServiceError::backend(format!("cannot create tile work dir: {e}")))?;
 
         let _tiles_cleanup = TemporaryTrickplayDirectory(work_dir.clone());
@@ -737,7 +742,7 @@ impl FerrofinTrickplayManager {
                 info.height = height;
             }
 
-            let bytes = std::fs::metadata(&tile_path)
+            let bytes = off_runtime(|| std::fs::metadata(&tile_path))
                 .map_err(|e| ServiceError::backend(format!("cannot stat tile: {e}")))?
                 .len();
             let bitrate = tile_bitrate(bytes, info.tile_width, info.tile_height, info.interval);
@@ -745,21 +750,21 @@ impl FerrofinTrickplayManager {
         }
 
         // Move trickplay tiles to the output directory (replacing any old ones).
-        move_dir(work_dir, output_dir)?;
+        off_runtime(|| move_dir(work_dir, output_dir))?;
         Ok(info)
     }
 
     /// Port of the "Import tiles" branch of `RefreshTrickplayDataInternal`:
     /// adopts on-disk tile files without a DB row, computing height/bandwidth
     /// from the files themselves. As in the C#, the row stores the *requested*
-    /// width and the configured interval/tile grid.
+    /// width and the configured interval/tile grid. Returns the saved row.
     async fn import_tiles(
         &self,
         item_id: Uuid,
         width: i32,
         options: &TrickplayOptions,
         existing_files: &[String],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<TrickplayInfoEntity, ServiceError> {
         let mut info = TrickplayInfoEntity {
             item_id: guid_to_db(item_id),
             width,
@@ -774,7 +779,7 @@ impl FerrofinTrickplayManager {
         for tile in existing_files {
             let size = self.image_encoder.get_image_size(tile).await?;
             info.height = info.height.max(ceil_div(size.height, info.tile_height));
-            let bytes = std::fs::metadata(tile)
+            let bytes = off_runtime(|| std::fs::metadata(tile))
                 .map_err(|e| ServiceError::backend(format!("cannot stat tile: {e}")))?
                 .len();
             let bitrate = tile_bitrate(bytes, info.tile_width, info.tile_height, info.interval);
@@ -783,18 +788,21 @@ impl FerrofinTrickplayManager {
 
         self.save_trickplay_info(&info).await?;
         tracing::debug!(item = %item_id, "imported existing trickplay files");
-        Ok(())
+        Ok(info)
     }
 
-    /// The orphaned-row prune of `DiscoverExistingTrickplayAsync`: drops DB
-    /// rows whose tile folder no longer exists in either possible location
-    /// (internal or media-adjacent).
+    /// The orphaned-row prune of `DiscoverExistingTrickplayAsync`: drops the
+    /// rows (from the database and from `rows`) whose tile folder no longer
+    /// exists in either possible location (internal or media-adjacent).
     async fn prune_orphaned_rows(
         &self,
         item_id: Uuid,
         media_path: &str,
+        rows: &mut HashMap<i32, TrickplayInfoEntity>,
     ) -> Result<(), ServiceError> {
-        let existing = self.resolutions_for(item_id).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
         let local_root = self.path_manager.trickplay_directory(
             item_id,
             MediaLocation::of_file(media_path),
@@ -805,24 +813,32 @@ impl FerrofinTrickplayManager {
             MediaLocation::of_file(media_path),
             true,
         );
-        for info in existing.values() {
-            let sub = format!("{} - {}x{}", info.width, info.tile_width, info.tile_height);
-            if !has_tiles(&Path::new(&local_root).join(&sub))
-                && (media_root.is_empty() || !has_tiles(&Path::new(&media_root).join(&sub)))
-            {
-                tracing::info!(
-                    width = info.width,
-                    path = media_path,
-                    "removed orphaned trickplay DB entry"
-                );
-                self.delete_trickplay_row(item_id, info.width).await?;
-            }
+        let orphaned: Vec<i32> = off_runtime(|| {
+            rows.values()
+                .filter(|info| {
+                    let sub = format!("{} - {}x{}", info.width, info.tile_width, info.tile_height);
+                    !has_tiles(&Path::new(&local_root).join(&sub))
+                        && (media_root.is_empty() || !has_tiles(&Path::new(&media_root).join(&sub)))
+                })
+                .map(|info| info.width)
+                .collect()
+        });
+        for width in orphaned {
+            tracing::info!(
+                width,
+                path = media_path,
+                "removed orphaned trickplay DB entry"
+            );
+            self.delete_trickplay_row(item_id, width).await?;
+            rows.remove(&width);
         }
         Ok(())
     }
 
     /// Discovers the selected location before applying the extraction flag.
     /// User-managed grids are catalogued even when extraction is disabled.
+    /// `rows` are the item's stored rows, kept up to date as it prunes and
+    /// adds.
     async fn discover_existing_trickplay(
         &self,
         entity: &BaseItemEntity,
@@ -830,25 +846,39 @@ impl FerrofinTrickplayManager {
         media_path: &str,
         save_with_media: bool,
         options: &TrickplayOptions,
+        rows: &mut HashMap<i32, TrickplayInfoEntity>,
     ) -> Result<(), ServiceError> {
-        self.prune_orphaned_rows(item_id, media_path).await?;
-        let mut existing = self.resolutions_for(item_id).await?;
+        self.prune_orphaned_rows(item_id, media_path, rows).await?;
         let root = self.path_manager.trickplay_directory(
             item_id,
             MediaLocation::of_file(media_path),
             save_with_media,
         );
-        if !Path::new(&root).is_dir() {
+        // Listed off the runtime, each entry with whether it is a folder; an
+        // entry that cannot be read fails discovery once the loop reaches it,
+        // after the grids listed before it.
+        let Some(entries) = off_runtime(|| {
+            Path::new(&root).is_dir().then(|| {
+                std::fs::read_dir(&root).map(|entries| {
+                    entries
+                        .map(|entry| {
+                            entry
+                                .map(|entry| entry.path())
+                                .map(|path| (path.is_dir(), path))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+        }) else {
             return Ok(());
-        }
-        let entries = std::fs::read_dir(&root)
+        };
+        let entries = entries
             .map_err(|error| ServiceError::backend(format!("cannot list trickplay: {error}")))?;
         for entry in entries {
-            let entry = entry.map_err(|error| {
+            let (is_dir, path) = entry.map_err(|error| {
                 ServiceError::backend(format!("cannot list trickplay: {error}"))
             })?;
-            let path = entry.path();
-            if !path.is_dir() {
+            if !is_dir {
                 continue;
             }
             let Some((width, tile_width, tile_height)) = path
@@ -858,26 +888,10 @@ impl FerrofinTrickplayManager {
             else {
                 continue;
             };
-            if existing.contains_key(&width) {
+            if rows.contains_key(&width) {
                 continue;
             }
-            let mut tiles = Vec::new();
-            for tile in std::fs::read_dir(&path).map_err(|error| {
-                ServiceError::backend(format!("cannot read trickplay grid: {error}"))
-            })? {
-                let tile = tile
-                    .map_err(|error| {
-                        ServiceError::backend(format!("cannot list trickplay grid: {error}"))
-                    })?
-                    .path();
-                if tile.is_file()
-                    && tile
-                        .extension()
-                        .is_some_and(|extension| extension.eq_ignore_ascii_case("jpg"))
-                {
-                    tiles.push(tile.to_string_lossy().into_owned());
-                }
-            }
+            let mut tiles = off_runtime(|| grid_tiles(&path))?;
             tiles.sort();
             let Some(first) = tiles.first() else {
                 continue;
@@ -894,7 +908,7 @@ impl FerrofinTrickplayManager {
                 continue;
             };
             let size = self.image_encoder.get_image_size(first).await?;
-            let mut info = TrickplayInfoEntity {
+            let info = TrickplayInfoEntity {
                 item_id: guid_to_db(item_id),
                 width,
                 tile_width,
@@ -902,54 +916,43 @@ impl FerrofinTrickplayManager {
                 interval,
                 thumbnail_count,
                 height: ceil_div(size.height, tile_height).max(1),
-                bandwidth: 0,
+                bandwidth: off_runtime(|| peak_bitrate(&tiles, tile_width, tile_height, interval))?,
             };
-            for tile in &tiles {
-                let bytes = std::fs::metadata(tile)
-                    .map_err(|error| ServiceError::backend(format!("cannot stat tile: {error}")))?
-                    .len();
-                info.bandwidth =
-                    info.bandwidth
-                        .max(tile_bitrate(bytes, tile_width, tile_height, interval));
-            }
             self.save_trickplay_info(&info).await?;
-            existing.insert(width, info);
+            rows.insert(width, info);
             tracing::debug!(item_id = %item_id, width, interval, thumbnail_count, "discovered existing trickplay grid");
         }
         Ok(())
     }
 
     /// The trailing cleanup of `RefreshTrickplayDataAsync`: removes tile
-    /// folders in the trickplay directory that no stored row accounts for.
-    async fn prune_unexpected_folders(
-        &self,
-        item_id: Uuid,
-        trickplay_dir: &str,
-    ) -> Result<(), ServiceError> {
+    /// folders in the trickplay directory that none of the item's stored
+    /// `rows` accounts for.
+    fn prune_unexpected_folders(trickplay_dir: &str, rows: &HashMap<i32, TrickplayInfoEntity>) {
         let root = Path::new(trickplay_dir);
-        if !root.is_dir() {
-            return Ok(());
-        }
-        let rows = self.resolutions_for(item_id).await?;
-        let expected: std::collections::HashSet<PathBuf> = rows
+        let expected: HashSet<PathBuf> = rows
             .values()
             .map(|i| root.join(format!("{} - {}x{}", i.width, i.tile_width, i.tile_height)))
             .collect();
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if path.is_dir() && !expected.contains(&path) {
-                    tracing::warn!(folder = %path.display(), "pruning trickplay files");
-                    if let Err(e) = std::fs::remove_dir_all(&path) {
-                        tracing::warn!(
-                            folder = %path.display(),
-                            "unable to remove trickplay directory: {e}"
-                        );
+        off_runtime(|| {
+            if !root.is_dir() {
+                return;
+            }
+            if let Ok(entries) = std::fs::read_dir(root) {
+                for entry in entries.filter_map(Result::ok) {
+                    let path = entry.path();
+                    if path.is_dir() && !expected.contains(&path) {
+                        tracing::warn!(folder = %path.display(), "pruning trickplay files");
+                        if let Err(e) = std::fs::remove_dir_all(&path) {
+                            tracing::warn!(
+                                folder = %path.display(),
+                                "unable to remove trickplay directory: {e}"
+                            );
+                        }
                     }
                 }
             }
-        }
-        Ok(())
+        });
     }
 
     /// Moves this item's generated trickplay tiles to the location the
@@ -1085,6 +1088,11 @@ impl FerrofinTrickplayManager {
         ) else {
             return Ok(true);
         };
+        // The item's rows, read once: every later step reads this map, and
+        // each write below updates it. The item lock keeps other refreshes
+        // and moves out; an item deletion or rekey meanwhile is not seen, as
+        // the reads between this refresh's steps could miss it too.
+        let mut rows = self.resolutions_for(item_id).await?;
         // Catalog what is already on disk before pruning or generating.
         if !replace {
             self.discover_existing_trickplay(
@@ -1093,6 +1101,7 @@ impl FerrofinTrickplayManager {
                 &media_path,
                 library_options.save_trickplay_with_media,
                 &options,
+                &mut rows,
             )
             .await?;
         }
@@ -1115,15 +1124,20 @@ impl FerrofinTrickplayManager {
         // goes without images and a failed Replace loses nothing.
         if !enabled {
             // Prune existing data.
-            if Path::new(&trickplay_dir).exists()
-                && let Err(e) = std::fs::remove_dir_all(&trickplay_dir)
-            {
+            if let Err(e) = off_runtime(|| {
+                if Path::new(&trickplay_dir).exists() {
+                    std::fs::remove_dir_all(&trickplay_dir)
+                } else {
+                    Ok(())
+                }
+            }) {
                 tracing::warn!(
                     directory = trickplay_dir,
                     "unable to clear trickplay directory: {e}"
                 );
             }
             self.delete_trickplay_data(item_id).await?;
+            rows.clear();
             if !replace {
                 return Ok(true);
             }
@@ -1141,7 +1155,7 @@ impl FerrofinTrickplayManager {
         };
         // On a checking pass, the widths Ferrofin made sets at (earlier
         // passes' and those a scan or refresh recorded), as this video narrows
-        // them, and the sets on disk before anything is regenerated.
+        // them.
         let previous: Option<HashSet<i32>> =
             check.zip(ctx.video_stream.as_ref()).map(|(check, stream)| {
                 check
@@ -1150,37 +1164,31 @@ impl FerrofinTrickplayManager {
                     .map(|width| generated_width(*width, stream).0)
                     .collect()
             });
-        let rows = if previous.is_some() {
-            self.resolutions_for(item_id).await?
-        } else {
-            HashMap::new()
-        };
-        let generated = self.refresh_widths(&ctx, replace, &rows, &options).await;
+        let generated = self
+            .refresh_widths(&ctx, replace, previous.is_some(), &mut rows, &options)
+            .await;
 
         if replace || previous.is_some() {
-            self.remove_dropped_widths(item_id, &generated, previous.as_ref())
+            self.remove_dropped_widths(item_id, &generated, previous.as_ref(), &mut rows)
                 .await?;
         }
-        self.prune_unexpected_folders(item_id, &trickplay_dir)
-            .await?;
-        match previous {
-            Some(previous) => {
-                self.sets_match(
-                    item_id,
-                    &trickplay_dir,
-                    &generated,
-                    &previous,
-                    options.full_chroma,
-                )
-                .await
-            }
-            None => Ok(true),
-        }
+        Self::prune_unexpected_folders(&trickplay_dir, &rows);
+        Ok(previous.is_none_or(|previous| {
+            Self::sets_match(
+                item_id,
+                &trickplay_dir,
+                &generated,
+                &previous,
+                options.full_chroma,
+                &rows,
+            )
+        }))
     }
 
     /// Refreshes each selected width, returning the widths generated for this
-    /// video. `rows` are the sets on disk on a checking pass (empty
-    /// otherwise): one at another chroma is regenerated and swapped in.
+    /// video. `rows` are the item's stored rows, which imports and generated
+    /// sets add to; on a checking pass (`check_chroma`), a stored set at
+    /// another chroma is regenerated and swapped in.
     ///
     /// Each width is checked first ([`Self::prepare_width`]: skipped,
     /// imported, or to generate), then the widths to generate are made
@@ -1192,7 +1200,8 @@ impl FerrofinTrickplayManager {
         &self,
         ctx: &WidthRefreshContext<'_>,
         replace: bool,
-        rows: &HashMap<i32, TrickplayInfoEntity>,
+        check_chroma: bool,
+        rows: &mut HashMap<i32, TrickplayInfoEntity>,
         options: &TrickplayOptions,
     ) -> HashSet<i32> {
         let mut generated = HashSet::new();
@@ -1213,15 +1222,16 @@ impl FerrofinTrickplayManager {
                 continue;
             }
             let replace_width = replace
-                || target
-                    .and_then(|target| rows.get(&target))
-                    .is_some_and(|row| {
-                        chroma_mismatch(ctx.trickplay_dir, row, options.full_chroma)
-                    });
+                || (check_chroma
+                    && target
+                        .and_then(|target| rows.get(&target))
+                        .is_some_and(|row| {
+                            chroma_mismatch(ctx.trickplay_dir, row, options.full_chroma)
+                        }));
             // Per-width failures are logged and do not abort the remaining
             // resolutions (the C# catch-and-log).
             match self
-                .prepare_width(ctx, replace_width, *width, options)
+                .prepare_width(ctx, replace_width, *width, options, rows)
                 .await
             {
                 Ok(Some(set)) => pending.push(set),
@@ -1232,7 +1242,7 @@ impl FerrofinTrickplayManager {
             }
         }
         if !pending.is_empty() {
-            let results = self.generate_sets(ctx, &pending, options).await;
+            let results = self.generate_sets(ctx, &pending, options, rows).await;
             for (set, result) in pending.iter().zip(results) {
                 if let Err(e) = result {
                     tracing::error!(item_id = %ctx.item_id, width = set.width, "error creating trickplay images: {e}");
@@ -1248,20 +1258,20 @@ impl FerrofinTrickplayManager {
     /// that could not be replaced (a failed generation, a missing file) keeps
     /// the pass from being recorded, so the next run checks it again. A width
     /// with no set at all does not: every run generates a missing width anyway.
-    async fn sets_match(
-        &self,
+    /// `rows` are the item's stored rows after the pass.
+    fn sets_match(
         item_id: Uuid,
         trickplay_dir: &str,
         generated: &HashSet<i32>,
         previous: &HashSet<i32>,
         full_chroma: bool,
-    ) -> Result<bool, ServiceError> {
+        rows: &HashMap<i32, TrickplayInfoEntity>,
+    ) -> bool {
         // No width selected for this video: nothing is removed (a video keeps
         // its images), so there is nothing to wait for either.
         if generated.is_empty() {
-            return Ok(true);
+            return true;
         }
-        let rows = self.resolutions_for(item_id).await?;
         let left_behind = rows
             .keys()
             .find(|width| previous.contains(width) && !generated.contains(width));
@@ -1276,9 +1286,9 @@ impl FerrofinTrickplayManager {
                 mismatched = mismatched.map(|row| row.width),
                 "trickplay images still differ from the settings"
             );
-            return Ok(false);
+            return false;
         }
-        Ok(true)
+        true
     }
 
     /// After a Replace or a checking pass, removes the rows of widths no
@@ -1288,22 +1298,29 @@ impl FerrofinTrickplayManager {
     /// every other width, as upstream's prune-first Replace leaves none. A
     /// checking pass removes only the widths Ferrofin made sets at (the
     /// passes' widths, and those [`Self::record_set_made`] recorded), so a
-    /// user-placed grid stays.
+    /// user-placed grid stays. `rows` are the item's stored rows, which the
+    /// removed widths leave.
     async fn remove_dropped_widths(
         &self,
         item_id: Uuid,
         generated: &HashSet<i32>,
         previous: Option<&HashSet<i32>>,
+        rows: &mut HashMap<i32, TrickplayInfoEntity>,
     ) -> Result<(), ServiceError> {
-        let rows = self.resolutions_for(item_id).await?;
         if generated.is_empty() || !generated.iter().all(|width| rows.contains_key(width)) {
             return Ok(());
         }
-        for width in rows.keys().filter(|width| {
-            !generated.contains(width) && previous.is_none_or(|p| p.contains(width))
-        }) {
+        let dropped: Vec<i32> = rows
+            .keys()
+            .copied()
+            .filter(|width| {
+                !generated.contains(width) && previous.is_none_or(|p| p.contains(width))
+            })
+            .collect();
+        for width in dropped {
             tracing::debug!(item_id = %item_id, width, "removing trickplay images of a width no longer selected");
-            self.delete_trickplay_row(item_id, *width).await?;
+            self.delete_trickplay_row(item_id, width).await?;
+            rows.remove(&width);
         }
         Ok(())
     }
@@ -1927,7 +1944,7 @@ fn chroma_mismatch(trickplay_dir: &str, row: &TrickplayInfoEntity, full_chroma: 
             row.width, row.tile_width, row.tile_height
         ))
         .join("0.jpg");
-    let Some(found) = jpeg_full_chroma(&tile) else {
+    let Some(found) = off_runtime(|| jpeg_full_chroma(&tile)) else {
         tracing::debug!(path = %tile.display(), "cannot read the chroma of a trickplay tile; keeping it");
         return false;
     };
@@ -1941,14 +1958,61 @@ fn chroma_mismatch(trickplay_dir: &str, row: &TrickplayInfoEntity, full_chroma: 
 /// afterwards.
 fn drop_probed_folder(ctx: &WidthRefreshContext<'_>, set: &PendingSet) {
     if ctx.save_with_media {
-        let _ = std::fs::remove_dir(&set.output_dir);
+        let _ = off_runtime(|| std::fs::remove_dir(&set.output_dir));
     }
 }
 
 /// Whether `dir` exists and directly contains at least one `.jpg` file
-/// (C# `HasTrickplayTiles`).
+/// (C# `HasTrickplayTiles`), stopping at the first one.
 fn has_tiles(dir: &Path) -> bool {
-    !jpg_files_sorted(dir).is_empty()
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| is_jpg_file(&entry.path()))
+    })
+}
+
+/// Whether `path` is a file with a `.jpg` extension (any case).
+fn is_jpg_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
+}
+
+/// The `.jpg` tiles of a grid folder discovery adopts, unsorted; a folder or
+/// an entry that cannot be read fails discovery.
+fn grid_tiles(path: &Path) -> Result<Vec<String>, ServiceError> {
+    let mut tiles = Vec::new();
+    for tile in std::fs::read_dir(path)
+        .map_err(|error| ServiceError::backend(format!("cannot read trickplay grid: {error}")))?
+    {
+        let tile = tile
+            .map_err(|error| ServiceError::backend(format!("cannot list trickplay grid: {error}")))?
+            .path();
+        if is_jpg_file(&tile) {
+            tiles.push(tile.to_string_lossy().into_owned());
+        }
+    }
+    Ok(tiles)
+}
+
+/// The largest [`tile_bitrate`] of `tiles`, the bandwidth of a discovered
+/// grid; a tile that cannot be read fails discovery.
+fn peak_bitrate(
+    tiles: &[String],
+    tile_width: i32,
+    tile_height: i32,
+    interval: i32,
+) -> Result<i32, ServiceError> {
+    let mut bandwidth = 0;
+    for tile in tiles {
+        let bytes = std::fs::metadata(tile)
+            .map_err(|error| ServiceError::backend(format!("cannot stat tile: {error}")))?
+            .len();
+        bandwidth = bandwidth.max(tile_bitrate(bytes, tile_width, tile_height, interval));
+    }
+    Ok(bandwidth)
 }
 
 /// The `.jpg` files directly inside `dir`, sorted by file name; a missing or
@@ -1960,11 +2024,7 @@ fn jpg_files_sorted(dir: &Path) -> Vec<String> {
     let mut files: Vec<String> = entries
         .filter_map(Result::ok)
         .map(|e| e.path())
-        .filter(|p| {
-            p.is_file()
-                && p.extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jpg"))
-        })
+        .filter(|p| is_jpg_file(p))
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     files.sort();
@@ -2991,6 +3051,37 @@ mod tests {
         assert_eq!(r.extractor.calls(), 2, "replace regenerates");
         let res = r.mgr.get_trickplay_resolutions(item).await.expect("res");
         assert_eq!(res[&320].thumbnail_count, 4);
+    }
+
+    /// A stored width whose tiles are only in the other location keeps its
+    /// row (they are found there) and is made in the selected folder.
+    #[tokio::test]
+    async fn a_stored_width_with_no_tiles_in_the_selected_folder_is_made_there() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), FakeExtractor::new(4, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let beside =
+            PathBuf::from(r.pm.trickplay_directory(item, MediaLocation::of_file(&media), true))
+                .join("320 - 2x2");
+        std::fs::create_dir_all(&beside).expect("set beside the media");
+        std::fs::write(beside.join("0.jpg"), b"tile").expect("tile");
+        r.mgr
+            .save_trickplay_info(&TrickplayInfoEntity {
+                tile_width: 2,
+                tile_height: 2,
+                ..info(item, 320)
+            })
+            .await
+            .expect("row");
+
+        r.mgr
+            .refresh_trickplay_data(item, false, &extraction_on())
+            .await
+            .expect("refresh");
+
+        assert_eq!(r.extractor.sets(), [vec![320]], "the set is made");
+        assert!(set_dir(&r, item, &media, 320).join("0.jpg").is_file());
     }
 
     /// The folder of an item's internal set at `width` on the 2×2 grid.

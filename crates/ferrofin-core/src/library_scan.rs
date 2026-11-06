@@ -1491,13 +1491,13 @@ impl ExternalProbeSeam {
     }
 }
 
-/// Runs blocking filesystem work (a plan pass, a window's file checks) on
-/// this worker after handing the worker's other tasks to the rest of the
-/// runtime (`block_in_place`), so requests keep every other worker while a
-/// scan walks a slow disk. On a current-thread runtime it runs the work
-/// inline: there is no other worker to hand the tasks to, and
-/// `block_in_place` would panic there.
-fn off_runtime<R>(work: impl FnOnce() -> R) -> R {
+/// Runs blocking filesystem work (a plan pass, a window's file checks, a
+/// trickplay refresh's folder probes) on this worker after handing the
+/// worker's other tasks to the rest of the runtime (`block_in_place`), so
+/// requests keep every other worker while a scan walks a slow disk. On a
+/// current-thread runtime it runs the work inline: there is no other worker
+/// to hand the tasks to, and `block_in_place` would panic there.
+pub(crate) fn off_runtime<R>(work: impl FnOnce() -> R) -> R {
     match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
         _ => work(),
@@ -18125,7 +18125,7 @@ impl LibraryScanner {
             let during_scan =
                 options.is_some_and(|options| options.extract_chapter_images_during_library_scan);
             let outcome = extractor
-                .refresh(video, &mut chapters, during_scan, cancel)
+                .refresh(video, &mut chapters, None, during_scan, cancel)
                 .await?;
             if outcome.cancelled {
                 return Ok(());

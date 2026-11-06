@@ -1509,7 +1509,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetMediaSources) and \
                    MediaBrowser.Controller/Entities/Video.cs (GetAllItemsForMediaSources)",
-        date: "2026-11-04",
+        date: "2026-11-05",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \
