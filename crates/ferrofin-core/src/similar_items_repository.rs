@@ -17,7 +17,7 @@ use ferrofin_traits::error::ServiceError;
 
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
-use crate::user_entity_ext::{guid_preference, has_permission};
+use crate::user_entity_ext::{cached_guid_preference, cached_permission};
 
 /// Raw-SQL data access for similar items and movie recommendations.
 #[derive(Clone)]
@@ -158,12 +158,17 @@ impl SimilarItemsRepository {
     /// permission sees only the `EnabledFolders` preference. C# guards an
     /// empty scope with a fresh `Guid.NewGuid()` so the query matches nothing
     /// rather than everything; the caller does the same with `Some(vec![])`.
+    ///
+    /// The permission and preferences come from the cross-request policy
+    /// cache ([`Database::user_policy`]), as upstream reads them off the `User`
+    /// it holds.
     pub(crate) async fn accessible_top_parents(
         &self,
         user: &UserEntity,
     ) -> Result<Option<Vec<Uuid>>, ServiceError> {
         let pool = self.db.pool();
-        let blocked = guid_preference(pool, &user.id, PreferenceKind::BlockedMediaFolders).await?;
+        let blocked =
+            cached_guid_preference(&self.db, &user.id, PreferenceKind::BlockedMediaFolders).await?;
         if !blocked.is_empty() {
             // The rows a `BlockedMediaFolders` preference names are the
             // libraries' collection folders.
@@ -184,11 +189,11 @@ impl SimilarItemsRepository {
                     .collect(),
             ));
         }
-        if has_permission(pool, &user.id, PermissionKind::EnableAllFolders).await? {
+        if cached_permission(&self.db, &user.id, PermissionKind::EnableAllFolders).await? {
             return Ok(None);
         }
         Ok(Some(
-            guid_preference(pool, &user.id, PreferenceKind::EnabledFolders).await?,
+            cached_guid_preference(&self.db, &user.id, PreferenceKind::EnabledFolders).await?,
         ))
     }
 
