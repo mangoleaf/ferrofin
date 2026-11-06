@@ -1199,7 +1199,9 @@ pub trait ItemPersistenceService: Send + Sync {
     }
 
     /// The stored dimensions/blurhash of every image row attached to
-    /// `item_ids`, read in one batch.
+    /// `item_ids`, read in one batch, with each row's item and type, so a
+    /// caller can also tell whether an item's rows already match what it
+    /// would write.
     ///
     /// This is the read half of C#'s `LibraryManager.ImageNeedsRefresh`: an
     /// image whose stored `Width`/`Height`/`BlurHash` are already filled and
@@ -2624,9 +2626,14 @@ pub struct ItemChildLink {
 ///
 /// Returned by
 /// [`ItemPersistenceService::image_metadata_for_items`] and consumed by the
-/// scan's port of C#'s `LibraryManager.ImageNeedsRefresh`.
+/// scan's port of C#'s `LibraryManager.ImageNeedsRefresh`, and by its credited
+/// people's image write, which compares each person's whole row set.
 #[derive(Debug, Clone)]
 pub struct StoredImageMetadata {
+    /// The item the row belongs to.
+    pub item_id: Uuid,
+    /// The row's image type.
+    pub image_type: ImageType,
     /// The image file's path — the identity of the artwork on disk.
     pub path: String,
     /// The stored pixel width (`0` when never probed).

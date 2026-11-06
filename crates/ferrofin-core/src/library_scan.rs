@@ -12508,30 +12508,48 @@ impl LibraryScanner {
         }
     }
 
-    /// What previous scans already probed for the profile images of `written`,
-    /// keyed by image path — one query for the whole credit list.
+    /// What previous scans stored for the profile images of `written`, in one
+    /// query for the whole credit list: each person's image rows, by person id
+    /// (`None` when they could not be read), and what was probed, by path.
     ///
     /// Built here rather than carried on the scan's `ArtworkCache`: person ids
     /// are only known once `update_people` has written them, which is after the
     /// per-scan prereads have run.
-    async fn stored_person_image_metadata(
+    async fn stored_person_images(
         &self,
         written: &[ferrofin_traits::persistence::WrittenPerson],
-    ) -> ProbedImages {
-        let mut images = ProbedImages::new();
+    ) -> (Option<HashMap<Uuid, Vec<ItemImageInfo>>>, ProbedImages) {
+        let mut probed = ProbedImages::new();
         let with_art: Vec<Uuid> = written
             .iter()
             .filter(|p| p.image_url.is_some())
             .map(|p| p.id)
             .collect();
         if with_art.is_empty() {
-            return images;
+            return (Some(HashMap::new()), probed);
         }
         match self.persistence.image_metadata_for_items(&with_art).await {
-            Ok(rows) => remember_stored_images(&mut images, rows),
-            Err(err) => tracing::warn!(%err, "could not read stored person image metadata"),
+            Ok(rows) => {
+                let mut rows_of: HashMap<Uuid, Vec<ItemImageInfo>> = HashMap::new();
+                for row in rows {
+                    let image = ItemImageInfo {
+                        path: row.path,
+                        image_type: row.image_type,
+                        date_modified: row.date_modified,
+                        width: row.width,
+                        height: row.height,
+                        blur_hash: row.blur_hash,
+                    };
+                    remember_settled_image(&mut probed, &image);
+                    rows_of.entry(row.item_id).or_default().push(image);
+                }
+                (Some(rows_of), probed)
+            }
+            Err(err) => {
+                tracing::warn!(%err, "could not read stored person image metadata");
+                (None, probed)
+            }
         }
-        images
     }
 
     /// The stored row and `LockedFields` of every credited person whose
@@ -12629,7 +12647,8 @@ impl LibraryScanner {
     /// Enriches credited people: downloads each one's TMDB profile image as their
     /// `Primary` artwork, and fetches a biography (bio/birthday/deathday/birthplace)
     /// for each *newly-created* person. Best-effort and cached — images skip
-    /// existing files, and bios only run for new people, so re-scans stay cheap.
+    /// existing files and are written only when the person's stored rows differ,
+    /// and bios only run for new people, so re-scans stay cheap.
     ///
     /// ponytail: runs serially — a large cast makes the first scan slower, but the
     /// per-file / new-only guards make re-scans cheap. Batch if first-scan latency
@@ -12648,7 +12667,7 @@ impl LibraryScanner {
         // re-BlurHash-encodes every cast member's profile photo, which on a
         // library with thousands of credited people is more image work than the
         // items themselves. One read per credited cast, not one per person.
-        let stored = self.stored_person_image_metadata(&written).await;
+        let (mut stored_rows, stored) = self.stored_person_images(&written).await;
         let person_locks = self.person_locks(&written).await;
         let server_locale = self.server_metadata_locale();
         // Read only for a biography fetch, which most credits never make (a
@@ -12696,10 +12715,26 @@ impl LibraryScanner {
                 // answer has to live.)
                 adopt_stored_image_metadata(&mut infos, &stored);
                 self.fill_image_metadata(&mut infos).await;
-                if !infos.is_empty()
-                    && let Err(err) = self.persistence.save_item_images(person.id, &infos).await
-                {
-                    tracing::warn!(%err, person = %id, "failed to persist person image");
+                // Upstream saves a person only when something changed
+                // (`SavePeopleMetadataAsync`'s `saveEntity`). Rows that already
+                // match take no writer transaction, which a recurring cast
+                // would otherwise take once per credit of every saved item.
+                let person_rows = stored_rows
+                    .as_ref()
+                    .map(|rows| rows.get(&person.id).map_or(&[][..], Vec::as_slice));
+                if !infos.is_empty() && images_changed(&infos, person_rows) {
+                    match self.persistence.save_item_images(person.id, &infos).await {
+                        // A person credited more than once here (a director who
+                        // also wrote it) is one person: written once.
+                        Ok(()) => {
+                            if let Some(rows) = &mut stored_rows {
+                                rows.insert(person.id, infos);
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, person = %id, "failed to persist person image");
+                        }
+                    }
                 }
             }
 
@@ -23971,6 +24006,7 @@ impl ProbedImage {
             height,
             blur_hash,
             date_modified,
+            ..
         } = row;
         (
             path,
@@ -24139,6 +24175,8 @@ mod trickplay;
 
 #[cfg(test)]
 mod directory_cache_tests;
+#[cfg(test)]
+mod person_image_tests;
 #[cfg(test)]
 mod plan_paths_tests;
 
@@ -34598,6 +34636,8 @@ mod tests {
 
         let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let row = |path: &str, width: i32| StoredImageMetadata {
+            item_id: uuid::Uuid::nil(),
+            image_type: ImageType::Primary,
             path: path.to_owned(),
             width,
             height: 1500,
