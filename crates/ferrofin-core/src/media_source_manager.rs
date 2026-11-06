@@ -40,6 +40,7 @@ use ferrofin_traits::persistence::{
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, ProviderManager};
 
 use crate::db_error::media_stream_type_from_disc;
+use crate::scheduled_tasks::maintenance::CACHE_FILE_MAX_AGE;
 
 /// The concrete media-source manager.
 ///
@@ -89,14 +90,20 @@ pub struct FerrofinMediaSourceManager {
     /// Refreshes an item's file with the remote content probe on
     /// (`GetPlaybackMediaSources`' forced `FullRefresh`), awaiting the result.
     remote_probe: Option<RemoteProbe>,
-    /// What a live stream's probe found, keyed by the open token that names it.
+    /// What a live stream's probe found and when, keyed by the open token that
+    /// names it.
     ///
     /// Port of `LiveStreamHelper`'s `{cache}/mediainfo/{md5(cacheKey)}.json`
     /// cache: probing costs a 3 s wait plus an ffprobe against a live stream,
     /// and without the cache every channel change and every extra viewer pays
-    /// it again. Ferrofin keeps it in memory rather than on disk — a restart
-    /// re-probes once per channel, which is the only difference.
-    probe_cache: Arc<Mutex<HashMap<String, MediaSourceInfo>>>,
+    /// it again. Upstream writes the file once and the daily "Clean Cache
+    /// Directory" deletes it once it is more than [`CACHE_FILE_MAX_AGE`] old,
+    /// so an entry here is as good as gone past that age, and storing a probe
+    /// drops every entry past it. Ferrofin keeps it in memory rather than on
+    /// disk, so a restart re-probes once per channel, and an entry ages out at
+    /// exactly that age, not at the next sweep (nor never, with that task
+    /// disabled).
+    probe_cache: Arc<Mutex<HashMap<String, (tokio::time::Instant, MediaSourceInfo)>>>,
 }
 
 impl std::fmt::Debug for FerrofinMediaSourceManager {
@@ -715,7 +722,8 @@ impl FerrofinMediaSourceManager {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(key)
-                .cloned()
+                .filter(|(probed_at, _)| probed_at.elapsed() <= CACHE_FILE_MAX_AGE)
+                .map(|(_, probed)| probed.clone())
         }) {
             apply_probed_media_info(source, &cached, cache_key.is_some());
             return true;
@@ -742,10 +750,16 @@ impl FerrofinMediaSourceManager {
             return false;
         };
         if let Some(key) = cache_key {
-            self.probe_cache
+            let mut cache = self
+                .probe_cache
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key.to_owned(), probed.clone());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // What "Clean Cache Directory" would have deleted by now goes.
+            cache.retain(|_, (probed_at, _)| probed_at.elapsed() <= CACHE_FILE_MAX_AGE);
+            cache.insert(
+                key.to_owned(),
+                (tokio::time::Instant::now(), probed.clone()),
+            );
         }
         apply_probed_media_info(source, &probed, cache_key.is_some());
         true
@@ -1932,25 +1946,12 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             return Ok(source);
         }
 
-        // Not a Live TV token: probe the item and register it under a fresh id.
-        let request_info = ferrofin_traits::media_encoding::MediaInfoRequest {
-            media_source: MediaSourceInfo {
-                id: Some(request.item_id.to_string()),
-                ..Default::default()
-            },
-            extract_chapters: false,
-            media_is_audio: false,
-        };
-        let mut source = self.encoder.get_media_info(&request_info).await?;
-        derive_stream_getters(&mut source.media_streams);
-        let live_id = Uuid::new_v4().to_string();
-        source.live_stream_id = Some(live_id.clone());
-        source.requires_closing = true;
-        self.open_streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(stream_key(&live_id), source.clone());
-        Ok(source)
+        // Only a Live TV channel token opens anything: upstream's `GetProvider`
+        // throws on a missing token, and no provider opens any other one.
+        // There is no fallback that probes the item instead.
+        Err(ServiceError::invalid_input(
+            "the open token is missing or is not a Live TV channel token",
+        ))
     }
 
     async fn get_live_stream(&self, id: &str) -> Result<MediaSourceInfo, ServiceError> {
@@ -3868,12 +3869,56 @@ mod tests {
         assert!(sources.is_empty(), "{sources:?}");
     }
 
+    /// `OpenLiveStreamInternal` opens only through the provider the token
+    /// names (`GetProvider`): a missing or empty token is an
+    /// `ArgumentException` upstream, and a whitespace-only token or one naming
+    /// no provider opens nothing. No path probes the item instead.
+    #[tokio::test]
+    async fn an_open_token_naming_no_provider_opens_nothing() {
+        let db = test_db().await;
+        let mgr = manager(&db).with_live_tv(Arc::new(FakeLiveTv::default()));
+        let channel = Uuid::from_u128(7);
+        for open_token in [
+            None,
+            Some(String::new()),
+            Some("  ".to_owned()),
+            Some(format!("someprovider_LiveTvChannel_{}", channel.simple())),
+        ] {
+            let request = LiveStreamRequest {
+                open_token: open_token.clone(),
+                item_id: channel,
+                ..Default::default()
+            };
+            let err = mgr
+                .open_live_stream(&request)
+                .await
+                .expect_err("nothing opens this token");
+            assert!(
+                matches!(err, ServiceError::InvalidInput(_)),
+                "{open_token:?}: {err:?}"
+            );
+        }
+        assert!(
+            mgr.open_streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "a refused open registers no stream"
+        );
+    }
+
     #[tokio::test]
     async fn live_stream_open_get_close_round_trips() {
         let db = test_db().await;
-        let mgr = manager(&db);
+        let mgr = manager(&db).with_live_tv(Arc::new(FakeLiveTv::default()));
+        let channel = Uuid::from_u128(7);
         let request = LiveStreamRequest {
-            item_id: Uuid::from_u128(7),
+            open_token: Some(format!(
+                "{}_LiveTvChannel_{}_source-1",
+                live_tv_provider_key(),
+                channel.simple()
+            )),
+            item_id: channel,
             ..Default::default()
         };
 
@@ -3896,6 +3941,58 @@ mod tests {
 
         mgr.close_live_stream(&shouted).await.expect("close");
         assert!(mgr.get_live_stream(&id).await.is_err());
+    }
+
+    /// Upstream's probe cache file is written once and deleted by "Clean
+    /// Cache Directory" once it is more than `CACHE_FILE_MAX_AGE` old: until
+    /// then every open of the token reuses the probe, after it the next open
+    /// probes again, and storing that probe drops the other aged-out entries.
+    #[tokio::test]
+    async fn a_cached_live_stream_probe_ages_out_with_the_cache_directory() {
+        async fn probed_container(mgr: &FerrofinMediaSourceManager, key: &str) -> Option<String> {
+            let mut source = MediaSourceInfo::default();
+            assert!(
+                mgr.add_media_info_with_probe(&mut source, Some(key), false)
+                    .await
+            );
+            source.container
+        }
+
+        let db = test_db().await;
+        let mgr = manager(&db);
+        // Nothing below touches the database, so the paused clock cannot time
+        // out a pool acquire.
+        tokio::time::pause();
+        let earlier = MediaSourceInfo {
+            container: Some("ts".to_owned()),
+            ..Default::default()
+        };
+        for key in ["tuned", "abandoned"] {
+            mgr.probe_cache.lock().expect("cache").insert(
+                key.to_owned(),
+                (tokio::time::Instant::now(), earlier.clone()),
+            );
+        }
+
+        tokio::time::advance(CACHE_FILE_MAX_AGE).await;
+        assert_eq!(
+            probed_container(&mgr, "tuned").await.as_deref(),
+            Some("ts"),
+            "not past the sweep's age yet: the cached probe"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            probed_container(&mgr, "tuned").await.as_deref(),
+            Some("mkv"),
+            "aged out: probed again (the stub encoder answers mkv)"
+        );
+        let cache = mgr.probe_cache.lock().expect("cache");
+        assert_eq!(
+            cache.keys().collect::<Vec<_>>(),
+            ["tuned"],
+            "the aged-out probe nobody opened again is dropped"
+        );
+        assert_eq!(cache["tuned"].1.container.as_deref(), Some("mkv"));
     }
 }
 
