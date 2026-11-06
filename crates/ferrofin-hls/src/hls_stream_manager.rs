@@ -631,7 +631,15 @@ where
         {
             // `current` sees in-progress `.tmp` segments too, so a live job that
             // is still encoding its first segment reads as progress, not absence.
-            let current = current_transcoding_index(&playlist_path, ext);
+            // Listed on the blocking pool: the directory holds every segment of
+            // every live transcode (gl-1255).
+            let listed = playlist_path.clone();
+            let current =
+                tokio::task::spawn_blocking(move || current_transcoding_index(&listed, ext))
+                    .await
+                    .map_err(|error| {
+                        ServiceError::backend(format!("list transcode segments: {error}"))
+                    })?;
             if should_wait_for_running_job(current, segment_id) {
                 // The wait is an active consumer: the guard keeps the idle
                 // reaper away and self-releases if the client disconnects.
@@ -1417,6 +1425,7 @@ fn segment_containing(starts: &[i64], ticks: i64) -> (i32, i64) {
 /// `n` — the running job's progress front. `None` when nothing has been
 /// produced yet. Port of `GetCurrentTranscodingIndex`; used to decide whether a
 /// segment request is a read-ahead (wait) or a seek (evict + restart).
+/// Blocking: an async caller runs it on the blocking pool.
 fn current_transcoding_index(playlist: &Path, ext: &str) -> Option<i32> {
     let folder = playlist.parent()?;
     let stem = playlist.file_stem()?.to_string_lossy().into_owned();
@@ -2420,6 +2429,55 @@ mod tests {
         assert_eq!(plans.lock().unwrap().len(), 1, "the wait planned");
     }
 
+    /// A missing segment waits for the running job or restarts it at that
+    /// segment, by where the job's front is on disk: Ferrofin's variant of
+    /// `GetDynamicSegment`'s decision (its own wait gap, and `.tmp` segments
+    /// count). A seek behind the front or past the wait gap restarts, and a
+    /// request at or just ahead of it waits, also when the front is a `.tmp`
+    /// segment still being encoded after a seek.
+    #[rstest::rstest]
+    #[case::just_ahead_waits(&[], 1, false)]
+    #[case::at_the_wait_gap_waits(&[], SEGMENT_WAIT_GAP, false)]
+    #[case::a_seek_past_the_wait_gap_restarts(&[], SEGMENT_WAIT_GAP + 1, true)]
+    #[case::a_seek_behind_the_front_restarts(&["out10.ts", "out11.ts"], 5, true)]
+    #[case::a_retry_during_a_seeks_first_segment_waits(&["out20.ts.tmp"], 20, false)]
+    #[tokio::test]
+    async fn the_running_jobs_front_decides_between_waiting_and_restarting(
+        #[case] written: &[&str],
+        #[case] segment: i32,
+        #[case] restarts: bool,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        // The child keeps running, so the job stays live between requests.
+        let script = FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        };
+        let (mgr, _, spawns) = manager_full(tmp.path(), script, "ts");
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        for name in written {
+            std::fs::write(tmp.path().join(name), b"seg").unwrap();
+        }
+
+        // The requested segment never appears, so the request parks in the
+        // wait on the running job or on the restarted one.
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            mgr.dynamic_segment(&req(), segment, false),
+        )
+        .await;
+        assert!(
+            parked.is_err(),
+            "segment {segment} was answered: {parked:?}"
+        );
+        assert_eq!(
+            spawns.requests.lock().unwrap().len(),
+            if restarts { 2 } else { 1 },
+            "segment {segment} restarted the transcode: {restarts}"
+        );
+    }
+
     #[tokio::test]
     async fn serving_an_existing_segment_keeps_the_job_alive() {
         // Serving a segment straight off disk is an active consumer: it must
@@ -2659,6 +2717,67 @@ mod tests {
             second.await.unwrap();
             let served = serve.await.unwrap();
             assert!(served.path.ends_with("abc0.ts"));
+        });
+    }
+
+    /// A segment past a running job's front lists the transcode directory for
+    /// that front on the blocking pool, never inline on a runtime worker
+    /// (gl-1255): the directory holds every segment of every live transcode.
+    /// With the pool's only thread held busy the request cannot finish, which
+    /// an inline listing would ignore.
+    #[test]
+    fn the_running_jobs_front_is_listed_on_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            // Whatever starts dies without the segment, so the request
+            // answers at once once it is past the listing.
+            let script = FakeScript {
+                exits_immediately: true,
+                ..FakeScript::default()
+            };
+            let (mgr, _) = manager_with(tmp.path(), script, "ts");
+            std::fs::write(tmp.path().join("out0.ts"), b"seg").unwrap();
+            mgr.manager.register_job(TranscodingJobHandle {
+                play_session_id: Some("sess".to_owned()),
+                path: tmp.path().join("out.m3u8").to_string_lossy().into_owned(),
+                job_type: TranscodingJobType::Hls,
+                device_id: Some("dev".to_owned()),
+                live_stream_id: None,
+            });
+
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.unwrap();
+
+            let starved = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                mgr.dynamic_segment(&req(), 1, false),
+            )
+            .await;
+            assert!(
+                starved.is_err(),
+                "the request finished with the blocking pool starved, so the listing ran inline"
+            );
+
+            release_tx.send(()).unwrap();
+            hog.await.unwrap();
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                mgr.dynamic_segment(&req(), 1, false),
+            )
+            .await
+            .expect("the request finishes once the pool is free")
+            .unwrap_err();
+            assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
         });
     }
 

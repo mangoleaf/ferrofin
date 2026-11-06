@@ -92,7 +92,13 @@ Conventions:
     publishing what detection stored, as upstream's scan runs it.
   - **Support bundle:** the version line also names Ferrofin's; the ffmpeg
     checks run when the bundle is asked for (upstream: at start); the bundle
-    names the Chromaprint backend.
+    names the Chromaprint backend. The queue counts come from the last
+    whole-library queue (the scheduled pass, Clean Intro Skipper Cache, Clear
+    excluded). An automatic analysis or a season rescan queues only its
+    seasons (below), so a bundle asked for after one builds the whole queue
+    once, without ffprobe, and counts it then; upstream counts every
+    analysis's queue, so the two differ only when the library changed after
+    the last automatic analysis.
   - **Task keys:** the detection task was `IntroSkipper.Detect` before D6; the
     task manager adopts what was saved under that key.
 - **Memory** (implementation only, the behaviour is the same): upstream
@@ -102,7 +108,14 @@ Conventions:
   place each item in its library, then library by library to queue it. The
   items, their libraries and their order are the same, so the queue is the
   same. Rows that tie on all four sort keys keep whatever order SQLite's plan
-  gives them; neither the snapshot nor the whole list promises one.
+  gives them; neither the snapshot nor the whole list promises one. An
+  automatic analysis or a season rescan, which upstream gives the whole queue
+  and then filters to its seasons, reads only those seasons' series and
+  movies (each episode's ancestors hold its series) and probes only the items
+  it analyses: the ids it reads keep the whole snapshot's order, and a
+  season's entries depend only on its series' items, so its seasons are
+  queued exactly as the whole queue has them (given the series link every
+  scanned season and episode row carries).
 
 ### File Transformation
 - Ferrofin files: `crates/ferrofin-extensions/src/file_transformation.rs`,
@@ -171,10 +184,18 @@ Conventions:
   Two copies of one airing still merge, as the core resolver groups them. The
   stored `PremiereDate` is not used: an NFO, or a row adopted from Jellyfin
   (server-local midnight), can store an airing's date on another day. A file
-  name with no such key keeps upstream's key. The self-heal also undoes a
-  group made by hand through `POST /Videos/MergeVersions` of two airings, or
-  of two copies only one of whose file names carries the key; the playlist
-  and collection entries that merge rerouted to the primary stay on it.
+  name with no such key carries the file name without its extension,
+  compared case-insensitively: the resolver's name cuts everything after a
+  year or release clutter, so unnumbered, undated episodes such as
+  `Show (1975) - Guest A` and `Show (1975) - Christmas Special` are both
+  "Show", 1975, and upstream's key merged them. Two copies with one such name
+  in different folders still merge, whatever their containers; copies whose
+  names differ (`Pilot 1080p`, `Pilot 720p`) no longer do. Only a row with no
+  path or no file name keeps upstream's key. The self-heal also undoes a
+  group made by hand through `POST /Videos/MergeVersions` of two airings, of
+  two copies only one of whose file names carries the key, or of two
+  unnumbered, undated episodes whose file names differ; the playlist and
+  collection entries that merge rerouted to the primary stay on it.
   For the same two-libraries reason as the series-row scoping, movie
   grouping is keyed by (owning library `TopParentId`, `Tmdb` id) rather than
   the `Tmdb` id alone: the same film held in a cold (NAS) and a hot (local)

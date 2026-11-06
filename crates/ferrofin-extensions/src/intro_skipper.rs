@@ -274,6 +274,18 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
     }
 
     async fn support_bundle(&self) -> String {
+        // An automatic run or a season rescan queued only its seasons: count
+        // the whole queue now, without ffprobe (it moves windows, not counts).
+        // The whole build clears the flag, so a failed or dropped one leaves it.
+        if self.runtime.counts_stale.load(Ordering::Relaxed) {
+            let config = IntroSkipperConfig {
+                probe_audio_duration: false,
+                ..(*self.load_config().await).clone()
+            };
+            if let Err(err) = self.queue(&config, None).await {
+                tracing::warn!(%err, "intro skipper: could not count the queue for the support bundle");
+            }
+        }
         // `CheckFFmpegVersionAsync` (run at start upstream; here when asked).
         let check = self.ffmpeg.check().await;
         // Upstream's ffmpeg is its only fingerprinter; here `fpcalc` stands in
@@ -302,7 +314,7 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
         let config = self.load_config().await;
         // `GetExcludedInventoryAsync`: the queue with the excluded items in.
         let mut ids: Vec<Uuid> = self
-            .queue(&config)
+            .queue(&config, None)
             .await?
             .into_iter()
             .flat_map(|(_, entries)| entries)
@@ -795,8 +807,13 @@ impl Drop for ReleaseOnDrop {
 
 impl DetectSegmentsTask {
     /// The queue (`QueueManager.GetMediaItems(includeExcluded: true)`): every
-    /// entry, excluded ones flagged.
-    async fn queue(&self, config: &IntroSkipperConfig) -> Result<queue::Queue, ServiceError> {
+    /// entry, excluded ones flagged; with `only`, just those seasons (and
+    /// movies), as `AnalyzeItemsAsync(seasonsToAnalyze)` filters it.
+    async fn queue(
+        &self,
+        config: &IntroSkipperConfig,
+        only: Option<&HashSet<Uuid>>,
+    ) -> Result<queue::Queue, ServiceError> {
         let folders = self.virtual_folders.get_virtual_folders().await?;
         let queue = queue::build(
             self.library.as_ref(),
@@ -804,8 +821,14 @@ impl DetectSegmentsTask {
             &folders,
             config,
             true,
+            only,
         )
         .await?;
+        if only.is_some() {
+            // No whole-library count: the support bundle makes one.
+            self.runtime.counts_stale.store(true, Ordering::Relaxed);
+            return Ok(queue);
+        }
         // `TotalQueued` / `TotalSeasons`, for the support bundle.
         let queued = queue
             .iter()
@@ -817,6 +840,7 @@ impl DetectSegmentsTask {
             .filter(|(_, entries)| entries.iter().any(|e| !e.is_excluded))
             .count();
         self.runtime.seasons.store(seasons, Ordering::Relaxed);
+        self.runtime.counts_stale.store(false, Ordering::Relaxed);
         Ok(queue)
     }
 
@@ -827,7 +851,7 @@ impl DetectSegmentsTask {
     /// out of analysis keeps its seasons' settings.
     #[tracing::instrument(name = "extension_run", skip_all, fields(extension = "intro_skipper"))]
     async fn run_analysis(&self, progress: &TaskProgress, config: &IntroSkipperConfig) {
-        let queue = match self.queue(config).await {
+        let queue = match self.queue(config, None).await {
             Ok(queue) => queue,
             Err(err) => {
                 tracing::warn!(%err, "intro skipper: could not build the analysis queue");
@@ -922,7 +946,7 @@ impl DetectSegmentsTask {
         let _release = self.acquire_latch().await;
         let config = self.load_config().await;
         // Excluded items keep their state: only leaving a library is stale.
-        let queue = self.queue(&config).await?;
+        let queue = self.queue(&config, None).await?;
         let live: HashSet<Uuid> = queue
             .iter()
             .flat_map(|(_, entries)| entries.iter().map(|e| e.episode_id))
@@ -997,7 +1021,7 @@ impl DetectSegmentsTask {
     /// (segments, cache, republish), then `AnalyzeItemsAsync([seasonId])`.
     async fn rescan_season(&self, season_id: Uuid) {
         let config = self.load_config().await;
-        let queue = match self.queue(&config).await {
+        let queue = match self.queue(&config, Some(&HashSet::from([season_id]))).await {
             Ok(queue) => queue,
             Err(err) => {
                 tracing::error!(%err, %season_id, "intro skipper: could not enumerate the season to rescan");
@@ -1642,7 +1666,7 @@ mod tests {
         pub(super) segments: Arc<dyn MediaSegmentManager>,
         actions: Arc<ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore>,
         pub(super) calls: Arc<AtomicUsize>,
-        persistence: Arc<ferrofin_core::FerrofinItemPersistenceService>,
+        pub(super) persistence: Arc<ferrofin_core::FerrofinItemPersistenceService>,
         cache: tempfile::TempDir,
     }
 
@@ -2303,6 +2327,7 @@ mod tests {
             &folders,
             &config,
             true,
+            None,
         )
         .await
         .expect("queue");
@@ -2329,10 +2354,43 @@ mod tests {
             &folders,
             &config,
             false,
+            None,
         )
         .await
         .expect("queue");
         assert!(strict.iter().all(|(k, _)| *k != id(0x55)));
+    }
+
+    /// A library over an empty database whose list reads go through
+    /// [`OnePageAtATime`](crate::library_pages::tests::OnePageAtATime) (more
+    /// than a page at once fails; the rows read are logged), with that fake.
+    async fn paged_library() -> (
+        ferrofin_core::FerrofinItemPersistenceService,
+        ferrofin_core::FerrofinLibraryManager,
+        Arc<crate::library_pages::tests::OnePageAtATime>,
+    ) {
+        let db = ferrofin_db::Database::connect_in_memory()
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrations");
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+        let items = Arc::new(crate::library_pages::tests::OnePageAtATime::new(Arc::new(
+            ferrofin_core::FerrofinItemRepository::new(db.clone(), lookup),
+        )));
+        let library = ferrofin_core::FerrofinLibraryManager::new(
+            Arc::clone(&items) as Arc<dyn ferrofin_traits::persistence::ItemRepository>,
+            Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+            Arc::new(ferrofin_core::FerrofinItemPersistenceService::new(
+                db.clone(),
+            )),
+            Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+        );
+        (
+            ferrofin_core::FerrofinItemPersistenceService::new(db),
+            library,
+            items,
+        )
     }
 
     /// gl-1013: the queue reads the library a page at a time and keeps the
@@ -2343,25 +2401,7 @@ mod tests {
     #[tokio::test]
     async fn the_queue_reads_the_library_a_page_at_a_time() {
         let h = harness(&[], true, "{}", true).await;
-        let db = ferrofin_db::Database::connect_in_memory()
-            .await
-            .expect("connect");
-        db.run_migrations().await.expect("migrations");
-        let persistence = ferrofin_core::FerrofinItemPersistenceService::new(db.clone());
-        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
-            Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
-        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
-            Arc::new(crate::library_pages::tests::OnePageAtATime(Arc::new(
-                ferrofin_core::FerrofinItemRepository::new(db.clone(), lookup),
-            )));
-        let library = ferrofin_core::FerrofinLibraryManager::new(
-            items,
-            Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
-            Arc::new(ferrofin_core::FerrofinItemPersistenceService::new(
-                db.clone(),
-            )),
-            Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
-        );
+        let (persistence, library, _) = paged_library().await;
         // More episodes than a page, one per series. The series take the
         // three roots in turn, so the query's order interleaves the libraries.
         let roots = ["/lib/kids", "/lib/main", "/lib/old"];
@@ -2421,6 +2461,7 @@ mod tests {
             &folders,
             &IntroSkipperConfig::default(),
             true,
+            None,
         )
         .await
         .expect("queue");
@@ -2433,6 +2474,117 @@ mod tests {
         // One entry per file: the kids' files, which `/lib` holds too, are
         // queued once.
         assert!(queue.iter().all(|(_, entries)| entries.len() == 1));
+    }
+
+    /// gl-1272: a queue for some seasons (an automatic run's, a rescan's)
+    /// reads only their series' items and the movies asked for, probes only
+    /// what it keeps, and keeps those seasons as the whole queue has them,
+    /// the special that aired in one included.
+    #[tokio::test]
+    async fn a_queue_for_some_seasons_reads_only_their_series() {
+        let (persistence, library, items) = paged_library().await;
+        let id = |n: u128| Uuid::from_u128(n);
+        let row = |n: u128, kind, series: Option<Uuid>| BaseItemEntity {
+            id: guid_to_db(id(n)),
+            type_: (ferrofin_core::item_type_lookup::stored_type_name(kind).expect("type"))
+                .to_owned(),
+            series_id: series.map(guid_to_db),
+            ..BaseItemEntity::default()
+        };
+        let (show, season, specials, other, other_season) =
+            (id(0x51), id(0x52), id(0x53), id(0x54), id(0x55));
+        let episode = |n: u128, season_id: Uuid, series_id: Uuid, number: i64| BaseItemEntity {
+            path: Some(format!("/media/{n:x}.mkv")),
+            run_time_ticks: Some(1_800 * 10_000_000),
+            season_id: Some(guid_to_db(season_id)),
+            series_name: Some(format!("{series_id}")),
+            parent_index_number: Some(number),
+            index_number: Some(1),
+            ..row(n, BaseItemKind::Episode, Some(series_id))
+        };
+        let movie = |n: u128| BaseItemEntity {
+            path: Some(format!("/media/{n:x}.mkv")),
+            name: Some(format!("Film {n:x}")),
+            run_time_ticks: Some(6_000 * 10_000_000),
+            ..row(n, BaseItemKind::Movie, None)
+        };
+        let mut special = episode(0x63, specials, show, 0);
+        special.data = Some(r#"{"AirsBeforeSeasonNumber":1}"#.to_owned());
+        persistence
+            .save_items(&[
+                row(0x51, BaseItemKind::Series, None),
+                row(0x52, BaseItemKind::Season, Some(show)),
+                row(0x53, BaseItemKind::Season, Some(show)),
+                row(0x54, BaseItemKind::Series, None),
+                row(0x55, BaseItemKind::Season, Some(other)),
+                episode(0x61, season, show, 1),
+                episode(0x62, season, show, 1),
+                special,
+                episode(0x64, other_season, other, 1),
+                movie(0x66),
+                movie(0x67),
+            ])
+            .await
+            .expect("seed");
+        // As the scanner links them: the series and the season.
+        for (item, parents) in [
+            (0x61, [show, season]),
+            (0x62, [show, season]),
+            (0x63, [show, specials]),
+            (0x64, [other, other_season]),
+        ] {
+            persistence
+                .set_ancestors(id(item), &parents)
+                .await
+                .expect("ancestors");
+        }
+        let folders = vec![ferrofin_model::entities_media::VirtualFolderInfo {
+            locations: vec!["/media".to_owned()],
+            ..Default::default()
+        }];
+        let ffmpeg = crate::ffmpeg::FakeFfmpeg {
+            audio_duration: Some(1_700.0),
+            ..crate::ffmpeg::FakeFfmpeg::default()
+        };
+        let config: IntroSkipperConfig =
+            serde_json::from_str(r#"{"ProbeAudioDuration":true}"#).expect("config");
+        let whole = queue::build(&library, &ffmpeg, &folders, &config, true, None)
+            .await
+            .expect("whole queue");
+        items.1.lock().expect("read").clear();
+        ffmpeg.take_probes();
+
+        let only = HashSet::from([season, id(0x66)]);
+        let some = queue::build(&library, &ffmpeg, &folders, &config, true, Some(&only))
+            .await
+            .expect("queue for some seasons");
+
+        let expected: queue::Queue = whole
+            .into_iter()
+            .filter(|(key, _)| only.contains(key))
+            .collect();
+        assert_eq!(some, expected);
+        let joined = some
+            .iter()
+            .find(|(key, _)| *key == season)
+            .expect("season 1");
+        assert_eq!(joined.1.len(), 3, "the special joined season 1");
+        let read = items.1.lock().expect("read").clone();
+        assert!(read.contains(&guid_to_db(id(0x61))), "{read:?}");
+        for unread in [0x64, 0x67] {
+            assert!(!read.contains(&guid_to_db(id(unread))), "{read:?}");
+        }
+        let mut probed = ffmpeg.take_probes();
+        probed.sort();
+        assert_eq!(
+            probed,
+            [
+                "/media/61.mkv",
+                "/media/62.mkv",
+                "/media/63.mkv",
+                "/media/66.mkv"
+            ]
+        );
     }
 
     /// `ClearExcludedTimestampsAsync`: the items the exclusion policy now
@@ -2583,7 +2735,7 @@ mod tests {
             ..h.task.clone()
         };
         let base = IntroSkipperConfig::default();
-        let queue = task.queue(&base).await.expect("queue");
+        let queue = task.queue(&base, None).await.expect("queue");
         let entry = &queue[0].1[0];
         let detect = |config: IntroSkipperConfig| {
             let task = task.clone();
@@ -2852,7 +3004,7 @@ mod tests {
             black_frame_threshold: 32,
             ..IntroSkipperConfig::default()
         };
-        let queued = h.task.queue(&config).await.expect("queue");
+        let queued = h.task.queue(&config, None).await.expect("queue");
         let entry = queue::QueuedEpisode {
             duration: 330.0,
             credits_fingerprint_start: 0.0,
@@ -2942,7 +3094,7 @@ mod tests {
             ..h.task.clone()
         };
         let base = IntroSkipperConfig::default();
-        let queued = task.queue(&base).await.expect("queue");
+        let queued = task.queue(&base, None).await.expect("queue");
         let entry = &queued[0].1[0];
         let read = |minimum| {
             let config = IntroSkipperConfig {
@@ -3121,7 +3273,7 @@ mod tests {
             let config: IntroSkipperConfig = serde_json::from_str(config).expect("config");
             let task = task.clone();
             async move {
-                let queue = task.queue(&config).await.expect("queue");
+                let queue = task.queue(&config, None).await.expect("queue");
                 queue[0].1[0].credits_fingerprint_end
             }
         };

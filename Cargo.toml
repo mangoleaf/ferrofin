@@ -229,7 +229,7 @@ pbkdf2 = "0.13.0"          # password hashing — matches Jellyfin's Rfc2898Deri
 sha2 = "0.11.0"            # PBKDF2-HMAC-SHA512 (default hash id)
 sha1 = "0.11.0"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "ico"] }
-kamadak-exif = "0.6"                                        # photo EXIF (ferrofin-drawing PhotoProvider)
+kamadak-exif = "0.6.2"                                      # photo EXIF (ferrofin-drawing PhotoProvider)
 webp = { version = "0.3", default-features = false }  # LOSSY WebP encode via libwebp (BSD-3) — image-webp is lossless-only; Skia parity needs Google's encoder
 jpeg-encoder = "0.7"     # JPEG encode with 4:2:0 chroma subsampling — the `image` crate's encoder is hardcoded 4:4:4; Skia's SkJpegEncoder defaults to 4:2:0
 jpeg-decoder = { version = "0.3.2", default-features = false }  # DCT-scaled JPEG decode (1/2, 1/4, 1/8) for blur hashes and thumbnails, like Skia's GetScaledDimensions; zune-jpeg (the `image` crate's decoder) cannot scale. In maintenance mode upstream. No rayon: without it a decode wider than 128 px runs one short-lived thread per colour component, inside the encode permits that bound concurrent decodes to the cores (a failed spawn falls back to the full decode)
