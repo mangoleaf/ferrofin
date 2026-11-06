@@ -258,7 +258,8 @@ impl SessionReporter for NoopSessionReporter {
 /// Port of `DeleteHlsPartialStreamFiles`: every file in `output_dir` whose name
 /// contains the playlist stem is removed. Behind a seam so kill/cleanup stays
 /// unit-testable against a temp dir without touching a real transcode cache.
-pub trait FileCleaner: Send + Sync {
+/// The teardown runs it on the blocking pool (hence `'static`) and waits for it.
+pub trait FileCleaner: Send + Sync + 'static {
     /// Deletes every file in `output_dir` whose filename contains
     /// `playlist_stem` (case-insensitively). Port of `DeleteHlsPartialStreamFiles`.
     fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str);
@@ -318,6 +319,10 @@ struct RunningJob {
     /// The segment file extension (e.g. `.ts`), for diagnostics/index scans.
     #[allow(dead_code)]
     segment_extension: String,
+    /// The first segment this job's ffmpeg writes: its `-start_number`, or the
+    /// hls muxer's default 0. Segments below it, or past a gap in its run, are
+    /// an earlier job's (gl-52).
+    start_number: i32,
     /// Where this job's ffmpeg stderr is being written — inside the server's
     /// log directory, so a diagnostic can name a file the operator can actually
     /// fetch from `GET /System/Logs/Log`.
@@ -356,9 +361,21 @@ impl RunningJob {
             output_dir,
             playlist_path,
             segment_extension,
+            // `start_ffmpeg` sets it from the job's arguments.
+            start_number: 0,
             log_path,
         }
     }
+}
+
+/// The first segment an HLS ffmpeg writes: the value of its `-start_number`,
+/// or the hls muxer's default 0.
+fn hls_start_number(arguments: &[String]) -> i32 {
+    arguments
+        .windows(2)
+        .find(|pair| pair[0] == "-start_number")
+        .and_then(|pair| pair[1].parse().ok())
+        .unwrap_or(0)
 }
 
 /// Per-job control state, serialized with teardown.
@@ -578,7 +595,7 @@ fn take_job_to_admit(
 pub struct TranscodeManagerImpl<S: SessionReporter, C: FileCleaner = FsFileCleaner> {
     jobs: Mutex<Vec<RegisteredJob>>,
     reporter: S,
-    file_cleaner: C,
+    file_cleaner: std::sync::Arc<C>,
     encoding_config:
         Option<std::sync::Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
     /// The throttle's reads of `encoding_config`, which report a document
@@ -622,7 +639,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         Self {
             jobs: Mutex::new(Vec::new()),
             reporter,
-            file_cleaner,
+            file_cleaner: std::sync::Arc::new(file_cleaner),
             encoding_config: None,
             throttle_options: crate::configuration::EncodingOptionsReader::new(
                 "transcode throttle",
@@ -1077,6 +1094,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 
         // 3. Build the spawn request.
         let stderr_log = log_path.clone();
+        let start_number = hls_start_number(&arguments);
         let req = SpawnRequest {
             program: program.to_owned(),
             arguments,
@@ -1109,15 +1127,18 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         // 6. Store the live job so kill/cleanup can reach the child + cache dir.
         self.attach_running(
             &handle,
-            RunningJob::new(
-                child,
-                state,
-                directory,
-                output_path.to_path_buf(),
-                segment_extension,
-                stderr_log.clone(),
-                hardware_acceleration_type,
-            ),
+            RunningJob {
+                start_number,
+                ..RunningJob::new(
+                    child,
+                    state,
+                    directory,
+                    output_path.to_path_buf(),
+                    segment_extension,
+                    stderr_log.clone(),
+                    hardware_acceleration_type,
+                )
+            },
         );
 
         // 7. Wait until the target file exists OR the process exits, bounded.
@@ -1340,6 +1361,17 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         }
     }
 
+    /// The first segment the running job behind `handle` writes (its
+    /// `-start_number`), or `None` when no process is attached to it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    #[must_use]
+    pub fn segment_start_number(&self, handle: &TranscodingJobHandle) -> Option<i32> {
+        self.with_running(handle, |running| running.start_number)
+    }
+
     /// Kills the process behind `handle` (if any) and removes it, deleting its
     /// partial segment files when `delete_files` is set. Shared by the timeout
     /// path, the kill-timer, and `kill_transcoding_jobs`.
@@ -1434,8 +1466,17 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.file_cleaner
-                    .delete_partial_stream_files(&running.output_dir, &stem);
+                // The directory scan and unlinks block, so they run on the
+                // blocking pool; awaited, so callers still go on only after them.
+                let cleaner = std::sync::Arc::clone(&self.file_cleaner);
+                let output_dir = running.output_dir;
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    cleaner.delete_partial_stream_files(&output_dir, &stem);
+                })
+                .await
+                {
+                    tracing::error!(path = %handle.path, %error, "deleting a killed transcode's partial files failed");
+                }
             }
         }
         self.reporter
@@ -2399,6 +2440,47 @@ mod start_ffmpeg_tests {
         assert!(!playlist.with_extension("log").exists());
     }
 
+    /// The registry knows the first segment each job writes, from its own
+    /// `-start_number` (the hls muxer's default 0 without one), so the
+    /// segment path can tell its output from an earlier job's (gl-52).
+    #[tokio::test]
+    async fn a_job_records_the_first_segment_its_ffmpeg_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let args = |start: &[&str]| {
+            ["-i", "in.mkv"]
+                .iter()
+                .chain(start)
+                .map(|arg| (*arg).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let seek = tmp.path().join("seek").join("out.m3u8");
+        let st = state(&seek, None);
+        let handle = m
+            .start_ffmpeg(
+                &fake,
+                ffmpeg_req(&st, &seek, args(&["-start_number", "15"])),
+            )
+            .await
+            .expect("start");
+        assert_eq!(m.segment_start_number(&handle), Some(15));
+
+        let from_zero = tmp.path().join("zero").join("out.m3u8");
+        let st = state(&from_zero, None);
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &from_zero, args(&[])))
+            .await
+            .expect("start");
+        assert_eq!(m.segment_start_number(&handle), Some(0));
+
+        m.kill_and_remove(&handle, false, false).await;
+        assert_eq!(m.segment_start_number(&handle), None, "no job, no start");
+    }
+
     #[tokio::test]
     async fn a_starting_job_publishes_itself_to_the_session_layer() {
         // Without this the dashboard's transcode panel stays blank: the session
@@ -2649,20 +2731,24 @@ mod start_ffmpeg_tests {
         );
     }
 
-    /// A [`FileCleaner`] that records the deletions it was asked to perform, and
-    /// still performs them, so kill/cleanup is observable over a temp dir.
+    /// A [`FileCleaner`] that records the deletions it was asked to perform (and
+    /// the thread each ran on), and still performs them, so kill/cleanup is
+    /// observable over a temp dir.
     #[derive(Clone)]
     struct RecordingCleaner {
-        calls: Arc<Mutex<Vec<(std::path::PathBuf, String)>>>,
+        calls: Arc<Mutex<Vec<(std::path::PathBuf, String, std::thread::ThreadId)>>>,
     }
 
     impl FileCleaner for RecordingCleaner {
         fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str) {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((output_dir.to_path_buf(), playlist_stem.to_owned()));
             FsFileCleaner.delete_partial_stream_files(output_dir, playlist_stem);
+            // Recorded once the files are gone, so a kill that returned before
+            // its deletion finished leaves no call behind.
+            self.calls.lock().unwrap().push((
+                output_dir.to_path_buf(),
+                playlist_stem.to_owned(),
+                std::thread::current().id(),
+            ));
         }
     }
 
@@ -2694,6 +2780,9 @@ mod start_ffmpeg_tests {
         let calls = cleaner.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, "out"); // playlist stem
+        // The current-thread runtime's only worker is this thread: the scan and
+        // unlinks ran on the blocking pool instead.
+        assert_ne!(calls[0].2, std::thread::current().id());
         // The partial files (containing the stem "out") are gone.
         assert!(!out_dir.join("out0.ts").exists());
         assert!(!playlist.exists());

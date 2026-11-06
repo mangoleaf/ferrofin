@@ -1315,10 +1315,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    save_play_state and apply_play_report (UpdatePlayState), \
                    reset_playback_stream_selections (ResetPlaybackStreamSelections), \
                    record_playback_start, set_likes, mark_item_played, mark_item_unplayed, \
-                   clear_own_play_state and propagate_played_state. Compared with \
+                   mark_container with mutate_rows (a container's members, a chunk per write \
+                   transaction), clear_own_play_state and propagate_played_state. Compared with \
                    Emby.Server.Implementations/Session/SessionManager.cs (OnPlaybackStart, \
                    OnPlaybackProgress, UpdatePlaybackSettings, OnPlaybackStopped), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
+                   MediaBrowser.Controller/Entities/Folder.cs and \
+                   MediaBrowser.Controller/Entities/Movies/BoxSet.cs (MarkPlayed, MarkUnplayed), \
                    MediaBrowser.Controller/Entities/TV/Episode.cs and \
                    MediaBrowser.Controller/Entities/TV/Season.cs (Series, FindSeriesId, \
                    GetUserDataKeys), \
@@ -1336,7 +1339,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    retired-key update of SaveUserData, from the row ResolveUserDataRow reads), \
                    compared with Jellyfin.Server.Implementations/Item/\
                    ItemPersistenceService.cs (ReattachUserDataAsync, ReconcileUserDataAsync)",
-        date: "2026-11-03",
+        date: "2026-11-06",
         divergences: &[
             "After a scan or boot-repair fold, which upstream does not have (it deletes the \
              duplicate, and ReconcileUserDataAsync gives the user's rows the most recent play when \
@@ -1350,6 +1353,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Marking a container unplayed also clears the play state on the container's own rows, \
              which earlier Ferrofin builds wrote; upstream's MarkUnplayed leaves them, so a Played \
              set on a container through the UserData API survives it there. Fix path: gl-1064.",
+            "A container's members are saved a chunk at a time, each chunk in one write \
+             transaction, where upstream's Folder.MarkPlayed commits each member's SaveUserData \
+             alone and stops at the first that fails: here a member's write that fails also rolls \
+             back the members of its chunk saved before it, and a version's save that fails \
+             leaves the chunk's later members saved (gl-1321).",
         ],
     },
     VerifiedSubsystem {
@@ -1515,7 +1523,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetMediaSources) and \
                    MediaBrowser.Controller/Entities/Video.cs (GetAllItemsForMediaSources)",
-        date: "2026-11-05",
+        date: "2026-11-06",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \
@@ -1544,6 +1552,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Importing a width's folder that has no row counts only its .jpg tiles; upstream \
              counts every file in it, so a stray file there makes the import fail on its image \
              size. Jellyfin bug not ported.",
+            "Importing a width's folder that has no row saves the row at the width the folder \
+             was made at (the selected width, or the video's own when it is narrower, rounded \
+             down to even), as a generated set's row is; upstream saves the selected width, \
+             so when the two differ the row names a folder that does not exist (its tiles 404) \
+             and gives the tiles the wrong aspect. Jellyfin bug not ported (gl-1246).",
             "TrickplayOptions has a Ferrofin-only FullChroma member, off by default and absent \
              from the JSON while off, which writes 4:4:4 tiles, from 4:4:4 frames on the \
              software path (see the trickplay-extraction row), instead of 4:2:0 (owner \
@@ -1850,7 +1863,9 @@ pub const VERIFIED: &[Verified] = &[
                stamped by upsert_session (GetSessionInfo, GetImageCacheTag); \
                LastPlaybackCheckIn is DateTime.MinValue until update_now_playing stamps it \
                (SessionInfo.LastPlaybackCheckIn, UpdateNowPlayingItem) and \
-               NowPlayingQueueFullItems is never sent (v12.4's SessionInfoDto has none)",
+               NowPlayingQueueFullItems is never sent (v12.4's SessionInfoDto has none); the \
+               pool loses a session where upstream's does (report_session_ended, close_if_needed; \
+               ReportSessionEnded, CloseIfNeededAsync) and also to evict_idle_sessions",
         date: "2026-11-05",
         divergences: SESSIONS_DIVERGENCES,
         refs: &[],
@@ -2314,6 +2329,11 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "MaxActiveSessions counts the user's sessions in the pool, as upstream \
+         (SessionManager.cs Sessions.Count), but the pool ends a session with no WebSocket that \
+         plays nothing once it is idle past session_idle_hours (the GET /Sessions row), so \
+         stale HTTP-only sessions stop counting then; upstream counts them until the server \
+         restarts. Owner decision (gl-1267, 2026-11-05).",
             "Ferrofin's login backoff (owner decisions on gl-1099; upstream has no rate limit): \
          past login_backoff_attempts failures an account's and a client address's next \
          attempts wait, from 1 s doubling to login_backoff_max_delay_secs. An address that \
@@ -3723,6 +3743,14 @@ const SESSIONS_DIVERGENCES: &[&str] = &[
     "The 403 (controllableByUserId naming another user without the administrator role) and \
      400 (a value the query binder cannot convert) bodies are Ferrofin's error shape, not \
      upstream's. Fix path: gl-666.",
+    "A session with no WebSocket that plays nothing is ended once it has made no request for \
+     longer than the session_idle_hours setting (24 by default, 1 to 168), through the path a \
+     closed socket takes (SessionEnded and its activity-log entry), and its device's \
+     capabilities are forgotten unless a Devices row or another session has its id; upstream \
+     keeps such a session, and every device's capabilities, until the server restarts. A \
+     client that returns gets a new session with the same id, so what the ended one held \
+     (AdditionalUsers, NowViewingItem, the last NowPlayingQueue, PlaylistItemId and pause, \
+     LastPlaybackCheckIn) starts over. Owner decision (gl-1267, 2026-11-05).",
 ];
 
 /// `GET /Users`, `/Users/Public` and `/Users/{userId}` leave other accounts'

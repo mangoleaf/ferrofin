@@ -57,12 +57,16 @@ pub fn episode_image_order(order: &str, season: i32) -> (&str, i32) {
 /// SeriesDisplayOrder`): empty when the row has none.
 #[must_use]
 pub fn display_order_of(data: Option<&str>) -> String {
-    data.and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
-        .and_then(|data| {
-            data.get("DisplayOrder")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
+    /// The one member read. Deserializing into it skips the blob's other
+    /// members without building a `serde_json::Value` tree for them: a Series
+    /// DTO reads this on every list page.
+    #[derive(Deserialize)]
+    struct DisplayOrderOnly {
+        #[serde(rename = "DisplayOrder")]
+        display_order: Option<String>,
+    }
+    data.and_then(|data| serde_json::from_str::<DisplayOrderOnly>(data).ok())
+        .and_then(|data| data.display_order)
         .unwrap_or_default()
 }
 
@@ -1524,6 +1528,22 @@ mod tests {
         );
         assert_eq!(super::display_order_of(Some("not json")), "");
         assert_eq!(super::display_order_of(None), "");
+        // The blob's other members are skipped, whatever their shape.
+        assert_eq!(
+            super::display_order_of(Some(
+                r#"{"AirDays":["Monday"],"Status":"Ended","Nested":{"A":[1,2,{"B":null}]},"DisplayOrder":"absolute","AirTime":"20:00"}"#
+            )),
+            "absolute"
+        );
+        assert_eq!(super::display_order_of(Some("{}")), "");
+        assert_eq!(super::display_order_of(Some("")), "");
+        // An escaped string reads as its text; a value that is not a string
+        // reads as none, as `Value::as_str` did.
+        assert_eq!(
+            super::display_order_of(Some(r#"{"DisplayOrder":"dvd"}"#)),
+            "dvd"
+        );
+        assert_eq!(super::display_order_of(Some(r#"{"DisplayOrder":3}"#)), "");
         assert_eq!(super::season_lookup_order(""), "official");
         assert_eq!(super::season_lookup_order("  "), "official");
         assert_eq!(super::season_lookup_order("dvd"), "dvd");

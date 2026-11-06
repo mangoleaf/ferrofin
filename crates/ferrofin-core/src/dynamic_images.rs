@@ -810,24 +810,14 @@ impl DynamicImageProviders {
         Ok(None)
     }
 
-    /// `BaseFolderImageProvider.GetItemsWithImages` (BaseFolderImageProvider.cs:32-45),
+    /// `BaseFolderImageProvider.GetItemsWithImages` (BaseFolderImageProvider.cs:29-44),
     /// shared by `PhotoAlbumImageProvider` and `FolderImageProvider`: the
     /// folder's first descendant with a Primary — files before folders, then by
     /// sort name, `Limit = 1`.
     async fn folder_sources(&self, album_id: Uuid) -> Result<Vec<String>, ServiceError> {
         let ids = self
             .items
-            .get_item_ids(&InternalItemsQuery {
-                parent_id: album_id,
-                recursive: true,
-                image_types: vec![ImageType::Primary],
-                order_by: vec![
-                    (ItemSortBy::IsFolder, SortOrder::Ascending),
-                    (ItemSortBy::SortName, SortOrder::Ascending),
-                ],
-                limit: Some(1),
-                ..InternalItemsQuery::default()
-            })
+            .get_item_ids(&folder_sources_query(album_id))
             .await?;
         // `CreateSingleImage` takes the Primary only (no Thumb fallback) and
         // needs a file extension to carry over.
@@ -901,6 +891,26 @@ impl DynamicImageProviders {
             .await?
             .iter()
             .any(|i| i.image_type == ImageType::Primary))
+    }
+}
+
+/// The query of `BaseFolderImageProvider.GetItemsWithImages`
+/// (BaseFolderImageProvider.cs:29-44): the folder's descendants with a
+/// Primary, files before folders, then by sort name, `Limit = 1`. Driven by
+/// the folder's subtree: every library validation runs it for each folder and
+/// photo album it draws or re-checks.
+fn folder_sources_query(folder_id: Uuid) -> InternalItemsQuery {
+    InternalItemsQuery {
+        parent_id: folder_id,
+        recursive: true,
+        drive_from_parent_subtree: true,
+        image_types: vec![ImageType::Primary],
+        order_by: vec![
+            (ItemSortBy::IsFolder, SortOrder::Ascending),
+            (ItemSortBy::SortName, SortOrder::Ascending),
+        ],
+        limit: Some(1),
+        ..InternalItemsQuery::default()
     }
 }
 
@@ -1958,5 +1968,88 @@ mod tests {
         assert!(!dir.join("primary.jpg").exists());
         assert!(dir.join("backdrop.jpg").exists());
         assert!(keep.exists());
+    }
+
+    /// The subtree-driven folder source query returns what the probed one
+    /// does: a photo anywhere below the album (files before folders, then by
+    /// sort name), never one from a sibling album, even one that sorts first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn folder_source_query_reads_the_same_rows_either_way() {
+        let fx = fixture().await;
+        let library = fx
+            .seed(BaseItemKind::CollectionFolder, "Photos", None, None)
+            .await;
+        let poster = write_png(&fx.media_dir(), "photo.png", [9, 9, 9]);
+        let row = |kind: BaseItemKind, name: &str, parent: Uuid| BaseItemEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            type_: stored_type_name(kind).expect("type name").to_owned(),
+            name: Some(name.to_owned()),
+            sort_name: Some(name.to_owned()),
+            parent_id: Some(guid_to_db(parent)),
+            is_folder: kind == BaseItemKind::PhotoAlbum,
+            ..Default::default()
+        };
+        let add = async |kind: BaseItemKind, name: &str, ancestors: &[Uuid]| {
+            let entity = row(kind, name, ancestors[0]);
+            let id = Uuid::parse_str(&entity.id).expect("id");
+            fx.persistence
+                .save_items(std::slice::from_ref(&entity))
+                .await
+                .expect("row");
+            fx.persistence
+                .set_ancestors(id, ancestors)
+                .await
+                .expect("ancestors");
+            seed_images(&fx.db, id, &[image_info(ImageType::Primary, &poster, None)]).await;
+            id
+        };
+        let album = add(BaseItemKind::PhotoAlbum, "m-album", &[library]).await;
+        let sibling = add(BaseItemKind::PhotoAlbum, "z-sibling", &[library]).await;
+        add(BaseItemKind::Photo, "0-elsewhere", &[sibling, library]).await;
+        let nested = add(BaseItemKind::PhotoAlbum, "a-nested", &[album, library]).await;
+        let deep = add(BaseItemKind::Photo, "b-deep", &[nested, album, library]).await;
+        let own = add(BaseItemKind::Photo, "c-own", &[album, library]).await;
+
+        let driven = folder_sources_query(album);
+        assert!(driven.drive_from_parent_subtree);
+        let ids = |q: InternalItemsQuery| {
+            let items = Arc::clone(&fx.items);
+            async move { items.get_item_ids(&q).await.expect("ids") }
+        };
+        // The whole ordered set, then the source the provider takes.
+        let all = InternalItemsQuery {
+            limit: None,
+            ..driven.clone()
+        };
+        let probed = InternalItemsQuery {
+            drive_from_parent_subtree: false,
+            ..all.clone()
+        };
+        assert_eq!(ids(probed).await, [deep, own, nested]);
+        assert_eq!(ids(all).await, [deep, own, nested]);
+        assert_eq!(
+            ids(driven).await,
+            [deep],
+            "the photo below, before the folder"
+        );
+    }
+
+    /// gl-1278: a folder's source query reads that folder's subtree, not the
+    /// library. Probed from every `BaseItems` row, each draw or re-check of a
+    /// folder or photo album read the whole table (13 ms a folder at 24k rows).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn folder_source_query_is_driven_by_the_folders_subtree() {
+        use crate::translate_query::{QueryShape, build_query};
+
+        let query = build_query(&folder_sources_query(Uuid::new_v4()), QueryShape::IdsOnly);
+        let plan = crate::latest_tv_repository::explain(&test_db().await, query).await;
+        assert!(
+            plan.contains("SEARCH a USING INDEX IX_AncestorIds_ParentItemId (ParentItemId=?)"),
+            "{plan}"
+        );
+        assert!(
+            plan.starts_with("SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+            "{plan}"
+        );
     }
 }

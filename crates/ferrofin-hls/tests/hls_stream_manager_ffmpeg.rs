@@ -19,14 +19,16 @@
 //! `FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-hls --test hls_stream_manager_ffmpeg`
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ferrofin_hls::{
     DynamicHlsPlaylistGenerator, HlsStreamManagerImpl, PlaylistKind, StreamStatePlanner,
     TranscodePlan,
 };
-use ferrofin_mediaencoding::transcoding::{NoopSessionReporter, TokioSegmentTranscoder};
+use ferrofin_mediaencoding::transcoding::{
+    NoopSessionReporter, SegmentTranscoder, SpawnRequest, TokioSegmentTranscoder, TranscodeChild,
+};
 use ferrofin_mediaencoding::{
     BaseEncodingJobOptions, EncodingJobInfo, TranscodeDisplayNames, TranscodeManagerImpl,
 };
@@ -58,17 +60,22 @@ fn ffmpeg_gate() -> bool {
 
 /// Generates a tiny 6-second `testsrc`+`sine` clip at `path`.
 fn make_clip(path: &Path) {
+    make_clip_of(path, 6);
+}
+
+/// Generates a tiny `secs`-second `testsrc`+`sine` clip at `path`.
+fn make_clip_of(path: &Path, secs: u32) {
     let status = std::process::Command::new("ffmpeg")
         .args([
             "-y",
             "-f",
             "lavfi",
             "-i",
-            "testsrc=duration=6:size=128x72:rate=10",
+            &format!("testsrc=duration={secs}:size=128x72:rate=10"),
             "-f",
             "lavfi",
             "-i",
-            "sine=frequency=440:duration=6",
+            &format!("sine=frequency=440:duration={secs}"),
             "-c:v",
             "libx264",
             "-c:a",
@@ -157,6 +164,10 @@ struct FfmpegPlanner {
     clip: PathBuf,
     /// Emit fMP4 segments (`out%d.mp4` + `out-1.mp4` init) instead of mpegts.
     fmp4: bool,
+    /// Encode at the source's pace (`-re`) and seek the input to the requested
+    /// segment, with the production planner's `temp_file` segments, so segment
+    /// requests can outrun the encoder.
+    realtime: bool,
 }
 
 impl FfmpegPlanner {
@@ -166,16 +177,34 @@ impl FfmpegPlanner {
     /// emits (`-hls_playlist_type`, `-hls_base_url`, and the mpegts-only
     /// `-flags -global_header`), so the event assertions below are about what a
     /// real ffmpeg actually writes.
-    fn hls_args(&self, playlist: &Path, kind: PlaylistKind) -> Vec<String> {
+    fn hls_args(
+        &self,
+        playlist: &Path,
+        kind: PlaylistKind,
+        segment_id: Option<i32>,
+    ) -> Vec<String> {
         let event = kind == PlaylistKind::Event;
         let seg_ext = if self.fmp4 { "mp4" } else { "ts" };
         let seg_pattern = self.dir.join(format!("out%d.{seg_ext}"));
-        let mut args = vec![
-            "-y".into(),
+        let mut args = vec!["-y".to_owned()];
+        if self.realtime {
+            args.push("-re".into());
+            // The input seek to the segment's start, 2 s per segment.
+            if let Some(id) = segment_id.filter(|&id| id > 0) {
+                args.extend(["-ss".into(), (id * 2).to_string()]);
+            }
+        }
+        args.extend([
             "-i".into(),
             self.clip.to_string_lossy().into_owned(),
             "-c:v".into(),
             "libx264".into(),
+        ]);
+        // No lookahead, so a paced job's first segment takes its 2 s, not more.
+        if self.realtime {
+            args.extend(["-preset".into(), "ultrafast".into()]);
+        }
+        args.extend([
             // Force keyframes so the synthetic clip actually segments.
             "-force_key_frames".into(),
             "expr:gte(t,n_forced*2)".into(),
@@ -191,7 +220,14 @@ impl FfmpegPlanner {
             if event { "event".into() } else { "vod".into() },
             "-hls_segment_filename".into(),
             seg_pattern.to_string_lossy().into_owned(),
-        ];
+        ]);
+        // The production planner numbers a job's segments from the one asked for.
+        if let Some(id) = segment_id {
+            args.extend(["-start_number".into(), id.to_string()]);
+        }
+        if self.realtime {
+            args.extend(["-hls_flags".into(), "temp_file".into()]);
+        }
         if event {
             args.extend(["-hls_base_url".into(), "hls/out/".into()]);
             if !self.fmp4 {
@@ -257,7 +293,7 @@ impl StreamStatePlanner for FfmpegPlanner {
         };
         Ok(TranscodePlan {
             ffmpeg_env: Vec::new(),
-            arguments: self.hls_args(&playlist, kind),
+            arguments: self.hls_args(&playlist, kind, segment_id),
             state,
             playlist_path: playlist,
             media_path: self.clip.to_string_lossy().into_owned(),
@@ -296,6 +332,7 @@ fn build_manager(dir: &Path, clip: &Path) -> Mgr {
         dir: dir.to_path_buf(),
         clip: clip.to_path_buf(),
         fmp4: false,
+        realtime: false,
     };
     let transcoder = TokioSegmentTranscoder::new();
     let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
@@ -383,6 +420,7 @@ fn build_manager_fmp4(dir: &Path, clip: &Path) -> Mgr {
         dir: dir.to_path_buf(),
         clip: clip.to_path_buf(),
         fmp4: true,
+        realtime: false,
     };
     let transcoder = TokioSegmentTranscoder::new();
     let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
@@ -519,4 +557,81 @@ async fn live_playlist_routes_the_real_fmp4_init_uri() {
     assert!(text.contains("hls/out/out0.mp4"), "routed segments: {text}");
     assert!(cache.join("out-1.mp4").exists(), "init written");
     assert!(cache.join("out0.mp4").exists(), "segment 0 written");
+}
+
+/// The real transcoder, recording each spawn's arguments.
+struct RecordingTranscoder {
+    inner: TokioSegmentTranscoder,
+    spawns: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+#[async_trait]
+impl SegmentTranscoder for RecordingTranscoder {
+    async fn start_transcode(&self, req: &SpawnRequest) -> Result<Box<dyn TranscodeChild>, String> {
+        self.spawns.lock().unwrap().push(req.arguments.clone());
+        self.inner.start_transcode(req).await
+    }
+}
+
+/// gl-52 against a real ffmpeg encoding at the source's pace: play 0 to 2,
+/// seek forward to 20, play 21, seek back to 10, play 11 and 12. The killed
+/// jobs' segments stay on disk (20 onward, past the job started at 10), but the
+/// running job's front is its own: only the start and the two seeks spawn an
+/// ffmpeg, and every sequential read waits on the running job. The jumps are
+/// wide because a killed ffmpeg keeps writing through its graceful `q` exit.
+#[tokio::test]
+async fn a_seek_back_below_a_killed_jobs_segments_keeps_the_running_job() {
+    if !ffmpeg_gate() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let cache = tmp.path().join("transcodes");
+    std::fs::create_dir_all(&cache).unwrap();
+    let clip = tmp.path().join("clip.mp4");
+    make_clip_of(&clip, 60);
+
+    let planner = FfmpegPlanner {
+        dir: cache.clone(),
+        clip,
+        fmp4: false,
+        realtime: true,
+    };
+    let spawns = Arc::new(Mutex::new(Vec::new()));
+    let transcoder = RecordingTranscoder {
+        inner: TokioSegmentTranscoder::new(),
+        spawns: Arc::clone(&spawns),
+    };
+    let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
+    let cfg: Box<dyn Fn() -> EncodingOptions + Send + Sync> = Box::new(EncodingOptions::default);
+    let generator = Arc::new(DynamicHlsPlaylistGenerator::new(cfg, Vec::new()));
+    let paths = Arc::new(TempPaths {
+        transcode: cache.to_string_lossy().into_owned(),
+    });
+    let mgr = HlsStreamManagerImpl::new(planner, transcoder, manager, generator, paths, "ffmpeg");
+
+    let req = request();
+    for segment in [0, 1, 2, 20, 21, 10, 11, 12] {
+        let served = mgr
+            .dynamic_segment(&req, segment, false)
+            .await
+            .unwrap_or_else(|error| panic!("segment {segment}: {error:?}"));
+        assert!(
+            served.path.ends_with(&format!("out{segment}.ts")),
+            "segment {segment} served {}",
+            served.path
+        );
+    }
+
+    let start_numbers: Vec<String> = spawns
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|args| {
+            args.windows(2)
+                .find(|pair| pair[0] == "-start_number")
+                .map(|pair| pair[1].clone())
+        })
+        .collect();
+    assert_eq!(start_numbers, ["0", "20", "10"], "one ffmpeg per seek");
+    mgr.stop_encoding(&req).await.expect("stop_encoding");
 }
