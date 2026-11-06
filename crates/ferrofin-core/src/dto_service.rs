@@ -299,6 +299,15 @@ fn take_or_clone<V: Clone>(map: &mut HashMap<Uuid, V>, id: &Uuid, repeated: bool
     }
 }
 
+/// Each item's provider id rows as the DTO's `ProviderIds` map.
+fn provider_id_maps(
+    rows: HashMap<Uuid, Vec<(String, String)>>,
+) -> HashMap<Uuid, HashMap<String, String>> {
+    rows.into_iter()
+        .map(|(id, pairs)| (id, pairs.into_iter().collect()))
+        .collect()
+}
+
 impl Prefetched {
     /// The clean lookup key for a display name, reusing the value the prefetch
     /// already computed for it.
@@ -3461,14 +3470,15 @@ impl FerrofinDtoService {
     }
 
     /// All provider ids for `item_ids` in one query per chunk, keyed by item
-    /// id. Prefetched for the page so the per-item lookup does not fan out
+    /// id, each item's `(ProviderId, ProviderValue)` pairs in row order (the
+    /// form the user-data keys read; [`provider_id_maps`] makes the DTO's).
+    /// Prefetched for the page so the per-item lookup does not fan out
     /// across the 2-connection pool.
     async fn load_provider_ids_batch(
         &self,
         item_ids: &[Uuid],
-    ) -> Result<HashMap<Uuid, HashMap<String, String>>, ServiceError> {
-        let mut map: HashMap<Uuid, HashMap<String, String>> =
-            HashMap::with_capacity(item_ids.len());
+    ) -> Result<HashMap<Uuid, Vec<(String, String)>>, ServiceError> {
+        let mut map: HashMap<Uuid, Vec<(String, String)>> = HashMap::with_capacity(item_ids.len());
         if item_ids.is_empty() {
             return Ok(map);
         }
@@ -3484,7 +3494,7 @@ impl FerrofinDtoService {
             }
             for (item_id, key, value) in query.fetch_all(self.db.pool()).await.map_err(db_err)? {
                 if let Ok(id) = Uuid::parse_str(&item_id) {
-                    map.entry(id).or_default().insert(key, value);
+                    map.entry(id).or_default().push((key, value));
                 }
             }
         }
@@ -4404,12 +4414,24 @@ impl FerrofinDtoService {
         let want_images =
             options.enable_images || options.contains_field(ItemFields::PrimaryImageAspectRatio);
         let want_user_data = user.is_some() && options.enable_user_data;
+        let want_external_urls = options.contains_field(ItemFields::ExternalUrls);
+        let want_provider_ids =
+            options.contains_field(ItemFields::ProviderIds) || want_external_urls;
         // User-data and the page's credits are independent; run them concurrently.
         // Images wait for the credits, because the cast's by-name Person rows
         // want images too and both id sets go in ONE `BaseItemImageInfos` read
         // (this used to be two, and a random page is mostly people).
+        //
+        // The page's provider ids are read first, in the user-data branch:
+        // a hydrated row's user-data key derives from the same rows the DTO's
+        // `ProviderIds` and `ExternalUrls` show, so the page reads them once.
         let user_data_fut = async {
-            if want_user_data && let Some(u) = user {
+            let providers = if want_provider_ids {
+                self.load_provider_ids_batch(&ids).await?
+            } else {
+                HashMap::new()
+            };
+            let user_data = if want_user_data && let Some(u) = user {
                 let user_id = parse_user_id(&u.id)?;
                 // Row-aware: the synthetic `Key` for an item with no stored
                 // user-data row is derived from the item's metadata (C#
@@ -4424,12 +4446,19 @@ impl FerrofinDtoService {
                 // `tt0111161` with `Fields=ProviderIds` or by id.
                 let hydrate_providers =
                     providers_loaded || options.contains_field(ItemFields::ProviderIds);
-                self.user_data
-                    .get_user_data_dtos_for_rows(items, user_id, hydrate_providers)
-                    .await
+                if hydrate_providers && want_provider_ids {
+                    self.user_data
+                        .get_user_data_dtos_for_rows_with_providers(items, user_id, &providers)
+                        .await?
+                } else {
+                    self.user_data
+                        .get_user_data_dtos_for_rows(items, user_id, hydrate_providers)
+                        .await?
+                }
             } else {
-                Ok(HashMap::new())
-            }
+                HashMap::new()
+            };
+            Ok::<_, ServiceError>((user_data, providers))
         };
         let people_fut = async {
             if options.contains_field(ItemFields::People) {
@@ -4445,7 +4474,7 @@ impl FerrofinDtoService {
                 Ok(HashMap::new())
             }
         };
-        let (user_data, people, locked_fields) =
+        let ((user_data, provider_rows), people, locked_fields) =
             tokio::try_join!(user_data_fut, people_fut, locked_fields_fut)?;
         // The page ids that can actually own media sources. A folder or a
         // by-name item (person, genre, studio, …) owns no stream, chapter,
@@ -4768,13 +4797,7 @@ impl FerrofinDtoService {
         // An id listed here is another page item's alternate, so its streams are
         // read while projecting that item — it cannot be drained by its own.
         let alt_referenced: std::collections::HashSet<Uuid> = versions.ids().collect();
-        let want_external_urls = options.contains_field(ItemFields::ExternalUrls);
-        let provider_ids = if options.contains_field(ItemFields::ProviderIds) || want_external_urls
-        {
-            self.load_provider_ids_batch(&ids).await?
-        } else {
-            HashMap::new()
-        };
+        let provider_ids = provider_id_maps(provider_rows);
         // A season/episode's links come from its series' ids, so collect the
         // distinct series on the page and read their ids in the same batched
         // way (one extra query for a page of episodes, none otherwise).
@@ -4796,7 +4819,7 @@ impl FerrofinDtoService {
         }
         let series_provider_ids = if want_external_urls {
             series_display_order = self.load_series_display_order(&series_ids).await?;
-            self.load_provider_ids_batch(&series_ids).await?
+            provider_id_maps(self.load_provider_ids_batch(&series_ids).await?)
         } else {
             HashMap::new()
         };
