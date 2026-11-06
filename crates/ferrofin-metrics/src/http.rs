@@ -5,15 +5,15 @@
 //! [`MatchedPath`] template and the final status code. When the crate's
 //! instrument [`OnceLock`] is unset it is a pure pass-through.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use axum::extract::{MatchedPath, Request};
-use axum::http::Method;
+use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
-use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
+use opentelemetry::{KeyValue, StringValue};
 
 use crate::labels::RouteLabels;
 
@@ -78,23 +78,21 @@ pub async fn track_http(req: Request, next: Next) -> Response {
         return next.run(req).await;
     };
 
-    let method = req.method().clone();
     // The matched route TEMPLATE (bounded cardinality), never the raw request
     // path. Unmatched requests (404) carry no `MatchedPath` → "".
     let matched = req
         .extensions()
         .get::<MatchedPath>()
-        .map(|m| m.as_str().to_owned())
-        .unwrap_or_default();
+        .map_or("", MatchedPath::as_str);
     // Contract routes: controller/action + the Jellyfin-form endpoint (spec path,
     // no leading slash). Non-contract matched routes (`/health/*`, `/metrics`):
     // empty controller/action, endpoint = the raw matched path (prometheus-net's
     // convention for its own middleware routes like `/health`).
-    let (controller, action, endpoint) =
-        inst.labels
-            .lookup(&method, &matched)
-            .unwrap_or(("", "", matched.as_str()));
-    let shared = shared_labels(&method, controller, action, endpoint);
+    let (controller, action, endpoint) = inst
+        .labels
+        .lookup(req.method(), matched)
+        .unwrap_or_else(|| ("".into(), "".into(), matched.to_owned().into()));
+    let shared = shared_labels(req.method(), controller, action, endpoint);
 
     let in_progress = InProgress::enter(&inst.in_progress, &shared);
     let start = Instant::now();
@@ -102,11 +100,9 @@ pub async fn track_http(req: Request, next: Next) -> Response {
     let elapsed = start.elapsed().as_secs_f64();
     drop(in_progress);
 
-    let mut labelled = shared;
-    labelled.push(KeyValue::new(
-        "code",
-        response.status().as_u16().to_string(),
-    ));
+    let [method, controller, action, page, endpoint] = shared;
+    let code = KeyValue::new("code", code_label(response.status()));
+    let labelled = [method, controller, action, page, endpoint, code];
     inst.received.add(1, &labelled);
     inst.duration.record(elapsed, &labelled);
 
@@ -157,12 +153,55 @@ fn method_label(method: &Method) -> &'static str {
 /// which the caller appends for the other two). `page` is always empty — it is a
 /// Razor-Pages artifact prometheus-net emits on every series (fixture parity);
 /// Ferrofin has no pages, so it is a constant `""`.
-fn shared_labels(method: &Method, controller: &str, action: &str, endpoint: &str) -> Vec<KeyValue> {
-    vec![
+fn shared_labels(
+    method: &Method,
+    controller: StringValue,
+    action: StringValue,
+    endpoint: StringValue,
+) -> [KeyValue; 5] {
+    [
         KeyValue::new("method", method_label(method)),
-        KeyValue::new("controller", controller.to_owned()),
-        KeyValue::new("action", action.to_owned()),
+        KeyValue::new("controller", controller),
+        KeyValue::new("action", action),
         KeyValue::new("page", ""),
-        KeyValue::new("endpoint", endpoint.to_owned()),
+        KeyValue::new("endpoint", endpoint),
     ]
+}
+
+/// The lowest status code: a `StatusCode` is always `100..=999` (the `http`
+/// crate's invariant).
+const FIRST_CODE: usize = 100;
+
+/// One `code` label value per status code, made on its first response. Its
+/// slots are the whole `StatusCode` range, indexed by `code - FIRST_CODE`: a
+/// derived bound, nothing to tune.
+static CODE_LABELS: [OnceLock<StringValue>; 1000 - FIRST_CODE] =
+    [const { OnceLock::new() }; 1000 - FIRST_CODE];
+
+/// The `code` label: the status's three digits as a string (`"200"`), shared
+/// so a request formats nothing.
+fn code_label(status: StatusCode) -> StringValue {
+    match usize::from(status.as_u16())
+        .checked_sub(FIRST_CODE)
+        .and_then(|i| CODE_LABELS.get(i))
+    {
+        Some(slot) => slot
+            .get_or_init(|| Arc::<str>::from(status.as_str()).into())
+            .clone(),
+        // Unreachable while `http` keeps its range; a metrics bug must not panic.
+        None => status.as_str().to_owned().into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_status_code_renders_as_its_digits() {
+        for code in 100..=999 {
+            let status = StatusCode::from_u16(code).expect("a valid status code");
+            assert_eq!(code_label(status).as_str(), code.to_string());
+        }
+    }
 }

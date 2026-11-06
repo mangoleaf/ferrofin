@@ -246,6 +246,17 @@ struct StubDisplayPreferences {
     sections: Mutex<Option<Vec<(i32, i32)>>>,
     /// The item id the last `get_display_preferences` asked for.
     asked_item: Mutex<Option<Uuid>>,
+    /// When set, each of the GET's three independent reads waits here for the
+    /// other two, so a handler that awaits them one after another never returns.
+    reads_together: Option<Arc<tokio::sync::Barrier>>,
+}
+
+impl StubDisplayPreferences {
+    async fn wait_for_the_other_reads(&self) {
+        if let Some(barrier) = &self.reads_together {
+            barrier.wait().await;
+        }
+    }
 }
 
 fn canned_prefs() -> DisplayPreferencesEntity {
@@ -292,6 +303,7 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for StubDisplayPr
         _client: &str,
     ) -> Result<DisplayPreferencesEntity, ServiceError> {
         *self.asked_item.lock().unwrap() = Some(item_id);
+        self.wait_for_the_other_reads().await;
         Ok(canned_prefs())
     }
     async fn get_item_display_preferences(
@@ -300,6 +312,7 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for StubDisplayPr
         _item_id: Uuid,
         _client: &str,
     ) -> Result<ItemDisplayPreferencesEntity, ServiceError> {
+        self.wait_for_the_other_reads().await;
         Ok(canned_item_prefs())
     }
     async fn list_item_display_preferences(
@@ -315,6 +328,7 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for StubDisplayPr
         _item_id: Uuid,
         _client: &str,
     ) -> Result<std::collections::HashMap<String, Option<String>>, ServiceError> {
+        self.wait_for_the_other_reads().await;
         let mut m = std::collections::HashMap::new();
         m.insert("customKey".to_owned(), Some("customVal".to_owned()));
         Ok(m)
@@ -444,6 +458,28 @@ async fn send(
 
 fn json(bytes: &[u8]) -> serde_json::Value {
     serde_json::from_slice(bytes).expect("valid JSON body")
+}
+
+/// The GET's row, item-prefs and custom-prefs reads are independent, so they
+/// run together rather than one after another (each stub read waits until all
+/// three have started).
+#[tokio::test]
+async fn display_preferences_get_runs_its_independent_reads_together() {
+    let prefs = StubDisplayPreferences {
+        reads_together: Some(Arc::new(tokio::sync::Barrier::new(3))),
+        ..StubDisplayPreferences::default()
+    };
+    let app = state_with_display_prefs(Arc::new(prefs));
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        get(app, "/DisplayPreferences/home?client=web"),
+    )
+    .await
+    .expect("the three reads ran one after another");
+    assert_eq!(status, StatusCode::OK);
+    let v = json(&body);
+    assert_eq!(v["CustomPrefs"]["customKey"], "customVal");
+    assert_eq!(v["SortOrder"], "Descending");
 }
 
 #[tokio::test]

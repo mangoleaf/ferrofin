@@ -34,6 +34,7 @@ use ferrofin_db::entities::display_preferences::{
 };
 use ferrofin_db::enums::{ChromecastVersion, HomeSectionType, IndexingKind, ViewType};
 use ferrofin_model::dto::{DisplayPreferencesDto, ScrollDirection, SortOrder};
+use ferrofin_traits::error::ServiceError;
 use ferrofin_util::guid_extensions::parse_dotnet_guid;
 use uuid::Uuid;
 
@@ -172,29 +173,27 @@ async fn get_display_preferences(
         .ok_or_else(|| ApiError::BadRequest("missing required 'client'".to_owned()))?;
     let item_id = resolve_item_id(&display_preferences_id);
 
-    let prefs = state
-        .display_preferences
-        .get_display_preferences(user_id, item_id, &client)
-        .await?;
-    let item_prefs = state
-        .display_preferences
-        .get_item_display_preferences(user_id, item_id, &client)
-        .await?;
-    let custom = state
-        .display_preferences
-        .list_custom_item_display_preferences(user_id, item_id, &client)
-        .await?;
+    // The three reads are independent (each keyed by user, item and client),
+    // so they run together; only the home sections wait, for the row's id.
+    let manager = &state.display_preferences;
+    let ((prefs, home_sections), item_prefs, custom) = tokio::try_join!(
+        async {
+            let prefs = manager
+                .get_display_preferences(user_id, item_id, &client)
+                .await?;
+            let sections = manager.list_home_sections(prefs.id).await?;
+            Ok::<_, ServiceError>((prefs, sections))
+        },
+        manager.get_item_display_preferences(user_id, item_id, &client),
+        manager.list_custom_item_display_preferences(user_id, item_id, &client),
+    )?;
 
     let mut custom_prefs: HashMap<String, Option<String>> = HashMap::new();
     // The row's home sections, as `homesection{order}` = the lowercased
     // `HomeSectionType` name. Written before the scalar keys and before the
     // stored custom prefs, matching the C# order (the stored-prefs merge is a
     // `TryAdd`, so anything emitted here wins).
-    for section in state
-        .display_preferences
-        .list_home_sections(prefs.id)
-        .await?
-    {
+    for section in home_sections {
         custom_prefs.insert(
             format!("homesection{}", section.order),
             Some(home_section_name(section.type_)),
