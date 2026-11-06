@@ -2057,19 +2057,21 @@ async fn write_entries_in(
         .execute(&mut *conn)
         .await
         .map_err(db_err)?;
-    for (ordinal, (child, child_type)) in entries.iter().enumerate() {
-        sqlx::query(
-            r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
-               VALUES (?1, ?2, ?3, ?4)"#,
-        )
-        .bind(playlist_id)
-        .bind(i64::try_from(ordinal).unwrap_or(i64::MAX))
-        .bind(child)
-        .bind(child_type)
-        .execute(&mut *conn)
-        .await
-        .map_err(db_err)?;
-    }
+    // One statement for the whole list, not one per entry (gl-1264): each
+    // entry is a `[ChildId, ChildType]` pair, and `json_each` yields them in
+    // order with the array index as `key`, the dense `SortOrder`.
+    let pairs = serde_json::to_string(entries)
+        .map_err(|e| ServiceError::Backend(format!("serialize playlist entries: {e}")))?;
+    sqlx::query(
+        r#"INSERT INTO "LinkedChildren" ("ParentId", "SortOrder", "ChildId", "ChildType")
+           SELECT ?1, "key", json_extract("value", '$[0]'), json_extract("value", '$[1]')
+           FROM json_each(?2)"#,
+    )
+    .bind(playlist_id)
+    .bind(pairs)
+    .execute(&mut *conn)
+    .await
+    .map_err(db_err)?;
     Ok(())
 }
 
