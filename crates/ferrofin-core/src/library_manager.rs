@@ -66,6 +66,15 @@ use ferrofin_traits::library::ScanProgressSink;
 /// `00000000-0000-0000-0000-000000000001`).
 const PLACEHOLDER_ITEM_ID: Uuid = Uuid::from_u128(1);
 
+/// How many items' `ItemValues` one writer transaction of
+/// [`FerrofinLibraryManager::update_items`] rewrites, unless the composition
+/// root sets another ([`FerrofinLibraryManager::with_item_values_write_chunk`]).
+/// Upstream's `UpdateItemsAsync` writes a whole batch in one transaction
+/// (`UpdateOrInsertItems`), but its metadata-edit cascades save item by item,
+/// which `1` reproduces; the chunk bounds how long a large cascade (a lock
+/// over every descendant of a folder) holds the single writer.
+pub const DEFAULT_ITEM_VALUES_WRITE_CHUNK: u32 = 500;
+
 /// The concrete library manager.
 ///
 /// Holds cheaply-cloneable `Arc<dyn _>` handles to the four persistence traits it
@@ -139,6 +148,9 @@ pub struct FerrofinLibraryManager {
     /// every deleted row, shared with the scan's removals. Set by the
     /// composition root; `None` (unit tests) removes neither.
     item_data: Option<Arc<crate::item_data_cleanup::ItemDataCleanup>>,
+    /// How many items' `ItemValues` one writer transaction of `update_items`
+    /// rewrites; at least 1. [`DEFAULT_ITEM_VALUES_WRITE_CHUNK`] unless set.
+    item_values_write_chunk: usize,
 }
 
 /// `Folder.QueryRecursive`'s post-filter gate (v12.2 Folder.cs:1008-1014): a
@@ -1354,7 +1366,18 @@ impl FerrofinLibraryManager {
             changed: None,
             app_paths: None,
             item_data: None,
+            item_values_write_chunk: DEFAULT_ITEM_VALUES_WRITE_CHUNK as usize,
         }
+    }
+
+    /// Sets how many items' `ItemValues` one writer transaction of
+    /// `update_items` rewrites (a value below 1 is taken as 1). The
+    /// composition root sets it from the server's settings; unit tests keep
+    /// [`DEFAULT_ITEM_VALUES_WRITE_CHUNK`].
+    #[must_use]
+    pub fn with_item_values_write_chunk(mut self, chunk: usize) -> Self {
+        self.item_values_write_chunk = chunk.max(1);
+        self
     }
 
     /// Configure live dashboard display options for controller folder browses.
@@ -3144,13 +3167,19 @@ impl LibraryManager for FerrofinLibraryManager {
         // Re-index each item's genre/tag/studio/artist links: the filter
         // facets and by-name browses read `ItemValues`, not the row columns,
         // so a metadata edit that only saved the row was invisible to them
-        // until the next full scan.
-        for item in items {
-            let Ok(id) = Uuid::parse_str(&item.id) else {
-                continue;
-            };
-            let values = crate::library_scan::item_values_of(item);
-            self.persistence.save_item_values(id, &values).await?;
+        // until the next full scan. Batched, as `UpdateOrInsertItems` saves
+        // every item's values in its one transaction
+        // (`ItemPersistenceService.cs:334`), but in chunks, so a cascade over
+        // a large folder does not hold the single writer for all of it.
+        let values: Vec<(Uuid, Vec<(i32, String)>)> = items
+            .iter()
+            .filter_map(|item| {
+                let id = Uuid::parse_str(&item.id).ok()?;
+                Some((id, crate::library_scan::item_values_of(item)))
+            })
+            .collect();
+        for chunk in values.chunks(self.item_values_write_chunk) {
+            self.persistence.save_item_values_for_items(chunk).await?;
         }
         // `Video.UpdateToRepositoryAsync` (`Video.cs:704-726`): a saved
         // primary's local versions take its metadata. Only a video whose
@@ -5680,6 +5709,137 @@ mod tests {
             .expect("facets");
         assert_eq!(facets.genres, vec!["Sci-Fi".to_owned()]);
         assert_eq!(facets.tags, vec!["4K".to_owned(), "Christmas".to_owned()]);
+    }
+
+    /// One `save_item_values_for_items` call's items, each with its values.
+    type ItemValuesBatch = Vec<(Uuid, Vec<(i32, String)>)>;
+
+    /// An item store that records how `ItemValues` were written: each batched
+    /// call's items with their values, and how many single-item calls came
+    /// through.
+    #[derive(Default)]
+    struct ItemValueWrites {
+        batches: std::sync::Mutex<Vec<ItemValuesBatch>>,
+        singles: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ItemPersistenceService for ItemValueWrites {
+        async fn delete_items(&self, _: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn deletion_closure(&self, _: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn save_items(&self, _: &[BaseItemEntity]) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn set_primary_version_id(
+            &self,
+            _: Uuid,
+            _: Option<Uuid>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn set_parent_id(&self, _: Uuid, _: Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn set_collection_type(&self, _: Uuid, _: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn save_item_values(&self, _: Uuid, _: &[(i32, String)]) -> Result<(), ServiceError> {
+            self.singles
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn save_item_values_for_items(
+            &self,
+            items: &[(Uuid, Vec<(i32, String)>)],
+        ) -> Result<(), ServiceError> {
+            self.batches.lock().expect("batches").push(items.to_vec());
+            Ok(())
+        }
+        async fn item_exists(&self, _: Uuid) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn set_ancestors(&self, _: Uuid, _: &[Uuid]) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn save_images(&self, _: &BaseItemEntity) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn reattach_user_data(&self, _: &BaseItemEntity) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn update_inherited_values(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// A batch edit (a lock or rating cascade over a series) re-indexes the
+    /// items' `ItemValues` in batched writes, as `UpdateOrInsertItems` saves
+    /// them in its one transaction, not one writer transaction per item; the
+    /// chunk size splits the batch. Each item keeps its own values, in the
+    /// caller's order, and a row whose id is not a GUID is still skipped.
+    #[tokio::test]
+    async fn update_items_writes_the_item_values_in_batches() {
+        let row = |id: u128, genres: &str| BaseItemEntity {
+            id: Uuid::from_u128(id).to_string(),
+            type_: "MediaBrowser.Controller.Entities.TV.Episode".to_owned(),
+            genres: Some(genres.to_owned()),
+            ..BaseItemEntity::default()
+        };
+        let not_a_guid = BaseItemEntity {
+            id: "not-a-guid".to_owned(),
+            ..row(0, "Drama")
+        };
+        let items = [
+            row(0xE2, "Drama"),
+            not_a_guid,
+            row(0xE1, "Comedy|Drama"),
+            row(0xE3, "News"),
+        ];
+        let written: ItemValuesBatch = [&items[0], &items[2], &items[3]]
+            .into_iter()
+            .map(|item| {
+                (
+                    Uuid::parse_str(&item.id).expect("guid"),
+                    crate::library_scan::item_values_of(item),
+                )
+            })
+            .collect();
+        let db = test_db().await;
+        for (chunk, expected) in [
+            (None, vec![written.clone()]),
+            (Some(2), vec![written[..2].to_vec(), written[2..].to_vec()]),
+            (
+                Some(0),
+                written.iter().map(|one| vec![one.clone()]).collect(),
+            ),
+        ] {
+            let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+                Arc::new(ItemTypeLookup::new());
+            let store = Arc::new(ItemValueWrites::default());
+            let mut mgr = FerrofinLibraryManager::new(
+                Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+                Arc::new(FerrofinItemCountService::new(db.clone())),
+                Arc::clone(&store) as _,
+                Arc::new(FerrofinPeopleRepository::new(db.clone())),
+            );
+            if let Some(chunk) = chunk {
+                mgr = mgr.with_item_values_write_chunk(chunk);
+            }
+
+            mgr.update_items(&items, None).await.expect("update");
+
+            assert_eq!(
+                store.singles.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no per-item write"
+            );
+            let batches = store.batches.lock().expect("batches").clone();
+            assert_eq!(batches, expected, "chunk {chunk:?}");
+        }
     }
 
     /// C# re-derives `SortName` on every save of a loaded item: the mapper
