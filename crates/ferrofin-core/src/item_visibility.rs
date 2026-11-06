@@ -49,6 +49,13 @@ pub struct ItemVisibility {
     /// once-per-scan test.
     #[cfg(test)]
     library_loads: std::sync::atomic::AtomicUsize,
+    /// How many times a hierarchy walk read rows, for the scan's
+    /// once-per-parent test.
+    #[cfg(test)]
+    hierarchy_reads: std::sync::atomic::AtomicUsize,
+    /// How many rows those reads returned.
+    #[cfg(test)]
+    hierarchy_rows: std::sync::atomic::AtomicUsize,
 }
 
 /// The library rows and each library's options that visibility and rating
@@ -76,6 +83,10 @@ impl ItemVisibility {
             paths: crate::virtual_paths::VirtualPathExpander::identity(),
             #[cfg(test)]
             library_loads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            hierarchy_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            hierarchy_rows: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -83,6 +94,20 @@ impl ItemVisibility {
     #[cfg(test)]
     pub(crate) fn library_loads(&self) -> usize {
         self.library_loads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many times a hierarchy walk read rows ([`repository::reachable`]).
+    #[cfg(test)]
+    pub(crate) fn hierarchy_reads(&self) -> usize {
+        self.hierarchy_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many rows the hierarchy walks read.
+    #[cfg(test)]
+    pub(crate) fn hierarchy_rows(&self) -> usize {
+        self.hierarchy_rows
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Expands the portable data and metadata paths stored in adopted databases.
@@ -467,9 +492,17 @@ impl ItemVisibility {
     /// [`Self::update_rating_scores`] over `libraries` read earlier with
     /// [`Self::rating_libraries`], so a batch job that scores one item at a
     /// time (the library scan) reads the libraries and their options once.
-    /// Each call still reads the items' own parent chain, so an ancestor saved
-    /// since `libraries` was read is seen; the library rows themselves are the
-    /// snapshot `libraries` took, as the scan's library policy is.
+    /// The library rows are the snapshot `libraries` took, as the scan's
+    /// library policy is.
+    ///
+    /// `ancestors` carries the rows above the items from one call to the
+    /// next (gl-1252): a call reads only the part of its items' chain that
+    /// `ancestors` lacks, then keeps the rows above its own items and nothing
+    /// else, so the episodes of a season, scored one after another, read
+    /// their chain once. An item is never above itself, so a job that saves
+    /// each parent before scoring its children reads every parent after its
+    /// save. A caller empties `ancestors` when a row in it may have been
+    /// written since; an error empties it too.
     ///
     /// # Errors
     /// Returns storage errors or an error for a cyclic hierarchy.
@@ -477,8 +510,10 @@ impl ItemVisibility {
         &self,
         items: &mut [BaseItemEntity],
         libraries: &RatingLibraries,
+        ancestors: &mut Vec<BaseItemEntity>,
     ) -> Result<(), ServiceError> {
-        self.update_rating_scores_with(items, Some(libraries)).await
+        self.update_rating_scores_with(items, Some((libraries, ancestors)))
+            .await
     }
 
     /// Reads the library rows, each library's options and its stored
@@ -541,26 +576,35 @@ impl ItemVisibility {
     async fn update_rating_scores_with(
         &self,
         items: &mut [BaseItemEntity],
-        libraries: Option<&RatingLibraries>,
+        batch: Option<(&RatingLibraries, &mut Vec<BaseItemEntity>)>,
     ) -> Result<(), ServiceError> {
         if items.is_empty() {
             return Ok(());
         }
         let read;
-        let libraries = if let Some(libraries) = libraries {
-            libraries
+        let mut unkept = Vec::new();
+        let (libraries, ancestors) = if let Some(batch) = batch {
+            batch
         } else {
             read = self.rating_libraries().await?;
-            &read
+            (&read, &mut unkept)
         };
+        // Taken while the context borrows them; the rows above `items` go back.
+        let mut known = std::mem::take(ancestors);
         // Scored over the rows as passed in, then written: the context borrows them.
-        let scores = {
-            let context = self.load(items, None, &libraries.set).await?;
-            items
+        let (scores, (kept, fresh)) = {
+            let context = self
+                .load_known(items.iter(), &known, None, &libraries.set)
+                .await?;
+            let scores = items
                 .iter()
                 .map(|item| context.rating_score(context.row(item)))
-                .collect::<Result<Vec<_>, ServiceError>>()?
+                .collect::<Result<Vec<_>, ServiceError>>()?;
+            (scores, context.into_ancestors(items))
         };
+        known.retain(|row| kept.contains(&row_id(row)));
+        known.extend(fresh);
+        *ancestors = known;
         for (item, score) in items.iter_mut().zip(scores) {
             item.unrated_type = Some(
                 crate::kinds::unrated_item(kind(item), uuid(item.channel_id.as_deref()).is_some())
@@ -600,19 +644,36 @@ impl ItemVisibility {
         .map(str::to_owned))
     }
 
-    /// `playlist_links` also reads playlists' members, which only a
-    /// rating-limited user's `HasParentalAllowedChild` needs.
+    /// Reads `wanted` and everything `rows` and those rows refer to up the hierarchy, and box
+    /// sets' members, into `rows` and `links`. `examined` holds the rows whose references were
+    /// already followed, so a later call reads only what its own `wanted` adds.
     async fn load_hierarchy(
         &self,
         rows: &mut HashMap<Uuid, Cow<'_, BaseItemEntity>>,
-        playlist_links: bool,
-    ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
-        let mut examined = HashSet::new();
-        let mut requested: HashSet<Uuid> = rows.keys().copied().collect();
-        let mut links: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        links: &mut HashMap<Uuid, Vec<Uuid>>,
+        examined: &mut HashSet<Uuid>,
+        mut wanted: HashSet<Uuid>,
+    ) -> Result<(), ServiceError> {
+        let mut requested: HashSet<Uuid> = rows.keys().chain(&wanted).copied().collect();
         // Each round batches all new references, including nested collections.
         // Missing references are remembered, so they cannot cause repeated reads.
         loop {
+            if !wanted.is_empty() {
+                // The whole chain above `wanted` in one read. A reference it could not follow (a
+                // missing row) is asked for once more, by itself, in the next round.
+                #[cfg(test)]
+                self.hierarchy_reads
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                for row in
+                    repository::reachable(&self.db, &wanted.drain().collect::<Vec<_>>()).await?
+                {
+                    #[cfg(test)]
+                    self.hierarchy_rows
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // What the caller passed (an item with unsaved changes, the cached libraries) wins.
+                    rows.entry(row_id(&row)).or_insert(Cow::Owned(row));
+                }
+            }
             let fresh: Vec<_> = rows
                 .keys()
                 .filter(|id| !examined.contains(*id))
@@ -623,11 +684,7 @@ impl ItemVisibility {
             }
             let containers: Vec<_> = fresh
                 .iter()
-                .filter(|id| match kind(&rows[id]) {
-                    BaseItemKind::BoxSet => true,
-                    BaseItemKind::Playlist => playlist_links,
-                    _ => false,
-                })
+                .filter(|id| kind(&rows[id]) == BaseItemKind::BoxSet)
                 .copied()
                 .collect();
             for (parent, child) in repository::linked_children(&self.db, &containers).await? {
@@ -635,7 +692,6 @@ impl ItemVisibility {
                     links.entry(parent).or_default().push(child);
                 }
             }
-            let mut wanted = HashSet::new();
             for id in fresh {
                 examined.insert(id);
                 let row = &rows[&id];
@@ -646,19 +702,92 @@ impl ItemVisibility {
                     }
                 }
             }
-            if wanted.is_empty() {
-                break;
-            }
-            // The whole chain above `wanted` in one read. A reference it could not follow (a
-            // missing row) is asked for once more, by itself, in the next round.
-            for row in
-                repository::reachable(&self.db, &wanted.into_iter().collect::<Vec<_>>()).await?
-            {
-                // What the caller passed (an item with unsaved changes, the cached libraries) wins.
-                rows.entry(row_id(&row)).or_insert(Cow::Owned(row));
+        }
+        Ok(())
+    }
+
+    /// Every reader sees the expanded path; a borrowed row is copied only when it changes.
+    fn expand_paths(&self, rows: &mut HashMap<Uuid, Cow<'_, BaseItemEntity>>) {
+        for row in rows.values_mut() {
+            let expanded = match row.path.as_deref().map(|path| self.paths.expand_cow(path)) {
+                Some(Cow::Owned(path)) => Some(path),
+                _ => None,
+            };
+            if let Some(path) = expanded {
+                row.to_mut().path = Some(path);
             }
         }
-        Ok(links)
+    }
+
+    /// The member half of `Playlist.HasParentalAllowedChild` (v12.4 `Playlist.cs:261-271`) for
+    /// each of `playlists`: no member, or one passing `IsParentalAllowed(user, true)`. Only a
+    /// rating-limited user asks it. The member ids are read at once; the members and the chains
+    /// above them in doubling batches (1, 2, 4, …) across the playlists still undecided, as
+    /// `linkedItems.Any` stops at the first allowed one, so the common playlist reads one member
+    /// rather than all of them (gl-1261). A link to a missing item is no member, as in
+    /// `GetLinkedChildren`. Members are taken in the order `LinkedChildren` returns them; the
+    /// answer does not depend on it. A member that fails its check (a cyclic chain) is that
+    /// playlist's answer, returned only when a check asks for it, as the check that asked one
+    /// member at a time did.
+    async fn parental_members(
+        &self,
+        context: &mut Context<'_>,
+        examined: &mut HashSet<Uuid>,
+        playlists: &[Uuid],
+    ) -> Result<(), ServiceError> {
+        let mut members: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        for (parent, child) in repository::linked_children(&self.db, playlists).await? {
+            if let (Some(parent), Some(child)) = (uuid(Some(&parent)), uuid(Some(&child))) {
+                members.entry(parent).or_default().push(child);
+            }
+        }
+        // Each undecided playlist, the first of its members not checked yet, and whether one of
+        // those checked exists.
+        let mut pending: Vec<(Uuid, usize, bool)> =
+            playlists.iter().map(|id| (*id, 0, false)).collect();
+        let mut size = 1;
+        while !pending.is_empty() {
+            let batch = |id: &Uuid, start: usize| {
+                let ids = members.get(id).map_or(&[][..], Vec::as_slice);
+                &ids[start.min(ids.len())..(start + size).min(ids.len())]
+            };
+            let wanted = pending
+                .iter()
+                .flat_map(|(id, start, _)| batch(id, *start))
+                .filter(|id| !context.rows.contains_key(*id))
+                .copied()
+                .collect();
+            self.load_hierarchy(&mut context.rows, &mut context.links, examined, wanted)
+                .await?;
+            self.expand_paths(&mut context.rows);
+            let mut next = Vec::new();
+            for (id, start, mut found) in pending {
+                // An error stays this playlist's answer, for a check that asks it.
+                let mut answer = None;
+                for member in batch(&id, start).iter().filter_map(|m| context.get(m)) {
+                    found = true;
+                    match context.parental(member, true) {
+                        Ok(false) => {}
+                        decided => {
+                            answer = Some(decided);
+                            break;
+                        }
+                    }
+                }
+                let end = start + size;
+                if answer.is_none() && end >= members.get(&id).map_or(0, Vec::len) {
+                    answer = Some(Ok(!found));
+                }
+                match answer {
+                    Some(answer) => {
+                        context.parental_members.insert(id, answer);
+                    }
+                    None => next.push((id, end, found)),
+                }
+            }
+            (pending, size) = (next, size * 2);
+        }
+        Ok(())
     }
 
     /// The context that evaluates `items` over `libraries` (from [`Self::rating_libraries`]).
@@ -699,22 +828,10 @@ impl ItemVisibility {
         for row in known.iter().chain(&libraries.ancestors) {
             rows.entry(row_id(row)).or_insert(Cow::Borrowed(row));
         }
-        let links = self
-            .load_hierarchy(
-                &mut rows,
-                user.is_some_and(|user| user.max_parental_rating_score.is_some()),
-            )
+        let (mut links, mut examined) = (HashMap::new(), HashSet::new());
+        self.load_hierarchy(&mut rows, &mut links, &mut examined, HashSet::new())
             .await?;
-        // Every reader sees the expanded path; a borrowed row is copied only when it changes.
-        for row in rows.values_mut() {
-            let expanded = match row.path.as_deref().map(|path| self.paths.expand_cow(path)) {
-                Some(Cow::Owned(path)) => Some(path),
-                _ => None,
-            };
-            if let Some(path) = expanded {
-                row.to_mut().path = Some(path);
-            }
-        }
+        self.expand_paths(&mut rows);
         // Each library's list, expanded once for every path match of this context. A caller's
         // copy of a library row stands in for the set's here as in `rows`, so a list is taken
         // from the set only for the `Data` it was parsed from.
@@ -755,7 +872,7 @@ impl ItemVisibility {
                 }
             }
         }
-        Ok(Context {
+        let mut context = Context {
             service: self,
             user,
             rows,
@@ -763,6 +880,7 @@ impl ItemVisibility {
             links,
             libraries,
             playlists,
+            parental_members: HashMap::new(),
             permissions: permissions.into_iter().collect(),
             preferences: preferences
                 .into_iter()
@@ -776,7 +894,12 @@ impl ItemVisibility {
                     )
                 })
                 .collect(),
-        })
+        };
+        if user.is_some_and(|user| user.max_parental_rating_score.is_some()) {
+            self.parental_members(&mut context, &mut examined, &playlist_ids)
+                .await?;
+        }
+        Ok(context)
     }
 }
 
@@ -801,6 +924,9 @@ struct Context<'a> {
     /// The library set the rows above were read with; its `options` are each library's.
     libraries: &'a LibrarySet,
     playlists: HashMap<Uuid, bool>,
+    /// For a rating-limited user, each playlist's member test from
+    /// [`ItemVisibility::parental_members`].
+    parental_members: HashMap<Uuid, Result<bool, ServiceError>>,
     permissions: HashMap<i32, bool>,
     preferences: HashMap<i32, Vec<String>>,
 }
@@ -848,6 +974,36 @@ impl Context<'_> {
     /// The context's row for `item`'s id, path expanded; `item` itself when it has none.
     fn row<'r>(&'r self, item: &'r BaseItemEntity) -> &'r BaseItemEntity {
         self.get(&row_id(item)).unwrap_or(item)
+    }
+
+    /// The rows above `items` by the references [`ItemVisibility::load_hierarchy`] follows, short
+    /// of the library set's: the ids of those borrowed from the caller's `known` rows, and those
+    /// this context owns.
+    fn into_ancestors(mut self, items: &[BaseItemEntity]) -> (HashSet<Uuid>, Vec<BaseItemEntity>) {
+        let mut seen: HashSet<Uuid> = items
+            .iter()
+            .chain(&self.libraries.rows)
+            .chain(&self.libraries.ancestors)
+            .map(row_id)
+            .collect();
+        let mut next: Vec<Uuid> = items.iter().flat_map(references).collect();
+        let (mut borrowed, mut owned) = (HashSet::new(), Vec::new());
+        while let Some(id) = next.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let Some(row) = self.rows.remove(&id) else {
+                continue;
+            };
+            next.extend(references(&row));
+            match row {
+                Cow::Borrowed(_) => {
+                    borrowed.insert(id);
+                }
+                Cow::Owned(row) => owned.push(row),
+            }
+        }
+        (borrowed, owned)
     }
 
     fn preference(&self, kind: PreferenceKind) -> &[String] {
@@ -1082,9 +1238,11 @@ impl Context<'_> {
         Ok(true)
     }
 
-    /// `Playlist.HasParentalAllowedChild` (v12.2 Playlist.cs:261-271): a
+    /// `Playlist.HasParentalAllowedChild` (v12.4 Playlist.cs:261-271): a
     /// rating-limited user sees a playlist only when it has no members or one
-    /// of them passes `IsParentalAllowed(user, true)`.
+    /// of them passes `IsParentalAllowed(user, true)`. A playlist's answer comes
+    /// from [`ItemVisibility::parental_members`]; a box set's members are all read
+    /// already, for its library check.
     fn has_parental_allowed_child(
         &self,
         item: &BaseItemEntity,
@@ -1092,6 +1250,17 @@ impl Context<'_> {
     ) -> Result<bool, ServiceError> {
         if user.max_parental_rating_score.is_none() {
             return Ok(true);
+        }
+        if kind(item) == BaseItemKind::Playlist {
+            return match self.parental_members.get(&row_id(item)) {
+                Some(Ok(allowed)) => Ok(*allowed),
+                Some(Err(ServiceError::Backend(why))) => Err(ServiceError::backend(why.clone())),
+                Some(Err(other)) => Err(ServiceError::backend(other.to_string())),
+                None => Err(ServiceError::backend(format!(
+                    "members of playlist {} not read",
+                    row_id(item)
+                ))),
+            };
         }
         let mut members = self
             .links
@@ -1953,6 +2122,160 @@ mod tests {
         assert_eq!(child.inherited_parental_rating_sub_value, None);
     }
 
+    /// A library holding a series rated PG for Canada, one season of it and three episodes:
+    /// `[library, series, season, episode, episode, episode]` (gl-1252).
+    async fn rated_season(f: &Fixture) -> [BaseItemEntity; 6] {
+        let library = f
+            .item(70, BaseItemKind::CollectionFolder, Some("/shows"), None)
+            .await;
+        let mut series = f
+            .item(71, BaseItemKind::Series, Some("/shows/a"), Some(&library))
+            .await;
+        series.official_rating = Some("PG".into());
+        series.preferred_metadata_country_code = Some("CA".into());
+        f.save(&series).await;
+        let mut season = f
+            .item(72, BaseItemKind::Season, Some("/shows/a/s1"), Some(&series))
+            .await;
+        season.series_id = Some(series.id.clone());
+        f.save(&season).await;
+        let mut episodes = Vec::new();
+        for id in 73..76 {
+            let path = format!("/shows/a/s1/{id}.mkv");
+            let mut episode = f
+                .item(id, BaseItemKind::Episode, Some(&path), Some(&season))
+                .await;
+            episode.season_id = Some(season.id.clone());
+            episode.series_id = Some(series.id.clone());
+            f.save(&episode).await;
+            episodes.push(episode);
+        }
+        let [first, second, third] = <[BaseItemEntity; 3]>::try_from(episodes).expect("three");
+        [library, series, season, first, second, third]
+    }
+
+    /// Each row's stored parental score and sub-score.
+    fn scores(rows: &[BaseItemEntity]) -> Vec<(Option<i64>, Option<i64>)> {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.inherited_parental_rating_value,
+                    row.inherited_parental_rating_sub_value,
+                )
+            })
+            .collect()
+    }
+
+    /// The batch scorer reads the rows above a season's episodes once, scores each as the one-off
+    /// scorer does, and carries only the rows above the item it scored last (gl-1252).
+    #[tokio::test]
+    async fn batch_scores_carry_only_the_chain_above_the_last_item() {
+        let f = Fixture::new().await;
+        let [library, series, season, episodes @ ..] = rated_season(&f).await;
+        let movie = f
+            .item(
+                76,
+                BaseItemKind::Movie,
+                Some("/shows/b.mkv"),
+                Some(&library),
+            )
+            .await;
+
+        let libraries = f.service.rating_libraries().await.expect("libraries");
+        let mut ancestors = Vec::new();
+        let before = f.service.hierarchy_reads();
+        let mut batch = episodes.clone();
+        for episode in &mut batch {
+            f.service
+                .update_rating_scores_in(std::slice::from_mut(episode), &libraries, &mut ancestors)
+                .await
+                .expect("batch score");
+        }
+        assert_eq!(
+            f.service.hierarchy_reads() - before,
+            1,
+            "one read for the season"
+        );
+        let mut held: Vec<_> = ancestors.iter().map(row_id).collect();
+        held.sort();
+        assert_eq!(
+            held,
+            [row_id(&series), row_id(&season)],
+            "the library set's rows stay out"
+        );
+        let mut single = episodes;
+        f.service
+            .update_rating_scores(&mut single)
+            .await
+            .expect("single score");
+        assert_eq!(scores(&batch), [(Some(8), Some(1)); 3]);
+        assert_eq!(scores(&batch), scores(&single));
+        let before = f.service.hierarchy_reads();
+        let mut movie = movie;
+        f.service
+            .update_rating_scores_in(std::slice::from_mut(&mut movie), &libraries, &mut ancestors)
+            .await
+            .expect("movie score");
+        assert_eq!(
+            f.service.hierarchy_reads(),
+            before,
+            "the library is in the set"
+        );
+        assert!(
+            ancestors.is_empty(),
+            "the series' chain is not above the movie"
+        );
+    }
+
+    /// A parent the batch scorer carries is scored and saved again: it leaves the carry with its
+    /// own scoring, so its next child reads the saved row (gl-1252).
+    #[tokio::test]
+    async fn a_carried_parent_scored_again_is_read_after_its_save() {
+        let f = Fixture::new().await;
+        let [_, mut series, _, mut first, mut second, _] = rated_season(&f).await;
+        let libraries = f.service.rating_libraries().await.expect("libraries");
+        let mut ancestors = Vec::new();
+        f.service
+            .update_rating_scores_in(std::slice::from_mut(&mut first), &libraries, &mut ancestors)
+            .await
+            .expect("first score");
+        assert_eq!(scores(std::slice::from_ref(&first)), [(Some(8), Some(1))]);
+        assert!(ancestors.iter().any(|row| row_id(row) == row_id(&series)));
+        series.official_rating = Some("18A".into());
+        f.service
+            .update_rating_scores_in(
+                std::slice::from_mut(&mut series),
+                &libraries,
+                &mut ancestors,
+            )
+            .await
+            .expect("series score");
+        assert!(
+            ancestors.iter().all(|row| row_id(row) != row_id(&series)),
+            "an item is never carried above itself"
+        );
+        f.save(&series).await;
+        let mut fresh = second.clone();
+        f.service
+            .update_rating_scores_in(
+                std::slice::from_mut(&mut second),
+                &libraries,
+                &mut ancestors,
+            )
+            .await
+            .expect("second score");
+        f.service
+            .update_rating_scores(std::slice::from_mut(&mut fresh))
+            .await
+            .expect("fresh score");
+        assert_ne!(scores(std::slice::from_ref(&second)), [(Some(8), Some(1))]);
+        assert_eq!(
+            scores(std::slice::from_ref(&second)),
+            scores(std::slice::from_ref(&fresh)),
+            "the saved rating, as a fresh read scores it"
+        );
+    }
+
     #[tokio::test]
     async fn channel_content_and_cycles_fail_closed() {
         let f = Fixture::new().await;
@@ -2275,6 +2598,118 @@ mod tests {
             .await
             .expect("admin");
         assert_eq!(hidden(&f).await, HashSet::new(), "Jellyfin's answer");
+    }
+
+    /// A rating-limited user's `HasParentalAllowedChild` reads a playlist's members in doubling
+    /// batches and stops at the first allowed one, with `linkedItems.Any`'s answer: a playlist
+    /// whose first member is allowed reads that member alone, one whose only allowed member comes
+    /// last still finds it, and one with none stays hidden (gl-1261).
+    #[tokio::test]
+    async fn playlist_members_are_read_until_one_is_allowed() {
+        let mut f = Fixture::new().await;
+        let library = f
+            .item(120, BaseItemKind::CollectionFolder, Some("/library"), None)
+            .await;
+        let mut movies = Vec::new();
+        for id in 121..=129 {
+            let mut movie = f
+                .item(
+                    id,
+                    BaseItemKind::Movie,
+                    Some(&format!("/library/{id}")),
+                    Some(&library),
+                )
+                .await;
+            movie.official_rating = Some(if id == 121 { "G" } else { "R" }.to_owned());
+            f.save(&movie).await;
+            movies.push(movie);
+        }
+        let (allowed, rated) = movies.split_first().expect("movies");
+        let playlist = async |f: &Fixture, id: u128, members: &[&BaseItemEntity]| {
+            let mut row = f
+                .item(
+                    id,
+                    BaseItemKind::Playlist,
+                    Some(&format!("/server/data/playlists/{id}")),
+                    None,
+                )
+                .await;
+            row.data = Some(serde_json::json!({"OwnerUserId": f.user.id}).to_string());
+            f.save(&row).await;
+            for member in members {
+                crate::FerrofinLinkedChildrenService::new(f.db.clone())
+                    .upsert_linked_child(row_id(&row), row_id(member), 0)
+                    .await
+                    .expect("link");
+            }
+            row
+        };
+        let first = playlist(
+            &f,
+            130,
+            &std::iter::once(allowed).chain(rated).collect::<Vec<_>>(),
+        )
+        .await;
+        let last = playlist(&f, 131, &rated.iter().chain([allowed]).collect::<Vec<_>>()).await;
+        let none = playlist(&f, 132, &rated.iter().collect::<Vec<_>>()).await;
+        f.user.max_parental_rating_score = Some(13);
+
+        let before = f.service.hierarchy_rows();
+        assert!(f.visible(&first).await, "the first member is allowed");
+        assert_eq!(
+            f.service.hierarchy_rows() - before,
+            2,
+            "that member and the library above it, not the other eight"
+        );
+        assert!(f.visible(&last).await, "the last member is allowed");
+        assert!(!f.visible(&none).await, "no member is allowed");
+        let hidden = f.service.hidden_playlists(&f.user, &[]).await.unwrap();
+        assert_eq!(hidden, vec![row_id(&none)], "one rule for the listing");
+    }
+
+    /// A member whose chain is cyclic fails only the playlist checks that ask for it: another
+    /// user's private playlist holding it is hidden by its owner test, as it was when members
+    /// were checked one at a time, and the listing goes on; the user's own fails (gl-1261).
+    #[tokio::test]
+    async fn a_cyclic_member_fails_only_the_playlist_that_asks() {
+        let mut f = Fixture::new().await;
+        let mut first = f.item(140, BaseItemKind::Folder, None, None).await;
+        let second = f.item(141, BaseItemKind::Folder, None, Some(&first)).await;
+        first.parent_id = Some(second.id.clone());
+        f.save(&first).await;
+        let movie = f
+            .item(142, BaseItemKind::Movie, Some("/cycle/142"), Some(&second))
+            .await;
+        let playlist = async |f: &Fixture, id: u128, owner: Uuid| {
+            let mut row = f
+                .item(
+                    id,
+                    BaseItemKind::Playlist,
+                    Some(&format!("/server/data/playlists/{id}")),
+                    None,
+                )
+                .await;
+            row.data = Some(serde_json::json!({"OwnerUserId": owner}).to_string());
+            f.save(&row).await;
+            crate::FerrofinLinkedChildrenService::new(f.db.clone())
+                .upsert_linked_child(row_id(&row), row_id(&movie), 0)
+                .await
+                .expect("link");
+            row
+        };
+        let private = playlist(&f, 143, Uuid::from_u128(999)).await;
+        f.user.max_parental_rating_score = Some(13);
+        assert_eq!(
+            f.service.hidden_playlists(&f.user, &[]).await.unwrap(),
+            vec![row_id(&private)]
+        );
+        let own = playlist(&f, 144, Uuid::parse_str(&f.user.id).expect("user id")).await;
+        assert!(
+            f.service
+                .visible(std::slice::from_ref(&own), &f.user, true)
+                .await
+                .is_err()
+        );
     }
 
     /// `playlist_policy` is `Playlist.IsVisible` minus the owner/share test,
