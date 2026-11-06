@@ -63,6 +63,7 @@ use ferrofin_traits::configuration::{
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::system::ServerApplicationPaths;
+use ferrofin_util::file_helper::FileStamp;
 
 use crate::app_paths::FerrofinServerApplicationPaths;
 use crate::config_import;
@@ -256,37 +257,10 @@ fn forget_warning(warned: &std::sync::Mutex<Option<WarnedFile>>) {
         .take();
 }
 
-/// A named document as last read, and the stamp its file had just before.
+/// A named document as last read, and the stamp its file had just before,
+/// with the change time: a save renames a new file in (a new inode), a hand
+/// edit moves the modified and change times, and a chmod the change time.
 type Kept<T> = std::sync::Mutex<Option<(FileStamp, T)>>;
-
-/// A file's length, modified time and, on unix, inode and change time: what
-/// a kept document is checked against before it is served again. A save
-/// renames a new file in (a new inode), a hand edit moves the modified and
-/// change times, and a chmod the change time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
-    len: u64,
-    modified: Option<std::time::SystemTime>,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    changed: (i64, i64),
-}
-
-impl FileStamp {
-    fn of(meta: &std::fs::Metadata) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt as _;
-        Self {
-            len: meta.len(),
-            modified: meta.modified().ok(),
-            #[cfg(unix)]
-            inode: meta.ino(),
-            #[cfg(unix)]
-            changed: (meta.ctime(), meta.ctime_nsec()),
-        }
-    }
-}
 
 /// Drops the document kept in `kept`, so the next read goes to the file.
 fn forget_kept<T>(kept: &Kept<T>) {
@@ -650,7 +624,7 @@ impl FerrofinServerConfigurationManager {
         kept: &Kept<T>,
     ) -> Result<T, ServiceError> {
         let stamp = match tokio::fs::metadata(path).await {
-            Ok(meta) => FileStamp::of(&meta),
+            Ok(meta) => FileStamp::with_change_time(&meta),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 forget_warning(warned);
                 forget_kept(kept);

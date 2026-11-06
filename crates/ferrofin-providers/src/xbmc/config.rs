@@ -50,13 +50,14 @@ impl NfoConfiguration {
 /// (`IConfigurationManager.GetNfoConfiguration()`), re-read when the file
 /// changes so a dashboard edit applies to the next item without a restart.
 ///
-/// The file is stat-checked on every call and re-parsed only when its modified
-/// time or size moved; a missing or unparseable file reads as the defaults,
-/// as an unset named configuration does upstream.
+/// The file is stat-checked on every call and re-parsed only when its
+/// [`FileStamp`](ferrofin_util::file_helper::FileStamp) moved (a save renames a
+/// new file in); a missing or unparseable file reads as the defaults, as an
+/// unset named configuration does upstream.
 #[derive(Debug)]
 pub struct NfoConfigurationFile {
     path: std::path::PathBuf,
-    cached: std::sync::Mutex<Option<(std::time::SystemTime, u64, NfoConfiguration)>>,
+    cached: std::sync::Mutex<Option<(ferrofin_util::file_helper::FileStamp, NfoConfiguration)>>,
 }
 
 impl NfoConfigurationFile {
@@ -75,14 +76,17 @@ impl NfoConfigurationFile {
         let Ok(metadata) = std::fs::metadata(&self.path) else {
             return NfoConfiguration::default();
         };
-        let stamp = (metadata.modified().ok(), metadata.len());
+        // Without a modified time nothing is kept: the file is read every call.
+        let stamp = metadata
+            .modified()
+            .is_ok()
+            .then(|| ferrofin_util::file_helper::FileStamp::of(&metadata));
         let mut cached = self
             .cached
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let (Some(modified), Some((at, len, config))) = (stamp.0, cached.as_ref())
-            && *at == modified
-            && *len == stamp.1
+        if let (Some(stamp), Some((at, config))) = (stamp, cached.as_ref())
+            && *at == stamp
         {
             return config.clone();
         }
@@ -96,8 +100,8 @@ impl NfoConfigurationFile {
                 user_id: options.user_id,
                 release_date_format: options.release_date_format,
             });
-        if let Some(modified) = stamp.0 {
-            *cached = Some((modified, stamp.1, config.clone()));
+        if let Some(stamp) = stamp {
+            *cached = Some((stamp, config.clone()));
         }
         config
     }
@@ -129,5 +133,31 @@ mod tests {
 
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(source.current(), NfoConfiguration::default());
+    }
+
+    /// gl-1394: a save renames a new file in, and one of the same length and
+    /// modified time as the file it replaces (one timestamp tick) is still
+    /// read, by its inode.
+    #[cfg(unix)]
+    #[test]
+    fn a_same_length_save_within_one_tick_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("xbmcmetadata.json");
+        let source = NfoConfigurationFile::new(path.clone());
+        let save = |format: &str| {
+            let new = dir.path().join("xbmcmetadata.json.new");
+            std::fs::write(&new, format!(r#"{{"ReleaseDateFormat":"{format}"}}"#)).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&new)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+                .unwrap();
+            std::fs::rename(&new, &path).unwrap();
+        };
+        save("dd.MM.yyyy");
+        assert_eq!(source.current().release_date_format, "dd.MM.yyyy");
+        save("MM.dd.yyyy");
+        assert_eq!(source.current().release_date_format, "MM.dd.yyyy");
     }
 }
