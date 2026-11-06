@@ -66,6 +66,10 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 /// ASP.NET's `HostOptions.ShutdownTimeout` default, which Jellyfin runs with.
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u32 = 30;
 
+/// The hours a session with no WebSocket that plays nothing may go without a
+/// request before it is ended (owner decision on gl-1267, 2026-11-05).
+const DEFAULT_SESSION_IDLE_HOURS: u32 = 24;
+
 /// Command-line arguments — the highest-precedence configuration layer.
 ///
 /// Only the knobs a operator commonly overrides on the command line are
@@ -198,6 +202,7 @@ struct FileConfig {
     wasm_write_content_mb: Option<u32>,
     wasm_subtitle_extract_mb: Option<u32>,
     playback_metrics_queue: Option<u32>,
+    session_idle_hours: Option<u32>,
     quick_connect_pending_per_ip: Option<u32>,
     login_backoff: Option<bool>,
     login_backoff_attempts: Option<u32>,
@@ -796,6 +801,15 @@ pub struct Config {
     /// [`PLAYBACK_METRICS_QUEUE_RANGE`] with a warning.
     pub playback_metrics_queue: Option<u32>,
 
+    /// How long a session with no WebSocket that plays nothing may go without
+    /// a request before the one-minute session loop ends it, in hours. Jellyfin
+    /// keeps such a session until it restarts, so a client that changes its
+    /// device id on every run would grow the session pool without end.
+    /// Resolved `FERROFIN_SESSION_IDLE_HOURS` env > `session_idle_hours` in
+    /// `config.toml` > 24, clamped to [`SESSION_IDLE_HOURS_RANGE`] with a
+    /// warning.
+    pub session_idle_hours: u32,
+
     /// Unauthorized Quick Connect requests one remote IP may hold at once;
     /// the next `POST /QuickConnect/Initiate` from that IP drops its oldest.
     /// `None`/zero = `ferrofin_core::quick_connect_manager::DEFAULT_PENDING_PER_IP` (10). Jellyfin has no
@@ -1234,6 +1248,15 @@ impl Config {
                 DEFAULT_SHUTDOWN_TIMEOUT_SECS,
                 SHUTDOWN_TIMEOUT_SECS_RANGE,
                 "seconds",
+            ),
+            session_idle_hours: resolve_clamped(
+                env,
+                "FERROFIN_SESSION_IDLE_HOURS",
+                "session_idle_hours",
+                file.session_idle_hours,
+                DEFAULT_SESSION_IDLE_HOURS,
+                SESSION_IDLE_HOURS_RANGE,
+                "hours",
             ),
             scan_progress_every: resolve_clamped_or_unset(
                 env,
@@ -1677,6 +1700,7 @@ impl Config {
             metrics_sample_interval: None,
             metrics_scan_duration_buckets: None,
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+            session_idle_hours: DEFAULT_SESSION_IDLE_HOURS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
             scan_directory_cache_records: None,
@@ -1774,6 +1798,12 @@ pub const SHUTDOWN_TIMEOUT_SECS_RANGE: RangeInclusive<u32> = 5..=600;
 
 /// The hours TheTVDB lookups are reused (`tvdb_cache_hours`).
 pub const TVDB_CACHE_HOURS_RANGE: RangeInclusive<u32> = 1..=168;
+
+/// The hours a session with no WebSocket that plays nothing may go without a
+/// request (`session_idle_hours`): an hour to a week (owner decision on
+/// gl-1267), well above the dashboard's 16-minute activity filter and the
+/// 5-minute idle-playback stop.
+pub const SESSION_IDLE_HOURS_RANGE: RangeInclusive<u32> = 1..=168;
 
 /// The seconds one WASM plugin call may run (`wasm_call_timeout_secs`).
 pub const WASM_CALL_TIMEOUT_SECS_RANGE: RangeInclusive<u32> = 1..=600;
@@ -3732,6 +3762,47 @@ mod tests {
         assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
     }
 
+    /// The session idle window: 24 hours unset, the file's value, the variable
+    /// over the file, and a value outside an hour to a week clamped with a
+    /// warning naming it.
+    #[test]
+    fn session_idle_hours_defaults_env_beats_file_and_clamps() {
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(unset.session_idle_hours, 24);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "session_idle_hours = 72\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(cfg.session_idle_hours, 72);
+
+        let env = FakeEnv::new().with("FERROFIN_SESSION_IDLE_HOURS", "2");
+        assert_eq!(
+            Config::load_from(cli.clone(), &env)
+                .unwrap()
+                .session_idle_hours,
+            2
+        );
+
+        for (raw, used) in [("0", 1), ("169", 168)] {
+            let env = FakeEnv::new().with("FERROFIN_SESSION_IDLE_HOURS", raw);
+            let cfg = Config::load_from(cli.clone(), &env).unwrap();
+            assert_eq!(cfg.session_idle_hours, used);
+            assert_eq!(cfg.load_warnings.len(), 1, "{:?}", cfg.load_warnings);
+            assert!(
+                cfg.load_warnings[0].contains("session_idle_hours")
+                    && cfg.load_warnings[0].contains(&format!("using {used}")),
+                "{:?}",
+                cfg.load_warnings
+            );
+        }
+    }
+
     #[test]
     fn db_pool_file_accepts_auto_and_rejects_garbage() {
         let dir = tempfile::tempdir().unwrap();
@@ -4438,6 +4509,11 @@ row_cache_ttl_secs = 10
                 "shutdown_timeout_secs",
                 DEFAULT_SHUTDOWN_TIMEOUT_SECS,
                 SHUTDOWN_TIMEOUT_SECS_RANGE,
+            ),
+            (
+                "session_idle_hours",
+                DEFAULT_SESSION_IDLE_HOURS,
+                SESSION_IDLE_HOURS_RANGE,
             ),
             (
                 "tvdb_cache_hours",

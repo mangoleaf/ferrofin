@@ -1032,6 +1032,22 @@ pub static SETTINGS: &[SettingSpec] = &[
         running: |c| json!(c.playback_metrics_queue),
         ..ROW
     },
+    SettingSpec {
+        key: "session_idle_hours",
+        env: Some("FERROFIN_SESSION_IDLE_HOURS"),
+        env_read: PARSED_U32,
+        label: "Idle session lifetime",
+        group: Group::Performance,
+        kind: whole_numbers(config::SESSION_IDLE_HOURS_RANGE),
+        unit: Some(Unit::Hours),
+        default: "24",
+        description: "How long a session with no WebSocket that plays nothing is kept after its \
+                      last request.",
+        note: "Jellyfin keeps such a session until it restarts. Ending it frees its memory, and \
+               for a signed-in user the activity log notes the disconnect.",
+        running: |c| json!(c.session_idle_hours),
+        ..ROW
+    },
     // ---- Logging -----------------------------------------------------------
     SettingSpec {
         key: "log_level",

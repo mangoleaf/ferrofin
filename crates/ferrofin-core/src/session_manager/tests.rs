@@ -2491,8 +2491,9 @@ async fn the_sessions_live_stream_follows_the_reports() {
 /// `OnSessionStarted` → `ReportCapabilities(info, _deviceManager.GetCapabilities
 /// (deviceId), saveCapabilities: false)`. This is what makes ending a session on
 /// socket close safe: the client stays remote-controllable without having to
-/// re-post `/Sessions/Capabilities/Full`, and it is why the device manager's
-/// capabilities map is never evicted.
+/// re-post `/Sessions/Capabilities/Full`, and it is why ending a session keeps
+/// the device manager's capabilities entry (only the idle sweep drops one no
+/// `Devices` row and no other session uses: `idle_eviction`).
 #[tokio::test]
 async fn a_recreated_session_inherits_the_devices_capabilities() {
     use ferrofin_traits::session::SessionEvent;
@@ -4195,17 +4196,20 @@ async fn each_minute_runs_the_checks_that_are_due() {
     };
 
     // Minute 4, no threshold: neither check runs.
-    mgr.run_playback_checks_at(4, 0, now).await;
+    mgr.run_playback_checks_at(4, 0, chrono::TimeDelta::hours(24), now)
+        .await;
     assert!(stopped.lock().unwrap().is_empty());
     assert_eq!(stops_sent(&connection), 0);
 
     // Minute 4 with a threshold: only the inactive check.
-    mgr.run_playback_checks_at(4, 30, now).await;
+    mgr.run_playback_checks_at(4, 30, chrono::TimeDelta::hours(24), now)
+        .await;
     assert!(stopped.lock().unwrap().is_empty());
     assert_eq!(stops_sent(&connection), 1);
 
     // Minute 5: the idle check too.
-    mgr.run_playback_checks_at(5, 0, now).await;
+    mgr.run_playback_checks_at(5, 0, chrono::TimeDelta::hours(24), now)
+        .await;
     assert_eq!(stopped.lock().unwrap().len(), 1);
     assert_eq!(stops_sent(&connection), 1);
 }
@@ -4628,6 +4632,10 @@ mod device_reads;
 /// The session's `NowPlayingItem`, built once per item by the first listing
 /// after the report that names it, and the session summaries that read it.
 mod now_playing_item;
+
+/// The idle-session sweep: socketless sessions that play nothing end after
+/// the idle window, and their unused capabilities go.
+mod idle_eviction;
 
 /// The session's play state, queue, transcoding info and now-viewing item.
 mod play_state;

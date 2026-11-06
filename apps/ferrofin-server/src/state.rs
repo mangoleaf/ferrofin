@@ -2461,10 +2461,13 @@ pub async fn build_app_state(
         // `SendPlayCommand` -> `TranslateItemForInstantMix`).
         .with_music_manager(Arc::clone(&music)),
     );
-    // The idle-playback and inactive-session checks (C# `StartCheckTimers`),
-    // for this host's lifetime.
+    // The idle-playback and inactive-session checks (C# `StartCheckTimers`)
+    // and the idle-session sweep, for this host's lifetime.
     background.push(tokio::spawn(tracing::Instrument::instrument(
-        Arc::clone(&sessions_impl).run_playback_checks(Arc::clone(&config_trait)),
+        Arc::clone(&sessions_impl).run_playback_checks(
+            Arc::clone(&config_trait),
+            std::time::Duration::from_hours(u64::from(config.session_idle_hours)),
+        ),
         tracing::info_span!(
             parent: None,
             "playback_checks",

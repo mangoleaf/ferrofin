@@ -195,6 +195,10 @@ ferrofin:
     # FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS: "30"
     # FERROFIN_LOGIN_BACKOFF_WINDOW_MINS: "15"
     # FERROFIN_LOGIN_BACKOFF_MAX_TRACKED: "100000"
+    # Hours a session with no WebSocket that plays nothing is kept after its last
+    # request (1 to 168, default 24). Jellyfin keeps such a session until it
+    # restarts, so a client sending a new device id on every run grows memory.
+    # FERROFIN_SESSION_IDLE_HOURS: "24"
     # Prepared statements each SQLite connection keeps (100-1024, default 150).
     # Each connection of the pool keeps its own, so a larger value costs memory
     # on every connection: 150 held 6-13 MiB more than 100 on an 8-core server.
