@@ -319,6 +319,10 @@ struct RunningJob {
     /// The segment file extension (e.g. `.ts`), for diagnostics/index scans.
     #[allow(dead_code)]
     segment_extension: String,
+    /// The first segment this job's ffmpeg writes: its `-start_number`, or the
+    /// hls muxer's default 0. Segments below it, or past a gap in its run, are
+    /// an earlier job's (gl-52).
+    start_number: i32,
     /// Where this job's ffmpeg stderr is being written — inside the server's
     /// log directory, so a diagnostic can name a file the operator can actually
     /// fetch from `GET /System/Logs/Log`.
@@ -357,9 +361,21 @@ impl RunningJob {
             output_dir,
             playlist_path,
             segment_extension,
+            // `start_ffmpeg` sets it from the job's arguments.
+            start_number: 0,
             log_path,
         }
     }
+}
+
+/// The first segment an HLS ffmpeg writes: the value of its `-start_number`,
+/// or the hls muxer's default 0.
+fn hls_start_number(arguments: &[String]) -> i32 {
+    arguments
+        .windows(2)
+        .find(|pair| pair[0] == "-start_number")
+        .and_then(|pair| pair[1].parse().ok())
+        .unwrap_or(0)
 }
 
 /// Per-job control state, serialized with teardown.
@@ -1078,6 +1094,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 
         // 3. Build the spawn request.
         let stderr_log = log_path.clone();
+        let start_number = hls_start_number(&arguments);
         let req = SpawnRequest {
             program: program.to_owned(),
             arguments,
@@ -1110,15 +1127,18 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         // 6. Store the live job so kill/cleanup can reach the child + cache dir.
         self.attach_running(
             &handle,
-            RunningJob::new(
-                child,
-                state,
-                directory,
-                output_path.to_path_buf(),
-                segment_extension,
-                stderr_log.clone(),
-                hardware_acceleration_type,
-            ),
+            RunningJob {
+                start_number,
+                ..RunningJob::new(
+                    child,
+                    state,
+                    directory,
+                    output_path.to_path_buf(),
+                    segment_extension,
+                    stderr_log.clone(),
+                    hardware_acceleration_type,
+                )
+            },
         );
 
         // 7. Wait until the target file exists OR the process exits, bounded.
@@ -1333,6 +1353,17 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             }
             waiter.wait().await;
         }
+    }
+
+    /// The first segment the running job behind `handle` writes (its
+    /// `-start_number`), or `None` when no process is attached to it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    #[must_use]
+    pub fn segment_start_number(&self, handle: &TranscodingJobHandle) -> Option<i32> {
+        self.with_running(handle, |running| running.start_number)
     }
 
     /// Kills the process behind `handle` (if any) and removes it, deleting its
@@ -2401,6 +2432,47 @@ mod start_ffmpeg_tests {
         assert_eq!(log_path.extension().and_then(|e| e.to_str()), Some("log"));
         // …and nothing shaped like a log sits next to the playlist any more.
         assert!(!playlist.with_extension("log").exists());
+    }
+
+    /// The registry knows the first segment each job writes, from its own
+    /// `-start_number` (the hls muxer's default 0 without one), so the
+    /// segment path can tell its output from an earlier job's (gl-52).
+    #[tokio::test]
+    async fn a_job_records_the_first_segment_its_ffmpeg_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let args = |start: &[&str]| {
+            ["-i", "in.mkv"]
+                .iter()
+                .chain(start)
+                .map(|arg| (*arg).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let seek = tmp.path().join("seek").join("out.m3u8");
+        let st = state(&seek, None);
+        let handle = m
+            .start_ffmpeg(
+                &fake,
+                ffmpeg_req(&st, &seek, args(&["-start_number", "15"])),
+            )
+            .await
+            .expect("start");
+        assert_eq!(m.segment_start_number(&handle), Some(15));
+
+        let from_zero = tmp.path().join("zero").join("out.m3u8");
+        let st = state(&from_zero, None);
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &from_zero, args(&[])))
+            .await
+            .expect("start");
+        assert_eq!(m.segment_start_number(&handle), Some(0));
+
+        m.kill_and_remove(&handle, false, false).await;
+        assert_eq!(m.segment_start_number(&handle), None, "no job, no start");
     }
 
     #[tokio::test]
