@@ -1858,7 +1858,9 @@ pub const VERIFIED: &[Verified] = &[
                stamped by upsert_session (GetSessionInfo, GetImageCacheTag); \
                LastPlaybackCheckIn is DateTime.MinValue until update_now_playing stamps it \
                (SessionInfo.LastPlaybackCheckIn, UpdateNowPlayingItem) and \
-               NowPlayingQueueFullItems is never sent (v12.4's SessionInfoDto has none)",
+               NowPlayingQueueFullItems is never sent (v12.4's SessionInfoDto has none); the \
+               pool loses a session where upstream's does (report_session_ended, close_if_needed; \
+               ReportSessionEnded, CloseIfNeededAsync) and also to evict_idle_sessions",
         date: "2026-11-05",
         divergences: SESSIONS_DIVERGENCES,
         refs: &[],
@@ -2322,6 +2324,11 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "MaxActiveSessions counts the user's sessions in the pool, as upstream \
+         (SessionManager.cs Sessions.Count), but the pool ends a session with no WebSocket that \
+         plays nothing once it is idle past session_idle_hours (the GET /Sessions row), so \
+         stale HTTP-only sessions stop counting then; upstream counts them until the server \
+         restarts. Owner decision (gl-1267, 2026-11-05).",
             "Ferrofin's login backoff (owner decisions on gl-1099; upstream has no rate limit): \
          past login_backoff_attempts failures an account's and a client address's next \
          attempts wait, from 1 s doubling to login_backoff_max_delay_secs. An address that \
@@ -3731,6 +3738,14 @@ const SESSIONS_DIVERGENCES: &[&str] = &[
     "The 403 (controllableByUserId naming another user without the administrator role) and \
      400 (a value the query binder cannot convert) bodies are Ferrofin's error shape, not \
      upstream's. Fix path: gl-666.",
+    "A session with no WebSocket that plays nothing is ended once it has made no request for \
+     longer than the session_idle_hours setting (24 by default, 1 to 168), through the path a \
+     closed socket takes (SessionEnded and its activity-log entry), and its device's \
+     capabilities are forgotten unless a Devices row or another session has its id; upstream \
+     keeps such a session, and every device's capabilities, until the server restarts. A \
+     client that returns gets a new session with the same id, so what the ended one held \
+     (AdditionalUsers, NowViewingItem, the last NowPlayingQueue, PlaylistItemId and pause, \
+     LastPlaybackCheckIn) starts over. Owner decision (gl-1267, 2026-11-05).",
 ];
 
 /// `GET /Users`, `/Users/Public` and `/Users/{userId}` leave other accounts'
