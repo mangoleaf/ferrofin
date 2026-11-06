@@ -2293,10 +2293,12 @@ pub const VERIFIED: &[Verified] = &[
                then the device check, as UpdatePolicyAsync does), the saved provider id, \
                the disabled, remote and schedule checks, \
                the failure counter and lockout, the device and session limits, token \
-               rotation and session activity, and that upstream has no login rate limit. \
+               rotation (device_manager.rs query_devices for DeviceManager.GetDevices: the \
+               user's rows for the device id in Id order, then Logout(Device) of each) and \
+               session activity, and that upstream has no login rate limit. \
                The UserDto and SessionInfoDto \
                builders are shared with other routes and not compared here",
-        date: "2026-11-02",
+        date: "2026-11-05",
         divergences: &[
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",

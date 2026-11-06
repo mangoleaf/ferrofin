@@ -1449,6 +1449,62 @@ mod tests {
         assert!(!info.is_authenticated, "revoked token rejected immediately");
     }
 
+    /// Deleting one device (a logout, or a returning device's login replacing
+    /// its row) drops that token alone: another user's cached session stays
+    /// warm instead of going back to the database.
+    #[tokio::test]
+    async fn a_device_delete_drops_only_its_own_token() {
+        use ferrofin_traits::devices::DeviceManager as _;
+        let db = crate::test_support::test_db().await;
+        let (uid, other_uid) = (Uuid::from_u128(0x9a), Uuid::from_u128(0x9b));
+        crate::test_support::seed_user(&db, uid).await;
+        crate::test_support::seed_named_user(&db, other_uid, "other").await;
+        seed_device(&db, uid).await;
+
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let ctx = context(db.clone()).with_auth_cache(Arc::clone(&cache));
+        let devices = crate::device_manager::FerrofinDeviceManager::new(db.clone())
+            .with_auth_cache(Arc::clone(&cache));
+        let mut other = devices
+            .get_device_by_access_token("dev-tok")
+            .await
+            .expect("token lookup")
+            .expect("seeded device");
+        other.access_token = "other-tok".into();
+        other.device_id = "dev-2".into();
+        other.user_id = ferrofin_db::store::guid_to_db(other_uid);
+        devices.create_device(&other).await.expect("second device");
+        let other_request = header_request("Authorization", r#"MediaBrowser Token="other-tok""#);
+        for request in [token_request(), other_request.clone()] {
+            assert!(
+                ctx.get_authorization_info(&request)
+                    .await
+                    .unwrap()
+                    .is_authenticated
+            );
+        }
+        assert_eq!(cache.len(), 2);
+
+        let device = devices
+            .get_device_by_access_token("dev-tok")
+            .await
+            .expect("token lookup")
+            .expect("seeded device");
+        devices.delete_device(&device).await.unwrap();
+
+        let info = ctx.get_authorization_info(&token_request()).await.unwrap();
+        assert!(
+            !info.is_authenticated,
+            "the deleted token is rejected at once"
+        );
+        assert!(
+            cache.get("other-tok").is_some(),
+            "the other user's cached session survives the delete"
+        );
+        let info = ctx.get_authorization_info(&other_request).await.unwrap();
+        assert_eq!(info.user_id(), other_uid);
+    }
+
     /// The read-through window: a request misses the cache and reads the (still
     /// valid) device row, the admin revokes the device while that request is
     /// mid-flight, and only then does the request store what it read. The

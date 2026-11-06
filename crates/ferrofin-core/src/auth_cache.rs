@@ -7,15 +7,17 @@
 //! part that matters at a trust boundary — **revocation-correct**: the
 //! composition root shares ONE instance between the authorization context
 //! (read-through) and the user/device managers, which [`AuthCache::clear`] it
-//! on every auth-relevant mutation (device delete or update, user
-//! update/delete, password/policy/configuration change; a device's options,
-//! its custom name, are not cached and clear nothing). Clearing wholesale
-//! instead of per-entry keeps the invalidation story impossible to get wrong;
-//! the price is one 2-query re-read per live token afterwards. The one
-//! exception is a login attempt that does not lock the account out: it writes
-//! only that user's row, so it drops only that user's entries
+//! on every auth-relevant mutation (device update, user update/delete,
+//! password/policy/configuration change; a device's options, its custom name,
+//! are not cached and clear nothing). Clearing wholesale instead of per-entry
+//! keeps the invalidation story impossible to get wrong; the price is one
+//! 2-query re-read per live token afterwards. Two writes are narrow enough to
+//! drop less: a login attempt that does not lock the account out writes only
+//! that user's row, so it drops only that user's entries
 //! ([`AuthCache::invalidate_user`]), and wrong passwords for one account
-//! cannot keep every other user's cache cold.
+//! cannot keep every other user's cache cold; a device delete (logout, or a
+//! returning device's login replacing its row) removes one token, so it drops
+//! only that token ([`AuthCache::invalidate_token`]).
 //!
 //! The TTL bounds staleness for anything that *isn't* hooked (e.g. a row
 //! edited by hand in the DB); it is deliberately short. A revoked token never
@@ -98,8 +100,8 @@ struct CachedUserDto {
 #[derive(Debug)]
 pub struct AuthCache {
     ttl: Duration,
-    /// Bumped by [`AuthCache::clear`] and [`AuthCache::invalidate_user`] before
-    /// they touch the maps. A `put` whose
+    /// Bumped by [`AuthCache::clear`], [`AuthCache::invalidate_user`] and
+    /// [`AuthCache::invalidate_token`] before they touch the maps. A `put` whose
     /// caller-captured generation no longer matches is dropped — see the module
     /// docs for why a read-through cache needs this on top of the clear.
     generation: AtomicU64,
@@ -303,6 +305,23 @@ impl AuthCache {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|id, _| !id.eq_ignore_ascii_case(user_id));
+    }
+
+    /// Drops the cached resolution of `token` alone, leaving every other
+    /// token's in place.
+    ///
+    /// For a write that changes that one token (a device row deleted at logout
+    /// or at a returning device's login), where [`clear`](Self::clear) would
+    /// send every live token back to the database. The generation is bumped
+    /// first, as a clear bumps it, so a read of this token taken before the
+    /// write cannot be stored after it; the price is that the other in-flight
+    /// reads skip storing their result once.
+    pub fn invalidate_token(&self, token: &str) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.entries
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(token);
     }
 
     /// The number of live entries (TTL-expired entries included until evicted).
