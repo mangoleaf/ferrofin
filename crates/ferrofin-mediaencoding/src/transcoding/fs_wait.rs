@@ -16,11 +16,20 @@ use tokio::sync::Notify;
 
 use super::manager::SEGMENT_READY_POLL_INTERVAL_MS;
 
+#[cfg(test)]
+thread_local! {
+    /// How many watches [`FsWaiter::new`] armed on this thread, so a test can
+    /// tell a wait that never parked from one that did.
+    pub(crate) static ARMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A wake-up source for "has ffmpeg written `path` yet?" loops.
 ///
-/// Create it **before** the first existence check: a change that lands between
-/// the check and the wait is then held as a permit, never lost. Callers keep
-/// their own `exists()` / `has_exited()` predicate and call [`wait`](Self::wait)
+/// Each one costs a thread, an inotify instance, an epoll and an eventfd, so a
+/// caller may check once before creating it and skip the wait. Once created,
+/// check again **before** the first wait: a change that lands between that
+/// check and the wait is then held as a permit, never lost. Callers keep their
+/// own `exists()` / `has_exited()` predicate and call [`wait`](Self::wait)
 /// between checks.
 pub struct FsWaiter {
     _watcher: Option<RecommendedWatcher>,
@@ -33,6 +42,8 @@ impl FsWaiter {
     /// silently degrades to the fallback tick, so the loop still terminates.
     #[must_use]
     pub fn new(path: &Path) -> Self {
+        #[cfg(test)]
+        ARMED.with(|armed| armed.set(armed.get() + 1));
         let notify = Arc::new(Notify::new());
         let wake = Arc::clone(&notify);
         let watcher = path.parent().and_then(|dir| {

@@ -1281,7 +1281,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// ready the moment its own file exists. Dropping the `+1` wait roughly halves
     /// time-to-first-segment (~4.3s → ~2.4s here) on start and on every seek.
     ///
-    /// Wakes on the directory's inotify events (fallback tick
+    /// Returns at once for a segment already on disk. Otherwise wakes on the
+    /// directory's inotify events (fallback tick
     /// [`SEGMENT_READY_POLL_INTERVAL_MS`]) until the file exists or the job
     /// exits; returns `true` if the segment ends up on disk.
     ///
@@ -1298,6 +1299,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             .with_running(handle, |r| r.segment_extension.clone())
             .unwrap_or_else(|| ".ts".to_owned());
         let seg = segment_path(playlist_path, index, &ext);
+        // A segment already written needs no watch; the loop checks again once
+        // the watch is armed, so one written in between is not missed.
+        if seg.exists() {
+            return true;
+        }
         let waiter = FsWaiter::new(&seg);
 
         loop {
@@ -2584,6 +2590,63 @@ mod start_ffmpeg_tests {
             .await
             .unwrap();
         assert!(!m.wait_for_segment(&handle, &playlist, 3).await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_segment_arms_no_watch_for_a_segment_already_on_disk() {
+        // A client reading behind ffmpeg asks for segments already written:
+        // that wait must not pay for a watcher (a thread, inotify, epoll and
+        // an eventfd) it never parks on.
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("s").join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+        let armed = crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get);
+        assert!(m.wait_for_segment(&handle, &playlist, 0).await);
+        assert_eq!(
+            crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get),
+            armed,
+            "a watch was armed for a segment already on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_segment_arms_a_watch_and_finds_a_segment_written_later() {
+        // The job is running and segment 1 is not written yet: the wait arms
+        // its watch and returns once ffmpeg writes the file.
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+        let armed = crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get);
+        let later = out_dir.join("out1.ts");
+        // On this current-thread runtime the writer runs only once the wait
+        // parks, i.e. after its first check and the watch being armed.
+        tokio::spawn(async move { std::fs::write(later, b"seg").unwrap() });
+        assert!(m.wait_for_segment(&handle, &playlist, 1).await);
+        assert_eq!(
+            crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get),
+            armed + 1
+        );
     }
 
     /// A [`FileCleaner`] that records the deletions it was asked to perform, and
