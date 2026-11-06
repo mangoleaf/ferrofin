@@ -1523,7 +1523,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetMediaSources) and \
                    MediaBrowser.Controller/Entities/Video.cs (GetAllItemsForMediaSources)",
-        date: "2026-11-05",
+        date: "2026-11-06",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \
@@ -1552,6 +1552,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Importing a width's folder that has no row counts only its .jpg tiles; upstream \
              counts every file in it, so a stray file there makes the import fail on its image \
              size. Jellyfin bug not ported.",
+            "Importing a width's folder that has no row saves the row at the width the folder \
+             was made at (the selected width, or the video's own when it is narrower, rounded \
+             down to even), as a generated set's row is; upstream saves the selected width, \
+             so when the two differ the row names a folder that does not exist (its tiles 404) \
+             and gives the tiles the wrong aspect. Jellyfin bug not ported (gl-1246).",
             "TrickplayOptions has a Ferrofin-only FullChroma member, off by default and absent \
              from the JSON while off, which writes 4:4:4 tiles, from 4:4:4 frames on the \
              software path (see the trickplay-extraction row), instead of 4:2:0 (owner \
