@@ -51,6 +51,8 @@
 //! - An unscoped `GET /Items?Recursive=true` (gl-1283). Its scope, the user's
 //!   libraries, views and playlists folder, comes from the cached library set,
 //!   as upstream holds them in memory: a warm listing reads none of those rows.
+//!   With no set live, as after its TTL, a listing reads the set and caches it,
+//!   so the next listing reads none of them either (gl-1399).
 
 use std::sync::Mutex;
 
@@ -425,8 +427,9 @@ async fn a_warm_views_request_reads_no_library_row_again() {
 /// An unscoped `GET /Items?Recursive=true&IncludeItemTypes=Movie` (gl-1283):
 /// `AddUserToQuery` scopes it to the user's views, the libraries, the
 /// playlists folder and the `UserView` rows, which upstream holds in memory.
-/// The library set the visibility check caches holds all of them, so a warm
-/// listing reads none of their rows again.
+/// The cached library set holds all of them, so a warm listing reads none of
+/// their rows again. With none live, as after its TTL, a listing reads the set
+/// and caches it, so the next one reads none either (gl-1399).
 #[tokio::test]
 async fn a_warm_unscoped_listing_reads_no_library_or_view_row_again() {
     record_statements();
@@ -446,12 +449,35 @@ async fn a_warm_unscoped_listing_reads_no_library_or_view_row_again() {
         harness.db.cached_libraries().is_some(),
         "a listing leaves the library set cached"
     );
+    a_listing_reading_no_library_or_view_row(&router, &auth_header, &uri, &warm).await;
+
+    // The set gone, as when its TTL lapses (gl-1399): a listing reads the
+    // rows and caches them, so the next one reads none.
+    harness.db.invalidate_libraries();
+    let (status, cold) = send(&router, &auth_header, "GET", &uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cold, warm, "the cold listing answers as the warm one");
+    assert!(
+        harness.db.cached_libraries().is_some(),
+        "a cold listing caches the library set"
+    );
+    a_listing_reading_no_library_or_view_row(&router, &auth_header, &uri, &warm).await;
+}
+
+/// Sends `uri` inside [`UNSCOPED_SPAN`] and checks it answers `warm` and reads
+/// none of the scope's library, view or playlists-folder rows.
+async fn a_listing_reading_no_library_or_view_row(
+    router: &axum::Router,
+    auth_header: &str,
+    uri: &str,
+    warm: &serde_json::Value,
+) {
     clear_statements(UNSCOPED_SPAN);
-    let (status, page) = send(&router, &auth_header, "GET", &uri, None)
+    let (status, page) = send(router, auth_header, "GET", uri, None)
         .instrument(tracing::info_span!(UNSCOPED_SPAN))
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(page, warm, "the recorded request answers as the warm one");
+    assert_eq!(&page, warm, "the recorded request answers as the warm one");
     let statements = statements_in(UNSCOPED_SPAN);
     let listing = statements.join("\n");
     assert!(
@@ -463,7 +489,8 @@ async fn a_warm_unscoped_listing_reads_no_library_or_view_row_again() {
     assert!(
         !statements
             .iter()
-            .any(|s| s.contains(r#"FROM "BaseItems" WHERE "Type" IN ("#)),
+            .any(|s| s.contains(r#"FROM "BaseItems" WHERE "Type" IN ("#)
+                || s.contains(r#"WHERE "Data" IS NOT NULL AND +"Type" ="#)),
         "the scope's libraries, views and playlists folder come from the cached \
          library set:\n{listing}"
     );

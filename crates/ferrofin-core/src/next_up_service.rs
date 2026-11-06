@@ -22,9 +22,10 @@
 //! per series. One next-up request costs:
 //!
 //! * 1 query mapping the scope's collection folders to their physical
-//!   folders (none while the library set is cached), 1 reading the views
-//!   among the other parents when there are any (plus the grouping arm's own
-//!   reads when one is a grouped view), then 1 for the eligible series keys
+//!   folders (none while the library set is cached), the views among the
+//!   other parents from the library set when there are any (read once when
+//!   none is cached, plus the grouping arm's own reads when one is a grouped
+//!   view), then 1 for the eligible series keys
 //!   ([`get_next_up_series_keys`]);
 //! * 1 query for the projection of every episode of those series joined to the
 //!   user's `UserData` — `(id, season, episode, premiere date, virtual,
@@ -38,9 +39,10 @@
 //!   the manager settled on ([`get_next_up_episode_rows`]), none when no
 //!   episode is on it.
 //!
-//! So 4 round-trips in the default configuration, one more when the scope holds
-//! a parent other than a library with physical folders (the playlists folder
-//! the default scope lists, a view), and one more with specials on. Unlike
+//! So 4 round-trips in the default configuration, 3 while the library set is
+//! cached; with none cached, a scope holding a parent other than a library
+//! with physical folders (the playlists folder the default scope lists, a
+//! view) adds the set's read, and specials add one more. Unlike
 //! C#, the batch loads no full row: its picks and last watched episodes come
 //! from the projection and its specials from their own narrow statement, so an
 //! episode or special picked outside the requested page never has its row
