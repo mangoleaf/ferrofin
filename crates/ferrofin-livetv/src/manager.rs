@@ -65,7 +65,7 @@ use crate::projection::{
 };
 use crate::schedules_direct::{SchedulesDirect, SdChannel, SdProgram};
 use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
-use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, read_xmltv_where};
+use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, read_xmltv_each};
 use crate::xmltv_cache::XmlTvDocument;
 
 /// SQLite's conservative default bind-parameter limit (`SQLITE_MAX_VARIABLE_NUMBER`
@@ -379,6 +379,14 @@ const CHANNEL_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
 /// its first-seen `DateCreated` (upstream stamps it only on a NEW
 /// `LiveTvProgram`; a pre-migration NULL heals to the refresh instant via the
 /// COALESCE), while everything else is the listing's current word.
+///
+/// An airing listed again unchanged is left as it is. `GuideManager.GetProgram`
+/// saves an existing programme only when its listing moved (v12.4
+/// GuideManager.cs:490-675). Without the guard, a refresh would rewrite every
+/// row of a guide that barely changed, index entries included, inside the
+/// write that holds the database's one writer. The guard compares every
+/// column the `SET` takes from the listing (unqualified names are the stored
+/// row), and a NULL `DateCreated` still heals.
 const PROGRAM_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
                     "DateCreated"=COALESCE("FerrofinLiveTvPrograms"."DateCreated", excluded."DateCreated"),
                     "ChannelId"=excluded."ChannelId","StartDate"=excluded."StartDate",
@@ -393,7 +401,22 @@ const PROGRAM_UPSERT_CONFLICT: &str = r#" ON CONFLICT("Id") DO UPDATE SET
                     "IsSports"=excluded."IsSports","ExternalId"=excluded."ExternalId",
                     "IsLive"=excluded."IsLive","ExternalSeriesId"=excluded."ExternalSeriesId",
                     "SeasonNumber"=excluded."SeasonNumber","EpisodeNumber"=excluded."EpisodeNumber",
-                    "ShowId"=excluded."ShowId""#;
+                    "ShowId"=excluded."ShowId"
+                WHERE "DateCreated" IS NULL
+                   OR ("ChannelId","StartDate","EndDate","Title","EpisodeTitle","Overview",
+                       "Genres","ImageUrl","ProductionYear","EpisodeNum","IsNew","IsPremiere",
+                       "IsRepeat","OfficialRating","IsMovie","IsSeries","IsNews","IsKids",
+                       "IsSports","ExternalId","IsLive","ExternalSeriesId","SeasonNumber",
+                       "EpisodeNumber","ShowId")
+               IS NOT (excluded."ChannelId",excluded."StartDate",excluded."EndDate",
+                       excluded."Title",excluded."EpisodeTitle",excluded."Overview",
+                       excluded."Genres",excluded."ImageUrl",excluded."ProductionYear",
+                       excluded."EpisodeNum",excluded."IsNew",excluded."IsPremiere",
+                       excluded."IsRepeat",excluded."OfficialRating",excluded."IsMovie",
+                       excluded."IsSeries",excluded."IsNews",excluded."IsKids",
+                       excluded."IsSports",excluded."ExternalId",excluded."IsLive",
+                       excluded."ExternalSeriesId",excluded."SeasonNumber",
+                       excluded."EpisodeNumber",excluded."ShowId")"#;
 
 /// The on-disk locations the Live TV engine reads and writes.
 ///
@@ -1020,8 +1043,9 @@ impl Drop for FiringClaim {
     }
 }
 
-/// Reads an XMLTV document from its file on the blocking pool, keeping the
-/// programmes `keep` accepts, and hands the document back with the result.
+/// Reads an XMLTV document's channels, and whether it is readable, from its
+/// file on the blocking pool, and hands the document back with the result.
+/// Every programme's children are read past, unbuilt.
 ///
 /// A large IPTV guide is hundreds of megabytes and takes seconds to parse, and
 /// a guide refresh reads each document twice (channels here, then the bound
@@ -1032,24 +1056,25 @@ impl Drop for FiringClaim {
 async fn parse_guide(
     document: XmlTvDocument,
     language: Option<String>,
-    keep: impl FnMut(&XmltvProgramme) -> bool + Send + 'static,
 ) -> Result<(XmlTvDocument, Xmltv), ServiceError> {
     tokio::task::spawn_blocking(move || {
-        let guide = read_document(&document, language.as_deref(), keep);
+        let guide = read_document(&document, language.as_deref(), |_| false, |_| {});
         (document, guide)
     })
     .await
     .map_err(|e| ServiceError::Backend(format!("XMLTV parse task failed: {e}")))
 }
 
-/// Reads `document` from its start, keeping the programmes `keep` accepts.
+/// Reads `document` from its start, handing each programme `keep` accepts on
+/// its start tag to `each` ([`read_xmltv_each`]).
 fn read_document(
     document: &XmlTvDocument,
     language: Option<&str>,
     keep: impl FnMut(&XmltvProgramme) -> bool,
+    each: impl FnMut(XmltvProgramme),
 ) -> Xmltv {
     match document.reader() {
-        Ok(reader) => read_xmltv_where(reader, language, keep),
+        Ok(reader) => read_xmltv_each(reader, language, keep, each),
         Err(e) => Xmltv {
             error: Some(format!("the XMLTV document could not be read: {e}")),
             ..Xmltv::default()
@@ -1079,7 +1104,7 @@ async fn spool_guide(
     document: XmlTvDocument,
     dir: PathBuf,
     language: Option<String>,
-    mut keep: impl FnMut(&XmltvProgramme) -> bool + Send + 'static,
+    keep: impl FnMut(&XmltvProgramme) -> bool + Send + 'static,
 ) -> Result<(std::fs::File, Option<String>), ServiceError> {
     use std::io::{Seek as _, Write as _};
     let spool_error = |e| ServiceError::from(LiveTvError::io("set the guide's airings aside", e));
@@ -1089,14 +1114,13 @@ async fn spool_guide(
             .map_err(spool_error)?;
         let mut out = std::io::BufWriter::new(spool);
         let mut failed = None;
-        let guide = read_document(&document, language.as_deref(), |prog| {
-            if failed.is_none() && keep(prog) {
-                failed = serde_json::to_writer(&mut out, prog)
+        let guide = read_document(&document, language.as_deref(), keep, |prog| {
+            if failed.is_none() {
+                failed = serde_json::to_writer(&mut out, &prog)
                     .map_err(std::io::Error::from)
                     .and_then(|()| out.write_all(b"\n"))
                     .err();
             }
-            false
         });
         drop(document);
         if let Some(e) = failed {
@@ -1965,10 +1989,7 @@ impl FerrofinLiveTvManager {
     ///   (`CopyProgramInfoToTimerInfo`), are saved and re-armed
     ///   (`TimerManager.Update`).
     async fn refresh_timers(&self) -> Result<(), ServiceError> {
-        for timer in self.all_timers().await? {
-            if timer.status == RecordingStatus::Completed {
-                continue;
-            }
+        for timer in self.get_timers().await? {
             let Some(id) = timer.base.id.filter(|id| !id.is_empty()) else {
                 continue;
             };
@@ -2166,8 +2187,8 @@ impl FerrofinLiveTvManager {
                 .collect());
         }
         let document = self.xmltv.get_xml(info).await?;
-        // The channels only: every airing is dropped as soon as it is read.
-        let (_, guide) = parse_guide(document, self.guide_language(info), |_| false).await?;
+        // The channels only: every airing's children are read past, unbuilt.
+        let (_, guide) = parse_guide(document, self.guide_language(info)).await?;
         // Upstream's `GetChannels` throws on a bad document, so the mapping
         // dialog shows an error instead of "no channels".
         if let Some(e) = guide.error {
@@ -2586,9 +2607,9 @@ impl FerrofinLiveTvManager {
             // `Err` below.
             Ok(document) => {
                 // The channels and whether the document is readable; every
-                // airing is dropped as it is read.
+                // airing's children are read past, unbuilt.
                 let (document, probe) =
-                    parse_guide(document, self.guide_language(provider), |_| false).await?;
+                    parse_guide(document, self.guide_language(provider)).await?;
                 if let Some(e) = &probe.error {
                     tracing::warn!(
                         listings_provider = provider.id.as_deref().unwrap_or_default(),
@@ -3754,7 +3775,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // page, so a programme reached through `/Items` carries its
         // `TimerId`/`SeriesTimerId` exactly as one reached through
         // `/LiveTv/Programs` does.
-        let timers: Vec<TimerInfoDto> = self.get_timers().await?;
+        let timers = self
+            .scheduled_timers_for(dtos.iter().filter_map(|dto| rows.get(&dto.id)))
+            .await?;
         if timers.is_empty() {
             return Ok(());
         }
@@ -4034,16 +4057,18 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn get_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
-        // Port of `DefaultLiveTvService.GetTimersAsync` (v10.11.8
+        // Port of `DefaultLiveTvService.GetTimersAsync` (v12.4
         // DefaultLiveTvService.cs:392-403): a COMPLETED timer is not a scheduled
         // recording any more and is excluded from every list read. The row stays
-        // (the recording it made points at it); only this view drops it.
-        Ok(self
-            .all_timers()
-            .await?
-            .into_iter()
-            .filter(|t| t.status != RecordingStatus::Completed)
-            .collect())
+        // (the recording it made points at it, and upstream's timers.json keeps
+        // it too); only this view drops it, in the query, so completed rows are
+        // never parsed.
+        self.json_list(
+            "FerrofinLiveTvTimers",
+            r#"SELECT "Id", "Data" FROM "FerrofinLiveTvTimers"
+               WHERE "Status" <> 'Completed' ORDER BY "StartDate", rowid"#,
+        )
+        .await
     }
 
     async fn get_timer(&self, id: &str) -> Result<Option<TimerInfoDto>, ServiceError> {
@@ -4827,7 +4852,7 @@ impl FerrofinLiveTvManager {
             return Ok(());
         }
         // One timer read for the page (upstream lazily loads the list once).
-        let timers: Vec<TimerInfoDto> = self.get_timers().await?;
+        let timers = self.scheduled_timers_for(rows.iter()).await?;
         if timers.is_empty() {
             return Ok(());
         }
@@ -4835,6 +4860,27 @@ impl FerrofinLiveTvManager {
             Self::apply_recording_info(dto, row, &timers);
         }
         Ok(())
+    }
+
+    /// The `GetTimersAsync` timers (every one but the `Completed`) whose
+    /// `ProgramId` is one of these programmes' `ExternalId`s: all that
+    /// [`Self::apply_recording_info`] can match on the page, in the same
+    /// `StartDate` order, so its first match is upstream's `FirstOrDefault`.
+    async fn scheduled_timers_for(
+        &self,
+        rows: impl Iterator<Item = &GuideProgramRow>,
+    ) -> Result<Vec<TimerInfoDto>, ServiceError> {
+        let ids: Vec<&str> = rows.filter_map(|row| row.external_id.as_deref()).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(
+            crate::dvr_repository::scheduled_timers_for_programs(&self.db, &ids)
+                .await?
+                .into_iter()
+                .filter_map(|(id, data)| self.parse_stored_row("FerrofinLiveTvTimers", &id, &data))
+                .collect(),
+        )
     }
 
     /// [`Self::add_recording_info`]'s per-programme body, over an
@@ -5155,7 +5201,7 @@ impl FerrofinLiveTvManager {
 
     /// Every stored timer, whatever its status — C# `TimerManager.GetAll()`,
     /// which is what the restart path re-arms from. The trait's `get_timers`
-    /// is the FILTERED view on top of this.
+    /// reads the same table, in the same order, minus the `Completed` rows.
     async fn all_timers(&self) -> Result<Vec<TimerInfoDto>, ServiceError> {
         self.json_list(
             "FerrofinLiveTvTimers",
@@ -12862,7 +12908,7 @@ mod tests {
             );
         }
         mgr.refresh_guide().await.expect("refresh");
-        crate::guide_repository::test_support::pin_program_dates(&mgr.db, first)
+        crate::guide_repository::test_support::pin_program_dates(&mgr.db, Some(first))
             .await
             .expect("pin");
 
@@ -12954,6 +13000,134 @@ mod tests {
                 .expect("airings"),
             before
         );
+    }
+
+    /// An airing a refresh lists again unchanged keeps its row untouched, so
+    /// re-reading a guide that barely moved does not rewrite every airing on
+    /// the database's one writer. A changed listing is still written, and an
+    /// airing stored before `DateCreated` existed still takes the write's
+    /// instant.
+    #[tokio::test]
+    async fn a_guide_write_rewrites_only_the_airings_that_changed() {
+        use super::{CategoryClasses, GuideWrite, XmltvProgramme, xmltv_program_rows};
+        use crate::guide_repository::test_support::{
+            channel_ids, pin_program_dates, program_dates, program_rows, total_changes,
+        };
+
+        /// Writes `airing` in a guide write of its own, answering how many
+        /// rows that write changed.
+        async fn write(
+            mgr: &FerrofinLiveTvManager,
+            airing: &XmltvProgramme,
+            by_epg_channel: &HashMap<String, Vec<(String, String)>>,
+        ) -> i64 {
+            let classes = CategoryClasses::from_provider(&ListingsProviderInfo::default());
+            let mut write = GuideWrite::begin(&mgr.db).await.expect("begin");
+            let before = total_changes(&mut write.tx).await.expect("changes");
+            let mut rows: Vec<_> = xmltv_program_rows(airing, by_epg_channel, &classes).collect();
+            write.upsert(&mut rows).await.expect("upsert");
+            let changed = total_changes(&mut write.tx).await.expect("changes") - before;
+            write.finish(&[]).await.expect("finish");
+            changed
+        }
+
+        let mgr = manager_with_relative_guide().await;
+        let channel = channel_ids(&mgr.db).await.expect("channels").remove(0);
+        let by_epg_channel =
+            HashMap::from([("one.tv".to_owned(), vec![(channel, "external".to_owned())])]);
+        let mut airing = XmltvProgramme {
+            channel_id: "one.tv".to_owned(),
+            start: chrono::DateTime::parse_from_rfc3339("2030-01-01T06:00:00+00:00").ok(),
+            title: "Rerun".to_owned(),
+            ..XmltvProgramme::default()
+        };
+
+        assert_eq!(
+            write(&mgr, &airing, &by_epg_channel).await,
+            1,
+            "a new airing"
+        );
+        assert_eq!(
+            write(&mgr, &airing, &by_epg_channel).await,
+            0,
+            "an airing listed again unchanged is not rewritten"
+        );
+
+        airing.desc = Some("Now with a description".to_owned());
+        assert_eq!(
+            write(&mgr, &airing, &by_epg_channel).await,
+            1,
+            "a changed airing"
+        );
+        let overview = |rows: Vec<crate::projection::ProgramRow>| {
+            rows.into_iter()
+                .find(|row| row.title == "Rerun")
+                .and_then(|row| row.overview)
+        };
+        assert_eq!(
+            overview(program_rows(&mgr.db).await.expect("airings")).as_deref(),
+            Some("Now with a description")
+        );
+
+        pin_program_dates(&mgr.db, None).await.expect("unpin");
+        assert_eq!(
+            write(&mgr, &airing, &by_epg_channel).await,
+            1,
+            "an airing without a DateCreated takes the write's instant"
+        );
+        let date = program_dates(&mgr.db)
+            .await
+            .expect("airings")
+            .into_iter()
+            .find(|(title, _, _)| title == "Rerun")
+            .and_then(|(_, _, date)| date);
+        assert!(date.is_some(), "the NULL DateCreated healed");
+    }
+
+    /// The upsert's unchanged-row guard compares, pairwise, exactly the
+    /// columns its `SET` takes from the listing, so a column added to one
+    /// cannot be missed by the other.
+    #[test]
+    fn the_programme_upsert_guard_compares_every_column_it_sets() {
+        let (set, guard) = super::PROGRAM_UPSERT_CONFLICT
+            .split_once(" WHERE ")
+            .expect("a guard");
+        let assigned: Vec<&str> = set
+            .split("=excluded.")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').nth(1))
+            .collect();
+        let (stored, listed) = guard
+            .split_once(" IS NOT ")
+            .expect("a row-value comparison");
+        let names = |tuple: &str, prefix: &str| -> Vec<String> {
+            let inner = tuple.rsplit('(').next().unwrap_or_default();
+            inner
+                .split(')')
+                .next()
+                .unwrap_or_default()
+                .split(',')
+                .map(|name| {
+                    let name = name.trim();
+                    name.strip_prefix(prefix)
+                        .unwrap_or(name)
+                        .trim_matches('"')
+                        .to_owned()
+                })
+                .collect()
+        };
+        assert_eq!(assigned.len(), 25, "{assigned:?}");
+        // Every other assignment copies its own column from the listing; the
+        // one left over is `DateCreated`'s COALESCE.
+        for name in &assigned {
+            assert!(
+                set.contains(&format!("\"{name}\"=excluded.\"{name}\"")),
+                "{name}"
+            );
+        }
+        assert_eq!(set.matches("\"=").count(), assigned.len() + 1, "{set}");
+        assert_eq!(names(stored, ""), assigned);
+        assert_eq!(names(listed, "excluded."), assigned);
     }
 
     /// The spool is read back a batch at a time, and a line that is not an
@@ -13343,6 +13517,75 @@ mod tests {
             .expect("after");
         assert_eq!(after.timer_id, None);
         assert_eq!(after.status, None);
+    }
+
+    /// gl-1256: a programme page parses only the timers it can link, the
+    /// scheduled (not `Completed`) ones for its own programmes. The other
+    /// rows are corrupt here, so any read of them would be recorded as a row
+    /// that does not parse. The page's timer still links whatever the case of
+    /// its `ProgramId` (upstream's `OrdinalIgnoreCase`).
+    #[tokio::test]
+    async fn program_dtos_parse_only_the_pages_scheduled_timers() {
+        use ferrofin_model::live_tv::{BaseTimerInfoDto, RecordingStatus, TimerInfoDto};
+        let mgr = manager_with_relative_guide().await;
+        let rows = mgr
+            .query_program_rows(&InternalItemsQuery::default(), chrono::Utc::now())
+            .await
+            .expect("rows");
+        let target = rows
+            .iter()
+            .find(|r| r.title == "Now Playing")
+            .expect("now playing row");
+        let external_id = target.external_id.clone().expect("external id");
+        let upper = external_id.to_ascii_uppercase();
+        assert_ne!(upper, external_id, "the case-folding path is exercised");
+        let channel_id = Uuid::parse_str(&target.channel_id).expect("guid");
+        let timer = |id: &str, program_id: &str, status| TimerInfoDto {
+            status,
+            base: BaseTimerInfoDto {
+                id: Some(id.to_owned()),
+                channel_id,
+                program_id: Some(program_id.to_owned()),
+                start_date: chrono::Utc::now() + chrono::Duration::hours(6),
+                end_date: chrono::Utc::now() + chrono::Duration::hours(7),
+                ..BaseTimerInfoDto::default()
+            },
+            ..TimerInfoDto::default()
+        };
+        mgr.persist_timer(&timer("scheduled", &upper, RecordingStatus::New))
+            .await
+            .expect("scheduled");
+        for (id, program_id, status) in [
+            ("done", external_id.as_str(), RecordingStatus::Completed),
+            ("elsewhere", "not-on-this-page", RecordingStatus::New),
+        ] {
+            mgr.persist_timer(&timer(id, program_id, status))
+                .await
+                .expect("stored");
+            crate::dvr_repository::test_support::corrupt_timer_data(&mgr.db, id)
+                .await
+                .expect("corrupt");
+        }
+
+        let programs = mgr
+            .get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+            .await
+            .expect("programs");
+        let linked = programs
+            .items
+            .iter()
+            .find(|p| p.name.as_deref() == Some("Now Playing"))
+            .expect("linked");
+        assert_eq!(linked.timer_id.as_deref(), Some("scheduled"));
+        assert_eq!(linked.status.as_deref(), Some("New"));
+        let parsed_broken = mgr
+            .unparseable_rows
+            .lock()
+            .expect("unparseable rows")
+            .get("FerrofinLiveTvTimers")
+            .cloned()
+            .unwrap_or_default();
+        assert!(parsed_broken.is_empty(), "{parsed_broken:?}");
     }
 
     /// Countries come off the shared fetcher and cache under the manager's own

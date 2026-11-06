@@ -2019,11 +2019,12 @@ impl LocalProviderManager {
     }
 
     /// The box-set arm of the single-item refresh — port of
-    /// `TmdbBoxSetProvider` + `TmdbBoxSetImageProvider`: the collection a
+    /// `TmdbBoxSetProvider`: the collection a
     /// `Tmdb` id pins (on the box set, or on the chosen Identify result),
     /// else the top hit of a collection search by the box set's name, parsed
     /// and cleaned as `GetMetadata` does (`TmdbBoxSetProvider.cs:105-108`), as
-    /// a provider result — its name and overview, its id, and its artwork.
+    /// a provider result — its name and overview, and its id. Its artwork is
+    /// `refresh_ordered_images`' (`TmdbBoxSetImageProvider`).
     async fn fetch_box_set(
         tmdb: &TmdbClient,
         name: &str,
@@ -2045,30 +2046,20 @@ impl LocalProviderManager {
         let mut fetched = Fetched::default();
         if fetch.metadata {
             fetched.item = Some(BaseItemEntity {
-                name: Some(collection.name.clone()),
-                overview: collection.overview.clone(),
+                name: Some(collection.name),
+                overview: collection.overview,
                 ..BaseItemEntity::default()
             });
             fetched.provider_ids = vec![("Tmdb".to_owned(), collection_id.to_string())];
         }
-        if fetch.images {
-            for image_type in [ImageType::Primary, ImageType::Backdrop] {
-                if let Some(image) = collection
-                    .images
-                    .iter()
-                    .find(|i| i.image_type == image_type)
-                {
-                    fetched.images.push((image_type, image.url.clone()));
-                }
-            }
-        }
         Some(fetched)
     }
 
-    /// The person arm — port of `TmdbPersonProvider` +
-    /// `TmdbPersonImageProvider`: the person's TMDB id (stored or chosen,
-    /// else the first name-search hit), its biography, birth and death dates
-    /// and birthplace under the looked-up `name`, and its profile image.
+    /// The person arm — port of `TmdbPersonProvider`: the person's TMDB id
+    /// (stored or chosen, else the first name-search hit), and its biography,
+    /// birth and death dates and birthplace under the looked-up `name`. Its
+    /// profile image is `refresh_ordered_images`' (`TmdbPersonImageProvider`),
+    /// which reads the same `/person` response ([`TmdbClient::person_images`]).
     async fn fetch_person(
         tmdb: &TmdbClient,
         name: &str,
@@ -2096,14 +2087,6 @@ impl LocalProviderManager {
             });
             fetched.provider_ids = vec![("Tmdb".to_owned(), tmdb_id.to_string())];
         }
-        if fetch.images
-            && let Some(url) = tmdb
-                .person_lookup(tmdb_id, language)
-                .await
-                .and_then(|p| p.profile_url)
-        {
-            fetched.images.push((ImageType::Primary, url));
-        }
         Some(fetched)
     }
 
@@ -2112,16 +2095,13 @@ impl LocalProviderManager {
     /// 955-1025`): `TmdbSeasonProvider` and the TVDB plugin's
     /// `TvdbSeasonProvider`, each answer folded into `temp` by `MergeData(
     /// result, temp, [], false, false)` (`:1003`), mapped as the scan maps
-    /// them ([`crate::season`]); and TheMovieDb's season poster
-    /// (`TmdbSeasonImageProvider`).
+    /// them ([`crate::season`]).
     ///
     /// Both providers resolve by the SERIES' ids (`SeasonInfo.
     /// SeriesProviderIds`): the series row's, or — identifying — the chosen
     /// result's (`ApplySearchResult`, `:272-293`). TheMovieDb's needs the
-    /// series' `Tmdb` id and never searches (`TmdbSeasonProvider.cs:49-56`;
-    /// its image provider likewise, `TmdbSeasonImageProvider.cs`); its one
-    /// season response serves the metadata and the poster
-    /// (`GetSeasonAsync`'s cache). TheTVDB's needs the series' `Tvdb` id.
+    /// series' `Tmdb` id and never searches (`TmdbSeasonProvider.cs:49-56`).
+    /// TheTVDB's needs the series' `Tvdb` id.
     /// Neither provider declares an `IHasOrder`, so the library's saved
     /// order ranks them and registration — TheTVDB first, a plugin in
     /// Jellyfin, whose plugins register before the server's providers
@@ -2168,9 +2148,8 @@ impl LocalProviderManager {
             Some(&self.preferred_metadata_language(row).await),
             Some(&self.preferred_metadata_country_code(row).await),
         );
-        let wants_tmdb = fetch.images || sources.contains(&fetcher_names::TMDB);
         let details = match tmdb {
-            Some((client, id)) if wants_tmdb => {
+            Some((client, id)) if sources.contains(&fetcher_names::TMDB) => {
                 client
                     .season_details_for_language(id, season_number, language.as_deref())
                     .await
@@ -2224,11 +2203,6 @@ impl LocalProviderManager {
         if answered {
             fetched.item = Some(temp.item);
             fetched.provider_ids = temp.provider_ids;
-        }
-        if fetch.images
-            && let Some(url) = details.and_then(|d| d.poster)
-        {
-            fetched.images.push((ImageType::Primary, url));
         }
         fetched
     }
@@ -2677,10 +2651,7 @@ impl LocalProviderManager {
                         .search_result
                         .as_ref()
                         .and_then(|r| r.search_provider_name.as_deref()),
-                    fetch: Fetch {
-                        images: false,
-                        ..fetch
-                    },
+                    fetch,
                 };
                 // Boxed: the fold's future carries both providers' state
                 // (`clippy::large_futures`).
@@ -2715,10 +2686,7 @@ impl LocalProviderManager {
                         .search_result
                         .as_ref()
                         .and_then(|r| r.search_provider_name.as_deref()),
-                    fetch: Fetch {
-                        images: false,
-                        ..fetch
-                    },
+                    fetch,
                 };
                 let (fetched, failures) = crate::rate_limit::count_request_failures(Box::pin(
                     self.fetch_episode_providers(episode),
@@ -2737,10 +2705,7 @@ impl LocalProviderManager {
                         target,
                         &stored_ids,
                         chosen_name,
-                        Fetch {
-                            images: false,
-                            ..fetch
-                        },
+                        fetch,
                         language.as_deref(),
                     ))
                     .await
@@ -3525,7 +3490,8 @@ impl LocalProviderManager {
     }
 }
 
-/// Which halves of a provider arm run: its metadata, its artwork.
+/// Which halves of a refresh run: the provider arm's metadata, and the
+/// artwork `refresh_ordered_images` acquires.
 #[derive(Debug, Clone, Copy)]
 struct Fetch {
     /// The remote metadata provider runs.
@@ -3552,16 +3518,13 @@ const NO_FILE: FileFacts = FileFacts {
 
 /// What a provider arm of the single-item refresh returned: upstream's
 /// `MetadataResult` of a remote provider (the item fields it sets and its ids,
-/// `None` when metadata was not asked for or it had nothing), plus the
-/// artwork its image provider offers.
+/// `None` when metadata was not asked for or it had nothing).
 #[derive(Debug, Default)]
 struct Fetched {
     /// The provider result's row: only the fields the provider sets.
     item: Option<BaseItemEntity>,
     /// The ids the provider sets on its result.
     provider_ids: Vec<(String, String)>,
-    /// The artwork to download, by image type.
-    images: Vec<(ImageType, String)>,
     /// Each answering provider's `People`, in the order they ran (`None` a
     /// null list), which [`pass_credits`](crate::metadata_merge::pass_credits)
     /// folds.
@@ -8959,6 +8922,14 @@ mod tests {
             .await
             .expect("refresh");
         assert_eq!(update, ItemUpdateType::MetadataDownload);
+        // The metadata and the profile images read one `/person` response, as
+        // `GetPersonAsync`'s cache serves both upstream (gl-1250).
+        assert_eq!(
+            server
+                .query_values("/person/287", "append_to_response")
+                .len(),
+            1
+        );
 
         {
             let saved = store.saved.lock().expect("lock");

@@ -209,6 +209,41 @@ pub async fn timers_for_program(
     .map_err(db_err)
 }
 
+/// The `(Id, Data)` rows of the timers that are not `Completed` and whose
+/// `ProgramId` is one of `program_ids` (ignoring ASCII case), unparsed, in
+/// `StartDate` order (ties in insertion order, as upstream's stable `OrderBy`
+/// over `timers.json`).
+///
+/// The slice of `GetTimersAsync` a programme page's `AddRecordingInfo` can
+/// match, read with the promoted columns so the rest of the table (every
+/// completed recording's timer, every other programme's) is never parsed.
+///
+/// # Errors
+///
+/// Fails when the read fails, or when the ids cannot be serialized.
+pub async fn scheduled_timers_for_programs(
+    db: &Database,
+    program_ids: &[&str],
+) -> Result<Vec<(String, String)>, ServiceError> {
+    let ids = serde_json::to_string(program_ids).map_err(|e| {
+        ServiceError::from(crate::error::LiveTvError::serialize(
+            "serialize program ids",
+            e,
+        ))
+    })?;
+    // One JSON-array bind, not one per id: a guide page has no row limit.
+    sqlx::query_as(
+        r#"SELECT "Id","Data" FROM "FerrofinLiveTvTimers"
+           WHERE "Status" <> 'Completed'
+             AND "ProgramId" COLLATE NOCASE IN (SELECT value FROM json_each(?1))
+           ORDER BY "StartDate", rowid"#,
+    )
+    .bind(ids)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)
+}
+
 /// Inserts the row a capture is about to fill.
 ///
 /// # Errors

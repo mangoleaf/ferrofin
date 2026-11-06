@@ -822,8 +822,9 @@ pub mod test_support {
         Ok(())
     }
 
-    /// Pins every airing's `DateCreated` to a sentinel value.
-    pub async fn pin_program_dates(db: &Database, value: &str) -> Result<(), ServiceError> {
+    /// Pins every airing's `DateCreated` to a sentinel value, or to NULL (an
+    /// airing stored before the column existed).
+    pub async fn pin_program_dates(db: &Database, value: Option<&str>) -> Result<(), ServiceError> {
         sqlx::query(r#"UPDATE "FerrofinLiveTvPrograms" SET "DateCreated" = ?1"#)
             .bind(value)
             .execute(db.writer())
@@ -846,6 +847,15 @@ pub mod test_support {
         .fetch_all(db.pool())
         .await
         .map_err(db_err)
+    }
+
+    /// The rows `conn` has inserted, updated or deleted since it opened
+    /// (`total_changes()`), so a test can tell what a statement wrote.
+    pub async fn total_changes(conn: &mut sqlx::SqliteConnection) -> Result<i64, ServiceError> {
+        sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(conn)
+            .await
+            .map_err(db_err)
     }
 
     /// Every channel's stored `DateCreated`.
