@@ -2665,7 +2665,7 @@ pub async fn build_app_state(
         // Port of `PlaybackStartLogger` / `PlaybackStopLogger`, on the same
         // awaited bus, so every route that reports playback (the obsolete
         // `/PlayingItems/{itemId}` forms included) writes its entry.
-        ferrofin_core::playback_activity::subscribe(&event_bus, &activity, &library);
+        ferrofin_core::playback_activity::subscribe(&event_bus, &activity);
     }
 
     // These two maintenance tasks gate on active playback, so they register

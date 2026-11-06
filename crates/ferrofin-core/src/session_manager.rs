@@ -1863,22 +1863,6 @@ impl SessionManager for FerrofinSessionManager {
             self.library_manager.get_item_by_id(info.item_id).await?
         };
 
-        // C# `OnPlaybackStart`: "User {0} started playback of '{1}' ({2} {3})",
-        // logged here so every route that reports a start logs it once.
-        if let Some(item) = &item {
-            info!(
-                user = session.user_name.as_deref(),
-                user_id = %session.user_id,
-                item_id = %info.item_id,
-                item = item.name.as_deref(),
-                device = session.device_name.as_deref(),
-                device_id = %session.device_id,
-                client = session.client.as_deref(),
-                application_version = session.application_version.as_deref(),
-                "user started playback",
-            );
-        }
-
         // The row moves into the now-playing item, which a listing builds.
         let is_library_item = item.is_some();
         let now_playing = item.map(|row| {
@@ -1886,6 +1870,27 @@ impl SessionManager for FerrofinSessionManager {
                 .kept_now_playing_item(info.item_id)
                 .unwrap_or_else(|| NowPlayingItem::new(row, NowPlaying::of(info)))
         });
+
+        // C# `OnPlaybackStart`: "User {0} started playback of '{1}' ({2} {3})",
+        // logged here so every route that reports a start logs it once, named
+        // from `info.Item`, the now-playing item, kept or new.
+        if let Some(item) = &now_playing {
+            info!(
+                user = session.user_name.as_deref(),
+                user_id = %session.user_id,
+                item_id = %info.item_id,
+                item = item.row.name.as_deref(),
+                device = session.device_name.as_deref(),
+                device_id = %session.device_id,
+                client = session.client.as_deref(),
+                application_version = session.application_version.as_deref(),
+                "user started playback",
+            );
+        }
+        // C# `MediaInfo = info.Item`.
+        let media_info = now_playing
+            .as_deref()
+            .map(|item| playback_media_info(&item.row));
 
         // Record the now-playing item + mark automatic progress started.
         {
@@ -1917,7 +1922,12 @@ impl SessionManager for FerrofinSessionManager {
             }
         }
 
-        let payload = playback_event_payload(&session, info.item_id, info.position_ticks);
+        let payload = playback_event_payload(
+            &session,
+            info.item_id,
+            info.position_ticks,
+            media_info.as_ref(),
+        );
         let _ = self.event_manager.publish("PlaybackStart", &payload).await;
         self.raise(SessionEvent::PlaybackStart);
         Ok(())
@@ -1959,6 +1969,9 @@ impl SessionManager for FerrofinSessionManager {
                 .map(|row| NowPlayingItem::new(row, NowPlaying::of(info)))
         };
         let is_library_item = now_playing.is_some();
+        let media_info = now_playing
+            .as_deref()
+            .map(|item| playback_media_info(&item.row));
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
@@ -1995,7 +2008,12 @@ impl SessionManager for FerrofinSessionManager {
             }
         }
 
-        let payload = playback_event_payload(&session, info.item_id, info.position_ticks);
+        let payload = playback_event_payload(
+            &session,
+            info.item_id,
+            info.position_ticks,
+            media_info.as_ref(),
+        );
         let _ = self
             .event_manager
             .publish("PlaybackProgress", &payload)
@@ -2073,9 +2091,16 @@ impl SessionManager for FerrofinSessionManager {
             Err(error) => (None, Err(error)),
         };
 
+        // C# `info.Item`: the item the session shows when the stop names it
+        // (`info.Item = current`), else the row read above; none when the
+        // library no longer has it.
+        let kept = session.kept_now_playing_item(info.item_id);
+        let stopped_item = stopped_item
+            .as_ref()
+            .map(|row| kept.as_ref().map_or(row, |item| &item.row));
+
         // C# `OnPlaybackStopped`: "User {0} stopped playback of '{1}' at {2}ms
-        // ({3} {4})", for a stop whose item resolves, named from the row read
-        // above (upstream builds `info.Item` from its one `libraryItem`).
+        // ({3} {4})", for a stop whose item resolves, named from `info.Item`.
         // `position_ms` is left out when the client sent no position (upstream
         // writes "unknown"; a numeric field cannot).
         if let Some(item) = stopped_item {
@@ -2104,7 +2129,14 @@ impl SessionManager for FerrofinSessionManager {
             None => Ok(()),
         };
 
-        let payload = playback_event_payload(&session, info.item_id, info.position_ticks);
+        // C# `MediaInfo = info.Item`.
+        let media_info = stopped_item.map(playback_media_info);
+        let payload = playback_event_payload(
+            &session,
+            info.item_id,
+            info.position_ticks,
+            media_info.as_ref(),
+        );
         let _ = self
             .event_manager
             .publish("PlaybackStopped", &payload)
@@ -3148,13 +3180,16 @@ const TICKS_PER_MILLISECOND: i64 = 10_000;
 
 /// The JSON payload for a playback event. The user name, device name and
 /// client stand for `PlaybackProgressEventArgs`' `Users`, `DeviceName` and
-/// `ClientName`: the playback activity loggers read the first two
-/// ([`crate::playback_activity`]), and plugins receive all three, as
+/// `ClientName`, and `MediaInfo` ([`playback_media_info`], `null` for an item
+/// the library does not have) for its `MediaInfo` and `Item`: the playback
+/// activity loggers read the user and device names and the item
+/// ([`crate::playback_activity`]), and plugins receive them all, as
 /// upstream's event consumers do.
 fn playback_event_payload(
     session: &PlaybackSession,
     item_id: Uuid,
     position_ticks: Option<i64>,
+    media_info: Option<&serde_json::Value>,
 ) -> String {
     serde_json::json!({
         "SessionId": session.id,
@@ -3164,8 +3199,23 @@ fn playback_event_payload(
         "ClientName": session.client,
         "ItemId": item_id,
         "PositionTicks": position_ticks,
+        "MediaInfo": media_info,
     })
     .to_string()
+}
+
+/// A playback event's `MediaInfo`, from the row the report read: the
+/// `BaseItemDto` fields upstream's `PlaybackStartLogger` and
+/// `PlaybackStopLogger` read from `eventArgs.MediaInfo` (and `ExtraType` for
+/// `eventArgs.Item.IsThemeMedia`), so the loggers read no row of their own.
+fn playback_media_info(row: &BaseItemEntity) -> serde_json::Value {
+    serde_json::json!({
+        "Name": row.name,
+        "SeriesName": row.series_name,
+        "Artists": crate::dto_service::split_multi(row.artists.as_deref()),
+        "MediaType": row.media_type,
+        "ExtraType": row.extra_type.and_then(crate::dto_service::extra_type_from_disc),
+    })
 }
 
 /// Tests for the **bus-fallback exclusivity** rule of [`FerrofinSessionManager::broadcast`]:

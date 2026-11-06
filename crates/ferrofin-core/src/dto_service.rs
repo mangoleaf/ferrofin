@@ -805,7 +805,7 @@ fn collection_type_of(item: &BaseItemEntity, kind: BaseItemKind) -> Option<Colle
 
 /// Splits a stored pipe-delimited multi-value column into a list, dropping
 /// empties. Jellyfin joins `Genres`/`Studios`/`Artists`/… with `|`.
-fn split_multi(stored: Option<&str>) -> Vec<String> {
+pub(crate) fn split_multi(stored: Option<&str>) -> Vec<String> {
     split_multi_str(stored).map(str::to_owned).collect()
 }
 
