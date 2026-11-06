@@ -4221,9 +4221,10 @@ impl FerrofinDtoService {
         owner_id: Option<Uuid>,
         read: RowRead,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        // Visibility filtering needs the domain tree (`IsVisible`), which is not
-        // ported at this layer; the caller is expected to have filtered the set,
-        // so every input row is projected.
+        // Rows are projected as given. Only `get_base_item_dtos` filters them
+        // (`IsVisible`, for a user, unless its caller skips the check). The
+        // by-id read does not, as upstream's `GetBaseItemDto` does not, and
+        // neither does the linked-children read.
         let mut prefetched = self
             // `GetBaseItemDto` (by id) vs `GetBaseItemDtos` (a page): only the
             // page asks the non-virtual `CanDelete(user, allCollectionFolders)`.
