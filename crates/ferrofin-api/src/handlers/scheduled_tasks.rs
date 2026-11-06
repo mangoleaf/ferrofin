@@ -14,9 +14,11 @@
 //!   triggers (`204`; `404` when missing). The triggers are persisted, surfaced
 //!   on the task's next read, and acted on by the registry's scheduler.
 //!
-//! Elevation-policy enforcement (`Policies.RequiresElevation`) is deferred to the
-//! composition root, matching the other admin controllers; every handler here
-//! takes [`RequireAuth`] so an unauthenticated request still gets `401`.
+//! Every handler here takes [`RequireAdmin`], the controller's
+//! `Policies.RequiresElevation`.
+//!
+//! Names, descriptions and categories come back in the request's UI culture:
+//! the core registry localizes them (`ScheduledTask::is_localized`).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

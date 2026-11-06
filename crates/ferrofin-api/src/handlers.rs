@@ -1132,7 +1132,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         key: "websocket-streams",
         upstream_file: "MediaBrowser.Controller/Net/BasePeriodicWebSocketListener.cs",
         upstream_method: "HandleMessages",
-        ferrofin: "handlers/websocket.rs handle_socket → Streams::apply, event_stream, wake_due \
+        ferrofin: "handlers/websocket.rs websocket_upgrade runs handle_socket under the upgrade \
+                   request's culture and UI culture (WebSocketManager's RequestUICulture, \
+                   applied by ApplyRequestCulture before each inbound message and, in \
+                   SendDataForConnectionAsync, before each GetDataToSendForConnection), and \
+                   task_transition_message re-shows a captured snapshot \
+                   in it through TaskManager::localize_tasks (ferrofin-core scheduled_tasks.rs \
+                   show_text, sort_by_name); handle_socket → Streams::apply, event_stream, wake_due \
                    (drain, should_send); sessions_wake (session_event_forces), sessions_message → \
                    ferrofin-core session_manager.rs SessionEvent raises, with upsert_session's \
                    SessionActivity past SESSION_ACTIVITY_INTERVAL (LogSessionActivity, a new \
@@ -1155,7 +1161,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    WebSocketConnection.SendAsync's SerializeToUtf8Bytes does (property order \
                    compared with MediaBrowser.Model/Dto/SessionInfoDto.cs, \
                    Session/PlayerStateInfo.cs and Tasks/TaskInfo.cs)",
-        date: "2026-11-02",
+        date: "2026-11-05",
         divergences: &[
             "Events already queued for a socket are drained and answered with one Sessions or \
              ActivityLogEntry frame, where upstream sends one per forced event: a burst yields \
@@ -1169,10 +1175,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              sends nothing until a task event, because jellyfin-web's scan button has no HTTP \
              fallback; it costs one registry snapshot per subscribe and none per period, and counts \
              as the stream's last send, so progress inside the first period is held back.",
-            "A task start or completion is sent with the task list captured at the transition, \
+            "A task start or completion is sent with the task list captured at the transition \
+             (its names, descriptions and categories shown again in the socket's culture), \
              where upstream reads the list when it sends; a progress frame due while one is still \
              queued is dropped, so a short run never shows out of order, and a later report sends \
              once the period has passed.",
+            "A socket's task list is ordered in its own upgrade request's culture. Upstream's one \
+             send loop per listener orders every socket's list in the CurrentCulture it inherited \
+             when the listener was built, on the first request after boot to reach the WebSocket \
+             middleware (any request, not only a /socket upgrade); no client shows the order as \
+             sent, since jellyfin-web sorts the tasks itself (owner decision 2026-11-05, gl-428).",
             "A session list that cannot be built is logged and skipped and the subscription stays; \
              upstream logs it and drops the connection's subscription.",
             "A session's NowPlayingItem map members (ImageTags, ProviderIds, ImageBlurHashes, \
