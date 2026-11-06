@@ -119,7 +119,9 @@ fn credits(people: &[String], kind: &str) -> String {
 
 /// Writes one series with one season of `episodes` episodes under `root`:
 /// series and season NFOs, each episode a placeholder file (the probe fails on
-/// it, as on a damaged file) with an NFO crediting two guest stars.
+/// it, as on a damaged file) with an NFO crediting two guest stars and giving
+/// it two genres and a studio, the same for every episode (so each by-name row
+/// is made once, whatever the episode count), and two tags of its own.
 fn write_series(root: &std::path::Path, episodes: usize) {
     let series = root.join("Bench Show (2001)");
     let season = series.join("Season 01");
@@ -149,7 +151,10 @@ fn write_series(root: &std::path::Path, episodes: usize) {
             format!(
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<episodedetails>\n  \
                  <title>Episode {episode}</title>\n  <season>1</season>\n  \
-                 <episode>{episode}</episode>\n  <plot>Episode {episode}.</plot>\n{}\
+                 <episode>{episode}</episode>\n  <plot>Episode {episode}.</plot>\n  \
+                 <genre>Drama</genre>\n  <genre>Comedy</genre>\n  \
+                 <studio>Bench Studio</studio>\n  <tag>Tag {episode}-0</tag>\n  \
+                 <tag>Tag {episode}-1</tag>\n{}\
                  </episodedetails>\n",
                 credits(&guests, "GuestStar")
             ),
@@ -444,6 +449,28 @@ async fn an_episode_reads_neither_the_library_listing_nor_its_row_twice() {
         scans.each(1),
         "an episode writes its ancestors in one statement:\n{listing}"
     );
+
+    // An episode's genres, studios and tags are written a few statements at a
+    // time, not four per value (gl-1282): the id read is one statement up to
+    // 128 values, and each insert one per power-of-two run of its rows. The
+    // episode's 5 values are a run of 4 and one of 1, and so are their links;
+    // its 3 by-name rows (the genres and the studio) a run of 2 and one of 1.
+    for (step, needle, statements) in [
+        ("value rows", r#"INSERT OR IGNORE INTO "ItemValues" ("#, 2),
+        ("value ids", r#""ItemValueId" FROM "ItemValues" WHERE"#, 1),
+        ("links", r#"INSERT OR IGNORE INTO "ItemValuesMap""#, 2),
+        (
+            "by-name rows",
+            r#"INSERT INTO "BaseItems" ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","#,
+            2,
+        ),
+    ] {
+        assert_eq!(
+            scans.more(|s| s.contains(needle)),
+            scans.each(statements),
+            "the statement count of an episode's {step}:\n{listing}"
+        );
+    }
 
     // The parental score reads the rows above an episode only when the item
     // scored before it did not hold them (gl-1252): every episode after a
