@@ -698,7 +698,8 @@ pub struct Config {
     pub auth_cache_ttl_secs: Option<u32>,
 
     /// How long, in seconds, the per-user access check may serve a user's
-    /// policy rows and the libraries' rows and options from its cache
+    /// policy rows, the libraries' rows and options, and the views' and the
+    /// playlists folder's rows from its cache
     /// (`ferrofin_db::row_cache`), which the user-library scope and every
     /// lookup of a library's physical folders also read. The cache also holds
     /// whether a Live TV tuner is configured, which the Live TV gate reads.
