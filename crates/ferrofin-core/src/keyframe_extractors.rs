@@ -251,7 +251,7 @@ pub fn keyframe_extractors(
     repository: Arc<dyn KeyframeRepository>,
     encoder: Arc<dyn MediaEncoder>,
 ) -> Vec<Arc<dyn KeyframeExtractor>> {
-    let ffprobe = FfProbeKeyframeExtractor::new(encoder, &NamingOptions::new());
+    let ffprobe = FfProbeKeyframeExtractor::new(encoder, NamingOptions::shared());
     vec![
         Arc::new(CachedKeyframeExtractor::new(
             Arc::clone(&repository),
