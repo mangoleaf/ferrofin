@@ -473,7 +473,8 @@ impl ItemVisibility {
         kind: BaseItemKind,
         user: &UserEntity,
     ) -> Result<bool, ServiceError> {
-        let top_parents = crate::item_repository::root_folder_top_parents(&self.db, user).await?;
+        let top_parents =
+            crate::item_repository::root_folder_top_parents(&self.db, &self.paths, user).await?;
         self.has_visible_item(kind, user, &top_parents).await
     }
 

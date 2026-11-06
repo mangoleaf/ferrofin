@@ -1491,6 +1491,15 @@ impl ExternalProbeSeam {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times [`LibraryScanner::append_art_dir_images`] listed an
+    /// item's art folders on this thread, for the tests that pin how often a
+    /// scan does. A plain `#[tokio::test]` runs the scan on the test's own
+    /// thread; a `multi_thread` runtime could list where this cannot see it.
+    static ART_DIR_LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Runs blocking filesystem work (a plan pass, a window's file checks, a
 /// trickplay refresh's folder probes) on this worker after handing the
 /// worker's other tasks to the rest of the runtime (`block_in_place`), so
@@ -3832,6 +3841,35 @@ pub(crate) fn dead_by_name_queries() -> [InternalItemsQuery; 2] {
 /// The closing passes [`LibraryScanner::post_scan_passes`] runs, each worth
 /// an equal share of the last 4 % of a scan's progress.
 const POST_SCAN_PASSES: u32 = 12;
+
+/// The `albums` whose stored Primary is still the cover `covers` holds for
+/// them, from one read of their image rows. A failed read is logged and
+/// counts as none: each album then has its cover published again, as an
+/// album whose rows could not be read always had.
+async fn albums_keeping_their_cover(
+    items: &dyn ItemRepository,
+    albums: &[Uuid],
+    covers: &HashMap<Uuid, ItemImageInfo>,
+) -> std::collections::HashSet<Uuid> {
+    let stored = items
+        .get_image_infos_batch(albums)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "could not read the albums' stored artwork to check their covers");
+            HashMap::new()
+        });
+    stored
+        .into_iter()
+        .filter(|(id, images)| {
+            covers.get(id).is_some_and(|cover| {
+                images
+                    .iter()
+                    .any(|image| image.image_type == ImageType::Primary && image.path == cover.path)
+            })
+        })
+        .map(|(id, _)| id)
+        .collect()
+}
 
 /// How many items the splashscreen draws its posters (and, separately, its
 /// thumbs or backdrops) from: `GetItemsWithImageType`'s `Limit = 30`.
@@ -9496,26 +9534,47 @@ impl LibraryScanner {
         let Some(items) = &self.item_repository else {
             return;
         };
-        let albums: std::collections::HashSet<Uuid> = cache
+        let mut albums: Vec<Uuid> = cache
             .track_albums
             .values()
             .chain(cache.album_covers.keys())
             .copied()
             .collect();
-        for id in albums {
-            // Between two albums: the lane's refreshes run (every album
-            // below is read back from the database, so nothing is stale).
-            Box::pin(self.serve_lane(run)).await;
-            // Unchanged albums already supplied covers during the item walk.
-            // Avoid re-reading every track's images on each routine rescan.
-            if !cache.albums_needing_backfill.contains(&id)
-                && let Some(cover) = cache.album_covers.get(&id)
-                && let Ok(images) = items.get_image_infos(id).await
-                && images
-                    .iter()
-                    .any(|image| image.image_type == ImageType::Primary && image.path == cover.path)
-            {
-                continue;
+        albums.sort_unstable();
+        albums.dedup();
+        // Unchanged albums already supplied covers during the item walk.
+        // Avoid re-reading every track's images on each routine rescan.
+        let unchanged = |id: &Uuid| {
+            !cache.albums_needing_backfill.contains(id) && cache.album_covers.contains_key(id)
+        };
+        // The unchanged albums still storing that cover, from one read of
+        // their image rows.
+        let mut keeping: Option<std::collections::HashSet<Uuid>> = None;
+        for (index, &id) in albums.iter().enumerate() {
+            // Between two albums: the lane's refreshes run. A refresh served
+            // here may have rewritten the rows read for the albums still to
+            // come, so they are read again: none is judged by rows it rewrote.
+            if !Box::pin(self.serve_lane(run)).await.is_empty() {
+                keeping = None;
+            }
+            if unchanged(&id) {
+                if keeping.is_none() {
+                    let rest: Vec<Uuid> = albums[index..]
+                        .iter()
+                        .copied()
+                        .filter(|id| unchanged(id))
+                        .collect();
+                    keeping = Some(
+                        albums_keeping_their_cover(items.as_ref(), &rest, &cache.album_covers)
+                            .await,
+                    );
+                }
+                if keeping
+                    .as_ref()
+                    .is_some_and(|keeping| keeping.contains(&id))
+                {
+                    continue;
+                }
             }
             self.inherit_album_cover(id, items.as_ref()).await;
         }
@@ -13401,7 +13460,13 @@ impl LibraryScanner {
         {
             artwork::prune_old_backdrops_in(&written_art_dirs(&root.resolve(), entity), &images);
         }
-        self.append_art_dir_images(entity, &mut images);
+        // The art folders again, for what the providers wrote there. Without a
+        // remote fetch only the extractors run, and they add what they write
+        // to `images`, so the first listing stands unless a cancel cut them
+        // short.
+        if remote || cut_short {
+            self.append_art_dir_images(entity, &mut images);
+        }
         // An album's Primary is stored as its shared, content-addressed cover
         // (what `finish_album_artwork` publishes after the walk). Storing the
         // source file here instead made the two passes rewrite each other's
@@ -14377,6 +14442,8 @@ impl LibraryScanner {
         let Some(meta_root) = &self.metadata_dir else {
             return;
         };
+        #[cfg(test)]
+        ART_DIR_LISTINGS.with(|listings| listings.set(listings.get() + 1));
         // Snapshot the types discovery produced up front, so several art-dir
         // files of one type (backdrop.jpg, backdrop1.jpg, …) all append.
         let discovered: std::collections::HashSet<ImageType> =
@@ -14384,31 +14451,35 @@ impl LibraryScanner {
         // The item's own folder first. The legacy folder adds only the types
         // the own folder has none of, so art present in both lists once.
         let mut found = std::collections::HashSet::new();
-        for dir in written_art_dirs(&meta_root.resolve(), entity) {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            let mut here = std::collections::HashSet::new();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let Some(image_type) = parse_art_file_stem(&path) else {
+        // Folder listings and a file time per image: off the runtime workers,
+        // which a slow metadata share would otherwise stall.
+        off_runtime(|| {
+            for dir in written_art_dirs(&meta_root.resolve(), entity) {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
                     continue;
                 };
-                if discovered.contains(&image_type) || found.contains(&image_type) {
-                    continue;
+                let mut here = std::collections::HashSet::new();
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Some(image_type) = parse_art_file_stem(&path) else {
+                        continue;
+                    };
+                    if discovered.contains(&image_type) || found.contains(&image_type) {
+                        continue;
+                    }
+                    here.insert(image_type);
+                    images.push(ItemImageInfo {
+                        path: path.to_string_lossy().into_owned(),
+                        image_type,
+                        date_modified: file_date_modified(&path),
+                        width: 0,
+                        height: 0,
+                        blur_hash: None,
+                    });
                 }
-                here.insert(image_type);
-                images.push(ItemImageInfo {
-                    path: path.to_string_lossy().into_owned(),
-                    image_type,
-                    date_modified: file_date_modified(&path),
-                    width: 0,
-                    height: 0,
-                    blur_hash: None,
-                });
+                found.extend(here);
             }
-            found.extend(here);
-        }
+        });
     }
 
     /// Resolve the selected provider's complete candidate list and acquire
@@ -24369,6 +24440,8 @@ mod playlists;
 mod provider_cache;
 mod trickplay;
 
+#[cfg(test)]
+mod art_dir_images_tests;
 #[cfg(test)]
 mod directory_cache_tests;
 #[cfg(test)]
