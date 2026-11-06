@@ -356,6 +356,14 @@ pub struct InternalItemsQuery {
     /// bypassing its parent's Series/Season/Channel GetItemsInternal override.
     /// Derived dispatch context, never a client option.
     pub folder_query_recursive: bool,
+    /// Drive a [`recursive`](Self::recursive) [`parent_id`](Self::parent_id)
+    /// scope from the parent's own `AncestorIds` rows, reaching `BaseItems`
+    /// by id, instead of probing them from every `BaseItems` row. The rows are
+    /// the same; only the plan differs, and with it the order of rows the
+    /// `ORDER BY` ties. For a caller whose parent holds a small part of the
+    /// library (a folder's image source), where the probe reads the whole
+    /// table per call. Internal, never a client option.
+    pub drive_from_parent_subtree: bool,
     /// The parent item kind, if known.
     pub parent_type: Option<BaseItemKind>,
     /// The parent's row as the caller already read it, through
@@ -627,6 +635,7 @@ impl Default for InternalItemsQuery {
             user_root_children: false,
             apply_folder_display_options: false,
             folder_query_recursive: false,
+            drive_from_parent_subtree: false,
             parent_type: None,
             parent_row: None,
             descendant_of_id: None,
