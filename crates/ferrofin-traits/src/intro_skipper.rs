@@ -201,8 +201,9 @@ fn seconds_to_ticks(seconds: f64) -> i64 {
 /// episode). Upstream's `RunSegmentPluginProviders(overwrite)` deletes every
 /// provider's rows of the item and re-runs the external providers; Ferrofin's
 /// other segment writers (WASM plugins) manage their own rows, so only the
-/// plugin's rows are replaced. The delete and inserts are not one transaction
-/// (nor are upstream's); a racing refresh is repaired by the next one.
+/// plugin's rows are replaced, with one `replace_producer_segments` call: the
+/// real manager runs it as one transaction (upstream's delete and inserts are
+/// separate), so a failure part-way keeps the previous rows.
 ///
 /// # Errors
 /// A store or media-segment failure.
@@ -211,15 +212,15 @@ pub async fn refresh(
     media_segments: &dyn MediaSegmentManager,
     item_id: Uuid,
 ) -> Result<(), ServiceError> {
-    let provider = provider_id();
     let segments = store.segments_unless_excluded(item_id).await?;
     media_segments
-        .delete_provider_segments(item_id, &provider, None)
-        .await?;
-    for segment in published(item_id, &segments) {
-        media_segments.create_segment(&segment, &provider).await?;
-    }
-    Ok(())
+        .replace_producer_segments(
+            item_id,
+            &provider_id(),
+            None,
+            &published(item_id, &segments),
+        )
+        .await
 }
 
 /// `MediaSegmentRefreshService.RemoveIntroSkipperSegmentsAsync`: drops the
