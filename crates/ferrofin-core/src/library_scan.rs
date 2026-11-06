@@ -17963,7 +17963,7 @@ impl LibraryScanner {
             let during_scan =
                 options.is_some_and(|options| options.extract_chapter_images_during_library_scan);
             let outcome = extractor
-                .refresh(video, &mut chapters, during_scan, cancel)
+                .refresh(video, &mut chapters, None, during_scan, cancel)
                 .await?;
             if outcome.cancelled {
                 return Ok(());

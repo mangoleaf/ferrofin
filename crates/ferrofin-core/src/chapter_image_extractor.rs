@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::{Arc, Weak};
 
 use chrono::{DateTime, Utc};
-use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::base_items::{BaseItemEntity, MediaStreamInfoEntity};
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::{MediaStreamType, Video3DFormat, VideoType};
 use ferrofin_model::entities_media::{ChapterInfo, MediaStream, owning_library};
@@ -18,6 +18,7 @@ use ferrofin_traits::system::PathManager;
 use uuid::Uuid;
 
 use crate::ScanCancel;
+use crate::library_scan::off_runtime;
 
 const TICKS_PER_SECOND: i64 = 10_000_000;
 
@@ -49,28 +50,36 @@ impl ChapterImageRefresh {
         if self.cancelled {
             return;
         }
-        for path in &self.current_images {
-            let referenced = chapters.iter().any(|chapter| {
-                chapter
-                    .image_path
-                    .as_deref()
-                    .is_some_and(|image| !image.is_empty() && image.eq_ignore_ascii_case(path))
-            });
-            let image = Path::new(path)
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| {
-                    ["png", "jpg", "jpeg", "webp", "tbn", "gif", "svg"]
-                        .iter()
-                        .any(|supported| extension.eq_ignore_ascii_case(supported))
-                });
-            if !referenced
-                && image
-                && let Err(error) = std::fs::remove_file(path)
-            {
-                tracing::warn!(%path, %error, "cannot delete unused chapter image");
-            }
+        let unused: Vec<&String> =
+            self.current_images
+                .iter()
+                .filter(|path| {
+                    let referenced = chapters.iter().any(|chapter| {
+                        chapter.image_path.as_deref().is_some_and(|image| {
+                            !image.is_empty() && image.eq_ignore_ascii_case(path)
+                        })
+                    });
+                    let image = Path::new(path)
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| {
+                            ["png", "jpg", "jpeg", "webp", "tbn", "gif", "svg"]
+                                .iter()
+                                .any(|supported| extension.eq_ignore_ascii_case(supported))
+                        });
+                    !referenced && image
+                })
+                .collect();
+        if unused.is_empty() {
+            return;
         }
+        off_runtime(|| {
+            for path in unused {
+                if let Err(error) = std::fs::remove_file(path) {
+                    tracing::warn!(%path, %error, "cannot delete unused chapter image");
+                }
+            }
+        });
     }
 }
 
@@ -110,6 +119,10 @@ impl ChapterImageExtractor {
 
     /// Refreshes image references even when extraction is disabled or a video
     /// is ineligible. The caller decides when to save the changed chapter rows.
+    /// `streams` are the video's stored streams of every type when the caller
+    /// has read them already (a page of the scheduled task,
+    /// [`Self::streams_batch`]); the default video stream is picked from them
+    /// here. `None` reads the video's streams instead.
     ///
     /// # Errors
     /// Returns failures reading library options or stored video streams.
@@ -117,6 +130,7 @@ impl ChapterImageExtractor {
         &self,
         video: &BaseItemEntity,
         chapters: &mut [ChapterInfo],
+        streams: Option<&[MediaStreamInfoEntity]>,
         extract: bool,
         cancel: &ScanCancel,
     ) -> Result<ChapterImageRefresh, ServiceError> {
@@ -139,23 +153,31 @@ impl ChapterImageExtractor {
         )
         .and_then(|folder| folder.library_options.as_ref())
         .is_some_and(|options| options.enable_chapter_image_extraction);
-        let streams = self
-            .streams
-            .get_media_streams(&MediaStreamQuery {
-                item_id,
-                stream_type: Some(MediaStreamType::Video),
-                index: None,
-            })
-            .await?;
+        let stored;
+        let streams = if let Some(streams) = streams {
+            streams
+        } else {
+            stored = self
+                .streams
+                .get_media_streams(&MediaStreamQuery {
+                    item_id,
+                    stream_type: Some(MediaStreamType::Video),
+                    index: None,
+                })
+                .await?;
+            &stored
+        };
+        let video_type = crate::db_error::media_stream_type_disc(MediaStreamType::Video);
         let data = crate::item_data::parse_data(video.data.as_deref());
         let stream = data
             .get("DefaultVideoStreamIndex")
             .and_then(serde_json::Value::as_i64)
             .and_then(|index| {
                 streams
-                    .into_iter()
-                    .find(|stream| stream.stream_index == index)
+                    .iter()
+                    .find(|stream| stream.stream_type == video_type && stream.stream_index == index)
             })
+            .cloned()
             .map(crate::media_source_manager::stream_to_dto);
         let active_recording = self.is_active_recording(video).await;
         let context = RefreshContext {
@@ -172,7 +194,7 @@ impl ChapterImageExtractor {
         let directory = self
             .paths
             .chapter_image_folder_path(item_id, video.path.as_deref().unwrap_or_default());
-        outcome.current_images = saved_images(&directory);
+        outcome.current_images = off_runtime(|| saved_images(&directory));
         for chapter in chapters {
             if chapter.start_position_ticks >= video.run_time_ticks.unwrap_or(0) {
                 break;
@@ -210,6 +232,18 @@ impl ChapterImageExtractor {
             }
         }
         Ok(outcome)
+    }
+
+    /// Every stored stream of each of `item_ids`, in one read, for a caller
+    /// that refreshes a page of videos (the `streams` of [`Self::refresh`]).
+    ///
+    /// # Errors
+    /// Returns failures reading the stored streams.
+    pub async fn streams_batch(
+        &self,
+        item_ids: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Vec<MediaStreamInfoEntity>>, ServiceError> {
+        self.streams.get_media_streams_batch(item_ids).await
     }
 
     /// `Video.IsActiveRecording()`: whether Live TV is still writing the
@@ -288,7 +322,7 @@ impl ChapterImageExtractor {
         target: &str,
     ) -> Result<bool, ServiceError> {
         if let Some(directory) = Path::new(target).parent() {
-            std::fs::create_dir_all(directory)
+            off_runtime(|| std::fs::create_dir_all(directory))
                 .map_err(|error| ServiceError::backend(error.to_string()))?;
         }
         let video = context.video;
@@ -336,8 +370,9 @@ impl ChapterImageExtractor {
             return Err(ServiceError::backend("chapter image extraction cancelled"));
         };
         let frame = frame?;
-        std::fs::copy(&frame, target).map_err(|error| ServiceError::backend(error.to_string()))?;
-        if let Err(error) = std::fs::remove_file(&frame) {
+        off_runtime(|| std::fs::copy(&frame, target))
+            .map_err(|error| ServiceError::backend(error.to_string()))?;
+        if let Err(error) = off_runtime(|| std::fs::remove_file(&frame)) {
             tracing::warn!(%frame, %error, "cannot delete temporary chapter image");
         }
         Ok(true)
@@ -400,7 +435,7 @@ pub(crate) fn date_modified_ticks(date: Option<DateTime<Utc>>) -> i64 {
 }
 
 fn last_write_time(path: &str) -> DateTime<Utc> {
-    std::fs::metadata(path)
+    off_runtime(|| std::fs::metadata(path))
         .and_then(|metadata| metadata.modified())
         .map(DateTime::<Utc>::from)
         .unwrap_or_default()
@@ -655,10 +690,54 @@ pub(crate) mod tests {
             extract: bool,
         ) -> ChapterImageRefresh {
             self.extractor
-                .refresh(&self.video, chapters, extract, &ScanCancel::default())
+                .refresh(&self.video, chapters, None, extract, &ScanCancel::default())
                 .await
                 .unwrap()
         }
+    }
+
+    /// Streams a caller has read already are used as given: the stored ones
+    /// are not read instead, and only a video stream is extracted from.
+    #[tokio::test]
+    async fn refresh_uses_the_streams_it_is_given() {
+        let fixture = Fixture::new(RecordingEncoder::default()).await;
+        let given = |stream_type, width| MediaStreamInfoEntity {
+            item_id: fixture.video.id.clone(),
+            stream_index: 2,
+            codec: Some("h264".to_owned()),
+            width: Some(width),
+            stream_type: media_stream_type_to_disc(stream_type),
+            ..Default::default()
+        };
+        let fixture = &fixture;
+        let refresh = |streams: Vec<MediaStreamInfoEntity>| async move {
+            let mut rows = chapters(&[0]);
+            fixture
+                .extractor
+                .refresh(
+                    &fixture.video,
+                    &mut rows,
+                    Some(&streams),
+                    true,
+                    &ScanCancel::default(),
+                )
+                .await
+                .unwrap()
+        };
+
+        let audio = refresh(vec![given(MediaStreamType::Audio, 640)]).await;
+        assert!(!audio.changed, "no video stream at the default index");
+        assert!(fixture.encoder.calls.lock().unwrap().is_empty());
+
+        let video = refresh(vec![given(MediaStreamType::Video, 640)]).await;
+        assert!(video.changed);
+        let calls = fixture.encoder.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].3.width,
+            Some(640),
+            "the given stream, not the stored one"
+        );
     }
 
     pub(crate) fn chapters(positions: &[i64]) -> Vec<ChapterInfo> {
@@ -879,7 +958,7 @@ pub(crate) mod tests {
         let mut cached = chapters(&[0]);
         let outcome = fixture
             .extractor
-            .refresh(&fixture.video, &mut cached, true, &cancel)
+            .refresh(&fixture.video, &mut cached, None, true, &cancel)
             .await
             .unwrap();
         assert!(outcome.success && outcome.changed && !outcome.cancelled);
@@ -890,7 +969,7 @@ pub(crate) mod tests {
         let mut uncached = chapters(&[200_000_000]);
         let outcome = fixture
             .extractor
-            .refresh(&fixture.video, &mut uncached, true, &cancel)
+            .refresh(&fixture.video, &mut uncached, None, true, &cancel)
             .await
             .unwrap();
         assert!(!outcome.success && !outcome.changed && outcome.cancelled);
