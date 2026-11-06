@@ -49,11 +49,20 @@
 //!   season of daily or weekly airings into one episode. The stored
 //!   `PremiereDate` is not used: an NFO, or a row adopted from Jellyfin
 //!   (server-local midnight), can store an airing's date on another day. A
-//!   file name with no such key keeps upstream's key. The self-heal above
-//!   releases those links on the next run. It also undoes a group made by
-//!   hand through `POST /Videos/MergeVersions` of two airings, or of two
-//!   copies only one of whose file names carries the key; the playlist and
-//!   collection entries that merge rerouted to the primary stay on it.
+//!   file name with no such key carries the file name without its extension,
+//!   compared case-insensitively: the resolver's name cuts everything after a
+//!   year or release clutter, so unnumbered, undated episodes such as
+//!   `Show (1975) - Guest A` and `Show (1975) - Christmas Special` are both
+//!   "Show", 1975, and upstream's key merged them. Two copies with one such
+//!   name in different folders still merge, whatever their containers;
+//!   copies whose names differ (`Pilot 1080p`, `Pilot 720p`) no longer do.
+//!   Only a row with no path or no file name keeps upstream's key. The
+//!   self-heal above releases the links the older keys made on the next run.
+//!   It also undoes a group made by hand through `POST /Videos/MergeVersions`
+//!   of two airings, of two copies only one of whose file names carries the
+//!   key, or of two unnumbered, undated episodes whose file names differ; the
+//!   playlist and collection entries that merge rerouted to the primary stay
+//!   on it.
 //! - Ferrofin models a version group solely by the `PrimaryVersionId` pointer;
 //!   the upstream `OwnerId`/`LocalAlternateVersions`/`LinkedAlternateVersions`
 //!   columns and the linked-child reroute are Jellyfin-internal representation
@@ -865,7 +874,7 @@ static NAMING: LazyLock<NamingOptions> = LazyLock::new(NamingOptions::new);
 /// The upstream 12.0 `GetEpisodeMergeKey`: the first non-blank provider id
 /// (`Tvdb` → `Tmdb` → `Imdb`), else season/episode numbers, else title
 /// fields and — unlike upstream — the file name's version key (its air date,
-/// or its season and episode numbers).
+/// or its season and episode numbers), or the file name when it has neither.
 /// The caller lowercases the key (`StringComparer.OrdinalIgnoreCase`).
 fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<String>) -> String {
     // Every branch is scoped to the series *identity* (presentation key), not
@@ -915,8 +924,15 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
     // longer do. It is read from the file name, not the stored
     // `PremiereDate`: that has several writers (the scan's UTC midnight, an
     // adopted Jellyfin row's server-local midnight, an NFO), so it can put two
-    // airings on one day or one airing on two. A file name with no such key
-    // keeps the upstream key unchanged.
+    // airings on one day or one airing on two.
+    //
+    // A file name with no such key carries the file name without its
+    // extension, a third divergence: the resolver's name cuts everything after
+    // a year or release clutter, so `Show (1975) - Guest A.ts` and `Show (1975)
+    // - Christmas Special.ts` are both "Show", 1975, and upstream's key would
+    // merge them. Two copies with one such name in different folders still
+    // share a key (the caller lowercases it). Only a row with no path or no
+    // file name keeps the upstream key unchanged.
     let key = format!(
         "{series}|title:{}:{}:{}",
         ep.season_name.as_deref().unwrap_or_default(),
@@ -925,13 +941,15 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
             .map(|y| y.to_string())
             .unwrap_or_default()
     );
-    match ep
-        .path
-        .as_deref()
-        .and_then(|path| VideoListResolver::new(&NAMING).episode_version_key(path))
-    {
+    let Some(path) = ep.path.as_deref() else {
+        return key;
+    };
+    match VideoListResolver::new(&NAMING).episode_version_key(path) {
         Some(version) => format!("{key}:{version}"),
-        None => key,
+        None => match Path::new(path).file_stem().and_then(|stem| stem.to_str()) {
+            Some(stem) => format!("{key}:file:{stem}"),
+            None => key,
+        },
     }
 }
 
@@ -1446,7 +1464,7 @@ mod tests {
             episode_merge_key(&numbered, |_| None),
             "Show|title:Season 1:Pilot:2020:S1E2"
         );
-        // No date in the file name: the plugin's key, whatever is stored.
+        // No date in the file name: the file name, whatever is stored.
         let pilot = BaseItemEntity {
             path: Some("/tv/Show/Season 1/Pilot.mkv".to_owned()),
             premiere_date: Some("2020-01-05T00:00:00Z".parse().expect("date")),
@@ -1454,7 +1472,45 @@ mod tests {
         };
         assert_eq!(
             episode_merge_key(&pilot, |_| None),
-            "Show|title:Season 1:Pilot:2020"
+            "Show|title:Season 1:Pilot:2020:file:Pilot"
+        );
+    }
+
+    /// With no date and no numbers in the file name, the title fallback
+    /// carries the file name: two files the resolver names alike ("Show",
+    /// 1975, cut at the year) get two keys, two copies of one file name in
+    /// different folders one. A row with no path keeps the plugin's key.
+    #[test]
+    fn episode_merge_key_keys_undated_titles_on_the_file_name() {
+        let at = |file: &str| BaseItemEntity {
+            path: Some(format!("/tv/Show (1975)/Season 49/{file}")),
+            ..episode("Show", "Season 49", "Show", None)
+        };
+        let guest = at("Show (1975) - Guest A.ts");
+        assert_ne!(
+            episode_merge_key(&guest, |_| None),
+            episode_merge_key(&at("Show (1975) - Christmas Special.ts"), |_| None)
+        );
+        assert_eq!(
+            episode_merge_key(&guest, |_| None),
+            "Show|title:Season 49:Show:2020:file:Show (1975) - Guest A"
+        );
+        assert_eq!(
+            episode_merge_key(&guest, |_| None),
+            episode_merge_key(&at("SD/Show (1975) - Guest A.mkv"), |_| None)
+        );
+        let pathless = episode("Show", "Season 49", "Show", None);
+        assert_eq!(
+            episode_merge_key(&pathless, |_| None),
+            "Show|title:Season 49:Show:2020"
+        );
+        let nameless = BaseItemEntity {
+            path: Some("/".to_owned()),
+            ..episode("Show", "Season 49", "Show", None)
+        };
+        assert_eq!(
+            episode_merge_key(&nameless, |_| None),
+            "Show|title:Season 49:Show:2020"
         );
     }
 
@@ -2248,6 +2304,53 @@ mod tests {
             primary_of(&db, &svc, copy_b).await,
             Some(copy_a.to_string()),
             "two copies of one airing are one episode"
+        );
+        assert_eq!(primary_of(&db, &svc, copy_a).await, None);
+    }
+
+    // Episodes with no number and no date in their file names reach the title
+    // fallback, and the resolver names them all alike when the show's year
+    // comes before what tells them apart: `Show (1975) - Guest A.ts` and
+    // `Show (1975) - Christmas Special.ts` are both "Show", 1975 (Jellyfin's
+    // name for them, and the scan's). They stay apart, and a link an earlier
+    // run made between them is released; two copies of one file name in two
+    // folders, in any case and container, are still one episode.
+    #[tokio::test]
+    async fn merge_episodes_keeps_undated_episodes_named_alike_apart() {
+        let db = test_db().await;
+        let (special, guest_a, guest_b) = (
+            Uuid::from_u128(0x491),
+            Uuid::from_u128(0x492),
+            Uuid::from_u128(0x493),
+        );
+        let (copy_a, copy_b) = (Uuid::from_u128(0x494), Uuid::from_u128(0x495));
+        for (id, width, file) in [
+            (special, 1920, "Show (1975) - Christmas Special.ts"),
+            (guest_a, 1920, "Show (1975) - Guest A.ts"),
+            (guest_b, 1920, "Show (1975) - Guest B.ts"),
+            (copy_a, 1920, "Show (1975) - Reunion.ts"),
+            (copy_b, 640, "SD/show (1975) - reunion.mkv"),
+        ] {
+            let path = format!("/tv/Show (1975)/Season 49/{file}");
+            seed(&db, id, BaseItemKind::Episode, Some(&path), width).await;
+            set_episode_fields(&db, id, "Show", "Season 49", "Show", None, 1975).await;
+        }
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        persistence
+            .set_primary_version_id(guest_b, Some(guest_a))
+            .await
+            .expect("seed stale link");
+
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+        svc.merge_episodes(None).await.expect("merge episodes");
+
+        for id in [special, guest_a, guest_b] {
+            assert_eq!(primary_of(&db, &svc, id).await, None, "episode {id}");
+        }
+        assert_eq!(
+            primary_of(&db, &svc, copy_b).await,
+            Some(copy_a.to_string()),
+            "two copies of one file name are one episode"
         );
         assert_eq!(primary_of(&db, &svc, copy_a).await, None);
     }

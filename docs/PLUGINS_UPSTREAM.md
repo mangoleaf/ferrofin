@@ -171,10 +171,18 @@ Conventions:
   Two copies of one airing still merge, as the core resolver groups them. The
   stored `PremiereDate` is not used: an NFO, or a row adopted from Jellyfin
   (server-local midnight), can store an airing's date on another day. A file
-  name with no such key keeps upstream's key. The self-heal also undoes a
-  group made by hand through `POST /Videos/MergeVersions` of two airings, or
-  of two copies only one of whose file names carries the key; the playlist
-  and collection entries that merge rerouted to the primary stay on it.
+  name with no such key carries the file name without its extension,
+  compared case-insensitively: the resolver's name cuts everything after a
+  year or release clutter, so unnumbered, undated episodes such as
+  `Show (1975) - Guest A` and `Show (1975) - Christmas Special` are both
+  "Show", 1975, and upstream's key merged them. Two copies with one such name
+  in different folders still merge, whatever their containers; copies whose
+  names differ (`Pilot 1080p`, `Pilot 720p`) no longer do. Only a row with no
+  path or no file name keeps upstream's key. The self-heal also undoes a
+  group made by hand through `POST /Videos/MergeVersions` of two airings, of
+  two copies only one of whose file names carries the key, or of two
+  unnumbered, undated episodes whose file names differ; the playlist and
+  collection entries that merge rerouted to the primary stay on it.
   For the same two-libraries reason as the series-row scoping, movie
   grouping is keyed by (owning library `TopParentId`, `Tmdb` id) rather than
   the `Tmdb` id alone: the same film held in a cold (NAS) and a hot (local)

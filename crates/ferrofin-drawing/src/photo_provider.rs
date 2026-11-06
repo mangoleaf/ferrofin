@@ -1535,6 +1535,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_file_reaching_one_ifd_twice_reads_as_no_exif() {
+        // IFD0 points twice at one Exif IFD holding ISO 400. kamadak-exif
+        // 0.6.1 read that IFD again for every pointer, which nested pointers
+        // multiply (GHSA-53gf-vqf6-qvp8); 0.6.2 refuses the file.
+        const EXIF_IFD_TWICE: &[u8] = b"MM\x00\x2a\x00\x00\x00\x08\
+            \x00\x02\x87\x69\x00\x04\x00\x00\x00\x01\x00\x00\x00\x26\
+            \x87\x69\x00\x04\x00\x00\x00\x01\x00\x00\x00\x26\x00\x00\x00\x00\
+            \x00\x01\x88\x27\x00\x03\x00\x00\x00\x01\x01\x90\x00\x00\x00\x00\x00\x00";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, "twice.tiff", EXIF_IFD_TWICE);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(1, 1)));
+        let mut item = PhotoItem {
+            path,
+            width: 1,
+            height: 1,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert_eq!(item.exif, PhotoExif::default());
+        // Read as an unparsable EXIF block (fields cleared), not an I/O error.
+        assert!(item.exif_was_read);
+    }
+
+    #[tokio::test]
     async fn a_non_candidate_extension_is_never_opened_for_exif() {
         let dir = tempfile::tempdir().expect("tempdir");
         // A real EXIF payload, but under an extension the gate excludes.
