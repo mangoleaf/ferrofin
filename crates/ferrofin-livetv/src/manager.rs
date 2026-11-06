@@ -2049,19 +2049,36 @@ impl FerrofinLiveTvManager {
         };
         let before = timer.clone();
         copy_program_into_timer(&program, &mut timer);
-        let changed = timer != before;
+        self.save_and_rearm(Some(&before), &timer).await
+    }
+
+    /// Saves a timer a guide pass has decided on when it differs from
+    /// `stored_row` (`None` for a timer not stored yet), and arms it again
+    /// when it changed or has no arm.
+    ///
+    /// `_timerManager.Update(timer)` → `AddOrUpdateSystemTimer`, for every
+    /// live timer whether or not the guide changed it: re-arming is the
+    /// backstop for an arm that was lost, and a timer whose showing is under
+    /// way fires again at once, which `on_timer_fired` turns away when it is
+    /// already recording. An unchanged timer that still has an arm keeps
+    /// it: re-arming would aim at the same moment, and it keeps a read
+    /// retry's backoff (`retry_unread_timer`) instead of firing at once.
+    async fn save_and_rearm(
+        &self,
+        stored_row: Option<&TimerInfoDto>,
+        timer: &TimerInfoDto,
+    ) -> Result<(), ServiceError> {
+        let changed = stored_row != Some(timer);
         if changed {
-            self.persist_timer(&timer).await?;
+            self.persist_timer(timer).await?;
         }
-        // `_timerManager.Update(timer)` → `AddOrUpdateSystemTimer`, for every
-        // live timer whether or not the guide changed it: re-arming is the
-        // backstop for an arm that was lost, and a timer whose showing is under
-        // way fires again at once, which `on_timer_fired` turns away when it is
-        // already recording. An unchanged timer that still has an arm keeps
-        // it: re-arming would aim at the same moment, and it keeps a read
-        // retry's backoff (`retry_unread_timer`) instead of firing at once.
-        if changed || !self.armed_timers_lock().contains_key(id) {
-            self.arm_timer(&timer);
+        let armed = timer
+            .base
+            .id
+            .as_deref()
+            .is_some_and(|id| self.armed_timers_lock().contains_key(id));
+        if changed || !armed {
+            self.arm_timer(timer);
         }
         Ok(())
     }
@@ -5452,6 +5469,15 @@ impl FerrofinLiveTvManager {
     /// add a timer for every future airing it should record, refresh the ones
     /// that already exist, and — when asked — drop the pending ones it no longer
     /// matches.
+    ///
+    /// Upstream saves and re-arms every timer it touches
+    /// (`_timerManager.Add`/`Update`), and its duplicate sweep saves each
+    /// cancelled repeat a second time. Here each timer is saved once, with
+    /// the sweep's verdict, and only when it differs from its stored row; it
+    /// is re-armed when it changed or has no arm, as
+    /// [`refresh_timer`](Self::refresh_timer) does. The guide refresh runs
+    /// this for every series timer, and saving the same rows again would
+    /// rewrite and re-arm every showing each time (gl-1292).
     async fn update_timers_for_series_timer(
         &self,
         stored: &StoredSeriesTimer,
@@ -5463,6 +5489,9 @@ impl FerrofinLiveTvManager {
         // `enabledTimersForSeries` — the timers this pass left recordable, which
         // is what the duplicate-showing sweep below runs over.
         let mut enabled: Vec<EnabledShowing> = Vec::new();
+        // Each timer the pass decided on, beside its stored row (`None` for a
+        // new one), saved once the duplicate sweep has had its say.
+        let mut decided: Vec<(Option<TimerInfoDto>, TimerInfoDto)> = Vec::new();
         for (program, mut timer) in candidates {
             let id = timer.base.id.clone().unwrap_or_default();
             all_ids.push(id.clone());
@@ -5484,8 +5513,7 @@ impl FerrofinLiveTvManager {
                             timer.clone(),
                         ));
                     }
-                    self.persist_timer(&timer).await?;
-                    self.arm_timer(&timer);
+                    decided.push((None, timer));
                 }
                 Some(mut existing) => {
                     let existing_id = existing.base.id.clone().unwrap_or_default();
@@ -5496,6 +5524,7 @@ impl FerrofinLiveTvManager {
                     {
                         continue;
                     }
+                    let stored_row = existing.clone();
                     update_existing_timer_with_new_metadata(&mut existing, &timer);
                     let is_manual =
                         crate::dvr_repository::timer_is_manual(&self.db, &existing_id).await?;
@@ -5527,8 +5556,7 @@ impl FerrofinLiveTvManager {
                             existing.clone(),
                         ));
                     }
-                    self.persist_timer(&existing).await?;
-                    self.arm_timer(&existing);
+                    decided.push((Some(stored_row), existing));
                 }
             }
         }
@@ -5538,11 +5566,15 @@ impl FerrofinLiveTvManager {
         // for a series timer that skips episodes already in the library
         // (v12.2 DefaultLiveTvService.cs:776-779, jellyfin/jellyfin PR 16220).
         if stored.dto.skip_episodes_in_library {
-            for mut loser in duplicate_showings_to_cancel(&enabled) {
-                loser.status = RecordingStatus::Cancelled;
-                self.persist_timer(&loser).await?;
-                self.arm_timer(&loser);
+            for loser in duplicate_showings_to_cancel(&enabled) {
+                let found = decided.iter_mut().find(|(_, t)| t.base.id == loser.base.id);
+                if let Some((_, timer)) = found {
+                    timer.status = RecordingStatus::Cancelled;
+                }
             }
+        }
+        for (stored_row, timer) in &decided {
+            self.save_and_rearm(stored_row.as_ref(), timer).await?;
         }
 
         if delete_invalid_timers {
@@ -12105,6 +12137,108 @@ mod tests {
                 .iter()
                 .all(|t| t.series_timer_id.as_deref() == Some(st_id.as_str())),
             "and every timer it re-made still belongs to the series timer"
+        );
+    }
+
+    /// Every guide refresh re-expands every series timer, so a fan-out over a
+    /// guide that has not moved must leave each showing as it is. Nothing is
+    /// rewritten and no arm is replaced, as `refresh_timer` treats an
+    /// unchanged timer (gl-898). That includes a repeat the duplicate sweep
+    /// cancels, which the pass first puts back to `New`. A showing that lost
+    /// its arm is armed again, and one the fan-out changes is written once and
+    /// re-armed (gl-1292).
+    #[tokio::test]
+    async fn a_fan_out_over_an_unchanged_guide_rewrites_and_rearms_nothing() {
+        /// The rows the test database's one connection has written so far.
+        async fn writes(mgr: &FerrofinLiveTvManager) -> i64 {
+            let mut conn = mgr.db.writer().acquire().await.expect("connection");
+            crate::guide_repository::test_support::total_changes(&mut conn)
+                .await
+                .expect("changes")
+        }
+        /// The series timer's showings' statuses, earliest first.
+        async fn statuses(mgr: &FerrofinLiveTvManager) -> Vec<RecordingStatus> {
+            let mut timers = mgr.get_timers().await.expect("timers");
+            timers.sort_by_key(|t| t.base.start_date);
+            timers.iter().map(|t| t.status).collect()
+        }
+
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, future).await)
+            .await
+            .expect("create st");
+        let created = statuses(&mgr).await;
+        assert_eq!(
+            created,
+            [
+                RecordingStatus::New,
+                RecordingStatus::Cancelled,
+                RecordingStatus::Cancelled
+            ],
+            "the first showing records and its repeats are duplicates"
+        );
+        let mut timers = mgr.get_timers().await.expect("timers");
+        timers.sort_by_key(|t| t.base.start_date);
+        let recorded = timers[0].base.id.clone().expect("id");
+        let arm = Arc::clone(&mgr.armed_timers_lock()[&recorded]);
+        let mut stored = mgr
+            .stored_series_timer(&st_id)
+            .await
+            .expect("read")
+            .expect("stored series timer");
+
+        let before = writes(&mgr).await;
+        mgr.update_timers_for_series_timer(&stored, false, true)
+            .await
+            .expect("fan-out");
+        assert_eq!(
+            writes(&mgr).await - before,
+            0,
+            "an unchanged showing is not rewritten"
+        );
+        assert!(
+            Arc::ptr_eq(&arm, &mgr.armed_timers_lock()[&recorded]),
+            "and keeps its arm"
+        );
+        assert_eq!(statuses(&mgr).await, created);
+
+        mgr.disarm_timer(&recorded);
+        mgr.update_timers_for_series_timer(&stored, false, true)
+            .await
+            .expect("fan-out");
+        assert!(
+            mgr.armed_timers_lock().contains_key(&recorded),
+            "a showing that lost its arm is armed again"
+        );
+
+        stored.dto.base.pre_padding_seconds += 60;
+        let arm = Arc::clone(&mgr.armed_timers_lock()[&recorded]);
+        let before = writes(&mgr).await;
+        mgr.update_timers_for_series_timer(&stored, true, true)
+            .await
+            .expect("fan-out");
+        assert_eq!(
+            writes(&mgr).await - before,
+            3,
+            "each showing the series timer's new padding changes is written once"
+        );
+        assert!(
+            !Arc::ptr_eq(&arm, &mgr.armed_timers_lock()[&recorded]),
+            "and the one to record is re-armed"
+        );
+        assert_eq!(statuses(&mgr).await, created);
+        assert!(
+            mgr.get_timers()
+                .await
+                .expect("timers")
+                .iter()
+                .all(|t| t.base.pre_padding_seconds == stored.dto.base.pre_padding_seconds)
         );
     }
 
