@@ -562,7 +562,7 @@ pub(crate) fn build_latest_tv_episodes_query(
     }
     qb.push(r#" AND bi."SeriesName" IN ("#);
     let mut names = qb.separated(", ");
-    for name in series_names {
+    for name in ferrofin_db::padded_in_list(series_names) {
         names.push_bind(name.clone());
     }
     qb.push(")");
@@ -1648,12 +1648,8 @@ fn append_name_predicates(
         .map(get_clean_value)
         .collect();
     if !clean_names.is_empty() {
-        qb.push(r#" AND bi."CleanName" IN ("#);
-        let mut sep = qb.separated(", ");
-        for clean in &clean_names {
-            sep.push_bind(clean.clone());
-        }
-        qb.push(")");
+        qb.push(" AND ");
+        push_in_list(qb, r#"bi."CleanName""#, &clean_names);
     }
 
     if let Some(contains) = non_blank(filter.name_contains.as_ref()) {
@@ -3584,7 +3580,8 @@ fn append_paging(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
 
 /// Pushes `<column> IN (?, ?, …)` binding each value, or `1 = 0` for an empty
 /// list (an empty `IN ()` is a SQL syntax error and, like C# `Contains` over an
-/// empty set, matches nothing).
+/// empty set, matches nothing). The binds are padded to a power of two
+/// ([`ferrofin_db::padded_in_list`]), so a list's text is one of a few lengths.
 ///
 /// Values are cloned into the builder, so the source slice need not outlive it;
 /// the cloned owned values (`String`/`i64`/`bool`) satisfy the `'a` encode bound.
@@ -3598,7 +3595,7 @@ where
     }
     qb.push(column).push(" IN (");
     let mut sep = qb.separated(", ");
-    for v in values {
+    for v in ferrofin_db::padded_in_list(values) {
         sep.push_bind(v.clone());
     }
     qb.push(")");
@@ -3637,6 +3634,23 @@ mod tests {
     use ferrofin_model::dto::SortOrder;
     use ferrofin_model::live_tv::ItemSortBy;
     use ferrofin_traits::options::InternalItemsQuery;
+
+    /// `push_in_list` binds a list padded to a power of two, so its text is one
+    /// of a few lengths whatever the count (gl-1243); an empty list matches
+    /// nothing.
+    #[rstest::rstest]
+    #[case(0, "1 = 0")]
+    #[case(1, "c IN (?)")]
+    #[case(3, "c IN (?, ?, ?, ?)")]
+    #[case(4, "c IN (?, ?, ?, ?)")]
+    #[case(5, "c IN (?, ?, ?, ?, ?, ?, ?, ?)")]
+    fn an_in_list_is_padded_to_a_power_of_two(#[case] count: i64, #[case] sql: &str) {
+        use sqlx::{QueryBuilder, Sqlite};
+        let values: Vec<i64> = (0..count).collect();
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("");
+        super::push_in_list(&mut qb, "c", &values);
+        assert_eq!(qb.sql().as_str(), sql);
+    }
 
     /// `push_access_filter`'s text: no library term for an empty scope, a
     /// plain or `+` term by [`super::TopParentTerm`], and no version or owner

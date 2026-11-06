@@ -1876,7 +1876,7 @@ impl PeopleRepository for FerrofinPeopleRepository {
         if item_ids.is_empty() {
             return Ok(out);
         }
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(item_ids) {
             let mut qb = QueryBuilder::<Sqlite>::new(
                 // The role is read back VERBATIM, as in `credits_of`:
                 // `UpdatePeople` normalizes a null role to
@@ -2057,7 +2057,7 @@ impl PeopleRepository for FerrofinPeopleRepository {
         );
         {
             let mut sep = qb.separated(", ");
-            for id in item_ids {
+            for id in ferrofin_db::padded_in_list(item_ids) {
                 sep.push_bind(guid_to_db(*id));
             }
         }

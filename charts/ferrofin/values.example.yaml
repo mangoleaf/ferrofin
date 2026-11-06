@@ -195,10 +195,10 @@ ferrofin:
     # FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS: "30"
     # FERROFIN_LOGIN_BACKOFF_WINDOW_MINS: "15"
     # FERROFIN_LOGIN_BACKOFF_MAX_TRACKED: "100000"
-    # Prepared statements each SQLite connection keeps (100-1024, default 200).
-    # Each connection of the pool keeps its own, about 16 KiB a statement, so a
-    # larger value costs memory on every connection.
-    # FERROFIN_DB_STATEMENT_CACHE: "200"
+    # Prepared statements each SQLite connection keeps (100-1024, default 150).
+    # Each connection of the pool keeps its own, so a larger value costs memory
+    # on every connection: 150 held 6-13 MiB more than 100 on an 8-core server.
+    # FERROFIN_DB_STATEMENT_CACHE: "150"
     # How many videos generate trickplay images at once, each one's widths in
     # turn (default: auto, up to the image-encoding limit, one per CPU). Each
     # generation is an ffmpeg process, and with hardware acceleration holds GPU

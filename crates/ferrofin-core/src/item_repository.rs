@@ -2136,7 +2136,7 @@ impl FerrofinItemRepository {
         // SQLite's variable cap. Each name's counts are computed entirely within
         // its own chunk (the grouping key is the name), so merging is exact.
         let mut counts = HashMap::new();
-        for chunk in page_clean_names.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in page_clean_names.chunks(ferrofin_db::PADDED_LIST_MAX) {
             counts.extend(
                 self.item_counts_by_clean_name(scope, value_types, chunk)
                     .await?,
@@ -2348,9 +2348,10 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
     } else {
         if !filter.exclude_item_ids.is_empty() {
             qb.push(r#" AND ci."Id" NOT IN ("#);
+            let ids = to_guid_strings(&filter.exclude_item_ids);
             let mut sep = qb.separated(", ");
-            for id in to_guid_strings(&filter.exclude_item_ids) {
-                sep.push_bind(id);
+            for id in ferrofin_db::padded_in_list(&ids) {
+                sep.push_bind(id.clone());
             }
             qb.push(")");
         }
@@ -2465,7 +2466,7 @@ fn push_representative_rank(
     {
         qb.push(r#"CASE WHEN bi."TopParentId" IN ("#);
         let mut sep = qb.separated(", ");
-        for t in top_parents {
+        for t in ferrofin_db::padded_in_list(top_parents) {
             sep.push_bind(t.clone());
         }
         qb.push(") THEN 0 ELSE 1 END, ");
@@ -2519,7 +2520,7 @@ pub(crate) async fn physical_folders_by_view(
     let mut by_view = HashMap::new();
     // Chunked: a count batch passes a whole unpaged page, which can exceed
     // SQLite's bind limit.
-    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ids.chunks(ferrofin_db::PADDED_LIST_MAX) {
         let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             // `+"Type"`: the id list is the selective side; see `append_type_filters`.
             r#"SELECT "Id", "Data" FROM "BaseItems" WHERE "Data" IS NOT NULL AND +"Type" = "#,
@@ -3677,7 +3678,7 @@ impl ItemRepository for FerrofinItemRepository {
 
     async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
         let mut rows = Vec::new();
-        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(ids) {
             let sql = format!(
                 r#"SELECT * FROM "BaseItems" WHERE "Id" IN ({})"#,
                 placeholders(chunk.len())
@@ -4040,7 +4041,7 @@ impl ItemRepository for FerrofinItemRepository {
         primary_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<BaseItemEntity>>, ServiceError> {
         let mut map: HashMap<Uuid, Vec<BaseItemEntity>> = HashMap::new();
-        for chunk in primary_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(primary_ids) {
             let sql = format!(
                 r#"SELECT * FROM "BaseItems"
                    WHERE "PrimaryVersionId" IN ({}) AND "Id" <> ?{}"#,
@@ -4117,7 +4118,7 @@ impl ItemRepository for FerrofinItemRepository {
     ) -> Result<std::collections::HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
         let mut map: std::collections::HashMap<Uuid, Vec<ItemImageInfo>> =
             std::collections::HashMap::with_capacity(item_ids.len());
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(item_ids) {
             let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(
                 images_of_items_sql(&placeholders),
@@ -4709,7 +4710,7 @@ pub(crate) async fn select_item_rows_on(
     ids: &[Uuid],
 ) -> Result<Vec<BaseItemEntity>, ServiceError> {
     let mut rows = Vec::new();
-    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ferrofin_db::padded_in_chunks(ids) {
         let marks = ferrofin_db::numbered_placeholders(1..=chunk.len());
         let sql = format!(r#"SELECT * FROM "BaseItems" WHERE {column} IN ({marks})"#);
         let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql));
@@ -4754,7 +4755,7 @@ pub(crate) async fn rows_by_primary_flagged(
     primary_ids: &[Uuid],
 ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
     let mut map: HashMap<Uuid, Vec<(BaseItemEntity, bool)>> = HashMap::new();
-    for chunk in primary_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ferrofin_db::padded_in_chunks(primary_ids) {
         let sql = rows_by_primary_flagged_sql(chunk.len());
         let mut query = sqlx::query_as::<_, FlaggedRow>(sqlx::AssertSqlSafe(sql));
         for id in chunk {
@@ -4852,57 +4853,65 @@ mod tests {
 
     /// A page's artist and music-video album links resolve through one
     /// `(Type, CleanName)` index search per chunk ([`item_ids_by_clean_name`]),
-    /// never a scan of `BaseItems`.
+    /// never a scan of `BaseItems`, at every length a padded list takes
+    /// (gl-1243).
     #[tokio::test]
     async fn item_ids_by_clean_name_seeks_the_type_clean_name_index() {
         let db = test_db().await;
-        let sql = format!("EXPLAIN QUERY PLAN {}", item_ids_by_clean_name_sql(2));
-        let plan: Vec<String> = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind("MediaBrowser.Controller.Entities.Audio.MusicAlbum")
-            .bind("a")
-            .bind("b")
-            .fetch_all(db.pool())
-            .await
-            .expect("plan")
-            .iter()
-            .map(|row| sqlx::Row::get::<String, _>(row, "detail"))
-            .collect();
-        assert!(
-            plan.iter()
-                .any(|detail| detail.starts_with("SEARCH BaseItems USING")
-                    && detail.contains("Type_CleanName")
-                    && detail.contains("(Type=? AND CleanName=?)")),
-            "{plan:#?}"
-        );
-        assert!(
-            !plan
+        for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+            let sql = format!("EXPLAIN QUERY PLAN {}", item_ids_by_clean_name_sql(n));
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind("MediaBrowser.Controller.Entities.Audio.MusicAlbum");
+            for _ in 0..n {
+                query = query.bind("a");
+            }
+            let plan: Vec<String> = query
+                .fetch_all(db.pool())
+                .await
+                .expect("plan")
                 .iter()
-                .any(|detail| detail.starts_with("SCAN BaseItems")),
-            "{plan:#?}"
-        );
+                .map(|row| sqlx::Row::get::<String, _>(row, "detail"))
+                .collect();
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.starts_with("SEARCH BaseItems USING")
+                        && detail.contains("Type_CleanName")
+                        && detail.contains("(Type=? AND CleanName=?)")),
+                "{n} names: {plan:#?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.starts_with("SCAN BaseItems")),
+                "{n} names: {plan:#?}"
+            );
+        }
     }
 
     /// A page's image read comes off the `(ItemId, ImageType)` index already
-    /// in `rowid` order; ordering by `Id` added a temp B-tree sort.
+    /// in `rowid` order; ordering by `Id` added a temp B-tree sort. So at every
+    /// length a padded list takes (gl-1243).
     #[tokio::test]
     async fn page_image_read_needs_no_sort() {
         let db = test_db().await;
-        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "EXPLAIN QUERY PLAN {}",
-            images_of_items_sql("?1,?2")
-        )))
-        .fetch_all(db.pool())
-        .await
-        .expect("plan");
-        let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
-        assert!(
-            details.iter().any(|d| d.contains("_ItemId_ImageType")),
-            "{details:?}"
-        );
-        assert!(
-            !details.iter().any(|d| d.contains("TEMP B-TREE")),
-            "{details:?}"
-        );
+        for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+            let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+                "EXPLAIN QUERY PLAN {}",
+                images_of_items_sql(&ferrofin_db::numbered_placeholders(1..=n))
+            )))
+            .fetch_all(db.pool())
+            .await
+            .expect("plan");
+            let details: Vec<&str> = plan.iter().map(|r| r.3.as_str()).collect();
+            assert!(
+                details.iter().any(|d| d.contains("_ItemId_ImageType")),
+                "{n} ids: {details:?}"
+            );
+            assert!(
+                !details.iter().any(|d| d.contains("TEMP B-TREE")),
+                "{n} ids: {details:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -7334,32 +7343,40 @@ mod tests {
     #[tokio::test]
     async fn the_flagged_version_read_seeks_the_partial_index() {
         let db = test_db().await;
-        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(format!(
-            "EXPLAIN QUERY PLAN {}",
-            rows_by_primary_flagged_sql(2)
-        )));
-        for _ in 0..3 {
-            query = query.bind("00000000-0000-0000-0000-000000000001");
+        // At every length a padded list takes (gl-1243).
+        for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+            let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(
+                format!("EXPLAIN QUERY PLAN {}", rows_by_primary_flagged_sql(n)),
+            ));
+            for _ in 0..=n {
+                query = query.bind("00000000-0000-0000-0000-000000000001");
+            }
+            let plan: Vec<String> = query
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect();
+            let seeks = |alias: &str| {
+                plan.iter().any(|d| {
+                    d.starts_with(&format!("SEARCH {alias} USING"))
+                        && d.contains("_PrimaryVersionId (PrimaryVersionId=?)")
+                })
+            };
+            assert!(
+                seeks("b"),
+                "{n} ids: the rows by their pointer, got: {plan:?}"
+            );
+            assert!(
+                seeks("x"),
+                "{n} ids: the flag by the same index, got: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.starts_with("SCAN")),
+                "{n} ids: no scan, got: {plan:?}"
+            );
         }
-        let plan: Vec<String> = query
-            .fetch_all(db.pool())
-            .await
-            .expect("explain query plan")
-            .into_iter()
-            .map(|(_, _, _, detail)| detail)
-            .collect();
-        let seeks = |alias: &str| {
-            plan.iter().any(|d| {
-                d.starts_with(&format!("SEARCH {alias} USING"))
-                    && d.contains("_PrimaryVersionId (PrimaryVersionId=?)")
-            })
-        };
-        assert!(seeks("b"), "the rows by their pointer, got: {plan:?}");
-        assert!(seeks("x"), "the flag by the same index, got: {plan:?}");
-        assert!(
-            !plan.iter().any(|d| d.starts_with("SCAN")),
-            "no scan, got: {plan:?}"
-        );
 
         let (primary, merged, local) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
         for id in [primary, merged, local] {
@@ -15510,7 +15527,7 @@ pub(crate) async fn item_ids_by_clean_name(
     cleans: &[&String],
 ) -> Result<HashMap<String, Uuid>, ServiceError> {
     let mut ids: HashMap<String, Uuid> = HashMap::new();
-    for chunk in cleans.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ferrofin_db::padded_in_chunks(cleans) {
         let sql = item_ids_by_clean_name_sql(chunk.len());
         let mut query =
             sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql)).bind(type_name);

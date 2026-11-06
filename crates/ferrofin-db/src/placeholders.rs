@@ -31,22 +31,36 @@ pub fn values_rows(rows: usize, columns: usize) -> String {
     vec![row; rows].join(", ")
 }
 
-/// The binds of the `IN (…)` reads over `items`, a chunk at a time: at most
-/// the largest power of two within [`BATCH_BIND_CHUNK`](crate::BATCH_BIND_CHUNK)
-/// per chunk, each padded to a power-of-two length by repeating its last item.
+/// The longest list [`padded_in_list`] pads, and the chunk
+/// [`padded_in_chunks`] reads in: the largest power of two within
+/// [`BATCH_BIND_CHUNK`](crate::BATCH_BIND_CHUNK).
+pub const PADDED_LIST_MAX: usize = 1 << crate::BATCH_BIND_CHUNK.ilog2();
+
+/// The binds of one `IN (…)` list over `items`: padded to the next power of
+/// two by repeating the last item, up to [`PADDED_LIST_MAX`] items; a longer
+/// list keeps its length.
 ///
-/// A repeated value changes no `IN`, so up to that size the read stays one
-/// statement, and its text is one of a few lengths in the prepared-statement
-/// cache (gl-1071) whatever the count.
+/// A repeated value changes no `IN` (`NOT IN` alike), and SQLite returns each
+/// matching row once. So the list's SQL text is one of a few lengths in each
+/// connection's prepared-statement cache, whatever the count, instead of one
+/// per count (gl-1071, gl-1243).
+#[must_use]
+pub fn padded_in_list<T>(items: &[T]) -> Vec<&T> {
+    let pad = if items.len() <= PADDED_LIST_MAX {
+        items.len().next_power_of_two() - items.len()
+    } else {
+        0
+    };
+    items
+        .iter()
+        .chain(std::iter::repeat_n(items.last(), pad).flatten())
+        .collect()
+}
+
+/// The binds of the `IN (…)` reads over `items`, a chunk at a time: at most
+/// [`PADDED_LIST_MAX`] per chunk, each padded as [`padded_in_list`] pads.
 pub fn padded_in_chunks<T>(items: &[T]) -> impl Iterator<Item = Vec<&T>> {
-    let cap = 1_usize << crate::BATCH_BIND_CHUNK.ilog2();
-    items.chunks(cap).map(|chunk| {
-        let pad = chunk.len().next_power_of_two() - chunk.len();
-        chunk
-            .iter()
-            .chain(std::iter::repeat_n(chunk.last(), pad).flatten())
-            .collect()
-    })
+    items.chunks(PADDED_LIST_MAX).map(padded_in_list)
 }
 
 /// `items` in runs whose lengths are powers of two, largest first, none
@@ -107,6 +121,29 @@ mod tests {
             rest = tail;
         }
         assert_eq!(rest, [0_usize; 0]);
+    }
+
+    /// A list up to 256 is the items in order, then the last repeated up to a
+    /// power of two; a longer one is the items alone.
+    #[rstest::rstest]
+    #[case(0, 0)]
+    #[case(1, 1)]
+    #[case(3, 4)]
+    #[case(4, 4)]
+    #[case(5, 8)]
+    #[case(100, 128)]
+    #[case(256, 256)]
+    #[case(257, 257)]
+    #[case(300, 300)]
+    fn padded_in_list_repeats_the_last_item_up_to_a_power_of_two(
+        #[case] count: usize,
+        #[case] len: usize,
+    ) {
+        let items: Vec<usize> = (0..count).collect();
+        let list = padded_in_list(&items);
+        assert_eq!(list.len(), len);
+        assert!(list[..count].iter().copied().eq(items.iter()));
+        assert!(list[count..].iter().all(|item| Some(*item) == items.last()));
     }
 
     /// Every item once, in order, in power-of-two runs no longer than the cap.

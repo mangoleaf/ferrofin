@@ -61,6 +61,7 @@ impl SimilarItemsRepository {
             return Ok(Vec::new());
         }
         let seed = guid_to_db(seed_id);
+        let exclude_ids = ferrofin_db::padded_in_list(exclude_ids);
         let sql = weighted_similar_sql(candidate_types.len(), exclude_ids.len());
         let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql)).bind(&seed);
         for type_name in candidate_types {
@@ -107,7 +108,7 @@ impl SimilarItemsRepository {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        for chunk in values.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(values) {
             let placeholders = ferrofin_db::numbered_placeholders(2..=chunk.len() + 1);
             let sql = format!(
                 // COLLATE binds to the whole comparison, so it must sit on the
@@ -202,11 +203,13 @@ impl SimilarItemsRepository {
         if item_ids.is_empty() || person_types.is_empty() {
             return Ok(Vec::new());
         }
+        let db_ids: Vec<String> = item_ids.iter().map(|id| guid_to_db(*id)).collect();
+        let binds = ferrofin_db::padded_in_list(&db_ids);
         let mut sql = String::from(
             r#"SELECT pm."ItemId", p."Name", pm."ListOrder" FROM "PeopleBaseItemMap" pm
                JOIN "Peoples" p ON p."Id" = pm."PeopleId" WHERE pm."ItemId" IN ("#,
         );
-        for i in 0..item_ids.len() {
+        for i in 0..binds.len() {
             if i > 0 {
                 sql.push(',');
             }
@@ -221,10 +224,9 @@ impl SimilarItemsRepository {
         }
         sql.push(')');
 
-        let db_ids: Vec<String> = item_ids.iter().map(|id| guid_to_db(*id)).collect();
         let mut query =
             sqlx::query_as::<_, (String, Option<String>, Option<i64>)>(sqlx::AssertSqlSafe(sql));
-        for id in &db_ids {
+        for id in binds {
             query = query.bind(id);
         }
         for t in person_types {
@@ -269,7 +271,7 @@ impl SimilarItemsRepository {
         let mut out = std::collections::HashMap::new();
         // The client's `ItemLimit` is unbounded, so the ids are chunked like
         // every other bound list in this file.
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(item_ids) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
                 r#"SELECT "ItemId", "ProviderValue" FROM "BaseItemProviders"

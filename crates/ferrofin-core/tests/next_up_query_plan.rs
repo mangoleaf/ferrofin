@@ -46,27 +46,31 @@ async fn series_keys_are_index_driven_with_no_join_pin() {
     let db = Database::connect_in_memory().await.expect("connect");
     db.run_migrations().await.expect("migrations");
 
-    // user/type/placeholder + three `TopParentId` placeholders + cutoff.
-    let sql = next_up_series_keys_sql(3, false);
-    assert!(!sql.contains("CROSS JOIN"), "no join-order pin: {sql}");
-    let steps = plan(&db, &sql, 7).await;
+    // user/type/placeholder + `n` `TopParentId` placeholders + cutoff, at
+    // every length a padded list takes (gl-1243).
+    for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+        let sql = next_up_series_keys_sql(n, false);
+        assert!(!sql.contains("CROSS JOIN"), "no join-order pin: {sql}");
+        let steps = plan(&db, &sql, n + 4).await;
 
-    assert!(
-        steps
-            .iter()
-            .any(|d| d.starts_with("SEARCH bi USING INDEX") && d.contains("Type=?")),
-        "BaseItems must be read through a Type-led index, got: {steps:?}"
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|d| d.contains(" ud ") && d.contains("UserId=? AND ItemId=?")),
-        "UserData must be reached by (UserId, ItemId) from the BaseItems row, got: {steps:?}"
-    );
-    assert!(
-        !steps.iter().any(|d| d.contains("SCAN")),
-        "no full scan of either table: {steps:?}"
-    );
+        assert!(
+            steps
+                .iter()
+                .any(|d| d.starts_with("SEARCH bi USING INDEX") && d.contains("Type=?")),
+            "{n} parents: BaseItems must be read through a Type-led index, got: {steps:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|d| d.contains(" ud ") && d.contains("UserId=? AND ItemId=?")),
+            "{n} parents: UserData must be reached by (UserId, ItemId) from the BaseItems row, \
+             got: {steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|d| d.contains("SCAN")),
+            "{n} parents: no full scan of either table: {steps:?}"
+        );
+    }
 
     // With a limit the statement carries one more bind and a LIMIT.
     let limited = next_up_series_keys_sql(3, true);

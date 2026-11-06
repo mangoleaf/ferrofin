@@ -88,7 +88,7 @@ fn playlists_statement(top_parents: &[Uuid]) -> sqlx::QueryBuilder<sqlx::Sqlite>
     if !top_parents.is_empty() {
         query.push(r#" AND "TopParentId" IN ("#);
         let mut separated = query.separated(",");
-        for id in top_parents {
+        for id in ferrofin_db::padded_in_list(top_parents) {
             separated.push_bind(guid_to_db(*id));
         }
         separated.push_unseparated(")");
@@ -101,7 +101,7 @@ pub(crate) async fn linked_children(
     parent_ids: &[Uuid],
 ) -> Result<Vec<(String, String)>, ServiceError> {
     let mut pairs = Vec::new();
-    for chunk in parent_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ferrofin_db::padded_in_chunks(parent_ids) {
         let mut query = sqlx::QueryBuilder::new(
             r#"SELECT "ParentId", "ChildId" FROM "LinkedChildren" WHERE "ParentId" IN ("#,
         );
@@ -144,7 +144,7 @@ pub(crate) async fn playlist_access(
     playlist_ids: &[Uuid],
 ) -> Result<Vec<(String, Option<String>, bool, bool)>, ServiceError> {
     let mut access = Vec::new();
-    for chunk in playlist_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ferrofin_db::padded_in_chunks(playlist_ids) {
         let mut query = sqlx::QueryBuilder::new(
             r#"SELECT p."PlaylistId", p."OwnerUserId", p."OpenAccess",
             EXISTS(SELECT 1 FROM "FerrofinPlaylistShares" s WHERE s."PlaylistId" = p."PlaylistId" AND s."UserId" = "#,
@@ -180,7 +180,10 @@ mod tests {
     async fn the_playlist_candidates_seek_their_type() {
         use sqlx::{Execute, Row};
         let db = test_db().await;
-        for top_parents in [vec![Uuid::from_u128(0x201), Uuid::from_u128(0x202)], vec![]] {
+        // No scope, and every length a padded scope list takes (gl-1243).
+        let scopes = std::iter::once(0)
+            .chain((1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_u128 << k));
+        for top_parents in scopes.map(|n| (1..=n).map(Uuid::from_u128).collect::<Vec<_>>()) {
             let mut builder = playlists_statement(&top_parents);
             let mut query = builder.build();
             let args = query.take_arguments().expect("arguments").expect("binds");

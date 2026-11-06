@@ -37,7 +37,7 @@ pub(crate) async fn get_extra_owner_ids_batch(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
-    for chunk in videos.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ferrofin_db::padded_in_chunks(&videos) {
         let sql = video_owners_sql(chunk.len());
         let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
         for id in chunk {
@@ -63,7 +63,7 @@ pub(crate) async fn get_extra_owner_ids_batch(
         }
     }
     let keys: Vec<&str> = series_by_key.keys().copied().collect();
-    for chunk in keys.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ferrofin_db::padded_in_chunks(&keys) {
         let sql = format!(
             "SELECT PresentationUniqueKey, Id FROM BaseItems WHERE PresentationUniqueKey IN ({}) AND Type='MediaBrowser.Controller.Entities.TV.Series'",
             vec!["?"; chunk.len()].join(",")

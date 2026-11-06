@@ -3957,7 +3957,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         item_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<ferrofin_model::entities::MetadataField>>, ServiceError> {
         let mut out: HashMap<Uuid, Vec<ferrofin_model::entities::MetadataField>> = HashMap::new();
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(item_ids) {
             let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
             // `IX_BaseItemMetadataFields_ItemId` serves the lookup; ordered by
             // field so the set reads back the same way every time.

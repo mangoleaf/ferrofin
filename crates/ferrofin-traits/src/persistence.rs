@@ -241,7 +241,8 @@ pub trait ItemRepository: Send + Sync {
     async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
     /// The stored rows of the given items, in as few queries as the
-    /// host-variable limit allows (`ferrofin_db::BATCH_BIND_CHUNK` ids each).
+    /// host-variable limit allows (padded chunks of `ferrofin_db::PADDED_LIST_MAX`
+    /// ids each).
     ///
     /// The batch twin of [`retrieve_item`](Self::retrieve_item), for the
     /// library scan: it needs what is already stored for the items it planned
