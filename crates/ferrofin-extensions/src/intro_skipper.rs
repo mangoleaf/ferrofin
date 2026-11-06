@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use ferrofin_chromaprint::AnalysisMode;
@@ -197,7 +197,7 @@ fn detector(cx: &ExtensionContext) -> DetectSegmentsTask {
         fingerprinter: cx.fingerprinter.clone(),
         ffmpeg: Arc::clone(&cx.ffmpeg),
         cache_dir: cx.cache_dir.child("introskipper"),
-        running: Arc::clone(&cx.intro_skipper_runtime.running),
+        running: cx.intro_skipper_runtime.running.clone(),
         runtime: Arc::clone(&cx.intro_skipper_runtime),
         actions: Arc::clone(&cx.intro_skipper),
         virtual_folders: Arc::clone(&cx.virtual_folders),
@@ -215,7 +215,7 @@ pub fn analysis(cx: &ExtensionContext) -> Arc<dyn IntroSkipperAnalysis> {
 #[async_trait]
 impl IntroSkipperAnalysis for DetectSegmentsTask {
     fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+        self.running.is_busy()
     }
 
     async fn rescan(&self, season_id: Uuid) -> Result<bool, ServiceError> {
@@ -226,13 +226,13 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
                 "Intro Skipper is disabled".to_owned(),
             ));
         }
-        if self.running.swap(true, Ordering::SeqCst) {
+        let Some(lease) = self.running.try_acquire() else {
             return Ok(false);
-        }
+        };
         // Background, not bound to the request, as upstream's `Task.Run`.
         let task = self.clone();
         tokio::spawn(async move {
-            let _release = ReleaseOnDrop(Arc::clone(&task.running));
+            let _release = lease;
             tracing::info!(%season_id, "intro skipper: rescanning a season");
             task.rescan_season(season_id).await;
         });
@@ -727,8 +727,8 @@ struct DetectSegmentsTask {
     /// Silence and keyframe detection, the audio duration probe.
     ffmpeg: Arc<dyn FfmpegService>,
     cache_dir: ferrofin_util::directory_path::DirectoryPath,
-    /// `true` while an analysis pass is running (the runtime's latch).
-    running: Arc<AtomicBool>,
+    /// Held while an analysis pass is running (the runtime's latch).
+    running: automatic::Latch,
     /// The shared run state.
     runtime: Arc<Runtime>,
     /// The per-season analyzer actions (`POST /Intros/AnalyzerActions/UpdateSeason`).
@@ -784,7 +784,7 @@ impl ScheduledTask for DetectSegmentsTask {
         // may hold it. The guard releases it even if the run is aborted
         // mid-await (the task manager cancels a run by aborting its task).
         self.cancel_automatic().await;
-        let _release = self.acquire_latch().await;
+        let _release = self.running.acquire().await?;
         let config = self.load_config().await;
         // Run inline: the task manager queues the execution on its own spawned
         // task, so this body's runtime IS the dashboard's Running state — a
@@ -792,16 +792,6 @@ impl ScheduledTask for DetectSegmentsTask {
         // milliseconds and the run button would appear to do nothing.
         self.run_analysis(progress, &config).await;
         Ok(())
-    }
-}
-
-/// Clears the intro skipper's one-pass-at-a-time latch when dropped, so an
-/// aborted (cancelled) analysis run cannot leave it stuck.
-struct ReleaseOnDrop(Arc<AtomicBool>);
-
-impl Drop for ReleaseOnDrop {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -943,7 +933,7 @@ impl DetectSegmentsTask {
     /// episode between the clean's queue snapshot and its delete could lose
     /// that episode's segments — an accepted divergence.
     async fn clean_cache(&self) -> Result<(), ServiceError> {
-        let _release = self.acquire_latch().await;
+        let _release = self.running.acquire().await?;
         let config = self.load_config().await;
         // Excluded items keep their state: only leaving a library is stale.
         let queue = self.queue(&config, None).await?;
@@ -1800,7 +1790,7 @@ mod tests {
                 fingerprinter,
                 ffmpeg: Arc::new(crate::ffmpeg::FakeFfmpeg::default()),
                 cache_dir: cache.path().join("introskipper").into(),
-                running: Arc::clone(&runtime.running),
+                running: runtime.running.clone(),
                 runtime: Arc::clone(&runtime),
                 virtual_folders: Arc::new(MediaLibrary(media.to_string_lossy().into_owned())),
                 chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
@@ -2226,9 +2216,9 @@ mod tests {
             })
             .await
             .expect("store");
-        h.task.running.store(true, Ordering::SeqCst);
+        let held = h.task.running.acquire().await.expect("latch");
         assert!(!h.task.rescan(SEASON).await.expect("busy"));
-        h.task.running.store(false, Ordering::SeqCst);
+        drop(held);
         assert!(h.task.rescan(SEASON).await.expect("started"));
         for _ in 0..200 {
             if !h.task.is_running() {
@@ -3488,16 +3478,16 @@ mod tests {
     #[tokio::test]
     async fn a_scheduled_pass_waits_for_the_one_in_flight() {
         let h = harness(&TWO_EPISODES, true, "{}", true).await;
-        h.task.running.store(true, Ordering::SeqCst);
+        let held = h.task.running.acquire().await.expect("latch");
         let task = h.task.clone();
         let pass = tokio::spawn(async move { task.execute(&TaskProgress::default()).await });
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!pass.is_finished());
         assert_eq!(h.calls.load(Ordering::SeqCst), 0);
-        h.task.running.store(false, Ordering::SeqCst);
+        drop(held);
         pass.await.expect("join").expect("run");
         assert!(h.calls.load(Ordering::SeqCst) > 0);
-        assert!(!h.task.running.load(Ordering::SeqCst), "released after");
+        assert!(!h.task.is_running(), "released after");
     }
 
     #[tokio::test]

@@ -223,6 +223,11 @@ pub struct FerrofinServerConfigurationManager {
     xbmc_metadata_warned: std::sync::Mutex<Option<WarnedFile>>,
     /// The same for `livetv.json`.
     live_tv_warned: std::sync::Mutex<Option<WarnedFile>>,
+    /// `branding.json` as last read, with its file's stamp then: the
+    /// anonymous branding routes read it on every request.
+    branding_kept: Kept<BrandingOptions>,
+    /// The same for `encoding.json`, read for every playback and transcode.
+    encoding_kept: Kept<EncodingOptions>,
     configuration: Arc<RwLock<Arc<ServerConfiguration>>>,
     write_lock: Arc<tokio::sync::Mutex<()>>,
     listeners: Arc<RwLock<Vec<Arc<ConfigurationListener>>>>,
@@ -247,6 +252,45 @@ fn first_warning(warned: &std::sync::Mutex<Option<WarnedFile>>, path: &std::path
 fn forget_warning(warned: &std::sync::Mutex<Option<WarnedFile>>) {
     warned
         .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+}
+
+/// A named document as last read, and the stamp its file had just before.
+type Kept<T> = std::sync::Mutex<Option<(FileStamp, T)>>;
+
+/// A file's length, modified time and, on unix, inode and change time: what
+/// a kept document is checked against before it is served again. A save
+/// renames a new file in (a new inode), a hand edit moves the modified and
+/// change times, and a chmod the change time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            inode: meta.ino(),
+            #[cfg(unix)]
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+/// Drops the document kept in `kept`, so the next read goes to the file.
+fn forget_kept<T>(kept: &Kept<T>) {
+    kept.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
 }
@@ -415,6 +459,8 @@ impl FerrofinServerConfigurationManager {
             network_warned: std::sync::Mutex::new(None),
             xbmc_metadata_warned: std::sync::Mutex::new(None),
             live_tv_warned: std::sync::Mutex::new(None),
+            branding_kept: Kept::default(),
+            encoding_kept: Kept::default(),
             configuration: Arc::new(RwLock::new(Arc::new(configuration))),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             listeners: Arc::new(RwLock::new(Vec::new())),
@@ -582,6 +628,50 @@ impl FerrofinServerConfigurationManager {
         }
     }
 
+    /// [`Self::read_named`] for a document read on every request: the
+    /// document last read is served again, without a read or a parse, while
+    /// its file keeps the [`FileStamp`] it had just before that read, so a
+    /// save or a hand edit is still read on the next call (upstream keeps the
+    /// document until a save through the API replaces it).
+    ///
+    /// The stat goes through `tokio::fs`, like the splashscreen check: a cold
+    /// stat on a network-mounted configuration directory can park a worker.
+    /// On NFS it answers from the attribute cache, so an edit made on another
+    /// client is seen once that cache expires.
+    ///
+    /// shortcut: a same-length rewrite in place within one timestamp tick of
+    /// the previous write keeps the stamp; this manager's saves rename a new
+    /// file in and drop the kept document. Upgrade to a save generation if a
+    /// writer that rewrites in place shows up.
+    async fn read_named_kept<T: serde::de::DeserializeOwned + Default + Clone>(
+        what: &'static str,
+        path: &std::path::Path,
+        warned: &std::sync::Mutex<Option<WarnedFile>>,
+        kept: &Kept<T>,
+    ) -> Result<T, ServiceError> {
+        let stamp = match tokio::fs::metadata(path).await {
+            Ok(meta) => FileStamp::of(&meta),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                forget_warning(warned);
+                forget_kept(kept);
+                return Ok(T::default());
+            }
+            Err(e) => return Err(io_err(what, path, &e)),
+        };
+        if let Some((kept_stamp, document)) = &*kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            && *kept_stamp == stamp
+        {
+            return Ok(document.clone());
+        }
+        let document: T = Self::read_named(what, path, warned).await?;
+        *kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((stamp, document.clone()));
+        Ok(document)
+    }
+
     /// A shared handle to the current configuration.
     ///
     /// Clones the `Arc`, not the document, so a reader that only needs to
@@ -642,7 +732,11 @@ impl FerrofinServerConfigurationManager {
 #[async_trait]
 impl ServerConfigurationManager for FerrofinServerConfigurationManager {
     fn named_configuration_updated(&self, key: &str, json: Arc<str>) {
+        if key.eq_ignore_ascii_case("branding") {
+            forget_kept(&self.branding_kept);
+        }
         if key.eq_ignore_ascii_case("encoding") {
+            forget_kept(&self.encoding_kept);
             match serde_json::from_str::<EncodingOptions>(&json) {
                 Ok(options) => self
                     .paths
@@ -723,7 +817,13 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
     }
 
     async fn get_branding(&self) -> Result<BrandingOptions, ServiceError> {
-        Self::read_named("read branding", &self.branding_file, &self.branding_warned).await
+        Self::read_named_kept(
+            "read branding",
+            &self.branding_file,
+            &self.branding_warned,
+            &self.branding_kept,
+        )
+        .await
     }
 
     async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError> {
@@ -733,7 +833,7 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
             .into();
         let path = self.branding_file.clone();
         let listeners = Arc::clone(&self.listeners);
-        tokio::task::spawn_blocking(move || {
+        let saved = tokio::task::spawn_blocking(move || {
             let _save = save;
             ferrofin_util::file_helper::atomic_write(&path, json.as_bytes())
                 .map_err(|e| io_err("write branding", &path, &e))?;
@@ -747,14 +847,17 @@ impl ServerConfigurationManager for FerrofinServerConfigurationManager {
             Ok(())
         })
         .await
-        .map_err(|e| ServiceError::backend(format!("branding writer: {e}")))?
+        .map_err(|e| ServiceError::backend(format!("branding writer: {e}")))?;
+        forget_kept(&self.branding_kept);
+        saved
     }
 
     async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
-        Self::read_named(
+        Self::read_named_kept(
             "read encoding options",
             &self.encoding_file,
             &self.encoding_warned,
+            &self.encoding_kept,
         )
         .await
     }
@@ -1816,6 +1919,72 @@ mod tests {
         };
         mgr.update_branding(&branding).await.expect("save branding");
         assert_eq!(mgr.get_branding().await.expect("branding"), branding);
+    }
+
+    /// `encoding` (and `branding`) are read on every request, so the document
+    /// read last is served again while its file is unchanged, and read again
+    /// once a hand edit or a save changes the file.
+    #[tokio::test]
+    async fn a_named_document_is_read_again_only_when_its_file_changes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        let saved = |encoding_thread_count| {
+            serde_json::to_vec(&EncodingOptions {
+                encoding_thread_count,
+                ..EncodingOptions::default()
+            })
+            .expect("serialize")
+        };
+        let threads = || async {
+            mgr.get_encoding_options()
+                .await
+                .expect("read")
+                .encoding_thread_count
+        };
+        ferrofin_util::file_helper::atomic_write(&mgr.encoding_file, &saved(3)).expect("save");
+        assert_eq!(threads().await, 3);
+
+        // Unchanged, the file is not read: what was kept comes back.
+        mgr.encoding_kept
+            .lock()
+            .expect("kept")
+            .as_mut()
+            .expect("kept after a read")
+            .1
+            .encoding_thread_count = 99;
+        assert_eq!(threads().await, 99);
+
+        // A hand edit in place keeps the inode and changes the length.
+        std::fs::write(&mgr.encoding_file, saved(12)).expect("hand edit");
+        assert_eq!(threads().await, 12);
+
+        // A save of the same length renames a new file in.
+        ferrofin_util::file_helper::atomic_write(&mgr.encoding_file, &saved(13)).expect("save");
+        assert_eq!(threads().await, 13);
+
+        // A save through the manager drops what was kept.
+        mgr.named_configuration_updated("encoding", Arc::from("{}"));
+        assert!(mgr.encoding_kept.lock().expect("kept").is_none());
+        let branding = BrandingOptions::default();
+        mgr.update_branding(&branding).await.expect("save branding");
+        assert_eq!(mgr.get_branding().await.expect("branding"), branding);
+        assert!(mgr.branding_kept.lock().expect("kept").is_some());
+        mgr.update_branding(&branding).await.expect("save branding");
+        assert!(mgr.branding_kept.lock().expect("kept").is_none());
+        mgr.get_branding().await.expect("branding");
+        mgr.named_configuration_updated("BRANDING", Arc::from("{}"));
+        assert!(mgr.branding_kept.lock().expect("kept").is_none());
+
+        // A removed file reads as the defaults and drops what was kept.
+        assert_eq!(threads().await, 13);
+        std::fs::remove_file(&mgr.encoding_file).expect("remove");
+        assert_eq!(
+            mgr.get_encoding_options().await.expect("defaults"),
+            EncodingOptions::default()
+        );
+        assert!(mgr.encoding_kept.lock().expect("kept").is_none());
     }
 
     /// A hand-edited `system.json` that no longer parses stops the boot with
