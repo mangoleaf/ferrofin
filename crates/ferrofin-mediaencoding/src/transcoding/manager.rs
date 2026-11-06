@@ -258,7 +258,8 @@ impl SessionReporter for NoopSessionReporter {
 /// Port of `DeleteHlsPartialStreamFiles`: every file in `output_dir` whose name
 /// contains the playlist stem is removed. Behind a seam so kill/cleanup stays
 /// unit-testable against a temp dir without touching a real transcode cache.
-pub trait FileCleaner: Send + Sync {
+/// The teardown runs it on the blocking pool (hence `'static`) and waits for it.
+pub trait FileCleaner: Send + Sync + 'static {
     /// Deletes every file in `output_dir` whose filename contains
     /// `playlist_stem` (case-insensitively). Port of `DeleteHlsPartialStreamFiles`.
     fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str);
@@ -578,7 +579,7 @@ fn take_job_to_admit(
 pub struct TranscodeManagerImpl<S: SessionReporter, C: FileCleaner = FsFileCleaner> {
     jobs: Mutex<Vec<RegisteredJob>>,
     reporter: S,
-    file_cleaner: C,
+    file_cleaner: std::sync::Arc<C>,
     encoding_config:
         Option<std::sync::Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
     /// The throttle's reads of `encoding_config`, which report a document
@@ -622,7 +623,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         Self {
             jobs: Mutex::new(Vec::new()),
             reporter,
-            file_cleaner,
+            file_cleaner: std::sync::Arc::new(file_cleaner),
             encoding_config: None,
             throttle_options: crate::configuration::EncodingOptionsReader::new(
                 "transcode throttle",
@@ -1428,8 +1429,17 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.file_cleaner
-                    .delete_partial_stream_files(&running.output_dir, &stem);
+                // The directory scan and unlinks block, so they run on the
+                // blocking pool; awaited, so callers still go on only after them.
+                let cleaner = std::sync::Arc::clone(&self.file_cleaner);
+                let output_dir = running.output_dir;
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    cleaner.delete_partial_stream_files(&output_dir, &stem);
+                })
+                .await
+                {
+                    tracing::error!(path = %handle.path, %error, "deleting a killed transcode's partial files failed");
+                }
             }
         }
         self.reporter
@@ -2586,20 +2596,24 @@ mod start_ffmpeg_tests {
         assert!(!m.wait_for_segment(&handle, &playlist, 3).await);
     }
 
-    /// A [`FileCleaner`] that records the deletions it was asked to perform, and
-    /// still performs them, so kill/cleanup is observable over a temp dir.
+    /// A [`FileCleaner`] that records the deletions it was asked to perform (and
+    /// the thread each ran on), and still performs them, so kill/cleanup is
+    /// observable over a temp dir.
     #[derive(Clone)]
     struct RecordingCleaner {
-        calls: Arc<Mutex<Vec<(std::path::PathBuf, String)>>>,
+        calls: Arc<Mutex<Vec<(std::path::PathBuf, String, std::thread::ThreadId)>>>,
     }
 
     impl FileCleaner for RecordingCleaner {
         fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str) {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((output_dir.to_path_buf(), playlist_stem.to_owned()));
             FsFileCleaner.delete_partial_stream_files(output_dir, playlist_stem);
+            // Recorded once the files are gone, so a kill that returned before
+            // its deletion finished leaves no call behind.
+            self.calls.lock().unwrap().push((
+                output_dir.to_path_buf(),
+                playlist_stem.to_owned(),
+                std::thread::current().id(),
+            ));
         }
     }
 
@@ -2631,6 +2645,9 @@ mod start_ffmpeg_tests {
         let calls = cleaner.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, "out"); // playlist stem
+        // The current-thread runtime's only worker is this thread: the scan and
+        // unlinks ran on the blocking pool instead.
+        assert_ne!(calls[0].2, std::thread::current().id());
         // The partial files (containing the stem "out") are gone.
         assert!(!out_dir.join("out0.ts").exists());
         assert!(!playlist.exists());
