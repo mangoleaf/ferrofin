@@ -4423,13 +4423,32 @@ impl LiveTvManager for FerrofinLiveTvManager {
         options: &DtoOptions,
         visible: Option<&dyn RecordingVisibility>,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
+        use futures_util::StreamExt as _;
+        // Read once: `usable_cores` reads the cgroup files on every call.
+        static CHECKS_AT_ONCE: OnceLock<usize> = OnceLock::new();
+
         let mut rows = crate::dvr_repository::recording_rows(&self.db, query).await?;
-        let mut gone = HashSet::new();
-        for row in &rows {
-            if Self::recording_file_is_gone(row).await {
-                gone.insert(row.id.clone());
-            }
-        }
+        // Every row is checked, not just the page's: the files that have gone
+        // decide `TotalRecordCount` and where the page starts. On a network
+        // share each check is a round trip, so they overlap, as many at a time
+        // as the server has usable cores.
+        // Collected first: a stream `map` closure over borrowed rows makes the
+        // returned future not provably `Send` (higher-ranked lifetime).
+        let checks: Vec<_> = rows
+            .iter()
+            .map(|row| async move {
+                Self::recording_file_is_gone(row)
+                    .await
+                    .then(|| row.id.clone())
+            })
+            .collect();
+        let gone: HashSet<String> = futures_util::stream::iter(checks)
+            .buffer_unordered(*CHECKS_AT_ONCE.get_or_init(|| {
+                usize::try_from(ferrofin_db::database::usable_cores()).unwrap_or(1)
+            }))
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
         rows.retain(|row| !gone.contains(&row.id));
         let rows = Self::visible_recording_rows(rows, visible).await?;
         let start_index = query.start_index.unwrap_or(0);
@@ -10826,6 +10845,77 @@ mod tests {
             .await
             .expect("recordings");
         assert_eq!(everything.total_record_count, 5, "no filter, every row");
+    }
+
+    /// Every row's file is checked before paging, so a recording whose file
+    /// has gone leaves `TotalRecordCount` and moves the pages after it, on
+    /// whichever page it would have been. One whose folder has gone too (an
+    /// unmounted share) and a capture still being written stay.
+    #[tokio::test]
+    async fn recordings_whose_file_has_gone_leave_every_page_and_the_count() {
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let unmounted = dir.path().join("unmounted");
+        let done = Some(RecordingStatus::Completed);
+        let start = Utc::now();
+        let mut listed = Vec::new();
+        for n in 0..64_i64 {
+            let (folder, written, status) = match n % 4 {
+                0 => (dir.path(), true, done),
+                1 => (dir.path(), false, done),
+                2 => (unmounted.as_path(), false, done),
+                _ => (dir.path(), false, None),
+            };
+            let path = folder.join(format!("{n}.ts"));
+            if written {
+                std::fs::write(&path, b"recorded").expect("file");
+            }
+            let id = Uuid::new_v4();
+            let timer = crate::dvr::TimerRecordingInfo {
+                id: format!("timer-{n}"),
+                name: format!("recording {n}"),
+                ..crate::dvr::TimerRecordingInfo::default()
+            };
+            crate::dvr_repository::insert_recording(
+                &mgr.db,
+                id,
+                &timer,
+                &path,
+                start + chrono::Duration::minutes(n),
+            )
+            .await
+            .expect("insert");
+            if let Some(status) = status {
+                crate::dvr_repository::finish_recording(&mgr.db, id, status, path.to_str())
+                    .await
+                    .expect("finish");
+            }
+            if n % 4 != 1 {
+                listed.push(id);
+            }
+        }
+        listed.reverse(); // newest first
+
+        let list = async |start_index: Option<i32>, limit: Option<i32>| {
+            let page = mgr
+                .get_recordings_matching(
+                    &ferrofin_model::live_tv::RecordingQuery {
+                        start_index,
+                        limit,
+                        ..ferrofin_model::live_tv::RecordingQuery::default()
+                    },
+                    None,
+                    &DtoOptions::default(),
+                    None,
+                )
+                .await
+                .expect("recordings");
+            let ids: Vec<Uuid> = page.items.iter().map(|dto| dto.id).collect();
+            (page.total_record_count, ids)
+        };
+        assert_eq!(list(None, None).await, (48, listed.clone()));
+        assert_eq!(list(Some(5), Some(7)).await, (48, listed[5..12].to_vec()));
+        assert_eq!(list(Some(45), Some(10)).await, (48, listed[45..].to_vec()));
     }
 
     #[tokio::test]
