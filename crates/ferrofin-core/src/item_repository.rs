@@ -4535,9 +4535,9 @@ impl ItemRepository for FerrofinItemRepository {
         // instead of materializing the whole matching id set and binding it back as a
         // giant `IN` per facet. The old "resolve every matching id in the app, then
         // re-send them as a thousand-parameter IN, four times" round-trip dominated the
-        // Filters/Filters2/Years CPU under load.
-        let years = self.distinct_years(filter).await?;
-        let official_ratings = self.distinct_official_ratings(filter).await?;
+        // Filters/Filters2/Years CPU under load. Years and ratings come from the
+        // same rows, so one statement reads both.
+        let (years, official_ratings) = self.distinct_years_and_ratings(filter).await?;
         let genres = self
             .distinct_item_values(filter, ItemValueType::Genre)
             .await?;
@@ -4558,8 +4558,8 @@ impl ItemRepository for FerrofinItemRepository {
         filter: &InternalItemsQuery,
     ) -> Result<Vec<i32>, ServiceError> {
         // `/Years` wants the years and nothing else. Going through
-        // `get_query_filters_legacy` for them also ran the official-ratings
-        // scan and both `ItemValues` MIN aggregates and dropped all three — but
+        // `get_query_filters_legacy` for them also read the official ratings
+        // and ran both `ItemValues` MIN aggregates and dropped all three — but
         // it does share that method's view resolution and user scoping, which
         // have to be applied here too.
         let scoped = self.resolve_views(filter).await?;
@@ -4715,16 +4715,7 @@ impl FerrofinItemRepository {
     /// Distinct positive production years of the filter's matching items, ascending —
     /// the filter runs as this query's own WHERE, no app-side id materialization.
     async fn distinct_years(&self, filter: &InternalItemsQuery) -> Result<Vec<i32>, ServiceError> {
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            r#"SELECT DISTINCT bi."ProductionYear" FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
-        );
-        qb.push_bind(PLACEHOLDER_ID);
-        append_predicates(&mut qb, filter);
-        qb.push(
-            r#" AND bi."ProductionYear" IS NOT NULL AND bi."ProductionYear" > 0
-                ORDER BY bi."ProductionYear""#,
-        );
-        let rows: Vec<i64> = qb
+        let rows: Vec<i64> = years_statement(filter)
             .build_query_scalar()
             .fetch_all(self.db.pool())
             .await
@@ -4735,24 +4726,32 @@ impl FerrofinItemRepository {
             .collect())
     }
 
-    /// Distinct non-empty official ratings of the filter's matching items, ascending.
-    async fn distinct_official_ratings(
+    /// [`Self::distinct_years`] and the distinct non-empty official ratings of
+    /// the same items in SQLite's BINARY order, read in one pass: upstream's two
+    /// facet queries over one `baseQuery`.
+    async fn distinct_years_and_ratings(
         &self,
         filter: &InternalItemsQuery,
-    ) -> Result<Vec<String>, ServiceError> {
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            r#"SELECT DISTINCT bi."OfficialRating" FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
-        );
-        qb.push_bind(PLACEHOLDER_ID);
-        append_predicates(&mut qb, filter);
-        qb.push(
-            r#" AND bi."OfficialRating" IS NOT NULL AND bi."OfficialRating" <> ''
-                ORDER BY bi."OfficialRating""#,
-        );
-        qb.build_query_scalar()
+    ) -> Result<(Vec<i32>, Vec<String>), ServiceError> {
+        let rows: Vec<(Option<i64>, Option<String>)> = years_and_ratings_statement(filter)
+            .build_query_as()
             .fetch_all(self.db.pool())
             .await
-            .map_err(db_err)
+            .map_err(db_err)?;
+        let mut years = std::collections::BTreeSet::new();
+        let mut ratings = std::collections::BTreeSet::new();
+        for (year, rating) in rows {
+            years.extend(year.filter(|y| *y > 0));
+            ratings.extend(rating.filter(|r| !r.is_empty()));
+        }
+        // A `String`'s byte order is BINARY's `memcmp` order.
+        Ok((
+            years
+                .into_iter()
+                .map(|y| i32::try_from(y).unwrap_or(i32::MAX))
+                .collect(),
+            ratings.into_iter().collect(),
+        ))
     }
 
     /// Distinct display values of one `ItemValues` type over the filter's matching items.
@@ -4770,6 +4769,35 @@ impl FerrofinItemRepository {
             .await
             .map_err(db_err)
     }
+}
+
+/// The statement [`FerrofinItemRepository::distinct_years`] runs.
+fn years_statement(filter: &InternalItemsQuery) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT DISTINCT bi."ProductionYear" FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
+    );
+    qb.push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+    qb.push(
+        r#" AND bi."ProductionYear" IS NOT NULL AND bi."ProductionYear" > 0
+            ORDER BY bi."ProductionYear""#,
+    );
+    qb
+}
+
+/// The statement [`FerrofinItemRepository::distinct_years_and_ratings`] runs:
+/// the distinct `(ProductionYear, OfficialRating)` pairs of the items `filter`
+/// matches, one walk of them where a year and a rating statement walked them
+/// twice. `years_and_ratings_statement_reads_items_once_like_the_year_statement`
+/// pins it.
+fn years_and_ratings_statement(filter: &InternalItemsQuery) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT DISTINCT bi."ProductionYear", bi."OfficialRating"
+           FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
+    );
+    qb.push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+    qb
 }
 
 /// The statement [`FerrofinItemRepository::distinct_item_values`] runs: one
@@ -9345,7 +9373,7 @@ mod tests {
     }
 
     /// `/Years` reads the year facet on its own. The override must answer
-    /// exactly what the four-statement aggregate's `years` field held — the
+    /// exactly what the facet aggregate's `years` field held — the
     /// same filter, the same values, the same order — for every shape the
     /// aggregate handles, including the empty one.
     #[tokio::test]
@@ -9803,6 +9831,70 @@ mod tests {
             .await,
             ["Near"]
         );
+    }
+
+    /// Plan pin for the legacy facets' year and rating read (`/Items/Filters`):
+    /// one pass over `BaseItems`, reaching `bi` exactly as the year-only
+    /// statement (`/Years`) does, so folding the ratings in adds no second walk
+    /// and no worse access path.
+    #[tokio::test]
+    async fn years_and_ratings_statement_reads_items_once_like_the_year_statement() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let plan_of = |mut qb: QueryBuilder<Sqlite>| {
+            let db = db.clone();
+            async move {
+                let mut query = qb.build();
+                let args = query.take_arguments().expect("arguments").expect("binds");
+                let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+                sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                    .fetch_all(db.pool())
+                    .await
+                    .expect("plan")
+                    .iter()
+                    .map(|row| row.get::<String, _>("detail"))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let item_reads = |plan: &[String]| {
+            plan.iter()
+                .filter(|d| d.starts_with("SCAN bi") || d.starts_with("SEARCH bi "))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let libraries = [Uuid::from_u128(0xA4E1), Uuid::from_u128(0xA4E2)];
+        // Unscoped, one kind, a strict parent, and a user-scoped statement
+        // (`TopParentId IN (…)`) with an ancestor scope.
+        for (kinds, parent, top_parent_ids, ancestor_ids) in [
+            (vec![], Uuid::nil(), vec![], vec![]),
+            (vec![BaseItemKind::Movie], Uuid::nil(), vec![], vec![]),
+            (
+                vec![BaseItemKind::Movie],
+                Uuid::from_u128(0xA4E0),
+                vec![],
+                vec![],
+            ),
+            (
+                vec![BaseItemKind::Movie],
+                Uuid::nil(),
+                libraries.to_vec(),
+                vec![libraries[0]],
+            ),
+        ] {
+            let filter = InternalItemsQuery {
+                include_item_types: kinds,
+                parent_id: parent,
+                physical_children_only: !parent.is_nil(),
+                top_parent_ids,
+                ancestor_ids,
+                ..InternalItemsQuery::default()
+            };
+            let folded = plan_of(years_and_ratings_statement(&filter)).await;
+            let years = plan_of(years_statement(&filter)).await;
+            let reads = item_reads(&folded);
+            assert_eq!(reads.len(), 1, "{folded:#?}");
+            assert_eq!(reads, item_reads(&years), "{folded:#?}\n{years:#?}");
+        }
     }
 
     /// Plan pin for the tag facet (`/Items/Filters2`; the legacy facet set's
