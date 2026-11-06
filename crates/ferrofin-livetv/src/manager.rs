@@ -4776,12 +4776,8 @@ impl FerrofinLiveTvManager {
         query: &InternalItemsQuery,
         now: DateTime<Utc>,
     ) -> Result<Vec<GuideProgramRow>, ServiceError> {
-        let start_index = query.start_index.unwrap_or(0);
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(PROGRAM_SELECT);
-        push_program_filters(&mut qb, query, now);
-        push_program_order(&mut qb, &query.order_by);
-        push_program_paging(&mut qb, query.limit, start_index);
-        qb.build_query_as()
+        program_rows_query(query, now)
+            .build_query_as()
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)
@@ -5607,24 +5603,10 @@ impl FerrofinLiveTvManager {
         &self,
         stored: &StoredSeriesTimer,
     ) -> Result<Vec<(GuideProgramRow, TimerInfoDto)>, ServiceError> {
-        let series_id = stored
-            .series_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let mut query = InternalItemsQuery {
-            min_end_date: Some(Utc::now()),
-            external_series_id: series_id.map(str::to_owned),
-            order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
-            ..InternalItemsQuery::default()
-        };
-        if series_id.is_none() {
-            query.name.clone_from(&stored.dto.base.name);
-        }
-        if !stored.dto.record_any_channel {
-            query.channel_ids = vec![stored.dto.base.channel_id];
-        }
-        let rows = self.query_program_rows(&query, Utc::now()).await?;
+        let now = Utc::now();
+        let rows = self
+            .query_program_rows(&series_programs_query(stored, now), now)
+            .await?;
         // C# `tempChannelCache`: one channel lookup per distinct channel, not one
         // per airing — a series timer over a week's guide walks the same one or
         // two channels dozens of times.
@@ -5691,6 +5673,11 @@ impl FerrofinLiveTvManager {
     ///
     /// Takes the shared base DTO so the single-timer and series-timer paths can
     /// both ask (`GetProgramInfoFromCache` serves both upstream).
+    ///
+    /// By the listing provider's id this is `GetProgramInfoFromCache(programId)`
+    /// (v12.4 DefaultLiveTvService.cs:604-614): a programme's own id is derived
+    /// from it (`GetInternalProgramId`), so it is one keyed read, whatever
+    /// channel the timer names.
     async fn program_row_for_timer(
         &self,
         timer: &ferrofin_model::live_tv::BaseTimerInfoDto,
@@ -5711,24 +5698,7 @@ impl FerrofinLiveTvManager {
         else {
             return Ok(None);
         };
-        // The listing provider's id is not the row's key, so fall back to the
-        // channel's guide and match on it (upstream's cache lookup does the
-        // same by external id).
-        Ok(self
-            .query_program_rows(
-                &InternalItemsQuery {
-                    channel_ids: vec![timer.channel_id],
-                    ..InternalItemsQuery::default()
-                },
-                Utc::now(),
-            )
-            .await?
-            .into_iter()
-            .find(|row| {
-                row.external_id
-                    .as_deref()
-                    .is_some_and(|id| id.eq_ignore_ascii_case(external))
-            }))
+        self.program_row(internal_program_id(external)).await
     }
 
     /// Arms (or re-arms) the system timer behind one recording timer.
@@ -6819,6 +6789,41 @@ impl FerrofinLiveTvManager {
         self.forget_row_state(id);
         Ok(())
     }
+}
+
+/// The guide query a series timer's fan-out runs (`GetTimersForSeries`): the
+/// airings not over yet, by the listings series id or, when the listings
+/// carry none, by title, on the series timer's channel unless it records any
+/// channel.
+fn series_programs_query(stored: &StoredSeriesTimer, now: DateTime<Utc>) -> InternalItemsQuery {
+    let series_id = stored
+        .series_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let mut query = InternalItemsQuery {
+        min_end_date: Some(now),
+        external_series_id: series_id.map(str::to_owned),
+        order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
+        ..InternalItemsQuery::default()
+    };
+    if series_id.is_none() {
+        query.name.clone_from(&stored.dto.base.name);
+    }
+    if !stored.dto.record_any_channel {
+        query.channel_ids = vec![stored.dto.base.channel_id];
+    }
+    query
+}
+
+/// The statement [`FerrofinLiveTvManager::query_program_rows`] runs for
+/// `query`: [`PROGRAM_SELECT`] with its filters, order and page.
+fn program_rows_query(query: &InternalItemsQuery, now: DateTime<Utc>) -> QueryBuilder<Sqlite> {
+    let mut qb = QueryBuilder::new(PROGRAM_SELECT);
+    push_program_filters(&mut qb, query, now);
+    push_program_order(&mut qb, &query.order_by);
+    push_program_paging(&mut qb, query.limit, query.start_index.unwrap_or(0));
+    qb
 }
 
 /// Emits `WHERE` for the first predicate of a query and `AND` for each one
@@ -11318,6 +11323,98 @@ mod tests {
         );
         for (n, plan) in &plans[1..] {
             assert_eq!(plan, &plans[0].1, "{n} channels against 2");
+        }
+    }
+
+    /// A timer that names its programme only by the listing provider's id finds
+    /// it as `GetProgramInfoFromCache(programId)` does: one keyed read of the id
+    /// `GetInternalProgramId` derives, whatever the listing id's case and
+    /// with no channel named, not a read of the channel's whole guide
+    /// (gl-1293).
+    #[tokio::test]
+    async fn a_timer_finds_its_programme_by_the_listing_id_alone() {
+        let mgr = manager_with_series_guide().await;
+        let airing = airings_of(&mgr, "Recurring")
+            .await
+            .pop()
+            .expect("an airing");
+        let external = airing.external_id.clone().expect("a listing id");
+        let shouted = external.to_uppercase();
+        assert_ne!(shouted, external, "the listing id has letters to fold");
+        let timer = ferrofin_model::live_tv::BaseTimerInfoDto {
+            program_id: Some("not-a-guid".to_owned()),
+            external_program_id: Some(shouted),
+            ..ferrofin_model::live_tv::BaseTimerInfoDto::default()
+        };
+        let found = mgr.program_row_for_timer(&timer).await.expect("lookup");
+        assert_eq!(found.map(|row| row.id), Some(airing.id.clone()));
+        let unknown = ferrofin_model::live_tv::BaseTimerInfoDto {
+            external_program_id: Some(format!("{external}-gone")),
+            ..timer
+        };
+        let found = mgr.program_row_for_timer(&unknown).await.expect("lookup");
+        assert!(
+            found.is_none(),
+            "a listing id the guide lacks finds nothing"
+        );
+
+        let query = InternalItemsQuery {
+            item_ids: vec![super::internal_program_id(&external)],
+            ..InternalItemsQuery::default()
+        };
+        let plan = crate::guide_repository::test_support::plan(
+            &mgr.db,
+            super::program_rows_query(&query, Utc::now()),
+        )
+        .await
+        .expect("plan");
+        assert!(
+            plan.iter().any(|d| d
+                .starts_with("SEARCH p USING INDEX sqlite_autoindex_FerrofinLiveTvPrograms")
+                && d.ends_with("(Id=?)")),
+            "the programme by its key: {plan:?}"
+        );
+    }
+
+    /// A series timer's fan-out reads only its own channel's airings, off the
+    /// `(ChannelId, StartDate)` index, whether it matches on the listings
+    /// series id or on the title. So a series timer that does not record any
+    /// channel (upstream's default) never walks the guide for its unindexed
+    /// `ExternalSeriesId` or its cleaned title (gl-1293).
+    #[tokio::test]
+    async fn a_series_fan_out_reads_its_channel_off_the_channel_index() {
+        let mgr = manager_with_series_guide().await;
+        let airings = airings_of(&mgr, "Recurring").await;
+        let future = airings
+            .iter()
+            .find(|r| parse_dt(&r.start_date).is_some_and(|s| s > Utc::now()))
+            .expect("a future airing");
+        let st_id = mgr
+            .create_series_timer(defaults_for(&mgr, future).await)
+            .await
+            .expect("create st");
+        let mut stored = mgr
+            .stored_series_timer(&st_id)
+            .await
+            .expect("read")
+            .expect("stored series timer");
+        assert!(!stored.dto.record_any_channel);
+        for series_id in [None, Some("EP0001".to_owned())] {
+            stored.series_id.clone_from(&series_id);
+            let now = Utc::now();
+            let query = super::series_programs_query(&stored, now);
+            let plan = crate::guide_repository::test_support::plan(
+                &mgr.db,
+                super::program_rows_query(&query, now),
+            )
+            .await
+            .expect("plan");
+            assert!(
+                plan.iter().any(|d| d.starts_with(
+                    "SEARCH p USING INDEX FerrofinIX_LiveTvPrograms_ChannelId_StartDate (ChannelId=?"
+                )),
+                "series id {series_id:?}: {plan:?}"
+            );
         }
     }
 
