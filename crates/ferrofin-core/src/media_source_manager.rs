@@ -1932,25 +1932,12 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             return Ok(source);
         }
 
-        // Not a Live TV token: probe the item and register it under a fresh id.
-        let request_info = ferrofin_traits::media_encoding::MediaInfoRequest {
-            media_source: MediaSourceInfo {
-                id: Some(request.item_id.to_string()),
-                ..Default::default()
-            },
-            extract_chapters: false,
-            media_is_audio: false,
-        };
-        let mut source = self.encoder.get_media_info(&request_info).await?;
-        derive_stream_getters(&mut source.media_streams);
-        let live_id = Uuid::new_v4().to_string();
-        source.live_stream_id = Some(live_id.clone());
-        source.requires_closing = true;
-        self.open_streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(stream_key(&live_id), source.clone());
-        Ok(source)
+        // Only a Live TV channel token opens anything: upstream's `GetProvider`
+        // throws on a missing token, and no provider opens any other one.
+        // There is no fallback that probes the item instead.
+        Err(ServiceError::invalid_input(
+            "the open token is missing or is not a Live TV channel token",
+        ))
     }
 
     async fn get_live_stream(&self, id: &str) -> Result<MediaSourceInfo, ServiceError> {
@@ -3868,12 +3855,56 @@ mod tests {
         assert!(sources.is_empty(), "{sources:?}");
     }
 
+    /// `OpenLiveStreamInternal` opens only through the provider the token
+    /// names (`GetProvider`): a missing or empty token is an
+    /// `ArgumentException` upstream, and a whitespace-only token or one naming
+    /// no provider opens nothing. No path probes the item instead.
+    #[tokio::test]
+    async fn an_open_token_naming_no_provider_opens_nothing() {
+        let db = test_db().await;
+        let mgr = manager(&db).with_live_tv(Arc::new(FakeLiveTv::default()));
+        let channel = Uuid::from_u128(7);
+        for open_token in [
+            None,
+            Some(String::new()),
+            Some("  ".to_owned()),
+            Some(format!("someprovider_LiveTvChannel_{}", channel.simple())),
+        ] {
+            let request = LiveStreamRequest {
+                open_token: open_token.clone(),
+                item_id: channel,
+                ..Default::default()
+            };
+            let err = mgr
+                .open_live_stream(&request)
+                .await
+                .expect_err("nothing opens this token");
+            assert!(
+                matches!(err, ServiceError::InvalidInput(_)),
+                "{open_token:?}: {err:?}"
+            );
+        }
+        assert!(
+            mgr.open_streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "a refused open registers no stream"
+        );
+    }
+
     #[tokio::test]
     async fn live_stream_open_get_close_round_trips() {
         let db = test_db().await;
-        let mgr = manager(&db);
+        let mgr = manager(&db).with_live_tv(Arc::new(FakeLiveTv::default()));
+        let channel = Uuid::from_u128(7);
         let request = LiveStreamRequest {
-            item_id: Uuid::from_u128(7),
+            open_token: Some(format!(
+                "{}_LiveTvChannel_{}_source-1",
+                live_tv_provider_key(),
+                channel.simple()
+            )),
+            item_id: channel,
             ..Default::default()
         };
 
