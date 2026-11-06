@@ -63,9 +63,10 @@ pub struct FerrofinDeviceManager {
     /// the same population as the persisted `Devices` table, at a few hundred
     /// bytes each — so this is not a leak that outruns the database.
     capabilities: Arc<RwLock<HashMap<String, ClientCapabilities>>>,
-    /// The shared token-resolution cache — cleared on every device mutation so
-    /// a deleted/rewritten token can never be served from cache (revocation is
-    /// immediate, not TTL-bounded).
+    /// The shared token-resolution cache — a created or deleted device's token
+    /// is dropped from it and an update clears it, so a deleted/rewritten token
+    /// can never be served from cache (revocation is immediate, not
+    /// TTL-bounded).
     auth_cache: Arc<crate::auth_cache::AuthCache>,
 }
 
@@ -207,21 +208,12 @@ impl FerrofinDeviceManager {
         &self,
         query: &DeviceQuery,
     ) -> Result<QueryResult<DeviceEntity>, ServiceError> {
-        let mut all: Vec<DeviceEntity> =
-            sqlx::query_as::<_, DeviceEntity>(r#"SELECT * FROM "Devices" ORDER BY "Id""#)
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
-
-        if let Some(user_id) = query.user_id {
-            // Compare in the canonical storage form so stored (uppercase) GUIDs
-            // match regardless of the caller's formatting.
-            let uid = guid_to_db(user_id);
-            all.retain(|d| d.user_id.eq_ignore_ascii_case(&uid));
-        }
-        if let Some(device_id) = &query.device_id {
-            all.retain(|d| &d.device_id == device_id);
-        }
+        // The stored (uppercase) form: `UserId` is a foreign key to `Users.Id`.
+        let uid = query.user_id.map(guid_to_db);
+        let all = self
+            .repo
+            .matching(uid.as_deref(), query.device_id.as_deref())
+            .await?;
 
         let count = i32::try_from(all.len()).unwrap_or(i32::MAX);
 
@@ -356,6 +348,9 @@ impl DeviceManager for FerrofinDeviceManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        // A token cached as matching nothing must resolve to this device on the
+        // next request.
+        self.auth_cache.invalidate_token(&device.access_token);
 
         sqlx::query_as::<_, DeviceEntity>(
             r#"SELECT * FROM "Devices" WHERE "AccessToken" = ?1 ORDER BY "Id" DESC LIMIT 1"#,
@@ -483,13 +478,17 @@ impl DeviceManager for FerrofinDeviceManager {
         // The `capabilities` entry for `device.device_id` deliberately survives
         // (C# `DeleteDevice` drops only `_devices`) — see the field's docs: it
         // still gates `can_access_device` for restricted users.
-        sqlx::query(r#"DELETE FROM "Devices" WHERE "Id" = ?1"#)
-            .bind(device.id)
-            .execute(self.db.writer())
-            .await
-            .map_err(db_err)?;
-        // Revocation: the deleted token must stop authenticating NOW.
-        self.auth_cache.clear();
+        let stored: Option<String> =
+            sqlx::query_scalar(r#"DELETE FROM "Devices" WHERE "Id" = ?1 RETURNING "AccessToken""#)
+                .bind(device.id)
+                .fetch_optional(self.db.writer())
+                .await
+                .map_err(db_err)?;
+        // Revocation: the deleted token must stop authenticating NOW. Only that
+        // token: a returning device's login must not send every other user's
+        // cached session back to the database.
+        self.auth_cache
+            .invalidate_token(stored.as_deref().unwrap_or(&device.access_token));
         Ok(())
     }
 

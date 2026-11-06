@@ -172,34 +172,22 @@ impl FerrofinAuthorizationContext {
         None
     }
 
-    /// Resolves a device token into the auth info, refreshing stale/changed
-    /// device rows (C# device branch). Returns `true` when the token matched a
-    /// device.
+    /// Resolves a device token from the database into the auth info,
+    /// refreshing stale/changed device rows (C# device branch), and caches it.
+    /// Returns `true` when the token matched a device. `generation` is
+    /// [`AuthCache::generation`], captured by the caller before any database
+    /// read of this request.
     async fn resolve_device_token(
         &self,
         info: &mut AuthorizationInfo,
         token: &str,
+        generation: u64,
     ) -> Result<bool, ServiceError> {
-        // Read-through: a fresh cached resolution answers without touching the
-        // database (the two per-request queries this path otherwise costs).
-        // The row-refresh bookkeeping below is deliberately skipped on a hit —
-        // it re-runs on the next TTL expiry, the same cadence Jellyfin's
-        // in-memory device map effectively gives it.
-        if let Some((device, user, policy)) = self.auth_cache.get(token) {
-            info.is_authenticated = true;
-            fill_blank_client_fields(info, &device);
-            info.user = user;
-            info.user_policy = policy;
-            return Ok(true);
-        }
-
-        // Captured BEFORE the read below: everything from here to the `put` at
-        // the tail is in-flight work over a device row that a concurrent
-        // logout/delete/rename may revoke. Storing that read afterwards would
-        // resurrect the revoked token for a full TTL; tagging the write with the
-        // generation makes the cache drop it instead.
-        let generation = self.auth_cache.generation();
-
+        // `generation` was captured BEFORE the read below: everything from
+        // here to the `put` at the tail is in-flight work over a device row
+        // that a concurrent logout/delete/rename may revoke. Storing that read
+        // afterwards would resurrect the revoked token for a full TTL; tagging
+        // the write with the generation makes the cache drop it instead.
         let Some(mut device) = self.device_by_token(token).await? else {
             return Ok(false);
         };
@@ -277,20 +265,12 @@ impl FerrofinAuthorizationContext {
         Ok(true)
     }
 
-    /// Resolves an api-key token into the auth info (C# api-key branch). Returns
-    /// `true` when the token matched a key.
-    async fn resolve_api_key_token(
-        &self,
-        info: &mut AuthorizationInfo,
-        token: &str,
-    ) -> Result<bool, ServiceError> {
-        let Some(key) = self.api_key_by_token(token).await? else {
-            return Ok(false);
-        };
-
+    /// Fills the auth info for the api key named `name` (C# api-key branch).
+    /// C# also sets `Token = key.AccessToken`: the same string as the request's
+    /// token, which the key was matched on exactly.
+    fn resolve_api_key(&self, info: &mut AuthorizationInfo, name: String) {
         info.is_authenticated = true;
-        info.client = Some(key.name);
-        info.token = Some(key.access_token.into());
+        info.client = Some(name);
         if info.device_id.as_deref().unwrap_or("").trim().is_empty() {
             info.device_id = Some(self.system_id.clone());
         }
@@ -303,7 +283,6 @@ impl FerrofinAuthorizationContext {
             info.version = Some(self.server_version.clone());
         }
         info.is_api_key = true;
-        Ok(true)
     }
 
     /// Looks up the most-recently-active device row bearing this access token.
@@ -387,12 +366,38 @@ impl AuthorizationContext for FerrofinAuthorizationContext {
         if !info.has_token() {
             return Ok(info);
         }
-        let token = info.token.clone().unwrap_or_default();
+        let secret = info.token.clone().unwrap_or_default();
+        let token = secret.expose();
 
-        // Device tokens take precedence over api keys (C# order).
-        if !self.resolve_device_token(&mut info, token.expose()).await? {
-            self.resolve_api_key_token(&mut info, token.expose())
-                .await?;
+        // Captured before any database read below (see `AuthCache::generation`).
+        let generation = self.auth_cache.generation();
+        // Device tokens take precedence over api keys (C# order). A cached
+        // resolution answers without the database; the device row-refresh
+        // bookkeeping is deliberately skipped on a hit — it re-runs on the next
+        // TTL expiry, the same cadence Jellyfin's in-memory device map
+        // effectively gives it. A token the cache knows matched no device skips
+        // both reads: an api key's name, or a rejection.
+        let api_key_name = if let Some((device, user, policy)) = self.auth_cache.get(token) {
+            info.is_authenticated = true;
+            fill_blank_client_fields(&mut info, &device);
+            info.user = user;
+            info.user_policy = policy;
+            None
+        } else if let Some(cached) = self.auth_cache.get_non_device(token) {
+            cached
+        } else if self
+            .resolve_device_token(&mut info, token, generation)
+            .await?
+        {
+            None
+        } else {
+            let name = self.api_key_by_token(token).await?.map(|key| key.name);
+            self.auth_cache
+                .put_non_device(generation, token, name.clone());
+            name
+        };
+        if let Some(name) = api_key_name {
+            self.resolve_api_key(&mut info, name);
         }
         // The HTTP middleware consumes this context directly, so the disabled
         // check must run here as well as through AuthService. Existing device
@@ -1447,6 +1452,157 @@ mod tests {
             .unwrap();
         let info = ctx.get_authorization_info(&token_request()).await.unwrap();
         assert!(!info.is_authenticated, "revoked token rejected immediately");
+    }
+
+    /// An API-key resolution is cached like a device token's: a key deleted
+    /// behind the cache's back (a manager that does not share it) still
+    /// answers within the TTL, proof that no database read ran.
+    #[tokio::test]
+    async fn an_api_key_resolution_is_served_from_the_cache() {
+        use ferrofin_traits::security::ApiKeyManager as _;
+        let db = crate::test_support::test_db().await;
+        seed_api_key(&db, "key-tok", "sonarr").await;
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let ctx = context(db.clone()).with_auth_cache(Arc::clone(&cache));
+        let request = query_request("ApiKey=key-tok");
+
+        let first = ctx.get_authorization_info(&request).await.unwrap();
+        assert!(first.is_authenticated && first.is_api_key);
+        assert_eq!(first.client.as_deref(), Some("sonarr"));
+
+        crate::api_key_manager::FerrofinApiKeyManager::new(db.clone())
+            .delete_api_key("key-tok")
+            .await
+            .unwrap();
+        let hit = ctx.get_authorization_info(&request).await.unwrap();
+        assert_eq!(hit, first, "the hit answers as the database read did");
+    }
+
+    /// An API key deleted through the shared manager stops authenticating on
+    /// the very next request, though its resolution was cached.
+    #[tokio::test]
+    async fn an_api_key_delete_revokes_its_cached_resolution_at_once() {
+        use ferrofin_traits::security::ApiKeyManager as _;
+        let db = crate::test_support::test_db().await;
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let ctx = context(db.clone()).with_auth_cache(Arc::clone(&cache));
+        let keys = crate::api_key_manager::FerrofinApiKeyManager::new(db.clone())
+            .with_auth_cache(Arc::clone(&cache));
+        keys.create_api_key("jellyseerr").await.unwrap();
+        let listed = keys.get_api_keys().await.unwrap();
+        let token = listed[0].access_token.clone().expect("token");
+        let request = query_request(&format!("ApiKey={}", token.expose()));
+
+        for _ in 0..2 {
+            let info = ctx.get_authorization_info(&request).await.unwrap();
+            assert!(info.is_authenticated && info.is_api_key);
+        }
+        assert_eq!(
+            cache.get_non_device(token.expose()),
+            Some(Some("jellyseerr".into()))
+        );
+
+        keys.delete_api_key(token.expose()).await.unwrap();
+        let info = ctx.get_authorization_info(&request).await.unwrap();
+        assert!(!info.is_authenticated, "a deleted key is rejected at once");
+    }
+
+    /// A token that matched nothing is rejected from the cache: a device row
+    /// written behind the cache's back stays rejected within the TTL. A device
+    /// created through the shared manager is accepted on the next request.
+    #[tokio::test]
+    async fn an_unknown_token_is_rejected_from_the_cache_until_a_device_takes_it() {
+        use ferrofin_traits::devices::DeviceManager as _;
+        let db = crate::test_support::test_db().await;
+        let uid = Uuid::from_u128(0x9c);
+        crate::test_support::seed_user(&db, uid).await;
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let ctx = context(db.clone()).with_auth_cache(Arc::clone(&cache));
+        let devices = crate::device_manager::FerrofinDeviceManager::new(db.clone())
+            .with_auth_cache(Arc::clone(&cache));
+
+        let info = ctx.get_authorization_info(&token_request()).await.unwrap();
+        assert!(
+            !info.is_authenticated,
+            "no device or key bears the token yet"
+        );
+        seed_device(&db, uid).await;
+        let info = ctx.get_authorization_info(&token_request()).await.unwrap();
+        assert!(
+            !info.is_authenticated,
+            "the unknown outcome is served from cache"
+        );
+
+        let fresh_request = header_request("Authorization", r#"MediaBrowser Token="fresh-tok""#);
+        let info = ctx.get_authorization_info(&fresh_request).await.unwrap();
+        assert!(!info.is_authenticated);
+        let mut fresh = devices
+            .get_device_by_access_token("dev-tok")
+            .await
+            .expect("token lookup")
+            .expect("seeded device");
+        fresh.access_token = "fresh-tok".into();
+        fresh.device_id = "dev-fresh".into();
+        devices.create_device(&fresh).await.expect("create");
+        let info = ctx.get_authorization_info(&fresh_request).await.unwrap();
+        assert!(info.is_authenticated, "a new device's token works at once");
+        assert_eq!(info.user_id(), uid);
+    }
+
+    /// Deleting one device (a logout, or a returning device's login replacing
+    /// its row) drops that token alone: another user's cached session stays
+    /// warm instead of going back to the database.
+    #[tokio::test]
+    async fn a_device_delete_drops_only_its_own_token() {
+        use ferrofin_traits::devices::DeviceManager as _;
+        let db = crate::test_support::test_db().await;
+        let (uid, other_uid) = (Uuid::from_u128(0x9a), Uuid::from_u128(0x9b));
+        crate::test_support::seed_user(&db, uid).await;
+        crate::test_support::seed_named_user(&db, other_uid, "other").await;
+        seed_device(&db, uid).await;
+
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let ctx = context(db.clone()).with_auth_cache(Arc::clone(&cache));
+        let devices = crate::device_manager::FerrofinDeviceManager::new(db.clone())
+            .with_auth_cache(Arc::clone(&cache));
+        let mut other = devices
+            .get_device_by_access_token("dev-tok")
+            .await
+            .expect("token lookup")
+            .expect("seeded device");
+        other.access_token = "other-tok".into();
+        other.device_id = "dev-2".into();
+        other.user_id = ferrofin_db::store::guid_to_db(other_uid);
+        devices.create_device(&other).await.expect("second device");
+        let other_request = header_request("Authorization", r#"MediaBrowser Token="other-tok""#);
+        for request in [token_request(), other_request.clone()] {
+            assert!(
+                ctx.get_authorization_info(&request)
+                    .await
+                    .unwrap()
+                    .is_authenticated
+            );
+        }
+        assert_eq!(cache.len(), 2);
+
+        let device = devices
+            .get_device_by_access_token("dev-tok")
+            .await
+            .expect("token lookup")
+            .expect("seeded device");
+        devices.delete_device(&device).await.unwrap();
+
+        let info = ctx.get_authorization_info(&token_request()).await.unwrap();
+        assert!(
+            !info.is_authenticated,
+            "the deleted token is rejected at once"
+        );
+        assert!(
+            cache.get("other-tok").is_some(),
+            "the other user's cached session survives the delete"
+        );
+        let info = ctx.get_authorization_info(&other_request).await.unwrap();
+        assert_eq!(info.user_id(), other_uid);
     }
 
     /// The read-through window: a request misses the cache and reads the (still

@@ -1096,7 +1096,7 @@ pub async fn build_app_state(
     let devices: Arc<dyn ferrofin_traits::devices::DeviceManager> =
         Arc::new(FerrofinDeviceManager::new(db.clone()).with_auth_cache(Arc::clone(&auth_cache)));
     let api_keys: Arc<dyn ferrofin_traits::security::ApiKeyManager> =
-        Arc::new(FerrofinApiKeyManager::new(db.clone()));
+        Arc::new(FerrofinApiKeyManager::new(db.clone()).with_auth_cache(Arc::clone(&auth_cache)));
     let display_preferences: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager> =
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
     let search: Arc<dyn ferrofin_traits::library::SearchManager> = Arc::new(
