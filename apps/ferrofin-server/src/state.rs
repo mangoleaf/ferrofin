@@ -1749,7 +1749,9 @@ pub async fn build_app_state(
         .with_app_paths(Arc::clone(&paths))
         // Every delete removes the deleted rows' metadata folders and
         // extracted data first.
-        .with_item_data_cleanup(Arc::clone(&item_data_cleanup)),
+        .with_item_data_cleanup(Arc::clone(&item_data_cleanup))
+        // How many items' links one transaction of a batched save rewrites.
+        .with_item_values_write_chunk(config.item_values_write_chunk as usize),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // Marking a series, season, box set or folder played marks the items
@@ -2473,10 +2475,13 @@ pub async fn build_app_state(
         // `SendPlayCommand` -> `TranslateItemForInstantMix`).
         .with_music_manager(Arc::clone(&music)),
     );
-    // The idle-playback and inactive-session checks (C# `StartCheckTimers`),
-    // for this host's lifetime.
+    // The idle-playback and inactive-session checks (C# `StartCheckTimers`)
+    // and the idle-session sweep, for this host's lifetime.
     background.push(tokio::spawn(tracing::Instrument::instrument(
-        Arc::clone(&sessions_impl).run_playback_checks(Arc::clone(&config_trait)),
+        Arc::clone(&sessions_impl).run_playback_checks(
+            Arc::clone(&config_trait),
+            std::time::Duration::from_hours(u64::from(config.session_idle_hours)),
+        ),
         tracing::info_span!(
             parent: None,
             "playback_checks",

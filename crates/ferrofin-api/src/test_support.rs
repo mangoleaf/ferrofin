@@ -2231,6 +2231,9 @@ impl DeviceManager for FakeDevices {
     ) -> Result<ClientCapabilities, ServiceError> {
         Ok(ClientCapabilities::default())
     }
+    async fn forget_capabilities(&self, _device_ids: &[String]) -> Result<(), ServiceError> {
+        Ok(())
+    }
     async fn get_device(&self, _id: &str) -> Result<Option<DeviceInfoDto>, ServiceError> {
         unimplemented!("fake")
     }

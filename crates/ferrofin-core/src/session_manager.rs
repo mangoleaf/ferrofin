@@ -37,14 +37,21 @@
 //!   (`SessionInfo.StartAutomaticProgress`) is tracked as a flag on the
 //!   in-memory session. TODO(gl-803): port its one-second position estimate,
 //!   keeping the client-reported position the idle stop saves.
-//! - **The session pool is evicted exactly where upstream evicts it**, never on
-//!   a timer: [`SessionManager::report_session_ended`] (`/Sessions/Logout`, and
-//!   the C# `WebSocketController.OnConnectionClosed` -> `CloseIfNeededAsync`
-//!   path the API layer's `/socket` handler calls when a session's last socket
-//!   closes) and [`SessionManager::logout`]. A client that only ever speaks
-//!   HTTP therefore keeps its entry until the server restarts — same as
-//!   upstream, where `/Sessions` filters the stale ones by `activeWithinSeconds`
-//!   rather than reaping them; its playback is stopped by the idle check.
+//! - **The session pool is evicted where upstream evicts it, and also on an
+//!   idle timer** (a divergence, owner decision on gl-1267, 2026-11-05):
+//!   [`SessionManager::report_session_ended`] (`/Sessions/Logout`, and the C#
+//!   `WebSocketController.OnConnectionClosed` -> `CloseIfNeededAsync` path the
+//!   API layer's `/socket` handler calls when a session's last socket closes)
+//!   and [`SessionManager::logout`], as upstream; and
+//!   [`FerrofinSessionManager::evict_idle_sessions`], which the one-minute loop
+//!   runs: a session with no live socket, nothing playing and no request for
+//!   longer than the `session_idle_hours` setting ends through the
+//!   socket-close path, and the capabilities of its device are forgotten when
+//!   no `Devices` row and no other session has its id. Upstream keeps a
+//!   socketless session until the server restarts (`/Sessions` filters the
+//!   stale ones by `activeWithinSeconds`, and `_capabilitiesMap` is never
+//!   pruned), so a client that sends a new `DeviceId` on every run grew the
+//!   pool, and the device manager's capabilities map, without bound.
 //! - **Exceptions → `Result<_, ServiceError>`**: `SecurityException` /
 //!   `AuthenticationException` → [`ServiceError::Unauthorized`]; a missing
 //!   session / user → [`ServiceError::NotFound`]; bad arguments →
@@ -57,7 +64,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ferrofin_db::Database;
@@ -746,15 +753,92 @@ impl FerrofinSessionManager {
         }
     }
 
-    /// Runs [`Self::check_for_idle_playback`] and
-    /// [`Self::check_for_inactive_streams`] for as long as the host lives: the
-    /// port of `SessionManager.StartCheckTimers`' two timers. Every minute the
-    /// inactive check runs while `InactiveSessionThreshold` (read live) is
-    /// above 0, and every [`IDLE_PLAYBACK_MINUTES`] minutes the idle check
-    /// runs. Upstream starts both with a playback and stops them while nothing
-    /// plays; here they then find nothing to do. The composition root spawns
-    /// this and aborts it when the host is torn down.
-    pub async fn run_playback_checks(self: Arc<Self>, config: Arc<dyn ServerConfigurationManager>) {
+    /// Ends every session that has no live socket, plays nothing and made no
+    /// request for longer than `window` before `now`, through the path a
+    /// closed socket takes ([`SessionManager::close_if_needed`]: `SessionEnded`
+    /// and its activity-log entry). Then forgets the capabilities of each
+    /// ended session's device that no remaining session uses and no `Devices`
+    /// row has ([`DeviceManager::forget_capabilities`]). Ferrofin only:
+    /// upstream never ends a socketless session (see the module docs).
+    pub async fn evict_idle_sessions(&self, window: chrono::TimeDelta, now: DateTime<Utc>) {
+        let is_idle = |s: &SessionInfo| {
+            s.now_playing_item_id.is_none()
+                && now - s.last_activity_date > window
+                && !self.session_is_active(s)
+        };
+        let candidates: Vec<String> = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .iter()
+                .filter(|(_, s)| is_idle(s))
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let mut ended_devices = Vec::new();
+        for key in candidates {
+            // Checked again just before it ends, since ending each earlier
+            // one awaits its `SessionEnded` consumers: a request or a socket
+            // since the snapshot keeps the session. This narrows the race
+            // with a returning client to the close itself, which only makes
+            // its next request start the session again.
+            let Some((session_id, device_id)) = self
+                .sessions
+                .lock()
+                .await
+                .get(&key)
+                .filter(|s| is_idle(s))
+                .map(|s| (s.id.clone(), s.device_id.clone()))
+            else {
+                continue;
+            };
+            debug!(session_id, "ending an idle session with no socket");
+            if let Err(err) = self.close_if_needed(&session_id).await {
+                warn!(session_id, %err, "error ending an idle session");
+            }
+            ended_devices.push(device_id);
+        }
+        // Not atomic with the forget below: a client returning to one of these
+        // devices meanwhile keeps its own copy of the capabilities, and the
+        // entry comes back with its next report. A failed forget is not
+        // retried; the entries stay until a restart, as upstream keeps them.
+        let unused: Vec<String> = {
+            let sessions = self.sessions.lock().await;
+            let in_use: std::collections::HashSet<&str> =
+                sessions.values().map(|s| s.device_id.as_str()).collect();
+            let mut unused: Vec<String> = ended_devices
+                .into_iter()
+                .filter(|device_id| !in_use.contains(device_id.as_str()))
+                .collect();
+            unused.sort_unstable();
+            unused.dedup();
+            unused
+        };
+        if let Err(err) = self.device_manager.forget_capabilities(&unused).await {
+            warn!(%err, devices = unused.len(), "could not forget idle devices' capabilities");
+        }
+    }
+
+    /// Runs [`Self::check_for_idle_playback`],
+    /// [`Self::check_for_inactive_streams`] and [`Self::evict_idle_sessions`]
+    /// for as long as the host lives: the port of
+    /// `SessionManager.StartCheckTimers`' two timers, plus the idle-session
+    /// sweep upstream does not have. Every minute the inactive check runs
+    /// while `InactiveSessionThreshold` (read live) is above 0 and sessions
+    /// idle past `idle_session_window` end, and every
+    /// [`IDLE_PLAYBACK_MINUTES`] minutes the idle check runs. Upstream starts
+    /// its timers with a playback and stops them while nothing plays; here
+    /// they then find nothing to do. The composition root spawns this and
+    /// aborts it when the host is torn down.
+    pub async fn run_playback_checks(
+        self: Arc<Self>,
+        config: Arc<dyn ServerConfigurationManager>,
+        idle_session_window: std::time::Duration,
+    ) {
+        let idle_session_window =
+            chrono::TimeDelta::from_std(idle_session_window).unwrap_or(chrono::TimeDelta::MAX);
         let mut minutes = tokio::time::interval_at(
             tokio::time::Instant::now() + PLAYBACK_CHECK_PERIOD,
             PLAYBACK_CHECK_PERIOD,
@@ -771,20 +855,27 @@ impl FerrofinSessionManager {
                     0
                 }
             };
-            self.run_playback_checks_at(minute, threshold, Utc::now())
+            self.run_playback_checks_at(minute, threshold, idle_session_window, Utc::now())
                 .await;
         }
     }
 
     /// One tick of [`Self::run_playback_checks`]: the `minute`-th, with the
-    /// `InactiveSessionThreshold` in force, at `now`.
-    async fn run_playback_checks_at(&self, minute: u64, threshold: i32, now: DateTime<Utc>) {
+    /// `InactiveSessionThreshold` and idle-session window in force, at `now`.
+    async fn run_playback_checks_at(
+        &self,
+        minute: u64,
+        threshold: i32,
+        idle_session_window: chrono::TimeDelta,
+        now: DateTime<Utc>,
+    ) {
         if threshold > 0 {
             self.check_for_inactive_streams(threshold, now).await;
         }
         if idle_check_due(minute) {
             self.check_for_idle_playback(now).await;
         }
+        self.evict_idle_sessions(idle_session_window, now).await;
     }
 
     /// Computes the session key the pool is indexed by (C# `GetSessionKey`:
@@ -896,8 +987,8 @@ impl FerrofinSessionManager {
             // A newly created session inherits the device's last reported
             // capabilities (C# `OnSessionStarted` -> `ReportCapabilities(info,
             // caps, saveCapabilities: false)`). That is what makes the device
-            // manager's never-evicted capabilities map load-bearing: a session
-            // recreated after its socket closed still advertises
+            // manager's capabilities map load-bearing: a session recreated
+            // after its socket closed still advertises
             // `SupportsRemoteControl`, so the client does not vanish from the
             // cast menu until it re-posts `/Sessions/Capabilities/Full`.
             let device_capabilities = self
@@ -1086,8 +1177,8 @@ impl FerrofinSessionManager {
         // connection nor a registered bus sink is dropped here: `bus.send` would
         // miss the map and return `false`, so skipping it delivers the same
         // messages to the same clients while costing nothing. That matters
-        // because the session pool holds every device that ever authenticated,
-        // live or not.
+        // because the session pool holds every client active within the idle
+        // window (`session_idle_hours`), live or not.
         let targets: Vec<(String, Vec<Arc<dyn WebSocketConnection>>)> = {
             let sessions = self.sessions.lock().await;
             sessions
@@ -3403,7 +3494,7 @@ mod bus_fallback_tests {
         }
     }
 
-    /// The session pool keeps every device that ever authenticated, so a
+    /// The session pool keeps every client active within the idle window, so a
     /// broadcast's predicate routinely matches sessions that have no live socket
     /// at all. Those must cost nothing: no bus delivery is attempted for them.
     #[tokio::test]

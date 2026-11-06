@@ -43,6 +43,7 @@
 //! builds `BaseItemDto.Trickplay` over the group from
 //! [`TrickplayManager::get_trickplay_resolutions_batch`].
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -476,19 +477,22 @@ impl FerrofinTrickplayManager {
         // Import existing trickplay tiles.
         if !replace {
             // A stored width only needs a tile there; importing needs them all.
-            if rows.contains_key(&actual_width) {
-                if off_runtime(|| has_tiles(&output_dir)) {
-                    tracing::debug!(item = %ctx.item_id, "found existing trickplay files");
-                    return Ok(None);
+            match rows.entry(actual_width) {
+                Entry::Occupied(_) => {
+                    if off_runtime(|| has_tiles(&output_dir)) {
+                        tracing::debug!(item = %ctx.item_id, "found existing trickplay files");
+                        return Ok(None);
+                    }
                 }
-            } else {
-                let existing_files = off_runtime(|| jpg_files_sorted(&output_dir));
-                if !existing_files.is_empty() {
-                    let info = self
-                        .import_tiles(ctx.item_id, width, options, &existing_files)
-                        .await?;
-                    rows.insert(width, info);
-                    return Ok(None);
+                Entry::Vacant(slot) => {
+                    let existing_files = off_runtime(|| jpg_files_sorted(&output_dir));
+                    if !existing_files.is_empty() {
+                        let info = self
+                            .import_tiles(ctx.item_id, actual_width, options, &existing_files)
+                            .await?;
+                        slot.insert(info);
+                        return Ok(None);
+                    }
                 }
             }
         }
@@ -756,8 +760,12 @@ impl FerrofinTrickplayManager {
 
     /// Port of the "Import tiles" branch of `RefreshTrickplayDataInternal`:
     /// adopts on-disk tile files without a DB row, computing height/bandwidth
-    /// from the files themselves. As in the C#, the row stores the *requested*
-    /// width and the configured interval/tile grid. Returns the saved row.
+    /// from the files themselves. The row stores `width`, the width the tiles'
+    /// folder was made at (the selected width, or the video's own when it is
+    /// narrower, rounded down to even), and the configured interval/tile
+    /// grid, and returns the saved row. The C# stores the selected width,
+    /// which, when the two differ, names a folder that does not exist
+    /// (gl-1246).
     async fn import_tiles(
         &self,
         item_id: Uuid,
@@ -3856,6 +3864,57 @@ mod tests {
             !temp.exists() || std::fs::read_dir(&temp).expect("temp").next().is_none(),
             "the unanswered width's frames are cleaned up too"
         );
+    }
+
+    /// A video narrower than the selected width has its tiles at its own
+    /// width, so importing them saves the row at that width, the folder's:
+    /// stored at the selected 640, the row would name a `640 - 2x2` folder
+    /// that does not exist and give 480-wide tiles a 640 × 270 aspect
+    /// (gl-1246). Discovery catalogues such a folder before this check runs,
+    /// so the check is called directly, as when discovery skips the folder.
+    #[tokio::test]
+    async fn importing_a_narrow_videos_tiles_saves_the_folders_width() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let options = options_2x2(&[640]);
+        let r = rig(&db, options.clone(), FakeExtractor::new(0, 180));
+        let media = seed_video(&db, &r, item, Some(HOUR_TICKS), Some(480)).await;
+        let tiles = set_dir(&r, item, &media, 480);
+        std::fs::create_dir_all(&tiles).expect("tiles without a row");
+        image::RgbImage::new(960, 540)
+            .save(tiles.join("0.jpg"))
+            .expect("tile");
+        let trickplay_dir =
+            r.pm.trickplay_directory(item, MediaLocation::of_file(&media), false);
+        let ctx = super::WidthRefreshContext {
+            item_id: item,
+            media_path: &media,
+            video_stream: Some(MediaStream {
+                width: Some(480),
+                ..MediaStream::default()
+            }),
+            media_streams: Vec::new(),
+            trickplay_dir: &trickplay_dir,
+            save_with_media: false,
+        };
+        let mut rows = std::collections::HashMap::new();
+
+        let pending = r
+            .mgr
+            .prepare_width(&ctx, false, 640, &options, &mut rows)
+            .await
+            .expect("import");
+
+        assert!(pending.is_none(), "imported, not generated");
+        assert_eq!(rows.keys().copied().collect::<Vec<_>>(), vec![480]);
+        let stored = r.mgr.get_trickplay_resolutions(item).await.expect("rows");
+        assert_eq!(stored.keys().copied().collect::<Vec<_>>(), vec![480]);
+        assert_eq!(
+            (stored[&480].width, stored[&480].height),
+            (480, 270),
+            "the folder's width and the tiles' height"
+        );
+        assert_eq!(r.extractor.calls(), 0, "import path never extracts");
     }
 
     #[tokio::test]

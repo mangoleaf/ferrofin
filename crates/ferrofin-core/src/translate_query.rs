@@ -936,7 +936,18 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
     }
 
     if filter.parent_id != Uuid::nil() {
-        if filter.recursive {
+        if filter.recursive && filter.drive_from_parent_subtree {
+            // The same closure as below, as a set the statement is driven by
+            // (`IX_AncestorIds_ParentItemId`, then `BaseItems` by id). The
+            // probe below lets SQLite seed from `IX_BaseItems_IsFolder_…` for
+            // an `IsFolder` order and read every row in the table per call.
+            // Other callers keep the probe, which their own plans may use.
+            qb.push(
+                r#" AND bi."Id" IN (SELECT a."ItemId" FROM "AncestorIds" a WHERE a."ParentItemId" = "#,
+            )
+            .push_bind(guid_to_db(filter.parent_id))
+            .push(")");
+        } else if filter.recursive {
             // Recursive browse (e.g. a library's "Episodes" tab): match any
             // descendant via the `AncestorIds` closure, not just direct children.
             // Port of Jellyfin translating a recursive `ParentId` into an ancestor

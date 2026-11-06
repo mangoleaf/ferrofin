@@ -153,6 +153,9 @@ impl DeviceManager for StubDevices {
     ) -> Result<ferrofin_model::session::ClientCapabilities, ServiceError> {
         unimplemented!()
     }
+    async fn forget_capabilities(&self, _device_ids: &[String]) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
     async fn get_device(&self, id: &str) -> Result<Option<DeviceInfoDto>, ServiceError> {
         Ok(self
             .known

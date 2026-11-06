@@ -1,9 +1,10 @@
 //! Cross-request caches of the rows the per-user visibility check reads on every by-id request: a
 //! user's `Permissions` and `Preferences`, and the library set (every `CollectionFolder` row and
-//! each library's options and physical locations). They change rarely and were read several times
-//! per request (gl-973). A third entry keeps whether any Live TV tuner host is configured: one
-//! views request asks the Live TV gate (C# `LiveTvManager.IsLiveTvEnabled`, which upstream answers
-//! from the `LiveTvOptions` it holds in memory) up to three times (gl-1154).
+//! each library's options and physical locations, and the `UserView` and playlists-folder rows an
+//! unscoped query's scope lists beside the libraries, gl-1283). They change rarely and were read
+//! several times per request (gl-973). A third entry keeps whether any Live TV tuner host is
+//! configured: one views request asks the Live TV gate (C# `LiveTvManager.IsLiveTvEnabled`, which
+//! upstream answers from the `LiveTvOptions` it holds in memory) up to three times (gl-1154).
 //!
 //! Every runtime writer of those rows invalidates what it wrote, after its commit:
 //! [`Database::invalidate_user_policy`], [`Database::invalidate_all_user_policies`],
@@ -72,11 +73,15 @@ impl UserPolicyRows {
 }
 
 /// The library set: every `CollectionFolder` row, the rows above them (the user root and the root
-/// folder), and each library's options and physical locations, keyed by row id.
+/// folder), the views and the playlists folder, and each library's options and physical locations,
+/// keyed by row id.
 #[derive(Debug, Clone, Default)]
 pub struct LibrarySet {
     /// The `CollectionFolder` rows.
     pub rows: Vec<BaseItemEntity>,
+    /// The `UserView`, `PlaylistsFolder` and `ManualPlaylistsFolder` rows: what an unscoped
+    /// query's scope (`AddUserToQuery`) lists beside the libraries.
+    pub views: Vec<BaseItemEntity>,
     /// The rows the libraries' hierarchy reaches above them, which every visibility walk ends in.
     pub ancestors: Vec<BaseItemEntity>,
     /// Each library's options, by the row's id.
@@ -261,9 +266,10 @@ impl RowCache {
     }
 
     /// After a write to the `BaseItems` rows `ids` (stored GUID form): drops the library set when
-    /// one of them is a library or a row above one. With no live set cached it only cancels the loads under way,
-    /// which may have read one of those rows before the write. A write that adds a library row,
-    /// or turns a row into one, calls [`Self::invalidate_libraries`] instead: its id is in no set.
+    /// one of them is in it: a library, a row above one, a view or the playlists folder. With no
+    /// live set cached it only cancels the loads under way, which may have read one of those rows
+    /// before the write. A write that adds such a row, or turns a row into one, calls
+    /// [`Self::invalidate_libraries`] instead: its id is in no set.
     pub(crate) fn note_items_written<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
         let hit = match self.libraries() {
             None => self.library_loads.load(Ordering::SeqCst) > 0,
@@ -271,6 +277,7 @@ impl RowCache {
                 set.rows
                     .iter()
                     .chain(&set.ancestors)
+                    .chain(&set.views)
                     .any(|row| row.id.eq_ignore_ascii_case(id))
             }),
         };
@@ -414,7 +421,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_to_a_library_row_drops_the_set_and_a_write_elsewhere_keeps_it() {
+    fn a_write_to_a_row_in_the_set_drops_it_and_a_write_elsewhere_keeps_it() {
         let cache = enabled(ROW_CACHE_TTL);
         let library = BaseItemEntity {
             id: "AAAA".into(),
@@ -441,6 +448,16 @@ mod tests {
             cache.libraries().is_none(),
             "a row above the libraries: dropped"
         );
+        let view = BaseItemEntity {
+            id: "DDDD".into(),
+            ..BaseItemEntity::default()
+        };
+        let _ = cache.begin_library_load().store(LibrarySet {
+            views: vec![view],
+            ..LibrarySet::default()
+        });
+        cache.note_items_written(["dddd"]);
+        assert!(cache.libraries().is_none(), "a view's row: dropped");
     }
 
     #[test]
