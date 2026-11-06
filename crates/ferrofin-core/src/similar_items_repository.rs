@@ -10,13 +10,11 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::{PermissionKind, PreferenceKind};
 use ferrofin_db::store::guid_to_db;
-use ferrofin_model::data::BaseItemKind;
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 
 use crate::db_error::db_err;
-use crate::item_type_lookup::stored_type_name;
 use crate::user_entity_ext::{cached_guid_preference, cached_permission};
 
 /// Raw-SQL data access for similar items and movie recommendations.
@@ -166,21 +164,12 @@ impl SimilarItemsRepository {
         &self,
         user: &UserEntity,
     ) -> Result<Option<Vec<Uuid>>, ServiceError> {
-        let pool = self.db.pool();
         let blocked =
             cached_guid_preference(&self.db, &user.id, PreferenceKind::BlockedMediaFolders).await?;
         if !blocked.is_empty() {
             // The rows a `BlockedMediaFolders` preference names are the
             // libraries' collection folders.
-            let Some(folder_type) = stored_type_name(BaseItemKind::CollectionFolder) else {
-                return Ok(Some(Vec::new()));
-            };
-            let folders: Vec<String> =
-                sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1"#)
-                    .bind(folder_type)
-                    .fetch_all(pool)
-                    .await
-                    .map_err(db_err)?;
+            let folders = crate::item_repository::library_ids(&self.db).await?;
             return Ok(Some(
                 folders
                     .iter()

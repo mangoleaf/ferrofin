@@ -518,7 +518,8 @@ impl ItemVisibility {
     }
 
     /// Reads the library rows, each library's options and its stored
-    /// physical locations, which every visibility and rating evaluation needs.
+    /// physical locations, which every visibility and rating evaluation needs,
+    /// and the view and playlists-folder rows an unscoped query's scope reads.
     ///
     /// # Errors
     /// Returns storage errors.
@@ -528,7 +529,7 @@ impl ItemVisibility {
         }
         // Begun before the reads: a library written meanwhile keeps this set out of the cache.
         let load = self.db.begin_library_load();
-        let rows = repository::libraries(&self.db).await?;
+        let (rows, views) = repository::libraries(&self.db).await?;
         #[cfg(test)]
         self.library_loads
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -567,6 +568,7 @@ impl ItemVisibility {
             .collect();
         let set = load.store(LibrarySet {
             rows,
+            views,
             ancestors,
             options,
             physical_locations,
@@ -1681,9 +1683,9 @@ mod tests {
     }
 
     /// With the server's caches on, any number of evaluations read the library set once, and
-    /// read it again only after a library's own row is written (gl-973).
+    /// read it again only after a library's own row is written (gl-973), or a view's (gl-1283).
     #[tokio::test]
-    async fn the_library_set_is_read_once_until_a_library_row_is_written() {
+    async fn the_library_set_is_read_once_until_a_row_in_it_is_written() {
         let f = Fixture::new().await;
         let library = f
             .item(20, BaseItemKind::CollectionFolder, Some("/views/one"), None)
@@ -1714,6 +1716,22 @@ mod tests {
             f.service.library_loads(),
             before + 2,
             "the library's row: read again"
+        );
+        let view = f
+            .item(22, BaseItemKind::UserView, Some("/views/two"), None)
+            .await;
+        f.visible(&movie).await;
+        assert_eq!(
+            f.service.library_loads(),
+            before + 3,
+            "a new view: read again"
+        );
+        f.save(&view).await;
+        f.visible(&movie).await;
+        assert_eq!(
+            f.service.library_loads(),
+            before + 4,
+            "the view's row: read again"
         );
     }
 

@@ -963,6 +963,21 @@ pub static SETTINGS: &[SettingSpec] = &[
         ..ROW
     },
     SettingSpec {
+        key: "item_values_write_chunk",
+        env: Some("FERROFIN_ITEM_VALUES_WRITE_CHUNK"),
+        env_read: PARSED_U32,
+        label: "Item link write batch",
+        group: Group::Performance,
+        kind: whole_numbers(config::ITEM_VALUES_WRITE_CHUNK_RANGE),
+        unit: Some(Unit::Items),
+        default: "500",
+        description: "Items whose genre, studio, tag and artist links one database transaction \
+                      rewrites when an edit saves many at once; smaller holds the database \
+                      writer for shorter stretches.",
+        running: |c| json!(c.item_values_write_chunk),
+        ..ROW
+    },
+    SettingSpec {
         key: "auth_cache_ttl_secs",
         env: Some("FERROFIN_AUTH_CACHE_TTL_SECS"),
         env_read: EnvRead::NonBlank,
@@ -1030,6 +1045,22 @@ pub static SETTINGS: &[SettingSpec] = &[
         default: "1024",
         description: "Depth of the playback-metrics write queue.",
         running: |c| json!(c.playback_metrics_queue),
+        ..ROW
+    },
+    SettingSpec {
+        key: "session_idle_hours",
+        env: Some("FERROFIN_SESSION_IDLE_HOURS"),
+        env_read: PARSED_U32,
+        label: "Idle session lifetime",
+        group: Group::Performance,
+        kind: whole_numbers(config::SESSION_IDLE_HOURS_RANGE),
+        unit: Some(Unit::Hours),
+        default: "24",
+        description: "How long a session with no WebSocket that plays nothing is kept after its \
+                      last request.",
+        note: "Jellyfin keeps such a session until it restarts. Ending it frees its memory, and \
+               for a signed-in user the activity log notes the disconnect.",
+        running: |c| json!(c.session_idle_hours),
         ..ROW
     },
     // ---- Logging -----------------------------------------------------------
