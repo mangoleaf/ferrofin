@@ -1315,10 +1315,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    save_play_state and apply_play_report (UpdatePlayState), \
                    reset_playback_stream_selections (ResetPlaybackStreamSelections), \
                    record_playback_start, set_likes, mark_item_played, mark_item_unplayed, \
-                   clear_own_play_state and propagate_played_state. Compared with \
+                   mark_container with mutate_rows (a container's members, a chunk per write \
+                   transaction), clear_own_play_state and propagate_played_state. Compared with \
                    Emby.Server.Implementations/Session/SessionManager.cs (OnPlaybackStart, \
                    OnPlaybackProgress, UpdatePlaybackSettings, OnPlaybackStopped), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
+                   MediaBrowser.Controller/Entities/Folder.cs and \
+                   MediaBrowser.Controller/Entities/Movies/BoxSet.cs (MarkPlayed, MarkUnplayed), \
                    MediaBrowser.Controller/Entities/TV/Episode.cs and \
                    MediaBrowser.Controller/Entities/TV/Season.cs (Series, FindSeriesId, \
                    GetUserDataKeys), \
@@ -1336,7 +1339,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    retired-key update of SaveUserData, from the row ResolveUserDataRow reads), \
                    compared with Jellyfin.Server.Implementations/Item/\
                    ItemPersistenceService.cs (ReattachUserDataAsync, ReconcileUserDataAsync)",
-        date: "2026-11-03",
+        date: "2026-11-06",
         divergences: &[
             "After a scan or boot-repair fold, which upstream does not have (it deletes the \
              duplicate, and ReconcileUserDataAsync gives the user's rows the most recent play when \
@@ -1350,6 +1353,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Marking a container unplayed also clears the play state on the container's own rows, \
              which earlier Ferrofin builds wrote; upstream's MarkUnplayed leaves them, so a Played \
              set on a container through the UserData API survives it there. Fix path: gl-1064.",
+            "A container's members are saved a chunk at a time, each chunk in one write \
+             transaction, where upstream's Folder.MarkPlayed commits each member's SaveUserData \
+             alone and stops at the first that fails: here a member's write that fails also rolls \
+             back the members of its chunk saved before it, and a version's save that fails \
+             leaves the chunk's later members saved (gl-1321).",
         ],
     },
     VerifiedSubsystem {
