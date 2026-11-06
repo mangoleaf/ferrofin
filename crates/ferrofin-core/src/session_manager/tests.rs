@@ -3513,6 +3513,8 @@ async fn saved_session_limits_apply_to_new_logins(#[case] cap: i32, #[case] admi
 #[tokio::test]
 async fn remote_control_permission_gates_delivery_and_saved_changes() {
     let db = test_db().await;
+    // As the server runs: the permission is read from the policy cache.
+    db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
     let (mgr, bus) = cast_manager(&db);
     let alice = seed_named_user(&db, Uuid::new_v4(), "controller").await;
     let alice_id = Uuid::parse_str(&alice.id).unwrap();
@@ -3578,6 +3580,9 @@ async fn remote_control_permission_gates_delivery_and_saved_changes() {
 #[tokio::test]
 async fn shared_device_filter_uses_the_requested_user_and_device_access() {
     let db = test_db().await;
+    // As the server runs: every permission below is read from the policy
+    // cache, so each change must reach the next listing through its invalidation.
+    db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
     let (mgr, bus) = cast_manager(&db);
     let alice = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
     let id = Uuid::parse_str(&alice.id).unwrap();

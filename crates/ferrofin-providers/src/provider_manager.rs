@@ -2019,11 +2019,12 @@ impl LocalProviderManager {
     }
 
     /// The box-set arm of the single-item refresh — port of
-    /// `TmdbBoxSetProvider` + `TmdbBoxSetImageProvider`: the collection a
+    /// `TmdbBoxSetProvider`: the collection a
     /// `Tmdb` id pins (on the box set, or on the chosen Identify result),
     /// else the top hit of a collection search by the box set's name, parsed
     /// and cleaned as `GetMetadata` does (`TmdbBoxSetProvider.cs:105-108`), as
-    /// a provider result — its name and overview, its id, and its artwork.
+    /// a provider result — its name and overview, and its id. Its artwork is
+    /// `refresh_ordered_images`' (`TmdbBoxSetImageProvider`).
     async fn fetch_box_set(
         tmdb: &TmdbClient,
         name: &str,
@@ -2045,30 +2046,20 @@ impl LocalProviderManager {
         let mut fetched = Fetched::default();
         if fetch.metadata {
             fetched.item = Some(BaseItemEntity {
-                name: Some(collection.name.clone()),
-                overview: collection.overview.clone(),
+                name: Some(collection.name),
+                overview: collection.overview,
                 ..BaseItemEntity::default()
             });
             fetched.provider_ids = vec![("Tmdb".to_owned(), collection_id.to_string())];
         }
-        if fetch.images {
-            for image_type in [ImageType::Primary, ImageType::Backdrop] {
-                if let Some(image) = collection
-                    .images
-                    .iter()
-                    .find(|i| i.image_type == image_type)
-                {
-                    fetched.images.push((image_type, image.url.clone()));
-                }
-            }
-        }
         Some(fetched)
     }
 
-    /// The person arm — port of `TmdbPersonProvider` +
-    /// `TmdbPersonImageProvider`: the person's TMDB id (stored or chosen,
-    /// else the first name-search hit), its biography, birth and death dates
-    /// and birthplace under the looked-up `name`, and its profile image.
+    /// The person arm — port of `TmdbPersonProvider`: the person's TMDB id
+    /// (stored or chosen, else the first name-search hit), and its biography,
+    /// birth and death dates and birthplace under the looked-up `name`. Its
+    /// profile image is `refresh_ordered_images`' (`TmdbPersonImageProvider`),
+    /// which reads the same `/person` response ([`TmdbClient::person_images`]).
     async fn fetch_person(
         tmdb: &TmdbClient,
         name: &str,
@@ -2096,14 +2087,6 @@ impl LocalProviderManager {
             });
             fetched.provider_ids = vec![("Tmdb".to_owned(), tmdb_id.to_string())];
         }
-        if fetch.images
-            && let Some(url) = tmdb
-                .person_lookup(tmdb_id, language)
-                .await
-                .and_then(|p| p.profile_url)
-        {
-            fetched.images.push((ImageType::Primary, url));
-        }
         Some(fetched)
     }
 
@@ -2112,16 +2095,13 @@ impl LocalProviderManager {
     /// 955-1025`): `TmdbSeasonProvider` and the TVDB plugin's
     /// `TvdbSeasonProvider`, each answer folded into `temp` by `MergeData(
     /// result, temp, [], false, false)` (`:1003`), mapped as the scan maps
-    /// them ([`crate::season`]); and TheMovieDb's season poster
-    /// (`TmdbSeasonImageProvider`).
+    /// them ([`crate::season`]).
     ///
     /// Both providers resolve by the SERIES' ids (`SeasonInfo.
     /// SeriesProviderIds`): the series row's, or — identifying — the chosen
     /// result's (`ApplySearchResult`, `:272-293`). TheMovieDb's needs the
-    /// series' `Tmdb` id and never searches (`TmdbSeasonProvider.cs:49-56`;
-    /// its image provider likewise, `TmdbSeasonImageProvider.cs`); its one
-    /// season response serves the metadata and the poster
-    /// (`GetSeasonAsync`'s cache). TheTVDB's needs the series' `Tvdb` id.
+    /// series' `Tmdb` id and never searches (`TmdbSeasonProvider.cs:49-56`).
+    /// TheTVDB's needs the series' `Tvdb` id.
     /// Neither provider declares an `IHasOrder`, so the library's saved
     /// order ranks them and registration — TheTVDB first, a plugin in
     /// Jellyfin, whose plugins register before the server's providers
@@ -2168,9 +2148,8 @@ impl LocalProviderManager {
             Some(&self.preferred_metadata_language(row).await),
             Some(&self.preferred_metadata_country_code(row).await),
         );
-        let wants_tmdb = fetch.images || sources.contains(&fetcher_names::TMDB);
         let details = match tmdb {
-            Some((client, id)) if wants_tmdb => {
+            Some((client, id)) if sources.contains(&fetcher_names::TMDB) => {
                 client
                     .season_details_for_language(id, season_number, language.as_deref())
                     .await
@@ -2224,11 +2203,6 @@ impl LocalProviderManager {
         if answered {
             fetched.item = Some(temp.item);
             fetched.provider_ids = temp.provider_ids;
-        }
-        if fetch.images
-            && let Some(url) = details.and_then(|d| d.poster)
-        {
-            fetched.images.push((ImageType::Primary, url));
         }
         fetched
     }
@@ -2677,10 +2651,7 @@ impl LocalProviderManager {
                         .search_result
                         .as_ref()
                         .and_then(|r| r.search_provider_name.as_deref()),
-                    fetch: Fetch {
-                        images: false,
-                        ..fetch
-                    },
+                    fetch,
                 };
                 // Boxed: the fold's future carries both providers' state
                 // (`clippy::large_futures`).
@@ -2715,10 +2686,7 @@ impl LocalProviderManager {
                         .search_result
                         .as_ref()
                         .and_then(|r| r.search_provider_name.as_deref()),
-                    fetch: Fetch {
-                        images: false,
-                        ..fetch
-                    },
+                    fetch,
                 };
                 let (fetched, failures) = crate::rate_limit::count_request_failures(Box::pin(
                     self.fetch_episode_providers(episode),
@@ -2737,10 +2705,7 @@ impl LocalProviderManager {
                         target,
                         &stored_ids,
                         chosen_name,
-                        Fetch {
-                            images: false,
-                            ..fetch
-                        },
+                        fetch,
                         language.as_deref(),
                     ))
                     .await
@@ -3272,7 +3237,9 @@ impl LocalProviderManager {
             {
                 continue;
             }
-            match self.write_automatic_image(item_id, kind, &download.bytes, &download.content_type)
+            match self
+                .write_automatic_image(item_id, kind, download.bytes, &download.content_type)
+                .await
             {
                 Ok(image) => {
                     images.push(image);
@@ -3284,11 +3251,11 @@ impl LocalProviderManager {
         saved
     }
 
-    fn write_automatic_image(
+    async fn write_automatic_image(
         &self,
         item_id: Uuid,
         kind: ImageType,
-        bytes: &[u8],
+        bytes: Vec<u8>,
         mime: &str,
     ) -> Result<ItemImageInfo, ServiceError> {
         let index = if kind == ImageType::Backdrop {
@@ -3307,6 +3274,7 @@ impl LocalProviderManager {
             None
         };
         self.write_image_file(item_id, bytes, mime, kind, index)
+            .await
     }
 
     async fn refresh_plugin_images(
@@ -3343,7 +3311,7 @@ impl LocalProviderManager {
                 continue;
             };
             let mime = mime_types::get_mime_type(&format!("image.{ext}"));
-            match self.write_automatic_image(item_id, kind, &bytes, mime) {
+            match self.write_automatic_image(item_id, kind, bytes, mime).await {
                 Ok(image) => {
                     images.push(image);
                     saved = true;
@@ -3354,10 +3322,10 @@ impl LocalProviderManager {
         saved
     }
 
-    fn write_image_file(
+    async fn write_image_file(
         &self,
         item_id: Uuid,
-        content: &[u8],
+        content: impl Into<Vec<u8>>,
         mime_type: &str,
         image_type: ImageType,
         image_index: Option<i32>,
@@ -3376,21 +3344,27 @@ impl LocalProviderManager {
         let item_dir = meta_root.join(ferrofin_db::store::guid_to_db(item_id));
         let stem = image_file_stem(image_type, image_index);
         let dest = item_dir.join(format!("{stem}.{ext}"));
-        std::fs::create_dir_all(&item_dir).map_err(|e| {
-            ProvidersError::io(format!("create image dir {}", item_dir.display()), e)
-        })?;
-        ferrofin_util::file_helper::atomic_write(&dest, content)
-            .map_err(|e| ProvidersError::io(format!("write image {}", dest.display()), e))?;
-        for other in ["jpg", "jpeg", "png", "webp", "gif"] {
-            if other != ext {
-                let _ = std::fs::remove_file(item_dir.join(format!("{stem}.{other}")));
+        let content: Vec<u8> = content.into();
+        // `atomic_write` fsyncs: keep the disk work off the async workers.
+        let (dest, modified) = tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&item_dir).map_err(|e| {
+                ProvidersError::io(format!("create image dir {}", item_dir.display()), e)
+            })?;
+            ferrofin_util::file_helper::atomic_write(&dest, &content)
+                .map_err(|e| ProvidersError::io(format!("write image {}", dest.display()), e))?;
+            for other in ["jpg", "jpeg", "png", "webp", "gif"] {
+                if other != ext {
+                    let _ = std::fs::remove_file(item_dir.join(format!("{stem}.{other}")));
+                }
             }
-        }
+            let modified = std::fs::metadata(&dest).and_then(|info| info.modified());
+            Ok::<_, ServiceError>((dest, modified))
+        })
+        .await
+        .map_err(|error| ServiceError::backend(error.to_string()))??;
         // `SetImagePath(…, FileInfo)`: the file's own modification time, so
         // the dynamic image providers' date gate sees an upload as current.
-        let date_modified = std::fs::metadata(&dest)
-            .and_then(|info| info.modified())
-            .map_or_else(|_| Utc::now(), chrono::DateTime::from);
+        let date_modified = modified.map_or_else(|_| Utc::now(), chrono::DateTime::from);
         Ok(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type,
@@ -3525,7 +3499,8 @@ impl LocalProviderManager {
     }
 }
 
-/// Which halves of a provider arm run: its metadata, its artwork.
+/// Which halves of a refresh run: the provider arm's metadata, and the
+/// artwork `refresh_ordered_images` acquires.
 #[derive(Debug, Clone, Copy)]
 struct Fetch {
     /// The remote metadata provider runs.
@@ -3552,16 +3527,13 @@ const NO_FILE: FileFacts = FileFacts {
 
 /// What a provider arm of the single-item refresh returned: upstream's
 /// `MetadataResult` of a remote provider (the item fields it sets and its ids,
-/// `None` when metadata was not asked for or it had nothing), plus the
-/// artwork its image provider offers.
+/// `None` when metadata was not asked for or it had nothing).
 #[derive(Debug, Default)]
 struct Fetched {
     /// The provider result's row: only the fields the provider sets.
     item: Option<BaseItemEntity>,
     /// The ids the provider sets on its result.
     provider_ids: Vec<(String, String)>,
-    /// The artwork to download, by image type.
-    images: Vec<(ImageType, String)>,
     /// Each answering provider's `People`, in the order they ran (`None` a
     /// null list), which [`pass_credits`](crate::metadata_merge::pass_credits)
     /// folds.
@@ -5048,8 +5020,9 @@ impl ProviderManager for LocalProviderManager {
             0
         };
         let write_index = image_upload_file_index(image_type, index, &current)?;
-        let mut image =
-            self.write_image_file(item_id, content, mime_type, image_type, write_index)?;
+        let mut image = self
+            .write_image_file(item_id, content, mime_type, image_type, write_index)
+            .await?;
         let mut cleanup = None;
         if let (Some(saver), Some(items)) = (&self.image_saver, &self.items)
             && let Some(row) = items.retrieve_item(item_id).await?
@@ -8959,6 +8932,14 @@ mod tests {
             .await
             .expect("refresh");
         assert_eq!(update, ItemUpdateType::MetadataDownload);
+        // The metadata and the profile images read one `/person` response, as
+        // `GetPersonAsync`'s cache serves both upstream (gl-1250).
+        assert_eq!(
+            server
+                .query_values("/person/287", "append_to_response")
+                .len(),
+            1
+        );
 
         {
             let saved = store.saved.lock().expect("lock");
@@ -10381,8 +10362,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn image_upload_backdrop_append_does_not_overwrite_a_referenced_file() {
+    #[tokio::test]
+    async fn image_upload_backdrop_append_does_not_overwrite_a_referenced_file() {
         use super::image_upload_file_index;
         let directory = tempfile::tempdir().unwrap();
         let item_id = Uuid::from_u128(0x9020);
@@ -10400,12 +10381,14 @@ mod tests {
                 ImageType::Backdrop,
                 Some(1),
             )
+            .await
             .unwrap();
         let index =
             image_upload_file_index(ImageType::Backdrop, 1, std::slice::from_ref(&existing))
                 .unwrap();
         let appended = manager
             .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, index)
+            .await
             .unwrap();
         assert_ne!(appended.path, existing.path);
         assert_eq!(std::fs::read(&existing.path).unwrap(), b"earlier");
@@ -10416,6 +10399,7 @@ mod tests {
         let index = image_upload_file_index(ImageType::Backdrop, 2, &current).unwrap();
         let identical = manager
             .write_image_file(item_id, b"earlier", "image/png", ImageType::Backdrop, index)
+            .await
             .unwrap();
         assert!(identical.path.strip_suffix("backdrop3.png").is_some());
         assert_eq!(std::fs::read(existing.path).unwrap(), b"earlier");
@@ -10424,8 +10408,8 @@ mod tests {
     /// `SetImagePath(…, FileInfo)`: an upload records its file's own
     /// modification time, so the dynamic image providers' date gate sees an
     /// upload left in the internal folder as current (gl-590).
-    #[test]
-    fn image_upload_records_the_file_modification_time() {
+    #[tokio::test]
+    async fn image_upload_records_the_file_modification_time() {
         let directory = tempfile::tempdir().unwrap();
         let manager = LocalProviderManager::default().with_image_store(
             Arc::new(RecordingStore::default()),
@@ -10439,6 +10423,7 @@ mod tests {
                 ImageType::Primary,
                 None,
             )
+            .await
             .unwrap();
         let modified = std::fs::metadata(&image.path).unwrap().modified().unwrap();
         assert_eq!(
@@ -10447,8 +10432,43 @@ mod tests {
         );
     }
 
+    /// The fsync'd image write runs on the blocking pool, not on the runtime
+    /// thread awaiting it (gl-1269): while the pool's only thread is held, the
+    /// write cannot finish.
     #[test]
-    fn image_upload_backdrop_replacement_preserves_a_case_only_path_change() {
+    fn image_write_runs_on_the_blocking_pool() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let manager = LocalProviderManager::default().with_image_store(
+                Arc::new(RecordingStore::default()),
+                directory.path().to_path_buf(),
+            );
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || held.recv());
+            let mut write = std::pin::pin!(manager.write_image_file(
+                Uuid::from_u128(0x9591),
+                b"art",
+                "image/png",
+                ImageType::Primary,
+                None,
+            ));
+            let early =
+                tokio::time::timeout(std::time::Duration::from_millis(50), &mut write).await;
+            assert!(early.is_err(), "the write ran on the runtime thread");
+            release.send(()).unwrap();
+            let image = write.await.unwrap();
+            assert_eq!(std::fs::read(image.path).unwrap(), b"art");
+            blocker.await.unwrap().unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn image_upload_backdrop_replacement_preserves_a_case_only_path_change() {
         let directory = tempfile::tempdir().unwrap();
         let item_id = Uuid::from_u128(0x9022);
         let manager = LocalProviderManager::default().with_image_store(
@@ -10457,6 +10477,7 @@ mod tests {
         );
         let replacement = manager
             .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(0))
+            .await
             .unwrap();
         let previous_path = std::path::Path::new(&replacement.path).with_file_name("BACKDROP.PNG");
         std::fs::write(&previous_path, b"earlier").unwrap();
@@ -10480,8 +10501,8 @@ mod tests {
 
     /// A failed deletion of the replaced internal backdrop is reported, while
     /// an already-missing file is not.
-    #[test]
-    fn replaced_backdrop_deletion_failures_are_returned() {
+    #[tokio::test]
+    async fn replaced_backdrop_deletion_failures_are_returned() {
         let directory = tempfile::tempdir().unwrap();
         let item_id = Uuid::from_u128(0x9023);
         let manager = LocalProviderManager::default().with_image_store(
@@ -10490,6 +10511,7 @@ mod tests {
         );
         let replacement = manager
             .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(0))
+            .await
             .unwrap();
         let previous_path = std::path::Path::new(&replacement.path).with_file_name("old.jpg");
         let previous = ItemImageInfo {
@@ -10519,8 +10541,8 @@ mod tests {
         assert!(error.to_string().contains("remove replaced image"));
     }
 
-    #[test]
-    fn image_upload_backdrop_replacement_preserves_another_slots_case_alias() {
+    #[tokio::test]
+    async fn image_upload_backdrop_replacement_preserves_another_slots_case_alias() {
         let directory = tempfile::tempdir().unwrap();
         let item_id = Uuid::from_u128(0x9023);
         let manager = LocalProviderManager::default().with_image_store(
@@ -10535,6 +10557,7 @@ mod tests {
                 ImageType::Backdrop,
                 Some(1),
             )
+            .await
             .unwrap();
         let replacement = manager
             .write_image_file(
@@ -10544,6 +10567,7 @@ mod tests {
                 ImageType::Backdrop,
                 Some(2),
             )
+            .await
             .unwrap();
         let alias = ItemImageInfo {
             path: std::path::Path::new(&previous.path)
@@ -10561,8 +10585,8 @@ mod tests {
         assert_eq!(std::fs::read(replacement.path).unwrap(), b"replacement");
     }
 
-    #[test]
-    fn image_upload_backdrop_replacement_cleans_only_owned_unshared_files() {
+    #[tokio::test]
+    async fn image_upload_backdrop_replacement_cleans_only_owned_unshared_files() {
         let directory = tempfile::tempdir().unwrap();
         let item_id = Uuid::from_u128(0x9021);
         let manager = LocalProviderManager::default().with_image_store(
@@ -10577,9 +10601,11 @@ mod tests {
                 ImageType::Backdrop,
                 Some(1),
             )
+            .await
             .unwrap();
         let replacement = manager
             .write_image_file(item_id, b"later", "image/png", ImageType::Backdrop, Some(2))
+            .await
             .unwrap();
         manager
             .remove_replaced_internal_file(

@@ -16,9 +16,9 @@
 use crate::destination::{self, DestinationPolicy, DestinationRefused, PublicOnlyResolver};
 use crate::rate_limit::{LimitedRequest as _, RateLimiter, RequestError, request_limits};
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// Most redirects one fetch follows: reqwest's default policy
 /// (`redirect::Policy::default()`), which downloads went by until they followed
@@ -41,7 +41,7 @@ pub(crate) fn limiter_for(url: &str, label: &'static str) -> RateLimiter {
     LIMITERS
         .get_or_init(Mutex::default)
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(PoisonError::into_inner)
         .entry(origin)
         .or_insert_with_key(|origin| RateLimiter::new(origin.clone()))
         .counted_as(label)
@@ -167,10 +167,70 @@ pub(crate) struct GuardedHttp {
     /// ([`destination::environment_proxy`]): the client that goes through it.
     /// The proxy resolves names itself, out of the resolver's sight, so a name
     /// is checked on the server's own answer before each request and pinned
-    /// to it for the hosts the proxy settings exclude.
+    /// to it ([`VettedAddresses`]) for the hosts the proxy settings exclude.
+    /// One client serves every request, so its connections are reused
+    /// (gl-1270).
     proxied: Option<reqwest::Client>,
+    /// The proxied client's resolver.
+    pinned: Arc<VettedAddresses>,
     policy: Arc<dyn DestinationPolicy>,
     kind: &'static FetchKind,
+}
+
+/// The proxied client's resolver: a name resolves to the addresses
+/// [`GuardedHttp::client_for`] last vetted for it, which is where a host the
+/// proxy settings exclude is reached. A name never vetted, which is the
+/// proxy's own, gets the system's answer unchecked, since a proxy may well be
+/// private. A client per request with `resolve_to_addrs` did the same, but
+/// loaded the root certificates and connected afresh each time.
+///
+/// An entry is replaced by the next request to its host and never removed:
+/// a connection the pool finishes after its request has ended must still
+/// find it. So the map holds one entry per host fetched through the proxy.
+#[derive(Default)]
+struct VettedAddresses(Mutex<HashMap<String, Vec<SocketAddr>>>);
+
+impl VettedAddresses {
+    /// Sends `host` to `addresses`, just vetted for it, from now on. The port
+    /// is dropped: each connection takes its own URL's port. (Hosts compare
+    /// in lower case on both sides, so that a miss never falls through to the
+    /// unchecked lookup.)
+    fn pin(&self, host: &str, addresses: &[SocketAddr]) {
+        let addresses = addresses
+            .iter()
+            .map(|address| {
+                // `set_port`, not a new address: an IPv6 zone stays.
+                let mut address = *address;
+                address.set_port(0);
+                address
+            })
+            .collect();
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(host.to_ascii_lowercase(), addresses);
+    }
+}
+
+impl reqwest::dns::Resolve for VettedAddresses {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let pinned = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&name.as_str().to_ascii_lowercase())
+            .cloned();
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses = match pinned {
+                Some(addresses) => addresses,
+                None => destination::lookup(&host, 0).await.map_err(|failed| {
+                    Box::new(failed) as Box<dyn std::error::Error + Send + Sync>
+                })?,
+            };
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }
 
 impl GuardedHttp {
@@ -187,15 +247,18 @@ impl GuardedHttp {
             .dns_resolver(Arc::new(PublicOnlyResolver::new(Arc::clone(&policy))))
             .build()
             .ok();
+        let pinned = Arc::new(VettedAddresses::default());
         let proxied = proxy.then(|| {
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(Arc::clone(&pinned))
                 .build()
                 .ok()
         });
         Self {
             vetted,
             proxied: proxied.flatten(),
+            pinned,
             policy,
             kind,
         }
@@ -289,23 +352,20 @@ impl GuardedHttp {
             }
             Ok(Err(_)) | Err(_) => None,
         };
-        if self.proxied.is_none() {
+        let Some(proxied) = &self.proxied else {
             return self
                 .vetted
                 .clone()
                 .ok_or_else(|| kind.unsent("the HTTP client could not be built"));
-        }
+        };
         // Through the proxy, or straight to the vetted addresses for a host
         // the proxy settings exclude.
         let Some(addresses) = vetted else {
             kind.unresolvable_behind_a_proxy(host);
             return Err(kind.unsent("a host the server cannot resolve, behind a proxy"));
         };
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(host, &addresses)
-            .build()
-            .map_err(|_| kind.unsent("the HTTP client could not be built"))
+        self.pinned.pin(host, &addresses);
+        Ok(proxied.clone())
     }
 }
 
@@ -335,6 +395,9 @@ fn redirect_target(response: &reqwest::Response, current: &reqwest::Url) -> Opti
 
 #[cfg(test)]
 mod tests {
+    static KIND: super::FetchKind =
+        super::FetchKind::new(crate::metrics::IMAGE, "image", "images", "nothing", None);
+
     /// The label never picks the gate: an artwork download and a subtitle
     /// download from one origin share its pacing and cooldowns, each counted
     /// under its own provider; another origin has a gate of its own.
@@ -347,5 +410,114 @@ mod tests {
         assert!(!artwork.shares_gate_with(&other));
         assert_eq!(artwork.metric_label(), "image");
         assert_eq!(subtitle.metric_label(), "opensubtitles");
+    }
+
+    /// gl-1270: with a proxy configured, the requests to a named host go
+    /// through one client, so the second reuses the first's connection
+    /// instead of building a client and connecting again. (No proxy is set
+    /// in the test's environment, so the client reaches the host directly, at
+    /// the addresses vetted for it.)
+    #[tokio::test]
+    async fn behind_a_proxy_requests_to_a_named_host_share_a_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("address").port();
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let connections = std::sync::Arc::clone(&connections);
+            async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    connections.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let (mut buffer, mut request) = ([0; 4096], Vec::new());
+                        while let Ok(read @ 1..) = socket.read(&mut buffer).await {
+                            request.extend_from_slice(&buffer[..read]);
+                            // A GET has no body: its head ends the request.
+                            if !request.ends_with(b"\r\n\r\n") {
+                                continue;
+                            }
+                            request.clear();
+                            let kept_alive = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                            if socket.write_all(kept_alive).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        let nothing: fn(std::net::IpAddr) -> bool = |_| false;
+        let http = super::GuardedHttp::new(std::sync::Arc::new(nothing), true, &KIND);
+        for _ in 0..2 {
+            let fetched = http
+                .send(&format!("http://localhost:{port}/a.png"))
+                .await
+                .expect("sent");
+            assert_eq!(fetched.response.text().await.expect("body"), "ok");
+        }
+        server.abort();
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        // It went to the addresses vetted for the name, pinned without a port.
+        let pins = http.pinned.0.lock().expect("pins");
+        let vetted = pins.get("localhost").expect("a pin for the name");
+        assert!(
+            vetted
+                .iter()
+                .all(|address| address.ip().is_loopback() && address.port() == 0),
+            "{vetted:?}"
+        );
+    }
+
+    /// The proxied client's resolver answers a vetted name with the addresses
+    /// vetted for it, without their port, so that a request to another port
+    /// of the host still takes its own; any other name, the proxy's, with the
+    /// system's answer.
+    #[tokio::test]
+    async fn the_proxied_resolver_answers_a_vetted_name_with_its_vetted_addresses() {
+        use reqwest::dns::Resolve as _;
+        let pinned = super::VettedAddresses::default();
+        pinned.pin(
+            "Images.Example",
+            &["203.0.113.7:8080".parse().expect("address")],
+        );
+        let vetted: Vec<std::net::SocketAddr> = pinned
+            .resolve("images.example".parse().expect("name"))
+            .await
+            .expect("pinned")
+            .collect();
+        assert_eq!(vetted, ["203.0.113.7:0".parse().expect("address")]);
+        let mut proxy = pinned
+            .resolve("localhost".parse().expect("name"))
+            .await
+            .expect("the system's answer");
+        assert!(proxy.all(|address| address.ip().is_loopback()));
+    }
+
+    /// The proxied client reaches a named host at the addresses last pinned
+    /// for it, whatever the system would answer (this name it cannot), and on
+    /// the URL's port, not the pin's.
+    #[tokio::test]
+    async fn the_proxied_client_connects_to_the_addresses_last_pinned_for_a_name() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start_raw(vec![MockServer::raw_ok("", b"ok")]).await;
+        let port = server.base_url.rsplit(':').next().expect("port");
+        let url = format!("http://pinned.invalid:{port}/a.png");
+        let nothing: fn(std::net::IpAddr) -> bool = |_| false;
+        let http = super::GuardedHttp::new(std::sync::Arc::new(nothing), true, &KIND);
+        let proxied = http.proxied.clone().expect("a proxied client");
+
+        // The server listens on 127.0.0.1 only.
+        http.pinned
+            .pin("pinned.invalid", &["127.0.0.2:9".parse().expect("address")]);
+        assert!(proxied.get(&url).send().await.is_err(), "nothing there");
+        http.pinned
+            .pin("pinned.invalid", &["127.0.0.1:9".parse().expect("address")]);
+        let response = proxied.get(&url).send().await.expect("the new pin");
+        assert_eq!(response.text().await.expect("body"), "ok");
+        assert_eq!(server.requests(), 1);
     }
 }

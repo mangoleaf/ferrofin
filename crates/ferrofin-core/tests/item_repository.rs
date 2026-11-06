@@ -688,7 +688,7 @@ async fn retrieve_items_reads_across_chunks_and_skips_missing_ids() {
     let persist = FerrofinItemPersistenceService::new(db.clone());
     let repository = repo(&db);
 
-    // Two and a half chunks of stored rows, with a missing id after each one.
+    // Several read chunks of stored rows (1,250), with a missing id after each one.
     let stored_count = ferrofin_db::BATCH_BIND_CHUNK * 2 + ferrofin_db::BATCH_BIND_CHUNK / 2;
     let mut rows = Vec::new();
     let mut asked = Vec::new();

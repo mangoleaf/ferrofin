@@ -35,6 +35,11 @@
 //! - `POST /Sessions/Playing`, then `GET /Sessions` twice (gl-1242). The start
 //!   report builds no `NowPlayingItem`: the first listing builds it, from the
 //!   row the report read, and the second copies it.
+//! - `GET /Sessions`, plain and with `controllableByUserId`, from an
+//!   administrator and from a user (gl-1265). The permissions the listing
+//!   checks come from the policy cache, as upstream reads them from the user
+//!   it holds, and the caller's row is read once; a policy saved through the
+//!   API reaches the very next listing.
 
 use std::sync::Mutex;
 
@@ -52,8 +57,6 @@ use tracing_subscriber::registry::LookupSpan;
 const ADMIN_USER: &str = "admin";
 const ADMIN_PASSWORD: &str = "request-statements-pw";
 
-const CLIENT_AUTH: &str = r#"MediaBrowser Client="Request Statements", Device="Test Rig", DeviceId="rig-rs", Version="1.0.0""#;
-
 /// The span the recorded views request runs in.
 const VIEWS_SPAN: &str = "gl981_views_request";
 
@@ -68,6 +71,9 @@ const PARENT_SPAN: &str = "gl1153_parent_browse_request";
 
 /// The span the recorded playback start reports run in.
 const PLAYING_SPAN: &str = "gl1242_playing_request";
+
+/// The span the recorded session listings run in.
+const SESSIONS_SPAN: &str = "gl1265_sessions_request";
 
 /// The statements recorded inside each test's span, in order, tagged with the
 /// span: `cargo test` runs a binary's tests on threads of one process.
@@ -93,6 +99,7 @@ where
                     LIVE_TV_SPAN,
                     PARENT_SPAN,
                     PLAYING_SPAN,
+                    SESSIONS_SPAN,
                 ]
                 .into_iter()
                 .find(|name| span.name() == *name)
@@ -268,23 +275,35 @@ fn record_statements() {
     });
 }
 
+/// Signs `user` in from `device_id`; returns the authorization header and the
+/// user's id.
+async fn sign_in(
+    router: &axum::Router,
+    user: &str,
+    password: &str,
+    device_id: &str,
+) -> (String, String) {
+    let client = format!(
+        r#"MediaBrowser Client="Request Statements", Device="Test Rig", DeviceId="{device_id}", Version="1.0.0""#
+    );
+    let (status, auth) = send(
+        router,
+        &client,
+        "POST",
+        "/Users/AuthenticateByName",
+        Some(serde_json::json!({ "Username": user, "Pw": password })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{user} authenticates: {auth}");
+    let token = auth["AccessToken"].as_str().expect("token");
+    let user_id = auth["User"]["Id"].as_str().expect("user id").to_owned();
+    (format!(r#"{client}, Token="{token}""#), user_id)
+}
+
 /// Signs the admin in, adds the movies library with no remote fetchers and
 /// scans it; returns the admin's authorization header and user id.
 async fn sign_in_and_scan(harness: &Harness, router: &axum::Router) -> (String, String) {
-    let (status, auth) = send(
-        router,
-        CLIENT_AUTH,
-        "POST",
-        "/Users/AuthenticateByName",
-        Some(serde_json::json!({ "Username": ADMIN_USER, "Pw": ADMIN_PASSWORD })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "admin authenticates: {auth}");
-    let token = auth["AccessToken"].as_str().expect("token");
-    let user_id = auth["User"]["Id"].as_str().expect("user id").to_owned();
-    let auth_header = format!(
-        r#"MediaBrowser Client="Request Statements", Device="Test Rig", DeviceId="rig-rs", Version="1.0.0", Token="{token}""#
-    );
+    let (auth_header, user_id) = sign_in(router, ADMIN_USER, ADMIN_PASSWORD, "rig-rs").await;
 
     // No remote metadata or image fetchers: a scan that asks TMDb waits on it.
     let (status, body) = send(
@@ -862,4 +881,103 @@ fn row_reads_by_id(statements: &[String]) -> usize {
         .iter()
         .filter(|statement| statement.contains(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#))
         .count()
+}
+
+/// `GET /Sessions` asks whether the caller is an administrator and may control
+/// other users' sessions, and with `controllableByUserId` whether that user
+/// shares device control. Upstream reads all three from the `User` it holds
+/// (`SessionManager.GetSessions`); here they come from the policy cache, so a
+/// warm listing reads no `Permissions` or `Preferences` row and reads the
+/// caller's own row once, the `controllableByUserId` naming the caller
+/// included. A policy saved through the API still reaches the very next
+/// listing.
+#[tokio::test]
+async fn a_sessions_listing_reads_permissions_from_the_policy_cache() {
+    record_statements();
+    let harness = boot(&[]).await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (admin, _) = sign_in(&router, ADMIN_USER, ADMIN_PASSWORD, "rig-admin").await;
+    let (status, created) = send(
+        &router,
+        &admin,
+        "POST",
+        "/Users/New",
+        Some(serde_json::json!({ "Name": "viewer", "Password": "viewer-pw" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "user created: {created}");
+    let (viewer, viewer_id) = sign_in(&router, "viewer", "viewer-pw", "rig-viewer").await;
+    let devices = |sessions: &serde_json::Value| -> Vec<String> {
+        let mut ids: Vec<String> = sessions
+            .as_array()
+            .expect("a session list")
+            .iter()
+            .filter_map(|session| session["DeviceId"].as_str().map(str::to_owned))
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    // Warm: the first listings leave both callers' policies cached.
+    for header in [&admin, &viewer] {
+        let (status, sessions) = send(&router, header, "GET", "/Sessions", None).await;
+        assert_eq!(status, StatusCode::OK, "{sessions}");
+    }
+    let controllable = format!("/Sessions?controllableByUserId={viewer_id}");
+    for (header, uri, expected) in [
+        (&admin, "/Sessions", &["rig-admin", "rig-viewer"][..]),
+        (&viewer, "/Sessions", &["rig-viewer"][..]),
+        // No session here has a live connection, so none is controllable.
+        (&viewer, controllable.as_str(), &[][..]),
+    ] {
+        clear_statements(SESSIONS_SPAN);
+        let (status, sessions) = send(&router, header, "GET", uri, None)
+            .instrument(tracing::info_span!(SESSIONS_SPAN))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {sessions}");
+        assert_eq!(devices(&sessions), expected, "{uri}: {sessions}");
+        let statements = statements_in(SESSIONS_SPAN);
+        assert!(
+            !statements
+                .iter()
+                .any(|s| s.contains(r#"FROM "Permissions""#) || s.contains(r#"FROM "Preferences""#)),
+            "{uri} reads the policy from the cache: {statements:#?}"
+        );
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|s| s.contains(r#"FROM "Users""#))
+                .count(),
+            1,
+            "{uri} reads the caller's row once: {statements:#?}"
+        );
+    }
+
+    // The viewer made an administrator sees every session on the next
+    // listing, and only its own again once that is taken back.
+    let (status, user) = send(&router, &admin, "GET", &format!("/Users/{viewer_id}"), None).await;
+    assert_eq!(status, StatusCode::OK, "{user}");
+    let mut policy = user["Policy"].clone();
+    for (is_admin, expected) in [
+        (true, &["rig-admin", "rig-viewer"][..]),
+        (false, &["rig-viewer"][..]),
+    ] {
+        policy["IsAdministrator"] = serde_json::json!(is_admin);
+        let (status, body) = send(
+            &router,
+            &admin,
+            "POST",
+            &format!("/Users/{viewer_id}/Policy"),
+            Some(policy.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "policy saved: {body}");
+        let (status, sessions) = send(&router, &viewer, "GET", "/Sessions", None).await;
+        assert_eq!(status, StatusCode::OK, "{sessions}");
+        assert_eq!(
+            devices(&sessions),
+            expected,
+            "IsAdministrator = {is_admin} reaches the next listing"
+        );
+    }
 }

@@ -241,7 +241,8 @@ pub trait ItemRepository: Send + Sync {
     async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
     /// The stored rows of the given items, in as few queries as the
-    /// host-variable limit allows (`ferrofin_db::BATCH_BIND_CHUNK` ids each).
+    /// host-variable limit allows (padded chunks of `ferrofin_db::PADDED_LIST_MAX`
+    /// ids each).
     ///
     /// The batch twin of [`retrieve_item`](Self::retrieve_item), for the
     /// library scan: it needs what is already stored for the items it planned
@@ -372,6 +373,25 @@ pub trait ItemRepository: Send + Sync {
         &self,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
+    /// [`Self::get_item_list`]'s rows, in its order, carrying only what a
+    /// season's episode filter and the aired-order sort read: `Id`, `Type`,
+    /// `ParentId`, `SeasonId`, `ChannelId`, `Path`, `IndexNumber`,
+    /// `ParentIndexNumber`, `PremiereDate`, `PresentationUniqueKey`, and `Data`
+    /// where it names an `Airs*` member. A repository may leave every other
+    /// column at its default; this default returns the full rows.
+    ///
+    /// A series' episode listing reads all of its rows to place one season's,
+    /// then [`Self::retrieve_items`] the full rows of those it lists.
+    ///
+    /// # Errors
+    /// Propagates the repository failure.
+    async fn get_episode_order_rows(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_item_list(filter).await
+    }
 
     /// Returns `(Id, CleanName)` for every row matching the query, in the same
     /// order — and under the same predicates, ordering and paging — as
@@ -1179,7 +1199,9 @@ pub trait ItemPersistenceService: Send + Sync {
     }
 
     /// The stored dimensions/blurhash of every image row attached to
-    /// `item_ids`, read in one batch.
+    /// `item_ids`, read in one batch, with each row's item and type, so a
+    /// caller can also tell whether an item's rows already match what it
+    /// would write.
     ///
     /// This is the read half of C#'s `LibraryManager.ImageNeedsRefresh`: an
     /// image whose stored `Width`/`Height`/`BlurHash` are already filled and
@@ -2604,9 +2626,14 @@ pub struct ItemChildLink {
 ///
 /// Returned by
 /// [`ItemPersistenceService::image_metadata_for_items`] and consumed by the
-/// scan's port of C#'s `LibraryManager.ImageNeedsRefresh`.
+/// scan's port of C#'s `LibraryManager.ImageNeedsRefresh`, and by its credited
+/// people's image write, which compares each person's whole row set.
 #[derive(Debug, Clone)]
 pub struct StoredImageMetadata {
+    /// The item the row belongs to.
+    pub item_id: Uuid,
+    /// The row's image type.
+    pub image_type: ImageType,
     /// The image file's path — the identity of the artwork on disk.
     pub path: String,
     /// The stored pixel width (`0` when never probed).

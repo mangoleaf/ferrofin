@@ -11,7 +11,7 @@ async fn the_configured_statement_cache_reaches_both_pools() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = Config {
         db_pool: Some(1),
-        db_statement_cache: Some(150),
+        db_statement_cache: Some(120),
         ..Config::test_stub(tmp.path())
     };
     let db = open_database(&config).await.expect("database opens");
@@ -23,6 +23,6 @@ async fn the_configured_statement_cache_reaches_both_pools() {
                 .await
                 .expect("select");
         }
-        assert_eq!(sqlx::Connection::cached_statements_size(&*conn), 150);
+        assert_eq!(sqlx::Connection::cached_statements_size(&*conn), 120);
     }
 }

@@ -402,7 +402,7 @@ impl LibraryManager for SeriesLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         Ok(self.by_id.get(&id).cloned())
     }
-    async fn get_item_list(
+    async fn get_episode_order_rows(
         &self,
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
@@ -413,6 +413,20 @@ impl LibraryManager for SeriesLibrary {
         );
         let staged = self.staged.lock().expect("staged").take();
         Ok(staged.unwrap_or_else(|| self.rows.clone()))
+    }
+    async fn get_item_list(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        assert!(
+            !query.item_ids.is_empty(),
+            "only the page's rows are read in full"
+        );
+        Ok(query
+            .item_ids
+            .iter()
+            .filter_map(|id| self.by_id.get(id).cloned())
+            .collect())
     }
     async fn query_items(
         &self,

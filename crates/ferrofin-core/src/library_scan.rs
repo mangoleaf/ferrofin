@@ -120,6 +120,10 @@ struct ArtworkCache {
     /// The libraries and their options the parental-score resolver reads,
     /// once per scan rather than once per scanned item.
     rating_libraries: Option<crate::item_visibility::RatingLibraries>,
+    /// The rows above the item the resolver scored last, which the next item
+    /// sharing them does not read again
+    /// ([`update_rating_scores_in`](crate::item_visibility::ItemVisibility::update_rating_scores_in)).
+    rating_ancestors: Vec<BaseItemEntity>,
     /// Lookup locales already resolved by this pass's metadata providers.
     resolved_locales: HashMap<String, (String, String)>,
     /// Track → actual album identity, including multi-disc descendants.
@@ -220,10 +224,9 @@ enum SeasonLookup {
 /// item id, the season number and the TMDB language.
 type SeasonKey = (String, i32, Option<String>);
 
-/// How long a TMDB response is kept after it was fetched:
-/// `TmdbClientManager.CacheDurationInHours` (`TmdbClientManager.cs:26`), the
-/// absolute expiration it caches every response under (`:771-780`).
-const TMDB_CACHE_DURATION: std::time::Duration = std::time::Duration::from_hours(1);
+/// How long a TMDB response is kept after it was fetched
+/// ([`ferrofin_providers::tmdb::CACHE_DURATION`]).
+const TMDB_CACHE_DURATION: std::time::Duration = ferrofin_providers::tmdb::CACHE_DURATION;
 
 /// The weight of TMDB responses kept at most:
 /// `TmdbClientManager.CacheSizeLimit` (`TmdbClientManager.cs:28-30,48`),
@@ -4963,7 +4966,11 @@ impl LibraryScanner {
             let scored = match libraries {
                 Ok(libraries) => {
                     let scored = resolver
-                        .update_rating_scores_in(std::slice::from_mut(entity), &libraries)
+                        .update_rating_scores_in(
+                            std::slice::from_mut(entity),
+                            &libraries,
+                            &mut cache.rating_ancestors,
+                        )
                         .await;
                     cache.rating_libraries = Some(libraries);
                     scored
@@ -7592,6 +7599,8 @@ impl LibraryScanner {
         cache.unread_parents.retain(|id| !keys.contains(id));
         cache.locale_parents.retain(|id, _| !keys.contains(id));
         cache.resolved_locales.retain(|id, _| !keys.contains(id));
+        // A refresh may have rewritten a row above the next item, rating or parent alike.
+        cache.rating_ancestors.clear();
         let albums: Vec<Uuid> = touched
             .iter()
             .filter(|id| cache.album_covers.remove(id).is_some())
@@ -12498,30 +12507,48 @@ impl LibraryScanner {
         }
     }
 
-    /// What previous scans already probed for the profile images of `written`,
-    /// keyed by image path — one query for the whole credit list.
+    /// What previous scans stored for the profile images of `written`, in one
+    /// query for the whole credit list: each person's image rows, by person id
+    /// (`None` when they could not be read), and what was probed, by path.
     ///
     /// Built here rather than carried on the scan's `ArtworkCache`: person ids
     /// are only known once `update_people` has written them, which is after the
     /// per-scan prereads have run.
-    async fn stored_person_image_metadata(
+    async fn stored_person_images(
         &self,
         written: &[ferrofin_traits::persistence::WrittenPerson],
-    ) -> ProbedImages {
-        let mut images = ProbedImages::new();
+    ) -> (Option<HashMap<Uuid, Vec<ItemImageInfo>>>, ProbedImages) {
+        let mut probed = ProbedImages::new();
         let with_art: Vec<Uuid> = written
             .iter()
             .filter(|p| p.image_url.is_some())
             .map(|p| p.id)
             .collect();
         if with_art.is_empty() {
-            return images;
+            return (Some(HashMap::new()), probed);
         }
         match self.persistence.image_metadata_for_items(&with_art).await {
-            Ok(rows) => remember_stored_images(&mut images, rows),
-            Err(err) => tracing::warn!(%err, "could not read stored person image metadata"),
+            Ok(rows) => {
+                let mut rows_of: HashMap<Uuid, Vec<ItemImageInfo>> = HashMap::new();
+                for row in rows {
+                    let image = ItemImageInfo {
+                        path: row.path,
+                        image_type: row.image_type,
+                        date_modified: row.date_modified,
+                        width: row.width,
+                        height: row.height,
+                        blur_hash: row.blur_hash,
+                    };
+                    remember_settled_image(&mut probed, &image);
+                    rows_of.entry(row.item_id).or_default().push(image);
+                }
+                (Some(rows_of), probed)
+            }
+            Err(err) => {
+                tracing::warn!(%err, "could not read stored person image metadata");
+                (None, probed)
+            }
         }
-        images
     }
 
     /// The stored row and `LockedFields` of every credited person whose
@@ -12619,7 +12646,8 @@ impl LibraryScanner {
     /// Enriches credited people: downloads each one's TMDB profile image as their
     /// `Primary` artwork, and fetches a biography (bio/birthday/deathday/birthplace)
     /// for each *newly-created* person. Best-effort and cached — images skip
-    /// existing files, and bios only run for new people, so re-scans stay cheap.
+    /// existing files and are written only when the person's stored rows differ,
+    /// and bios only run for new people, so re-scans stay cheap.
     ///
     /// ponytail: runs serially — a large cast makes the first scan slower, but the
     /// per-file / new-only guards make re-scans cheap. Batch if first-scan latency
@@ -12638,7 +12666,7 @@ impl LibraryScanner {
         // re-BlurHash-encodes every cast member's profile photo, which on a
         // library with thousands of credited people is more image work than the
         // items themselves. One read per credited cast, not one per person.
-        let stored = self.stored_person_image_metadata(&written).await;
+        let (mut stored_rows, stored) = self.stored_person_images(&written).await;
         let person_locks = self.person_locks(&written).await;
         let server_locale = self.server_metadata_locale();
         // Read only for a biography fetch, which most credits never make (a
@@ -12686,10 +12714,26 @@ impl LibraryScanner {
                 // answer has to live.)
                 adopt_stored_image_metadata(&mut infos, &stored);
                 self.fill_image_metadata(&mut infos).await;
-                if !infos.is_empty()
-                    && let Err(err) = self.persistence.save_item_images(person.id, &infos).await
-                {
-                    tracing::warn!(%err, person = %id, "failed to persist person image");
+                // Upstream saves a person only when something changed
+                // (`SavePeopleMetadataAsync`'s `saveEntity`). Rows that already
+                // match take no writer transaction, which a recurring cast
+                // would otherwise take once per credit of every saved item.
+                let person_rows = stored_rows
+                    .as_ref()
+                    .map(|rows| rows.get(&person.id).map_or(&[][..], Vec::as_slice));
+                if !infos.is_empty() && images_changed(&infos, person_rows) {
+                    match self.persistence.save_item_images(person.id, &infos).await {
+                        // A person credited more than once here (a director who
+                        // also wrote it) is one person: written once.
+                        Ok(()) => {
+                            if let Some(rows) = &mut stored_rows {
+                                rows.insert(person.id, infos);
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, person = %id, "failed to persist person image");
+                        }
+                    }
                 }
             }
 
@@ -24003,6 +24047,7 @@ impl ProbedImage {
             height,
             blur_hash,
             date_modified,
+            ..
         } = row;
         (
             path,
@@ -24171,6 +24216,8 @@ mod trickplay;
 
 #[cfg(test)]
 mod directory_cache_tests;
+#[cfg(test)]
+mod person_image_tests;
 #[cfg(test)]
 mod plan_paths_tests;
 
@@ -24773,8 +24820,8 @@ mod tests {
     use ferrofin_traits::persistence::ItemPersistenceService as _;
 
     /// The parental-score resolver reads the libraries and their options once
-    /// per scan, not once per scanned item; each item still reads its own
-    /// parent chain, so an ancestor saved earlier in the pass is seen.
+    /// per scan, not once per scanned item; an ancestor saved earlier in the
+    /// pass is still seen.
     #[tokio::test]
     async fn a_scan_reads_the_rating_libraries_once() {
         use crate::item_repository::FerrofinItemRepository;
@@ -24881,6 +24928,141 @@ mod tests {
             .expect("episode");
         assert!(score("TV-MA").is_some());
         assert_eq!(row.inherited_parental_rating_value, score("TV-MA"));
+    }
+
+    /// The parental score reads each parent row once for all its children
+    /// (gl-1252): a season's episodes share the chain the first one read,
+    /// and that chain is read after the scan saved the series and the
+    /// season above it, so each unrated child still inherits the nearest
+    /// rating this scan saved.
+    #[tokio::test]
+    async fn a_scan_reads_each_parent_chain_once_for_its_children() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::{ItemTypeLookup, derive_item_id};
+        use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
+        use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+        use ferrofin_model::entities::CollectionTypeOptions;
+        use ferrofin_traits::library::VirtualFolderManager as _;
+        use ferrofin_traits::persistence::ItemRepository;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shows = tmp.path().join("shows");
+        let series = shows.join("Show (2001)");
+        std::fs::create_dir_all(&series).expect("mkdir");
+        std::fs::write(
+            series.join("tvshow.nfo"),
+            "<tvshow><title>Show</title><mpaa>TV-MA</mpaa></tvshow>",
+        )
+        .expect("nfo");
+        let mut episodes = Vec::new();
+        for season in 1..=2 {
+            let folder = series.join(format!("Season 0{season}"));
+            std::fs::create_dir_all(&folder).expect("mkdir");
+            for episode in 1..=3 {
+                let path = folder.join(format!("Show S0{season}E0{episode}.mkv"));
+                std::fs::write(&path, b"").expect("write");
+                episodes.push((season, path));
+            }
+        }
+        // The second season carries a rating of its own, which its episodes
+        // take over the series'.
+        std::fs::write(
+            series.join("Season 02/season.nfo"),
+            "<season><title>Season 2</title><mpaa>TV-PG</mpaa></season>",
+        )
+        .expect("nfo");
+        let db = crate::test_support::test_db().await;
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Shows",
+            Some(CollectionTypeOptions::tvshows),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: shows.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .expect("library");
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::clone(&items),
+            Arc::new(crate::LocalizationManager::new("US")),
+            tmp.path().join("data").to_string_lossy().into_owned(),
+        ));
+        let scanner =
+            LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+                .with_items(Arc::clone(&items))
+                .with_rating_resolver(Arc::clone(&visibility));
+        scanner.scan_all().await.expect("scan");
+
+        let score = |rating: &str| {
+            crate::LocalizationManager::new("US")
+                .get_rating_score(rating, None)
+                .map(|score| i64::from(score.score))
+        };
+        assert_ne!(score("TV-MA"), score("TV-PG"));
+        for (season, path) in &episodes {
+            let id = derive_item_id(BaseItemKind::Episode, &path.to_string_lossy()).expect("id");
+            let row = items
+                .retrieve_item(id)
+                .await
+                .expect("read")
+                .expect("episode");
+            let rating = if *season == 1 { "TV-MA" } else { "TV-PG" };
+            assert_eq!(
+                row.inherited_parental_rating_value,
+                score(rating),
+                "{}",
+                path.display()
+            );
+        }
+        // The series hangs off the library, which the library set holds; the
+        // first season reads the series, and each season's first episode its
+        // season. The second season finds the series in the chain its
+        // predecessor's episodes read.
+        assert_eq!(visibility.hierarchy_reads(), 3, "one read per parent row");
+    }
+
+    /// An item refresh served between two scan items may have rewritten a
+    /// row above the next one, so the rows the parental score carries are
+    /// dropped with the rest of what it touched (gl-1252).
+    #[tokio::test]
+    async fn a_refresh_between_items_drops_the_carried_rating_ancestors() {
+        use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = crate::test_support::test_db().await;
+        let scanner = LibraryScanner::new(
+            Arc::new(FerrofinVirtualFolderManager::new(
+                tmp.path().join("default"),
+            )),
+            Arc::new(FerrofinFileSystem::new()),
+            Arc::new(FerrofinItemPersistenceService::new(db)),
+        );
+        let mut cache = super::ArtworkCache {
+            rating_ancestors: vec![BaseItemEntity::default()],
+            ..super::ArtworkCache::default()
+        };
+        scanner
+            .reread_touched(
+                &[uuid::Uuid::from_u128(1)],
+                &mut cache,
+                &mut std::collections::HashMap::new(),
+            )
+            .await;
+        assert!(cache.rating_ancestors.is_empty(), "the carry is emptied");
     }
 
     #[rstest::rstest]
@@ -34538,6 +34720,8 @@ mod tests {
 
         let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
         let row = |path: &str, width: i32| StoredImageMetadata {
+            item_id: uuid::Uuid::nil(),
+            image_type: ImageType::Primary,
             path: path.to_owned(),
             width,
             height: 1500,

@@ -441,7 +441,7 @@ async fn linked_children_for_parents(
     child_type: Option<i32>,
 ) -> Result<std::collections::HashMap<Uuid, std::collections::HashSet<Uuid>>, ServiceError> {
     let mut result = std::collections::HashMap::new();
-    for parents in parents.chunks(512) {
+    for parents in ferrofin_db::padded_in_chunks(parents) {
         let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             r#"SELECT "ParentId", "ChildId" FROM "LinkedChildren" WHERE "ParentId" IN ("#,
         );

@@ -1836,6 +1836,9 @@ pub async fn build_app_state(
     // Failed runs also land in the dashboard's activity feed as `TaskFailed`
     // Alerts (port of upstream's `TaskCompletedLogger`).
     task_manager.set_activity_manager(Arc::clone(&activity));
+    // Core task names, descriptions and categories are shown in the request's
+    // UI culture, else the live server `UICulture`.
+    task_manager.set_localization_manager(Arc::clone(&localization));
     task_manager.register(Arc::new(ferrofin_core::RefreshLibraryTask::new(
         Arc::clone(&library),
     )));

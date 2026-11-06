@@ -312,7 +312,9 @@ fn episode_air_order(item: &BaseItemEntity) -> ferrofin_model::entities_media::A
 /// season belongs to it — and sorted in aired order (season 0 keeps the
 /// series' `SortName` order). Empty when the season has no series.
 /// `season_id` is the season's id; `query` supplies the user and the DTO
-/// options the series query runs with.
+/// options the series query runs with. The series' rows are read with only
+/// the columns the selection reads, and the full rows of the season's
+/// episodes after it (gl-1259).
 #[allow(clippy::too_many_lines)] // source relation resolution, then selection
 pub(crate) async fn season_episode_rows(
     items: &dyn ItemRepository,
@@ -332,7 +334,7 @@ pub(crate) async fn season_episode_rows(
         return Ok(Vec::new());
     };
     let rows = items
-        .get_item_list(&InternalItemsQuery {
+        .get_episode_order_rows(&InternalItemsQuery {
             user: query.user.clone(),
             series_presentation_unique_key: Some(episode_presentation_key(&series)),
             include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
@@ -431,7 +433,17 @@ pub(crate) async fn season_episode_rows(
         // comparer is not a total order, on which `sort_by` may panic.
         stable_sort_by(&mut matches, |(left, _), (right, _)| left.compare(right));
     }
-    Ok(matches.into_iter().map(|(_, row)| row).collect())
+    let ids: Vec<Uuid> = matches
+        .iter()
+        .filter_map(|(_, row)| Uuid::parse_str(&row.id).ok())
+        .collect();
+    let mut full: HashMap<Uuid, BaseItemEntity> = items
+        .retrieve_items(&ids)
+        .await?
+        .into_iter()
+        .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
+        .collect();
+    Ok(ids.iter().filter_map(|id| full.remove(id)).collect())
 }
 
 /// One scan request: what it covers, the options its items refresh with,
@@ -2951,6 +2963,13 @@ impl LibraryManager for FerrofinLibraryManager {
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         self.items.get_item_list(query).await
+    }
+
+    async fn get_episode_order_rows(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.items.get_episode_order_rows(query).await
     }
 
     fn empty_by_name_item(&self, kind: BaseItemKind) -> BaseItemEntity {

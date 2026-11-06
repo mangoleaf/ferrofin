@@ -1303,6 +1303,7 @@ dependencies = [
 name = "ferrofin-chromaprint"
 version = "0.4.1"
 dependencies = [
+ "indexmap",
  "rstest",
 ]
 
@@ -1500,6 +1501,7 @@ dependencies = [
  "ferrofin-traits",
  "ferrofin-util",
  "flate2",
+ "futures-util",
  "icu_collator",
  "quick-xml",
  "regex",

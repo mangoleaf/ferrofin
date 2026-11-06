@@ -69,7 +69,7 @@ impl MediaAttachmentRepository for FerrofinMediaAttachmentRepository {
     {
         let mut map: std::collections::HashMap<Uuid, Vec<AttachmentStreamInfoEntity>> =
             std::collections::HashMap::new();
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(item_ids) {
             let ph = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT * FROM "AttachmentStreamInfos" WHERE "ItemId" IN ({ph})

@@ -585,12 +585,41 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
         let supported = Self::supported_image(&original_image_path, date_modified);
         original_image_path = supported.0;
 
+        let requires_transparency =
+            TRANSPARENT_IMAGE_TYPES.contains(&extension_of(&original_image_path).as_str());
+
+        // `autoOrient` for a Photo; the caller, which read the item, sets it.
+        let auto_orient = options.auto_orient;
+        let default_options = options
+            .has_default_options(&original_image_path, original_image_size)
+            && (!auto_orient || !options.requires_auto_orientation);
+        let output_format =
+            self.output_format(&options.supported_output_formats, requires_transparency);
+        // The cache key is known before any stat, so `File.Exists(original)`,
+        // then `File.Exists(cacheFilePath)` and its time, take one blocking-pool
+        // hop (gl-1258). The cache file is stat'd only where upstream does: the
+        // original exists and the options are not default.
+        let cache_file_path = (!default_options).then(|| {
+            self.cache_file_path(
+                &original_image_path,
+                options,
+                options.quality,
+                supported.1,
+                output_format,
+            )
+        });
         // Original file is gif, or original file doesn't exist. Either way the
         // original is served, so the GIF test goes first and a GIF costs no stat.
-        if mime_type.eq_ignore_ascii_case(GIF_MIME_TYPE) || {
-            let path = original_image_path.clone();
-            !self.stat(move |meta| meta.exists(&path)).await?
-        } {
+        let (original_exists, cached) = if mime_type.eq_ignore_ascii_case(GIF_MIME_TYPE) {
+            (false, None)
+        } else {
+            self.stat_original_and_cache(
+                &original_image_path,
+                cache_file_path.as_ref().and_then(|path| path.as_ref().ok()),
+            )
+            .await?
+        };
+        if !original_exists {
             return Ok(ProcessedImage {
                 path: original_image_path,
                 mime_type: Some(mime_type),
@@ -599,33 +628,15 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
         }
 
         date_modified = supported.1;
-        let requires_transparency =
-            TRANSPARENT_IMAGE_TYPES.contains(&extension_of(&original_image_path).as_str());
-
-        // `autoOrient` for a Photo; the caller, which read the item, sets it.
-        let auto_orient = options.auto_orient;
-
-        if options.has_default_options(&original_image_path, original_image_size)
-            && (!auto_orient || !options.requires_auto_orientation)
-        {
+        let Some(cache_file_path) = cache_file_path else {
             // Just spit out the original file if all the options are default.
             return Ok(ProcessedImage {
                 path: original_image_path.clone(),
                 mime_type: Some(get_mime_type(&original_image_path).to_owned()),
                 date_modified,
             });
-        }
-
-        let quality = options.quality;
-        let output_format =
-            self.output_format(&options.supported_output_formats, requires_transparency);
-        let cache_file_path = self.cache_file_path(
-            &original_image_path,
-            options,
-            quality,
-            date_modified,
-            output_format,
-        )?;
+        };
+        let cache_file_path = cache_file_path?;
 
         // The whole tail is the C# try/catch: any error returns the original.
         match self
@@ -633,8 +644,9 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
                 &original_image_path,
                 date_modified,
                 &cache_file_path,
+                cached,
                 auto_orient,
-                quality,
+                options.quality,
                 options,
                 output_format,
             )
@@ -700,8 +712,30 @@ impl<F: FileMeta + 'static> ImageProcessor<F> {
             .map_err(ServiceError::backend_source)
     }
 
+    /// `File.Exists(original)`, and when it holds and `cache` is given,
+    /// `File.Exists(cache)` with its `GetLastWriteTimeUtc`: one [`Self::stat`].
+    async fn stat_original_and_cache(
+        &self,
+        original: &str,
+        cache: Option<&String>,
+    ) -> Result<(bool, Option<DateTime<Utc>>), ServiceError> {
+        let original = original.to_owned();
+        let cache = cache.cloned();
+        self.stat(move |meta| {
+            let exists = meta.exists(&original);
+            let cached = cache
+                .filter(|_| exists)
+                .and_then(|path| meta.exists(&path).then(|| meta.last_write_time_utc(&path)));
+            (exists, cached)
+        })
+        .await
+    }
+
     /// The cache-write half of [`process_image`](ImageProcessorTrait::process_image),
     /// factored out so its fallible I/O is a single `?`-chain the pipeline wraps.
+    ///
+    /// `cached` is the cache file's `GetLastWriteTimeUtc` when
+    /// `File.Exists(cacheFilePath)`, which the caller stat'd with the original.
     ///
     /// Returns `Ok(Some(processed))` for a fresh or cached resized file,
     /// `Ok(None)` when the encoder short-circuited to the original path, and
@@ -712,19 +746,12 @@ impl<F: FileMeta + 'static> ImageProcessor<F> {
         original_image_path: &str,
         date_modified: DateTime<Utc>,
         cache_file_path: &str,
+        cached: Option<DateTime<Utc>>,
         auto_orient: bool,
         quality: i32,
         options: &ImageProcessingOptions,
         output_format: ImageFormat,
     ) -> Result<Option<ProcessedImage>, ServiceError> {
-        // `File.Exists(cacheFilePath)`, and on a hit the
-        // `GetLastWriteTimeUtc(cacheFilePath)` the C# returns: one blocking-pool
-        // hop for the two.
-        let cached = {
-            let path = cache_file_path.to_owned();
-            self.stat(move |meta| meta.exists(&path).then(|| meta.last_write_time_utc(&path)))
-                .await?
-        };
         // `None` is a cache miss: encode, then read the new file's time.
         let date_written = if let Some(date_written) = cached {
             date_written
@@ -1802,5 +1829,104 @@ mod tests {
         assert!(processed.path.contains("resized-images"));
         assert_eq!(encoder.calls.load(Ordering::SeqCst), 1);
         assert_eq!(processor.file_meta.calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A [`FakeFs`] that records the blocking-pool task each call ran on, so a
+    /// test counts the hops `process_image` makes.
+    #[derive(Default)]
+    struct HopFs {
+        inner: FakeFs,
+        hops: Mutex<Vec<Option<tokio::task::Id>>>,
+    }
+
+    impl HopFs {
+        /// The calls since the last take, and the distinct tasks they ran on.
+        fn take(&self) -> (usize, usize) {
+            let hops = std::mem::take(&mut *self.hops.lock().expect("lock"));
+            let tasks: std::collections::HashSet<_> = hops.iter().collect();
+            assert!(hops.iter().all(Option::is_some), "a stat ran on no task");
+            (hops.len(), tasks.len())
+        }
+    }
+
+    impl FileMeta for HopFs {
+        fn exists(&self, path: &str) -> bool {
+            self.hops.lock().expect("lock").push(tokio::task::try_id());
+            self.inner.exists(path)
+        }
+
+        fn last_write_time_utc(&self, path: &str) -> DateTime<Utc> {
+            self.hops.lock().expect("lock").push(tokio::task::try_id());
+            self.inner.last_write_time_utc(path)
+        }
+    }
+
+    /// gl-1258: the original's existence and the cached file's existence and
+    /// time are one blocking-pool hop, so a cached poster costs one hop; a miss
+    /// adds only the written file's time. A missing original and a request
+    /// with default options stat the original alone.
+    #[tokio::test]
+    async fn the_original_and_cache_stats_share_one_hop() {
+        let cache = TempDir::new().expect("cache");
+        let encoder = Arc::new(CountingEncoder {
+            work: None,
+            calls: AtomicUsize::new(0),
+            return_original: None,
+        });
+        let fs = HopFs {
+            inner: FakeFs::with(&["/input.jpg"]),
+            ..Default::default()
+        };
+        let processor =
+            ImageProcessor::with_file_meta(encoder.clone(), cache.path().to_path_buf(), fs);
+        let resize = |path: &str| ImageProcessingOptions {
+            image: ItemImageInfo {
+                path: path.into(),
+                ..Default::default()
+            },
+            width: Some(100),
+            ..Default::default()
+        };
+
+        let miss = processor
+            .process_image(&resize("/input.jpg"))
+            .await
+            .expect("miss");
+        assert_eq!(processor.file_meta.take(), (3, 2), "miss");
+        processor.file_meta.inner.add(&miss.path);
+        let hit = processor
+            .process_image(&resize("/input.jpg"))
+            .await
+            .expect("hit");
+        assert_eq!(hit, miss);
+        assert_eq!(processor.file_meta.take(), (3, 1), "hit");
+        assert_eq!(encoder.calls.load(Ordering::SeqCst), 1);
+
+        let missing = processor
+            .process_image(&resize("/missing.jpg"))
+            .await
+            .expect("missing");
+        assert_eq!(missing.path, "/missing.jpg");
+        assert_eq!(processor.file_meta.take(), (1, 1), "missing original");
+        let original = processor
+            .process_image(&ImageProcessingOptions {
+                image: ItemImageInfo {
+                    path: "/input.jpg".into(),
+                    ..Default::default()
+                },
+                quality: 100,
+                supported_output_formats: vec![ImageFormat::Jpg],
+                ..Default::default()
+            })
+            .await
+            .expect("default options");
+        assert_eq!(original.path, "/input.jpg");
+        assert_eq!(processor.file_meta.take(), (1, 1), "default options");
+        let gif = processor
+            .process_image(&resize("/input.gif"))
+            .await
+            .expect("gif");
+        assert_eq!(gif.path, "/input.gif");
+        assert_eq!(processor.file_meta.take(), (0, 0), "gif");
     }
 }

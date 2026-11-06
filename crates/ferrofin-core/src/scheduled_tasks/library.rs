@@ -1,8 +1,9 @@
 //! The Library-category scheduled tasks.
 //!
-//! Faithful ports of the upstream library `IScheduledTask`s (names, keys,
-//! categories, descriptions and default triggers match the upstream classes and
-//! en-US localization strings):
+//! Faithful ports of the upstream library `IScheduledTask`s (keys, default
+//! triggers and the localization keys of their names, categories and
+//! descriptions match the upstream classes; the TMDb task keeps upstream's
+//! literals):
 //!
 //! - [`KeyframeExtractionTask`] — `KeyframeExtractionScheduledTask`
 //!   (`KeyframeExtraction`)
@@ -66,8 +67,8 @@ use super::{ScheduledTask, TaskProgress};
 /// 100-nanosecond ticks per second (the `TaskTriggerInfo` time unit).
 const TICKS_PER_SECOND: i64 = 10_000_000;
 
-/// The upstream Library category display string (`TasksLibraryCategory`).
-const LIBRARY: &str = "Library";
+/// The upstream Library category's localization key.
+pub(super) const LIBRARY: &str = "TasksLibraryCategory";
 
 /// Items examined per page (the upstream `QueryPageLimit`). The extensions'
 /// library walks (Intro Skipper's queue, Merge Versions) read their rows in
@@ -152,14 +153,16 @@ impl ScheduledTask for KeyframeExtractionTask {
         "KeyframeExtraction"
     }
     fn name(&self) -> &str {
-        "Keyframe Extractor"
+        "TaskKeyframeExtractor"
     }
     fn description(&self) -> &str {
-        "Extracts keyframes from video files to create more precise HLS playlists. This task \
-         may run for a long time."
+        "TaskKeyframeExtractorDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         // `KeyframeExtractionScheduledTask.cs:55-65`: every library video,
@@ -518,13 +521,16 @@ impl ScheduledTask for AudioNormalizationTask {
         "AudioNormalization"
     }
     fn name(&self) -> &str {
-        "Audio Normalization"
+        "TaskAudioNormalization"
     }
     fn description(&self) -> &str {
-        "Scans files for audio normalization data."
+        "TaskAudioNormalizationDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(24)]
@@ -591,10 +597,9 @@ impl ChapterImagesTask {
     async fn refresh_video(
         &self,
         video: &BaseItemEntity,
+        item_id: Uuid,
         extract: bool,
     ) -> Result<bool, ServiceError> {
-        let item_id = Uuid::parse_str(&video.id)
-            .map_err(|error| ServiceError::invalid_input(error.to_string()))?;
         let mut chapters = self.chapters.get_chapters(item_id).await?;
         let outcome = self
             .extractor
@@ -661,13 +666,16 @@ impl ScheduledTask for ChapterImagesTask {
         "RefreshChapterImages"
     }
     fn name(&self) -> &str {
-        "Extract Chapter Images"
+        "TaskRefreshChapterImages"
     }
     fn description(&self) -> &str {
-        "Creates thumbnails for videos that have chapters."
+        "TaskRefreshChapterImagesDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![TaskTriggerInfo {
@@ -746,6 +754,12 @@ impl ScheduledTask for ChapterImagesTask {
                 let Some(path) = video.path.as_deref().filter(|path| !path.is_empty()) else {
                     continue;
                 };
+                // Neither Jellyfin nor Ferrofin writes a non-GUID id, so only a
+                // damaged row reaches this: skip it, or it fails every run.
+                let Ok(item_id) = Uuid::parse_str(&video.id) else {
+                    tracing::warn!(item_id = %video.id, path, "skipping a video whose id is not a GUID");
+                    continue;
+                };
                 let modified =
                     crate::chapter_image_extractor::date_modified_ticks(video.date_modified);
                 let history_key = format!("{path}{modified}").to_lowercase();
@@ -753,7 +767,7 @@ impl ScheduledTask for ChapterImagesTask {
                 // errors: those fail the run and blocklist nothing. Only an
                 // attempted extraction can fail, so a key is never appended twice.
                 let success = self
-                    .refresh_video(video, !failed.contains(&history_key))
+                    .refresh_video(video, item_id, !failed.contains(&history_key))
                     .await?;
                 if !success {
                     append_failure_history(&fail_history_path, &history_key)?;
@@ -1046,13 +1060,16 @@ impl ScheduledTask for PeopleValidationTask {
     }
 
     fn name(&self) -> &str {
-        "Refresh People"
+        "TaskRefreshPeople"
     }
     fn description(&self) -> &str {
-        "Updates metadata for actors and directors in your media library."
+        "TaskRefreshPeopleDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(7 * 24)]
@@ -1114,13 +1131,16 @@ impl ScheduledTask for SubtitleDownloadTask {
         "DownloadSubtitles"
     }
     fn name(&self) -> &str {
-        "Download missing subtitles"
+        "TaskDownloadMissingSubtitles"
     }
     fn description(&self) -> &str {
-        "Searches the internet for missing subtitles based on metadata configuration."
+        "TaskDownloadMissingSubtitlesDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(24)]
@@ -1219,13 +1239,16 @@ impl ScheduledTask for LyricDownloadTask {
         "DownloadLyrics"
     }
     fn name(&self) -> &str {
-        "Download missing lyrics"
+        "TaskDownloadMissingLyrics"
     }
     fn description(&self) -> &str {
-        "Downloads lyrics for songs"
+        "TaskDownloadMissingLyricsDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(24)]
@@ -1419,8 +1442,9 @@ impl ScheduledTask for TmdbUpcomingEpisodesTask {
     fn description(&self) -> &str {
         "Checks TheMovieDb for newly announced episodes and creates virtual entries for unaired and missing episodes, according to the TMDb plugin settings. When both options are disabled, removes any virtual entries previously created."
     }
+    // Upstream's literal, not `TasksLibraryCategory`: this task is not localized.
     fn category(&self) -> &str {
-        LIBRARY
+        "Library"
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         let days = self
@@ -1532,13 +1556,16 @@ impl ScheduledTask for TrickplayImagesTask {
         "RefreshTrickplayImages"
     }
     fn name(&self) -> &str {
-        "Generate Trickplay Images"
+        "TaskRefreshTrickplayImages"
     }
     fn description(&self) -> &str {
-        "Creates trickplay previews for videos in enabled libraries."
+        "TaskRefreshTrickplayImagesDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![TaskTriggerInfo {
@@ -1677,13 +1704,16 @@ impl ScheduledTask for MediaSegmentExtractionTask {
         "TaskExtractMediaSegments"
     }
     fn name(&self) -> &str {
-        "Media Segment Scan"
+        "TaskExtractMediaSegments"
     }
     fn description(&self) -> &str {
-        "Extracts or obtains media segments from MediaSegment enabled plugins."
+        "TaskExtractMediaSegmentsDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(12)]
@@ -3465,12 +3495,9 @@ mod tests {
         let task = MediaSegmentExtractionTask::new(library, segments.clone());
 
         assert_eq!(task.key(), "TaskExtractMediaSegments");
-        assert_eq!(task.name(), "Media Segment Scan");
-        assert_eq!(task.category(), "Library");
-        assert_eq!(
-            task.description(),
-            "Extracts or obtains media segments from MediaSegment enabled plugins."
-        );
+        assert_eq!(task.name(), "TaskExtractMediaSegments");
+        assert_eq!(task.category(), "TasksLibraryCategory");
+        assert_eq!(task.description(), "TaskExtractMediaSegmentsDescription");
         let triggers = task.default_triggers();
         assert_eq!(triggers.len(), 1);
         assert_eq!(triggers[0].type_, TaskTriggerInfoType::IntervalTrigger);
@@ -4336,6 +4363,21 @@ mod tests {
 
         let reads = chapters.reads.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(reads, files.len(), "every video was reconciled");
+        drop(media);
+    }
+
+    #[tokio::test]
+    async fn chapter_task_skips_a_video_whose_id_is_not_a_guid() {
+        let (media, movie, chapters, task) = chapter_task_fixture(false).await;
+        let mut damaged = task.library.get_item_by_id(movie).await.unwrap().unwrap();
+        damaged.id = "not-a-guid".to_owned();
+        task.library.create_items(&[damaged], None).await.unwrap();
+
+        task.execute(&TaskProgress::default())
+            .await
+            .expect("one damaged row does not fail the run");
+        let reads = chapters.reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reads, 1, "the valid video was still reconciled");
         drop(media);
     }
 

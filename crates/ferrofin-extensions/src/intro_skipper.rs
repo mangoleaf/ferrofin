@@ -364,6 +364,13 @@ impl ScheduledTask for MediaSegmentScanTask {
     fn category(&self) -> &str {
         self.providers.category()
     }
+    // The core task's text is its localization keys.
+    fn is_localized(&self) -> bool {
+        self.providers.is_localized()
+    }
+    fn description_argument(&self) -> Option<String> {
+        self.providers.description_argument()
+    }
     fn default_triggers(&self) -> Vec<ferrofin_model::tasks::TaskTriggerInfo> {
         self.providers.default_triggers()
     }
@@ -2073,9 +2080,19 @@ mod tests {
         register_provider(&h);
         let scan = scan_task(&h);
         assert_eq!(scan.key(), "TaskExtractMediaSegments");
-        assert_eq!(scan.name(), "Media Segment Scan");
-        assert_ne!(scan.description(), "");
-        assert_eq!(scan.category(), "Library");
+        // The core task's localization keys, shown by the registry.
+        assert!(scan.is_localized());
+        let registry = ferrofin_core::scheduled_tasks::FerrofinTaskManager::new();
+        registry.register(Arc::new(scan_task(&h)));
+        let shown = registry
+            .get("TaskExtractMediaSegments")
+            .expect("registered");
+        assert_eq!(shown.name.as_deref(), Some("Media Segment Scan"));
+        assert_eq!(shown.category.as_deref(), Some("Library"));
+        assert_eq!(
+            shown.description.as_deref(),
+            Some("Extracts or obtains media segments from MediaSegment enabled plugins.")
+        );
         let triggers = scan.default_triggers();
         assert_eq!(triggers.len(), 1);
         assert_eq!(triggers[0].interval_ticks, Some(12 * 3600 * 10_000_000));

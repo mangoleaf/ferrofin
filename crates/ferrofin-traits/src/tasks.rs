@@ -52,6 +52,18 @@ pub trait TaskManager: Send + Sync {
         None
     }
 
+    /// Re-resolves the names, descriptions and categories of a captured
+    /// transition snapshot in the ambient UI culture, and re-orders it by name.
+    ///
+    /// A transition snapshot is built in the culture of the run that
+    /// published it and shared by every subscriber, where upstream builds each
+    /// connection's payload in that connection's own culture
+    /// (`BasePeriodicWebSocketListener` calls `ApplyRequestCulture` before
+    /// `GetDataToSend`). The default returns the snapshot unchanged.
+    fn localize_tasks(&self, tasks: Vec<TaskInfo>) -> Vec<TaskInfo> {
+        tasks
+    }
+
     /// Lists every registered task as a wire [`TaskInfo`].
     ///
     /// The unfiltered listing, in the C# wire order

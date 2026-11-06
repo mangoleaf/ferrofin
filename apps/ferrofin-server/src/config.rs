@@ -572,10 +572,11 @@ pub struct Config {
     pub db_pool: Option<u32>,
 
     /// How many prepared statements each SQLite connection keeps, reader and
-    /// writer pools alike. `None` = 200
+    /// writer pools alike. `None` = 150
     /// (`ferrofin_db::DEFAULT_STATEMENT_CACHE_CAPACITY`). A browse of the
     /// library runs more distinct statements per connection than sqlx's own
-    /// 100, so a smaller cache prepares again statements it evicted. Resolved
+    /// 100, so a smaller cache prepares again statements it evicted, and each
+    /// slot costs memory on every connection. Resolved
     /// `FERROFIN_DB_STATEMENT_CACHE` env > `db_statement_cache` in
     /// `config.toml` > default; must be within [`STATEMENT_CACHE_RANGE`].
     pub db_statement_cache: Option<u32>,

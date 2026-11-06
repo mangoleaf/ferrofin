@@ -79,7 +79,7 @@ impl FerrofinMediaStreamRepository {
         item_ids: &[Uuid],
     ) -> Result<Vec<Uuid>, ServiceError> {
         let mut matching = Vec::new();
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(item_ids) {
             let sql = stream_type_probe_sql(chunk.len());
             let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
                 .bind(i64::from(media_stream_type_disc(stream_type)));
@@ -147,7 +147,7 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
             return Ok(map);
         }
         // One query for the whole page; rows arrive in per-item StreamIndex order.
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(item_ids) {
             let ph = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT * FROM "MediaStreamInfos" WHERE "ItemId" IN ({ph})
@@ -480,31 +480,36 @@ mod tests {
     /// `IX_MediaStreamInfos_StreamType` and walks every subtitle row (4,169 of
     /// 9,368 on the bench library) plus a temp b-tree for the `DISTINCT`:
     /// 710 µs vs 33 µs for a 50-id page, on a statement that fires on every
-    /// list page carrying videos. Pinned here against the real migrated schema.
+    /// list page carrying videos. Pinned here against the real migrated schema,
+    /// at every length a padded list takes: the planner weighs the `IN` list's
+    /// length against the `StreamType` equality (gl-1243).
     #[tokio::test]
     async fn subtitle_probe_uses_the_item_id_index() {
         let db = test_db().await;
-        let sql = super::stream_type_probe_sql(50);
-        let explain = format!("EXPLAIN QUERY PLAN {sql}");
-        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain));
-        for _ in 0..51 {
-            query = query.bind("x");
-        }
-        let plan: Vec<String> = query
-            .fetch_all(db.pool())
-            .await
-            .expect("explain query plan")
-            .into_iter()
-            .map(|(_, _, _, detail)| detail)
-            .collect();
+        for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+            let sql = super::stream_type_probe_sql(n);
+            let explain = format!("EXPLAIN QUERY PLAN {sql}");
+            let mut query =
+                sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain));
+            for _ in 0..=n {
+                query = query.bind("x");
+            }
+            let plan: Vec<String> = query
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect();
 
-        assert!(
-            plan.iter().any(|s| s.contains("ItemId=?")),
-            "subtitle probe must seek by ItemId, got: {plan:?}"
-        );
-        assert!(
-            !plan.iter().any(|s| s.contains("TEMP B-TREE")),
-            "subtitle probe must not sort for DISTINCT, got: {plan:?}"
-        );
+            assert!(
+                plan.iter().any(|s| s.contains("ItemId=?")),
+                "{n} ids: subtitle probe must seek by ItemId, got: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|s| s.contains("TEMP B-TREE")),
+                "{n} ids: subtitle probe must not sort for DISTINCT, got: {plan:?}"
+            );
+        }
     }
 }

@@ -1132,7 +1132,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         key: "websocket-streams",
         upstream_file: "MediaBrowser.Controller/Net/BasePeriodicWebSocketListener.cs",
         upstream_method: "HandleMessages",
-        ferrofin: "handlers/websocket.rs handle_socket → Streams::apply, event_stream, wake_due \
+        ferrofin: "handlers/websocket.rs websocket_upgrade runs handle_socket under the upgrade \
+                   request's culture and UI culture (WebSocketManager's RequestUICulture, \
+                   applied by ApplyRequestCulture before each inbound message and, in \
+                   SendDataForConnectionAsync, before each GetDataToSendForConnection), and \
+                   task_transition_message re-shows a captured snapshot \
+                   in it through TaskManager::localize_tasks (ferrofin-core scheduled_tasks.rs \
+                   show_text, sort_by_name); handle_socket → Streams::apply, event_stream, wake_due \
                    (drain, should_send); sessions_wake (session_event_forces), sessions_message → \
                    ferrofin-core session_manager.rs SessionEvent raises, with upsert_session's \
                    SessionActivity past SESSION_ACTIVITY_INTERVAL (LogSessionActivity, a new \
@@ -1155,7 +1161,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    WebSocketConnection.SendAsync's SerializeToUtf8Bytes does (property order \
                    compared with MediaBrowser.Model/Dto/SessionInfoDto.cs, \
                    Session/PlayerStateInfo.cs and Tasks/TaskInfo.cs)",
-        date: "2026-11-02",
+        date: "2026-11-05",
         divergences: &[
             "Events already queued for a socket are drained and answered with one Sessions or \
              ActivityLogEntry frame, where upstream sends one per forced event: a burst yields \
@@ -1169,10 +1175,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              sends nothing until a task event, because jellyfin-web's scan button has no HTTP \
              fallback; it costs one registry snapshot per subscribe and none per period, and counts \
              as the stream's last send, so progress inside the first period is held back.",
-            "A task start or completion is sent with the task list captured at the transition, \
+            "A task start or completion is sent with the task list captured at the transition \
+             (its names, descriptions and categories shown again in the socket's culture), \
              where upstream reads the list when it sends; a progress frame due while one is still \
              queued is dropped, so a short run never shows out of order, and a later report sends \
              once the period has passed.",
+            "A socket's task list is ordered in its own upgrade request's culture. Upstream's one \
+             send loop per listener orders every socket's list in the CurrentCulture it inherited \
+             when the listener was built, on the first request after boot to reach the WebSocket \
+             middleware (any request, not only a /socket upgrade); no client shows the order as \
+             sent, since jellyfin-web sorts the tasks itself (owner decision 2026-11-05, gl-428).",
             "A session list that cannot be built is logged and skipped and the subscription stays; \
              upstream logs it and drops the connection's subscription.",
             "A session's NowPlayingItem map members (ImageTags, ProviderIds, ImageBlurHashes, \
@@ -1802,8 +1814,12 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetSessions",
         ferrofin: "handlers/session.rs get_sessions (items.rs effective_user_id) → \
                ferrofin-core session_manager.rs get_sessions (shared_device_control_for, \
-               retain_accessible_session_devices, to_dto → session_info_to_dto) \
-               (SessionManager.GetSessions, ToSessionInfoDto); the NowPlayingItem it shows is \
+               retain_accessible_session_devices → device_manager.rs can_access_devices, \
+               to_dto → session_info_to_dto) (SessionManager.GetSessions, CanAccessDevice, \
+               ToSessionInfoDto), the users' permissions and EnabledDevices read from the policy \
+               cache (user_entity_ext.rs cached_permission, cached_preference; the User \
+               upstream holds) and a controllableByUserId naming the caller answered from the \
+               caller's row; the NowPlayingItem it shows is \
                the item on_playback_start and on_playback_progress name (kept_now_playing_item, \
                NowPlayingItem::new on the report's row; UpdateNowPlayingItem), built by the \
                first listing and then copied (shown_now_playing_item → now_playing_item → \
@@ -1824,7 +1840,7 @@ pub const VERIFIED: &[Verified] = &[
                LastPlaybackCheckIn is DateTime.MinValue until update_now_playing stamps it \
                (SessionInfo.LastPlaybackCheckIn, UpdateNowPlayingItem) and \
                NowPlayingQueueFullItems is never sent (v12.4's SessionInfoDto has none)",
-        date: "2026-11-04",
+        date: "2026-11-05",
         divergences: SESSIONS_DIVERGENCES,
         refs: &[],
     },
@@ -2509,16 +2525,18 @@ pub const VERIFIED: &[Verified] = &[
                holding_libraries over ferrofin-model entities_media.rs libraries_holding, \
                libraries_allow) → ferrofin-livetv manager.rs \
                get_recordings_matching (dvr_repository.rs recording_rows, \
-               visible_recording_rows, remove_fields, recording_dtos, \
-               add_info_to_recording_dtos) (RequestHelpers.GetUserId, \
+               recording_file_is_gone, visible_recording_rows, remove_fields, \
+               recording_dtos, add_info_to_recording_dtos) (RequestHelpers.GetUserId, \
                LiveTvManager.GetRecordingsAsync, GetEmbyRecordingsAsync, \
                GetRecordingFoldersAsync, LibraryManager.GetCollectionFolders, RemoveFields)",
-        date: "2026-11-02",
+        date: "2026-11-05",
         divergences: &[
             "Recordings are the rows of Ferrofin's DVR table, not library items under the \
          recording folders, so the list differs wherever the two models do: an id is the \
          row's, not the library item's; a recording file with no row (one from an adopted \
-         Jellyfin database, or a partial file) is not listed; channelId, status, seriesTimerId \
+         Jellyfin database, or a partial file) is not listed; a finished recording whose file \
+         has gone from a folder that is still there leaves the list at once, where upstream \
+         lists the library item until a scan removes it; channelId, status, seriesTimerId \
          and isNews filter the rows, where upstream ignores them; isMovie, isSeries, isKids \
          and isSports match the programme's flags, either way, where upstream matches the \
          Movie and Episode kinds and, for true only, the Sports, Kids, Children and Family \

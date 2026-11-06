@@ -1,15 +1,11 @@
 //! The Internet-Channels-category scheduled task.
 //!
 //! Faithful port of upstream's `src/Jellyfin.LiveTv/Channels/RefreshChannelsScheduledTask.cs`
-//! (key, name, description, category and default trigger), including its
-//! untranslated display strings — upstream asks the localizer for
-//! `TasksRefreshChannels`/`TasksRefreshChannelsDescription`, which are *not* in
-//! `Core/en-US.json` (the shipped keys are `TaskRefreshChannels…`), and
-//! `LocalizationManager.GetLocalizedString` returns the key itself when it is
-//! missing. A live Jellyfin 10.11.8 therefore serves `"Name":
-//! "TasksRefreshChannels"` for this task, and so does Ferrofin — parity beats
-//! prettiness. If upstream ever adds the missing strings, this task's name and
-//! description follow them.
+//! (key, the localization keys of its name, description and category, and its
+//! default trigger). Up to 10.11.8 upstream asked for the missing
+//! `TasksRefreshChannels…` keys and served them raw;
+//! jellyfin/jellyfin#16488 (v12.0-rc1) moved to the shipped
+//! `TaskRefreshChannels…` keys, so Jellyfin 12 serves "Refresh Channels".
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,9 +17,8 @@ use ferrofin_traits::stubs::ChannelManager;
 
 use super::{ScheduledTask, TaskProgress, interval_hours};
 
-/// The upstream Internet Channels category display string
-/// (`TasksChannelsCategory`).
-const CHANNELS: &str = "Internet Channels";
+/// The upstream Internet Channels category's localization key.
+const CHANNELS: &str = "TasksChannelsCategory";
 
 /// "Refresh Channels" — refreshes the internet channels' item listings. Port of
 /// `RefreshChannelsScheduledTask`.
@@ -90,14 +85,16 @@ impl ScheduledTask for RefreshChannelsTask {
     }
 
     fn name(&self) -> &str {
-        // Upstream's untranslated localization key — see the module docs.
-        "TasksRefreshChannels"
+        "TaskRefreshChannels"
     }
     fn description(&self) -> &str {
-        "TasksRefreshChannelsDescription"
+        "TaskRefreshChannelsDescription"
     }
     fn category(&self) -> &str {
         CHANNELS
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn is_hidden(&self) -> bool {
         self.channel_count.load(Ordering::Relaxed) == 0
@@ -197,10 +194,11 @@ mod tests {
     async fn metadata_matches_upstream() {
         let task = task(Vec::new()).await;
         assert_eq!(task.key(), "RefreshInternetChannels");
-        // Upstream serves the untranslated localization keys here.
-        assert_eq!(task.name(), "TasksRefreshChannels");
-        assert_eq!(task.description(), "TasksRefreshChannelsDescription");
-        assert_eq!(task.category(), "Internet Channels");
+        // Upstream's localization keys since jellyfin/jellyfin#16488 (v12.0-rc1).
+        assert!(task.is_localized());
+        assert_eq!(task.name(), "TaskRefreshChannels");
+        assert_eq!(task.description(), "TaskRefreshChannelsDescription");
+        assert_eq!(task.category(), "TasksChannelsCategory");
         let triggers = task.default_triggers();
         assert_eq!(triggers.len(), 1);
         assert_eq!(
@@ -209,6 +207,34 @@ mod tests {
         );
         // 24 hours, matching the oracle's `IntervalTicks`.
         assert_eq!(triggers[0].interval_ticks, Some(864_000_000_000));
+    }
+
+    /// The registry lists the task in the ambient UI culture, as Jellyfin 12
+    /// serves it: "Refresh Channels" in English, never the raw key.
+    #[tokio::test]
+    async fn the_registry_lists_it_in_the_request_culture() {
+        let registry = super::super::FerrofinTaskManager::new();
+        registry.register(Arc::new(task(Vec::new()).await));
+        let english = registry.get("RefreshInternetChannels").expect("registered");
+        assert_eq!(english.name.as_deref(), Some("Refresh Channels"));
+        assert_eq!(
+            english.description.as_deref(),
+            Some("Refreshes internet channel information.")
+        );
+        assert_eq!(english.category.as_deref(), Some("Internet Channels"));
+
+        let german = ferrofin_util::current_culture::scope_with_ui(
+            "de".to_owned(),
+            Some("de".to_owned()),
+            async { registry.get("RefreshInternetChannels").expect("registered") },
+        )
+        .await;
+        assert_eq!(german.name.as_deref(), Some("Kanäle aktualisieren"));
+        assert_eq!(
+            german.description.as_deref(),
+            Some("Aktualisiert Internet-Kanal-Informationen.")
+        );
+        assert_eq!(german.category.as_deref(), Some("Internet-Kanäle"));
     }
 
     #[tokio::test]

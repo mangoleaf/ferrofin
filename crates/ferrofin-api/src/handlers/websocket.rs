@@ -144,8 +144,19 @@ async fn websocket_upgrade(
         Err(e) => return e.into_response(),
     };
     let caller = resolve_caller(&state, &info).await;
+    // The socket keeps this request's culture for everything it answers and
+    // pushes, as upstream's `WebSocketManager` stores the upgrade's
+    // `CurrentUICulture` and each send calls `ApplyRequestCulture`.
+    let culture = ferrofin_util::current_culture::capture();
+    let ui_culture = ferrofin_util::current_culture::ambient_ui_culture();
     ws.read_buffer_size(READ_BUFFER_BYTES)
-        .on_upgrade(move |socket| handle_socket(socket, state, caller))
+        .on_upgrade(move |socket| {
+            ferrofin_util::current_culture::scope_with_ui(
+                culture,
+                ui_culture,
+                handle_socket(socket, state, caller),
+            )
+        })
 }
 
 /// The resolved identity of an authenticated socket: its session id (the bus
@@ -1201,14 +1212,14 @@ async fn subscribe_tasks(
 
 /// A captured task start or completion (`TaskExecuting`, `TaskCompleted`):
 /// `SendData(true)`, so it sends at once, with the snapshot captured at the
-/// transition.
+/// transition, its text shown in this socket's culture.
 async fn task_transition_message(
     state: &AppState,
     update: Result<Vec<ferrofin_model::tasks::TaskInfo>, tokio::sync::broadcast::error::RecvError>,
     streams: &mut Streams,
 ) -> Option<String> {
     let message = match update {
-        Ok(tasks) => task_snapshot_message(tasks),
+        Ok(tasks) => task_snapshot_message(state.tasks.localize_tasks(tasks)),
         // Resubscribe atomically after lag, dropping obsolete queued
         // snapshots; the progress subscription stays as it is.
         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -1846,7 +1857,7 @@ mod tests {
         };
         let visible = visible_tasks(vec![
             task("Clean Activity Log", false),
-            task("TasksRefreshChannels", true),
+            task("Refresh Channels", true),
             task("Scan Media Library", false),
         ]);
         assert_eq!(

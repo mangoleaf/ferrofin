@@ -33,7 +33,7 @@ use ferrofin_traits::error::ServiceError;
 
 use crate::db_error::db_err;
 use crate::device_repository::DeviceRepository;
-use crate::user_entity_ext::{get_preference, has_permission};
+use crate::user_entity_ext::{cached_permission, cached_preference};
 
 /// The concrete device manager.
 #[derive(Clone)]
@@ -237,7 +237,8 @@ impl FerrofinDeviceManager {
     /// Resolves the **user-scoped** half of
     /// [`DeviceManager::can_access_device`] once, so a listing pays for it once
     /// instead of once per device. Neither permission nor the `EnabledDevices`
-    /// list depends on the device being tested.
+    /// list depends on the device being tested. Both come from the policy cache
+    /// ([`cached_permission`]), as upstream reads them from the user it holds.
     async fn resolve_access(
         &self,
         user: Option<&UserEntity>,
@@ -245,14 +246,14 @@ impl FerrofinDeviceManager {
         let Some(user) = user else {
             return Ok(DeviceAccess::Unfiltered);
         };
-        let pool = self.db.pool();
-        if has_permission(pool, &user.id, PermissionKind::EnableAllDevices).await?
-            || has_permission(pool, &user.id, PermissionKind::IsAdministrator).await?
+        let db = &self.db;
+        if cached_permission(db, &user.id, PermissionKind::EnableAllDevices).await?
+            || cached_permission(db, &user.id, PermissionKind::IsAdministrator).await?
         {
             return Ok(DeviceAccess::All);
         }
         Ok(DeviceAccess::Enabled(
-            get_preference(pool, &user.id, PreferenceKind::EnabledDevices).await?,
+            cached_preference(db, &user.id, PreferenceKind::EnabledDevices).await?,
         ))
     }
 

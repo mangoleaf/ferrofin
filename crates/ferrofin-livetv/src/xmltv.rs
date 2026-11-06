@@ -150,18 +150,27 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
 }
 
 /// [`parse_xmltv`], keeping only the programmes `keep` accepts. Each one is
-/// judged as its element closes and dropped there, so a reader that wants a
-/// few channels' airings over a window never holds the rest of a large
-/// guide. Channels and [`Xmltv::error`] are reported in full, so
-/// `parse_xmltv_where(xml, |_| false)` reads just the channel list and whether
-/// the document is readable.
+/// judged on its start tag, before its children are read, so `keep` sees only
+/// the `channel`, `start` and `stop` it carries; the children of one it
+/// rejects are read past without being built, so a reader that wants a few
+/// channels' airings over a window builds no more of the rest of a large
+/// guide than their start tags. `keep` is also asked about a
+/// programme that never closes (cut off by an error, or left open around a
+/// nested one), so it should only decide. Channels and [`Xmltv::error`] are
+/// reported in full, so `parse_xmltv_where(xml, |_| false)` reads just the
+/// channel list and whether the document is readable.
 ///
 /// The text is already decoded, so an encoding the document declares is not
 /// applied again, and it is read with no language, as `new XmlTvReader(path)`
 /// reads it.
 #[must_use]
 pub fn parse_xmltv_where(xml: &str, keep: impl FnMut(&XmltvProgramme) -> bool) -> Xmltv {
-    read_events(Reader::from_str(xml), None, keep)
+    let mut programmes = Vec::new();
+    let guide = read_events(Reader::from_str(xml), None, keep, |p| programmes.push(p));
+    Xmltv {
+        programmes,
+        ..guide
+    }
 }
 
 /// [`parse_xmltv_where`] over a document read as it arrives, from a file or
@@ -185,9 +194,26 @@ pub fn parse_xmltv_where(xml: &str, keep: impl FnMut(&XmltvProgramme) -> bool) -
 /// element without a `lang` is the match.
 #[must_use]
 pub fn read_xmltv_where<R: BufRead>(
+    source: R,
+    language: Option<&str>,
+    keep: impl FnMut(&XmltvProgramme) -> bool,
+) -> Xmltv {
+    let mut programmes = Vec::new();
+    let guide = read_xmltv_each(source, language, keep, |p| programmes.push(p));
+    Xmltv {
+        programmes,
+        ..guide
+    }
+}
+
+/// [`read_xmltv_where`], handing each programme `keep` accepts to `each` as
+/// its element closes instead of collecting them ([`Xmltv::programmes`] stays
+/// empty), so a reader can set them aside one at a time.
+pub(crate) fn read_xmltv_each<R: BufRead>(
     mut source: R,
     language: Option<&str>,
     keep: impl FnMut(&XmltvProgramme) -> bool,
+    each: impl FnMut(XmltvProgramme),
 ) -> Xmltv {
     // The head, up to the end of its first markup (`?>` for a declaration),
     // read whatever the source's buffer size, then read again by the parser.
@@ -213,12 +239,13 @@ pub fn read_xmltv_where<R: BufRead>(
     let source = std::io::Read::chain(std::io::Cursor::new(head), source);
     match encoding {
         Ok(TextEncoding::Whatwg(encoding)) if encoding == encoding_rs::UTF_8 => {
-            read_events(Reader::from_reader(source), language, keep)
+            read_events(Reader::from_reader(source), language, keep, each)
         }
         Ok(encoding) => read_events(
             Reader::from_reader(Decoded::new(source, encoding)),
             language,
             keep,
+            each,
         ),
         Err(error) => Xmltv {
             error: Some(error),
@@ -561,8 +588,9 @@ fn located(error: impl std::fmt::Display, position: u64) -> String {
     format!("{error} (near byte {position} of its UTF-8 text)")
 }
 
-/// Reads the XMLTV document `reader` yields, keeping the programmes `keep`
-/// accepts — see [`parse_xmltv_where`].
+/// Reads the XMLTV document `reader` yields, handing each programme `keep`
+/// accepts on its start tag to `each` as it closes — see
+/// [`parse_xmltv_where`].
 ///
 /// The guide is read where `XmlTvReader` reads it ([`TvScope`]), and what
 /// `XmlReader` would read on the way must be well-formed: a mismatched end
@@ -586,6 +614,7 @@ fn read_events<R: BufRead>(
     mut reader: Reader<R>,
     language: Option<&str>,
     mut keep: impl FnMut(&XmltvProgramme) -> bool,
+    mut each: impl FnMut(XmltvProgramme),
 ) -> Xmltv {
     let config = reader.config_mut();
     config.check_end_names = true;
@@ -652,7 +681,9 @@ fn read_events<R: BufRead>(
                     }
                     b"programme" if tv.reads_programmes() => {
                         tv.met(true);
-                        programme = Some(OpenProgramme::new(read_programme(&e), depth + 1));
+                        let start = read_programme(&e);
+                        let kept = keep(&start);
+                        programme = Some(OpenProgramme::new(start, depth + 1, kept));
                     }
                     b"channel" | b"programme" => {}
                     name => apply_start(
@@ -764,11 +795,9 @@ fn read_events<R: BufRead>(
                         }
                     }
                     b"programme" => {
-                        if let Some(mut p) = programme.take() {
+                        if let Some(mut p) = programme.take().filter(|p| p.kept) {
                             end_programme_run(&mut p, language);
-                            if keep(&p.programme) {
-                                out.programmes.push(p.programme);
-                            }
+                            each(p.programme);
                         }
                     }
                     _ => {}
@@ -882,6 +911,9 @@ struct OpenProgramme {
     programme: XmltvProgramme,
     /// The depth of the programme's own children.
     child_depth: usize,
+    /// Whether the reader's `keep` took it on its start tag. One it did not
+    /// is read past: its children are left unapplied.
+    kept: bool,
     /// Whether its first populated `<icon>` has been read.
     icon_read: bool,
     /// Whether its first kept `<rating>` has been read.
@@ -902,10 +934,11 @@ struct OpenProgramme {
 }
 
 impl OpenProgramme {
-    fn new(programme: XmltvProgramme, child_depth: usize) -> Self {
+    fn new(programme: XmltvProgramme, child_depth: usize, kept: bool) -> Self {
         Self {
             programme,
             child_depth,
+            kept,
             icon_read: false,
             rating_read: false,
             rating: None,
@@ -1099,7 +1132,7 @@ fn apply_start(
     programme: Option<&mut OpenProgramme>,
 ) {
     if let Some(p) = programme {
-        if depth != p.child_depth {
+        if !p.kept || depth != p.child_depth {
             return;
         }
         // `ProcessNode`/`ProcessMultipleNodes` read siblings of one name
@@ -1267,7 +1300,9 @@ fn apply_end(
         }
         return;
     }
-    let Some(open) = programme else { return };
+    let Some(open) = programme.filter(|open| open.kept) else {
+        return;
+    };
     if depth == open.child_depth + 1 {
         // `ProcessRating` reads a `<value>` (matched ignoring case) of the open
         // rating: an empty one drops the rating, a later one replaces an
@@ -1523,28 +1558,67 @@ mod tests {
   <channel id="b"><display-name>Channel B</display-name></channel>
 </tv>"#;
 
-    /// `keep` sees every programme once, whole, in document order, and only the
-    /// ones it accepts are stored; the channels are read whatever it decides.
+    /// `keep` judges every programme once, in document order, on its start
+    /// tag: it sees the `channel` and `start` there and none of the children.
+    /// Only the ones it accepts are built, whole, and stored; the channels are
+    /// read whatever it decides.
     #[test]
     fn parse_where_keeps_only_the_programmes_it_accepts() {
         let mut seen = Vec::new();
         let g = parse_xmltv_where(CHANNELS_LAST, |p| {
-            seen.push((p.title.clone(), p.categories.clone()));
+            seen.push((p.channel_id.clone(), p.start.is_some(), p.title.clone()));
             p.channel_id == "a"
         });
-        assert_eq!(
-            seen,
-            vec![
-                ("A1".to_owned(), Vec::<String>::new()),
-                ("B1".to_owned(), Vec::new()),
-                ("A2".to_owned(), vec!["News".to_owned()]),
-            ]
-        );
-        let titles: Vec<&str> = g.programmes.iter().map(|p| p.title.as_str()).collect();
-        assert_eq!(titles, ["A1", "A2"]);
+        let judged = |channel: &str| (channel.to_owned(), true, String::new());
+        assert_eq!(seen, vec![judged("a"), judged("b"), judged("a")]);
+        let kept: Vec<(&str, &[String])> = g
+            .programmes
+            .iter()
+            .map(|p| (p.title.as_str(), p.categories.as_slice()))
+            .collect();
+        assert_eq!(kept, [("A1", &[][..]), ("A2", &["News".to_owned()][..])]);
         let ids: Vec<&str> = g.channels.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
         assert_eq!(g.error, None);
+    }
+
+    /// A programme judged on its start tag reads the same as one judged whole:
+    /// in odd documents too (elements nested where they do not belong, a
+    /// self-closing programme, a cut-off one), the channels, the error and the
+    /// kept programmes are those of the full parse.
+    #[rstest::rstest]
+    // The nested channel's icon is what tells: the open programme absorbs the
+    // channel's start events, so the full parse never reads it.
+    #[case::channel_inside_a_programme(
+        r#"<tv><programme start="20260725060000 +0000" channel="b"><channel id="c"><display-name>C</display-name><icon src="http://logos.invalid/c.png"/></channel><title>B</title></programme><channel id="a"><display-name>A</display-name></channel></tv>"#
+    )]
+    #[case::programme_inside_a_programme(
+        r#"<tv><programme start="20260725060000 +0000" channel="b"><title>Outer</title><programme start="20260725070000 +0000" channel="a"><title>Inner</title></programme><desc>After</desc></programme><programme start="20260725080000 +0000" channel="a"><title>A</title><programme start="20260725090000 +0000" channel="b"><title>B</title></programme><desc>After</desc></programme></tv>"#
+    )]
+    #[case::programme_inside_a_channel(
+        r#"<tv><channel id="a"><display-name>A</display-name><programme start="20260725060000 +0000" channel="b"><title>X</title><display-name>Y</display-name></programme><programme start="20260725070000 +0000" channel="a"><title>Z</title></programme></channel></tv>"#
+    )]
+    #[case::self_closing_and_unplaced(
+        r#"<tv><programme start="20260725060000 +0000" channel="a"/><programme channel="a"><title>No start</title><episode-num system="xmltv_ns">1.2.</episode-num></programme><channel id="a"><display-name>A</display-name></channel></tv>"#
+    )]
+    #[case::cut_off_inside_a_programme(
+        r#"<tv><channel id="a"><display-name>A</display-name></channel><programme start="20260725060000 +0000" channel="a"><title>Whole</title></programme><programme start="20260725070000 +0000" channel="a"><title>Cut"#
+    )]
+    fn judging_on_the_start_tag_reads_like_the_full_parse(#[case] xml: &str) {
+        let full = parse_xmltv(xml);
+        let none = parse_xmltv_where(xml, |_| false);
+        assert_eq!(none.channels, full.channels);
+        assert_eq!(none.error, full.error);
+        assert!(none.programmes.is_empty(), "{:?}", none.programmes);
+        let only_a = parse_xmltv_where(xml, |p| p.channel_id == "a");
+        let full_a: Vec<XmltvProgramme> = full
+            .programmes
+            .into_iter()
+            .filter(|p| p.channel_id == "a")
+            .collect();
+        assert_eq!(only_a.programmes, full_a);
+        assert_eq!(only_a.channels, full.channels);
+        assert_eq!(only_a.error, full.error);
     }
 
     /// Rejecting every programme reads the channel list and the document's

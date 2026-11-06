@@ -139,7 +139,23 @@ pub enum QueryShape {
     /// Select `bi."Type", COUNT(*)` grouped by type — the per-type counts in one
     /// query, without materializing every matching row. No `ORDER BY` / paging.
     TypeCounts,
+    /// Select the columns of [`EPISODE_ORDER_SELECT`]: the rows and order of
+    /// [`QueryShape::FullRows`], with only the columns a season's episode
+    /// filter and the aired-order sort read.
+    EpisodeOrder,
 }
+
+/// The [`QueryShape::EpisodeOrder`] projection: what `FilterEpisodesBySeason`
+/// and `AiredEpisodeOrderComparer` read of an episode or season row. `Data` is
+/// read only for its `Airs*` members, so a blob that spells no `"Airs` key
+/// literally is left out: both parsers read all three as absent from it,
+/// valid or not. (A key written with a `\u` escape would be missed; no
+/// writer, serde_json or System.Text.Json, escapes a letter.)
+const EPISODE_ORDER_SELECT: &str = r#"SELECT bi."Id", bi."Type", bi."ParentId", bi."SeasonId",
+    bi."ChannelId", bi."Path", bi."IndexNumber", bi."ParentIndexNumber", bi."PremiereDate",
+    bi."PresentationUniqueKey",
+    CASE WHEN instr(bi."Data", '"Airs') > 0 THEN bi."Data" END AS "Data"
+    FROM "BaseItems" AS bi WHERE "#;
 
 /// Whether this query collapses merged versions into one row — C#
 /// `BaseItemRepository.EnableGroupByPresentationUniqueKey`.
@@ -245,8 +261,9 @@ pub(crate) fn build_folder_children_query(
 ///
 /// The returned [`QueryBuilder`] is ready to `.build_query_as()` /
 /// `.build_query_scalar()`. Ordering and paging are appended for
-/// [`QueryShape::FullRows`], [`QueryShape::IdsOnly`] and
-/// [`QueryShape::IdAndCleanName`]; the count shapes stop after the `WHERE`
+/// [`QueryShape::FullRows`], [`QueryShape::IdsOnly`],
+/// [`QueryShape::IdAndCleanName`] and [`QueryShape::EpisodeOrder`]; the count
+/// shapes stop after the `WHERE`
 /// clause.
 #[must_use]
 pub fn build_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryBuilder<Sqlite> {
@@ -271,6 +288,7 @@ pub fn build_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryBuild
             r#"SELECT COUNT(*) FROM "BaseItems" AS bi WHERE "#
         }
         QueryShape::TypeCounts => r#"SELECT bi."Type", COUNT(*) FROM "BaseItems" AS bi WHERE "#,
+        QueryShape::EpisodeOrder => EPISODE_ORDER_SELECT,
     };
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(projection);
 
@@ -293,7 +311,10 @@ pub fn build_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryBuild
         QueryShape::TypeCounts => {
             qb.push(r#" GROUP BY bi."Type""#);
         }
-        QueryShape::FullRows | QueryShape::IdsOnly | QueryShape::IdAndCleanName => {
+        QueryShape::FullRows
+        | QueryShape::IdsOnly
+        | QueryShape::IdAndCleanName
+        | QueryShape::EpisodeOrder => {
             append_order_by(&mut qb, filter);
             append_paging(&mut qb, filter);
         }
@@ -541,7 +562,7 @@ pub(crate) fn build_latest_tv_episodes_query(
     }
     qb.push(r#" AND bi."SeriesName" IN ("#);
     let mut names = qb.separated(", ");
-    for name in series_names {
+    for name in ferrofin_db::padded_in_list(series_names) {
         names.push_bind(name.clone());
     }
     qb.push(")");
@@ -1627,12 +1648,8 @@ fn append_name_predicates(
         .map(get_clean_value)
         .collect();
     if !clean_names.is_empty() {
-        qb.push(r#" AND bi."CleanName" IN ("#);
-        let mut sep = qb.separated(", ");
-        for clean in &clean_names {
-            sep.push_bind(clean.clone());
-        }
-        qb.push(")");
+        qb.push(" AND ");
+        push_in_list(qb, r#"bi."CleanName""#, &clean_names);
     }
 
     if let Some(contains) = non_blank(filter.name_contains.as_ref()) {
@@ -1751,6 +1768,7 @@ fn build_box_set_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryB
             r#"SELECT bi."Id", bi."CleanName" FROM "BaseItems" bi WHERE "#
         }
         QueryShape::GroupedCount => r#"SELECT COUNT(*) FROM "BaseItems" bi WHERE "#,
+        QueryShape::EpisodeOrder => EPISODE_ORDER_SELECT,
         QueryShape::Count | QueryShape::TypeCounts => unreachable!("raw count shapes do not group"),
     });
     qb.push(r#"bi."Id" IN (SELECT "Id" FROM collapsed_ids)"#);
@@ -3562,7 +3580,8 @@ fn append_paging(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
 
 /// Pushes `<column> IN (?, ?, …)` binding each value, or `1 = 0` for an empty
 /// list (an empty `IN ()` is a SQL syntax error and, like C# `Contains` over an
-/// empty set, matches nothing).
+/// empty set, matches nothing). The binds are padded to a power of two
+/// ([`ferrofin_db::padded_in_list`]), so a list's text is one of a few lengths.
 ///
 /// Values are cloned into the builder, so the source slice need not outlive it;
 /// the cloned owned values (`String`/`i64`/`bool`) satisfy the `'a` encode bound.
@@ -3576,7 +3595,7 @@ where
     }
     qb.push(column).push(" IN (");
     let mut sep = qb.separated(", ");
-    for v in values {
+    for v in ferrofin_db::padded_in_list(values) {
         sep.push_bind(v.clone());
     }
     qb.push(")");
@@ -3615,6 +3634,23 @@ mod tests {
     use ferrofin_model::dto::SortOrder;
     use ferrofin_model::live_tv::ItemSortBy;
     use ferrofin_traits::options::InternalItemsQuery;
+
+    /// `push_in_list` binds a list padded to a power of two, so its text is one
+    /// of a few lengths whatever the count (gl-1243); an empty list matches
+    /// nothing.
+    #[rstest::rstest]
+    #[case(0, "1 = 0")]
+    #[case(1, "c IN (?)")]
+    #[case(3, "c IN (?, ?, ?, ?)")]
+    #[case(4, "c IN (?, ?, ?, ?)")]
+    #[case(5, "c IN (?, ?, ?, ?, ?, ?, ?, ?)")]
+    fn an_in_list_is_padded_to_a_power_of_two(#[case] count: i64, #[case] sql: &str) {
+        use sqlx::{QueryBuilder, Sqlite};
+        let values: Vec<i64> = (0..count).collect();
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("");
+        super::push_in_list(&mut qb, "c", &values);
+        assert_eq!(qb.sql().as_str(), sql);
+    }
 
     /// `push_access_filter`'s text: no library term for an empty scope, a
     /// plain or `+` term by [`super::TopParentTerm`], and no version or owner

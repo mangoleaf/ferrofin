@@ -20,11 +20,6 @@ use ferrofin_traits::error::ServiceError;
 
 use crate::db_error::db_err;
 
-/// How many ids one batched `IN (…)` carries. SQLite's default bind-variable
-/// ceiling is 999; 500 keeps a wide margin and matches the chunk size the other
-/// batched readers in this crate use.
-const ID_CHUNK: usize = 500;
-
 /// Raw-SQL data access for devices, their options, and their owners' names.
 #[derive(Clone)]
 pub(crate) struct DeviceRepository {
@@ -59,7 +54,7 @@ impl DeviceRepository {
         device_ids: &[&str],
     ) -> Result<HashMap<String, DeviceOptionsEntity>, ServiceError> {
         let mut out: HashMap<String, DeviceOptionsEntity> = HashMap::new();
-        for chunk in device_ids.chunks(ID_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(device_ids) {
             let mut sql = String::from(r#"SELECT * FROM "DeviceOptions" WHERE "DeviceId" IN ("#);
             push_placeholders(&mut sql, chunk.len());
             sql.push(')');
@@ -85,7 +80,7 @@ impl DeviceRepository {
         user_ids: &[&str],
     ) -> Result<HashMap<String, String>, ServiceError> {
         let mut out: HashMap<String, String> = HashMap::new();
-        for chunk in user_ids.chunks(ID_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(user_ids) {
             let mut sql = String::from(r#"SELECT "Id", "Username" FROM "Users" WHERE "Id" IN ("#);
             push_placeholders(&mut sql, chunk.len());
             sql.push(')');
