@@ -1509,6 +1509,26 @@ impl crate::library_monitor::WatchRootsSource for FerrofinVirtualFolderManager {
     }
 }
 
+/// Sorts each library's locations as `GetVirtualFolderInfo` does
+/// (`Locations.Order()`, a comparison in the current culture). The snapshot
+/// [`library_folders`](VirtualFolderManager::library_folders) serves keeps
+/// them in ordinal order, so a response built from it re-sorts them here.
+pub fn sort_locations_in_current_culture<'a>(lists: impl IntoIterator<Item = &'a mut Vec<String>>) {
+    let mut cached = None;
+    for locations in lists {
+        if locations.len() < 2 {
+            continue;
+        }
+        let Some(comparer) = cached.get_or_insert_with(|| {
+            ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture())
+                .ok()
+        }) else {
+            return;
+        };
+        locations.sort_by(|a, b| comparer.compare(a, b));
+    }
+}
+
 impl FerrofinVirtualFolderManager {
     /// Lists every library on disk and in the item store, in the order the
     /// file system enumerates the root (`GetVirtualFolders` maps
@@ -1614,14 +1634,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // in the request's culture. Only the response is re-sorted: the snapshot
         // above keeps the ordinal order background readers get whatever
         // request refreshed it.
-        if folders.iter().any(|folder| folder.locations.len() > 1)
-            && let Ok(comparer) =
-                ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture())
-        {
-            for folder in &mut folders {
-                folder.locations.sort_by(|a, b| comparer.compare(a, b));
-            }
-        }
+        sort_locations_in_current_culture(folders.iter_mut().map(|folder| &mut folder.locations));
         // Capture once after all filesystem/DB awaits, so every library uses
         // the same scan generation and we build the visible map only once.
         let progress: std::collections::HashMap<_, _> = self

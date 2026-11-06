@@ -308,7 +308,8 @@ fn disk_usage(_path: &str) -> Option<(i64, i64)> {
 /// Supplies the per-library storage folders.
 ///
 /// Stands in for `ILibraryManager.GetVirtualFolders()`. Async because the real
-/// provider reads the virtual folders from disk; the default [`NoLibraries`]
+/// provider reads the libraries from the virtual-folder manager (its snapshot,
+/// listed from disk when a change dropped it); the default [`NoLibraries`]
 /// reports none.
 #[async_trait]
 pub trait LibraryStorageProvider: Send + Sync {
@@ -526,7 +527,13 @@ impl ferrofin_traits::system::SystemManager for FerrofinSystemManager {
             paths.extend(folders.iter().cloned());
         }
 
-        let mut probed = self.storage_probe.probe_all(&paths).into_iter();
+        // `statvfs` (and the mount-table read) can block on a stalled network
+        // filesystem, so the probe stays off the runtime's workers.
+        let probe = Arc::clone(&self.storage_probe);
+        let mut probed = tokio::task::spawn_blocking(move || probe.probe_all(&paths))
+            .await
+            .map_err(|e| ServiceError::backend(format!("storage probe: {e}")))?
+            .into_iter();
         let mut next = || probed.next().unwrap_or_default();
         let program_data_folder = next();
         let web_folder = next();
@@ -714,6 +721,54 @@ mod tests {
         assert_eq!(storage.cache_folder.used_space, 50);
         assert!(storage.libraries.is_empty(), "{:?}", storage.libraries);
         assert!(storage.transcoding_temp_folder.path.ends_with("transcodes"));
+    }
+
+    /// A probe that answers only once the runtime has run another task while
+    /// it blocks, as a `statvfs` on a stalled network mount would block.
+    struct GatedProbe {
+        started: Arc<tokio::sync::Notify>,
+        ack: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl StorageProbe for GatedProbe {
+        fn probe(&self, path: &str) -> FolderStorageInfo {
+            SizedProbe.probe(path)
+        }
+
+        fn probe_all(&self, paths: &[String]) -> Vec<FolderStorageInfo> {
+            self.started.notify_one();
+            let acked = self
+                .ack
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok();
+            paths
+                .iter()
+                .map(|path| FolderStorageInfo {
+                    free_space: if acked { 100 } else { -1 },
+                    ..SizedProbe.probe(path)
+                })
+                .collect()
+        }
+    }
+
+    /// The storage probe runs on the blocking pool: on the (single) runtime
+    /// thread it would starve the task that lets it answer.
+    #[tokio::test]
+    async fn storage_info_probes_off_the_runtime() {
+        let (mgr, _) = build().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (ack, ack_rx) = std::sync::mpsc::channel();
+        let mgr = mgr.with_storage_probe(Arc::new(GatedProbe {
+            started: Arc::clone(&started),
+            ack: std::sync::Mutex::new(ack_rx),
+        }));
+        tokio::spawn(async move {
+            started.notified().await;
+            ack.send(()).unwrap();
+        });
+        let storage = mgr.get_system_storage_info().await.unwrap();
+        assert_eq!(storage.program_data_folder.free_space, 100);
     }
 
     /// The backup's free-space check reads the storage probe's free space.
