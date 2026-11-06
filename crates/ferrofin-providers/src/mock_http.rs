@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 
 /// A loopback listener for a mock server. Image downloads refuse loopback
 /// unless the server's policy lets them reach it (gl-1096), so binding one
@@ -50,6 +51,21 @@ impl MockServer {
 
     /// Like start, but attach quota headers to each successful response.
     pub async fn with_headers(routes: Vec<(&'static str, String)>, headers: &'static str) -> Self {
+        Self::serve(routes, headers, None).await
+    }
+
+    /// Like [`always`](Self::always), but each request is answered only once
+    /// `gate` has counted `open_at` requests, across every server sharing it:
+    /// servers on one gate answer only clients whose requests overlap.
+    pub async fn gated(body: &str, gate: Arc<watch::Sender<usize>>, open_at: usize) -> Self {
+        Self::serve(vec![("/", body.to_owned())], "", Some((gate, open_at))).await
+    }
+
+    async fn serve(
+        routes: Vec<(&'static str, String)>,
+        headers: &'static str,
+        gate: Option<(Arc<watch::Sender<usize>>, usize)>,
+    ) -> Self {
         let routes = Arc::new(routes);
         let targets = Arc::new(Mutex::new(Vec::new()));
         let listener = bind().await;
@@ -59,6 +75,7 @@ impl MockServer {
             async move {
                 while let Ok((mut sock, _)) = listener.accept().await {
                     let (routes, targets) = (Arc::clone(&routes), Arc::clone(&targets));
+                    let gate = gate.clone();
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 16 * 1024];
                         let n = sock.read(&mut buf).await.unwrap_or(0);
@@ -69,6 +86,10 @@ impl MockServer {
                             .and_then(|l| l.split_whitespace().nth(1))
                             .unwrap_or("");
                         targets.lock().expect("lock").push(path.to_owned());
+                        if let Some((gate, open_at)) = gate {
+                            gate.send_modify(|seen| *seen += 1);
+                            let _ = gate.subscribe().wait_for(|seen| *seen >= open_at).await;
+                        }
                         let body = routes
                             .iter()
                             .find(|(k, _)| path.contains(k))
