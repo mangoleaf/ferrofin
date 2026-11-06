@@ -495,7 +495,8 @@ impl FerrofinItemRepository {
             let mut enabled = Vec::with_capacity(rows.len());
             for row in rows {
                 if Some(row.type_.as_str()) != stored_type_name(BaseItemKind::CollectionFolder)
-                    || library_enabled(&self.db, &row.id, row.path.as_deref()).await
+                    || library_enabled(&self.db, &self.virtual_paths, &row.id, row.path.as_deref())
+                        .await
                 {
                     enabled.push(row);
                 }
@@ -1102,9 +1103,14 @@ impl FerrofinItemRepository {
             // AddUserToQuery still grants the user's libraries after Parent is
             // cleared; DescendantOfId is not one of its confinement guards.
             return Ok(Some(
-                scope_to_user_libraries_prepared(&self.db, self.visibility().as_deref(), prepared)
-                    .await?
-                    .unwrap_or_else(|| prepared.clone()),
+                scope_to_user_libraries_prepared(
+                    &self.db,
+                    &self.virtual_paths,
+                    self.visibility().as_deref(),
+                    prepared,
+                )
+                .await?
+                .unwrap_or_else(|| prepared.clone()),
             ));
         }
         Ok(self
@@ -1173,9 +1179,14 @@ impl FerrofinItemRepository {
             let mut resolved = filter.clone();
             resolved.parent_id = Uuid::nil();
             return Ok(Some(
-                scope_to_user_libraries(&self.db, self.visibility().as_deref(), &resolved)
-                    .await?
-                    .unwrap_or(resolved),
+                scope_to_user_libraries(
+                    &self.db,
+                    &self.virtual_paths,
+                    self.visibility().as_deref(),
+                    &resolved,
+                )
+                .await?
+                .unwrap_or(resolved),
             ));
         }
         // A *recursive* browse of a library is scoped by top parent, not by the
@@ -1194,6 +1205,7 @@ impl FerrofinItemRepository {
             && !filter.physical_children_only
             && let Some(mut folders) = Self::top_parent_ids_for_query(
                 &self.db,
+                &self.virtual_paths,
                 filter.parent_id,
                 filter.user.as_deref(),
                 0,
@@ -1219,7 +1231,13 @@ impl FerrofinItemRepository {
             return Ok(Some(resolved));
         }
         if !wants_parent && filter.top_parent_ids.is_empty() {
-            return scope_to_user_libraries(&self.db, self.visibility().as_deref(), filter).await;
+            return scope_to_user_libraries(
+                &self.db,
+                &self.virtual_paths,
+                self.visibility().as_deref(),
+                filter,
+            )
+            .await;
         }
 
         let mut resolved = None;
@@ -1319,6 +1337,7 @@ impl FerrofinItemRepository {
     /// a `DisplayParentId` pointing at the real `PlaylistsFolder`.
     async fn top_parent_ids_for_query(
         db: &Database,
+        paths: &VirtualPathExpander,
         id: Uuid,
         user: Option<&UserEntity>,
         depth: u8,
@@ -1409,6 +1428,7 @@ impl FerrofinItemRepository {
             return Ok(Some(
                 Box::pin(Self::top_parent_ids_for_query(
                     db,
+                    paths,
                     next,
                     user,
                     depth + 1,
@@ -1422,6 +1442,7 @@ impl FerrofinItemRepository {
         let view_type = crate::user_view_repository::view_type_of(data.as_deref());
         Box::pin(Self::grouped_library_ids(
             db,
+            paths,
             view_type.as_deref(),
             user,
             depth,
@@ -1442,6 +1463,7 @@ impl FerrofinItemRepository {
     /// too — a view that groups no library stands for no library.
     async fn grouped_library_ids(
         db: &Database,
+        paths: &VirtualPathExpander,
         view_type: Option<&str>,
         user: Option<&UserEntity>,
         depth: u8,
@@ -1450,9 +1472,10 @@ impl FerrofinItemRepository {
             return Ok(Some(Vec::new()));
         };
         let mut scope = Vec::new();
-        for folder in grouped_libraries(db, user, view_type).await? {
+        for folder in grouped_libraries(db, paths, user, view_type).await? {
             match Box::pin(Self::top_parent_ids_for_query(
                 db,
+                paths,
                 folder,
                 Some(user),
                 depth + 1,
@@ -1996,8 +2019,13 @@ impl FerrofinItemRepository {
             .collect();
         // `AddUserToQuery` for the by-name tabs. A no-op for a query that is
         // already scoped (a browse under one library passes `ancestor_ids`).
-        let scoped =
-            scope_to_user_libraries(&self.db, self.visibility().as_deref(), filter).await?;
+        let scoped = scope_to_user_libraries(
+            &self.db,
+            &self.virtual_paths,
+            self.visibility().as_deref(),
+            filter,
+        )
+        .await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         let top_parents = to_guid_strings(&filter.top_parent_ids);
 
@@ -2604,6 +2632,7 @@ struct IdentifiedViewRow {
 /// then only the reads a followed pointer or the grouping arm needs.
 pub(crate) async fn view_top_parent_ids(
     db: &Database,
+    paths: &VirtualPathExpander,
     ids: &[Uuid],
     user: Option<&UserEntity>,
 ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
@@ -2632,7 +2661,8 @@ pub(crate) async fn view_top_parent_ids(
             continue;
         };
         let folders =
-            FerrofinItemRepository::top_parent_ids_for_query(db, id, user, 0, Some(row)).await?;
+            FerrofinItemRepository::top_parent_ids_for_query(db, paths, id, user, 0, Some(row))
+                .await?;
         by_view.insert(id, folders.unwrap_or_default());
     }
     Ok(by_view)
@@ -2989,18 +3019,22 @@ pub(crate) async fn query_user(
 /// every query already excludes.
 pub(crate) async fn scope_to_user_libraries(
     db: &Database,
+    paths: &VirtualPathExpander,
     visibility: Option<&ItemVisibility>,
     filter: &InternalItemsQuery,
 ) -> Result<Option<InternalItemsQuery>, ServiceError> {
     let preferences = crate::query_restrictions::resolve(db, filter).await?;
     let prepared = preferences.as_ref().unwrap_or(filter);
-    Ok(scope_to_user_libraries_prepared(db, visibility, prepared)
-        .await?
-        .or(preferences))
+    Ok(
+        scope_to_user_libraries_prepared(db, paths, visibility, prepared)
+            .await?
+            .or(preferences),
+    )
 }
 
 async fn scope_to_user_libraries_prepared(
     db: &Database,
+    paths: &VirtualPathExpander,
     visibility: Option<&ItemVisibility>,
     filter: &InternalItemsQuery,
 ) -> Result<Option<InternalItemsQuery>, ServiceError> {
@@ -3019,7 +3053,7 @@ async fn scope_to_user_libraries_prepared(
         return Ok(None);
     }
 
-    let views = visible_view_rows(db, user).await?;
+    let views = visible_view_rows(db, paths, user).await?;
     let ids: Vec<Uuid> = views.iter().map(|view| view.id).collect();
     let by_view = library_top_parents_by_view(db, &ids).await?;
     let views = without_itemless_linked_libraries(views, &by_view, visibility, user).await?;
@@ -3127,9 +3161,10 @@ async fn without_itemless_linked_libraries(
 /// GetTopParentIds)`, `UserViewManager.cs:161-185`).
 pub(crate) async fn root_folder_top_parents(
     db: &Database,
+    paths: &VirtualPathExpander,
     user: &UserEntity,
 ) -> Result<Vec<Uuid>, ServiceError> {
-    let roots: Vec<Uuid> = visible_view_rows(db, user)
+    let roots: Vec<Uuid> = visible_view_rows(db, paths, user)
         .await?
         .into_iter()
         .filter(|view| !view.user_view)
@@ -3152,6 +3187,7 @@ pub(crate) async fn root_folder_top_parents(
 /// counts (`DtoService.GetChildCountSourceIds`, v12.2 `DtoService.cs:781-792`).
 pub(crate) async fn grouped_libraries(
     db: &Database,
+    paths: &VirtualPathExpander,
     user: &UserEntity,
     view_type: Option<&str>,
 ) -> Result<Vec<Uuid>, ServiceError> {
@@ -3163,7 +3199,7 @@ pub(crate) async fn grouped_libraries(
         return Ok(Vec::new());
     }
     let mut libraries = Vec::new();
-    for folder in visible_views(db, user).await? {
+    for folder in visible_views(db, paths, user).await? {
         if !grouped.contains(&folder) {
             continue;
         }
@@ -3180,8 +3216,12 @@ pub(crate) async fn grouped_libraries(
 /// (`GetUserRootFolder().GetChildren(user, true)`) and the `UserView` rows,
 /// before `GetUserViews`' playlists and box-set gate (see
 /// [`visible_view_rows`]).
-async fn visible_views(db: &Database, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
-    Ok(visible_view_rows(db, user)
+async fn visible_views(
+    db: &Database,
+    paths: &VirtualPathExpander,
+    user: &UserEntity,
+) -> Result<Vec<Uuid>, ServiceError> {
+    Ok(visible_view_rows(db, paths, user)
         .await?
         .into_iter()
         .map(|view| view.id)
@@ -3212,6 +3252,7 @@ struct VisibleView {
 /// [`user_entity_ext::live_tv_enabled_for`]).
 async fn visible_view_rows(
     db: &Database,
+    paths: &VirtualPathExpander,
     user: &UserEntity,
 ) -> Result<Vec<VisibleView>, ServiceError> {
     let Some(collection_folder) = stored_type_name(BaseItemKind::CollectionFolder) else {
@@ -3271,7 +3312,8 @@ async fn visible_view_rows(
     // restart.
     let mut active = Vec::with_capacity(rows.len());
     for row in rows {
-        if row.1 != collection_folder || library_enabled(db, &row.0, row.2.as_deref()).await {
+        if row.1 != collection_folder || library_enabled(db, paths, &row.0, row.2.as_deref()).await
+        {
             active.push(row);
         }
     }
@@ -3337,26 +3379,30 @@ async fn visible_view_rows(
 /// unscoped query, and each was a read and a parse of the options file
 /// (gl-981). Otherwise the file is read.
 ///
-/// The set's options were read at the library's expanded path
-/// (`ItemVisibility::rating_libraries`), while the file read below takes the
-/// stored path as it is. The two read the same file whenever the path holds no
-/// `%AppDataPath%`/`%MetadataPath%` token, so only a path without a `%` takes
-/// the set's options: any other keeps the file read below, whatever is cached.
-async fn library_enabled(db: &Database, id: &str, path: Option<&str>) -> bool {
+/// Both read the options at the library's expanded path: a row stored as
+/// `%MetadataPath%/root/default/<Name>` (Jellyfin's `ReverseVirtualPath`, when
+/// the metadata path holds the root folder) reads them where upstream does,
+/// off the row `BaseItemMapper.Map` expanded (gl-1338). `visible_view_rows`
+/// passes the stored path and `user_root_children` an expanded one; expanding
+/// that again changes nothing.
+async fn library_enabled(
+    db: &Database,
+    paths: &VirtualPathExpander,
+    id: &str,
+    path: Option<&str>,
+) -> bool {
     let Some(path) = path else {
         return true;
     };
-    if !path.contains('%')
-        && let Some(set) = db.cached_libraries()
+    if let Some(set) = db.cached_libraries()
         && let Ok(id) = Uuid::parse_str(id)
         && let Some(options) = set.options.get(&id)
     {
         return options.enabled;
     }
-    // Only `Enabled` is read, so the media paths need no expanding.
     crate::virtual_folder_manager::FerrofinVirtualFolderManager::read_options(
-        std::path::Path::new(path),
-        &crate::virtual_paths::VirtualPathExpander::identity(),
+        std::path::Path::new(paths.expand_cow(path).as_ref()),
+        paths,
     )
     .await
     .enabled
@@ -3668,7 +3714,7 @@ impl ItemRepository for FerrofinItemRepository {
     }
 
     async fn visible_library_ids(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
-        visible_views(&self.db, user).await
+        visible_views(&self.db, &self.virtual_paths, user).await
     }
 
     async fn build_access_filter(
@@ -3688,9 +3734,14 @@ impl ItemRepository for FerrofinItemRepository {
             return Ok(None);
         }
         Ok(Some(
-            scope_to_user_libraries(&self.db, self.visibility().as_deref(), &filter)
-                .await?
-                .unwrap_or(filter),
+            scope_to_user_libraries(
+                &self.db,
+                &self.virtual_paths,
+                self.visibility().as_deref(),
+                &filter,
+            )
+            .await?
+            .unwrap_or(filter),
         ))
     }
 
@@ -11747,8 +11798,8 @@ mod tests {
     /// The scope takes a library's `Enabled` from the cached library set when
     /// it holds the library's options, as the direct visibility check does,
     /// and from the options file otherwise (gl-981). A library stored under a
-    /// virtual-path token keeps the file read: the set's options were read at
-    /// the expanded path, the file read takes the stored one.
+    /// virtual-path token takes the set's options too: both read at the
+    /// expanded path (gl-1338).
     #[tokio::test]
     async fn the_scope_reads_a_library_s_enabled_option_from_the_cached_set() {
         let db = test_db().await;
@@ -11791,9 +11842,9 @@ mod tests {
         .await;
         assert_eq!(
             unscoped_names(&repository, &user).await,
-            ["In First", "In Second"],
-            "the set's options answer for the first library; the tokenized \
-             second keeps its file read"
+            ["In First"],
+            "the set's options answer for both libraries, the tokenized \
+             second's included"
         );
         db.invalidate_libraries();
         assert_eq!(
@@ -13905,8 +13956,98 @@ mod tests {
         }
     }
 
+    /// A library row stored tokenised, as `ReverseVirtualPath` saves one when
+    /// the configured metadata path holds the root folder
+    /// (`%MetadataPath%/root/default/<Name>`), takes `Enabled` from the
+    /// options at the expanded path, as `CollectionFolder.GetLibraryOptions(
+    /// Path)` reads them off the mapped row (gl-1338). The cached library set,
+    /// read with the same expander, answers the same.
     #[tokio::test]
-    async fn disabled_adopted_library_is_hidden_from_user_root_without_writing_options() {
+    async fn a_disabled_library_stored_tokenised_leaves_the_unscoped_scope() {
+        let db = test_db().await;
+        let metadata = tempfile::tempdir().unwrap();
+        let expander = metadata_expander(metadata.path());
+        let repository = Arc::new(repo(&db).with_virtual_paths(expander.clone()));
+        let (_, second, _, user) = two_libraries(&db).await;
+        let folder = metadata.path().join("root/default/Second");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("options.xml"),
+            "<LibraryOptions><Enabled>false</Enabled></LibraryOptions>",
+        )
+        .unwrap();
+        crate::test_support::set_item_path(&db, second, "%MetadataPath%/root/default/Second").await;
+        let query = InternalItemsQuery {
+            user: Some(Arc::new(user.clone())),
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Movie],
+            ..Default::default()
+        };
+        let page = repository.get_items(&query).await.unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .filter_map(|row| row.name.as_deref())
+                .collect::<Vec<_>>(),
+            ["In First"]
+        );
+        assert_eq!(page.total_record_count, 1);
+        assert!(
+            !repository
+                .visible_library_ids(&user)
+                .await
+                .unwrap()
+                .contains(&second)
+        );
+        let counts = crate::item_count_service::FerrofinItemCountService::new(db.clone())
+            .with_virtual_paths(expander.clone());
+        {
+            use ferrofin_traits::persistence::ItemCountService;
+            assert_eq!(counts.get_count(&query).await.unwrap(), 1);
+        }
+
+        db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+        let visibility = ItemVisibility::new(
+            db.clone(),
+            repository.clone(),
+            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+            "/unused/data".to_owned(),
+        )
+        .with_virtual_paths(expander);
+        visibility.rating_libraries().await.unwrap();
+        let set = db.cached_libraries().expect("the set is cached");
+        assert!(
+            !set.options[&second].enabled,
+            "the set read the expanded path"
+        );
+        // The file says enabled now; the warm set still answers.
+        std::fs::write(
+            folder.join("options.xml"),
+            "<LibraryOptions><Enabled>true</Enabled></LibraryOptions>",
+        )
+        .unwrap();
+        assert_eq!(repository.get_items(&query).await.unwrap().items.len(), 1);
+    }
+
+    /// An expander whose `%MetadataPath%` is `metadata`.
+    fn metadata_expander(metadata: &std::path::Path) -> VirtualPathExpander {
+        let paths = Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+            "/unused", "log", "config", "cache", "web",
+        ));
+        paths.set_internal_metadata_path(metadata.to_str());
+        VirtualPathExpander::from_paths(paths)
+    }
+
+    /// Also for a row stored tokenised (gl-1338): the user root's children come
+    /// expanded through `mapped_rows`, and `library_enabled` expands them again,
+    /// which changes nothing.
+    #[rstest::rstest]
+    #[case::resolved(false)]
+    #[case::tokenised(true)]
+    #[tokio::test]
+    async fn disabled_adopted_library_is_hidden_from_user_root_without_writing_options(
+        #[case] tokenised: bool,
+    ) {
         use crate::aggregate_folder::RootFolderIds;
         use crate::test_support::seed_folder_item;
         let db = test_db().await;
@@ -13940,13 +14081,27 @@ mod tests {
                 .unwrap();
         }
         let options = tempfile::tempdir().unwrap();
+        let (folder, stored, expander) = if tokenised {
+            (
+                options.path().join("root/default/Second"),
+                "%MetadataPath%/root/default/Second".to_owned(),
+                metadata_expander(options.path()),
+            )
+        } else {
+            (
+                options.path().to_path_buf(),
+                options.path().to_str().unwrap().to_owned(),
+                VirtualPathExpander::identity(),
+            )
+        };
+        std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(
-            options.path().join("options.xml"),
+            folder.join("options.xml"),
             "<LibraryOptions><Enabled>false</Enabled></LibraryOptions>",
         )
         .unwrap();
-        crate::test_support::set_item_path(&db, second, options.path().to_str().unwrap()).await;
-        let repository = repo(&db).with_root_ids(roots);
+        crate::test_support::set_item_path(&db, second, &stored).await;
+        let repository = repo(&db).with_root_ids(roots).with_virtual_paths(expander);
         let query = InternalItemsQuery {
             user_root_children: true,
             user: Some(Arc::new(user)),
@@ -13961,7 +14116,7 @@ mod tests {
             ["First"]
         );
         assert_eq!(page.total_record_count, 1);
-        assert!(!options.path().join("options.json").exists());
+        assert!(!folder.join("options.json").exists());
         let userless = repository
             .get_items(&InternalItemsQuery {
                 user: None,
