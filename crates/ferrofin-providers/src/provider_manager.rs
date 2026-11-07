@@ -3891,14 +3891,19 @@ impl LocalProviderManager {
     ) -> Result<Vec<RemoteImageInfo>, ServiceError> {
         // `ProviderManager.GetAvailableRemoteImages`: every remote image
         // provider for the item, narrowed to `ProviderName` when given
-        // (`OrdinalIgnoreCase`), each asked for its images, which are then
-        // narrowed to the requested `ImageType`.
+        // (`OrdinalIgnoreCase`) and to those whose `GetSupportedImages` lists
+        // the requested `ImageType`, before any is asked for its images.
         let name_filter = Some(query.provider_name.trim()).filter(|n| !n.is_empty());
         let sources: Vec<RemoteImageSource> = self
             .ordered_image_sources(entity)
             .await
             .into_iter()
             .filter(|source| name_filter.is_none_or(|n| source.name().eq_ignore_ascii_case(n)))
+            .filter(|source| {
+                query
+                    .image_type
+                    .is_none_or(|t| source.supported_images().contains(&t))
+            })
             .collect();
         if sources.is_empty() {
             return Ok(Vec::new());
@@ -8854,6 +8859,51 @@ mod tests {
             by_provider,
             ["FanArt", "FanArt", "TheAudioDB", "TheAudioDB", "TheAudioDB"],
             "each provider's block, in provider order"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_remote_images_skip_providers_without_the_type() {
+        // `GetAvailableRemoteImages` drops the providers whose
+        // `GetSupportedImages` lacks the requested type before asking any:
+        // TheAudioDB's artist provider lists no Art, so an Art listing never
+        // calls it.
+        let fanart = crate::mock_http::MockServer::always(FANART_MUSIC).await;
+        let audiodb = crate::mock_http::MockServer::always(AUDIODB_ARTIST).await;
+        let (item_id, mgr) = image_manager(
+            "Audio.MusicArtist",
+            "Miles Davis",
+            &[("MusicBrainzArtist", "artist-mbid")],
+            Arc::new(crate::tmdb::TmdbClient::new()),
+            |mgr| {
+                mgr.with_fanart(Arc::new(
+                    crate::fanart::FanartClient::new(None).with_base_url(&fanart.base_url),
+                ))
+                .with_audiodb(Arc::new(
+                    crate::audiodb::AudioDbClient::with_base_url(&audiodb.base_url),
+                ))
+            },
+        );
+
+        let art = mgr
+            .get_available_remote_images(
+                item_id,
+                &RemoteImageQuery {
+                    image_type: Some(ImageType::Art),
+                    ..RemoteImageQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(art.is_empty(), "{art:?}");
+        assert_eq!(
+            fanart.query_values("/music/artist-mbid", "api_key").len(),
+            1,
+            "FanArt lists Art, so it is asked"
+        );
+        assert!(
+            audiodb.query_values("/artist-mb.php", "i").is_empty(),
+            "TheAudioDB lists no Art, so it is not asked"
         );
     }
 
