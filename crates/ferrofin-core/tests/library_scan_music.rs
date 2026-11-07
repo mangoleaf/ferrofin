@@ -2528,3 +2528,89 @@ async fn a_failed_write_leaves_the_album_due() {
     assert!(row.date_last_refreshed.is_some(), "stamped once written");
     assert_eq!(row.production_year, Some(1959));
 }
+
+/// Counts the warnings whose message contains its needle, while it is the
+/// thread's default subscriber.
+#[derive(Clone)]
+struct WarningCount(&'static str, Arc<Mutex<usize>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningCount {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            if message.0.contains(self.0) {
+                *self.1.lock().expect("count") += 1;
+            }
+        }
+    }
+}
+
+/// An album's metadata locale walks its parents
+/// (`GetPreferredMetadataLanguage`), which end at a row that cannot be read
+/// as at one that is not there: the albums under an undecodable artist folder
+/// still run their providers in the music pass and are stamped, and each pass
+/// that reads the row (the walk, the music pass) warns about it once, not once
+/// per album. Current-thread on purpose: the thread-local subscriber must see
+/// every warning.
+#[tokio::test]
+async fn albums_under_an_undecodable_artist_still_refresh() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::build(
+        tmp.path(),
+        plugin_ranked(true),
+        PluginDb::new().source(),
+        false,
+    )
+    .await;
+    fx.scan().await;
+    sqlx::query(r#"UPDATE "BaseItems" SET "DateCreated" = 'not a date' WHERE "Id" = ?1"#)
+        .bind(ferrofin_db::store::guid_to_db(fx.artist_id()))
+        .execute(fx.db.writer())
+        .await
+        .expect("corrupt the artist");
+    let albums: Vec<PathBuf> = ["Milestones", "Workin'"]
+        .iter()
+        .map(|name| {
+            let dir = fx.artist_dir.join(name);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("01 - Track.mp3"), b"").expect("track");
+            dir
+        })
+        .collect();
+
+    let warned = Arc::new(Mutex::new(0));
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(
+        WarningCount("could not read a parent row", Arc::clone(&warned)),
+    ));
+    fx.scan().await;
+
+    for dir in &albums {
+        let id = derive_item_id(BaseItemKind::MusicAlbum, &dir.to_string_lossy()).expect("id");
+        let album = fx.row(id).await;
+        assert_eq!(
+            album.overview.as_deref(),
+            Some("PluginDb album text."),
+            "{dir:?}"
+        );
+        assert!(album.date_last_refreshed.is_some(), "{dir:?} is stamped");
+    }
+    assert_eq!(
+        *warned.lock().expect("warned"),
+        2,
+        "the walk's, the music pass's"
+    );
+}

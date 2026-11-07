@@ -35,16 +35,33 @@
 //! - `POST /Sessions/Playing`, then `GET /Sessions` twice (gl-1242). The start
 //!   report builds no `NowPlayingItem`: the first listing builds it, from the
 //!   row the report read, and the second copies it.
+//! - `POST /Sessions/Playing` and `/Sessions/Playing/Stopped` (gl-1392). Each
+//!   reads the item's row once: the playback activity entry is written from
+//!   the event's `MediaInfo`, as upstream's `PlaybackStartLogger` and
+//!   `PlaybackStopLogger` read `eventArgs.MediaInfo` and query nothing.
 //! - `GET /Sessions`, plain and with `controllableByUserId`, from an
 //!   administrator and from a user (gl-1265). The permissions the listing
 //!   checks come from the policy cache, as upstream reads them from the user
 //!   it holds, and the caller's row is read once; a policy saved through the
 //!   API reaches the very next listing.
+//! - The user's views with the Live TV view and the user's playlists view
+//!   (gl-1322). Both rows are in the listing of view rows the read takes, so a
+//!   warm read looks neither up by id; a row deleted since is made again.
 //! - `GET /Items?Fields=ProviderIds`, `GET /Items/{id}` and
 //!   `GET /Items?Fields=ExternalUrls` as a user (gl-1323). The DTO's provider
 //!   ids and the key of the user data the user never wrote come from the
 //!   page's `BaseItemProviders` rows, read once, as upstream's both come from
 //!   the item's `Provider` navigation.
+//! - A series' episodes and seasons with `ExternalUrls` (gl-1390): with and
+//!   without user data, with `ProviderIds`, an episode's own page, and a page
+//!   listing the series too, in both orders. The links come from the series'
+//!   provider ids as well as the items' own, and both are read in one
+//!   `BaseItemProviders` query.
+//! - An unscoped `GET /Items?Recursive=true` (gl-1283). Its scope, the user's
+//!   libraries, views and playlists folder, comes from the cached library set,
+//!   as upstream holds them in memory: a warm listing reads none of those rows.
+//!   With no set live, as after its TTL, a listing reads the set and caches it,
+//!   so the next listing reads none of them either (gl-1399).
 
 use std::sync::Mutex;
 
@@ -80,8 +97,18 @@ const PLAYING_SPAN: &str = "gl1242_playing_request";
 /// The span the recorded session listings run in.
 const SESSIONS_SPAN: &str = "gl1265_sessions_request";
 
+/// The span the recorded views reads holding the Live TV and playlists views
+/// run in.
+const VIEW_ROWS_SPAN: &str = "gl1322_view_rows_read";
+
 /// The span the recorded item reads with provider ids run in.
 const PROVIDERS_SPAN: &str = "gl1323_provider_ids_request";
+
+/// The span the recorded episode listings with links run in.
+const SERIES_PROVIDERS_SPAN: &str = "gl1390_series_provider_ids_request";
+
+/// The span the recorded unscoped listing runs in.
+const UNSCOPED_SPAN: &str = "gl1283_unscoped_listing_request";
 
 /// The statements recorded inside each test's span, in order, tagged with the
 /// span: `cargo test` runs a binary's tests on threads of one process.
@@ -108,7 +135,10 @@ where
                     PARENT_SPAN,
                     PLAYING_SPAN,
                     SESSIONS_SPAN,
+                    VIEW_ROWS_SPAN,
                     PROVIDERS_SPAN,
+                    SERIES_PROVIDERS_SPAN,
+                    UNSCOPED_SPAN,
                 ]
                 .into_iter()
                 .find(|name| span.name() == *name)
@@ -344,6 +374,59 @@ async fn sign_in_and_scan(harness: &Harness, router: &axum::Router) -> (String, 
     (auth_header, user_id)
 }
 
+/// Adds a shows library holding one episode of a series named with its Tmdb
+/// and Tvdb ids, with no remote fetchers, and scans it; returns the series' id.
+async fn scan_a_show(
+    harness: &Harness,
+    router: &axum::Router,
+    auth_header: &str,
+    user_id: &str,
+) -> String {
+    let shows = std::path::Path::new(&harness.movies_dir).with_file_name("shows");
+    let episode = shows.join("Show (2008) [tmdbid-1396] [tvdbid-81189]/Season 01/Show S01E01.mkv");
+    std::fs::create_dir_all(episode.parent().expect("season dir")).expect("season dir");
+    std::fs::write(&episode, [0u8; 1024]).expect("episode file");
+    let (status, body) = send(
+        router,
+        auth_header,
+        "POST",
+        &format!(
+            "/Library/VirtualFolders?name=Shows&collectionType=tvshows&paths={}&refreshLibrary=false",
+            urlencoding(&shows.to_string_lossy())
+        ),
+        Some(serde_json::json!({"LibraryOptions": {"TypeOptions": [
+            {"Type": "Series", "MetadataFetchers": [], "ImageFetchers": []},
+            {"Type": "Season", "MetadataFetchers": [], "ImageFetchers": []},
+            {"Type": "Episode", "MetadataFetchers": [], "ImageFetchers": []}
+        ]}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "library added: {body}");
+    assert!(
+        harness
+            .wired
+            .state
+            .library
+            .run_library_scan(ScanTrigger::Api, None)
+            .await
+            .expect("scan"),
+        "the scan ran"
+    );
+    let (status, series) = send(
+        router,
+        auth_header,
+        "GET",
+        &format!("/Items?userId={user_id}&includeItemTypes=Series&recursive=true"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "series: {series}");
+    series["Items"][0]["Id"]
+        .as_str()
+        .expect("the series")
+        .to_owned()
+}
+
 #[tokio::test]
 async fn a_warm_views_request_reads_no_library_row_again() {
     record_statements();
@@ -405,6 +488,78 @@ async fn a_warm_views_request_reads_no_library_row_again() {
     );
 
     a_dashboard_toggle_reaches_the_next_request(&harness, &router, &auth_header, &user_id).await;
+}
+
+/// An unscoped `GET /Items?Recursive=true&IncludeItemTypes=Movie` (gl-1283):
+/// `AddUserToQuery` scopes it to the user's views, the libraries, the
+/// playlists folder and the `UserView` rows, which upstream holds in memory.
+/// The cached library set holds all of them, so a warm listing reads none of
+/// their rows again. With none live, as after its TTL, a listing reads the set
+/// and caches it, so the next one reads none either (gl-1399).
+#[tokio::test]
+async fn a_warm_unscoped_listing_reads_no_library_or_view_row_again() {
+    record_statements();
+    let harness = boot(&[
+        "Film Alpha (1999)/Film Alpha (1999).mkv",
+        "Film Beta (2004)/Film Beta (2004).mkv",
+    ])
+    .await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let uri = format!("/Items?Recursive=true&IncludeItemTypes=Movie&userId={user_id}");
+
+    let (status, warm) = send(&router, &auth_header, "GET", &uri, None).await;
+    assert_eq!(status, StatusCode::OK, "listing: {warm}");
+    assert_eq!(warm["TotalRecordCount"], 2, "{warm}");
+    assert!(
+        harness.db.cached_libraries().is_some(),
+        "a listing leaves the library set cached"
+    );
+    a_listing_reading_no_library_or_view_row(&router, &auth_header, &uri, &warm).await;
+
+    // The set gone, as when its TTL lapses (gl-1399): a listing reads the
+    // rows and caches them, so the next one reads none.
+    harness.db.invalidate_libraries();
+    let (status, cold) = send(&router, &auth_header, "GET", &uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cold, warm, "the cold listing answers as the warm one");
+    assert!(
+        harness.db.cached_libraries().is_some(),
+        "a cold listing caches the library set"
+    );
+    a_listing_reading_no_library_or_view_row(&router, &auth_header, &uri, &warm).await;
+}
+
+/// Sends `uri` inside [`UNSCOPED_SPAN`] and checks it answers `warm` and reads
+/// none of the scope's library, view or playlists-folder rows.
+async fn a_listing_reading_no_library_or_view_row(
+    router: &axum::Router,
+    auth_header: &str,
+    uri: &str,
+    warm: &serde_json::Value,
+) {
+    clear_statements(UNSCOPED_SPAN);
+    let (status, page) = send(router, auth_header, "GET", uri, None)
+        .instrument(tracing::info_span!(UNSCOPED_SPAN))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&page, warm, "the recorded request answers as the warm one");
+    let statements = statements_in(UNSCOPED_SPAN);
+    let listing = statements.join("\n");
+    assert!(
+        statements
+            .iter()
+            .any(|s| s.contains(r#"bi."TopParentId" IN ("#)),
+        "the scoped listing is recorded:\n{listing}"
+    );
+    assert!(
+        !statements
+            .iter()
+            .any(|s| s.contains(r#"FROM "BaseItems" WHERE "Type" IN ("#)
+                || s.contains(r#"WHERE "Data" IS NOT NULL AND +"Type" ="#)),
+        "the scope's libraries, views and playlists folder come from the cached \
+         library set:\n{listing}"
+    );
 }
 
 /// A movie with two versions on a library browse, the runtime-sorted edge
@@ -845,6 +1000,87 @@ async fn a_playback_start_leaves_the_now_playing_item_to_the_first_read() {
     assert_eq!(shown, film);
 }
 
+/// A start and a stop each read the item's row once, in the session manager:
+/// the playback loggers write their entries from the event's `MediaInfo`
+/// instead of reading the row again, and name the item as before (gl-1392).
+#[tokio::test]
+async fn a_playback_start_and_stop_read_the_item_s_row_once() {
+    record_statements();
+    let harness = boot(&["Film Alpha (1999)/Film Alpha (1999).mkv"]).await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let (status, films) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!("/Items?userId={user_id}&recursive=true&includeItemTypes=Movie"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "films: {films}");
+    let film = films["Items"][0]["Id"].as_str().expect("the film");
+
+    let start = playing_statements(
+        &router,
+        &auth_header,
+        "POST",
+        "/Sessions/Playing",
+        Some(serde_json::json!({"ItemId": film})),
+    )
+    .await;
+    assert_eq!(row_reads_by_id(&start), 1, "{start:#?}");
+    let stop = playing_statements(
+        &router,
+        &auth_header,
+        "POST",
+        "/Sessions/Playing/Stopped",
+        Some(serde_json::json!({"ItemId": film, "PositionTicks": 600_000_000})),
+    )
+    .await;
+    assert_eq!(row_reads_by_id(&stop), 1, "{stop:#?}");
+
+    let (status, page) = send(
+        &router,
+        &auth_header,
+        "GET",
+        "/System/ActivityLog/Entries?limit=100",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let playback: Vec<(&str, &str, &str)> = page["Items"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter_map(|entry| {
+            let type_ = entry["Type"].as_str()?;
+            type_.contains("Playback").then(|| {
+                (
+                    type_,
+                    entry["Name"].as_str().unwrap_or_default(),
+                    entry["ItemId"].as_str().unwrap_or_default(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        playback,
+        [
+            (
+                "VideoPlaybackStopped",
+                "admin has finished playing Film Alpha (1999) on Test Rig",
+                film
+            ),
+            (
+                "VideoPlayback",
+                "admin is playing Film Alpha (1999) on Test Rig",
+                film
+            ),
+        ],
+        "{page}"
+    );
+}
+
 /// Sends a request inside [`PLAYING_SPAN`] and returns its statements.
 async fn playing_statements(
     router: &axum::Router,
@@ -991,6 +1227,139 @@ async fn a_sessions_listing_reads_permissions_from_the_policy_cache() {
     }
 }
 
+/// The user's views on a server holding the Live TV view and the user's
+/// playlists view (gl-1322). Upstream's `GetNamedView` finds each row with
+/// `GetItemById`, from its item cache. Here the listing of view rows the read
+/// takes holds both, so a warm read looks neither up by id. A row deleted
+/// since is made again on the next read, as `GetNamedView` makes it.
+#[tokio::test]
+async fn a_warm_views_read_finds_its_view_rows_in_its_listing() {
+    record_statements();
+    let harness = boot(&["Film Alpha (1999)/Film Alpha (1999).mkv"]).await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    add_tuner_and_playlist(&harness, &router, &auth_header, &user_id).await;
+    let views_uri = format!("/Users/{user_id}/Views");
+    let view_ids = |views: &serde_json::Value| -> Vec<(String, String)> {
+        views["Items"]
+            .as_array()
+            .expect("views")
+            .iter()
+            .map(|view| {
+                (
+                    view["CollectionType"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    view["Id"].as_str().expect("view id").to_owned(),
+                )
+            })
+            .collect()
+    };
+
+    // Cold: the first read makes both view rows.
+    let (status, cold) = send(&router, &auth_header, "GET", &views_uri, None).await;
+    assert_eq!(status, StatusCode::OK, "views: {cold}");
+    let listed = view_ids(&cold);
+    let kinds: Vec<&str> = listed.iter().map(|(kind, _)| kind.as_str()).collect();
+    assert_eq!(kinds, ["livetv", "movies", "playlists"], "{cold}");
+
+    let user = uuid::Uuid::parse_str(&user_id).expect("user id");
+    clear_statements(VIEW_ROWS_SPAN);
+    let views = harness
+        .wired
+        .state
+        .user_views
+        .get_user_views(user)
+        .instrument(tracing::info_span!(VIEW_ROWS_SPAN))
+        .await
+        .expect("views");
+    assert_eq!(views.len(), 3, "{views:?}");
+    let statements = statements_in(VIEW_ROWS_SPAN);
+    let listing = statements.join("\n");
+    assert!(
+        !statements
+            .iter()
+            .any(|s| s.contains(r#"FROM "BaseItems" WHERE "Id" = ?1"#)),
+        "a warm read looks no view row up by id:\n{listing}"
+    );
+    // It finds both rows, so it writes neither and lists the views once.
+    assert!(
+        !statements
+            .iter()
+            .any(|s| s.contains(r#"INSERT INTO "BaseItems""#)),
+        "a warm read writes no view row:\n{listing}"
+    );
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|s| s.contains(r#"ORDER BY bi."SortName" ASC, bi."Name" ASC"#))
+            .count(),
+        1,
+        "a warm read lists the view rows once:\n{listing}"
+    );
+
+    // Each row deleted is made again by the next read, under the same id.
+    for (kind, id) in listed.iter().filter(|(kind, _)| kind != "movies") {
+        let id = uuid::Uuid::parse_str(id).expect("view id");
+        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(ferrofin_db::store::guid_to_db(id))
+            .execute(harness.db.writer())
+            .await
+            .expect("view row deleted");
+        let (status, views) = send(&router, &auth_header, "GET", &views_uri, None).await;
+        assert_eq!(status, StatusCode::OK, "views: {views}");
+        assert_eq!(view_ids(&views), listed, "the {kind} view is back: {views}");
+    }
+}
+
+/// Adds an M3U tuner, so the Live TV view is listed, and a playlist of the
+/// library's movie owned by `user_id`, so the user's Playlists view is.
+async fn add_tuner_and_playlist(
+    harness: &Harness,
+    router: &axum::Router,
+    auth_header: &str,
+    user_id: &str,
+) {
+    let tuner = std::path::Path::new(&harness.movies_dir).with_file_name("tuner.m3u");
+    std::fs::write(
+        &tuner,
+        "#EXTM3U\n#EXTINF:-1 tvg-id=\"one\" tvg-chno=\"1\",one\nhttp://tuner.invalid/one\n",
+    )
+    .expect("tuner playlist");
+    let (status, body) = send(
+        router,
+        auth_header,
+        "POST",
+        "/LiveTv/TunerHosts",
+        Some(serde_json::json!({ "Type": "m3u", "Url": tuner.to_string_lossy() })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "tuner added: {body}");
+    let (status, movies) = send(
+        router,
+        auth_header,
+        "GET",
+        &format!("/Items?userId={user_id}&includeItemTypes=Movie&recursive=true"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "movies: {movies}");
+    let movie = movies["Items"][0]["Id"]
+        .as_str()
+        .expect("a movie")
+        .to_owned();
+    let (status, body) = send(
+        router,
+        auth_header,
+        "POST",
+        "/Playlists",
+        Some(serde_json::json!({ "Name": "Mine", "Ids": [movie], "UserId": user_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "playlist created: {body}");
+}
+
 /// A page showing provider ids, a movie's own page, and a page showing only
 /// its links each read the page's `BaseItemProviders` rows once (gl-1323).
 /// The DTO's `ProviderIds` and the key of the user data the user never wrote
@@ -1043,6 +1412,112 @@ async fn an_item_page_reads_its_provider_ids_once() {
                 .count(),
             1,
             "{uri} reads the provider ids once: {statements:#?}"
+        );
+    }
+}
+
+/// A series' episodes and seasons with `ExternalUrls` read the series'
+/// provider ids, which their links are built from, in the same
+/// `BaseItemProviders` query as their own (gl-1390): with or without user
+/// data, with `ProviderIds`, on the episode's own page, and on a page that
+/// lists the series too. The user-data key still derives from the series'
+/// ids, as without the field.
+#[tokio::test]
+async fn an_episode_page_reads_its_series_provider_ids_with_its_own() {
+    record_statements();
+    let harness = boot(&["Heat (1995)/Heat (1995).mkv"]).await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let series = scan_a_show(&harness, &router, &auth_header, &user_id).await;
+    let series = series.as_str();
+    let shows = |path: &str, query: &str| format!("/Shows/{series}/{path}?userId={user_id}{query}");
+    let (status, plain) = send(&router, &auth_header, "GET", &shows("Episodes", ""), None).await;
+    assert_eq!(status, StatusCode::OK, "episodes: {plain}");
+    let episode = plain["Items"][0]["Id"].as_str().expect("the episode");
+    // The series' Tvdb id, then the season's (and the episode's) number.
+    let episode_key = Some("81189001001");
+    assert_eq!(plain["Items"][0]["UserData"]["Key"].as_str(), episode_key);
+    let episode_link = "https://www.themoviedb.org/tv/1396/season/1/episode/1";
+    let season_link = "https://www.themoviedb.org/tv/1396/season/1";
+    let mixed = |order: &str| {
+        format!(
+            "/Items?userId={user_id}&recursive=true&includeItemTypes=Series,Episode\
+             &fields=ProviderIds,ExternalUrls&sortBy=SortName&sortOrder={order}"
+        )
+    };
+
+    // (uri, the kind checked, its link, its key). `ProviderIds` and the
+    // item's own page hand the page's rows, the series' with them, to the
+    // user-data key; a page holding the series too projects it first in one
+    // of the two orders.
+    for (uri, kind, link, key) in [
+        (
+            shows("Episodes", "&fields=ExternalUrls"),
+            "Episode",
+            episode_link,
+            episode_key,
+        ),
+        (
+            shows("Episodes", "&fields=ExternalUrls&enableUserData=false"),
+            "Episode",
+            episode_link,
+            None,
+        ),
+        (
+            shows("Episodes", "&fields=ProviderIds,ExternalUrls"),
+            "Episode",
+            episode_link,
+            episode_key,
+        ),
+        (
+            format!("/Items/{episode}?userId={user_id}"),
+            "Episode",
+            episode_link,
+            episode_key,
+        ),
+        (
+            shows("Seasons", "&fields=ExternalUrls"),
+            "Season",
+            season_link,
+            Some("81189001"),
+        ),
+        (mixed("Ascending"), "Episode", episode_link, episode_key),
+        (mixed("Descending"), "Episode", episode_link, episode_key),
+    ] {
+        clear_statements(SERIES_PROVIDERS_SPAN);
+        let (status, body) = send(&router, &auth_header, "GET", &uri, None)
+            .instrument(tracing::info_span!(SERIES_PROVIDERS_SPAN))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let dtos = body["Items"]
+            .as_array()
+            .map_or_else(|| vec![&body], |items| items.iter().collect());
+        let dto = dtos
+            .iter()
+            .find(|dto| dto["Type"] == kind)
+            .unwrap_or_else(|| panic!("{uri}: a {kind}: {body}"));
+        assert!(
+            dto["ExternalUrls"]
+                .as_array()
+                .is_some_and(|links| links.iter().any(|found| found["Url"] == link)),
+            "{uri}: the series' Tmdb id builds the link: {body}"
+        );
+        assert_eq!(dto["UserData"]["Key"].as_str(), key, "{uri}: {body}");
+        if uri.contains("includeItemTypes=Series") {
+            let listed = dtos
+                .iter()
+                .find(|dto| dto["Type"] == "Series")
+                .unwrap_or_else(|| panic!("{uri}: the series is listed: {body}"));
+            assert_eq!(listed["ProviderIds"]["Tmdb"], "1396", "{uri}: {body}");
+        }
+        let statements = statements_in(SERIES_PROVIDERS_SPAN);
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|s| s.contains(r#"FROM "BaseItemProviders""#))
+                .count(),
+            1,
+            "{uri} runs one BaseItemProviders IN-query: {statements:#?}"
         );
     }
 }

@@ -24,6 +24,7 @@ use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::{BaseItemEntity, BaseItemImageInfoEntity};
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::{ItemValueType, PermissionKind, PreferenceKind};
+use ferrofin_db::row_cache::LibrarySet;
 use ferrofin_db::store::{datetime_to_db, guid_to_db};
 use ferrofin_model::data::{BaseItemKind, CollectionType};
 use ferrofin_model::dto::ItemCounts;
@@ -268,7 +269,7 @@ struct ViewRow {
     /// A row built from one the caller read ([`FerrofinItemRepository::view_row_of`])
     /// looks it up only for a recursive browse of a box set or a playlist, the
     /// one browse that reads it ([`FerrofinItemRepository::linked_container_scope`]),
-    /// and says `false` otherwise.
+    /// and says `false` otherwise, as a library-set row does ([`view_row`]).
     #[sqlx(rename = "_HasLinkedChildren")]
     has_linked_children: bool,
 }
@@ -492,10 +493,11 @@ impl FerrofinItemRepository {
         // a `UserView` (not an `ICollectionFolder`) and the playlists folder (a
         // `BasePluginFolder`) always pass.
         if let Some(user) = filter.user.as_ref() {
+            let set = crate::item_visibility::library_set(&self.db, &self.virtual_paths).await?;
             let mut enabled = Vec::with_capacity(rows.len());
             for row in rows {
                 if Some(row.type_.as_str()) != stored_type_name(BaseItemKind::CollectionFolder)
-                    || library_enabled(&self.db, &self.virtual_paths, &row.id, row.path.as_deref())
+                    || library_enabled(&set, &self.virtual_paths, &row.id, row.path.as_deref())
                         .await
                 {
                     enabled.push(row);
@@ -947,16 +949,8 @@ impl FerrofinItemRepository {
         if cached_permission(&self.db, &user.id, PermissionKind::EnableAllFolders).await? {
             return Ok(Vec::new());
         }
-        let Some(collection_folder) = stored_type_name(BaseItemKind::CollectionFolder) else {
-            return Ok(Vec::new());
-        };
         let allowed = folder_preference(&self.db, user, PreferenceKind::EnabledFolders).await?;
-        let rows: Vec<String> =
-            sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1"#)
-                .bind(collection_folder)
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
+        let rows = library_ids(&self.db).await?;
         Ok(rows
             .iter()
             .filter_map(|id| Uuid::parse_str(id).ok())
@@ -991,6 +985,10 @@ impl FerrofinItemRepository {
         }
         if let Some(row) = filter.known_parent_row() {
             return Self::view_row_of(&self.db, filter, row).await.map(Some);
+        }
+        // A library, a view or the playlists folder: upstream holds it in memory (gl-1399).
+        if let Some(row) = cached_view_row(&self.db, filter.parent_id) {
+            return Ok(Some(row));
         }
         Self::query_view_row(&self.db, filter.parent_id).await
     }
@@ -1027,12 +1025,8 @@ impl FerrofinItemRepository {
             .await
             .map_err(db_err)?;
         Ok(ViewRow {
-            type_name: row.type_.clone(),
-            parent_id: row.parent_id.clone(),
-            path: row.path.clone(),
-            data: row.data.clone(),
-            top_parent_id: row.top_parent_id.clone(),
             has_linked_children,
+            ..view_row(row)
         })
     }
 
@@ -1349,7 +1343,7 @@ impl FerrofinItemRepository {
         if depth > 8 {
             return Ok(Some(Vec::new()));
         }
-        let row = match row {
+        let row = match row.or_else(|| cached_view_row(db, id)) {
             Some(row) => Some(row),
             None => Self::query_view_row(db, id).await?,
         };
@@ -1499,12 +1493,14 @@ impl FerrofinItemRepository {
     /// library, which upstream treats as matching any view. A mixed library
     /// (`mixed.collection`) is untyped, as upstream parses it.
     async fn collection_type_of(db: &Database, id: Uuid) -> Result<Option<String>, ServiceError> {
-        let data: Option<Option<String>> =
-            sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
+        let data: Option<Option<String>> = match cached_view_row(db, id) {
+            Some(row) => Some(row.data),
+            None => sqlx::query_scalar(r#"SELECT "Data" FROM "BaseItems" WHERE "Id" = ?1"#)
                 .bind(guid_to_db(id))
                 .fetch_optional(db.pool())
                 .await
-                .map_err(db_err)?;
+                .map_err(db_err)?,
+        };
         Ok(data
             .flatten()
             .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok())
@@ -2525,14 +2521,17 @@ fn push_representative_rank(
 /// library on an adopted database Ferrofin has not scanned yet. Reads that
 /// scope a library by `TopParentId` take [`library_top_parents_by_view`].
 ///
-/// The rows come from the library set the visibility check caches
-/// (`ferrofin_db::row_cache`) when one is live: it holds every
+/// The rows come from the cached library set (`ferrofin_db::row_cache`)
+/// when one is live: it holds every
 /// `CollectionFolder` row, `Data` included, and the library mutation hooks keep
 /// it current. Upstream reads the same ids off the in-memory
 /// `CollectionFolder.PhysicalFolderIds`. One request asks this several times
 /// (`/Users/{id}/Views` three: the playlists probe's scope, that probe's own
 /// query and the views' child counts), and each was a statement (gl-981). With
-/// none cached the rows are read.
+/// none live the rows are read and nothing is cached: the scan and the item
+/// saves ask this under item writes, which would cancel a load each time. A
+/// listing reaches it after its scope or its parent's visibility check has
+/// read the set (gl-1399).
 pub(crate) async fn physical_folders_by_view(
     db: &Database,
     ids: &[Uuid],
@@ -2612,13 +2611,47 @@ pub(crate) async fn library_top_parents_by_view(
     Ok(by_view)
 }
 
-/// A [`ViewRow`] and the id it was read for.
-#[derive(sqlx::FromRow)]
-struct IdentifiedViewRow {
-    #[sqlx(rename = "Id")]
-    id: String,
-    #[sqlx(flatten)]
-    row: ViewRow,
+/// Every library's row id, as stored: from the cached library set when one is
+/// live (gl-1283), as upstream lists its collection folders from memory.
+pub(crate) async fn library_ids(db: &Database) -> Result<Vec<String>, ServiceError> {
+    if let Some(set) = db.cached_libraries() {
+        return Ok(set.rows.iter().map(|row| row.id.clone()).collect());
+    }
+    let Some(collection_folder) = stored_type_name(BaseItemKind::CollectionFolder) else {
+        return Ok(Vec::new());
+    };
+    sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1"#)
+        .bind(collection_folder)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// `row`'s [`ViewRow`], its linked children not looked up. A library-set row
+/// never needs them: the set holds no box set or playlist, the only parents
+/// whose linked children scope a browse
+/// ([`FerrofinItemRepository::linked_container_scope`]).
+fn view_row(row: &BaseItemEntity) -> ViewRow {
+    ViewRow {
+        type_name: row.type_.clone(),
+        parent_id: row.parent_id.clone(),
+        path: row.path.clone(),
+        data: row.data.clone(),
+        top_parent_id: row.top_parent_id.clone(),
+        has_linked_children: false,
+    }
+}
+
+/// `id`'s [`ViewRow`] from the cached library set, when one is live and holds
+/// the row (a library, a view or the playlists folder), as stored (gl-1283).
+fn cached_view_row(db: &Database, id: Uuid) -> Option<ViewRow> {
+    let set = db.cached_libraries()?;
+    let stored = guid_to_db(id);
+    set.rows
+        .iter()
+        .chain(&set.views)
+        .find(|row| row.id == stored)
+        .map(view_row)
 }
 
 /// The `TopParentId`s each `UserView` among `ids` stands for, as
@@ -2628,8 +2661,9 @@ struct IdentifiedViewRow {
 /// `ParentId` what that item stands for, a Live TV view itself. A view that
 /// stands for nothing maps to an empty list. Ids that are not views are absent.
 ///
-/// For a scope built from a handful of parents: one read of the views' rows,
-/// then only the reads a followed pointer or the grouping arm needs.
+/// The views' rows come from the library set, which holds every `UserView`
+/// row, as upstream holds its views in memory (gl-1399); then only the reads a
+/// followed pointer or the grouping arm needs.
 pub(crate) async fn view_top_parent_ids(
     db: &Database,
     paths: &VirtualPathExpander,
@@ -2642,27 +2676,26 @@ pub(crate) async fn view_top_parent_ids(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-        r#"SELECT "Id", "Type", "ParentId", "Path", "Data", "TopParentId",
-           EXISTS (SELECT 1 FROM "LinkedChildren" WHERE "ParentId" = "BaseItems"."Id")
-               AS "_HasLinkedChildren"
-           FROM "BaseItems" WHERE +"Type" = "#,
-    );
-    qb.push_bind(user_view).push(" AND ");
-    push_in_list(&mut qb, r#""Id""#, &to_guid_strings(ids));
-    let rows: Vec<IdentifiedViewRow> = qb
-        .build_query_as()
-        .fetch_all(db.pool())
-        .await
-        .map_err(db_err)?;
-    let mut by_view = HashMap::with_capacity(rows.len());
-    for IdentifiedViewRow { id, row } in rows {
-        let Ok(id) = Uuid::parse_str(&id) else {
+    let set = crate::item_visibility::library_set(db, paths).await?;
+    let mut by_view = HashMap::with_capacity(ids.len());
+    for &id in ids {
+        let stored = guid_to_db(id);
+        let Some(view) = set
+            .views
+            .iter()
+            .find(|row| row.id == stored && row.type_ == user_view)
+        else {
             continue;
         };
-        let folders =
-            FerrofinItemRepository::top_parent_ids_for_query(db, paths, id, user, 0, Some(row))
-                .await?;
+        let folders = FerrofinItemRepository::top_parent_ids_for_query(
+            db,
+            paths,
+            id,
+            user,
+            0,
+            Some(view_row(view)),
+        )
+        .await?;
         by_view.insert(id, folders.unwrap_or_default());
     }
     Ok(by_view)
@@ -3278,19 +3311,19 @@ async fn visible_view_rows(
     let playlists_folder = stored_type_name(BaseItemKind::PlaylistsFolder).unwrap_or_default();
     let manual_playlists_folder =
         stored_type_name(BaseItemKind::ManualPlaylistsFolder).unwrap_or_default();
-    // A library's `CollectionType` lives in its `Data` blob; only those
-    // rows' blobs are read.
-    let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-        r#"SELECT "Id", "Type", "Path", CASE WHEN "Type" = ?1 THEN "Data" END
-           FROM "BaseItems" WHERE "Type" IN (?1, ?2, ?3, ?4)"#,
-    )
-    .bind(collection_folder)
-    .bind(user_view)
-    .bind(playlists_folder)
-    .bind(manual_playlists_folder)
-    .fetch_all(db.pool())
-    .await
-    .map_err(db_err)?;
+    // A library's `CollectionType` lives in its `Data` blob. The library set
+    // holds all of these rows, as upstream holds them in memory (gl-1283),
+    // and a listing that finds none live reads and caches it (gl-1399).
+    let set = crate::item_visibility::library_set(db, paths).await?;
+    let row = |row: &BaseItemEntity, data: Option<String>| {
+        (row.id.clone(), row.type_.clone(), row.path.clone(), data)
+    };
+    let rows: Vec<(String, String, Option<String>, Option<String>)> = set
+        .rows
+        .iter()
+        .map(|library| row(library, library.data.clone()))
+        .chain(set.views.iter().map(|view| row(view, None)))
+        .collect();
 
     // Live TV is a view only while Live TV exists — see
     // `live_tv_enabled_for`. Jellyfin leaves it out of `GetUserViews`
@@ -3312,7 +3345,8 @@ async fn visible_view_rows(
     // restart.
     let mut active = Vec::with_capacity(rows.len());
     for row in rows {
-        if row.1 != collection_folder || library_enabled(db, paths, &row.0, row.2.as_deref()).await
+        if row.1 != collection_folder
+            || library_enabled(&set, paths, &row.0, row.2.as_deref()).await
         {
             active.push(row);
         }
@@ -3371,13 +3405,13 @@ async fn visible_view_rows(
 /// The saved CollectionFolder option, including adopted XML and constructor
 /// defaults. This read does not create files or repair the database.
 ///
-/// From the library set the visibility check caches (`ferrofin_db::row_cache`)
-/// when one is live and holds the library's options, as upstream's
-/// `CollectionFolder.GetLibraryOptions` serves them from memory: an options
-/// write drops the set (`update_library_options`), so a dashboard toggle takes
-/// effect on the next request. The scope asks this for every library on every
-/// unscoped query, and each was a read and a parse of the options file
-/// (gl-981). Otherwise the file is read.
+/// From `set` ([`crate::item_visibility::library_set`]) when it holds the
+/// library's options, as upstream's `CollectionFolder.GetLibraryOptions`
+/// serves them from memory: an options write drops the cached set
+/// (`update_library_options`), so a dashboard toggle takes effect on the next
+/// request. The scope asks this for every library on every unscoped query, and
+/// each was a read and a parse of the options file (gl-981). A library the set
+/// does not hold has its file read.
 ///
 /// Both read the options at the library's expanded path: a row stored as
 /// `%MetadataPath%/root/default/<Name>` (Jellyfin's `ReverseVirtualPath`, when
@@ -3386,7 +3420,7 @@ async fn visible_view_rows(
 /// passes the stored path and `user_root_children` an expanded one; expanding
 /// that again changes nothing.
 async fn library_enabled(
-    db: &Database,
+    set: &LibrarySet,
     paths: &VirtualPathExpander,
     id: &str,
     path: Option<&str>,
@@ -3394,8 +3428,7 @@ async fn library_enabled(
     let Some(path) = path else {
         return true;
     };
-    if let Some(set) = db.cached_libraries()
-        && let Ok(id) = Uuid::parse_str(id)
+    if let Ok(id) = Uuid::parse_str(id)
         && let Some(options) = set.options.get(&id)
     {
         return options.enabled;
@@ -3674,19 +3707,30 @@ async fn folder_preference(
 }
 
 /// `ManagedFileSystem.SwapFiles`: exchanges the contents of two files through a
-/// temporary copy of the first. A failure part-way restores the first file.
+/// temporary copy of the first. A failure part-way restores the first file;
+/// when the restore fails too, the temporary copy is kept, since it may hold the
+/// only copy of the original, and the error names it.
 fn swap_image_files(first: &std::path::Path, second: &std::path::Path) -> std::io::Result<()> {
     let temp = first.with_file_name(format!(".ferrofin-swap-{}", Uuid::new_v4().simple()));
     std::fs::copy(first, &temp)?;
-    let result = std::fs::copy(second, first)
-        .and_then(|_| std::fs::rename(&temp, second))
-        .inspect_err(|_| {
-            // Put the first file back; the temporary copy is its only other
-            // holder of the original content.
-            let _ = std::fs::copy(&temp, first);
-        });
-    let _ = std::fs::remove_file(&temp);
-    result
+    let Err(error) = std::fs::copy(second, first).and_then(|_| std::fs::rename(&temp, second))
+    else {
+        return Ok(());
+    };
+    if let Err(restore) = std::fs::copy(&temp, first) {
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; restoring {} failed too ({restore}), its original content is kept in {}",
+                first.display(),
+                temp.display()
+            ),
+        ));
+    }
+    if let Err(remove) = std::fs::remove_file(&temp) {
+        tracing::debug!(path = %temp.display(), error = %remove, "could not remove the swap's temporary copy");
+    }
+    Err(error)
 }
 
 /// `!ItemImageInfo.IsLocalFile`: upstream's case-insensitive `StartsWith("http")`.
@@ -4492,9 +4536,9 @@ impl ItemRepository for FerrofinItemRepository {
         // instead of materializing the whole matching id set and binding it back as a
         // giant `IN` per facet. The old "resolve every matching id in the app, then
         // re-send them as a thousand-parameter IN, four times" round-trip dominated the
-        // Filters/Filters2/Years CPU under load.
-        let years = self.distinct_years(filter).await?;
-        let official_ratings = self.distinct_official_ratings(filter).await?;
+        // Filters/Filters2/Years CPU under load. Years and ratings come from the
+        // same rows, so one statement reads both.
+        let (years, official_ratings) = self.distinct_years_and_ratings(filter).await?;
         let genres = self
             .distinct_item_values(filter, ItemValueType::Genre)
             .await?;
@@ -4515,8 +4559,8 @@ impl ItemRepository for FerrofinItemRepository {
         filter: &InternalItemsQuery,
     ) -> Result<Vec<i32>, ServiceError> {
         // `/Years` wants the years and nothing else. Going through
-        // `get_query_filters_legacy` for them also ran the official-ratings
-        // scan and both `ItemValues` MIN aggregates and dropped all three — but
+        // `get_query_filters_legacy` for them also read the official ratings
+        // and ran both `ItemValues` MIN aggregates and dropped all three — but
         // it does share that method's view resolution and user scoping, which
         // have to be applied here too.
         let scoped = self.resolve_views(filter).await?;
@@ -4672,16 +4716,7 @@ impl FerrofinItemRepository {
     /// Distinct positive production years of the filter's matching items, ascending —
     /// the filter runs as this query's own WHERE, no app-side id materialization.
     async fn distinct_years(&self, filter: &InternalItemsQuery) -> Result<Vec<i32>, ServiceError> {
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            r#"SELECT DISTINCT bi."ProductionYear" FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
-        );
-        qb.push_bind(PLACEHOLDER_ID);
-        append_predicates(&mut qb, filter);
-        qb.push(
-            r#" AND bi."ProductionYear" IS NOT NULL AND bi."ProductionYear" > 0
-                ORDER BY bi."ProductionYear""#,
-        );
-        let rows: Vec<i64> = qb
+        let rows: Vec<i64> = years_statement(filter)
             .build_query_scalar()
             .fetch_all(self.db.pool())
             .await
@@ -4692,24 +4727,32 @@ impl FerrofinItemRepository {
             .collect())
     }
 
-    /// Distinct non-empty official ratings of the filter's matching items, ascending.
-    async fn distinct_official_ratings(
+    /// [`Self::distinct_years`] and the distinct non-empty official ratings of
+    /// the same items in SQLite's BINARY order, read in one pass: upstream's two
+    /// facet queries over one `baseQuery`.
+    async fn distinct_years_and_ratings(
         &self,
         filter: &InternalItemsQuery,
-    ) -> Result<Vec<String>, ServiceError> {
-        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            r#"SELECT DISTINCT bi."OfficialRating" FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
-        );
-        qb.push_bind(PLACEHOLDER_ID);
-        append_predicates(&mut qb, filter);
-        qb.push(
-            r#" AND bi."OfficialRating" IS NOT NULL AND bi."OfficialRating" <> ''
-                ORDER BY bi."OfficialRating""#,
-        );
-        qb.build_query_scalar()
+    ) -> Result<(Vec<i32>, Vec<String>), ServiceError> {
+        let rows: Vec<(Option<i64>, Option<String>)> = years_and_ratings_statement(filter)
+            .build_query_as()
             .fetch_all(self.db.pool())
             .await
-            .map_err(db_err)
+            .map_err(db_err)?;
+        let mut years = std::collections::BTreeSet::new();
+        let mut ratings = std::collections::BTreeSet::new();
+        for (year, rating) in rows {
+            years.extend(year.filter(|y| *y > 0));
+            ratings.extend(rating.filter(|r| !r.is_empty()));
+        }
+        // A `String`'s byte order is BINARY's `memcmp` order.
+        Ok((
+            years
+                .into_iter()
+                .map(|y| i32::try_from(y).unwrap_or(i32::MAX))
+                .collect(),
+            ratings.into_iter().collect(),
+        ))
     }
 
     /// Distinct display values of one `ItemValues` type over the filter's matching items.
@@ -4727,6 +4770,35 @@ impl FerrofinItemRepository {
             .await
             .map_err(db_err)
     }
+}
+
+/// The statement [`FerrofinItemRepository::distinct_years`] runs.
+fn years_statement(filter: &InternalItemsQuery) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT DISTINCT bi."ProductionYear" FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
+    );
+    qb.push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+    qb.push(
+        r#" AND bi."ProductionYear" IS NOT NULL AND bi."ProductionYear" > 0
+            ORDER BY bi."ProductionYear""#,
+    );
+    qb
+}
+
+/// The statement [`FerrofinItemRepository::distinct_years_and_ratings`] runs:
+/// the distinct `(ProductionYear, OfficialRating)` pairs of the items `filter`
+/// matches, one walk of them where a year and a rating statement walked them
+/// twice. `years_and_ratings_statement_reads_items_once_like_the_year_statement`
+/// pins it.
+fn years_and_ratings_statement(filter: &InternalItemsQuery) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT DISTINCT bi."ProductionYear", bi."OfficialRating"
+           FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
+    );
+    qb.push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+    qb
 }
 
 /// The statement [`FerrofinItemRepository::distinct_item_values`] runs: one
@@ -8197,6 +8269,69 @@ mod tests {
         assert!(images.iter().all(|image| image.width == 1920));
     }
 
+    /// When putting the first file back fails too, the temporary copy may be
+    /// the only copy of its original content: it is kept, and the error names
+    /// it.
+    #[tokio::test]
+    async fn swap_item_images_keeps_the_backup_when_the_restore_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let db = test_db().await;
+        let repository = repo(&db);
+        let item = Uuid::from_u128(0x9370);
+        seed_named_item(&db, item, BaseItemKind::Movie, "Unwritable").await;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked.jpg");
+        let other = dir.path().join("other.jpg");
+        std::fs::write(&locked, "LOCKED").unwrap();
+        std::fs::write(&other, "OTHER").unwrap();
+        for (n, path) in [(0_u128, &locked), (1, &other)] {
+            sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                    ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
+                    VALUES (?1, NULL, NULL, 1080, 2, ?2, ?3, 1920)"#,
+            )
+            .bind(guid_to_db(Uuid::from_u128(0x9380 + n)))
+            .bind(guid_to_db(item))
+            .bind(path.to_string_lossy().as_ref())
+            .execute(db.writer())
+            .await
+            .expect("insert backdrop");
+        }
+        // A read-only first file fails both the swap's write and the restore.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&locked)
+            .is_ok()
+        {
+            eprintln!("skipped: the read-only file is still writable (running as root?)");
+            return;
+        }
+
+        let error = repository
+            .swap_item_images(item, ImageType::Backdrop, 0, 1)
+            .await
+            .expect_err("the swap fails");
+        let backups: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".ferrofin-swap-"))
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), "LOCKED");
+        assert!(
+            error
+                .to_string()
+                .contains(backups[0].to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "OTHER");
+    }
+
     #[tokio::test]
     async fn swap_item_images_ignores_remote_urls() {
         let db = test_db().await;
@@ -9302,7 +9437,7 @@ mod tests {
     }
 
     /// `/Years` reads the year facet on its own. The override must answer
-    /// exactly what the four-statement aggregate's `years` field held — the
+    /// exactly what the facet aggregate's `years` field held — the
     /// same filter, the same values, the same order — for every shape the
     /// aggregate handles, including the empty one.
     #[tokio::test]
@@ -9760,6 +9895,70 @@ mod tests {
             .await,
             ["Near"]
         );
+    }
+
+    /// Plan pin for the legacy facets' year and rating read (`/Items/Filters`):
+    /// one pass over `BaseItems`, reaching `bi` exactly as the year-only
+    /// statement (`/Years`) does, so folding the ratings in adds no second walk
+    /// and no worse access path.
+    #[tokio::test]
+    async fn years_and_ratings_statement_reads_items_once_like_the_year_statement() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let plan_of = |mut qb: QueryBuilder<Sqlite>| {
+            let db = db.clone();
+            async move {
+                let mut query = qb.build();
+                let args = query.take_arguments().expect("arguments").expect("binds");
+                let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+                sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                    .fetch_all(db.pool())
+                    .await
+                    .expect("plan")
+                    .iter()
+                    .map(|row| row.get::<String, _>("detail"))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let item_reads = |plan: &[String]| {
+            plan.iter()
+                .filter(|d| d.starts_with("SCAN bi") || d.starts_with("SEARCH bi "))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let libraries = [Uuid::from_u128(0xA4E1), Uuid::from_u128(0xA4E2)];
+        // Unscoped, one kind, a strict parent, and a user-scoped statement
+        // (`TopParentId IN (…)`) with an ancestor scope.
+        for (kinds, parent, top_parent_ids, ancestor_ids) in [
+            (vec![], Uuid::nil(), vec![], vec![]),
+            (vec![BaseItemKind::Movie], Uuid::nil(), vec![], vec![]),
+            (
+                vec![BaseItemKind::Movie],
+                Uuid::from_u128(0xA4E0),
+                vec![],
+                vec![],
+            ),
+            (
+                vec![BaseItemKind::Movie],
+                Uuid::nil(),
+                libraries.to_vec(),
+                vec![libraries[0]],
+            ),
+        ] {
+            let filter = InternalItemsQuery {
+                include_item_types: kinds,
+                parent_id: parent,
+                physical_children_only: !parent.is_nil(),
+                top_parent_ids,
+                ancestor_ids,
+                ..InternalItemsQuery::default()
+            };
+            let folded = plan_of(years_and_ratings_statement(&filter)).await;
+            let years = plan_of(years_statement(&filter)).await;
+            let reads = item_reads(&folded);
+            assert_eq!(reads.len(), 1, "{folded:#?}");
+            assert_eq!(reads, item_reads(&years), "{folded:#?}\n{years:#?}");
+        }
     }
 
     /// Plan pin for the tag facet (`/Items/Filters2`; the legacy facet set's
@@ -11728,13 +11927,14 @@ mod tests {
         db: &Database,
         options: HashMap<Uuid, ferrofin_model::configuration::LibraryOptions>,
     ) {
-        let rows = crate::item_visibility_repository::libraries(db)
+        let (rows, views) = crate::item_visibility_repository::libraries(db)
             .await
             .expect("libraries");
         let _ = db
             .begin_library_load()
             .store(ferrofin_db::row_cache::LibrarySet {
                 rows,
+                views,
                 ancestors: Vec::new(),
                 options,
                 physical_locations: HashMap::new(),
@@ -11793,6 +11993,268 @@ mod tests {
             HashMap::from([(adopted, vec![moved])]),
             "a reported write to the library drops the set"
         );
+    }
+
+    /// With the library set cached, the scope's views come from it as its
+    /// libraries do (gl-1283): a `UserView` stands for itself in an unscoped
+    /// browse. A write the mutation hooks never hear of waits for the set to
+    /// go, which is what shows the set answering; a reported one is seen at
+    /// once.
+    #[tokio::test]
+    async fn the_scope_reads_its_views_from_the_cached_library_set() {
+        let db = test_db().await;
+        db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+        let repository = repo(&db);
+        let (_first, _second, _user_id, user) = two_libraries(&db).await;
+        let view = Uuid::from_u128(0x9806);
+        seed_named_item(&db, view, BaseItemKind::UserView, "View").await;
+        seed_top_parented_item(
+            &db,
+            Uuid::from_u128(0x9807),
+            BaseItemKind::Movie,
+            "In View",
+            view,
+        )
+        .await;
+        let all = ["In First", "In Second", "In View"];
+        assert_eq!(unscoped_names(&repository, &user).await, all);
+        cache_library_set(&db, HashMap::new()).await;
+
+        sqlx::query(r#"UPDATE "BaseItems" SET "Type" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(view))
+            .bind(stored_type_name(BaseItemKind::Folder).expect("folder type"))
+            .execute(db.writer())
+            .await
+            .expect("retype");
+        assert_eq!(
+            unscoped_names(&repository, &user).await,
+            all,
+            "an unreported write waits for the set to go"
+        );
+        db.note_items_written([guid_to_db(view).as_str()]);
+        assert_eq!(
+            unscoped_names(&repository, &user).await,
+            ["In First", "In Second"],
+            "a reported write to the view drops the set"
+        );
+    }
+
+    /// The scope's views come from the library set (gl-1283), which the scope
+    /// reads itself when none is live (gl-1399), over every kind the set
+    /// holds: a typed library and one that links to box sets, both
+    /// playlists-folder kinds, a `UserView`, and the Live TV view, which stays
+    /// out while Live TV is off. A set stored straight from the rows answers
+    /// the same.
+    #[tokio::test]
+    async fn the_scope_s_views_from_the_cached_set_are_the_read_s() {
+        let db = test_db().await;
+        db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+        let repository = repo(&db);
+        let [movies, boxsets, playlists, manual, view, live_tv, movie] =
+            [0x9831, 0x9832, 0x9833, 0x9834, 0x9835, 0x9836, 0x9837].map(Uuid::from_u128);
+        for (id, kind) in [
+            (movies, BaseItemKind::CollectionFolder),
+            (boxsets, BaseItemKind::CollectionFolder),
+            (playlists, BaseItemKind::PlaylistsFolder),
+            (manual, BaseItemKind::ManualPlaylistsFolder),
+            (view, BaseItemKind::UserView),
+            (live_tv, BaseItemKind::UserView),
+            (movie, BaseItemKind::Movie),
+        ] {
+            seed_named_item(&db, id, kind, "Row").await;
+        }
+        for (id, collection_type) in [(movies, "movies"), (boxsets, "boxsets")] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(format!(r#"{{"CollectionType":"{collection_type}"}}"#))
+                .execute(db.writer())
+                .await
+                .expect("data");
+        }
+        crate::test_support::set_item_path(&db, live_tv, "/metadata/views/livetv").await;
+        let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9838)).await;
+        let views = async || {
+            let mut views: Vec<(Uuid, bool, Option<BaseItemKind>)> =
+                visible_view_rows(&db, &repository.virtual_paths, &user)
+                    .await
+                    .expect("views")
+                    .into_iter()
+                    .map(|view| (view.id, view.user_view, view.linked_kind))
+                    .collect();
+            views.sort_by_key(|view| view.0);
+            views
+        };
+        let read = views().await;
+        assert_eq!(
+            read,
+            [
+                (movies, false, None),
+                (boxsets, false, Some(BaseItemKind::BoxSet)),
+                (playlists, false, Some(BaseItemKind::Playlist)),
+                (manual, false, Some(BaseItemKind::Playlist)),
+                (view, true, None),
+            ]
+        );
+        cache_library_set(&db, HashMap::new()).await;
+        assert_eq!(views().await, read, "the stored set answers the same");
+    }
+
+    /// A library's or a view's row in the cached library set answers as the
+    /// read it replaces (gl-1283), for a view's top parents and a grouped
+    /// library's type, and a row outside the set is still read. The
+    /// libraries' ids come from the set too. A write the hooks never hear of
+    /// waits for the set to go, which is what shows the set answering.
+    #[tokio::test]
+    async fn the_cached_library_set_answers_for_its_rows() {
+        let db = test_db().await;
+        db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+        let (first, second, _user_id, _user) = two_libraries(&db).await;
+        let view = Uuid::from_u128(0x9806);
+        seed_child_item(&db, view, BaseItemKind::UserView, "View", second).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(view))
+            .bind(format!(
+                r#"{{"ViewType":"movies","DisplayParentId":"{}"}}"#,
+                first.simple()
+            ))
+            .execute(db.writer())
+            .await
+            .expect("view data");
+        let set_type = async |collection_type: &str| {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(first))
+                .bind(format!(r#"{{"CollectionType":"{collection_type}"}}"#))
+                .execute(db.writer())
+                .await
+                .expect("data");
+        };
+        set_type("movies").await;
+        let fields = |row: ViewRow| {
+            (
+                row.type_name,
+                row.parent_id,
+                row.path,
+                row.data,
+                row.top_parent_id,
+            )
+        };
+        let mut read = Vec::new();
+        for id in [first, view] {
+            let row = FerrofinItemRepository::query_view_row(&db, id)
+                .await
+                .expect("read")
+                .expect("row");
+            read.push(fields(row));
+        }
+        cache_library_set(&db, HashMap::new()).await;
+        for (id, read) in [first, view].into_iter().zip(read) {
+            assert_eq!(cached_view_row(&db, id).map(fields), Some(read));
+        }
+        assert!(
+            cached_view_row(&db, Uuid::from_u128(0x9803)).is_none(),
+            "a movie is not in the set"
+        );
+
+        set_type("tvshows").await;
+        seed_named_item(
+            &db,
+            Uuid::from_u128(0x9808),
+            BaseItemKind::CollectionFolder,
+            "Third",
+        )
+        .await;
+        let collection_type = async || {
+            FerrofinItemRepository::collection_type_of(&db, first)
+                .await
+                .expect("type")
+        };
+        let mut ids = library_ids(&db).await.expect("ids");
+        ids.sort();
+        assert_eq!(
+            (collection_type().await.as_deref(), ids),
+            (Some("movies"), vec![guid_to_db(first), guid_to_db(second)]),
+            "unreported writes wait for the set to go"
+        );
+        db.invalidate_libraries();
+        assert_eq!(collection_type().await.as_deref(), Some("tvshows"));
+        assert_eq!(library_ids(&db).await.expect("ids").len(), 3);
+    }
+
+    /// A query scoped to a library reads the library's row from the cached
+    /// library set, and `view_top_parent_ids` the views' rows, as upstream's
+    /// `GetItemById` answers both from memory (gl-1399). With no set live the
+    /// parent's row is read, and the views' reader reads the set and caches it.
+    /// A write the hooks never hear of waits for the set to go, which is what
+    /// shows the set answering.
+    #[tokio::test]
+    async fn a_scoped_query_reads_its_library_and_views_from_the_cached_set() {
+        let db = test_db().await;
+        db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+        let repository = repo(&db);
+        let (first, second, _user_id, _user) = two_libraries(&db).await;
+        let view = Uuid::from_u128(0x9806);
+        seed_child_item(&db, view, BaseItemKind::UserView, "View", second).await;
+        let set_data = async |id: Uuid, data: String| {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(data)
+                .execute(db.writer())
+                .await
+                .expect("data");
+        };
+        let movies = r#"{"CollectionType":"movies"}"#;
+        let tvshows = r#"{"CollectionType":"tvshows"}"#;
+        set_data(
+            view,
+            format!(
+                r#"{{"ViewType":"movies","DisplayParentId":"{}"}}"#,
+                first.simple()
+            ),
+        )
+        .await;
+        set_data(first, movies.to_owned()).await;
+        let parent_data = async || {
+            let parent = InternalItemsQuery {
+                parent_id: first,
+                ..InternalItemsQuery::default()
+            };
+            repository
+                .query_parent_row(&parent)
+                .await
+                .expect("parent")
+                .and_then(|row| row.data)
+        };
+        let views = async || {
+            view_top_parent_ids(&db, &repository.virtual_paths, &[view, first], None)
+                .await
+                .expect("views")
+        };
+        let read = HashMap::from([(view, vec![first])]);
+        assert_eq!(views().await, read, "only the view is a view");
+        assert!(
+            db.cached_libraries().is_some(),
+            "the views' reader cached the set"
+        );
+
+        set_data(first, tvshows.to_owned()).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Type" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(view))
+            .bind(stored_type_name(BaseItemKind::Folder).expect("folder type"))
+            .execute(db.writer())
+            .await
+            .expect("retype");
+        assert_eq!(
+            (parent_data().await.as_deref(), views().await),
+            (Some(movies), read),
+            "unreported writes wait for the set to go"
+        );
+        db.invalidate_libraries();
+        assert_eq!(
+            parent_data().await.as_deref(),
+            Some(tvshows),
+            "the row is read"
+        );
+        assert_eq!(views().await, HashMap::new(), "the view is a folder now");
     }
 
     /// The scope takes a library's `Enabled` from the cached library set when
@@ -15722,10 +16184,7 @@ pub(crate) async fn item_ids_by_clean_name(
         for clean in chunk {
             query = query.bind(clean.as_str());
         }
-        let rows = query
-            .fetch_all(db.pool())
-            .await
-            .map_err(|error| ServiceError::backend(error.to_string()))?;
+        let rows = query.fetch_all(db.pool()).await.map_err(db_err)?;
         for (clean, id) in rows {
             if let Ok(uuid) = Uuid::parse_str(&id) {
                 ids.entry(clean).or_insert(uuid);

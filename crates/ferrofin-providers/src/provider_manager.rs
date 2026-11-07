@@ -617,13 +617,8 @@ impl RemoteSearchProvider for OmdbSearchProvider {
 
 /// The shared naming options the providers' `ParseName` runs by (the OMDb
 /// Identify search, the TVDB search, the box-set refresh).
-///
-/// [`NamingOptions::new`] compiles the whole clean-name regex table, so it is
-/// built once for the process rather than per search request.
 pub(crate) fn naming_options() -> &'static ferrofin_naming::common::NamingOptions {
-    static OPTIONS: std::sync::OnceLock<ferrofin_naming::common::NamingOptions> =
-        std::sync::OnceLock::new();
-    OPTIONS.get_or_init(ferrofin_naming::common::NamingOptions::new)
+    ferrofin_naming::common::NamingOptions::shared()
 }
 
 /// The display name of the MusicBrainz providers (`Plugin.Name`).
@@ -1074,13 +1069,14 @@ pub trait RemoteSearchProvider: Send + Sync {
     ///
     /// `GetMetadataProvidersInternal` sorts remote providers by the library's
     /// configured `MetadataFetcherOrder` and then `.ThenBy(GetDefaultOrder)`
-    /// (`ProviderManager.cs:459` / `:506`), where `GetDefaultOrder` is the
-    /// provider's `IHasOrder.Order` if it declares one and **50** if it does
-    /// not — "after items that want to be first (~0) but before items that
-    /// want to be last (~100)", in upstream's own words. The default here is
-    /// that same 50, so a provider that declares nothing sorts exactly where a
-    /// non-`IHasOrder` C# provider sorts. Ties keep registration order, since
-    /// `slice::sort_by_key` is stable and so is LINQ's `OrderBy`/`ThenBy`.
+    /// (in `GetOrCreateOrderedProviders`, v12.4 `ProviderManager.cs:539` /
+    /// `:630`), where `GetDefaultOrder` is the provider's `IHasOrder.Order`
+    /// if it declares one and **50** if it does not — "after items that want
+    /// to be first (~0) but before items that want to be last (~100)", in
+    /// upstream's own words. The default here is that same 50, so a provider
+    /// that declares nothing sorts exactly where a non-`IHasOrder` C# provider
+    /// sorts. Ties keep registration order, since `slice::sort_by_key` is
+    /// stable and so is LINQ's `OrderBy`/`ThenBy`.
     fn default_order(&self) -> i32 {
         50
     }
@@ -1201,11 +1197,11 @@ pub struct LocalProviderManager {
     /// from a library's `TypeOptions`. `GetMetadataProvidersInternal` falls
     /// back to `globalMetadataOptions.MetadataFetcherOrder` whenever the
     /// library saved no `TypeOptions` entry for the kind
-    /// (`ProviderManager.cs:445`), so without this an admin's server-wide
-    /// fetcher order is silently ignored. Read live, like the language and
-    /// country readers above, so a `POST /System/Configuration` applies
-    /// without a restart. Absent → an empty global array, i.e. no
-    /// server-wide ranking.
+    /// (`GetOrCreateOrderedProviders`, v12.4 `ProviderManager.cs:525`), so
+    /// without this an admin's server-wide fetcher order is silently ignored.
+    /// Read live, like the language and country readers above, so a
+    /// `POST /System/Configuration` applies without a restart. Absent → an
+    /// empty global array, i.e. no server-wide ranking.
     metadata_options: Option<Arc<dyn Fn() -> Vec<MetadataOptions> + Send + Sync>>,
 }
 
@@ -1417,8 +1413,8 @@ impl LocalProviderManager {
 
     /// Attaches `ServerConfiguration.MetadataCountryCode`, the fallback a
     /// remote search applies to a blank `SearchInfo.MetadataCountryCode`
-    /// (C# `ProviderManager.GetRemoteSearchResults`, v10.11.8
-    /// `MediaBrowser.Providers/Manager/ProviderManager.cs:841-844`). Read live
+    /// (C# `ProviderManager.GetRemoteSearchResults`, v12.4
+    /// `MediaBrowser.Providers/Manager/ProviderManager.cs:974-977`). Read live
     /// so changing the setting takes effect without a restart.
     #[must_use]
     pub fn with_metadata_country(
@@ -1452,7 +1448,7 @@ impl LocalProviderManager {
     /// Attaches a reader for the server configuration's `MetadataOptions`
     /// array, so the remote-search provider ordering can fall back to the
     /// SERVER-WIDE `MetadataFetcherOrder` for a kind the library did not
-    /// customise (`ProviderManager.cs:445`).
+    /// customise (`GetOrCreateOrderedProviders`, v12.4 `ProviderManager.cs:525`).
     ///
     /// The closure is called once per search and read live, so a
     /// `POST /System/Configuration` applies without a restart. Without it the
@@ -2216,10 +2212,15 @@ impl LocalProviderManager {
         })
     }
 
-    /// Every episode provider for a path-less episode — `TmdbEpisodeProvider`,
-    /// `OmdbEpisodeProvider` and the TVDB plugin's `TvdbEpisodeProvider`, those
-    /// the library has enabled, in its provider order — as
-    /// `ExecuteRemoteProviders` folds them (`MetadataService.cs:955-1025`).
+    /// Every episode provider for an episode with no file of its own —
+    /// `TmdbEpisodeProvider`, `OmdbEpisodeProvider` and the TVDB plugin's
+    /// `TvdbEpisodeProvider`, those the library has enabled, in its provider
+    /// order — as `ExecuteRemoteProviders` folds them
+    /// (`MetadataService.cs:955-1025`).
+    ///
+    /// A missing episode (no path) gets no answer from TheMovieDb or OMDb, so
+    /// only TheTVDB is asked ([`answers_for_episode`]); one with a remote path,
+    /// or a path outside every library, is asked of all three.
     ///
     /// Each provider resolves by the parent series' ids alone, never by its
     /// name: TheMovieDb by the series' `Tmdb` id (`TmdbEpisodeProvider.cs:
@@ -2256,7 +2257,7 @@ impl LocalProviderManager {
         let mut sources: Vec<&'static str> = self
             .metadata_fetchers("Episode")
             .into_iter()
-            .filter(|name| fetch.metadata && enabled(name))
+            .filter(|name| fetch.metadata && enabled(name) && answers_for_episode(row, name))
             .collect();
         sources
             .sort_by_key(|name| metadata_fetcher_rank(library, global.as_ref(), "Episode", name));
@@ -3891,14 +3892,19 @@ impl LocalProviderManager {
     ) -> Result<Vec<RemoteImageInfo>, ServiceError> {
         // `ProviderManager.GetAvailableRemoteImages`: every remote image
         // provider for the item, narrowed to `ProviderName` when given
-        // (`OrdinalIgnoreCase`), each asked for its images, which are then
-        // narrowed to the requested `ImageType`.
+        // (`OrdinalIgnoreCase`) and to those whose `GetSupportedImages` lists
+        // the requested `ImageType`, before any is asked for its images.
         let name_filter = Some(query.provider_name.trim()).filter(|n| !n.is_empty());
         let sources: Vec<RemoteImageSource> = self
             .ordered_image_sources(entity)
             .await
             .into_iter()
             .filter(|source| name_filter.is_none_or(|n| source.name().eq_ignore_ascii_case(n)))
+            .filter(|source| {
+                query
+                    .image_type
+                    .is_none_or(|t| source.supported_images().contains(&t))
+            })
             .collect();
         if sources.is_empty() {
             return Ok(Vec::new());
@@ -4529,6 +4535,17 @@ fn short_kind(entity: &BaseItemEntity) -> &str {
 /// before any option is read ([`channel_fetcher_override`]).
 fn channel_gate(entity: &BaseItemEntity) -> Option<bool> {
     channel_fetcher_override(short_kind(entity), entity.channel_id.as_deref())
+}
+
+/// Whether episode provider `name` answers for the episode `row`: TheMovieDb's
+/// and OMDb's return an empty result for a missing episode (`IsMissingEpisode`,
+/// `LocationType.Virtual`: no path; `TmdbEpisodeProvider.cs:86-90`,
+/// `OmdbEpisodeProvider.cs:52-56`), TheTVDB's answers every episode. A
+/// channel's path-less item is `Remote`, but [`channel_gate`] has already
+/// turned every fetcher off for one (Ferrofin has no channel plugins, gl-298).
+fn answers_for_episode(row: &BaseItemEntity, name: &str) -> bool {
+    row.path.as_deref().is_some_and(|path| !path.is_empty())
+        || ![fetcher_names::TMDB, fetcher_names::OMDB].contains(&name)
 }
 
 /// The pure `(kind, name, year)` extraction for a movie/series row, shared by
@@ -5227,8 +5244,8 @@ impl ProviderManager for LocalProviderManager {
         &self,
         request: &RemoteSearchRequest,
     ) -> Result<Vec<RemoteSearchResult>, ServiceError> {
-        // Port of `ProviderManager.GetRemoteSearchResults` (v10.11.8
-        // `MediaBrowser.Providers/Manager/ProviderManager.cs:787-844`).
+        // Port of `ProviderManager.GetRemoteSearchResults` (v12.4
+        // `MediaBrowser.Providers/Manager/ProviderManager.cs:920-1020`).
         //
         // The reference item decides the gate: `ItemId` set → the real row and
         // ITS library's `LibraryOptions` (its "Metadata downloaders"
@@ -5252,9 +5269,9 @@ impl ProviderManager for LocalProviderManager {
             Some(entity) => short_kind(entity).to_owned(),
             None => format!("{:?}", request.item_kind),
         };
-        // `CanRefreshMetadata` (`ProviderManager.cs:462`): `includeDisabled`
-        // short-circuits to true before every other test, and a LOCKED
-        // reference item drops every non-local provider outright.
+        // `CanRefreshMetadata` (`ProviderManager.cs:571`): `includeDisabled`
+        // short-circuits to true before the locked and fetcher tests, and a
+        // LOCKED reference item drops every non-local provider outright.
         let locked = reference.as_ref().is_some_and(|e| e.is_locked);
         let global = self.global_metadata_options_for(&kind);
         let channel = reference.as_ref().and_then(channel_gate);
@@ -5284,17 +5301,18 @@ impl ProviderManager for LocalProviderManager {
             })
             .collect();
         // `.OrderBy(GetConfiguredOrder(metadataFetcherOrder, i.Name))` then
-        // `.ThenBy(GetDefaultOrder)` (`ProviderManager.cs:455-459`), where
+        // `.ThenBy(GetDefaultOrder)` (`GetOrCreateOrderedProviders`,
+        // `ProviderManager.cs:529-539`), where
         //   metadataFetcherOrder = typeOptions?.MetadataFetcherOrder
-        //                          ?? globalMetadataOptions.MetadataFetcherOrder  (:445)
+        //                          ?? globalMetadataOptions.MetadataFetcherOrder  (:525)
         // Both halves matter and both used to be missing here. The `??` fires
         // on a MISSING library `TypeOptions` entry only, which is why
         // `metadata_fetcher_order` returns an Option: a saved-but-empty order
         // list means "this library ranks nothing" and must not re-inherit the
         // server-wide one. `GetConfiguredOrder` gives an unranked provider
-        // `int.MaxValue` (:502), so it sorts after every ranked one, and the
+        // `int.MaxValue` (:627), so it sorts after every ranked one, and the
         // `GetDefaultOrder` tie-break is the provider's own `IHasOrder.Order`
-        // (50 when it declares none, :506) — NOT registration order, which is
+        // (50 when it declares none, :638) — NOT registration order, which is
         // what the bare stable sort used to substitute for it. Ties on both
         // keys still keep registration order: `sort_by_key` is stable, as
         // LINQ's `OrderBy`/`ThenBy` are.
@@ -5311,7 +5329,7 @@ impl ProviderManager for LocalProviderManager {
         });
 
         // `searchInfo.SearchInfo.MetadataLanguage`/`MetadataCountryCode` default
-        // from the SERVER configuration when blank (ProviderManager.cs:836-844)
+        // from the SERVER configuration when blank (`ProviderManager.cs:969-977`)
         // — the library's own preference is deliberately not consulted here.
         let mut request = request.clone();
         if request
@@ -5379,7 +5397,7 @@ impl ProviderManager for LocalProviderManager {
         is_new_library: bool,
     ) -> Result<ferrofin_model::configuration::LibraryOptionsResultDto, ServiceError> {
         // The server-wide `MetadataOptions` order the fetchers a new library
-        // is shown (`GetPluginSummary` reads them, `ProviderManager.cs:670`).
+        // is shown (`GetPluginSummary` reads them, v12.4 `ProviderManager.cs:672`).
         let global = self
             .metadata_options
             .as_ref()
@@ -5394,7 +5412,7 @@ impl ProviderManager for LocalProviderManager {
     }
 
     async fn get_metadata_options(&self, item_id: Uuid) -> Result<MetadataOptions, ServiceError> {
-        // `ProviderManager.GetMetadataOptions(BaseItem item)` (`:652`):
+        // `ProviderManager.GetMetadataOptions(BaseItem item)` (v12.4 `:785-786`):
         // `GetMetadataOptionsForType(item.GetType().Name) ?? new MetadataOptions()`
         // — the server-wide entry for the item's own type, and a default
         // (all-empty) one when the configuration names none. An unresolvable
@@ -6486,8 +6504,8 @@ mod tests {
     }
 
     /// Port check for `ProviderManager.GetRemoteSearchResults`
-    /// (`ProviderManager.cs:787`) → `GetMetadataProvidersInternal` →
-    /// `CanRefreshMetadata` (`:462`) → `BaseItemManager.IsMetadataFetcherEnabled`.
+    /// (v12.4 `ProviderManager.cs:920`) → `GetMetadataProvidersInternal` →
+    /// `CanRefreshMetadata` (`:571`) → `BaseItemManager.IsMetadataFetcherEnabled`.
     ///
     /// An Identify search SCOPED to an item resolves that item's library and
     /// drops every remote fetcher the library's "Metadata downloaders" list
@@ -6495,7 +6513,7 @@ mod tests {
     /// `LibraryOptions`, where nothing is unticked, so it keeps the provider —
     /// which is why the two only diverge once `ItemId` is sent.
     /// `GetMetadataProvidersInternal`'s ordering, both halves
-    /// (`ProviderManager.cs:442-459`):
+    /// (`GetOrCreateOrderedProviders`, v12.4 `ProviderManager.cs:525-539`):
     ///   metadataFetcherOrder = typeOptions?.MetadataFetcherOrder
     ///                          ?? globalMetadataOptions.MetadataFetcherOrder
     ///   .OrderBy(GetConfiguredOrder(...)).ThenBy(GetDefaultOrder)
@@ -6747,7 +6765,7 @@ mod tests {
         assert_eq!(mgr.remote_search(&unscoped).await.unwrap().len(), 1);
 
         // `IncludeDisabledProviders` short-circuits `CanRefreshMetadata`
-        // (`ProviderManager.cs:474`) before the fetcher list is consulted.
+        // (`ProviderManager.cs:583`) before the fetcher list is consulted.
         let mut forced = scoped.clone();
         forced.include_disabled_providers = true;
         assert_eq!(mgr.remote_search(&forced).await.unwrap().len(), 1);
@@ -6770,7 +6788,7 @@ mod tests {
         );
 
         // A LOCKED reference item drops every remote provider outright
-        // ("If locked only allow local providers", `ProviderManager.cs:478`).
+        // ("If locked only allow local providers", `ProviderManager.cs:588`).
         entity.is_locked = true;
         let mut locked_rows = HashMap::new();
         locked_rows.insert(artist_id, entity);
@@ -7264,7 +7282,7 @@ mod tests {
         assert_eq!(opts, MetadataOptions::default());
     }
 
-    /// `ProviderManager.GetMetadataOptions(item)` (`:652`) is
+    /// `ProviderManager.GetMetadataOptions(item)` (v12.4 `ProviderManager.cs:785-786`) is
     /// `GetMetadataOptionsForType(item.GetType().Name) ?? new MetadataOptions()`
     /// — the SERVER-WIDE entry for the item's OWN type. It used to return the
     /// default unconditionally, which made the server-wide options invisible.
@@ -8858,6 +8876,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_remote_images_skip_providers_without_the_type() {
+        // `GetAvailableRemoteImages` drops the providers whose
+        // `GetSupportedImages` lacks the requested type before asking any:
+        // TheAudioDB's artist provider lists no Art, so an Art listing never
+        // calls it.
+        let fanart = crate::mock_http::MockServer::always(FANART_MUSIC).await;
+        let audiodb = crate::mock_http::MockServer::always(AUDIODB_ARTIST).await;
+        let (item_id, mgr) = image_manager(
+            "Audio.MusicArtist",
+            "Miles Davis",
+            &[("MusicBrainzArtist", "artist-mbid")],
+            Arc::new(crate::tmdb::TmdbClient::new()),
+            |mgr| {
+                mgr.with_fanart(Arc::new(
+                    crate::fanart::FanartClient::new(None).with_base_url(&fanart.base_url),
+                ))
+                .with_audiodb(Arc::new(
+                    crate::audiodb::AudioDbClient::with_base_url(&audiodb.base_url),
+                ))
+            },
+        );
+
+        let art = mgr
+            .get_available_remote_images(
+                item_id,
+                &RemoteImageQuery {
+                    image_type: Some(ImageType::Art),
+                    ..RemoteImageQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(art.is_empty(), "{art:?}");
+        assert_eq!(
+            fanart.query_values("/music/artist-mbid", "api_key").len(),
+            1,
+            "FanArt lists Art, so it is asked"
+        );
+        assert!(
+            audiodb.query_values("/artist-mb.php", "i").is_empty(),
+            "TheAudioDB lists no Art, so it is not asked"
+        );
+    }
+
+    #[tokio::test]
     async fn music_album_remote_images_need_the_release_group_id() {
         let fanart = crate::mock_http::MockServer::always(FANART_MUSIC).await;
         let audiodb = crate::mock_http::MockServer::always(AUDIODB_ALBUM).await;
@@ -9643,8 +9706,8 @@ mod tests {
     // C# `ProviderManager.GetRemoteSearchResults` resolves `ItemId` to a
     // reference item, reads THAT library's options and runs every candidate
     // fetcher through `CanRefreshMetadata` before any request goes out
-    // (v10.11.8 `MediaBrowser.Providers/Manager/ProviderManager.cs:801-830`,
-    // `:462-491`). Ferrofin used to filter on `supports(kind)` alone, so
+    // (v12.4 `MediaBrowser.Providers/Manager/ProviderManager.cs:920-967`,
+    // `:571-615`). Ferrofin used to filter on `supports(kind)` alone, so
     // clearing a library's "Metadata downloaders" checkboxes changed nothing
     // for the Identify dialog.
 
@@ -9913,7 +9976,7 @@ mod tests {
     async fn remote_search_defaults_blank_language_and_country_from_server_config() {
         // `ProviderManager.GetRemoteSearchResults` fills a blank
         // `SearchInfo.MetadataLanguage` / `MetadataCountryCode` from the SERVER
-        // configuration before dispatching (ProviderManager.cs:836-844).
+        // configuration before dispatching (v12.4 `ProviderManager.cs:969-977`).
         let provider = Arc::new(CapturingProvider {
             seen: std::sync::Mutex::new(None),
         });
@@ -12457,7 +12520,7 @@ mod tests {
         assert!(season.people.written.lock().expect("lock").is_empty());
     }
 
-    // ── a path-less episode: every episode provider ─────────────────────────
+    // ── an episode with no file of its own: its episode providers ──────────
 
     /// TheMovieDb's season listing with episode 2, and the episode's own
     /// request (its external ids and one guest star).
@@ -12532,7 +12595,7 @@ mod tests {
     /// What a path-less episode's refresh needs: episode 2 of season 1 under a
     /// series whose stored ids are `series_ids`, in a library saved with
     /// `options`, the stores it writes to, and a manager over `base` with all
-    /// three episode providers wired.
+    /// three episode providers wired. `stored` may give it a path ([`remote`]).
     struct VirtualEpisode {
         episode_id: Uuid,
         store: Arc<RecordingStore>,
@@ -12621,17 +12684,79 @@ mod tests {
         }
     }
 
-    /// A path-less episode refreshes through every episode provider the
-    /// library ticks, in its fetcher order, as the scan's episode does: the
-    /// first answer wins a field (title, synopsis, air date), a later one fills
-    /// what is still empty (OMDb's rating), the ids all gather on the row, and
-    /// each credited provider's credits are folded. Every provider resolves by
-    /// the series' ids — never a search.
+    /// A remote path: `LocationType.Remote`, so no missing episode.
+    const REMOTE_PATH: &str = "https://media.invalid/Show/S01E02.mkv";
+
+    /// Gives the episode [`REMOTE_PATH`], so every episode provider answers
+    /// for it.
+    fn remote(row: &mut BaseItemEntity) {
+        row.path = Some(REMOTE_PATH.to_owned());
+    }
+
+    /// A missing episode (no path: `IsMissingEpisode`) is asked of TheTVDB
+    /// alone: `TmdbEpisodeProvider` and `OmdbEpisodeProvider` return an empty
+    /// result for one (`TmdbEpisodeProvider.cs:86-90`,
+    /// `OmdbEpisodeProvider.cs:52-56`), so neither TheMovieDb nor OMDb is
+    /// requested, and the refresh is still stamped, in a library or not. An
+    /// episode with a remote path, or a path outside every library, is no
+    /// missing episode: all three are asked.
+    #[rstest::rstest]
+    #[case::no_path(None, true, false)]
+    #[case::empty_path(Some(""), true, false)]
+    #[case::no_path_outside_every_library(None, false, false)]
+    #[case::remote_path(Some(REMOTE_PATH), true, true)]
+    #[case::outside_every_library(Some("/elsewhere/Show/S01E02.mkv"), false, true)]
+    #[tokio::test]
+    async fn only_a_missing_episode_skips_tmdb_and_omdb(
+        #[case] path: Option<&str>,
+        #[case] in_library: bool,
+        #[case] asks_tmdb_and_omdb: bool,
+    ) {
+        let (base, log) = spawn_episode_providers(false);
+        let episode = VirtualEpisode::new(
+            &base,
+            &[("Tmdb", "1399"), ("Tvdb", "121361"), ("Imdb", "tt0000001")],
+            ferrofin_model::configuration::LibraryOptions::default(),
+            |row| {
+                row.path = path.map(str::to_owned);
+                if !in_library {
+                    row.top_parent_id = None;
+                }
+            },
+        );
+        episode
+            .mgr
+            .refresh_full_item(episode.episode_id, &search_missing())
+            .await
+            .expect("refresh");
+        let asked = log.lock().expect("log").clone();
+        for provider in ["/tmdb/", "/omdb/"] {
+            assert_eq!(
+                asked.iter().any(|l| l.contains(provider)),
+                asks_tmdb_and_omdb,
+                "{provider}: {asked:?}"
+            );
+        }
+        assert!(asked.iter().any(|l| l.contains("/tvdb/")), "{asked:?}");
+        let row = episode.saved().expect("a full refresh saves");
+        if !asks_tmdb_and_omdb {
+            assert_eq!(row.name.as_deref(), Some("TVDB Episode"));
+        }
+        assert!(row.date_last_refreshed.is_some());
+    }
+
+    /// An episode with no file of its own that is no missing episode (a
+    /// remote path) refreshes through every episode provider the library
+    /// ticks, in its fetcher order, as the scan's episode does: the first
+    /// answer wins a field (title, synopsis, air date), a later one fills what
+    /// is still empty (OMDb's rating), the ids all gather on the row, and each
+    /// credited provider's credits are folded. Every provider resolves by the
+    /// series' ids — never a search.
     #[rstest::rstest]
     #[case::tmdb_first(&[crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::OMDB], "TMDB Episode", "TMDB synopsis.", "2011-04-24", "tt0002002")]
     #[case::tvdb_first(&[crate::library_options::fetcher_names::TVDB, crate::library_options::fetcher_names::TMDB, crate::library_options::fetcher_names::OMDB], "TVDB Episode", "TVDB synopsis.", "2011-04-23", "tt0005002")]
     #[tokio::test]
-    async fn a_virtual_episode_runs_every_episode_provider_in_the_librarys_order(
+    async fn a_remote_episode_runs_every_episode_provider_in_the_librarys_order(
         #[case] order: &[&str],
         #[case] name: &str,
         #[case] overview: &str,
@@ -12643,7 +12768,7 @@ mod tests {
             &base,
             &[("Tmdb", "1399"), ("Tvdb", "121361"), ("Imdb", "tt0000001")],
             episode_fetchers(order),
-            |_| {},
+            remote,
         );
         episode
             .mgr
@@ -12701,13 +12826,13 @@ mod tests {
     /// ids for a provider spares it the request. OMDb reads the episode's own
     /// `Imdb` id from TheMovieDb's answer (it ran first).
     #[tokio::test]
-    async fn a_virtual_episode_asks_only_the_providers_it_has_ids_for() {
+    async fn a_remote_episode_asks_only_the_providers_it_has_ids_for() {
         let (base, log) = spawn_episode_providers(false);
         let episode = VirtualEpisode::new(
             &base,
             &[("Imdb", "tt0000001")],
             episode_fetchers(&[crate::library_options::fetcher_names::OMDB]),
-            |_| {},
+            remote,
         );
         episode
             .mgr
@@ -12733,7 +12858,10 @@ mod tests {
             &base,
             &[],
             ferrofin_model::configuration::LibraryOptions::default(),
-            |row| row.overview = Some("Stored.".to_owned()),
+            |row| {
+                remote(row);
+                row.overview = Some("Stored.".to_owned());
+            },
         );
         none.mgr
             .refresh_full_item(none.episode_id, &search_missing())
@@ -12750,7 +12878,7 @@ mod tests {
     /// both written (each provider answers with its own list), and a `Cast`
     /// lock keeps the stored ones.
     #[tokio::test]
-    async fn a_virtual_episodes_credits_are_written_and_a_cast_lock_keeps_them() {
+    async fn a_remote_episodes_credits_are_written_and_a_cast_lock_keeps_them() {
         let (base, _log) = spawn_episode_providers(false);
         let episode = VirtualEpisode::new(
             &base,
@@ -12759,7 +12887,7 @@ mod tests {
                 crate::library_options::fetcher_names::TMDB,
                 crate::library_options::fetcher_names::TVDB,
             ]),
-            |_| {},
+            remote,
         );
         episode
             .mgr
@@ -12775,7 +12903,7 @@ mod tests {
             &base,
             &[("Tmdb", "1399")],
             ferrofin_model::configuration::LibraryOptions::default(),
-            |_| {},
+            remote,
         );
         let store = Arc::new(RecordingStore {
             locked: HashMap::from([(locked.episode_id, vec![MetadataField::Cast])]),
@@ -12802,7 +12930,7 @@ mod tests {
     /// its language: with French preferred, TheTVDB's French synopsis is the
     /// episode's although OMDb's English plot ran (and was taken) first.
     #[tokio::test]
-    async fn a_virtual_episodes_preferred_language_beats_an_english_fallback() {
+    async fn a_remote_episodes_preferred_language_beats_an_english_fallback() {
         let (base, _log) = spawn_episode_providers(false);
         let episode = VirtualEpisode::new(
             &base,
@@ -12814,7 +12942,7 @@ mod tests {
                     crate::library_options::fetcher_names::TVDB,
                 ])
             },
-            |_| {},
+            remote,
         );
         episode
             .mgr
@@ -12828,13 +12956,16 @@ mod tests {
     /// Every provider failing under "Replace all metadata" erases nothing and
     /// leaves the refresh unstamped, as for a season.
     #[tokio::test]
-    async fn failing_virtual_episode_providers_never_clear_the_episode() {
+    async fn failing_remote_episode_providers_never_clear_the_episode() {
         let (base, _log) = spawn_episode_providers(true);
         let episode = VirtualEpisode::new(
             &base,
             &[("Tmdb", "1399"), ("Tvdb", "121361"), ("Imdb", "tt0000001")],
             ferrofin_model::configuration::LibraryOptions::default(),
-            |row| row.overview = Some("Stored.".to_owned()),
+            |row| {
+                remote(row);
+                row.overview = Some("Stored.".to_owned());
+            },
         );
         let replace_all = Opts {
             replace_all_metadata: true,

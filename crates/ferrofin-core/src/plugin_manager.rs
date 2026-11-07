@@ -712,7 +712,13 @@ impl FerrofinPluginManager {
     fn record_installed_egress(&self, guid: Uuid, declared: Vec<String>) {
         let mut state = self.state.lock().expect("plugin state lock poisoned");
         state.installed_egress.insert(guid.to_string(), declared);
-        let _ = self.persist(&state);
+        if let Err(error) = self.persist(&state) {
+            tracing::warn!(
+                plugin = %guid,
+                %error,
+                "could not save the plugin's declared egress; after a restart, an upgrade's new egress goes unwarned"
+            );
+        }
     }
 
     /// Records an installed artifact's digest (best-effort persist — the
@@ -724,7 +730,14 @@ impl FerrofinPluginManager {
             .entry(guid.to_string())
             .or_default()
             .insert(version.to_owned(), digest);
-        let _ = self.persist(&state);
+        if let Err(error) = self.persist(&state) {
+            tracing::warn!(
+                plugin = %guid,
+                version,
+                %error,
+                "could not save the installed artifact's digest; after a restart, different bytes for this version are not refused"
+            );
+        }
     }
 
     /// Flips a plugin's enabled flag, persisting the change.
@@ -989,7 +1002,13 @@ impl PluginManager for FerrofinPluginManager {
                     let mut state = self.state.lock().expect("plugin state lock poisoned");
                     state.enabled.remove(&id.to_string());
                     state.installed_egress.remove(&id.to_string());
-                    let _ = self.persist(&state);
+                    if let Err(error) = self.persist(&state) {
+                        tracing::warn!(
+                            plugin = %id,
+                            %error,
+                            "could not save the plugin state after the uninstall; its enabled flag and egress record stay in state.json"
+                        );
+                    }
                 }
                 if let Some(lifecycle) = &self.lifecycle {
                     lifecycle.mark_restart_required();
@@ -2043,6 +2062,33 @@ mod tests {
         assert!(
             saved["StillSize"].is_null(),
             "an unset size is null: {saved}"
+        );
+    }
+
+    /// A digest `state.json` cannot take is warned about: after a restart the
+    /// published-version check no longer knows it.
+    #[test]
+    fn a_digest_that_cannot_be_saved_is_warned_about() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A file where the plugins directory should be fails every write.
+        let not_a_dir = dir.path().join("plugins");
+        std::fs::write(&not_a_dir, b"").expect("write");
+        let mgr = FerrofinPluginManager::new(Vec::new(), not_a_dir);
+        let logs = crate::test_support::CapturedLogs::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            mgr.record_installed_digest(Uuid::from_u128(7), "1.0.0", "ab".to_owned());
+        }
+        let text = logs.text();
+        assert!(
+            text.contains("WARN")
+                && text.contains("could not save the installed artifact's digest"),
+            "{text}"
         );
     }
 

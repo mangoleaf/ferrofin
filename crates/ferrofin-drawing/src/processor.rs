@@ -29,6 +29,7 @@
 //!   worker serving the request.
 
 use ferrofin_util::directory_path::DirectoryPath;
+use ferrofin_util::keyed_locks::KeyedLocks;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -131,6 +132,9 @@ pub struct ImageProcessor<F = StdFileMeta> {
     encoder: Arc<dyn ImageEncoder>,
     /// Held until actual pixel work finishes, including after request cancellation.
     encoding_slots: Arc<tokio::sync::Semaphore>,
+    /// One lock per cache file being encoded, held as long as an encoding slot,
+    /// so concurrent misses for one resized image encode it once (gl-1300).
+    cache_file_locks: KeyedLocks,
 
     /// The base image-cache directory (`IServerApplicationPaths.ImageCachePath`).
     image_cache_path: DirectoryPath,
@@ -156,6 +160,7 @@ impl ImageProcessor<StdFileMeta> {
             encoding_slots: Arc::new(tokio::sync::Semaphore::new(
                 std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
             )),
+            cache_file_locks: KeyedLocks::new(),
             image_cache_path: image_cache_path.into(),
             file_meta: Arc::new(StdFileMeta),
             cache_version: DEFAULT_CACHE_VERSION,
@@ -177,6 +182,7 @@ impl<F: FileMeta> ImageProcessor<F> {
             encoding_slots: Arc::new(tokio::sync::Semaphore::new(
                 std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
             )),
+            cache_file_locks: KeyedLocks::new(),
             image_cache_path: image_cache_path.into(),
             file_meta: Arc::new(file_meta),
             cache_version: DEFAULT_CACHE_VERSION,
@@ -753,9 +759,31 @@ impl<F: FileMeta + 'static> ImageProcessor<F> {
         output_format: ImageFormat,
     ) -> Result<Option<ProcessedImage>, ServiceError> {
         // `None` is a cache miss: encode, then read the new file's time.
-        let date_written = if let Some(date_written) = cached {
-            date_written
-        } else {
+        let date_written = 'written: {
+            if let Some(date_written) = cached {
+                break 'written date_written;
+            }
+            // One encode per cache file at a time (gl-1300). A miss that finds
+            // the file's lock held waits for that encode, then serves the file
+            // it wrote, or encodes for itself when it wrote none (it failed, or
+            // served the original). Upstream has no such lock.
+            // shortcut: an uncontended lock trusts the stat made with the
+            // original (one hop, gl-1258), so an encode that ended in between
+            // runs again, as before this lock; re-stat here too if that shows.
+            let lock = self.cache_file_locks.get(cache_file_path);
+            let guard = if let Ok(guard) = Arc::clone(&lock).try_lock_owned() {
+                guard
+            } else {
+                let guard = lock.lock_owned().await;
+                let path = cache_file_path.to_owned();
+                let written = self
+                    .stat(move |meta| meta.exists(&path).then(|| meta.last_write_time_utc(&path)))
+                    .await?;
+                if let Some(date_written) = written {
+                    break 'written date_written;
+                }
+                guard
+            };
             let permit = Arc::clone(&self.encoding_slots)
                 .acquire_owned()
                 .await
@@ -765,9 +793,10 @@ impl<F: FileMeta + 'static> ImageProcessor<F> {
             let output = cache_file_path.to_owned();
             let options = options.clone();
             // Dropping a request cannot stop spawn_blocking pixel work. Keep
-            // its permit in an independent task until the encoder really ends.
+            // its permit and the file's lock in an independent task until the
+            // encoder really ends, so a waiter never starts a second encode.
             let result_path = tokio::spawn(async move {
-                let _permit = permit;
+                let _held = (permit, guard);
                 encoder
                     .encode_image(
                         &input,
@@ -903,18 +932,25 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(work) = &self.work {
                 work.entered.add_permits(1);
-                let work = Arc::clone(work);
+                let gate = Arc::clone(work);
                 tokio::task::spawn_blocking(move || {
-                    let released = work.release.0.lock().unwrap();
-                    let _released = work.release.1.wait_while(released, |v| !*v).unwrap();
+                    let released = gate.release.0.lock().unwrap();
+                    let _released = gate.release.1.wait_while(released, |v| !*v).unwrap();
                 })
                 .await
                 .unwrap();
+                if work.fail.load(Ordering::SeqCst) {
+                    return Err(ServiceError::invalid_input("corrupt source"));
+                }
             }
-            match &self.return_original {
-                Some(p) => Ok(p.clone()),
-                None => Ok(output_path.to_owned()),
+            if let Some(p) = &self.return_original {
+                return Ok(p.clone());
             }
+            // Written, so a processor on the real filesystem finds the file.
+            let output = Path::new(output_path);
+            std::fs::create_dir_all(output.parent().expect("parent")).expect("mkdir");
+            std::fs::write(output, b"encoded").expect("write");
+            Ok(output_path.to_owned())
         }
         async fn create_image_collage(
             &self,
@@ -1641,6 +1677,18 @@ mod tests {
     struct EncodingWork {
         entered: tokio::sync::Semaphore,
         release: (Mutex<bool>, std::sync::Condvar),
+        /// Every encode fails once released, as a corrupt source does.
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl EncodingWork {
+        fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                entered: tokio::sync::Semaphore::new(0),
+                release: (Mutex::new(false), std::sync::Condvar::new()),
+                fail: fail.into(),
+            })
+        }
     }
 
     struct ReleaseWork(Arc<EncodingWork>);
@@ -1654,10 +1702,7 @@ mod tests {
     #[tokio::test]
     async fn encoding_limit_survives_request_cancellation_until_pixel_work_finishes() {
         for limit in [1, 2] {
-            let work = Arc::new(EncodingWork {
-                entered: tokio::sync::Semaphore::new(0),
-                release: (Mutex::new(false), std::sync::Condvar::new()),
-            });
+            let work = EncodingWork::new(false);
             let release = ReleaseWork(Arc::clone(&work));
             let encoder = Arc::new(CountingEncoder {
                 work: Some(Arc::clone(&work)),
@@ -1669,7 +1714,9 @@ mod tests {
                 processor_with(encoder.clone(), &cache, FakeFs::with(&["/input.jpg"]))
                     .with_encoding_limit(limit),
             );
-            let request = |processor: Arc<ImageProcessor<FakeFs>>| {
+            // Each request asks for its own width, so its own cache file: one
+            // file's encodes run one at a time (gl-1300).
+            let request = |processor: Arc<ImageProcessor<FakeFs>>, width: i32| {
                 tokio::spawn(async move {
                     processor
                         .process_image(&ImageProcessingOptions {
@@ -1677,7 +1724,7 @@ mod tests {
                                 path: "/input.jpg".into(),
                                 ..Default::default()
                             },
-                            width: Some(100),
+                            width: Some(width),
                             ..Default::default()
                         })
                         .await
@@ -1688,7 +1735,7 @@ mod tests {
             // spawned together take the slots in no fixed order, and the one
             // aborted below could be the queued one rather than an encode.
             let mut tasks: Vec<_> = (0..limit)
-                .map(|_| request(Arc::clone(&processor)))
+                .map(|i| request(Arc::clone(&processor), 100 + i32::try_from(i).unwrap()))
                 .collect();
             tokio::time::timeout(
                 std::time::Duration::from_secs(3),
@@ -1698,7 +1745,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .forget();
-            tasks.push(request(Arc::clone(&processor)));
+            tasks.push(request(Arc::clone(&processor), 99));
             let first = tasks.remove(0);
             first.abort();
             let _ = first.await;
@@ -1724,6 +1771,114 @@ mod tests {
             .unwrap();
             assert_eq!(encoder.calls.load(Ordering::SeqCst), limit + 1);
         }
+    }
+
+    /// gl-1300: concurrent misses for one cache file encode it once. The others
+    /// wait for that encode, even after its request is dropped, and serve the
+    /// file it wrote. When it wrote none, each encodes for itself, as it would
+    /// alone: a failure reaches every request and is not kept for the next.
+    #[rstest::rstest]
+    #[case::encoded(false, false)]
+    #[case::encoded_after_the_first_request_is_dropped(false, true)]
+    #[case::failed(true, false)]
+    #[case::failed_after_the_first_request_is_dropped(true, true)]
+    #[tokio::test]
+    async fn concurrent_misses_for_one_cache_file_encode_it_once(
+        #[case] fail: bool,
+        #[case] drop_first: bool,
+    ) {
+        const WAITERS: usize = 3;
+        let wait = std::time::Duration::from_secs(3);
+        let work = EncodingWork::new(fail);
+        let release = ReleaseWork(Arc::clone(&work));
+        let encoder = Arc::new(CountingEncoder {
+            work: Some(Arc::clone(&work)),
+            calls: AtomicUsize::new(0),
+            return_original: None,
+        });
+        let dir = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let input = dir.path().join("input.jpg").to_string_lossy().into_owned();
+        std::fs::write(&input, b"source").unwrap();
+        // A slot for every request: only the cache file's lock holds one back.
+        let processor = Arc::new(
+            ImageProcessor::new(encoder.clone(), cache.path().to_path_buf())
+                .with_encoding_limit(WAITERS + 1),
+        );
+        let request = |width: i32| {
+            let processor = Arc::clone(&processor);
+            let input = input.clone();
+            tokio::spawn(async move {
+                processor
+                    .process_image(&ImageProcessingOptions {
+                        image: ItemImageInfo {
+                            path: input,
+                            ..Default::default()
+                        },
+                        width: Some(width),
+                        ..Default::default()
+                    })
+                    .await
+            })
+        };
+
+        let first = request(100);
+        tokio::time::timeout(wait, work.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let mut waiters: Vec<_> = (0..WAITERS).map(|_| request(100)).collect();
+        let mut first = Some(first);
+        if drop_first {
+            let first = first.take().unwrap();
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), work.entered.acquire())
+                .await
+                .is_err(),
+            "a second encode of the same file started"
+        );
+        // A request dropped while it waits changes nothing for the others.
+        let dropped = waiters.remove(0);
+        dropped.abort();
+        assert!(dropped.await.unwrap_err().is_cancelled());
+        drop(release);
+
+        let mut served = Vec::new();
+        for task in first.into_iter().chain(waiters) {
+            served.push(
+                tokio::time::timeout(wait, task)
+                    .await
+                    .expect("a waiter hung")
+                    .unwrap()
+                    .unwrap()
+                    .path,
+            );
+        }
+        let encodes = if fail { 1 + WAITERS - 1 } else { 1 };
+        assert_eq!(encoder.calls.load(Ordering::SeqCst), encodes);
+        if fail {
+            assert!(served.iter().all(|path| *path == input), "{served:?}");
+        } else {
+            assert!(served.iter().all(|path| path.contains("resized-images")));
+            assert!(served.windows(2).all(|pair| pair[0] == pair[1]));
+        }
+
+        work.fail.store(false, Ordering::SeqCst);
+        let again = request(100).await.unwrap().unwrap();
+        assert!(again.path.contains("resized-images"));
+        assert_eq!(
+            encoder.calls.load(Ordering::SeqCst),
+            encodes + usize::from(fail),
+            "a failure is retried, a written file is served"
+        );
+        // Every lock taken above was released, so another file's encode sweeps
+        // them out: the map holds only the files being encoded.
+        request(101).await.unwrap().unwrap();
+        assert_eq!(processor.cache_file_locks.len(), 1);
     }
 
     /// A [`FileMeta`] whose `held`-th call (counting `exists` and

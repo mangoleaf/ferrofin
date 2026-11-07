@@ -258,7 +258,8 @@ impl SessionReporter for NoopSessionReporter {
 /// Port of `DeleteHlsPartialStreamFiles`: every file in `output_dir` whose name
 /// contains the playlist stem is removed. Behind a seam so kill/cleanup stays
 /// unit-testable against a temp dir without touching a real transcode cache.
-pub trait FileCleaner: Send + Sync {
+/// The teardown runs it on the blocking pool (hence `'static`) and waits for it.
+pub trait FileCleaner: Send + Sync + 'static {
     /// Deletes every file in `output_dir` whose filename contains
     /// `playlist_stem` (case-insensitively). Port of `DeleteHlsPartialStreamFiles`.
     fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str);
@@ -318,6 +319,10 @@ struct RunningJob {
     /// The segment file extension (e.g. `.ts`), for diagnostics/index scans.
     #[allow(dead_code)]
     segment_extension: String,
+    /// The first segment this job's ffmpeg writes: its `-start_number`, or the
+    /// hls muxer's default 0. Segments below it, or past a gap in its run, are
+    /// an earlier job's (gl-52).
+    start_number: i32,
     /// Where this job's ffmpeg stderr is being written — inside the server's
     /// log directory, so a diagnostic can name a file the operator can actually
     /// fetch from `GET /System/Logs/Log`.
@@ -356,9 +361,21 @@ impl RunningJob {
             output_dir,
             playlist_path,
             segment_extension,
+            // `start_ffmpeg` sets it from the job's arguments.
+            start_number: 0,
             log_path,
         }
     }
+}
+
+/// The first segment an HLS ffmpeg writes: the value of its `-start_number`,
+/// or the hls muxer's default 0.
+fn hls_start_number(arguments: &[String]) -> i32 {
+    arguments
+        .windows(2)
+        .find(|pair| pair[0] == "-start_number")
+        .and_then(|pair| pair[1].parse().ok())
+        .unwrap_or(0)
 }
 
 /// Per-job control state, serialized with teardown.
@@ -578,7 +595,7 @@ fn take_job_to_admit(
 pub struct TranscodeManagerImpl<S: SessionReporter, C: FileCleaner = FsFileCleaner> {
     jobs: Mutex<Vec<RegisteredJob>>,
     reporter: S,
-    file_cleaner: C,
+    file_cleaner: std::sync::Arc<C>,
     encoding_config:
         Option<std::sync::Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
     /// The throttle's reads of `encoding_config`, which report a document
@@ -622,7 +639,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         Self {
             jobs: Mutex::new(Vec::new()),
             reporter,
-            file_cleaner,
+            file_cleaner: std::sync::Arc::new(file_cleaner),
             encoding_config: None,
             throttle_options: crate::configuration::EncodingOptionsReader::new(
                 "transcode throttle",
@@ -886,14 +903,21 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// Runs the progress pump and due throttle timers until the manager drops.
     ///
     /// A weak reference prevents this composition task from retaining all jobs
-    /// after server shutdown.
+    /// after server shutdown. A tick that panics is logged and ends alone
+    /// (`survive_panic`): the next tick runs as usual.
     pub async fn run_transcode_controls(manager: std::sync::Weak<Self>) {
+        let mut failing = false;
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let Some(manager) = manager.upgrade() else {
                 return;
             };
-            manager.update_transcoding_jobs().await;
+            survive_panic(
+                "transcode_controls",
+                &mut failing,
+                manager.update_transcoding_jobs(),
+            )
+            .await;
         }
     }
 
@@ -1077,6 +1101,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 
         // 3. Build the spawn request.
         let stderr_log = log_path.clone();
+        let start_number = hls_start_number(&arguments);
         let req = SpawnRequest {
             program: program.to_owned(),
             arguments,
@@ -1109,15 +1134,18 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         // 6. Store the live job so kill/cleanup can reach the child + cache dir.
         self.attach_running(
             &handle,
-            RunningJob::new(
-                child,
-                state,
-                directory,
-                output_path.to_path_buf(),
-                segment_extension,
-                stderr_log.clone(),
-                hardware_acceleration_type,
-            ),
+            RunningJob {
+                start_number,
+                ..RunningJob::new(
+                    child,
+                    state,
+                    directory,
+                    output_path.to_path_buf(),
+                    segment_extension,
+                    stderr_log.clone(),
+                    hardware_acceleration_type,
+                )
+            },
         );
 
         // 7. Wait until the target file exists OR the process exits, bounded.
@@ -1281,7 +1309,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// ready the moment its own file exists. Dropping the `+1` wait roughly halves
     /// time-to-first-segment (~4.3s → ~2.4s here) on start and on every seek.
     ///
-    /// Wakes on the directory's inotify events (fallback tick
+    /// Returns at once for a segment already on disk. Otherwise wakes on the
+    /// directory's inotify events (fallback tick
     /// [`SEGMENT_READY_POLL_INTERVAL_MS`]) until the file exists or the job
     /// exits; returns `true` if the segment ends up on disk.
     ///
@@ -1298,6 +1327,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             .with_running(handle, |r| r.segment_extension.clone())
             .unwrap_or_else(|| ".ts".to_owned());
         let seg = segment_path(playlist_path, index, &ext);
+        // A segment already written needs no watch; the loop checks again once
+        // the watch is armed, so one written in between is not missed.
+        if seg.exists() {
+            return true;
+        }
         let waiter = FsWaiter::new(&seg);
 
         loop {
@@ -1332,6 +1366,17 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             }
             waiter.wait().await;
         }
+    }
+
+    /// The first segment the running job behind `handle` writes (its
+    /// `-start_number`), or `None` when no process is attached to it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    #[must_use]
+    pub fn segment_start_number(&self, handle: &TranscodingJobHandle) -> Option<i32> {
+        self.with_running(handle, |running| running.start_number)
     }
 
     /// Kills the process behind `handle` (if any) and removes it, deleting its
@@ -1420,7 +1465,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     }
                 }
             }
-            let _ = running.child.kill().await;
+            if let Err(error) = running.child.kill().await {
+                tracing::error!(path = %handle.path, %error, "killing ffmpeg at teardown failed; it may still be running");
+            }
             drop(controller);
             if delete_files {
                 let stem = running
@@ -1428,8 +1475,17 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.file_cleaner
-                    .delete_partial_stream_files(&running.output_dir, &stem);
+                // The directory scan and unlinks block, so they run on the
+                // blocking pool; awaited, so callers still go on only after them.
+                let cleaner = std::sync::Arc::clone(&self.file_cleaner);
+                let output_dir = running.output_dir;
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    cleaner.delete_partial_stream_files(&output_dir, &stem);
+                })
+                .await
+                {
+                    tracing::error!(path = %handle.path, %error, "deleting a killed transcode's partial files failed");
+                }
             }
         }
         self.reporter
@@ -1480,10 +1536,16 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 
     /// Runs [`Self::reap_idle_jobs`] forever, sweeping every `interval`. The
     /// composition root spawns this once next to the manager.
+    ///
+    /// A sweep that panics is logged and ends alone (`survive_panic`): the
+    /// jobs it had not reached are still registered, so the next sweep reaps
+    /// them. The job it was tearing down is already out of the registry and
+    /// is not retried.
     pub async fn run_idle_reaper(self: std::sync::Arc<Self>, interval: Duration) {
+        let mut failing = false;
         loop {
             tokio::time::sleep(interval).await;
-            self.reap_idle_jobs().await;
+            survive_panic("transcode_idle_reaper", &mut failing, self.reap_idle_jobs()).await;
         }
     }
 
@@ -1638,6 +1700,35 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             })
             .and_then(|j| j.running.as_ref())
             .map(f)
+    }
+}
+
+/// Runs one pass of the singleton loop `task`, so that a panic ends the pass
+/// and not the loop, whose next tick is the retry (LOGGING.md §7).
+///
+/// `failing` carries the loop's streak: the first panic logs at `error`, the
+/// ones straight after it at `debug` (a poisoned lock would otherwise repeat
+/// it every tick, beside the panic hook's own line), and the first pass to
+/// finish after them at `info`.
+async fn survive_panic(task: &'static str, failing: &mut bool, pass: impl Future) {
+    match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(pass)).await {
+        Ok(_) => {
+            if std::mem::take(failing) {
+                tracing::info!(task, "transcode loop recovered: a pass finished again");
+            }
+        }
+        Err(payload) => {
+            let panic = ferrofin_util::panic::message(payload.as_ref());
+            if std::mem::replace(failing, true) {
+                tracing::debug!(task, panic, "transcode loop pass panicked again");
+            } else {
+                tracing::error!(
+                    task,
+                    panic,
+                    "transcode loop pass panicked; the loop goes on at its next tick"
+                );
+            }
+        }
     }
 }
 
@@ -2216,6 +2307,109 @@ mod tests {
                 .is_ok()
         );
     }
+
+    /// A reporter whose first `panics` teardowns panic, as a fault part-way
+    /// through a sweep would, and which records the paths of the rest.
+    #[derive(Default)]
+    struct FaultyReporter {
+        panics: std::sync::atomic::AtomicUsize,
+        killed: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl SessionReporter for FaultyReporter {
+        async fn report_started(
+            &self,
+            _job: &TranscodingJobHandle,
+            _info: ferrofin_model::session::TranscodingInfo,
+        ) {
+        }
+        async fn on_job_failed_to_start(&self, _job: &TranscodingJobHandle) {}
+        async fn report_progress(
+            &self,
+            _job: &TranscodingJobHandle,
+            _progress: TranscodingProgress,
+        ) {
+        }
+        async fn on_job_killed(
+            &self,
+            job: &TranscodingJobHandle,
+            _delete_files: bool,
+            _close_live_stream: bool,
+        ) {
+            use std::sync::atomic::Ordering;
+            if self
+                .panics
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                panic!("teardown of {} failed", job.path);
+            }
+            self.killed.lock().unwrap().push(job.path.clone());
+        }
+    }
+
+    /// A sweep that panics ends that sweep only: the reaper logs it with its
+    /// `task` and sweeps again at the next tick, reaping the jobs the panic cut
+    /// it off from. A second panic in a row is not logged above `debug`, and
+    /// the first sweep to finish after them says so at `info`.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_sweep_is_logged_and_the_reaper_sweeps_again_next_tick() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let reporter = Arc::new(FaultyReporter {
+            panics: 2.into(),
+            ..FaultyReporter::default()
+        });
+        let m = Arc::new(TranscodeManagerImpl::new(Arc::clone(&reporter)));
+        for (session, path) in [
+            ("s1", "/t/a.m3u8"),
+            ("s2", "/t/b.m3u8"),
+            ("s3", "/t/c.m3u8"),
+        ] {
+            m.register_job(handle(session, path, TranscodingJobType::Hls, "dev1"));
+        }
+        for job in m.jobs.lock().unwrap().iter_mut() {
+            job.ping_timeout_ms = -1;
+        }
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        let reaper =
+            tokio::spawn(Arc::clone(&m).run_idle_reaper(std::time::Duration::from_secs(10)));
+        // Each sweep reaches one job: the first two panic in its teardown.
+        for _ in 0..60 {
+            if m.active_job_count() == 0 && !reporter.killed.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        drop(guard);
+
+        assert!(!reaper.is_finished(), "the reaper ended at its first panic");
+        reaper.abort();
+        assert_eq!(*reporter.killed.lock().unwrap(), ["/t/c.m3u8"]);
+        assert_eq!(m.active_job_count(), 0);
+        let reaper_lines = |level| -> Vec<String> {
+            logs.lines_at(level)
+                .into_iter()
+                .filter(|line| line.contains("task=\"transcode_idle_reaper\""))
+                .collect()
+        };
+        let errors = reaper_lines("ERROR");
+        assert!(
+            errors.len() == 1 && errors[0].contains("teardown of /t/a.m3u8 failed"),
+            "{errors:#?}"
+        );
+        let repeats = reaper_lines("DEBUG");
+        assert!(
+            repeats.len() == 1 && repeats[0].contains("teardown of /t/b.m3u8 failed"),
+            "{repeats:#?}"
+        );
+        let recovered = reaper_lines("INFO");
+        assert_eq!(recovered.len(), 1, "{recovered:#?}");
+    }
 }
 
 /// Tests for the `start_ffmpeg` spawn orchestration, driven by the
@@ -2391,6 +2585,47 @@ mod start_ffmpeg_tests {
         assert_eq!(log_path.extension().and_then(|e| e.to_str()), Some("log"));
         // …and nothing shaped like a log sits next to the playlist any more.
         assert!(!playlist.with_extension("log").exists());
+    }
+
+    /// The registry knows the first segment each job writes, from its own
+    /// `-start_number` (the hls muxer's default 0 without one), so the
+    /// segment path can tell its output from an earlier job's (gl-52).
+    #[tokio::test]
+    async fn a_job_records_the_first_segment_its_ffmpeg_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let args = |start: &[&str]| {
+            ["-i", "in.mkv"]
+                .iter()
+                .chain(start)
+                .map(|arg| (*arg).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let seek = tmp.path().join("seek").join("out.m3u8");
+        let st = state(&seek, None);
+        let handle = m
+            .start_ffmpeg(
+                &fake,
+                ffmpeg_req(&st, &seek, args(&["-start_number", "15"])),
+            )
+            .await
+            .expect("start");
+        assert_eq!(m.segment_start_number(&handle), Some(15));
+
+        let from_zero = tmp.path().join("zero").join("out.m3u8");
+        let st = state(&from_zero, None);
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &from_zero, args(&[])))
+            .await
+            .expect("start");
+        assert_eq!(m.segment_start_number(&handle), Some(0));
+
+        m.kill_and_remove(&handle, false, false).await;
+        assert_eq!(m.segment_start_number(&handle), None, "no job, no start");
     }
 
     #[tokio::test]
@@ -2586,20 +2821,81 @@ mod start_ffmpeg_tests {
         assert!(!m.wait_for_segment(&handle, &playlist, 3).await);
     }
 
-    /// A [`FileCleaner`] that records the deletions it was asked to perform, and
-    /// still performs them, so kill/cleanup is observable over a temp dir.
+    #[tokio::test]
+    async fn wait_for_segment_arms_no_watch_for_a_segment_already_on_disk() {
+        // A client reading behind ffmpeg asks for segments already written:
+        // that wait must not pay for a watcher (a thread, inotify, epoll and
+        // an eventfd) it never parks on.
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("s").join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+        let armed = crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get);
+        assert!(m.wait_for_segment(&handle, &playlist, 0).await);
+        assert_eq!(
+            crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get),
+            armed,
+            "a watch was armed for a segment already on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_segment_arms_a_watch_and_finds_a_segment_written_later() {
+        // The job is running and segment 1 is not written yet: the wait arms
+        // its watch and returns once ffmpeg writes the file.
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+        let armed = crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get);
+        let later = out_dir.join("out1.ts");
+        // On this current-thread runtime the writer runs only once the wait
+        // parks, i.e. after its first check and the watch being armed.
+        tokio::spawn(async move { std::fs::write(later, b"seg").unwrap() });
+        assert!(m.wait_for_segment(&handle, &playlist, 1).await);
+        assert_eq!(
+            crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get),
+            armed + 1
+        );
+    }
+
+    /// A [`FileCleaner`] that records the deletions it was asked to perform (and
+    /// the thread each ran on), and still performs them, so kill/cleanup is
+    /// observable over a temp dir.
     #[derive(Clone)]
     struct RecordingCleaner {
-        calls: Arc<Mutex<Vec<(std::path::PathBuf, String)>>>,
+        calls: Arc<Mutex<Vec<(std::path::PathBuf, String, std::thread::ThreadId)>>>,
     }
 
     impl FileCleaner for RecordingCleaner {
         fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str) {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((output_dir.to_path_buf(), playlist_stem.to_owned()));
             FsFileCleaner.delete_partial_stream_files(output_dir, playlist_stem);
+            // Recorded once the files are gone, so a kill that returned before
+            // its deletion finished leaves no call behind.
+            self.calls.lock().unwrap().push((
+                output_dir.to_path_buf(),
+                playlist_stem.to_owned(),
+                std::thread::current().id(),
+            ));
         }
     }
 
@@ -2631,6 +2927,9 @@ mod start_ffmpeg_tests {
         let calls = cleaner.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, "out"); // playlist stem
+        // The current-thread runtime's only worker is this thread: the scan and
+        // unlinks ran on the blocking pool instead.
+        assert_ne!(calls[0].2, std::thread::current().id());
         // The partial files (containing the stem "out") are gone.
         assert!(!out_dir.join("out0.ts").exists());
         assert!(!playlist.exists());
@@ -3220,7 +3519,10 @@ pub(super) mod throttle_tests {
         progress: Mutex<Option<FfmpegProgress>>,
         events: Mutex<Vec<Vec<u8>>>,
         fail_write: AtomicBool,
+        fail_kill: AtomicBool,
         exited: AtomicBool,
+        /// How many more progress reads panic.
+        panics: AtomicUsize,
     }
     struct ControlledChild(Arc<ChildState>);
     #[async_trait]
@@ -3237,10 +3539,23 @@ pub(super) mod throttle_tests {
         }
         async fn kill(&self) -> Result<(), String> {
             self.0.events.lock().unwrap().push(b"kill".to_vec());
+            if self.0.fail_kill.load(Ordering::SeqCst) {
+                return Err("fixture kill failure".to_owned());
+            }
             self.0.exited.store(true, Ordering::SeqCst);
             Ok(())
         }
         fn progress(&self) -> Option<FfmpegProgress> {
+            if self
+                .0
+                .panics
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                panic!("reading ffmpeg progress failed");
+            }
             *self.0.progress.lock().unwrap()
         }
         async fn write_stdin(&self, bytes: &[u8]) -> Result<(), String> {
@@ -3550,6 +3865,27 @@ pub(super) mod throttle_tests {
         assert_eq!(manager.active_job_count(), 0);
     }
 
+    /// A kill that fails at teardown is logged: ffmpeg may still be running.
+    #[tokio::test]
+    async fn a_failed_kill_at_teardown_is_logged() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let (_directory, manager, child, handle) = fixture(None).await;
+        child.fail_kill.store(true, Ordering::SeqCst);
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        manager.kill_and_remove(&handle, false, false).await;
+        drop(guard);
+        let errors = logs.lines_at("ERROR");
+        assert!(
+            errors
+                .iter()
+                .any(|line| line.contains("killing ffmpeg at teardown failed")
+                    && line.contains("fixture kill failure")),
+            "{errors:#?}"
+        );
+        assert_eq!(manager.active_job_count(), 0);
+    }
+
     #[tokio::test]
     async fn stdin_failures_keep_state_retry_and_teardown_still_kills() {
         let (_directory, manager, child, handle) = fixture(Some(PauseKeys::Legacy)).await;
@@ -3716,6 +4052,59 @@ pub(super) mod throttle_tests {
             .filter(|line| line.contains("cannot read the encoding configuration"))
             .count();
         assert_eq!(repeats, 2);
+    }
+
+    /// A tick that panics ends that tick only: the controls loop logs it with
+    /// its `task` and pumps the job's progress at the next one.
+    #[tokio::test]
+    async fn a_panicking_tick_is_logged_and_the_controls_loop_carries_on() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let (_directory, manager, child, handle) = fixture(None).await;
+        encoded(&child, 200);
+        child.panics.store(1, Ordering::SeqCst);
+        tokio::time::pause();
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        let controls = tokio::spawn(TranscodeManagerImpl::run_transcode_controls(
+            Arc::downgrade(&manager),
+        ));
+        for _ in 0..10 {
+            if progress(&manager, &handle)
+                .lock()
+                .unwrap()
+                .encoded
+                .framerate
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        drop(guard);
+
+        assert!(
+            !controls.is_finished(),
+            "the controls loop ended at its first panic"
+        );
+        controls.abort();
+        assert_eq!(
+            progress(&manager, &handle)
+                .lock()
+                .unwrap()
+                .encoded
+                .framerate,
+            Some(25.0)
+        );
+        let errors: Vec<_> = logs
+            .lines_at("ERROR")
+            .into_iter()
+            .filter(|line| line.contains("task=\"transcode_controls\""))
+            .collect();
+        assert!(
+            errors.len() == 1 && errors[0].contains("reading ffmpeg progress failed"),
+            "{errors:#?}"
+        );
     }
 
     #[tokio::test]

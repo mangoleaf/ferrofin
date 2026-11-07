@@ -35,10 +35,7 @@ pub async fn import_live_tv_config(
     db: &Database,
     config_dir: &std::path::Path,
 ) -> Result<usize, ServiceError> {
-    let done = db
-        .meta_get(META_KEY)
-        .await
-        .map_err(|e| ServiceError::Backend(e.to_string()))?;
+    let done = db.meta_get(META_KEY).await?;
     if done.as_deref() == Some("1") {
         return Ok(0);
     }
@@ -51,9 +48,7 @@ pub async fn import_live_tv_config(
             0
         }
     };
-    db.meta_set(META_KEY, "1")
-        .await
-        .map_err(|e| ServiceError::Backend(e.to_string()))?;
+    db.meta_set(META_KEY, "1").await?;
     Ok(written)
 }
 
@@ -216,6 +211,25 @@ mod tests {
                 .await
                 .expect("import"),
             0
+        );
+    }
+
+    /// A database failure reaches the boot as the typed database error, not a
+    /// string, so its cause (a closed pool, `SQLITE_BUSY`) stays inspectable.
+    #[tokio::test]
+    async fn a_database_failure_keeps_its_typed_cause() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = test_db().await;
+        db.close().await;
+        let err = import_live_tv_config(&db, dir.path())
+            .await
+            .expect_err("a closed database cannot read the marker");
+        assert!(
+            matches!(
+                &err,
+                ServiceError::Db(ferrofin_db::DbError::Sqlx(sqlx::Error::PoolClosed))
+            ),
+            "{err:?}"
         );
     }
 }

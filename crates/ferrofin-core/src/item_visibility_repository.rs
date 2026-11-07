@@ -60,13 +60,26 @@ pub(crate) const REACHABLE_SQL: &str = r#"
     )
     SELECT * FROM "BaseItems" WHERE "Id" IN (SELECT "Id" FROM reach)"#;
 
-pub(crate) async fn libraries(db: &Database) -> Result<Vec<BaseItemEntity>, ServiceError> {
-    sqlx::query_as(r#"SELECT * FROM "BaseItems" WHERE "Type" = ?"#)
-        .bind(stored_type_name(BaseItemKind::CollectionFolder).unwrap_or_default())
+/// The library set's rows, in one read: the `CollectionFolder` rows, then the
+/// `UserView` and playlists-folder rows an unscoped query's scope lists beside
+/// them (`ferrofin_db::row_cache::LibrarySet::views`).
+pub(crate) async fn libraries(
+    db: &Database,
+) -> Result<(Vec<BaseItemEntity>, Vec<BaseItemEntity>), ServiceError> {
+    let library = stored_type_name(BaseItemKind::CollectionFolder).unwrap_or_default();
+    let rows: Vec<BaseItemEntity> = sqlx::query_as(LIBRARIES_SQL)
+        .bind(library)
+        .bind(stored_type_name(BaseItemKind::UserView).unwrap_or_default())
+        .bind(stored_type_name(BaseItemKind::PlaylistsFolder).unwrap_or_default())
+        .bind(stored_type_name(BaseItemKind::ManualPlaylistsFolder).unwrap_or_default())
         .fetch_all(db.pool())
         .await
-        .map_err(db_err)
+        .map_err(db_err)?;
+    Ok(rows.into_iter().partition(|row| row.type_ == library))
 }
+
+/// [`libraries`]' statement.
+const LIBRARIES_SQL: &str = r#"SELECT * FROM "BaseItems" WHERE "Type" IN (?1, ?2, ?3, ?4)"#;
 
 /// The `Playlist` rows under `top_parents`, or every one when none are named:
 /// the rows a listing's SQL can reach, from the `(Type, TopParentId)` index.
@@ -210,6 +223,48 @@ mod tests {
                 "{plan:?}"
             );
         }
+    }
+
+    /// The library set is read in one `Type` seek, never a scan of `BaseItems`, and its rows
+    /// are split into the libraries and the views and playlists folder.
+    #[tokio::test]
+    async fn the_library_set_is_one_type_seek() {
+        let db = test_db().await;
+        let [library, view, playlists, movie] = [0x111, 0x112, 0x113, 0x114].map(Uuid::from_u128);
+        seed_item(&db, library, BaseItemKind::CollectionFolder).await;
+        seed_item(&db, view, BaseItemKind::UserView).await;
+        seed_item(&db, playlists, BaseItemKind::PlaylistsFolder).await;
+        seed_item(&db, movie, BaseItemKind::Movie).await;
+        let (rows, views) = libraries(&db).await.unwrap();
+        let ids = |rows: &[BaseItemEntity]| -> Vec<Uuid> {
+            let mut ids: Vec<Uuid> = rows
+                .iter()
+                .filter_map(|r| Uuid::parse_str(&r.id).ok())
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids(&rows), [library]);
+        assert_eq!(ids(&views), [view, playlists]);
+
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {LIBRARIES_SQL}"
+        )))
+        .bind("a")
+        .bind("b")
+        .bind("c")
+        .bind("d")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let steps: Vec<&str> = plan.iter().map(|row| row.3.as_str()).collect();
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.starts_with("SEARCH") && s.contains("(Type=?)")),
+            "{steps:?}"
+        );
+        assert!(!steps.iter().any(|s| s.starts_with("SCAN")), "{steps:?}");
     }
 
     /// One read returns the whole chain above an item, and reaches every row through the

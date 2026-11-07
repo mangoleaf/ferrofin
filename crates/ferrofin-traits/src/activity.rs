@@ -129,7 +129,7 @@ pub trait ActivityManager: Send + Sync {
     ) -> Result<QueryResult<ActivityLogEntry>, ServiceError>;
 
     /// Persists a new activity-log entry (C# `CreateAsync`), stamping it with the
-    /// current time. Best-effort callers may ignore the result.
+    /// current time. Best-effort callers log a failure rather than fail on it.
     async fn create_entry(&self, entry: ActivityLogCreate) -> Result<(), ServiceError>;
 
     /// Subscribes to entry creation: one `()` per entry

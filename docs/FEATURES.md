@@ -159,6 +159,13 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     selected checks nothing, and the next change still removes the old widths. A `Qscale` or JPEG
     quality edited by hand still needs a Replace, as in Jellyfin. Upgrading records the
     current settings and replaces nothing.
+  - **Departure from Jellyfin: wider trickplay sets get a smaller tile grid.** The configured
+    Tile width and Tile height are the grid at 320. Above that, each is multiplied by
+    320 / width, rounded down, at least 1 (640 gets 5 x 5 at the default 10 x 10), so a tile
+    holds no more pixels than a 320 tile until the grid is down to 1 x 1. Clients decode a
+    whole tile to show one preview, and Wholphin was seen decoding a 6400 x 3600 tile at 640
+    again on every scrub. Jellyfin uses the configured grid at every width. The next Generate
+    Trickplay Images run replaces sets made at the old grid.
   - **Departure from Jellyfin: trickplay sizes are listed largest first.** An item's
     `Trickplay` field lists its preview sizes from the widest down, in the same order every
     time; Jellyfin lists them smallest first in practice. With Preview Size set to Both, apps

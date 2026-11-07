@@ -1002,25 +1002,34 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    refresh of an item or folder ends with that item's own failure) \
                    ← parent_row (a failed read counts as \
                    no row, once per pass) ← sync_series_name (FindSeriesName), \
-                   sync_season_name, remember_series_folder; apply_parental_rating_score and \
+                   sync_season_name, remember_series_folder, locale_parent (GetParents, \
+                   GetCollectionFolders, read by resolve_metadata_locale); \
+                   apply_parental_rating_score and \
                    inherit_stored_rating; keep_stored_series_key. Compared with \
                    MediaBrowser.Controller/LibraryTaskScheduler/\
                    LimitedConcurrencyLibraryScheduler.cs (ProcessItem), \
                    MediaBrowser.Controller/Entities/Folder.cs (RunTasks, \
                    RefreshChildMetadata), \
-                   MediaBrowser.Controller/Entities/BaseItem.cs (RefreshMetadata), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (RefreshMetadata, \
+                   GetPreferredMetadataLanguage, GetPreferredMetadataCountryCode, GetParents), \
                    MediaBrowser.Providers/Manager/ProviderManager.cs (RefreshItem), \
                    MediaBrowser.Providers/Manager/MetadataService.cs (RefreshMetadata), \
                    MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
                    MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
-        date: "2026-10-30",
+        date: "2026-11-06",
         divergences: &[
             "An item whose parent chain cannot be read is scored from its own rating and \
              country, an ancestor's custom rating not counting, else takes the score stored on \
              its parent, and the children of an undecodable series keep the series key stored \
              on its row. Upstream has no such row to fall back from: the read would throw into \
              the per-child catch and the item would not refresh.",
+            "A child whose parent row cannot be read takes its metadata language and country \
+             as if its parents ended there, from the collection folder, the library or the \
+             server, and one whose collection folder row cannot be read from the library or \
+             the server, so an override on the unreadable row or above it goes unused and the \
+             child is fetched, and stamped, in that locale, where upstream's read of such a \
+             row would throw into the per-child catch and the item would not refresh.",
             "A stored item that fails after its row was saved has its DateLastRefreshed \
              cleared, so the next scan retries it as a first refresh where upstream, which \
              saves the row after the providers and the probe, retries it because the row kept \
@@ -1315,10 +1324,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    save_play_state and apply_play_report (UpdatePlayState), \
                    reset_playback_stream_selections (ResetPlaybackStreamSelections), \
                    record_playback_start, set_likes, mark_item_played, mark_item_unplayed, \
-                   clear_own_play_state and propagate_played_state. Compared with \
+                   mark_container with mutate_rows (a container's members, a chunk per write \
+                   transaction), clear_own_play_state and propagate_played_state. Compared with \
                    Emby.Server.Implementations/Session/SessionManager.cs (OnPlaybackStart, \
                    OnPlaybackProgress, UpdatePlaybackSettings, OnPlaybackStopped), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
+                   MediaBrowser.Controller/Entities/Folder.cs and \
+                   MediaBrowser.Controller/Entities/Movies/BoxSet.cs (MarkPlayed, MarkUnplayed), \
                    MediaBrowser.Controller/Entities/TV/Episode.cs and \
                    MediaBrowser.Controller/Entities/TV/Season.cs (Series, FindSeriesId, \
                    GetUserDataKeys), \
@@ -1336,7 +1348,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    retired-key update of SaveUserData, from the row ResolveUserDataRow reads), \
                    compared with Jellyfin.Server.Implementations/Item/\
                    ItemPersistenceService.cs (ReattachUserDataAsync, ReconcileUserDataAsync)",
-        date: "2026-11-03",
+        date: "2026-11-06",
         divergences: &[
             "After a scan or boot-repair fold, which upstream does not have (it deletes the \
              duplicate, and ReconcileUserDataAsync gives the user's rows the most recent play when \
@@ -1350,6 +1362,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Marking a container unplayed also clears the play state on the container's own rows, \
              which earlier Ferrofin builds wrote; upstream's MarkUnplayed leaves them, so a Played \
              set on a container through the UserData API survives it there. Fix path: gl-1064.",
+            "A container's members are saved a chunk at a time, each chunk in one write \
+             transaction, where upstream's Folder.MarkPlayed commits each member's SaveUserData \
+             alone and stops at the first that fails: here a member's write that fails also rolls \
+             back the members of its chunk saved before it, and a version's save that fails \
+             leaves the chunk's later members saved (gl-1321).",
         ],
     },
     VerifiedSubsystem {
@@ -1515,7 +1532,7 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Emby.Server.Implementations/Dto/DtoService.cs (the Trickplay field), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetMediaSources) and \
                    MediaBrowser.Controller/Entities/Video.cs (GetAllItemsForMediaSources)",
-        date: "2026-11-05",
+        date: "2026-11-06",
         divergences: &[
             "An explicit Replace does not delete the item's trickplay folder and rows first: \
              each selected width is generated in the work directory and swapped in, so the old \
@@ -1544,6 +1561,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
             "Importing a width's folder that has no row counts only its .jpg tiles; upstream \
              counts every file in it, so a stray file there makes the import fail on its image \
              size. Jellyfin bug not ported.",
+            "Importing a width's folder that has no row saves the row at the width the folder \
+             was made at (the selected width, or the video's own when it is narrower, rounded \
+             down to even), as a generated set's row is; upstream saves the selected width, \
+             so when the two differ the row names a folder that does not exist (its tiles 404) \
+             and gives the tiles the wrong aspect. Jellyfin bug not ported (gl-1246).",
             "TrickplayOptions has a Ferrofin-only FullChroma member, off by default and absent \
              from the JSON while off, which writes 4:4:4 tiles, from 4:4:4 frames on the \
              software path (see the trickplay-extraction row), instead of 4:2:0 (owner \
@@ -1567,6 +1589,17 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              logged and leaves the other widths as upstream's catch does. Order and the \
              number of decodes only: the widths made, and each width's checks, frames and \
              tiles, are unchanged (gl-1228).",
+            "A set wider than 320 is made at a smaller tile grid than TileWidth x TileHeight \
+             (options_at_width): each is multiplied by 320 / width, rounded down, at least 1, \
+             so 640 gets 5 x 5 at the default 10 x 10 and a tile holds no more pixels than a \
+             320 tile until an axis is down to 1. The grid names the set's folder and is \
+             stored in its row, as upstream's configured grid is (RefreshTrickplayDataInternal, \
+             CreateTiles), so a set at another grid is regenerated without a Replace, as \
+             after a tile size change upstream. Upstream packs every width at the configured \
+             grid. Deliberate \
+             divergence (owner decision 2026-11-05, gl-1400): clients decode a whole tile to \
+             show one preview, and Wholphin was seen decoding a 6400 x 3600 tile again on \
+             every scrub. jellyfin-web and Wholphin read each width's own grid.",
         ],
     },
     VerifiedSubsystem {
@@ -1850,7 +1883,9 @@ pub const VERIFIED: &[Verified] = &[
                stamped by upsert_session (GetSessionInfo, GetImageCacheTag); \
                LastPlaybackCheckIn is DateTime.MinValue until update_now_playing stamps it \
                (SessionInfo.LastPlaybackCheckIn, UpdateNowPlayingItem) and \
-               NowPlayingQueueFullItems is never sent (v12.4's SessionInfoDto has none)",
+               NowPlayingQueueFullItems is never sent (v12.4's SessionInfoDto has none); the \
+               pool loses a session where upstream's does (report_session_ended, close_if_needed; \
+               ReportSessionEnded, CloseIfNeededAsync) and also to evict_idle_sessions",
         date: "2026-11-05",
         divergences: SESSIONS_DIVERGENCES,
         refs: &[],
@@ -1867,9 +1902,10 @@ pub const VERIFIED: &[Verified] = &[
                update_live_stream_session_mapping, update_now_playing for UpdateNowPlayingItem \
                with the NowPlayingItem kept or named on the row it read, the ClearTranscodingInfo \
                of a report that does not transcode, record_playback_start per session user on \
-               progress_item for GetProgressItem, the log line, the PlaybackStart event) → \
-               playback_activity.rs (PlaybackStartLogger)",
-        date: "2026-11-04",
+               progress_item for GetProgressItem, the log line and the PlaybackStart event's \
+               MediaInfo (playback_media_info) named from info.Item, the now-playing item) → \
+               playback_activity.rs (PlaybackStartLogger, from that MediaInfo, reading nothing)",
+        date: "2026-11-06",
         divergences: PLAYBACK_START_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -1899,8 +1935,9 @@ pub const VERIFIED: &[Verified] = &[
                for GetNowPlayingItem, update_now_playing with the check-in only when not automated, \
                the ClearTranscodingInfo of a report that does not transcode, update_play_progress \
                per session user for OnPlaybackProgress(user, item, info), \
-               update_live_stream_session_mapping, the PlaybackProgress event)",
-        date: "2026-11-04",
+               update_live_stream_session_mapping, the PlaybackProgress event carrying the \
+               now-playing item's playback_media_info for MediaInfo = info.Item)",
+        date: "2026-11-06",
         divergences: PLAYBACK_PROGRESS_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -1927,9 +1964,12 @@ pub const VERIFIED: &[Verified] = &[
                (SessionManager.OnPlaybackStopped: the negative-position refusal after releasing the \
                live stream, the reported NowPlayingQueue and PlaylistItemId, RemoveNowPlayingItem's \
                PlayState reset and ClearTranscodingInfo, save_stopped_play_state per session user \
-               unless the playback failed, the log line, close_live_stream_if_needed, the \
-               PlaybackStopped event) → playback_activity.rs (PlaybackStopLogger)",
-        date: "2026-11-02",
+               unless the playback failed, close_live_stream_if_needed, the log line and the \
+               PlaybackStopped event's MediaInfo (playback_media_info) named from info.Item: the \
+               kept now-playing item when the stop names it (info.Item = current), else the row \
+               the stop read, none once the library no longer has it) → \
+               playback_activity.rs (PlaybackStopLogger, from that MediaInfo, reading nothing)",
+        date: "2026-11-06",
         divergences: PLAYBACK_STOP_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -2314,6 +2354,11 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+            "MaxActiveSessions counts the user's sessions in the pool, as upstream \
+         (SessionManager.cs Sessions.Count), but the pool ends a session with no WebSocket that \
+         plays nothing once it is idle past session_idle_hours (the GET /Sessions row), so \
+         stale HTTP-only sessions stop counting then; upstream counts them until the server \
+         restarts. Owner decision (gl-1267, 2026-11-05).",
             "Ferrofin's login backoff (owner decisions on gl-1099; upstream has no rate limit): \
          past login_backoff_attempts failures an account's and a client address's next \
          attempts wait, from 1 s doubling to login_backoff_max_delay_secs. An address that \
@@ -2610,16 +2655,18 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetNamedConfiguration",
         ferrofin: "handlers/config.rs get_named_configuration → ferrofin-core \
                configuration_manager.rs get_named_configuration and get_encoding_options \
-               (read_named; BaseConfigurationManager.GetConfiguration and \
-               LoadConfiguration, the seven ConfigurationStore registrations) → \
-               encoding_response for encoding, the Live TV manager's tuner and provider rows \
-               for livetv, blank_for_non_administrator for livetv and network",
+               (read_named, through read_named_kept for branding and encoding; \
+               BaseConfigurationManager.GetConfiguration and LoadConfiguration, the seven \
+               ConfigurationStore registrations) → encoding_response for encoding, the Live \
+               TV manager's tuner and provider rows for livetv, blank_for_non_administrator \
+               for livetv and network",
         date: "2026-10-23",
         divergences: &[
-            "The stored document is reread on every call instead of cached from the first load \
-         until a save, so a hand-edited file applies without a restart, and a document that \
-         does not parse is logged at warn once per change of the file where upstream logs it \
-         at error once.",
+            "The stored document is not cached from the first load until a save: branding and \
+         encoding are kept until their file's stamp changes, and the other stored documents \
+         are reread on every call. So a hand-edited file applies without a restart, and a \
+         document that does not parse is logged at warn once per change of the file where \
+         upstream logs it at error once.",
             "A stored document that exists but cannot be read is a 500, and so is a save of \
          encoding (the one store with a validator) over it. LoadConfiguration catches every \
          exception but IOException, so upstream serves the defaults for a permission-denied \
@@ -3687,7 +3734,8 @@ const PLAYBACK_STOP_DIVERGENCES: &[&str] = &[
     "A stop naming no PlaySessionId kills every transcode on the caller's device; upstream \
      kills none. Fix path: gl-1184.",
     "A report's own Item is not used: the log line and the activity entry name the library \
-     item. Fix path: gl-1062.",
+     item, as the session shows it or, for an item it does not show, as the stop read it. Fix \
+     path: gl-1062.",
     "The activity entry is written in English, not the server's UI culture. Fix path: gl-429.",
     "The live stream is released and the stop published even when the user-data save fails, \
      and the item is always read again rather than taken from the session, so an item deleted \
@@ -3723,6 +3771,14 @@ const SESSIONS_DIVERGENCES: &[&str] = &[
     "The 403 (controllableByUserId naming another user without the administrator role) and \
      400 (a value the query binder cannot convert) bodies are Ferrofin's error shape, not \
      upstream's. Fix path: gl-666.",
+    "A session with no WebSocket that plays nothing is ended once it has made no request for \
+     longer than the session_idle_hours setting (24 by default, 1 to 168), through the path a \
+     closed socket takes (SessionEnded and its activity-log entry); upstream keeps such a \
+     session until the server restarts. A client that returns gets a new session with the \
+     same id and its device's capabilities (the map is never pruned, as upstream's \
+     _capabilitiesMap), so only what the ended session held (AdditionalUsers, NowViewingItem, \
+     the last NowPlayingQueue, PlaylistItemId and pause, LastPlaybackCheckIn) starts over. \
+     Owner decision (gl-1267, 2026-11-05).",
 ];
 
 /// `GET /Users`, `/Users/Public` and `/Users/{userId}` leave other accounts'
