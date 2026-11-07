@@ -81,9 +81,6 @@ impl DeviceManager for CountingDevices {
         self.capability_reads.fetch_add(1, Ordering::SeqCst);
         self.inner.get_capabilities(device_id).await
     }
-    async fn forget_capabilities(&self, device_ids: &[String]) -> Result<(), ServiceError> {
-        self.inner.forget_capabilities(device_ids).await
-    }
     async fn get_device(&self, id: &str) -> Result<Option<DeviceInfoDto>, ServiceError> {
         self.inner.get_device(id).await
     }

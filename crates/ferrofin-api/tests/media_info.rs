@@ -1804,9 +1804,6 @@ impl ferrofin_traits::devices::DeviceManager for ProfileDevices {
             ..ferrofin_model::session::ClientCapabilities::default()
         })
     }
-    async fn forget_capabilities(&self, _device_ids: &[String]) -> Result<(), ServiceError> {
-        unimplemented!()
-    }
     async fn get_device(
         &self,
         _id: &str,

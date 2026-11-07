@@ -1,9 +1,8 @@
 //! The idle-session sweep of the one-minute loop (gl-1267): a session with no
 //! live socket, nothing playing and no request for longer than the idle window
-//! ends the way a closed socket ends it, and its device's capabilities are
-//! forgotten when no `Devices` row and no other session still uses that device
-//! id. A divergence from v12.4, which keeps a socketless session until the
-//! server restarts.
+//! ends the way a closed socket ends it, and its device's capabilities stay, as
+//! upstream never prunes `_capabilitiesMap`. A divergence from v12.4, which
+//! keeps a socketless session until the server restarts.
 
 use std::sync::Arc;
 
@@ -62,7 +61,7 @@ async fn connect(mgr: &FerrofinSessionManager, session_id: &str) {
 }
 
 #[tokio::test]
-async fn an_idle_socketless_session_ends_and_capabilities_no_one_uses_go() {
+async fn an_idle_socketless_session_ends_and_its_devices_capabilities_stay() {
     let db = test_db().await;
     let (mgr, events) = manager_with_events(&db);
     // The `/socket` handler's path: a sink on the session bus.
@@ -155,16 +154,17 @@ async fn an_idle_socketless_session_ends_and_capabilities_no_one_uses_go() {
         assert!(expected.contains(id), "{id} ended");
     }
 
-    // Only the device id nothing else uses forgets its capabilities.
-    assert!(!remote_control("dev-idle").await, "no row, no session");
-    assert!(remote_control("dev-shared").await, "a connected session");
-    assert!(remote_control("dev-registered").await, "a Devices row");
-    assert!(remote_control("dev-socket").await, "its session stays");
+    // Every device keeps its capabilities, the one no row or session uses too.
+    for device in ["dev-idle", "dev-shared", "dev-registered", "dev-socket"] {
+        assert!(
+            remote_control(device).await,
+            "{device} keeps its capabilities"
+        );
+    }
 }
 
 /// A session that becomes active again while the sweep ends the ones before it
-/// is kept: each is checked again just before it ends, and only the devices of
-/// the sessions it ended forget their capabilities.
+/// is kept: each is checked again just before it ends.
 #[tokio::test]
 async fn a_session_active_again_during_the_sweep_is_kept() {
     let db = test_db().await;
@@ -203,11 +203,7 @@ async fn a_session_active_again_during_the_sweep_is_kept() {
         .map(|payload| payload["Id"].as_str().expect("id").to_owned())
         .collect();
     assert_eq!(ended.len(), 1, "{ended:?}");
-    let ((kept, kept_device), ended_device) = if ended[0] == first {
-        ((second, "dev-second"), "dev-first")
-    } else {
-        ((first, "dev-first"), "dev-second")
-    };
+    let kept = if ended[0] == first { second } else { first };
     let listed: Vec<String> = mgr
         .get_sessions(Uuid::nil(), None, None, None, true)
         .await
@@ -216,22 +212,4 @@ async fn a_session_active_again_during_the_sweep_is_kept() {
         .filter_map(|s| s.id)
         .collect();
     assert_eq!(listed, [kept]);
-    let remote_control = |device: &'static str| {
-        let devices = Arc::clone(&mgr.device_manager);
-        async move {
-            devices
-                .get_capabilities(Some(device))
-                .await
-                .expect("capabilities")
-                .supports_media_control
-        }
-    };
-    assert!(
-        !remote_control(ended_device).await,
-        "the ended session's device"
-    );
-    assert!(
-        remote_control(kept_device).await,
-        "the kept session's device"
-    );
 }

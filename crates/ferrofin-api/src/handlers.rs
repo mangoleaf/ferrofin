@@ -3773,12 +3773,12 @@ const SESSIONS_DIVERGENCES: &[&str] = &[
      upstream's. Fix path: gl-666.",
     "A session with no WebSocket that plays nothing is ended once it has made no request for \
      longer than the session_idle_hours setting (24 by default, 1 to 168), through the path a \
-     closed socket takes (SessionEnded and its activity-log entry), and its device's \
-     capabilities are forgotten unless a Devices row or another session has its id; upstream \
-     keeps such a session, and every device's capabilities, until the server restarts. A \
-     client that returns gets a new session with the same id, so what the ended one held \
-     (AdditionalUsers, NowViewingItem, the last NowPlayingQueue, PlaylistItemId and pause, \
-     LastPlaybackCheckIn) starts over. Owner decision (gl-1267, 2026-11-05).",
+     closed socket takes (SessionEnded and its activity-log entry); upstream keeps such a \
+     session until the server restarts. A client that returns gets a new session with the \
+     same id and its device's capabilities (the map is never pruned, as upstream's \
+     _capabilitiesMap), so only what the ended session held (AdditionalUsers, NowViewingItem, \
+     the last NowPlayingQueue, PlaylistItemId and pause, LastPlaybackCheckIn) starts over. \
+     Owner decision (gl-1267, 2026-11-05).",
 ];
 
 /// `GET /Users`, `/Users/Public` and `/Users/{userId}` leave other accounts'
