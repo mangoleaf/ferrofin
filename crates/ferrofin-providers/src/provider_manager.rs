@@ -617,13 +617,8 @@ impl RemoteSearchProvider for OmdbSearchProvider {
 
 /// The shared naming options the providers' `ParseName` runs by (the OMDb
 /// Identify search, the TVDB search, the box-set refresh).
-///
-/// [`NamingOptions::new`] compiles the whole clean-name regex table, so it is
-/// built once for the process rather than per search request.
 pub(crate) fn naming_options() -> &'static ferrofin_naming::common::NamingOptions {
-    static OPTIONS: std::sync::OnceLock<ferrofin_naming::common::NamingOptions> =
-        std::sync::OnceLock::new();
-    OPTIONS.get_or_init(ferrofin_naming::common::NamingOptions::new)
+    ferrofin_naming::common::NamingOptions::shared()
 }
 
 /// The display name of the MusicBrainz providers (`Plugin.Name`).

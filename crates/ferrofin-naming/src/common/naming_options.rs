@@ -5,6 +5,7 @@
 //! "tidy" these strings.
 
 use std::collections::HashMap;
+use std::sync::{Arc, LazyLock};
 
 use ferrofin_model::entities::ExtraType;
 
@@ -81,6 +82,18 @@ impl Default for NamingOptions {
 }
 
 impl NamingOptions {
+    /// The process's one set of default naming options, built on first use.
+    ///
+    /// Jellyfin registers `NamingOptions` as a singleton (`ApplicationHost`'s
+    /// `AddSingleton<NamingOptions>()`) and nothing changes it afterwards, so
+    /// every caller shares this one and the regexes it has compiled.
+    #[must_use]
+    pub fn shared() -> &'static Arc<Self> {
+        static SHARED: LazyLock<Arc<NamingOptions>> =
+            LazyLock::new(|| Arc::new(NamingOptions::new()));
+        &SHARED
+    }
+
     /// Creates the default naming options, compiling the clean regexes.
     #[must_use]
     #[allow(clippy::too_many_lines)]

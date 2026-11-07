@@ -21,6 +21,13 @@
 //! Results are therefore byte-identical to running `fancy-regex` alone; only the
 //! failing path gets cheaper. If the relaxed pattern fails to build for any
 //! reason the guard is simply dropped and behaviour is unchanged.
+//!
+//! A pattern with no lookaround has nothing to relax and gets no guard. Every
+//! vendored one runs whole on the linear-time engine `fancy-regex` delegates
+//! to, so a guard would only compile it twice and scan each match twice.
+//! `tests/common_guarded_regex.rs` checks that for every vendored pattern, and
+//! fails on a new one that `fancy-regex` would backtrack on without lookaround
+//! (a `\b`, say), which would need its guard kept.
 
 use fancy_regex::{Captures, Error, Regex};
 
@@ -36,7 +43,8 @@ pub struct GuardedRegex {
 }
 
 impl GuardedRegex {
-    /// Compiles `pattern`, building the rejection guard when possible.
+    /// Compiles `pattern`, building the rejection guard when it has lookaround
+    /// to relax.
     ///
     /// # Errors
     ///
@@ -48,7 +56,9 @@ impl GuardedRegex {
     )]
     pub fn new(pattern: &str) -> Result<Self, Error> {
         let inner = Regex::new(pattern)?;
-        let guard = strip_lookaround(pattern).and_then(|relaxed| regex::Regex::new(&relaxed).ok());
+        let guard = strip_lookaround(pattern)
+            .filter(|relaxed| relaxed != pattern)
+            .and_then(|relaxed| regex::Regex::new(&relaxed).ok());
         Ok(Self { guard, inner })
     }
 
