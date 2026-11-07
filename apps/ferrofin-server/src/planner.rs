@@ -2486,6 +2486,14 @@ impl FerrofinStreamStatePlanner {
             .file_stem()
             .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
         let ext = segment_file_extension(segment_container);
+        // `GetCommandLineArguments`' `-avoid_negative_ts disabled`, kept
+        // without its `-copyts` (see `-output_ts_offset` below). A job from the
+        // start begins below zero (B-frame reorder delay, AAC priming), and
+        // the muxer would shift every stream of it later by that much, while
+        // a seek job, already past zero, is not shifted: their fMP4 segments
+        // then disagree by up to a few frames (gl-1244). TS segments still
+        // do, as upstream's do: ffmpeg's per-segment mpegts muxer shifts them.
+        push_split(&mut args, "-avoid_negative_ts disabled");
         // DynamicHlsController floors the output muxing queue at 128. This
         // applies to both copied and encoded streams, including audio-only HLS.
         push_split(&mut args, "-max_muxing_queue_size");
@@ -6765,6 +6773,52 @@ mod tests {
                     .any(|w| w == ["-f", "hls", "-max_delay", "5000000"]),
                 "{args:?}"
             );
+        }
+    }
+
+    /// `GetCommandLineArguments`' `-avoid_negative_ts disabled`, ahead of
+    /// `-max_muxing_queue_size`, on every HLS job: TS and fMP4, audio and
+    /// video, VOD and event, from the start and seeked (gl-1244). Still
+    /// without upstream's `-copyts` (see `-output_ts_offset`).
+    #[tokio::test]
+    async fn every_hls_job_keeps_negative_timestamps() {
+        let p = planner(vec![source(
+            "abc",
+            vec![video_stream("h264"), audio_stream("aac")],
+        )]);
+        for container in ["ts", "mp4"] {
+            for (is_audio, kind) in [
+                (false, PlaylistKind::Vod),
+                (false, PlaylistKind::Event),
+                (true, PlaylistKind::Vod),
+            ] {
+                for segment in [0_i32, 3] {
+                    let mut req = at_segment(request("abc"), segment.into());
+                    req.segment_container = Some(container.to_owned());
+                    let args = p
+                        .plan(&req, is_audio, Some(segment), kind)
+                        .await
+                        .unwrap()
+                        .arguments;
+                    assert!(
+                        args.windows(3)
+                            .any(|w| w
+                                == ["-avoid_negative_ts", "disabled", "-max_muxing_queue_size"]),
+                        "{container} {is_audio} {kind:?} {segment}: {args:?}"
+                    );
+                    assert!(!args.iter().any(|a| a == "-copyts"), "{args:?}");
+                    // Nor the segment muxer's: TS keeps upstream's shift.
+                    assert!(
+                        !args.iter().any(|a| a.contains("avoid_negative_ts=")),
+                        "{args:?}"
+                    );
+                    assert_eq!(
+                        args.iter().any(|a| a == "-output_ts_offset"),
+                        segment > 0,
+                        "{args:?}"
+                    );
+                }
+            }
         }
     }
 
