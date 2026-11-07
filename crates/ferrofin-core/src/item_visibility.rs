@@ -45,8 +45,8 @@ pub struct ItemVisibility {
     localization: Arc<dyn LocalizationManager>,
     data_path: String,
     paths: crate::virtual_paths::VirtualPathExpander,
-    /// How many times the library rows were read, for the scan's
-    /// once-per-scan test.
+    /// How many times [`ItemVisibility::rating_libraries`] found no live library set
+    /// and read it, for the scan's once-per-scan test.
     #[cfg(test)]
     library_loads: std::sync::atomic::AtomicUsize,
     /// How many times a hierarchy walk read rows, for the scan's
@@ -519,61 +519,20 @@ impl ItemVisibility {
 
     /// Reads the library rows, each library's options and its stored
     /// physical locations, which every visibility and rating evaluation needs,
-    /// and the view and playlists-folder rows an unscoped query's scope reads.
+    /// and the view and playlists-folder rows an unscoped query's scope reads
+    /// ([`library_set`]).
     ///
     /// # Errors
     /// Returns storage errors.
     pub(crate) async fn rating_libraries(&self) -> Result<RatingLibraries, ServiceError> {
-        if let Some(set) = self.db.cached_libraries() {
-            return Ok(RatingLibraries { set });
-        }
-        // Begun before the reads: a library written meanwhile keeps this set out of the cache.
-        let load = self.db.begin_library_load();
-        let (rows, views) = repository::libraries(&self.db).await?;
         #[cfg(test)]
-        self.library_loads
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut options = HashMap::new();
-        // Read the existing options without GetVirtualFolders, which also heals
-        // library rows and would turn an authorization read into a mutation.
-        for row in &rows {
-            if let Some(path) = self.paths.expand_opt(row.path.as_deref()) {
-                options.insert(
-                    row_id(row),
-                    crate::virtual_folder_manager::FerrofinVirtualFolderManager::read_options(
-                        std::path::Path::new(&path),
-                        &self.paths,
-                    )
-                    .await,
-                );
-            }
+        if self.db.cached_libraries().is_none() {
+            self.library_loads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
-        // The rows above the libraries (the user root, the root folder), where every walk ends.
-        let library_ids: HashSet<Uuid> = rows.iter().map(row_id).collect();
-        let above: Vec<Uuid> = rows
-            .iter()
-            .flat_map(references)
-            .filter(|id| !library_ids.contains(id))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let ancestors = if above.is_empty() {
-            Vec::new()
-        } else {
-            repository::reachable(&self.db, &above).await?
-        };
-        let physical_locations = rows
-            .iter()
-            .map(|row| (row_id(row), stored_physical_locations(row.data.as_deref())))
-            .collect();
-        let set = load.store(LibrarySet {
-            rows,
-            views,
-            ancestors,
-            options,
-            physical_locations,
-        });
-        Ok(RatingLibraries { set })
+        Ok(RatingLibraries {
+            set: library_set(&self.db, &self.paths).await?,
+        })
     }
 
     async fn update_rating_scores_with(
@@ -913,6 +872,66 @@ impl ferrofin_traits::providers::ParentalRatingScorer for ItemVisibility {
     async fn update_rating_scores(&self, items: &mut [BaseItemEntity]) -> Result<(), ServiceError> {
         ItemVisibility::update_rating_scores(self, items).await
     }
+}
+
+/// The library set ([`LibrarySet`]): the cached one while it is live, else read
+/// and cached, so the first reader after a write or a TTL lapse reads it for
+/// the readers after it (gl-1399), as upstream holds the libraries and their
+/// options in memory. The visibility check and the query scope's readers take
+/// it here.
+///
+/// # Errors
+/// Returns storage errors.
+pub(crate) async fn library_set(
+    db: &Database,
+    paths: &crate::virtual_paths::VirtualPathExpander,
+) -> Result<Arc<LibrarySet>, ServiceError> {
+    if let Some(set) = db.cached_libraries() {
+        return Ok(set);
+    }
+    // Begun before the reads: a library written meanwhile keeps this set out of the cache.
+    let load = db.begin_library_load();
+    let (rows, views) = repository::libraries(db).await?;
+    let mut options = HashMap::new();
+    // Read the existing options without GetVirtualFolders, which also heals
+    // library rows and would turn an authorization read into a mutation.
+    for row in &rows {
+        if let Some(path) = paths.expand_opt(row.path.as_deref()) {
+            options.insert(
+                row_id(row),
+                crate::virtual_folder_manager::FerrofinVirtualFolderManager::read_options(
+                    std::path::Path::new(&path),
+                    paths,
+                )
+                .await,
+            );
+        }
+    }
+    // The rows above the libraries (the user root, the root folder), where every walk ends.
+    let library_ids: HashSet<Uuid> = rows.iter().map(row_id).collect();
+    let above: Vec<Uuid> = rows
+        .iter()
+        .flat_map(references)
+        .filter(|id| !library_ids.contains(id))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let ancestors = if above.is_empty() {
+        Vec::new()
+    } else {
+        repository::reachable(db, &above).await?
+    };
+    let physical_locations = rows
+        .iter()
+        .map(|row| (row_id(row), stored_physical_locations(row.data.as_deref())))
+        .collect();
+    Ok(load.store(LibrarySet {
+        rows,
+        views,
+        ancestors,
+        options,
+        physical_locations,
+    }))
 }
 
 struct Context<'a> {
