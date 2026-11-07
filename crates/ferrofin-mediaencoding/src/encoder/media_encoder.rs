@@ -685,6 +685,15 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .map_err(MediaEncodingError::process)?;
 
         let data = Self::parse_probe(&output)?;
+        // `GetMediaInfoInternal`: ffprobe prints `{}` when it cannot read its
+        // input, which is a failure, not a file with no streams.
+        if data.streams.is_none() && data.format.is_none() {
+            return Err(MediaEncodingError::process(format!(
+                "ffprobe failed - streams and format are both null: {}",
+                ferrofin_util::source_url::redact_url(input_file)
+            ))
+            .into());
+        }
         let mut info = self.normalizer.get_media_info(
             data,
             source.video_type,
@@ -2931,6 +2940,72 @@ mod tests {
 
         async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
             true
+        }
+    }
+
+    /// A [`Transcoder`] fake whose ffprobe prints `output` and exits non-zero.
+    struct CannedProbe(&'static str);
+
+    #[async_trait]
+    impl Transcoder for CannedProbe {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            _arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            Ok(ProcessOutput {
+                output: self.0.to_owned(),
+                success: false,
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    // `GetMediaInfoInternal` throws when the probe has neither streams nor a
+    // format, which is what ffprobe prints (`{}`) for an input it cannot open;
+    // either one alone is a probe. The error names a `.strm` target by its
+    // host only (gl-1372).
+    #[rstest]
+    #[case::neither("{}", false)]
+    #[case::streams_only(r#"{"streams":[]}"#, true)]
+    #[case::format_only(r#"{"format":{}}"#, true)]
+    #[tokio::test]
+    async fn a_probe_with_neither_streams_nor_format_fails(
+        #[case] output: &'static str,
+        #[case] probed: bool,
+    ) {
+        let enc = MediaEncoderImpl::new(
+            Arc::new(CannedProbe(output)),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig::default(),
+        );
+        let request = MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some(
+                    "http://acct-user:info-secret@tuner.example:8080/live/path-secret/1.ts"
+                        .to_owned(),
+                ),
+                protocol: MediaProtocol::Http,
+                ..MediaSourceInfo::default()
+            },
+            extract_chapters: false,
+            media_is_audio: false,
+        };
+        let result = enc.get_media_info_full(&request).await;
+        assert_eq!(result.is_ok(), probed, "{result:?}");
+        if let Err(e) = result {
+            let message = e.to_string();
+            assert!(message.contains("http://tuner.example:8080"), "{message}");
+            for secret in ["acct-user", "info-secret", "path-secret"] {
+                assert!(!message.contains(secret), "{secret} leaked: {message}");
+            }
         }
     }
 
