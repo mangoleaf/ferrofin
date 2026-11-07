@@ -37684,7 +37684,7 @@ mod tests {
 
     /// A fake encoder whose probe returns a fixed 3s h264+aac source — exercises
     /// the scan's probe→persist path without a real ffmpeg.
-    struct FakeProbe;
+    pub(super) struct FakeProbe;
 
     #[async_trait]
     impl MediaEncoder for FakeProbe {

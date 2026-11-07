@@ -8,9 +8,20 @@
 //! providers) share one listing of it instead of listing it again for every
 //! item.
 //!
-//! - It is a [`FileSystem`]: a listing is memoised, every other call goes to
-//!   the filesystem it wraps. A listing that fails is not memoised, so the
-//!   next reader tries again.
+//! - It is a [`FileSystem`]: a listing is memoised, and every other call but
+//!   `directory_exists` goes to the filesystem it wraps. A listing that
+//!   fails is not memoised, so the next reader tries again.
+//! - [`directory_exists`](FileSystem::directory_exists) says yes for a
+//!   folder it holds a listing of (over a filesystem whose listing fails for
+//!   anything but a directory, as `FerrofinFileSystem`'s does), so the
+//!   readers that ask before they read a folder's listing (the external
+//!   file searches, twice per video) ask nothing of the disk about it. It
+//!   reads the listing's own key, spelled exactly; every no, and every
+//!   other spelling, is the filesystem's. A "no" is never memoised (as
+//!   upstream's `GetFileSystemEntry` memoises only what it found), so a
+//!   folder created since is never hidden; one removed since says yes while
+//!   its listing is held, as that listing still names its files to the
+//!   reader that asked.
 //! - [`relist`](DirectoryCache::relist) lists afresh and memoises what it
 //!   read (upstream's `clearCache: true`). The plan pass lists that way: it
 //!   decides from its listings what exists and what is gone, so it never
@@ -261,7 +272,9 @@ impl FileSystem for DirectoryCache {
     }
 
     fn directory_exists(&self, path: &str) -> bool {
-        self.file_system.directory_exists(path)
+        // Not inline: the lock must not be held across the stat below.
+        let listed = self.state().entries.contains_key(path);
+        listed || self.file_system.directory_exists(path)
     }
 
     fn validate_writable(&self, path: &str) -> Result<(), ServiceError> {
@@ -434,7 +447,9 @@ mod tests {
         assert!(cache.try_get_file_system_entries(&missing).is_err());
         let file_system_entries = cache.get_file_system_entries(&missing);
         assert!(file_system_entries.is_empty(), "{file_system_entries:?}");
+        assert!(!cache.directory_exists(&missing));
         std::fs::create_dir(&missing).unwrap();
+        assert!(cache.directory_exists(&missing), "a no is never memoised");
         assert!(cache.try_get_file_system_entries(&missing).is_ok());
         assert_eq!(fs.listings(), 3);
     }
