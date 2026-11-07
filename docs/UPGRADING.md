@@ -74,6 +74,11 @@ Back up the data directory first, as for any major upgrade.
   rolling update: it writes back Jellyfin's list of the locations it made libraries for, and the new
   pod's next pass can then remove those libraries. Wait until the old pod has gone, or stop it first.
 
+- **Restoring a backup:** a restore now needs free disk for the restored files alongside the ones they
+  replace, for the configuration, library root and any metadata, trickplay and subtitle trees as the
+  database already did. If extraction fails, the server boots on its old data and records the failure
+  in the activity log, where it used to stop.
+
 **If scripts or other API clients use the server**
 
 - `POST /System/Restart` needs an administrator or an API key. An ordinary account gets `403`.
@@ -135,6 +140,9 @@ Back up the data directory first, as for any major upgrade.
 - Trickplay, chapter images and screen-grabbed posters made by earlier versions keep their old
   colours until they are made again. Refresh an item's metadata with **Replace existing trickplay
   images** (or **Replace existing images** for a grabbed poster), or delete its trickplay folder.
+  The first Generate Trickplay Images run after upgrading also remakes every trickplay set wider than
+  320 with a smaller tile grid (`640 - 10x10` becomes `640 - 5x5`), one decode per video at
+  below-normal priority; a server with only 320 selected is not affected.
   After an admin changes the trickplay widths or `FullChroma`, the next Generate Trickplay Images
   run (daily at 3 am) re-decodes every video whose images no longer match: on a large library that
   takes long, is safe to interrupt, and continues on the next run.
@@ -152,6 +160,11 @@ Back up the data directory first, as for any major upgrade.
   from the database at the next scan, and they are not read back.
 
 **After you upgrade**
+
+- The prepared-statement cache (`FERROFIN_DB_STATEMENT_CACHE`, `db_statement_cache`) defaults to 150
+  per connection, new in 1.5.0 (v1.4.1 used 100). With the padded query lists it costs about 6–13 MiB
+  more than 100 on an 8-core server and leaves no re-prepares on a repeat browse. Set it to 100 to
+  match v1.4.1's memory. A value you already set is kept.
 
 - Read the startup log's warnings. Remove `FERROFIN_WS_MIN_STREAM_PERIOD_MS` and
   `websocket_min_stream_period_ms`, which are no longer read, and rename any `config.toml` key the
