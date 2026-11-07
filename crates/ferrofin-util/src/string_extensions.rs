@@ -77,6 +77,17 @@ fn contains_non_conforming_unicode(text: &str) -> bool {
 /// ligatures are folded.
 #[must_use]
 pub fn remove_diacritics(text: &str) -> String {
+    // Every step of the fold is identity on ASCII: only U+FFFD is stripped,
+    // NFD/NFC leave ASCII alone, and no nonspacing mark or ligature key is ASCII.
+    if text.is_ascii() {
+        return text.to_owned();
+    }
+    fold_diacritics(text)
+}
+
+/// The full diacritic fold behind [`remove_diacritics`], without its ASCII
+/// fast path.
+fn fold_diacritics(text: &str) -> String {
     let cleaned = strip_non_conforming_unicode(text);
     let map = ligature_map();
     let mut decomposed = String::with_capacity(cleaned.len());
@@ -409,6 +420,31 @@ mod tests {
     fn remove_diacritics_valid_input_corrects(#[case] input: &str, #[case] expected: &str) {
         let result = remove_diacritics(input);
         assert_eq!(expected, result);
+    }
+
+    /// The ASCII fast path returns exactly what the full fold would: the fold
+    /// leaves every ASCII char alone, all of them together, and the ASCII on
+    /// both sides of a non-ASCII run (which takes the full fold).
+    #[test]
+    fn remove_diacritics_ascii_fast_path_matches_full_fold() {
+        let all_ascii: String = (0u8..=127).map(char::from).collect();
+        for input in all_ascii
+            .chars()
+            .map(String::from)
+            .chain([all_ascii.clone()])
+        {
+            assert_eq!(fold_diacritics(&input), input, "{input:?}");
+            assert_eq!(remove_diacritics(&input), input, "{input:?}");
+        }
+        for mixed in ["é", "e\u{301}", "\u{301}", "œ", "Ø", "ß", "\u{FFFD}", "운"] {
+            let folded = fold_diacritics(mixed);
+            let input = format!("{all_ascii}{mixed}{all_ascii}");
+            assert_eq!(
+                remove_diacritics(&input),
+                format!("{all_ascii}{folded}{all_ascii}"),
+                "{mixed:?}"
+            );
+        }
     }
 
     #[rstest]
