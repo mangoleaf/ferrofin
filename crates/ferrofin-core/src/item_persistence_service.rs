@@ -1067,20 +1067,13 @@ impl FerrofinItemPersistenceService {
     /// Whether the one-shot pass recorded under `key` in `FerrofinMeta` has
     /// already run on this database.
     async fn repair_done(&self, key: &str) -> Result<bool, ServiceError> {
-        let done = self
-            .db
-            .meta_get(key)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?;
+        let done = self.db.meta_get(key).await?;
         Ok(done.as_deref() == Some("1"))
     }
 
     /// Records the one-shot pass under `key` as complete.
     async fn mark_repair_done(&self, key: &str) -> Result<(), ServiceError> {
-        self.db
-            .meta_set(key, "1")
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))
+        Ok(self.db.meta_set(key, "1").await?)
     }
 
     /// One-shot startup pass — the port of Jellyfin 12.0's
@@ -1520,12 +1513,7 @@ impl FerrofinItemPersistenceService {
         if self.repair_done(META_KEY).await? {
             return Ok(0);
         }
-        if self
-            .db
-            .jellyfin_migration_applied(JELLYFIN_ROUTINE)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?
-        {
+        if self.db.jellyfin_migration_applied(JELLYFIN_ROUTINE).await? {
             self.mark_repair_done(META_KEY).await?;
             return Ok(0);
         }

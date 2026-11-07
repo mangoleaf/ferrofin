@@ -9,7 +9,7 @@ use ferrofin_db::store::guid_to_db;
 use sqlx::Row as _;
 use uuid::Uuid;
 
-use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::error::{ServiceError, db_err};
 use ferrofin_traits::stubs::LiveTvChannelQuery;
 
 use crate::projection::{ChannelRow, ChannelUserData, ProgramRow};
@@ -663,11 +663,6 @@ pub async fn channel_stream_source(
             r.get::<String, _>("TunerHostId"),
         )
     }))
-}
-
-/// Maps a `sqlx` error into a [`ServiceError`] via `ferrofin-db`'s `DbError`.
-fn db_err(e: sqlx::Error) -> ServiceError {
-    ServiceError::from(ferrofin_db::DbError::from(e))
 }
 
 /// Seeding helpers for the manager's channel tests (they live here so the raw

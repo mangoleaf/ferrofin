@@ -16184,10 +16184,7 @@ pub(crate) async fn item_ids_by_clean_name(
         for clean in chunk {
             query = query.bind(clean.as_str());
         }
-        let rows = query
-            .fetch_all(db.pool())
-            .await
-            .map_err(|error| ServiceError::backend(error.to_string()))?;
+        let rows = query.fetch_all(db.pool()).await.map_err(db_err)?;
         for (clean, id) in rows {
             if let Ok(uuid) = Uuid::parse_str(&id) {
                 ids.entry(clean).or_insert(uuid);

@@ -1540,11 +1540,7 @@ impl FerrofinDtoService {
                 break;
             }
             let stored: Vec<String> = wanted.iter().copied().map(guid_to_db).collect();
-            let fetched = self
-                .db
-                .image_parent_rows(&stored)
-                .await
-                .map_err(|e| ServiceError::Backend(e.to_string()))?;
+            let fetched = self.db.image_parent_rows(&stored).await?;
             let mut next: Vec<Uuid> = Vec::new();
             for fetched_row in &fetched {
                 let Ok(id) = Uuid::parse_str(&fetched_row.id) else {
@@ -1597,12 +1593,7 @@ impl FerrofinDtoService {
             })
             .collect();
         if !artist_ids.is_empty() {
-            for fetched_row in self
-                .db
-                .image_parent_rows(&artist_ids)
-                .await
-                .map_err(|e| ServiceError::Backend(e.to_string()))?
-            {
+            for fetched_row in self.db.image_parent_rows(&artist_ids).await? {
                 if let Ok(id) = Uuid::parse_str(&fetched_row.id) {
                     graph
                         .rows
@@ -1652,11 +1643,7 @@ impl FerrofinDtoService {
                 })
                 .collect());
         }
-        let rows = self
-            .db
-            .rows_of_type(type_name)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?;
+        let rows = self.db.rows_of_type(type_name).await?;
         Ok(rows
             .into_iter()
             .filter_map(|(id, path, data)| {
@@ -3515,12 +3502,7 @@ impl FerrofinDtoService {
             return Ok(map);
         }
         let stored: Vec<String> = series_ids.iter().copied().map(guid_to_db).collect();
-        for (item_id, data) in self
-            .db
-            .item_data_blobs(&stored)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?
-        {
+        for (item_id, data) in self.db.item_data_blobs(&stored).await? {
             if let Ok(id) = Uuid::parse_str(&item_id)
                 && let Some(order) = crate::item_data::read_data_string(
                     &crate::item_data::parse_data(Some(&data)),
@@ -3548,12 +3530,7 @@ impl FerrofinDtoService {
             return Ok(map);
         }
         let stored: Vec<String> = series_ids.iter().copied().map(guid_to_db).collect();
-        for (item_id, studios) in self
-            .db
-            .item_studios(&stored)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?
-        {
+        for (item_id, studios) in self.db.item_studios(&stored).await? {
             if let Ok(id) = Uuid::parse_str(&item_id) {
                 map.insert(id, studios);
             }
@@ -3578,8 +3555,7 @@ impl FerrofinDtoService {
         Ok(self
             .db
             .item_original_languages(&stored)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?
+            .await?
             .into_iter()
             .filter_map(|(id, language)| Uuid::parse_str(&id).ok().map(|id| (id, language)))
             .collect())
@@ -3603,12 +3579,7 @@ impl FerrofinDtoService {
         // library's collection folder, and calling that an album would send the
         // client somewhere that is not one. The filter lives in the query.
         let stored: Vec<String> = album_ids.iter().copied().map(guid_to_db).collect();
-        for (item_id, name) in self
-            .db
-            .photo_album_names(&stored)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?
-        {
+        for (item_id, name) in self.db.photo_album_names(&stored).await? {
             if let Ok(id) = Uuid::parse_str(&item_id) {
                 map.insert(id, name);
             }
@@ -4577,12 +4548,7 @@ impl FerrofinDtoService {
             count_ids.dedup();
             if !count_ids.is_empty() {
                 let stored: Vec<String> = count_ids.iter().copied().map(guid_to_db).collect();
-                for (primary, count) in self
-                    .db
-                    .alternate_version_counts(&stored)
-                    .await
-                    .map_err(|e| ServiceError::Backend(e.to_string()))?
-                {
+                for (primary, count) in self.db.alternate_version_counts(&stored).await? {
                     if let (Ok(primary), Ok(count)) =
                         (Uuid::parse_str(&primary), usize::try_from(count))
                     {
@@ -4984,8 +4950,7 @@ impl FerrofinDtoService {
         } else {
             self.db
                 .image_parent_rows(&tagged_persons)
-                .await
-                .map_err(|e| ServiceError::Backend(e.to_string()))?
+                .await?
                 .into_iter()
                 .filter_map(|row| {
                     let id = Uuid::parse_str(&row.id).ok()?;
@@ -5384,12 +5349,7 @@ impl FerrofinDtoService {
             .map(|item| guid_to_db(row_id(item)))
             .collect();
         if !playlists.is_empty() {
-            for (playlist, owner) in self
-                .db
-                .playlist_owners(&playlists)
-                .await
-                .map_err(|e| ServiceError::Backend(e.to_string()))?
-            {
+            for (playlist, owner) in self.db.playlist_owners(&playlists).await? {
                 if let (Ok(playlist), Ok(owner)) =
                     (Uuid::parse_str(&playlist), Uuid::parse_str(&owner))
                 {
@@ -5508,12 +5468,7 @@ impl FerrofinDtoService {
         if wanted.is_empty() {
             return Ok(());
         }
-        for fetched in self
-            .db
-            .image_parent_rows(&wanted)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?
-        {
+        for fetched in self.db.image_parent_rows(&wanted).await? {
             if let Ok(id) = Uuid::parse_str(&fetched.id) {
                 rows.insert(id, LibraryHop::from_row(fetched));
             }

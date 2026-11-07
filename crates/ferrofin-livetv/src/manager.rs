@@ -37,7 +37,7 @@ use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::dto::DtoService;
-use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::error::{ServiceError, db_err};
 use ferrofin_traits::library::{RecordingLibrary, SelfWrite, SelfWriteGuard, UserViewManager};
 use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, ItemImageInfo};
@@ -7578,10 +7578,6 @@ fn live_tv_service_key() -> &'static str {
             .simple()
             .to_string()
     })
-}
-
-fn db_err(e: sqlx::Error) -> ServiceError {
-    ServiceError::from(ferrofin_db::DbError::from(e))
 }
 
 #[cfg(test)]
