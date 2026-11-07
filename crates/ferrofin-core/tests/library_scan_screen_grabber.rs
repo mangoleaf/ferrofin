@@ -273,7 +273,8 @@ async fn the_library_checkbox_gates_the_grab() {
     )
     .await;
     off.scanner.scan_all().await.unwrap();
-    assert!(images(&off).await.is_empty());
+    let found = images(&off).await;
+    assert!(found.is_empty(), "{found:?}");
     assert!(off.encoder.grabs.lock().unwrap().is_empty());
 }
 
@@ -298,7 +299,8 @@ async fn a_failed_grab_stores_nothing_and_is_tried_again() {
     let h = harness(LibraryOptions::default(), Some(6_000_000_000)).await;
     h.encoder.fail.store(true, Ordering::SeqCst);
     h.scanner.scan_all().await.unwrap();
-    assert!(images(&h).await.is_empty());
+    let found = images(&h).await;
+    assert!(found.is_empty(), "{found:?}");
     h.scanner.scan_all().await.unwrap();
     assert_eq!(h.encoder.grabs.lock().unwrap().len(), 2);
     h.encoder.fail.store(false, Ordering::SeqCst);
@@ -329,7 +331,8 @@ async fn a_primary_limit_of_zero_grabs_nothing() {
     )
     .await;
     h.scanner.scan_all().await.unwrap();
-    assert!(images(&h).await.is_empty());
+    let found = images(&h).await;
+    assert!(found.is_empty(), "{found:?}");
     assert!(h.encoder.grabs.lock().unwrap().is_empty());
 }
 
@@ -338,7 +341,8 @@ async fn a_primary_limit_of_zero_grabs_nothing() {
 async fn a_file_without_a_video_stream_grabs_nothing() {
     let h = harness_with(LibraryOptions::default(), Some(6_000_000_000), false).await;
     h.scanner.scan_all().await.unwrap();
-    assert!(images(&h).await.is_empty());
+    let found = images(&h).await;
+    assert!(found.is_empty(), "{found:?}");
     assert!(h.encoder.grabs.lock().unwrap().is_empty());
 }
 

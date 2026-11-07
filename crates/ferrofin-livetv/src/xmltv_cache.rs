@@ -64,6 +64,14 @@ impl XmlTvCache {
         }
     }
 
+    /// The directory the cached documents are kept in, where a guide write
+    /// also sets a document's airings aside while it reads them. It may not
+    /// exist yet.
+    #[must_use]
+    pub fn cache_dir(&self) -> PathBuf {
+        self.cache_dir.join(CACHE_SUBDIR)
+    }
+
     /// The cache file for provider `id`. Provider ids are generated as
     /// `Guid.ToString("N")`; anything that is not a GUID is kept out of the
     /// path, as `InvalidateListingsProviderCache` keeps it out.
@@ -105,7 +113,8 @@ impl XmlTvCache {
             return match XmlTvDocument::open(&cache_file).await {
                 Ok(document) => Ok(document),
                 Err(_) => Err(ServiceError::Backend(format!(
-                    "Skipping the XMLTV download after a recent failure: {path}"
+                    "Skipping the XMLTV download after a recent failure: {}",
+                    crate::fetch::redact_url(path)
                 ))),
             };
         }
@@ -121,7 +130,8 @@ impl XmlTvCache {
                 match XmlTvDocument::open(&cache_file).await {
                     Ok(document) => {
                         tracing::warn!(
-                            %path,
+                            listings_provider = info.id.as_deref().unwrap_or_default(),
+                            path = %crate::fetch::redact_url(path),
                             error = %err,
                             "live tv: XMLTV download failed; using the previously downloaded file"
                         );
@@ -229,13 +239,17 @@ impl XmlTvCache {
         let (file, written) = tokio::time::timeout(DOWNLOAD_TIMEOUT, download)
             .await
             .map_err(|_| {
-                ServiceError::Backend(format!("Timed out downloading the XMLTV file from {path}"))
+                ServiceError::Backend(format!(
+                    "Timed out downloading the XMLTV file from {}",
+                    crate::fetch::redact_url(path)
+                ))
             })??;
         // `UnzipIfNeededAndCopy`: an empty document is a failed download, so it
         // never replaces a good cached copy.
         if written == 0 {
             return Err(ServiceError::Backend(format!(
-                "Downloaded XMLTV file is empty: {path}"
+                "Downloaded XMLTV file is empty: {}",
+                crate::fetch::redact_url(path)
             )));
         }
         Ok(XmlTvDocument {
@@ -380,7 +394,7 @@ mod tests {
         );
         let info = ListingsProviderInfo {
             id: Some(uuid::Uuid::new_v4().simple().to_string()),
-            path: Some("http://guide/xmltv.xml".to_owned()),
+            path: Some("http://guide/xmltv.xml?password=query-secret".to_owned()),
             ..ListingsProviderInfo::default()
         };
 
@@ -393,6 +407,7 @@ mod tests {
             matches!(&err, ServiceError::Backend(message) if message.starts_with("Timed out")),
             "{err:?}"
         );
+        assert!(err.to_string().ends_with("from http://guide"), "{err}");
         assert!(matches!(
             cache.get_xml(&info).await,
             Err(ServiceError::Backend(message)) if message.starts_with("Skipping")

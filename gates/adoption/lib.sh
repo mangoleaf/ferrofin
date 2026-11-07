@@ -7,8 +7,30 @@
 
 # Probe answers that legitimately differ between Ferrofin and Jellyfin, or between two boots.
 ADOPTION_IGNORE='/System/Info|/ScheduledTasks|/Plugins|/Devices|/Library/VirtualFolders|/System/ActivityLog|/Sessions'
-# What a boot repair logs when it did something; a second boot must log none of these.
+# What a boot repair logs when it did something; a second boot must log none of these. "rewrote " is
+# also the program-data move's ("rewrote stored paths under a previous program-data directory").
 ADOPTION_REPAIR_RE='imported playlist|repaired |rewrote |recomputed |merged |backfilled |dropped dead|consolidat|reverted'
+# Where Ferrofin boots a fixture Jellyfin wrote in another layout (synthetic.py LAYOUTS): a Debian
+# package's directories, as scripts/migrate-jellyfin.sh copies a Jellyfin package's into them, with the
+# configuration directory apart from the data directory.
+# shellcheck disable=SC2034  # read by run.sh, which sources this file
+ADOPTION_MOVED_DATA=/var/lib/ferrofin
+# shellcheck disable=SC2034
+ADOPTION_MOVED_CONFIG=/etc/ferrofin
+# shellcheck disable=SC2034
+ADOPTION_MOVED_CACHE=/var/cache/ferrofin
+
+# adoption_fixture_layout <fixture dir>: "<program data> <configuration>", the directories Jellyfin wrote
+# the fixture in when they are not its image's /config (its synthetic-ready.json "layout"), or nothing.
+# A layout without both, or one that is not absolute, is a refusal: one line on stderr, status 2.
+adoption_fixture_layout() {
+  local ready=$1/synthetic-ready.json layout
+  [ -f "$ready" ] || return 0
+  layout=$(jq -r '.layout // empty | [.data, .config]
+    | if all(type == "string" and startswith("/") and (contains(" ") | not)) then join(" ") else error("bad") end' \
+    "$ready" 2>/dev/null) || { echo "${1##*/}: synthetic-ready.json has an unreadable layout" >&2; return 2; }
+  [ -z "$layout" ] || printf '%s\n' "$layout"
+}
 
 # adoption_fixtures_dir <who>: the fixtures' directory under the output root (gates/lib.sh), named for
 # what builds the fixtures: the files the synthetic recipe hashes (synthetic.py recipe()), the oracle
@@ -73,7 +95,7 @@ adoption_check_db() {
 }
 
 # adoption_check_messy <jellyfin.db> <fixture copy>: one reason per line for each messy shape
-# (messy.py) whose end state is not what Jellyfin 12.2 left it, or the divergence written down for
+# (messy.py) whose end state is not what the oracle release (messy.ORACLE_RELEASE) left it, or the divergence written down for
 # it. A checker that cannot run is a reason too, never a pass.
 adoption_check_messy() {
   local out rc=0

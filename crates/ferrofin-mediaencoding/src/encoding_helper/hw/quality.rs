@@ -295,7 +295,7 @@ mod tests {
         // ...and with no tonemap at all there is nothing to work around.
         let none = EncodingOptions {
             enable_tonemapping: false,
-            ..ocl.clone()
+            ..ocl
         };
         assert!(!i915_hang_workaround(
             &ctx(&caps, &none, &stream),

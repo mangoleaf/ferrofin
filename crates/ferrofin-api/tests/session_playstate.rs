@@ -24,13 +24,15 @@ use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::{NameIdPair, SessionInfoDto, UpdateUserItemDataDto, UserItemDataDto};
 use ferrofin_model::session::{
-    ClientCapabilities, GeneralCommand, MessageCommand, PlayRequest, PlaybackProgressInfo,
-    PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest, SessionMessageType, SessionUserInfo,
-    TranscodingInfo,
+    ClientCapabilities, GeneralCommand, MessageCommand, PlayMethod, PlayRequest,
+    PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest,
+    SessionMessageType, SessionUserInfo, TranscodingInfo,
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserDataManager, UserManager};
-use ferrofin_traits::media_encoding::{HlsStreamManager, HlsStreamRequest, ServedFile};
+use ferrofin_traits::media_encoding::{
+    HlsStreamManager, HlsStreamRequest, ServedFile, TranscodingJobHandle, TranscodingJobType,
+};
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, InternalItemsQuery, InternalPeopleQuery,
@@ -145,7 +147,7 @@ fn authed_info() -> AuthorizationInfo {
         version: Some("1.0".to_owned()),
         token: Some("token-abc".into()),
         is_api_key: false,
-        user: Some(user_entity(USER_ID, "alice")),
+        user: Some(Arc::new(user_entity(USER_ID, "alice"))),
         user_policy: None,
         is_authenticated: true,
         remote_endpoint: Some("203.0.113.9".to_owned()),
@@ -498,6 +500,9 @@ struct SessionCalls {
     listed: Option<(Option<String>, Option<i32>)>,
     played_starts: usize,
     progress: usize,
+    /// The `PlayMethod` each start and progress report reached the session
+    /// manager with, after `ValidatePlayMethod`.
+    reported_methods: Vec<PlayMethod>,
     stops: usize,
     general_command: Option<GeneralCommand>,
     play: Option<PlayRequest>,
@@ -560,16 +565,20 @@ impl SessionManager for RecordingSessions {
             .push(user.map(|user| user.id.clone()));
         Ok(current_session_dto(self.with_guest))
     }
-    async fn on_playback_start(&self, _i: &PlaybackStartInfo) -> Result<(), ServiceError> {
-        self.calls.lock().unwrap().played_starts += 1;
+    async fn on_playback_start(&self, i: &PlaybackStartInfo) -> Result<(), ServiceError> {
+        let mut calls = self.calls.lock().unwrap();
+        calls.played_starts += 1;
+        calls.reported_methods.push(i.play_method);
         Ok(())
     }
     async fn on_playback_progress(
         &self,
-        _i: &PlaybackProgressInfo,
+        i: &PlaybackProgressInfo,
         _a: bool,
     ) -> Result<(), ServiceError> {
-        self.calls.lock().unwrap().progress += 1;
+        let mut calls = self.calls.lock().unwrap();
+        calls.progress += 1;
+        calls.reported_methods.push(i.play_method);
         Ok(())
     }
     async fn on_playback_stopped(&self, _i: &PlaybackStopInfo) -> Result<(), ServiceError> {
@@ -802,6 +811,8 @@ struct RecordingHls {
     pings: Mutex<Vec<(String, Option<bool>)>>,
     /// Every `stop_encoding` call: `(device_id, play_session_id)`.
     stops: Mutex<Vec<(Option<String>, Option<String>)>>,
+    /// The play sessions a transcoding job runs for.
+    jobs: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -858,6 +869,24 @@ impl HlsStreamManager for RecordingHls {
             .unwrap()
             .push((play_session_id.to_owned(), is_user_paused));
         Ok(())
+    }
+    async fn get_transcoding_job(
+        &self,
+        play_session_id: &str,
+    ) -> Result<Option<TranscodingJobHandle>, ServiceError> {
+        Ok(self
+            .jobs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|job| job == play_session_id)
+            .then(|| TranscodingJobHandle {
+                play_session_id: Some(play_session_id.to_owned()),
+                path: "/cache/job.m3u8".to_owned(),
+                job_type: TranscodingJobType::Hls,
+                device_id: None,
+                live_stream_id: None,
+            }))
     }
 }
 
@@ -1132,7 +1161,7 @@ impl PolicyAuth {
         let mut user = user_entity(USER_ID, "alice");
         user.sync_play_access = self.access;
         AuthorizationInfo {
-            user: (!self.api_key).then_some(user),
+            user: (!self.api_key).then_some(Arc::new(user)),
             is_api_key: self.api_key,
             user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
                 is_administrator: self.admin,
@@ -1685,6 +1714,59 @@ async fn ping_playback_session_is_204() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
+/// `PlaystateController.ValidatePlayMethod`: a `Transcode` report stays one
+/// only while a transcoding job runs for its play session, on the four routes
+/// that call it; without one it becomes `DirectPlay`.
+#[tokio::test]
+async fn a_transcode_report_stays_one_only_while_its_play_session_transcodes() {
+    use PlayMethod::{DirectPlay, DirectStream, Transcode};
+
+    let (sessions, user_data) = recording();
+    let hls = Arc::new(RecordingHls::default());
+    hls.jobs.lock().unwrap().push("transcoding".to_owned());
+    let app = state_with_hls(sessions.clone(), user_data, hls);
+    for uri in ["/Sessions/Playing", "/Sessions/Playing/Progress"] {
+        for play_session_id in [Some("transcoding"), Some("idle"), None] {
+            let info = PlaybackProgressInfo {
+                item_id: ITEM_ID,
+                play_method: PlayMethod::Transcode,
+                play_session_id: play_session_id.map(str::to_owned),
+                ..PlaybackProgressInfo::default()
+            };
+            let (status, _) = send(
+                app.clone(),
+                "POST",
+                uri,
+                Body::from(serde_json::to_vec(&info).unwrap()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{uri}");
+        }
+    }
+    for uri in [
+        format!("/PlayingItems/{ITEM_ID}?playMethod=Transcode&playSessionId=transcoding"),
+        format!("/PlayingItems/{ITEM_ID}/Progress?playMethod=Transcode&playSessionId=idle"),
+        format!("/PlayingItems/{ITEM_ID}?playMethod=DirectStream&playSessionId=idle"),
+    ] {
+        let (status, _) = send(app.clone(), "POST", &uri, Body::empty()).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{uri}");
+    }
+    assert_eq!(
+        sessions.calls.lock().unwrap().reported_methods,
+        vec![
+            Transcode,
+            DirectPlay,
+            DirectPlay,
+            Transcode,
+            DirectPlay,
+            DirectPlay,
+            Transcode,
+            DirectPlay,
+            DirectStream,
+        ]
+    );
+}
+
 #[tokio::test]
 async fn obsolete_playing_items_start_is_204() {
     let (sessions, user_data) = recording();
@@ -1932,6 +2014,36 @@ async fn report_viewing_uses_current_session_when_absent() {
         .expect("viewing");
     assert_eq!(session, SESSION_ID);
     assert_eq!(item, ITEM_ID.to_string());
+}
+
+/// `ReportViewing`'s `[FromQuery, Required] string? itemId` fails model
+/// validation, a 400, before the action runs, whatever session it names; and
+/// a blank `sessionId` binds as null (`ConvertEmptyStringToNull`), so the
+/// caller's own session is the one viewing.
+#[tokio::test]
+async fn report_viewing_wants_an_item_first_and_reads_a_blank_session_as_the_callers() {
+    let (sessions, user_data) = recording();
+    let app = state(sessions.clone(), user_data);
+    for uri in [
+        "/Sessions/Viewing?sessionId=forbidden-session",
+        "/Sessions/Viewing?sessionId=forbidden-session&itemId=%20",
+    ] {
+        let (status, _) = send(app.clone(), "POST", uri, Body::empty()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+    let (status, _) = send(
+        app,
+        "POST",
+        &format!("/Sessions/Viewing?sessionId=%20&itemId={ITEM_ID}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let viewing = sessions.calls.lock().unwrap().now_viewing.clone();
+    assert_eq!(
+        viewing.map(|(session, _)| session).as_deref(),
+        Some(SESSION_ID)
+    );
 }
 
 #[tokio::test]

@@ -156,7 +156,7 @@ async fn instant_mix_from_item(
     let user = resolve_user_opt(state, auth, query.user_id).await?;
     let entity = state
         .library
-        .get_item_by_id_for_user(item_id, user.as_ref())
+        .get_item_by_id_for_user(item_id, user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     if let Some(kind) = require_kind
@@ -170,7 +170,7 @@ async fn instant_mix_from_item(
         .music
         .get_instant_mix_from_item(item_id, user_uuid, &options)
         .await?;
-    build_result(state, items, user.as_ref(), query.limit, &options).await
+    build_result(state, items, user.as_deref(), query.limit, &options).await
 }
 
 /// `GET /Songs/{itemId}/InstantMix`.
@@ -301,7 +301,7 @@ async fn from_music_genre_name(
         .music
         .get_instant_mix_from_genres(&[name], user_uuid, &options)
         .await?;
-    build_result(&state, items, user.as_ref(), query.limit, &options).await
+    build_result(&state, items, user.as_deref(), query.limit, &options).await
 }
 
 /// `GET /Artists/InstantMix` — the obsolete `?id=` artist variant.

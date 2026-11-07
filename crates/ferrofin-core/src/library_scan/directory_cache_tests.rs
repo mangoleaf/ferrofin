@@ -1,6 +1,7 @@
 //! How a scan keeps its run's directory listings ([`DirectoryCache`])
 //! current where it writes: the artwork it saves into a media folder, and
-//! the item refreshes it serves between its items.
+//! the item refreshes it serves between its items; and how its readers ask
+//! a listed folder's existence of the listing.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -11,26 +12,42 @@ use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::{CollectionTypeOptions, ImageType};
 use ferrofin_model::io::FileSystemEntryInfo;
+use ferrofin_naming::common::NamingOptions;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::filesystem::{FileMetadata, FileSystem};
 use ferrofin_traits::library::{ScanTarget, VirtualFolderManager};
 use ferrofin_traits::options::ItemImageInfo;
-use ferrofin_traits::persistence::ItemRepository;
+use ferrofin_traits::persistence::{ItemRepository, StoredItemLinks};
 
+use super::tests::FakeProbe;
 use super::{
-    DirectoryCache, DirectoryCacheLimits, LaneRefresh, LibraryScanner, PriorityLane, ScanCancel,
-    ScanOutcome, ScanPasses, ScanRun,
+    DirectoryCache, DirectoryCacheLimits, ExternalProbeSeam, LaneRefresh, LibraryScanner, Planned,
+    PriorityLane, ScanCancel, ScanOutcome, ScanPasses, ScanRun, sidecars_changed,
 };
 use crate::file_system::FerrofinFileSystem;
 use crate::item_persistence_service::FerrofinItemPersistenceService;
 use crate::item_repository::FerrofinItemRepository;
 use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
+use crate::localization_manager::LocalizationManager;
+use crate::media_info_resolver::ExternalStreamResolvers;
 use crate::virtual_folder_manager::FerrofinVirtualFolderManager;
 
-/// The real filesystem, counting the listings of one directory.
+/// The real filesystem, counting the listings of one directory and the
+/// times it is asked whether that directory, in any spelling, exists.
 struct Counting {
     dir: String,
     listings: AtomicUsize,
+    stats: AtomicUsize,
+}
+
+impl Counting {
+    fn new(dir: &str) -> Self {
+        Self {
+            dir: dir.to_owned(),
+            listings: AtomicUsize::new(0),
+            stats: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl FileSystem for Counting {
@@ -53,6 +70,9 @@ impl FileSystem for Counting {
         Path::new(path).is_file()
     }
     fn directory_exists(&self, path: &str) -> bool {
+        if path.eq_ignore_ascii_case(&self.dir) {
+            self.stats.fetch_add(1, Ordering::SeqCst);
+        }
         Path::new(path).is_dir()
     }
     fn validate_writable(&self, _path: &str) -> Result<(), ServiceError> {
@@ -90,10 +110,7 @@ impl PriorityLane for OneRefresh {
 async fn a_refresh_the_run_serves_clears_its_listings() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().to_string_lossy().into_owned();
-    let fs = Arc::new(Counting {
-        dir: dir.clone(),
-        listings: AtomicUsize::new(0),
-    });
+    let fs = Arc::new(Counting::new(&dir));
     let db = crate::test_support::test_db().await;
     let persistence = Arc::new(FerrofinItemPersistenceService::new(db));
     let vf: Arc<dyn VirtualFolderManager> =
@@ -224,4 +241,77 @@ async fn artwork_saved_into_a_media_folder_lands_in_the_runs_listing() {
         .map(|entry| entry.path)
         .collect();
     assert!(listed.contains(&images[0].path), "{listed:?}");
+}
+
+/// The plan's sidecar check (`ProbeProvider.HasChanged`) asks whether a
+/// video's folder exists before its subtitle search and again before its
+/// audio search read the folder's files. A folder the run listed is
+/// answered from that listing; once a write forgets the listing, the
+/// filesystem answers again, so a sidecar added or a folder removed since
+/// is seen.
+#[test]
+fn the_sidecar_check_asks_a_listed_folders_existence_of_its_listing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("Heat (1995)");
+    std::fs::create_dir(&folder).unwrap();
+    let video = folder.join("Heat (1995).mkv");
+    let subtitle = folder.join("Heat (1995).en.srt");
+    std::fs::write(&video, b"video").unwrap();
+    std::fs::write(&subtitle, b"1").unwrap();
+    let dir = folder.to_string_lossy().into_owned();
+    let fs = Arc::new(Counting::new(&dir));
+    let dirs = Arc::new(DirectoryCache::new(
+        fs.clone(),
+        DirectoryCacheLimits::default(),
+    ));
+    let seam = ExternalProbeSeam {
+        resolvers: Arc::new(ExternalStreamResolvers::new(
+            Arc::new(NamingOptions::new()),
+            Arc::new(LocalizationManager::new("")),
+            Arc::new(FakeProbe),
+            dirs.clone(),
+        )),
+        metadata_dir: Some(tmp.path().join("metadata").into()),
+        dirs: Some(Arc::clone(&dirs)),
+    };
+    let item = Planned {
+        id: uuid::Uuid::new_v4(),
+        entity: BaseItemEntity {
+            path: Some(video.to_string_lossy().into_owned()),
+            ..Default::default()
+        }
+        .into(),
+        ancestors: Vec::new(),
+        generated_names: Vec::new(),
+    };
+    let links = StoredItemLinks {
+        external_subtitles: vec![subtitle.to_string_lossy().into_owned()],
+        ..StoredItemLinks::default()
+    };
+    let stats = || fs.stats.load(Ordering::SeqCst);
+    let listings = || fs.listings.load(Ordering::SeqCst);
+    // The plan pass lists the folder.
+    dirs.relist(&dir).unwrap();
+
+    assert!(!sidecars_changed(&seam, &item, Some(&links)));
+    assert_eq!((stats(), listings()), (0, 1), "answered from the listing");
+    // Only the spelling listed: another is the filesystem's to answer (a
+    // case-insensitive mount says yes to it itself).
+    dirs.directory_exists(&dir.replace("Heat", "heat"));
+    assert_eq!(stats(), 1, "asked of the filesystem");
+
+    // A sidecar saved beside the video forgets the folder's listing: the
+    // first search asks the filesystem and lists it, the second reads that.
+    let commentary = folder.join("Heat (1995).commentary.mka");
+    std::fs::write(&commentary, b"1").unwrap();
+    dirs.invalidate(&commentary.to_string_lossy());
+    assert!(sidecars_changed(&seam, &item, Some(&links)), "the new one");
+    assert_eq!((stats(), listings()), (2, 2));
+
+    // A folder removed, once forgotten, is gone: no listing says it is there.
+    std::fs::remove_dir_all(&folder).unwrap();
+    dirs.invalidate(&dir);
+    let links = StoredItemLinks::default();
+    assert!(!sidecars_changed(&seam, &item, Some(&links)), "none left");
+    assert_eq!((stats(), listings()), (4, 2), "both searches asked");
 }

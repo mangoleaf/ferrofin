@@ -596,7 +596,8 @@ mod tests {
             parse_pipe_strings(Some("Action | Sci-Fi |")),
             vec!["Action".to_owned(), "Sci-Fi".to_owned()]
         );
-        assert!(parse_pipe_strings(None).is_empty());
+        let found = parse_pipe_strings(None);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `locationTypes`/`excludeLocationTypes` are the ONLY things that set

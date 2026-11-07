@@ -7,15 +7,17 @@
 //! part that matters at a trust boundary — **revocation-correct**: the
 //! composition root shares ONE instance between the authorization context
 //! (read-through) and the user/device managers, which [`AuthCache::clear`] it
-//! on every auth-relevant mutation (device delete or update, user
-//! update/delete, password/policy/configuration change; a device's options,
-//! its custom name, are not cached and clear nothing). Clearing wholesale
-//! instead of per-entry keeps the invalidation story impossible to get wrong;
-//! the price is one 2-query re-read per live token afterwards. The one
-//! exception is a login attempt that does not lock the account out: it writes
-//! only that user's row, so it drops only that user's entries
+//! on every auth-relevant mutation (device update, user update/delete,
+//! password/policy/configuration change; a device's options, its custom name,
+//! are not cached and clear nothing). Clearing wholesale instead of per-entry
+//! keeps the invalidation story impossible to get wrong; the price is one
+//! 2-query re-read per live token afterwards. Two writes are narrow enough to
+//! drop less: a login attempt that does not lock the account out writes only
+//! that user's row, so it drops only that user's entries
 //! ([`AuthCache::invalidate_user`]), and wrong passwords for one account
-//! cannot keep every other user's cache cold.
+//! cannot keep every other user's cache cold; a device delete (logout, or a
+//! returning device's login replacing its row) removes one token, so it drops
+//! only that token ([`AuthCache::invalidate_token`]).
 //!
 //! The TTL bounds staleness for anything that *isn't* hooked (e.g. a row
 //! edited by hand in the DB); it is deliberately short. A revoked token never
@@ -28,6 +30,18 @@
 //! ([`AuthCache::generation`], captured before its database read) and a write
 //! whose generation is stale is dropped instead of resurrecting a revoked
 //! token for a whole TTL.
+//!
+//! Tokens that match no device are cached too, in their own map: an API
+//! key's resolution (its name: Sonarr, Jellyseerr and scripts poll with one)
+//! and a token that matched nothing, so neither pays the device miss plus the
+//! `ApiKeys` read on every request. The same contract keeps them correct: an
+//! API key's create and delete and a device's create drop that token
+//! ([`AuthCache::invalidate_token`]), a clear drops them all, and writes carry
+//! the generation. That map is keyed by the token's SHA-256, not the token: a
+//! request chooses that string, and a made-up one of any length must not grow
+//! the cache past 32 bytes an entry. It has its own cap, so a flood of made-up
+//! tokens drops only it (API keys included, which then pay one read again),
+//! never the device resolutions.
 //!
 //! The cache also holds the assembled [`UserDto`] per user (the other half of
 //! Jellyfin's in-memory `UserManager`): building it costs two more round-trips
@@ -47,10 +61,12 @@ use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::UserDto;
 use ferrofin_model::users::UserPolicy;
+use sha2::{Digest as _, Sha256};
+use uuid::Uuid;
 
 type TokenResolution = (
     Arc<DeviceEntity>,
-    Option<UserEntity>,
+    Option<Arc<UserEntity>>,
     Option<Arc<UserPolicy>>,
 );
 
@@ -63,10 +79,11 @@ type TokenResolution = (
 /// `auth_cache_ttl_secs` setting (`FERROFIN_AUTH_CACHE_TTL_SECS`) overrides it.
 pub const AUTH_CACHE_TTL: Duration = Duration::from_secs(30);
 
-/// Hard entry cap — a runaway bound, not a working-set tuner. Tokens are one
-/// per device row, so a real server sits orders of magnitude below this; if
-/// something floods distinct tokens the whole map is dropped rather than
-/// growing without bound.
+/// Hard entry cap of each token map — a runaway bound, not a working-set
+/// tuner. Device tokens are one per device row, so a real server sits orders of
+/// magnitude below this; if something floods distinct tokens (made-up ones land
+/// in the non-device map) that whole map is dropped rather than growing without
+/// bound.
 const AUTH_CACHE_MAX_ENTRIES: usize = 4096;
 
 /// One cached token resolution.
@@ -78,8 +95,24 @@ const AUTH_CACHE_MAX_ENTRIES: usize = 4096;
 #[derive(Debug, Clone)]
 struct CachedAuth {
     device: Arc<DeviceEntity>,
-    user: Option<UserEntity>,
+    user: Option<Arc<UserEntity>>,
     policy: Option<Arc<UserPolicy>>,
+    cached_at: Instant,
+}
+
+/// The SHA-256 of an access token: the [`AuthCache`] non-device map's key.
+type TokenDigest = [u8; 32];
+
+/// The fixed-size key a token is cached under in the non-device map.
+fn token_digest(token: &str) -> TokenDigest {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+/// One cached outcome for a token that matched no device row.
+#[derive(Debug, Clone)]
+struct CachedNonDevice {
+    /// The matching API key's name, or `None` when the token matched nothing.
+    api_key_name: Option<String>,
     cached_at: Instant,
 }
 
@@ -97,12 +130,14 @@ struct CachedUserDto {
 #[derive(Debug)]
 pub struct AuthCache {
     ttl: Duration,
-    /// Bumped by [`AuthCache::clear`] and [`AuthCache::invalidate_user`] before
-    /// they touch the maps. A `put` whose
+    /// Bumped by [`AuthCache::clear`], [`AuthCache::invalidate_user`] and
+    /// [`AuthCache::invalidate_token`] before they touch the maps. A `put` whose
     /// caller-captured generation no longer matches is dropped — see the module
     /// docs for why a read-through cache needs this on top of the clear.
     generation: AtomicU64,
     entries: RwLock<HashMap<String, CachedAuth>>,
+    /// Keyed by [`token_digest`]; see the module docs.
+    non_device: RwLock<HashMap<TokenDigest, CachedNonDevice>>,
     user_dtos: RwLock<HashMap<String, CachedUserDto>>,
 }
 
@@ -120,6 +155,7 @@ impl AuthCache {
             ttl,
             generation: AtomicU64::new(0),
             entries: RwLock::new(HashMap::new()),
+            non_device: RwLock::new(HashMap::new()),
             user_dtos: RwLock::new(HashMap::new()),
         }
     }
@@ -127,10 +163,10 @@ impl AuthCache {
     /// The cache's current generation.
     ///
     /// A read-through caller captures this **before** the database read it is
-    /// about to cache, and hands it back to [`AuthCache::put`] /
-    /// [`AuthCache::put_user_dto`]. Anything cleared in between makes the write
-    /// a no-op, so a revocation can never be undone by a request that was
-    /// already in flight when it landed.
+    /// about to cache, and hands it back to [`AuthCache::put`],
+    /// [`AuthCache::put_non_device`] or [`AuthCache::put_user_dto`]. Anything
+    /// cleared in between makes the write a no-op, so a revocation can never be
+    /// undone by a request that was already in flight when it landed.
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
@@ -148,12 +184,9 @@ impl AuthCache {
 
     /// The cached resolution for `token`, if present and fresher than the TTL.
     ///
-    /// The device row comes back as a shared [`Arc`] (callers only read it), so
-    /// a hit costs one refcount bump rather than a deep copy of every column.
-    /// The user entity is still cloned because [`AuthorizationInfo`] owns it
-    /// outright.
-    ///
-    /// [`AuthorizationInfo`]: ferrofin_traits::options::AuthorizationInfo
+    /// The device row, the user row and the policy come back as shared
+    /// [`Arc`]s (callers only read them), so a hit costs refcount bumps rather
+    /// than a deep copy of every column.
     #[must_use]
     pub fn get(&self, token: &str) -> Option<TokenResolution> {
         let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
@@ -175,7 +208,7 @@ impl AuthCache {
         generation: u64,
         token: &str,
         device: DeviceEntity,
-        user: Option<UserEntity>,
+        user: Option<Arc<UserEntity>>,
         policy: Option<Arc<UserPolicy>>,
     ) {
         let mut entries = self.entries.write().unwrap_or_else(PoisonError::into_inner);
@@ -196,11 +229,79 @@ impl AuthCache {
         );
     }
 
+    /// The cached outcome for a token that matched no device row, if fresher
+    /// than the TTL: `Some(Some(name))` for the API key named `name`,
+    /// `Some(None)` for a token that matched nothing, `None` for a miss.
+    #[must_use]
+    pub fn get_non_device(&self, token: &str) -> Option<Option<String>> {
+        let entries = self
+            .non_device
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        let hit = entries.get(&token_digest(token))?;
+        if hit.cached_at.elapsed() > self.ttl {
+            return None;
+        }
+        Some(hit.api_key_name.clone())
+    }
+
+    /// Caches the outcome for a token that matched no device row (the API
+    /// key's name, or `None` for no match), unless the cache was cleared or a
+    /// token invalidated since `generation` was captured.
+    pub fn put_non_device(&self, generation: u64, token: &str, api_key_name: Option<String>) {
+        let key = token_digest(token);
+        let mut entries = self
+            .non_device
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !self.is_current(generation) {
+            return;
+        }
+        if entries.len() >= AUTH_CACHE_MAX_ENTRIES {
+            entries.clear();
+        }
+        entries.insert(
+            key,
+            CachedNonDevice {
+                api_key_name,
+                cached_at: Instant::now(),
+            },
+        );
+    }
+
     /// The cached [`UserDto`] for `entity`'s user, if present, fresher than the
     /// TTL, and built from an identical entity (a row that changed since —
     /// login stamp, rename, config column — misses and is rebuilt).
     #[must_use]
     pub fn get_user_dto(&self, entity: &UserEntity) -> Option<UserDto> {
+        self.read_user_dto(entity, UserDto::clone)
+    }
+
+    /// The `LatestItemsExcludes` list of the cached [`UserDto`] for `entity`'s
+    /// user, under the same freshness and entity checks as
+    /// [`AuthCache::get_user_dto`], copying only that list.
+    #[must_use]
+    pub fn latest_items_excludes(&self, entity: &UserEntity) -> Option<Vec<Uuid>> {
+        self.read_user_dto(entity, |dto| {
+            dto.configuration
+                .as_ref()
+                .map(|c| c.latest_items_excludes.clone())
+                .unwrap_or_default()
+        })
+    }
+
+    /// The `PrimaryImageTag` of the cached [`UserDto`] for `entity`'s user,
+    /// under the same freshness and entity checks as
+    /// [`AuthCache::get_user_dto`]: `Some(None)` for a cached user with no
+    /// profile image, `None` for a miss.
+    #[must_use]
+    pub fn primary_image_tag(&self, entity: &UserEntity) -> Option<Option<String>> {
+        self.read_user_dto(entity, |dto| dto.primary_image_tag.clone())
+    }
+
+    /// Applies `read` to the cached [`UserDto`] for `entity`'s user, if it is
+    /// fresher than the TTL and was built from an identical entity.
+    fn read_user_dto<T>(&self, entity: &UserEntity, read: impl FnOnce(&UserDto) -> T) -> Option<T> {
         let dtos = self
             .user_dtos
             .read()
@@ -209,7 +310,7 @@ impl AuthCache {
         if hit.cached_at.elapsed() > self.ttl || hit.entity != *entity {
             return None;
         }
-        Some(hit.dto.clone())
+        Some(read(&hit.dto))
     }
 
     /// Caches a user's assembled DTO alongside the entity it was built from,
@@ -249,6 +350,10 @@ impl AuthCache {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.non_device
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         self.user_dtos
             .write()
             .unwrap_or_else(PoisonError::into_inner)
@@ -277,6 +382,28 @@ impl AuthCache {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|id, _| !id.eq_ignore_ascii_case(user_id));
+    }
+
+    /// Drops the cached resolution of `token` alone, leaving every other
+    /// token's in place.
+    ///
+    /// For a write that changes that one token (a device row deleted at logout
+    /// or at a returning device's login, a device or an API key created, an
+    /// API key deleted), where [`clear`](Self::clear) would
+    /// send every live token back to the database. The generation is bumped
+    /// first, as a clear bumps it, so a read of this token taken before the
+    /// write cannot be stored after it; the price is that the other in-flight
+    /// reads skip storing their result once.
+    pub fn invalidate_token(&self, token: &str) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.entries
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(token);
+        self.non_device
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&token_digest(token));
     }
 
     /// The number of live entries (TTL-expired entries included until evicted).
@@ -322,6 +449,62 @@ mod tests {
         assert_eq!(AUTH_CACHE_TTL, ferrofin_db::row_cache::ROW_CACHE_TTL);
     }
 
+    /// A non-device outcome expires with the TTL, and one read before an
+    /// invalidation of its token (or a clear) is never stored after it.
+    #[test]
+    fn non_device_outcomes_expire_and_lose_to_an_invalidation() {
+        let cache = AuthCache::new(Duration::from_millis(30));
+        cache.put_non_device(cache.generation(), "key", Some("sonarr".into()));
+        cache.put_non_device(cache.generation(), "bogus", None);
+        assert_eq!(cache.get_non_device("key"), Some(Some("sonarr".into())));
+        assert_eq!(cache.get_non_device("bogus"), Some(None));
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(cache.get_non_device("key"), None, "expired entry misses");
+
+        let cache = AuthCache::default();
+        let in_flight = cache.generation();
+        cache.invalidate_token("new");
+        cache.put_non_device(in_flight, "new", None);
+        assert_eq!(
+            cache.get_non_device("new"),
+            None,
+            "the stale write is dropped"
+        );
+        cache.put_non_device(cache.generation(), "gone", Some("k".into()));
+        cache.clear();
+        assert_eq!(cache.get_non_device("gone"), None, "a clear drops them");
+
+        // A made-up token of any length is held by its 32-byte digest.
+        let long = "x".repeat(1 << 20);
+        cache.put_non_device(cache.generation(), &long, None);
+        assert_eq!(cache.get_non_device(&long), Some(None));
+        assert_eq!(
+            cache.get_non_device(&long[1..]),
+            None,
+            "another token misses"
+        );
+        cache.invalidate_token(&long);
+        assert_eq!(cache.get_non_device(&long), None);
+    }
+
+    /// A flood of made-up tokens is bounded by the cap and leaves the device
+    /// resolutions in place.
+    #[test]
+    fn a_flood_of_unknown_tokens_is_bounded_and_spares_device_tokens() {
+        let cache = AuthCache::default();
+        cache.put(cache.generation(), "dev", device("dev"), None, None);
+        for i in 0..=AUTH_CACHE_MAX_ENTRIES {
+            cache.put_non_device(cache.generation(), &format!("bogus-{i}"), None);
+        }
+        let held = cache
+            .non_device
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        assert!(held <= AUTH_CACHE_MAX_ENTRIES, "{held}");
+        assert!(cache.get("dev").is_some());
+    }
+
     #[test]
     fn hit_within_ttl_miss_after_expiry() {
         let cache = AuthCache::new(Duration::from_millis(30));
@@ -329,6 +512,71 @@ mod tests {
         assert!(cache.get("tok").is_some(), "fresh entry hits");
         std::thread::sleep(Duration::from_millis(40));
         assert!(cache.get("tok").is_none(), "expired entry misses");
+    }
+
+    /// The `LatestItemsExcludes` read serves only a DTO `get_user_dto` would:
+    /// one within the TTL, built from the same entity.
+    #[tokio::test]
+    async fn the_latest_excludes_read_misses_when_get_user_dto_would() {
+        let db = crate::test_support::test_db().await;
+        let entity = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x60)).await;
+        let excluded = vec![uuid::Uuid::from_u128(0xe1)];
+        let dto = UserDto {
+            configuration: Some(ferrofin_model::configuration::UserConfiguration {
+                latest_items_excludes: excluded.clone(),
+                ..Default::default()
+            }),
+            ..UserDto::default()
+        };
+        let cache = AuthCache::new(Duration::from_millis(30));
+        cache.put_user_dto(cache.generation(), &entity, dto);
+
+        assert_eq!(cache.latest_items_excludes(&entity), Some(excluded));
+        let mut changed = entity.clone();
+        changed.username.push('2');
+        assert!(
+            cache.latest_items_excludes(&changed).is_none(),
+            "a row that changed since misses"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            cache.latest_items_excludes(&entity).is_none(),
+            "an expired entry misses"
+        );
+    }
+
+    /// The `PrimaryImageTag` read serves the cached DTO's tag, a cached user
+    /// with no image included, and misses exactly when `get_user_dto` would.
+    #[tokio::test]
+    async fn the_primary_image_tag_read_misses_when_get_user_dto_would() {
+        let db = crate::test_support::test_db().await;
+        let entity = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x61)).await;
+        let cache = AuthCache::new(Duration::from_millis(30));
+        assert_eq!(cache.primary_image_tag(&entity), None, "nothing cached");
+        cache.put_user_dto(cache.generation(), &entity, UserDto::default());
+        assert_eq!(cache.primary_image_tag(&entity), Some(None), "no image");
+        let dto = UserDto {
+            primary_image_tag: Some("tag".to_owned()),
+            ..UserDto::default()
+        };
+        cache.put_user_dto(cache.generation(), &entity, dto);
+        assert_eq!(
+            cache.primary_image_tag(&entity),
+            Some(Some("tag".to_owned()))
+        );
+        let mut changed = entity.clone();
+        changed.username.push('2');
+        assert_eq!(
+            cache.primary_image_tag(&changed),
+            None,
+            "a changed row misses"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(
+            cache.primary_image_tag(&entity),
+            None,
+            "an expired entry misses"
+        );
     }
 
     /// Finding #3: a hit must hand out a shared handle to the device row, not a
@@ -352,6 +600,31 @@ mod tests {
             "no per-hit String reallocation"
         );
         assert_eq!(first.access_token, "tok", "the shared row is the right one");
+    }
+
+    /// The user row is shared the same way: every request that hits the cache
+    /// reads it, and a deep copy costs one allocation per `String` column.
+    #[tokio::test]
+    async fn hits_share_the_user_row_instead_of_deep_copying_it() {
+        let db = crate::test_support::test_db().await;
+        let entity = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x5f)).await;
+        let cache = AuthCache::default();
+        cache.put(
+            cache.generation(),
+            "tok",
+            device("tok"),
+            Some(Arc::new(entity.clone())),
+            None,
+        );
+
+        let (_, first, _) = cache.get("tok").expect("first hit");
+        let (_, second, _) = cache.get("tok").expect("second hit");
+        let (first, second) = (first.expect("user"), second.expect("user"));
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "both hits point at the one cached user row"
+        );
+        assert_eq!(*first, entity, "the shared row is the right one");
     }
 
     #[test]
@@ -421,14 +694,14 @@ mod tests {
             generation,
             "tried",
             device("tried"),
-            Some(tried.clone()),
+            Some(Arc::new(tried.clone())),
             None,
         );
         cache.put(
             generation,
             "other",
             device("other"),
-            Some(other.clone()),
+            Some(Arc::new(other.clone())),
             None,
         );
         cache.put(generation, "api-key", device("api-key"), None, None);
@@ -437,7 +710,13 @@ mod tests {
 
         let in_flight = cache.generation();
         cache.invalidate_user(&tried.id.to_ascii_lowercase());
-        cache.put(in_flight, "late", device("late"), Some(other.clone()), None);
+        cache.put(
+            in_flight,
+            "late",
+            device("late"),
+            Some(Arc::new(other.clone())),
+            None,
+        );
 
         assert!(cache.get("tried").is_none());
         assert!(cache.get_user_dto(&tried).is_none());

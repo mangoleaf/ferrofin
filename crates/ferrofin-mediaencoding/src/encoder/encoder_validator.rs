@@ -603,7 +603,8 @@ mod tests {
              \x20... alphasrc          |->V       Provide an alpha channel source.\n";
         let filters = EncoderValidator::get_filters_internal(output);
         assert_eq!(filters, ["tonemapx", "scale_cuda", "alphasrc"]);
-        assert!(EncoderValidator::get_filters_internal("").is_empty());
+        let filters = EncoderValidator::get_filters_internal("");
+        assert!(filters.is_empty(), "{filters:?}");
     }
 
     #[test]
@@ -630,8 +631,10 @@ mod tests {
             EncoderValidator::get_decoders_internal(output),
             ["aac", "h264_cuvid"]
         );
-        assert!(EncoderValidator::get_encoders_internal("").is_empty());
-        assert!(EncoderValidator::get_decoders_internal("").is_empty());
+        let encoders = EncoderValidator::get_encoders_internal("");
+        assert!(encoders.is_empty(), "{encoders:?}");
+        let decoders = EncoderValidator::get_decoders_internal("");
+        assert!(decoders.is_empty(), "{decoders:?}");
     }
 
     #[test]
@@ -645,13 +648,14 @@ mod tests {
             EncoderValidator::get_hwaccels_internal(output),
             ["vaapi", "qsv", "cuda"]
         );
-        assert!(EncoderValidator::get_hwaccels_internal("").is_empty());
+        let hwaccels = EncoderValidator::get_hwaccels_internal("");
+        assert!(hwaccels.is_empty(), "{hwaccels:?}");
         // Whitespace-only output is nothing, not a blank-named method.
-        assert!(EncoderValidator::get_hwaccels_internal(" \n \n \n").is_empty());
+        let hwaccels = EncoderValidator::get_hwaccels_internal(" \n \n \n");
+        assert!(hwaccels.is_empty(), "{hwaccels:?}");
         // Header only: nothing available.
-        assert!(
-            EncoderValidator::get_hwaccels_internal("Hardware acceleration methods:\n").is_empty()
-        );
+        let hwaccels = EncoderValidator::get_hwaccels_internal("Hardware acceleration methods:\n");
+        assert!(hwaccels.is_empty(), "{hwaccels:?}");
     }
 
     #[test]

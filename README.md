@@ -40,7 +40,7 @@ the clients that connect to it, and the server code it ports. Thank you.
   client, so `docker run` gives you the whole server, web UI included.
 - **Drop-in compatible.** Same API contract, same on-disk database format (pinned to
   Jellyfin 12.0), same password hashes. Adopt an existing Jellyfin 10.11.8–10.11.11,
-  12.0.0, 12.1.0 or 12.2.0 library with no re-scan; see [supported and tested versions](gates/adoption/README.md#supported-and-tested-versions).
+  12.0.0, 12.1.0, 12.2.0, 12.3.0 or 12.4.0 library with no re-scan; see [supported and tested versions](gates/adoption/README.md#supported-and-tested-versions).
 - **Plugins cannot own your server.** Jellyfin loads plugins as full-trust .NET code inside
   the server process. Ferrofin does not, and will not. Third-party plugins run as
   sandboxed WASM with no filesystem or network access of their own. This is the one place
@@ -140,20 +140,20 @@ Configuration is via CLI flags, `FERROFIN_*` environment variables, or
 ## Migrating from Jellyfin
 
 Ferrofin reads Jellyfin's database directly. Point it at a data directory containing a Jellyfin
-**10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0 or 12.2.0** `jellyfin.db` and on first boot
-it detects the database, validates its migration set (and refuses loudly rather than half-adopting
-an unexpected version), and adopts it in place: **no re-scan, no re-import**. Users, watch state,
-playlists, and Live TV configuration carry forward. A 10.11 database also loses the items whose
-files are gone (see [below](#items-whose-files-are-gone-1011-databases)). Ferrofin retains the
-`Users.NormalizedUsername` column and unique index from Jellyfin 10.11.10/10.11.11 and adds them to
-older databases. Login, creation, and renaming use Unicode-aware invariant uppercase keys compatible
-with Jellyfin, while the original spelling remains visible. If existing usernames collide under
-these rules, startup stops with the conflicting account IDs and names; resolve the names in the
-original server before retrying. Accounts are never merged.
+**10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0, 12.3.0 or 12.4.0** `jellyfin.db` and
+on first boot it detects the database, validates its migration set (and refuses loudly rather than
+half-adopting an unexpected version), and adopts it in place: **no re-scan, no re-import**. Users,
+watch state, playlists, and Live TV configuration carry forward. A 10.11 database also loses the
+items whose files are gone (see [below](#items-whose-files-are-gone-1011-databases)). Ferrofin
+retains the `Users.NormalizedUsername` column and unique index from Jellyfin 10.11.10/10.11.11 and
+adds them to older databases. Login, creation, and renaming use Unicode-aware invariant uppercase
+keys compatible with Jellyfin, while the original spelling remains visible. If existing usernames
+collide under these rules, startup stops with the conflicting account IDs and names; resolve the
+names in the original server before retrying. Accounts are never merged.
 
 Every release's gates session adopts each supported version and upgrade route, and the latest
 release's status is in [Results](#adopting-an-existing-jellyfin-database). Checks cover API
-summaries against Jellyfin 12.2, database integrity, and stable responses without repeated
+summaries against the latest Jellyfin release (12.4), database integrity, and stable responses without repeated
 repairs after restart. See the [support matrix and tested build](gates/adoption/README.md#supported-and-tested-versions).
 Support is determined by the exact migration history; these version numbers do not imply
 support for every 10.11.x or 12.x release.
@@ -172,7 +172,8 @@ support for every 10.11.x or 12.x release.
 >    separately, for example in `/etc/jellyfin` on Debian. Include any external state
 >    directories too.
 > 3. Copy Jellyfin's `data/jellyfin.db`, `data/playlists/`, `data/collections/`,
->    `root/default/` and `metadata/` to the same relative paths under Ferrofin's data
+>    `root/default/`, `metadata/` and, if Jellyfin used LDAP-Auth,
+>    `plugins/configurations/LDAP-Auth.xml` to the same relative paths under Ferrofin's data
 >    directory, and its XML configuration into Ferrofin's config directory, **before
 >    Ferrofin's first startup**. [`scripts/migrate-jellyfin.sh`](scripts/migrate-jellyfin.sh)
 >    does this for the Debian layout. Keep the originals and backup intact. An existing
@@ -260,8 +261,8 @@ two tiers, and no third:
 
 - **Compiled-in extensions** are Jellyfin plugins ported into this repository, reviewed
   like any other code and shipped inside the binary. They get full power *because* they
-  went through review. Intro Skipper, File Transformation, and Merge Versions are ported
-  today. They surface through the normal `/Plugins` API: dashboard entries, settings pages,
+  went through review. Intro Skipper, File Transformation, Merge Versions and LDAP-Auth are
+  ported today. They surface through the normal `/Plugins` API: dashboard entries, settings pages,
   enable/disable.
 - **Sandboxed WASM plugins** are how code this repository has never seen gets installed:
   drop a `.wasm` component into `{data_dir}/plugins/` (or install from a configured plugin
@@ -314,8 +315,9 @@ The tiered matrix with verification depth per area is
 Ferrofin is built to be run under a modern monitoring stack, not tailed in a terminal.
 
 - **Structured JSON logs** on stdout by default, one event per line with a level, target
-  and typed fields (`item_id`, `user_id`, `task`, …). Set `FERROFIN_LOG_FORMAT=text` for
-  the human-readable form when running interactively; `FERROFIN_LOG` takes the usual
+  and typed fields (`item_id`, `user_id`, `task`, …). Set `FERROFIN_LOG_FORMAT=text` (or
+  `log_format = "text"` in `config.toml`) for the human-readable form when running
+  interactively; `FERROFIN_LOG` takes the usual
   `RUST_LOG` filter syntax.
 - **Prometheus metrics** at `/metrics` when `FERROFIN_ENABLE_METRICS=true`, using
   Jellyfin's own metric names (`http_*`, `process_*`) so existing dashboards keep
@@ -356,7 +358,7 @@ an 80 % per-crate line-coverage floor. Performance and memory are benchmarked be
 release.
 See [`CONTRIBUTING.md`](CONTRIBUTING.md); the deeper operating guide is [`CLAUDE.md`](CLAUDE.md).
 
-Security policy: [`SECURITY.md`](SECURITY.md). Changelog: [`CHANGELOG.md`](CHANGELOG.md).
+Security policy: [`SECURITY.md`](SECURITY.md). Release notes: [GitHub Releases](https://github.com/mangoleaf/ferrofin/releases).
 Releasing: [`RELEASE.md`](RELEASE.md).
 
 ## License

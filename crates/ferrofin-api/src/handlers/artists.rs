@@ -43,7 +43,7 @@ async fn get_artists(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
-    query.parent(&state).await?;
+    query.parent(&state, &auth, user.as_deref()).await?;
     let internal = query.artists_query(&state, user.clone()).await?;
     let result = state.library.get_artists(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
@@ -52,7 +52,7 @@ async fn get_artists(
         result,
         &options,
         query.should_include_item_types(),
-        user.as_ref(),
+        user.as_deref(),
     )
     .await?;
     Ok(Json(projected))
@@ -75,7 +75,7 @@ async fn get_album_artists(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
-    query.parent(&state).await?;
+    query.parent(&state, &auth, user.as_deref()).await?;
     let internal = query.artists_query(&state, user.clone()).await?;
     let result = state.library.get_album_artists(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
@@ -84,7 +84,7 @@ async fn get_album_artists(
         result,
         &options,
         query.should_include_item_types(),
-        user.as_ref(),
+        user.as_deref(),
     )
     .await?;
     Ok(Json(projected))
@@ -122,7 +122,7 @@ async fn get_artist_by_name(
     let options = DtoOptions::default();
     let dto = state
         .dto
-        .get_base_item_dto(&item, &options, user.as_ref(), None)
+        .get_base_item_dto(&item, &options, user.as_deref(), None)
         .await?;
     Ok(Json(dto))
 }

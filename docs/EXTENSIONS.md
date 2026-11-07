@@ -30,14 +30,23 @@ pub trait Extension: Send + Sync {
     fn id(&self) -> Uuid;                                  // also its /Plugins id
     fn descriptor(&self) -> PluginDescriptor;              // name, version, description
     fn default_config(&self) -> Vec<u8>;                   // seed config on first run
-    fn config_pages(&self) -> Vec<PluginConfigPage> { … }  // vendored settings page(s)
+    fn config_pages(&self) -> Vec<PluginConfigPage> { … }  // its settings page(s)
+    fn media_segment_providers(&self, cx: &ExtensionContext)
+        -> Vec<Arc<dyn MediaSegmentProvider>> { … }        // intro/credit producers
+    fn auth_providers(&self, cx: &ExtensionContext)
+        -> Vec<Arc<dyn AuthenticationManager>> { … }       // sign-in backends
+    fn password_reset_providers(&self, cx: &ExtensionContext)
+        -> Vec<Arc<dyn PasswordResetManager>> { … }        // forgotten-password backends
     fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>>;
 }
 ```
 
 An extension receives **only manager trait objects**, never concrete types — an
 `ExtensionContext` bundling the `LibraryManager`, `MediaSegmentManager`, `PluginManager`,
-`MergeVersionsManager`, an optional audio `Fingerprinter`, and a per-extension cache dir. It
+`MergeVersionsManager`, `UserManager`, the `ExternalIdentityStore` (which outside identity,
+such as an LDAP uid, belongs to which user), the `RemoteImageFetcher` (image downloads under
+the server's limits: no private address unless `image_private_http_allow` lists it, and
+`image_download_max_mb`), an optional audio `Fingerprinter`, and a per-extension cache dir. It
 is the same dependency-injection seam the rest of the server uses (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md)), so an extension can do real work — scan the library,
 persist media segments, register background tasks — without reaching into implementation
@@ -55,6 +64,23 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
 - **Vendored settings pages.** The upstream plugin's HTML settings page is committed into
   `crates/ferrofin-extensions/assets/<name>/` at build time, so normal builds are hermetic
   (no network fetch). Refresh with `FERROFIN_REFRESH_PLUGIN_ASSETS=1 cargo build -p ferrofin-extensions`.
+  The Ferrofin Settings extension's own page is the exception: it is authored here
+  ([below](#the-ferrofin-settings-extension)).
+- **Authentication providers join sign-in late.** The user manager is built before the
+  extensions, so the composition root hands it every extension's `auth_providers` once
+  they are wired (`register_auth_providers`). Sign-in consults them after the built-in
+  default, and `GET /Auth/Providers` lists each enabled one by its display name and the id a
+  user's `AuthenticationProviderId` stores, which may differ. A provider reports the
+  user's administrator flag in its result rather than saving the user's policy itself
+  (which would wait forever on the login lock it is called under). The user manager applies
+  it through `UserManager::apply_external_administrator`, which sign-in paths outside the
+  password flow call too, and never demotes the last administrator.
+- **Password-reset providers join the same way.** `register_auth_providers` also hands the
+  user manager every extension's `password_reset_providers`. A forgotten-password request
+  goes to the enabled provider a user's `PasswordResetProviderId` names, and to the
+  built-in PIN-file provider otherwise. A PIN is offered to the built-in provider first, then
+  to each extension's, so a provider with no request matching it answers "no match" (never
+  an error, which would stop the redemption).
 - **The `CanUninstall=true` quirk.** jellyfin-web gates the enable/disable toggle on the
   plugin reporting `CanUninstall=true`, so compiled-in extensions report `true` to surface
   the toggle — even though the actual uninstall call is still rejected (you can't uninstall
@@ -62,15 +88,17 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
 
 ## The ported plugins
 
-Three third-party Jellyfin plugins ship as extensions today. Each is a faithful port of a
+Four third-party Jellyfin plugins ship as extensions today. Each is a faithful port of a
 pinned upstream revision; the pins and the full delta live in
-[`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md).
+[`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md). LDAP-Auth, the one that changes how users sign
+in, is described in [LDAP-Auth](#ldap-auth) below.
 
 | Extension | Upstream | Ported rev | What it does |
 |---|---|---|---|
 | **Intro Skipper** | [intro-skipper/intro-skipper](https://github.com/intro-skipper/intro-skipper) | `db09359` | Intro, credits, recap, preview and commercial detection (audio fingerprints, chapters, black frames), exposed as media segments |
 | **File Transformation** | [IAmParadox27/jellyfin-plugin-file-transformation](https://github.com/IAmParadox27/jellyfin-plugin-file-transformation) | `f4f01c3` | Transform-on-serve hook other extensions build on |
 | **Merge Versions** | [danieladov/jellyfin-plugin-mergeversions](https://github.com/danieladov/jellyfin-plugin-mergeversions) | `e6f58d6` | Bulk-merge duplicate movie/episode versions into one item, two 24h tasks |
+| **LDAP-Auth** | [jellyfin/jellyfin-plugin-ldapauth](https://github.com/jellyfin/jellyfin-plugin-ldapauth) | `d11c86a` | Sign users in against an LDAP directory: accounts created on first sign-in, the admin filter, password changes and reset links, profile pictures, referrals, and an adopted Jellyfin's settings imported |
 
 **Accepted divergences** (not bugs — do not "fix" them during an upstream sync): Ferrofin
 models version groups solely through the `PrimaryVersionId` pointer rather than Jellyfin's
@@ -79,6 +107,91 @@ surface. Intro Skipper fingerprints with `ffmpeg -f chromaprint` (jellyfin-ffmpe
 that muxer), falling back to `fpcalc`; without either, the analyzers that need no fingerprint
 (chapters, black frames) still run. The precise per-plugin list is in
 [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md).
+
+### LDAP-Auth
+
+LDAP-Auth signs users in with their directory username and password, from any client, with
+nothing to change on the client. It is **off by default**: an administrator enables it under
+Dashboard → Plugins, opens its Settings (upstream's own page), enters the server, bind user
+and base DN, and presses "Save and Test LDAP Server Settings". From then on:
+
+- A directory user's first sign-in creates their account when "Enable User Creation" is on,
+  with the library access chosen on that page; with it off, they are refused. A local account
+  that already has their name is never taken over.
+- A returning user is matched by their LDAP uid, so a rename in the directory renames them
+  here. Their administrator flag follows `LDAP Admin Filter` at each sign-in, except that the
+  filter never demotes the last administrator: that user stays one and the server logs a
+  warning.
+- With "Allow Password Change" on, a password change is written to the directory (the bind
+  user must be allowed to set users' passwords). A blank password, which is what an
+  administrator's reset sends, is refused. "Forgot password" shows an LDAP user the
+  `Password Reset Url`, with `$userName` and `$userId` in it filled in.
+- With profile image synchronization on, a new user's picture comes from the directory, and
+  the "LDAP - Synchronize profile images" task keeps every LDAP user's current.
+- Searches follow the directory's referrals as the bind user, over the same TLS as the
+  configured connection.
+
+A directory that cannot be reached fails a sign-in with a server error after at most 5 seconds
+to connect or 10 seconds for each step, and that failure does not count toward the user's
+lockout. Local accounts keep signing in meanwhile. LDAP sign-ins with a name that is not an
+account's name (a uid or a mail, or a first sign-in) take turns, as on Jellyfin, so during an
+outage each of those waits for the ones before it. An empty password is refused before anything
+is sent to the directory. Disabling the plugin removes its provider and makes its users'
+sign-ins fail; their accounts stay. Settings apply as soon as they are saved, whatever the note
+at the top of the page says.
+
+An adopted Jellyfin's `plugins/configurations/LDAP-Auth.xml` is imported on the first start,
+with its uid map, and the plugin is turned on only when a user's saved authentication provider
+is LDAP-Auth's ([INSTALL.md](INSTALL.md) lists the file to copy). A file that cannot be read is
+a warning, and the next start tries again. The file itself is never changed, and changes made in
+Ferrofin never reach it. Adoption is one-way: the database Ferrofin migrates may not open under
+Jellyfin again, and going back means restoring `jellyfin.db.pre-ferrofin`, the copy taken before
+the first change ([INSTALL.md](INSTALL.md)).
+
+To try it, [`contrib/ldap-test-directory/`](../contrib/ldap-test-directory/README.md) starts a
+throwaway OpenLDAP directory with test users and prints the settings to enter. It has been
+proven against OpenLDAP only: Active Directory has not been tested.
+
+> **Warning:** LDAP-Auth's username and uid attributes must be ones users cannot change on
+> their own entry. As upstream, a directory user is matched to an existing LDAP-Auth account by
+> `LdapUidAttribute` (`uid` by default) and, when no account is linked to their uid yet, by
+> `LdapUsernameAttribute` (`cn` by default). Where users can write either attribute (many
+> directories let users edit their own `cn`, such as OpenLDAP's common `by self write`), one of
+> them can set it to another LDAP user's value and sign in to that account, whatever its rights,
+> with their own password. Choose attributes only administrators can write, or restrict
+> self-writes to them. An account already linked to a uid the directory still has is never
+> taken by name (a Ferrofin divergence), but one not linked yet is, so the username attribute
+> must also be unique: two entries sharing a `cn` would otherwise share the account until it is
+> linked.
+
+### The Ferrofin Settings extension
+
+Beside the ports, one extension is Ferrofin's own: **Ferrofin Settings**
+(`crates/ferrofin-extensions/src/ferrofin_settings.rs`). It ports no plugin and has no tasks,
+hooks or providers; it gives the server's own settings (`GET` and `POST /Ferrofin/Settings`, see
+[`CONFIG.md`](CONFIG.md#seeing-what-is-set)) a plugin identity and an enabled flag, so the
+dashboard's Disable toggle turns them off. Its version is the server's release.
+`FERROFIN_DISABLE_EXTENSIONS` leaves it registered: it has nothing to fire inside a benchmark.
+
+Its settings page, the Settings link under Dashboard → Plugins → Ferrofin Settings and the dashboard
+menu's **Ferrofin Settings** entry, lists every setting that route reports, in a tab per group in a
+pane on the left, with a search box across every tab and filters (changed, hide read-only) above
+the tabs. Each setting has a readable name with the `config.toml` key, environment variable, flag
+and default below it, a badge for what sets it (`config.toml`, environment or flag) when anything
+does, and, for a setting the page may not change, its value as text with a lock, the reason and
+where it is changed instead. Secrets are shown to the administrator, marked as secrets. A setting
+the page may change is edited on one line: a field for its kind showing the default, muted, when
+nothing sets it, its unit and **Reset to default**. Each tab counts its unsaved edits; Save posts
+the changed ones of every tab, a refused value shows the server's message next to it, and **Restart
+now** applies them ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)). The page holds no
+setting itself, since `GET /web/ConfigurationPage` is anonymous: its script reads them from the
+admin-only route and sets every string as text, never as HTML. Disabling the plugin removes the page
+and the menu entry.
+
+The extension is first-party, so it has no row or pin in
+[`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md): its page
+(`crates/ferrofin-extensions/assets/ferrofin/settings.html`) is authored in this repository,
+not vendored, and `build.rs` neither fetches nor pins it.
 
 ## Adding an extension
 
@@ -196,17 +309,30 @@ PCM, or ≤ 16 sampled stills ≤ 320 px per call. Fingerprinting, loudness, sil
 black-frame detection — and analyses nobody has written yet — are all guest code over
 these windows; extraction runs under a global decode budget (`FERROFIN_WASM_ANALYSIS_CONCURRENCY`,
 default a quarter of the cores) so plugin analysis never starves transcodes. Plugins that declare `scan-targets` are
-offered each new matching item once by the "Plugin media analysis" dashboard
-task. When the plugin's circuit breaker stops a pass, the items it did not reach are
-offered after the restart, and an item sharing the cut-off item's creation time (or, on
-a first pass, an undated one) can be offered again, so analysis must be idempotent.
+offered each matching item by the "Plugin media analysis" dashboard task, once per
+plugin: the server records in its database each item it offered to each plugin, and
+each pass offers the items not recorded yet. An item is offered whatever its creation
+date says, so media moved or copied in with old file times, unpacked from an archive,
+or a photo with an old EXIF date is offered like any other. An item is left for a later
+pass while its library turns the plugin's segments off (Media segment providers in the
+library's settings), or when the server refused the plugin's segment write for it. When
+the plugin's circuit breaker stops a pass, the items it did not reach are offered after
+the restart. Offers are recorded a page of items at a time, so a server that stops
+partway through a page offers that page's items again: analysis must be idempotent.
+Uninstalling a plugin forgets what it was offered, so installed again it is offered the
+whole library. Servers before this record kept a watermark instead, the newest creation
+time offered; on upgrade, each plugin's first pass counts every item at or before its
+watermark as offered, so nothing is offered twice. An item the watermark had already
+passed over with its old creation time stays unoffered after the upgrade: to have a
+plugin analyze those, uninstall and install it again (an uninstall also removes the
+plugin's settings and stored data).
 Why a host-driven pass instead of each plugin polling `query-items` with its own
-cursor (which the 0.3 surface already allowed): the offer-once watermark lives under a
-`host:`-reserved state key a guest can neither read nor rewind (a self-managed cursor
-could be rewound to re-burn the shared decode budget), disabled plugins are centrally
-skipped, N analyzers appear as one dashboard task instead of N, and future scan
-behaviors (changed-item re-offers, scan-completion triggering, progress) evolve
-host-side without another ABI change. A guest error never fails a scan. Trust note: this grants
+cursor (which the 0.3 surface already allowed): the record of what was offered is the
+server's, out of the guest's reach (a self-managed cursor could be rewound to re-burn
+the shared decode budget), disabled plugins are centrally skipped, N analyzers appear
+as one dashboard task instead of N, and future scan behaviors (changed-item re-offers,
+scan-completion triggering, progress) evolve host-side without another ABI change. A
+guest error never fails a scan. Trust note: this grants
 the guest **media content**, one rung above catalog metadata — leaving the sandbox
 still requires declared egress, and a genuine analysis plugin declares `[]`.
 
@@ -470,8 +596,9 @@ host capabilities are issues on this repository and land as additive WIT changes
 
 ## Non-goals for the WASM tier
 
-- **Authentication providers (SSO/LDAP)** — security-critical core surface; if wanted it
-  becomes a core feature, never sandbox-hosted third-party code.
+- **Authentication providers (SSO/LDAP)** — security-critical surface: they are internal
+  plugins (compiled-in extensions, through `Extension::auth_providers`) or core features,
+  never sandbox-hosted third-party code.
 - **DLNA** — needs SSDP/UDP sockets; the sandbox has no sockets by design.
 - **Item mutation/linking** (Merge-Versions-shaped) — item identity stays host-owned;
   plugins contribute metadata, they never restructure the library.

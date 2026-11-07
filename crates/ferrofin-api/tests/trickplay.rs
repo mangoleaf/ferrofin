@@ -86,7 +86,7 @@ impl AuthService for OkAuth {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
             is_api_key: false,
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_authenticated: true,
             ..Default::default()
         })
@@ -101,7 +101,7 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_authenticated: true,
             ..Default::default()
         })
@@ -297,15 +297,6 @@ impl TrickplayManager for CannedTrickplay {
     }
     async fn delete_trickplay_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
         Ok(())
-    }
-    async fn get_trickplay_manifest(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<
-        HashMap<String, HashMap<i32, ferrofin_db::entities::playback::TrickplayInfoEntity>>,
-        ServiceError,
-    > {
-        Ok(HashMap::new())
     }
     async fn get_hls_playlist(
         &self,

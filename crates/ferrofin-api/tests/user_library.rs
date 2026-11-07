@@ -43,7 +43,9 @@ use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
-use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
+use ferrofin_traits::session::{
+    AuthenticationRequest, AuthenticationResultData, SessionManager, SessionSummary,
+};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -208,7 +210,7 @@ impl AuthService for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: self.user(),
+            user: self.user().map(Arc::new),
             is_api_key: self.elevated || self.keyless_user,
             is_authenticated: true,
             ..AuthorizationInfo::default()
@@ -223,7 +225,7 @@ impl AuthorizationContext for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: self.user(),
+            user: self.user().map(Arc::new),
             is_api_key: self.elevated || self.keyless_user,
             is_authenticated: true,
             ..AuthorizationInfo::default()
@@ -517,10 +519,10 @@ impl UserViewManager for StubUserViews {
     }
     async fn get_user_views_with_hidden(
         &self,
-        user_id: Uuid,
+        _user_id: Uuid,
         include_hidden: bool,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let mut views = self.get_media_folders(user_id).await?;
+        let mut views = self.get_media_folders().await?;
         if !include_hidden {
             views.retain(|view| {
                 !self
@@ -530,7 +532,13 @@ impl UserViewManager for StubUserViews {
         }
         Ok(views)
     }
-    async fn get_media_folders(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    async fn get_user_root_children(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_media_folders().await
+    }
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
         Ok(vec![
             item_entity(SHOWS_ID, "Shows", BaseItemKind::CollectionFolder),
             item_entity(MOVIES_ID, "Movies", BaseItemKind::CollectionFolder),
@@ -1210,7 +1218,7 @@ async fn user_scoped_intros_returns_empty_query_result() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
-    assert!(result.items.is_empty());
+    assert!(result.items.is_empty(), "{:?}", result.items);
     // The alias must be indistinguishable from the modern query form on the wire.
     let (modern_status, modern_body) = send(
         "GET",
@@ -1387,7 +1395,13 @@ impl UserViewManager for LatestViews {
     async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("latest fake")
     }
-    async fn get_media_folders(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("latest fake")
+    }
+    async fn get_user_root_children(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("latest fake")
     }
     async fn get_latest_items(
@@ -1467,7 +1481,7 @@ impl HidingAuth {
         let mut user = user_entity(USER_ID, "alice");
         user.hide_played_in_latest = true;
         AuthorizationInfo {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         }
@@ -1969,7 +1983,8 @@ impl LibraryManager for RecordingResumeLibrary {
     }
 }
 
-/// A [`SessionManager`] whose only live method is `get_sessions`.
+/// A [`SessionManager`] whose only live method is `get_session_summaries`:
+/// `excludeActiveSessions` reads ids, so it never lists the full sessions.
 struct ResumeSessions;
 
 #[async_trait]
@@ -2124,19 +2139,22 @@ impl SessionManager for ResumeSessions {
         _controllable_user_to_check: Option<Uuid>,
         _is_api_key: bool,
     ) -> Result<Vec<SessionInfoDto>, ServiceError> {
-        // Alice's session plays the ALTERNATE version; another user's session
-        // plays something else and must be ignored.
-        let playing = |user_id: Uuid, item: Uuid| SessionInfoDto {
+        unreachable!("excludeActiveSessions reads the session summaries")
+    }
+    async fn get_session_summaries(&self) -> Result<Vec<SessionSummary>, ServiceError> {
+        // Alice's session plays the ALTERNATE version and her other session
+        // plays nothing; another user's session plays something else and must
+        // be ignored.
+        let session = |user_id: Uuid, item: Option<Uuid>| SessionSummary {
             user_id,
-            now_playing_item: Some(BaseItemDto {
-                id: item,
-                ..BaseItemDto::default()
-            }),
-            ..SessionInfoDto::default()
+            now_playing_item_id: item,
+            play_method: None,
+            is_transcoding: false,
         };
         Ok(vec![
-            playing(USER_ID, ALTERNATE_ID),
-            playing(Uuid::from_u128(0x0B0B), OTHER_USERS_ITEM_ID),
+            session(USER_ID, Some(ALTERNATE_ID)),
+            session(USER_ID, None),
+            session(Uuid::from_u128(0x0B0B), Some(OTHER_USERS_ITEM_ID)),
         ])
     }
     async fn get_session_by_authentication_token(
@@ -2332,11 +2350,12 @@ async fn resume_confines_an_unscoped_request_to_the_users_remaining_root_folders
     )
     .await;
     let query = recorded.expect("ran");
-    assert!(query.ancestor_ids.is_empty());
+    assert!(query.ancestor_ids.is_empty(), "{:?}", query.ancestor_ids);
     assert_eq!(query.parent_id, RESUME_MOVIES_ID);
     // …and so does a user with no excludes.
     let (_, _, recorded) = send_resume(Vec::new(), "/UserItems/Resume").await;
-    assert!(recorded.expect("ran").ancestor_ids.is_empty());
+    let ancestor_ids = recorded.expect("ran").ancestor_ids;
+    assert!(ancestor_ids.is_empty(), "{ancestor_ids:?}");
 }
 
 /// v12 ItemsController.cs:963-976: `excludeActiveSessions` drops every
@@ -2356,7 +2375,8 @@ async fn resume_excludes_every_version_of_what_the_users_sessions_play() {
 
     // Off by default.
     let (_, _, recorded) = send_resume(Vec::new(), "/UserItems/Resume").await;
-    assert!(recorded.expect("ran").exclude_item_ids.is_empty());
+    let exclude_item_ids = recorded.expect("ran").exclude_item_ids;
+    assert!(exclude_item_ids.is_empty(), "{exclude_item_ids:?}");
 }
 
 /// `AddAdditionalDtoOptions` reaches the projection: `enableImages=false`

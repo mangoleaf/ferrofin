@@ -110,7 +110,9 @@ use ferrofin_model::entities::ImageType;
 use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::options::{ImageCollageOptions, InternalItemsQuery, ItemImageInfo};
+use ferrofin_traits::options::{
+    ImageCollageOptions, InternalItemsQuery, ItemImageInfo, live_tv_image_is_internal,
+};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 use ferrofin_traits::providers::{GeneratedImageProvider, ItemUpdateType, MetadataRefreshOptions};
 use uuid::Uuid;
@@ -400,7 +402,7 @@ impl DynamicImageProviders {
         for row in rows {
             between().await;
             // No library: `GetLibraryOptions` gives the root the defaults.
-            let plan = crate::library_scan::unwalked_refresh_plan(Some(&row), options, None);
+            let plan = crate::library_scan::unwalked_refresh_plan(Some(&row), options, None, false);
             let pass = self
                 .refresh_tallied(&row, plan.run_all_providers, &mut report)
                 .await;
@@ -808,33 +810,21 @@ impl DynamicImageProviders {
         Ok(None)
     }
 
-    /// `BaseFolderImageProvider.GetItemsWithImages` (BaseFolderImageProvider.cs:32-45),
+    /// `BaseFolderImageProvider.GetItemsWithImages` (BaseFolderImageProvider.cs:29-44),
     /// shared by `PhotoAlbumImageProvider` and `FolderImageProvider`: the
     /// folder's first descendant with a Primary — files before folders, then by
     /// sort name, `Limit = 1`.
     async fn folder_sources(&self, album_id: Uuid) -> Result<Vec<String>, ServiceError> {
         let ids = self
             .items
-            .get_item_ids(&InternalItemsQuery {
-                parent_id: album_id,
-                recursive: true,
-                image_types: vec![ImageType::Primary],
-                order_by: vec![
-                    (ItemSortBy::IsFolder, SortOrder::Ascending),
-                    (ItemSortBy::SortName, SortOrder::Ascending),
-                ],
-                limit: Some(1),
-                ..InternalItemsQuery::default()
-            })
+            .get_item_ids(&folder_sources_query(album_id))
             .await?;
         // `CreateSingleImage` takes the Primary only (no Thumb fallback) and
         // needs a file extension to carry over.
         let mut paths = Vec::new();
         for id in ids {
-            let infos = self.items.get_image_infos(id).await?;
-            if let Some(primary) = infos
-                .iter()
-                .find(|i| i.image_type == ImageType::Primary && i.is_local_file())
+            let infos = self.local_images(id).await?;
+            if let Some(primary) = infos.iter().find(|i| i.image_type == ImageType::Primary)
                 && Path::new(&primary.path).extension().is_some()
             {
                 paths.push(primary.path.clone());
@@ -857,14 +847,40 @@ impl DynamicImageProviders {
 
     /// The item's local Primary path, else its local Thumb path.
     async fn primary_or_thumb_path(&self, id: Uuid) -> Result<Option<String>, ServiceError> {
-        let infos = self.items.get_image_infos(id).await?;
+        let infos = self.local_images(id).await?;
         let pick = |kind: ImageType| {
             infos
                 .iter()
-                .find(|i| i.image_type == kind && i.is_local_file())
+                .find(|i| i.image_type == kind)
                 .map(|i| i.path.clone())
         };
         Ok(pick(ImageType::Primary).or_else(|| pick(ImageType::Thumb)))
+    }
+
+    /// The item's images a collage may draw: `IsLocalFile`, and for a Live TV
+    /// item only those in the internal metadata directory, the parent of the
+    /// item-art root ([`live_tv_image_is_internal`]). Upstream draws any local
+    /// file a Live TV item's row names.
+    async fn local_images(&self, id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
+        let served = self.items.get_image_infos_to_serve(id).await?;
+        let art_root = self.metadata_dir.resolve();
+        let mut images = Vec::with_capacity(served.images.len());
+        for image in served.images {
+            if !image.is_local_file() {
+                continue;
+            }
+            if served.live_tv {
+                let internal = match art_root.parent() {
+                    Some(root) => live_tv_image_is_internal(&image.path, root).await,
+                    None => false,
+                };
+                if !internal {
+                    continue;
+                }
+            }
+            images.push(image);
+        }
+        Ok(images)
     }
 
     /// `HasImage(ImageType.Primary)`.
@@ -875,6 +891,26 @@ impl DynamicImageProviders {
             .await?
             .iter()
             .any(|i| i.image_type == ImageType::Primary))
+    }
+}
+
+/// The query of `BaseFolderImageProvider.GetItemsWithImages`
+/// (BaseFolderImageProvider.cs:29-44): the folder's descendants with a
+/// Primary, files before folders, then by sort name, `Limit = 1`. Driven by
+/// the folder's subtree: every library validation runs it for each folder and
+/// photo album it draws or re-checks.
+fn folder_sources_query(folder_id: Uuid) -> InternalItemsQuery {
+    InternalItemsQuery {
+        parent_id: folder_id,
+        recursive: true,
+        drive_from_parent_subtree: true,
+        image_types: vec![ImageType::Primary],
+        order_by: vec![
+            (ItemSortBy::IsFolder, SortOrder::Ascending),
+            (ItemSortBy::SortName, SortOrder::Ascending),
+        ],
+        limit: Some(1),
+        ..InternalItemsQuery::default()
     }
 }
 
@@ -960,12 +996,7 @@ pub(crate) fn drop_missing_images(images: &mut Vec<ItemImageInfo>) -> bool {
     images.len() != before
 }
 
-/// The file's modification time, or now when it cannot be read.
-pub(crate) fn file_date_modified(path: &Path) -> DateTime<Utc> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
-}
+pub(crate) use ferrofin_providers::local_images::file_date_modified;
 
 /// `BaseDynamicImageProvider.CreateSingleImage`: copies the source into the
 /// item's folder as `primary.<source extension>`, replacing any earlier Primary.
@@ -1745,6 +1776,50 @@ mod tests {
         assert_eq!(copy().await, recoloured, "a locked root is left alone");
     }
 
+    /// A Live TV item's row is a source only from the internal metadata
+    /// directory, the parent of the item-art root.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_tv_row_is_a_source_only_from_the_metadata_directory() {
+        let fx = fixture().await;
+        let logos = fx.tmp.path().join("metadata").join("logos");
+        std::fs::create_dir_all(&logos).expect("logos");
+        let inside = write_png(&logos, "inside.png", [1, 2, 3]);
+        let outside = write_png(&fx.media_dir(), "outside.png", [4, 5, 6]);
+        let album = fx.seed(BaseItemKind::PhotoAlbum, "Album", None, None).await;
+        let channel = fx
+            .seed(BaseItemKind::LiveTvChannel, "Channel", None, Some(&outside))
+            .await;
+        fx.persistence
+            .set_parent_id(channel, album)
+            .await
+            .expect("parent");
+        fx.persistence
+            .set_ancestors(channel, &[album])
+            .await
+            .expect("ancestors");
+        let row = fx.items.retrieve_item(album).await.unwrap().unwrap();
+
+        let sources = fx
+            .providers
+            .sources_for(DynamicImageKind::PhotoAlbum, &row, album)
+            .await
+            .expect("sources");
+        assert!(sources.is_empty(), "{sources:?}");
+
+        seed_images(
+            &fx.db,
+            channel,
+            &[image_info(ImageType::Primary, &inside, None)],
+        )
+        .await;
+        let sources = fx
+            .providers
+            .sources_for(DynamicImageKind::PhotoAlbum, &row, album)
+            .await
+            .expect("sources");
+        assert_eq!(sources, [inside]);
+    }
+
     /// `PhotoAlbumImageProvider` (`BaseFolderImageProvider`): the first photo
     /// by sort name is copied verbatim, keeping its extension, as the album's
     /// Primary — and is not redone while current.
@@ -1817,7 +1892,8 @@ mod tests {
             DynamicImageKind::for_entity(&row),
             Some(DynamicImageKind::MusicArtist)
         );
-        assert!(ArtistSources::image_paths().is_empty());
+        let found = ArtistSources::image_paths();
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(
             fx.providers.refresh_item(&row, true).await.expect("artist"),
             ItemUpdateType::None
@@ -1892,5 +1968,88 @@ mod tests {
         assert!(!dir.join("primary.jpg").exists());
         assert!(dir.join("backdrop.jpg").exists());
         assert!(keep.exists());
+    }
+
+    /// The subtree-driven folder source query returns what the probed one
+    /// does: a photo anywhere below the album (files before folders, then by
+    /// sort name), never one from a sibling album, even one that sorts first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn folder_source_query_reads_the_same_rows_either_way() {
+        let fx = fixture().await;
+        let library = fx
+            .seed(BaseItemKind::CollectionFolder, "Photos", None, None)
+            .await;
+        let poster = write_png(&fx.media_dir(), "photo.png", [9, 9, 9]);
+        let row = |kind: BaseItemKind, name: &str, parent: Uuid| BaseItemEntity {
+            id: guid_to_db(Uuid::new_v4()),
+            type_: stored_type_name(kind).expect("type name").to_owned(),
+            name: Some(name.to_owned()),
+            sort_name: Some(name.to_owned()),
+            parent_id: Some(guid_to_db(parent)),
+            is_folder: kind == BaseItemKind::PhotoAlbum,
+            ..Default::default()
+        };
+        let add = async |kind: BaseItemKind, name: &str, ancestors: &[Uuid]| {
+            let entity = row(kind, name, ancestors[0]);
+            let id = Uuid::parse_str(&entity.id).expect("id");
+            fx.persistence
+                .save_items(std::slice::from_ref(&entity))
+                .await
+                .expect("row");
+            fx.persistence
+                .set_ancestors(id, ancestors)
+                .await
+                .expect("ancestors");
+            seed_images(&fx.db, id, &[image_info(ImageType::Primary, &poster, None)]).await;
+            id
+        };
+        let album = add(BaseItemKind::PhotoAlbum, "m-album", &[library]).await;
+        let sibling = add(BaseItemKind::PhotoAlbum, "z-sibling", &[library]).await;
+        add(BaseItemKind::Photo, "0-elsewhere", &[sibling, library]).await;
+        let nested = add(BaseItemKind::PhotoAlbum, "a-nested", &[album, library]).await;
+        let deep = add(BaseItemKind::Photo, "b-deep", &[nested, album, library]).await;
+        let own = add(BaseItemKind::Photo, "c-own", &[album, library]).await;
+
+        let driven = folder_sources_query(album);
+        assert!(driven.drive_from_parent_subtree);
+        let ids = |q: InternalItemsQuery| {
+            let items = Arc::clone(&fx.items);
+            async move { items.get_item_ids(&q).await.expect("ids") }
+        };
+        // The whole ordered set, then the source the provider takes.
+        let all = InternalItemsQuery {
+            limit: None,
+            ..driven.clone()
+        };
+        let probed = InternalItemsQuery {
+            drive_from_parent_subtree: false,
+            ..all.clone()
+        };
+        assert_eq!(ids(probed).await, [deep, own, nested]);
+        assert_eq!(ids(all).await, [deep, own, nested]);
+        assert_eq!(
+            ids(driven).await,
+            [deep],
+            "the photo below, before the folder"
+        );
+    }
+
+    /// gl-1278: a folder's source query reads that folder's subtree, not the
+    /// library. Probed from every `BaseItems` row, each draw or re-check of a
+    /// folder or photo album read the whole table (13 ms a folder at 24k rows).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn folder_source_query_is_driven_by_the_folders_subtree() {
+        use crate::translate_query::{QueryShape, build_query};
+
+        let query = build_query(&folder_sources_query(Uuid::new_v4()), QueryShape::IdsOnly);
+        let plan = crate::latest_tv_repository::explain(&test_db().await, query).await;
+        assert!(
+            plan.contains("SEARCH a USING INDEX IX_AncestorIds_ParentItemId (ParentItemId=?)"),
+            "{plan}"
+        );
+        assert!(
+            plan.starts_with("SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+            "{plan}"
+        );
     }
 }

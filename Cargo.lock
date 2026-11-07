@@ -1273,6 +1273,7 @@ dependencies = [
  "form_urlencoded",
  "futures-core",
  "futures-util",
+ "httpdate",
  "libc",
  "opentelemetry",
  "opentelemetry_sdk",
@@ -1302,6 +1303,7 @@ dependencies = [
 name = "ferrofin-chromaprint"
 version = "0.4.1"
 dependencies = [
+ "indexmap",
  "rstest",
 ]
 
@@ -1310,6 +1312,7 @@ name = "ferrofin-common"
 version = "0.4.1"
 dependencies = [
  "pbkdf2",
+ "rand 0.10.3",
  "regex",
  "rstest",
  "sha1 0.11.0",
@@ -1389,6 +1392,7 @@ dependencies = [
  "ferrofin-traits",
  "ferrofin-util",
  "image",
+ "jpeg-decoder",
  "jpeg-encoder",
  "kamadak-exif",
  "rstest",
@@ -1405,26 +1409,39 @@ name = "ferrofin-extensions"
 version = "0.4.1"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "chrono",
  "fancy-regex",
  "ferrofin-chromaprint",
+ "ferrofin-common",
  "ferrofin-core",
  "ferrofin-db",
+ "ferrofin-health",
  "ferrofin-model",
+ "ferrofin-naming",
  "ferrofin-traits",
  "ferrofin-util",
  "futures-util",
+ "ldap3",
+ "percent-encoding",
+ "rcgen",
  "regex",
  "reqwest",
  "rstest",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+ "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1485,6 +1502,7 @@ dependencies = [
  "ferrofin-traits",
  "ferrofin-util",
  "flate2",
+ "futures-util",
  "icu_collator",
  "quick-xml",
  "regex",
@@ -1513,6 +1531,8 @@ dependencies = [
  "ferrofin-model",
  "ferrofin-traits",
  "ferrofin-util",
+ "futures-util",
+ "image",
  "notify",
  "quick-xml",
  "regex",
@@ -1551,6 +1571,7 @@ dependencies = [
  "bitflags",
  "chrono",
  "ferrofin-util",
+ "indexmap",
  "rstest",
  "secrecy",
  "serde",
@@ -1587,7 +1608,9 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1602,8 +1625,10 @@ dependencies = [
  "ferrofin-db",
  "ferrofin-model",
  "ferrofin-naming",
+ "ferrofin-networking",
  "ferrofin-traits",
  "ferrofin-util",
+ "futures-util",
  "opentelemetry",
  "opentelemetry_sdk",
  "quick-xml",
@@ -1632,6 +1657,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "chrono",
  "clap",
  "clap_mangen",
  "config",
@@ -1654,6 +1680,7 @@ dependencies = [
  "ferrofin-wasm",
  "flate2",
  "futures-util",
+ "http-body",
  "image",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -1672,6 +1699,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.30.0",
+ "toml_edit",
  "tower",
  "tower-http 0.7.1",
  "tracing",
@@ -1695,6 +1723,7 @@ dependencies = [
  "ferrofin-util",
  "serde",
  "serde_json",
+ "sqlx",
  "thiserror",
  "tokio",
  "uuid",
@@ -1718,6 +1747,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "unicode-normalization",
+ "url",
  "uuid",
  "windows-sys 0.61.2",
  "zerovec",
@@ -1729,11 +1759,13 @@ version = "0.4.1"
 dependencies = [
  "async-trait",
  "chrono",
+ "crc32fast",
  "ferrofin-core",
  "ferrofin-db",
  "ferrofin-model",
  "ferrofin-providers",
  "ferrofin-traits",
+ "ferrofin-util",
  "regex",
  "reqwest",
  "rstest",
@@ -1847,6 +1879,7 @@ checksum = "a88cf1f829d945f548cf8fec32c61b1f202b6d93b45848602fc02af4b12ad218"
 dependencies = [
  "futures-channel",
  "futures-core",
+ "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -2637,6 +2670,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "jpeg-decoder"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00810f1d8b74be64b13dbf3db89ac67740615d6c891f0e7b6179326533011a07"
+
+[[package]]
 name = "jpeg-encoder"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2655,9 +2694,9 @@ dependencies = [
 
 [[package]]
 name = "kamadak-exif"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1130d80c7374efad55a117d715a3af9368f0fa7a2c54573afc15a188cd984837"
+checksum = "8772c92c0f41c4a672cbdee6728253e5ae8fcc1c5eb5c6c676579565684bbf68"
 dependencies = [
  "mutate_once",
 ]
@@ -2687,6 +2726,41 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
+name = "lber"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbcf559624bfd9fe8d488329a8959766335a43a9b8b2cdd6a2c379fca02909a5"
+dependencies = [
+ "bytes",
+ "nom",
+]
+
+[[package]]
+name = "ldap3"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01fe89f5e7cfb7e4701e3a38ff9f00358e026a9aee940355d88ee9d81e5c7503"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "futures-util",
+ "lber",
+ "log",
+ "nom",
+ "percent-encoding",
+ "rustls",
+ "rustls-native-certs",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tokio-util",
+ "url",
+ "x509-parser",
+]
 
 [[package]]
 name = "leb128fmt"
@@ -3885,9 +3959,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
+checksum = "4a073f5dc7469f984c52ad2752b63b0807745133b6de880b7b64c1ac4c48aec4"
 dependencies = [
  "openssl-probe",
  "rustls-pki-types",
@@ -4778,33 +4852,40 @@ dependencies = [
 
 [[package]]
 name = "toml_datetime"
-version = "1.1.1+spec-1.1.0"
+version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
+checksum = "2b86d767906c6c42421dcba507eb9d203e779497710a47782a224bb871653053"
 dependencies = [
  "serde_core",
 ]
 
 [[package]]
 name = "toml_edit"
-version = "0.25.13+spec-1.1.0"
+version = "0.25.17+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6975367e4d2ef766d86af01ffad14b622fecc8d4357a998fbc4deb6e9bacaf9b"
+checksum = "e3641d5bbb5349a79e1020a242d251efbc546ad8048d133958323ce9c40a9c9c"
 dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
 [[package]]
 name = "toml_parser"
-version = "1.1.3+spec-1.1.0"
+version = "1.1.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d38ac1cf9b95face32296c0a3ede1fdc270627c9d9c02a7274dd6d960dc4d56"
+checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
 dependencies = [
  "winnow",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "tonic"

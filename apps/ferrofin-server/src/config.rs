@@ -16,9 +16,15 @@
 //! individually-named vars).
 
 use std::net::IpAddr;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use ferrofin_core::user_manager::LoginBackoffSettings;
+use ferrofin_drawing::ImageLimits;
+use ferrofin_mediaencoding::transcoding::TranscodeLimits;
+use ferrofin_providers::rate_limit::RequestLimits;
+use ferrofin_providers::{DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS, IMAGE_NEGATIVE_CACHE_TTL_SECS};
 use serde::Deserialize;
 
 /// Default TCP port for the HTTP endpoint.
@@ -53,24 +59,23 @@ const SYSTEM_DATA_DIR: &str = "/var/lib/ferrofin";
 /// The file stem of the SQLite database inside the data directory.
 const DATABASE_FILE_NAME: &str = "ferrofin.db";
 
+/// The bootstrap file's name inside the data directory, where it is read
+/// from unless `--config` or `FERROFIN_CONFIG_FILE` names another.
+const CONFIG_FILE_NAME: &str = "config.toml";
+
 /// ASP.NET's `HostOptions.ShutdownTimeout` default, which Jellyfin runs with.
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u32 = 30;
 
-/// Minimum period, in milliseconds, between pushes of a dashboard WebSocket
-/// stream (Sessions / ScheduledTasksInfo / ActivityLogEntry). The client names
-/// the period in its `*Start` subscription; Ferrofin floors it because it drives
-/// these streams on a timer — each tick recomputes and resends the full snapshot
-/// — unlike upstream's event-driven `BasePeriodicWebSocketListener`, where the
-/// period is only a debounce ceiling. 100 ms allows far faster updates than
-/// jellyfin-web's 1500 ms while bounding the worst case for a hostile client.
-const DEFAULT_WS_MIN_STREAM_PERIOD_MS: u32 = 100;
+/// The hours a session with no WebSocket that plays nothing may go without a
+/// request before it is ended (owner decision on gl-1267, 2026-11-05).
+const DEFAULT_SESSION_IDLE_HOURS: u32 = 24;
 
 /// Command-line arguments — the highest-precedence configuration layer.
 ///
 /// Only the knobs a operator commonly overrides on the command line are
 /// exposed as flags; everything else is env / file / default. Each flag, when
 /// present, overrides the corresponding env var and `config.toml` value.
-#[derive(Debug, Default, Parser)]
+#[derive(Debug, Default, Clone, Parser)]
 #[command(name = "ferrofin-server", about = "Ferrofin media server", version)]
 pub struct Cli {
     /// Program-data root directory (overrides `FERROFIN_DATA_DIR`).
@@ -94,18 +99,36 @@ pub struct Cli {
     #[arg(long = "ffmpeg", value_name = "PATH")]
     pub ffmpeg_path: Option<PathBuf>,
 
-    /// Path to an optional `config.toml` bootstrap file.
+    /// Path to an optional `config.toml` bootstrap file
+    /// (overrides `FERROFIN_CONFIG_FILE`).
     ///
-    /// When omitted, `{data_dir}/config.toml` is consulted if present.
+    /// When omitted, `config.toml` in the data directory (`--data-dir`, else
+    /// `FERROFIN_DATA_DIR`, else the default location) is read if present.
     #[arg(long = "config", value_name = "FILE")]
     pub config_file: Option<PathBuf>,
 }
 
+/// The `FERROFIN_*` variables whose `config.toml` key is not their stem
+/// (lower-cased, prefix stripped), with that key. Every other variable's key
+/// is its stem, and `FERROFIN_CONFIG_FILE`, which names the file, has none.
+/// One spelling per setting: the stem is no alias for these, since a file
+/// holding both spellings would set one setting twice; it is an unknown key,
+/// whose warning names the key to use.
+const KEYS_NOT_NAMED_BY_STEM: &[(&str, &str)] = &[
+    ("FERROFIN_LOG", "log_level"),
+    ("FERROFIN_OMDB_KEY", "omdb_api_key"),
+    ("FERROFIN_TVDB_KEY", "tvdb_api_key"),
+    ("FERROFIN_TVDB_PIN", "tvdb_subscriber_pin"),
+    ("FERROFIN_FANART_KEY", "fanart_personal_api_key"),
+    ("FERROFIN_MUSICBRAINZ_URL", "musicbrainz_base_url"),
+];
+
 /// The subset of [`Config`] fields that may appear in `config.toml`.
 ///
 /// All fields are optional: `config.toml` is a sparse override layer, and the
-/// whole file is optional. Field names match the `FERROFIN_*` env var stems
-/// (lower-cased, prefix stripped) so the two layers describe the same knobs.
+/// whole file is optional. Field names are the keys: the `FERROFIN_*` env var
+/// stems (lower-cased, prefix stripped), except those
+/// [`KEYS_NOT_NAMED_BY_STEM`] lists, so the two layers describe the same knobs.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct FileConfig {
@@ -132,21 +155,35 @@ struct FileConfig {
     tvdb_token_days: Option<String>,
     fanart_personal_api_key: Option<String>,
     musicbrainz_base_url: Option<String>,
+    provider_timeout_seconds: Option<u64>,
+    provider_max_wait_seconds: Option<u64>,
+    image_decode_max_megapixels: Option<u32>,
+    image_decode_max_memory_mb: Option<u32>,
+    image_resize_budget_mb: Option<u32>,
+    image_download_max_mb: Option<u32>,
+    image_negative_cache_ttl_secs: Option<u64>,
+    image_private_http_allow: Option<String>,
+    subtitle_private_http_allow: Option<String>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     ffmpeg_img_extract_perf_tradeoff: Option<bool>,
+    max_transcodes: Option<u32>,
+    max_transcodes_per_user: Option<u32>,
     library_roots: Option<Vec<PathBuf>>,
     server_name: Option<String>,
     log_level: Option<String>,
+    log_format: Option<String>,
     admin_user: Option<String>,
     admin_password: Option<String>,
     db_pool: Option<DbPoolFileValue>,
+    db_statement_cache: Option<u32>,
+    item_values_write_chunk: Option<u32>,
     enable_metrics: Option<bool>,
     disable_extensions: Option<bool>,
+    detect_network_change: Option<bool>,
     metrics_sample_interval: Option<u32>,
     metrics_scan_duration_buckets: Option<Vec<f64>>,
     shutdown_timeout_secs: Option<u32>,
-    websocket_min_stream_period_ms: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
     scan_directory_cache_records: Option<u32>,
@@ -166,7 +203,13 @@ struct FileConfig {
     wasm_write_content_mb: Option<u32>,
     wasm_subtitle_extract_mb: Option<u32>,
     playback_metrics_queue: Option<u32>,
+    session_idle_hours: Option<u32>,
     quick_connect_pending_per_ip: Option<u32>,
+    login_backoff: Option<bool>,
+    login_backoff_attempts: Option<u32>,
+    login_backoff_max_delay_secs: Option<u32>,
+    login_backoff_window_mins: Option<u32>,
+    login_backoff_max_tracked: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -255,6 +298,18 @@ impl ProviderEndpoints {
     }
 }
 
+/// How log lines are written to stdout. The log file is always plain text:
+/// `GET /System/Logs` shows it in the dashboard's log viewer as written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    /// One JSON object per line, carrying the request span's `trace_id` (for a
+    /// log pipeline such as Alloy and Loki). The default.
+    #[default]
+    Json,
+    /// Human-readable lines, for running the server by hand.
+    Text,
+}
+
 /// The resolved bootstrap configuration, after layering CLI > env > file >
 /// defaults and deriving the sub-directories under `data_dir`.
 ///
@@ -263,14 +318,37 @@ impl ProviderEndpoints {
 /// ffmpeg discovery, and fresh-install seeding.
 // Field names deliberately mirror the `FERROFIN_*` env-var stems / `config.toml`
 // keys (`config_dir`, `cache_dir`, ...), so the `_dir` suffix repeating the
-// struct name is intentional and keeps the three config layers 1:1.
-#[allow(clippy::struct_field_names)]
+// struct name is intentional and keeps the three config layers 1:1. Its bools
+// are independent settings and facts, not the states of one machine.
+#[allow(clippy::struct_field_names, clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Program-data root; derives the `data`/`config`/`cache`/`log`/`web`
     /// sub-directories. From `--data-dir` / `FERROFIN_DATA_DIR`, else
     /// `$XDG_DATA_HOME/ferrofin`, else [`SYSTEM_DATA_DIR`].
     pub data_dir: PathBuf,
+
+    /// The bootstrap `config.toml` this configuration was read from, or would
+    /// have been: `--config`, else `FERROFIN_CONFIG_FILE`, else
+    /// `{data_dir}/config.toml` for the data directory `--data-dir`,
+    /// `FERROFIN_DATA_DIR` or the default location names (never a `data_dir`
+    /// set inside the file itself). Whether it existed is
+    /// [`config_file_found`](Self::config_file_found).
+    pub config_file: PathBuf,
+
+    /// Whether [`config_file`](Self::config_file) existed and was read.
+    pub config_file_found: bool,
+
+    /// The command-line flags this configuration was loaded under, so the
+    /// settings report (`crate::settings`) can tell a value a flag set,
+    /// which the settings page then locks.
+    pub cli: Cli,
+
+    /// What loading noticed and set aside without failing, e.g. a key the
+    /// file may not set. Loading runs before logging starts, so the server
+    /// logs these once it has (at boot, and after each in-process restart),
+    /// with [`config_file`](Self::config_file) as context.
+    pub load_warnings: Vec<String>,
 
     /// Configuration directory holding `system.json` + `branding.json`.
     /// From `FERROFIN_CONFIG_DIR`, else `{data_dir}/config`.
@@ -344,8 +422,10 @@ pub struct Config {
     /// each series the season provider reads a season's id from. Resolved
     /// `FERROFIN_TVDB_CACHE_HOURS` env > `tvdb_cache_hours` in `config.toml` >
     /// unset; validated by [`tvdb_cache_duration`](Self::tvdb_cache_duration)
-    /// where the client is built, so a bad value warns (tracing is up by
-    /// then) and the default applies — it never stops the server.
+    /// where the client is built, so a value outside
+    /// [`TVDB_CACHE_HOURS_RANGE`] is clamped and one that is no whole number
+    /// is the default, each with a warning (tracing is up by then) — it never
+    /// stops the server.
     pub tvdb_cache_hours: Option<String>,
 
     /// How old TheTVDB's bearer token may get before Ferrofin logs in again,
@@ -367,6 +447,77 @@ pub struct Config {
     /// 1 req/sec limit).
     pub musicbrainz_base_url: String,
 
+    /// Default per-attempt timeout of a metadata-provider request, in seconds
+    /// (a request that sets its own keeps it). Resolved
+    /// `FERROFIN_PROVIDER_TIMEOUT_SECONDS` env > `provider_timeout_seconds` in
+    /// `config.toml` > 20, clamped to
+    /// [`RequestLimits::TIMEOUT_SECONDS`](ferrofin_providers::rate_limit::RequestLimits::TIMEOUT_SECONDS)
+    /// with a warning. The server hands it to every provider limiter for each
+    /// lifetime (`ferrofin_providers::rate_limit::set_request_limits`).
+    pub provider_timeout_seconds: u64,
+
+    /// Longest pending pacing or quota wait before a metadata lookup is
+    /// skipped, in seconds. Resolved `FERROFIN_PROVIDER_MAX_WAIT_SECONDS` env >
+    /// `provider_max_wait_seconds` in `config.toml` > 60, clamped to
+    /// [`RequestLimits::MAX_WAIT_SECONDS`](ferrofin_providers::rate_limit::RequestLimits::MAX_WAIT_SECONDS)
+    /// with a warning; applied as
+    /// [`provider_timeout_seconds`](Self::provider_timeout_seconds) is.
+    pub provider_max_wait_seconds: u64,
+
+    /// The largest image decoded, in megapixels (width × height). Resolved
+    /// `FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS` env >
+    /// `image_decode_max_megapixels` in `config.toml` > 200, clamped to
+    /// [`ImageLimits::DECODE_MEGAPIXELS`] with a warning. A larger image is
+    /// served as its original file.
+    pub image_decode_max_megapixels: u32,
+
+    /// The most memory one image decode may take, in MiB. Resolved
+    /// `FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB` env > `image_decode_max_memory_mb`
+    /// in `config.toml` > 512, clamped to [`ImageLimits::DECODE_MEMORY_MB`]
+    /// with a warning.
+    pub image_decode_max_memory_mb: u32,
+
+    /// The memory all image resizes and compositing in flight share, in MiB. Resolved
+    /// `FERROFIN_IMAGE_RESIZE_BUDGET_MB` env > `image_resize_budget_mb` in
+    /// `config.toml` > 2048, clamped to [`ImageLimits::RESIZE_BUDGET_MB`] with
+    /// a warning. A resize or compositing that alone needs more serves the
+    /// original file.
+    pub image_resize_budget_mb: u32,
+
+    /// The largest remote image downloaded, in MiB. Resolved
+    /// `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` env > `image_download_max_mb` in
+    /// `config.toml` > 64, clamped to [`RequestLimits::DOWNLOAD_MAX_MB`] with a
+    /// warning. A larger one is refused, and the read stops at the limit.
+    pub image_download_max_mb: u32,
+
+    /// How long a remote image URL that gave no image is left alone, in
+    /// seconds. Resolved `FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS` env >
+    /// `image_negative_cache_ttl_secs` in `config.toml` > 3600, clamped to
+    /// [`IMAGE_NEGATIVE_CACHE_TTL_SECS`] with a warning.
+    pub image_negative_cache_ttl_secs: u64,
+
+    /// The private hosts and networks image downloads may reach, besides the
+    /// configured Live TV tuners' hosts: host names, addresses and CIDR
+    /// networks, comma-separated
+    /// ([`PrivateAllowList`](ferrofin_providers::destination::PrivateAllowList)).
+    /// `None` = no private address but a tuner's. Resolved
+    /// `FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW` env > `image_private_http_allow`
+    /// in `config.toml` > none; blank is unset, and an entry that is none of
+    /// those warns and allows nothing. Read with
+    /// [`image_private_allow_list`](Self::image_private_allow_list).
+    pub image_private_http_allow: Option<String>,
+
+    /// The private hosts and networks the OpenSubtitles download link may
+    /// reach, in the same form as
+    /// [`image_private_http_allow`](Self::image_private_http_allow), which
+    /// does not apply to it (owner decision 2026-11-03, gl-1160). `None` = no
+    /// private address. Resolved `FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW` env >
+    /// `subtitle_private_http_allow` in `config.toml` > none; blank is unset,
+    /// and an entry that is not a host, an address or a network warns and
+    /// allows nothing. Read with
+    /// [`subtitle_private_allow_list`](Self::subtitle_private_allow_list).
+    pub subtitle_private_http_allow: Option<String>,
+
     /// Explicit `ffmpeg` executable path. `None` falls back to `system.json`
     /// then `$PATH` during discovery.
     pub ffmpeg_path: Option<PathBuf>,
@@ -384,6 +535,20 @@ pub struct Config {
     /// Jellyfin's default.
     pub ffmpeg_img_extract_perf_tradeoff: bool,
 
+    /// Re-encoding jobs the whole server may run at once; `0` is no cap. Past
+    /// it a signed-in user's idle job on the same device is ended first, and a
+    /// start that still has no room is answered `503` with `Retry-After`. Resolved
+    /// `FERROFIN_MAX_TRANSCODES` env > `max_transcodes` in `config.toml` > `0`,
+    /// clamped to [`TranscodeLimits::RANGE`].
+    pub max_transcodes: u32,
+
+    /// Re-encoding jobs one signed-in user may run at once; `0` is no cap. An
+    /// API key has no user, so only [`Self::max_transcodes`] applies to it.
+    /// Resolved `FERROFIN_MAX_TRANSCODES_PER_USER` env >
+    /// `max_transcodes_per_user` in `config.toml` > `0`, clamped to
+    /// [`TranscodeLimits::RANGE`].
+    pub max_transcodes_per_user: u32,
+
     /// Initial media library roots used to seed a fresh install.
     pub library_roots: Vec<PathBuf>,
 
@@ -393,6 +558,11 @@ pub struct Config {
 
     /// Log filter in `EnvFilter` (RUST_LOG) syntax.
     pub log_level: String,
+
+    /// How stdout log lines are written. Resolved `FERROFIN_LOG_FORMAT` env >
+    /// `log_format` in `config.toml` (`json` or `text`, any case) > JSON; any
+    /// other value warns and is JSON. Logging is set up once per process.
+    pub log_format: LogFormat,
 
     /// Administrator username seeded on a fresh install.
     pub admin_user: String,
@@ -407,6 +577,26 @@ pub struct Config {
     /// every other knob.
     pub db_pool: Option<u32>,
 
+    /// How many prepared statements each SQLite connection keeps, reader and
+    /// writer pools alike. `None` = 150
+    /// (`ferrofin_db::DEFAULT_STATEMENT_CACHE_CAPACITY`). A browse of the
+    /// library runs more distinct statements per connection than sqlx's own
+    /// 100, so a smaller cache prepares again statements it evicted, and each
+    /// slot costs memory on every connection. Resolved
+    /// `FERROFIN_DB_STATEMENT_CACHE` env > `db_statement_cache` in
+    /// `config.toml` > default; must be within [`STATEMENT_CACHE_RANGE`].
+    pub db_statement_cache: Option<u32>,
+
+    /// How many items' genre, studio, tag and artist links (`ItemValues`) one
+    /// database transaction rewrites when an edit saves many items at once (a
+    /// lock over a folder's descendants, a series' tags onto its episodes).
+    /// Smaller holds the single writer for shorter stretches; `1` writes each
+    /// item's links in a transaction of its own. Resolved `FERROFIN_ITEM_VALUES_WRITE_CHUNK` env >
+    /// `item_values_write_chunk` in `config.toml` >
+    /// [`ferrofin_core::library_manager::DEFAULT_ITEM_VALUES_WRITE_CHUNK`],
+    /// clamped to [`ITEM_VALUES_WRITE_CHUNK_RANGE`] with a warning.
+    pub item_values_write_chunk: u32,
+
     /// Bootstrap override for the metrics endpoint toggle. `Some(true)`/`Some(false)`
     /// force it on/off regardless of the persisted `ServerConfiguration.EnableMetrics`;
     /// `None` defers to `system.json`. Resolved `FERROFIN_ENABLE_METRICS` env >
@@ -418,7 +608,9 @@ pub struct Config {
     pub enable_metrics: Option<bool>,
 
     /// Suppress the compiled-in extensions (intro skipper, file
-    /// transformation, merge versions) — `true` registers none of them.
+    /// transformation, merge versions, LDAP-Auth) — `true` registers none of them but
+    /// the Ferrofin settings extension, the server's own settings page
+    /// (`ferrofin_extensions::registered_extensions`).
     ///
     /// This exists for measurement. A benchmark leg has to compare like with
     /// like, and the Jellyfin leg runs with no plugins installed; leaving
@@ -432,12 +624,20 @@ pub struct Config {
     /// to Jellyfin.
     pub disable_extensions: bool,
 
+    /// Whether the server listens for the operating system's network changes
+    /// and reads its network interfaces again after each one (Jellyfin's
+    /// `DetectNetworkChange` startup key, `True` by default; `--nonetchange`
+    /// turns it off). Resolved `FERROFIN_DETECT_NETWORK_CHANGE` env >
+    /// `detect_network_change` in `config.toml` > `true`.
+    pub detect_network_change: bool,
+
     /// Metrics gauge-sampler interval, in seconds. `None` = the 15 s default
     /// (aligned with the Prometheus scrape interval). Resolved
     /// `FERROFIN_METRICS_SAMPLE_INTERVAL` env > `metrics_sample_interval` in
-    /// `config.toml` > default. Only consulted when `EnableMetrics` is set; kept
-    /// out of the API `ServerConfiguration` so `/System/Configuration` stays
-    /// byte-identical to Jellyfin.
+    /// `config.toml` > default, clamped to [`METRICS_SAMPLE_INTERVAL_RANGE`]
+    /// with a warning; zero is the default. Only consulted when `EnableMetrics`
+    /// is set; kept out of the API `ServerConfiguration` so
+    /// `/System/Configuration` stays byte-identical to Jellyfin.
     pub metrics_sample_interval: Option<u32>,
 
     /// Bucket boundaries (seconds, ascending) of the library-scan duration
@@ -460,21 +660,16 @@ pub struct Config {
     /// client mid-stream would keep a draining host alive indefinitely, so an
     /// in-process restart during playback would never come back. Resolved
     /// `FERROFIN_SHUTDOWN_TIMEOUT_SECS` env > `shutdown_timeout_secs` in
-    /// `config.toml` > 30.
+    /// `config.toml` > 30, clamped to [`SHUTDOWN_TIMEOUT_SECS_RANGE`] with a
+    /// warning.
     pub shutdown_timeout_secs: u32,
-
-    /// Minimum period (milliseconds) between pushes of a dashboard WebSocket
-    /// stream; the client-chosen Sessions / ScheduledTasksInfo /
-    /// ActivityLogEntry period is clamped up to it. Resolved
-    /// `FERROFIN_WS_MIN_STREAM_PERIOD_MS` env > `websocket_min_stream_period_ms`
-    /// in `config.toml` > 100. See [`DEFAULT_WS_MIN_STREAM_PERIOD_MS`].
-    pub websocket_min_stream_period_ms: u32,
 
     /// Library-scan progress cadence: emit a progress `info!` every N items.
     /// `None` = the 100-item default; `0` disables progress logs. Resolved in
     /// order: `FERROFIN_SCAN_PROGRESS_EVERY` env, then `scan_progress_every` in
-    /// `config.toml`, else the default. A logging knob only — mistuning it changes
-    /// log density, never scan correctness.
+    /// `config.toml`, else the default, clamped to [`SCAN_PROGRESS_EVERY_RANGE`]
+    /// with a warning. A logging knob only — mistuning it changes log density,
+    /// never scan correctness.
     pub scan_progress_every: Option<u32>,
 
     /// How many ffprobe processes a library scan keeps in flight. The probe is
@@ -485,7 +680,8 @@ pub struct Config {
     /// on a spinning disk or a network mount, where a wide window turns
     /// sequential reads into seek thrash. Resolved
     /// `FERROFIN_SCAN_PROBE_CONCURRENCY` env > `scan_probe_concurrency` in
-    /// `config.toml` > default.
+    /// `config.toml` > default, clamped to [`SCAN_PROBE_CONCURRENCY_RANGE`]
+    /// with a warning.
     pub scan_probe_concurrency: Option<u32>,
 
     /// The directory listings one library scan keeps: dropped whole once
@@ -495,20 +691,21 @@ pub struct Config {
     /// a folder is listed again. `None` = upstream's
     /// `DirectoryService.MaxCachedRecords` (100 000). Resolved
     /// `FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS` env >
-    /// `scan_directory_cache_records` in `config.toml` > default; `0` is an
-    /// error.
+    /// `scan_directory_cache_records` in `config.toml` > default, clamped to
+    /// [`SCAN_DIRECTORY_CACHE_RECORDS_RANGE`] with a warning, `0` included.
     pub scan_directory_cache_records: Option<u32>,
 
     /// How long, in seconds, a library scan's directory listings survive
     /// unread before they are dropped whole. `None` = upstream's
     /// `DirectoryService.IdleTimeoutMs` (300 s). Resolved
     /// `FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS` env >
-    /// `scan_directory_cache_idle_secs` in `config.toml` > default; `0` is an
-    /// error.
+    /// `scan_directory_cache_idle_secs` in `config.toml` > default, clamped to
+    /// [`SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE`] with a warning, `0` included.
     pub scan_directory_cache_idle_secs: Option<u32>,
 
     /// How long, in seconds, a resolved access token (its device, user and
-    /// policy) may be served from the auth cache. `None` = 30 s
+    /// policy, an API key's name, or the rejection of a token that matched
+    /// nothing) may be served from the auth cache. `None` = 30 s
     /// (`AUTH_CACHE_TTL`). Every change made through the server takes effect
     /// at once; this only bounds how long one made outside it, in the database
     /// itself, goes unseen. Resolved `FERROFIN_AUTH_CACHE_TTL_SECS` env >
@@ -517,19 +714,22 @@ pub struct Config {
     pub auth_cache_ttl_secs: Option<u32>,
 
     /// How long, in seconds, the per-user access check may serve a user's
-    /// policy rows and the libraries' rows and options from its cache
+    /// policy rows, the libraries' rows and options, and the views' and the
+    /// playlists folder's rows from its cache
     /// (`ferrofin_db::row_cache`), which the user-library scope and every
-    /// lookup of a library's physical folders also read. `None` = 30 s
-    /// (`ROW_CACHE_TTL`). As for
+    /// lookup of a library's physical folders also read. The cache also holds
+    /// whether a Live TV tuner is configured, which the Live TV gate reads.
+    /// `None` = 30 s (`ROW_CACHE_TTL`). As for
     /// the auth cache, it only bounds edits made outside the server. Resolved
     /// `FERROFIN_ROW_CACHE_TTL_SECS` env > `row_cache_ttl_secs` in
     /// `config.toml` > default; must be within [`CACHE_TTL_RANGE_SECS`].
     pub row_cache_ttl_secs: Option<u32>,
 
-    /// How many trickplay generations (one item width each, an ffmpeg frame
-    /// extraction plus tile packing) run at once. A library scan runs several;
-    /// the scheduled task runs one but shares the cap. `None` = `auto`: as many as the shared image-encoding
-    /// pool allows (`ParallelImageEncodingLimit`, else the usable cores).
+    /// How many items generate trickplay at once (each one's widths in turn,
+    /// an ffmpeg frame extraction plus tile packing per width). A library scan
+    /// runs several; the scheduled task runs one but shares the cap. `None` =
+    /// `auto`: as many as the shared image-encoding pool allows
+    /// (`ParallelImageEncodingLimit`, else the usable cores).
     /// Jellyfin runs one at a time; `1` restores that. Zero, negative, and
     /// values above the auto value also mean auto (applied in `state.rs`).
     /// Resolved `FERROFIN_TRICKPLAY_CONCURRENCY` env (integer or `auto`) >
@@ -539,13 +739,15 @@ pub struct Config {
     /// Per-guest-call deadline for WASM plugins, in seconds. `None` = the
     /// 30 s default (`ferrofin_wasm::WasmSettings`). Resolved
     /// `FERROFIN_WASM_CALL_TIMEOUT_SECS` env > `wasm_call_timeout_secs` in
-    /// `config.toml` > default; zero is treated as unset.
+    /// `config.toml` > default, clamped to [`WASM_CALL_TIMEOUT_SECS_RANGE`]
+    /// with a warning; zero is treated as unset.
     pub wasm_call_timeout_secs: Option<u32>,
 
     /// Per-plugin linear-memory cap for WASM plugins, in MiB. `None` = the
     /// 128 MiB default (a `memory.grow` ceiling, never a reservation).
     /// Resolved `FERROFIN_WASM_MEMORY_LIMIT_MB` env > `wasm_memory_limit_mb`
-    /// in `config.toml` > default; zero is treated as unset.
+    /// in `config.toml` > default, clamped to [`WASM_MEMORY_LIMIT_MB_RANGE`]
+    /// with a warning; zero is treated as unset.
     pub wasm_memory_limit_mb: Option<u32>,
 
     /// Per-plugin event queue depth for WASM plugins. `None` = the 256
@@ -553,8 +755,9 @@ pub struct Config {
     /// hints; the DB is the truth), and web requests may hold at most half
     /// of it. Resolved
     /// `FERROFIN_WASM_EVENT_QUEUE_CAPACITY` env >
-    /// `wasm_event_queue_capacity` in `config.toml` > default; zero is
-    /// treated as unset.
+    /// `wasm_event_queue_capacity` in `config.toml` > default, clamped to
+    /// [`WASM_EVENT_QUEUE_CAPACITY_RANGE`] with a warning; zero is treated as
+    /// unset.
     pub wasm_event_queue_capacity: Option<u32>,
 
     /// WASM plugins allowed to `http-fetch` private/loopback destinations:
@@ -568,31 +771,36 @@ pub struct Config {
     /// settings and cursors fit easily; stats-heavy plugins (e.g. a
     /// playback-reporting port) may need more. Resolved
     /// `FERROFIN_WASM_STATE_LIMIT_MB` env > `wasm_state_limit_mb` in
-    /// `config.toml` > default.
+    /// `config.toml` > default, clamped to [`WASM_STATE_LIMIT_MB_RANGE`] with a
+    /// warning.
     pub wasm_state_limit_mb: Option<u32>,
 
     /// Cap on one plugin-artwork download, in MiB. `None`/zero = 20 MiB
     /// (posters/backdrops are single-digit MiB; anything larger is not
     /// artwork). Resolved `FERROFIN_WASM_IMAGE_DOWNLOAD_MB` env >
-    /// `wasm_image_download_mb` in `config.toml` > default.
+    /// `wasm_image_download_mb` in `config.toml` > default, clamped to
+    /// [`WASM_IMAGE_DOWNLOAD_MB_RANGE`] with a warning.
     pub wasm_image_download_mb: Option<u32>,
 
     /// Wall-clock bound on one plugin-artwork download, in seconds.
     /// `None`/zero = 30 s (a CDN GET, not a transfer job). Resolved
     /// `FERROFIN_WASM_IMAGE_TIMEOUT_SECS` env > `wasm_image_timeout_secs`
-    /// in `config.toml` > default.
+    /// in `config.toml` > default, clamped to
+    /// [`WASM_IMAGE_TIMEOUT_SECS_RANGE`] with a warning.
     pub wasm_image_timeout_secs: Option<u32>,
 
     /// Cap on one plugin `write-lyrics`/`write-subtitles` payload, in MiB.
     /// `None`/zero = 2 MiB (settings-class writes, not media). Resolved
     /// `FERROFIN_WASM_WRITE_CONTENT_MB` env > `wasm_write_content_mb` in
-    /// `config.toml` > default.
+    /// `config.toml` > default, clamped to [`WASM_WRITE_CONTENT_MB_RANGE`]
+    /// with a warning.
     pub wasm_write_content_mb: Option<u32>,
 
     /// Cap on one plugin-extracted subtitle track, in MiB. `None`/zero =
     /// 10 MiB (generous for SRT text). Resolved
     /// `FERROFIN_WASM_SUBTITLE_EXTRACT_MB` env >
-    /// `wasm_subtitle_extract_mb` in `config.toml` > default.
+    /// `wasm_subtitle_extract_mb` in `config.toml` > default, clamped to
+    /// [`WASM_SUBTITLE_EXTRACT_MB_RANGE`] with a warning.
     pub wasm_subtitle_extract_mb: Option<u32>,
 
     /// Depth of the playback-metrics write queue, in events. `None`/zero =
@@ -602,30 +810,76 @@ pub struct Config {
     /// queue drops the event with a warning rather than blocking. Raise it if
     /// `playback-metrics queue full` shows up in the log under a load spike.
     /// Resolved `FERROFIN_PLAYBACK_METRICS_QUEUE` env >
-    /// `playback_metrics_queue` in `config.toml` > default.
+    /// `playback_metrics_queue` in `config.toml` > default, clamped to
+    /// [`PLAYBACK_METRICS_QUEUE_RANGE`] with a warning.
     pub playback_metrics_queue: Option<u32>,
+
+    /// How long a session with no WebSocket that plays nothing may go without
+    /// a request before the one-minute session loop ends it, in hours. Jellyfin
+    /// keeps such a session until it restarts, so a client that changes its
+    /// device id on every run would grow the session pool without end.
+    /// Resolved `FERROFIN_SESSION_IDLE_HOURS` env > `session_idle_hours` in
+    /// `config.toml` > 24, clamped to [`SESSION_IDLE_HOURS_RANGE`] with a
+    /// warning.
+    pub session_idle_hours: u32,
 
     /// Unauthorized Quick Connect requests one remote IP may hold at once;
     /// the next `POST /QuickConnect/Initiate` from that IP drops its oldest.
     /// `None`/zero = `ferrofin_core::quick_connect_manager::DEFAULT_PENDING_PER_IP` (10). Jellyfin has no
     /// cap. Resolved `FERROFIN_QUICK_CONNECT_PENDING_PER_IP` env >
-    /// `quick_connect_pending_per_ip` in `config.toml` > default.
+    /// `quick_connect_pending_per_ip` in `config.toml` > default, clamped to
+    /// [`QUICK_CONNECT_PENDING_PER_IP_RANGE`] with a warning.
     pub quick_connect_pending_per_ip: Option<u32>,
+
+    /// Whether Ferrofin's login backoff runs (Jellyfin has none): repeated
+    /// failed logins make an account's and a client address's next attempts
+    /// wait. Resolved `FERROFIN_LOGIN_BACKOFF` env > `login_backoff` in
+    /// `config.toml` > `true`.
+    pub login_backoff: bool,
+
+    /// Failed logins an account or a client address may make before its
+    /// attempts are paced. Resolved `FERROFIN_LOGIN_BACKOFF_ATTEMPTS` env >
+    /// `login_backoff_attempts` in `config.toml` > 5; within
+    /// [`LoginBackoffSettings::ATTEMPTS_RANGE`].
+    pub login_backoff_attempts: u32,
+
+    /// The longest wait, in seconds, the login backoff gives an attempt. An
+    /// address whose attempt would wait longer is refused; an account's
+    /// attempts only wait, this long at most. Resolved
+    /// `FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS` env >
+    /// `login_backoff_max_delay_secs` in `config.toml` > 30; within
+    /// [`LoginBackoffSettings::MAX_DELAY_RANGE_SECS`].
+    pub login_backoff_max_delay_secs: u32,
+
+    /// How long, in minutes, the login backoff remembers an account's or an
+    /// address's failures after the last one. Resolved
+    /// `FERROFIN_LOGIN_BACKOFF_WINDOW_MINS` env > `login_backoff_window_mins`
+    /// in `config.toml` > 15; within [`LoginBackoffSettings::WINDOW_RANGE_MINS`].
+    pub login_backoff_window_mins: u32,
+
+    /// The most accounts and addresses the login backoff remembers at once;
+    /// past it, the ones not yet paced are forgotten first. Resolved
+    /// `FERROFIN_LOGIN_BACKOFF_MAX_TRACKED` env > `login_backoff_max_tracked`
+    /// in `config.toml` > 100,000; within
+    /// [`LoginBackoffSettings::MAX_TRACKED_RANGE`].
+    pub login_backoff_max_tracked: u32,
 
     /// Concurrent media-decode budget for WASM plugin analysis
     /// (`extract-audio`/`extract-frames`). `None`/zero = a quarter of the
     /// visible cores, at least one — plugin analysis must never starve
     /// transcodes, but a NAS and a 32-core host disagree on what that
     /// means. Resolved `FERROFIN_WASM_ANALYSIS_CONCURRENCY` env >
-    /// `wasm_analysis_concurrency` in `config.toml` > default.
+    /// `wasm_analysis_concurrency` in `config.toml` > default, clamped to
+    /// [`WASM_ANALYSIS_CONCURRENCY_RANGE`] with a warning.
     pub wasm_analysis_concurrency: Option<u32>,
 
     /// Size cap on a plugin artifact downloaded during a repository install,
     /// in MiB. `None` = the 128 MiB default (sized for interpreter-language
     /// guests bundling their runtime; an abuse guard, not a tuning knob).
     /// Resolved `FERROFIN_MAX_PLUGIN_DOWNLOAD_MB` env >
-    /// `max_plugin_download_mb` in `config.toml` > default; zero is treated
-    /// as unset.
+    /// `max_plugin_download_mb` in `config.toml` > default, clamped to
+    /// [`MAX_PLUGIN_DOWNLOAD_MB_RANGE`] with a warning; zero is treated as
+    /// unset.
     pub max_plugin_download_mb: Option<u32>,
 }
 
@@ -645,19 +899,70 @@ impl Config {
         Self::load_from(cli, &EnvProvider)
     }
 
+    /// [`Config::load`] with `vars` in place of the process environment, so a
+    /// test that loads a `config.toml` as the binary does sees none of the
+    /// environment it runs in.
+    ///
+    /// # Errors
+    ///
+    /// As [`Config::load`].
+    #[doc(hidden)]
+    pub fn load_with_vars(cli: Cli, vars: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        struct Vars<'a>(&'a dyn Fn(&str) -> Option<String>);
+        impl Env for Vars<'_> {
+            fn var(&self, key: &str) -> Option<String> {
+                (self.0)(key)
+            }
+        }
+        Self::load_from(cli, &Vars(vars))
+    }
+
     /// [`Config::load`] against an injectable environment provider (for tests).
     // One linear layering of CLI > env > file > default per knob; it grows by a
     // line per config field, so the length is inherent (cf. `build_app_state`).
     #[allow(clippy::too_many_lines)]
-    fn load_from(cli: Cli, env: &dyn Env) -> anyhow::Result<Self> {
-        let file = load_file_config(cli.config_file.as_deref(), env)?;
-
-        // data_dir: CLI > env > file > $XDG_DATA_HOME/ferrofin > /var/lib/ferrofin.
-        let data_dir = cli
+    pub(crate) fn load_from(cli: Cli, env: &dyn Env) -> anyhow::Result<Self> {
+        let flags = cli.clone();
+        let env = &WarningEnv {
+            env,
+            warnings: std::cell::RefCell::default(),
+        };
+        let mut load_warnings = Vec::new();
+        let chosen_data_dir = cli
             .data_dir
-            .or_else(|| env.var("FERROFIN_DATA_DIR").map(PathBuf::from))
-            .or(file.data_dir)
-            .unwrap_or_else(|| default_data_dir(env));
+            .or_else(|| env.var("FERROFIN_DATA_DIR").map(PathBuf::from));
+        let named_file = cli.config_file.or_else(|| {
+            env.var("FERROFIN_CONFIG_FILE")
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+        });
+
+        // data_dir: CLI > env > file > $XDG_DATA_HOME/ferrofin > /var/lib/ferrofin,
+        // where the file may set it only when `--config`/`FERROFIN_CONFIG_FILE`
+        // named the file: one found in the data directory cannot move it.
+        let (data_dir, config_file, file, config_file_found) = if let Some(config_file) = named_file
+        {
+            let (file, found, unknown) = load_file_config(&config_file)?;
+            load_warnings.extend(unknown);
+            let data_dir = chosen_data_dir
+                .or_else(|| file.data_dir.clone())
+                .unwrap_or_else(|| default_data_dir(env));
+            (data_dir, config_file, file, found)
+        } else {
+            let data_dir = chosen_data_dir.unwrap_or_else(|| default_data_dir(env));
+            let config_file = data_dir.join(CONFIG_FILE_NAME);
+            let (file, found, unknown) = load_file_config(&config_file)?;
+            load_warnings.extend(unknown);
+            if let Some(ignored) = file.data_dir.as_ref().filter(|dir| **dir != data_dir) {
+                load_warnings.push(format!(
+                    "data_dir `{}` in config.toml is ignored: a config.toml found in the data \
+                     directory cannot move it; set --data-dir or FERROFIN_DATA_DIR, or name \
+                     the file with --config or FERROFIN_CONFIG_FILE",
+                    ignored.display()
+                ));
+            }
+            (data_dir, config_file, file, found)
+        };
 
         let config_dir = env
             .var("FERROFIN_CONFIG_DIR")
@@ -749,6 +1054,89 @@ impl Config {
             .or(file.musicbrainz_base_url)
             .unwrap_or_default();
 
+        let provider_timeout_seconds = resolve_clamped(
+            env,
+            "FERROFIN_PROVIDER_TIMEOUT_SECONDS",
+            "provider_timeout_seconds",
+            file.provider_timeout_seconds,
+            RequestLimits::DEFAULT_TIMEOUT_SECONDS,
+            RequestLimits::TIMEOUT_SECONDS,
+            "seconds",
+        );
+        let provider_max_wait_seconds = resolve_clamped(
+            env,
+            "FERROFIN_PROVIDER_MAX_WAIT_SECONDS",
+            "provider_max_wait_seconds",
+            file.provider_max_wait_seconds,
+            RequestLimits::DEFAULT_MAX_WAIT_SECONDS,
+            RequestLimits::MAX_WAIT_SECONDS,
+            "seconds",
+        );
+
+        let image_decode_max_megapixels = resolve_clamped(
+            env,
+            "FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS",
+            "image_decode_max_megapixels",
+            file.image_decode_max_megapixels,
+            ImageLimits::DEFAULT_DECODE_MEGAPIXELS,
+            ImageLimits::DECODE_MEGAPIXELS,
+            "megapixels",
+        );
+        let image_decode_max_memory_mb = resolve_clamped(
+            env,
+            "FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB",
+            "image_decode_max_memory_mb",
+            file.image_decode_max_memory_mb,
+            ImageLimits::DEFAULT_DECODE_MEMORY_MB,
+            ImageLimits::DECODE_MEMORY_MB,
+            "MiB",
+        );
+        let image_resize_budget_mb = resolve_clamped(
+            env,
+            "FERROFIN_IMAGE_RESIZE_BUDGET_MB",
+            "image_resize_budget_mb",
+            file.image_resize_budget_mb,
+            ImageLimits::DEFAULT_RESIZE_BUDGET_MB,
+            ImageLimits::RESIZE_BUDGET_MB,
+            "MiB",
+        );
+        let image_download_max_mb = resolve_clamped(
+            env,
+            "FERROFIN_IMAGE_DOWNLOAD_MAX_MB",
+            "image_download_max_mb",
+            file.image_download_max_mb,
+            RequestLimits::DEFAULT_DOWNLOAD_MAX_MB,
+            RequestLimits::DOWNLOAD_MAX_MB,
+            "MiB",
+        );
+        let max_transcodes = resolve_clamped(
+            env,
+            "FERROFIN_MAX_TRANSCODES",
+            "max_transcodes",
+            file.max_transcodes,
+            0,
+            TranscodeLimits::RANGE,
+            "transcodes",
+        );
+        let max_transcodes_per_user = resolve_clamped(
+            env,
+            "FERROFIN_MAX_TRANSCODES_PER_USER",
+            "max_transcodes_per_user",
+            file.max_transcodes_per_user,
+            0,
+            TranscodeLimits::RANGE,
+            "transcodes",
+        );
+        let image_negative_cache_ttl_secs = resolve_clamped(
+            env,
+            "FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS",
+            "image_negative_cache_ttl_secs",
+            file.image_negative_cache_ttl_secs,
+            DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS,
+            IMAGE_NEGATIVE_CACHE_TTL_SECS,
+            "seconds",
+        );
+
         let ffmpeg_path = cli
             .ffmpeg_path
             .or_else(|| env.var("FERROFIN_FFMPEG_PATH").map(PathBuf::from))
@@ -775,6 +1163,8 @@ impl Config {
             .or(file.log_level)
             .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned());
 
+        let log_format = resolve_log_format(env, file.log_format);
+
         let admin_user = env
             .var("FERROFIN_ADMIN_USER")
             .or(file.admin_user)
@@ -786,9 +1176,23 @@ impl Config {
             .unwrap_or_default();
 
         let db_pool = resolve_db_pool(env, file.db_pool)?;
+        let db_statement_cache = resolve_statement_cache(env, file.db_statement_cache)?;
+        let item_values_write_chunk = resolve_clamped(
+            env,
+            "FERROFIN_ITEM_VALUES_WRITE_CHUNK",
+            "item_values_write_chunk",
+            file.item_values_write_chunk,
+            ferrofin_core::library_manager::DEFAULT_ITEM_VALUES_WRITE_CHUNK,
+            ITEM_VALUES_WRITE_CHUNK_RANGE,
+            "items",
+        );
 
-        Ok(Self {
+        let mut config = Self {
             data_dir,
+            config_file,
+            config_file_found,
+            cli: flags,
+            load_warnings: Vec::new(),
             config_dir,
             cache_dir,
             web_dir,
@@ -808,8 +1212,29 @@ impl Config {
             tvdb_token_days,
             fanart_personal_api_key,
             musicbrainz_base_url,
+            provider_timeout_seconds,
+            provider_max_wait_seconds,
+            image_decode_max_megapixels,
+            image_decode_max_memory_mb,
+            image_resize_budget_mb,
+            image_download_max_mb,
+            image_negative_cache_ttl_secs,
+            image_private_http_allow: resolve_private_allow(
+                env,
+                "FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW",
+                "image_private_http_allow",
+                file.image_private_http_allow,
+            ),
+            subtitle_private_http_allow: resolve_private_allow(
+                env,
+                "FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW",
+                "subtitle_private_http_allow",
+                file.subtitle_private_http_allow,
+            ),
             ffmpeg_path,
             ffprobe_path,
+            max_transcodes,
+            max_transcodes_per_user,
             ffmpeg_img_extract_perf_tradeoff: parse_bool_var(
                 env,
                 "FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF",
@@ -819,41 +1244,79 @@ impl Config {
             library_roots,
             server_name,
             log_level,
+            log_format,
             admin_user,
             admin_password,
             db_pool,
+            db_statement_cache,
+            item_values_write_chunk,
             enable_metrics: parse_bool_var(env, "FERROFIN_ENABLE_METRICS").or(file.enable_metrics),
             disable_extensions: parse_bool_var(env, "FERROFIN_DISABLE_EXTENSIONS")
                 .or(file.disable_extensions)
                 .unwrap_or(false),
+            detect_network_change: parse_bool_var(env, "FERROFIN_DETECT_NETWORK_CHANGE")
+                .or(file.detect_network_change)
+                .unwrap_or(true),
             metrics_sample_interval: resolve_metrics_interval(env, file.metrics_sample_interval),
             metrics_scan_duration_buckets: env
                 .var("FERROFIN_METRICS_SCAN_DURATION_BUCKETS")
                 .filter(|raw| !raw.trim().is_empty())
                 .map(|raw| parse_bucket_list(&raw))
                 .or(file.metrics_scan_duration_buckets),
-            shutdown_timeout_secs: parse_var(env, "FERROFIN_SHUTDOWN_TIMEOUT_SECS")
-                .or(file.shutdown_timeout_secs)
-                .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
-            websocket_min_stream_period_ms: parse_var(env, "FERROFIN_WS_MIN_STREAM_PERIOD_MS")
-                .or(file.websocket_min_stream_period_ms)
-                .unwrap_or(DEFAULT_WS_MIN_STREAM_PERIOD_MS),
-            scan_progress_every: parse_var(env, "FERROFIN_SCAN_PROGRESS_EVERY")
-                .or(file.scan_progress_every),
-            scan_probe_concurrency: parse_var(env, "FERROFIN_SCAN_PROBE_CONCURRENCY")
-                .or(file.scan_probe_concurrency),
-            scan_directory_cache_records: resolve_positive(
+            shutdown_timeout_secs: resolve_clamped(
+                env,
+                "FERROFIN_SHUTDOWN_TIMEOUT_SECS",
+                "shutdown_timeout_secs",
+                file.shutdown_timeout_secs,
+                DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+                SHUTDOWN_TIMEOUT_SECS_RANGE,
+                "seconds",
+            ),
+            session_idle_hours: resolve_clamped(
+                env,
+                "FERROFIN_SESSION_IDLE_HOURS",
+                "session_idle_hours",
+                file.session_idle_hours,
+                DEFAULT_SESSION_IDLE_HOURS,
+                SESSION_IDLE_HOURS_RANGE,
+                "hours",
+            ),
+            scan_progress_every: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_SCAN_PROGRESS_EVERY",
+                "scan_progress_every",
+                file.scan_progress_every,
+                &SCAN_PROGRESS_EVERY_RANGE,
+                "items",
+                Zero::InRange,
+            ),
+            scan_probe_concurrency: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_SCAN_PROBE_CONCURRENCY",
+                "scan_probe_concurrency",
+                file.scan_probe_concurrency,
+                &SCAN_PROBE_CONCURRENCY_RANGE,
+                "processes",
+                Zero::Default,
+            ),
+            scan_directory_cache_records: resolve_clamped_or_unset(
                 env,
                 "FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS",
                 "scan_directory_cache_records",
                 file.scan_directory_cache_records,
-            )?,
-            scan_directory_cache_idle_secs: resolve_positive(
+                &SCAN_DIRECTORY_CACHE_RECORDS_RANGE,
+                "records",
+                Zero::InRange,
+            ),
+            scan_directory_cache_idle_secs: resolve_clamped_or_unset(
                 env,
                 "FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS",
                 "scan_directory_cache_idle_secs",
                 file.scan_directory_cache_idle_secs,
-            )?,
+                &SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE,
+                "seconds",
+                Zero::InRange,
+            ),
             auth_cache_ttl_secs: resolve_cache_ttl(
                 env,
                 "FERROFIN_AUTH_CACHE_TTL_SECS",
@@ -867,35 +1330,158 @@ impl Config {
                 file.row_cache_ttl_secs,
             )?,
             trickplay_concurrency: resolve_trickplay_concurrency(env, file.trickplay_concurrency)?,
-            wasm_call_timeout_secs: parse_var(env, "FERROFIN_WASM_CALL_TIMEOUT_SECS")
-                .or(file.wasm_call_timeout_secs),
-            wasm_memory_limit_mb: parse_var(env, "FERROFIN_WASM_MEMORY_LIMIT_MB")
-                .or(file.wasm_memory_limit_mb),
-            wasm_event_queue_capacity: parse_var(env, "FERROFIN_WASM_EVENT_QUEUE_CAPACITY")
-                .or(file.wasm_event_queue_capacity),
+            wasm_call_timeout_secs: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_CALL_TIMEOUT_SECS",
+                "wasm_call_timeout_secs",
+                file.wasm_call_timeout_secs,
+                &WASM_CALL_TIMEOUT_SECS_RANGE,
+                "seconds",
+                Zero::Default,
+            ),
+            wasm_memory_limit_mb: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_MEMORY_LIMIT_MB",
+                "wasm_memory_limit_mb",
+                file.wasm_memory_limit_mb,
+                &WASM_MEMORY_LIMIT_MB_RANGE,
+                "MiB",
+                Zero::Default,
+            ),
+            wasm_event_queue_capacity: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_EVENT_QUEUE_CAPACITY",
+                "wasm_event_queue_capacity",
+                file.wasm_event_queue_capacity,
+                &WASM_EVENT_QUEUE_CAPACITY_RANGE,
+                "events",
+                Zero::Default,
+            ),
             wasm_private_http_allow: env
                 .var("FERROFIN_WASM_PRIVATE_HTTP_ALLOW")
                 .or(file.wasm_private_http_allow)
                 .filter(|s| !s.trim().is_empty()),
-            max_plugin_download_mb: parse_var(env, "FERROFIN_MAX_PLUGIN_DOWNLOAD_MB")
-                .or(file.max_plugin_download_mb),
-            wasm_analysis_concurrency: parse_var(env, "FERROFIN_WASM_ANALYSIS_CONCURRENCY")
-                .or(file.wasm_analysis_concurrency),
-            wasm_state_limit_mb: parse_var(env, "FERROFIN_WASM_STATE_LIMIT_MB")
-                .or(file.wasm_state_limit_mb),
-            wasm_image_download_mb: parse_var(env, "FERROFIN_WASM_IMAGE_DOWNLOAD_MB")
-                .or(file.wasm_image_download_mb),
-            wasm_image_timeout_secs: parse_var(env, "FERROFIN_WASM_IMAGE_TIMEOUT_SECS")
-                .or(file.wasm_image_timeout_secs),
-            wasm_write_content_mb: parse_var(env, "FERROFIN_WASM_WRITE_CONTENT_MB")
-                .or(file.wasm_write_content_mb),
-            wasm_subtitle_extract_mb: parse_var(env, "FERROFIN_WASM_SUBTITLE_EXTRACT_MB")
-                .or(file.wasm_subtitle_extract_mb),
-            playback_metrics_queue: parse_var(env, "FERROFIN_PLAYBACK_METRICS_QUEUE")
-                .or(file.playback_metrics_queue),
-            quick_connect_pending_per_ip: parse_var(env, "FERROFIN_QUICK_CONNECT_PENDING_PER_IP")
-                .or(file.quick_connect_pending_per_ip),
-        })
+            max_plugin_download_mb: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_MAX_PLUGIN_DOWNLOAD_MB",
+                "max_plugin_download_mb",
+                file.max_plugin_download_mb,
+                &MAX_PLUGIN_DOWNLOAD_MB_RANGE,
+                "MiB",
+                Zero::Default,
+            ),
+            wasm_analysis_concurrency: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_ANALYSIS_CONCURRENCY",
+                "wasm_analysis_concurrency",
+                file.wasm_analysis_concurrency,
+                &WASM_ANALYSIS_CONCURRENCY_RANGE,
+                "decodes",
+                Zero::Default,
+            ),
+            wasm_state_limit_mb: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_STATE_LIMIT_MB",
+                "wasm_state_limit_mb",
+                file.wasm_state_limit_mb,
+                &WASM_STATE_LIMIT_MB_RANGE,
+                "MiB",
+                Zero::Default,
+            ),
+            wasm_image_download_mb: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_IMAGE_DOWNLOAD_MB",
+                "wasm_image_download_mb",
+                file.wasm_image_download_mb,
+                &WASM_IMAGE_DOWNLOAD_MB_RANGE,
+                "MiB",
+                Zero::Default,
+            ),
+            wasm_image_timeout_secs: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_IMAGE_TIMEOUT_SECS",
+                "wasm_image_timeout_secs",
+                file.wasm_image_timeout_secs,
+                &WASM_IMAGE_TIMEOUT_SECS_RANGE,
+                "seconds",
+                Zero::Default,
+            ),
+            wasm_write_content_mb: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_WRITE_CONTENT_MB",
+                "wasm_write_content_mb",
+                file.wasm_write_content_mb,
+                &WASM_WRITE_CONTENT_MB_RANGE,
+                "MiB",
+                Zero::Default,
+            ),
+            wasm_subtitle_extract_mb: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_WASM_SUBTITLE_EXTRACT_MB",
+                "wasm_subtitle_extract_mb",
+                file.wasm_subtitle_extract_mb,
+                &WASM_SUBTITLE_EXTRACT_MB_RANGE,
+                "MiB",
+                Zero::Default,
+            ),
+            playback_metrics_queue: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_PLAYBACK_METRICS_QUEUE",
+                "playback_metrics_queue",
+                file.playback_metrics_queue,
+                &PLAYBACK_METRICS_QUEUE_RANGE,
+                "events",
+                Zero::Default,
+            ),
+            quick_connect_pending_per_ip: resolve_clamped_or_unset(
+                env,
+                "FERROFIN_QUICK_CONNECT_PENDING_PER_IP",
+                "quick_connect_pending_per_ip",
+                file.quick_connect_pending_per_ip,
+                &QUICK_CONNECT_PENDING_PER_IP_RANGE,
+                "requests",
+                Zero::Default,
+            ),
+            login_backoff: parse_bool_var(env, "FERROFIN_LOGIN_BACKOFF")
+                .or(file.login_backoff)
+                .unwrap_or(true),
+            login_backoff_attempts: resolve_ranged(
+                env,
+                "FERROFIN_LOGIN_BACKOFF_ATTEMPTS",
+                "login_backoff_attempts",
+                file.login_backoff_attempts,
+                LoginBackoffSettings::DEFAULT_ATTEMPTS,
+                LoginBackoffSettings::ATTEMPTS_RANGE,
+            )?,
+            login_backoff_max_delay_secs: resolve_ranged(
+                env,
+                "FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS",
+                "login_backoff_max_delay_secs",
+                file.login_backoff_max_delay_secs,
+                LoginBackoffSettings::DEFAULT_MAX_DELAY_SECS,
+                LoginBackoffSettings::MAX_DELAY_RANGE_SECS,
+            )?,
+            login_backoff_window_mins: resolve_ranged(
+                env,
+                "FERROFIN_LOGIN_BACKOFF_WINDOW_MINS",
+                "login_backoff_window_mins",
+                file.login_backoff_window_mins,
+                LoginBackoffSettings::DEFAULT_WINDOW_MINS,
+                LoginBackoffSettings::WINDOW_RANGE_MINS,
+            )?,
+            login_backoff_max_tracked: resolve_ranged(
+                env,
+                "FERROFIN_LOGIN_BACKOFF_MAX_TRACKED",
+                "login_backoff_max_tracked",
+                file.login_backoff_max_tracked,
+                LoginBackoffSettings::DEFAULT_MAX_TRACKED,
+                LoginBackoffSettings::MAX_TRACKED_RANGE,
+            )?,
+        };
+        // The file's warnings first, then the variables', in the order read.
+        load_warnings.extend(env.warnings.take());
+        config.load_warnings = load_warnings;
+        Ok(config)
     }
 
     /// The path to the SQLite database file.
@@ -931,28 +1517,54 @@ impl Config {
     }
 
     /// TheTVDB's cache duration ([`tvdb_cache_hours`](Self::tvdb_cache_hours)):
-    /// the configured whole hours, or the plugin's default of one hour
+    /// the configured whole hours, clamped to [`TVDB_CACHE_HOURS_RANGE`] with
+    /// a warning, or the plugin's default of one hour
     /// ([`ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION`]) when unset. A
-    /// value that is not a whole number of hours above zero is refused with
-    /// a warning and the default is used, as the sibling settings do; call
-    /// it once tracing is installed.
+    /// value that is not a whole number of hours is refused with a warning
+    /// and the default is used, as the sibling settings do; call it once
+    /// tracing is installed.
     #[must_use]
     pub fn tvdb_cache_duration(&self) -> std::time::Duration {
         let default = ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION;
         let Some(raw) = self.tvdb_cache_hours.as_deref() else {
             return default;
         };
-        match raw.trim().parse::<u32>() {
-            Ok(hours) if hours > 0 => std::time::Duration::from_hours(u64::from(hours)),
-            _ => {
-                tracing::warn!(
-                    value = raw,
-                    default_hours = default.as_secs() / 3600,
-                    "FERROFIN_TVDB_CACHE_HOURS / tvdb_cache_hours is not a whole number of hours above zero; using the default"
-                );
-                default
-            }
+        // `hours` is the value used in both warnings.
+        let Ok(written) = raw.trim().parse::<u32>() else {
+            tracing::warn!(
+                value = raw,
+                hours = default.as_secs() / 3600,
+                "FERROFIN_TVDB_CACHE_HOURS / tvdb_cache_hours is not a whole number of hours; using the default"
+            );
+            return default;
+        };
+        let hours = clamp_tvdb_cache_hours(written);
+        if hours != written {
+            tracing::warn!(
+                value = raw,
+                hours,
+                min = TVDB_CACHE_HOURS_RANGE.start(),
+                max = TVDB_CACHE_HOURS_RANGE.end(),
+                "FERROFIN_TVDB_CACHE_HOURS / tvdb_cache_hours is outside its range; using the nearest bound"
+            );
         }
+        std::time::Duration::from_hours(u64::from(hours))
+    }
+
+    /// The private hosts and networks image downloads may reach
+    /// ([`image_private_http_allow`](Self::image_private_http_allow)), its
+    /// refused entries left out: the loader warned about them.
+    #[must_use]
+    pub fn image_private_allow_list(&self) -> ferrofin_providers::destination::PrivateAllowList {
+        private_allow_list(self.image_private_http_allow.as_deref())
+    }
+
+    /// The private hosts and networks the OpenSubtitles download link may
+    /// reach ([`subtitle_private_http_allow`](Self::subtitle_private_http_allow)),
+    /// its refused entries left out: the loader warned about them.
+    #[must_use]
+    pub fn subtitle_private_allow_list(&self) -> ferrofin_providers::destination::PrivateAllowList {
+        private_allow_list(self.subtitle_private_http_allow.as_deref())
     }
 
     /// TheTVDB's token max age ([`tvdb_token_days`](Self::tvdb_token_days)):
@@ -977,6 +1589,56 @@ impl Config {
             "FERROFIN_TVDB_TOKEN_DAYS / tvdb_token_days is not a whole number of days from 1 to 29; using the default"
         );
         default
+    }
+
+    /// `next`, loaded again for an in-process restart, with what this process
+    /// holds for its whole life put back to its running value; and the
+    /// `config.toml` keys of the settings whose new value that leaves
+    /// unapplied until the process restarts.
+    ///
+    /// Held for the process's life: the data, configuration and cache
+    /// directories (the database, configuration and caches never move under a
+    /// running process), the log filter and format (`init_tracing` installs
+    /// them once), and
+    /// the scan-duration histogram buckets (the metrics pipeline installs them
+    /// once; kept even before metrics were first enabled, so the setting
+    /// always applies on a process restart). The test seams that are no
+    /// setting (`discovery_bind_addr`, `provider_endpoints`) carry over
+    /// without a mention. `web_dir` is served anew each lifetime, so it
+    /// follows the reload, even when it derives from a `data_dir` kept here.
+    #[must_use]
+    pub fn for_restart(&self, mut next: Config) -> (Config, Vec<&'static str>) {
+        let mut kept = Vec::new();
+        keep_running(&mut next.data_dir, &self.data_dir, "data_dir", &mut kept);
+        keep_running(
+            &mut next.config_dir,
+            &self.config_dir,
+            "config_dir",
+            &mut kept,
+        );
+        keep_running(&mut next.cache_dir, &self.cache_dir, "cache_dir", &mut kept);
+        keep_running(&mut next.log_level, &self.log_level, "log_level", &mut kept);
+        keep_running(
+            &mut next.log_format,
+            &self.log_format,
+            "log_format",
+            &mut kept,
+        );
+        // Compared bit for bit: an unparsable entry is NaN, which never equals
+        // itself, and an unchanged list must not read as a change.
+        let bits = |buckets: &Option<Vec<f64>>| {
+            buckets
+                .as_ref()
+                .map(|list| list.iter().map(|b| b.to_bits()).collect::<Vec<_>>())
+        };
+        if bits(&next.metrics_scan_duration_buckets) != bits(&self.metrics_scan_duration_buckets) {
+            next.metrics_scan_duration_buckets
+                .clone_from(&self.metrics_scan_duration_buckets);
+            kept.push("metrics_scan_duration_buckets");
+        }
+        next.discovery_bind_addr = self.discovery_bind_addr;
+        next.provider_endpoints.clone_from(&self.provider_endpoints);
+        (next, kept)
     }
 
     /// The `sqlite:` connection URL for [`Config::database_path`], suitable for
@@ -1010,6 +1672,10 @@ impl Config {
     pub fn test_stub(root: &Path) -> Self {
         Config {
             data_dir: root.join("data"),
+            config_file: root.join("data").join(CONFIG_FILE_NAME),
+            config_file_found: false,
+            cli: Cli::default(),
+            load_warnings: Vec::new(),
             config_dir: root.join("config"),
             cache_dir: root.join("cache"),
             web_dir: root.join("web"),
@@ -1029,21 +1695,37 @@ impl Config {
             tvdb_token_days: None,
             fanart_personal_api_key: String::new(),
             musicbrainz_base_url: OFFLINE_PROVIDER_URL.to_owned(),
+            provider_timeout_seconds: RequestLimits::DEFAULT_TIMEOUT_SECONDS,
+            provider_max_wait_seconds: RequestLimits::DEFAULT_MAX_WAIT_SECONDS,
+            image_decode_max_megapixels: ImageLimits::DEFAULT_DECODE_MEGAPIXELS,
+            image_decode_max_memory_mb: ImageLimits::DEFAULT_DECODE_MEMORY_MB,
+            image_resize_budget_mb: ImageLimits::DEFAULT_RESIZE_BUDGET_MB,
+            image_download_max_mb: RequestLimits::DEFAULT_DOWNLOAD_MAX_MB,
+            image_negative_cache_ttl_secs: DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS,
+            image_private_http_allow: None,
+            subtitle_private_http_allow: None,
             ffmpeg_path: None,
             ffprobe_path: None,
             ffmpeg_img_extract_perf_tradeoff: false,
+            max_transcodes: 0,
+            max_transcodes_per_user: 0,
             library_roots: Vec::new(),
             server_name: "ferrofin-test".to_owned(),
             log_level: "info".to_owned(),
+            log_format: LogFormat::Json,
             admin_user: "admin".to_owned(),
             admin_password: String::new(),
             db_pool: None,
+            db_statement_cache: None,
+            item_values_write_chunk:
+                ferrofin_core::library_manager::DEFAULT_ITEM_VALUES_WRITE_CHUNK,
             enable_metrics: None,
             disable_extensions: false,
+            detect_network_change: true,
             metrics_sample_interval: None,
             metrics_scan_duration_buckets: None,
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
-            websocket_min_stream_period_ms: DEFAULT_WS_MIN_STREAM_PERIOD_MS,
+            session_idle_hours: DEFAULT_SESSION_IDLE_HOURS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
             scan_directory_cache_records: None,
@@ -1064,18 +1746,284 @@ impl Config {
             wasm_subtitle_extract_mb: None,
             playback_metrics_queue: None,
             quick_connect_pending_per_ip: None,
+            // Off, so a test's failed logins do not make its next logins wait;
+            // the login backoff's own tests turn it on.
+            login_backoff: false,
+            login_backoff_attempts: LoginBackoffSettings::DEFAULT_ATTEMPTS,
+            login_backoff_max_delay_secs: LoginBackoffSettings::DEFAULT_MAX_DELAY_SECS,
+            login_backoff_window_mins: LoginBackoffSettings::DEFAULT_WINDOW_MINS,
+            login_backoff_max_tracked: LoginBackoffSettings::DEFAULT_MAX_TRACKED,
+        }
+    }
+
+    /// The login backoff these settings describe.
+    #[must_use]
+    pub fn login_backoff_settings(&self) -> LoginBackoffSettings {
+        LoginBackoffSettings::new(
+            if self.login_backoff {
+                self.login_backoff_attempts
+            } else {
+                0
+            },
+            self.login_backoff_max_delay_secs,
+            self.login_backoff_window_mins,
+            self.login_backoff_max_tracked,
+        )
+    }
+}
+
+/// [`Config::for_restart`]'s step for one setting: sets `next` back to
+/// `running` and records `key` when the reload changed it.
+fn keep_running<T: Clone + PartialEq>(
+    next: &mut T,
+    running: &T,
+    key: &'static str,
+    kept: &mut Vec<&'static str>,
+) {
+    if next != running {
+        next.clone_from(running);
+        kept.push(key);
+    }
+}
+
+// The ranges of the counts below (owner decision D2 of the settings-page
+// milestone). The settings page reads each as its row's bounds, so the page, a
+// save and startup cannot disagree.
+
+/// The unauthorized Quick Connect requests one client IP may hold
+/// (`quick_connect_pending_per_ip`).
+pub const QUICK_CONNECT_PENDING_PER_IP_RANGE: RangeInclusive<u32> = 1..=1_000;
+
+/// The ffprobe processes a library scan keeps in flight
+/// (`scan_probe_concurrency`).
+pub const SCAN_PROBE_CONCURRENCY_RANGE: RangeInclusive<u32> = 1..=64;
+
+/// The items between scan-progress log lines (`scan_progress_every`); `0`
+/// turns them off.
+pub const SCAN_PROGRESS_EVERY_RANGE: RangeInclusive<u32> = 0..=100_000;
+
+/// The directory-listing records one library scan keeps
+/// (`scan_directory_cache_records`).
+pub const SCAN_DIRECTORY_CACHE_RECORDS_RANGE: RangeInclusive<u32> = 1_000..=10_000_000;
+
+/// The seconds a library scan's directory listings survive unread
+/// (`scan_directory_cache_idle_secs`).
+pub const SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE: RangeInclusive<u32> = 30..=3_600;
+
+/// The events the playback-metrics write queue holds
+/// (`playback_metrics_queue`).
+pub const PLAYBACK_METRICS_QUEUE_RANGE: RangeInclusive<u32> = 64..=65_536;
+
+/// The items whose `ItemValues` one writer transaction of a batched item save
+/// rewrites (`item_values_write_chunk`; owner decision, gl-1320): from 1, a
+/// transaction per item's links, to 5000, about 2.5 s of writer hold at the debug
+/// build's measured 0.5 ms per item, well inside the 30 s other writers wait.
+pub const ITEM_VALUES_WRITE_CHUNK_RANGE: RangeInclusive<u32> = 1..=5_000;
+
+/// The seconds between process-metric samples (`metrics_sample_interval`).
+pub const METRICS_SAMPLE_INTERVAL_RANGE: RangeInclusive<u32> = 1..=300;
+
+/// The seconds a shutdown or restart waits for requests in flight
+/// (`shutdown_timeout_secs`).
+pub const SHUTDOWN_TIMEOUT_SECS_RANGE: RangeInclusive<u32> = 5..=600;
+
+/// The hours TheTVDB lookups are reused (`tvdb_cache_hours`).
+pub const TVDB_CACHE_HOURS_RANGE: RangeInclusive<u32> = 1..=168;
+
+/// The hours a session with no WebSocket that plays nothing may go without a
+/// request (`session_idle_hours`): an hour to a week (owner decision on
+/// gl-1267), well above the dashboard's 16-minute activity filter and the
+/// 5-minute idle-playback stop.
+pub const SESSION_IDLE_HOURS_RANGE: RangeInclusive<u32> = 1..=168;
+
+/// The seconds one WASM plugin call may run (`wasm_call_timeout_secs`).
+pub const WASM_CALL_TIMEOUT_SECS_RANGE: RangeInclusive<u32> = 1..=600;
+
+/// The MiB of memory one WASM plugin may grow to (`wasm_memory_limit_mb`).
+pub const WASM_MEMORY_LIMIT_MB_RANGE: RangeInclusive<u32> = 16..=4_096;
+
+/// The events one WASM plugin's queue holds (`wasm_event_queue_capacity`).
+pub const WASM_EVENT_QUEUE_CAPACITY_RANGE: RangeInclusive<u32> = 16..=65_536;
+
+/// The MiB a plugin downloaded from a repository may take
+/// (`max_plugin_download_mb`).
+pub const MAX_PLUGIN_DOWNLOAD_MB_RANGE: RangeInclusive<u32> = 8..=1_024;
+
+/// The media decodes plugin analysis may run at once
+/// (`wasm_analysis_concurrency`).
+pub const WASM_ANALYSIS_CONCURRENCY_RANGE: RangeInclusive<u32> = 1..=64;
+
+/// The MiB of key/value state one WASM plugin may keep
+/// (`wasm_state_limit_mb`).
+pub const WASM_STATE_LIMIT_MB_RANGE: RangeInclusive<u32> = 1..=256;
+
+/// The MiB one plugin artwork download may take (`wasm_image_download_mb`).
+pub const WASM_IMAGE_DOWNLOAD_MB_RANGE: RangeInclusive<u32> = 1..=256;
+
+/// The seconds one plugin artwork download may take
+/// (`wasm_image_timeout_secs`).
+pub const WASM_IMAGE_TIMEOUT_SECS_RANGE: RangeInclusive<u32> = 5..=300;
+
+/// The MiB of lyrics or subtitles one plugin write may hold
+/// (`wasm_write_content_mb`).
+pub const WASM_WRITE_CONTENT_MB_RANGE: RangeInclusive<u32> = 1..=64;
+
+/// The MiB one subtitle track a plugin extracts may take
+/// (`wasm_subtitle_extract_mb`).
+pub const WASM_SUBTITLE_EXTRACT_MB_RANGE: RangeInclusive<u32> = 1..=128;
+
+/// Resolves a number with a range: `env_key` when it parses, else `file`, else
+/// `default`, clamped to `range` ([`clamp_with_warning`]): a limit never
+/// stops a boot.
+fn resolve_clamped<T>(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<T>,
+    default: T,
+    range: RangeInclusive<T>,
+    unit: &str,
+) -> T
+where
+    T: Copy + Ord + std::fmt::Display + std::str::FromStr,
+{
+    let value = parse_var(env, env_key).or(file).unwrap_or(default);
+    clamp_with_warning(env, env_key, file_key, value, &range, unit)
+}
+
+/// `hours` of `tvdb_cache_hours` clamped to [`TVDB_CACHE_HOURS_RANGE`]: the
+/// hours TheTVDB lookups are reused for ([`Config::tvdb_cache_duration`]).
+#[must_use]
+pub fn clamp_tvdb_cache_hours(hours: u32) -> u32 {
+    hours.clamp(
+        *TVDB_CACHE_HOURS_RANGE.start(),
+        *TVDB_CACHE_HOURS_RANGE.end(),
+    )
+}
+
+/// What `0` means to a count [`resolve_clamped_or_unset`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Zero {
+    /// A value like any other, clamped when it is outside the range.
+    InRange,
+    /// The default, as the setting's docs say: kept, and the consumer applies
+    /// its default.
+    Default,
+}
+
+/// Resolves a count whose default its consumer applies: `env_key` when it
+/// parses, else `file`, else `None`, clamped to `range`
+/// ([`clamp_with_warning`]). With [`Zero::Default`], `0` is kept as it is.
+fn resolve_clamped_or_unset(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<u32>,
+    range: &RangeInclusive<u32>,
+    unit: &str,
+    zero: Zero,
+) -> Option<u32> {
+    let value = parse_var(env, env_key).or(file)?;
+    if value == 0 && zero == Zero::Default {
+        return Some(0);
+    }
+    Some(clamp_with_warning(
+        env, env_key, file_key, value, range, unit,
+    ))
+}
+
+/// `value` clamped to `range`. A value outside warns, naming both layers'
+/// keys, the range in `unit` and the value used, and the server starts on it.
+fn clamp_with_warning<T>(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    value: T,
+    range: &RangeInclusive<T>,
+    unit: &str,
+) -> T
+where
+    T: Copy + Ord + std::fmt::Display,
+{
+    let clamped = value.clamp(*range.start(), *range.end());
+    if clamped != value {
+        env.warn(format!(
+            "{env_key} / {file_key} `{value}` is outside {} to {} {unit}; using {clamped}",
+            range.start(),
+            range.end()
+        ));
+    }
+    clamped
+}
+
+/// Resolves a private allow-list (`image_private_http_allow`,
+/// `subtitle_private_http_allow`): the `var` env var when it is not blank,
+/// else `config.toml`'s `key`, else none. Each entry the list refuses warns
+/// ([`Env::warn`]) and allows nothing; the rest apply.
+fn resolve_private_allow(
+    env: &dyn Env,
+    var: &str,
+    key: &str,
+    file: Option<String>,
+) -> Option<String> {
+    let raw = env
+        .var(var)
+        .filter(|raw| !raw.trim().is_empty())
+        .or(file)
+        .filter(|raw| !raw.trim().is_empty())?;
+    for (entry, reason) in ferrofin_providers::destination::PrivateAllowList::parse(&raw).1 {
+        env.warn(format!("{var} / {key}: `{entry}` {reason}; it is ignored"));
+    }
+    Some(raw)
+}
+
+/// A resolved private allow-list, its refused entries left out; empty when
+/// unset.
+fn private_allow_list(raw: Option<&str>) -> ferrofin_providers::destination::PrivateAllowList {
+    raw.map(|raw| ferrofin_providers::destination::PrivateAllowList::parse(raw).0)
+        .unwrap_or_default()
+}
+
+/// Resolves the stdout log format: the `FERROFIN_LOG_FORMAT` env var when it
+/// is not blank, else `log_format` in `config.toml`, else JSON. `json` and
+/// `text` match in any case; anything else warns ([`Env::warn`]) and is JSON,
+/// as it always was.
+fn resolve_log_format(env: &dyn Env, file: Option<String>) -> LogFormat {
+    let Some(raw) = env
+        .var("FERROFIN_LOG_FORMAT")
+        .filter(|raw| !raw.trim().is_empty())
+        .or(file)
+    else {
+        return LogFormat::Json;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "json" => LogFormat::Json,
+        "text" => LogFormat::Text,
+        _ => {
+            env.warn(format!(
+                "FERROFIN_LOG_FORMAT / log_format `{raw}` is neither `json` nor `text`; using json"
+            ));
+            LogFormat::Json
         }
     }
 }
 
 /// Resolves the metrics sampler interval (seconds): `FERROFIN_METRICS_SAMPLE_INTERVAL`
 /// env > `metrics_sample_interval` in `config.toml` > `None` (the sampler's 15 s
-/// default). A zero or unparsable value falls back to the default — a mistuned
-/// scrape knob changes cadence, never correctness.
+/// default), clamped to [`METRICS_SAMPLE_INTERVAL_RANGE`] with a warning. A
+/// zero or unparsable value falls back to the default — a mistuned scrape knob
+/// changes cadence, never correctness.
 fn resolve_metrics_interval(env: &dyn Env, file: Option<u32>) -> Option<u32> {
-    parse_var(env, "FERROFIN_METRICS_SAMPLE_INTERVAL")
-        .or(file)
-        .filter(|&s| s > 0)
+    resolve_clamped_or_unset(
+        env,
+        "FERROFIN_METRICS_SAMPLE_INTERVAL",
+        "metrics_sample_interval",
+        file,
+        &METRICS_SAMPLE_INTERVAL_RANGE,
+        "seconds",
+        Zero::Default,
+    )
+    .filter(|&s| s > 0)
 }
 
 /// Parses a comma-separated list of bucket boundaries (seconds). An entry
@@ -1147,11 +2095,39 @@ fn resolve_positive(
     Ok(file)
 }
 
+/// Resolves a whole number that must lie within `range`: the `env_key` env
+/// var > `file_key` in `config.toml` > `default`. Anything else is an error,
+/// so a typo is noticed instead of silently changing a security setting. An
+/// empty env value is unset.
+fn resolve_ranged(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<u32>,
+    default: u32,
+    range: std::ops::RangeInclusive<u32>,
+) -> anyhow::Result<u32> {
+    let value = match env.var(env_key).filter(|s| !s.trim().is_empty()) {
+        Some(raw) => raw
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid {env_key} `{raw}`: expected a whole number"))?,
+        None => file.unwrap_or(default),
+    };
+    anyhow::ensure!(
+        range.contains(&value),
+        "invalid {env_key} / {file_key} `{value}`: expected {} to {}",
+        range.start(),
+        range.end()
+    );
+    Ok(value)
+}
+
 /// The seconds a cache lifetime setting may take (`auth_cache_ttl_secs`,
 /// `row_cache_ttl_secs`): from 5, below which a busy client's request burst
 /// stops hitting the cache, to 300, past which an edit made outside the server
 /// goes unseen for longer than an operator would wait for it.
-pub const CACHE_TTL_RANGE_SECS: std::ops::RangeInclusive<u32> = 5..=300;
+pub const CACHE_TTL_RANGE_SECS: RangeInclusive<u32> = 5..=300;
 
 /// [`resolve_positive`] for a cache lifetime, which must also lie within
 /// [`CACHE_TTL_RANGE_SECS`].
@@ -1171,6 +2147,33 @@ fn resolve_cache_ttl(
         );
     }
     Ok(secs)
+}
+
+/// The prepared statements each SQLite connection may keep
+/// (`db_statement_cache`; owner decision, gl-1071): from 100, sqlx's own
+/// default, which one browse of the library outgrows, to 1024. Every
+/// connection keeps its own statements, so the memory a larger cache holds is
+/// multiplied by the pool size.
+pub const STATEMENT_CACHE_RANGE: RangeInclusive<u32> = 100..=1024;
+
+/// Resolves the per-connection statement cache: `FERROFIN_DB_STATEMENT_CACHE`
+/// env > `db_statement_cache` in `config.toml` > `None` (the default). A value
+/// outside [`STATEMENT_CACHE_RANGE`], or one that is not an integer, is an
+/// error, so a typo stops the server instead of silently changing how much
+/// it prepares.
+fn resolve_statement_cache(env: &dyn Env, file: Option<u32>) -> anyhow::Result<Option<u32>> {
+    const ENV_KEY: &str = "FERROFIN_DB_STATEMENT_CACHE";
+    const FILE_KEY: &str = "db_statement_cache";
+    let statements = resolve_positive(env, ENV_KEY, FILE_KEY, file)?;
+    if let Some(n) = statements {
+        anyhow::ensure!(
+            STATEMENT_CACHE_RANGE.contains(&n),
+            "invalid {ENV_KEY} / {FILE_KEY} `{n}`: expected {} to {} statements",
+            STATEMENT_CACHE_RANGE.start(),
+            STATEMENT_CACHE_RANGE.end()
+        );
+    }
+    Ok(statements)
 }
 
 /// Resolves the trickplay concurrency: `FERROFIN_TRICKPLAY_CONCURRENCY` env
@@ -1207,34 +2210,188 @@ fn resolve_trickplay_concurrency(
     }
 }
 
-/// Reads and parses the optional `config.toml`.
-///
-/// The file is looked up at, in order: the `--config` flag, `FERROFIN_CONFIG_FILE`
-/// env var, else `{data_dir}/config.toml` when `FERROFIN_DATA_DIR` is set. A
-/// missing file yields an empty (all-`None`) config — never an error.
-fn load_file_config(explicit: Option<&Path>, env: &dyn Env) -> anyhow::Result<FileConfig> {
-    let path = explicit
-        .map(Path::to_path_buf)
-        .or_else(|| env.var("FERROFIN_CONFIG_FILE").map(PathBuf::from))
-        .or_else(|| {
-            env.var("FERROFIN_DATA_DIR")
-                .map(|d| PathBuf::from(d).join("config.toml"))
-        });
+/// The keys `config.toml` may hold: [`FileConfig`]'s field names, as its
+/// derived `Deserialize` hands them to the deserializer, so no list is kept
+/// by hand.
+pub(crate) fn file_config_keys() -> &'static [&'static str] {
+    use serde::de::{self, Visitor};
 
-    let Some(path) = path else {
-        return Ok(FileConfig::default());
-    };
-    if !path.exists() {
-        return Ok(FileConfig::default());
+    /// Carries the field names out of `deserialize_struct`.
+    #[derive(Debug)]
+    struct Fields(&'static [&'static str]);
+    impl std::fmt::Display for Fields {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("field names")
+        }
+    }
+    impl std::error::Error for Fields {}
+    impl de::Error for Fields {
+        fn custom<T: std::fmt::Display>(_: T) -> Self {
+            Fields(&[])
+        }
     }
 
-    let settings = config::Config::builder()
-        .add_source(config::File::from(path.as_path()))
-        .build()
-        .map_err(|e| anyhow::anyhow!("failed to read config file `{}`: {e}", path.display()))?;
-    settings
+    /// A deserializer that only records the struct's field names.
+    struct FieldNames;
+    impl<'de> de::Deserializer<'de> for FieldNames {
+        type Error = Fields;
+        fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Fields> {
+            Err(Fields(&[]))
+        }
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Fields> {
+            Err(Fields(fields))
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+            identifier ignored_any
+        }
+    }
+
+    match FileConfig::deserialize(FieldNames) {
+        Err(Fields(fields)) => fields,
+        Ok(_) => &[],
+    }
+}
+
+/// Warnings for the keys of `table` that `config.toml` cannot hold, in key
+/// order: each names the key, and the key to use where it is a key in the
+/// wrong case (`Port`) or the stem of a variable whose key is spelled
+/// otherwise ([`KEYS_NOT_NAMED_BY_STEM`]); the file's keys are case-sensitive.
+fn unknown_key_warnings<'a>(table: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let known = file_config_keys();
+    let mut unknown: Vec<&String> = table
+        .into_iter()
+        .filter(|key| !known.contains(&key.as_str()))
+        .collect();
+    unknown.sort();
+    unknown
+        .into_iter()
+        .map(|key| {
+            let canonical = known
+                .iter()
+                .find(|known| known.eq_ignore_ascii_case(key))
+                .copied()
+                .or_else(|| {
+                    KEYS_NOT_NAMED_BY_STEM.iter().find_map(|(var, file_key)| {
+                        var.strip_prefix("FERROFIN_")
+                            .is_some_and(|stem| stem.eq_ignore_ascii_case(key))
+                            .then_some(*file_key)
+                    })
+                });
+            match canonical {
+                Some(file_key) => format!(
+                    "unknown key `{key}` in config.toml is ignored; did you mean `{file_key}`?"
+                ),
+                None => format!("unknown key `{key}` in config.toml is ignored"),
+            }
+        })
+        .collect()
+}
+
+/// Reads and parses the optional `config.toml` at `path` (chosen by
+/// [`Config::load_from`]), says whether it existed, and warns about each key
+/// it holds that is not a setting ([`unknown_key_warnings`]). A missing file
+/// yields an empty (all-`None`) config — never an error.
+fn load_file_config(path: &Path) -> anyhow::Result<(FileConfig, bool, Vec<String>)> {
+    let Some(settings) = read_config_file(path)? else {
+        return Ok((FileConfig::default(), false, Vec::new()));
+    };
+    let warnings = unknown_key_warnings(top_level_keys(&settings, path)?.keys());
+    let file = settings
         .try_deserialize()
+        .map_err(|e| anyhow::anyhow!("failed to parse config file `{}`: {e}", path.display()))?;
+    Ok((file, true, warnings))
+}
+
+/// The keys `config.toml` at `path` holds at its top level, read as
+/// [`Config::load`] reads the file; none when it does not exist.
+///
+/// # Errors
+///
+/// As [`Config::load`], when the file exists but does not parse.
+pub(crate) fn config_file_keys(path: &Path) -> anyhow::Result<Vec<String>> {
+    let Some(settings) = read_config_file(path)? else {
+        return Ok(Vec::new());
+    };
+    Ok(top_level_keys(&settings, path)?.into_keys().collect())
+}
+
+/// The value `config.toml` at `path` holds for its top-level `key`, as text
+/// (a number or an on/off as written), as the loader reads it before it
+/// judges it; `None` when the file or the key is missing, or the value is a
+/// list or a table.
+pub(crate) fn config_file_text(path: &Path, key: &str) -> anyhow::Result<Option<String>> {
+    let Some(settings) = read_config_file(path)? else {
+        return Ok(None);
+    };
+    Ok(top_level_keys(&settings, path)?
+        .remove(key)
+        .and_then(|value| value.into_string().ok()))
+}
+
+/// Reads `config.toml` at `path` through the `config` crate, or `None` when
+/// it does not exist. A parse error never quotes the file
+/// ([`without_source_lines`]).
+fn read_config_file(path: &Path) -> anyhow::Result<Option<config::Config>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    config::Config::builder()
+        .add_source(config::File::from(path))
+        .build()
+        .map(Some)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read config file `{}`: {}",
+                path.display(),
+                without_source_lines(&e.to_string())
+            )
+        })
+}
+
+/// `settings`' top-level table, keyed by the keys as written.
+fn top_level_keys(
+    settings: &config::Config,
+    path: &Path,
+) -> anyhow::Result<std::collections::HashMap<String, config::Value>> {
+    settings
+        .clone()
+        .try_deserialize::<std::collections::HashMap<String, config::Value>>()
         .map_err(|e| anyhow::anyhow!("failed to parse config file `{}`: {e}", path.display()))
+}
+
+/// A TOML parse error without the lines of the file it quotes: the line at
+/// fault may hold a password or an API key, and the error reaches the log (an
+/// in-process restart logs it) and the terminal. What is left names the line
+/// and column and the problem, e.g. `TOML parse error at line 3, column 18:
+/// invalid basic string`.
+pub(crate) fn without_source_lines(message: &str) -> String {
+    let quotes_the_file = |line: &str| {
+        line.trim_start()
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .trim_start()
+            .starts_with('|')
+    };
+    let mut kept = String::new();
+    for line in message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !quotes_the_file(line))
+    {
+        // The `config` crate appends ` in <file>` on a line of its own.
+        let separator = if line.starts_with("in ") { " " } else { ": " };
+        if !kept.is_empty() {
+            kept.push_str(separator);
+        }
+        kept.push_str(line);
+    }
+    kept
 }
 
 /// The default program-data root: `$XDG_DATA_HOME/ferrofin`, else
@@ -1269,15 +2426,49 @@ fn split_list(value: &str) -> Vec<PathBuf> {
 ///
 /// Kept object-safe (no generic methods) so it can be threaded as `&dyn Env`;
 /// typed parsing lives in the free [`parse_var`] helper.
-trait Env {
+pub(crate) trait Env {
     /// Returns the value of `key`, or `None` if unset or non-UTF-8.
     fn var(&self, key: &str) -> Option<String>;
+
+    /// Records a value that is set but cannot be used. The process
+    /// environment and the test fakes drop it; [`Config::load_from`] reads
+    /// through a [`WarningEnv`], which keeps it for [`Config::load_warnings`].
+    fn warn(&self, _warning: String) {}
 }
 
-/// Reads `key` from `env` and parses it as `T`, yielding `None` when the var is
-/// unset or does not parse.
-fn parse_var<T: std::str::FromStr>(env: &dyn Env, key: &str) -> Option<T> {
-    env.var(key).and_then(|v| v.parse().ok())
+/// An [`Env`] that keeps the warnings its values raise ([`Env::warn`]).
+struct WarningEnv<'a> {
+    env: &'a dyn Env,
+    warnings: std::cell::RefCell<Vec<String>>,
+}
+
+impl Env for WarningEnv<'_> {
+    fn var(&self, key: &str) -> Option<String> {
+        self.env.var(key)
+    }
+
+    fn warn(&self, warning: String) {
+        self.warnings.borrow_mut().push(warning);
+    }
+}
+
+/// Reads `key` from `env` and parses it as `T` (blanks around the value
+/// ignored), yielding `None` when the var is unset or blank, and when it does
+/// not parse, which also warns ([`Env::warn`]) so the operator learns the
+/// value did nothing.
+pub(crate) fn parse_var<T: std::str::FromStr>(env: &dyn Env, key: &str) -> Option<T> {
+    let raw = env.var(key)?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let parsed = value.parse().ok();
+    if parsed.is_none() {
+        env.warn(format!(
+            "{key} `{raw}` is not a valid value and is ignored; config.toml or the default applies"
+        ));
+    }
+    parsed
 }
 
 /// A boolean env var, accepting the forms people actually write in a container
@@ -1287,17 +2478,26 @@ fn parse_var<T: std::str::FromStr>(env: &dyn Env, key: &str) -> Option<T> {
 /// silently discards `FERROFIN_ENABLE_METRICS=1`: it parses as `None`, falls
 /// through to the file/default, and the operator sees a knob that did nothing
 /// and said nothing. Accepted here, case-insensitively: `1`/`0`, `true`/`false`,
-/// `yes`/`no`, `on`/`off`. Anything else is `None`, same as before.
-fn parse_bool_var(env: &dyn Env, key: &str) -> Option<bool> {
-    match env.var(key)?.trim().to_ascii_lowercase().as_str() {
+/// `yes`/`no`, `on`/`off`. Blank is unset; anything else is `None` too, with a
+/// warning ([`Env::warn`]).
+pub(crate) fn parse_bool_var(env: &dyn Env, key: &str) -> Option<bool> {
+    let raw = env.var(key)?;
+    match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
+        "" => None,
+        _ => {
+            env.warn(format!(
+                "{key} `{raw}` is not on or off (1/0, true/false, yes/no, on/off) and is \
+                 ignored; config.toml or the default applies"
+            ));
+            None
+        }
     }
 }
 
 /// The real process environment.
-struct EnvProvider;
+pub(crate) struct EnvProvider;
 
 impl Env for EnvProvider {
     fn var(&self, key: &str) -> Option<String> {
@@ -1313,8 +2513,19 @@ mod tests {
     /// A fake environment backed by a map — no real `std::env` mutation.
     struct FakeEnv(HashMap<String, String>);
 
+    /// `XDG_DATA_HOME` in [`FakeEnv::new`]: a directory no host has, so a test
+    /// that names no data directory reads no `config.toml` of the host's.
+    const NOWHERE: &str = "/nonexistent/ferrofin-config-test";
+
     impl FakeEnv {
+        /// An environment that sets only `XDG_DATA_HOME`, to [`NOWHERE`].
         fn new() -> Self {
+            Self::empty().with("XDG_DATA_HOME", NOWHERE)
+        }
+
+        /// An environment that sets nothing at all, for the tests of the
+        /// default data directory's fallbacks.
+        fn empty() -> Self {
             Self(HashMap::new())
         }
 
@@ -1334,35 +2545,17 @@ mod tests {
     fn defaults_apply_with_empty_env_and_cli() {
         let env = FakeEnv::new();
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.data_dir, PathBuf::from(NOWHERE).join("ferrofin"));
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
         assert_eq!(cfg.https_port, DEFAULT_HTTPS_PORT);
         assert_eq!(cfg.bind_addr.to_string(), DEFAULT_BIND_ADDR);
         assert_eq!(cfg.log_level, DEFAULT_LOG_LEVEL);
         assert_eq!(cfg.admin_user, DEFAULT_ADMIN_USER);
-        assert!(cfg.admin_password.is_empty());
+        assert_eq!(cfg.admin_password, "");
         assert!(cfg.published_url.is_none());
-        assert!(cfg.base_url.is_empty());
-        assert!(cfg.library_roots.is_empty());
+        assert_eq!(cfg.base_url, "");
+        assert!(cfg.library_roots.is_empty(), "{:?}", cfg.library_roots);
         assert!(cfg.ffmpeg_path.is_none());
-        // With no XDG/HOME the system location is used.
-        assert_eq!(cfg.data_dir, PathBuf::from(SYSTEM_DATA_DIR));
-        assert_eq!(
-            cfg.websocket_min_stream_period_ms,
-            DEFAULT_WS_MIN_STREAM_PERIOD_MS
-        );
-    }
-
-    #[test]
-    fn websocket_min_stream_period_resolves_env_over_default() {
-        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
-        assert_eq!(
-            cfg.websocket_min_stream_period_ms,
-            DEFAULT_WS_MIN_STREAM_PERIOD_MS
-        );
-
-        let env = FakeEnv::new().with("FERROFIN_WS_MIN_STREAM_PERIOD_MS", "250");
-        let cfg = Config::load_from(Cli::default(), &env).unwrap();
-        assert_eq!(cfg.websocket_min_stream_period_ms, 250);
     }
 
     #[test]
@@ -1402,9 +2595,22 @@ mod tests {
 
     #[test]
     fn home_fallback_when_no_xdg() {
-        let env = FakeEnv::new().with("HOME", "/home/u");
+        let env = FakeEnv::empty().with("HOME", "/home/u");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.data_dir, PathBuf::from("/home/u/.local/share/ferrofin"));
+    }
+
+    /// With no `XDG_DATA_HOME` and no `HOME`, the system location. It reads
+    /// the host's `/var/lib/ferrofin/config.toml` if there is one, which
+    /// cannot move the data directory it was found in.
+    #[test]
+    fn system_data_dir_when_no_xdg_and_no_home() {
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::empty()).unwrap();
+        assert_eq!(cfg.data_dir, PathBuf::from(SYSTEM_DATA_DIR));
+        assert_eq!(
+            cfg.config_file,
+            PathBuf::from(SYSTEM_DATA_DIR).join("config.toml")
+        );
     }
 
     #[test]
@@ -1492,6 +2698,723 @@ mod tests {
         );
     }
 
+    /// `{data_dir}/config.toml` is read whatever names the data directory:
+    /// the `--data-dir` flag, `FERROFIN_DATA_DIR`, or the default location.
+    #[test]
+    fn config_toml_in_the_data_dir_is_read_however_the_data_dir_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let flag_dir = dir.path().join("flag");
+        let env_dir = dir.path().join("env");
+        let xdg = dir.path().join("xdg");
+        let default_dir = xdg.join("ferrofin");
+        for (data_dir, port) in [(&flag_dir, 5001), (&env_dir, 5002), (&default_dir, 5003)] {
+            std::fs::create_dir_all(data_dir).unwrap();
+            std::fs::write(data_dir.join("config.toml"), format!("port = {port}\n")).unwrap();
+        }
+
+        let by_flag = Cli {
+            data_dir: Some(flag_dir.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(by_flag, &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.port, 5001, "--data-dir names the file");
+        assert_eq!(cfg.config_file, flag_dir.join("config.toml"));
+        assert!(cfg.config_file_found);
+
+        let env = FakeEnv::new().with("FERROFIN_DATA_DIR", env_dir.to_str().unwrap());
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.port, 5002, "FERROFIN_DATA_DIR names the file");
+        assert_eq!(cfg.config_file, env_dir.join("config.toml"));
+
+        let env = FakeEnv::new().with("XDG_DATA_HOME", xdg.to_str().unwrap());
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.port, 5003, "the default data dir names the file");
+        assert_eq!(cfg.data_dir, default_dir);
+        assert_eq!(cfg.config_file, default_dir.join("config.toml"));
+    }
+
+    /// The flag beats the variable for the file as it does for the data
+    /// directory, so `FERROFIN_DATA_DIR=/a --data-dir /b` reads
+    /// `/b/config.toml`, never `/a/config.toml`.
+    #[test]
+    fn the_data_dir_flag_names_the_config_file_over_the_env_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        for (data_dir, port) in [(&a, 5001), (&b, 5002)] {
+            std::fs::create_dir_all(data_dir).unwrap();
+            std::fs::write(data_dir.join("config.toml"), format!("port = {port}\n")).unwrap();
+        }
+        let env = FakeEnv::new().with("FERROFIN_DATA_DIR", a.to_str().unwrap());
+        let cli = Cli {
+            data_dir: Some(b.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(cfg.data_dir, b);
+        assert_eq!(cfg.port, 5002);
+        assert_eq!(cfg.config_file, b.join("config.toml"));
+    }
+
+    /// No file in the data directory: the path it would be read from is
+    /// still resolved (and logged), and nothing is read.
+    #[test]
+    fn a_missing_config_toml_still_names_where_it_was_looked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            data_dir: Some(dir.path().to_path_buf()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.config_file, dir.path().join("config.toml"));
+        assert!(!cfg.config_file_found);
+        assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+    }
+
+    /// `data_dir` inside the file applies only to a file named by `--config`
+    /// or `FERROFIN_CONFIG_FILE`. Found in the data directory, the file cannot
+    /// move that directory: the key is ignored with a warning naming it.
+    #[test]
+    fn data_dir_in_the_file_applies_only_to_a_file_named_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&data).unwrap();
+        let body = format!(
+            "data_dir = {:?}\nport = 5004\n",
+            elsewhere.to_str().unwrap()
+        );
+        std::fs::write(data.join("config.toml"), &body).unwrap();
+
+        let cli = Cli {
+            data_dir: Some(data.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(
+            cfg.data_dir, data,
+            "the file found in the data dir cannot move it"
+        );
+        assert_eq!(cfg.port, 5004, "the file's other keys still apply");
+        assert_eq!(cfg.load_warnings.len(), 1, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("data_dir"),
+            "{:?}",
+            cfg.load_warnings
+        );
+
+        let env = FakeEnv::new().with(
+            "FERROFIN_CONFIG_FILE",
+            data.join("config.toml").to_str().unwrap(),
+        );
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.data_dir, elsewhere, "a file named explicitly sets it");
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+    }
+
+    /// `--config` beats `FERROFIN_CONFIG_FILE`; a blank variable is unset, so
+    /// the data directory's file is read; a named file that does not exist
+    /// is no error and reads nothing, even with a data-dir file present.
+    #[test]
+    fn a_named_config_file_wins_and_a_blank_variable_is_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (flag_file, env_file) = (dir.path().join("flag.toml"), dir.path().join("env.toml"));
+        std::fs::write(&flag_file, "port = 5001\n").unwrap();
+        std::fs::write(&env_file, "port = 5002\n").unwrap();
+        std::fs::write(dir.path().join("config.toml"), "port = 5003\n").unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_DATA_DIR", data_dir)
+            .with("FERROFIN_CONFIG_FILE", env_file.to_str().unwrap());
+        let cli = Cli {
+            config_file: Some(flag_file.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!((cfg.port, cfg.config_file), (5001, flag_file));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_DATA_DIR", data_dir)
+            .with("FERROFIN_CONFIG_FILE", "  ");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.port, 5003, "a blank FERROFIN_CONFIG_FILE is unset");
+        assert_eq!(cfg.config_file, dir.path().join("config.toml"));
+
+        let missing = dir.path().join("missing.toml");
+        let env = FakeEnv::new()
+            .with("FERROFIN_DATA_DIR", data_dir)
+            .with("FERROFIN_CONFIG_FILE", missing.to_str().unwrap());
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(
+            cfg.port, DEFAULT_HTTP_PORT,
+            "the named file, not the data dir's"
+        );
+        assert_eq!(cfg.config_file, missing);
+        assert!(!cfg.config_file_found);
+    }
+
+    /// A `data_dir` key naming the directory the file was found in changes
+    /// nothing, so it draws no warning.
+    #[test]
+    fn data_dir_in_the_file_naming_its_own_directory_is_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("data_dir = {:?}\n", dir.path().to_str().unwrap());
+        std::fs::write(dir.path().join("config.toml"), body).unwrap();
+        let cli = Cli {
+            data_dir: Some(dir.path().to_path_buf()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert!(cfg.config_file_found);
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+    }
+
+    /// An in-process restart applies what the reload changed, except what
+    /// the process holds for its life, which keeps its running value and is
+    /// named; the test seams carry over unnamed.
+    #[test]
+    fn a_restart_applies_the_reload_but_keeps_what_the_process_holds() {
+        let running = Config {
+            metrics_scan_duration_buckets: Some(vec![f64::NAN, 1.0]),
+            ..Config::test_stub(Path::new("/run"))
+        };
+        let reloaded = Config {
+            server_name: "renamed".to_owned(),
+            scan_probe_concurrency: Some(3),
+            // A bad bucket entry (NaN) on both sides is no change.
+            metrics_scan_duration_buckets: Some(vec![f64::NAN, 1.0]),
+            discovery_bind_addr: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7359))),
+            provider_endpoints: ProviderEndpoints::default(),
+            ..Config::test_stub(Path::new("/run"))
+        };
+        let (next, kept) = running.for_restart(reloaded);
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(next.server_name, "renamed");
+        assert_eq!(next.scan_probe_concurrency, Some(3));
+        assert_eq!(next.discovery_bind_addr, None);
+        assert_eq!(next.provider_endpoints, ProviderEndpoints::offline());
+
+        let moved = Config {
+            log_level: "debug".to_owned(),
+            metrics_scan_duration_buckets: Some(vec![0.5, 5.0]),
+            ..Config::test_stub(Path::new("/elsewhere"))
+        };
+        let (next, kept) = running.for_restart(moved);
+        assert_eq!(
+            kept,
+            [
+                "data_dir",
+                "config_dir",
+                "cache_dir",
+                "log_level",
+                "metrics_scan_duration_buckets"
+            ]
+        );
+        assert_eq!(next.data_dir, running.data_dir);
+        assert_eq!(next.config_dir, running.config_dir);
+        assert_eq!(next.cache_dir, running.cache_dir);
+        assert_eq!(
+            next.web_dir,
+            PathBuf::from("/elsewhere/web"),
+            "served anew each lifetime"
+        );
+        assert_eq!(next.log_level, running.log_level);
+        assert_eq!(
+            bits(next.metrics_scan_duration_buckets.as_deref()),
+            bits(running.metrics_scan_duration_buckets.as_deref())
+        );
+    }
+
+    fn bits(buckets: Option<&[f64]>) -> Option<Vec<u64>> {
+        buckets.map(|list| list.iter().map(|b| b.to_bits()).collect())
+    }
+
+    /// A file that does not parse is refused naming its line and column, but
+    /// never quoting the line: it may be a password's.
+    #[test]
+    fn a_parse_error_never_quotes_the_line_at_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "port = 5000\nadmin_password = \"hunter2\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let message = format!("{:#}", Config::load_from(cli, &FakeEnv::new()).unwrap_err());
+        assert!(!message.contains("hunter2"), "{message}");
+        assert!(message.contains("line 2"), "{message}");
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(!message.contains(": in "), "{message}");
+    }
+
+    /// A secret written without quotes is read as text, so its type never
+    /// makes an error that would quote it.
+    #[test]
+    fn an_unquoted_secret_is_read_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "admin_password = 123456\ntvdb_subscriber_pin = 4321\nomdb_api_key = true\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.admin_password, "123456");
+        assert_eq!(cfg.tvdb_subscriber_pin, "4321");
+        assert_eq!(cfg.omdb_api_key, "true");
+    }
+
+    /// A key `config.toml` cannot hold is a warning that names it, and the
+    /// variable's stem where the key is spelled otherwise names the key to
+    /// use; the file's other keys still apply, and the stem is no alias.
+    #[test]
+    fn an_unknown_key_is_a_warning_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "tvdb_pin = \"1234\"\nbogus = 1\nport = 5000\nServer_Name = \"x\"\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.port, 5000);
+        assert_eq!(cfg.tvdb_subscriber_pin, "", "the stem is not an alias");
+        assert_eq!(cfg.load_warnings.len(), 3, "{:?}", cfg.load_warnings);
+        let about = |key: &str| {
+            cfg.load_warnings
+                .iter()
+                .find(|w| w.contains(&format!("`{key}`")))
+                .unwrap_or_else(|| panic!("no warning about {key}: {:?}", cfg.load_warnings))
+        };
+        assert!(
+            about("tvdb_pin").contains("`tvdb_subscriber_pin`"),
+            "{:?}",
+            cfg.load_warnings
+        );
+        assert!(
+            !about("bogus").contains("did you mean"),
+            "{:?}",
+            cfg.load_warnings
+        );
+        assert!(
+            about("Server_Name").contains("`server_name`"),
+            "{:?}",
+            cfg.load_warnings
+        );
+        assert_ne!(cfg.server_name, "x", "keys are case-sensitive");
+    }
+
+    /// v1.5.0 removed the WebSocket minimum stream period: a `config.toml`
+    /// that still sets it loads, and the key is only warned about.
+    #[test]
+    fn a_leftover_websocket_min_stream_period_key_loads_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "websocket_min_stream_period_ms = 250\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+        assert_eq!(
+            cfg.load_warnings,
+            ["unknown key `websocket_min_stream_period_ms` in config.toml is ignored"]
+        );
+    }
+
+    /// Every `FERROFIN_*` variable this module reads has a `config.toml`
+    /// key, its stem or the one [`KEYS_NOT_NAMED_BY_STEM`] gives it, and
+    /// every key has a variable; `docs/CONFIG.md` has a row for every
+    /// variable and lists every key that is not a stem. A new setting that
+    /// misses any of these fails here.
+    #[test]
+    fn every_variable_has_a_key_and_a_row_in_the_docs() {
+        let source = include_str!("config.rs");
+        let code = &source[..source.find("\nmod tests {").expect("the test module")];
+        let docs = include_str!("../../../docs/CONFIG.md");
+        let vars: std::collections::BTreeSet<String> = code
+            .match_indices("\"FERROFIN_")
+            .map(|(at, _)| {
+                code[at + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                    .collect::<String>()
+            })
+            .filter(|name| name.len() > "FERROFIN_".len())
+            .collect();
+        let key_of = |var: &str| {
+            KEYS_NOT_NAMED_BY_STEM
+                .iter()
+                .find(|(named, _)| *named == var)
+                .map_or_else(
+                    || var["FERROFIN_".len()..].to_ascii_lowercase(),
+                    |(_, key)| (*key).to_owned(),
+                )
+        };
+        let keys = file_config_keys();
+        let mut problems = Vec::new();
+        for var in &vars {
+            if !docs.contains(&format!("| `{var}` |")) {
+                problems.push(format!("{var}: no row in docs/CONFIG.md"));
+            }
+            let key = key_of(var);
+            if var != "FERROFIN_CONFIG_FILE" && !keys.contains(&key.as_str()) {
+                problems.push(format!("{var}: config.toml has no key `{key}`"));
+            }
+            if var != "FERROFIN_CONFIG_FILE"
+                && !crate::settings::SETTINGS
+                    .iter()
+                    .any(|row| row.key == key && row.env == Some(var.as_str()))
+            {
+                problems.push(format!(
+                    "{var}: no settings row has key `{key}` and this variable"
+                ));
+            }
+        }
+        for key in keys {
+            if !vars.iter().any(|var| key_of(var) == *key) {
+                problems.push(format!("`{key}`: no FERROFIN_* variable reads it"));
+            }
+        }
+        for (var, key) in KEYS_NOT_NAMED_BY_STEM {
+            if !docs.contains(&format!("| `{var}` | `{key}` |")) {
+                problems.push(format!(
+                    "{var} → {key}: missing from docs/CONFIG.md's key table"
+                ));
+            }
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
+        assert!(
+            vars.len() > 40,
+            "the scan found too few variables: {vars:?}"
+        );
+    }
+
+    /// A variable that does not parse is a warning naming it, and
+    /// `config.toml` or the default applies as before; a blank one is unset.
+    #[test]
+    fn an_unparsable_variable_is_a_warning_naming_it() {
+        let env = FakeEnv::new()
+            .with("FERROFIN_PORT", "80g")
+            .with("FERROFIN_ENABLE_METRICS", "maybe")
+            .with("FERROFIN_HTTPS_PORT", "")
+            .with("FERROFIN_SHUTDOWN_TIMEOUT_SECS", " 45 ");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+        assert_eq!(cfg.enable_metrics, None);
+        assert_eq!(cfg.https_port, DEFAULT_HTTPS_PORT);
+        assert_eq!(
+            cfg.shutdown_timeout_secs, 45,
+            "surrounding blanks are not an error"
+        );
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("FERROFIN_PORT"),
+            "{:?}",
+            cfg.load_warnings
+        );
+        assert!(
+            cfg.load_warnings[1].contains("FERROFIN_ENABLE_METRICS"),
+            "{:?}",
+            cfg.load_warnings
+        );
+    }
+
+    /// The provider request limits and the log format are settings of the
+    /// file too, not unknown keys.
+    #[test]
+    fn the_provider_limits_and_the_log_format_are_config_toml_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "provider_timeout_seconds = 30\nprovider_max_wait_seconds = 120\nlog_format = \"text\"\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(cfg.provider_timeout_seconds, 30);
+        assert_eq!(cfg.provider_max_wait_seconds, 120);
+        assert_eq!(cfg.log_format, LogFormat::Text);
+
+        // The variables win; out of range is clamped with a warning, an
+        // unknown format warns and is JSON.
+        let env = FakeEnv::new()
+            .with("FERROFIN_PROVIDER_TIMEOUT_SECONDS", "5")
+            .with("FERROFIN_PROVIDER_MAX_WAIT_SECONDS", "45")
+            .with("FERROFIN_LOG_FORMAT", "pretty");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(cfg.provider_timeout_seconds, 10);
+        assert_eq!(cfg.provider_max_wait_seconds, 45);
+        assert_eq!(cfg.log_format, LogFormat::Json);
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("FERROFIN_PROVIDER_TIMEOUT_SECONDS"),
+            "{:?}",
+            cfg.load_warnings
+        );
+        assert!(
+            cfg.load_warnings[1].contains("`pretty`"),
+            "{:?}",
+            cfg.load_warnings
+        );
+
+        // Unset: the defaults, which the provider crate defines.
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            (cfg.provider_timeout_seconds, cfg.provider_max_wait_seconds),
+            (
+                RequestLimits::DEFAULT_TIMEOUT_SECONDS,
+                RequestLimits::DEFAULT_MAX_WAIT_SECONDS
+            )
+        );
+        assert_eq!(cfg.log_format, LogFormat::Json);
+    }
+
+    /// The image limits: `config.toml`, then the variables, then the defaults
+    /// the drawing crate defines; a value out of range warns and is clamped.
+    #[test]
+    fn the_image_limits_resolve_like_the_provider_limits() {
+        let image_limits = |cfg: &Config| {
+            (
+                cfg.image_decode_max_megapixels,
+                cfg.image_decode_max_memory_mb,
+                cfg.image_resize_budget_mb,
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "image_decode_max_megapixels = 300\nimage_decode_max_memory_mb = 1024\n\
+             image_resize_budget_mb = 4096\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(image_limits(&cfg), (300, 1024, 4096));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS", "100")
+            .with("FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB", "256")
+            .with("FERROFIN_IMAGE_RESIZE_BUDGET_MB", "1024");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(image_limits(&cfg), (100, 256, 1024));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS", "1")
+            .with("FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB", "999999")
+            .with("FERROFIN_IMAGE_RESIZE_BUDGET_MB", "lots");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(image_limits(&cfg), (50, 2048, 4096));
+        assert_eq!(cfg.load_warnings.len(), 3, "{:?}", cfg.load_warnings);
+        for variable in [
+            "FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS",
+            "FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB",
+            "FERROFIN_IMAGE_RESIZE_BUDGET_MB",
+        ] {
+            assert!(
+                cfg.load_warnings.iter().any(|w| w.contains(variable)),
+                "{variable}: {:?}",
+                cfg.load_warnings
+            );
+        }
+
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            image_limits(&cfg),
+            (
+                ImageLimits::DEFAULT_DECODE_MEGAPIXELS,
+                ImageLimits::DEFAULT_DECODE_MEMORY_MB,
+                ImageLimits::DEFAULT_RESIZE_BUDGET_MB
+            )
+        );
+    }
+
+    /// The remote image settings: `config.toml`, then the variables, then the
+    /// defaults; a value out of range warns and is clamped.
+    #[test]
+    fn the_remote_image_settings_resolve_like_the_image_limits() {
+        let settings =
+            |cfg: &Config| (cfg.image_download_max_mb, cfg.image_negative_cache_ttl_secs);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "image_download_max_mb = 128\nimage_negative_cache_ttl_secs = 600\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(settings(&cfg), (128, 600));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_IMAGE_DOWNLOAD_MAX_MB", "32")
+            .with("FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS", "7200");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(settings(&cfg), (32, 7200));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_IMAGE_DOWNLOAD_MAX_MB", "1")
+            .with("FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS", "999999");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(settings(&cfg), (16, 86_400));
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(settings(&cfg), (64, 3600));
+    }
+
+    /// The image downloads' private allow-list (gl-1096): the variable, then
+    /// `config.toml`, then none; a blank value is unset, and an entry that is
+    /// not a host, an address or a network warns and allows nothing.
+    #[test]
+    fn the_image_private_allow_list_resolves_and_warns_about_bad_entries() {
+        use ferrofin_providers::destination::PrivateAllowList;
+        let lan: std::net::IpAddr = "192.168.1.20".parse().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "image_private_http_allow = \"nas.lan\"\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.image_private_http_allow, None, "nothing by default");
+        assert!(cfg.image_private_allow_list().is_empty());
+
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert!(cfg.image_private_allow_list().allows("nas.lan", lan));
+
+        let env = FakeEnv::new().with("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW", "192.168.1.0/24");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert_eq!(
+            cfg.image_private_http_allow.as_deref(),
+            Some("192.168.1.0/24"),
+            "the variable beats the file"
+        );
+        assert!(cfg.image_private_allow_list().allows("printer.lan", lan));
+        assert!(
+            !cfg.image_private_allow_list()
+                .allows("nas.lan", "10.0.0.1".parse().unwrap())
+        );
+
+        let env = FakeEnv::new().with("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW", "  ");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(
+            cfg.image_private_http_allow.as_deref(),
+            Some("nas.lan"),
+            "a blank variable is unset"
+        );
+
+        let env = FakeEnv::new().with(
+            "FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW",
+            "nas.lan:8080, 10.0.0.0/8",
+        );
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.load_warnings.len(), 1, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("`nas.lan:8080`")
+                && cfg.load_warnings[0].contains("image_private_http_allow"),
+            "{}",
+            cfg.load_warnings[0]
+        );
+        assert_eq!(
+            cfg.image_private_allow_list(),
+            PrivateAllowList::parse("10.0.0.0/8").0,
+            "the rest applies"
+        );
+    }
+
+    /// The subtitle link's own allow-list (gl-1160): resolved as the image
+    /// list is, and independent of it both ways.
+    #[test]
+    fn the_subtitle_private_allow_list_is_its_own() {
+        use ferrofin_providers::destination::PrivateAllowList;
+        let lan: std::net::IpAddr = "192.168.1.20".parse().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "subtitle_private_http_allow = \"mirror.lan\"\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.subtitle_private_http_allow, None, "nothing by default");
+        assert!(cfg.subtitle_private_allow_list().is_empty());
+
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert!(cfg.subtitle_private_allow_list().allows("mirror.lan", lan));
+        assert!(cfg.image_private_allow_list().is_empty(), "not the images'");
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW", "192.168.1.0/24")
+            .with("FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW", "10.0.0.0/8");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert_eq!(
+            cfg.subtitle_private_http_allow.as_deref(),
+            Some("192.168.1.0/24"),
+            "the variable beats the file"
+        );
+        assert!(
+            !cfg.subtitle_private_allow_list()
+                .allows("x", "10.0.0.1".parse().unwrap()),
+            "the image list does not apply"
+        );
+
+        let env = FakeEnv::new().with("FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW", "  ");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(
+            cfg.subtitle_private_http_allow.as_deref(),
+            Some("mirror.lan"),
+            "a blank variable is unset"
+        );
+
+        let env = FakeEnv::new().with("FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW", "*, 10.0.0.0/8");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.load_warnings.len(), 1, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("`*`")
+                && cfg.load_warnings[0].contains("FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW")
+                && cfg.load_warnings[0].contains("subtitle_private_http_allow"),
+            "{}",
+            cfg.load_warnings[0]
+        );
+        assert_eq!(
+            cfg.subtitle_private_allow_list(),
+            PrivateAllowList::parse("10.0.0.0/8").0,
+            "the rest applies"
+        );
+    }
+
     /// The config file is TOML: a file named for another format is refused,
     /// not read in a format the docs never describe, and so is one with no
     /// extension, as before.
@@ -1526,6 +3449,31 @@ mod tests {
     fn db_pool_defaults_to_auto() {
         let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
         assert_eq!(cfg.db_pool, None, "no knob set ⇒ auto sizing");
+    }
+
+    /// Network-change detection resolves env > `config.toml` > on, as
+    /// Jellyfin's `DetectNetworkChange` defaults to `True`.
+    #[test]
+    fn detect_network_change_defaults_on_and_env_beats_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "detect_network_change = false\n").unwrap();
+        let load =
+            |cli: Cli, env: &FakeEnv| Config::load_from(cli, env).unwrap().detect_network_change;
+        let from_file = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert!(load(Cli::default(), &FakeEnv::new()));
+        assert!(!load(
+            Cli::default(),
+            &FakeEnv::new().with("FERROFIN_DETECT_NETWORK_CHANGE", "off")
+        ));
+        assert!(!load(from_file(), &FakeEnv::new()));
+        assert!(load(
+            from_file(),
+            &FakeEnv::new().with("FERROFIN_DETECT_NETWORK_CHANGE", "1")
+        ));
     }
 
     /// The extension kill-switch resolves env > file > off, and accepts the
@@ -1674,17 +3622,14 @@ mod tests {
         );
     }
 
-    /// A value that is not a whole number of hours above zero — from the
-    /// env or the file — warns and falls back to the default, never stops
-    /// the server.
+    /// A value that is not a whole number of hours — from the env or the
+    /// file — warns and falls back to the default, never stops the server.
     #[test]
     fn a_bad_tvdb_cache_hours_falls_back_to_the_default() {
-        let cases: [(Option<&str>, &str); 9] = [
-            (Some("0"), ""),
+        let cases: [(Option<&str>, &str); 7] = [
             (Some("-3"), ""),
             (Some("1.5"), ""),
             (Some("6h"), ""),
-            (None, "tvdb_cache_hours = 0\n"),
             (None, "tvdb_cache_hours = -2\n"),
             (None, "tvdb_cache_hours = 1.5\n"),
             (None, "tvdb_cache_hours = \"6h\"\n"),
@@ -1815,6 +3760,120 @@ mod tests {
         assert_eq!(Config::load_from(cli(), &env).unwrap().db_pool, Some(8));
     }
 
+    /// Both caps default off, the variable beats the file, and a value past
+    /// the range is clamped with a warning rather than stopping the boot.
+    #[test]
+    fn transcode_caps_default_off_env_beats_file_and_clamp() {
+        let caps = |cfg: &Config| (cfg.max_transcodes, cfg.max_transcodes_per_user);
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(caps(&unset), (0, 0));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "max_transcodes = 16\nmax_transcodes_per_user = 4\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(caps(&cfg), (16, 4));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_MAX_TRANSCODES", "0")
+            .with("FERROFIN_MAX_TRANSCODES_PER_USER", "2");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert_eq!(caps(&cfg), (0, 2));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_MAX_TRANSCODES", "1025")
+            .with("FERROFIN_MAX_TRANSCODES_PER_USER", "99999");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(caps(&cfg), (1024, 1024));
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+    }
+
+    /// gl-1320: the item-values write chunk defaults to the library
+    /// manager's 500, the file sets it, the variable beats the file, and a
+    /// value outside 1 to 5000 is clamped with a warning naming the setting.
+    #[test]
+    fn item_values_write_chunk_defaults_env_beats_file_and_clamps() {
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(unset.item_values_write_chunk, 500);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "item_values_write_chunk = 50\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(cfg.item_values_write_chunk, 50);
+
+        let env = FakeEnv::new().with("FERROFIN_ITEM_VALUES_WRITE_CHUNK", "1");
+        assert_eq!(
+            Config::load_from(cli.clone(), &env)
+                .unwrap()
+                .item_values_write_chunk,
+            1
+        );
+
+        for (value, clamped) in [("0", 1), ("5001", 5_000)] {
+            let env = FakeEnv::new().with("FERROFIN_ITEM_VALUES_WRITE_CHUNK", value);
+            let cfg = Config::load_from(cli.clone(), &env).unwrap();
+            assert_eq!(cfg.item_values_write_chunk, clamped, "{value}");
+            assert_eq!(cfg.load_warnings.len(), 1, "{:?}", cfg.load_warnings);
+            assert!(
+                cfg.load_warnings[0].contains("FERROFIN_ITEM_VALUES_WRITE_CHUNK"),
+                "{:?}",
+                cfg.load_warnings
+            );
+        }
+    }
+
+    /// The session idle window: 24 hours unset, the file's value, the variable
+    /// over the file, and a value outside an hour to a week clamped with a
+    /// warning naming it.
+    #[test]
+    fn session_idle_hours_defaults_env_beats_file_and_clamps() {
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(unset.session_idle_hours, 24);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "session_idle_hours = 72\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(cfg.session_idle_hours, 72);
+
+        let env = FakeEnv::new().with("FERROFIN_SESSION_IDLE_HOURS", "2");
+        assert_eq!(
+            Config::load_from(cli.clone(), &env)
+                .unwrap()
+                .session_idle_hours,
+            2
+        );
+
+        for (raw, used) in [("0", 1), ("169", 168)] {
+            let env = FakeEnv::new().with("FERROFIN_SESSION_IDLE_HOURS", raw);
+            let cfg = Config::load_from(cli.clone(), &env).unwrap();
+            assert_eq!(cfg.session_idle_hours, used);
+            assert_eq!(cfg.load_warnings.len(), 1, "{:?}", cfg.load_warnings);
+            assert!(
+                cfg.load_warnings[0].contains("session_idle_hours")
+                    && cfg.load_warnings[0].contains(&format!("using {used}")),
+                "{:?}",
+                cfg.load_warnings
+            );
+        }
+    }
+
     #[test]
     fn db_pool_file_accepts_auto_and_rejects_garbage() {
         let dir = tempfile::tempdir().unwrap();
@@ -1900,6 +3959,59 @@ mod tests {
     }
 
     #[test]
+    fn db_statement_cache_resolves_and_rejects_values_out_of_range() {
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.db_statement_cache, None, "unset ⇒ the default");
+        for value in ["100", "1024"] {
+            let env = FakeEnv::new().with("FERROFIN_DB_STATEMENT_CACHE", value);
+            let cfg = Config::load_from(Cli::default(), &env).unwrap();
+            assert_eq!(cfg.db_statement_cache, Some(value.parse().unwrap()));
+        }
+        for value in ["0", "99", "1025", "lots"] {
+            let env = FakeEnv::new().with("FERROFIN_DB_STATEMENT_CACHE", value);
+            let err = Config::load_from(Cli::default(), &env)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("FERROFIN_DB_STATEMENT_CACHE"),
+                "{value}: {err}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "db_statement_cache = 300\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert_eq!(
+            Config::load_from(cli(), &FakeEnv::new())
+                .unwrap()
+                .db_statement_cache,
+            Some(300)
+        );
+        let env = FakeEnv::new().with("FERROFIN_DB_STATEMENT_CACHE", " 150 ");
+        assert_eq!(
+            Config::load_from(cli(), &env).unwrap().db_statement_cache,
+            Some(150),
+            "the variable beats the file"
+        );
+        let env = FakeEnv::new().with("FERROFIN_DB_STATEMENT_CACHE", "  ");
+        assert_eq!(
+            Config::load_from(cli(), &env).unwrap().db_statement_cache,
+            Some(300),
+            "a blank variable is unset"
+        );
+        for value in ["0", "99", "2048"] {
+            std::fs::write(&toml, format!("db_statement_cache = {value}\n")).unwrap();
+            let err = Config::load_from(cli(), &FakeEnv::new())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("db_statement_cache"), "{value}: {err}");
+        }
+    }
+
+    #[test]
     fn missing_config_toml_is_not_an_error() {
         let env = FakeEnv::new();
         let cli = Cli {
@@ -1908,6 +4020,62 @@ mod tests {
         };
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+    }
+
+    #[test]
+    fn login_backoff_settings_resolve_and_refuse_values_out_of_range() {
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            unset.login_backoff_settings(),
+            LoginBackoffSettings::DEFAULT
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(
+            &toml,
+            "login_backoff = false\nlogin_backoff_attempts = 3\n\
+             login_backoff_max_delay_secs = 300\nlogin_backoff_window_mins = 1\n\
+             login_backoff_max_tracked = 1000\n",
+        )
+        .unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let from_file = Config::load_from(cli(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            (
+                from_file.login_backoff_attempts,
+                from_file.login_backoff_max_delay_secs,
+                from_file.login_backoff_window_mins,
+                from_file.login_backoff_max_tracked
+            ),
+            (3, 300, 1, 1000)
+        );
+        assert_eq!(from_file.login_backoff_settings().attempts, 0, "off");
+        let env = FakeEnv::new().with("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "20");
+        assert_eq!(
+            Config::load_from(cli(), &env)
+                .unwrap()
+                .login_backoff_attempts,
+            20
+        );
+        for (key, value) in [
+            ("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "0"),
+            ("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "2"),
+            ("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "21"),
+            ("FERROFIN_LOGIN_BACKOFF_ATTEMPTS", "five"),
+            ("FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS", "4"),
+            ("FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS", "0"),
+            ("FERROFIN_LOGIN_BACKOFF_WINDOW_MINS", "1441"),
+            ("FERROFIN_LOGIN_BACKOFF_WINDOW_MINS", "0"),
+            ("FERROFIN_LOGIN_BACKOFF_MAX_TRACKED", "999"),
+            ("FERROFIN_LOGIN_BACKOFF_MAX_TRACKED", "10000001"),
+        ] {
+            let env = FakeEnv::new().with(key, value);
+            let err = Config::load_from(Cli::default(), &env).unwrap_err();
+            assert!(err.to_string().contains(key), "{key}={value}: {err}");
+        }
     }
 
     #[test]
@@ -2071,7 +4239,7 @@ row_cache_ttl_secs = 10
     }
 
     #[test]
-    fn scan_directory_cache_limits_resolve_and_reject_zero() {
+    fn scan_directory_cache_limits_resolve_and_clamp_zero() {
         // Unset → None (the scanner keeps upstream's values).
         let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
         assert_eq!(cfg.scan_directory_cache_records, None);
@@ -2084,16 +4252,39 @@ row_cache_ttl_secs = 10
         assert_eq!(cfg.scan_directory_cache_records, Some(5000));
         assert_eq!(cfg.scan_directory_cache_idle_secs, Some(60));
 
-        for (key, value) in [
-            ("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "0"),
-            ("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "lots"),
-            ("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "0"),
-            ("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "-5"),
+        // Never a refusal to boot: 0 is clamped, and a value that does not
+        // parse is ignored, each with a warning naming the variable.
+        for (key, value, records, idle) in [
+            (
+                "FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS",
+                "0",
+                Some(1000),
+                None,
+            ),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "lots", None, None),
+            (
+                "FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS",
+                "0",
+                None,
+                Some(30),
+            ),
+            ("FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS", "-5", None, None),
         ] {
-            let err = Config::load_from(Cli::default(), &FakeEnv::new().with(key, value))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(key), "{key}={value}: {err}");
+            let cfg = Config::load_from(Cli::default(), &FakeEnv::new().with(key, value)).unwrap();
+            assert_eq!(
+                (
+                    cfg.scan_directory_cache_records,
+                    cfg.scan_directory_cache_idle_secs
+                ),
+                (records, idle),
+                "{key}={value}"
+            );
+            assert_eq!(cfg.load_warnings.len(), 1, "{key}={value}");
+            assert!(
+                cfg.load_warnings[0].contains(key),
+                "{key}={value}: {:?}",
+                cfg.load_warnings
+            );
         }
 
         let dir = tempfile::tempdir().unwrap();
@@ -2104,26 +4295,30 @@ row_cache_ttl_secs = 10
                 config_file: Some(toml.clone()),
                 ..Cli::default()
             };
-            Config::load_from(cli, &FakeEnv::new())
+            Config::load_from(cli, &FakeEnv::new()).unwrap()
         };
         let cfg =
-            load("scan_directory_cache_records = 7\nscan_directory_cache_idle_secs = 9\n").unwrap();
-        assert_eq!(cfg.scan_directory_cache_records, Some(7));
-        assert_eq!(cfg.scan_directory_cache_idle_secs, Some(9));
-        let err = load("scan_directory_cache_idle_secs = 0\n").unwrap_err();
+            load("scan_directory_cache_records = 7000\nscan_directory_cache_idle_secs = 90\n");
+        assert_eq!(cfg.scan_directory_cache_records, Some(7000));
+        assert_eq!(cfg.scan_directory_cache_idle_secs, Some(90));
+        let cfg = load("scan_directory_cache_records = 7\nscan_directory_cache_idle_secs = 0\n");
+        assert_eq!(cfg.scan_directory_cache_records, Some(1000));
+        assert_eq!(cfg.scan_directory_cache_idle_secs, Some(30));
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
         assert!(
-            err.to_string().contains("scan_directory_cache_idle_secs"),
-            "{err}"
+            cfg.load_warnings[1].contains("scan_directory_cache_idle_secs"),
+            "{:?}",
+            cfg.load_warnings
         );
         // Env wins over the file.
-        std::fs::write(&toml, "scan_directory_cache_records = 7\n").unwrap();
+        std::fs::write(&toml, "scan_directory_cache_records = 7000\n").unwrap();
         let cli = Cli {
             config_file: Some(toml.clone()),
             ..Cli::default()
         };
-        let env = FakeEnv::new().with("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "11");
+        let env = FakeEnv::new().with("FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS", "11000");
         let cfg = Config::load_from(cli, &env).unwrap();
-        assert_eq!(cfg.scan_directory_cache_records, Some(11));
+        assert_eq!(cfg.scan_directory_cache_records, Some(11000));
     }
 
     #[test]
@@ -2141,6 +4336,312 @@ row_cache_ttl_secs = 10
         let env = FakeEnv::new().with("FERROFIN_SCAN_PROGRESS_EVERY", "0");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.scan_progress_every, Some(0));
+    }
+
+    /// A count with no default of its own in the loader, from the variable or
+    /// `config.toml`, is clamped to its range with a warning naming the
+    /// setting and the value used; the server still boots.
+    #[test]
+    fn a_count_outside_its_range_is_clamped_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(
+            &toml,
+            "wasm_subtitle_extract_mb = 100000\nplayback_metrics_queue = 8\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(toml),
+            ..Cli::default()
+        };
+        let env = FakeEnv::new()
+            .with("FERROFIN_SCAN_PROBE_CONCURRENCY", "500")
+            .with("FERROFIN_WASM_MEMORY_LIMIT_MB", "4");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(
+            cfg.wasm_subtitle_extract_mb,
+            Some(128),
+            "the file's, clamped"
+        );
+        assert_eq!(cfg.playback_metrics_queue, Some(64), "the file's, clamped");
+        assert_eq!(
+            cfg.scan_probe_concurrency,
+            Some(64),
+            "the variable's, clamped"
+        );
+        assert_eq!(
+            cfg.wasm_memory_limit_mb,
+            Some(16),
+            "the variable's, clamped"
+        );
+        assert_eq!(cfg.load_warnings.len(), 4, "{:?}", cfg.load_warnings);
+        for (setting, used) in [
+            ("wasm_subtitle_extract_mb", "using 128"),
+            ("playback_metrics_queue", "using 64"),
+            ("FERROFIN_SCAN_PROBE_CONCURRENCY", "using 64"),
+            ("FERROFIN_WASM_MEMORY_LIMIT_MB", "using 16"),
+        ] {
+            assert!(
+                cfg.load_warnings
+                    .iter()
+                    .any(|w| w.contains(setting) && w.contains(used)),
+                "{setting}: {:?}",
+                cfg.load_warnings
+            );
+        }
+    }
+
+    /// The two counts with a zero of their own clamp above their range too:
+    /// `scan_progress_every`, whose `0` is off, and `metrics_sample_interval`,
+    /// whose `0` is the sampler's default.
+    #[test]
+    fn the_counts_with_a_zero_of_their_own_clamp_above_their_range() {
+        let env = FakeEnv::new()
+            .with("FERROFIN_SCAN_PROGRESS_EVERY", "200000")
+            .with("FERROFIN_METRICS_SAMPLE_INTERVAL", "1000");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.scan_progress_every, Some(100_000));
+        assert_eq!(cfg.metrics_sample_interval, Some(300));
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+        for (setting, used) in [
+            ("scan_progress_every", "using 100000"),
+            ("metrics_sample_interval", "using 300"),
+        ] {
+            assert!(
+                cfg.load_warnings
+                    .iter()
+                    .any(|w| w.contains(setting) && w.contains(used)),
+                "{setting}: {:?}",
+                cfg.load_warnings
+            );
+        }
+    }
+
+    /// The shutdown timeout, which the loader defaults itself, is clamped the
+    /// same way, from either layer.
+    #[test]
+    fn the_shutdown_timeout_is_clamped_with_a_warning() {
+        let env = FakeEnv::new().with("FERROFIN_SHUTDOWN_TIMEOUT_SECS", "100000");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.shutdown_timeout_secs, 600);
+        assert_eq!(cfg.load_warnings.len(), 1, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("using 600"),
+            "{:?}",
+            cfg.load_warnings
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "shutdown_timeout_secs = 0\n").unwrap();
+        let cli = Cli {
+            config_file: Some(toml),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.shutdown_timeout_secs, 5);
+        assert!(
+            cfg.load_warnings[0].contains("shutdown_timeout_secs"),
+            "{:?}",
+            cfg.load_warnings
+        );
+    }
+
+    /// `0` is the default where the setting's docs say so, from either layer:
+    /// kept, so the consumer applies its default, and no warning.
+    #[test]
+    fn zero_stays_the_default_where_the_docs_say_so() {
+        let keys = [
+            "quick_connect_pending_per_ip",
+            "scan_probe_concurrency",
+            "playback_metrics_queue",
+            "wasm_call_timeout_secs",
+            "wasm_memory_limit_mb",
+            "wasm_event_queue_capacity",
+            "max_plugin_download_mb",
+            "wasm_analysis_concurrency",
+            "wasm_state_limit_mb",
+            "wasm_image_download_mb",
+            "wasm_image_timeout_secs",
+            "wasm_write_content_mb",
+            "wasm_subtitle_extract_mb",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        let lines: Vec<String> = keys.iter().map(|key| format!("{key} = 0\n")).collect();
+        std::fs::write(&toml, lines.concat()).unwrap();
+        let cli = Cli {
+            config_file: Some(toml),
+            ..Cli::default()
+        };
+        let env = FakeEnv::new().with("FERROFIN_METRICS_SAMPLE_INTERVAL", "0");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        for value in [
+            cfg.quick_connect_pending_per_ip,
+            cfg.scan_probe_concurrency,
+            cfg.playback_metrics_queue,
+            cfg.wasm_call_timeout_secs,
+            cfg.wasm_memory_limit_mb,
+            cfg.wasm_event_queue_capacity,
+            cfg.max_plugin_download_mb,
+            cfg.wasm_analysis_concurrency,
+            cfg.wasm_state_limit_mb,
+            cfg.wasm_image_download_mb,
+            cfg.wasm_image_timeout_secs,
+            cfg.wasm_write_content_mb,
+            cfg.wasm_subtitle_extract_mb,
+        ] {
+            assert_eq!(value, Some(0));
+        }
+        assert_eq!(cfg.metrics_sample_interval, None, "the sampler's default");
+    }
+
+    /// TheTVDB's cache duration outside 1 to 168 hours, from the env or the
+    /// file, is clamped where the client is built, with a warning naming the
+    /// setting and the hours used.
+    #[test]
+    fn a_tvdb_cache_hours_outside_its_range_is_clamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        for (env_value, file, hours, warns) in [
+            (Some("500"), "", 168, true),
+            (Some("168"), "", 168, false),
+            (Some("0"), "", 1, true),
+            (None, "tvdb_cache_hours = 1000\n", 168, true),
+            (None, "tvdb_cache_hours = 0\n", 1, true),
+            (None, "tvdb_cache_hours = 24\n", 24, false),
+        ] {
+            std::fs::write(&toml, file).unwrap();
+            let cli = Cli {
+                config_file: Some(toml.clone()),
+                ..Cli::default()
+            };
+            let env = match env_value {
+                Some(value) => FakeEnv::new().with("FERROFIN_TVDB_CACHE_HOURS", value),
+                None => FakeEnv::new(),
+            };
+            let cfg = Config::load_from(cli, &env).unwrap();
+            let logs = crate::test_logs::CapturedLogs::default();
+            let duration = {
+                let _capture = logs.install();
+                cfg.tvdb_cache_duration()
+            };
+            assert_eq!(duration.as_secs() / 3600, hours, "{env_value:?} {file:?}");
+            let warnings = logs.lines_at("WARN");
+            if warns {
+                assert_eq!(warnings.len(), 1, "{env_value:?} {file:?}: {warnings:?}");
+                assert!(
+                    warnings[0].contains("tvdb_cache_hours")
+                        && warnings[0].contains(&format!("hours={hours}")),
+                    "{warnings:?}"
+                );
+            } else {
+                assert!(warnings.is_empty(), "{env_value:?} {file:?}: {warnings:?}");
+            }
+        }
+    }
+
+    /// Every default lies inside its setting's range, wherever the default
+    /// is defined.
+    #[test]
+    fn every_default_lies_inside_its_range() {
+        let count = |n: usize| u32::try_from(n).expect("a u32");
+        let secs = |d: std::time::Duration| u32::try_from(d.as_secs()).expect("a u32");
+        let wasm = ferrofin_wasm::WasmSettings::default();
+        let directories = ferrofin_core::library_scan::DirectoryCacheLimits::default();
+        for (key, default, range) in [
+            (
+                "quick_connect_pending_per_ip",
+                count(ferrofin_core::quick_connect_manager::DEFAULT_PENDING_PER_IP),
+                QUICK_CONNECT_PENDING_PER_IP_RANGE,
+            ),
+            (
+                "scan_probe_concurrency",
+                count(ferrofin_core::library_scan::DEFAULT_SCAN_PROBE_CONCURRENCY),
+                SCAN_PROBE_CONCURRENCY_RANGE,
+            ),
+            (
+                "scan_directory_cache_records",
+                count(directories.max_records.get()),
+                SCAN_DIRECTORY_CACHE_RECORDS_RANGE,
+            ),
+            (
+                "scan_directory_cache_idle_secs",
+                secs(directories.idle_timeout),
+                SCAN_DIRECTORY_CACHE_IDLE_SECS_RANGE,
+            ),
+            (
+                "playback_metrics_queue",
+                count(ferrofin_core::playback_metrics::DEFAULT_QUEUE_DEPTH),
+                PLAYBACK_METRICS_QUEUE_RANGE,
+            ),
+            (
+                "item_values_write_chunk",
+                ferrofin_core::library_manager::DEFAULT_ITEM_VALUES_WRITE_CHUNK,
+                ITEM_VALUES_WRITE_CHUNK_RANGE,
+            ),
+            (
+                "shutdown_timeout_secs",
+                DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+                SHUTDOWN_TIMEOUT_SECS_RANGE,
+            ),
+            (
+                "session_idle_hours",
+                DEFAULT_SESSION_IDLE_HOURS,
+                SESSION_IDLE_HOURS_RANGE,
+            ),
+            (
+                "tvdb_cache_hours",
+                secs(ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION) / 3600,
+                TVDB_CACHE_HOURS_RANGE,
+            ),
+            (
+                "wasm_call_timeout_secs",
+                wasm.call_timeout_secs,
+                WASM_CALL_TIMEOUT_SECS_RANGE,
+            ),
+            (
+                "wasm_memory_limit_mb",
+                wasm.memory_limit_mb,
+                WASM_MEMORY_LIMIT_MB_RANGE,
+            ),
+            (
+                "wasm_event_queue_capacity",
+                wasm.event_queue_capacity,
+                WASM_EVENT_QUEUE_CAPACITY_RANGE,
+            ),
+            (
+                "wasm_state_limit_mb",
+                wasm.state_limit_mb,
+                WASM_STATE_LIMIT_MB_RANGE,
+            ),
+            (
+                "wasm_image_download_mb",
+                wasm.image_download_mb,
+                WASM_IMAGE_DOWNLOAD_MB_RANGE,
+            ),
+            (
+                "wasm_image_timeout_secs",
+                wasm.image_timeout_secs,
+                WASM_IMAGE_TIMEOUT_SECS_RANGE,
+            ),
+            (
+                "wasm_write_content_mb",
+                wasm.write_content_mb,
+                WASM_WRITE_CONTENT_MB_RANGE,
+            ),
+            (
+                "wasm_subtitle_extract_mb",
+                wasm.subtitle_extract_mb,
+                WASM_SUBTITLE_EXTRACT_MB_RANGE,
+            ),
+        ] {
+            assert!(
+                range.contains(&default),
+                "{key}: {default} outside {range:?}"
+            );
+        }
     }
 
     /// A test server's scan never reaches a public metadata provider:

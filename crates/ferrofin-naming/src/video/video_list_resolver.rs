@@ -34,6 +34,14 @@ impl<'a> VideoListResolver<'a> {
         Self { naming_options }
     }
 
+    /// The key under which two episode files are versions of one episode
+    /// (`GetEpisodeVersionKey`): `D{yyyyMMdd}` for a file named by air date,
+    /// `S{n}E{n}` for one with both numbers, `None` (never grouped) otherwise.
+    #[must_use]
+    pub fn episode_version_key(&self, path: &str) -> Option<String> {
+        episode_version_key(&EpisodePathParser::new(self.naming_options), path)
+    }
+
     /// Resolves alternative versions and extras from a list of video files.
     #[must_use]
     pub fn resolve(

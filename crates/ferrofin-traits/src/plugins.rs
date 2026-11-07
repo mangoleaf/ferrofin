@@ -270,6 +270,56 @@ pub struct ValidatedArtifact {
 
 fn _assert_object_safe_plugin_artifact_validator(_: &dyn PluginArtifactValidator) {}
 
+/// Which library items the "Plugin media analysis" pass has offered to which
+/// analyzer plugin: the Ferrofin-owned `FerrofinPluginOfferedItems` table
+/// (migration 0049). Jellyfin has no plugin analysis pass, so this is
+/// Ferrofin's own.
+///
+/// The pass writes it here and reads it back through
+/// [`InternalItemsQuery::not_offered_to_plugin`](crate::options::InternalItemsQuery::not_offered_to_plugin),
+/// an anti-join in the item query. A row goes with its item: deleting the
+/// item deletes its rows.
+#[async_trait]
+pub trait PluginOfferedItemStore: Send + Sync {
+    /// Records that `plugin_id` has been offered `item_ids`, now. An item
+    /// already recorded keeps its first time, and an id no longer in the
+    /// library is skipped.
+    ///
+    /// # Errors
+    /// When the database fails.
+    async fn mark_offered(&self, plugin_id: Uuid, item_ids: &[Uuid]) -> Result<(), ServiceError>;
+
+    /// Records as offered to `plugin_id`, now, every item of `kinds` created
+    /// before `created_before` (and at or after `created_from`, when given),
+    /// and every undated one too when `include_undated`, except the items in
+    /// `except`. Returns how many items it recorded that were not recorded
+    /// already.
+    ///
+    /// This is the switch from the pass's old `DateCreated` watermark: the
+    /// items it had offered by that rule count as offered.
+    ///
+    /// # Errors
+    /// When the database fails.
+    async fn mark_offered_created_between(
+        &self,
+        plugin_id: Uuid,
+        kinds: &[ferrofin_model::data::BaseItemKind],
+        created_from: Option<chrono::DateTime<chrono::Utc>>,
+        created_before: chrono::DateTime<chrono::Utc>,
+        include_undated: bool,
+        except: &[Uuid],
+    ) -> Result<u64, ServiceError>;
+
+    /// Forgets every item offered to `plugin_id`, so the plugin installed
+    /// again is offered the whole library, as it was the first time.
+    ///
+    /// # Errors
+    /// When the database fails.
+    async fn forget_plugin(&self, plugin_id: Uuid) -> Result<(), ServiceError>;
+}
+
+fn _assert_object_safe_plugin_offered_item_store(_: &dyn PluginOfferedItemStore) {}
+
 /// One step of a web-file transformation pipeline.
 ///
 /// Port of the File Transformation plugin's `TransformFile` delegate: given the
@@ -445,7 +495,7 @@ mod tests {
     #[test]
     fn descriptor_default_is_empty_and_disabled() {
         let d = PluginDescriptor::default();
-        assert!(d.name.is_empty());
+        assert_eq!(d.name, "");
         assert!(!d.enabled);
         assert!(!d.can_uninstall);
         assert!(d.id.is_nil());
@@ -454,10 +504,13 @@ mod tests {
     #[tokio::test]
     async fn disabled_manager_has_no_plugins() {
         let mgr = DisabledPluginManager;
-        assert!(mgr.list_plugins().await.expect("list").is_empty());
+        let plugins = mgr.list_plugins().await.expect("list");
+        assert!(plugins.is_empty(), "{plugins:?}");
         assert!(mgr.get_plugin(Uuid::new_v4()).await.expect("get").is_none());
-        assert!(mgr.get_repositories().await.expect("repos").is_empty());
-        assert!(mgr.list_packages().await.expect("pkgs").is_empty());
+        let repositories = mgr.get_repositories().await.expect("repos");
+        assert!(repositories.is_empty(), "{repositories:?}");
+        let packages = mgr.list_packages().await.expect("pkgs");
+        assert!(packages.is_empty(), "{packages:?}");
         assert!(mgr.enable_plugin(Uuid::new_v4()).await.is_err());
         assert!(mgr.set_repositories(Vec::new()).await.is_err());
     }

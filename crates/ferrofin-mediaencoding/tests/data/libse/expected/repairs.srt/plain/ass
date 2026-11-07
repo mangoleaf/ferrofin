@@ -1,0 +1,23 @@
+[Script Info]
+; This is an Advanced Sub Station Alpha v4+ script.
+Title: untitled
+ScriptType: v4.00+
+PlayDepth: 0
+ScaledBorderAndShadow: Yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,1,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.10,0:00:00.90,Default,,0,0,0,,well-formed, so ffprobe opens the file
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,single-dash arrow
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,em-dash arrow
+Dialogue: 0,0:00:05.00,0:00:05.50,Default,,0,0,0,,no hours
+Dialogue: 0,0:00:06.00,0:00:07.50,Default,,0,0,0,,dots between the fields
+Dialogue: 0,0:00:00.00,0:00:08.00,Default,,0,0,0,,negative start
+Dialogue: 0,0:00:09.00,0:00:10.00,Default,,0,0,0,,DVD-rip position info
+Dialogue: 0,0:00:11.00,0:00:12.00,Default,,0,0,0,,nul char
+Dialogue: 0,0:00:13.00,0:00:14.00,Default,,0,0,0,,Hello\Nworld
+Dialogue: 0,0:00:15.00,0:00:16.00,Default,,0,0,0,,nbsp\Ndeleted

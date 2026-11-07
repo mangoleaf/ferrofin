@@ -6,9 +6,11 @@
 //! to `Users` and to the children of the rows it deletes. 0045 re-points an `OwnerId`
 //! that names no item at the placeholder item, which the boot repair then deletes.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use ferrofin_db::{Database, JELLYFIN_GENERATIONS};
+use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{ConnectOptions, SqlitePool};
 
@@ -355,8 +357,15 @@ async fn adoption_re_points_a_dangling_owner_at_the_placeholder(
     );
 }
 
-/// Every foreign key to `Users` has its delete in 0044, so a table that gains
-/// one later fails here instead of at a user's boot.
+/// The tables with a foreign key to `Users` that a migration after 0044 creates,
+/// empty. 0044 is released and cannot gain their deletes, and they need none: no
+/// database brings rows into them, and Ferrofin writes them, and deletes users,
+/// with foreign keys on, so their `ON DELETE CASCADE` keeps them clean. Each must
+/// not exist yet when 0044 runs.
+const CREATED_EMPTY_AFTER_0044: [&str; 1] = ["FerrofinExternalIdentities"];
+
+/// Every foreign key to `Users` that exists when 0044 runs has its delete there,
+/// so a table that gains one later fails here instead of at a user's boot.
 #[tokio::test]
 async fn cleanup_covers_every_foreign_key_to_users() {
     let db = Database::connect_in_memory().await.expect("database");
@@ -373,8 +382,27 @@ async fn cleanup_covers_every_foreign_key_to_users() {
         dependents.contains(&("UserData".to_owned(), "UserId".to_owned())),
         "the query sees the schema: {dependents:?}"
     );
+    for table in CREATED_EMPTY_AFTER_0044 {
+        assert!(
+            dependents.contains(&(table.to_owned(), "UserId".to_owned())),
+            "{table} references Users: {dependents:?}"
+        );
+        let on_delete: Vec<String> = sqlx::query_scalar(
+            r#"SELECT "on_delete" FROM pragma_foreign_key_list(?1) WHERE "table" = 'Users'"#,
+        )
+        .bind(table)
+        .fetch_all(db.pool())
+        .await
+        .expect("on_delete");
+        assert_eq!(
+            on_delete,
+            ["CASCADE"],
+            "{table}: the cascade is what keeps it clean"
+        );
+    }
     let missing: Vec<String> = dependents
         .iter()
+        .filter(|(table, _)| !CREATED_EMPTY_AFTER_0044.contains(&table.as_str()))
         .filter(|(table, column)| {
             !CLEANUP_SQL.contains(&format!(
                 r#"DELETE FROM "{table}" WHERE "{column}" NOT IN (SELECT "Id" FROM "Users")"#
@@ -385,4 +413,38 @@ async fn cleanup_covers_every_foreign_key_to_users() {
         .map(|(table, column)| format!("{table}.{column}"))
         .collect();
     assert!(missing.is_empty(), "0044 has no delete for {missing:?}");
+
+    // `Database` registers the SQL functions earlier migrations call. Running
+    // the migrator directly skips `run_migrations`' foreign-keys-off wrapper,
+    // which is safe only because this database is empty: a table rebuild has
+    // no rows to cascade. Seed nothing here.
+    let at_0044 = Database::connect_in_memory().await.expect("database");
+    let through_0044 = Migrator {
+        migrations: Cow::Owned(
+            sqlx::migrate!("./migrations")
+                .migrations
+                .iter()
+                .filter(|m| m.version <= 44)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate!("./migrations")
+    };
+    through_0044
+        .run(at_0044.pool())
+        .await
+        .expect("migrations through 0044");
+    for table in CREATED_EMPTY_AFTER_0044 {
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        )
+        .bind(table)
+        .fetch_one(at_0044.pool())
+        .await
+        .expect("sqlite_master");
+        assert_eq!(
+            exists, 0,
+            "{table} exists when 0044 runs, so 0044 must clear it"
+        );
+    }
 }

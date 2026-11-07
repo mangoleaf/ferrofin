@@ -638,8 +638,8 @@ mod tests {
         };
         let chain = nvidia_vid_filters_prefered(&inp);
         assert_eq!(chain.main.last().unwrap(), "subtitles=f='/media/a.srt'");
-        assert!(chain.sub.is_empty());
-        assert!(chain.overlay.is_empty());
+        assert!(chain.sub.is_empty(), "{:?}", chain.sub);
+        assert!(chain.overlay.is_empty(), "{:?}", chain.overlay);
     }
 
     #[test]
@@ -708,7 +708,7 @@ mod tests {
                 "subtitles=f='/media/a.srt'".to_owned(),
             ]
         );
-        assert!(chain.sub.is_empty());
+        assert!(chain.sub.is_empty(), "{:?}", chain.sub);
     }
 
     #[test]

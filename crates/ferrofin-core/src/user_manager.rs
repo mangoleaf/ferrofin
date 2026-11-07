@@ -15,9 +15,11 @@
 //! load-bearing rather than incidental — a guard evaluated on the *read* pool
 //! and acted on through the *writer* pool is a check-then-act, and the
 //! last-user / last-admin / duplicate-name guards below are all written in the
-//! transaction that acts on them for exactly that reason. The `.NET` event manager
-//! (`UserCreated`/`UserUpdated`/…) is out of scope (event wiring lands
-//! separately).
+//! transaction that acts on them for exactly that reason. A committed rename
+//! or policy save publishes `UserUpdated` on the event bus
+//! ([`with_events`](FerrofinUserManager::with_events)), as upstream's
+//! `RenameUser` and `UpdatePolicyAsync` publish `UserUpdatedEventArgs`; its
+//! consumers are in [`crate::user_updated`].
 //!
 //! Faithful port simplifications, each flagged:
 //! - `authenticate_user` shares the configured network policy with HTTP auth,
@@ -31,7 +33,7 @@
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, RwLock, Weak};
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -41,20 +43,25 @@ use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use ferrofin_model::configuration::{SubtitlePlaybackMode, UserConfiguration};
 use ferrofin_model::data::UnratedItem;
 use ferrofin_model::dto::{NameIdPair, UserDto};
-use ferrofin_model::users::{SyncPlayUserAccessType, UserPolicy};
+use ferrofin_model::users::{
+    ForgotPasswordResult, PinRedeemResult, SyncPlayUserAccessType, UserPolicy,
+};
 use ferrofin_util::string_extensions::upper_invariant;
 use sqlx::{Sqlite, SqliteExecutor};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{PolicyGuardState, PolicySaved, UserManager, policy_update_refusal};
-use ferrofin_traits::security::AuthenticationManager;
+use ferrofin_traits::library::{
+    AdminFlagOutcome, ExternalUserSetup, PolicyGuardState, PolicySaved, UserManager,
+    policy_update_refusal,
+};
+use ferrofin_traits::security::{AuthenticationManager, PasswordResetManager};
 
 use crate::auth_providers::{
-    DEFAULT_AUTH_PROVIDER_ID, DefaultAuthenticationProvider, INVALID_AUTH_PROVIDER_ID,
-    InvalidAuthProvider,
+    DEFAULT_AUTH_PROVIDER_ID, DefaultAuthenticationProvider, InvalidAuthProvider,
 };
 use crate::db_error::db_err;
+use crate::password_reset::{DEFAULT_PASSWORD_RESET_PROVIDER_NAME, DefaultPasswordResetProvider};
 use crate::user_entity_ext::{
     has_permission, is_parental_schedule_allowed, seed_defaults, set_permission, set_permission_tx,
     set_preference_tx,
@@ -66,29 +73,65 @@ use crate::user_entity_ext::{
 pub const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
     "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider";
 
+/// The one message every failed username/password login answers with
+/// (`UserManager.AuthenticateUser` and `SessionManager` both throw it,
+/// v12.4), whether the username was unknown or the password wrong, so the
+/// response does not tell a caller which usernames exist.
+pub(crate) const INVALID_CREDENTIALS_MESSAGE: &str = "Invalid username or password entered.";
+
 /// The default username assigned during first-run bootstrap when the host user
 /// name is unusable (C# `"MyJellyfinUser"`).
 const DEFAULT_BOOTSTRAP_USERNAME: &str = "MyJellyfinUser";
 
 type LoginLocks = Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>;
 
+mod login_backoff;
 mod user_repository;
+
+pub use login_backoff::LoginBackoffSettings;
 
 /// The concrete user manager.
 ///
 /// Holds the registered [`AuthenticationManager`] providers by shared reference
 /// so the composition root can supply LDAP/other backends alongside the
-/// built-in default; the built-in [`DefaultAuthenticationProvider`] is kept
+/// built-in default, those of compiled-in extensions joining late
+/// ([`set_extension_providers`](Self::set_extension_providers)). A provider
+/// is stored and selected by its [`id`](AuthenticationManager::id) and shown
+/// by its [`name`](AuthenticationManager::name). The built-in
+/// [`DefaultAuthenticationProvider`] is kept
 /// separately for its password-hash formatting helper (which is not on the
 /// object-safe trait).
 #[derive(Clone)]
 pub struct FerrofinUserManager {
     db: Database,
     login_locks: Arc<LoginLocks>,
+    /// Ferrofin's login backoff, shared by every clone.
+    login_backoff: Arc<login_backoff::LoginBackoff>,
     network: Option<Arc<RwLock<ferrofin_networking::NetworkManager>>>,
     default_provider: DefaultAuthenticationProvider,
     invalid_provider: InvalidAuthProvider,
     providers: Vec<Arc<dyn AuthenticationManager>>,
+    /// The providers compiled-in extensions contribute, consulted after
+    /// [`providers`](Self::providers). The manager is built long before the
+    /// extensions are, so the composition root fills this once they are
+    /// wired ([`set_extension_providers`](Self::set_extension_providers)).
+    /// It is behind an `Arc` so every clone of the manager sees that fill.
+    extension_providers: Arc<OnceLock<Vec<Arc<dyn AuthenticationManager>>>>,
+    /// The password-reset providers compiled-in extensions contribute,
+    /// offered after the built-in PIN-file provider. Filled once, like
+    /// [`extension_providers`](Self::extension_providers)
+    /// ([`set_extension_reset_providers`](Self::set_extension_reset_providers)).
+    extension_reset_providers: Arc<OnceLock<Vec<Arc<dyn PasswordResetManager>>>>,
+    /// Where the built-in provider writes its PIN files: upstream's
+    /// `ProgramDataPath`. Set by the composition root
+    /// ([`with_password_reset_dir`](Self::with_password_reset_dir)); `None`
+    /// fails a request to issue one.
+    password_reset_dir: Option<std::path::PathBuf>,
+    /// Serializes the built-in provider's PIN-file work (issuing a file, and
+    /// redeeming one through the password save), so two redemptions of one PIN
+    /// reset the password once. Only that provider takes it: another provider
+    /// never waits on it. Shared by every clone.
+    password_reset_lock: Arc<tokio::sync::Mutex<()>>,
     /// This server's stable id, stamped onto every [`UserDto.ServerId`] when the
     /// caller does not supply one. The web client keys its per-server api-client
     /// on it and throws (`getApiClient(null)`) if it is missing. Set by the
@@ -98,6 +141,10 @@ pub struct FerrofinUserManager {
     /// Optional activity-log seam: a lockout is recorded as a dashboard Alert
     /// (port of upstream's `UserLockedOutLogger`). `None` in tests.
     activity: Option<Arc<dyn ferrofin_traits::activity::ActivityManager>>,
+    /// Where a rename or a policy save is announced
+    /// ([`USER_UPDATED_EVENT`](crate::user_updated::USER_UPDATED_EVENT)).
+    /// `None` in tests, which then announce nothing.
+    events: Option<Arc<dyn ferrofin_traits::events::EventManager>>,
     /// Server configuration, read to resolve a user's cast receiver against
     /// the configured applications (upstream does this at DTO time). `None`
     /// in tests, which then echo the stored value.
@@ -116,7 +163,7 @@ pub struct FerrofinUserManager {
 impl std::fmt::Debug for FerrofinUserManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FerrofinUserManager")
-            .field("provider_count", &self.providers.len())
+            .field("provider_count", &self.registered_providers().count())
             .finish_non_exhaustive()
     }
 }
@@ -161,7 +208,27 @@ impl FerrofinUserManager {
         }
     }
 
+    /// Every registered provider in the order sign-in consults them (C#
+    /// `_authenticationProviders`, the built-in types before the plugins'): the
+    /// built-in default, any [`with_providers`](Self::with_providers) extras,
+    /// then the extensions' ([`set_extension_providers`](Self::set_extension_providers)).
+    fn registered_providers(&self) -> impl Iterator<Item = &dyn AuthenticationManager> {
+        self.providers
+            .iter()
+            .chain(self.extension_providers.get().into_iter().flatten())
+            .map(Arc::as_ref)
+    }
+
     /// Enabled providers selected by the saved ID; an unknown ID fails closed.
+    ///
+    /// The id is matched before `is_enabled` is asked, the reverse of C#'s
+    /// `Where(IsEnabled)` then `Where(id)`, with the same result: a provider
+    /// another user's sign-in never selects is not consulted, so an extension
+    /// provider whose `is_enabled` fails cannot fail a local account's sign-in.
+    ///
+    /// When nothing matches, the invalid provider stands in, and a warning
+    /// names the user and the saved id as upstream's does. That covers a sign-in
+    /// and a password change alike.
     async fn authentication_providers_for(
         &self,
         user: Option<&UserEntity>,
@@ -170,14 +237,24 @@ impl FerrofinUserManager {
             .map(|u| u.authentication_provider_id.as_str())
             .filter(|id| !id.is_empty());
         let mut candidates: Vec<&dyn AuthenticationManager> = Vec::new();
-        for provider in &self.providers {
-            if provider.is_enabled().await?
-                && wanted.is_none_or(|id| provider_id(provider.name()).eq_ignore_ascii_case(id))
+        for provider in self.registered_providers() {
+            if wanted.is_none_or(|id| provider.id().eq_ignore_ascii_case(id))
+                && provider.is_enabled().await?
             {
-                candidates.push(provider.as_ref());
+                candidates.push(provider);
             }
         }
         if candidates.is_empty() {
+            tracing::warn!(
+                username = user.map(|u| tracing::field::display(&u.username)),
+                user_id = user.map(|u| tracing::field::display(&u.id)),
+                // Saved text an administrator or an adopted database supplied:
+                // Debug escapes it (LOGGING.md, rule 6).
+                authentication_provider_id = wanted.map(tracing::field::debug),
+                "the user's saved authentication provider is missing or disabled; assigning \
+                 the invalid provider, which refuses every sign-in and ignores a password \
+                 change, until this is corrected"
+            );
             candidates.push(&self.invalid_provider);
         }
         Ok(candidates)
@@ -200,7 +277,7 @@ impl FerrofinUserManager {
                 Err(ServiceError::Unauthorized(_)) => continue,
                 Err(error) => return Err(error),
             };
-            let id = provider_id(provider.name());
+            let id = provider.id();
             let mut resolved = if let Some(user) = &user {
                 self.fetch_user(
                     Uuid::parse_str(&user.id)
@@ -230,6 +307,17 @@ impl FerrofinUserManager {
                 id.clone_into(&mut user.authentication_provider_id);
                 self.users_changed();
             }
+            // After the new-user policy, so the provider's flag is the last word.
+            // As upstream's LDAP plugin sets it inside `Authenticate`, this
+            // comes before the disabled, remote-access and schedule checks.
+            if let Some(administrator) = result.administrator
+                && let Some(user) = &resolved
+            {
+                let uid = Uuid::parse_str(&user.id)
+                    .map_err(|error| ServiceError::backend(error.to_string()))?;
+                self.apply_external_administrator(uid, administrator)
+                    .await?;
+            }
             return Ok((resolved, true));
         }
         Ok((user, false))
@@ -256,8 +344,8 @@ impl FerrofinUserManager {
                 "account locked out after repeated failed logins"
             );
             // The admin needs to see this without reading the server log.
-            if let Some(activity) = &self.activity {
-                let _ = activity
+            if let Some(activity) = &self.activity
+                && let Err(error) = activity
                     .create_entry(ferrofin_traits::activity::ActivityLogCreate {
                         name: format!("User {} has been locked out", user.username),
                         type_: "UserLockedOut".to_owned(),
@@ -265,7 +353,9 @@ impl FerrofinUserManager {
                         severity: ferrofin_model::activity::LogLevel::Error,
                         ..Default::default()
                     })
-                    .await;
+                    .await
+            {
+                tracing::warn!(user_id = %user.id, %error, "could not record the lockout in the activity log");
             }
         }
         sqlx::query(r#"UPDATE "Users" SET "InvalidLoginAttemptCount" = ?2 WHERE "Id" = ?1"#)
@@ -297,17 +387,151 @@ impl FerrofinUserManager {
         Self {
             db,
             login_locks: Arc::new(Mutex::new(HashMap::new())),
+            login_backoff: Arc::new(login_backoff::LoginBackoff::new(
+                LoginBackoffSettings::DEFAULT,
+            )),
             network: None,
             default_provider: DefaultAuthenticationProvider::new(),
             invalid_provider: InvalidAuthProvider::new(),
             providers,
+            extension_providers: Arc::default(),
+            extension_reset_providers: Arc::default(),
+            password_reset_dir: None,
+            password_reset_lock: Arc::default(),
             server_id: None,
             activity: None,
+            events: None,
             config: None,
             profile_image_dir: None,
             image_processor: None,
             auth_cache: Arc::new(crate::auth_cache::AuthCache::default()),
         }
+    }
+
+    /// Registers the authentication providers compiled-in extensions
+    /// contribute, consulted after the built-in default and any
+    /// [`with_providers`](Self::with_providers) extras, in the order given.
+    ///
+    /// Called once by the composition root after the extensions are wired:
+    /// the manager exists long before they do. Every clone of this manager,
+    /// earlier or later, sees the providers. A second call is a no-op and
+    /// logs a warning.
+    ///
+    /// A provider may hold the user manager it is registered with, a
+    /// reference cycle. Both live for the whole process, so it is never freed,
+    /// which is harmless.
+    pub fn set_extension_providers(&self, providers: Vec<Arc<dyn AuthenticationManager>>) {
+        if self.extension_providers.set(providers).is_err() {
+            tracing::warn!("extension authentication providers were already registered; ignoring");
+        }
+    }
+
+    /// Registers the password-reset providers compiled-in extensions
+    /// contribute, offered after the built-in PIN-file provider, in the order
+    /// given. Called once by the composition root with
+    /// [`set_extension_providers`](Self::set_extension_providers); every clone
+    /// sees them, and a second call is a no-op that logs a warning.
+    pub fn set_extension_reset_providers(&self, providers: Vec<Arc<dyn PasswordResetManager>>) {
+        if self.extension_reset_providers.set(providers).is_err() {
+            tracing::warn!("extension password-reset providers were already registered; ignoring");
+        }
+    }
+
+    /// Sets the directory the built-in password-reset provider writes its PIN
+    /// files to: upstream's `ProgramDataPath`. Called once by the composition
+    /// root.
+    #[must_use]
+    pub fn with_password_reset_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.password_reset_dir = Some(dir.into());
+        self
+    }
+
+    /// The directory the built-in password-reset provider writes its PIN
+    /// files to, once [`with_password_reset_dir`](Self::with_password_reset_dir)
+    /// set it.
+    pub(crate) fn password_reset_dir(&self) -> Option<&std::path::Path> {
+        self.password_reset_dir.as_deref()
+    }
+
+    /// The lock the built-in password-reset provider holds across its PIN-file
+    /// work.
+    pub(crate) fn password_reset_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.password_reset_lock
+    }
+
+    /// Writes the dashboard's "Password has been changed" entry (upstream's
+    /// `UserPasswordChangedLogger`, which every `ChangePassword` raises) for a
+    /// password a recovery PIN set. A failed write is not the reset's failure.
+    pub(crate) async fn log_password_changed(&self, user_id: Uuid, username: &str) {
+        if let Some(activity) = &self.activity
+            && let Err(error) = activity
+                .create_entry(ferrofin_traits::activity::ActivityLogCreate {
+                    name: format!("Password has been changed for user {username}"),
+                    type_: "UserPasswordChanged".to_owned(),
+                    user_id: Some(user_id),
+                    ..Default::default()
+                })
+                .await
+        {
+            tracing::debug!(%error, %user_id, "could not write the password-changed activity entry");
+        }
+    }
+
+    /// The password-reset providers compiled-in extensions registered, in
+    /// order. The built-in PIN-file provider comes before them and is built
+    /// per request ([`DefaultPasswordResetProvider`]).
+    fn extension_reset_providers(&self) -> impl Iterator<Item = &dyn PasswordResetManager> {
+        self.extension_reset_providers
+            .get()
+            .into_iter()
+            .flatten()
+            .map(Arc::as_ref)
+    }
+
+    /// The provider a forgotten-password request for `user` goes to (C#
+    /// `GetPasswordResetProvider(User)`): no user gets the built-in provider,
+    /// and a user gets the first enabled provider whose id their saved
+    /// `PasswordResetProviderId` names (case-insensitive), any enabled one when
+    /// it is blank, or the built-in provider when none matches.
+    async fn password_reset_provider_for<'a>(
+        &'a self,
+        user: Option<&UserEntity>,
+        default: &'a DefaultPasswordResetProvider<'a>,
+    ) -> Result<&'a dyn PasswordResetManager, ServiceError> {
+        let Some(user) = user else {
+            return Ok(default);
+        };
+        let wanted = Some(user.password_reset_provider_id.as_str()).filter(|id| !id.is_empty());
+        let providers = std::iter::once(default as &dyn PasswordResetManager)
+            .chain(self.extension_reset_providers());
+        for provider in providers {
+            if wanted.is_none_or(|id| provider.id().eq_ignore_ascii_case(id))
+                && provider.is_enabled().await?
+            {
+                return Ok(provider);
+            }
+        }
+        Ok(default)
+    }
+
+    /// Offers `pin` to each provider in turn and answers the first that
+    /// redeems it (C# `RedeemPasswordResetPin`). A provider's error stops the
+    /// redemption, as upstream's exception does. When none redeems it, the
+    /// answer is upstream's: its built-in provider throws
+    /// `ResourceNotFoundException`, a `404`.
+    async fn redeem_with(
+        providers: &[&dyn PasswordResetManager],
+        pin: &str,
+    ) -> Result<PinRedeemResult, ServiceError> {
+        for provider in providers {
+            let result = provider.redeem_password_reset_pin(pin).await?;
+            if result.success {
+                return Ok(result);
+            }
+        }
+        Err(ServiceError::not_found(
+            "no matching password reset request",
+        ))
     }
 
     /// Shares the live network policy used by HTTP authorization and trusted
@@ -399,6 +623,44 @@ impl FerrofinUserManager {
             .then_some(sent)
     }
 
+    /// Admits a login attempt to the login backoff: how long it waits, or
+    /// `None` when its address is refused. Unknown names are paced like known
+    /// ones, folded as the lookup folds them, which keeps the backoff from
+    /// telling the two apart.
+    fn admit_login(
+        &self,
+        user: Option<&UserEntity>,
+        username: &str,
+        remote_endpoint: &str,
+    ) -> Option<(std::time::Duration, login_backoff::Attempt<'_>)> {
+        let user_id = user.map(|user| user.id.as_str());
+        let account = login_backoff::account_key(user_id, username);
+        let who = login_backoff::Who {
+            account: &account,
+            user_id,
+            username,
+            address: (!remote_endpoint.is_empty()).then_some(remote_endpoint),
+        };
+        let admitted = self.login_backoff.admit(&who, std::time::Instant::now());
+        if admitted.is_none() {
+            tracing::debug!(
+                username = ?username,
+                remote_ip = remote_endpoint,
+                reason = "backoff",
+                "login refused by the login backoff"
+            );
+        }
+        admitted
+    }
+
+    /// Sets the login backoff (`login_backoff_*`; [`LoginBackoffSettings::DEFAULT`]
+    /// until the composition root calls this).
+    #[must_use]
+    pub fn with_login_backoff(mut self, settings: LoginBackoffSettings) -> Self {
+        self.login_backoff = Arc::new(login_backoff::LoginBackoff::new(settings));
+        self
+    }
+
     /// Attaches the activity-log seam so an account lockout is recorded as a
     /// dashboard Alert.
     #[must_use]
@@ -408,6 +670,35 @@ impl FerrofinUserManager {
     ) -> Self {
         self.activity = Some(activity);
         self
+    }
+
+    /// Attaches the event bus a committed rename or policy save is announced
+    /// on, so its consumers ([`crate::user_updated::subscribe`]) run whoever
+    /// called the manager.
+    #[must_use]
+    pub fn with_events(mut self, events: Arc<dyn ferrofin_traits::events::EventManager>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// Publishes [`USER_UPDATED_EVENT`](crate::user_updated::USER_UPDATED_EVENT)
+    /// for `user_id`, after a committed rename or policy save: upstream's
+    /// `PublishAsync(new UserUpdatedEventArgs(user))` and `OnUserUpdated`.
+    /// The bus logs a failing consumer and goes on, so this never fails the
+    /// save it follows. A save calls it after releasing its own login lock,
+    /// as upstream raises the event once `_userLock` is released; the
+    /// consumers take no login lock, so the sign-in path may hold its own.
+    async fn announce_user_updated(&self, user_id: Uuid) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        if let Ok(payload) = serde_json::to_string(&user_id)
+            && let Err(error) = events
+                .publish(crate::user_updated::USER_UPDATED_EVENT, &payload)
+                .await
+        {
+            tracing::debug!(user_id = %user_id, %error, "could not announce the user update");
+        }
     }
 
     /// Installs the shared [`crate::auth_cache::AuthCache`] (composition root
@@ -593,7 +884,7 @@ impl FerrofinUserManager {
     ) -> Result<PolicySaved, ServiceError> {
         let id = guid_to_db(user_id);
         let login_lock = self.login_lock(&id);
-        let _login_guard = login_lock.lock().await;
+        let login_guard = login_lock.lock().await;
         self.require_user(user_id).await?;
 
         // "The default number of login attempts is 3, but for some god forsaken
@@ -686,6 +977,8 @@ impl FerrofinUserManager {
         // One `SaveChangesAsync`: all or nothing.
         tx.commit().await.map_err(db_err)?;
         self.users_changed();
+        drop(login_guard);
+        self.announce_user_updated(user_id).await;
         Ok(PolicySaved {
             newly_disabled: policy.is_disabled && !was_disabled,
         })
@@ -767,18 +1060,6 @@ impl FerrofinUserManager {
         self.db.invalidate_user_policy(&id_str);
 
         self.require_user(id).await
-    }
-}
-
-/// The stored provider id for a provider `name` (C# `GetType().FullName`). The
-/// two built-in providers map to their canonical `Jellyfin.*` type names so a
-/// migrated database matches; any other provider is assumed to already report
-/// its fully-qualified id as its name.
-fn provider_id(name: &str) -> &str {
-    match name {
-        "Default" => DEFAULT_AUTH_PROVIDER_ID,
-        "InvalidOrMissingAuthenticationProvider" => INVALID_AUTH_PROVIDER_ID,
-        other => other,
     }
 }
 
@@ -948,6 +1229,7 @@ impl UserManager for FerrofinUserManager {
             return Err(db_err(e));
         }
         self.users_changed();
+        self.announce_user_updated(user_id).await;
         Ok(())
     }
 
@@ -1050,6 +1332,58 @@ impl UserManager for FerrofinUserManager {
             .await
     }
 
+    async fn create_external_user(
+        &self,
+        name: &str,
+        setup: &ExternalUserSetup,
+    ) -> Result<UserEntity, ServiceError> {
+        require_valid_username(name)?;
+        // Set up inside the insert's transaction: committed first and set up
+        // after, the row would for a moment be a passwordless local account,
+        // which the built-in provider signs in with an empty password.
+        let setup = setup.clone();
+        let user = self
+            .insert_user(name, move |tx, id| {
+                Box::pin(async move {
+                    user_repository::set_providers(
+                        &mut **tx,
+                        id,
+                        &setup.authentication_provider_id,
+                        &setup.password_reset_provider_id,
+                    )
+                    .await
+                    .map_err(db_err)?;
+                    set_permission_tx(
+                        tx,
+                        id,
+                        PermissionKind::EnableAllFolders,
+                        setup.enable_all_folders,
+                    )
+                    .await?;
+                    if let Some(folders) = &setup.enabled_folders {
+                        set_preference_tx(tx, id, PreferenceKind::EnabledFolders, folders).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await?;
+        // `CreateUserAsync` publishes `UserCreatedEventArgs`, which
+        // `UserCreatedLogger` records, whoever created the user.
+        if let Some(activity) = &self.activity
+            && let Err(error) = activity
+                .create_entry(ferrofin_traits::activity::ActivityLogCreate {
+                    name: format!("User {} has been created", user.username),
+                    type_: "UserCreated".to_owned(),
+                    user_id: Uuid::parse_str(&user.id).ok(),
+                    ..Default::default()
+                })
+                .await
+        {
+            tracing::debug!(user_id = %user.id, error = %error, "could not record the user's creation");
+        }
+        Ok(user)
+    }
+
     async fn delete_user(&self, user_id: Uuid) -> Result<(), ServiceError> {
         // "At least one user" and "at least one admin" are invariants over the
         // whole table, so they are read INSIDE the transaction that deletes —
@@ -1083,14 +1417,16 @@ impl UserManager for FerrofinUserManager {
             )));
         }
 
-        // The `Permissions`/`Preferences`/`AccessSchedules`/`ImageInfos` rows are
-        // removed with the user; delete them explicitly so the port does not
-        // depend on schema cascade configuration.
+        // The `Permissions`/`Preferences`/`AccessSchedules`/`ImageInfos` rows and
+        // the user's `FerrofinExternalIdentities` links are removed with the
+        // user; delete them explicitly so the port does not depend on schema
+        // cascade configuration.
         for table in [
             "Permissions",
             "Preferences",
             "AccessSchedules",
             "ImageInfos",
+            "FerrofinExternalIdentities",
         ] {
             let sql = format!(r#"DELETE FROM "{table}" WHERE "UserId" = ?1"#);
             sqlx::query(sqlx::AssertSqlSafe(sql))
@@ -1130,7 +1466,7 @@ impl UserManager for FerrofinUserManager {
         let candidates = self.authentication_providers_for(Some(&user)).await?;
         let provider = candidates[0]; // The invalid-provider fallback guarantees a candidate.
         provider.change_password(&user, new_password).await?;
-        if provider_id(provider.name()) != DEFAULT_AUTH_PROVIDER_ID {
+        if provider.id() != DEFAULT_AUTH_PROVIDER_ID {
             self.users_changed();
             return Ok(());
         }
@@ -1159,6 +1495,17 @@ impl UserManager for FerrofinUserManager {
         }
 
         let user = self.get_user_by_name(username).await?;
+        // Ferrofin's login backoff paces repeated failures before the lock, so
+        // a waiting attempt holds nothing. The attempt is dropped on every way
+        // out but success, which counts as a failure.
+        let Some((wait, attempt)) = self.admit_login(user.as_ref(), username, remote_endpoint)
+        else {
+            // Answered as a wrong password, which every caller already handles.
+            return Ok(None);
+        };
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
         // Authentication reads the user before password verification and writes
         // its counters afterwards. A writer transaction alone cannot serialize
         // that whole span. Match C#'s per-user lock and reload inside it.
@@ -1174,9 +1521,7 @@ impl UserManager for FerrofinUserManager {
             // No such user: an auth failure regardless of provider result. Security
             // audit trail — never log the attempted password.
             tracing::warn!(username, reason = "unknown_user", "login failed");
-            return Err(ServiceError::unauthorized(
-                "Invalid username or password entered.",
-            ));
+            return Err(ServiceError::unauthorized(INVALID_CREDENTIALS_MESSAGE));
         };
 
         if has_permission(self.db.pool(), &user.id, PermissionKind::IsDisabled).await? {
@@ -1190,6 +1535,7 @@ impl UserManager for FerrofinUserManager {
         if !self.is_local_client(remote_endpoint)
             && !has_permission(self.db.pool(), &user.id, PermissionKind::EnableRemoteAccess).await?
         {
+            tracing::warn!(username, user_id = %user.id, reason = "remote_access", "login failed");
             return Err(ServiceError::Forbidden(
                 "remote access is not permitted for this user".to_owned(),
             ));
@@ -1252,6 +1598,7 @@ impl UserManager for FerrofinUserManager {
         }
 
         tracing::info!(user_id = %user.id, username = %user.username, "login succeeded");
+        attempt.succeeded();
         // The writes above touch this user's row only.
         self.user_changed(&user.id);
         Ok(Some(user))
@@ -1259,30 +1606,108 @@ impl UserManager for FerrofinUserManager {
 
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
         let mut pairs = Vec::new();
-        for provider in &self.providers {
+        for provider in self.registered_providers() {
             if provider.is_enabled().await? {
                 pairs.push(NameIdPair {
                     name: Some(provider.name().to_owned()),
-                    id: Some(provider_id(provider.name()).to_owned()),
+                    id: Some(provider.id().to_owned()),
                 });
             }
         }
-        // Default provider first, then by name (C# ordering).
+        // C# `OrderBy(i => i is DefaultAuthenticationProvider ? 0 : 1)
+        // .ThenBy(i => i.Name)`: a stable sort, the names compared in the
+        // current culture (`Comparer<string>.Default`). A stock server lists
+        // Default alone, which needs no comparer.
+        if pairs.len() < 2 {
+            return Ok(pairs);
+        }
+        let comparer =
+            ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture())
+                .ok();
         pairs.sort_by(|a, b| {
             let rank =
                 |p: &NameIdPair| i32::from(p.id.as_deref() != Some(DEFAULT_AUTH_PROVIDER_ID));
-            rank(a).cmp(&rank(b)).then_with(|| a.name.cmp(&b.name))
+            let (a_name, b_name) = (
+                a.name.as_deref().unwrap_or_default(),
+                b.name.as_deref().unwrap_or_default(),
+            );
+            rank(a).cmp(&rank(b)).then_with(|| {
+                comparer.as_ref().map_or_else(
+                    || a_name.cmp(b_name),
+                    |comparer| comparer.compare(a_name, b_name),
+                )
+            })
         });
         Ok(pairs)
     }
 
     async fn get_password_reset_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
-        // Unknown saved IDs fall back to this sole registered provider, just
-        // as UserManager.GetPasswordResetProviders does upstream.
-        Ok(vec![NameIdPair {
-            name: Some("Default Password Reset Provider".to_owned()),
-            id: Some(DEFAULT_PASSWORD_RESET_PROVIDER_ID.to_owned()),
-        }])
+        // C# `Where(IsEnabled).OrderBy(i => i is DefaultPasswordResetProvider
+        // ? 0 : 1).ThenBy(i => i.Name)`: the built-in provider is always
+        // enabled and first, the rest follow by name in the current culture.
+        let mut pairs = Vec::new();
+        for provider in self.extension_reset_providers() {
+            if provider.is_enabled().await? {
+                pairs.push(NameIdPair {
+                    name: Some(provider.name().to_owned()),
+                    id: Some(provider.id().to_owned()),
+                });
+            }
+        }
+        if pairs.len() > 1 {
+            let comparer = ferrofin_util::current_culture::comparer(
+                &ferrofin_util::current_culture::capture(),
+            )
+            .ok();
+            pairs.sort_by(|a, b| {
+                let (a, b) = (
+                    a.name.as_deref().unwrap_or_default(),
+                    b.name.as_deref().unwrap_or_default(),
+                );
+                comparer
+                    .as_ref()
+                    .map_or_else(|| a.cmp(b), |comparer| comparer.compare(a, b))
+            });
+        }
+        pairs.insert(
+            0,
+            NameIdPair {
+                name: Some(DEFAULT_PASSWORD_RESET_PROVIDER_NAME.to_owned()),
+                id: Some(DEFAULT_PASSWORD_RESET_PROVIDER_ID.to_owned()),
+            },
+        );
+        Ok(pairs)
+    }
+
+    async fn start_forgot_password_process(
+        &self,
+        entered_username: &str,
+        is_in_network: bool,
+    ) -> Result<ForgotPasswordResult, ServiceError> {
+        let user = if entered_username.trim().is_empty() {
+            None
+        } else {
+            self.get_user_by_name(entered_username).await?
+        };
+        let default = DefaultPasswordResetProvider::new(self);
+        // Upstream then saves the user unchanged (`UpdateUserAsync`) for a
+        // local request; a provider here gets the row read-only, so there is
+        // nothing of its to save.
+        self.password_reset_provider_for(user.as_ref(), &default)
+            .await?
+            .start_forgot_password_process(user.as_ref(), entered_username, is_in_network)
+            .await
+    }
+
+    async fn redeem_password_reset_pin(&self, pin: &str) -> Result<PinRedeemResult, ServiceError> {
+        let default = DefaultPasswordResetProvider::new(self);
+        // Every provider, enabled or not, in upstream's order: the built-in
+        // one first. The built-in one serializes its own file work.
+        let providers: Vec<&dyn PasswordResetManager> =
+            std::iter::once(&default as &dyn PasswordResetManager)
+                .chain(self.extension_reset_providers())
+                .collect();
+        Self::redeem_with(&providers, pin).await
     }
 
     async fn get_user_dto(
@@ -1356,10 +1781,14 @@ impl UserManager for FerrofinUserManager {
 
         let policy = build_user_policy(pool, user, user_uuid, &perms, &prefs).await?;
 
+        // `GetImageCacheTag(User)`: the profile image's OWN path with its
+        // `LastModified`, the one tag upstream does not take from an item.
         let primary_image_tag = if let Some(processor) = &self.image_processor
             && let Some(image) = self.get_profile_image(user_uuid).await?
         {
-            processor.get_image_cache_tag(user_uuid, &image).await?
+            processor
+                .get_image_cache_tag_for_path(&image.path, image.date_modified)
+                .await?
         } else {
             None
         };
@@ -1387,6 +1816,32 @@ impl UserManager for FerrofinUserManager {
             dto.server_id = server_id;
         }
         Ok(dto)
+    }
+
+    async fn user_primary_image_tag(
+        &self,
+        user: &UserEntity,
+    ) -> Result<Option<String>, ServiceError> {
+        // A hit copies the one tag instead of the whole DTO; a miss builds the
+        // DTO (and caches it) exactly as `get_user_dto` would.
+        if let Some(tag) = self.auth_cache.primary_image_tag(user) {
+            return Ok(tag);
+        }
+        Ok(self.get_user_dto(user, None).await?.primary_image_tag)
+    }
+
+    async fn latest_items_excludes(&self, user: &UserEntity) -> Result<Vec<Uuid>, ServiceError> {
+        // A hit copies the one list instead of the whole DTO; a miss builds the
+        // DTO (and caches it) exactly as `get_user_dto` would.
+        if let Some(excludes) = self.auth_cache.latest_items_excludes(user) {
+            return Ok(excludes);
+        }
+        Ok(self
+            .get_user_dto(user, None)
+            .await?
+            .configuration
+            .map(|c| c.latest_items_excludes)
+            .unwrap_or_default())
     }
 
     async fn update_configuration(
@@ -1462,6 +1917,49 @@ impl UserManager for FerrofinUserManager {
         policy: &UserPolicy,
     ) -> Result<PolicySaved, ServiceError> {
         self.save_policy(user_id, policy, true).await
+    }
+
+    /// One writer transaction reads the flag, counts the administrators and
+    /// writes, so concurrent sign-ins cannot both demote one of the last two
+    /// administrators. It takes no login lock: the password path calls it
+    /// while holding the user's, which does not nest (`save_policy` would wait
+    /// on it forever).
+    ///
+    /// It announces nothing, unlike a policy save: upstream's LDAP plugin
+    /// writes the flag with `UpdateUserAsync` (jellyfin-plugin-ldapauth v24,
+    /// `LdapAuthenticationProviderPlugin.Authenticate`), which publishes no
+    /// `UserUpdatedEventArgs`.
+    async fn apply_external_administrator(
+        &self,
+        user_id: Uuid,
+        administrator: bool,
+    ) -> Result<AdminFlagOutcome, ServiceError> {
+        let id = guid_to_db(user_id);
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let user = Self::fetch_user_on(&mut *tx, user_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("user {user_id}")))?;
+        if has_permission(&mut *tx, &id, PermissionKind::IsAdministrator).await? == administrator {
+            return Ok(AdminFlagOutcome::Unchanged);
+        }
+        if !administrator && Self::admin_count_on(&mut *tx).await? <= 1 {
+            tracing::warn!(
+                user_id = %user.id,
+                username = %user.username,
+                "sign-in would demote the last administrator; keeping them one"
+            );
+            return Ok(AdminFlagOutcome::KeptLastAdministrator);
+        }
+        set_permission_tx(&mut tx, &id, PermissionKind::IsAdministrator, administrator).await?;
+        tx.commit().await.map_err(db_err)?;
+        self.users_changed();
+        tracing::info!(
+            user_id = %user.id,
+            username = %user.username,
+            administrator,
+            "sign-in set the administrator flag"
+        );
+        Ok(AdminFlagOutcome::Applied)
     }
 
     async fn save_profile_image(
@@ -1873,7 +2371,7 @@ mod tests {
         let source = Arc::clone(&current);
         let mgr = FerrofinUserManager::new(db)
             .with_profile_image_dir(DirectoryPath::live(move || source.read().unwrap().clone()))
-            .with_image_processor(processor);
+            .with_image_processor(Arc::clone(&processor) as _);
         let user = mgr.create_user("synthetic-avatar").await.unwrap();
         assert!(
             mgr.get_user_dto(&user, None)
@@ -1921,6 +2419,18 @@ mod tests {
         assert_eq!(
             std::path::Path::new(&info.path),
             replacement.join("synthetic-avatar").join("profile.jpg")
+        );
+        // `GetImageCacheTag(User)`: the profile image's own path and its
+        // `LastModified`, unlike an item image's tag (gl-849).
+        assert_eq!(
+            Some(second.clone()),
+            ferrofin_traits::drawing::ImageProcessor::get_image_cache_tag_for_path(
+                &*processor,
+                &info.path,
+                info.date_modified,
+            )
+            .await
+            .unwrap()
         );
         assert!(std::path::Path::new(&info.path).is_file());
         assert!(
@@ -2267,7 +2777,11 @@ mod tests {
             .expect("dto")
             .policy
             .expect("policy");
-        assert!(read.access_schedules.is_empty());
+        assert!(
+            read.access_schedules.is_empty(),
+            "{:?}",
+            read.access_schedules
+        );
         assert_eq!(read.enabled_folders, vec![Uuid::from_u128(0xF3)]);
         assert!(read.enable_all_folders);
     }
@@ -2585,6 +3099,11 @@ mod tests {
         // First build populates the cache; a repeat with the same entity hits it.
         let first = mgr.get_user_dto(&user, None).await.expect("dto");
         assert_eq!(mgr.auth_cache.get_user_dto(&user), Some(first.clone()));
+        assert_eq!(
+            mgr.auth_cache.latest_items_excludes(&user),
+            Some(Vec::new()),
+            "the list read hits the same cached DTO"
+        );
         let second = mgr.get_user_dto(&user, None).await.expect("dto again");
         assert_eq!(second, first);
 
@@ -2620,8 +3139,62 @@ mod tests {
         let mut renamed = user.clone();
         renamed.username = "erin2".to_owned();
         assert!(mgr.auth_cache.get_user_dto(&renamed).is_none());
+        assert!(
+            mgr.auth_cache.latest_items_excludes(&renamed).is_none(),
+            "the list read checks the entity the DTO was built from too"
+        );
         let fresh = mgr.get_user_dto(&renamed, None).await.expect("dto renamed");
         assert_eq!(fresh.name.as_deref(), Some("erin2"));
+    }
+
+    /// `/Items/Latest` and `/UserItems/Resume` read one list off the user's
+    /// configuration. The read answers what `get_user_dto` would, from a cold
+    /// cache and from a warm one, and follows a configuration change.
+    #[tokio::test]
+    async fn latest_items_excludes_reads_the_configuration_get_user_dto_builds() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let user = mgr.create_user("fern").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        let excluded = vec![Uuid::from_u128(0xa1), Uuid::from_u128(0xa2)];
+        let config = UserConfiguration {
+            latest_items_excludes: excluded.clone(),
+            ..mgr
+                .get_user_dto(&user, None)
+                .await
+                .expect("dto")
+                .configuration
+                .expect("configuration")
+        };
+        mgr.update_configuration(id, &config).await.expect("update");
+
+        // Cold: the update cleared the cache, so this read builds and caches.
+        assert!(mgr.auth_cache.get_user_dto(&user).is_none());
+        assert_eq!(
+            mgr.latest_items_excludes(&user).await.expect("cold read"),
+            excluded
+        );
+        assert!(
+            mgr.auth_cache.get_user_dto(&user).is_some(),
+            "a cold read leaves the DTO cached for the next request"
+        );
+        // Warm: the same answer from the cached DTO.
+        assert_eq!(
+            mgr.latest_items_excludes(&user).await.expect("warm read"),
+            excluded
+        );
+
+        let cleared = UserConfiguration {
+            latest_items_excludes: Vec::new(),
+            ..config
+        };
+        mgr.update_configuration(id, &cleared).await.expect("clear");
+        assert_eq!(
+            mgr.latest_items_excludes(&user)
+                .await
+                .expect("after change"),
+            Vec::<Uuid>::new()
+        );
     }
 
     #[rstest::rstest]
@@ -2950,7 +3523,13 @@ mod tests {
                     is_active: true,
                     user_id: user.id.clone(),
                 };
-                cache.put(generation, token, device, Some(user.clone()), None);
+                cache.put(
+                    generation,
+                    token,
+                    device,
+                    Some(Arc::new(user.clone())),
+                    None,
+                );
                 cache.put_user_dto(generation, user, UserDto::default());
             }
         };
@@ -3015,7 +3594,12 @@ mod tests {
         #[case] locked_at: Option<i64>,
     ) {
         let db = test_db().await;
-        let mgr = FerrofinUserManager::new(db);
+        // Upstream's lockout, not Ferrofin's backoff, whose wait would slow
+        // the final login.
+        let mgr = FerrofinUserManager::new(db).with_login_backoff(LoginBackoffSettings {
+            attempts: 0,
+            ..LoginBackoffSettings::DEFAULT
+        });
         let user = mgr.create_user("sentinel").await.unwrap();
         let uid = Uuid::parse_str(&user.id).unwrap();
         let mut policy = UserPolicy {
@@ -3064,7 +3648,12 @@ mod tests {
         #[case] expected: i64,
     ) {
         let db = test_db().await;
-        let mgr = FerrofinUserManager::new(db);
+        // Upstream's counter, not Ferrofin's backoff, which would refuse most
+        // of these before they count.
+        let mgr = FerrofinUserManager::new(db).with_login_backoff(LoginBackoffSettings {
+            attempts: 0,
+            ..LoginBackoffSettings::DEFAULT
+        });
         let user = mgr.create_user("concurrent").await.unwrap();
         let uid = Uuid::parse_str(&user.id).unwrap();
         mgr.update_policy(
@@ -3234,3 +3823,7 @@ mod tests {
 #[cfg(test)]
 #[path = "user_manager/provider_tests.rs"]
 mod provider_tests;
+
+#[cfg(test)]
+#[path = "user_manager/password_reset_tests.rs"]
+mod password_reset_tests;

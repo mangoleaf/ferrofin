@@ -16,7 +16,8 @@ are blocked, connect the Jellyfin client manually using the server URL.
 
 When using `FERROFIN_BASE_URL` (for example `/jellyfin`), Ferrofin advertises and
 serves the API/web client under that prefix. The bootstrap `base_url` setting in
-`config.toml` is equivalent; restart the process to reload either setting. The
+`config.toml` is equivalent. A change to `config.toml` applies at the next restart, the
+dashboard's included; a change to the variable needs a restart of the process. The
 named network document's `BaseUrl` does not control the mount. Configure reverse
 proxies to preserve the prefix. Requests missing it redirect to the web client. Ferrofin's deployment
 probes `/health/live` and `/health/ready` remain available at the root as well as

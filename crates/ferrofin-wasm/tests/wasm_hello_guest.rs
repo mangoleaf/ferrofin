@@ -58,7 +58,7 @@ fn build_guest() -> Option<PathBuf> {
         // guest, WIT drift) is a real failure and must fail loudly.
         let missing_toolchain = stderr.contains("may not be installed")
             || stderr.contains("rustup target add wasm32-wasip2")
-            || stderr.contains("toolchain '1.98.1' is not installed");
+            || stderr.contains("toolchain '1.99.1' is not installed");
         assert!(
             missing_toolchain,
             "guest build FAILED (not a toolchain gap — this is a real error):\n{stderr}"

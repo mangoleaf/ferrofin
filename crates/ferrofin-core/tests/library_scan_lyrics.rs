@@ -305,7 +305,8 @@ async fn lyric_sidecars_become_the_tracks_lyric_stream_and_changes_reprobe_it() 
 
     // Unchanged: nothing is probed.
     h.scanner.scan_all().await.expect("rescan");
-    assert!(h.probe.take().is_empty());
+    let probe_requests = h.probe.take();
+    assert!(probe_requests.is_empty(), "{probe_requests:?}");
 
     // A row scanned before `LyricFiles` was recorded, with a lyric beside
     // it, is re-probed once, which records the list.
@@ -317,7 +318,8 @@ async fn lyric_sidecars_become_the_tracks_lyric_stream_and_changes_reprobe_it() 
     assert_eq!(h.probe.take(), ["01 - Song.flac"]);
     assert_eq!(h.lyric_files().await, ["01 - song.en.LRC"]);
     h.scanner.scan_all().await.expect("rescan after backfill");
-    assert!(h.probe.take().is_empty());
+    let probe_requests = h.probe.take();
+    assert!(probe_requests.is_empty(), "{probe_requests:?}");
 
     // A lyric the task downloads into the metadata folder is a changed set:
     // the track is re-probed, both files are recorded, the first is the
@@ -340,8 +342,10 @@ async fn lyric_sidecars_become_the_tracks_lyric_stream_and_changes_reprobe_it() 
     std::fs::remove_file(downloaded.join("01 - Song.lrc")).expect("rm");
     h.scanner.scan_all().await.expect("scan after delete");
     assert_eq!(h.probe.take(), ["01 - Song.flac"]);
-    assert!(h.lyric_streams().await.is_empty());
-    assert!(h.lyric_files().await.is_empty());
+    let lyric_streams = h.lyric_streams().await;
+    assert!(lyric_streams.is_empty(), "{lyric_streams:?}");
+    let lyric_files = h.lyric_files().await;
+    assert!(lyric_files.is_empty(), "{lyric_files:?}");
 }
 
 /// The refresh `LyricsController.UploadLyrics` queues after saving a lyric
@@ -357,7 +361,8 @@ async fn an_item_refresh_records_a_lyric_saved_beside_the_track() {
     let h = harness(tmp.path()).await;
     h.scanner.scan_all().await.expect("scan");
     assert_eq!(h.probe.take(), ["01 - Song.flac"]);
-    assert!(h.lyric_streams().await.is_empty());
+    let lyric_streams = h.lyric_streams().await;
+    assert!(lyric_streams.is_empty(), "{lyric_streams:?}");
 
     let album = h.track.parent().expect("album");
     std::fs::write(album.join("01 - Song.lrc"), "[00:01.00]hello").expect("upload");
@@ -412,7 +417,8 @@ async fn embedded_lyrics_are_saved_to_the_metadata_folder_and_become_the_lyric_s
 
     // The saved file is the recorded set: nothing is probed again.
     h.scanner.scan_all().await.expect("rescan");
-    assert!(h.probe.take().is_empty());
+    let probe_requests = h.probe.take();
+    assert!(probe_requests.is_empty(), "{probe_requests:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -481,7 +487,8 @@ async fn a_locked_track_never_saves_its_embedded_lyrics() {
     h.scanner.scan_all().await.expect("rescan");
     assert_eq!(h.probe.take(), ["01 - Song.flac"]);
     assert!(!h.metadata_folder().await.join("01 - Song.lrc").exists());
-    assert!(h.lyric_streams().await.is_empty());
+    let lyric_streams = h.lyric_streams().await;
+    assert!(lyric_streams.is_empty(), "{lyric_streams:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -83,7 +83,11 @@ mod tests {
         assert!(q.parent_id.is_none());
         assert!(q.series_id.is_none());
         assert!(q.limit.is_none());
-        assert!(q.enable_image_types.is_empty());
+        assert!(
+            q.enable_image_types.is_empty(),
+            "{:?}",
+            q.enable_image_types
+        );
         assert!(q.next_up_date_cutoff.is_none());
         assert!(!q.enable_rewatching);
     }

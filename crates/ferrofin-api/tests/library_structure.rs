@@ -171,12 +171,10 @@ async fn add_virtual_folder_rejects_names_outside_the_upstream_regex() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
     }
-    assert!(
-        ferrofin_traits::library::VirtualFolderManager::get_virtual_folders(&*vf)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let virtual_folders = ferrofin_traits::library::VirtualFolderManager::get_virtual_folders(&*vf)
+        .await
+        .unwrap();
+    assert!(virtual_folders.is_empty(), "{virtual_folders:?}");
 }
 
 #[tokio::test]
@@ -474,6 +472,78 @@ async fn update_library_options_by_name_and_missing_is_404() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+/// `POST /Library/VirtualFolders/LibraryOptions` with `body`, returning the status
+/// and the JSON body.
+async fn post_options_body(router: &axum::Router, body: String) -> (StatusCode, serde_json::Value) {
+    let res = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/Library/VirtualFolders/LibraryOptions")
+                .header("X-Emby-Token", TOKEN)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status();
+    (status, json_body(res).await)
+}
+
+/// A body without `LibraryOptions`, or with `"LibraryOptions": null`, is refused
+/// and writes nothing (gl-1204). Upstream dereferences `request.LibraryOptions!`
+/// after the library lookup and before any write, so the request fails with the
+/// library's options untouched; saving the defaults instead would wipe every
+/// setting and the recorded `PathInfos`. An unknown library is still a 404 first,
+/// as upstream's lookup comes before the dereference.
+#[tokio::test]
+async fn update_library_options_without_options_is_400_and_writes_nothing() {
+    let (state, vf) = working_state();
+    let options = ferrofin_model::configuration::LibraryOptions {
+        enable_trickplay_image_extraction: true,
+        enable_realtime_monitor: false,
+        path_infos: vec![ferrofin_model::configuration::MediaPathInfo {
+            path: "/media/lib".to_owned(),
+        }],
+        ..Default::default()
+    };
+    ferrofin_traits::library::VirtualFolderManager::add_virtual_folder(&*vf, "Lib", None, &options)
+        .await
+        .unwrap();
+    let router = create_router(state);
+    let before = folders(&router).await;
+    let id = before[0]["ItemId"].as_str().unwrap().to_owned();
+
+    for body in [
+        format!(r#"{{"Id":"{id}"}}"#),
+        format!(r#"{{"Id":"{id}","LibraryOptions":null}}"#),
+        r#"{"Name":"Lib"}"#.to_owned(),
+    ] {
+        let (status, error) = post_options_body(&router, body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            error,
+            serde_json::json!({"error": "bad request: LibraryOptions must not be null"}),
+            "{body}"
+        );
+        assert_eq!(
+            folders(&router).await,
+            before,
+            "a refused request must leave the library as it was: {body}"
+        );
+    }
+
+    // The lookup comes first: an unknown library without options is a 404.
+    let (status, _) = post_options_body(
+        &router,
+        r#"{"Id":"00000000-0000-0000-0000-000000000001"}"#.to_owned(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 /// `GET /Library/VirtualFolders` as JSON, for tests that key off the projected `ItemId`.
@@ -912,11 +982,13 @@ struct CountingMonitor(AtomicUsize);
 #[async_trait::async_trait]
 impl ferrofin_traits::library::LibraryMonitor for CountingMonitor {
     async fn start(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
-        self.0.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     async fn stop(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
         Ok(())
+    }
+    fn restart(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
     }
     async fn report_file_system_change_beginning(
         &self,
@@ -1058,4 +1130,136 @@ async fn a_structure_change_refused_up_front_neither_restarts_nor_refreshes(
     let (status, restarts, scans) = structure_request(vf, method, uri, None).await;
     assert_eq!(status, expected);
     assert_eq!((restarts, scans), (0, 0));
+}
+
+/// A [`LibraryMonitor`](ferrofin_traits::library::LibraryMonitor) whose watch
+/// walk never ends: `start` is a recursive watch of a library on a mount that
+/// stopped answering. It counts the restarts it is asked for.
+#[derive(Default)]
+struct StuckWalkMonitor {
+    restarts: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ferrofin_traits::library::LibraryMonitor for StuckWalkMonitor {
+    async fn start(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
+        std::future::pending().await
+    }
+    async fn stop(&self) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+    /// A real monitor's restart runs this walk on its own task.
+    fn restart(&self) {
+        self.restarts.fetch_add(1, Ordering::SeqCst);
+    }
+    async fn report_file_system_change_beginning(
+        &self,
+        _path: &str,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+    async fn report_file_system_change_complete(
+        &self,
+        _path: &str,
+        _refresh_path: bool,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+    async fn report_file_system_changed(
+        &self,
+        _path: &str,
+    ) -> Result<(), ferrofin_traits::error::ServiceError> {
+        Ok(())
+    }
+}
+
+/// Upstream's `LibraryMonitor.Start` creates each watcher on a thread-pool
+/// task (`StartWatchingPath`'s `Task.Run`), and the path and rename actions
+/// call it from a `Task.Run` of their own, so no structure request waits for a
+/// watch to exist. Every structure change answers while the monitor's walk is
+/// still running, and asks for exactly one restart, but `Paths/Update`, which
+/// changes no location and, as upstream's, restarts nothing.
+#[rstest::rstest]
+#[case::add_library("POST", "/Library/VirtualFolders?name=Films", None, 1)]
+#[case::remove_library("DELETE", "/Library/VirtualFolders?name=Movies", None, 1)]
+#[case::rename_library(
+    "POST",
+    "/Library/VirtualFolders/Name?name=Movies&newName=Films",
+    None,
+    1
+)]
+#[case::add_media_path(
+    "POST",
+    "/Library/VirtualFolders/Paths",
+    Some(r#"{"Name":"Movies","Path":"/media/films"}"#),
+    1
+)]
+#[case::update_media_path(
+    "POST",
+    "/Library/VirtualFolders/Paths/Update",
+    Some(r#"{"Name":"Movies","PathInfo":{"Path":"/media/movies"}}"#),
+    0
+)]
+#[case::remove_media_path(
+    "DELETE",
+    "/Library/VirtualFolders/Paths?name=Movies&path=/media/movies",
+    None,
+    1
+)]
+#[case::library_options(
+    "POST",
+    "/Library/VirtualFolders/LibraryOptions",
+    Some(r#"{"Name":"Movies","LibraryOptions":{"EnableRealtimeMonitor":true}}"#),
+    1
+)]
+#[tokio::test(start_paused = true)]
+async fn a_structure_change_answers_before_the_monitor_has_watched_anything(
+    #[case] method: &str,
+    #[case] uri: &str,
+    #[case] body: Option<&str>,
+    #[case] restarts: usize,
+) {
+    let vf = FakeVirtualFolders::working();
+    ferrofin_traits::library::VirtualFolderManager::add_virtual_folder(
+        &vf,
+        "Movies",
+        None,
+        &ferrofin_model::configuration::LibraryOptions {
+            path_infos: vec![ferrofin_model::configuration::MediaPathInfo {
+                path: "/media/movies".to_owned(),
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let monitor = Arc::new(StuckWalkMonitor::default());
+    let state =
+        authed_state_with_library_and_monitor(Arc::new(CountingScans::default()), monitor.clone())
+            .with_virtual_folders(Arc::new(vf));
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("X-Emby-Token", TOKEN);
+    if body.is_some() {
+        request = request.header(header::CONTENT_TYPE, "application/json");
+    }
+    let request = request
+        .body(body.map_or_else(Body::empty, |b| Body::from(b.to_owned())))
+        .unwrap();
+    // Paused time: the deadline lapses as soon as the request has nothing
+    // left to do but wait, so its length only has to be non-zero.
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        create_router(state).oneshot(request),
+    )
+    .await
+    .expect("the structure request waited for the monitor's watch walk")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        monitor.restarts.load(Ordering::SeqCst),
+        restarts,
+        "restarts asked"
+    );
 }

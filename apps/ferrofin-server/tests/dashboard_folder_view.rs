@@ -124,7 +124,9 @@ async fn live_folder_view_flag_name_and_secure_root_browse() {
     let mut settings = get(&router, token, "/System/Configuration").await;
     settings["EnableFolderView"] = json!(false);
     post(&router, token, "/System/Configuration", settings.clone()).await;
-    assert!(folders(&get(&router, token, &view_path).await).is_empty());
+    let folder_view = get(&router, token, &view_path).await;
+    let found = folders(&folder_view);
+    assert!(found.is_empty(), "{found:?}");
     settings["EnableFolderView"] = json!(true);
     post(&router, token, "/System/Configuration", settings.clone()).await;
     let views = get(&router, token, &view_path).await;
@@ -165,7 +167,8 @@ async fn live_folder_view_flag_name_and_secure_root_browse() {
     verify_folders_api_filter_whitelist(&router, token, admin, &id).await;
     let beyond = get(&router, token, &format!("{parent}&startIndex=99&limit=1")).await;
     assert_eq!(beyond["TotalRecordCount"], 3);
-    assert!(names(&beyond).is_empty());
+    let found = names(&beyond);
+    assert!(found.is_empty(), "{found:?}");
     let root_page = get(&router, token, &parent).await;
     let requested_root = root_page["Items"][0]["Id"].as_str().unwrap();
     let requested_name = root_page["Items"][0]["Name"].as_str().unwrap();
@@ -185,7 +188,9 @@ async fn live_folder_view_flag_name_and_secure_root_browse() {
     assert_eq!(folders(&localized)[0]["Name"], "Dossiers");
     settings["EnableFolderView"] = json!(false);
     post(&router, token, "/System/Configuration", settings.clone()).await;
-    assert!(folders(&get(&router, token, &view_path).await).is_empty());
+    let folder_view = get(&router, token, &view_path).await;
+    let found = folders(&folder_view);
+    assert!(found.is_empty(), "{found:?}");
     settings["EnableFolderView"] = json!(true);
     post(&router, token, "/System/Configuration", settings).await;
     assert_eq!(folders(&get(&router, token, &view_path).await)[0]["Id"], id);
@@ -216,7 +221,8 @@ async fn verify_folders_api_filter_whitelist(
         ] {
             let positive = get(router, token, &format!("{base}&{parameter}=true&limit=1")).await;
             assert_eq!(positive["TotalRecordCount"], 0, "{parameter}");
-            assert!(names(&positive).is_empty());
+            let found = names(&positive);
+            assert!(found.is_empty(), "{found:?}");
             let negative = get(router, token, &format!("{base}&{parameter}=false&limit=1")).await;
             assert_eq!(negative["TotalRecordCount"], 3, "{parameter}");
             assert_eq!(names(&negative), ["Zulu"]);
@@ -235,7 +241,8 @@ async fn verify_folders_api_filter_whitelist(
                 rows["TotalRecordCount"], 0,
                 "undated root children: {parameter}"
             );
-            assert!(names(&rows).is_empty());
+            let found = names(&rows);
+            assert!(found.is_empty(), "{found:?}");
             let absent = get(router, token, &format!("{base}&{parameter}=%20&limit=1")).await;
             assert_eq!(absent["TotalRecordCount"], 3);
             assert_eq!(names(&absent), ["Zulu"]);
@@ -273,7 +280,8 @@ async fn verify_folders_adjacency(router: &axum::Router, token: &str, base: &str
     )
     .await;
     assert_eq!(unknown["TotalRecordCount"], 0);
-    assert!(names(&unknown).is_empty());
+    let found = names(&unknown);
+    assert!(found.is_empty(), "{found:?}");
     let nil = get(
         router,
         token,

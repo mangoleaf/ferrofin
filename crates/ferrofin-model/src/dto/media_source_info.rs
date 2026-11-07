@@ -33,6 +33,14 @@ pub struct MediaSourceInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
 
+    /// Whether this source reads a provider's URL, which often carries the
+    /// account's credentials, so that a caller who is not an administrator
+    /// gets neither its `path` nor direct play. It stays set once the source
+    /// is opened, whatever the path has become. Internal: Jellyfin has no such
+    /// member, and it is never on the wire.
+    #[serde(skip)]
+    pub path_is_private: bool,
+
     /// Gets or sets the encoder path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoder_path: Option<String>,
@@ -218,6 +226,7 @@ impl Default for MediaSourceInfo {
             protocol: MediaProtocol::default(),
             id: None,
             path: None,
+            path_is_private: false,
             encoder_path: None,
             encoder_protocol: None,
             type_: MediaSourceType::Default,

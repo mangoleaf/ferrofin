@@ -623,7 +623,7 @@ mod tests {
             .await;
         let a = a.expect("artist");
         assert!(a.biography(None).0.is_some());
-        assert!(!a.images.is_empty());
+        assert!(!a.images.is_empty(), "{:?}", a.images);
     }
 }
 

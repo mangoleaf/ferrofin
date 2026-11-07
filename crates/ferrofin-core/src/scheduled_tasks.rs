@@ -30,6 +30,7 @@ use ferrofin_model::tasks::{
 };
 
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::localization::LocalizationManager;
 use tracing::Instrument as _;
 
 pub mod application;
@@ -58,6 +59,11 @@ pub(crate) fn interval_hours(hours: i64) -> TaskTriggerInfo {
 /// `StartupTrigger.DelayMs` (3000), ported verbatim: the grace period keeps a
 /// task's first run off the boot critical path.
 const STARTUP_TRIGGER_DELAY: Duration = Duration::from_secs(3);
+
+/// How long [`FerrofinTaskManager::shutdown`] waits for each cancelled run to
+/// stop before recording it `Aborted`: upstream's `task.Wait(2000)` in
+/// `ScheduledTaskWorker.Dispose`.
+const SHUTDOWN_RUN_WAIT: Duration = Duration::from_secs(2);
 
 /// How long after startup an interval task that has **never completed** first
 /// becomes due — upstream's `IntervalTrigger.Start` arms `now.AddHours(1)` when
@@ -103,6 +109,9 @@ pub struct TaskProgress {
     /// Why the run started (`api`, `schedule`, `startup`); empty for a
     /// foreground [`run_now`](FerrofinTaskManager::run_now).
     trigger: &'static str,
+    /// The registry's progress signal, raised by [`report`](Self::report)
+    /// (upstream's `TaskProgress` event); `None` outside a registry run.
+    progressed: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
 impl TaskProgress {
@@ -127,10 +136,17 @@ impl TaskProgress {
         self.stopped.load(Ordering::Relaxed)
     }
 
-    /// Reports the task's completion percentage (clamped to `0.0..=100.0`).
+    /// Reports the task's completion percentage (clamped to `0.0..=100.0`)
+    /// and raises the registry's progress signal, as upstream's
+    /// `ScheduledTaskWorker.OnProgressChanged` raises `TaskProgress` on every
+    /// report.
     pub fn report(&self, percent: f64) {
         self.percent
             .store(percent.clamp(0.0, 100.0).to_bits(), Ordering::Relaxed);
+        if let Some(progressed) = &self.progressed {
+            // Nobody subscribed is not an error.
+            let _ = progressed.send(());
+        }
     }
 
     /// Reads the last reported percentage.
@@ -153,14 +169,39 @@ pub trait ScheduledTask: Send + Sync {
     /// Used as the registry map key and echoed into [`TaskInfo::key`]/`id`.
     fn key(&self) -> &str;
 
-    /// The task's human-readable display name.
+    /// The task's human-readable display name, or its localization key when
+    /// [`is_localized`](ScheduledTask::is_localized).
     fn name(&self) -> &str;
 
-    /// A one-line description of what the task does.
+    /// A one-line description of what the task does, or its localization key
+    /// when [`is_localized`](ScheduledTask::is_localized).
     fn description(&self) -> &str;
 
-    /// The category the task is grouped under in the UI.
+    /// The category the task is grouped under in the UI, or its localization
+    /// key when [`is_localized`](ScheduledTask::is_localized).
     fn category(&self) -> &str;
+
+    /// Whether [`name`](ScheduledTask::name),
+    /// [`description`](ScheduledTask::description) and
+    /// [`category`](ScheduledTask::category) are keys into the core
+    /// localization dictionaries rather than display text.
+    ///
+    /// The registry then shows each in the ambient UI culture, as upstream's
+    /// core tasks return `_localization.GetLocalizedString("<key>")`. Defaults
+    /// to `false`: extension and WASM tasks show their own strings, as
+    /// upstream plugins localize themselves, and so do the two core tasks
+    /// upstream leaves as literals (`RefreshGuide`,
+    /// `TmdbRefreshUpcomingEpisodes`).
+    fn is_localized(&self) -> bool {
+        false
+    }
+
+    /// The value formatted into a localized description's `{0}`, as
+    /// upstream's `string.Format(GetLocalizedString(key), value)`. Only
+    /// `CleanLogFiles` has one.
+    fn description_argument(&self) -> Option<String> {
+        None
+    }
 
     /// Whether the task is hidden from the normal task listing.
     ///
@@ -227,8 +268,9 @@ struct Registration {
     triggers_override: Option<Vec<TaskTriggerInfo>>,
     /// The running task's live progress handle (meaningful while `Running`).
     progress: TaskProgress,
-    /// Abort handle for a queued (spawned) run, so `cancel` can stop it.
-    abort: Option<tokio::task::AbortHandle>,
+    /// The queued (spawned) run, so `cancel` can stop it and shutdown can
+    /// wait for it to stop.
+    run: Option<tokio::task::JoinHandle<()>>,
     /// When the current run was claimed (meaningful while `Running`).
     started_at: Option<DateTime<Utc>>,
     /// The running invocation's own time limit: the `MaxRuntimeTicks` of the
@@ -292,22 +334,62 @@ impl Registration {
     /// MD5 of the task type's name (see
     /// [`task_id_for_key`](ferrofin_traits::tasks::task_id_for_key)), which is
     /// what every client addresses the task by.
-    fn to_info(&self) -> TaskInfo {
+    fn to_info(&self, localization: &dyn LocalizationManager) -> TaskInfo {
         let key = self.task.key().to_string();
-        TaskInfo {
-            name: Some(self.task.name().to_string()),
+        let mut info = TaskInfo {
             state: self.state,
             current_progress_percentage: (self.state == TaskState::Running)
                 .then(|| self.progress.current()),
             id: Some(self.id.clone()),
             last_execution_result: self.last_result.clone(),
             triggers: self.effective_triggers(),
-            description: Some(self.task.description().to_string()),
-            category: Some(self.task.category().to_string()),
             is_hidden: self.task.is_hidden(),
             key: Some(key),
-        }
+            ..TaskInfo::default()
+        };
+        self.show_text(&mut info, localization);
+        info
     }
+
+    /// Sets `info`'s name, description and category in the ambient UI culture.
+    fn show_text(&self, info: &mut TaskInfo, localization: &dyn LocalizationManager) {
+        let task = self.task.as_ref();
+        let mut description = shown(task, task.description(), localization);
+        if let Some(value) = task.description_argument() {
+            description = description.replace("{0}", &value);
+        }
+        info.name = Some(shown(task, task.name(), localization));
+        info.description = Some(description);
+        info.category = Some(shown(task, task.category(), localization));
+    }
+}
+
+/// A task's `text` as it is shown: a core task's localization key in the
+/// ambient UI culture (upstream's `GetLocalizedString(key)`, which falls back
+/// to the server culture, then `en-US`, then the key), any other task's string
+/// as it is.
+fn shown(task: &dyn ScheduledTask, text: &str, localization: &dyn LocalizationManager) -> String {
+    if task.is_localized() {
+        localization.get_localized_string(text)
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Orders tasks by name as C#'s `OrderBy(o => o.Name)` does: a stable sort
+/// with `Comparer<string>.Default`, the current culture's compare.
+fn sort_by_name(infos: &mut [TaskInfo]) {
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture()).ok();
+    infos.sort_by(|a, b| {
+        let (a, b) = (
+            a.name.as_deref().unwrap_or_default(),
+            b.name.as_deref().unwrap_or_default(),
+        );
+        comparer
+            .as_ref()
+            .map_or_else(|| a.cmp(b), |comparer| comparer.compare(a, b))
+    });
 }
 
 /// A run requested while its task was busy: the task key, the trigger tag
@@ -364,13 +446,41 @@ pub struct FerrofinTaskManager {
     /// [`Failed`](TaskCompletionStatus::Failed) is recorded as a `TaskFailed`
     /// dashboard Alert (port of upstream's `TaskCompletedLogger`).
     activity: Arc<Mutex<Option<Arc<dyn ferrofin_traits::activity::ActivityManager>>>>,
+    /// The localizer that shows the core tasks' text
+    /// ([`ScheduledTask::is_localized`]); `None` uses the embedded
+    /// dictionaries with an `en-US` server culture.
+    localization: Arc<Mutex<Option<Arc<dyn ferrofin_traits::localization::LocalizationManager>>>>,
+    /// Set by [`shutdown`](Self::shutdown): no run starts after it, and the
+    /// scheduler fires nothing (upstream's disposed worker, its triggers
+    /// disposed). Written and read under the `tasks` lock.
+    shut_down: Arc<AtomicBool>,
 }
 
-struct TaskUpdates(tokio::sync::broadcast::Sender<Vec<TaskInfo>>);
+/// Capacity of the [`TaskUpdates`] transitions broadcast; a fixed constant,
+/// not a setting (owner decision). A subscriber further behind sees `Lagged`
+/// and resubscribes for a fresh snapshot, so no state is lost.
+const TASK_TRANSITIONS_CAPACITY: usize = 64;
+
+/// Capacity of the [`TaskUpdates`] progress broadcast; a fixed constant, not
+/// a setting (owner decision). A subscriber further behind sees `Lagged`,
+/// which it counts as a forced send: one extra read, and no state lost.
+const TASK_PROGRESS_CAPACITY: usize = 64;
+
+/// The registry's broadcasts to the WebSocket `ScheduledTasksInfo` stream.
+struct TaskUpdates {
+    /// Snapshots captured at each run's start and end (`TaskExecuting`,
+    /// `TaskCompleted`).
+    transitions: tokio::sync::broadcast::Sender<Vec<TaskInfo>>,
+    /// One `()` per progress report of a running task (`TaskProgress`).
+    progress: tokio::sync::broadcast::Sender<()>,
+}
 
 impl Default for TaskUpdates {
     fn default() -> Self {
-        Self(tokio::sync::broadcast::channel(64).0)
+        Self {
+            transitions: tokio::sync::broadcast::channel(TASK_TRANSITIONS_CAPACITY).0,
+            progress: tokio::sync::broadcast::channel(TASK_PROGRESS_CAPACITY).0,
+        }
     }
 }
 
@@ -499,12 +609,29 @@ impl FerrofinTaskManager {
     /// Captures transitions while holding the registry lock. A short task's
     /// start must survive even when it finishes before the socket reads it.
     fn publish_snapshot(&self, tasks: &HashMap<String, Registration>) {
-        if self.updates.0.receiver_count() == 0 {
+        if self.updates.transitions.receiver_count() == 0 {
             return;
         }
-        let mut snapshot: Vec<_> = tasks.values().map(Registration::to_info).collect();
-        snapshot.sort_by(|a, b| a.name.cmp(&b.name));
-        let _ = self.updates.0.send(snapshot);
+        let _ = self.updates.transitions.send(self.snapshot(tasks));
+    }
+
+    /// Every registered task, ordered by name, in the ambient UI culture.
+    fn snapshot(&self, tasks: &HashMap<String, Registration>) -> Vec<TaskInfo> {
+        let localization = self.localizer();
+        let mut snapshot: Vec<_> = tasks
+            .values()
+            .map(|reg| reg.to_info(localization.as_ref()))
+            .collect();
+        sort_by_name(&mut snapshot);
+        snapshot
+    }
+
+    /// The attached localizer, or the embedded dictionaries with an `en-US`
+    /// server culture when none is.
+    fn localizer(&self) -> Arc<dyn LocalizationManager> {
+        lock(&self.localization).clone().unwrap_or_else(|| {
+            Arc::new(crate::localization_manager::LocalizationManager::default())
+        })
     }
 
     /// Creates an empty task registry.
@@ -610,7 +737,7 @@ impl FerrofinTaskManager {
             last_result,
             triggers_override,
             progress: TaskProgress::default(),
-            abort: None,
+            run: None,
             started_at: None,
             run_max_ticks: None,
             trigger_fires: HashMap::new(),
@@ -688,6 +815,7 @@ impl FerrofinTaskManager {
         is_hidden: Option<bool>,
         is_enabled: Option<bool>,
     ) -> Vec<TaskInfo> {
+        let localization = self.localizer();
         let guard = lock(&self.tasks);
         let mut infos: Vec<TaskInfo> = guard
             .values()
@@ -698,29 +826,20 @@ impl FerrofinTaskManager {
                 is_hidden.is_none_or(|want| want == reg.task.is_hidden())
                     && is_enabled.is_none_or(|want| want == reg.task.is_enabled())
             })
-            .map(Registration::to_info)
+            .map(|reg| reg.to_info(localization.as_ref()))
             .collect();
         drop(guard);
-        // ORDINAL, where C#'s `OrderBy(o => o.Name)` is `Comparer<string>
-        // .Default` — `string.CompareTo`, i.e. a CurrentCulture compare. The two
-        // agree on all twenty of 10.11.8's task names (verified against the live
-        // wire order on both servers, byte for byte), because every one of them
-        // is ASCII and starts with an upper-case letter. They would NOT agree on
-        // a name whose first letter is lower-case (culture interleaves
-        // "audio…"/"Backup…", ordinal puts every upper-case name first), nor on
-        // names differing only by punctuation or diacritics, which a culture
-        // compare weights at a lower level than letters. Porting the culture
-        // comparator means an ICU collation dependency; this is a named, still
-        // open difference, not an accepted one, and it becomes visible the
-        // moment a task name breaks the ASCII/capitalised pattern.
-        infos.sort_by(|a, b| a.name.cmp(&b.name));
+        sort_by_name(&mut infos);
         infos
     }
 
     /// Gets a single task's info by key, if registered.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<TaskInfo> {
-        lock(&self.tasks).get(key).map(Registration::to_info)
+        let localization = self.localizer();
+        lock(&self.tasks)
+            .get(key)
+            .map(|reg| reg.to_info(localization.as_ref()))
     }
 
     /// Resolves a wire task id (`ScheduledTaskWorker.Id`) to the registry key.
@@ -772,6 +891,16 @@ impl FerrofinTaskManager {
         *lock(&self.activity) = Some(activity);
     }
 
+    /// Attaches the localizer the core tasks' names, descriptions and
+    /// categories are shown through, so the server's live `UICulture` applies
+    /// outside a request.
+    pub fn set_localization_manager(
+        &self,
+        localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
+    ) {
+        *lock(&self.localization) = Some(localization);
+    }
+
     /// Writes the `TaskFailed` activity entry for a failed run (best-effort,
     /// spawned — recording never blocks on the write). Only `Failed` outcomes
     /// are logged, matching upstream's `TaskCompletedLogger`.
@@ -789,9 +918,12 @@ impl FerrofinTaskManager {
             overview: result.error_message.clone(),
             ..Default::default()
         };
+        let task = result.key.clone().unwrap_or_default();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _ = activity.create_entry(entry).await;
+                if let Err(error) = activity.create_entry(entry).await {
+                    tracing::warn!(task, %error, "could not record the failed task in the activity log");
+                }
             });
         }
     }
@@ -822,7 +954,7 @@ impl FerrofinTaskManager {
         if let Some(reg) = guard.get_mut(key) {
             reg.state = TaskState::Idle;
             reg.last_result = Some(result);
-            reg.abort = None;
+            reg.run = None;
             reg.started_at = None;
             reg.run_max_ticks = None;
         }
@@ -972,10 +1104,14 @@ impl FerrofinTaskManager {
         ));
         let mut guard = lock(&self.tasks);
         if let Some(reg) = guard.get_mut(key) {
-            // The spawned run may already have finished (state back to Idle);
-            // only track the handle while it is still the live run.
+            // Track the handle while it is still the live run. Otherwise the
+            // run either finished (aborting it is a no-op) or was stopped
+            // (cancelled, or the registry shut down) between `claim` and here,
+            // before its handle was stored: abort it so it cannot outlive that.
             if reg.state == TaskState::Running {
-                reg.abort = Some(handle.abort_handle());
+                reg.run = Some(handle);
+            } else {
+                handle.abort();
             }
         }
         Ok(())
@@ -998,8 +1134,16 @@ impl FerrofinTaskManager {
                 "scheduled task {key} is already running"
             )));
         }
+        if self.shut_down.load(Ordering::Acquire) {
+            return Err(ServiceError::unavailable(format!(
+                "scheduled task {key} cannot start: the server is shutting down"
+            )));
+        }
         reg.state = TaskState::Running;
-        reg.progress = TaskProgress::default();
+        reg.progress = TaskProgress {
+            progressed: Some(self.updates.progress.clone()),
+            ..TaskProgress::default()
+        };
         reg.started_at = Some(Utc::now());
         reg.run_max_ticks = max_runtime_ticks;
         let claimed = (Arc::clone(&reg.task), reg.progress.clone());
@@ -1028,7 +1172,8 @@ impl FerrofinTaskManager {
                 start_time_utc: start,
                 end_time_utc: Utc::now(),
                 status,
-                name: Some(task.name().to_string()),
+                // Upstream's `ScheduledTaskWorker.Name`, read as the run ends.
+                name: Some(shown(task.as_ref(), task.name(), self.localizer().as_ref())),
                 key: Some(key.to_string()),
                 id: Some(self.id_for_key(key)),
                 error_message,
@@ -1050,9 +1195,53 @@ impl FerrofinTaskManager {
         self.stop_run(key, TaskCompletionStatus::Cancelled)
     }
 
+    /// Ends the registry with its host: port of `TaskManager.Dispose`, which
+    /// disposes each `ScheduledTaskWorker`. From here on no run starts and the
+    /// scheduler fires nothing (`DisposeTriggers`); each running run is
+    /// cancelled, waited on for at most [`SHUTDOWN_RUN_WAIT`], and recorded as
+    /// [`Aborted`](TaskCompletionStatus::Aborted), which jellyfin-web shows as
+    /// "Aborted by server shutdown".
+    ///
+    /// Requests queued behind a busy task are dropped, where upstream's
+    /// completion path would start them on the workers it is disposing. A run
+    /// that finished on its own while being waited on keeps its own result
+    /// (upstream records Aborted over it).
+    pub async fn shutdown(&self) {
+        let running: Vec<(String, Option<tokio::task::JoinHandle<()>>)> = {
+            let mut guard = lock(&self.tasks);
+            self.shut_down.store(true, Ordering::Release);
+            guard
+                .iter_mut()
+                .filter(|(_, reg)| reg.state == TaskState::Running)
+                .map(|(key, reg)| (key.clone(), reg.run.take()))
+                .collect()
+        };
+        // `claim` refusing is the guarantee; clearing the queue (and the
+        // sweep's early return) keeps those refusals out of the log.
+        lock(&self.busy_queue).clear();
+        // Every run is cancelled before any is waited on, so the runs stop
+        // together rather than one wait after another.
+        for (key, run) in &running {
+            tracing::info!(task = key, "cancelling scheduled task for shutdown");
+            if let Some(run) = run {
+                run.abort();
+            }
+        }
+        for (key, run) in running {
+            // A `run_now` run belongs to its caller: there is nothing to wait on.
+            if let Some(run) = run
+                && tokio::time::timeout(SHUTDOWN_RUN_WAIT, run).await.is_err()
+            {
+                tracing::warn!(task = key, "timed out waiting for scheduled task to stop");
+            }
+            let _ = self.stop_run(&key, TaskCompletionStatus::Aborted);
+        }
+    }
+
     /// Aborts a running task's spawned run, recording `status`, and returns it
     /// to [`Idle`](TaskState::Idle).
     fn stop_run(&self, key: &str, status: TaskCompletionStatus) -> Result<(), ServiceError> {
+        let localization = self.localizer();
         let mut guard = lock(&self.tasks);
         let reg = guard
             .get_mut(key)
@@ -1060,8 +1249,8 @@ impl FerrofinTaskManager {
         if reg.state != TaskState::Running {
             return Ok(());
         }
-        if let Some(abort) = reg.abort.take() {
-            abort.abort();
+        if let Some(run) = reg.run.take() {
+            run.abort();
         }
         let start = reg.started_at.take().unwrap_or_else(Utc::now);
         reg.run_max_ticks = None;
@@ -1070,7 +1259,11 @@ impl FerrofinTaskManager {
             start_time_utc: start,
             end_time_utc: Utc::now(),
             status,
-            name: Some(reg.task.name().to_string()),
+            name: Some(shown(
+                reg.task.as_ref(),
+                reg.task.name(),
+                localization.as_ref(),
+            )),
             key: Some(key.to_string()),
             id: Some(reg.id.clone()),
             error_message: None,
@@ -1136,7 +1329,7 @@ impl FerrofinTaskManager {
     ///
     /// Fires each registered task's `StartupTrigger`s after
     /// [`STARTUP_TRIGGER_DELAY`], then evaluates daily/weekly/interval triggers
-    /// every [`SCHEDULER_PERIOD`] and aborts runs that exceed their trigger's
+    /// every [`SCHEDULER_PERIOD`] and cancels runs that exceed their trigger's
     /// `max_runtime_ticks`. Call once from the composition root; a task
     /// registered afterwards fires its own startup trigger from
     /// [`register`](Self::register).
@@ -1179,13 +1372,16 @@ impl FerrofinTaskManager {
         })
     }
 
-    /// One scheduler pass: queue tasks whose triggers are due and abort runs
-    /// past their max runtime.
+    /// One scheduler pass: queue tasks whose triggers are due and cancel runs
+    /// past their max runtime. Does nothing once the registry is shut down.
     fn scheduler_sweep(&self, scheduler_start: DateTime<Utc>, now: DateTime<Utc>) {
         let mut due: Vec<(String, Option<i64>)> = Vec::new();
         let mut overrun: Vec<String> = Vec::new();
         {
             let mut guard = lock(&self.tasks);
+            if self.shut_down.load(Ordering::Acquire) {
+                return;
+            }
             for (key, reg) in guard.iter_mut() {
                 let triggers = reg.effective_triggers();
                 if reg.state == TaskState::Running
@@ -1214,9 +1410,15 @@ impl FerrofinTaskManager {
                 }
             }
         }
+        // Upstream's `CancelAfter(MaxRuntimeTicks)` surfaces in the run as an
+        // `OperationCanceledException`, recorded as Cancelled; Aborted is what
+        // a shutdown records ([`Self::shutdown`]).
         for key in overrun {
-            tracing::warn!(task = key, "scheduled task exceeded max runtime; aborting");
-            let _ = self.stop_run(&key, TaskCompletionStatus::Aborted);
+            tracing::warn!(
+                task = key,
+                "scheduled task exceeded max runtime; cancelling"
+            );
+            let _ = self.stop_run(&key, TaskCompletionStatus::Cancelled);
         }
         for (key, max_ticks) in due {
             tracing::info!(task = key, "trigger fired; queueing scheduled task");
@@ -1486,13 +1688,16 @@ impl ScheduledTask for RefreshLibraryTask {
         "RefreshLibrary"
     }
     fn name(&self) -> &str {
-        "Scan Media Library"
+        "TaskRefreshLibrary"
     }
     fn description(&self) -> &str {
-        "Scans your media library for new files and refreshes metadata."
+        "TaskRefreshLibraryDescription"
     }
     fn category(&self) -> &str {
-        "Library"
+        library::LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![TaskTriggerInfo {
@@ -1521,8 +1726,10 @@ impl ScheduledTask for RefreshLibraryTask {
             .library
             .run_library_scan(trigger, Some(Arc::new(move |percent| sink.report(percent))))
             .await?;
-        // Stopped (the host shutting down) or refused (already shut down):
-        // cancelled, not completed.
+        // Stopped by the library manager's own shutdown or refused (already
+        // shut down): cancelled, not completed. A host shutdown never gets
+        // here: the task registry's `shutdown` aborts this run first and
+        // records it Aborted.
         if !finished {
             progress.stopped();
         }
@@ -1541,10 +1748,26 @@ impl ScheduledTask for RefreshLibraryTask {
 impl ferrofin_traits::tasks::TaskManager for FerrofinTaskManager {
     fn subscribe_task_updates(&self) -> Option<ferrofin_traits::tasks::TaskSubscription> {
         let guard = lock(&self.tasks);
-        let updates = self.updates.0.subscribe();
-        let mut snapshot: Vec<_> = guard.values().map(Registration::to_info).collect();
-        snapshot.sort_by(|a, b| a.name.cmp(&b.name));
-        Some(ferrofin_traits::tasks::TaskSubscription { snapshot, updates })
+        let updates = self.updates.transitions.subscribe();
+        let progress = self.updates.progress.subscribe();
+        Some(ferrofin_traits::tasks::TaskSubscription {
+            snapshot: self.snapshot(&guard),
+            updates,
+            progress,
+        })
+    }
+
+    fn localize_tasks(&self, mut tasks: Vec<TaskInfo>) -> Vec<TaskInfo> {
+        let localization = self.localizer();
+        let guard = lock(&self.tasks);
+        for info in &mut tasks {
+            if let Some(reg) = info.key.as_deref().and_then(|key| guard.get(key)) {
+                reg.show_text(info, localization.as_ref());
+            }
+        }
+        drop(guard);
+        sort_by_name(&mut tasks);
+        tasks
     }
 
     async fn get_tasks(&self) -> Result<Vec<TaskInfo>, ServiceError> {
@@ -1639,7 +1862,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_transitions_capture_short_runs_and_failures_before_the_next_tick() {
+    async fn task_transitions_capture_short_runs_and_failures() {
         use ferrofin_traits::tasks::TaskManager as _;
         for fail in [false, true] {
             let mgr = FerrofinTaskManager::new();
@@ -1668,6 +1891,42 @@ mod tests {
             );
             assert!(subscription.updates.try_recv().is_err());
         }
+    }
+
+    /// `ScheduledTaskWorker.OnProgressChanged` raises `TaskProgress` on every
+    /// report of a running task: one report, one progress signal, and none
+    /// before the run. Both run paths raise it: `run_now`, and `queue` (the
+    /// dashboard's and the scheduler's), whose spawned run rebuilds the handle
+    /// with its trigger tag.
+    #[tokio::test]
+    async fn a_running_tasks_progress_report_raises_the_progress_signal() {
+        use ferrofin_traits::tasks::TaskManager as _;
+        let mgr = FerrofinTaskManager::new();
+        mgr.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: false,
+            hidden: false,
+        }));
+        let mut subscription = mgr.subscribe_task_updates().unwrap();
+        assert!(subscription.progress.try_recv().is_err(), "nothing ran yet");
+        mgr.run_now("counting").await.unwrap();
+        assert_eq!(subscription.progress.try_recv(), Ok(()));
+        assert!(subscription.progress.try_recv().is_err(), "one report");
+
+        while subscription.updates.try_recv().is_ok() {}
+        mgr.queue("counting").unwrap();
+        // The run's start and end transitions; the end follows its report.
+        for _ in 0..2 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                subscription.updates.recv(),
+            )
+            .await
+            .expect("the queued run in time")
+            .unwrap();
+        }
+        assert_eq!(subscription.progress.try_recv(), Ok(()));
+        assert!(subscription.progress.try_recv().is_err(), "one report");
     }
 
     /// A task recording the trigger each of its runs saw.
@@ -1811,6 +2070,103 @@ mod tests {
             sorted.sort_unstable();
             sorted
         });
+    }
+
+    /// A core task whose name is the localization key it is registered under.
+    struct KeyedTask(&'static str);
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for KeyedTask {
+        fn key(&self) -> &str {
+            self.0
+        }
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "no such phrase"
+        }
+        fn category(&self) -> &str {
+            "TasksMaintenanceCategory"
+        }
+        fn is_localized(&self) -> bool {
+            true
+        }
+        async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    fn names(list: &[ferrofin_model::tasks::TaskInfo]) -> Vec<&str> {
+        list.iter().filter_map(|t| t.name.as_deref()).collect()
+    }
+
+    /// Outside any request there is no ambient UI culture, so a core task is
+    /// listed in the server's `UICulture`, as upstream's
+    /// `GetLocalizedString` falls back to it; a phrase missing from the
+    /// dictionaries is shown as it is.
+    #[test]
+    fn outside_a_request_core_tasks_use_the_server_culture() {
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_localization_manager(Arc::new(
+            crate::localization_manager::LocalizationManager::new("US").with_ui_culture("de"),
+        ));
+        mgr.register(Arc::new(KeyedTask("TaskCleanActivityLog")));
+        let info = mgr.get("TaskCleanActivityLog").expect("registered");
+        assert_eq!(info.name.as_deref(), Some("Aktivitätsverlauf bereinigen"));
+        assert_eq!(info.category.as_deref(), Some("Wartung"));
+        assert_eq!(info.description.as_deref(), Some("no such phrase"));
+    }
+
+    /// C#'s `OrderBy(o => o.Name)` compares in the current culture, which an
+    /// ordinal sort gets wrong once a name leaves ASCII: ordinal puts "Écran"
+    /// after "Zebra".
+    #[tokio::test]
+    async fn tasks_are_ordered_by_a_culture_compare() {
+        let mgr = FerrofinTaskManager::new();
+        for (key, name) in [("z", "Zebra"), ("e", "Écran"), ("a", "Apple")] {
+            mgr.register(Arc::new(MetaTask {
+                key,
+                name,
+                hidden: false,
+                configurable: false,
+                enabled: true,
+            }));
+        }
+        let list =
+            ferrofin_util::current_culture::scope("en-US".to_owned(), async { mgr.list() }).await;
+        assert_eq!(names(&list), vec!["Apple", "Écran", "Zebra"]);
+    }
+
+    /// A transition snapshot published under one culture is re-localized, and
+    /// re-ordered, in the culture of the socket that sends it. The two tasks
+    /// change places between German and English.
+    #[tokio::test]
+    async fn localize_tasks_redoes_a_snapshot_in_the_ambient_culture() {
+        use ferrofin_traits::tasks::TaskManager as _;
+        async fn in_culture<T>(culture: &str, work: impl std::future::Future<Output = T>) -> T {
+            ferrofin_util::current_culture::scope_with_ui(
+                culture.to_owned(),
+                Some(culture.to_owned()),
+                work,
+            )
+            .await
+        }
+        let mgr = FerrofinTaskManager::new();
+        mgr.register(Arc::new(KeyedTask("TaskDownloadMissingSubtitles")));
+        mgr.register(Arc::new(KeyedTask("TaskOptimizeDatabase")));
+        let german = in_culture("de", async { mgr.list() }).await;
+        assert_eq!(
+            names(&german),
+            vec!["Datenbank optimieren", "Fehlende Untertitel herunterladen"]
+        );
+        let english = in_culture("en-US", async { mgr.localize_tasks(german) }).await;
+        assert_eq!(
+            names(&english),
+            vec!["Download missing subtitles", "Optimize database"]
+        );
+        assert_eq!(english[0].category.as_deref(), Some("Maintenance"));
     }
 
     /// The C# applies `isHidden`/`isEnabled` only inside
@@ -2530,7 +2886,8 @@ mod tests {
             error.to_string().contains("could not save the triggers"),
             "{error}"
         );
-        assert!(mgr.get("counting").expect("info").triggers.is_empty());
+        let triggers = mgr.get("counting").expect("info").triggers;
+        assert!(triggers.is_empty(), "{triggers:?}");
         assert!(super::lock(&mgr.stored_overrides).is_empty());
     }
 
@@ -2583,7 +2940,8 @@ mod tests {
         }));
 
         // Defaults are empty (CountingTask uses the trait default).
-        assert!(mgr.get("counting").expect("info").triggers.is_empty());
+        let found = mgr.get("counting").expect("info").triggers;
+        assert!(found.is_empty(), "{found:?}");
 
         let triggers = vec![TaskTriggerInfo {
             type_: TaskTriggerInfoType::IntervalTrigger,
@@ -3211,7 +3569,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_fires_startup_triggers_and_aborts_overruns() {
+    async fn scheduler_fires_startup_triggers_and_cancels_overruns() {
         let mgr = FerrofinTaskManager::new();
         let runs = Arc::new(AtomicU32::new(0));
         mgr.register(Arc::new(StartupTask { runs: runs.clone() }));
@@ -3224,8 +3582,9 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         handle.abort();
 
-        // Overrun abort: a hung run whose trigger caps runtime is aborted by a
-        // sweep once the cap has passed.
+        // Overrun: a hung run whose trigger caps runtime is stopped by a sweep
+        // once the cap has passed, and recorded as Cancelled (upstream's
+        // `CancelAfter` surfaces as `OperationCanceledException`).
         let mgr = FerrofinTaskManager::new();
         let gate = Arc::new(tokio::sync::Notify::new());
         mgr.register(Arc::new(GatedTask { gate }));
@@ -3246,13 +3605,13 @@ mod tests {
         assert_eq!(info.state, TaskState::Idle);
         assert_eq!(
             info.last_execution_result.expect("result").status,
-            TaskCompletionStatus::Aborted
+            TaskCompletionStatus::Cancelled
         );
     }
 
     /// `TaskOptions.MaxRuntimeTicks` belongs to the invocation the trigger
     /// starts: a manual run, or a run started by a trigger with no limit, is
-    /// never aborted because another trigger of the task has one, and a run
+    /// never stopped because another trigger of the task has one, and a run
     /// queued behind a busy task keeps its own trigger's limit.
     #[tokio::test]
     async fn a_runs_time_limit_is_the_firing_triggers_not_the_tasks() {
@@ -3292,16 +3651,108 @@ mod tests {
         assert_eq!(info.state, TaskState::Idle);
         assert_eq!(
             info.last_execution_result.expect("result").status,
-            TaskCompletionStatus::Aborted
+            TaskCompletionStatus::Cancelled
         );
 
-        // A run the unlimited trigger starts is not aborted.
+        // A run the unlimited trigger starts is not stopped.
         mgr.queue_scheduled("gated", "schedule", None)
             .expect("queued");
         settle().await;
         mgr.scheduler_sweep(hour_ago, Utc::now());
         assert_eq!(mgr.get("gated").expect("info").state, TaskState::Running);
         mgr.cancel("gated").expect("cancel");
+    }
+
+    /// `ScheduledTaskWorker.Dispose`: a run the shutdown cuts off is recorded
+    /// as Aborted (jellyfin-web: "Aborted by server shutdown") and kept for
+    /// the next boot; an idle task gets no result; and nothing starts
+    /// afterwards, neither a request nor a due trigger nor one queued behind
+    /// the busy task.
+    #[tokio::test]
+    async fn shutdown_records_a_running_task_as_aborted_and_starts_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = dir.path().join("task_results.json");
+        let mgr = FerrofinTaskManager::new();
+        mgr.set_result_store(store.clone());
+        mgr.register(Arc::new(GatedTask {
+            gate: Arc::new(tokio::sync::Notify::new()),
+        }));
+        let runs = Arc::new(AtomicU32::new(0));
+        mgr.register(Arc::new(CountingTask {
+            runs: runs.clone(),
+            fail: false,
+            hidden: false,
+        }));
+        let due_now = TaskTriggerInfo {
+            type_: TaskTriggerInfoType::IntervalTrigger,
+            interval_ticks: Some(TICKS_PER_SECOND),
+            ..TaskTriggerInfo::default()
+        };
+        mgr.set_triggers("counting", &[due_now]).expect("set");
+        mgr.queue("gated").expect("queued");
+        mgr.queue_scheduled("gated", "schedule", None)
+            .expect("remembered");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        mgr.shutdown().await;
+
+        let info = mgr.get("gated").expect("info");
+        assert_eq!(info.state, TaskState::Idle);
+        assert_eq!(
+            info.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Aborted
+        );
+        assert!(
+            mgr.get("counting")
+                .expect("info")
+                .last_execution_result
+                .is_none()
+        );
+        assert!(mgr.queue("counting").is_err());
+        mgr.scheduler_sweep(Utc::now() - chrono::Duration::days(1), Utc::now());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(mgr.get("gated").expect("info").state, TaskState::Idle);
+        assert_eq!(mgr.get("counting").expect("info").state, TaskState::Idle);
+
+        let next_boot = FerrofinTaskManager::new();
+        next_boot.set_result_store(store);
+        next_boot.register(Arc::new(GatedTask {
+            gate: Arc::new(tokio::sync::Notify::new()),
+        }));
+        let restored = next_boot
+            .get("gated")
+            .expect("info")
+            .last_execution_result
+            .expect("restored result");
+        assert_eq!(restored.status, TaskCompletionStatus::Aborted);
+    }
+
+    /// A run with no spawned handle (`run_now`, which runs in its caller) is
+    /// recorded as Aborted by shutdown too, as upstream records any running
+    /// worker whatever started it.
+    #[tokio::test]
+    async fn shutdown_records_a_run_now_run_as_aborted() {
+        let mgr = FerrofinTaskManager::new();
+        mgr.register(Arc::new(GatedTask {
+            gate: Arc::new(tokio::sync::Notify::new()),
+        }));
+        let caller = tokio::spawn({
+            let mgr = mgr.clone();
+            async move { mgr.run_now("gated").await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(mgr.get("gated").expect("info").state, TaskState::Running);
+
+        mgr.shutdown().await;
+
+        let info = mgr.get("gated").expect("info");
+        assert_eq!(info.state, TaskState::Idle);
+        assert_eq!(
+            info.last_execution_result.expect("result").status,
+            TaskCompletionStatus::Aborted
+        );
+        caller.abort();
     }
 
     #[tokio::test]

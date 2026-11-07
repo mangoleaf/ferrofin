@@ -5,11 +5,14 @@
 //! upstream xUnit tests are ported verbatim as the oracle). [`process_priority`]
 //! is the OS process priority Jellyfin sets through .NET's
 //! `Process.PriorityClass`, [`http_client`] holds the .NET `HttpClient`
-//! defaults Jellyfin's outbound requests inherit, [`panic`](mod@panic)
+//! defaults Jellyfin's outbound requests inherit, [`source_url`] is what a log
+//! line may say about a source's URL, [`panic`](mod@panic)
 //! reads a caught panic's message where upstream's `catch` reads
 //! `Exception.Message`, and [`stable_sort`] is LINQ `OrderBy`'s tolerance of a
-//! comparer that is not a total order. With the `tokio` feature, `keyed_locks`
-//! is the async keyed lock the C# takes from `AsyncKeyedLock`.
+//! comparer that is not a total order. [`finite`] is `BaseItem.FiniteOrNull`,
+//! shared by every crate that assigns a rating or gain. With the `tokio`
+//! feature, `keyed_locks` is the async keyed lock the C# takes from
+//! `AsyncKeyedLock`.
 
 pub mod copy_to_extensions;
 pub mod current_culture;
@@ -18,6 +21,7 @@ pub mod directory_path;
 pub mod enumerable_extensions;
 pub mod error;
 pub mod file_helper;
+pub mod finite;
 pub mod formatting_stream_writer;
 pub mod guid_extensions;
 pub mod http_client;
@@ -30,6 +34,7 @@ pub mod process_priority;
 pub mod read_only_list_extension;
 pub mod shuffle_extensions;
 pub mod sort_name;
+pub mod source_url;
 pub mod split_string_extensions;
 pub mod stable_sort;
 pub mod stream_extensions;

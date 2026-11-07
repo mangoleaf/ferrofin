@@ -248,7 +248,8 @@ def checks_html(checks):
 def shapes_html(shapes):
     rows = [[f"<code>{esc(s['shape'])}</code>", badge(s["verdict"]), f"<code>{esc(json.dumps(s['got'], sort_keys=True))}</code>",
              f"<code>{esc(json.dumps(s['want'], sort_keys=True))}</code>", esc(s["source"])] for s in shapes]
-    return "<h3>Messy shapes: Ferrofin's end state against Jellyfin 12.2</h3>" + table(
+    # Each row names the release its expectation came from (or the divergence written for it).
+    return "<h3>Messy shapes: Ferrofin's end state against Jellyfin's</h3>" + table(
         ["Shape", "Verdict", "Ferrofin", "Expected", "Expected from"], rows)
 
 

@@ -6,7 +6,9 @@
 //! minimum interval. Only replayable GET requests are retried; other methods
 //! are sent once while sharing quota/cooldown tracking.
 
+use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -59,41 +61,93 @@ const fn backoff_skipped() -> bool {
     false
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Settings {
-    timeout: Duration,
-    max_wait: Duration,
+/// Bytes in a MiB, the unit of [`RequestLimits::DOWNLOAD_MAX_MB`].
+const MIB: u64 = 1024 * 1024;
+
+/// The default per-attempt timeout, the longest pending pacing or quota wait
+/// and the largest download that every [`RateLimiter`] applies. The server
+/// sets them from its configuration ([`set_request_limits`]) for each of its
+/// lifetimes; until then, and in tests, the defaults apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestLimits {
+    /// Per-attempt HTTP timeout; a request that sets its own keeps it. It runs
+    /// to the end of the body, so it also ends a body that stops arriving.
+    pub timeout: Duration,
+    /// Longest pending pacing or quota wait before a lookup is skipped.
+    pub max_wait: Duration,
+    /// Most bytes a body read as bytes may hold (`image_download_max_mb`).
+    pub download_max_bytes: u64,
 }
 
-impl Settings {
-    fn from_env() -> Self {
+impl RequestLimits {
+    /// The default timeout, in seconds.
+    pub const DEFAULT_TIMEOUT_SECONDS: u64 = 20;
+    /// The default maximum wait, in seconds.
+    pub const DEFAULT_MAX_WAIT_SECONDS: u64 = 60;
+    /// The seconds the timeout may take.
+    pub const TIMEOUT_SECONDS: RangeInclusive<u64> = 10..=60;
+    /// The seconds the maximum wait may take.
+    pub const MAX_WAIT_SECONDS: RangeInclusive<u64> = 30..=300;
+    /// `image_download_max_mb`'s default.
+    pub const DEFAULT_DOWNLOAD_MAX_MB: u32 = 64;
+    /// The values `image_download_max_mb` takes.
+    pub const DOWNLOAD_MAX_MB: RangeInclusive<u32> = 16..=256;
+
+    /// The limits from the settings' units, each clamped to its range
+    /// ([`Self::TIMEOUT_SECONDS`], [`Self::MAX_WAIT_SECONDS`],
+    /// [`Self::DOWNLOAD_MAX_MB`]).
+    #[must_use]
+    pub fn from_settings(timeout: u64, max_wait: u64, download_max_mb: u32) -> Self {
+        let clamp = |seconds: u64, range: RangeInclusive<u64>| {
+            Duration::from_secs(seconds.clamp(*range.start(), *range.end()))
+        };
+        let download_max_mb =
+            download_max_mb.clamp(*Self::DOWNLOAD_MAX_MB.start(), *Self::DOWNLOAD_MAX_MB.end());
         Self {
-            timeout: seconds_setting(
-                std::env::var("FERROFIN_PROVIDER_TIMEOUT_SECONDS")
-                    .ok()
-                    .as_deref(),
-                20,
-                10,
-                60,
-            ),
-            max_wait: seconds_setting(
-                std::env::var("FERROFIN_PROVIDER_MAX_WAIT_SECONDS")
-                    .ok()
-                    .as_deref(),
-                60,
-                30,
-                300,
-            ),
+            timeout: clamp(timeout, Self::TIMEOUT_SECONDS),
+            max_wait: clamp(max_wait, Self::MAX_WAIT_SECONDS),
+            download_max_bytes: u64::from(download_max_mb) * MIB,
         }
     }
 }
 
-fn seconds_setting(value: Option<&str>, default: u64, min: u64, max: u64) -> Duration {
-    Duration::from_secs(
-        value
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(default)
-            .clamp(min, max),
+impl Default for RequestLimits {
+    fn default() -> Self {
+        Self::from_settings(
+            Self::DEFAULT_TIMEOUT_SECONDS,
+            Self::DEFAULT_MAX_WAIT_SECONDS,
+            Self::DEFAULT_DOWNLOAD_MAX_MB,
+        )
+    }
+}
+
+/// [`RequestLimits::timeout`] in force, in seconds.
+static TIMEOUT_SECONDS: AtomicU64 = AtomicU64::new(RequestLimits::DEFAULT_TIMEOUT_SECONDS);
+/// [`RequestLimits::max_wait`] in force, in seconds.
+static MAX_WAIT_SECONDS: AtomicU64 = AtomicU64::new(RequestLimits::DEFAULT_MAX_WAIT_SECONDS);
+/// [`RequestLimits::download_max_bytes`] in force, in MiB.
+static DOWNLOAD_MAX_MB: AtomicU32 = AtomicU32::new(RequestLimits::DEFAULT_DOWNLOAD_MAX_MB);
+
+/// Sets the limits every limiter in the process applies from its next
+/// request on, limiters made earlier included (the image limiters live for
+/// the whole process). The server calls it once per lifetime, before any
+/// provider request, with its configuration's values.
+pub fn set_request_limits(limits: RequestLimits) {
+    TIMEOUT_SECONDS.store(limits.timeout.as_secs(), Ordering::Relaxed);
+    MAX_WAIT_SECONDS.store(limits.max_wait.as_secs(), Ordering::Relaxed);
+    DOWNLOAD_MAX_MB.store(
+        u32::try_from(limits.download_max_bytes / MIB).unwrap_or(u32::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+/// The limits in force: the last [`set_request_limits`], else the defaults.
+#[must_use]
+pub fn request_limits() -> RequestLimits {
+    RequestLimits::from_settings(
+        TIMEOUT_SECONDS.load(Ordering::Relaxed),
+        MAX_WAIT_SECONDS.load(Ordering::Relaxed),
+        DOWNLOAD_MAX_MB.load(Ordering::Relaxed),
     )
 }
 
@@ -127,7 +181,6 @@ pub struct RateLimiter {
     provider: Arc<str>,
     /// The `provider` label of this limiter's request metrics.
     metric_label: &'static str,
-    settings: Settings,
     state: Arc<Mutex<RequestRate>>,
 }
 
@@ -139,7 +192,6 @@ impl RateLimiter {
         Self {
             metric_label: crate::metrics::provider_label(&provider),
             provider,
-            settings: Settings::from_env(),
             state: Arc::default(),
         }
     }
@@ -188,8 +240,8 @@ impl RateLimiter {
     ///
     /// Returns `None` for permanent errors, exhausted retries,
     /// non-GET/non-replayable requests, an open circuit, or a pending cooldown
-    /// longer than the configured maximum wait. Long cooldowns are retained for later calls. Each HTTP attempt
-    /// has a 20-second default timeout; explicit request timeouts are preserved.
+    /// longer than the maximum wait ([`request_limits`]). Long cooldowns are retained for later calls. Each HTTP
+    /// attempt has the default timeout ([`request_limits`]); explicit request timeouts are preserved.
     /// The shared gate covers response headers as well as
     /// dispatch, so concurrent callers cannot miss a newly received cooldown.
     /// Cooldowns survive exhausted retries and cancelled callers.
@@ -240,7 +292,9 @@ impl RateLimiter {
         crate::metrics::request_finished(self.metric_label, request_result(&result, sent));
         let failed = match &result {
             Err(_) => true,
-            Ok(response) => is_failure_status(response.status()),
+            Ok(response) => {
+                is_failure_status(response.status()) && !is_redirect_to_follow(response)
+            }
         };
         if failed {
             note_request_failure();
@@ -268,12 +322,13 @@ impl RateLimiter {
         tracing::debug!(provider = %self.provider, %context, "metadata provider request");
         let mut original = Some(request);
         let interval = interval.min(Duration::from_secs(u64::from(u32::MAX)));
+        let limits = request_limits();
         for attempt in 1..=attempts {
             let mut rate = self.state.lock().await;
             // ponytail: serialize through response headers so quota updates cannot
             // race. This limits each provider/origin to one request in flight;
             // revisit with quota reservations if scans become concurrent.
-            rate.wait_ready(&self.provider, &context, self.settings.max_wait)
+            rate.wait_ready(&self.provider, &context, limits.max_wait)
                 .await?;
             // Reserve before awaiting I/O, including when this future is cancelled.
             rate.consume_quota();
@@ -286,9 +341,7 @@ impl RateLimiter {
                     .and_then(reqwest::Request::try_clone)
                     .ok_or(RequestError::NotReplayable)?
             };
-            attempt_request
-                .timeout_mut()
-                .get_or_insert(self.settings.timeout);
+            attempt_request.timeout_mut().get_or_insert(limits.timeout);
             if *sent > 0 {
                 crate::metrics::retried(self.metric_label);
             }
@@ -367,10 +420,10 @@ impl RateLimiter {
                 // as an empty result, not an authentication or service failure.
                 tracing::debug!(provider = %self.provider, %context, %status,
                     "Metadata provider lookup returned no result");
-            } else if !status.is_success() {
+            } else if !status.is_success() && !is_redirect_to_follow(response) {
                 tracing::warn!(provider = %self.provider, %context, %status,
                     "Metadata provider request rejected");
-            } else if rate.succeeded() {
+            } else if status.is_success() && rate.succeeded() {
                 tracing::info!(provider = %self.provider, "Metadata provider requests recovered");
             }
             rate.postpone(interval.max(server_delay).max(rate.adaptive_interval()));
@@ -400,7 +453,9 @@ impl RateLimiter {
 /// The `result` label of one logical request ([`crate::metrics`]): `skipped`
 /// only when nothing was ever sent (an open circuit or a cooldown longer than
 /// the caller may wait). A request that went out and then gave up — say a
-/// 429 whose `Retry-After` outlasts the wait for the retry — `failed`.
+/// 429 whose `Retry-After` outlasts the wait for the retry — `failed`. A
+/// redirect handed back to be followed ([`is_redirect_to_follow`]) is `ok`:
+/// each hop an image download follows is a request of its own.
 fn request_result(
     result: &Result<reqwest::Response, RequestError>,
     sent: u32,
@@ -408,7 +463,9 @@ fn request_result(
     use crate::metrics::RequestResult;
     match result {
         Err(RequestError::Cooldown) if sent == 0 => RequestResult::Skipped,
-        Ok(response) if response.status().is_success() => RequestResult::Ok,
+        Ok(response) if response.status().is_success() || is_redirect_to_follow(response) => {
+            RequestResult::Ok
+        }
         Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
             RequestResult::NotFound
         }
@@ -426,9 +483,30 @@ tokio::task_local! {
 /// answered. A 404 is an answer ("nothing here"): the provider clients
 /// report it as a miss, the way `TMDbLib` returns `null` for it instead of
 /// throwing. Every other non-success status (a 5xx or 429 that outlived
-/// its retries, an auth failure, a rejected request) is a failure.
+/// its retries, an auth failure, a rejected request) is a failure. A redirect
+/// handed back to be followed ([`is_redirect_to_follow`]) is not a final
+/// response, and its caller leaves it out.
 fn is_failure_status(status: reqwest::StatusCode) -> bool {
     !status.is_success() && status != reqwest::StatusCode::NOT_FOUND
+}
+
+/// The statuses reqwest's own redirect policy follows.
+pub(crate) const REDIRECT_STATUSES: [reqwest::StatusCode; 5] = [
+    reqwest::StatusCode::MOVED_PERMANENTLY,
+    reqwest::StatusCode::FOUND,
+    reqwest::StatusCode::SEE_OTHER,
+    reqwest::StatusCode::TEMPORARY_REDIRECT,
+    reqwest::StatusCode::PERMANENT_REDIRECT,
+];
+
+/// Whether `response` is a redirect handed back for its caller to follow: one
+/// of [`REDIRECT_STATUSES`], with a `Location`. A client that follows
+/// redirects never hands one back, so only the image downloads, which follow
+/// them themselves to vet each hop, see one: an answer, not a failure. Any
+/// other 3xx is what it always was.
+pub(crate) fn is_redirect_to_follow(response: &reqwest::Response) -> bool {
+    REDIRECT_STATUSES.contains(&response.status())
+        && response.headers().contains_key(reqwest::header::LOCATION)
 }
 
 /// Counts one failed provider call into the enclosing
@@ -475,8 +553,10 @@ pub async fn count_request_failures<F: std::future::Future>(future: F) -> (F::Ou
 pub(crate) trait CountedBody: Sized {
     /// `Response::json`, counting an error.
     async fn counted_json<T: serde::de::DeserializeOwned>(self) -> Result<T, reqwest::Error>;
-    /// `Response::bytes` (as a `Vec`), counting an error.
-    async fn counted_bytes(self) -> Result<Vec<u8>, reqwest::Error>;
+    /// The whole body, read under the download limit ([`request_limits`]),
+    /// counting a read error. Past the limit is an answer, not a failure: the
+    /// next attempt would get the same body.
+    async fn counted_bytes(self) -> Result<Vec<u8>, BodyError>;
     /// `Response::text`, counting an error.
     async fn counted_text(self) -> Result<String, reqwest::Error>;
 }
@@ -493,11 +573,77 @@ impl CountedBody for reqwest::Response {
     async fn counted_json<T: serde::de::DeserializeOwned>(self) -> Result<T, reqwest::Error> {
         counted(self.json().await)
     }
-    async fn counted_bytes(self) -> Result<Vec<u8>, reqwest::Error> {
-        counted(self.bytes().await.map(|b| b.to_vec()))
+    async fn counted_bytes(self) -> Result<Vec<u8>, BodyError> {
+        CappedBody::new(self, request_limits().download_max_bytes)?
+            .read_to_end(Vec::new())
+            .await
     }
     async fn counted_text(self) -> Result<String, reqwest::Error> {
         counted(self.text().await)
+    }
+}
+
+/// Why a capped body read stopped.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BodyError {
+    /// The connection failed, or the request's timeout ran out.
+    #[error("provider response could not be read: {0}")]
+    Read(#[from] reqwest::Error),
+    /// The body declared, or turned out to hold, more than the limit.
+    #[error("provider response is over the download limit")]
+    TooLarge,
+}
+
+/// A response body read a chunk at a time under a byte limit, so nothing past
+/// the limit is ever held. The running count is the enforcement:
+/// `Content-Length` only lets a body that admits to being too large be refused
+/// unread, since it is absent on a chunked response and need not be true.
+pub(crate) struct CappedBody {
+    response: reqwest::Response,
+    limit: u64,
+    read: u64,
+}
+
+impl CappedBody {
+    /// `response`'s body, or [`BodyError::TooLarge`] when it declares more
+    /// than `limit` bytes.
+    pub(crate) fn new(response: reqwest::Response, limit: u64) -> Result<Self, BodyError> {
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit)
+        {
+            return Err(BodyError::TooLarge);
+        }
+        Ok(Self {
+            response,
+            limit,
+            read: 0,
+        })
+    }
+
+    /// Appends the next chunk to `buffer`; `false` when the body has ended.
+    pub(crate) async fn read_into(&mut self, buffer: &mut Vec<u8>) -> Result<bool, BodyError> {
+        let Some(chunk) = counted(self.response.chunk().await)? else {
+            return Ok(false);
+        };
+        self.read = self.read.saturating_add(chunk.len() as u64);
+        if self.read > self.limit {
+            return Err(BodyError::TooLarge);
+        }
+        buffer.extend_from_slice(&chunk);
+        Ok(true)
+    }
+
+    /// The rest of the body, appended to `buffer`. It is sized from the
+    /// declared length, if that can be had, so that it is not copied as it
+    /// grows: a declared length is only a hint, and a failed allocation must
+    /// not end the process for one.
+    pub(crate) async fn read_to_end(mut self, mut buffer: Vec<u8>) -> Result<Vec<u8>, BodyError> {
+        let declared = self.response.content_length().unwrap_or(0);
+        let declared = usize::try_from(declared.min(self.limit)).unwrap_or(0);
+        let _ = buffer.try_reserve_exact(declared);
+        while self.read_into(&mut buffer).await? {}
+        Ok(buffer)
     }
 }
 
@@ -767,6 +913,36 @@ mod tests {
         }
     }
 
+    /// A body that stops arriving ends at the request's timeout, which is why
+    /// image downloads need no deadline of their own. In virtual time: the
+    /// timeout's floor is 10 s.
+    #[tokio::test(start_paused = true)]
+    async fn the_timeout_ends_a_body_that_stops_arriving() {
+        use crate::mock_http::MockServer;
+        let server = MockServer::start_stalled(MockServer::raw_ok(
+            "Content-Length: 1000\r\n",
+            b"the start of the body",
+        ))
+        .await;
+        let _clock = TestClock::start();
+        let response = RateLimiter::new("stalled")
+            .send_request(reqwest::Client::new().get(&server.base_url), Duration::ZERO)
+            .await
+            .expect("the headers came");
+
+        let timeout = request_limits().timeout;
+        let body = tokio::time::timeout(timeout * 2, response.counted_bytes());
+        let error = body
+            .await
+            .expect("the request's timeout ended the read")
+            .expect_err("the body never finished");
+
+        assert!(
+            matches!(&error, BodyError::Read(error) if error.is_timeout()),
+            "{error:?}"
+        );
+    }
+
     async fn lookup(client: &RateLimiter, url: &str, name: &str) -> Option<String> {
         let response: serde_json::Value = client
             .get_json(
@@ -777,6 +953,28 @@ mod tests {
             )
             .await?;
         Some(response["artists"][0]["id"].as_str()?.to_owned())
+    }
+
+    /// Each limit is clamped to its range, and the defaults sit inside them.
+    #[test]
+    fn request_limits_are_clamped_to_their_ranges() {
+        let secs = |limits: RequestLimits| {
+            (
+                limits.timeout.as_secs(),
+                limits.max_wait.as_secs(),
+                limits.download_max_bytes / MIB,
+            )
+        };
+        assert_eq!(secs(RequestLimits::default()), (20, 60, 64));
+        assert_eq!(
+            secs(RequestLimits::from_settings(30, 120, 128)),
+            (30, 120, 128)
+        );
+        assert_eq!(secs(RequestLimits::from_settings(1, 1, 1)), (10, 30, 16));
+        assert_eq!(
+            secs(RequestLimits::from_settings(u64::MAX, u64::MAX, u32::MAX)),
+            (60, 300, 256)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -901,9 +1099,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn connection_failure_opens_immediately_and_allows_later_probe() {
         let _clock = TestClock::start();
-        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Bound for the whole test and never listening, so connecting is
+        // refused. A port bound then dropped is free for another test
+        // process's listener, whose answers this request would then read
+        // (and whose script it would eat). The hold is exclusive only while
+        // this socket does not set SO_REUSEADDR, as the assert checks.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = socket.local_addr().unwrap();
-        drop(socket);
+        assert!(std::net::TcpListener::bind(addr).is_err(), "port is held");
         let url = format!("http://{addr}");
         let limiter = RateLimiter::new("offline");
         let http = reqwest::Client::new();
@@ -1127,21 +1331,10 @@ mod tests {
         }
     }
 
+    // The limits' bounds: `request_limits_are_clamped_to_their_ranges`; their
+    // parsing is the server configuration's (`ferrofin-server`'s config tests).
     #[test]
-    fn settings_bounds_and_safe_request_identifiers() {
-        assert_eq!(seconds_setting(None, 20, 10, 60), Duration::from_secs(20));
-        assert_eq!(
-            seconds_setting(Some("bad"), 20, 10, 60),
-            Duration::from_secs(20)
-        );
-        assert_eq!(
-            seconds_setting(Some("0"), 20, 10, 60),
-            Duration::from_secs(10)
-        );
-        assert_eq!(
-            seconds_setting(Some("1000"), 20, 10, 60),
-            Duration::from_mins(1)
-        );
+    fn safe_request_identifiers() {
         let url =
             reqwest::Url::parse("https://example.org/private-key?apikey=secret&i=tt123").unwrap();
         assert_eq!(request_context("omdb", &url), "tt123");
@@ -1275,6 +1468,47 @@ mod tests {
         assert_eq!(statuses, vec![200, 404, 401, 400]);
         assert_eq!(failures, 2, "401 and 400 failed; 200 and 404 answered");
         assert_eq!(task.await.unwrap().len(), 4);
+    }
+
+    /// A redirect handed back to be followed (the image downloads' client
+    /// follows none itself) is an answer, counted `ok`; a 3xx that cannot be
+    /// followed is still a failure.
+    #[tokio::test]
+    async fn a_redirect_to_follow_is_an_answer_and_another_3xx_a_failure() {
+        use crate::mock_http::MockServer;
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let client = RateLimiter::new("redirects");
+        for (raw, status, answered) in [
+            (
+                b"HTTP/1.1 302 Found\r\nLocation: /next\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                302,
+                true,
+            ),
+            (MockServer::raw_status("302 Found"), 302, false),
+            (MockServer::raw_status("300 Multiple Choices"), 300, false),
+        ] {
+            let server = MockServer::start_raw(vec![raw]).await;
+            let (response, failures) = count_request_failures(
+                client.send_request(http.get(&server.base_url), Duration::ZERO),
+            )
+            .await;
+            let response = response.unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(
+                failures,
+                u32::from(!answered),
+                "{status}, Location: {answered}"
+            );
+            let expected = if answered {
+                crate::metrics::RequestResult::Ok
+            } else {
+                crate::metrics::RequestResult::Failed
+            };
+            assert_eq!(request_result(&Ok(response), 1), expected);
+        }
     }
 
     #[tokio::test(start_paused = true)]

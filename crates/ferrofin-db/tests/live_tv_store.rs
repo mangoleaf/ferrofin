@@ -20,7 +20,8 @@ async fn db() -> Database {
 async fn tuner_hosts_upsert_by_id_and_drive_the_count() {
     let db = db().await;
     assert_eq!(db.live_tv_tuner_count().await.expect("count"), 0);
-    assert!(db.live_tv_tuner_hosts().await.expect("hosts").is_empty());
+    let live_tv_tuner_hosts = db.live_tv_tuner_hosts().await.expect("hosts");
+    assert!(live_tv_tuner_hosts.is_empty(), "{live_tv_tuner_hosts:?}");
 
     db.upsert_live_tv_tuner_host("B", "http://b/playlist.m3u", "m3u", "{}")
         .await
@@ -56,17 +57,55 @@ async fn tuner_hosts_upsert_by_id_and_drive_the_count() {
 
     db.delete_all_live_tv_tuner_hosts().await.expect("clear");
     assert_eq!(db.live_tv_tuner_count().await.expect("count"), 0);
-    assert!(db.live_tv_tuner_hosts().await.expect("hosts").is_empty());
+    let live_tv_tuner_hosts = db.live_tv_tuner_hosts().await.expect("hosts");
+    assert!(live_tv_tuner_hosts.is_empty(), "{live_tv_tuner_hosts:?}");
+}
+
+/// Whether any tuner is configured is served from memory once the row cache is on, as upstream
+/// answers it from its in-memory `LiveTvOptions` (gl-1154): every write through the handle drops
+/// the answer, and an edit made outside it waits for an invalidation (or the TTL).
+#[tokio::test]
+async fn the_cached_tuner_presence_follows_every_write() {
+    let db = db().await;
+    db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+    assert!(!db.live_tv_tuner_hosts_exist().await.expect("none"));
+
+    db.upsert_live_tv_tuner_host("A", "http://a/playlist.m3u", "m3u", "{}")
+        .await
+        .expect("insert a");
+    assert!(
+        db.live_tv_tuner_hosts_exist().await.expect("one"),
+        "an upsert drops the cached answer"
+    );
+
+    db.delete_all_live_tv_tuner_hosts().await.expect("clear");
+    assert!(
+        !db.live_tv_tuner_hosts_exist().await.expect("none again"),
+        "a delete drops the cached answer"
+    );
+
+    sqlx::query(
+        r#"INSERT INTO "FerrofinLiveTvTunerHosts" ("Id","Url","Type","Data")
+           VALUES ('B', 'http://b/playlist.m3u', 'm3u', '{}')"#,
+    )
+    .execute(db.writer())
+    .await
+    .expect("insert b behind the handle's back");
+    assert!(
+        !db.live_tv_tuner_hosts_exist().await.expect("cached"),
+        "the answer is served from memory"
+    );
+    db.invalidate_live_tv_tuner_hosts();
+    assert!(db.live_tv_tuner_hosts_exist().await.expect("reread"));
 }
 
 #[tokio::test]
 async fn listing_providers_upsert_by_id() {
     let db = db().await;
+    let live_tv_listing_providers = db.live_tv_listing_providers().await.expect("empty");
     assert!(
-        db.live_tv_listing_providers()
-            .await
-            .expect("empty")
-            .is_empty()
+        live_tv_listing_providers.is_empty(),
+        "{live_tv_listing_providers:?}"
     );
 
     db.upsert_live_tv_listing_provider("P2", "xmltv", "/guide/b.xml", "{}")

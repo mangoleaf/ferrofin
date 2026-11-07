@@ -1,5 +1,7 @@
 //! Port of `MediaBrowser.Model.Dlna.MediaOptions`.
 
+use std::sync::Arc;
+
 use uuid::Uuid;
 
 use super::device_profile::DeviceProfile;
@@ -38,8 +40,9 @@ pub struct MediaOptions {
     /// Gets or sets the media sources.
     pub media_sources: Vec<MediaSourceInfo>,
 
-    /// Gets or sets the device profile.
-    pub profile: DeviceProfile,
+    /// Gets or sets the device profile. Shared: a request negotiates every
+    /// media source against one profile, and each result keeps it.
+    pub profile: Arc<DeviceProfile>,
 
     /// Gets or sets a media source id. Optional. Only needed if a specific
     /// `AudioStreamIndex` or `SubtitleStreamIndex` are requested.
@@ -71,7 +74,7 @@ impl MediaOptions {
     /// Creates a new `MediaOptions` for the given device profile, mirroring the
     /// C# constructor defaults (`Streaming` context, direct play/stream on).
     #[must_use]
-    pub fn new(profile: DeviceProfile) -> Self {
+    pub fn new(profile: impl Into<Arc<DeviceProfile>>) -> Self {
         Self {
             enable_direct_play: true,
             enable_direct_stream: true,
@@ -82,7 +85,7 @@ impl MediaOptions {
             always_burn_in_subtitle_when_transcoding: false,
             item_id: Uuid::nil(),
             media_sources: Vec::new(),
-            profile,
+            profile: profile.into(),
             media_source_id: None,
             device_id: None,
             max_audio_channels: None,

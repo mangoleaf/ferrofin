@@ -10,14 +10,12 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::{PermissionKind, PreferenceKind};
 use ferrofin_db::store::guid_to_db;
-use ferrofin_model::data::BaseItemKind;
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 
 use crate::db_error::db_err;
-use crate::item_type_lookup::stored_type_name;
-use crate::user_entity_ext::{guid_preference, has_permission};
+use crate::user_entity_ext::{cached_guid_preference, cached_permission};
 
 /// Raw-SQL data access for similar items and movie recommendations.
 #[derive(Clone)]
@@ -61,6 +59,7 @@ impl SimilarItemsRepository {
             return Ok(Vec::new());
         }
         let seed = guid_to_db(seed_id);
+        let exclude_ids = ferrofin_db::padded_in_list(exclude_ids);
         let sql = weighted_similar_sql(candidate_types.len(), exclude_ids.len());
         let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql)).bind(&seed);
         for type_name in candidate_types {
@@ -107,11 +106,8 @@ impl SimilarItemsRepository {
             return Ok(Vec::new());
         }
         let mut out = Vec::new();
-        for chunk in values.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let placeholders = (2..=chunk.len() + 1)
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+        for chunk in ferrofin_db::padded_in_chunks(values) {
+            let placeholders = ferrofin_db::numbered_placeholders(2..=chunk.len() + 1);
             let sql = format!(
                 // COLLATE binds to the whole comparison, so it must sit on the
                 // *operand* to apply to each `IN` element — `IN (…) COLLATE
@@ -160,24 +156,20 @@ impl SimilarItemsRepository {
     /// permission sees only the `EnabledFolders` preference. C# guards an
     /// empty scope with a fresh `Guid.NewGuid()` so the query matches nothing
     /// rather than everything; the caller does the same with `Some(vec![])`.
+    ///
+    /// The permission and preferences come from the cross-request policy
+    /// cache ([`Database::user_policy`]), as upstream reads them off the `User`
+    /// it holds.
     pub(crate) async fn accessible_top_parents(
         &self,
         user: &UserEntity,
     ) -> Result<Option<Vec<Uuid>>, ServiceError> {
-        let pool = self.db.pool();
-        let blocked = guid_preference(pool, &user.id, PreferenceKind::BlockedMediaFolders).await?;
+        let blocked =
+            cached_guid_preference(&self.db, &user.id, PreferenceKind::BlockedMediaFolders).await?;
         if !blocked.is_empty() {
             // The rows a `BlockedMediaFolders` preference names are the
             // libraries' collection folders.
-            let Some(folder_type) = stored_type_name(BaseItemKind::CollectionFolder) else {
-                return Ok(Some(Vec::new()));
-            };
-            let folders: Vec<String> =
-                sqlx::query_scalar(r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1"#)
-                    .bind(folder_type)
-                    .fetch_all(pool)
-                    .await
-                    .map_err(db_err)?;
+            let folders = crate::item_repository::library_ids(&self.db).await?;
             return Ok(Some(
                 folders
                     .iter()
@@ -186,11 +178,11 @@ impl SimilarItemsRepository {
                     .collect(),
             ));
         }
-        if has_permission(pool, &user.id, PermissionKind::EnableAllFolders).await? {
+        if cached_permission(&self.db, &user.id, PermissionKind::EnableAllFolders).await? {
             return Ok(None);
         }
         Ok(Some(
-            guid_preference(pool, &user.id, PreferenceKind::EnabledFolders).await?,
+            cached_guid_preference(&self.db, &user.id, PreferenceKind::EnabledFolders).await?,
         ))
     }
 
@@ -205,11 +197,13 @@ impl SimilarItemsRepository {
         if item_ids.is_empty() || person_types.is_empty() {
             return Ok(Vec::new());
         }
+        let db_ids: Vec<String> = item_ids.iter().map(|id| guid_to_db(*id)).collect();
+        let binds = ferrofin_db::padded_in_list(&db_ids);
         let mut sql = String::from(
             r#"SELECT pm."ItemId", p."Name", pm."ListOrder" FROM "PeopleBaseItemMap" pm
                JOIN "Peoples" p ON p."Id" = pm."PeopleId" WHERE pm."ItemId" IN ("#,
         );
-        for i in 0..item_ids.len() {
+        for i in 0..binds.len() {
             if i > 0 {
                 sql.push(',');
             }
@@ -224,10 +218,9 @@ impl SimilarItemsRepository {
         }
         sql.push(')');
 
-        let db_ids: Vec<String> = item_ids.iter().map(|id| guid_to_db(*id)).collect();
         let mut query =
             sqlx::query_as::<_, (String, Option<String>, Option<i64>)>(sqlx::AssertSqlSafe(sql));
-        for id in &db_ids {
+        for id in binds {
             query = query.bind(id);
         }
         for t in person_types {
@@ -272,7 +265,7 @@ impl SimilarItemsRepository {
         let mut out = std::collections::HashMap::new();
         // The client's `ItemLimit` is unbounded, so the ids are chunked like
         // every other bound list in this file.
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(item_ids) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
                 r#"SELECT "ItemId", "ProviderValue" FROM "BaseItemProviders"

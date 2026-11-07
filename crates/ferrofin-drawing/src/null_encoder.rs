@@ -126,6 +126,7 @@ impl ImageEncoder for NullImageEncoder {
         _quality: i32,
         _img_width: i32,
         _img_height: Option<i32>,
+        _full_chroma: bool,
     ) -> Result<i32, ServiceError> {
         Err(Self::not_implemented())
     }
@@ -243,7 +244,7 @@ mod tests {
         let options = collage_options();
         assert!(matches!(
             encoder
-                .create_trickplay_tile(&options, 90, 10, Some(10))
+                .create_trickplay_tile(&options, 90, 10, Some(10), true)
                 .await,
             Err(ServiceError::Backend(_))
         ));

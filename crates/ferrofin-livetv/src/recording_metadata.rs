@@ -160,7 +160,7 @@ impl VideoNfo<'_> {
             // A first airing with no air date is dated now.
             let aired = info
                 .original_air_date
-                .or((!info.is_repeat).then_some(self.now));
+                .or_else(|| (!info.is_repeat).then_some(self.now));
             if let Some(aired) = aired {
                 nfo.element("aired", &(self.release_date)(aired));
             }

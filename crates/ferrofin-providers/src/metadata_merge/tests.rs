@@ -439,7 +439,8 @@ fn merge_trailers_replaces_appropriately() {
     );
     assert_eq!(merge_trailers(&["URL 1"], &["URL 2"], true), ["URL 2"]);
     assert_eq!(merge_trailers(&[], &["URL 2"], false), ["URL 2"]);
-    assert!(merge_trailers(&["URL 1"], &[], true).is_empty());
+    let found = merge_trailers(&["URL 1"], &[], true);
+    assert!(found.is_empty(), "{found:?}");
     assert_eq!(merge_trailers(&["URL 1"], &["URL 1"], false), ["URL 1"]);
 }
 
@@ -527,7 +528,8 @@ fn set_provider_ids_keeps_only_the_valid_pairs_given() {
         ]),
         ids(&[("Tmdb", "12"), ("SomePlugin", "p1")])
     );
-    assert!(set_provider_ids([]).is_empty());
+    let found = set_provider_ids([]);
+    assert!(found.is_empty(), "{found:?}");
 }
 
 /// `ProviderIdsExtensionsTests.IsValidProviderId_ChecksKnownFormats`

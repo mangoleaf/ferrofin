@@ -521,7 +521,7 @@ mod tests {
         let provider = provider();
         let streams = provider.fetch(&mut item, None);
 
-        assert!(streams.is_empty());
+        assert!(streams.is_empty(), "{streams:?}");
         assert_eq!(item.width, 0);
         assert_eq!(item.height, 0);
         assert!(!item.has_subtitles);

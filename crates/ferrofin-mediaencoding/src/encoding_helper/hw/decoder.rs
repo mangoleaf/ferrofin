@@ -1210,7 +1210,7 @@ mod tests {
         );
 
         // With the preference off, qsv itself.
-        let mut native_off = options.clone();
+        let mut native_off = options;
         native_off.prefer_system_native_hw_decoder = false;
         assert_eq!(
             hwaccel_type(&ctx(&linux, &native_off, &s), "h264", 8, true).as_deref(),
@@ -1305,7 +1305,7 @@ mod tests {
             None
         );
 
-        let mut rext_on = options.clone();
+        let mut rext_on = options;
         rext_on.enable_decoding_color_depth10_hevc_rext = true;
         assert!(hwaccel_type(&ctx(&ihd, &rext_on, &s), "hevc", 10, false).is_some());
 
@@ -1322,7 +1322,7 @@ mod tests {
             hwaccel_type(&ctx(&ihd, &rext_on, &s12), "hevc", 12, false),
             None
         );
-        let mut rext12 = rext_on.clone();
+        let mut rext12 = rext_on;
         rext12.enable_decoding_color_depth12_hevc_rext = true;
         assert!(hwaccel_type(&ctx(&ihd, &rext12, &s12), "hevc", 12, false).is_some());
     }
@@ -1651,7 +1651,7 @@ mod tests {
         );
 
         // The same switch on VAAPI does refuse.
-        let mut vaapi = options.clone();
+        let mut vaapi = options;
         vaapi.hardware_acceleration_type = HardwareAccelerationType::vaapi;
         let linux = caps_for(Platform::Linux);
         assert_eq!(

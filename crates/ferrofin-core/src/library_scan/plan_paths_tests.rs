@@ -137,13 +137,16 @@ const MOVIES: &[&str] = &[
 ];
 
 /// The untyped library's files: movies, a series by its `tvshow.nfo`, one by
-/// its season folder, a folder of plain videos (`season.nfo`), and audio.
+/// its season folder, one inside a plain folder, a folder of plain videos
+/// (`season.nfo`), and audio.
 const MIXED: &[&str] = &[
     "Film.mkv",
     "Folder/Other Film (2001).mkv",
     "Folder/pic.jpg",
     "Show/tvshow.nfo",
     "Show/Show S01E01.mkv",
+    "Shows/Nested Show/tvshow.nfo",
+    "Shows/Nested Show/Nested Show S01E01.mkv",
     "Anthology/Season 1/Anthology S01E01.mkv",
     "Anthology/Season 1/Anthology S01E02.mkv",
     "Notes/season.nfo",
@@ -281,7 +284,7 @@ fn canon(items: Vec<Planned>) -> Vec<(Uuid, Vec<Uuid>, BaseItemEntity)> {
     items
         .into_iter()
         .map(|p| {
-            let mut entity = p.entity;
+            let mut entity = p.entity.to_entity();
             // A directory — a folder's, a disc rip's — and a path-less
             // folder (a season with no folder) are stamped with the resolve
             // time.
@@ -317,7 +320,9 @@ fn filtered(full: &[Planned], paths: &[String], exact: Option<&str>) -> Vec<Plan
                     parts
                         .iter()
                         .filter_map(serde_json::Value::as_str)
-                        .any(|part| crate::item_data::path_is_directory(&p.entity) && kept(part))
+                        .any(|part| {
+                            crate::item_data::path_is_directory(&p.entity.to_entity()) && kept(part)
+                        })
                 })
     };
     let parents: std::collections::HashSet<String> = full
@@ -428,6 +433,18 @@ async fn plan_paths_matches_the_filtered_full_plan() {
             "the fixture plans no {kind}"
         );
     }
+    // Every column a planner sets is one the plan keeps inline
+    // (`PlanEntity`): one it does not would box a whole row for every item
+    // of that shape.
+    let boxed: Vec<_> = full
+        .iter()
+        .filter(|p| p.entity.rest.is_some())
+        .map(|p| (p.entity.type_.clone(), p.entity.path.clone()))
+        .collect();
+    assert!(
+        boxed.is_empty(),
+        "planned with a column PlanEntity lacks: {boxed:?}"
+    );
     assert_group_shapes(&full);
     // A dotted directory name is a name, not a file name with an extension.
     let named = |kind: &str, name: &str| {
@@ -445,6 +462,24 @@ async fn plan_paths_matches_the_filtered_full_plan() {
     );
     let mut paths: Vec<String> = full.iter().filter_map(|p| p.entity.path.clone()).collect();
     let root = tmp.path().to_string_lossy().into_owned();
+    // A series inside a plain folder of the untyped library hangs off the
+    // folder, and what it holds sits below the folder too.
+    let planned = |rel: &str| {
+        let path = format!("{root}/{rel}");
+        full.iter()
+            .find(|p| p.entity.path.as_deref() == Some(path.as_str()))
+            .unwrap_or_else(|| panic!("nothing planned at {rel}"))
+    };
+    let folder = planned("mixed/Shows").id;
+    assert_eq!(
+        planned("mixed/Shows/Nested Show").entity.parent_id,
+        Some(ferrofin_db::store::guid_to_db(folder))
+    );
+    assert!(
+        planned("mixed/Shows/Nested Show/Nested Show S01E01.mkv")
+            .ancestors
+            .contains(&folder)
+    );
     for extra in [
         "movies",
         "movies/Heat (1995)/trailers",
@@ -736,7 +771,7 @@ async fn plan_paths_walks_only_the_path_to_the_item() {
         vec![
             format!("{tv_root}/Show 7"),
             format!("{tv_root}/Show 7/Season 2"),
-            episode.clone(),
+            episode,
         ],
     );
     assert_eq!(
@@ -894,6 +929,53 @@ async fn plan_follows_linked_folders_and_stops_at_a_loop() {
     );
 }
 
+/// A file Live TV is writing stays out of the plan until the capture ends, and
+/// is planned like any other file then. The set is read per listing: a capture
+/// that starts during a pass is seen by the listings after it, which is all a
+/// file it created can be in.
+#[tokio::test]
+async fn a_file_being_recorded_stays_out_of_the_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dvr = tmp.path().join("dvr");
+    touch(&dvr, "Evening News - 2026-10-30.ts");
+    touch(&dvr, "Morning News - 2026-10-30.ts");
+    let recording = dvr
+        .join("Evening News - 2026-10-30.ts")
+        .display()
+        .to_string();
+    let paths = Arc::new(Mutex::new(vec![recording.clone()]));
+    let read = Arc::clone(&paths);
+    let folders = vec![library(1, None, &dvr)];
+    let scanner = scanner(tmp.path(), Arc::new(CountingFs::default()))
+        .await
+        .with_recording_paths(Arc::new(move || read.lock().unwrap().clone()));
+    let planned = |scanner: &LibraryScanner| -> Vec<String> {
+        scanner
+            .plan_in(
+                &folders,
+                &folders,
+                PlanScope::ALL,
+                super::DateAdded::default(),
+                None,
+                None,
+            )
+            .items
+            .iter()
+            .filter_map(|p| p.entity.path.clone())
+            .filter(|path| path.contains("News"))
+            .collect()
+    };
+
+    let during = planned(&scanner);
+    assert_eq!(during.len(), 1, "{during:?}");
+    assert!(!during.contains(&recording), "{during:?}");
+
+    paths.lock().unwrap().clear();
+    let after = planned(&scanner);
+    assert_eq!(after.len(), 2, "{after:?}");
+    assert!(after.contains(&recording), "{after:?}");
+}
+
 /// `DotIgnoreIgnoreRule` (`LibraryManager.IgnoreFile`): a `.ignore` file hides
 /// what lies beneath its folder from the plan, everything when it is empty
 /// and otherwise what its gitignore lines match. The plan records the hidden
@@ -947,4 +1029,50 @@ async fn dot_ignore_files_hide_paths_from_the_plan() {
             plan.excluded
         );
     }
+}
+
+/// A `.ignore` is checked for changes once per listing (gl-1328), so an edit
+/// made during a pass decides the listings after it, as upstream's check per
+/// entry does.
+#[tokio::test]
+async fn a_dot_ignore_edited_during_a_pass_decides_the_listings_after_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let movies = tmp.path().join("movies");
+    touch(&movies, "Heat (1995)/Heat (1995).mkv");
+    let file = movies.join(".ignore");
+    std::fs::write(&file, "drafts/\n").unwrap();
+    let listings = AtomicUsize::new(0);
+    let folders = vec![library(1, Some(CollectionTypeOptions::movies), &movies)];
+    // The hook runs in every listing before its entries are filtered: the
+    // edit lands after the library root's listing, before its folder's.
+    let scanner = scanner(tmp.path(), Arc::new(CountingFs::default()))
+        .await
+        .with_recording_paths(Arc::new(move || {
+            if listings.fetch_add(1, Ordering::Relaxed) == 1 {
+                std::fs::write(&file, "*.mkv\n").unwrap();
+            }
+            Vec::new()
+        }));
+    let plan = scanner.plan_in(
+        &folders,
+        &folders,
+        PlanScope::ALL,
+        super::DateAdded::default(),
+        None,
+        None,
+    );
+    let heat = format!("{}/Heat (1995)/Heat (1995).mkv", movies.display());
+    assert!(
+        plan.excluded.contains(&heat),
+        "the edit is not seen: {:?}",
+        plan.excluded
+    );
+    assert!(
+        plan.items
+            .iter()
+            .all(|p| p.entity.path.as_deref() != Some(heat.as_str())),
+        "{heat} planned"
+    );
 }

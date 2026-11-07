@@ -5,12 +5,12 @@
 
 use std::time::Duration;
 
-use ferrofin_server::config::Config;
+use ferrofin_server::config::{Cli, Config, OFFLINE_PROVIDER_URL, ProviderEndpoints};
 
 #[path = "support/boot.rs"]
 mod boot;
 
-use boot::{STARTUP_DEADLINE, free_port, is_up, spawn_server};
+use boot::{STARTUP_DEADLINE, free_port, is_up, spawn_server, spawn_server_with, unique_name};
 
 const ADMIN_USER: &str = "restart-admin";
 const ADMIN_PASSWORD: &str = "restart-pw";
@@ -217,6 +217,91 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
         !is_up(&client, &base, &name).await,
         "shutdown leaves nothing listening"
     );
+}
+
+/// No environment variables: what the test's own environment holds
+/// (`FERROFIN_SERVER_NAME`, say) must not override its `config.toml`.
+fn no_vars(_: &str) -> Option<String> {
+    None
+}
+
+/// `POST /System/Restart` loads the configuration again when the server runs
+/// as the binary runs it (`main` hands [`ferrofin_server::run_reloading`] a
+/// `Config::load` of its own command line; here against no environment
+/// variables, [`no_vars`]): a changed `config.toml` applies in
+/// the new lifetime, and one that no longer loads leaves the configuration
+/// the server was running in place instead of stopping it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_loads_config_toml_again_and_keeps_the_last_one_that_loaded() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("client");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    // Found through `--data-dir`, as `{data_dir}/config.toml`.
+    let config_file = data_dir.join("config.toml");
+    let write_config = |server_name: &str| {
+        std::fs::write(
+            &config_file,
+            format!(
+                "server_name = {server_name:?}\nadmin_user = {ADMIN_USER:?}\n\
+                 admin_password = {ADMIN_PASSWORD:?}\n\
+                 musicbrainz_base_url = {OFFLINE_PROVIDER_URL:?}\n\
+                 studios_repo_url = {OFFLINE_PROVIDER_URL:?}\n"
+            ),
+        )
+        .expect("write config.toml");
+    };
+    write_config("ferrofin-reload");
+    let cli = move |port: u16| Cli {
+        data_dir: Some(data_dir.clone()),
+        bind_addr: Some("127.0.0.1".to_owned()),
+        port: Some(port),
+        ..Cli::default()
+    };
+    let start = {
+        let cli = cli.clone();
+        move |config: Config| {
+            let cli = cli(config.port);
+            ferrofin_server::run_reloading(config, move || {
+                Config::load_with_vars(cli.clone(), &no_vars)
+            })
+        }
+    };
+    let (server, base, _) = spawn_server_with(
+        &client,
+        |port| Config {
+            // Test seams, not settings: the in-process restart carries them over.
+            discovery_bind_addr: None,
+            provider_endpoints: ProviderEndpoints::offline(),
+            ..Config::load_with_vars(cli(port), &no_vars).expect("load the configuration")
+        },
+        start,
+    )
+    .await;
+    let tok = token(&client, &base).await;
+
+    let renamed = unique_name("ferrofin-reloaded");
+    write_config(&renamed);
+    assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
+    wait_for_new_lifetime(&client, &base, &renamed, &tok).await;
+
+    std::fs::write(&config_file, "server_name = \"unterminated\n").expect("break config.toml");
+    assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
+    wait_for_new_lifetime(&client, &base, &renamed, &tok).await;
+    assert!(
+        !server.is_finished(),
+        "a broken config.toml must not stop the server"
+    );
+
+    assert_eq!(post(&client, &base, "/System/Shutdown", &tok).await, 204);
+    tokio::task::spawn_blocking(move || server.join())
+        .await
+        .expect("join task")
+        .expect("server thread did not panic")
+        .expect("run exits cleanly");
 }
 
 /// Saved dashboard settings survive a new lifetime, while the restart flag

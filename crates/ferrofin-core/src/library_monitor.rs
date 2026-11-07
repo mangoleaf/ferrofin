@@ -14,7 +14,10 @@
 //!   That set is the in-memory state this type owns.
 //! - **watch lifecycle:** `Start`/`Stop` begin/stop watching, delegated to the
 //!   injected [`FileSystemWatcher`] so the real inotify wrapper is supplied at
-//!   the composition root and tests use a fake.
+//!   the composition root and tests use a fake. A library-structure change
+//!   asks for a restart ([`LibraryMonitor::restart`]), which
+//!   [`FerrofinLibraryMonitor::run`] serves on its own task, so the change's
+//!   request answers before the walk of the library's tree ends.
 //!
 //! `ReportFileSystemChanged` dispatches a real refresh: a non-suppressed change
 //! queues a (coalescing) **path-scoped** scan through the injected
@@ -92,6 +95,27 @@ impl PendingChanges {
         self.groups.iter().map(|group| group.deadline).min()
     }
 
+    /// The first open group whose path is equal to `reported`, contains it,
+    /// is contained by it or is its sibling: where `CreateRefresher`'s loop
+    /// stops.
+    fn related(&self, reported: &Path) -> Option<usize> {
+        let folder = reported.parent();
+        self.groups.iter().position(|group| {
+            let anchor = Path::new(&group.anchor);
+            reported.starts_with(anchor)
+                || anchor.starts_with(reported)
+                || (folder.is_some() && anchor.parent() == folder)
+        })
+    }
+
+    /// Whether the group `path` joins already holds it. Every path a group
+    /// holds lies under its path (a rebase only moves that path up), so
+    /// joining it again changes nothing but the group's window.
+    fn holds(&self, path: &str) -> bool {
+        self.related(Path::new(path))
+            .is_some_and(|index| self.groups[index].paths.contains(path))
+    }
+
     /// The settle group `path` joins, opening one if no group is related to
     /// it: the port of `LibraryMonitor.CreateRefresher`. The first group whose
     /// path is equal to `path`, contains it, is contained by it (the group is
@@ -114,13 +138,7 @@ impl PendingChanges {
     ) -> &mut PendingGroup {
         let reported = Path::new(path);
         let folder = reported.parent();
-        let related = self.groups.iter().position(|group| {
-            let anchor = Path::new(&group.anchor);
-            reported.starts_with(anchor)
-                || anchor.starts_with(reported)
-                || (folder.is_some() && anchor.parent() == folder)
-        });
-        if let Some(index) = related {
+        if let Some(index) = self.related(reported) {
             let group = &mut self.groups[index];
             let anchor = Path::new(&group.anchor);
             let rebased = if reported.starts_with(anchor) {
@@ -208,9 +226,9 @@ fn _assert_object_safe_library_scan_trigger(_: &dyn LibraryScanTrigger) {}
 /// Supplies the filesystem roots the monitor should watch, and every library
 /// location, which its watcher's metadata-only filter treats as a root.
 ///
-/// Resolved fresh on every [`LibraryMonitor::start`], so a monitor restart
-/// after a library-structure change (folder added/removed, realtime option
-/// toggled) picks up the new set — the C# monitor re-reads
+/// Resolved fresh on every start, so a monitor restart
+/// ([`LibraryMonitor::restart`]) after a library-structure change (folder
+/// added/removed, realtime option toggled) picks up the new set — the C# monitor re-reads
 /// `GetVirtualFolders` the same way. The composition root implements this
 /// over the virtual-folder manager, filtered to libraries whose
 /// `enable_realtime_monitor` option is on; tests use a plain `Vec<String>`.
@@ -293,6 +311,14 @@ pub struct FerrofinLibraryMonitor {
     /// watch of a root cannot be told from a newer start's (owner decision
     /// 2026-10-25).
     lifecycle: Arc<tokio::sync::Mutex<()>>,
+    /// Whether a [`LibraryMonitor::restart`] is waiting for the worker in
+    /// [`FerrofinLibraryMonitor::run`]. `std::sync::Mutex`: the guard never
+    /// spans an `.await`, and the worker's "library monitor started" line is
+    /// logged under it, so that line never follows a request it has not
+    /// served.
+    restart_requested: Arc<Mutex<bool>>,
+    /// Wakes that worker for a requested restart.
+    restart_wake: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for FerrofinLibraryMonitor {
@@ -324,7 +350,131 @@ impl FerrofinLibraryMonitor {
             config: None,
             generation: Arc::new(AtomicU64::new(0)),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            restart_requested: Arc::new(Mutex::new(false)),
+            restart_wake: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Runs the watch lifecycle for the server's lifetime: the first
+    /// [`start`](LibraryMonitor::start), then each restart
+    /// [`LibraryMonitor::restart`] asks for, one at a time (upstream's
+    /// `ApplicationStarted` → `Start`, and each structure change's `Stop` …
+    /// `Start`). Requests that arrive during a restart are served by one more
+    /// restart once it ends, which reads the structure as it is then.
+    ///
+    /// The composition root spawns this once, as a background task, so a
+    /// teardown stops it with the rest of the lifetime: the old lifetime adds
+    /// no watches after it (upstream's `ApplicationStopping` disposes the
+    /// monitor). Without it running, a requested restart waits.
+    ///
+    /// Logs "library monitor started", with the number of roots it watches,
+    /// each time a start finishes with no restart waiting.
+    pub async fn run(self) {
+        use tracing::Instrument as _;
+        // The first walk reads the structure as it is now, so it serves a
+        // restart asked for before this ran.
+        *self.restart_flag() = false;
+        let mut watched = self
+            .watch_library_roots()
+            .instrument(tracing::info_span!(
+                parent: None,
+                "library_monitor_start",
+                trigger = "startup"
+            ))
+            .await;
+        loop {
+            let restart = {
+                let requested = self.restart_flag();
+                if !*requested && let Some(roots) = watched.take() {
+                    tracing::info!(roots, "library monitor started");
+                }
+                *requested
+            };
+            if !restart {
+                self.restart_wake.notified().await;
+                continue;
+            }
+            // A trace of its own: the requests it serves (structure changes
+            // over the API, Live TV's recording folders, boot's seeded
+            // libraries) are logged in theirs, and several can share one
+            // restart.
+            let span = tracing::info_span!(parent: None, "library_monitor_restart");
+            watched = async {
+                if let Err(err) = self.stop().await {
+                    tracing::warn!(%err, "failed to stop library monitor");
+                }
+                // Taken once the old watches are gone, so a request made while
+                // they were being removed is served by this walk rather than
+                // by one more.
+                *self.restart_flag() = false;
+                self.watch_library_roots().await
+            }
+            .instrument(span)
+            .await;
+        }
+    }
+
+    /// The restart flag, locked. A bool: whoever panicked holding it left it
+    /// whole.
+    fn restart_flag(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.restart_requested
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `LibraryMonitor.Start`: watches every root the [`WatchRootsSource`]
+    /// lists now, except one a watched parent covers. Returns how many it
+    /// watched, or `None` when a stop or a restart came first (the roots it
+    /// read may be gone; what it watched is that stop's to remove).
+    async fn watch_library_roots(&self) -> Option<usize> {
+        // Read before waiting for a `stop` in progress, so that `stop` ends
+        // this start too, as upstream's generation read in `StartWatchingPath`.
+        let generation = self.generation.load(Ordering::SeqCst);
+        let _lifecycle = self.lifecycle.lock().await;
+        let mut roots = self.roots.watch_roots().await;
+        roots.sort();
+        // Every library location is a library root to the metadata-only
+        // filter: the nested ones skipped below, and those of libraries
+        // without real-time monitoring inside a watched one. Read after the
+        // watch roots, whose listing refreshes the libraries it comes from.
+        self.watcher
+            .set_library_roots(&self.roots.library_locations().await);
+        let mut watched_roots: Vec<String> = Vec::new();
+        let mut watching = 0;
+        for root in roots {
+            // A `stop` since this start began: it is waiting to remove what
+            // this start watched, and the roots read above may be gone.
+            if self.generation.load(Ordering::SeqCst) != generation {
+                tracing::debug!(
+                    root,
+                    "library monitor stopped while starting; not watching the rest"
+                );
+                return None;
+            }
+            // `LibraryMonitor.Start` / `ContainsParentFolder`: a recursive
+            // parent watch already covers its children and shared roots.
+            // Compare directory boundaries, using .NET ordinal casing.
+            let key = ferrofin_util::string_extensions::upper_invariant(
+                root.trim_end_matches(std::path::MAIN_SEPARATOR),
+            );
+            if watched_roots.iter().any(|parent| {
+                key == *parent
+                    || key
+                        .strip_prefix(parent)
+                        .is_some_and(|tail| tail.starts_with(std::path::MAIN_SEPARATOR))
+            }) {
+                continue;
+            }
+            watched_roots.push(key);
+            // Per-root failures (root unmounted, inotify limit) must not stop
+            // the remaining roots from being watched — the C# monitor
+            // try/catches each path the same way.
+            match self.watcher.watch(&root).await {
+                Ok(()) => watching += 1,
+                Err(err) => tracing::warn!(root, %err, "failed to watch library root"),
+            }
+        }
+        (self.generation.load(Ordering::SeqCst) == generation).then_some(watching)
     }
 
     /// Attaches the library manager a real change should refresh. Called once by
@@ -465,51 +615,7 @@ impl FerrofinLibraryMonitor {
 #[async_trait]
 impl LibraryMonitor for FerrofinLibraryMonitor {
     async fn start(&self) -> Result<(), ServiceError> {
-        // Read before waiting for a `stop` in progress, so that `stop` ends
-        // this start too, as upstream's generation read in `StartWatchingPath`.
-        let generation = self.generation.load(Ordering::SeqCst);
-        let _lifecycle = self.lifecycle.lock().await;
-        let mut roots = self.roots.watch_roots().await;
-        roots.sort();
-        // Every library location is a library root to the metadata-only
-        // filter: the nested ones skipped below, and those of libraries
-        // without real-time monitoring inside a watched one. Read after the
-        // watch roots, whose listing refreshes the libraries it comes from.
-        self.watcher
-            .set_library_roots(&self.roots.library_locations().await);
-        let mut watched_roots: Vec<String> = Vec::new();
-        for root in roots {
-            // A `stop` since this start began: it is waiting to remove what
-            // this start watched, and the roots read above may be gone.
-            if self.generation.load(Ordering::SeqCst) != generation {
-                tracing::debug!(
-                    root,
-                    "library monitor stopped while starting; not watching the rest"
-                );
-                return Ok(());
-            }
-            // `LibraryMonitor.Start` / `ContainsParentFolder`: a recursive
-            // parent watch already covers its children and shared roots.
-            // Compare directory boundaries, using .NET ordinal casing.
-            let key = ferrofin_util::string_extensions::upper_invariant(
-                root.trim_end_matches(std::path::MAIN_SEPARATOR),
-            );
-            if watched_roots.iter().any(|parent| {
-                key == *parent
-                    || key
-                        .strip_prefix(parent)
-                        .is_some_and(|tail| tail.starts_with(std::path::MAIN_SEPARATOR))
-            }) {
-                continue;
-            }
-            watched_roots.push(key);
-            // Per-root failures (root unmounted, inotify limit) must not stop
-            // the remaining roots from being watched — the C# monitor
-            // try/catches each path the same way.
-            if let Err(err) = self.watcher.watch(&root).await {
-                tracing::warn!(root, %err, "failed to watch library root");
-            }
-        }
+        self.watch_library_roots().await;
         Ok(())
     }
 
@@ -519,6 +625,22 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
         self.generation.fetch_add(1, Ordering::SeqCst);
         let _lifecycle = self.lifecycle.lock().await;
         self.watcher.unwatch_all().await
+    }
+
+    /// Served by [`FerrofinLibraryMonitor::run`]. A start walking the old
+    /// structure watches no further root: the restart's own `stop` removes
+    /// what it watched anyway.
+    fn restart(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut requested = self.restart_flag();
+            *requested = true;
+            // Under the flag's lock, as the worker's "started" line is: a
+            // "started" line after this one is from a start that began after
+            // it.
+            tracing::info!("library monitor restart requested");
+        }
+        self.restart_wake.notify_one();
     }
 
     async fn report_file_system_change_beginning(&self, path: &str) -> Result<(), ServiceError> {
@@ -654,6 +776,20 @@ impl FerrofinLibraryMonitor {
             tracing::trace!(path, "change ignored (ignore patterns)");
             return Ok(());
         }
+        if self.is_path_suppressed(path) {
+            tracing::trace!(path, "change suppressed (server-initiated write)");
+            return Ok(());
+        }
+        let delay = self.debounce_delay().await;
+        // A path its settle group already holds only re-arms the group's
+        // window ("Path is already being refreshed", `CreateRefresher`). Its
+        // `.ignore` lookup ran when it joined: repeating it per event (each
+        // write of a file being copied is one) cost a 300-file extraction
+        // 120,000 lookups. Upstream's cached lookup skips the walk too.
+        if !delay.is_zero() && self.settle(path, trigger, delay, true) {
+            tracing::trace!(path, "change re-arms its settle window");
+            return Ok(());
+        }
         // `DotIgnoreIgnoreRule.ShouldIgnore` (`LibraryMonitor.cs:389`): nor
         // does a path a `.ignore` file hides. The lookup stats the path's
         // folders, so it stays off the async workers.
@@ -671,10 +807,6 @@ impl FerrofinLibraryMonitor {
             tracing::trace!(path, "change ignored (.ignore file)");
             return Ok(());
         }
-        if self.is_path_suppressed(path) {
-            tracing::trace!(path, "change suppressed (server-initiated write)");
-            return Ok(());
-        }
         tracing::debug!(
             path,
             trigger = trigger.as_str(),
@@ -684,7 +816,6 @@ impl FerrofinLibraryMonitor {
         // the items touched by the reported path (a deleted path prunes its
         // rows), so one new file does not re-walk the whole library. Overlapping
         // reports fold via the debounce window and the scan's in-flight guard.
-        let delay = self.debounce_delay().await;
         if delay.is_zero() {
             if let Some(library) = &self.refresh_target {
                 library
@@ -693,18 +824,27 @@ impl FerrofinLibraryMonitor {
             }
             return Ok(());
         }
-        // Accumulate the path into its settle group and (re)arm the group's
-        // window; the single worker task dispatches each group once its own
-        // window lapses with no further reports.
-        //
-        // The re-arm is clamped two ways, because a purely sliding window is
-        // unbounded in both time and memory: a source that keeps reporting
-        // holds the batch open forever, so the scan never runs and `paths`
-        // grows for the life of the process (measured: 60,000 reported paths
-        // held 27 MB resident, released only once the reports stopped). The
-        // clamps dispatch the batch — they never drop a path.
+        self.settle(path, trigger, delay, false);
+        Ok(())
+    }
+
+    /// Accumulates `path` into its settle group and (re)arms the group's
+    /// window; the single worker task dispatches each group once its own
+    /// window lapses with no further reports. With `held_only`, only when
+    /// the group already holds `path`. Returns whether it did.
+    ///
+    /// The re-arm is clamped two ways, because a purely sliding window is
+    /// unbounded in both time and memory: a source that keeps reporting
+    /// holds the batch open forever, so the scan never runs and `paths`
+    /// grows for the life of the process (measured: 60,000 reported paths
+    /// held 27 MB resident, released only once the reports stopped). The
+    /// clamps dispatch the batch — they never drop a path.
+    fn settle(&self, path: &str, trigger: ScanTrigger, delay: Duration, held_only: bool) -> bool {
         let (spawn_worker, wake_worker) = {
             let mut pending = self.pending.lock().expect("pending set not poisoned");
+            if held_only && !pending.holds(path) {
+                return false;
+            }
             let now = Instant::now();
             let previous = pending.next_deadline();
             let group = pending.group_for(path, trigger, now, delay);
@@ -723,7 +863,7 @@ impl FerrofinLibraryMonitor {
         } else if wake_worker {
             self.flush.notify_one();
         }
-        Ok(())
+        true
     }
 }
 
@@ -870,13 +1010,7 @@ mod tests {
     /// root; the `start` that follows the `stop` keeps its own watches.
     #[tokio::test]
     async fn a_stop_during_a_start_leaves_none_of_that_starts_watches() {
-        let watcher = Arc::new(SlowWalkWatcher {
-            slow: "/media/movies",
-            entered: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-            watched: StdMutex::new(HashSet::new()),
-            asked: StdMutex::new(Vec::new()),
-        });
+        let watcher = slow_walk_watcher("/media/movies");
         let monitor = Arc::new(FerrofinLibraryMonitor::new(
             watcher.clone(),
             vec!["/media/movies".to_owned(), "/media/tv".to_owned()],
@@ -914,6 +1048,131 @@ mod tests {
         watcher.release.notify_one();
         monitor.start().await.expect("the next start");
         assert_eq!(watcher.watched.lock().unwrap().len(), 2);
+    }
+
+    /// The library structure as it is now, which a test changes between
+    /// restarts.
+    #[derive(Default)]
+    struct LiveRoots(StdMutex<Vec<String>>);
+
+    impl LiveRoots {
+        fn set(&self, roots: &[&str]) {
+            *self.0.lock().unwrap() = roots.iter().map(|&root| root.to_owned()).collect();
+        }
+    }
+
+    #[async_trait]
+    impl WatchRootsSource for LiveRoots {
+        async fn watch_roots(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    /// Waits until `watcher` watches exactly `expected`.
+    async fn until_watching(watcher: &SlowWalkWatcher, expected: &[&str]) {
+        let expected: HashSet<String> = expected.iter().map(|&root| root.to_owned()).collect();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while *watcher.watched.lock().unwrap() != expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "watching {:?}, not {expected:?}",
+                watcher.watched.lock().unwrap()
+            )
+        });
+    }
+
+    fn slow_walk_watcher(slow: &'static str) -> Arc<SlowWalkWatcher> {
+        Arc::new(SlowWalkWatcher {
+            slow,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            watched: StdMutex::new(HashSet::new()),
+            asked: StdMutex::new(Vec::new()),
+        })
+    }
+
+    /// `restart` only asks: the worker that `run` is restarts the watches on
+    /// its own task, from the structure as it is when the restart runs.
+    #[tokio::test]
+    async fn a_restart_rewatches_the_structure_as_it_is_then() {
+        let watcher = slow_walk_watcher("/media/never-listed");
+        let roots = Arc::new(LiveRoots::default());
+        roots.set(&["/media/movies"]);
+        let monitor = FerrofinLibraryMonitor::new(watcher.clone(), Arc::clone(&roots));
+        let worker = tokio::spawn(monitor.clone().run());
+        until_watching(&watcher, &["/media/movies"]).await;
+
+        roots.set(&["/media/tv", "/media/music"]);
+        monitor.restart();
+        until_watching(&watcher, &["/media/tv", "/media/music"]).await;
+        worker.abort();
+    }
+
+    /// A restart asked for before the worker runs (boot's Live TV recording
+    /// folders can ask that early) is served by its first walk, which reads
+    /// the structure as it is then, not by a second one.
+    #[tokio::test]
+    async fn a_restart_asked_before_the_worker_runs_costs_no_second_walk() {
+        let watcher = slow_walk_watcher("/media/never-listed");
+        let roots = Arc::new(LiveRoots::default());
+        roots.set(&["/media/movies"]);
+        let monitor = FerrofinLibraryMonitor::new(watcher.clone(), Arc::clone(&roots));
+        monitor.restart();
+        let worker = tokio::spawn(monitor.clone().run());
+        until_watching(&watcher, &["/media/movies"]).await;
+
+        roots.set(&["/media/sentinel"]);
+        monitor.restart();
+        until_watching(&watcher, &["/media/sentinel"]).await;
+        assert_eq!(
+            *watcher.asked.lock().unwrap(),
+            ["/media/movies", "/media/sentinel"]
+        );
+        worker.abort();
+    }
+
+    /// Structure changes made while a restart walks a slow root do not each
+    /// walk the library again: the walk of the old structure goes no further,
+    /// and one more restart serves them all, reading the latest structure.
+    #[tokio::test]
+    async fn overlapping_restarts_converge_on_the_latest_structure_in_one_more_walk() {
+        let watcher = slow_walk_watcher("/media/movies");
+        let roots = Arc::new(LiveRoots::default());
+        roots.set(&["/media/movies", "/media/tv"]);
+        let monitor = FerrofinLibraryMonitor::new(watcher.clone(), Arc::clone(&roots));
+        let worker = tokio::spawn(monitor.clone().run());
+        watcher.entered.notified().await;
+
+        for latest in [
+            ["/media/movies", "/media/music"],
+            ["/media/tv", "/media/music"],
+            ["/media/books", "/media/music"],
+        ] {
+            roots.set(&latest);
+            monitor.restart();
+        }
+        watcher.release.notify_one();
+        until_watching(&watcher, &["/media/books", "/media/music"]).await;
+        // A restart after the worker has served those: had each request
+        // walked on its own, their walks would sit before this one's.
+        roots.set(&["/media/sentinel"]);
+        monitor.restart();
+        until_watching(&watcher, &["/media/sentinel"]).await;
+        assert_eq!(
+            *watcher.asked.lock().unwrap(),
+            [
+                "/media/movies",
+                "/media/books",
+                "/media/music",
+                "/media/sentinel"
+            ],
+            "the old walk stopped at its slow root, and one restart served the three requests"
+        );
+        worker.abort();
     }
 
     #[tokio::test]
@@ -1527,5 +1786,93 @@ mod tests {
             .await
             .expect("report");
         assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A report of a path already settling in its group only re-arms the
+    /// group's window (`CreateRefresher`: "Path is already being
+    /// refreshed"), without the `.ignore` lookup it had when it joined, so a
+    /// file being written costs one lookup, not one per event. Like
+    /// upstream's cached lookup, a `.ignore` created after the first report
+    /// therefore does not stop the re-arm; the path is in the batch either
+    /// way, and the scan reads the `.ignore` again. A group rebased to the
+    /// folder by a sibling still holds the path.
+    #[rstest::rstest]
+    #[case::alone(None)]
+    #[case::rebased_by_a_sibling(Some("Heat (1995).en.srt"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_settling_path_rearms_its_window_without_a_new_ignore_lookup(
+        #[case] sibling: Option<&str>,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let folder = tmp.path().join("movies/Heat (1995)");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        let file = folder
+            .join("Heat (1995).mkv")
+            .to_string_lossy()
+            .into_owned();
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_mins(1));
+        let mut expected = vec![file.clone()];
+        expected.extend(sibling.map(|name| folder.join(name).to_string_lossy().into_owned()));
+        for path in &expected {
+            monitor
+                .report_file_system_changed(path)
+                .await
+                .expect("report");
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        std::fs::write(folder.join(".ignore"), "").expect(".ignore");
+        monitor
+            .report_file_system_changed(&file)
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        assert_eq!(library.batches.lock().unwrap().len(), 0, "re-armed at 30s");
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let mut batches = library.batches.lock().unwrap().clone();
+        for batch in &mut batches {
+            batch.sort();
+        }
+        expected.sort();
+        assert_eq!(batches, vec![expected]);
+    }
+
+    /// The re-arm is only for a path its group already holds: a new path
+    /// joining an open group still has its `.ignore` lookup, and a
+    /// server-written path does not re-arm the window it is settling in.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_path_skips_only_the_ignore_lookup() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let movies = tmp.path().join("movies");
+        std::fs::create_dir_all(&movies).expect("mkdir");
+        std::fs::write(movies.join(".ignore"), "*.part\n").expect(".ignore");
+        let heat = movies.join("Heat.mkv").to_string_lossy().into_owned();
+        let part = movies.join("Ronin.mkv.part").to_string_lossy().into_owned();
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_mins(1));
+        monitor
+            .report_file_system_changed(&heat)
+            .await
+            .expect("report");
+        monitor
+            .report_file_system_changed(&part)
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        SelfWriteGuard::begin(&monitor, &heat);
+        monitor
+            .report_file_system_changed(&heat)
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert_eq!(
+            *library.batches.lock().unwrap(),
+            vec![vec![heat]],
+            "settled at 60s, without the hidden sibling"
+        );
     }
 }

@@ -18,10 +18,14 @@
 //! filesystem `FerrofinVirtualFolderManager` (see `handlers::library` for the two
 //! `LibraryController` structure reads, `PhysicalPaths` + `AvailableOptions`).
 //!
-//! Every mutation ends with the C# `ILibraryMonitor` stop/start dance (so the
-//! filesystem watcher's root set tracks the new structure and realtime-option
-//! toggles) and honors the `refreshLibrary` query flag by queueing a scan —
-//! mirroring the `finally` block of each C# controller action.
+//! Every mutation but `Paths/Update` ends with the C# `ILibraryMonitor`
+//! stop/start dance (so the filesystem watcher's root set tracks the new
+//! structure and realtime-option toggles), which the monitor runs on its own
+//! task after the response, and honors the `refreshLibrary` query flag by
+//! queueing a scan — mirroring the `finally` block of each C# controller
+//! action. Upstream's `UpdateLibraryOptions` does not restart the monitor;
+//! Ferrofin does, so a real-time monitoring toggle applies at once (its
+//! `VERIFIED` row).
 
 use axum::Router;
 use axum::extract::{Json, State};
@@ -38,19 +42,16 @@ use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
-/// Restarts the library monitor so its watch set matches the just-mutated
-/// library structure, then queues a full scan when the request asked for one —
-/// the `ILibraryMonitor` stop/start + `refreshLibrary` dance every C#
-/// `LibraryStructureController` action ends with. Best-effort: a watcher or
+/// Asks the library monitor to restart so its watch set matches the
+/// just-mutated library structure, then queues a full scan when the request
+/// asked for one — the `ILibraryMonitor` stop/start + `refreshLibrary` dance
+/// the C# `LibraryStructureController` actions end with. The restart runs on
+/// the monitor's own task: a recursive watch walks the library's whole tree,
+/// and upstream's `Start` returns before any watch exists too. Best-effort: a
 /// queue failure must not fail the admin request whose mutation already
 /// succeeded.
 async fn after_structure_change(state: &AppState, refresh_library: bool, scope: Option<Uuid>) {
-    if let Err(err) = state.library_monitor.stop().await {
-        tracing::warn!(%err, "failed to stop library monitor");
-    }
-    if let Err(err) = state.library_monitor.start().await {
-        tracing::warn!(%err, "failed to restart library monitor");
-    }
+    state.library_monitor.restart();
     if refresh_library {
         // A freshly-added library scans scoped: a full pass re-probes every
         // existing item (hours on a big install) and plans the new library's
@@ -67,10 +68,14 @@ async fn after_structure_change(state: &AppState, refresh_library: bool, scope: 
 }
 
 /// Upstream's `finally` after a structure change: unless the change was
-/// refused up front (the argument, existence and conflict checks upstream
-/// makes before its `try`: 400, 404, 409), run [`after_structure_change`]
-/// whether the change succeeded or failed part-way, then hand back the
-/// change's own result.
+/// refused up front (the argument, existence and conflict checks: 400, 404,
+/// 409), run [`after_structure_change`] whether the change succeeded or failed
+/// part-way, then hand back the change's own result. Upstream makes those
+/// checks before its `try` for the library routes, but for the media-path
+/// routes the library and path checks (and `AddMediaPath`'s argument checks)
+/// run inside it, so its `finally` still restarts the monitor or scans a
+/// library it did not change; a refused change here does neither (the routes'
+/// `VERIFIED` rows).
 async fn finish_structure_change<T>(
     state: &AppState,
     refresh_library: bool,
@@ -462,8 +467,8 @@ async fn update_media_path(
         .virtual_folders
         .update_media_path(&name, &path_info)
         .await?;
-    // No `refreshLibrary` flag on this route (matching the C# action).
-    after_structure_change(&state, false, None).await;
+    // No `refreshLibrary` flag and no monitor restart, as the C# action: it
+    // changes no location, so the watches stay as they are.
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -536,12 +541,18 @@ struct UpdateLibraryOptionsBody {
 /// projected string can never succeed. Parsing also makes the route
 /// format-agnostic the way C#'s `Guid` lookup is. `Name` is still honored when
 /// supplied; a request matching no library (by either) is a `404`.
+///
+/// **Missing options.** A body without `LibraryOptions` (or with `null`) is a
+/// `400` and writes nothing. Upstream fails the same request after its lookup,
+/// with a 500 from the `request.LibraryOptions!` dereference; the 400 names the
+/// field the client has to send (the route's `VERIFIED` row).
 #[utoipa::path(
     post,
     path = "/Library/VirtualFolders/LibraryOptions",
     request_body = UpdateLibraryOptionsBody,
     responses(
         (status = 204, description = "Library updated"),
+        (status = 400, description = "LibraryOptions missing or null"),
         (status = 404, description = "Item not found")
     ),
     tag = "ferrofin"
@@ -551,7 +562,6 @@ async fn update_library_options(
     FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     JsonBody(body): JsonBody<UpdateLibraryOptionsBody>,
 ) -> Result<StatusCode, ApiError> {
-    let options = body.library_options.unwrap_or_default();
     // No name: resolve the library by its CollectionFolder id (what jellyfin-web
     // posts). Match the projected `ItemId` against the persisted virtual folders.
     let name = if let Some(name) = body.name.filter(|n| !n.trim().is_empty()) {
@@ -569,6 +579,12 @@ async fn update_library_options(
             .and_then(|f| f.name)
             .ok_or_else(|| ApiError::NotFound(format!("library {id}")))?
     };
+    // After the lookup, as upstream's `request.LibraryOptions!` dereference: a
+    // missing or null `LibraryOptions` is refused and nothing is written, never
+    // replaced by the defaults (which would wipe every setting and `PathInfos`).
+    let options = body
+        .library_options
+        .ok_or_else(|| ApiError::BadRequest("LibraryOptions must not be null".to_owned()))?;
     state
         .virtual_folders
         .update_library_options(&name, &options)

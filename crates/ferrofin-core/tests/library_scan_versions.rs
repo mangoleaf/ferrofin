@@ -1488,7 +1488,8 @@ async fn a_primarys_metadata_reaches_its_versions_and_parts_once() {
         }
     };
     assert_eq!(ids(version.id.clone()).await, ids(primary.id.clone()).await);
-    assert!(!ids(primary.id.clone()).await.is_empty());
+    let found = ids(primary.id.clone()).await;
+    assert!(!found.is_empty(), "{found:?}");
     let genre_links: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*) FROM "ItemValuesMap" m JOIN "ItemValues" v
            ON v."ItemValueId" = m."ItemValueId" WHERE m."ItemId" = ? AND v."Type" = 2"#,
@@ -1668,13 +1669,11 @@ async fn a_restricted_user_gets_no_parts_of_a_movie_rated_above_them() {
         1
     );
     let restricted = user_row(Some(13)).await;
-    assert!(
-        manager
-            .get_additional_parts(&primary, Some(&restricted))
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let additional_parts = manager
+        .get_additional_parts(&primary, Some(&restricted))
+        .await
+        .unwrap();
+    assert!(additional_parts.is_empty(), "{additional_parts:?}");
 }
 
 /// A local version with an NFO of its own keeps what its NFO says until
@@ -1930,6 +1929,79 @@ async fn by_date_episodes_in_one_season_stay_separate() {
     assert_eq!(primary.primary_version_id, None);
 }
 
+/// A tvshows folder's episodes are named and dated as `ResolveVideos<Episode>`
+/// has them (`parseName: true`; `Name = video.Name`, `ProductionYear =
+/// video.Year`, `MovieResolver.cs:234,305-306`): the file name cut by
+/// `CleanDateTime` and `CleanString`, a stack by its stack name. A local
+/// alternate resolves on its own through `EpisodeResolver` and a stacked part
+/// is a `Video`: both keep the file name, as does an episode of an untyped
+/// library's series, which `MovieResolver` leaves to `EpisodeResolver`
+/// (`MovieResolver.cs:219-222`). A local version still takes its primary's
+/// year when the primary is saved (`Video.UpdateToRepositoryAsync`,
+/// `Video.cs:704-726`). A rescan keeps every name.
+#[tokio::test]
+async fn episodes_take_the_resolvers_parsed_name_and_year() {
+    const CLUTTERED: &str = "Show/Season 1/Show.S01E05.1080p.WEB-DL.mkv";
+    const TITLED: &str = "Show/Season 1/Show - S01E06 - Title.mkv";
+    const DATED_1080: &str = "Show/Season 1/Show (2001) - S01E07 - 1080p.mkv";
+    const DATED_720: &str = "Show/Season 1/Show (2001) - S01E07 - 720p.mkv";
+    let f = shows(&[
+        SNL_DEC16, SNL_DEC09, CLUTTERED, TITLED, DATED_1080, DATED_720, E01_1080, E01_720,
+        E03_PART1, E03_PART2,
+    ])
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    f.scanner.scan_all().await.unwrap();
+
+    for (file, kind, name, year) in [
+        (SNL_DEC16, "Episode", "Show", Some(1975)),
+        (SNL_DEC09, "Episode", "Show", Some(1975)),
+        (CLUTTERED, "Episode", "Show.S01E05", None),
+        (TITLED, "Episode", "Show - S01E06 - Title", None),
+        (DATED_1080, "Episode", "Show", Some(2001)),
+        (
+            DATED_720,
+            "Episode",
+            "Show (2001) - S01E07 - 720p",
+            Some(2001),
+        ),
+        (E01_1080, "Episode", "Show - S01E01 -", None),
+        (E01_720, "Episode", "Show - S01E01 - 720p", None),
+        (E03_PART1, "Episode", "Show - S01E03", None),
+        (E03_PART2, "Video", "Show - S01E03 - part2", None),
+    ] {
+        let row = f.row(file).await;
+        assert_eq!(kind_of(&row), kind, "{file}");
+        assert_eq!(row.name.as_deref(), Some(name), "{file}");
+        assert_eq!(row.production_year, year, "{file}");
+    }
+    // `Episode.CreateSortName`: an airing named after its show sorts by its
+    // season alone, so two airings tie on `SortName` (as in Jellyfin); their
+    // air dates order them (`AiredEpisodeOrderComparer.CompareEpisodes`).
+    let aired = |row: &BaseItemEntity| ferrofin_model::entities_media::AiredEpisodeOrder {
+        season: row.parent_index_number,
+        episode: row.index_number,
+        premiere: row.premiere_date,
+        airs_before_season: None,
+        airs_after_season: None,
+        airs_before_episode: None,
+    };
+    let (dec09, dec16) = (f.row(SNL_DEC09).await, f.row(SNL_DEC16).await);
+    assert_eq!(dec16.sort_name.as_deref(), Some("049 - Show"));
+    assert_eq!(dec09.sort_name, dec16.sort_name);
+    assert_eq!(
+        aired(&dec09).compare(&aired(&dec16)),
+        std::cmp::Ordering::Less
+    );
+
+    let untyped = Fixture::new(&["Show/tvshow.nfo", CLUTTERED], None).await;
+    untyped.scanner.scan_all().await.unwrap();
+    let row = untyped.row(CLUTTERED).await;
+    assert_eq!(kind_of(&row), "Episode");
+    assert_eq!(row.name.as_deref(), Some("Show.S01E05.1080p.WEB-DL"));
+    assert_eq!(row.production_year, None);
+}
+
 /// A two-part episode is ONE episode: its first file the `Episode`, listing
 /// the other as `AdditionalParts`, which is a `Video` it owns, hung in its
 /// season in its folder state (`Video.RefreshMetadataForOwnedVideo`). The
@@ -2158,7 +2230,7 @@ async fn next_up_of(
     let top = Uuid::parse_str(episode.top_parent_id.as_deref().unwrap()).unwrap();
     let service = ferrofin_core::FerrofinNextUpService::new(f.db.clone());
     let filter = ferrofin_traits::options::InternalItemsQuery {
-        user: Some(user_row(f, user).await),
+        user: Some(Arc::new(user_row(f, user).await)),
         top_parent_ids: vec![top],
         ..Default::default()
     };
@@ -2453,7 +2525,7 @@ async fn every_version_a_user_may_open_passes_the_source_filter() {
     let user = user_row_of(&f, user).await;
     let visible = |grouped: bool| {
         let mut q = query(grouped);
-        q.user = Some(user.clone());
+        q.user = Some(Arc::new(user.clone()));
         q
     };
     assert_eq!(repo.get_item_ids(&visible(false)).await.unwrap().len(), 3);

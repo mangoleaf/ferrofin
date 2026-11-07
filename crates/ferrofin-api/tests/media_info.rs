@@ -82,7 +82,7 @@ impl AuthService for OkAuthService {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -99,7 +99,7 @@ impl AuthorizationContext for OkAuthContext {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             client: Some("Wolphin".to_owned()),
             version: Some("1.0".to_owned()),
             device_id: Some("dev-1".to_owned()),
@@ -435,8 +435,14 @@ impl UserViewManager for OkUserViews {
     async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         Ok(vec![base_item_entity(self.item_id)])
     }
-    async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        self.get_user_views(user_id).await
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_user_views(Uuid::nil()).await
+    }
+    async fn get_user_root_children(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_media_folders().await
     }
     async fn get_latest_items(
         &self,
@@ -1564,6 +1570,209 @@ async fn auto_open_live_stream_opens_a_source_that_requires_opening() {
     );
 }
 
+/// An HTTP M3U tuner source as the Live TV manager builds it, read from `path`.
+fn tuner_source(path: &str) -> MediaSourceInfo {
+    MediaSourceInfo {
+        id: Some("channel".to_owned()),
+        path: Some(path.to_owned()),
+        path_is_private: true,
+        protocol: ferrofin_model::media_info::MediaProtocol::Http,
+        requires_opening: true,
+        is_infinite_stream: true,
+        open_token: Some("tok".to_owned()),
+        supports_direct_play: true,
+        supports_direct_stream: true,
+        supports_transcoding: true,
+        ..MediaSourceInfo::default()
+    }
+}
+
+/// A tuner's upstream channel URL.
+const TUNER_URL: &str = "http://iptv.example/live/user/secret/1.ts";
+
+/// An unopened Live TV source's `Path` is the tuner's upstream channel URL,
+/// which for an IPTV service carries the account's credentials. A caller who
+/// is not an administrator gets it blank, and no direct play: jellyfin-web
+/// plays `Path` as it stands while `SupportsDirectPlay` is set, so the client
+/// has to stream through the server instead.
+#[tokio::test]
+async fn unopened_live_source_path_is_hidden_from_a_caller_who_is_not_an_administrator() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let channel = tuner_source(TUNER_URL);
+    let json = post_versions(item_id, versioned(vec![channel]), &serde_json::json!({})).await;
+    let source = &json["MediaSources"][0];
+    assert_eq!(source["Id"], "channel", "{json}");
+    assert_eq!(source["Path"], "", "{source}");
+    assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+    assert_eq!(source["SupportsDirectStream"], true, "{source}");
+    assert_eq!(source["OpenToken"], "tok", "{source}");
+}
+
+/// With no profile nothing negotiates the source, and a user who may not remux
+/// has it direct playable but not direct streamable. Taking direct play must
+/// not leave it unplayable: the relay is the way left.
+#[tokio::test]
+async fn a_hidden_source_that_could_be_direct_played_stays_direct_streamable() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let channel = MediaSourceInfo {
+        supports_direct_stream: false,
+        ..tuner_source(TUNER_URL)
+    };
+    let json = post_versions(item_id, versioned(vec![channel]), &serde_json::json!({})).await;
+    let source = &json["MediaSources"][0];
+    assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+    assert_eq!(source["SupportsDirectStream"], true, "{source}");
+}
+
+/// The `GET` form answers as the `POST` form does.
+#[tokio::test]
+async fn the_get_form_of_playback_info_hides_a_tuner_url() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let state = versions_state(
+        item_id,
+        versioned(vec![tuner_source(TUNER_URL)]),
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    );
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    let source = &json["MediaSources"][0];
+    assert_eq!(source["Path"], "", "{source}");
+    assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+}
+
+/// The same request from an administrator: the URL and direct play stay.
+#[tokio::test]
+async fn an_administrator_keeps_a_tuner_url() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let state = ok_state_parts(
+        item_id,
+        versioned(vec![tuner_source(TUNER_URL)]),
+        Arc::new(ferrofin_api::test_support::FakeAdminUsers),
+        Arc::new(OkAuthContext),
+        Arc::new(OkAuthService),
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    );
+    let json = post_playback(state, item_id, Some(&serde_json::json!({}))).await;
+    let source = &json["MediaSources"][0];
+    assert_eq!(source["Path"], TUNER_URL, "{source}");
+    assert_eq!(source["SupportsDirectPlay"], true, "{source}");
+}
+
+/// An opened stream that is not shared keeps the tuner URL as its path. Both
+/// routes that open one hide it, and a device profile that would direct play
+/// the source leaves the client direct streaming it through the server: that
+/// is the only way left to read it, so no `TranscodingUrl` is needed.
+#[tokio::test]
+async fn an_opened_tuner_source_is_hidden_on_both_routes_that_open_it() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let opened = MediaSourceInfo {
+        path: Some("http://iptv.example/live/user/secret/1.mp4".to_owned()),
+        live_stream_id: Some("live-1".to_owned()),
+        path_is_private: true,
+        protocol: ferrofin_model::media_info::MediaProtocol::Http,
+        requires_opening: true,
+        is_infinite_stream: true,
+        ..opened_live("aac")
+    };
+    let devices = || Arc::new(ferrofin_api::test_support::FakeDevices);
+    let body = serde_json::json!({
+        "OpenToken": "tok",
+        "ItemId": item_id,
+        "DeviceProfile": web_profile(),
+    });
+
+    let sources = versioned_opening(vec![tuner_source(TUNER_URL)], opened.clone());
+    let json = post_open(versions_state(item_id, sources, devices()), &body).await;
+    let by_open = json["MediaSource"].clone();
+
+    let sources = versioned_opening(vec![tuner_source(TUNER_URL)], opened);
+    let body = serde_json::json!({ "AutoOpenLiveStream": true, "DeviceProfile": web_profile() });
+    let json = post_playback(
+        versions_state(item_id, sources, devices()),
+        item_id,
+        Some(&body),
+    )
+    .await;
+    let by_playback_info = json["MediaSources"][0].clone();
+
+    for source in [by_open, by_playback_info] {
+        assert_eq!(source["LiveStreamId"], "live-1", "{source}");
+        assert_eq!(source["Path"], "", "{source}");
+        assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+        assert_eq!(source["SupportsDirectStream"], true, "{source}");
+        assert!(source.get("TranscodingUrl").is_none(), "{source}");
+    }
+}
+
+/// A shared stream's path is the server's own buffer, which holds no
+/// credentials, but the client reads it through the same route as any other
+/// tuner source, so one rule covers them all.
+#[tokio::test]
+async fn a_buffered_tuner_source_is_hidden_too() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let opened = MediaSourceInfo {
+        path: Some(PUBLISHED_BUFFER.to_owned()),
+        live_stream_id: Some("live-1".to_owned()),
+        ..tuner_source(TUNER_URL)
+    };
+    let state = versions_state(
+        item_id,
+        versioned_opening(vec![tuner_source(TUNER_URL)], opened),
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    );
+    let json = post_open(state, &serde_json::json!({ "OpenToken": "tok" })).await;
+    let source = &json["MediaSource"];
+    assert_eq!(source["Path"], "", "{source}");
+    assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+}
+
+/// The decision covers the sources `create_media_source_info` builds. An opened
+/// HDHomeRun stream is `Http` and requires opening like one, and a `.strm`
+/// shortcut's target is `Http` too: both stay as Jellyfin answers them.
+#[tokio::test]
+async fn sources_that_are_not_private_keep_their_path_and_direct_play() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let hdhomerun = MediaSourceInfo {
+        id: Some("native_a_b".to_owned()),
+        path: Some("http://192.168.1.20:5004/auto/v2.1".to_owned()),
+        path_is_private: false,
+        live_stream_id: Some("live-1".to_owned()),
+        ..tuner_source(TUNER_URL)
+    };
+    let shortcut = MediaSourceInfo {
+        id: Some("strm".to_owned()),
+        path: Some("https://cdn.example/film.mp4".to_owned()),
+        protocol: ferrofin_model::media_info::MediaProtocol::Http,
+        is_remote: true,
+        supports_direct_play: true,
+        ..MediaSourceInfo::default()
+    };
+    // In one list with a private source, so that only that source is blanked.
+    let json = post_versions(
+        item_id,
+        versioned(vec![hdhomerun, shortcut, tuner_source(TUNER_URL)]),
+        &serde_json::json!({}),
+    )
+    .await;
+    let sources = &json["MediaSources"];
+    assert_eq!(sources[0]["Path"], "http://192.168.1.20:5004/auto/v2.1");
+    assert_eq!(sources[0]["SupportsDirectPlay"], true, "{json}");
+    assert_eq!(sources[1]["Path"], "https://cdn.example/film.mp4");
+    assert_eq!(sources[1]["SupportsDirectPlay"], true, "{json}");
+    assert_eq!(sources[2]["Path"], "", "{json}");
+    assert_eq!(sources[2]["SupportsDirectPlay"], false, "{json}");
+}
+
 /// A [`DeviceManager`](ferrofin_traits::devices::DeviceManager) whose stored
 /// capabilities carry the web profile, recording which device was asked for.
 struct ProfileDevices {
@@ -1856,7 +2065,7 @@ struct TranscodingAuth;
 impl TranscodingAuth {
     fn info() -> AuthorizationInfo {
         AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
                 enable_audio_playback_transcoding: true,
                 enable_video_playback_transcoding: true,
@@ -2331,4 +2540,108 @@ async fn a_direct_play_veto_keeps_the_direct_play_transcode_reasons(
     assert_eq!(hls_transcode(&source).0, "ts", "{source}");
     let url = source["TranscodingUrl"].as_str().expect("a transcode");
     assert_eq!(url_param(url, "TranscodeReasons"), Some(reasons), "{url}");
+}
+
+/// `source` carrying one font attachment at stream index `index`.
+fn with_font(source: MediaSourceInfo, index: i32) -> MediaSourceInfo {
+    MediaSourceInfo {
+        media_attachments: vec![ferrofin_model::entities_media::MediaAttachment {
+            codec: Some("ttf".to_owned()),
+            index,
+            file_name: Some("font.ttf".to_owned()),
+            mime_type: Some("application/x-truetype-font".to_owned()),
+            ..Default::default()
+        }],
+        ..source
+    }
+}
+
+/// The `DeliveryUrl` of each source's first attachment, by source id.
+fn attachment_urls(sources: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
+    let mut urls: Vec<_> = sources
+        .as_array()
+        .expect("sources")
+        .iter()
+        .map(|source| {
+            (
+                source["Id"].as_str().expect("id").to_owned(),
+                source["MediaAttachments"][0]["DeliveryUrl"].clone(),
+            )
+        })
+        .collect();
+    urls.sort_by(|a, b| a.0.cmp(&b.0));
+    urls
+}
+
+/// gl-1134: `MediaInfoHelper.SetDeviceSpecificData` (v12.4) ends by giving
+/// every attachment of each negotiated source the URL
+/// `/Videos/{item.Id}/{mediaSource.Id}/Attachments/{Index}`, the item id in
+/// .NET's default (hyphenated) spelling and the queried item's for every
+/// version. jellyfin-web hands each font's URL to its ASS renderer. Without a
+/// profile (none posted, none stored) no source is negotiated, so none gets
+/// one, as upstream calls `SetDeviceSpecificData` only with a profile.
+#[tokio::test]
+async fn a_negotiated_source_gives_each_attachment_its_delivery_url() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let sources = || {
+        versioned(vec![
+            with_font(version("v1", "aac"), 4),
+            with_font(version("v2", "ac3"), 5),
+        ])
+    };
+    let json = post_versions(
+        item_id,
+        sources(),
+        &serde_json::json!({"DeviceProfile": web_profile()}),
+    )
+    .await;
+    let item = item_id.as_hyphenated();
+    assert_eq!(
+        attachment_urls(&json["MediaSources"]),
+        [
+            (
+                "v1".to_owned(),
+                serde_json::json!(format!("/Videos/{item}/v1/Attachments/4"))
+            ),
+            (
+                "v2".to_owned(),
+                serde_json::json!(format!("/Videos/{item}/v2/Attachments/5"))
+            ),
+        ],
+        "{json}"
+    );
+
+    let json = post_versions(item_id, sources(), &serde_json::json!({})).await;
+    assert_eq!(
+        attachment_urls(&json["MediaSources"]),
+        [
+            ("v1".to_owned(), serde_json::Value::Null),
+            ("v2".to_owned(), serde_json::Value::Null),
+        ],
+        "{json}"
+    );
+}
+
+/// gl-1134: `POST /LiveStreams/Open` negotiates the opened source through the
+/// same `SetDeviceSpecificData` (`MediaInfoHelper.OpenMediaSource`), so its
+/// attachments get their URLs under the requested item.
+#[tokio::test]
+async fn an_opened_live_stream_gives_each_attachment_its_delivery_url() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let sources = versioned_opening(vec![version("v1", "aac")], with_font(opened_live("aac"), 6));
+    let state = versions_state(
+        item_id,
+        sources,
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    );
+    let json = post_open(
+        state,
+        &serde_json::json!({"OpenToken": "tok", "ItemId": item_id, "DeviceProfile": web_profile()}),
+    )
+    .await;
+    assert_eq!(
+        json["MediaSource"]["MediaAttachments"][0]["DeliveryUrl"],
+        format!("/Videos/{}/opened/Attachments/6", item_id.as_hyphenated()),
+        "{json}"
+    );
 }

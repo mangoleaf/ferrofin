@@ -576,7 +576,7 @@ mod tests {
         assert!(!is_sw_tonemap_available(&stock, Some(&s)));
 
         // 8-bit or SDR sources have nothing to map.
-        let mut eight = s.clone();
+        let mut eight = s;
         eight.pixel_format = Some("yuv420p".to_owned());
         assert!(!is_sw_tonemap_available(&caps, Some(&eight)));
         let sdr = hdr(VideoRangeType::Sdr);

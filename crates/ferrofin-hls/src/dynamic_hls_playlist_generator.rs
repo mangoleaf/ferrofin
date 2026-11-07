@@ -579,7 +579,8 @@ mod tests {
             segment_start_ticks(&[7.12, 1.88, 4.32, 2.023]),
             vec![0, 71_200_000, 90_000_000, 133_200_000]
         );
-        assert!(segment_start_ticks(&[]).is_empty());
+        let found = segment_start_ticks(&[]);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

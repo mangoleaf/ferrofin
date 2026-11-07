@@ -12,7 +12,8 @@
 //! rest of the same C# function: it runs the synthetic MJPEG job through the
 //! hardware matrix in [`crate::encoding_helper::hw`]. It is chosen per job when
 //! the request allows hardware, the configured accelerator has a ported filter
-//! chain, and a video stream is available to size it from — otherwise the
+//! chain, a video stream is available to size it from, and something runs on
+//! the GPU (a hardware decoder or a hardware MJPEG encoder) — otherwise the
 //! software path. A failed keyframe-only run retries on the path it took.
 //!
 //! The three switches come from `TrickplayOptions`, **not** from the playback
@@ -43,9 +44,74 @@
 //!   `setpts` (keyframe-only, or a stream with no frame rate), where it is
 //!   merely harmless: `fps=` thins the frames by time either way.
 //! - The software graph is assembled here (deinterlacer, scale, `setpts`,
-//!   `fps=` for an interlaced source; `setpts`, `fps=`, scale otherwise) rather
-//!   than through `sw_vid_filter_chain` and `video_processing_filter_args`, so
-//!   it keeps the `dar`-aware scale expression above. The order is upstream's.
+//!   `fps=` for an interlaced source; `setpts`, `fps=`, scale otherwise; an
+//!   HDR source's `setparams` ahead of the deinterlacer or the scale and its
+//!   `tonemapx` behind the scale) rather than through `sw_vid_filter_chain`
+//!   and `video_processing_filter_args`, so it keeps the `dar`-aware scale
+//!   expression above. The order is upstream's.
+//! - With `TrickplayExtraction::full_chroma`, the software graph holds frames
+//!   at 4:4:4 from the scale on (`format=yuvj444p`), by owner decision. With it
+//!   off the graph has no format filter, where upstream's chain ends in
+//!   `format=yuv420p`. The hardware path stays 4:2:0: its frames go through a
+//!   hardware decoder, scaler or encoder.
+//! - A job with nothing on the GPU, a source it cannot decode and a software
+//!   MJPEG encoder, takes this software path even with trickplay hardware
+//!   acceleration on. Every vendor chain hands such a job to
+//!   `GetSwVidFilterChain`, which this path ports, so it keeps full chroma, the
+//!   tone-map and the conversion below. Only the filter graph differs from
+//!   the vendor chain's. Neither initialises a device for such a job, except
+//!   upstream with VAAPI or QSV when the server's hardware encoding is on, its
+//!   MJPEG encoder is available (iHD for VAAPI) and trickplay's switch is off,
+//!   which starts a device nothing uses.
+//! - The software scale converts the frame to the BT.601 matrix
+//!   (`out_color_matrix=bt601`), the one every JPEG decoder reads, the tile
+//!   packer's included. ffmpeg converts the range to the JPEG's full range
+//!   itself. Upstream's chain re-tags an SDR frame BT.709 (`setparams`) and
+//!   converts no matrix, so a BT.709 source, which means most HD and 4K
+//!   video, comes out with shifted reds and greens: a Jellyfin bug not
+//!   ported (gl-1129). The scale takes the source's matrix from the frame's
+//!   tag and reads an untagged frame as BT.601, so BT.601 sources are not
+//!   converted, and neither are untagged ones, which players often show as
+//!   BT.709 when they are HD. The conversion needs ffmpeg 5.1 or later
+//!   ([`MIN_FFMPEG_JPEG_MATRIX_CONVERSION`]); an older one gets none and
+//!   gives upstream's colours. On the hardware path, frames a hardware decoder
+//!   hands the software MJPEG encoder get the same conversion at the end of
+//!   the graph, from the matrix they really hold (BT.709 when tone-mapped,
+//!   else the probed colour space), not from the BT.709 the chain's
+//!   `setparams` re-tags every SDR frame with. That was measured on NVENC;
+//!   the VAAPI and QSV downloads (`nv12`, limited or full range) were measured
+//!   with CPU scalers in their formats, not on Intel or AMD hardware. Frames
+//!   for a hardware MJPEG encoder (VAAPI, QSV) keep the source's matrix, as
+//!   upstream's do: open work (gl-1169), which needs that hardware to verify.
+//! - The tone-map of an HDR source departs twice. `tonemapx` writes BT.709,
+//!   so the BT.601 conversion above moves out of the scale, where it would
+//!   convert the BT.2020 input, into a `scale=out_color_matrix=bt601` behind
+//!   the tone-map, under the same ffmpeg 5.1 floor. With full chroma the
+//!   tone-map goes ahead of the scale: `tonemapx` writes 4:2:0 only, so behind
+//!   the scale it would halve the chroma the scale just built. It then runs
+//!   at the source's resolution, on each sampled frame, or on each decoded
+//!   frame of an interlaced source, whose sampler comes last.
+//! - On an ffmpeg without `tonemapx`, an HDR frame is not re-tagged BT.709 as
+//!   upstream's is. The scale converts its BT.2020 matrix to BT.601, and the
+//!   frame stays un-tone-mapped, as it does upstream.
+//! - Several widths of one video are made from one decode (gl-1228), where
+//!   upstream's `RefreshTrickplayDataAsync` runs this function once per width
+//!   and so decodes the video once per width. Each width's run is built as
+//!   above, and when their input, map and encoder options agree, one ffmpeg
+//!   run takes them all: the filters every width's graph starts with run once
+//!   and are `split`, each width's remaining filters follow on its own branch,
+//!   and each branch has its own image sequence in its own directory. A
+//!   width's frames go through the same filters in the same order as in its
+//!   own run, so they come out the same. That holds on the software path and
+//!   on NVENC, where the split comes behind the GPU deinterlacer and ahead of
+//!   `scale_cuda`; both were compared frame by frame against one run per
+//!   width. VAAPI and QSV scale on the GPU too, so their split would share
+//!   hardware frames, which no Intel or AMD device has verified: those chains
+//!   keep one run per width until that is checked on their hardware (open
+//!   work, gl-1237). A shared run that fails, after its standard-way retry
+//!   when it was keyframe-only, falls back to one run per width, so one
+//!   width's failure cannot cost the others their frames. One width is always
+//!   its own run, as upstream's.
 //! - The C# creates the temp output directory itself; here the caller owns the
 //!   output directory (the trickplay manager passes a temp dir and cleans it
 //!   up), so the extractor only creates and fills it.
@@ -63,7 +129,9 @@ use ferrofin_model::entities::HardwareAccelerationType;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::media_encoding::{TrickplayExtraction, TrickplayFrameExtractor};
+use ferrofin_traits::media_encoding::{
+    TrickplayExtraction, TrickplayFrameExtractor, TrickplayOutput,
+};
 
 use super::Transcoder;
 
@@ -80,6 +148,15 @@ fn pts_frame_rate(stream: Option<&MediaStream>) -> Option<f32> {
         .filter(|rate| *rate > 0.0)
 }
 
+/// The oldest ffmpeg line measured to convert a 4:2:0 frame to the BT.601
+/// matrix correctly while the JPEG encoder takes it to full range. On flat
+/// colour bars, 5.1.9, 6.1.1, 7.1.3 and later bring a BT.709 source within 2
+/// levels of its colours, while 4.4.2 lands up to 15 off. Below this the
+/// software graph converts no matrix and gives upstream's colours (see the
+/// module's departures), and so does the image extraction of
+/// [`crate::encoder::media_encoder`].
+pub const MIN_FFMPEG_JPEG_MATRIX_CONVERSION: FfmpegVersion = FfmpegVersion::new(5, 1);
+
 /// `setpts=N/{rate:F3}/TB,`, the filter upstream splices in front of the
 /// `fps=` sampler (`MediaEncoder.cs:948`). Numbering frames from the decode
 /// counter stops a container with corrupt timestamps or duration from making
@@ -95,6 +172,142 @@ fn map_argument(map_index: Option<i32>) -> String {
     map_index
         .map(|index| format!(" -map 0:{index}"))
         .unwrap_or_default()
+}
+
+/// One width's trickplay ffmpeg run, in its parts: the input and the encoder
+/// options, which a run of several widths shares ([`combined_args`]), and the
+/// graph and the output, which each width has.
+#[derive(Debug, Clone)]
+struct TrickplayCommand {
+    /// `-loglevel error … -i file:"…"`: the input and every option ahead of
+    /// it.
+    input: String,
+    /// The output options ahead of the map: ` -noautoscale` behind a hardware
+    /// decoder.
+    stream_options: &'static str,
+    /// The video stream's ffmpeg input index ([`map_argument`]).
+    map_index: Option<i32>,
+    /// The graph's option, `-vf`.
+    flag: &'static str,
+    /// The filter graph.
+    graph: String,
+    /// The encoder options, `-threads … -c:v … -f image2`.
+    encode: String,
+    /// ffmpeg's thread count, which a run of several widths gives its graph.
+    threads: i32,
+    /// The numbered-JPEG output pattern.
+    output: String,
+}
+
+impl TrickplayCommand {
+    /// The argument line of this width's own run.
+    fn args(&self) -> String {
+        format!(
+            "{input}{stream_options}{map} -an -sn {flag} \"{graph}\" {encode} {output}",
+            input = self.input,
+            stream_options = self.stream_options,
+            map = map_argument(self.map_index),
+            flag = self.flag,
+            graph = self.graph,
+            encode = self.encode,
+            output = quote(&self.output),
+        )
+    }
+}
+
+/// The filters of a `-vf` graph, split at the commas that separate them: not
+/// at an escaped comma (`\,`, as in the software scale's expression) or one
+/// inside single quotes. A backslash inside quotes counts as an escape here,
+/// where ffmpeg takes it literally; no trickplay graph quotes one.
+fn filters_of(graph: &str) -> Vec<&str> {
+    let mut filters = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (at, c) in graph.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '\'' {
+            quoted = !quoted;
+        } else if c == ',' && !quoted {
+            filters.push(&graph[start..at]);
+            start = at + 1;
+        }
+    }
+    filters.push(&graph[start..]);
+    filters
+}
+
+/// The argument line of one run that makes every width of `commands` from a
+/// single decode, or `None` when they cannot share one (fewer than two, a
+/// different input, map or encoder, no mapped stream, or a graph that is not
+/// a `-vf` chain).
+///
+/// The graphs' longest common run of filters is applied once and `split`
+/// behind it, and each width's remaining filters follow on their branch, into
+/// an output of its own. Each width's frames thus go through the same filters
+/// in the same order as in its own run, and come out the same. The graph is
+/// given the encoder's thread count (`-filter_complex_threads`), as a `-vf`
+/// chain takes it from `-threads`.
+fn combined_args(commands: &[TrickplayCommand]) -> Option<String> {
+    use std::fmt::Write as _;
+
+    let [first, others @ ..] = commands else {
+        return None;
+    };
+    let index = first.map_index?;
+    if others.is_empty()
+        || first.flag != "-vf"
+        || others.iter().any(|other| {
+            other.input != first.input
+                || other.stream_options != first.stream_options
+                || other.map_index != first.map_index
+                || other.flag != first.flag
+                || other.encode != first.encode
+        })
+    {
+        return None;
+    }
+    let graphs: Vec<Vec<&str>> = commands.iter().map(|c| filters_of(&c.graph)).collect();
+    let shared = graphs[0]
+        .iter()
+        .enumerate()
+        .take_while(|(at, filter)| graphs.iter().all(|graph| graph.get(*at) == Some(filter)))
+        .count();
+
+    let mut graph = format!("[0:{index}]");
+    for filter in &graphs[0][..shared] {
+        let _ = write!(graph, "{filter},");
+    }
+    let _ = write!(graph, "split={}", commands.len());
+    for at in 0..commands.len() {
+        let _ = write!(graph, "[tp{at}s]");
+    }
+    for (at, filters) in graphs.iter().enumerate() {
+        let rest = &filters[shared..];
+        let branch = if rest.is_empty() {
+            "null".to_owned()
+        } else {
+            rest.join(",")
+        };
+        let _ = write!(graph, ";[tp{at}s]{branch}[tp{at}]");
+    }
+
+    let mut args = format!(
+        "{input} -filter_complex_threads {threads} -filter_complex \"{graph}\"",
+        input = first.input,
+        threads = first.threads,
+    );
+    for (at, command) in commands.iter().enumerate() {
+        let _ = write!(
+            args,
+            " -map \"[tp{at}]\"{stream_options} -an -sn {encode} {output}",
+            stream_options = command.stream_options,
+            encode = command.encode,
+            output = quote(&command.output),
+        );
+    }
+    Some(args)
 }
 
 /// The concrete trickplay frame extractor: builds the ffmpeg argument line and
@@ -223,7 +436,8 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
 /// exact rational `1000/interval_ms`; the `scale` expression is Jellyfin's
 /// width-bounded software scaler (`trunc(min(max(iw,ih*dar),W)/2)*2` by
 /// `trunc(ow/dar/2)*2`), which keeps both dimensions even and honours
-/// anamorphic sources.
+/// anamorphic sources. Unlike Jellyfin's, it also converts the frame to the
+/// JPEG's BT.601 matrix on ffmpeg 5.1 and later (the module's departures).
 ///
 /// `pts_frame_rate` is `Some` when the timestamps are rebuilt in front of the
 /// sampler (keyframe-only extraction configured off; see [`pts_normalizer`]).
@@ -235,6 +449,18 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
 /// `IsDeinterlaceAvailable`). It goes ahead of the scale, and the sampling
 /// `fps=` (with `setpts` in front) then moves to the end, behind it, as
 /// `GetVideoProcessingFilterParam` places it (PR 17058).
+///
+/// `full_chroma` has no upstream counterpart: it holds the frame at 4:4:4 from
+/// the scale on (`TrickplayOptions::full_chroma`). A 16x16 chroma block is
+/// about 5% of a 320px thumbnail wide, and frames are only the input to the
+/// tile, so subsampling them is loss the tile can never win back.
+///
+/// `tonemap` is the software tone-map of an HDR source ([`SwTonemap`]); the
+/// module's departures say where it goes in the graph.
+///
+/// `input_threads` puts `-threads {threads}` ahead of the input too, as
+/// upstream does only while trickplay may not use hardware (`!allowHwAccel`,
+/// `MediaEncoder.cs:914-917`), and ffmpeg otherwise picks the decode threads.
 #[must_use]
 #[allow(
     clippy::too_many_arguments,
@@ -253,7 +479,51 @@ pub fn build_trickplay_args(
     pts_frame_rate: Option<f32>,
     map_index: Option<i32>,
     deinterlace: Option<&str>,
+    full_chroma: bool,
+    tonemap: Option<&SwTonemap>,
+    input_threads: bool,
 ) -> String {
+    software_command(
+        input_path,
+        interval_ms,
+        max_width,
+        qscale,
+        threads,
+        output_pattern,
+        ffmpeg_version,
+        keyframe_only,
+        pts_frame_rate,
+        map_index,
+        deinterlace,
+        full_chroma,
+        tonemap,
+        input_threads,
+    )
+    .args()
+}
+
+/// [`build_trickplay_args`] in its parts, which [`combined_args`] puts
+/// together for a run of several widths.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the argument list of `build_trickplay_args`, which it builds"
+)]
+fn software_command(
+    input_path: &str,
+    interval_ms: i32,
+    max_width: i32,
+    qscale: i32,
+    threads: i32,
+    output_pattern: &str,
+    ffmpeg_version: Option<FfmpegVersion>,
+    keyframe_only: bool,
+    pts_frame_rate: Option<f32>,
+    map_index: Option<i32>,
+    deinterlace: Option<&str>,
+    full_chroma: bool,
+    tonemap: Option<&SwTonemap>,
+    input_threads: bool,
+) -> TrickplayCommand {
     // ffmpeg qscale is 1 (best) – 31 (worst); C# clamps the configured value.
     let qscale = qscale.clamp(1, 31);
     // Upstream funnels the software and hardware paths through the same
@@ -270,20 +540,93 @@ pub fn build_trickplay_args(
         ""
     };
     let setpts = pts_frame_rate.map(pts_normalizer).unwrap_or_default();
-    let map = map_argument(map_index);
     let sample = format!("{setpts}fps=1000/{interval_ms}");
     let scale = format!("scale=trunc(min(max(iw\\,ih*dar)\\,{max_width})/2)*2:trunc(ow/dar/2)*2");
-    let filters = match deinterlace {
-        Some(deinterlace) => format!("{deinterlace},{scale},{sample}"),
-        None => format!("{sample},{scale}"),
+    // The JPEG's matrix, BT.601, read from the frame's tag (the module's
+    // departures). An unprobed ffmpeg gets the older graph, as
+    // `video_sync_option` gives it the older option.
+    let convert = ffmpeg_version.is_some_and(|v| v >= MIN_FFMPEG_JPEG_MATRIX_CONVERSION);
+    let to_bt601 = if convert {
+        ":out_color_matrix=bt601"
+    } else {
+        ""
     };
-    format!(
-        "-loglevel error {skip_frame}-threads {threads} -i file:{input}{map} -an -sn \
-         -vf \"{filters}\" \
-         -threads {threads} -c:v mjpeg -qscale:v {qscale}{sync} -f image2 {output}",
-        input = quote(input_path),
-        output = quote(output_pattern),
-    )
+    let chroma = if full_chroma { ",format=yuvj444p" } else { "" };
+    let (tags, main) = match tonemap {
+        None => (String::new(), format!("{scale}{to_bt601}{chroma}")),
+        Some(SwTonemap {
+            input_params,
+            filter,
+        }) => {
+            let main = if full_chroma {
+                format!("{filter},{scale}{to_bt601}{chroma}")
+            } else if convert {
+                format!("{scale},{filter},scale=out_color_matrix=bt601")
+            } else {
+                format!("{scale},{filter}")
+            };
+            (format!("{input_params},"), main)
+        }
+    };
+    let filters = match deinterlace {
+        Some(deinterlace) => format!("{tags}{deinterlace},{main},{sample}"),
+        None => format!("{sample},{tags}{main}"),
+    };
+    let input_threads = if input_threads {
+        format!("-threads {threads} ")
+    } else {
+        String::new()
+    };
+    TrickplayCommand {
+        input: format!(
+            "-loglevel error {skip_frame}{input_threads}-i file:{input}",
+            input = quote(input_path),
+        ),
+        stream_options: "",
+        map_index,
+        flag: "-vf",
+        graph: filters,
+        encode: format!("-threads {threads} -c:v mjpeg -qscale:v {qscale}{sync} -f image2"),
+        threads,
+        output: output_pattern.to_owned(),
+    }
+}
+
+/// The software tone-map of an HDR source, for [`build_trickplay_args`]. Built
+/// by the extractor when `is_sw_tonemap_available` holds for the job.
+#[derive(Debug, Clone)]
+pub struct SwTonemap {
+    /// `GetInputHdrParam`: the `setparams` stating the source's BT.2020
+    /// primaries and PQ or HLG transfer, ahead of everything else.
+    pub input_params: String,
+    /// The `tonemapx=…` filter (`sw_tonemap_filter`).
+    pub filter: String,
+}
+
+impl SwTonemap {
+    /// The tone-map of `stream` with `options`' tone-mapping settings, or
+    /// `None` when `IsSwTonemapAvailable` does not hold for it under `caps`.
+    ///
+    /// The frame format is `yuv420p`, `GetSwVidFilterChain`'s for a software
+    /// decoder and a software MJPEG encoder.
+    #[must_use]
+    pub fn for_stream(
+        caps: &FfmpegCapabilities,
+        options: &EncodingOptions,
+        stream: Option<&MediaStream>,
+    ) -> Option<Self> {
+        use crate::encoding_helper::hw::{sw_chain, tonemap};
+
+        let stream = stream.filter(|s| tonemap::is_sw_tonemap_available(caps, Some(s)))?;
+        Some(Self {
+            input_params: tonemap::input_hdr_param(stream.color_transfer.as_deref()),
+            filter: sw_chain::sw_tonemap_filter(
+                options,
+                "yuv420p",
+                tonemap::requires_dovi_reshaping(Some(stream)),
+            ),
+        })
+    }
 }
 
 /// One trickplay extraction run, as the argument builders read it.
@@ -339,26 +682,39 @@ pub struct TrickplayJob<'a> {
 /// is switched off for trickplay, no accelerator is configured, the configured
 /// accelerator has no ported filter chain (see the `match` below), or
 /// keyframe-only extraction was asked for and this accelerator's decoder
-/// cannot do it. That last case is upstream's: decoding *every* frame on the
-/// GPU is slower than decoding keyframes on the CPU, so it drops to software
-/// rather than accept the trade.
+/// cannot do it. That case is upstream's: decoding *every* frame on the GPU is
+/// slower than decoding keyframes on the CPU, so it drops to software rather
+/// than accept the trade. It also returns `None` when nothing would run on the
+/// GPU, no hardware decoder for this source and a software MJPEG encoder: every
+/// vendor chain hands such a job to `GetSwVidFilterChain`, which
+/// [`build_trickplay_args`] ports.
 ///
 /// The environment is not decoration: the VAAPI branch sets
 /// `LIBVA_DRIVER_NAME`/`LIBVA_DRIVER_NAME_JELLYFIN` and `AMD_DEBUG`, and on a
 /// host with more than one libva driver installed, dropping them picks the
 /// wrong one. Callers must apply it to the ffmpeg child, as the planner does.
 #[must_use]
+pub fn build_accelerated_trickplay_args(
+    caps: &FfmpegCapabilities,
+    options: &EncodingOptions,
+    job: &TrickplayJob<'_>,
+) -> Option<(String, Vec<(String, String)>)> {
+    accelerated_command(caps, options, job).map(|(command, env)| (command.args(), env))
+}
+
+/// [`build_accelerated_trickplay_args`] in its parts, which [`combined_args`]
+/// puts together for a run of several widths.
 #[allow(
     clippy::too_many_lines,
     reason = "one synthetic encoding job assembled field by field, as upstream \
               does; splitting it would hide which fields the trickplay path \
               sets differently from a real transcode"
 )]
-pub fn build_accelerated_trickplay_args(
+fn accelerated_command(
     caps: &FfmpegCapabilities,
     options: &EncodingOptions,
     job: &TrickplayJob<'_>,
-) -> Option<(String, Vec<(String, String)>)> {
+) -> Option<(TrickplayCommand, Vec<(String, String)>)> {
     use crate::encoding_helper::hw;
 
     let &TrickplayJob {
@@ -424,6 +780,14 @@ pub fn build_accelerated_trickplay_args(
     } else {
         hw::encoder::DEFAULT_MJPEG_ENCODER.to_owned()
     };
+    let video_decoder = hw::decoder::hardware_video_decoder(&decode_ctx).unwrap_or_default();
+    // Nothing on the GPU: a source it cannot decode and a software encoder.
+    // Every vendor chain hands that job to `GetSwVidFilterChain`, which the
+    // software builder ports, with its full chroma and its conversion to the
+    // JPEG's matrix (the module's departures).
+    if video_decoder.is_empty() && video_encoder == hw::encoder::DEFAULT_MJPEG_ENCODER {
+        return None;
+    }
     let render_node = hw::device_init::RenderNode::resolve(options.vaapi_device.as_deref());
     let qsv_node = hw::device_init::RenderNode::resolve(options.qsv_device.as_deref());
     let hwaccel = hw::input_args::input_video_hwaccel_args(
@@ -433,7 +797,6 @@ pub fn build_accelerated_trickplay_args(
         qsv_node,
         true,
     );
-    let video_decoder = hw::decoder::hardware_video_decoder(&decode_ctx).unwrap_or_default();
 
     // Frame-rate deinterlacing only (see the module's departures).
     let chain_options = frame_rate_deinterlacing(options);
@@ -456,7 +819,10 @@ pub fn build_accelerated_trickplay_args(
         // `IsDeinterlaceAvailable` on a job whose `BaseRequest` asks for
         // nothing: an interlaced source forces it.
         deinterlace: stream.is_interlaced,
-        do_sw_tonemap: false,
+        // `GetSwVidFilterChain`'s own test, for the vendor chains that fall
+        // back to it with a hardware decoder or encoder (CUDA not fully
+        // supported, no VAAPI OpenCL interop).
+        do_sw_tonemap: hw::tonemap::is_sw_tonemap_available(caps, Some(stream)),
         do_hw_tonemap: hw::input_args::is_hw_tonemap_available(&decode_ctx, &video_decoder),
         vulkan_tonemap_available: hw::tonemap::is_vulkan_hw_tonemap_available(
             options,
@@ -530,6 +896,23 @@ pub fn build_accelerated_trickplay_args(
         graph.insert_str(at?, &pts_normalizer(rate));
     }
 
+    // Frames a hardware decoder hands the software MJPEG encoder are still in
+    // the source's matrix; convert them to the JPEG's BT.601, as the software
+    // path does (the module's departures). A hardware MJPEG encoder keeps them
+    // on the GPU, where nothing converts them yet (gl-1169).
+    if video_encoder == hw::encoder::DEFAULT_MJPEG_ENCODER
+        && caps
+            .ffmpeg_version()
+            .is_some_and(|v| v >= MIN_FFMPEG_JPEG_MATRIX_CONVERSION)
+        && let Some(matrix) = frame_matrix(stream, &graph)
+    {
+        use std::fmt::Write as _;
+        let _ = write!(
+            graph,
+            ",scale=in_color_matrix={matrix}:out_color_matrix=bt601"
+        );
+    }
+
     let (quality_option, quality) = mjpeg_quality(&video_encoder, qscale);
     let hwaccel_args = hwaccel.args.trim();
     let separator = if hwaccel_args.is_empty() { "" } else { " " };
@@ -552,15 +935,49 @@ pub fn build_accelerated_trickplay_args(
     let sync = crate::encoding_helper::helper::video_sync_option("0", caps.ffmpeg_version());
     // `-noautoscale` belongs to `GetInputArgument`, and upstream appends the
     // map after the whole input argument.
-    let map = map_argument(map_index);
-    let args = format!(
-        "-loglevel error{skip_frame}{separator}{hwaccel_args} -i file:{input}\
-         {noautoscale}{map} -an -sn {flag} \"{graph}\" -threads {threads} \
-         -c:v {video_encoder} {quality_option} {quality}{sync} -f image2 {output}",
-        input = quote(input_path),
-        output = quote(output_pattern),
-    );
-    Some((args, hwaccel.env))
+    let command = TrickplayCommand {
+        input: format!(
+            "-loglevel error{skip_frame}{separator}{hwaccel_args} -i file:{input}",
+            input = quote(input_path),
+        ),
+        stream_options: noautoscale,
+        map_index,
+        flag,
+        graph,
+        encode: format!(
+            "-threads {threads} -c:v {video_encoder} {quality_option} {quality}{sync} -f image2"
+        ),
+        threads,
+        output: output_pattern.to_owned(),
+    };
+    Some((command, hwaccel.env))
+}
+
+/// The Y'CbCr matrix of the frames a hardware chain hands the encoder, by
+/// swscale's name, or `None` when they are BT.601 already or the source does
+/// not say (read as BT.601, as the software path reads an untagged frame).
+///
+/// A tone-mapped frame is BT.709: every tone-mapper the chains use writes it
+/// (`tonemap_cuda`, `tonemap_opencl`, `tonemap_vaapi`, `vpp_qsv`'s `tonemap=1`,
+/// libplacebo's `tonemapping=`, `tonemapx`). Otherwise the frame keeps the
+/// source's matrix whatever the chain's `setparams` re-tag says: an SD source
+/// re-tagged BT.709 still holds BT.601 values. A tone-map the driver ignores
+/// (`vpp_qsv`'s `tonemap=1` on an MSDK runtime, which upstream notes)
+/// is not detected: that frame is converted as BT.709 though it is BT.2020,
+/// and it is un-tone-mapped anyway.
+fn frame_matrix(stream: &MediaStream, graph: &str) -> Option<&'static str> {
+    // ponytail: read off the graph just built, as each name above holds
+    // `tonemap`; a flag from every vendor chain would repeat their gates.
+    if graph.contains("tonemap") {
+        return Some("bt709");
+    }
+    match stream.color_space.as_deref()? {
+        "bt709" => Some("bt709"),
+        "bt2020nc" | "bt2020c" => Some("bt2020"),
+        "smpte240m" => Some("smpte240m"),
+        "fcc" => Some("fcc"),
+        _ => None,
+    }
 }
 
 /// The MJPEG quality option name and value for `video_encoder`.
@@ -694,51 +1111,10 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
         &self,
         request: &TrickplayExtraction<'_>,
     ) -> Result<Vec<String>, ServiceError> {
-        if request.interval_ms <= 0 {
-            return Err(ServiceError::invalid_input(
-                "trickplay interval must be positive",
-            ));
-        }
-        if request.max_width <= 0 {
-            return Err(ServiceError::invalid_input(
-                "trickplay width must be positive",
-            ));
-        }
-
-        let dir = Path::new(request.output_dir);
-        std::fs::create_dir_all(dir).map_err(|e| {
-            MediaEncodingError::io(
-                format!("cannot create frame directory {}", request.output_dir),
-                e,
-            )
-        })?;
-        let output_pattern = dir.join("%08d.jpg");
-        let output_pattern = output_pattern.to_string_lossy();
-
-        // `MediaEncoder.cs:937-955`: decided once, from the configured flag, so
-        // the standard-way retry below reuses the keyframe-only filter as-is.
-        let pts_frame_rate = if request.keyframe_only {
-            None
-        } else {
-            pts_frame_rate(request.video_stream)
-        };
-        // `MediaEncoder.cs:925-932`: upstream throws when the stream it was
-        // asked to thumbnail is not among the source's streams, rather than
-        // let ffmpeg choose one.
-        let map_index = match request.video_stream {
-            Some(stream) => {
-                let index =
-                    crate::encoding_helper::helper::find_index(request.media_streams, stream);
-                if index < 0 {
-                    return Err(ServiceError::backend(format!(
-                        "unable to locate the requested video stream {} of {}",
-                        stream.index, request.input_path
-                    )));
-                }
-                Some(index)
-            }
-            None => None,
-        };
+        Self::validate(request)?;
+        let dir = Self::frame_directory(request.output_dir)?;
+        let output_pattern = frame_pattern(dir);
+        let (pts_frame_rate, map_index) = Self::stream_choice(request)?;
         let plan = self
             .plan(
                 request,
@@ -748,7 +1124,7 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
                 map_index,
             )
             .await;
-        let first = self.run(&plan, request.priority, dir).await?;
+        let first = self.run(&plan.own_run(), request.priority, &[dir]).await?;
         if let Some(frames) = Self::frames_of(dir, &first)? {
             return Ok(frames);
         }
@@ -780,7 +1156,7 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
                     map_index,
                 )
                 .await;
-            let second = self.run(&retry, request.priority, dir).await?;
+            let second = self.run(&retry.own_run(), request.priority, &[dir]).await?;
             if let Some(frames) = Self::frames_of(dir, &second)? {
                 return Ok(frames);
             }
@@ -791,22 +1167,252 @@ impl<T: Transcoder> TrickplayFrameExtractor for TrickplayFrameExtractorImpl<T> {
 
         Err(Self::no_frames(request, &first))
     }
+
+    /// Makes every width from one decode when their runs can share it
+    /// ([`combined_args`]; the module's departures), and each width with a
+    /// run of its own otherwise, or when the shared run fails.
+    async fn extract_trickplay_frame_sets(
+        &self,
+        request: &TrickplayExtraction<'_>,
+        outputs: &[TrickplayOutput<'_>],
+    ) -> Vec<Result<Vec<String>, ServiceError>> {
+        if outputs.len() > 1 {
+            match self.extract_together(request, outputs).await {
+                Ok(Some(sets)) => return sets.into_iter().map(Ok).collect(),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        path = request.input_path,
+                        widths = outputs.len(),
+                        "trickplay extraction of several widths failed, making each on its own: {e}"
+                    );
+                    // No frames of the shared run may splice into a width's
+                    // own (a width's own run fails on a directory it cannot
+                    // read anyway).
+                    for output in outputs {
+                        let _ = Self::clear_frames(Path::new(output.output_dir));
+                    }
+                }
+            }
+        }
+        let mut sets = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            sets.push(self.extract_trickplay_frames(&output.of(request)).await);
+        }
+        sets
+    }
+}
+
+/// `{dir}/%08d.jpg`, the numbered-JPEG pattern a run writes into `dir`.
+fn frame_pattern(dir: &Path) -> String {
+    dir.join("%08d.jpg").to_string_lossy().into_owned()
 }
 
 /// One resolved ffmpeg invocation: the argument line plus the environment it
 /// has to run under.
 #[derive(Debug)]
 struct ExtractionPlan {
-    args: String,
+    command: TrickplayCommand,
     env: Vec<(String, String)>,
     /// Whether this came from the hardware builder. Recorded when the plan is
     /// built rather than sniffed back out of the argument string: an
     /// unknown-vendor VAAPI job is hardware-decoded but carries neither
     /// `-init_hw_device` nor any environment, so the string does not say.
     hardware: bool,
+    /// Whether this width may share its decode with other widths' in one run
+    /// ([`combined_args`]). Not on a VAAPI or QSV chain: every one of them
+    /// scales on the GPU, so the decode would be shared by splitting
+    /// hardware frames, which no Intel or AMD device has verified (the
+    /// module's departures; gl-1237).
+    shares_decode: bool,
+}
+
+impl ExtractionPlan {
+    /// This width's own run.
+    fn own_run(&self) -> ExtractionRun {
+        ExtractionRun {
+            args: self.command.args(),
+            env: self.env.clone(),
+            hardware: self.hardware,
+        }
+    }
+
+    /// The single run making every width of `plans`, or `None` when they
+    /// cannot share one.
+    fn combined(plans: &[Self]) -> Option<ExtractionRun> {
+        let first = plans.first()?;
+        if plans.iter().any(|plan| {
+            !plan.shares_decode || plan.hardware != first.hardware || plan.env != first.env
+        }) {
+            return None;
+        }
+        let commands: Vec<TrickplayCommand> =
+            plans.iter().map(|plan| plan.command.clone()).collect();
+        Some(ExtractionRun {
+            args: combined_args(&commands)?,
+            env: first.env.clone(),
+            hardware: first.hardware,
+        })
+    }
+}
+
+/// One ffmpeg run as it is spawned: the argument line, the environment and
+/// whether it is on the hardware path (logged with the arguments).
+#[derive(Debug)]
+struct ExtractionRun {
+    args: String,
+    env: Vec<(String, String)>,
+    hardware: bool,
 }
 
 impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
+    /// Rejects a request no run can serve: `fps=` would be infinite, and a
+    /// zero width reaches the scaler as `w=0:h=0`.
+    fn validate(request: &TrickplayExtraction<'_>) -> Result<(), ServiceError> {
+        if request.interval_ms <= 0 {
+            return Err(ServiceError::invalid_input(
+                "trickplay interval must be positive",
+            ));
+        }
+        if request.max_width <= 0 {
+            return Err(ServiceError::invalid_input(
+                "trickplay width must be positive",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Creates `output_dir`, the caller's frame directory.
+    fn frame_directory(output_dir: &str) -> Result<&Path, ServiceError> {
+        let dir = Path::new(output_dir);
+        std::fs::create_dir_all(dir).map_err(|e| {
+            MediaEncodingError::io(format!("cannot create frame directory {output_dir}"), e)
+        })?;
+        Ok(dir)
+    }
+
+    /// The timestamp rebuild and the mapped stream of `request`'s runs.
+    ///
+    /// `MediaEncoder.cs:937-955`: the rebuild is decided once, from the
+    /// configured flag, so the standard-way retry reuses the keyframe-only
+    /// filter as-is. `MediaEncoder.cs:925-932`: upstream throws when the
+    /// stream it was asked to thumbnail is not among the source's streams,
+    /// rather than let ffmpeg choose one.
+    fn stream_choice(
+        request: &TrickplayExtraction<'_>,
+    ) -> Result<(Option<f32>, Option<i32>), ServiceError> {
+        let pts_frame_rate = if request.keyframe_only {
+            None
+        } else {
+            pts_frame_rate(request.video_stream)
+        };
+        let map_index = match request.video_stream {
+            Some(stream) => {
+                let index =
+                    crate::encoding_helper::helper::find_index(request.media_streams, stream);
+                if index < 0 {
+                    return Err(ServiceError::backend(format!(
+                        "unable to locate the requested video stream {} of {}",
+                        stream.index, request.input_path
+                    )));
+                }
+                Some(index)
+            }
+            None => None,
+        };
+        Ok((pts_frame_rate, map_index))
+    }
+
+    /// Makes every output's frames from one decode: `Some` with each output's
+    /// frames in order, or `None` when the widths' runs cannot share a decode
+    /// or the shared run (and its standard-way retry) made no complete set,
+    /// so each width gets a run of its own instead. Upstream has no such run
+    /// (the module's departures).
+    async fn extract_together(
+        &self,
+        request: &TrickplayExtraction<'_>,
+        outputs: &[TrickplayOutput<'_>],
+    ) -> Result<Option<Vec<Vec<String>>>, ServiceError> {
+        // A request a width's own run would reject is reported by that run.
+        // Two outputs into one directory would write over each other's
+        // frames, so they get a run each too.
+        let distinct: std::collections::HashSet<&str> =
+            outputs.iter().map(|output| output.output_dir).collect();
+        if distinct.len() < outputs.len()
+            || outputs
+                .iter()
+                .any(|output| Self::validate(&output.of(request)).is_err())
+        {
+            return Ok(None);
+        }
+        // So is a stream it cannot map or a directory it cannot create.
+        let Ok((pts_frame_rate, map_index)) = Self::stream_choice(request) else {
+            return Ok(None);
+        };
+        let Ok(dirs) = outputs
+            .iter()
+            .map(|output| Self::frame_directory(output.output_dir))
+            .collect::<Result<Vec<_>, _>>()
+        else {
+            return Ok(None);
+        };
+        let patterns: Vec<String> = dirs.iter().map(|dir| frame_pattern(dir)).collect();
+
+        let mut keyframe_only = request.keyframe_only;
+        loop {
+            let mut plans = Vec::with_capacity(outputs.len());
+            for (output, pattern) in outputs.iter().zip(&patterns) {
+                let width = TrickplayExtraction {
+                    keyframe_only,
+                    ..output.of(request)
+                };
+                plans.push(
+                    self.plan(
+                        &width,
+                        request.keyframe_only,
+                        pattern,
+                        pts_frame_rate,
+                        map_index,
+                    )
+                    .await,
+                );
+            }
+            let Some(shared) = ExtractionPlan::combined(&plans) else {
+                return Ok(None);
+            };
+            let run = self.run(&shared, request.priority, &dirs).await?;
+            if run.success {
+                let sets = dirs
+                    .iter()
+                    .map(|dir| jpg_files_sorted(dir))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if sets.iter().all(|frames| !frames.is_empty()) {
+                    return Ok(Some(sets));
+                }
+            }
+            for dir in &dirs {
+                Self::clear_frames(dir)?;
+            }
+            // The same retry a width's own run makes (see
+            // `extract_trickplay_frames`), once, for every width together.
+            if !keyframe_only {
+                tracing::warn!(
+                    path = request.input_path,
+                    widths = outputs.len(),
+                    "trickplay extraction of several widths in one run failed, making each on its own: {}",
+                    run.output.trim()
+                );
+                return Ok(None);
+            }
+            tracing::warn!(
+                path = request.input_path,
+                "I-frame trickplay extraction failed, retrying the standard way: {}",
+                run.output.trim()
+            );
+            keyframe_only = false;
+        }
+    }
+
     /// Chooses the hardware plan when everything it needs is present, and the
     /// software one otherwise.
     ///
@@ -837,7 +1443,7 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
         });
         if let Some(stream) = request.video_stream
             && let Some(options) = configured.as_ref()
-            && let Some((args, env)) = build_accelerated_trickplay_args(
+            && let Some((command, env)) = accelerated_command(
                 &self.caps,
                 options,
                 &TrickplayJob {
@@ -857,36 +1463,30 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
             )
         {
             return ExtractionPlan {
-                args,
+                command,
                 env,
                 hardware: true,
+                shares_decode: !matches!(
+                    options.hardware_acceleration_type,
+                    HardwareAccelerationType::vaapi | HardwareAccelerationType::qsv
+                ),
             };
         }
+        // Upstream's `allowHwAccel` once the keyframe-only gate has run. An
+        // extractor with no options to read (no configuration handle, or an
+        // unreadable one) counts as hardware off, as its job is.
+        let input_threads = configured.is_none();
         let options = configured.unwrap_or_default();
         let deinterlace = request
             .video_stream
             .filter(|stream| stream.is_interlaced)
             .map(|stream| trickplay_deinterlace_filter(&options, stream));
-        self.software_plan(
-            request,
-            output_pattern,
-            pts_frame_rate,
-            map_index,
-            deinterlace.as_deref(),
-        )
-    }
-
-    /// The software plan, which needs nothing probed.
-    fn software_plan(
-        &self,
-        request: &TrickplayExtraction<'_>,
-        output_pattern: &str,
-        pts_frame_rate: Option<f32>,
-        map_index: Option<i32>,
-        deinterlace: Option<&str>,
-    ) -> ExtractionPlan {
+        // A job without hardware resets `EnableTonemapping` to false, which
+        // does not switch this off: `IsSwTonemapAvailable` never reads it. The
+        // settings are `options`'.
+        let tonemap = SwTonemap::for_stream(&self.caps, &options, request.video_stream);
         ExtractionPlan {
-            args: build_trickplay_args(
+            command: software_command(
                 request.input_path,
                 request.interval_ms,
                 request.max_width,
@@ -897,10 +1497,14 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
                 request.keyframe_only,
                 pts_frame_rate,
                 map_index,
-                deinterlace,
+                deinterlace.as_deref(),
+                request.full_chroma,
+                tonemap.as_ref(),
+                input_threads,
             ),
             env: Vec::new(),
             hardware: false,
+            shares_decode: true,
         }
     }
 
@@ -958,17 +1562,17 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
     /// retried the standard way, as upstream's `FfmpegException` catch does.
     async fn run(
         &self,
-        plan: &ExtractionPlan,
+        run: &ExtractionRun,
         priority: ferrofin_model::configuration::ProcessPriorityClass,
-        dir: &Path,
+        dirs: &[&Path],
     ) -> Result<crate::encoder::ProcessOutput, ServiceError> {
         // The same convention the transcode manager follows: at debug, the
         // exact argument line. Whether a job took the hardware path is
         // otherwise invisible from the outside -- a software fallback and a
         // GPU run produce the same JPEGs, just at different speeds.
         tracing::debug!(
-            ffmpeg_args = %plan.args,
-            hardware = plan.hardware,
+            ffmpeg_args = %run.args,
+            hardware = run.hardware,
             "trickplay ffmpeg arguments"
         );
         let _permit = self
@@ -984,20 +1588,24 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
             configured,
             super::media_encoder::DEFAULT_HDR_IMAGE_EXTRACTION_TIMEOUT,
         );
-        let run = self.transcoder.get_process_output_at_priority(
+        let process = self.transcoder.get_process_output_at_priority(
             &self.ffmpeg_path,
-            &plan.args,
+            &run.args,
             true,
-            &plan.env,
+            &run.env,
             priority,
         );
-        tokio::pin!(run);
+        tokio::pin!(process);
         let mut last_count = 0;
         loop {
-            if let Ok(result) = tokio::time::timeout(window, &mut run).await {
+            if let Ok(result) = tokio::time::timeout(window, &mut process).await {
                 return result.map_err(|e| MediaEncodingError::process(e).into());
             }
-            let count = jpg_files_sorted(dir)?.len();
+            // A run of several widths writes into each width's directory.
+            let mut count = 0;
+            for dir in dirs {
+                count += jpg_files_sorted(dir)?.len();
+            }
             if count <= last_count {
                 // Returning drops the run, which kills ffmpeg (`kill_on_drop`).
                 return Ok(crate::encoder::ProcessOutput {
@@ -1044,6 +1652,8 @@ mod tests {
         /// it wrote, because that is the case that matters: ffmpeg dying
         /// partway exits non-zero **with** frames already on disk.
         exit_ok: bool,
+        /// Runs whose argument line contains this exit non-zero.
+        fail_when: Option<&'static str>,
     }
 
     impl RecordingTranscoder {
@@ -1055,7 +1665,15 @@ mod tests {
                 frames_to_write,
                 stderr: stderr.to_owned(),
                 exit_ok: true,
+                fail_when: None,
             }
+        }
+
+        /// The same fake, but a run whose arguments contain `marker` exits
+        /// non-zero.
+        fn failing_when(mut self, marker: &'static str) -> Self {
+            self.fail_when = Some(marker);
+            self
         }
 
         /// The same fake, but the process exits non-zero.
@@ -1089,20 +1707,30 @@ mod tests {
                 .expect("args lock")
                 .push(arguments.to_owned());
             self.env.lock().expect("env lock").push(env.to_vec());
-            // Recover the output dir from the trailing `"{dir}/%08d.jpg"`.
+            // Recover the output dirs from each `"{dir}/%08d.jpg"`: the last
+            // argument, and one per width in a run of several.
             let argv = crate::encoder::split_args(arguments)?;
-            let pattern = argv.last().expect("output pattern present");
-            let dir = std::path::Path::new(pattern)
-                .parent()
-                .expect("pattern has a parent dir");
-            // A keyframe-only run that writes nothing is how upstream's retry
-            // is triggered; `frames_to_write` of 0 models exactly that.
-            for i in 1..=self.frames_to_write {
-                std::fs::write(dir.join(format!("{i:08}.jpg")), b"jpg").expect("write frame");
+            assert!(
+                argv.last().is_some_and(|last| last.ends_with("%08d.jpg")),
+                "output pattern last: {arguments}"
+            );
+            for pattern in argv.iter().filter(|arg| arg.ends_with("%08d.jpg")) {
+                let dir = std::path::Path::new(pattern)
+                    .parent()
+                    .expect("pattern has a parent dir");
+                // A keyframe-only run that writes nothing is how upstream's
+                // retry is triggered; `frames_to_write` of 0 models exactly
+                // that.
+                for i in 1..=self.frames_to_write {
+                    std::fs::write(dir.join(format!("{i:08}.jpg")), b"jpg").expect("write frame");
+                }
             }
             Ok(ProcessOutput {
                 output: self.stderr.clone(),
-                success: self.exit_ok,
+                success: self.exit_ok
+                    && self
+                        .fail_when
+                        .is_none_or(|marker| !arguments.contains(marker)),
             })
         }
 
@@ -1127,6 +1755,8 @@ mod tests {
         }
     }
 
+    /// Upstream's format string, except that the scale also converts to a
+    /// JPEG's Y'CbCr (the module's departures; gl-1129).
     #[test]
     fn args_mirror_the_upstream_format_string() {
         let args = build_trickplay_args(
@@ -1141,12 +1771,38 @@ mod tests {
             None,
             None,
             None,
+            false,
+            None,
+            true,
         );
         assert_eq!(
             args,
             "-loglevel error -threads 1 -i file:\"/m/v.mkv\" -an -sn \
-             -vf \"fps=1000/10000,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2\" \
+             -vf \"fps=1000/10000,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2:out_color_matrix=bt601\" \
              -threads 1 -c:v mjpeg -qscale:v 4 -fps_mode passthrough -f image2 \"/tmp/out/%08d.jpg\""
+        );
+    }
+
+    /// The JPEG matrix conversion needs ffmpeg 5.1: an older or unprobed
+    /// ffmpeg keeps upstream's graph (the module's departures).
+    #[rstest::rstest]
+    #[case::unprobed(None, false)]
+    #[case::ffmpeg_4_4(Some(FfmpegVersion::with_build(4, 4, 2)), false)]
+    #[case::ffmpeg_5_0(Some(FfmpegVersion::with_build(5, 0, 3)), false)]
+    #[case::ffmpeg_5_1(Some(FfmpegVersion::new(5, 1)), true)]
+    #[case::ffmpeg_5_1_9(Some(FfmpegVersion::with_build(5, 1, 9)), true)]
+    #[case::ffmpeg_8_1(Some(FfmpegVersion::with_build(8, 1, 3)), true)]
+    fn the_jpeg_matrix_conversion_needs_ffmpeg_5_1(
+        #[case] version: Option<FfmpegVersion>,
+        #[case] converts: bool,
+    ) {
+        let args = build_trickplay_args(
+            "/m/v.mkv", 10_000, 320, 4, 1, "o", version, false, None, None, None, false, None, true,
+        );
+        assert_eq!(
+            args.contains("*2:out_color_matrix=bt601\" "),
+            converts,
+            "{args}"
         );
     }
 
@@ -1169,6 +1825,9 @@ mod tests {
             None,
             None,
             None,
+            false,
+            None,
+            true,
         );
         let tokens = crate::encoder::split_args(&args).unwrap();
         let i = tokens.iter().position(|a| a == "-i").unwrap();
@@ -1183,26 +1842,108 @@ mod tests {
         // or not hardware is in play, so a job that dropped to software
         // because its accelerator cannot skip keyframes still skips them here.
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 4, 1, "o", None, true, None, None, None,
+            "/m/v.mkv", 10_000, 320, 4, 1, "o", None, true, None, None, None, false, None, true,
         );
         assert!(
             args.starts_with("-loglevel error -skip_frame nokey -threads 1 -i "),
             "{args}"
         );
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 4, 1, "o", None, false, None, None, None,
+            "/m/v.mkv", 10_000, 320, 4, 1, "o", None, false, None, None, None, false, None, true,
         );
         assert!(!args.contains("-skip_frame"), "{args}");
+    }
+
+    /// 4:4:4 frames come straight off the scale, so nothing downstream ever
+    /// holds subsampled chroma, whichever side of it the sampler sits.
+    #[rstest::rstest]
+    #[case::progressive(
+        None,
+        "fps=1000/10000,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2:out_color_matrix=bt601,format=yuvj444p"
+    )]
+    #[case::interlaced(
+        Some("yadif=0:-1:0"),
+        "yadif=0:-1:0,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2:out_color_matrix=bt601,format=yuvj444p,fps=1000/10000"
+    )]
+    fn full_chroma_asks_for_444_right_after_the_scale(
+        #[case] deinterlace: Option<&str>,
+        #[case] filters: &str,
+    ) {
+        let args = build_trickplay_args(
+            "/m/v.mkv",
+            10_000,
+            320,
+            4,
+            1,
+            "/tmp/out/%08d.jpg",
+            Some(FfmpegVersion::with_build(7, 0, 1)),
+            false,
+            None,
+            None,
+            deinterlace,
+            true,
+            None,
+            true,
+        );
+        assert!(args.contains(&format!("-vf \"{filters}\"")), "{args}");
+    }
+
+    /// Off adds no format filter, so the frame is whatever ffmpeg negotiates:
+    /// 4:2:0 for a 4:2:0 source.
+    #[test]
+    fn jellyfin_chroma_leaves_the_format_to_ffmpeg() {
+        let args = build_trickplay_args(
+            "/m/v.mkv",
+            10_000,
+            320,
+            4,
+            1,
+            "/tmp/out/%08d.jpg",
+            Some(FfmpegVersion::with_build(7, 0, 1)),
+            false,
+            None,
+            None,
+            None,
+            false,
+            None,
+            true,
+        );
+        assert!(!args.contains("format="), "{args}");
+    }
+
+    /// The request's chroma reaches the software run ffmpeg is given.
+    #[tokio::test]
+    async fn full_chroma_reaches_the_software_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let out_dir = out.to_string_lossy();
+        let req = ferrofin_traits::media_encoding::TrickplayExtraction {
+            full_chroma: true,
+            ..request("/m/v.mkv", &out_dir)
+        };
+
+        extractor
+            .extract_trickplay_frames(&req)
+            .await
+            .expect("frames");
+
+        assert!(
+            transcoder.recorded()[0].contains(",format=yuvj444p"),
+            "{:?}",
+            transcoder.recorded()
+        );
     }
 
     #[test]
     fn qscale_is_clamped_to_ffmpeg_range() {
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 0, 0, "o", None, false, None, None, None,
+            "/m/v.mkv", 10_000, 320, 0, 0, "o", None, false, None, None, None, false, None, true,
         );
         assert!(args.contains("-qscale:v 1 "), "low clamp in {args}");
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 99, 0, "o", None, false, None, None, None,
+            "/m/v.mkv", 10_000, 320, 99, 0, "o", None, false, None, None, None, false, None, true,
         );
         assert!(args.contains("-qscale:v 31 "), "high clamp in {args}");
     }
@@ -1222,6 +1963,7 @@ mod tests {
             allow_hw_accel: false,
             enable_hw_encoding: false,
             keyframe_only: false,
+            full_chroma: false,
         }
     }
 
@@ -1555,6 +2297,308 @@ mod tests {
             "{}",
             recorded[0]
         );
+    }
+
+    /// A 10-bit HEVC stream with BT.2020 primaries and `transfer`, as ffprobe
+    /// reports an HDR10 (`smpte2084`) or HLG (`arib-std-b67`) video.
+    fn hdr_stream(transfer: &str) -> MediaStream {
+        MediaStream {
+            codec: Some("hevc".to_owned()),
+            stream_type: ferrofin_model::entities::MediaStreamType::Video,
+            pixel_format: Some("yuv420p10le".to_owned()),
+            color_transfer: Some(transfer.to_owned()),
+            color_primaries: Some("bt2020".to_owned()),
+            color_space: Some("bt2020nc".to_owned()),
+            average_frame_rate: Some(24.0),
+            ..MediaStream::default()
+        }
+    }
+
+    /// An extractor on ffmpeg 7.0.1 with `filters`, whose configured encoding
+    /// options are `options`.
+    fn tonemap_extractor(
+        transcoder: Arc<RecordingTranscoder>,
+        filters: &[&str],
+        options: EncodingOptions,
+    ) -> TrickplayFrameExtractorImpl<RecordingTranscoder> {
+        let caps = crate::encoding_helper::hw::FfmpegCapabilities::builder()
+            .filters(filters.iter().copied())
+            .ffmpeg_version(FfmpegVersion::with_build(7, 0, 1))
+            .build();
+        TrickplayFrameExtractorImpl::new(transcoder, "ffmpeg", None)
+            .with_hardware(Arc::new(caps), Arc::new(FixedEncoding(options)))
+    }
+
+    /// Runs one software extraction of `stream` and returns its argument line.
+    async fn args_of(
+        extractor: &TrickplayFrameExtractorImpl<RecordingTranscoder>,
+        transcoder: &RecordingTranscoder,
+        stream: &MediaStream,
+        allow_hw_accel: bool,
+        keyframe_only: bool,
+    ) -> String {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                video_stream: Some(stream),
+                media_streams: std::slice::from_ref(stream),
+                allow_hw_accel,
+                keyframe_only,
+                ..request("/m/v.mkv", &out.to_string_lossy())
+            })
+            .await
+            .expect("frames");
+        transcoder.recorded().remove(0)
+    }
+
+    /// Runs one software extraction of `stream` and returns its `-vf` graph.
+    async fn graph_of(
+        extractor: &TrickplayFrameExtractorImpl<RecordingTranscoder>,
+        transcoder: &RecordingTranscoder,
+        stream: &MediaStream,
+        allow_hw_accel: bool,
+    ) -> String {
+        let args = args_of(extractor, transcoder, stream, allow_hw_accel, false).await;
+        let start = args.find("-vf \"").expect("a filter graph") + 5;
+        let end = start + args[start..].find('"').expect("a closed graph");
+        args[start..end].to_owned()
+    }
+
+    /// The scale every graph below shares.
+    const SCALE: &str = "scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2";
+
+    /// `GetSwVidFilterChain` with `IsSwTonemapAvailable`: the source's HDR
+    /// `setparams` first, `tonemapx` behind the scale with `new
+    /// EncodingOptions()`'s settings (trickplay may not use hardware here),
+    /// and then the conversion to the JPEG's BT.601 that `tonemapx`'s BT.709
+    /// output needs (the module's departures; gl-1159).
+    ///
+    /// Dolby Vision profile 5 (`DOVI`) is reshaped, which asks for `yuv420p`:
+    /// the format this graph has anyway.
+    #[rstest::rstest]
+    #[case::hdr10("smpte2084", None)]
+    #[case::hlg("arib-std-b67", None)]
+    #[case::dovi_profile_5("smpte2084", Some(ferrofin_model::data::VideoRangeType::Dovi))]
+    #[tokio::test]
+    async fn an_hdr_source_is_tone_mapped_the_way_upstream_does(
+        #[case] transfer: &str,
+        #[case] range_type: Option<ferrofin_model::data::VideoRangeType>,
+    ) {
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let extractor = tonemap_extractor(
+            Arc::clone(&transcoder),
+            &crate::encoder::REQUIRED_FILTERS,
+            EncodingOptions::default(),
+        );
+        let stream = match range_type {
+            Some(range_type) => {
+                crate::encoding_helper::test_streams::with_range(hdr_stream(transfer), range_type)
+            }
+            None => hdr_stream(transfer),
+        };
+        if range_type.is_some() {
+            assert!(crate::encoding_helper::hw::tonemap::requires_dovi_reshaping(Some(&stream)));
+        }
+
+        let graph = graph_of(&extractor, &transcoder, &stream, false).await;
+
+        assert_eq!(
+            graph,
+            format!(
+                "setpts=N/24.000/TB,fps=1000/10000,\
+                 setparams=color_primaries=bt2020:color_trc={transfer}:colorspace=bt2020nc,\
+                 {SCALE},\
+                 tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p,\
+                 scale=out_color_matrix=bt601"
+            )
+        );
+    }
+
+    /// The tone-map takes its settings from the options upstream builds the
+    /// job with: the server's when trickplay may use hardware (here none is
+    /// configured, so the job is still software), `new EncodingOptions()`'s
+    /// otherwise. `EnableTonemapping` off stops neither, as upstream's
+    /// `IsSwTonemapAvailable` never reads it. Keyframe-only extraction asked
+    /// of an accelerator that cannot do it starts over from `new
+    /// EncodingOptions()` too (`MediaEncoder.cs:853-866`).
+    #[rstest::rstest]
+    #[case::server_options(
+        true,
+        false,
+        "tonemapx=tonemap=hable:desat=0.5:peak=400:t=bt709:m=bt709:p=bt709:format=yuv420p:param=0.3:range=tv"
+    )]
+    #[case::new_encoding_options(
+        false,
+        false,
+        "tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p"
+    )]
+    #[case::keyframe_only_without_a_keyframe_decoder(
+        true,
+        true,
+        "tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p"
+    )]
+    #[tokio::test]
+    async fn the_tone_map_reads_the_options_upstream_does(
+        #[case] allow_hw_accel: bool,
+        #[case] keyframe_only: bool,
+        #[case] tonemapx: &str,
+    ) {
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let options = EncodingOptions {
+            hardware_acceleration_type: HardwareAccelerationType::none,
+            enable_tonemapping: false,
+            tonemapping_algorithm: ferrofin_model::entities::TonemappingAlgorithm::hable,
+            tonemapping_desat: 0.5,
+            tonemapping_peak: 400.0,
+            tonemapping_param: 0.3,
+            tonemapping_range: ferrofin_model::entities::TonemappingRange::tv,
+            ..EncodingOptions::default()
+        };
+        let extractor = tonemap_extractor(
+            Arc::clone(&transcoder),
+            &crate::encoder::REQUIRED_FILTERS,
+            options,
+        );
+
+        let args = args_of(
+            &extractor,
+            &transcoder,
+            &hdr_stream("smpte2084"),
+            allow_hw_accel,
+            keyframe_only,
+        )
+        .await;
+
+        assert!(args.contains(&format!(",{tonemapx},")), "{args}");
+    }
+
+    /// Upstream sets the decode threads only while trickplay may not use
+    /// hardware (`MediaEncoder.cs:914-917`): with the trickplay hardware switch
+    /// on and no accelerator, the job is software but ffmpeg picks its decode
+    /// threads. Keyframe-only extraction that turns hardware off sets them.
+    #[rstest::rstest]
+    #[case::hardware_off(false, false, true)]
+    #[case::hardware_on_without_an_accelerator(true, false, false)]
+    #[case::keyframe_only_turns_hardware_off(true, true, true)]
+    #[tokio::test]
+    async fn the_decode_threads_are_set_only_while_hardware_is_off(
+        #[case] allow_hw_accel: bool,
+        #[case] keyframe_only: bool,
+        #[case] input_threads: bool,
+    ) {
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let extractor = tonemap_extractor(
+            Arc::clone(&transcoder),
+            &crate::encoder::REQUIRED_FILTERS,
+            EncodingOptions {
+                hardware_acceleration_type: HardwareAccelerationType::none,
+                ..EncodingOptions::default()
+            },
+        );
+
+        let args = args_of(
+            &extractor,
+            &transcoder,
+            &hdr_stream("bt709"),
+            allow_hw_accel,
+            keyframe_only,
+        )
+        .await;
+
+        assert_eq!(args.contains("-threads 1 -i "), input_threads, "{args}");
+        assert!(args.contains(" -threads 1 -c:v mjpeg"), "{args}");
+    }
+
+    /// No tone-map without `tonemapx` (a stock ffmpeg), for an 8-bit source,
+    /// or for an SDR one. The graph is then #1129's, with the matrix
+    /// conversion in the scale.
+    #[rstest::rstest]
+    #[case::stock_ffmpeg(&["scale", "fps"], "yuv420p10le", "smpte2084")]
+    #[case::eight_bit(&crate::encoder::REQUIRED_FILTERS, "yuv420p", "smpte2084")]
+    #[case::sdr(&crate::encoder::REQUIRED_FILTERS, "yuv420p10le", "bt709")]
+    #[tokio::test]
+    async fn only_an_hdr_source_on_an_ffmpeg_with_tonemapx_is_tone_mapped(
+        #[case] filters: &[&str],
+        #[case] pixel_format: &str,
+        #[case] transfer: &str,
+    ) {
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let extractor =
+            tonemap_extractor(Arc::clone(&transcoder), filters, EncodingOptions::default());
+        let stream = MediaStream {
+            pixel_format: Some(pixel_format.to_owned()),
+            ..hdr_stream(transfer)
+        };
+
+        let graph = graph_of(&extractor, &transcoder, &stream, false).await;
+
+        assert_eq!(
+            graph,
+            format!("setpts=N/24.000/TB,fps=1000/10000,{SCALE}:out_color_matrix=bt601")
+        );
+    }
+
+    /// Where the tone-map goes in each shape of the graph. An interlaced
+    /// source keeps upstream's order (`setparams`, deinterlacer, scale,
+    /// `tonemapx`, then the sampler). Full chroma tone-maps ahead of the
+    /// scale, which then converts and builds 4:4:4 from the source's chroma:
+    /// `tonemapx` writes 4:2:0 only. Below ffmpeg 5.1 nothing converts the
+    /// matrix, as on an SDR source.
+    #[rstest::rstest]
+    #[case::interlaced(
+        Some("yadif=0:-1:0"),
+        false,
+        (7, 0),
+        "TAGS,yadif=0:-1:0,SCALE,TONEMAP,scale=out_color_matrix=bt601,fps=1000/10000"
+    )]
+    #[case::full_chroma(
+        None,
+        true,
+        (7, 0),
+        "fps=1000/10000,TAGS,TONEMAP,SCALE:out_color_matrix=bt601,format=yuvj444p"
+    )]
+    #[case::interlaced_full_chroma(
+        Some("yadif=0:-1:0"),
+        true,
+        (7, 0),
+        "TAGS,yadif=0:-1:0,TONEMAP,SCALE:out_color_matrix=bt601,format=yuvj444p,fps=1000/10000"
+    )]
+    #[case::old_ffmpeg(None, false, (5, 0), "fps=1000/10000,TAGS,SCALE,TONEMAP")]
+    #[case::old_ffmpeg_full_chroma(
+        None,
+        true,
+        (5, 0),
+        "fps=1000/10000,TAGS,TONEMAP,SCALE,format=yuvj444p"
+    )]
+    fn each_graph_shape_puts_the_tone_map_where_it_belongs(
+        #[case] deinterlace: Option<&str>,
+        #[case] full_chroma: bool,
+        #[case] (major, minor): (i32, i32),
+        #[case] shape: &str,
+    ) {
+        let tonemap = super::SwTonemap {
+            input_params: "TAGS".to_owned(),
+            filter: "TONEMAP".to_owned(),
+        };
+        let args = build_trickplay_args(
+            "/m/v.mkv",
+            10_000,
+            320,
+            4,
+            1,
+            "/tmp/out/%08d.jpg",
+            Some(FfmpegVersion::new(major, minor)),
+            true,
+            None,
+            None,
+            deinterlace,
+            full_chroma,
+            Some(&tonemap),
+            true,
+        );
+        let graph = shape.replace("SCALE", SCALE);
+        assert!(args.contains(&format!("-vf \"{graph}\"")), "{args}");
     }
 
     /// A stream with no frame rate is deinterlaced too, at frame rate, and
@@ -2242,6 +3286,42 @@ mod tests {
         assert!(!recorded[1].contains("-skip_frame"), "{}", recorded[1]);
     }
 
+    /// A source the GPU cannot decode, with a software MJPEG encoder, puts
+    /// nothing on the GPU, and every vendor chain hands such a job to
+    /// `GetSwVidFilterChain`. It takes the software builder, which keeps full
+    /// chroma (gl-1132) and tone-maps an HDR source as that chain does, with
+    /// the configured options.
+    #[tokio::test]
+    async fn a_job_with_nothing_on_the_gpu_keeps_full_chroma_and_the_tone_map() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        // VAAPI decodes only H.264 here, so this HEVC source is decoded on
+        // the CPU.
+        let extractor = hardware_extractor(Arc::clone(&transcoder));
+        let stream = hdr_stream("smpte2084");
+
+        extractor
+            .extract_trickplay_frames(&TrickplayExtraction {
+                enable_hw_encoding: false,
+                full_chroma: true,
+                ..hardware_request(&stream, &out.to_string_lossy())
+            })
+            .await
+            .expect("frames");
+
+        let args = &transcoder.recorded()[0];
+        assert!(
+            args.contains(&format!(
+                "-vf \"fps=1000/10000,\
+                 setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,\
+                 tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p,\
+                 {SCALE}:out_color_matrix=bt601,format=yuvj444p\""
+            )),
+            "{args}"
+        );
+    }
+
     #[tokio::test]
     async fn hardware_decode_with_a_software_encoder_is_expressible() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2362,6 +3442,306 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// The widths a frame-set test asks for, each into its own directory
+    /// under `root`.
+    fn width_dirs(root: &std::path::Path, widths: &[i32]) -> Vec<(i32, String)> {
+        widths
+            .iter()
+            .map(|w| {
+                (
+                    *w,
+                    root.join(format!("w{w}")).to_string_lossy().into_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn outputs_of(
+        dirs: &[(i32, String)],
+    ) -> Vec<ferrofin_traits::media_encoding::TrickplayOutput<'_>> {
+        dirs.iter()
+            .map(
+                |(w, dir)| ferrofin_traits::media_encoding::TrickplayOutput {
+                    max_width: *w,
+                    output_dir: dir,
+                },
+            )
+            .collect()
+    }
+
+    /// A request for `stream`, the video stream ffmpeg maps.
+    fn mapped<'a>(stream: &'a MediaStream, output_dir: &'a str) -> TrickplayExtraction<'a> {
+        TrickplayExtraction {
+            video_stream: Some(stream),
+            media_streams: std::slice::from_ref(stream),
+            ..request("/m/v.mkv", output_dir)
+        }
+    }
+
+    /// One width is the run it always was: the same argument line as
+    /// `extract_trickplay_frames`.
+    #[tokio::test]
+    async fn one_width_of_a_frame_set_is_its_own_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs = width_dirs(tmp.path(), &[320]);
+        let stream = h264_stream();
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let sets = extractor
+            .extract_trickplay_frame_sets(&mapped(&stream, "/unused"), &outputs_of(&dirs))
+            .await;
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].as_ref().expect("frames").len(), 2);
+        let single = Arc::new(RecordingTranscoder::new(2, ""));
+        TrickplayFrameExtractorImpl::new(Arc::clone(&single), "ffmpeg", None)
+            .extract_trickplay_frames(&mapped(&stream, &dirs[0].1))
+            .await
+            .expect("frames");
+        assert_eq!(transcoder.recorded(), single.recorded());
+    }
+
+    /// Two or three widths are made by one run, each into its own directory
+    /// (the module's departures).
+    #[rstest::rstest]
+    #[case::two(&[320, 640])]
+    #[case::three(&[320, 480, 640])]
+    #[tokio::test]
+    async fn several_widths_are_made_by_one_run(#[case] widths: &[i32]) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs = width_dirs(tmp.path(), widths);
+        let stream = h264_stream();
+        let transcoder = Arc::new(RecordingTranscoder::new(3, ""));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let sets = extractor
+            .extract_trickplay_frame_sets(&mapped(&stream, "/unused"), &outputs_of(&dirs))
+            .await;
+        let recorded = transcoder.recorded();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert!(
+            recorded[0].contains(&format!("split={}", widths.len())),
+            "{}",
+            recorded[0]
+        );
+        for ((_, dir), set) in dirs.iter().zip(&sets) {
+            let frames = set.as_ref().expect("frames");
+            assert_eq!(frames.len(), 3);
+            assert!(
+                frames.iter().all(|f| f.starts_with(dir.as_str())),
+                "{frames:?}"
+            );
+        }
+    }
+
+    /// A shared run that fails costs no width its frames: each width is then
+    /// made by a run of its own.
+    #[tokio::test]
+    async fn a_failed_shared_run_falls_back_to_a_run_per_width() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs = width_dirs(tmp.path(), &[320, 640]);
+        let stream = h264_stream();
+        let transcoder =
+            Arc::new(RecordingTranscoder::new(2, "split broke").failing_when("-filter_complex"));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let sets = extractor
+            .extract_trickplay_frame_sets(&mapped(&stream, "/unused"), &outputs_of(&dirs))
+            .await;
+        let recorded = transcoder.recorded();
+        assert_eq!(recorded.len(), 3, "{recorded:?}");
+        assert!(recorded[0].contains("-filter_complex"));
+        for ((width, dir), (args, set)) in dirs.iter().zip(recorded[1..].iter().zip(&sets)) {
+            assert!(args.contains(&format!("\\,{width})")), "{args}");
+            assert!(args.contains(dir.as_str()), "{args}");
+            assert!(!args.contains("-filter_complex"), "{args}");
+            // The shared run's frames were cleared, so only the own run's
+            // two remain.
+            assert_eq!(set.as_ref().expect("frames").len(), 2);
+        }
+    }
+
+    /// A keyframe-only shared run that fails is retried the standard way as
+    /// one run too, as a width's own run would be.
+    #[tokio::test]
+    async fn a_keyframe_only_shared_run_retries_the_standard_way_together() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs = width_dirs(tmp.path(), &[320, 640]);
+        let stream = h264_stream();
+        let transcoder =
+            Arc::new(RecordingTranscoder::new(2, "").failing_when("-skip_frame nokey"));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let request = TrickplayExtraction {
+            keyframe_only: true,
+            ..mapped(&stream, "/unused")
+        };
+        let sets = extractor
+            .extract_trickplay_frame_sets(&request, &outputs_of(&dirs))
+            .await;
+        let recorded = transcoder.recorded();
+        assert_eq!(recorded.len(), 2, "{recorded:?}");
+        assert!(recorded[0].contains("-skip_frame nokey") && recorded[0].contains("split=2"));
+        assert!(!recorded[1].contains("-skip_frame") && recorded[1].contains("split=2"));
+        assert!(
+            sets.iter()
+                .all(|set| set.as_ref().is_ok_and(|f| f.len() == 2))
+        );
+    }
+
+    /// A keyframe-only shared run that fails both ways falls back to each
+    /// width's own run, with its own keyframe-only try and retry.
+    #[tokio::test]
+    async fn a_shared_run_failing_both_ways_falls_back_to_a_run_per_width() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs = width_dirs(tmp.path(), &[320, 640]);
+        let stream = h264_stream();
+        let transcoder = Arc::new(RecordingTranscoder::new(2, "").failing_when("-filter_complex"));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let request = TrickplayExtraction {
+            keyframe_only: true,
+            ..mapped(&stream, "/unused")
+        };
+        let sets = extractor
+            .extract_trickplay_frame_sets(&request, &outputs_of(&dirs))
+            .await;
+        let recorded = transcoder.recorded();
+        assert_eq!(recorded.len(), 4, "{recorded:?}");
+        assert!(recorded[0].contains("-skip_frame nokey") && recorded[0].contains("split=2"));
+        assert!(!recorded[1].contains("-skip_frame") && recorded[1].contains("split=2"));
+        for args in &recorded[2..] {
+            assert!(args.contains("-skip_frame nokey") && !args.contains("-filter_complex"));
+        }
+        assert!(
+            sets.iter()
+                .all(|set| set.as_ref().is_ok_and(|f| f.len() == 2))
+        );
+    }
+
+    /// Two outputs into one directory would overwrite each other's frames:
+    /// each gets a run of its own.
+    #[tokio::test]
+    async fn outputs_sharing_a_directory_get_a_run_each() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("same").to_string_lossy().into_owned();
+        let dirs = vec![(320, dir.clone()), (640, dir)];
+        let stream = h264_stream();
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        extractor
+            .extract_trickplay_frame_sets(&mapped(&stream, "/unused"), &outputs_of(&dirs))
+            .await;
+        let recorded = transcoder.recorded();
+        assert_eq!(recorded.len(), 2, "{recorded:?}");
+        assert!(
+            recorded
+                .iter()
+                .all(|args| !args.contains("-filter_complex"))
+        );
+    }
+
+    /// A width its own run would reject is rejected alone; the others are
+    /// still made.
+    #[tokio::test]
+    async fn an_invalid_width_is_reported_on_its_own() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs = width_dirs(tmp.path(), &[320, 0]);
+        let stream = h264_stream();
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let sets = extractor
+            .extract_trickplay_frame_sets(&mapped(&stream, "/unused"), &outputs_of(&dirs))
+            .await;
+        assert!(sets[0].is_ok());
+        assert!(sets[1].is_err());
+        assert_eq!(transcoder.recorded().len(), 1);
+    }
+
+    /// The extractor of `accel` on Linux, with a hardware decoder for H.264.
+    fn accelerated_extractor(
+        transcoder: Arc<RecordingTranscoder>,
+        accel: HardwareAccelerationType,
+    ) -> TrickplayFrameExtractorImpl<RecordingTranscoder> {
+        let caps = crate::encoding_helper::hw::FfmpegCapabilities::builder()
+            .platform(crate::encoding_helper::hw::Platform::Linux)
+            .encoders(["mjpeg_vaapi", "mjpeg_qsv", "mjpeg"])
+            .hwaccels(["vaapi", "qsv", "cuda"])
+            .filters(crate::encoder::REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .vaapi_driver(false, true, false)
+            .ffmpeg_version(FfmpegVersion::with_build(7, 0, 1))
+            .build();
+        let options = EncodingOptions {
+            hardware_acceleration_type: accel,
+            enable_hardware_encoding: true,
+            enable_enhanced_nvdec_decoder: true,
+            vaapi_device: Some("/dev/null".to_owned()),
+            hardware_decoding_codecs: vec!["h264".to_owned()],
+            ..EncodingOptions::default()
+        };
+        TrickplayFrameExtractorImpl::new(transcoder, "ffmpeg", None)
+            .with_hardware(Arc::new(caps), Arc::new(FixedEncoding(options)))
+    }
+
+    /// NVENC widths share one GPU decode; VAAPI and QSV widths keep a run
+    /// each, unchanged, since splitting their hardware frames is not
+    /// verified (the module's departures).
+    #[rstest::rstest]
+    #[case::nvenc(HardwareAccelerationType::nvenc, true, false)]
+    #[case::nvenc_software_encoder(HardwareAccelerationType::nvenc, false, false)]
+    #[case::vaapi(HardwareAccelerationType::vaapi, true, true)]
+    #[case::vaapi_software_encoder(HardwareAccelerationType::vaapi, false, true)]
+    #[case::qsv(HardwareAccelerationType::qsv, true, true)]
+    #[case::qsv_software_encoder(HardwareAccelerationType::qsv, false, true)]
+    #[tokio::test]
+    async fn only_software_and_nvenc_widths_share_a_run(
+        #[case] accel: HardwareAccelerationType,
+        #[case] enable_hw_encoding: bool,
+        #[case] run_each: bool,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs = width_dirs(tmp.path(), &[320, 640]);
+        let stream = h264_stream();
+        let transcoder = Arc::new(RecordingTranscoder::new(2, ""));
+        let extractor = accelerated_extractor(Arc::clone(&transcoder), accel);
+        let request = TrickplayExtraction {
+            allow_hw_accel: true,
+            enable_hw_encoding,
+            ..mapped(&stream, "/unused")
+        };
+        let sets = extractor
+            .extract_trickplay_frame_sets(&request, &outputs_of(&dirs))
+            .await;
+        assert!(sets.iter().all(Result::is_ok));
+        let recorded = transcoder.recorded();
+        assert!(
+            recorded.iter().all(|args| args.contains("-hwaccel ")),
+            "{recorded:?}"
+        );
+        if run_each {
+            assert_eq!(recorded.len(), 2, "{recorded:?}");
+            for ((width, dir), args) in dirs.iter().zip(&recorded) {
+                let own = extractor
+                    .plan(
+                        &TrickplayExtraction {
+                            max_width: *width,
+                            ..request
+                        },
+                        false,
+                        &super::frame_pattern(std::path::Path::new(dir)),
+                        None,
+                        Some(0),
+                    )
+                    .await;
+                assert!(own.hardware);
+                assert_eq!(*args, own.own_run().args);
+            }
+        } else {
+            assert_eq!(recorded.len(), 1, "{recorded:?}");
+            assert!(
+                recorded[0].contains("split=2[tp0s][tp1s];[tp0s]scale_cuda=w=320:"),
+                "{}",
+                recorded[0]
+            );
+        }
     }
 }
 
@@ -2788,6 +4168,12 @@ mod accelerated_tests {
             display_corrected_height(&stream(720, 576, Some("16:9"))),
             Some(405)
         );
+        // 1:0 would make it 0, which upstream hands its fixed-size scale: the
+        // stored height is kept.
+        assert_eq!(
+            display_corrected_height(&stream(720, 576, Some("1:0"))),
+            Some(576)
+        );
         // Already square: left alone.
         assert_eq!(
             display_corrected_height(&stream(1920, 1080, Some("16:9"))),
@@ -2814,6 +4200,253 @@ mod accelerated_tests {
             display_corrected_height(&stream(705, 400, Some("2:1"))),
             Some(352)
         );
+    }
+
+    /// NVENC decoding H.264 and HEVC (10-bit too) on the GPU, with the
+    /// keyframe-only decoder.
+    fn nvenc_options() -> EncodingOptions {
+        EncodingOptions {
+            hardware_acceleration_type: HardwareAccelerationType::nvenc,
+            enable_enhanced_nvdec_decoder: true,
+            hardware_decoding_codecs: vec!["h264".to_owned(), "hevc".to_owned()],
+            enable_decoding_color_depth10_hevc: true,
+            ..vaapi_options()
+        }
+    }
+
+    /// Frames a hardware decoder hands the software MJPEG encoder are still in
+    /// the source's matrix, whatever the chain's `setparams` re-tag says, and
+    /// a JPEG decoder reads BT.601: they are converted to it at the end of the
+    /// graph (gl-1157). A tone-mapped frame is BT.709. A BT.601 or untagged
+    /// source needs nothing, and below ffmpeg 5.1 nothing is converted, as on
+    /// the software path.
+    #[rstest::rstest]
+    #[case::bt709("h264", Some("bt709"), false, (7, 0), Some("bt709"))]
+    #[case::bt2020_sdr("h264", Some("bt2020nc"), false, (7, 0), Some("bt2020"))]
+    #[case::sd_bt601("h264", Some("smpte170m"), false, (7, 0), None)]
+    #[case::untagged("h264", None, false, (7, 0), None)]
+    #[case::old_ffmpeg("h264", Some("bt709"), false, (5, 0), None)]
+    #[case::tone_mapped_on_the_gpu("hevc", Some("bt2020nc"), true, (7, 0), Some("bt709"))]
+    fn frames_downloaded_for_the_software_encoder_are_converted_to_bt601(
+        #[case] codec: &str,
+        #[case] color_space: Option<&str>,
+        #[case] hdr: bool,
+        #[case] (major, minor): (i32, i32),
+        #[case] matrix: Option<&str>,
+    ) {
+        let caps = FfmpegCapabilities::builder()
+            .platform(Platform::Linux)
+            .encoders(["mjpeg"])
+            .hwaccels(["cuda"])
+            .filters(REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .ffmpeg_version(FfmpegVersion::new(major, minor))
+            .build();
+        let options = EncodingOptions {
+            enable_tonemapping: hdr,
+            ..nvenc_options()
+        };
+        let mut stream = stream(1920, 1080, None);
+        stream.codec = Some(codec.to_owned());
+        stream.color_space = color_space.map(str::to_owned);
+        if hdr {
+            stream.pixel_format = Some("yuv420p10le".to_owned());
+            stream.color_transfer = Some("smpte2084".to_owned());
+            stream.color_primaries = Some("bt2020".to_owned());
+        }
+
+        let (args, _) =
+            build_accelerated_trickplay_args(&caps, &options, &job(&stream, "/tmp/o/%08d.jpg"))
+                .expect("NVENC has a ported chain");
+
+        assert!(args.contains("-hwaccel cuda"), "decoded on the GPU: {args}");
+        assert!(args.contains("-c:v mjpeg "), "encoded on the CPU: {args}");
+        if hdr {
+            assert!(
+                args.contains("tonemap_cuda"),
+                "tone-mapped on the GPU: {args}"
+            );
+        }
+        match matrix {
+            Some(matrix) => assert!(
+                args.contains(&format!(
+                    ",scale=in_color_matrix={matrix}:out_color_matrix=bt601\" "
+                )),
+                "{args}"
+            ),
+            None => assert!(!args.contains("out_color_matrix"), "{args}"),
+        }
+    }
+
+    /// A hardware MJPEG encoder keeps the frames on the GPU, where nothing
+    /// converts the matrix yet (gl-1169): the graph is the vendor chain's.
+    #[test]
+    fn frames_for_a_hardware_mjpeg_encoder_are_not_converted() {
+        let caps = caps(Platform::Linux, true);
+        let mut stream = stream(1920, 1080, None);
+        stream.color_space = Some("bt709".to_owned());
+        let (args, _) = build_accelerated_trickplay_args(
+            &caps,
+            &vaapi_options(),
+            &job(&stream, "/tmp/o/%08d.jpg"),
+        )
+        .expect("VAAPI has a ported chain");
+        assert!(args.contains("-c:v mjpeg_vaapi"), "{args}");
+        assert!(!args.contains("out_color_matrix"), "{args}");
+    }
+
+    /// No hardware decoder and no hardware encoder: the job takes the
+    /// software builder instead of a vendor chain's software fallback, for
+    /// every accelerator. It is the encoder chosen that counts, not the
+    /// switch: NVENC has no MJPEG encoder, and VAAPI has one only on Intel's
+    /// iHD driver. A hardware MJPEG encoder keeps the job on the hardware path.
+    #[rstest::rstest]
+    #[case::vaapi(HardwareAccelerationType::vaapi, false, true, true)]
+    #[case::qsv(HardwareAccelerationType::qsv, false, true, true)]
+    #[case::nvenc(HardwareAccelerationType::nvenc, false, true, true)]
+    #[case::nvenc_hardware_encoding_on(HardwareAccelerationType::nvenc, true, true, true)]
+    #[case::vaapi_without_ihd(HardwareAccelerationType::vaapi, true, false, true)]
+    #[case::mjpeg_vaapi(HardwareAccelerationType::vaapi, true, true, false)]
+    #[case::mjpeg_qsv(HardwareAccelerationType::qsv, true, true, false)]
+    fn a_job_with_nothing_on_the_gpu_has_no_accelerated_args(
+        #[case] accel: HardwareAccelerationType,
+        #[case] enable_hw_encoding: bool,
+        #[case] driver_ihd: bool,
+        #[case] software: bool,
+    ) {
+        let caps = caps(Platform::Linux, driver_ihd);
+        let options = EncodingOptions {
+            hardware_acceleration_type: accel,
+            prefer_system_native_hw_decoder: true,
+            enable_enhanced_nvdec_decoder: true,
+            hardware_decoding_codecs: Vec::new(),
+            ..vaapi_options()
+        };
+        let stream = stream(1920, 1080, None);
+        let job = TrickplayJob {
+            enable_hw_encoding,
+            ..job(&stream, "/tmp/o/%08d.jpg")
+        };
+        assert_eq!(
+            build_accelerated_trickplay_args(&caps, &options, &job).is_none(),
+            software
+        );
+    }
+
+    /// A vendor chain that falls back to the software chain with a hardware
+    /// decoder (here VAAPI with no OpenCL interop) tone-maps an HDR source as
+    /// `GetSwVidFilterChain` does whenever `IsSwTonemapAvailable` holds.
+    #[test]
+    fn a_software_fallback_with_a_hardware_decoder_tone_maps() {
+        let caps = FfmpegCapabilities::builder()
+            .platform(Platform::Linux)
+            .encoders(["mjpeg_vaapi", "mjpeg"])
+            .hwaccels(["vaapi"])
+            .filters(REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .vaapi_driver(false, true, false)
+            .os_version(FfmpegVersion::new(6, 1))
+            .ffmpeg_version(FfmpegVersion::with_build(7, 0, 1))
+            .build();
+        let options = EncodingOptions {
+            hardware_decoding_codecs: vec!["hevc".to_owned()],
+            enable_decoding_color_depth10_hevc: true,
+            ..vaapi_options()
+        };
+        let mut stream = stream(1920, 1080, None);
+        stream.codec = Some("hevc".to_owned());
+        stream.pixel_format = Some("yuv420p10le".to_owned());
+        stream.color_transfer = Some("smpte2084".to_owned());
+        stream.color_primaries = Some("bt2020".to_owned());
+        stream.color_space = Some("bt2020nc".to_owned());
+        let job = TrickplayJob {
+            enable_hw_encoding: false,
+            ..job(&stream, "/tmp/o/%08d.jpg")
+        };
+
+        let (args, _) = build_accelerated_trickplay_args(&caps, &options, &job)
+            .expect("a hardware decoder keeps the job on the hardware path");
+
+        assert!(args.contains("-hwaccel vaapi"), "{args}");
+        assert!(args.contains(",tonemapx=tonemap=bt2390:"), "{args}");
+        // `tonemapx` writes BT.709, which the JPEG's BT.601 is converted from.
+        assert!(
+            args.contains(",scale=in_color_matrix=bt709:out_color_matrix=bt601\" "),
+            "{args}"
+        );
+    }
+
+    /// The VAAPI and QSV copy-back chains (a hardware decoder, the software
+    /// encoder) download the frames too, and they are converted like NVENC's.
+    /// An interlaced source keeps its sampler last, and the conversion follows
+    /// it, so only sampled frames are converted.
+    #[rstest::rstest]
+    #[case::progressive(HardwareAccelerationType::vaapi, false, "fps=0.10000000149011612,")]
+    #[case::interlaced(
+        HardwareAccelerationType::vaapi,
+        true,
+        "fps=0.10000000149011612,scale=in_color_matrix"
+    )]
+    #[case::qsv(HardwareAccelerationType::qsv, false, "fps=0.10000000149011612,")]
+    fn copy_back_frames_are_converted_to_bt601(
+        #[case] accel: HardwareAccelerationType,
+        #[case] interlaced: bool,
+        #[case] marker: &str,
+    ) {
+        let caps = caps(Platform::Linux, true);
+        let options = EncodingOptions {
+            hardware_acceleration_type: accel,
+            prefer_system_native_hw_decoder: true,
+            ..vaapi_options()
+        };
+        let mut stream = stream(1920, 1080, None);
+        stream.color_space = Some("bt709".to_owned());
+        stream.is_interlaced = interlaced;
+        let job = TrickplayJob {
+            enable_hw_encoding: false,
+            ..job(&stream, "/tmp/o/%08d.jpg")
+        };
+        let (args, _) = build_accelerated_trickplay_args(&caps, &options, &job)
+            .expect("VAAPI and QSV have a ported chain");
+        // QSV on Linux with the native decoder preferred decodes through VAAPI.
+        assert!(args.contains("-hwaccel vaapi"), "{args}");
+        assert!(args.contains("-c:v mjpeg "), "{args}");
+        // `hwmap=mode=read` brings the frames to system memory on iHD.
+        assert!(args.contains("hwmap=mode=read,format=nv12,"), "{args}");
+        assert!(
+            args.contains(",scale=in_color_matrix=bt709:out_color_matrix=bt601\" "),
+            "{args}"
+        );
+        assert!(args.contains(marker), "{args}");
+    }
+
+    /// The matrix the frames hold, by swscale's name: BT.709 after any
+    /// tone-mapper, otherwise the probed colour space; `None` for BT.601 and
+    /// for a source that says nothing.
+    #[rstest::rstest]
+    #[case::bt709(Some("bt709"), "scale_cuda=w=320", Some("bt709"))]
+    #[case::bt2020nc(Some("bt2020nc"), "scale_cuda=w=320", Some("bt2020"))]
+    #[case::bt2020c(Some("bt2020c"), "scale_cuda=w=320", Some("bt2020"))]
+    #[case::smpte240m(Some("smpte240m"), "scale_cuda=w=320", Some("smpte240m"))]
+    #[case::fcc(Some("fcc"), "scale_cuda=w=320", Some("fcc"))]
+    #[case::smpte170m(Some("smpte170m"), "scale_cuda=w=320", None)]
+    #[case::bt470bg(Some("bt470bg"), "scale_cuda=w=320", None)]
+    #[case::unknown(Some("unknown"), "scale_cuda=w=320", None)]
+    #[case::untagged(None, "scale_cuda=w=320", None)]
+    #[case::tonemap_cuda(Some("bt2020nc"), "tonemap_cuda=format=yuv420p", Some("bt709"))]
+    #[case::tonemap_opencl(Some("bt2020nc"), "tonemap_opencl=format=nv12", Some("bt709"))]
+    #[case::tonemap_vaapi(Some("bt2020nc"), "tonemap_vaapi=format=nv12", Some("bt709"))]
+    #[case::vpp_qsv(Some("bt2020nc"), "vpp_qsv=tonemap=1", Some("bt709"))]
+    #[case::libplacebo(Some("bt2020nc"), "libplacebo=tonemapping=bt.2390", Some("bt709"))]
+    #[case::tonemapx(Some("bt2020nc"), "tonemapx=tonemap=bt2390", Some("bt709"))]
+    fn the_frame_matrix_is_what_the_frames_hold(
+        #[case] color_space: Option<&str>,
+        #[case] graph: &str,
+        #[case] matrix: Option<&str>,
+    ) {
+        let mut stream = stream(1920, 1080, None);
+        stream.color_space = color_space.map(str::to_owned);
+        assert_eq!(frame_matrix(&stream, graph), matrix);
     }
 
     #[test]
@@ -2851,6 +4484,374 @@ mod accelerated_tests {
                 supports_keyframe_only_decode(&linux, &with(accel, &|_| {})),
                 "{accel:?}"
             );
+        }
+    }
+
+    /// The graph of a run of several widths: the shared filters in front of
+    /// the `split`, and each branch's filters, in output order.
+    fn shared_and_branches(args: &str) -> (Vec<String>, Vec<String>) {
+        let graph = args
+            .split_once("-filter_complex \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(graph, _)| graph)
+            .expect("a filter_complex graph");
+        let mut parts = graph.split(';');
+        let head = parts.next().expect("the shared head");
+        let head = head
+            .strip_prefix("[0:0]")
+            .expect("starts from the mapped stream");
+        let (shared, _) = head.split_once("split=").expect("a split");
+        let shared = filters_of(shared.trim_end_matches(','))
+            .into_iter()
+            .filter(|f| !f.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let branches = parts
+            .enumerate()
+            .map(|(at, branch)| {
+                branch
+                    .strip_prefix(&format!("[tp{at}s]"))
+                    .and_then(|b| b.strip_suffix(&format!("[tp{at}]")))
+                    .expect("a labelled branch")
+                    .to_owned()
+            })
+            .collect();
+        (shared, branches)
+    }
+
+    /// Every width's frames go through its own run's filters, in order: the
+    /// shared filters and then its branch rebuild the graph of its own run.
+    fn assert_each_branch_rebuilds_its_own_graph(commands: &[TrickplayCommand], args: &str) {
+        let (shared, branches) = shared_and_branches(args);
+        assert_eq!(branches.len(), commands.len(), "{args}");
+        for (command, branch) in commands.iter().zip(&branches) {
+            let mut rebuilt = shared.clone();
+            if branch != "null" {
+                rebuilt.extend(filters_of(branch).into_iter().map(str::to_owned));
+            }
+            assert_eq!(rebuilt.join(","), command.graph, "{args}");
+            // Each width has its own image sequence, with its own encoder.
+            let output = format!(
+                "-an -sn {} {}",
+                command.encode,
+                crate::encoder::encoding_utils::quote(&command.output)
+            );
+            assert_eq!(args.matches(&output).count(), 1, "{output} in {args}");
+        }
+    }
+
+    /// The software run of `width` into `/tmp/w{width}`, as the extractor
+    /// builds it for a 1080p BT.709 source on ffmpeg 7.
+    fn software(width: i32, interlace: bool, full_chroma: bool, hdr: bool) -> TrickplayCommand {
+        let tonemap = SwTonemap {
+            input_params:
+                "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc"
+                    .to_owned(),
+            filter:
+                "tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p"
+                    .to_owned(),
+        };
+        software_command(
+            "/m/v.mkv",
+            10_000,
+            width,
+            4,
+            1,
+            &format!("/tmp/w{width}/%08d.jpg"),
+            Some(FfmpegVersion::new(7, 0)),
+            false,
+            Some(23.976),
+            Some(0),
+            interlace.then_some("bwdif=0:-1:0"),
+            full_chroma,
+            hdr.then_some(&tonemap),
+            true,
+        )
+    }
+
+    /// One width is its own run, exactly as before: nothing to share.
+    #[test]
+    fn one_width_has_no_shared_run() {
+        assert!(combined_args(&[software(320, false, false, false)]).is_none());
+        assert!(combined_args(&[]).is_none());
+    }
+
+    /// Two widths of a progressive source share the decode and the sampler;
+    /// each scales and encodes on its own branch, into its own directory, and
+    /// the graph gets the run's thread count.
+    #[test]
+    fn two_software_widths_share_one_decode() {
+        let commands = [
+            software(320, false, false, false),
+            software(640, false, false, false),
+        ];
+        let args = combined_args(&commands).expect("one run");
+        assert_eq!(
+            args,
+            "-loglevel error -threads 1 -i file:\"/m/v.mkv\" -filter_complex_threads 1 \
+             -filter_complex \"[0:0]setpts=N/23.976/TB,fps=1000/10000,split=2[tp0s][tp1s];\
+             [tp0s]scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2:out_color_matrix=bt601[tp0];\
+             [tp1s]scale=trunc(min(max(iw\\,ih*dar)\\,640)/2)*2:trunc(ow/dar/2)*2:out_color_matrix=bt601[tp1]\" \
+             -map \"[tp0]\" -an -sn -threads 1 -c:v mjpeg -qscale:v 4 -fps_mode passthrough -f image2 \"/tmp/w320/%08d.jpg\" \
+             -map \"[tp1]\" -an -sn -threads 1 -c:v mjpeg -qscale:v 4 -fps_mode passthrough -f image2 \"/tmp/w640/%08d.jpg\""
+        );
+        assert_each_branch_rebuilds_its_own_graph(&commands, &args);
+        // The run is one argument line that splits back whole.
+        let split = crate::encoder::split_args(&args).expect("balanced quoting");
+        assert_eq!(split.iter().filter(|a| a.ends_with("%08d.jpg")).count(), 2);
+    }
+
+    /// Three widths on every software graph shape: progressive, interlaced
+    /// (the deinterlacer is shared, the sampler stays last on each branch),
+    /// full chroma, and an HDR source tone-mapped behind the scale or, with
+    /// full chroma, ahead of it (then shared too).
+    #[rstest::rstest]
+    #[case::progressive(false, false, false, &["setpts=N/23.976/TB", "fps=1000/10000"])]
+    #[case::interlaced(true, false, false, &["bwdif=0:-1:0"])]
+    #[case::full_chroma(false, true, false, &["setpts=N/23.976/TB", "fps=1000/10000"])]
+    #[case::hdr(false, false, true, &[
+        "setpts=N/23.976/TB",
+        "fps=1000/10000",
+        "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+    ])]
+    #[case::hdr_full_chroma(false, true, true, &[
+        "setpts=N/23.976/TB",
+        "fps=1000/10000",
+        "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+        "tonemapx=tonemap=bt2390:desat=0:peak=100:t=bt709:m=bt709:p=bt709:format=yuv420p",
+    ])]
+    #[case::interlaced_hdr(true, false, true, &[
+        "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+        "bwdif=0:-1:0",
+    ])]
+    fn three_software_widths_share_what_their_graphs_start_with(
+        #[case] interlace: bool,
+        #[case] full_chroma: bool,
+        #[case] hdr: bool,
+        #[case] expected_shared: &[&str],
+    ) {
+        let commands = [320, 480, 640].map(|w| software(w, interlace, full_chroma, hdr));
+        let args = combined_args(&commands).expect("one run");
+        assert_each_branch_rebuilds_its_own_graph(&commands, &args);
+        let (shared, branches) = shared_and_branches(&args);
+        assert_eq!(shared, expected_shared, "{args}");
+        for (branch, width) in branches.iter().zip([320, 480, 640]) {
+            assert!(
+                branch.starts_with("scale=") || branch.starts_with("tonemapx="),
+                "{branch}"
+            );
+            assert!(branch.contains(&format!("\\,{width})")), "{branch}");
+        }
+    }
+
+    /// Runs that differ in anything but the graph and the output cannot
+    /// share a decode: a different input or encoder, or no mapped stream.
+    #[test]
+    fn runs_that_differ_outside_the_graph_do_not_share() {
+        let base = software(320, false, false, false);
+        let mut other_input = software(640, false, false, false);
+        other_input.input = other_input.input.replace("/m/v.mkv", "/m/w.mkv");
+        let mut other_quality = software(640, false, false, false);
+        other_quality.encode = other_quality.encode.replace("-qscale:v 4", "-qscale:v 5");
+        let mut unmapped = [base.clone(), software(640, false, false, false)];
+        for command in &mut unmapped {
+            command.map_index = None;
+        }
+        assert!(combined_args(&[base.clone(), other_input]).is_none());
+        assert!(combined_args(&[base, other_quality]).is_none());
+        assert!(combined_args(&unmapped).is_none());
+    }
+
+    /// Two identical widths still get a branch each; the second graph adds
+    /// nothing to the shared filters, so its branch passes them on.
+    #[test]
+    fn a_width_whose_whole_graph_is_shared_gets_a_null_branch() {
+        let mut short = software(320, false, false, false);
+        short.graph = "setpts=N/23.976/TB,fps=1000/10000".to_owned();
+        short.output = "/tmp/short/%08d.jpg".to_owned();
+        let commands = [software(320, false, false, false), short];
+        let args = combined_args(&commands).expect("one run");
+        assert!(args.contains(";[tp1s]null[tp1]"), "{args}");
+        assert_each_branch_rebuilds_its_own_graph(&commands, &args);
+    }
+
+    #[rstest::rstest]
+    #[case::plain("a,b,c", &["a", "b", "c"])]
+    #[case::escaped("scale=min(iw\\,320):-2,fps=1", &["scale=min(iw\\,320):-2", "fps=1"])]
+    #[case::quoted("drawtext=text='a,b',null", &["drawtext=text='a,b'", "null"])]
+    #[case::one("null", &["null"])]
+    fn filters_split_at_their_own_commas(#[case] graph: &str, #[case] filters: &[&str]) {
+        assert_eq!(filters_of(graph), filters);
+    }
+
+    /// The NVENC run of `width` for a 1080p BT.709 H.264 source.
+    fn nvenc(width: i32, interlaced: bool, hdr: bool) -> TrickplayCommand {
+        let caps = FfmpegCapabilities::builder()
+            .platform(Platform::Linux)
+            .encoders(["mjpeg"])
+            .hwaccels(["cuda"])
+            .filters(REQUIRED_FILTERS)
+            .all_filter_options(true)
+            .ffmpeg_version(FfmpegVersion::new(7, 0))
+            .build();
+        let options = EncodingOptions {
+            enable_tonemapping: hdr,
+            ..nvenc_options()
+        };
+        let mut stream = stream(1920, 1080, None);
+        stream.color_space = Some("bt709".to_owned());
+        stream.is_interlaced = interlaced;
+        if hdr {
+            stream.codec = Some("hevc".to_owned());
+            stream.pixel_format = Some("yuv420p10le".to_owned());
+            stream.color_transfer = Some("smpte2084".to_owned());
+            stream.color_primaries = Some("bt2020".to_owned());
+            stream.color_space = Some("bt2020nc".to_owned());
+        }
+        let output = format!("/tmp/w{width}/%08d.jpg");
+        let (command, env) = accelerated_command(
+            &caps,
+            &options,
+            &TrickplayJob {
+                max_width: width,
+                keyframe_only: false,
+                pts_frame_rate: Some(23.976),
+                map_index: Some(0),
+                ..job(&stream, &output)
+            },
+        )
+        .expect("NVENC has a ported chain");
+        assert_eq!(
+            env,
+            Vec::<(String, String)>::new(),
+            "NVENC sets no environment"
+        );
+        command
+    }
+
+    /// NVENC decodes on the GPU once for every width: the split comes behind
+    /// the sampler and the GPU deinterlacer, ahead of each width's
+    /// `scale_cuda`, and every output keeps `-noautoscale`.
+    #[rstest::rstest]
+    #[case::progressive(false, false, &[
+        "setpts=N/23.976/TB",
+        "fps=0.10000000149011612",
+        "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+    ])]
+    #[case::interlaced(true, false, &[
+        "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+        "yadif_cuda=0:-1:0",
+    ])]
+    #[case::tone_mapped(false, true, &[
+        "setpts=N/23.976/TB",
+        "fps=0.10000000149011612",
+        "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc",
+    ])]
+    fn nvenc_widths_share_one_gpu_decode(
+        #[case] interlaced: bool,
+        #[case] hdr: bool,
+        #[case] expected_shared: &[&str],
+    ) {
+        for widths in [&[320, 640][..], &[320, 480, 640]] {
+            let commands: Vec<_> = widths.iter().map(|w| nvenc(*w, interlaced, hdr)).collect();
+            let args = combined_args(&commands).expect("one run");
+            assert_each_branch_rebuilds_its_own_graph(&commands, &args);
+            let (shared, branches) = shared_and_branches(&args);
+            assert_eq!(shared, expected_shared, "{args}");
+            for (branch, width) in branches.iter().zip(widths) {
+                assert!(
+                    branch.starts_with(&format!("scale_cuda=w={width}:")),
+                    "{branch}"
+                );
+                assert!(branch.contains("hwdownload"), "{branch}");
+            }
+            assert_eq!(args.matches("-hwaccel cuda").count(), 1, "{args}");
+            assert_eq!(
+                args.matches("-noautoscale -an -sn").count(),
+                widths.len(),
+                "{args}"
+            );
+            assert!(args.ends_with("\"/tmp/w640/%08d.jpg\""), "{args}");
+        }
+    }
+
+    /// The VAAPI and QSV runs of 1, 2 and 3 widths are each width's own,
+    /// unchanged: every chain scales on the GPU (`scale_vaapi`, `vpp_qsv`),
+    /// so a shared decode would split hardware frames, which is not verified
+    /// on their hardware (the extractor keeps them apart; see
+    /// `only_software_and_nvenc_widths_share_a_run`). Each width's graph differs
+    /// from the next only from its GPU scaler on.
+    #[rstest::rstest]
+    #[case::vaapi(HardwareAccelerationType::vaapi, true, "scale_vaapi=w=")]
+    #[case::qsv(HardwareAccelerationType::qsv, false, "vpp_qsv=w=")]
+    #[case::qsv_native_decoder(HardwareAccelerationType::qsv, true, "scale_vaapi=w=")]
+    fn vaapi_and_qsv_widths_scale_on_the_gpu(
+        #[case] accel: HardwareAccelerationType,
+        #[case] prefer_system_native_hw_decoder: bool,
+        #[case] scaler: &str,
+    ) {
+        let caps = caps(Platform::Linux, true);
+        let options = EncodingOptions {
+            hardware_acceleration_type: accel,
+            prefer_system_native_hw_decoder,
+            ..vaapi_options()
+        };
+        let stream = stream(1920, 1080, None);
+        for widths in [&[320][..], &[320, 640], &[320, 480, 640]] {
+            let outputs: Vec<String> = widths
+                .iter()
+                .map(|w| format!("/tmp/w{w}/%08d.jpg"))
+                .collect();
+            let commands: Vec<TrickplayCommand> = widths
+                .iter()
+                .zip(&outputs)
+                .map(|(w, output)| {
+                    accelerated_command(
+                        &caps,
+                        &options,
+                        &TrickplayJob {
+                            max_width: *w,
+                            map_index: Some(0),
+                            keyframe_only: false,
+                            ..job(&stream, output)
+                        },
+                    )
+                    .expect("a ported chain")
+                    .0
+                })
+                .collect();
+            for (command, w) in commands.iter().zip(widths.iter()) {
+                let own = build_accelerated_trickplay_args(
+                    &caps,
+                    &options,
+                    &TrickplayJob {
+                        max_width: *w,
+                        map_index: Some(0),
+                        keyframe_only: false,
+                        ..job(&stream, &format!("/tmp/w{w}/%08d.jpg"))
+                    },
+                )
+                .expect("a ported chain")
+                .0;
+                assert_eq!(command.args(), own);
+                let graph = filters_of(&command.graph);
+                let at = graph
+                    .iter()
+                    .position(|f| f.starts_with(scaler))
+                    .unwrap_or_else(|| panic!("a GPU scaler: {}", command.args()));
+                assert!(
+                    graph[at].starts_with(&format!("{scaler}{w}:")),
+                    "{}",
+                    command.graph
+                );
+                assert!(
+                    graph[..at]
+                        .iter()
+                        .all(|f| !f.starts_with("hwdownload") && !f.starts_with("hwmap")),
+                    "the frames are still on the GPU at the scaler: {}",
+                    command.graph
+                );
+            }
         }
     }
 }

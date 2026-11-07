@@ -9,7 +9,8 @@ use ferrofin_db::store::guid_to_db;
 use sqlx::Row as _;
 use uuid::Uuid;
 
-use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::error::{ServiceError, db_err};
+use ferrofin_traits::stubs::LiveTvChannelQuery;
 
 use crate::projection::{ChannelRow, ChannelUserData, ProgramRow};
 
@@ -25,28 +26,48 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
                       c."ChannelType" AS "ChannelMediaKind"
                FROM "FerrofinLiveTvPrograms" p
                JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId""#;
-/// Every channel in the lineup, in stored (`SortIndex`) order, each carrying
-/// the guide-derived movie/series/kids flags `GuideManager.RefreshChannels`
-/// aggregates onto upstream channel items (`isMovie |= program.IsMovie; ...`,
-/// plus the "Kids" tag) — the columns/tag the channel kind filters match on.
+/// Every channel in the lineup, in stored (`SortIndex`) order.
+///
+/// Each kind `query` filters on (`IsMovie`, `IsSeries`, `IsKids`) is derived
+/// from the guide the way `GuideManager.RefreshChannels` aggregates it onto
+/// upstream channel items (`isMovie |= program.IsMovie; ...`, plus the "Kids"
+/// tag). The kinds it does not filter on read as `false`: only the channel
+/// kind filters read them, and each one costs a pass over the airings.
 ///
 /// # Errors
 ///
 /// Fails when the database read fails.
-pub async fn channel_rows(db: &Database) -> Result<Vec<ChannelRow>, ServiceError> {
-    sqlx::query_as(
-        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl",
-                  EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
-                         WHERE p."ChannelId" = "FerrofinLiveTvChannels"."Id" AND p."IsMovie" = 1) AS "IsMovie",
-                  EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
-                         WHERE p."ChannelId" = "FerrofinLiveTvChannels"."Id" AND p."IsSeries" = 1) AS "IsSeries",
-                  EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
-                         WHERE p."ChannelId" = "FerrofinLiveTvChannels"."Id" AND p."IsKids" = 1) AS "IsKids"
-           FROM "FerrofinLiveTvChannels" ORDER BY "SortIndex", "Name""#,
-    )
-    .fetch_all(db.pool())
-    .await
-    .map_err(db_err)
+pub async fn channel_rows(
+    db: &Database,
+    query: &LiveTvChannelQuery,
+) -> Result<Vec<ChannelRow>, ServiceError> {
+    channel_rows_query(query)
+        .build_query_as()
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+}
+
+/// [`channel_rows`]' statement, shared with its plan pin.
+fn channel_rows_query(query: &LiveTvChannelQuery) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+    let mut qb = sqlx::QueryBuilder::new(
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl""#,
+    );
+    // A kind left out reads as `false` (`ChannelRow`'s `#[sqlx(default)]`).
+    for (filter, kind) in [
+        (query.is_movie, "IsMovie"),
+        (query.is_series, "IsSeries"),
+        (query.is_kids, "IsKids"),
+    ] {
+        if filter.is_some() {
+            qb.push(format_args!(
+                r#",EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
+                     WHERE p."ChannelId" = "FerrofinLiveTvChannels"."Id" AND p."{kind}" = 1) AS "{kind}""#
+            ));
+        }
+    }
+    qb.push(r#" FROM "FerrofinLiveTvChannels" ORDER BY "SortIndex", "Name""#);
+    qb
 }
 
 /// One channel by id, or `None` when unknown. The aggregated kind flags are
@@ -87,7 +108,7 @@ pub async fn channel_rows_by_ids(
     // One bind per id, so the page has to be chunked: a recursive `/Items` page
     // can name thousands of items and a channel only has to be one of them for
     // this lookup to run.
-    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ferrofin_db::padded_in_chunks(ids) {
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
             r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
                   0 AS "IsMovie", 0 AS "IsSeries", 0 AS "IsKids"
@@ -111,20 +132,38 @@ pub async fn channel_rows_by_ids(
     Ok(out)
 }
 
-/// Every stored guide programme, channel-joined.
+/// One channel's stored guide programmes, channel-joined.
 ///
-/// The mirror's source of truth: whatever `insert_programs` left in
-/// `FerrofinLiveTvPrograms` after the whole refresh is exactly upstream's
-/// `newProgramIdList` accumulated across every service.
+/// The guide mirror's unit of work. Whatever `insert_programs` left in
+/// `FerrofinLiveTvPrograms` after the whole refresh is upstream's
+/// `newProgramIdList` across every service, and upstream stores it one channel
+/// at a time: `RefreshChannelsInternal` reads each channel's existing
+/// programmes (`ChannelIds = [currentChannel.Id]`, v12.4
+/// src/Jellyfin.LiveTv/Guide/GuideManager.cs:250-255) and creates or updates
+/// them before it moves on. Reading the table one channel at a time keeps the
+/// mirror's memory to one channel's airings rather than the whole guide's. The
+/// `("ChannelId", "StartDate")` index serves it.
 ///
 /// # Errors
 ///
 /// Fails when the database read fails.
-pub async fn program_rows(db: &Database) -> Result<Vec<ProgramRow>, ServiceError> {
-    sqlx::query_as(PROGRAM_SELECT)
+pub async fn channel_program_rows(
+    db: &Database,
+    channel_id: &str,
+) -> Result<Vec<ProgramRow>, ServiceError> {
+    channel_program_rows_query(channel_id)
+        .build_query_as()
         .fetch_all(db.pool())
         .await
         .map_err(db_err)
+}
+
+/// [`channel_program_rows`]'s statement, shared with its plan pin.
+fn channel_program_rows_query(channel_id: &str) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(PROGRAM_SELECT);
+    qb.push(r#" WHERE p."ChannelId" = "#);
+    qb.push_bind(channel_id.to_owned());
+    qb
 }
 
 /// The guide programmes among `ids`, keyed by their `Uuid`.
@@ -142,7 +181,7 @@ pub async fn program_rows_by_ids(
     ids: &[Uuid],
 ) -> Result<std::collections::HashMap<Uuid, ProgramRow>, ServiceError> {
     let mut out = std::collections::HashMap::new();
-    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ferrofin_db::padded_in_chunks(ids) {
         let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(PROGRAM_SELECT);
         qb.push(r#" WHERE p."Id" IN ("#);
         let mut separated = qb.separated(", ");
@@ -303,7 +342,8 @@ pub async fn tuner_lineup(
 /// Every channel id currently cached.
 ///
 /// Backs the `CleanDatabase(newChannelIdList, [LiveTvChannel], …)` half of the
-/// guide refresh.
+/// guide refresh, and the programme mirror's walk over the lineup, one channel
+/// at a time.
 ///
 /// # Errors
 ///
@@ -352,6 +392,42 @@ pub async fn delete_programs(db: &Database, ids: &[String]) -> Result<(), Servic
     delete_by_id(db, "FerrofinLiveTvPrograms", ids).await
 }
 
+/// The ids of the airings stored on one channel, read on `conn`: inside a
+/// guide write's transaction, which removes those it did not re-emit.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub(crate) async fn channel_program_ids(
+    conn: &mut sqlx::SqliteConnection,
+    channel_id: &str,
+) -> Result<Vec<String>, ServiceError> {
+    sqlx::query_scalar(r#"SELECT "Id" FROM "FerrofinLiveTvPrograms" WHERE "ChannelId" = ?1"#)
+        .bind(channel_id)
+        .fetch_all(conn)
+        .await
+        .map_err(db_err)
+}
+
+/// [`delete_programs`] on `conn`: inside a guide write's transaction.
+///
+/// # Errors
+///
+/// Fails when the database write fails.
+pub(crate) async fn delete_programs_in(
+    conn: &mut sqlx::SqliteConnection,
+    ids: &[String],
+) -> Result<(), ServiceError> {
+    for chunk in ids.chunks(IDS_PER_DELETE) {
+        delete_by_id_statement("FerrofinLiveTvPrograms", chunk)
+            .build()
+            .execute(&mut *conn)
+            .await
+            .map_err(db_err)?;
+    }
+    Ok(())
+}
+
 /// Deletes rows of `table` by id, in bind-limit chunks.
 ///
 /// `table` is one of two crate-private literals, never caller input.
@@ -360,17 +436,30 @@ async fn delete_by_id(
     table: &'static str,
     ids: &[String],
 ) -> Result<(), ServiceError> {
-    for chunk in ids.chunks(500) {
-        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
-            sqlx::QueryBuilder::new(format!(r#"DELETE FROM "{table}" WHERE "Id" IN ("#));
-        let mut separated = qb.separated(", ");
-        for id in chunk {
-            separated.push_bind(id);
-        }
-        qb.push(")");
-        qb.build().execute(db.writer()).await.map_err(db_err)?;
+    for chunk in ids.chunks(IDS_PER_DELETE) {
+        delete_by_id_statement(table, chunk)
+            .build()
+            .execute(db.writer())
+            .await
+            .map_err(db_err)?;
     }
     Ok(())
+}
+
+/// How many ids one delete-by-id statement binds, under SQLite's
+/// 999-parameter limit.
+const IDS_PER_DELETE: usize = 500;
+
+/// The statement deleting the rows of `table` whose ids are `ids`.
+fn delete_by_id_statement(table: &'static str, ids: &[String]) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
+        sqlx::QueryBuilder::new(format!(r#"DELETE FROM "{table}" WHERE "Id" IN ("#));
+    let mut separated = qb.separated(", ");
+    for id in ids {
+        separated.push_bind(id);
+    }
+    qb.push(")");
+    qb
 }
 
 /// The tuner-host configuration table.
@@ -454,7 +543,8 @@ pub async fn store_listing_provider(
 /// `config.TunerHosts[index] = info` keeps the posted spelling of a matched id.
 /// Channel ids do not derive from the tuner id, so a rename moves no channel or
 /// its user data. One transaction, so a failed write leaves the old rows as
-/// they were.
+/// they were. Once committed, the cached answer of whether a tuner exists is
+/// dropped ([`Database::invalidate_live_tv_tuner_hosts`]).
 ///
 /// # Errors
 ///
@@ -495,7 +585,9 @@ pub async fn store_tuner_host(
     .execute(&mut *tx)
     .await
     .map_err(db_err)?;
-    tx.commit().await.map_err(db_err)
+    tx.commit().await.map_err(db_err)?;
+    db.invalidate_live_tv_tuner_hosts();
+    Ok(())
 }
 
 /// The tuner-facing external id of one channel, or `None` when the lineup does
@@ -573,18 +665,61 @@ pub async fn channel_stream_source(
     }))
 }
 
-/// Maps a `sqlx` error into a [`ServiceError`] via `ferrofin-db`'s `DbError`.
-fn db_err(e: sqlx::Error) -> ServiceError {
-    ServiceError::from(ferrofin_db::DbError::from(e))
-}
-
 /// Seeding helpers for the manager's channel tests (they live here so the raw
 /// SQL stays inside the repository boundary).
 #[cfg(test)]
 #[allow(clippy::missing_errors_doc)] // test seeding helpers; every error is "the write failed"
 pub mod test_support {
-    use super::{Database, db_err};
+    use super::{Database, PROGRAM_SELECT, ProgramRow, db_err};
     use ferrofin_traits::error::ServiceError;
+
+    /// Every stored guide programme, channel-joined, in one read.
+    pub async fn program_rows(db: &Database) -> Result<Vec<ProgramRow>, ServiceError> {
+        sqlx::query_as(PROGRAM_SELECT)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)
+    }
+
+    /// The `EXPLAIN QUERY PLAN` details of [`super::channel_program_rows`]'s
+    /// statement, in plan order.
+    pub async fn channel_program_rows_plan(
+        db: &Database,
+        channel_id: &str,
+    ) -> Result<Vec<String>, ServiceError> {
+        plan(db, super::channel_program_rows_query(channel_id)).await
+    }
+
+    /// The `EXPLAIN QUERY PLAN` details of [`super::channel_rows`]' statement
+    /// for `query`, in plan order.
+    pub async fn channel_rows_plan(
+        db: &Database,
+        query: &super::LiveTvChannelQuery,
+    ) -> Result<Vec<String>, ServiceError> {
+        plan(db, super::channel_rows_query(query)).await
+    }
+
+    /// The `EXPLAIN QUERY PLAN` details of `qb`'s statement, in plan order.
+    pub async fn plan(
+        db: &Database,
+        mut qb: sqlx::QueryBuilder<sqlx::Sqlite>,
+    ) -> Result<Vec<String>, ServiceError> {
+        use sqlx::Execute as _;
+        let mut query = qb.build();
+        let args = query
+            .take_arguments()
+            .map_err(|e| ServiceError::Backend(e.to_string()))?
+            .unwrap_or_default();
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let rows = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| sqlx::Row::get::<String, _>(row, "detail"))
+            .collect())
+    }
 
     /// Overwrites a configuration row's `Data` with JSON that no longer parses;
     /// `table` is [`super::TUNER_HOSTS_TABLE`] or
@@ -717,6 +852,42 @@ pub mod test_support {
             .await
             .map_err(db_err)?;
         Ok(())
+    }
+
+    /// Pins every airing's `DateCreated` to a sentinel value, or to NULL (an
+    /// airing stored before the column existed).
+    pub async fn pin_program_dates(db: &Database, value: Option<&str>) -> Result<(), ServiceError> {
+        sqlx::query(r#"UPDATE "FerrofinLiveTvPrograms" SET "DateCreated" = ?1"#)
+            .bind(value)
+            .execute(db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Every stored airing as `(title, its channel's tvg-id, DateCreated)`,
+    /// by title.
+    pub async fn program_dates(
+        db: &Database,
+    ) -> Result<Vec<(String, String, Option<String>)>, ServiceError> {
+        sqlx::query_as(
+            r#"SELECT p."Title", c."TvgId", p."DateCreated"
+               FROM "FerrofinLiveTvPrograms" p
+               JOIN "FerrofinLiveTvChannels" c ON c."Id" = p."ChannelId"
+               ORDER BY p."Title""#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+    }
+
+    /// The rows `conn` has inserted, updated or deleted since it opened
+    /// (`total_changes()`), so a test can tell what a statement wrote.
+    pub async fn total_changes(conn: &mut sqlx::SqliteConnection) -> Result<i64, ServiceError> {
+        sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(conn)
+            .await
+            .map_err(db_err)
     }
 
     /// Every channel's stored `DateCreated`.

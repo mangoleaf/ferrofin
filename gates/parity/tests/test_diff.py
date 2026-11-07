@@ -50,7 +50,7 @@ class Scratch(unittest.TestCase):
         return diff.load_rules(write(self.dir, "normalise.toml", toml))
 
     def ledger(self, toml):
-        return diff.load_ledger(write(self.dir, "ledger.toml", toml), write(self.dir, "mod.rs", VERIFIED_SOURCE))
+        return diff.load_ledger(write(self.dir, "ledger.toml", toml), write(self.dir, "handlers.rs", VERIFIED_SOURCE))
 
 
 def pair(oracle, ferrofin, rules=()):

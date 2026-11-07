@@ -41,10 +41,7 @@ use crate::db_error::{db_err, media_stream_type_disc};
 /// planner a leading-`ItemId` alternative that also covers the projection, and
 /// `subtitle_probe_uses_the_item_id_index` pins that it stays chosen.
 fn stream_type_probe_sql(ids: usize) -> String {
-    let ph = (2..=ids + 1)
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let ph = ferrofin_db::numbered_placeholders(2..=ids + 1);
     format!(
         r#"SELECT DISTINCT "ItemId" FROM "MediaStreamInfos"
                    WHERE "StreamType" = ?1 AND "ItemId" IN ({ph})"#
@@ -82,7 +79,7 @@ impl FerrofinMediaStreamRepository {
         item_ids: &[Uuid],
     ) -> Result<Vec<Uuid>, ServiceError> {
         let mut matching = Vec::new();
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(item_ids) {
             let sql = stream_type_probe_sql(chunk.len());
             let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
                 .bind(i64::from(media_stream_type_disc(stream_type)));
@@ -150,11 +147,8 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
             return Ok(map);
         }
         // One query for the whole page; rows arrive in per-item StreamIndex order.
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let ph = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+        for chunk in ferrofin_db::padded_in_chunks(item_ids) {
+            let ph = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT * FROM "MediaStreamInfos" WHERE "ItemId" IN ({ph})
                    ORDER BY "ItemId", "StreamIndex""#,
@@ -215,14 +209,6 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
         item_id: Uuid,
         streams: &[MediaStreamInfoEntity],
     ) -> Result<(), ServiceError> {
-        let insert_sql = format!(
-            r#"INSERT INTO "MediaStreamInfos" ({STREAM_COLUMNS}) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?)"#
-        );
-
-        let insert_sql: std::sync::Arc<str> = insert_sql.into();
         let item_id_db = guid_to_db(item_id);
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(r#"DELETE FROM "MediaStreamInfos" WHERE "ItemId" = ?1"#)
@@ -230,59 +216,69 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        for s in streams {
-            sqlx::query(sqlx::AssertSqlSafe(insert_sql.clone()))
-                .bind(&item_id_db)
-                .bind(s.stream_index)
-                .bind(&s.aspect_ratio)
-                .bind(s.average_frame_rate)
-                .bind(s.bit_depth)
-                .bind(s.bit_rate)
-                .bind(s.bl_present_flag)
-                .bind(&s.channel_layout)
-                .bind(s.channels)
-                .bind(&s.codec)
-                .bind(&s.codec_tag)
-                .bind(&s.codec_time_base)
-                .bind(&s.color_primaries)
-                .bind(&s.color_space)
-                .bind(&s.color_transfer)
-                .bind(&s.comment)
-                .bind(s.dv_bl_signal_compatibility_id)
-                .bind(s.dv_level)
-                .bind(s.dv_profile)
-                .bind(s.dv_version_major)
-                .bind(s.dv_version_minor)
-                .bind(s.el_present_flag)
-                .bind(s.hdr10_plus_present_flag)
-                .bind(s.height)
-                .bind(s.is_anamorphic)
-                .bind(s.is_avc)
-                .bind(s.is_default)
-                .bind(s.is_external)
-                .bind(s.is_forced)
-                .bind(s.is_hearing_impaired)
-                .bind(s.is_interlaced)
-                .bind(s.is_original)
-                .bind(&s.key_frames)
-                .bind(&s.language)
-                .bind(s.level)
-                .bind(&s.nal_length_size)
-                .bind(&s.path)
-                .bind(&s.pixel_format)
-                .bind(&s.profile)
-                .bind(s.real_frame_rate)
-                .bind(s.ref_frames)
-                .bind(s.rotation)
-                .bind(s.rpu_present_flag)
-                .bind(s.sample_rate)
-                .bind(s.stream_type)
-                .bind(&s.time_base)
-                .bind(&s.title)
-                .bind(s.width)
-                .execute(&mut *tx)
-                .await
-                .map_err(db_err)?;
+        // Many rows per statement (gl-1181): a scan saves every item's
+        // streams, one awaited statement per stream otherwise.
+        let columns = STREAM_COLUMNS.split(',').count();
+        for chunk in
+            ferrofin_db::power_of_two_chunks(streams, ferrofin_db::BATCH_BIND_CHUNK / columns)
+        {
+            let sql = format!(
+                r#"INSERT INTO "MediaStreamInfos" ({STREAM_COLUMNS}) VALUES {}"#,
+                ferrofin_db::values_rows(chunk.len(), columns)
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for s in chunk {
+                query = query
+                    .bind(&item_id_db)
+                    .bind(s.stream_index)
+                    .bind(&s.aspect_ratio)
+                    .bind(s.average_frame_rate)
+                    .bind(s.bit_depth)
+                    .bind(s.bit_rate)
+                    .bind(s.bl_present_flag)
+                    .bind(&s.channel_layout)
+                    .bind(s.channels)
+                    .bind(&s.codec)
+                    .bind(&s.codec_tag)
+                    .bind(&s.codec_time_base)
+                    .bind(&s.color_primaries)
+                    .bind(&s.color_space)
+                    .bind(&s.color_transfer)
+                    .bind(&s.comment)
+                    .bind(s.dv_bl_signal_compatibility_id)
+                    .bind(s.dv_level)
+                    .bind(s.dv_profile)
+                    .bind(s.dv_version_major)
+                    .bind(s.dv_version_minor)
+                    .bind(s.el_present_flag)
+                    .bind(s.hdr10_plus_present_flag)
+                    .bind(s.height)
+                    .bind(s.is_anamorphic)
+                    .bind(s.is_avc)
+                    .bind(s.is_default)
+                    .bind(s.is_external)
+                    .bind(s.is_forced)
+                    .bind(s.is_hearing_impaired)
+                    .bind(s.is_interlaced)
+                    .bind(s.is_original)
+                    .bind(&s.key_frames)
+                    .bind(&s.language)
+                    .bind(s.level)
+                    .bind(&s.nal_length_size)
+                    .bind(&s.path)
+                    .bind(&s.pixel_format)
+                    .bind(&s.profile)
+                    .bind(s.real_frame_rate)
+                    .bind(s.ref_frames)
+                    .bind(s.rotation)
+                    .bind(s.rpu_present_flag)
+                    .bind(s.sample_rate)
+                    .bind(s.stream_type)
+                    .bind(&s.time_base)
+                    .bind(&s.title)
+                    .bind(s.width);
+            }
+            query.execute(&mut *tx).await.map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())
@@ -350,6 +346,35 @@ mod tests {
             title: None,
             width: None,
         }
+    }
+
+    /// More streams than one statement's rows are saved whole, each with its
+    /// own values (gl-1181).
+    #[tokio::test]
+    async fn many_streams_are_saved_whole_and_in_order() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinMediaStreamRepository::new(db);
+        let languages: Vec<String> = (0..25).map(|i| format!("l{i:02}")).collect();
+        let streams: Vec<MediaStreamInfoEntity> = (0..25)
+            .map(|i| stream(i, 2, Some(&languages[usize::try_from(i).expect("index")])))
+            .collect();
+        repo.save_media_streams(item, &streams).await.expect("save");
+        let got: Vec<(i64, Option<String>)> = repo
+            .get_media_streams(&MediaStreamQuery {
+                item_id: item,
+                stream_type: None,
+                index: None,
+            })
+            .await
+            .expect("all")
+            .into_iter()
+            .map(|s| (s.stream_index, s.language))
+            .collect();
+        let expected: Vec<(i64, Option<String>)> =
+            (0..25).zip(languages.into_iter().map(Some)).collect();
+        assert_eq!(got, expected);
     }
 
     #[tokio::test]
@@ -455,31 +480,36 @@ mod tests {
     /// `IX_MediaStreamInfos_StreamType` and walks every subtitle row (4,169 of
     /// 9,368 on the bench library) plus a temp b-tree for the `DISTINCT`:
     /// 710 µs vs 33 µs for a 50-id page, on a statement that fires on every
-    /// list page carrying videos. Pinned here against the real migrated schema.
+    /// list page carrying videos. Pinned here against the real migrated schema,
+    /// at every length a padded list takes: the planner weighs the `IN` list's
+    /// length against the `StreamType` equality (gl-1243).
     #[tokio::test]
     async fn subtitle_probe_uses_the_item_id_index() {
         let db = test_db().await;
-        let sql = super::stream_type_probe_sql(50);
-        let explain = format!("EXPLAIN QUERY PLAN {sql}");
-        let mut query = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain));
-        for _ in 0..51 {
-            query = query.bind("x");
-        }
-        let plan: Vec<String> = query
-            .fetch_all(db.pool())
-            .await
-            .expect("explain query plan")
-            .into_iter()
-            .map(|(_, _, _, detail)| detail)
-            .collect();
+        for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+            let sql = super::stream_type_probe_sql(n);
+            let explain = format!("EXPLAIN QUERY PLAN {sql}");
+            let mut query =
+                sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(explain));
+            for _ in 0..=n {
+                query = query.bind("x");
+            }
+            let plan: Vec<String> = query
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .into_iter()
+                .map(|(_, _, _, detail)| detail)
+                .collect();
 
-        assert!(
-            plan.iter().any(|s| s.contains("ItemId=?")),
-            "subtitle probe must seek by ItemId, got: {plan:?}"
-        );
-        assert!(
-            !plan.iter().any(|s| s.contains("TEMP B-TREE")),
-            "subtitle probe must not sort for DISTINCT, got: {plan:?}"
-        );
+            assert!(
+                plan.iter().any(|s| s.contains("ItemId=?")),
+                "{n} ids: subtitle probe must seek by ItemId, got: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|s| s.contains("TEMP B-TREE")),
+                "{n} ids: subtitle probe must not sort for DISTINCT, got: {plan:?}"
+            );
+        }
     }
 }

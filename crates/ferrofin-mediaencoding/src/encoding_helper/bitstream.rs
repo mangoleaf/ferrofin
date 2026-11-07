@@ -1,10 +1,12 @@
 //! Bitstream filters: container fixups, stripping dynamic HDR metadata a
-//! client cannot handle, and the HLS copied-audio trim.
+//! client cannot handle, the HLS copied-audio trim, and the trim of an
+//! embedded subtitle sidecar in a seeked stream.
 //!
 //! Port of C# `EncodingHelper.ShouldRemoveDynamicHdrMetadata`,
 //! `CanEncoderRemoveDynamicHdrMetadata`, `IsDoviRemoved`, `IsHdr10PlusRemoved`,
 //! `GetBitStreamArgs` (10.11.z 1403-1540), `GetCopiedAudioTrimBsf` and
-//! `GetAudioBitStreamArguments`.
+//! `GetAudioBitStreamArguments`. The sidecar trim has no upstream counterpart
+//! ([`embedded_sidecar_trim_arguments`]).
 //!
 //! **Why this exists at all: it is what lets a Dolby Vision file stream-copy to
 //! a client that cannot play it.** Without these filters the only options are
@@ -22,17 +24,29 @@
 //!   wrong.
 //!
 //! The decision reads the *client's* declared range types, not the server's
-//! preferences: a player that never mentions Dolby Vision is deliberately
-//! allowed to copy a broken DOVI configuration, because an HDR10 player ignores
-//! the metadata it does not understand rather than crashing on it.
+//! preferences. Upstream lets a player that never mentions Dolby Vision copy
+//! the RPU through, a broken DOVI configuration included, because an HDR10
+//! player ignores metadata it does not understand rather than crashing on it.
+//!
+//! **Divergence (owner decision 2026-10-31, gl-737).** A Dolby Vision profile
+//! 8.1 AV1 title copied to jellyfin-web with its RPU did not render, although
+//! the browser plays the HDR10 base layer under it. So once a client has
+//! declared its range types, Ferrofin strips the RPU from every Dolby Vision
+//! stream it copies to a client that listed neither `DOVI` nor the stream's
+//! own range type ([`strips_dovi_for_a_client_without_dovi`]), where upstream
+//! plans no removal. The copy decision transcodes such a stream when this
+//! ffmpeg cannot strip it, or when the job's output takes no bitstream filter
+//! ([`video_bit_stream_filters_apply`]).
 
 use ferrofin_model::data::{VideoRange, VideoRangeType};
+use ferrofin_model::dlna::SubtitleDeliveryMethod;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_traits::media_encoding::TranscodingJobType;
 
 use super::hw::capabilities::{BsfOption, FfmpegCapabilities};
-use super::transcode_state::EncodingJobInfo;
+use super::hw::tonemap::is_dovi;
+use super::transcode_state::{EncoderCapabilities, EncodingJobInfo};
 use crate::encoder::FfmpegVersion;
 
 /// What, if anything, has to be stripped from the bitstream.
@@ -151,14 +165,92 @@ fn range_type_name(t: VideoRangeType) -> String {
     t.json_name().into_owned()
 }
 
+/// Whether Ferrofin strips the Dolby Vision RPU from this copy where upstream
+/// copies it through.
+///
+/// Divergence (owner decision 2026-10-31, gl-737). True for a Dolby Vision
+/// stream with a base layer (every Dolby Vision range type but profile 5's
+/// `DOVI`, which has none to fall back to) when the client declared range types
+/// and listed neither `DOVI` nor the stream's own range type: it plays the base
+/// layer, the HDR10, HLG or SDR fallback of profile 8 among them. Upstream
+/// plans no removal for most of these and ships the RPU, as it did the
+/// Dolby Vision profile 8.1 AV1 title that then did not render in
+/// jellyfin-web. False where upstream's
+/// [`should_remove_dynamic_hdr_metadata`] strips HDR10+ instead, for an
+/// enhancement-layer player, which then gets the range type it listed.
+#[must_use]
+pub fn strips_dovi_for_a_client_without_dovi(state: &EncodingJobInfo) -> bool {
+    let Some(video) = state.video_stream.as_ref() else {
+        return false;
+    };
+    let range_type = video.video_range_type();
+    if range_type == VideoRangeType::Dovi || !is_dovi(Some(video)) {
+        return false;
+    }
+    let requested = state.requested_range_types(video.codec.as_deref().unwrap_or_default());
+    let wants = |t: VideoRangeType| {
+        let name = range_type_name(t);
+        requested.iter().any(|r| r.eq_ignore_ascii_case(&name))
+    };
+    !requested.is_empty()
+        && !wants(VideoRangeType::Dovi)
+        && !wants(range_type)
+        && should_remove_dynamic_hdr_metadata(state) != HdrMetadataRemoval::RemoveHdr10Plus
+}
+
+/// What this job strips from a copied video: upstream's
+/// [`should_remove_dynamic_hdr_metadata`], plus the RPU of
+/// [`strips_dovi_for_a_client_without_dovi`] when this ffmpeg can strip it.
+///
+/// Without the filters it is upstream's plan alone. The copy decision
+/// transcodes such a stream, so only a copy it cannot refuse (the client asked
+/// for `copy`, or may not transcode) gets here, and it gets upstream's
+/// arguments rather than a filter this ffmpeg does not have.
+#[must_use]
+pub fn dynamic_hdr_metadata_removal<C: EncoderCapabilities + ?Sized>(
+    caps: &C,
+    state: &EncodingJobInfo,
+) -> HdrMetadataRemoval {
+    if strips_dovi_for_a_client_without_dovi(state)
+        && can_remove_dynamic_hdr_metadata(
+            caps,
+            HdrMetadataRemoval::RemoveDovi,
+            state.video_stream.as_ref(),
+        )
+    {
+        return HdrMetadataRemoval::RemoveDovi;
+    }
+    should_remove_dynamic_hdr_metadata(state)
+}
+
+/// Whether a copied video's [`bit_stream_args`] reach the ffmpeg command line,
+/// and so whether a planned removal happens at all.
+///
+/// Upstream's gates on the copy's `-bsf:v`, in `DynamicHlsController`'s
+/// `GetVideoArguments` and `EncodingHelper.GetProgressiveVideoArguments`: a
+/// progressive job takes it only into MPEG-TS, and no job takes it for a source
+/// already in Annex B form (`NalLengthSize == "0"`).
+#[must_use]
+pub fn video_bit_stream_filters_apply(state: &EncodingJobInfo) -> bool {
+    (state.transcoding_type != TranscodingJobType::Progressive
+        || state
+            .output_container
+            .as_deref()
+            .is_some_and(|container| container.eq_ignore_ascii_case("ts")))
+        && state
+            .video_stream
+            .as_ref()
+            .is_some_and(|video| video.nal_length_size.as_deref() != Some("0"))
+}
+
 /// Whether this ffmpeg can perform `plan` on `video_stream`. Port of
 /// `CanEncoderRemoveDynamicHdrMetadata`.
 ///
 /// A `None` plan is trivially possible. The asymmetry between the two removals
 /// lives here: Dolby Vision has a generic fallback filter, HDR10+ does not.
 #[must_use]
-pub fn can_remove_dynamic_hdr_metadata(
-    caps: &FfmpegCapabilities,
+pub fn can_remove_dynamic_hdr_metadata<C: EncoderCapabilities + ?Sized>(
+    caps: &C,
     plan: HdrMetadataRemoval,
     video_stream: Option<&MediaStream>,
 ) -> bool {
@@ -180,14 +272,15 @@ pub fn can_remove_dynamic_hdr_metadata(
     }
 }
 
-/// Whether Dolby Vision will actually be stripped. Port of `IsDoviRemoved`.
+/// Whether Dolby Vision will actually be stripped. Port of `IsDoviRemoved`,
+/// over the job's plan ([`dynamic_hdr_metadata_removal`]).
 ///
 /// Both halves matter: the client has to need it removed **and** this ffmpeg
 /// has to be able to. A build that cannot is why the copy gets refused instead.
 #[must_use]
 pub fn is_dovi_removed(caps: &FfmpegCapabilities, state: &EncodingJobInfo) -> bool {
     state.video_stream.is_some()
-        && should_remove_dynamic_hdr_metadata(state) == HdrMetadataRemoval::RemoveDovi
+        && dynamic_hdr_metadata_removal(caps, state) == HdrMetadataRemoval::RemoveDovi
         && can_remove_dynamic_hdr_metadata(
             caps,
             HdrMetadataRemoval::RemoveDovi,
@@ -195,11 +288,12 @@ pub fn is_dovi_removed(caps: &FfmpegCapabilities, state: &EncodingJobInfo) -> bo
         )
 }
 
-/// Whether HDR10+ will actually be stripped. Port of `IsHdr10PlusRemoved`.
+/// Whether HDR10+ will actually be stripped. Port of `IsHdr10PlusRemoved`,
+/// over the job's plan ([`dynamic_hdr_metadata_removal`]).
 #[must_use]
 pub fn is_hdr10_plus_removed(caps: &FfmpegCapabilities, state: &EncodingJobInfo) -> bool {
     state.video_stream.is_some()
-        && should_remove_dynamic_hdr_metadata(state) == HdrMetadataRemoval::RemoveHdr10Plus
+        && dynamic_hdr_metadata_removal(caps, state) == HdrMetadataRemoval::RemoveHdr10Plus
         && can_remove_dynamic_hdr_metadata(
             caps,
             HdrMetadataRemoval::RemoveHdr10Plus,
@@ -215,7 +309,9 @@ pub fn is_hdr10_plus_removed(caps: &FfmpegCapabilities, state: &EncodingJobInfo)
 /// - **Container fixups.** `h264_mp4toannexb` / `hevc_mp4toannexb` convert
 ///   length-prefixed MP4 NAL units to the start-code form mpegts wants, and
 ///   `aac_adtstoasc` converts the other way for audio.
-/// - **HDR metadata removal**, appended to the HEVC/AV1 filter chain.
+/// - **HDR metadata removal**, appended to the HEVC/AV1 filter chain. It
+///   follows the job's plan ([`dynamic_hdr_metadata_removal`]), so it also
+///   strips the RPU Ferrofin removes where upstream does not.
 #[must_use]
 pub fn bit_stream_args(
     caps: &FfmpegCapabilities,
@@ -238,10 +334,12 @@ pub fn bit_stream_args(
 
     if is_h265(stream) {
         let mut filter = "-bsf:v hevc_mp4toannexb".to_owned();
-        // No capability re-check here, deliberately: the copy would already
-        // have been refused if this ffmpeg could not do the removal, and a bsf
-        // only appears on a copy at all.
-        match should_remove_dynamic_hdr_metadata(state) {
+        // No capability re-check here, deliberately: a bsf only appears on a
+        // copy, a copy is refused when this ffmpeg cannot do upstream's
+        // removal, and a copy that cannot be refused (the client asked for
+        // `copy`, or may not transcode) gets Ferrofin's own strip only when
+        // this ffmpeg has the filters (`dynamic_hdr_metadata_removal`).
+        match dynamic_hdr_metadata_removal(caps, state) {
             HdrMetadataRemoval::None => {}
             HdrMetadataRemoval::RemoveDovi => {
                 filter.push_str(
@@ -264,7 +362,7 @@ pub fn bit_stream_args(
     if is_av1(stream) {
         // AV1 needs no container fixup, so unlike HEVC there is nothing to
         // return when no metadata has to go.
-        return match should_remove_dynamic_hdr_metadata(state) {
+        return match dynamic_hdr_metadata_removal(caps, state) {
             HdrMetadataRemoval::None => None,
             HdrMetadataRemoval::RemoveDovi => Some(
                 if caps.supports_bsf_with_option(BsfOption::Av1MetadataRemoveDovi) {
@@ -360,6 +458,126 @@ pub fn audio_bit_stream_arguments(
     Some(format!("-bsf:a {}", filters.join(",")))
 }
 
+/// The first ffmpeg whose `setts` filter can rewrite a packet's duration
+/// (its `duration` option and `DURATION` constant arrived after 5.0).
+const MIN_FFMPEG_SETTS_DURATION: FfmpegVersion = FfmpegVersion::new(5, 1);
+
+/// The external subtitle track `state` embeds into its output, if any.
+fn embedded_sidecar(state: &EncodingJobInfo) -> Option<&MediaStream> {
+    state.subtitle_stream.as_ref().filter(|sub| {
+        state.subtitle_delivery_method == SubtitleDeliveryMethod::Embed && sub.is_external
+    })
+}
+
+/// The output options that trim an embedded external subtitle to the start
+/// of a seeked stream, for the embedded track (`s:0`). `None` when the media
+/// file is not seeked (`seeked`: its `-ss` is past 0), the subtitle is not an
+/// external track embedded into the output, or the job copies timestamps.
+///
+/// Divergence, a Jellyfin bug not ported (gl-930): `GetInputArgument` seeks
+/// the sidecar with the media file's `-ss`, and a subtitle file's seek lands
+/// on the last cue that starts at or before that time, even one already over.
+/// Its timestamp is then negative on the output clock, and Matroska, which
+/// writes no negative timestamps, moves every stream later by it: a seek to
+/// 9 s past a cue at 3.5-8 s started the video 5.5 s into the file (measured
+/// on ffmpeg 4.4.2, 8.1.3-Jellyfin and 9.0.2), and the gap grows with the time
+/// since the last cue. An MP4 keeps the stale cue at the start instead.
+///
+/// From ffmpeg 5.1 the cues are trimmed as upstream's
+/// `SubtitleEncoder.FilterEvents` trims a sidecar it serves from a start
+/// position: the `noise` filter drops a cue that has ended by the start, and
+/// `setts` starts one still on screen at the start, its duration cut to the
+/// time it has left (measured on 8.1.3-Jellyfin and 9.0.2, a copied track and
+/// one converted to ASS or `mov_text` alike). A cue that ends exactly at the
+/// start goes too: upstream keeps it with no length, which shows nothing, but
+/// MP4's `mov_text` would stretch it to the next cue. ffmpeg 5.0's `setts`
+/// cannot change a duration, so there the `noise` filter, upstream's
+/// copied-audio trim tool, drops every cue that starts before the start, the
+/// one on screen included. An older ffmpeg has no `drop` option, and a
+/// version that cannot be read counts as the oldest supported: `-copypriorss`
+/// then drops those cues of a copied track.
+///
+/// Before 5.1 a text sidecar does not reach these options: the server cuts it
+/// to the start itself, as `FilterEvents` does, and the job reads that copy
+/// unseeked ([`embedded_sidecar_needs_trimmed_copy`], gl-1199). They still
+/// serve a text sidecar whose copy could not be made (the planner logs why) and
+/// a bitmap one. TODO(gl-1221): before 5.0 a bitmap sidecar converted to
+/// another codec (`subtitleCodec`) still moves every stream later, by the start
+/// position less its first display set's time (it is read from its start),
+/// since `-copypriorss` only reaches stream copy (ffmpeg 4.4.2: from 9 s past a
+/// box at 3.5-8 s, PGS converted to `dvdsub` started the video 5.5 s late). Fix
+/// path: drop the display sets before the start before ffmpeg converts them,
+/// from the sidecar's own timing (the `.sup` segment headers, the `.idx`
+/// timestamps, which gl-1215 reads too), on the clock gl-1214 decides.
+///
+/// A bitmap sidecar is read from its start on every ffmpeg (gl-1200), so every
+/// display set before the start reaches these options. TODO(gl-1215): its
+/// packets carry no duration, so every one before the start is dropped and a
+/// bitmap on screen at the start shows only from the next display set, often
+/// its own clear. Fix path: find the last display set at or before the start
+/// in the sidecar's own timing (the `.sup` segment headers, the `.idx`
+/// timestamps) and start it at 0 instead of dropping it; its time on the
+/// output clock follows the clock gl-1214 decides.
+///
+/// A job that copies timestamps (`-copyts -avoid_negative_ts disabled`) keeps
+/// the source's clock, on which nothing before the seek is negative and no
+/// stream moves (measured: the drop changes nothing there). The stream routes
+/// do not bind `copyTimestamps` yet (gl-1040), so no job does today.
+#[must_use]
+pub fn embedded_sidecar_trim_arguments(
+    state: &EncodingJobInfo,
+    seeked: bool,
+    ffmpeg_version: Option<FfmpegVersion>,
+) -> Option<&'static str> {
+    if !seeked
+        || embedded_sidecar(state).is_none()
+        || state.copies_timestamps()
+        || state.trimmed_subtitle_path.is_some()
+    {
+        return None;
+    }
+    let at_least = |minimum| ffmpeg_version.is_some_and(|version| version >= minimum);
+    Some(if at_least(MIN_FFMPEG_SETTS_DURATION) {
+        "-bsf:s:0 noise=drop='lt(pts\\,0)*lte(pts+duration\\,0)',setts=pts='max(PTS\\,0)':dts='max(DTS\\,0)':duration='DURATION+min(PTS\\,0)'"
+    } else if at_least(MIN_FFMPEG_NOISE_BSF_DROP) {
+        "-bsf:s:0 noise=drop='lt(pts\\,0)'"
+    } else {
+        "-copypriorss:s:0 0"
+    })
+}
+
+/// Whether a seeked stream embeds its external text sidecar from a copy the
+/// server cuts to the start, rather than from the sidecar seeked like the
+/// media file and trimmed on the output side
+/// ([`embedded_sidecar_trim_arguments`]). `seeked` as there.
+///
+/// Before ffmpeg 5.1, or with a version that cannot be read, the output trim
+/// cannot cut the sidecar as upstream's `SubtitleEncoder.FilterEvents` cuts
+/// one it serves from a start position: it drops the cue on screen at the
+/// start instead of starting it at 0, and before 5.0, for a track converted
+/// to another codec (`subtitleCodec`), it drops nothing, since `-copypriorss`
+/// only reaches stream copy, and every stream starts late by the time since
+/// the last cue before the start (ffmpeg 4.4.2: from 8.2 s past a cue at
+/// 3.5-8 s, converted to ASS, the video started 4.7 s late; gl-1199). There
+/// the server's own subtitle encoder cuts the sidecar with `FilterEvents`
+/// instead, and the job reads that copy, not seeked
+/// ([`EncodingJobInfo::trimmed_subtitle_path`]). Measured on 4.4.2 from 8.2
+/// and 9 s, copied, converted to ASS and to `mov_text`: every stream started
+/// on time, and the cue on screen at the start showed from 0. From 5.1 the
+/// output trim already cuts as `FilterEvents` does and the sidecar is read as
+/// it is. A bitmap sidecar has no text for the encoder to cut.
+#[must_use]
+pub fn embedded_sidecar_needs_trimmed_copy(
+    state: &EncodingJobInfo,
+    seeked: bool,
+    ffmpeg_version: Option<FfmpegVersion>,
+) -> bool {
+    seeked
+        && embedded_sidecar(state).is_some_and(MediaStream::is_text_subtitle_stream)
+        && !state.copies_timestamps()
+        && ffmpeg_version.is_none_or(|version| version < MIN_FFMPEG_SETTS_DURATION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +629,7 @@ mod tests {
             input_container: None,
             is_input_video: true,
             subtitle_delivery_method: ferrofin_model::dlna::enums::SubtitleDeliveryMethod::Encode,
+            trimmed_subtitle_path: None,
             run_time_ticks: Some(1),
             transcoding_type: ferrofin_traits::media_encoding::TranscodingJobType::Progressive,
             supported_video_codecs: Vec::new(),
@@ -531,10 +750,10 @@ mod tests {
         );
     }
 
-    // Transliterated from upstream's `EncodingHelperDoviTests` (v12.2,
+    // Transliterated from upstream's `EncodingHelperDoviTests` (v12.4,
     // `tests/Jellyfin.Controller.Tests/MediaEncoding/EncodingHelperDoviTests.cs`).
     // Its `CanStreamCopyVideo_InvalidDovi_RequiresRemovalSupportOnlyForDoviClients`
-    // is not ported here: it needs `CanStreamCopyVideo`'s range block (gl-737).
+    // is with the copy decision, in `helper.rs`.
 
     /// Upstream's `CreateState`: a copy of [`invalid_dovi`].
     fn invalid_dovi_state(codec: &str, transfer: Option<&str>) -> EncodingJobInfo {
@@ -543,9 +762,13 @@ mod tests {
         state
     }
 
-    /// Only a client that asked for DOVI gets an invalid stream's Dolby
-    /// Vision stripped, whatever its base layer: an SDR base no longer
-    /// skips the decision.
+    /// Port of `GetBitStreamArgs_InvalidDovi_PreservesClientDependentRemoval`.
+    /// Upstream strips an invalid stream's Dolby Vision only for a client that
+    /// asked for DOVI, whatever its base layer: an SDR base no longer skips the
+    /// decision. Three rows differ by a divergence (owner decision 2026-10-31,
+    /// gl-737): a client that declared `SDR`, `HDR10` or `DOVIWithEL` without
+    /// `DOVI` gets the RPU stripped too, where upstream copies it through. A
+    /// client that declared no ranges still gets it untouched.
     #[rstest]
     #[case("hevc", None, "hevc_metadata=remove_dovi=1")]
     #[case("hevc", Some("bt709"), "hevc_metadata=remove_dovi=1")]
@@ -565,9 +788,10 @@ mod tests {
         let no_removal = caps_with(&[]);
         for (requested, remove_dovi) in [
             (None, false),
-            (Some("SDR"), false),
-            (Some("HDR10"), false),
-            (Some("DOVIWithEL"), false),
+            // Upstream: false for these three.
+            (Some("SDR"), true),
+            (Some("HDR10"), true),
+            (Some("DOVIWithEL"), true),
             (Some("DOVI"), true),
             (Some("SDR,DOVI"), true),
         ] {
@@ -766,6 +990,126 @@ mod tests {
         );
     }
 
+    // ----- the RPU strip for a client that did not list DOVI -----------------
+
+    const HEVC_FIXUP: &str = "-bsf:v hevc_mp4toannexb";
+    const HEVC_STRIP: &str = "-bsf:v hevc_mp4toannexb,hevc_metadata=remove_dovi=1";
+    const AV1_STRIP: &str = "-bsf:v av1_metadata=remove_dovi=1";
+
+    /// Divergence (owner decision 2026-10-31, gl-737): a Dolby Vision stream
+    /// copied to a client that declared range types without `DOVI` or the
+    /// stream's own range type has its RPU stripped. Upstream plans no removal
+    /// for most of these rows (the base-layer fallbacks, HDR10+ beside Dolby
+    /// Vision, an invalid configuration) and copies the RPU through. The rows
+    /// a Dolby Vision player, a listed range type or upstream's own plan
+    /// decides are upstream's.
+    #[rstest]
+    #[case::p8_1_hevc(
+        "hevc",
+        VideoRangeType::DoviWithHdr10,
+        "SDR,HDR10,HLG",
+        Some(HEVC_STRIP)
+    )]
+    #[case::p8_1_av1(
+        "av1",
+        VideoRangeType::DoviWithHdr10,
+        "SDR,HDR10,HDR10Plus,HLG",
+        Some(AV1_STRIP)
+    )]
+    #[case::p8_4("hevc", VideoRangeType::DoviWithHlg, "SDR,HLG", Some(HEVC_STRIP))]
+    #[case::p8_2("hevc", VideoRangeType::DoviWithSdr, "SDR,HDR10", Some(HEVC_STRIP))]
+    #[case::p8_1_hdr10_plus(
+        "hevc",
+        VideoRangeType::DoviWithHdr10Plus,
+        "SDR,HDR10,HDR10Plus",
+        Some(HEVC_STRIP)
+    )]
+    #[case::p7_to_hlg("hevc", VideoRangeType::DoviWithEl, "SDR,HLG", Some(HEVC_STRIP))]
+    #[case::invalid("av1", VideoRangeType::DoviInvalid, "SDR,HDR10", Some(AV1_STRIP))]
+    // Upstream's own: a Dolby Vision player keeps the RPU...
+    #[case::dovi_player(
+        "hevc",
+        VideoRangeType::DoviWithHdr10,
+        "SDR,HDR10,DOVI",
+        Some(HEVC_FIXUP)
+    )]
+    #[case::dovi_player_av1("av1", VideoRangeType::DoviWithHdr10, "HDR10,DOVI", None)]
+    // ...so does a client that lists the stream's range type...
+    #[case::listed(
+        "hevc",
+        VideoRangeType::DoviWithHdr10,
+        "HDR10,DOVIWithHDR10",
+        Some(HEVC_FIXUP)
+    )]
+    // ...and one that declares no ranges at all.
+    #[case::no_ranges("hevc", VideoRangeType::DoviWithHdr10, "", Some(HEVC_FIXUP))]
+    // Profile 5 has no base layer the strip would leave playable.
+    #[case::p5("hevc", VideoRangeType::Dovi, "SDR,HDR10", Some(HEVC_FIXUP))]
+    // An enhancement-layer player loses the HDR10+ instead, as upstream.
+    #[case::el_player(
+        "hevc",
+        VideoRangeType::DoviWithElhdr10Plus,
+        "HDR10,DOVIWithEL",
+        Some("-bsf:v hevc_mp4toannexb,hevc_metadata=remove_hdr10plus=1")
+    )]
+    fn a_client_that_did_not_list_dovi_gets_the_rpu_stripped(
+        #[case] codec: &str,
+        #[case] range_type: VideoRangeType,
+        #[case] requested: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let requested: Vec<&str> = requested.split(',').filter(|r| !r.is_empty()).collect();
+        let state = state_with(video(codec, range_type), &requested);
+        let caps = all_bsf();
+        assert_eq!(
+            bit_stream_args(&caps, &state, MediaStreamType::Video).as_deref(),
+            expected,
+            "{codec}/{range_type:?}/{requested:?}"
+        );
+        assert_eq!(
+            is_dovi_removed(&caps, &state),
+            expected.is_some_and(|args| args.contains("remove_dovi")),
+            "{codec}/{range_type:?}/{requested:?}"
+        );
+    }
+
+    #[test]
+    fn the_strip_uses_the_generic_filter_where_the_codec_one_is_missing() {
+        let caps = caps_with(&[BsfOption::DoviRpuStrip]);
+        for (codec, expected) in [
+            ("hevc", "-bsf:v hevc_mp4toannexb,dovi_rpu=strip=1"),
+            ("av1", "-bsf:v dovi_rpu=strip=1"),
+        ] {
+            let state = state_with(video(codec, VideoRangeType::DoviWithHdr10), &["HDR10"]);
+            assert_eq!(
+                bit_stream_args(&caps, &state, MediaStreamType::Video).as_deref(),
+                Some(expected),
+                "{codec}"
+            );
+            assert!(is_dovi_removed(&caps, &state), "{codec}");
+        }
+    }
+
+    #[test]
+    fn an_ffmpeg_that_cannot_strip_gets_upstreams_arguments() {
+        // The copy check transcodes such a stream. A copy it cannot refuse (the
+        // client asked for `copy`, or may not transcode) gets what upstream
+        // sends rather than a filter this ffmpeg does not have.
+        let caps = caps_with(&[]);
+        let fallback = state_with(video("hevc", VideoRangeType::DoviWithHdr10), &["HDR10"]);
+        assert_eq!(
+            bit_stream_args(&caps, &fallback, MediaStreamType::Video).as_deref(),
+            Some(HEVC_FIXUP)
+        );
+        assert!(!is_dovi_removed(&caps, &fallback));
+        // Upstream's own removal plan is untouched.
+        let el = state_with(video("hevc", VideoRangeType::DoviWithEl), &["HDR10"]);
+        assert_eq!(
+            bit_stream_args(&caps, &el, MediaStreamType::Video).as_deref(),
+            Some("-bsf:v hevc_mp4toannexb,dovi_rpu=strip=1")
+        );
+    }
+
     #[test]
     fn a_missing_stream_yields_nothing_rather_than_panicking() {
         // Upstream throws a NullReferenceException here: it null-checks the
@@ -831,6 +1175,7 @@ mod tests {
             input_container: Some(input_container.to_owned()),
             is_input_video: true,
             subtitle_delivery_method: ferrofin_model::dlna::enums::SubtitleDeliveryMethod::Encode,
+            trimmed_subtitle_path: None,
             run_time_ticks: Some(6_000_000_000),
             transcoding_type: job_type,
             supported_video_codecs: Vec::new(),
@@ -942,5 +1287,182 @@ mod tests {
             ),
             Some(format!("-bsf:a noise=drop='lt(pts*tb\\,{cutoff})'")),
         );
+    }
+
+    /// A progressive job embedding the subtitle `sub` (`None`: no subtitle).
+    fn embed_state(sub: Option<MediaStream>, method: SubtitleDeliveryMethod) -> EncodingJobInfo {
+        EncodingJobInfo {
+            subtitle_stream: sub,
+            subtitle_delivery_method: method,
+            ..audio_bsf_state(
+                TranscodingJobType::Progressive,
+                "libx264",
+                "aac",
+                "aac",
+                "mkv",
+                DEFAULT_SEEK_TICKS,
+            )
+        }
+    }
+
+    /// A subtitle stream, external (a sidecar) or inside the media file.
+    fn subtitle(external: bool) -> MediaStream {
+        MediaStream {
+            codec: Some("subrip".to_owned()),
+            index: 2,
+            stream_type: MediaStreamType::Subtitle,
+            is_external: external,
+            path: external.then(|| "/media/movie.en.srt".to_owned()),
+            ..MediaStream::default()
+        }
+    }
+
+    const FILTER_EVENTS: &str = "-bsf:s:0 noise=drop='lt(pts\\,0)*lte(pts+duration\\,0)',setts=pts='max(PTS\\,0)':dts='max(DTS\\,0)':duration='DURATION+min(PTS\\,0)'";
+    const NOISE_DROP: &str = "-bsf:s:0 noise=drop='lt(pts\\,0)'";
+    const COPY_PRIOR: &str = "-copypriorss:s:0 0";
+
+    /// An embedded sidecar in a seeked stream is trimmed to the output's start
+    /// (gl-930): from ffmpeg 5.1 as `FilterEvents` trims it (elapsed cues
+    /// dropped, the one on screen started at 0), on 5.0 every cue before the
+    /// start dropped by the `noise` filter, `-copypriorss` on an older or
+    /// unread version. Nothing for an unseeked stream, a track in the media
+    /// file, another delivery method or no subtitle.
+    #[rstest]
+    #[case::from_5_1(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((5, 1)), Some(FILTER_EVENTS))]
+    #[case::current(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((9, 0)), Some(FILTER_EVENTS))]
+    #[case::on_5_0(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((5, 0)), Some(NOISE_DROP))]
+    #[case::before_5_0(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((4, 4)), Some(COPY_PRIOR))]
+    #[case::unknown_version(
+        true,
+        Some(subtitle(true)),
+        SubtitleDeliveryMethod::Embed,
+        None,
+        Some(COPY_PRIOR)
+    )]
+    #[case::not_seeked(false, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((9, 0)), None)]
+    #[case::internal_track(true, Some(subtitle(false)), SubtitleDeliveryMethod::Embed, Some((9, 0)), None)]
+    #[case::burned_in(true, Some(subtitle(true)), SubtitleDeliveryMethod::Encode, Some((9, 0)), None)]
+    #[case::external_delivery(true, Some(subtitle(true)), SubtitleDeliveryMethod::External, Some((9, 0)), None)]
+    #[case::no_subtitle(true, None, SubtitleDeliveryMethod::Embed, Some((9, 0)), None)]
+    fn an_embedded_sidecar_drops_the_cues_before_a_seek(
+        #[case] seeked: bool,
+        #[case] sub: Option<MediaStream>,
+        #[case] method: SubtitleDeliveryMethod,
+        #[case] version: Option<(i32, i32)>,
+        #[case] expected: Option<&str>,
+    ) {
+        let state = embed_state(sub, method);
+        let version = version.map(|(major, minor)| FfmpegVersion::new(major, minor));
+        assert_eq!(
+            embedded_sidecar_trim_arguments(&state, seeked, version),
+            expected
+        );
+    }
+
+    /// Copied timestamps keep the source's clock, so nothing is dropped; they
+    /// count only with a known runtime, as the planner's `-copyts` does.
+    #[rstest]
+    #[case::copied(Some(6_000_000_000), None)]
+    #[case::unknown_runtime(None, Some(FILTER_EVENTS))]
+    fn copied_timestamps_keep_the_sidecar_cues(
+        #[case] run_time_ticks: Option<i64>,
+        #[case] expected: Option<&str>,
+    ) {
+        let mut state = embed_state(Some(subtitle(true)), SubtitleDeliveryMethod::Embed);
+        state.base_request.copy_timestamps = true;
+        state.run_time_ticks = run_time_ticks;
+        assert_eq!(
+            embedded_sidecar_trim_arguments(&state, true, Some(FfmpegVersion::new(9, 0))),
+            expected
+        );
+    }
+
+    /// An external `.sup` sidecar.
+    fn bitmap_sidecar() -> MediaStream {
+        MediaStream {
+            codec: Some("PGSSUB".to_owned()),
+            path: Some("/media/movie.en.sup".to_owned()),
+            ..subtitle(true)
+        }
+    }
+
+    /// Before ffmpeg 5.1, or with a version that cannot be read, a seeked
+    /// stream embeds a text sidecar from a copy the server cut to the start
+    /// (gl-1199): the output trim there drops the cue on screen at the start,
+    /// and before 5.0 shifts every stream for a converted track. Not from 5.1,
+    /// whose trim cuts as `FilterEvents` does; not without a seek, for a track
+    /// in the media file, a bitmap sidecar, another delivery method, or a job
+    /// that copies timestamps.
+    #[rstest]
+    #[case::on_5_0(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((5, 0)), true)]
+    #[case::before_5_0(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((4, 4)), true)]
+    #[case::unknown_version(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, None, true)]
+    #[case::from_5_1(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((5, 1)), false)]
+    #[case::current(true, Some(subtitle(true)), SubtitleDeliveryMethod::Embed, Some((9, 0)), false)]
+    #[case::not_seeked(
+        false,
+        Some(subtitle(true)),
+        SubtitleDeliveryMethod::Embed,
+        None,
+        false
+    )]
+    #[case::internal_track(
+        true,
+        Some(subtitle(false)),
+        SubtitleDeliveryMethod::Embed,
+        None,
+        false
+    )]
+    #[case::bitmap(
+        true,
+        Some(bitmap_sidecar()),
+        SubtitleDeliveryMethod::Embed,
+        None,
+        false
+    )]
+    #[case::burned_in(
+        true,
+        Some(subtitle(true)),
+        SubtitleDeliveryMethod::Encode,
+        None,
+        false
+    )]
+    #[case::no_subtitle(true, None, SubtitleDeliveryMethod::Embed, None, false)]
+    fn a_seeked_text_sidecar_is_cut_by_the_server_before_ffmpeg_5_1(
+        #[case] seeked: bool,
+        #[case] sub: Option<MediaStream>,
+        #[case] method: SubtitleDeliveryMethod,
+        #[case] version: Option<(i32, i32)>,
+        #[case] expected: bool,
+    ) {
+        let state = embed_state(sub, method);
+        let version = version.map(|(major, minor)| FfmpegVersion::new(major, minor));
+        assert_eq!(
+            embedded_sidecar_needs_trimmed_copy(&state, seeked, version),
+            expected
+        );
+    }
+
+    /// Nor does a job copying timestamps get the copy: its clock keeps the
+    /// cues before the start positive.
+    #[test]
+    fn copied_timestamps_read_the_sidecar_itself() {
+        let mut state = embed_state(Some(subtitle(true)), SubtitleDeliveryMethod::Embed);
+        state.base_request.copy_timestamps = true;
+        state.run_time_ticks = Some(6_000_000_000);
+        assert!(!embedded_sidecar_needs_trimmed_copy(&state, true, None));
+    }
+
+    /// The copy the server cut starts at the start, so the output trim adds
+    /// nothing for it.
+    #[rstest]
+    #[case::on_5_0(Some((5, 0)))]
+    #[case::before_5_0(Some((4, 4)))]
+    #[case::unknown_version(None)]
+    fn a_trimmed_copy_needs_no_output_trim(#[case] version: Option<(i32, i32)>) {
+        let mut state = embed_state(Some(subtitle(true)), SubtitleDeliveryMethod::Embed);
+        state.trimmed_subtitle_path = Some("/cache/transcodes/abc-stream.90000000.srt".into());
+        let version = version.map(|(major, minor)| FfmpegVersion::new(major, minor));
+        assert_eq!(embedded_sidecar_trim_arguments(&state, true, version), None);
     }
 }

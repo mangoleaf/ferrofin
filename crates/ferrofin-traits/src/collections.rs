@@ -279,11 +279,11 @@ mod tests {
     #[test]
     fn creation_options_default_is_empty() {
         let o = CollectionCreationOptions::default();
-        assert!(o.name.is_empty());
+        assert_eq!(o.name, "");
         assert!(o.parent_id.is_none());
         assert!(!o.is_locked);
         assert!(o.provider_ids.is_empty());
-        assert!(o.item_id_list.is_empty());
-        assert!(o.user_ids.is_empty());
+        assert!(o.item_id_list.is_empty(), "{:?}", o.item_id_list);
+        assert!(o.user_ids.is_empty(), "{:?}", o.user_ids);
     }
 }

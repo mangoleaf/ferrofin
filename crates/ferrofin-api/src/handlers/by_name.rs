@@ -14,14 +14,16 @@
 //! just its route wiring plus the manager call that differs — extracting the
 //! reuse rather than copying it into six files.
 
+use std::sync::Arc;
+
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::querying::QueryResult;
-use ferrofin_traits::options::DtoOptions;
+use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
 use ferrofin_traits::persistence::ItemWithCounts;
 
 use crate::error::ApiError;
-use crate::handlers::items::parse_order_by;
+use crate::handlers::items::{parse_order_by, require_scope_visible};
 use crate::state::AppState;
 
 /// The paging + name-range query parameters shared by every by-name **list**
@@ -192,7 +194,7 @@ impl ByNameListQuery {
     /// a `400` — ASP.NET's binder and C# `ApplyFilters` reject them the same way.
     pub(crate) fn base_query(
         &self,
-        user: Option<UserEntity>,
+        user: Option<Arc<UserEntity>>,
     ) -> Result<ferrofin_traits::options::InternalItemsQuery, ApiError> {
         let mut ancestor_ids = Vec::new();
         if let Some(parent) = self.parent_id {
@@ -227,10 +229,10 @@ impl ByNameListQuery {
             // The repository computes per-kind counts only when `ItemCounts`
             // is requested (v12 `ByName.cs:251`), and the controller adds it
             // when a type filter is set — see [`Self::should_include_item_types`].
-            dto_options: DtoOptions {
+            dto_options: Arc::new(DtoOptions {
                 fields: self.requested_fields(),
                 ..DtoOptions::default()
-            },
+            }),
             include_item_types,
             exclude_item_types,
             media_types,
@@ -270,12 +272,14 @@ impl ByNameListQuery {
     ///
     /// # Errors
     ///
-    /// `400` for an id naming no item.
+    /// `400` for an id naming no item, `403` for one the user may not open.
     pub(crate) async fn parent(
         &self,
         state: &AppState,
+        auth: &AuthorizationInfo,
+        user: Option<&UserEntity>,
     ) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ApiError> {
-        resolve_parent(state, self.parent_id).await
+        resolve_parent(state, auth, self.parent_id, user).await
     }
 
     /// [`Self::base_query`] for `GET /Artists` and `GET /Artists/AlbumArtists`,
@@ -291,7 +295,7 @@ impl ByNameListQuery {
     pub(crate) async fn artists_query(
         &self,
         state: &AppState,
-        user: Option<UserEntity>,
+        user: Option<Arc<UserEntity>>,
     ) -> Result<ferrofin_traits::options::InternalItemsQuery, ApiError> {
         let mut query = self.base_query(user)?;
         if let Some(ids) = resolve_by_name_ids(
@@ -341,10 +345,13 @@ impl ByNameListQuery {
 ///
 /// # Errors
 ///
-/// `400` for an id naming no item, the zero id included.
+/// `400` for an id naming no item, the zero id included, and `403` for one the
+/// user may not open ([`require_scope_visible`]).
 pub(crate) async fn resolve_parent(
     state: &AppState,
+    auth: &AuthorizationInfo,
     parent_id: Option<uuid::Uuid>,
+    user: Option<&UserEntity>,
 ) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ApiError> {
     let Some(parent_id) = parent_id else {
         return Ok(None);
@@ -353,7 +360,10 @@ pub(crate) async fn resolve_parent(
         return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
     }
     match state.library.get_item_by_id(parent_id).await? {
-        Some(parent) => Ok(Some(parent)),
+        Some(parent) => {
+            require_scope_visible(state, auth, &parent, user).await?;
+            Ok(Some(parent))
+        }
         None => Err(ApiError::BadRequest(format!(
             "Invalid parent id: {parent_id}"
         ))),
@@ -729,7 +739,7 @@ mod tests {
         // `new DtoOptions { Fields = [] }.AddAdditionalDtoOptions(null, null, null, [])`
         // leaves images on, the type set complete and the limit unbounded.
         let o = additional_dto_options(None, None, None, None, None);
-        assert!(o.fields.is_empty());
+        assert!(o.fields.is_empty(), "{:?}", o.fields);
         assert!(o.enable_images);
         assert!(o.enable_user_data);
         assert_eq!(o.image_type_limit, i32::MAX);
@@ -773,7 +783,12 @@ mod tests {
             ..ByNameListQuery::default()
         };
         assert!(typed.should_include_item_types());
-        let fields = typed.base_query(None).expect("query").dto_options.fields;
+        let fields = typed
+            .base_query(None)
+            .expect("query")
+            .dto_options
+            .fields
+            .clone();
         assert_eq!(fields, vec![ItemFields::ItemCounts]);
 
         let by_field = ByNameListQuery {

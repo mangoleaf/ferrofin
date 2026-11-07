@@ -1,7 +1,7 @@
 //! The embedded `Emby.Server.Implementations/Localization/Core/*.json`
 //! UI-culture dictionaries (`GetLocalizationDictionary`), copied verbatim from
-//! Jellyfin v12.2 (`ca0f16eb7c`), the `UPSTREAM_TAG` release pinned in
-//! `ferrofin-api`'s `handlers/mod.rs`. After re-vendoring, keep this table in
+//! Jellyfin v12.2 (`ca0f16eb7c`) and byte-equal at v12.4, the `UPSTREAM_TAG`
+//! release pinned in `ferrofin-api`'s `handlers.rs`. After re-vendoring, keep this table in
 //! step with the directory's file list.
 
 /// `(culture code, JSON dictionary)` for every shipped core translation.

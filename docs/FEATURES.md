@@ -1,7 +1,7 @@
 # Feature status
 
-**Parity: 7 / 412 operations deep-verified against Jellyfin v12.2** (`ca0f16eb7c`), none
-owed a re-check against an earlier release, 0 subsystem rows (as of 2026-10-19; the
+**Parity: 65 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
+14 compared against v12.2 and owed a re-check, 9 subsystem rows (as of 2026-11-03; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
 Ferrofin answers the way Jellyfin does (identical, in another order, a known difference, filed, new), is in
@@ -19,7 +19,7 @@ shared subsystem, which operation rows reference) beside `REAL_ROUTES`, validate
 `crates/ferrofin-api/tests/contract_superset.rs`, which prints the line above
 (`cargo test -p ferrofin-api --test contract_superset verified_rows -- --nocapture`). The
 release compared against is `UPSTREAM_TAG` / `UPSTREAM_COMMIT` in
-`crates/ferrofin-api/src/handlers/mod.rs`, the latest Jellyfin release when the release branch was
+`crates/ferrofin-api/src/handlers.rs`, the latest Jellyfin release when the release branch was
 cut (the branch keeps it until its release); rows compared
 against an earlier pin are listed in `VERIFIED_AGAINST_EARLIER_PIN` until re-checked.
 
@@ -33,8 +33,8 @@ with `FERROFIN_UPSTREAM_DIR` naming a Jellyfin checkout at `UPSTREAM_COMMIT`, pr
 upstream test project the Ferrofin rstest cases that cite an upstream test next to that
 project's `[InlineData]` count (1,833 cases against 2,677 at v12.2, as of 2026-10-19).
 
-Separately, [`gates/bench/`](../gates/bench/README.md) compares response *shapes* against Jellyfin
-12.0-rc7 each run, on a generated library scanned by a real Jellyfin. That is supporting
+Separately, [`gates/bench/`](../gates/bench/README.md) compares response *shapes* against the Jellyfin
+release `UPSTREAM_TAG` names each run, on a generated library scanned by a real Jellyfin. That is supporting
 evidence, not the parity number — it covers 28 requests and only the fields those requests
 happen to exercise.
 
@@ -73,10 +73,19 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     saved again; a new one goes last. Jellyfin lists them by a random id it draws again on
     every save, so its backdrop order reshuffles. An item adopted from Jellyfin can show
     its backdrops in a different order once.
+  - **Accepted divergence (a fix, not a gap):** a tuner's or guide's artwork must be an
+    `http` or `https` URL, and any other value is ignored. Jellyfin also accepts a local
+    path there. Logos set in the metadata editor, and the ones an adopted Jellyfin database
+    downloaded, keep working.
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
   `Data`-JSON shape, the same source of truth Jellyfin itself reads.
+  - **Accepted divergence:** a playlist's items listing and a reorder leave out a member from a
+    library the user was not given, where Jellyfin lists it and hides only what the member's
+    rating or tags rule out. Library access is a boundary here. What is stored stays: adding
+    still stores an item from such a library, and `GET /Playlists/{id}` still lists every
+    member in `ItemIds`.
   - **Accepted divergence (a fix, not a gap):** a reorder counts positions among the members
     the user can see, as Jellyfin's `MoveItemAsync` does, but Jellyfin anchors on the list
     before the moved entry is taken out and lands it one place short when it moves down past
@@ -89,6 +98,11 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     the last user or administrator, and can hand a playlist to a deleted user.
 - **Playback delivery** — direct play, and **live HLS transcode** including subtitle burn-in
   and fMP4 HEVC/AV1.
+  - **Accepted divergence (a fix, not a gap):** when a *half top-and-bottom* 3D source is
+    transcoded to a requested width, Jellyfin's software scaler carries an unbalanced
+    bracket (`scale=(iw*2):ih)`), which ffmpeg's expression parser rejects, so the
+    transcode never starts. Ferrofin emits the balanced form, which Jellyfin's own image
+    extraction has used since 12.3.
 - **Hardware transcoding** — **NVENC, VAAPI and QSV**. Decode, scale, deinterlace, rotate,
   HDR→SDR tonemap and subtitle compositing all run on the GPU where the driver supports
   it, with the pipeline chosen from a runtime probe of the device rather than from
@@ -102,7 +116,9 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     the command line. Ferrofin quotes such a path; an ordinary one (`/dev/dri/renderD128`)
     is passed exactly as Jellyfin passes it.
 - **Live TV** — M3U **and HDHomeRun** tuners + XMLTV **and Schedules Direct** guides,
-  channels/programs, DB-backed DVR timers & recordings. The Schedules Direct provider is a
+  channels/programs, DB-backed DVR timers & recordings, with each recording folder a library of
+  its own, so a finished recording is scanned like any other media. A recording in progress is
+  listed by `/LiveTv/Recordings` and joins its library when it ends. The Schedules Direct provider is a
   port of Jellyfin 12.2's `SchedulesDirect` (login, lineups, the station map, schedules,
   program details and artwork, SD's error codes and daily limits); it is verified against
   Jellyfin's own JSON fixtures and a fake SD API, and **has not been run against a real
@@ -129,11 +145,32 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   off. Off by default, as in Jellyfin.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
-  - **Accepted divergence (a fix, not a gap):** Jellyfin's scaler for *half
-    top-and-bottom* 3D sources carries an unbalanced bracket (`scale=(iw*2):ih)`), which
-    ffmpeg's expression parser rejects outright — so chapter and thumbnail images cannot
-    be extracted for that layout there at all. Ferrofin emits the balanced form, the same
-    shape Jellyfin's own half-side-by-side case already has.
+  - **Departure from Jellyfin: trickplay images are replaced, not deleted first.** "Replace
+    existing trickplay images" makes each width's new images before it swaps them in for the
+    old ones, so a video keeps its preview (apart from the moment between two folder
+    renames) and a failed Replace keeps the old images; Jellyfin deletes them all first.
+    After the trickplay widths (`WidthResolutions`) or the chroma (`FullChroma`) change, the
+    next Generate Trickplay Images run replaces the images that no longer match the same way,
+    then removes the widths no longer selected that Ferrofin made, once the selected ones
+    exist: those of earlier runs, and those a library scan or an item refresh made after a
+    change; Jellyfin keeps old images until a Replace. Only that run reads the existing
+    tiles, and it counts as done only when every video's images match, so an interrupted
+    run, or one that could not replace a set, checks again next time. A run with no width
+    selected checks nothing, and the next change still removes the old widths. A `Qscale` or JPEG
+    quality edited by hand still needs a Replace, as in Jellyfin. Upgrading records the
+    current settings and replaces nothing.
+  - **Departure from Jellyfin: wider trickplay sets get a smaller tile grid.** The configured
+    Tile width and Tile height are the grid at 320. Above that, each is multiplied by
+    320 / width, rounded down, at least 1 (640 gets 5 x 5 at the default 10 x 10), so a tile
+    holds no more pixels than a 320 tile until the grid is down to 1 x 1. Clients decode a
+    whole tile to show one preview, and Wholphin was seen decoding a 6400 x 3600 tile at 640
+    again on every scrub. Jellyfin uses the configured grid at every width. The next Generate
+    Trickplay Images run replaces sets made at the old grid.
+  - **Departure from Jellyfin: trickplay sizes are listed largest first.** An item's
+    `Trickplay` field lists its preview sizes from the widest down, in the same order every
+    time; Jellyfin lists them smallest first in practice. With Preview Size set to Both, apps
+    that use the first size listed (Wholphin, and the Jellyfin Android TV and Android apps)
+    then show the sharper 640 previews. jellyfin-web picks a size by screen width either way.
   - **Accepted divergence (a fix, not a gap):** Jellyfin passes every 3D scaler unquoted
     (`-vf {3}`), and those graphs contain spaces, so the command line is split apart and
     no 3D layout gets chapter or thumbnail images. Ferrofin quotes the filter graph.
@@ -150,6 +187,32 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
 
 Wired and working, with a documented limitation or lighter verification:
 
+- **Ferrofin settings page** — Ferrofin's own, with no Jellyfin counterpart, so checked in
+  jellyfin-web only. Dashboard → Plugins → **Ferrofin Settings** → Settings, or the dashboard menu's
+  Ferrofin Settings entry, lists every Ferrofin setting in nine tabs in a pane on the left, with a
+  search across them, grouped by tab, and filters for changed settings and read-only ones. Each has
+  a readable name with its key, variable, flag and default below, what sets it (`config.toml`,
+  environment variable or flag), and, for each one the page may not change, its value with a lock,
+  why and where it is changed instead. Secrets are shown to administrators, marked as secrets. The
+  rest are edited there, each on one line with its default shown while unset: Save writes the
+  changes of every tab to `config.toml`, a refused value shows the server's message next to it,
+  Reset to default removes the key, and Restart now applies them, all but the few that need a full
+  process restart, which say so ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)). The
+  Trickplay tab's Preview Size and Image Quality are the dashboard's own `TrickplayOptions` instead:
+  Save writes them to the server configuration and they apply at once, Reset puts back a new
+  server's value, and a value typed on the dashboard that fits no option shows as Custom
+  ([`CONFIG.md`](CONFIG.md#trickplay)). Disabling the Ferrofin Settings plugin hides the page.
+- **LDAP sign-in** — Jellyfin's LDAP-Auth plugin (v24), compiled in and off until an
+  administrator enables it under Dashboard → Plugins ([`EXTENSIONS.md`](EXTENSIONS.md#ldap-auth)).
+  Directory users sign in from any client with their directory password: accounts created on
+  first sign-in, renames followed, the administrator flag kept in step with an LDAP filter,
+  password changes written to the directory, reset links, profile pictures, referrals, and an
+  adopted Jellyfin's LDAP-Auth settings and users carried over. Compared against the plugin's C#,
+  and run against OpenLDAP from jellyfin-web, a client library and a data directory adopted from
+  Jellyfin 12.4 with the plugin. **Active Directory has not been tested.** The accepted
+  divergences (off by default, an outage not counted toward lockout, the last administrator
+  never demoted, timeouts, a blank reset refused, among others) are listed in
+  [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md#ldap-auth).
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote
@@ -323,8 +386,6 @@ the season's folder change asks the season providers.
   location that is missing, empty or cannot be listed (an unmounted drive or share).
 - **Artwork is downloaded only for an item that has none.** Jellyfin also downloads each
   missing image type of an item that has some, such as a backdrop beside an existing poster.
-- **Replace existing trickplay images** does nothing during a scan yet: trickplay images
-  come only from the **Generate Trickplay Images** scheduled task.
 
 ### After an upgrade or an adoption
 
@@ -337,7 +398,7 @@ the season's folder change asks the season providers.
   refreshing (no `DateLastRefreshed`), which is refreshed in full, probe and providers
   included. Later scans of an unchanged library save nothing. See the same section.
 - With metrics on (`FERROFIN_ENABLE_METRICS=true`), `ferrofin_library_scan_items_total`
-  counts each scan's items by outcome (`created`, `updated`, `unchanged`, `removed`),
+  counts each scan's items by outcome (`created`, `updated`, `unchanged`, `removed`, `skipped`),
   `ferrofin_media_probe_total` its ffprobe runs and
   `ferrofin_metadata_provider_requests_total` its provider requests; the
   [Library scans dashboard](../contrib/metrics/README.md#library-scans-dashboard) plots them.

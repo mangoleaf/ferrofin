@@ -51,8 +51,9 @@
 //!   [`NextUpEpisodeBatchResult`](ferrofin_traits::persistence::NextUpEpisodeBatchResult)
 //!   output is consumed by `TvSeriesManager` in a later unit.
 //!
-//! The shared [`db_error`] module holds the single `sqlx` → `ServiceError`
-//! mapping and the `MediaStreamType` discriminant helper reused across units.
+//! The shared [`db_error`] module re-exports the single `sqlx` → `ServiceError`
+//! mapping (`ferrofin_traits::error::db_err`) and holds the `MediaStreamType`
+//! discriminant helper reused across units.
 //!
 //! ## Unit 5 — library manager, media sources, views, search, music
 //!
@@ -175,6 +176,7 @@ pub mod chapter_manager;
 pub mod chapter_repository;
 pub mod client_event_logger;
 pub mod collection_manager;
+mod collections_library;
 pub mod config_import;
 pub mod configuration_manager;
 pub mod db_error;
@@ -183,16 +185,19 @@ mod device_repository;
 mod directory_cache;
 pub mod display_preferences_manager;
 mod dot_ignore;
+mod drive_probe;
 pub mod dto_service;
 pub mod dynamic_images;
 mod embedded_lyrics;
 pub mod event_manager;
 pub mod external_data_manager;
+pub mod external_identity_repository;
 mod extra_owners_repository;
 pub mod file_system;
 pub mod intro_skipper_repository;
 pub mod item_count_service;
 pub mod item_data;
+pub mod item_data_cleanup;
 mod item_deletion;
 pub(crate) mod item_folders;
 pub mod item_persistence_service;
@@ -216,6 +221,7 @@ pub mod lyric_manager;
 pub mod media_attachment_repository;
 pub mod media_info_resolver;
 pub mod media_segment_manager;
+mod media_segment_repository;
 pub mod media_source_manager;
 pub mod media_stream_repository;
 mod media_stream_selector;
@@ -223,11 +229,13 @@ pub mod mount_table;
 pub mod music_manager;
 pub mod next_up_service;
 pub mod notify_watcher;
+pub mod password_reset;
 pub mod path_manager;
 pub mod people_repository;
 pub mod playback_activity;
 pub mod playback_metrics;
 pub mod plugin_manager;
+pub mod plugin_offered_item_repository;
 mod query_restrictions;
 pub mod quick_connect_manager;
 use ferrofin_providers::refresh_plan;
@@ -260,6 +268,7 @@ mod user_data_retention_repository;
 pub mod user_entity_ext;
 pub mod user_manager;
 pub mod user_root_folder;
+pub mod user_updated;
 pub mod user_view_manager;
 pub mod user_view_repository;
 pub mod video_versions;

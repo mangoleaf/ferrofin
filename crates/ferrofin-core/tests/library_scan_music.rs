@@ -535,7 +535,8 @@ async fn a_librarys_unticked_music_fetchers_ask_nothing() {
     assert!(fx.row(fx.album_id()).await.date_last_refreshed.is_some());
     assert!(fx.row(fx.artist_id()).await.date_last_refreshed.is_some());
     fx.scan_with(&replace_all()).await;
-    assert!(fx.music.take().is_empty());
+    let music_requests = fx.music.take();
+    assert!(music_requests.is_empty(), "{music_requests:?}");
 }
 
 /// Owner decision D1: a music provider that FAILS leaves the item
@@ -723,6 +724,111 @@ async fn a_by_name_artist_refreshes_through_the_scanner() {
         fx.id_of(id, "MusicBrainzArtist").await.as_deref(),
         Some(CHOSEN_ARTIST)
     );
+}
+
+/// gl-337: `MusicArtist.RequiresRefresh` for an artist known only by name
+/// whose `Path` is not its rebased path (the artists directory joined with
+/// the path's file name, `GetRebasedPath`): a Default refresh of it is
+/// required, so it runs every provider again (asking by the stored match),
+/// and `BeforeMetadataRefresh` moves the row to the rebased path. Once moved,
+/// the next Default refresh asks nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_by_name_artist_whose_path_moved_is_refreshed_and_moved_back() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::new(tmp.path(), LibraryOptions::default()).await;
+    let artists = tmp.path().join("metadata").join("artists");
+    let store = ferrofin_core::by_name_store::ByNameStore::new(
+        fx.persistence.clone(),
+        tmp.path().join("metadata").join("Genre"),
+        tmp.path().join("metadata").join("MusicGenre"),
+        tmp.path().join("metadata").join("Studio"),
+        &artists,
+    );
+    let fx = Fixture {
+        scanner: fx.scanner.with_by_name_store(store),
+        ..fx
+    };
+    fx.scan().await;
+    let track = derive_item_id(
+        BaseItemKind::Audio,
+        &fx.album_dir.join("01 - So What.mp3").to_string_lossy(),
+    )
+    .expect("id");
+    fx.persistence
+        .save_item_values(track, &[(1, "Gil Evans".into())])
+        .await
+        .expect("materialize");
+    let id = by_name_artist(&fx, "Gil Evans").await;
+    let refresh = |options: MetadataRefreshOptions| {
+        let target = ScanTarget::Artist {
+            id,
+            path: None,
+            folders: Vec::new(),
+        };
+        let scanner = &fx.scanner;
+        async move {
+            let cancel = ScanCancel::new();
+            scanner
+                .scan_target(
+                    &target,
+                    ScanRun::new(&options, &options, &cancel).with_passes(ScanPasses::Touched),
+                )
+                .await
+                .expect("refresh")
+        }
+    };
+    // Its first refresh, at the path it was made with.
+    let rebased = artists.join("Gil Evans").to_string_lossy().into_owned();
+    let row = fx.row(id).await;
+    fx.persistence
+        .save_items(&[BaseItemEntity {
+            path: Some(rebased.clone()),
+            ..row
+        }])
+        .await
+        .expect("place");
+    refresh(MetadataRefreshOptions::default()).await;
+    assert!(fx.row(id).await.date_last_refreshed.is_some());
+    assert_eq!(
+        fx.id_of(id, "MusicBrainzArtist").await.as_deref(),
+        Some(ARTIST)
+    );
+    fx.music.take();
+
+    // The metadata directory it was saved under moved away.
+    let moved = tmp
+        .path()
+        .join("old-metadata")
+        .join("artists")
+        .join("Gil Evans")
+        .to_string_lossy()
+        .into_owned();
+    let row = fx.row(id).await;
+    fx.persistence
+        .save_items(&[BaseItemEntity {
+            path: Some(moved),
+            ..row
+        }])
+        .await
+        .expect("move");
+    let outcome = refresh(MetadataRefreshOptions::default()).await;
+    assert_eq!(outcome.updated, 1, "{outcome:?}");
+    let asked = fx.music.take();
+    assert!(
+        searches(&asked).is_empty(),
+        "asked by the stored match: {asked:?}"
+    );
+    assert!(
+        asked
+            .iter()
+            .any(|l| l.contains(&format!("/ws/2/artist/{ARTIST}"))),
+        "a required refresh runs every provider: {asked:?}"
+    );
+    assert_eq!(fx.row(id).await.path.as_deref(), Some(rebased.as_str()));
+
+    let outcome = refresh(MetadataRefreshOptions::default()).await;
+    assert_eq!(outcome.unchanged, 1, "{outcome:?}");
+    assert!(fx.music.take().is_empty(), "in place again: nothing to ask");
 }
 
 /// The server-wide options ship with TheAudioDB off for music albums and
@@ -2421,4 +2527,90 @@ async fn a_failed_write_leaves_the_album_due() {
     let row = fx.row(fx.album_id()).await;
     assert!(row.date_last_refreshed.is_some(), "stamped once written");
     assert_eq!(row.production_year, Some(1959));
+}
+
+/// Counts the warnings whose message contains its needle, while it is the
+/// thread's default subscriber.
+#[derive(Clone)]
+struct WarningCount(&'static str, Arc<Mutex<usize>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarningCount {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            if message.0.contains(self.0) {
+                *self.1.lock().expect("count") += 1;
+            }
+        }
+    }
+}
+
+/// An album's metadata locale walks its parents
+/// (`GetPreferredMetadataLanguage`), which end at a row that cannot be read
+/// as at one that is not there: the albums under an undecodable artist folder
+/// still run their providers in the music pass and are stamped, and each pass
+/// that reads the row (the walk, the music pass) warns about it once, not once
+/// per album. Current-thread on purpose: the thread-local subscriber must see
+/// every warning.
+#[tokio::test]
+async fn albums_under_an_undecodable_artist_still_refresh() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::build(
+        tmp.path(),
+        plugin_ranked(true),
+        PluginDb::new().source(),
+        false,
+    )
+    .await;
+    fx.scan().await;
+    sqlx::query(r#"UPDATE "BaseItems" SET "DateCreated" = 'not a date' WHERE "Id" = ?1"#)
+        .bind(ferrofin_db::store::guid_to_db(fx.artist_id()))
+        .execute(fx.db.writer())
+        .await
+        .expect("corrupt the artist");
+    let albums: Vec<PathBuf> = ["Milestones", "Workin'"]
+        .iter()
+        .map(|name| {
+            let dir = fx.artist_dir.join(name);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            std::fs::write(dir.join("01 - Track.mp3"), b"").expect("track");
+            dir
+        })
+        .collect();
+
+    let warned = Arc::new(Mutex::new(0));
+    let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(
+        WarningCount("could not read a parent row", Arc::clone(&warned)),
+    ));
+    fx.scan().await;
+
+    for dir in &albums {
+        let id = derive_item_id(BaseItemKind::MusicAlbum, &dir.to_string_lossy()).expect("id");
+        let album = fx.row(id).await;
+        assert_eq!(
+            album.overview.as_deref(),
+            Some("PluginDb album text."),
+            "{dir:?}"
+        );
+        assert!(album.date_last_refreshed.is_some(), "{dir:?} is stamped");
+    }
+    assert_eq!(
+        *warned.lock().expect("warned"),
+        2,
+        "the walk's, the music pass's"
+    );
 }

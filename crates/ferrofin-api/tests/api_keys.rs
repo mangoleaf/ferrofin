@@ -98,7 +98,7 @@ impl AuthService for OkAuth {
             client: Some("Test Client".to_owned()),
             version: Some("9.9.9".to_owned()),
             is_api_key: self.is_api_key,
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_authenticated: true,
             ..Default::default()
         })
@@ -113,7 +113,7 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             // Must agree with `authenticate`: the router's auth layer inserts
             // THIS value as a request extension and `RequireAuth` prefers it,
             // so dropping `is_api_key` here silently downgrades every request

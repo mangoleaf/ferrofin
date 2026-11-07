@@ -6,7 +6,9 @@
 //! ceiling. Ceilings only ratchet down, so a plan test that issues its own
 //! `EXPLAIN` belongs outside `src/`.
 
-use ferrofin_core::next_up_service::{next_up_projection_sql, next_up_series_keys_sql};
+use ferrofin_core::next_up_service::{
+    next_up_projection_sql, next_up_series_keys_sql, next_up_specials_sql,
+};
 use ferrofin_db::Database;
 
 /// Runs `EXPLAIN QUERY PLAN` over `sql`, binding `binds` dummy parameters.
@@ -44,27 +46,31 @@ async fn series_keys_are_index_driven_with_no_join_pin() {
     let db = Database::connect_in_memory().await.expect("connect");
     db.run_migrations().await.expect("migrations");
 
-    // user/type/placeholder + three `TopParentId` placeholders + cutoff.
-    let sql = next_up_series_keys_sql(3, false);
-    assert!(!sql.contains("CROSS JOIN"), "no join-order pin: {sql}");
-    let steps = plan(&db, &sql, 7).await;
+    // user/type/placeholder + `n` `TopParentId` placeholders + cutoff, at
+    // every length a padded list takes (gl-1243).
+    for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+        let sql = next_up_series_keys_sql(n, false);
+        assert!(!sql.contains("CROSS JOIN"), "no join-order pin: {sql}");
+        let steps = plan(&db, &sql, n + 4).await;
 
-    assert!(
-        steps
-            .iter()
-            .any(|d| d.starts_with("SEARCH bi USING INDEX") && d.contains("Type=?")),
-        "BaseItems must be read through a Type-led index, got: {steps:?}"
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|d| d.contains(" ud ") && d.contains("UserId=? AND ItemId=?")),
-        "UserData must be reached by (UserId, ItemId) from the BaseItems row, got: {steps:?}"
-    );
-    assert!(
-        !steps.iter().any(|d| d.contains("SCAN")),
-        "no full scan of either table: {steps:?}"
-    );
+        assert!(
+            steps
+                .iter()
+                .any(|d| d.starts_with("SEARCH bi USING INDEX") && d.contains("Type=?")),
+            "{n} parents: BaseItems must be read through a Type-led index, got: {steps:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|d| d.contains(" ud ") && d.contains("UserId=? AND ItemId=?")),
+            "{n} parents: UserData must be reached by (UserId, ItemId) from the BaseItems row, \
+             got: {steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|d| d.contains("SCAN")),
+            "{n} parents: no full scan of either table: {steps:?}"
+        );
+    }
 
     // With a limit the statement carries one more bind and a LIMIT.
     let limited = next_up_series_keys_sql(3, true);
@@ -139,4 +145,43 @@ async fn the_projection_is_index_driven() {
         "each version's played row is a point seek: {steps:#?}"
     );
     assert!(!steps.iter().any(|d| d.contains("SCAN")), "{steps:#?}");
+}
+
+/// gl-1065: the specials statement selects only what the specials merge reads,
+/// and keeps the plan of the full-row `SELECT bi.*` it replaced — the same
+/// index walk, so each series' specials come back in the order they did, which
+/// a tie in the aired-order sort keeps. It is index-driven with no table scan,
+/// with the access predicates and a parental limit in place, both with no
+/// library scope (what the manager's batch sends) and with two libraries.
+#[tokio::test]
+async fn the_specials_statement_keeps_the_full_row_plan() {
+    let db = Database::connect_in_memory().await.expect("connect");
+    db.run_migrations().await.expect("migrations");
+    let filter = ferrofin_traits::options::InternalItemsQuery {
+        max_parental_rating: Some(ferrofin_model::entities_media::ParentalRatingScore {
+            score: 10,
+            sub_score: None,
+        }),
+        ..Default::default()
+    };
+    for top_parents in [&[][..], &[uuid::Uuid::nil(), uuid::Uuid::max()][..]] {
+        let sql = next_up_specials_sql(&filter, top_parents, 3);
+        let (columns, rest) = sql.split_once("FROM").expect("one SELECT … FROM");
+        assert!(
+            !columns.contains('*'),
+            "only the merge's columns: {columns}"
+        );
+        let binds = sql.matches('?').count();
+        let steps = plan(&db, &sql, binds).await;
+
+        let full_row = format!("SELECT bi.* FROM{rest}");
+        assert_eq!(steps, plan(&db, &full_row, binds).await, "{sql}");
+        assert!(
+            steps
+                .first()
+                .is_some_and(|d| d.starts_with("SEARCH bi USING INDEX") && d.contains("(Type=?")),
+            "{steps:#?}"
+        );
+        assert!(!steps.iter().any(|d| d.contains("SCAN")), "{steps:#?}");
+    }
 }

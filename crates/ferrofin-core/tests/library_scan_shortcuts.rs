@@ -28,7 +28,8 @@ use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 use ferrofin_traits::persistence::{ItemRepository, MediaStreamRepository};
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
-/// Answers every probe with one H.264 stream and records what it was asked.
+/// Answers every probe with one H.264 stream, except one of a `dead.example`
+/// target, which fails, and records what it was asked.
 #[derive(Default)]
 struct Recording {
     requests: Mutex<Vec<(String, MediaProtocol)>>,
@@ -49,10 +50,14 @@ impl MediaEncoder for Recording {
         &self,
         request: &MediaInfoRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
-        self.requests.lock().unwrap().push((
-            request.media_source.path.clone().unwrap_or_default(),
-            request.media_source.protocol,
-        ));
+        let path = request.media_source.path.clone().unwrap_or_default();
+        self.requests
+            .lock()
+            .unwrap()
+            .push((path.clone(), request.media_source.protocol));
+        if path.contains("dead.example") {
+            return Err(ServiceError::backend("ffprobe found no streams"));
+        }
         Ok(MediaSourceInfo {
             run_time_ticks: Some(6_000_000_000),
             container: Some("mp4".to_owned()),
@@ -284,7 +289,8 @@ async fn a_scan_records_the_shortcut_and_its_remote_target_without_probing_it() 
         h.data("Remote (2020)").await["ShortcutPath"],
         "http://origin.example/stream/movie.mp4"
     );
-    assert!(h.probed().is_empty());
+    let probed = h.probed();
+    assert!(probed.is_empty(), "{probed:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -383,4 +389,55 @@ async fn playbacks_forced_probe_refreshes_the_item_and_removes_nothing() {
     // Once the library manager is gone, the probe fails instead of scanning.
     drop(library);
     assert!(probe(h.strm("Remote (2020)")).await.is_err());
+}
+
+/// The text logged through it while its subscriber is the default.
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+
+/// A target whose probe fails is logged by its scheme and host: the URL can
+/// carry an account in its userinfo, its path and its query (gl-1121). A
+/// current-thread runtime, so the probe task logs through this test's
+/// subscriber.
+#[tokio::test]
+async fn a_failed_probe_logs_the_target_by_its_host() {
+    let h = harness(&[(
+        "Dead (2020)",
+        "http://acct-user:info-secret@dead.example/live/path-secret/1.ts?password=query-secret\n",
+    )])
+    .await;
+    h.scanner.scan_all().await.unwrap();
+    let logs = Logs::default();
+    let _guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+
+    h.full_refresh("Dead (2020)", true).await;
+
+    let text = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+    assert!(text.contains("media probe failed"), "{text}");
+    assert!(text.contains("http://dead.example"), "{text}");
+    for secret in ["acct-user", "info-secret", "path-secret", "query-secret"] {
+        assert!(!text.contains(secret), "{secret} logged: {text}");
+    }
 }

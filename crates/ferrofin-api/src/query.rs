@@ -461,7 +461,7 @@ pub(crate) mod tests {
                 super::lookup(&super::REQUIRED, &Method::GET, route),
             )
         );
-        assert!(!first.0.is_empty());
+        assert!(!first.0.is_empty(), "{:?}", first.0);
         let cached = super::BY_TEMPLATE.read().expect("cache")[&Method::GET][route];
         assert!(std::ptr::eq(cached.0, first.0) && std::ptr::eq(cached.1, first.1));
         assert_eq!(super::members(&Method::GET, route), first);
@@ -497,7 +497,8 @@ pub(crate) mod tests {
             !super::lookup(&super::NON_NULLABLE, &Method::GET, "/Items")
                 .contains(&"isFavorite".to_owned())
         );
-        assert!(super::lookup(&super::NON_NULLABLE, &Method::GET, "/NotAContractRoute").is_empty());
+        let found = super::lookup(&super::NON_NULLABLE, &Method::GET, "/NotAContractRoute");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

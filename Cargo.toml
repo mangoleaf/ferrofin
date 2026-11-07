@@ -52,6 +52,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 pedantic = { level = "warn", priority = -1 }
 # product names in docs (SQLite, ffmpeg, DLNA, …) trip doc_markdown — allow it
 doc_markdown = "allow"
+# modules with children are self-named `foo.rs` beside `foo/`, never `foo/mod.rs`
+# (integration-test helpers at `tests/<name>/mod.rs` are not flagged)
+mod_module_files = "warn"
+# nursery allocation lints (gl-1017): a clone whose original is never used again, a
+# collect only iterated, counted or searched once, an eagerly built `or`/`unwrap_or` default
+redundant_clone = "warn"
+needless_collect = "warn"
+or_fun_call = "warn"
 
 [workspace.dependencies]
 if-addrs = { version = "0.15.0", features = ["link-local"] }
@@ -81,6 +89,7 @@ ferrofin-api = { path = "crates/ferrofin-api" }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
+httpdate = "1.0.3"
 # Decoders for the response-compression tests only (the server never decodes a
 # response it just encoded). Streaming readers validate the wire response.
 flate2 = "1.1.10"
@@ -90,6 +99,7 @@ sevenz-rust2 = { version = "0.24.1", default-features = false, features = ["bzip
 brotli = "9.0.0"
 tokio = { version = "1", features = ["full"] }
 socket2 = "0.6"
+http-body = "1.0"
 # The `Stream` trait `axum::body::Body::from_stream` takes — the progressive
 # (tail-following) response bodies the Live TV live-stream/recording routes serve.
 futures-core = "0.3.34"
@@ -111,6 +121,12 @@ libsqlite3-sys = "0.37.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
+# A map that keeps its insertion order on the wire: BaseItemDto.Trickplay lists
+# its media sources in GetMediaSources order (ferrofin-model).
+indexmap = { version = "2.14", features = ["serde"] }
+# Edits config.toml in place, keeping its comments and layout: the settings
+# page's save (ferrofin-server `settings::save`).
+toml_edit = { version = "0.25.17", default-features = false, features = ["parse", "display"] }
 # The `$.Field[0]` path in a body-binder rejection: serde's own error names the
 # type, not the member that failed, and ASP.NET's ValidationProblemDetails keys
 # its `errors` dictionary by path. ferrofin-api's JsonBody extractor only.
@@ -138,6 +154,16 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "r
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "logging", "std", "tls12"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
 p12-keystore = "0.4.1"
+# The LDAP-Auth extension's directory client: LDAP, LDAPS and StartTLS over the
+# same rustls + aws-lc-rs stack (no default features, so neither native-tls nor
+# ring comes in).
+ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-aws-lc-rs"] }
+# The system's trusted roots for an LDAP-Auth TLS configuration Ferrofin builds
+# itself (a client certificate, or the default checks): what ldap3 reads too.
+rustls-native-certs = "0.8.5"
+# A certificate's validity period, for LDAP-Auth's check of a server certificate
+# given as its own root CA (already built for ldap3 and p12-keystore).
+x509-parser = "0.18.1"
 # Self-signed certificates for the HTTPS tests (dev-dependency only).
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 
@@ -185,21 +211,28 @@ uuid = { version = "1.26.1", features = ["v4", "serde"] }
 url = "2.5.8"
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1.25"
-rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`)
+rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`), password salts (ferrofin-common)
 # Legacy text encodings (subtitles, playlist files) — C# `UtfUnknown`.
 encoding_rs = "0.8.35"
 chardetng = "0.1.17"
 shlex = "2"              # ffmpeg command strings → argv (ferrofin-mediaencoding `split_args`)
 async-trait = "0.1.92"
 libc = "0.2"
-windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
+] }
 pbkdf2 = "0.13.0"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
 sha2 = "0.11.0"            # PBKDF2-HMAC-SHA512 (default hash id)
 sha1 = "0.11.0"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "ico"] }
-kamadak-exif = "0.6"                                        # photo EXIF (ferrofin-drawing PhotoProvider)
+kamadak-exif = "0.6.2"                                      # photo EXIF (ferrofin-drawing PhotoProvider)
 webp = { version = "0.3", default-features = false }  # LOSSY WebP encode via libwebp (BSD-3) — image-webp is lossless-only; Skia parity needs Google's encoder
 jpeg-encoder = "0.7"     # JPEG encode with 4:2:0 chroma subsampling — the `image` crate's encoder is hardcoded 4:4:4; Skia's SkJpegEncoder defaults to 4:2:0
+jpeg-decoder = { version = "0.3.2", default-features = false }  # DCT-scaled JPEG decode (1/2, 1/4, 1/8) for blur hashes and thumbnails, like Skia's GetScaledDimensions; zune-jpeg (the `image` crate's decoder) cannot scale. In maintenance mode upstream. No rayon: without it a decode wider than 128 px runs one short-lived thread per colour component, inside the encode permits that bound concurrent decodes to the cores (a failed spawn falls back to the full decode)
 blurhash = "0.2"         # ImageBlurHashes — functionally-valid hashes (not byte-identical to Jellyfin's Skia)
 config = { version = "0.15.26", default-features = false, features = ["toml"] }   # config.toml is TOML only
 clap = { version = "4.6.7", features = ["derive"] }
@@ -208,10 +241,15 @@ bitflags = "2.13.2"
 # CRC-32 (reflected zlib polynomial) for the HDHomeRun control protocol's packet
 # checksum — a port of `MediaBrowser.Common/Crc32.cs`, whose own tests pin
 # 0x414fa339 for "The quick brown fox...". Already in the lock file as a
-# transitive dependency of flate2/zip, so it adds no new compilation.
+# transitive dependency of flate2/zip, so it adds no new compilation. The WASM
+# host also uses it to tell whether a plugin's state file still holds the bytes
+# its kept map came from.
 crc32fast = "1.5.2"
 regex = "1"
 percent-encoding = "2.3.2"
+# Base64 with .NET's rules (`Base64.IsValid`, `Convert.FromBase64String`) for
+# LDAP-Auth's profile images. Already in the lock file as a transitive dependency.
+base64 = "0.23.1"
 # CLDR root collation — the port of .NET `StringComparison.InvariantCulture`
 # used by the Live TV name sort. ICU4X 2.x is already in the tree (icu_normalizer
 # 2.2 via idna), so this shares icu_collections/icu_provider/zerovec.

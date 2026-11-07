@@ -187,7 +187,7 @@ mod tests {
              stream,12.5\n\
              format,99.0\n";
         let data = parse_stream(input.as_bytes());
-        assert!(data.keyframe_ticks.is_empty());
+        assert!(data.keyframe_ticks.is_empty(), "{:?}", data.keyframe_ticks);
         // stream_duration 12.5s > 0 → used over format. 12.5s → 12500 ms → 125_000_000 ticks.
         assert_eq!(data.total_duration, 125_000_000);
     }

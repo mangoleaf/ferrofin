@@ -16,8 +16,10 @@ fn create_password_hash_with_password_returns_hash_with_iterations() {
 
     assert_eq!("PBKDF2-SHA512", hash.id());
     assert!(hash.parameters().iter().any(|(k, _)| k == "iterations"));
-    assert!(!hash.salt().is_empty());
-    assert!(!hash.hash().is_empty());
+    let salt = hash.salt();
+    assert!(!salt.is_empty(), "{salt:?}");
+    let hash_bytes = hash.hash();
+    assert!(!hash_bytes.is_empty(), "{hash_bytes:?}");
 }
 
 #[test]
@@ -112,7 +114,7 @@ fn verify_unsupported_hash_id_throws_not_supported_exception() {
 fn generate_salt_returns_non_empty_array() {
     let salt = sut().generate_salt();
 
-    assert!(!salt.is_empty());
+    assert!(!salt.is_empty(), "{salt:?}");
 }
 
 #[rstest]

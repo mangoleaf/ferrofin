@@ -40,6 +40,11 @@ fn image_type_size(image_type: ImageType) -> crate::plugin_config::TmdbImageKind
 /// artwork works out of the box. Verbatim port of `TmdbUtils.ApiKey`.
 const DEFAULT_API_KEY: &str = "4219e299c89411838049ab0dab19ebd5";
 
+/// How long a TMDB response is kept after it was fetched:
+/// `TmdbClientManager.CacheDurationInHours` (`TmdbClientManager.cs:26`), the
+/// absolute expiration it caches every response under (`:771-780`).
+pub const CACHE_DURATION: std::time::Duration = std::time::Duration::from_hours(1);
+
 /// The kind of item to match against TMDB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TmdbKind {
@@ -214,9 +219,10 @@ fn score_year(year: i32, result_year: Option<i32>) -> i32 {
     if year <= 0 {
         return 0;
     }
+    // Regional and festival release dates routinely straddle a new year, so a
+    // year off by one is as good as an exact one (jellyfin/jellyfin#18343).
     match result_year {
-        Some(ry) if (ry - year).abs() == 0 => 2, // YearExactScore
-        Some(ry) if (ry - year).abs() == 1 => 1, // YearAdjacentScore
+        Some(ry) if (ry - year).abs() <= 1 => 2, // YearScore
         _ => 0,
     }
 }
@@ -1380,6 +1386,29 @@ pub struct TmdbClient {
     /// Image root replacing TMDb's CDN, for tests
     /// ([`with_image_root`](TmdbClient::with_image_root)).
     image_root: Option<String>,
+    /// The last `/person/{id}` response ([`person_response`](Self::person_response)).
+    last_person: std::sync::Mutex<Option<CachedPerson>>,
+}
+
+/// A `/person/{id}` response as [`TmdbClient::person_response`] keeps it.
+#[derive(Debug)]
+struct CachedPerson {
+    /// The person's TMDB id and the request language.
+    key: (i64, Option<String>),
+    /// When it stops being used: [`CACHE_DURATION`] after it was fetched.
+    expires: std::time::Instant,
+    response: std::sync::Arc<PersonLookupResponse>,
+}
+
+impl CachedPerson {
+    /// The response, when it answers `key` and has not expired at `now`.
+    fn answer(
+        &self,
+        key: &(i64, Option<String>),
+        now: std::time::Instant,
+    ) -> Option<std::sync::Arc<PersonLookupResponse>> {
+        (self.key == *key && now < self.expires).then(|| std::sync::Arc::clone(&self.response))
+    }
 }
 
 /// The TMDb settings page's unaired/missing episode options
@@ -1437,6 +1466,7 @@ impl TmdbClient {
             base_url: API_BASE.to_owned(),
             plugin: crate::plugin_config::ConfigSource::new(),
             image_root: None,
+            last_person: std::sync::Mutex::default(),
         }
     }
 
@@ -1454,6 +1484,7 @@ impl TmdbClient {
             base_url: API_BASE.to_owned(),
             plugin: crate::plugin_config::ConfigSource::new(),
             image_root: None,
+            last_person: std::sync::Mutex::default(),
         }
     }
 
@@ -2544,15 +2575,19 @@ impl TmdbClient {
         let p = self.person_response(tmdb_id, language, &cfg).await?;
         Some(TmdbPersonHit {
             tmdb_id: p.id.unwrap_or(tmdb_id),
-            name: non_empty(p.name),
+            name: non_empty(p.name.clone()),
             // `Images.Profiles[0]` — the first profile image.
             profile_url: p
                 .images
-                .and_then(|i| i.profiles.into_iter().next())
-                .and_then(|i| non_empty(i.file_path))
+                .as_ref()
+                .and_then(|i| i.profiles.first())
+                .and_then(|i| non_empty(i.file_path.clone()))
                 .map(|path| cfg.image_url(crate::plugin_config::TmdbImageKind::Profile, &path)),
-            biography: non_empty(p.biography),
-            imdb_id: p.external_ids.and_then(|e| non_empty(e.imdb_id)),
+            biography: non_empty(p.biography.clone()),
+            imdb_id: p
+                .external_ids
+                .as_ref()
+                .and_then(|e| non_empty(e.imdb_id.clone())),
         })
     }
 
@@ -2578,14 +2613,14 @@ impl TmdbClient {
             .is_some_and(|size| !size.eq_ignore_ascii_case("original"));
         person
             .images
-            .into_iter()
-            .flat_map(|images| images.profiles)
+            .iter()
+            .flat_map(|images| &images.profiles)
             .filter_map(|image| {
                 Some(TmdbImage {
                     image_type: ImageType::Primary,
                     url: cfg.image_url(
                         crate::plugin_config::TmdbImageKind::Profile,
-                        &non_empty(image.file_path)?,
+                        &non_empty(image.file_path.clone())?,
                     ),
                     width: if scaled { None } else { image.width },
                     height: if scaled { None } else { image.height },
@@ -2601,12 +2636,34 @@ impl TmdbClient {
             .collect()
     }
 
+    /// `/person/{id}` in `language`, the one response a person's metadata,
+    /// profile images and Identify result are read from. A successful one is
+    /// kept for [`CACHE_DURATION`], as `GetPersonAsync` keeps it
+    /// (`TmdbClientManager.cs:324-346`), so a refresh that reads the metadata
+    /// and then the images asks TMDB once. The key is the language sent, where
+    /// upstream's leaves out the country it normalizes with.
     async fn person_response(
         &self,
         tmdb_id: i64,
         language: Option<&str>,
         cfg: &crate::plugin_config::TmdbConfig,
-    ) -> Option<PersonLookupResponse> {
+    ) -> Option<std::sync::Arc<PersonLookupResponse>> {
+        // Keyed by what `with_language` sends: an empty language is none.
+        let key = (
+            tmdb_id,
+            language.filter(|l| !l.is_empty()).map(str::to_owned),
+        );
+        // shortcut: only the last person is kept (upstream keeps 100k records), so
+        // two people read in turn or at once ask twice; bound a real cache if that matters.
+        let cached = self
+            .last_person
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(|last| last.answer(&key, std::time::Instant::now()));
+        if cached.is_some() {
+            return cached;
+        }
         let req = self
             .http
             .get(format!("{}/person/{tmdb_id}", self.base_url))
@@ -2623,7 +2680,16 @@ impl TmdbClient {
         if !resp.status().is_success() {
             return None;
         }
-        resp.counted_json().await.ok()
+        let response = std::sync::Arc::new(resp.counted_json().await.ok()?);
+        *self
+            .last_person
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(CachedPerson {
+            key,
+            expires: std::time::Instant::now() + CACHE_DURATION,
+            response: std::sync::Arc::clone(&response),
+        });
+        Some(response)
     }
 
     /// Fetches a person's biography via `/person/{id}`, or `None` on any
@@ -2644,29 +2710,12 @@ impl TmdbClient {
         // cast/crew caps and the image sizes; read per call, the way
         // `Plugin.Instance.Configuration` is (`TmdbClientManager`).
         let cfg = self.settings().await;
-        let key = cfg.api_key(self.api_key.expose_secret());
-        let req = self
-            .http
-            .get(format!("{}/person/{tmdb_id}", self.base_url))
-            .query(&[
-                ("api_key", key),
-                // `PersonMethods.Images | PersonMethods.ExternalIds`: Jellyfin
-                // 12.1 dropped the credits, which nothing reads.
-                ("append_to_response", "images,external_ids"),
-            ]);
-        let resp = with_language(req, language)
-            .send_limited(&self.limiter)
-            .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let p = resp.counted_json::<PersonDetailsResponse>().await.ok()?;
+        let p = self.person_response(tmdb_id, language, &cfg).await?;
         let details = TmdbPersonDetails {
-            biography: p.biography.filter(|s| !s.is_empty()),
-            birthday: p.birthday.filter(|s| !s.is_empty()),
-            deathday: p.deathday.filter(|s| !s.is_empty()),
-            place_of_birth: p.place_of_birth.filter(|s| !s.is_empty()),
+            biography: non_empty(p.biography.clone()),
+            birthday: non_empty(p.birthday.clone()),
+            deathday: non_empty(p.deathday.clone()),
+            place_of_birth: non_empty(p.place_of_birth.clone()),
         };
         // Skip persons with nothing worth storing (keeps re-fetch cheap).
         if details.biography.is_none()
@@ -2689,16 +2738,12 @@ impl TmdbClient {
         &self,
         url: &str,
     ) -> Result<crate::ArtworkDownload, crate::ArtworkDownloadFailure> {
-        crate::image_download::download_artwork(&self.http, url).await
+        crate::image_download::download_artwork(url).await
     }
 
     /// Downloads an image URL's bytes, or `None` on any failure.
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        let resp = crate::image_download::send(&self.http, url).await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        resp.counted_bytes().await.ok()
+        crate::image_download::download_bytes(url).await
     }
 }
 
@@ -2730,7 +2775,7 @@ struct PersonSearchHit {
 }
 
 /// `/person/{id}` with `images` + `external_ids` appended — the Identify
-/// by-id branch.
+/// by-id branch, the person's metadata and its profile images.
 #[derive(Debug, Deserialize)]
 struct PersonLookupResponse {
     #[serde(default)]
@@ -2739,6 +2784,12 @@ struct PersonLookupResponse {
     name: Option<String>,
     #[serde(default)]
     biography: Option<String>,
+    #[serde(default)]
+    birthday: Option<String>,
+    #[serde(default)]
+    deathday: Option<String>,
+    #[serde(default)]
+    place_of_birth: Option<String>,
     #[serde(default)]
     images: Option<PersonImages>,
     #[serde(default)]
@@ -2773,19 +2824,6 @@ struct PersonProfileImage {
 struct PersonExternalIds {
     #[serde(default)]
     imdb_id: Option<String>,
-}
-
-/// The subset of TMDB `/person/{id}` Ferrofin surfaces on the person page.
-#[derive(Debug, Default, Deserialize)]
-struct PersonDetailsResponse {
-    #[serde(default)]
-    biography: Option<String>,
-    #[serde(default)]
-    birthday: Option<String>,
-    #[serde(default)]
-    deathday: Option<String>,
-    #[serde(default)]
-    place_of_birth: Option<String>,
 }
 
 /// Resolves an item's studios: for series, its broadcast networks (Jellyfin's
@@ -2961,6 +2999,55 @@ mod tests {
         );
     }
 
+    /// A person's metadata, profile images and Identify result read one
+    /// `/person` response for [`CACHE_DURATION`], by id and language, as
+    /// `GetPersonAsync`'s cache serves them upstream (gl-1250).
+    #[tokio::test]
+    async fn a_person_response_is_kept_by_id_and_language() {
+        let server = crate::mock_http::MockServer::always(
+            r#"{"id":1,"biography":"An actor.","images":{"profiles":[{"file_path":"/a.jpg"}]}}"#,
+        )
+        .await;
+        let client = TmdbClient::new().with_base_url(&server.base_url);
+        let requests = || server.query_values("/person/1", "append_to_response").len();
+        let details = client.person_details_for_language(1, Some("fr-CA")).await;
+        assert_eq!(details.unwrap().biography.as_deref(), Some("An actor."));
+        assert_eq!(client.person_images(1, Some("fr-CA"), None).await.len(), 1);
+        assert!(client.person_lookup(1, Some("fr-CA")).await.is_some());
+        assert_eq!(requests(), 1);
+        assert!(
+            client
+                .person_details_for_language(1, Some("de"))
+                .await
+                .is_some()
+        );
+        assert_eq!(requests(), 2);
+        // No language and an empty one send the same request, so share it.
+        assert!(client.person_lookup(1, None).await.is_some());
+        assert!(client.person_lookup(1, Some("")).await.is_some());
+        assert_eq!(requests(), 3);
+
+        // A response that does not parse is not kept: the next reader asks again.
+        let broken = crate::mock_http::MockServer::always(r#"{"images":"none"}"#).await;
+        let failing = TmdbClient::new().with_base_url(&broken.base_url);
+        assert!(failing.person_lookup(3, None).await.is_none());
+        assert!(failing.person_lookup(3, None).await.is_none());
+        assert_eq!(
+            broken.query_values("/person/3", "append_to_response").len(),
+            2
+        );
+
+        let last = client.last_person.lock().unwrap();
+        let last = last.as_ref().unwrap();
+        let key = (1, None);
+        assert!(last.answer(&key, std::time::Instant::now()).is_some());
+        assert!(last.answer(&key, last.expires).is_none(), "expired");
+        assert!(
+            last.answer(&(2, key.1), std::time::Instant::now())
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn collection_metadata_keeps_image_language_param_separate_from_all_language_artwork() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -3005,7 +3092,8 @@ mod tests {
             1
         );
         assert!(client.person_details_for_language(1, None).await.is_some());
-        assert_eq!(client.person_images(1, None, None).await.len(), 1);
+        // Another person, so it is asked rather than read from the kept response.
+        assert_eq!(client.person_images(2, None, None).await.len(), 1);
         assert!(client.person_lookup(1, Some("fr-CA")).await.is_some());
         handle.await.unwrap();
         let seen = seen.lock().unwrap();
@@ -3246,7 +3334,8 @@ mod tests {
             Some("https://image.tmdb.org/t/p/original/bp.jpg")
         );
         assert!(hits[1].profile_url.is_none());
-        assert!(client.search_person("  ").await.is_empty());
+        let people = client.search_person("  ").await;
+        assert!(people.is_empty(), "{people:?}");
 
         let person = client.person_lookup(287, None).await.expect("lookup");
         assert_eq!(person.name.as_deref(), Some("Brad Pitt"));
@@ -3567,8 +3656,10 @@ mod tests {
 
     #[test]
     fn map_cast_no_cast_yields_nothing() {
-        assert!(map_aggregate_cast(Vec::new(), &cast_config(10)).is_empty());
-        assert!(map_cast(Vec::new(), &cast_config(10)).is_empty());
+        let found = map_aggregate_cast(Vec::new(), &cast_config(10));
+        assert!(found.is_empty(), "{found:?}");
+        let found = map_cast(Vec::new(), &cast_config(10));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `TmdbSeriesProvider.GetPersons` (v12.2): the whole run's cast from
@@ -3918,5 +4009,48 @@ mod tests {
     #[test]
     fn find_best_match_empty_returns_none() {
         assert!(super::find_best_match(&[], "Show", Some(2026)).is_none());
+    }
+
+    /// Upstream's `Movie(id, title, originalTitle, year)` test helper.
+    fn movie(tmdb_id: i64, title: &str, original_title: &str, year: i32) -> TmdbSearchHit {
+        TmdbSearchHit {
+            tmdb_id,
+            name: Some(title.to_owned()),
+            original_name: Some(original_title.to_owned()),
+            year: Some(year),
+            premiere_date: None,
+            poster_url: None,
+            overview: None,
+        }
+    }
+
+    // Rows of `TmdbUtilsTests.FindBestMatch_Movies_TestData` (Jellyfin v12.4),
+    // added by jellyfin/jellyfin#18343 in v12.3.
+    #[rstest::rstest]
+    // M. Night Shyamalan's Split premiered at a festival in 2016 and was
+    // released in 2017, so the obscure 2016 film of the same name must not
+    // outrank it. Years one apart tie and TMDb's own ordering decides.
+    #[case::split_2016(
+        "Split",
+        2016,
+        &[movie(381_288, "Split", "Split", 2017), movie(358_364, "Split", "Split", 2016)],
+        381_288
+    )]
+    // Two years apart is a different film, so the tie only covers a year off
+    // by one.
+    #[case::two_years_apart(
+        "Some Movie",
+        2016,
+        &[movie(1, "Some Movie", "Some Movie", 2018), movie(2, "Some Movie", "Some Movie", 2016)],
+        2
+    )]
+    fn find_best_match_movies(
+        #[case] name: &str,
+        #[case] year: i32,
+        #[case] results: &[TmdbSearchHit],
+        #[case] expected: i64,
+    ) {
+        let best = super::find_best_match(results, name, Some(year)).map(|hit| hit.tmdb_id);
+        assert_eq!(best, Some(expected));
     }
 }

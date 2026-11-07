@@ -168,12 +168,12 @@ pub fn init_tracing(config: &Config) -> Option<WorkerGuard> {
     };
 
     // JSON stdout by default (Alloy pod-log scrape → Loki, carrying the request
-    // span's `trace_id` on every in-span line); `FERROFIN_LOG_FORMAT=text` restores
-    // the legacy tee'd human-readable output for interactive dev. The rotating
-    // FILE is ALWAYS plain text regardless — `GET /System/Logs` feeds the Jellyfin
-    // dashboard log viewer, which renders raw lines (a parity surface).
-    let text_mode =
-        std::env::var("FERROFIN_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("text"));
+    // span's `trace_id` on every in-span line); `FERROFIN_LOG_FORMAT=text` (or
+    // `log_format = "text"`) restores the legacy tee'd human-readable output for
+    // interactive dev. The rotating FILE is ALWAYS plain text regardless —
+    // `GET /System/Logs` feeds the Jellyfin dashboard log viewer, which renders
+    // raw lines (a parity surface).
+    let text_mode = config.log_format == crate::config::LogFormat::Text;
     let mut layers = build_fmt_layers(text_mode, file_writer);
 
     // Compose the OTLP layer in only when export is configured and its exporter
@@ -511,7 +511,7 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     })?;
 
     let url = config.database_url();
-    let db = Database::connect_sized(&url, config.db_pool)
+    let db = Database::connect_tuned(&url, config.db_pool, config.db_statement_cache)
         .await
         .with_context(|| format!("failed to open database `{url}`"))?;
     db.run_migrations()

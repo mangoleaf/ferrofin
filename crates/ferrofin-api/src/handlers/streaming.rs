@@ -8,17 +8,27 @@
 //! `videos`/`audio` don't each duplicate it; everything else is transcoded by
 //! [`transcode_stream_fallback`].
 
-use axum::body::Body;
+use std::io::Read as _;
+
+use axum::body::{Body, Bytes};
 use axum::extract::Request;
+use axum::http::{Extensions, HeaderMap, StatusCode, header};
 use axum::response::Response;
+use chrono::{DateTime, Utc};
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::entities::VideoType;
+use ferrofin_model::users::UserPolicy;
+use ferrofin_traits::filesystem::OpenedFile;
 use ferrofin_traits::media_encoding::HlsStreamRequest;
+use ferrofin_traits::options::AuthorizationInfo;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
 
+use crate::auth::user_authorization;
 use crate::error::ApiError;
 use crate::handlers::hls::transcode_stream_fallback;
+use crate::handlers::live_tv::recording_visible;
 use crate::state::AppState;
 
 /// What a static (direct-play) request is served from: the requested media
@@ -41,6 +51,125 @@ pub(crate) struct StaticSource {
     /// The `User-Agent` the source requires (an IPTV tuner's), sent when a
     /// remote target is relayed.
     pub user_agent: Option<String>,
+}
+
+/// Holds a request that names a user to that user's account and libraries,
+/// before a stream, HLS, subtitle or attachment route resolves a source or
+/// starts a transcode: the account rules of [`user_authorization`] (a disabled
+/// account `401`; remote access and the access schedule `403`), then `404`
+/// unless the user may see `item_id` and the version `media_source_id` names,
+/// the library access check `/Items/{id}`, `/Download` and `/PlaybackInfo`
+/// already apply.
+///
+/// Divergence from upstream (gl-1090): `StreamingHelpers.GetStreamingState`
+/// reads the item with no user, so a restricted account could stream, and
+/// download through `static=true`, any item of a library it was not granted.
+///
+/// **With no user there is nothing to check, and nothing is read.** A request
+/// with no credential, or with a token that names nobody (the middleware
+/// resolves those alike), and an API key, stay as anonymous as upstream's. A
+/// disabled account's token does name its user, though it does not authenticate
+/// ([`AuthorizationInfo::is_authenticated`] is false), so this asks only whether
+/// there is one. This runs on every HLS segment and `Range` request: a user pays
+/// the one [`get_item_by_id_for_user`] `PlaybackInfo` pays, and a second read
+/// only for an id that is not their item's. A route behind `RequireAuth` has run
+/// the account rules already: running them again reads nothing, and keeps this
+/// the one check every route calls.
+///
+/// An id with no `BaseItems` row is no item of a library. A DVR recording's id
+/// has none (a scan gives its file a library item with another id) and answers
+/// to [`recording_refused`]. Anything else is left for the route, which finds an
+/// unmirrored channel's tuner or answers as it always has. An open live stream
+/// is not checked: its id is a capability, as on `PlaybackInfo`, which reads it
+/// by id once the item passes.
+///
+/// [`get_item_by_id_for_user`]: ferrofin_traits::library::LibraryManager::get_item_by_id_for_user
+pub(crate) async fn require_streamable_item(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    extensions: &Extensions,
+    headers: &HeaderMap,
+    item_id: Uuid,
+    media_source_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(user) = auth.user.as_ref().filter(|_| !auth.is_api_key) else {
+        return Ok(());
+    };
+    let client = state.client_address_of(extensions, headers);
+    let policy = user_authorization(auth, client, state, true).await?;
+    let refused = match row_access(state, item_id, user).await? {
+        RowAccess::Visible => false,
+        RowAccess::Hidden => true,
+        RowAccess::Absent => recording_refused(state, &policy, item_id, user).await?,
+    };
+    if refused {
+        return Err(ApiError::NotFound(format!("item {item_id}")));
+    }
+    // `GetStaticMediaSources(item, …, user)` keeps a hidden version out of
+    // `PlaybackInfo`; the stream routes pick by id from the userless list. An id
+    // that is no row's (a tuner source, a capture's timer) is no version.
+    if let Some(version) = media_source_id
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .filter(|version| *version != item_id)
+        && matches!(row_access(state, version, user).await?, RowAccess::Hidden)
+    {
+        return Err(ApiError::NotFound(format!("media source {version}")));
+    }
+    Ok(())
+}
+
+/// Where a row stands with a user.
+enum RowAccess {
+    /// The row exists and the user may see it.
+    Visible,
+    /// The row exists and the user may not see it.
+    Hidden,
+    /// There is no row.
+    Absent,
+}
+
+/// [`RowAccess`] of `id` for `user`. The row a user may see costs one lookup;
+/// only an id that lookup misses is read again, to tell the other two apart.
+async fn row_access(state: &AppState, id: Uuid, user: &UserEntity) -> Result<RowAccess, ApiError> {
+    if state
+        .library
+        .get_item_by_id_for_user(id, Some(user))
+        .await?
+        .is_some()
+    {
+        return Ok(RowAccess::Visible);
+    }
+    Ok(if state.library.get_item_by_id(id).await?.is_some() {
+        RowAccess::Hidden
+    } else {
+        RowAccess::Absent
+    })
+}
+
+/// Whether `user` is refused the DVR recording `id`, `false` when it is none.
+///
+/// `PlaybackInfo` finds no item for a recording's id, for any caller, so the
+/// rule is that of the one route that reads it, `GET /LiveTv/Recordings/{id}`:
+/// "Live TV access" ([`RequireLiveTvAccess`](crate::auth::RequireLiveTvAccess)),
+/// which is what shuts an account out of the DVR, and then the recording's own
+/// visibility ([`recording_visible`]), which holds a file inside a library to
+/// that library.
+async fn recording_refused(
+    state: &AppState,
+    policy: &UserPolicy,
+    id: Uuid,
+    user: &UserEntity,
+) -> Result<bool, ApiError> {
+    let Some(live_tv) = state.live_tv.as_ref() else {
+        return Ok(false);
+    };
+    let Some(recording) = live_tv.get_recording_item(id).await? else {
+        return Ok(false);
+    };
+    if !policy.is_administrator && !policy.enable_live_tv_access {
+        return Ok(true);
+    }
+    Ok(!recording_visible(state, recording, user).await?)
 }
 
 /// Resolves the direct-play source a stream request names.
@@ -87,10 +216,23 @@ pub(crate) async fn static_source(
     })
 }
 
+/// The container a `stream.{container}` route segment names, or `None` when the
+/// segment is not that route.
+///
+/// The route registers as one capture (`routes::to_axum_path`), so the literal
+/// is checked here, in any case, as ASP.NET matches a route's literals. The
+/// container keeps the case it was sent in.
+pub(crate) fn stream_route_container(segment: &str) -> Option<&str> {
+    const LITERAL: &str = "stream.";
+    let (literal, container) = segment.split_at_checked(LITERAL.len())?;
+    (literal.eq_ignore_ascii_case(LITERAL) && !container.is_empty()).then_some(container)
+}
+
 /// The shared body of `VideosController.GetVideoStream` and
 /// `AudioHelper.GetAudioStream`: a `Static=true` request is served from the
 /// source it names; anything else, and a static video request for a disc
-/// folder (which only ffmpeg reads), is transcoded.
+/// folder (which only ffmpeg reads), is transcoded, which needs a caller
+/// ([`transcode_stream_fallback`]).
 pub(crate) async fn static_or_transcode(
     state: &AppState,
     item_id: Uuid,
@@ -235,7 +377,9 @@ async fn serve_remote_static(
         })?
         .map_err(|error| {
             ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
-                "remote stream request failed: {error}"
+                "remote stream request to {} failed: {}",
+                ferrofin_util::source_url::redact_url(url),
+                error.without_url()
             )))
         })?;
     let status =
@@ -326,6 +470,89 @@ pub(crate) async fn serve_static_file(path: &str, request: Request) -> Result<Re
     Ok(response.map(Body::new))
 }
 
+/// How much of a file one blocking-pool hop of [`opened_file_response`] reads.
+const FILE_CHUNK_BYTES: u64 = 64 * 1024;
+
+/// The `200` for a file opened through the
+/// [`FileSystem`](ferrofin_traits::filesystem::FileSystem) seam, read on the
+/// blocking pool a chunk at a time as the client takes it, what
+/// `FileStreamResult` and `PhysicalFileResult` send: `Content-Length`, and no
+/// `Accept-Ranges` (both leave `EnableRangeProcessing` off).
+///
+/// The reads take no slot of [`AppState::blocking_file_system`]: the mount
+/// answered the open, so a read that hangs is one the mount took down with it,
+/// at most one per response under way, and a body must not stall on calls
+/// hung on some other mount.
+///
+/// The body stops at the length it declared. A log still being written is
+/// longer by the time the reader gets there, and a body that outran its
+/// `Content-Length` would abort the response; upstream's does. One that comes
+/// up short (the file was truncated) ends the connection early.
+pub(crate) fn opened_file_response(
+    file: OpenedFile,
+    content_type: &str,
+) -> Result<Response, ApiError> {
+    let OpenedFile {
+        path,
+        length,
+        reader,
+    } = file;
+    let unread = (reader.take(length), path);
+    let chunks = futures_util::stream::try_unfold(unread, |(mut reader, path)| async move {
+        let read = tokio::task::spawn_blocking(move || {
+            let mut chunk = Vec::new();
+            let read = reader
+                .by_ref()
+                .take(FILE_CHUNK_BYTES)
+                .read_to_end(&mut chunk);
+            read.map(|_| (reader, chunk))
+        })
+        .await;
+        let (reader, chunk) = read
+            .map_err(std::io::Error::from)
+            .and_then(|read| read)
+            .inspect_err(|error| {
+                tracing::warn!(path, %error, "reading a file for a response failed");
+            })?;
+        Ok::<_, std::io::Error>((!chunk.is_empty()).then(|| (Bytes::from(chunk), (reader, path))))
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, length)
+        .body(Body::from_stream(chunks))
+        .map_err(|error| ApiError::BadRequest(error.to_string()))
+}
+
+/// `FileResultExecutorBase.GetPreconditionState` for a `PhysicalFile`, which
+/// has a last-modified date and no entity tag: the status that answers instead
+/// of the file, if any. `last_modified` counts in whole seconds, as the executor
+/// rounds it down to, and a date in the future is ignored.
+///
+/// `If-Unmodified-Since` failing beats everything. An `If-Modified-Since` that
+/// says "not modified" holds only when nothing says to go on, and a passing
+/// `If-Unmodified-Since` does (`PreconditionState` takes the highest of the
+/// two).
+pub(crate) fn physical_file_precondition(
+    headers: &HeaderMap,
+    last_modified: DateTime<Utc>,
+) -> Option<StatusCode> {
+    let now = Utc::now();
+    let date = |name| {
+        let value = headers.get(name)?.to_str().ok()?;
+        let date = DateTime::<Utc>::from(httpdate::parse_http_date(value).ok()?);
+        (date <= now).then_some(date.timestamp())
+    };
+    let last_modified = last_modified.timestamp();
+    match (
+        date(header::IF_MODIFIED_SINCE),
+        date(header::IF_UNMODIFIED_SINCE),
+    ) {
+        (_, Some(since)) if since < last_modified => Some(StatusCode::PRECONDITION_FAILED),
+        (Some(since), None) if since >= last_modified => Some(StatusCode::NOT_MODIFIED),
+        _ => None,
+    }
+}
+
 /// Runs the response-completion callback when the body terminates, including
 /// cancellation. ASP.NET Core v10.0.0 Kestrel HttpProtocol.ProcessRequests calls
 /// FireOnCompleted after both normal and aborted responses.
@@ -370,14 +597,18 @@ pub(crate) fn track_transcode_body(
     ))
 }
 
-/// Reads a progressive output while ffmpeg is still extending it.
-/// An empty read waits 50ms while the producing process lives, as upstream's
-/// ProgressiveFileStream does. A body termination releases its request mark.
+/// Reads a progressive output while ffmpeg is still extending it, as upstream's
+/// `ProgressiveFileStream` does: an empty read polls every 50 ms and ends the
+/// body, with a job, once its process has exited; with no job behind the file
+/// (`observer` is `None`), once that read has waited 30 s. A body termination
+/// releases its request mark.
 pub(crate) async fn serve_growing_transcode(
     path: &str,
     request: Request,
     observer: Option<std::sync::Arc<dyn ferrofin_traits::media_encoding::TranscodeStreamProgress>>,
 ) -> Result<Response, ApiError> {
+    use crate::handlers::live_tv::{PROGRESSIVE_POLL_MS, PROGRESSIVE_TIMEOUT_MS};
+    use std::time::Duration;
     use tokio::io::AsyncReadExt as _;
     let completion = ResponseCompletion(observer);
     if request.method() == axum::http::Method::HEAD {
@@ -398,17 +629,23 @@ pub(crate) async fn serve_growing_transcode(
                 return None;
             }
             let mut buffer = vec![0; 32_768];
+            let read_began = tokio::time::Instant::now();
             loop {
                 match file.read(&mut buffer).await {
-                    Ok(0)
-                        if completion
-                            .0
-                            .as_ref()
-                            .is_some_and(|observer| !observer.has_exited()) =>
-                    {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok(0) => {
+                        // `StopReading`: `_job?.HasExited ?? elapsed >= _timeoutMs`.
+                        let stop = match &completion.0 {
+                            Some(observer) => observer.has_exited(),
+                            None => {
+                                read_began.elapsed()
+                                    >= Duration::from_millis(PROGRESSIVE_TIMEOUT_MS)
+                            }
+                        };
+                        if stop {
+                            return None;
+                        }
+                        tokio::time::sleep(Duration::from_millis(PROGRESSIVE_POLL_MS)).await;
                     }
-                    Ok(0) => return None,
                     Ok(length) => {
                         buffer.truncate(length);
                         if let Some(observer) = &completion.0 {
@@ -485,6 +722,26 @@ mod remote_static_tests {
             error.status(),
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// A pass-through channel's URL can carry the provider's account, and a
+    /// `5xx`'s text is logged at the boundary.
+    #[tokio::test]
+    async fn a_failed_relay_names_only_the_origins_host() {
+        let error = serve_remote_static(
+            "http://acct-user:info-secret@127.0.0.1:0/path-secret/1.ts?password=query-secret",
+            None,
+            Request::new(Body::empty()),
+            SHORT_TIMEOUT,
+        )
+        .await
+        .expect_err("nothing listens there");
+
+        let text = error.to_string();
+        assert!(text.contains("http://127.0.0.1:0"), "{text}");
+        for secret in ["acct-user", "info-secret", "path-secret", "query-secret"] {
+            assert!(!text.contains(secret), "{text}");
+        }
     }
 
     /// The timeout stops at the headers (`ResponseHeadersRead`): a body that
@@ -593,6 +850,69 @@ mod transcode_body_tests {
         assert!(body.next().await.is_none());
         assert_eq!(observer.bytes.load(Ordering::SeqCst), 11);
         assert!(observer.completed.load(Ordering::SeqCst));
+    }
+
+    /// `ProgressiveFileStream` with a null job: an empty read keeps polling
+    /// until bytes arrive or 30 s have passed since that read began.
+    #[tokio::test(start_paused = true)]
+    async fn growing_output_without_a_job_waits_out_the_read_timeout() {
+        use futures_util::StreamExt as _;
+        use std::io::Write as _;
+        use tokio::time::{Duration, Instant, sleep};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stream.ts");
+        std::fs::write(&path, b"").unwrap();
+        let response =
+            serve_growing_transcode(path.to_str().unwrap(), Request::new(Body::empty()), None)
+                .await
+                .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        let appended = path.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_secs(29)).await;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(appended)
+                .unwrap()
+                .write_all(b"late")
+                .unwrap();
+        });
+        assert_eq!(body.next().await.unwrap().unwrap().as_ref(), b"late");
+        let read_began = Instant::now();
+        let end = tokio::time::timeout(Duration::from_secs(60), body.next()).await;
+        assert!(matches!(end, Ok(None)), "the body did not end");
+        let waited = read_began.elapsed();
+        assert!(
+            (Duration::from_secs(30)..Duration::from_secs(31)).contains(&waited),
+            "{waited:?}"
+        );
+    }
+
+    /// The timeout is the null job's alone: a running job's output is waited
+    /// for however long its process lives.
+    #[tokio::test(start_paused = true)]
+    async fn growing_output_of_a_running_job_never_times_out() {
+        use futures_util::StreamExt as _;
+        use tokio::time::{Duration, timeout};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stream.ts");
+        std::fs::write(&path, b"").unwrap();
+        let observer = Arc::new(Observer::default());
+        let response = serve_growing_transcode(
+            path.to_str().unwrap(),
+            Request::new(Body::empty()),
+            Some(observer.clone()),
+        )
+        .await
+        .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        assert!(
+            timeout(Duration::from_secs(120), body.next())
+                .await
+                .is_err()
+        );
+        observer.exited.store(true, Ordering::SeqCst);
+        assert!(body.next().await.is_none());
     }
 
     #[tokio::test]

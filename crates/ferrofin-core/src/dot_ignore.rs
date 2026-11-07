@@ -10,7 +10,7 @@
 //! relative to the `.ignore` folder. So `Extras/` and `*.part` hide matches at
 //! any depth, while an anchored `/Extras` never matches.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -294,9 +294,20 @@ pub(crate) struct DotIgnoreRule {
     dirs: HashMap<String, Option<String>>,
     /// `.ignore` path → its rules, re-read when the file changes.
     files: HashMap<String, ParsedFile>,
+    /// The `.ignore` files checked for changes in the current listing;
+    /// `None` until [`Self::begin_listing`] starts one.
+    validated: Option<HashSet<String>>,
 }
 
 impl DotIgnoreRule {
+    /// Starts a directory listing: from then on each `.ignore` is checked
+    /// for changes once per listing, for all its entries, where upstream
+    /// stats it for every entry; a file that hides everything is still
+    /// checked on every entry. Until a rule starts one, every call checks.
+    pub(crate) fn begin_listing(&mut self) {
+        self.validated.get_or_insert_default().clear();
+    }
+
     /// `ShouldIgnore`: whether the nearest `.ignore` at or above `path`'s
     /// folder (the folder itself, for a folder) hides `path`.
     pub(crate) fn should_ignore(&mut self, path: &str, is_dir: bool) -> bool {
@@ -357,9 +368,26 @@ impl DotIgnoreRule {
     }
 
     /// `GetParsedRules`: `file`'s rules, read again when its length or
-    /// modification time changed; `None` once it is gone.
+    /// modification time changed, checked at most once per listing once
+    /// [`Self::begin_listing`] started one (a file that hides everything on
+    /// every entry); `None` once it is gone.
     fn parsed(&mut self, file: &Path) -> Option<&ParsedFile> {
         let key = file.to_string_lossy().into_owned();
+        if let Some(validated) = &mut self.validated {
+            if validated.contains(&key) {
+                // A file that hides everything is checked on every entry, as
+                // upstream does: one caught truncated must not hide a listing.
+                if self
+                    .files
+                    .get(&key)
+                    .is_none_or(|(_, _, rules)| rules.is_some())
+                {
+                    return self.files.get(&key);
+                }
+            } else {
+                validated.insert(key.clone());
+            }
+        }
         let meta = match std::fs::metadata(file) {
             Ok(meta) => meta,
             // A link whose target is gone counts as an empty file.
@@ -538,6 +566,37 @@ mod tests {
         std::fs::write(&file, "*.txt\n").expect("write");
         assert!(!ignored(&mut rule, &tmp.path().join("test.tmp"), false));
         assert!(ignored(&mut rule, &tmp.path().join("test.txt"), false));
+    }
+
+    /// A `.ignore` is checked for changes once per listing, not once per
+    /// entry (gl-1328): an edit shows from the next listing on.
+    #[test]
+    fn an_ignore_file_is_checked_once_per_listing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join(".ignore");
+        std::fs::write(&file, "*.tmp").expect("write");
+        let mut rule = DotIgnoreRule::default();
+        rule.begin_listing();
+        assert!(ignored(&mut rule, &tmp.path().join("a.tmp"), false));
+        std::fs::write(&file, "*.txt\n").expect("write");
+        assert!(ignored(&mut rule, &tmp.path().join("b.tmp"), false));
+        rule.begin_listing();
+        assert!(!ignored(&mut rule, &tmp.path().join("b.tmp"), false));
+        assert!(ignored(&mut rule, &tmp.path().join("b.txt"), false));
+    }
+
+    /// A `.ignore` that hides everything (empty, or caught truncated) is
+    /// checked again for every entry of a listing.
+    #[test]
+    fn an_ignore_file_hiding_everything_is_checked_per_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join(".ignore");
+        std::fs::write(&file, "").expect("write");
+        let mut rule = DotIgnoreRule::default();
+        rule.begin_listing();
+        assert!(ignored(&mut rule, &tmp.path().join("a.mkv"), false));
+        std::fs::write(&file, "*.tmp\n").expect("write");
+        assert!(!ignored(&mut rule, &tmp.path().join("b.mkv"), false));
     }
 
     #[rstest::rstest]

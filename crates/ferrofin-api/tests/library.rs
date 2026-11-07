@@ -294,6 +294,7 @@ impl LibraryMonitor for RecordingMonitor {
     async fn stop(&self) -> Result<(), ServiceError> {
         Ok(())
     }
+    fn restart(&self) {}
     async fn report_file_system_change_beginning(&self, _path: &str) -> Result<(), ServiceError> {
         Ok(())
     }
@@ -407,7 +408,8 @@ async fn series_updated_without_tvdb_reports_nothing() {
     let (router, monitor) = router_with(seeded_items());
     let status = post(router, "/Library/Series/Updated", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(reported(&monitor).is_empty());
+    let found = reported(&monitor);
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[tokio::test]
@@ -415,7 +417,8 @@ async fn series_updated_unknown_tvdb_reports_nothing() {
     let (router, monitor) = router_with(seeded_items());
     let status = post(router, "/Library/Series/Updated?tvdbId=nomatch", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(reported(&monitor).is_empty());
+    let found = reported(&monitor);
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[tokio::test]
@@ -446,7 +449,8 @@ async fn movies_added_without_any_id_reports_nothing() {
     let (router, monitor) = router_with(seeded_items());
     let status = post(router, "/Library/Movies/Added", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(reported(&monitor).is_empty());
+    let found = reported(&monitor);
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[tokio::test]
@@ -507,7 +511,8 @@ async fn media_updated_empty_batch_is_noop() {
     let (router, monitor) = router_with(seeded_items());
     let status = post(router, "/Library/Media/Updated", Some(r#"{"Updates":[]}"#)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(reported(&monitor).is_empty());
+    let found = reported(&monitor);
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[tokio::test]
@@ -516,7 +521,8 @@ async fn series_updated_empty_tvdb_reports_nothing() {
     let (router, monitor) = router_with(seeded_items());
     let status = post(router, "/Library/Series/Updated?tvdbId=", None).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(reported(&monitor).is_empty());
+    let found = reported(&monitor);
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[tokio::test]

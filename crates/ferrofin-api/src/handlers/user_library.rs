@@ -26,8 +26,7 @@
 //! ([`super::users::assert_can_update_user`]). The person on-demand metadata
 //! refresh (`RefreshOnDemandIfNeeded`) runs in `items::get_item`, which both
 //! item routes reach. `GET /Items/Latest` ports `GetLatestMedia` (the grouping
-//! lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)),
-//! except the mixed-library arm of the grouped request, not ported yet (gl-383).
+//! lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
 
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
@@ -605,8 +604,9 @@ struct LatestQuery {
 ///
 /// Port of `UserLibraryController.GetLatestMedia`. The
 /// [`UserViewManager`](ferrofin_traits::library::UserViewManager) returns the
-/// C# `(container, items)` tuples — one query across the user's views (or the
-/// `parentId` folder), grouped by index container up to `limit` groups — and
+/// C# `(container, items)` tuples — one query across the root folders the user
+/// may open (or the `parentId` folder), grouped by index container up to
+/// `limit` groups — and
 /// this handler applies the controller's projection: a container with more
 /// than one new item, or a `MusicAlbum` with any, is emitted in place of its
 /// items with `ChildCount` = the number of new items; everything else is the
@@ -625,6 +625,8 @@ async fn get_latest_media(
     use crate::handlers::query_parse::parse_csv_enums_lenient;
 
     let user = resolve_user(&state, &auth, query.user_id).await?;
+    crate::handlers::items::require_scope_id_visible(&state, &auth, query.parent_id, Some(&user))
+        .await?;
 
     // C#: an unset `isPlayed` defaults to `false` when the user hides played
     // items from the "latest" rows.
@@ -644,13 +646,7 @@ async fn get_latest_media(
     );
     // The views the user excluded from "latest"
     // (`user.GetPreferenceValues<Guid>(PreferenceKind.LatestItemExcludes)`).
-    let latest_item_excludes = state
-        .users
-        .get_user_dto(&user, None)
-        .await?
-        .configuration
-        .map(|c| c.latest_items_excludes)
-        .unwrap_or_default();
+    let latest_item_excludes = state.users.latest_items_excludes(&user).await?;
     let latest_query = ferrofin_traits::options::LatestItemsQuery {
         user: Some(user.clone()),
         parent_id: query.parent_id,

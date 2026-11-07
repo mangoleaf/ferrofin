@@ -25,7 +25,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-UPSTREAM_SOURCE = "crates/ferrofin-api/src/handlers/mod.rs"
+UPSTREAM_SOURCE = "crates/ferrofin-api/src/handlers.rs"
 PIN = "gates/bench/testdata/jellyfin-image.txt"
 REPO = "https://github.com/jellyfin/jellyfin"
 #: A release tag; release candidates (`v12.0-rc7`) and anything else do not match.

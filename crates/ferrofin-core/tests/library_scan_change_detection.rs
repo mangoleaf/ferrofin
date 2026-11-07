@@ -573,8 +573,10 @@ async fn a_touched_file_is_probed_fetched_and_saved_alone() {
 
     // And it is quiet again.
     assert_eq!(fx.scan().await.unchanged, 2);
-    assert!(fx.probe.take().is_empty());
-    assert!(fx.tmdb.take().is_empty());
+    let probe_requests = fx.probe.take();
+    assert!(probe_requests.is_empty(), "{probe_requests:?}");
+    let tmdb_requests = fx.tmdb.take();
+    assert!(tmdb_requests.is_empty(), "{tmdb_requests:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -655,7 +657,8 @@ async fn a_new_sidecar_subtitle_reprobes_only_that_video() {
 
     // The stored streams now name the sidecar: quiet again.
     assert_eq!(fx.scan().await.unchanged, 2);
-    assert!(fx.probe.take().is_empty());
+    let probe_requests = fx.probe.take();
+    assert!(probe_requests.is_empty(), "{probe_requests:?}");
 
     // Removing it is a change too.
     std::fs::remove_file(&sidecar).expect("rm");
@@ -686,8 +689,10 @@ async fn a_never_refreshed_item_runs_everything_once_then_goes_quiet() {
     assert!(fx.stamps(&fx.heat).await.1.is_some(), "and stamps the row");
 
     assert_eq!(fx.scan().await.unchanged, 2);
-    assert!(fx.probe.take().is_empty());
-    assert!(fx.tmdb.take().is_empty());
+    let probe_requests = fx.probe.take();
+    assert!(probe_requests.is_empty(), "{probe_requests:?}");
+    let tmdb_requests = fx.tmdb.take();
+    assert!(tmdb_requests.is_empty(), "{tmdb_requests:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -695,7 +700,8 @@ async fn an_elapsed_refresh_interval_refetches() {
     let tmp = tempfile::tempdir().expect("tmp");
     let fx = scanned_once(tmp.path(), 30).await;
     assert_eq!(fx.scan().await.unchanged, 2, "not yet elapsed");
-    assert!(fx.tmdb.take().is_empty());
+    let tmdb_requests = fx.tmdb.take();
+    assert!(tmdb_requests.is_empty(), "{tmdb_requests:?}");
 
     fx.set(
         &fx.matrix,
@@ -1086,7 +1092,8 @@ async fn a_new_replaced_or_deleted_poster_is_validated_on_an_unchanged_item() {
         .expect("images")
     };
     assert_eq!(scanner.scan_all().await.expect("scan").created, 1);
-    assert!(images().await.is_empty());
+    let stored = images().await;
+    assert!(stored.is_empty(), "{stored:?}");
 
     let poster = file.with_file_name("poster.jpg");
     std::fs::write(&poster, b"\xFF\xD8\xFFposter").expect("poster");
@@ -1270,7 +1277,8 @@ async fn an_edit_survives_a_quiet_rescan_and_a_provider_pass_only_where_locked()
         .await;
 
     assert_eq!(fx.scan().await.unchanged, 2);
-    assert!(fx.tmdb.take().is_empty());
+    let tmdb_requests = fx.tmdb.take();
+    assert!(tmdb_requests.is_empty(), "{tmdb_requests:?}");
     assert_eq!(
         rating_and_overview(&fx, &fx.matrix).await.1.as_deref(),
         Some("My overview"),
@@ -1617,7 +1625,8 @@ async fn replace_all_metadata_replaces_and_clears_but_keeps_locked_fields() {
     let replace = item_refresh(MetadataRefreshMode::FullRefresh, true);
 
     assert_eq!(fx.scan_with(&replace).await.updated, 2);
-    assert!(!fx.tmdb.take().is_empty());
+    let tmdb_requests = fx.tmdb.take();
+    assert!(!tmdb_requests.is_empty(), "{tmdb_requests:?}");
     assert_eq!(
         edited_fields(&fx, &fx.matrix).await,
         (Some("About The Matrix.".into()), Some(8.0), None)
@@ -1846,8 +1855,10 @@ async fn a_default_item_refresh_of_an_unchanged_item_is_quiet() {
         },
         "only the item is planned"
     );
-    assert!(fx.tmdb.take().is_empty());
-    assert!(fx.probe.take().is_empty());
+    let tmdb_requests = fx.tmdb.take();
+    assert!(tmdb_requests.is_empty(), "{tmdb_requests:?}");
+    let probe_requests = fx.probe.take();
+    assert!(probe_requests.is_empty(), "{probe_requests:?}");
     assert!(fx.writes().await.is_empty());
     assert_eq!(edited_fields(&fx, &fx.matrix).await, before);
 }

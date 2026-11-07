@@ -115,7 +115,7 @@ async fn get_years(
     //
     // A `parentId` naming no item, the zero id included, is `GetParentItem`'s
     // `ArgumentException`: a 400.
-    resolve_parent(&state, query.parent_id).await?;
+    resolve_parent(&state, &auth, query.parent_id, user.as_deref()).await?;
     let parent_id = match query.parent_id {
         Some(parent) => parent,
         None if !recursive => state
@@ -133,8 +133,8 @@ async fn get_years(
     let exclude_item_types = parse_csv_enums_lenient(query.exclude_item_types.as_deref());
     let media_types = parse_csv_enums_lenient(query.media_types.as_deref());
     // The user row moves into the query and is borrowed back out for the DTO
-    // projection below — `resolve_user_or_api_key` already cloned it off the
-    // auth context, and a second full copy of every string on it buys nothing.
+    // projection below — it is the auth context's shared row
+    // (`resolve_user_or_api_key`), and the query holds the same handle.
     let internal = ferrofin_traits::options::InternalItemsQuery {
         user,
         start_index: query.start_index,
@@ -155,7 +155,7 @@ async fn get_years(
         query.image_type_limit,
         query.enable_image_types.as_deref(),
     );
-    let projected = project_item_rows(&state, result, &options, internal.user.as_ref()).await?;
+    let projected = project_item_rows(&state, result, &options, internal.user.as_deref()).await?;
     Ok(Json(projected))
 }
 
@@ -211,7 +211,7 @@ async fn get_year(
     let options = DtoOptions::default();
     let dto = state
         .dto
-        .get_base_item_dto(&item, &options, user.as_ref(), None)
+        .get_base_item_dto(&item, &options, user.as_deref(), None)
         .await?;
     Ok(Json(dto))
 }

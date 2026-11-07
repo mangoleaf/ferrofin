@@ -112,7 +112,7 @@ def stores(db, expected=False):
     """What the database holds, in the form each preservation check compares. The start
     release's (expected=True) history is harmonized: a release before v1.4.0 left the seeded
     conflicting rows apart, and the candidate's boot repair makes them agree, as Jellyfin 12.2
-    does (synthetic.py run holds that against the 12.2 oracle)."""
+    and later do (synthetic.py run holds that against the 12.4 oracle)."""
     import metadata
     import user_accounts
     import watch_history
@@ -122,8 +122,8 @@ def stores(db, expected=False):
 
 def comparable(data, seeds):
     """An API snapshot without what the candidate's boot repairs change by design, following
-    Jellyfin 12.2 rather than the start release (synthetic.py run holds each against the 12.2
-    oracle): the seeded ratings' visibility (rescored from 12.2's tables), the conflicting
+    Jellyfin 12.2 and later rather than the start release (synthetic.py run holds each against
+    the 12.4 oracle): the seeded ratings' visibility (rescored from 12.2's tables), the conflicting
     movie's resume (harmonized) and the local alternate version's id (re-keyed from its
     primary's type, preservation.FROM_ORACLE), of which only the count is compared. Avatars
     are fetched with the admin's token (snapshot images=admin): v1.0.0 serves them to no

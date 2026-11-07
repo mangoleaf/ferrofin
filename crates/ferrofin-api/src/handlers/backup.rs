@@ -14,6 +14,17 @@
 //!   tree before the database is opened ([`apply_pending_restore`]), exactly as
 //!   Jellyfin's `ScheduleRestoreAndRestartServer` does. Restoring in-process
 //!   would overwrite an open SQLite file.
+//!
+//! One divergence beyond upstream: an archive is private (`0600` on Unix), and
+//! so is every file a restore puts back under the configuration tree, new or
+//! replaced. Upstream's `BackupService` writes the archive with
+//! `File.OpenWrite` (the umask mode), and Jellyfin writes its configuration
+//! files with the umask mode, so nothing it archives or restores is narrower.
+//! Ferrofin writes the configuration tree `0600`, since it holds plugin
+//! secrets (LDAP-Auth's bind password), and a backup must not undo that
+//! (gl-1233). The other trees keep the umask mode, as do the database, its
+//! snapshot and its restored file, whose on-disk mode Ferrofin does not narrow
+//! either.
 
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -539,9 +550,9 @@ fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
         if path.is_dir() {
             add_dir_to_zip(zip, &path, &zip_path, options)?;
         } else {
-            let bytes = std::fs::read(&path).map_err(|e| at(&path, e))?;
+            let mut file = std::fs::File::open(&path).map_err(|e| at(&path, e))?;
             zip.start_file(zip_path, options)?;
-            zip.write_all(&bytes)?;
+            std::io::copy(&mut file, zip).map_err(|e| at(&path, e))?;
         }
     }
     Ok(())
@@ -651,13 +662,20 @@ async fn run_create(state: &AppState, options: BackupOptions) -> Result<BackupMa
 }
 
 /// A create's scratch file — the database snapshot, the archive being
-/// written — removed when dropped, so no error path and no panic leaves it
-/// behind. Dropped once the archive is in place, it finds nothing to remove.
+/// written — or a restored file not moved into place yet, removed when
+/// dropped, so no error path and no panic leaves it behind. Dropped once the
+/// file is in place, it finds nothing to remove.
 struct ScratchFile(PathBuf);
 
 impl Drop for ScratchFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        match std::fs::remove_file(&self.0) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                let path = self.0.display();
+                tracing::warn!(%path, %error, "could not remove a scratch file");
+            }
+            _ => {}
+        }
     }
 }
 
@@ -772,7 +790,10 @@ fn write_archive(
     manifest: &BackupManifest,
     snapshot: Option<&Path>,
 ) -> std::io::Result<()> {
-    let file = std::fs::File::create(path)?;
+    // Private (`0600` on Unix): the archive holds the configuration tree,
+    // plugin secrets included. Upstream's `File.OpenWrite` takes the umask
+    // mode. The rename into place keeps the mode.
+    let file = ferrofin_util::file_helper::create_private(path)?;
     let mut zip = zip::ZipWriter::new(file);
     let opts = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
@@ -877,10 +898,14 @@ pub struct RestoreFailure {
     pub archive: Option<PathBuf>,
     /// What went wrong.
     pub error: std::io::Error,
-    /// Whether extraction had begun: the trees may be partly replaced, and the
-    /// server must not boot on them (Jellyfin's failed restore throws out of
-    /// startup). `false` for a missing, foreign or unreadable archive, which
-    /// touched nothing.
+    /// Whether the trees are partly replaced: the extracted files were being
+    /// moved into place (`swap_in`) when it failed. The boot that sees it
+    /// refuses to start on them (Jellyfin's failed restore throws out of
+    /// startup); the marker is gone by then, so the next boot starts on them,
+    /// as a restarted Jellyfin does after any failed restore, its restore path
+    /// being held in memory only. `false` when nothing was replaced: a
+    /// missing, foreign or unreadable archive, or an extraction that failed
+    /// before the move (a corrupt entry, a full disk), its files removed.
     pub partially_applied: bool,
 }
 
@@ -910,31 +935,46 @@ pub fn restore_pending(roots: &TreeRoots) -> bool {
 /// Applies a restore scheduled by `POST /Backup/Restore`, if one is pending.
 ///
 /// The composition root calls this at boot BEFORE the database is opened: it
-/// reads the marker under `{program_data}/data/backups/`, extracts the named
-/// archive over the tree described by `roots`, removes the marker, and returns the archive path
-/// it applied (`None` when nothing was pending). A marker naming a missing or
-/// foreign archive is dropped with an error so a stale marker cannot block
-/// every boot. One deliberate difference from Jellyfin, whose pending path is
-/// in-memory and dies with the process: the marker is durable, so a restore
-/// scheduled right before a crash still applies on the next boot (logged).
+/// reads and removes the marker under `{program_data}/data/backups/`,
+/// extracts the named archive over the tree described by `roots`
+/// (`stage_archive`, then `swap_in`), and returns the archive path it
+/// applied (`None` when nothing was pending). The marker goes first, so a
+/// restore that fails, a stale marker naming a missing or foreign archive
+/// included, is never retried by every boot. One deliberate difference from
+/// Jellyfin, whose pending path is in-memory and dies with the process: the
+/// marker is durable, so a restore scheduled right before a crash still
+/// applies on the next boot (logged).
 ///
 /// # Errors
 ///
-/// A [`RestoreFailure`]; the marker is removed either way. A failure before
-/// extraction began leaves the trees untouched ([`RestoreFailure::
-/// partially_applied`] is `false`); one during it does not.
+/// A [`RestoreFailure`]. The marker is removed before anything else; one that
+/// cannot be removed refuses the restore. Only a failure while the extracted
+/// files are moved into place leaves the trees partly replaced
+/// ([`RestoreFailure::partially_applied`]); any earlier one leaves them as
+/// they were.
 pub fn apply_pending_restore(roots: &TreeRoots) -> Result<Option<PathBuf>, RestoreFailure> {
     let dir = roots.program_data.join("data").join(BACKUPS_DIR);
     let marker = dir.join(RESTORE_PENDING_FILE);
     let Ok(name) = std::fs::read_to_string(&marker) else {
         return Ok(None);
     };
-    let _ = std::fs::remove_file(&marker);
     let untouched = |archive: Option<PathBuf>, error: std::io::Error| RestoreFailure {
         archive,
         error,
         partially_applied: false,
     };
+    // A marker that stays would apply the backup again at every boot, undoing
+    // everything done since.
+    std::fs::remove_file(&marker).map_err(|error| {
+        let reason = format!(
+            "{} could not be removed, so it was not applied",
+            marker.display()
+        );
+        untouched(
+            None,
+            std::io::Error::new(error.kind(), format!("{reason}: {error}")),
+        )
+    })?;
     let name = Path::new(name.trim())
         .file_name()
         .and_then(|n| n.to_str())
@@ -948,7 +988,9 @@ pub fn apply_pending_restore(roots: &TreeRoots) -> Result<Option<PathBuf>, Resto
     if let Some(reason) = restore_refusal(&archive) {
         return Err(untouched(Some(archive), std::io::Error::other(reason)));
     }
-    restore_archive(&archive, roots).map_err(|error| RestoreFailure {
+    let staged =
+        stage_archive(&archive, roots).map_err(|error| untouched(Some(archive.clone()), error))?;
+    swap_in(staged, &roots.database).map_err(|error| RestoreFailure {
         archive: Some(archive.clone()),
         error,
         partially_applied: true,
@@ -956,21 +998,52 @@ pub fn apply_pending_restore(roots: &TreeRoots) -> Result<Option<PathBuf>, Resto
     Ok(Some(archive))
 }
 
-/// Extracts a backup archive's entries back over `roots`: `data/ferrofin.db` →
-/// the database file, and each tree prefix to its on-disk root. Skips the
-/// manifest and anything else. Pure over paths so it is unit-testable and
-/// shared by the boot hook.
-///
-/// The database is written to a temporary file beside the target and renamed
-/// into place only once fully extracted, so a failure mid-way (disk full, a
-/// corrupt archive) cannot leave a truncated database behind. It runs in WAL
-/// mode, so its `-wal`/`-shm` sidecars are removed at the same moment: a stale
-/// WAL left beside a restored database would be replayed over it on open.
+/// The name suffix of a restored file not moved into place yet. It sits
+/// beside its destination, so the move is a rename within one directory.
+const RESTORE_STAGING_SUFFIX: &str = ".restore-tmp";
+
+/// A restore's extracted files, each named after the path it replaces plus
+/// [`RESTORE_STAGING_SUFFIX`]. Dropping it removes every one not moved into
+/// place.
+type StagedRestore = Vec<ScratchFile>;
+
+/// Where `dest` is extracted before the move.
+fn staging_path(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_owned();
+    name.push(RESTORE_STAGING_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// [`stage_archive`] then [`swap_in`]: the whole restore.
+#[cfg(test)]
 fn restore_archive(archive_path: &Path, roots: &TreeRoots) -> std::io::Result<()> {
+    swap_in(stage_archive(archive_path, roots)?, &roots.database)
+}
+
+/// Extracts a backup archive's entries for a restore over `roots`:
+/// `data/ferrofin.db` → the database file, and each tree prefix to its on-disk
+/// root. Skips the manifest and anything else. Pure over paths so it is
+/// unit-testable and shared by the boot hook.
+///
+/// Nothing is replaced yet: each file is written beside the one it replaces
+/// ([`RESTORE_STAGING_SUFFIX`]), for [`swap_in`] to move into place once the
+/// whole archive is extracted. A failure here (a corrupt entry, a full disk)
+/// removes what it wrote, so the live tree is left as it was, apart from the
+/// directories created for new files. Until the move, the restored files
+/// take disk beside the files they replace, as the database always did. The
+/// move puts a new file in place, with the umask mode and the server's owner
+/// outside the configuration tree, and replaces a link rather than writing
+/// through it. The staged names are 12 bytes longer, so a file whose name is
+/// within 12 bytes of the filesystem's limit fails the restore. The list of
+/// staged paths stays in memory until the move, one path per restored file. A
+/// process killed during a restore leaves its staged files behind; restoring
+/// the same archive again overwrites and moves them.
+fn stage_archive(archive_path: &Path, roots: &TreeRoots) -> std::io::Result<StagedRestore> {
     let file = std::fs::File::open(archive_path)?;
     let mut zip = zip::ZipArchive::new(file).map_err(std::io::Error::other)?;
     let db_entry = format!("data/{DB_FILE_NAME}");
     let mut roots = roots.clone();
+    let mut staged = StagedRestore::new();
     // Two passes: everything but the metadata trees first, so the restored
     // `system.json` can name where the metadata belongs. The roots known at
     // boot come from the configuration being replaced; a backup whose
@@ -979,8 +1052,17 @@ fn restore_archive(archive_path: &Path, roots: &TreeRoots) -> std::io::Result<()
     // `metadata-default` tree only while that is somewhere else ([`TreeRoots::
     // trees`]), never over the metadata just restored.
     for metadata_pass in [false, true] {
-        if metadata_pass && let Some(restored) = restored_metadata_root(&roots.config) {
-            roots.metadata = restored;
+        if metadata_pass {
+            let system_json = roots.config.join("system.json");
+            let staged_json = staging_path(&system_json);
+            let restored = if staged.iter().any(|file| file.0 == staged_json) {
+                staged_json
+            } else {
+                system_json
+            };
+            if let Some(metadata) = metadata_root_in(&restored) {
+                roots.metadata = metadata;
+            }
         }
         for i in 0..zip.len() {
             let mut entry = zip.by_index(i).map_err(std::io::Error::other)?;
@@ -992,33 +1074,18 @@ fn restore_archive(archive_path: &Path, roots: &TreeRoots) -> std::io::Result<()
             if metadata_tree != metadata_pass {
                 continue;
             }
-            if enclosed == Path::new(&db_entry) {
-                let tmp = roots.database.with_extension("restore-tmp");
-                {
-                    let mut out = std::fs::File::create(&tmp)?;
-                    std::io::copy(&mut entry, &mut out)?;
-                    out.sync_all()?;
-                }
-                for sidecar in ["-wal", "-shm"] {
-                    let mut name = roots.database.as_os_str().to_owned();
-                    name.push(sidecar);
-                    match std::fs::remove_file(&name) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e),
-                    }
-                }
-                std::fs::rename(&tmp, &roots.database)?;
-                continue;
-            }
-            let dest = if enclosed == Path::new(TASK_RESULTS_ENTRY) {
-                roots.task_results.clone()
-            } else if let Some((root, rest)) = roots
-                .trees()
-                .into_iter()
-                .find_map(|(prefix, root)| enclosed.strip_prefix(prefix).ok().map(|r| (root, r)))
-            {
-                root.join(rest)
+            let (dest, private) = if enclosed == Path::new(&db_entry) {
+                (roots.database.clone(), false)
+            } else if enclosed == Path::new(TASK_RESULTS_ENTRY) {
+                (roots.task_results.clone(), false)
+            } else if let Some((prefix, root, rest)) = roots.trees().find_map(|(prefix, root)| {
+                enclosed
+                    .strip_prefix(prefix)
+                    .ok()
+                    .filter(|rest| !rest.as_os_str().is_empty()) // a file named as the tree
+                    .map(|rest| (prefix, root, rest))
+            }) {
+                (root.join(rest), prefix == "config")
             } else {
                 continue;
             };
@@ -1028,17 +1095,64 @@ fn restore_archive(archive_path: &Path, roots: &TreeRoots) -> std::io::Result<()
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let mut out = std::fs::File::create(&dest)?;
+            let file = ScratchFile(staging_path(&dest));
+            // The configuration tree goes back private (`0600` on Unix), as
+            // Ferrofin writes it: it holds plugin secrets. The move replaces a
+            // file already there, so it does not keep its mode, as every
+            // Ferrofin config save through `atomic_write` does.
+            let mut out = if private {
+                ferrofin_util::file_helper::create_private(&file.0)?
+            } else {
+                std::fs::File::create(&file.0)?
+            };
             std::io::copy(&mut entry, &mut out)?;
+            // On disk before it moves, as the database and Ferrofin's
+            // configuration saves always are.
+            if private || dest == roots.database {
+                out.sync_all()?;
+            }
+            staged.push(file);
         }
+    }
+    Ok(staged)
+}
+
+/// Moves the files [`stage_archive`] extracted into place, each by a rename
+/// over the file it replaces. The database runs in WAL mode, so its
+/// `-wal`/`-shm` sidecars are removed just before it moves: a stale WAL left
+/// beside a restored database would be replayed over it on open. A failure
+/// part-way leaves the trees partly replaced; the files not moved yet are
+/// removed.
+fn swap_in(staged: StagedRestore, database: &Path) -> std::io::Result<()> {
+    for file in staged {
+        // Drops the suffix [`staging_path`] appended.
+        let dest = file.0.with_extension("");
+        if dest == database {
+            for sidecar in ["-wal", "-shm"] {
+                let mut name = database.as_os_str().to_owned();
+                name.push(sidecar);
+                match std::fs::remove_file(&name) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        std::fs::rename(&file.0, &dest)?;
     }
     Ok(())
 }
 
 /// The `MetadataPath` the restored configuration names, when it names one:
 /// read from `system.json` in the (just restored) configuration directory.
+#[must_use]
 pub fn restored_metadata_root(config_dir: &Path) -> Option<PathBuf> {
-    std::fs::read_to_string(config_dir.join("system.json"))
+    metadata_root_in(&config_dir.join("system.json"))
+}
+
+/// The `MetadataPath` the `system.json` at `path` names, when it names one.
+fn metadata_root_in(path: &Path) -> Option<PathBuf> {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|cfg| cfg.get("MetadataPath")?.as_str().map(str::to_owned))
@@ -1165,11 +1279,39 @@ mod tests {
         assert!(read_manifest(&bare).unwrap().is_none());
     }
 
-    /// A restore that fails after extraction began leaves the trees partly
-    /// replaced, which the boot must not paper over; a marker that names no
-    /// archive touches nothing.
+    /// A file reaches the archive whole, whatever its size against the copy's
+    /// buffer, and an empty one stays an entry.
     #[test]
-    fn a_restore_failing_mid_extraction_is_reported_as_partial() {
+    fn archived_files_keep_every_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let large: Vec<u8> = (0..1_000_003_u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(src.join("large.bin"), &large).unwrap();
+        std::fs::write(src.join("empty.bin"), b"").unwrap();
+
+        let archive = tmp.path().join("backup.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        add_dir_to_zip(&mut zip, &src, "config", opts).unwrap();
+        zip.finish().unwrap();
+
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&archive).unwrap()).unwrap();
+        let mut read = |name: &str| {
+            let mut bytes = Vec::new();
+            std::io::copy(&mut zip.by_name(name).unwrap(), &mut bytes).unwrap();
+            bytes
+        };
+        assert_eq!(read("config/large.bin"), large);
+        assert_eq!(read("config/empty.bin"), Vec::<u8>::new());
+    }
+
+    /// A restore that fails while its files are moved into place leaves the
+    /// trees partly replaced, which the boot must not paper over, and removes
+    /// the files it had not moved yet; a marker that names no archive touches
+    /// nothing.
+    #[test]
+    fn a_restore_failing_mid_swap_is_reported_as_partial() {
         use super::{apply_pending_restore, write_backup};
 
         let tmp = tempfile::tempdir().unwrap();
@@ -1191,27 +1333,39 @@ mod tests {
         )
         .unwrap();
 
-        // The target's `config` is a file, so extracting `config/system.json`
-        // cannot succeed.
-        let boot = tmp.path().join("boot");
+        // A directory sits where a file goes: it extracts beside it, but
+        // cannot move over it. The database moves first, so the second case
+        // fails after it moved and the first before the configuration did.
+        let archive = std::path::PathBuf::from(&manifest.path);
+        for (case, obstacle, moved) in [
+            ("database", "ferrofin.db", "config/system.json"),
+            ("config", "config/system.json", "ferrofin.db"),
+        ] {
+            let boot = tmp.path().join(case);
+            let backups = boot.join("data").join(super::BACKUPS_DIR);
+            std::fs::create_dir_all(&backups).unwrap();
+            std::fs::create_dir_all(boot.join(obstacle)).unwrap();
+            std::fs::copy(&archive, backups.join(archive.file_name().unwrap())).unwrap();
+            std::fs::write(
+                backups.join(super::RESTORE_PENDING_FILE),
+                archive.file_name().unwrap().to_str().unwrap(),
+            )
+            .unwrap();
+            let roots = TreeRoots::defaults(&boot, &boot.join("config"), &boot.join("ferrofin.db"));
+
+            let failure = apply_pending_restore(&roots).unwrap_err();
+            assert!(failure.partially_applied, "{case}: {failure}");
+            assert!(failure.archive.is_some());
+            assert_eq!(boot.join(moved).is_file(), case == "config", "{case}");
+            assert_eq!(staged_leftovers(&boot), Vec::<std::path::PathBuf>::new());
+            // The marker is consumed either way, so a retry cannot loop the boot.
+            assert!(!backups.join(super::RESTORE_PENDING_FILE).exists());
+        }
+        let boot = tmp.path().join("nameless");
         let backups = boot.join("data").join(super::BACKUPS_DIR);
         std::fs::create_dir_all(&backups).unwrap();
-        std::fs::write(boot.join("config"), b"in the way").unwrap();
-        let archive = std::path::PathBuf::from(&manifest.path);
-        std::fs::copy(&archive, backups.join(archive.file_name().unwrap())).unwrap();
-        std::fs::write(
-            backups.join(super::RESTORE_PENDING_FILE),
-            archive.file_name().unwrap().to_str().unwrap(),
-        )
-        .unwrap();
         let boot_roots =
             TreeRoots::defaults(&boot, &boot.join("config"), &boot.join("ferrofin.db"));
-
-        let failure = apply_pending_restore(&boot_roots).unwrap_err();
-        assert!(failure.partially_applied, "{failure}");
-        assert!(failure.archive.is_some());
-        // The marker is consumed either way, so a retry cannot loop the boot.
-        assert!(!backups.join(super::RESTORE_PENDING_FILE).exists());
 
         // A marker naming no file at all touches nothing.
         std::fs::write(backups.join(super::RESTORE_PENDING_FILE), "").unwrap();
@@ -1219,6 +1373,134 @@ mod tests {
         assert!(!nameless.partially_applied);
         assert!(nameless.archive.is_none());
         assert!(nameless.to_string().starts_with("restoring a backup:"));
+    }
+
+    /// The staged files ([`super::RESTORE_STAGING_SUFFIX`]) anywhere under `dir`.
+    fn staged_leftovers(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut left = Vec::new();
+        let mut dirs = vec![dir.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path
+                    .to_string_lossy()
+                    .ends_with(super::RESTORE_STAGING_SUFFIX)
+                {
+                    left.push(path);
+                }
+            }
+        }
+        left
+    }
+
+    /// gl-196: a restore that fails part-way through its archive (a corrupt
+    /// entry here; a full disk fails the same way) leaves the live tree as it
+    /// was and no staged file behind, and reports that it replaced nothing, so
+    /// the boot goes on with the data it had. Once with the database entry
+    /// failing, once with an entry that comes after the database and the
+    /// configuration.
+    #[test]
+    fn a_restore_failing_mid_extraction_leaves_the_live_tree_untouched() {
+        use super::{apply_pending_restore, write_backup};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let library = "root/default/Movies/options.json";
+        let program_data = tmp.path().join("program");
+        std::fs::create_dir_all(program_data.join("config")).unwrap();
+        std::fs::write(program_data.join("config/system.json"), b"RESTORED").unwrap();
+        std::fs::create_dir_all(program_data.join(library).parent().unwrap()).unwrap();
+        std::fs::write(program_data.join(library), b"RESTORED").unwrap();
+        let roots = TreeRoots::defaults(
+            &program_data,
+            &program_data.join("config"),
+            &program_data.join("ferrofin.db"),
+        );
+        let manifest = write_backup(
+            &tmp.path().join("backups"),
+            &roots,
+            BackupOptions::default(),
+            "2024-05-06T07:08:09Z".parse().unwrap(),
+            Some(&snapshot(tmp.path(), b"RESTORED DATABASE")),
+        )
+        .unwrap();
+        let archive = std::fs::read(&manifest.path).unwrap();
+
+        for (case, broken) in [("database", "data/ferrofin.db"), ("library", library)] {
+            // One byte flipped mid-entry: reading it fails its CRC (or its
+            // inflate) after the extraction began.
+            let mut corrupt = archive.clone();
+            let (start, len) = {
+                let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&archive)).unwrap();
+                let entry = zip.by_name(broken).unwrap();
+                (entry.data_start().unwrap(), entry.compressed_size())
+            };
+            corrupt[usize::try_from(start + len / 2).unwrap()] ^= 0xff;
+
+            let boot = tmp.path().join(case);
+            let backups = boot.join("data").join(super::BACKUPS_DIR);
+            std::fs::create_dir_all(&backups).unwrap();
+            std::fs::create_dir_all(boot.join(library).parent().unwrap()).unwrap();
+            let live = [
+                ("ferrofin.db", "LIVE DATABASE"),
+                ("config/system.json", "{}"),
+                (library, "LIVE"),
+            ];
+            std::fs::create_dir_all(boot.join("config")).unwrap();
+            for (rel, contents) in live {
+                std::fs::write(boot.join(rel), contents).unwrap();
+            }
+            std::fs::write(backups.join("corrupt.zip"), &corrupt).unwrap();
+            std::fs::write(backups.join(super::RESTORE_PENDING_FILE), "corrupt.zip").unwrap();
+            let boot_roots =
+                TreeRoots::defaults(&boot, &boot.join("config"), &boot.join("ferrofin.db"));
+
+            let failure = apply_pending_restore(&boot_roots).unwrap_err();
+            for (rel, contents) in live {
+                assert_eq!(
+                    std::fs::read_to_string(boot.join(rel)).unwrap(),
+                    contents,
+                    "{case}: {rel}"
+                );
+            }
+            let left = staged_leftovers(&boot);
+            assert!(left.is_empty(), "{case}: staged files left: {left:?}");
+            assert!(!failure.partially_applied, "{case}: {failure}");
+            assert!(!backups.join(super::RESTORE_PENDING_FILE).exists());
+        }
+    }
+
+    /// A marker the boot cannot remove would restore the backup again at
+    /// every boot, so it is not applied at all: the failure touches nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_that_cannot_be_removed_is_not_applied() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let boot = tmp.path().join("boot");
+        let backups = boot.join("data").join(super::BACKUPS_DIR);
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(boot.join("ferrofin.db"), b"LIVE").unwrap();
+        std::fs::write(backups.join(super::RESTORE_PENDING_FILE), "any.zip").unwrap();
+        std::fs::set_permissions(&backups, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores the mode bits: then there is nothing to show.
+        let removable = std::fs::File::create(backups.join("probe")).is_ok();
+        let roots = TreeRoots::defaults(&boot, &boot.join("config"), &boot.join("ferrofin.db"));
+        let result = super::apply_pending_restore(&roots);
+        std::fs::set_permissions(&backups, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if removable {
+            return;
+        }
+        let failure = result.unwrap_err();
+        assert!(!failure.partially_applied, "{failure}");
+        assert!(
+            failure.to_string().contains("could not be removed"),
+            "{failure}"
+        );
+        assert!(backups.join(super::RESTORE_PENDING_FILE).is_file());
+        assert_eq!(std::fs::read(boot.join("ferrofin.db")).unwrap(), b"LIVE");
     }
 
     /// An archive from a newer Ferrofin, whose database is migrated past this
@@ -2274,6 +2556,81 @@ mod tests {
         let path = dir.join(".snapshot-test.db");
         std::fs::write(&path, bytes).unwrap();
         path
+    }
+
+    /// gl-1233: an archive holds the configuration tree, plugin secrets
+    /// included (LDAP-Auth's bind password sits in a `0600` `config.json`), so
+    /// the archive is private, not the umask mode. A restore puts the
+    /// configuration tree back private, a new file or one already there, as
+    /// Ferrofin writes it; the library root, which is not secret, keeps the
+    /// umask mode.
+    #[cfg(unix)]
+    #[test]
+    fn archives_and_restored_configuration_are_private() {
+        use super::{restore_archive, write_backup};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let tmp = tempfile::tempdir().unwrap();
+        let program_data = tmp.path().join("program");
+        let roots = small_roots(&program_data);
+        let secret = "config/plugins/ldap/config.json";
+        let library = "root/default/Movies/options.json";
+        for rel in [secret, library] {
+            let path = program_data.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, rel).unwrap();
+        }
+        std::fs::set_permissions(
+            program_data.join(secret),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let now = "2024-05-06T07:08:09Z".parse().unwrap();
+        let manifest = write_backup(
+            &tmp.path().join("backups"),
+            &roots,
+            no_database(),
+            now,
+            None,
+        )
+        .unwrap();
+        let archive = std::path::PathBuf::from(&manifest.path);
+        assert_eq!(mode(&archive), 0o600, "the archive is private");
+
+        // A fresh data directory, then one whose configuration is already
+        // there with the umask mode.
+        let fresh = tmp.path().join("fresh");
+        let existing = tmp.path().join("existing");
+        let existing_roots = small_roots(&existing);
+        std::fs::create_dir_all(existing.join("config/plugins/ldap")).unwrap();
+        std::fs::write(existing.join(secret), b"old").unwrap();
+        std::fs::set_permissions(
+            existing.join(secret),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        let fresh_roots =
+            TreeRoots::defaults(&fresh, &fresh.join("config"), &fresh.join("ferrofin.db"));
+        for (dir, restore_roots) in [(&fresh, fresh_roots), (&existing, existing_roots)] {
+            restore_archive(&archive, &restore_roots).unwrap();
+            for rel in [secret, "config/system.json"] {
+                assert_eq!(mode(&dir.join(rel)), 0o600, "{}", dir.join(rel).display());
+            }
+            assert_eq!(std::fs::read(dir.join(secret)).unwrap(), secret.as_bytes());
+            // What a file created with the umask gets: the library root's.
+            let reference = dir.join("reference");
+            std::fs::File::create(&reference).unwrap();
+            assert_eq!(mode(&dir.join(library)), mode(&reference));
+            assert_eq!(
+                std::fs::read(dir.join(library)).unwrap(),
+                library.as_bytes()
+            );
+            let stray = staged_leftovers(dir);
+            assert!(stray.is_empty(), "temporary files left: {stray:?}");
+        }
     }
 
     /// With a `MetadataPath` elsewhere, `CreateBackupAsync` also archives the

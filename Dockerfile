@@ -15,7 +15,7 @@ ARG WEB_IMAGE=web-build
 ARG RUNTIME_IMAGE=runtime-build
 
 # ── jellyfin-web, built from source (skipped when CI passes WEB_IMAGE) ──
-ARG JELLYFIN_WEB_VERSION=12.2
+ARG JELLYFIN_WEB_VERSION=12.4
 FROM node:24-trixie AS web-source
 ARG JELLYFIN_WEB_VERSION
 # webpack's production build is memory-hungry; give Node headroom.
@@ -23,6 +23,13 @@ ENV NODE_OPTIONS=--max-old-space-size=4096
 WORKDIR /web
 # jellyfin-web pulls a couple of deps from github.com archive URLs that ECONNRESET;
 # raise npm's fetch retries and retry `npm ci` so a transient blip doesn't fail the build.
+#
+# JELLYFIN_VERSION becomes the bundle's build version (__JF_BUILD_VERSION__), which
+# is also the buster of the query cache jellyfin-web saves in the browser: unset, it
+# is "Release" forever and a saved cache outlives every upgrade. Jellyfin's own
+# image sets it to the web version too, so the cache drops whenever the bundled
+# jellyfin-web changes (not on a Ferrofin release that keeps the same web version).
+# Keep this in sync with ci/web.Dockerfile.
 RUN git clone --depth 1 --branch "v${JELLYFIN_WEB_VERSION}" \
       https://github.com/jellyfin/jellyfin-web.git . \
  && npm config set fetch-retries 5 fetch-retry-mintimeout 20000 fetch-retry-maxtimeout 120000 \
@@ -30,7 +37,7 @@ RUN git clone --depth 1 --branch "v${JELLYFIN_WEB_VERSION}" \
       n=$((n+1)); [ "$n" -ge 5 ] && echo "npm ci failed after $n attempts" && exit 1; \
       echo "npm ci failed, retry $n/5 after 15s"; sleep 15; \
     done \
- && npm run build:production
+ && JELLYFIN_VERSION="${JELLYFIN_WEB_VERSION}" npm run build:production
 FROM scratch AS web-build
 COPY --from=web-source /web/dist /dist
 
@@ -60,7 +67,7 @@ RUN apt-get update \
 FROM ${WEB_IMAGE} AS web
 
 # ── server binary ───────────────────────────────────────────────────────
-FROM rust:1.98.1-trixie AS build
+FROM rust:1.99.1-trixie AS build
 WORKDIR /src
 COPY . .
 # .git is excluded from the build context, so bake the release version in from

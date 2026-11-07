@@ -16,7 +16,9 @@ use ferrofin_model::session::TranscodingInfo;
 
 use crate::encoding_helper::EncodingJobInfo;
 
+use super::ffmpeg_log::shown_arguments;
 use super::fs_wait::FsWaiter;
+use super::limits::{StartFfmpegError, TranscodeLimits, TranscodeRefused};
 use super::segment_transcoder::{SegmentTranscoder, SpawnRequest, TranscodeChild};
 
 /// How long `start_ffmpeg` blocks for the first segment before erroring, in
@@ -73,6 +75,11 @@ pub struct StartFfMpegRequest<'a> {
     pub env: Vec<(String, String)>,
     /// The accelerator this job runs on, for the dashboard's transcode panel.
     pub hardware_acceleration_type: HardwareAccelerationType,
+    /// The authenticated user the job is for, from the authorization and
+    /// never the query; `None` for a userless API key. The per-user cap counts
+    /// by it, and only this user's idle jobs from the same device (the state's
+    /// `DeviceId`) are evicted for this job.
+    pub user_id: Option<uuid::Uuid>,
 }
 
 /// Records the current job's startup metadata and returns its display label.
@@ -97,7 +104,7 @@ fn trace_transcode_start(program: &str, state: &EncodingJobInfo, arguments: &[St
         args = arguments.len(),
         "transcode job starting"
     );
-    tracing::debug!(ffmpeg_args = ?arguments, "ffmpeg arguments");
+    tracing::debug!(ffmpeg_args = ?shown_arguments(arguments), "ffmpeg arguments");
     display
 }
 
@@ -167,6 +174,13 @@ pub trait SessionReporter: Send + Sync {
     /// them when stderr statistics provide framerate and completion values.
     async fn report_started(&self, job: &TranscodingJobHandle, info: TranscodingInfo);
 
+    /// Tells the session layer that `job`'s ffmpeg never started, so its
+    /// device stops showing the transcode [`Self::report_started`] published.
+    ///
+    /// Port of the `ClearTranscodingInfo(state.Request.DeviceId)` in
+    /// `TranscodeManager.OnTranscodeFailedToStart`.
+    async fn on_job_failed_to_start(&self, job: &TranscodingJobHandle);
+
     /// Tears a killed `job` down, deleting its partial output when
     /// `delete_files` is set.
     ///
@@ -200,6 +214,10 @@ impl<S: SessionReporter + ?Sized> SessionReporter for std::sync::Arc<S> {
         (**self).report_started(job, info).await;
     }
 
+    async fn on_job_failed_to_start(&self, job: &TranscodingJobHandle) {
+        (**self).on_job_failed_to_start(job).await;
+    }
+
     async fn on_job_killed(
         &self,
         job: &TranscodingJobHandle,
@@ -225,6 +243,7 @@ impl SessionReporter for NoopSessionReporter {
         _info: ferrofin_model::session::TranscodingInfo,
     ) {
     }
+    async fn on_job_failed_to_start(&self, _job: &TranscodingJobHandle) {}
     async fn on_job_killed(
         &self,
         _job: &TranscodingJobHandle,
@@ -239,7 +258,8 @@ impl SessionReporter for NoopSessionReporter {
 /// Port of `DeleteHlsPartialStreamFiles`: every file in `output_dir` whose name
 /// contains the playlist stem is removed. Behind a seam so kill/cleanup stays
 /// unit-testable against a temp dir without touching a real transcode cache.
-pub trait FileCleaner: Send + Sync {
+/// The teardown runs it on the blocking pool (hence `'static`) and waits for it.
+pub trait FileCleaner: Send + Sync + 'static {
     /// Deletes every file in `output_dir` whose filename contains
     /// `playlist_stem` (case-insensitively). Port of `DeleteHlsPartialStreamFiles`.
     fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str);
@@ -299,6 +319,10 @@ struct RunningJob {
     /// The segment file extension (e.g. `.ts`), for diagnostics/index scans.
     #[allow(dead_code)]
     segment_extension: String,
+    /// The first segment this job's ffmpeg writes: its `-start_number`, or the
+    /// hls muxer's default 0. Segments below it, or past a gap in its run, are
+    /// an earlier job's (gl-52).
+    start_number: i32,
     /// Where this job's ffmpeg stderr is being written — inside the server's
     /// log directory, so a diagnostic can name a file the operator can actually
     /// fetch from `GET /System/Logs/Log`.
@@ -337,9 +361,21 @@ impl RunningJob {
             output_dir,
             playlist_path,
             segment_extension,
+            // `start_ffmpeg` sets it from the job's arguments.
+            start_number: 0,
             log_path,
         }
     }
+}
+
+/// The first segment an HLS ffmpeg writes: the value of its `-start_number`,
+/// or the hls muxer's default 0.
+fn hls_start_number(arguments: &[String]) -> i32 {
+    arguments
+        .windows(2)
+        .find(|pair| pair[0] == "-start_number")
+        .and_then(|pair| pair[1].parse().ok())
+        .unwrap_or(0)
 }
 
 /// Per-job control state, serialized with teardown.
@@ -463,6 +499,13 @@ struct RegisteredJob {
     /// The live process + cache metadata when this job was spawned via
     /// `start_ffmpeg`; `None` for registry-only jobs (lookup tests).
     running: Option<RunningJob>,
+    /// The user the job transcodes for, counted against
+    /// [`TranscodeLimits::per_user`]; `None` for a userless API key and for
+    /// registry-only jobs.
+    user_id: Option<uuid::Uuid>,
+    /// Whether the job re-encodes any stream, so a [`TranscodeLimits`] cap
+    /// counts it ([`EncodingJobInfo::encodes_any_stream`]).
+    encodes: bool,
 }
 
 impl RegisteredJob {
@@ -471,6 +514,76 @@ impl RegisteredJob {
             TranscodingJobType::Progressive => PROGRESSIVE_PING_TIMEOUT_MS,
             TranscodingJobType::Hls | TranscodingJobType::Dash => HLS_PING_TIMEOUT_MS,
         }
+    }
+
+    /// Whether a [`TranscodeLimits`] cap counts this job: it re-encodes and its
+    /// process has not exited. A job still starting counts.
+    fn holds_transcode_slot(&self) -> bool {
+        self.encodes
+            && self
+                .running
+                .as_ref()
+                .is_none_or(|running| !running.child.has_exited())
+    }
+
+    /// Whether this job may be killed to admit another of `user`'s from
+    /// `device`: it is that user's, from that device (its `DeviceId`, ignoring
+    /// ASCII case as the kill-by-device path does; upstream's
+    /// `KillTranscodingJobs` uses `OrdinalIgnoreCase`), it holds a slot, and
+    /// nobody is reading from it right now. A job still starting has its start
+    /// as a consumer, unless the client hung up on that start.
+    fn is_evictable_for(&self, user: uuid::Uuid, device: &str) -> bool {
+        self.user_id == Some(user)
+            && self
+                .handle
+                .device_id
+                .as_deref()
+                .is_some_and(|own| own.eq_ignore_ascii_case(device))
+            && self.active_request_count <= 0
+            && self.holds_transcode_slot()
+    }
+}
+
+/// Makes room in `jobs` for one more re-encoding job of `user` from `device`,
+/// the request's `DeviceId`: `Ok(None)` when there is room, the job taken out
+/// to make it, or the cap that refuses it.
+///
+/// One job is always enough, since every job counted came through here. It is
+/// the longest-idle job of the same user on the same device, so "next episode"
+/// works while the last episode's job waits for its ping timeout. Another
+/// device's job is never taken: an idle job is not always abandoned, since an
+/// HLS player between two segment requests has no active request either, and
+/// ending it would have that player's next segment restart it and end this
+/// job in turn. That start is refused instead, until a job ends. A start
+/// without a user or without a device has no idle job to give up.
+fn take_job_to_admit(
+    jobs: &mut Vec<RegisteredJob>,
+    limits: TranscodeLimits,
+    user: Option<uuid::Uuid>,
+    device: Option<&str>,
+) -> Result<Option<RegisteredJob>, TranscodeRefused> {
+    let running = |user: Option<uuid::Uuid>| {
+        jobs.iter()
+            .filter(|job| job.holds_transcode_slot() && (user.is_none() || job.user_id == user))
+            .count()
+    };
+    let server_full = TranscodeLimits::is_full(limits.server, running(None));
+    let user_full = user.is_some() && TranscodeLimits::is_full(limits.per_user, running(user));
+    if !server_full && !user_full {
+        return Ok(None);
+    }
+    let device = device.filter(|device| !device.is_empty());
+    let longest_idle = user.zip(device).and_then(|(user, device)| {
+        jobs.iter()
+            .enumerate()
+            .filter(|(_, job)| job.is_evictable_for(user, device))
+            .min_by_key(|(_, job)| job.last_activity)
+            .map(|(index, _)| index)
+    });
+    match longest_idle {
+        Some(index) => Ok(Some(jobs.remove(index))),
+        None if user_full => Err(TranscodeRefused::User),
+        None => Err(TranscodeRefused::Server),
     }
 }
 
@@ -482,13 +595,16 @@ impl RegisteredJob {
 pub struct TranscodeManagerImpl<S: SessionReporter, C: FileCleaner = FsFileCleaner> {
     jobs: Mutex<Vec<RegisteredJob>>,
     reporter: S,
-    file_cleaner: C,
+    file_cleaner: std::sync::Arc<C>,
     encoding_config:
         Option<std::sync::Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
     /// The throttle's reads of `encoding_config`, which report a document
     /// that cannot be read once rather than on every due timer.
     throttle_options: crate::configuration::EncodingOptionsReader,
     pause_keys: super::throttler::PauseKeySlot,
+    /// The caps on concurrent re-encoding jobs; off unless
+    /// [`Self::with_transcode_limits`] sets them.
+    limits: TranscodeLimits,
 }
 
 /// An active-consumer mark on a transcode job, released on drop.
@@ -523,13 +639,26 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         Self {
             jobs: Mutex::new(Vec::new()),
             reporter,
-            file_cleaner,
+            file_cleaner: std::sync::Arc::new(file_cleaner),
             encoding_config: None,
             throttle_options: crate::configuration::EncodingOptionsReader::new(
                 "transcode throttle",
             ),
             pause_keys: super::throttler::PauseKeySlot::default(),
+            limits: TranscodeLimits::default(),
         }
+    }
+
+    /// Caps the concurrent re-encoding jobs, server-wide and per user. A start
+    /// past a cap first evicts an idle job of the same user on the same device
+    /// and is otherwise refused before anything is created or spawned.
+    ///
+    /// Divergence from upstream, which has no cap; see
+    /// [`limits`](super::limits).
+    #[must_use]
+    pub fn with_transcode_limits(mut self, limits: TranscodeLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// Uses the persisted encoding document for each running job's timer tick.
@@ -774,14 +903,21 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// Runs the progress pump and due throttle timers until the manager drops.
     ///
     /// A weak reference prevents this composition task from retaining all jobs
-    /// after server shutdown.
+    /// after server shutdown. A tick that panics is logged and ends alone
+    /// (`survive_panic`): the next tick runs as usual.
     pub async fn run_transcode_controls(manager: std::sync::Weak<Self>) {
+        let mut failing = false;
         loop {
             tokio::time::sleep(Duration::from_millis(500)).await;
             let Some(manager) = manager.upgrade() else {
                 return;
             };
-            manager.update_transcoding_jobs().await;
+            survive_panic(
+                "transcode_controls",
+                &mut failing,
+                manager.update_transcoding_jobs(),
+            )
+            .await;
         }
     }
 
@@ -805,9 +941,47 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             last_activity: std::time::Instant::now(),
             handle: handle.clone(),
             running: None,
+            user_id: None,
+            encodes: false,
         };
         self.jobs.lock().expect("jobs lock poisoned").push(job);
         handle
+    }
+
+    /// [`register_job`](Self::register_job) for a starting job of `user`, past
+    /// the [`TranscodeLimits`] check when it `encodes`, returning the idle job
+    /// of the same device (`handle.device_id`) it replaces, if any, for the
+    /// caller to tear down.
+    ///
+    /// The count and the insert happen under one lock, so concurrent starts
+    /// cannot both pass the check. The job enters with its start as a consumer,
+    /// which the caller's [`TranscodeRequestGuard`] releases: under the same
+    /// lock, so a concurrent start from the same user and device cannot take
+    /// it for idle.
+    fn register_job_for_user(
+        &self,
+        handle: &TranscodingJobHandle,
+        user: Option<uuid::Uuid>,
+        encodes: bool,
+    ) -> Result<Option<RegisteredJob>, TranscodeRefused> {
+        let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
+        let evicted = if encodes {
+            take_job_to_admit(&mut jobs, self.limits, user, handle.device_id.as_deref())?
+        } else {
+            None
+        };
+        jobs.push(RegisteredJob {
+            ping_timeout_ms: RegisteredJob::ping_timeout_for(handle.job_type),
+            display: String::new(),
+            is_user_paused: false,
+            active_request_count: 1,
+            last_activity: std::time::Instant::now(),
+            handle: handle.clone(),
+            running: None,
+            user_id: user,
+            encodes,
+        });
+        Ok(evicted)
     }
 
     /// Returns the number of currently registered jobs (test/inspection helper).
@@ -842,18 +1016,21 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 
     /// Spawns an ffmpeg transcode and blocks until its first segment exists.
     ///
-    /// Port of `TranscodeManager.StartFfMpeg`: create the output directory,
-    /// register the job *first* (so a concurrent segment request finds it),
-    /// spawn through the [`SegmentTranscoder`] seam, then poll until the target
+    /// Port of `TranscodeManager.StartFfMpeg`, past the [`TranscodeLimits`]
+    /// check upstream does not have: register the job *first* (so a concurrent
+    /// segment request finds it), create the output directory, spawn through
+    /// the [`SegmentTranscoder`] seam, then poll until the target
     /// file exists or the process exits — surfacing a non-zero exit as an error.
     /// Runtime statistics and eligible transcode throttle timers begin after
     /// the startup target has appeared; teardown resumes a paused child.
     ///
     /// # Errors
     ///
-    /// Returns an error if the output directory cannot be created, the process
-    /// cannot be spawned, ffmpeg exits non-zero, the job is killed before its
-    /// first segment appears, or that segment does not appear within
+    /// Returns [`StartFfmpegError::Refused`] when a [`TranscodeLimits`] cap stops
+    /// the job, before anything is created, logged or spawned, and
+    /// [`StartFfmpegError::Failed`] if the output directory cannot be created,
+    /// the process cannot be spawned, ffmpeg exits non-zero, the job is killed
+    /// before its first segment appears, or that segment does not appear within
     /// [`WAIT_FOR_FILE_TIMEOUT_MS`].
     ///
     /// # Panics
@@ -872,7 +1049,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         &self,
         transcoder: &dyn SegmentTranscoder,
         request: StartFfMpegRequest<'_>,
-    ) -> Result<TranscodingJobHandle, String> {
+    ) -> Result<TranscodingJobHandle, StartFfmpegError> {
         let StartFfMpegRequest {
             program,
             state,
@@ -882,21 +1059,49 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             working_dir,
             env,
             hardware_acceleration_type,
+            user_id,
         } = request;
-        let log_path = prepare_ffmpeg_log(&log_dir, state)?;
 
-        let display = trace_transcode_start(program, state, &arguments);
+        let handle = TranscodingJobHandle {
+            play_session_id: state.play_session_id.clone(),
+            path: output_path.to_string_lossy().into_owned(),
+            job_type: state.transcoding_type,
+            device_id: state.device_id.clone(),
+            live_stream_id: state.base_request.live_stream_id.clone(),
+        };
 
-        // 1. Directory.CreateDirectory(Path.GetDirectoryName(outputPath)).
-        let directory = output_path
-            .parent()
-            .ok_or_else(|| format!("output path {} has no parent", output_path.display()))?
-            .to_path_buf();
-        std::fs::create_dir_all(&directory)
-            .map_err(|e| format!("create output dir {}: {e}", directory.display()))?;
+        // 0. Admission, ahead of everything else: a refused job leaves no
+        // directory, no log file and no line in the log. Register the job here
+        // (OnTranscodeBeginning), so a concurrent segment request finds it. The
+        // startup wait below is the job's first consumer, as upstream's
+        // `OnTranscodeBeginning` starts it at `ActiveRequestCount = 1`: it can
+        // outlast the ping timeout (a cold 4K software encode), and the idle
+        // reaper must not kill the job this request is waiting on. A guard, not
+        // a count that stays: a start cancelled by a client disconnect drops
+        // it, so its job is still reaped.
+        let evicted = self.register_job_for_user(&handle, user_id, state.encodes_any_stream())?;
+        let _startup = TranscodeRequestGuard {
+            manager: self,
+            handle: handle.clone(),
+        };
+        if let Some(job) = evicted {
+            self.evict_job(job, &handle).await;
+        }
+
+        let (log_path, directory, display) =
+            match prepare_transcode_output(program, state, output_path, &arguments, &log_dir) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.remove_job_by_path(&handle.path, handle.job_type);
+                    return Err(error.into());
+                }
+            };
+        // Name what the job plays, so a later kill/reap log doesn't reduce to ids.
+        self.set_job_display(&handle, &display);
 
         // 3. Build the spawn request.
         let stderr_log = log_path.clone();
+        let start_number = hls_start_number(&arguments);
         let req = SpawnRequest {
             program: program.to_owned(),
             arguments,
@@ -907,25 +1112,6 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         };
 
         let segment_extension = segment_file_extension(state.segment_container.as_deref());
-        let handle = TranscodingJobHandle {
-            play_session_id: state.play_session_id.clone(),
-            path: output_path.to_string_lossy().into_owned(),
-            job_type: state.transcoding_type,
-            device_id: state.device_id.clone(),
-            live_stream_id: state.base_request.live_stream_id.clone(),
-        };
-
-        // 4. Register the job FIRST (OnTranscodeBeginning), naming what it
-        // plays so a later kill/reap log doesn't reduce to ids.
-        self.register_job(handle.clone());
-        self.set_job_display(&handle, &display);
-        // The startup wait below is the job's first consumer, as upstream's
-        // `OnTranscodeBeginning` starts it at `ActiveRequestCount = 1`: it can
-        // outlast the ping timeout (a cold 4K software encode), and the idle
-        // reaper must not kill the job this request is waiting on. A guard,
-        // not a count set in `register_job`: a start cancelled by a client
-        // disconnect drops it, so its job is still reaped.
-        let _startup = self.begin_request_guard(&handle.path, handle.job_type);
 
         // Tell the session layer what this job is, so the dashboard's transcode
         // panel is not blank. Only meaningful with a device to attach it to.
@@ -940,22 +1126,26 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             Ok(child) => child,
             Err(e) => {
                 self.remove_job_by_path(&handle.path, handle.job_type);
-                return Err(e);
+                self.reporter.on_job_failed_to_start(&handle).await;
+                return Err(e.into());
             }
         };
 
         // 6. Store the live job so kill/cleanup can reach the child + cache dir.
         self.attach_running(
             &handle,
-            RunningJob::new(
-                child,
-                state,
-                directory,
-                output_path.to_path_buf(),
-                segment_extension,
-                stderr_log.clone(),
-                hardware_acceleration_type,
-            ),
+            RunningJob {
+                start_number,
+                ..RunningJob::new(
+                    child,
+                    state,
+                    directory,
+                    output_path.to_path_buf(),
+                    segment_extension,
+                    stderr_log.clone(),
+                    hardware_acceleration_type,
+                )
+            },
         );
 
         // 7. Wait until the target file exists OR the process exits, bounded.
@@ -1119,7 +1309,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// ready the moment its own file exists. Dropping the `+1` wait roughly halves
     /// time-to-first-segment (~4.3s → ~2.4s here) on start and on every seek.
     ///
-    /// Wakes on the directory's inotify events (fallback tick
+    /// Returns at once for a segment already on disk. Otherwise wakes on the
+    /// directory's inotify events (fallback tick
     /// [`SEGMENT_READY_POLL_INTERVAL_MS`]) until the file exists or the job
     /// exits; returns `true` if the segment ends up on disk.
     ///
@@ -1136,6 +1327,11 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             .with_running(handle, |r| r.segment_extension.clone())
             .unwrap_or_else(|| ".ts".to_owned());
         let seg = segment_path(playlist_path, index, &ext);
+        // A segment already written needs no watch; the loop checks again once
+        // the watch is armed, so one written in between is not missed.
+        if seg.exists() {
+            return true;
+        }
         let waiter = FsWaiter::new(&seg);
 
         loop {
@@ -1172,6 +1368,17 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         }
     }
 
+    /// The first segment the running job behind `handle` writes (its
+    /// `-start_number`), or `None` when no process is attached to it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    #[must_use]
+    pub fn segment_start_number(&self, handle: &TranscodingJobHandle) -> Option<i32> {
+        self.with_running(handle, |running| running.start_number)
+    }
+
     /// Kills the process behind `handle` (if any) and removes it, deleting its
     /// partial segment files when `delete_files` is set. Shared by the timeout
     /// path, the kill-timer, and `kill_transcoding_jobs`.
@@ -1196,7 +1403,45 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 None => (String::new(), None),
             }
         };
-        let playing_label = display;
+        self.tear_down(handle, &display, running, delete_files, close_live_stream)
+            .await;
+    }
+
+    /// Kills an idle job taken out of the registry to admit `next`, another of
+    /// its user's from the same device. The same teardown as the idle reaper's,
+    /// which this job would otherwise have met at its ping timeout, except for
+    /// a `next` on the same live stream: as on a seek restart, that one is
+    /// about to re-open ffmpeg on the same tuner, so the tuner stays open.
+    async fn evict_job(&self, job: RegisteredJob, next: &TranscodingJobHandle) {
+        let RegisteredJob {
+            handle,
+            display: playing_label,
+            running,
+            ..
+        } = job;
+        tracing::info!(
+            path = %handle.path,
+            play_session_id = handle.play_session_id.as_deref().unwrap_or(""),
+            device_id = handle.device_id.as_deref().unwrap_or(""),
+            playing = %playing_label,
+            "killing idle transcode job to admit the same device's next one"
+        );
+        let same_live_stream =
+            handle.live_stream_id.is_some() && handle.live_stream_id == next.live_stream_id;
+        self.tear_down(&handle, &playing_label, running, true, !same_live_stream)
+            .await;
+    }
+
+    /// Stops a job already out of the registry: its process, its rolling
+    /// deletion and, when `delete_files` is set, its partial output.
+    async fn tear_down(
+        &self,
+        handle: &TranscodingJobHandle,
+        playing_label: &str,
+        running: Option<RunningJob>,
+        delete_files: bool,
+        close_live_stream: bool,
+    ) {
         if let Some(mut running) = running {
             // Stop rolling deletion before process and partial-file teardown.
             drop(running.segment_cleaner.take());
@@ -1220,7 +1465,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     }
                 }
             }
-            let _ = running.child.kill().await;
+            if let Err(error) = running.child.kill().await {
+                tracing::error!(path = %handle.path, %error, "killing ffmpeg at teardown failed; it may still be running");
+            }
             drop(controller);
             if delete_files {
                 let stem = running
@@ -1228,8 +1475,17 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     .file_stem()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.file_cleaner
-                    .delete_partial_stream_files(&running.output_dir, &stem);
+                // The directory scan and unlinks block, so they run on the
+                // blocking pool; awaited, so callers still go on only after them.
+                let cleaner = std::sync::Arc::clone(&self.file_cleaner);
+                let output_dir = running.output_dir;
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    cleaner.delete_partial_stream_files(&output_dir, &stem);
+                })
+                .await
+                {
+                    tracing::error!(path = %handle.path, %error, "deleting a killed transcode's partial files failed");
+                }
             }
         }
         self.reporter
@@ -1280,10 +1536,16 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 
     /// Runs [`Self::reap_idle_jobs`] forever, sweeping every `interval`. The
     /// composition root spawns this once next to the manager.
+    ///
+    /// A sweep that panics is logged and ends alone (`survive_panic`): the
+    /// jobs it had not reached are still registered, so the next sweep reaps
+    /// them. The job it was tearing down is already out of the registry and
+    /// is not retried.
     pub async fn run_idle_reaper(self: std::sync::Arc<Self>, interval: Duration) {
+        let mut failing = false;
         loop {
             tokio::time::sleep(interval).await;
-            self.reap_idle_jobs().await;
+            survive_panic("transcode_idle_reaper", &mut failing, self.reap_idle_jobs()).await;
         }
     }
 
@@ -1355,15 +1617,19 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         file_path: &Path,
         job_type: TranscodingJobType,
     ) -> Option<TranscodeRequestGuard<'_, S, C>> {
-        let stem = file_path.file_stem()?.to_string_lossy().into_owned();
+        // A case-insensitive prefix test on the raw bytes: it runs once per
+        // live job on every legacy segment request, so the test allocates
+        // nothing.
+        let stem = file_path.file_stem()?.as_encoded_bytes();
         let owner = {
             let jobs = self.jobs.lock().expect("jobs lock poisoned");
             jobs.iter()
                 .filter(|j| j.handle.job_type == job_type)
                 .find(|j| {
                     Path::new(&j.handle.path).file_stem().is_some_and(|s| {
-                        stem.to_ascii_lowercase()
-                            .starts_with(&s.to_string_lossy().to_ascii_lowercase())
+                        let s = s.as_encoded_bytes();
+                        stem.get(..s.len())
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(s))
                     })
                 })
                 .map(|j| j.handle.path.clone())
@@ -1437,6 +1703,35 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     }
 }
 
+/// Runs one pass of the singleton loop `task`, so that a panic ends the pass
+/// and not the loop, whose next tick is the retry (LOGGING.md §7).
+///
+/// `failing` carries the loop's streak: the first panic logs at `error`, the
+/// ones straight after it at `debug` (a poisoned lock would otherwise repeat
+/// it every tick, beside the panic hook's own line), and the first pass to
+/// finish after them at `info`.
+async fn survive_panic(task: &'static str, failing: &mut bool, pass: impl Future) {
+    match futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(pass)).await {
+        Ok(_) => {
+            if std::mem::take(failing) {
+                tracing::info!(task, "transcode loop recovered: a pass finished again");
+            }
+        }
+        Err(payload) => {
+            let panic = ferrofin_util::panic::message(payload.as_ref());
+            if std::mem::replace(failing, true) {
+                tracing::debug!(task, panic, "transcode loop pass panicked again");
+            } else {
+                tracing::error!(
+                    task,
+                    panic,
+                    "transcode loop pass panicked; the loop goes on at its next tick"
+                );
+            }
+        }
+    }
+}
+
 /// The segment file extension for `segment_container` (`.ts` default).
 ///
 /// Port of `EncodingHelper.GetSegmentFileExtension` (mirrors the `ferrofin-hls`
@@ -1449,6 +1744,27 @@ fn segment_file_extension(segment_container: Option<&str>) -> String {
         Some(container) if container.eq_ignore_ascii_case("mp4") => ".mp4".to_owned(),
         _ => ".ts".to_owned(),
     }
+}
+
+/// Readies the disk for an admitted job and logs its start: its ffmpeg log path,
+/// its output directory (`Directory.CreateDirectory(Path.GetDirectoryName(outputPath))`)
+/// and its display label.
+fn prepare_transcode_output(
+    program: &str,
+    state: &EncodingJobInfo,
+    output_path: &Path,
+    arguments: &[String],
+    log_dir: &Path,
+) -> Result<(PathBuf, PathBuf, String), String> {
+    let log_path = prepare_ffmpeg_log(log_dir, state)?;
+    let display = trace_transcode_start(program, state, arguments);
+    let directory = output_path
+        .parent()
+        .ok_or_else(|| format!("output path {} has no parent", output_path.display()))?
+        .to_path_buf();
+    std::fs::create_dir_all(&directory)
+        .map_err(|e| format!("create output dir {}: {e}", directory.display()))?;
+    Ok((log_path, directory, display))
 }
 
 /// Resolves this job's ffmpeg stderr log path inside `log_dir`, creating the
@@ -1850,11 +2166,14 @@ mod tests {
     }
 
     /// A reporter that records the kills it was asked to perform.
+    #[derive(Default)]
     pub(super) struct RecordingReporter {
         /// `(path, delete_files, close_live_stream)` per teardown.
         pub(super) killed: Mutex<Vec<(String, bool, bool)>>,
         /// `(device_id, accelerator, video_codec)` per started job.
         pub(super) started: Mutex<Vec<(String, super::HardwareAccelerationType, Option<String>)>>,
+        /// The device of each job whose ffmpeg never started.
+        pub(super) failed: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -1870,6 +2189,12 @@ mod tests {
                     .unwrap_or(super::HardwareAccelerationType::none),
                 info.video_codec,
             ));
+        }
+        async fn on_job_failed_to_start(&self, job: &TranscodingJobHandle) {
+            self.failed
+                .lock()
+                .unwrap()
+                .push(job.device_id.clone().unwrap_or_default());
         }
         async fn report_progress(
             &self,
@@ -1892,10 +2217,7 @@ mod tests {
 
     #[tokio::test]
     async fn kill_notifies_reporter_with_delete_flag() {
-        let reporter = Arc::new(RecordingReporter {
-            killed: Mutex::new(Vec::new()),
-            started: Mutex::new(Vec::new()),
-        });
+        let reporter = Arc::new(RecordingReporter::default());
         let m = TranscodeManagerImpl::new(ReporterHandle(Arc::clone(&reporter)));
         m.register_job(handle("s1", "/t/a.m3u8", TranscodingJobType::Hls, "dev1"));
         m.kill_transcoding_jobs("dev1", Some("s1"), true)
@@ -1913,10 +2235,7 @@ mod tests {
         // Upstream's two callers differ exactly here: `OnTranscodeKillTimerStopped`
         // passes `closeLiveStream: true` (the consumer is gone for good),
         // `KillTranscodingJobs` passes `false`.
-        let reporter = Arc::new(RecordingReporter {
-            killed: Mutex::new(Vec::new()),
-            started: Mutex::new(Vec::new()),
-        });
+        let reporter = Arc::new(RecordingReporter::default());
         let m = TranscodeManagerImpl::new(ReporterHandle(Arc::clone(&reporter)));
         let job = handle("s2", "/t/b.m3u8", TranscodingJobType::Hls, "dev2");
         m.register_job(job);
@@ -1943,6 +2262,9 @@ mod tests {
             info: ferrofin_model::session::TranscodingInfo,
         ) {
             self.0.report_started(job, info).await;
+        }
+        async fn on_job_failed_to_start(&self, job: &TranscodingJobHandle) {
+            self.0.on_job_failed_to_start(job).await;
         }
         async fn report_progress(&self, job: &TranscodingJobHandle, progress: TranscodingProgress) {
             self.0.report_progress(job, progress).await;
@@ -1985,6 +2307,109 @@ mod tests {
                 .is_ok()
         );
     }
+
+    /// A reporter whose first `panics` teardowns panic, as a fault part-way
+    /// through a sweep would, and which records the paths of the rest.
+    #[derive(Default)]
+    struct FaultyReporter {
+        panics: std::sync::atomic::AtomicUsize,
+        killed: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl SessionReporter for FaultyReporter {
+        async fn report_started(
+            &self,
+            _job: &TranscodingJobHandle,
+            _info: ferrofin_model::session::TranscodingInfo,
+        ) {
+        }
+        async fn on_job_failed_to_start(&self, _job: &TranscodingJobHandle) {}
+        async fn report_progress(
+            &self,
+            _job: &TranscodingJobHandle,
+            _progress: TranscodingProgress,
+        ) {
+        }
+        async fn on_job_killed(
+            &self,
+            job: &TranscodingJobHandle,
+            _delete_files: bool,
+            _close_live_stream: bool,
+        ) {
+            use std::sync::atomic::Ordering;
+            if self
+                .panics
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                panic!("teardown of {} failed", job.path);
+            }
+            self.killed.lock().unwrap().push(job.path.clone());
+        }
+    }
+
+    /// A sweep that panics ends that sweep only: the reaper logs it with its
+    /// `task` and sweeps again at the next tick, reaping the jobs the panic cut
+    /// it off from. A second panic in a row is not logged above `debug`, and
+    /// the first sweep to finish after them says so at `info`.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_sweep_is_logged_and_the_reaper_sweeps_again_next_tick() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let reporter = Arc::new(FaultyReporter {
+            panics: 2.into(),
+            ..FaultyReporter::default()
+        });
+        let m = Arc::new(TranscodeManagerImpl::new(Arc::clone(&reporter)));
+        for (session, path) in [
+            ("s1", "/t/a.m3u8"),
+            ("s2", "/t/b.m3u8"),
+            ("s3", "/t/c.m3u8"),
+        ] {
+            m.register_job(handle(session, path, TranscodingJobType::Hls, "dev1"));
+        }
+        for job in m.jobs.lock().unwrap().iter_mut() {
+            job.ping_timeout_ms = -1;
+        }
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        let reaper =
+            tokio::spawn(Arc::clone(&m).run_idle_reaper(std::time::Duration::from_secs(10)));
+        // Each sweep reaches one job: the first two panic in its teardown.
+        for _ in 0..60 {
+            if m.active_job_count() == 0 && !reporter.killed.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        drop(guard);
+
+        assert!(!reaper.is_finished(), "the reaper ended at its first panic");
+        reaper.abort();
+        assert_eq!(*reporter.killed.lock().unwrap(), ["/t/c.m3u8"]);
+        assert_eq!(m.active_job_count(), 0);
+        let reaper_lines = |level| -> Vec<String> {
+            logs.lines_at(level)
+                .into_iter()
+                .filter(|line| line.contains("task=\"transcode_idle_reaper\""))
+                .collect()
+        };
+        let errors = reaper_lines("ERROR");
+        assert!(
+            errors.len() == 1 && errors[0].contains("teardown of /t/a.m3u8 failed"),
+            "{errors:#?}"
+        );
+        let repeats = reaper_lines("DEBUG");
+        assert!(
+            repeats.len() == 1 && repeats[0].contains("teardown of /t/b.m3u8 failed"),
+            "{repeats:#?}"
+        );
+        let recovered = reaper_lines("INFO");
+        assert_eq!(recovered.len(), 1, "{recovered:#?}");
+    }
 }
 
 /// Tests for the `start_ffmpeg` spawn orchestration, driven by the
@@ -2026,6 +2451,7 @@ mod start_ffmpeg_tests {
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_default(),
             working_dir: None,
+            user_id: None,
         }
     }
 
@@ -2049,6 +2475,7 @@ mod start_ffmpeg_tests {
             input_container: None,
             is_input_video: true,
             subtitle_delivery_method: ferrofin_model::dlna::SubtitleDeliveryMethod::Encode,
+            trimmed_subtitle_path: None,
             run_time_ticks: None,
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
@@ -2160,6 +2587,47 @@ mod start_ffmpeg_tests {
         assert!(!playlist.with_extension("log").exists());
     }
 
+    /// The registry knows the first segment each job writes, from its own
+    /// `-start_number` (the hls muxer's default 0 without one), so the
+    /// segment path can tell its output from an earlier job's (gl-52).
+    #[tokio::test]
+    async fn a_job_records_the_first_segment_its_ffmpeg_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let args = |start: &[&str]| {
+            ["-i", "in.mkv"]
+                .iter()
+                .chain(start)
+                .map(|arg| (*arg).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let seek = tmp.path().join("seek").join("out.m3u8");
+        let st = state(&seek, None);
+        let handle = m
+            .start_ffmpeg(
+                &fake,
+                ffmpeg_req(&st, &seek, args(&["-start_number", "15"])),
+            )
+            .await
+            .expect("start");
+        assert_eq!(m.segment_start_number(&handle), Some(15));
+
+        let from_zero = tmp.path().join("zero").join("out.m3u8");
+        let st = state(&from_zero, None);
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &from_zero, args(&[])))
+            .await
+            .expect("start");
+        assert_eq!(m.segment_start_number(&handle), Some(0));
+
+        m.kill_and_remove(&handle, false, false).await;
+        assert_eq!(m.segment_start_number(&handle), None, "no job, no start");
+    }
+
     #[tokio::test]
     async fn a_starting_job_publishes_itself_to_the_session_layer() {
         // Without this the dashboard's transcode panel stays blank: the session
@@ -2173,10 +2641,7 @@ mod start_ffmpeg_tests {
             extra_files: vec!["out.m3u8".to_owned()],
             ..FakeScript::default()
         });
-        let reporter = Arc::new(super::tests::RecordingReporter {
-            killed: Mutex::new(Vec::new()),
-            started: Mutex::new(Vec::new()),
-        });
+        let reporter = Arc::new(super::tests::RecordingReporter::default());
         let m = TranscodeManagerImpl::new(super::tests::ReporterHandle(Arc::clone(&reporter)));
 
         let mut st = state(&playlist, Some(&playlist));
@@ -2254,15 +2719,19 @@ mod start_ffmpeg_tests {
         }
         let tmp = tempfile::tempdir().unwrap();
         let playlist = tmp.path().join("s").join("out.m3u8");
-        let m = manager();
+        let reporter = Arc::new(super::tests::RecordingReporter::default());
+        let m = TranscodeManagerImpl::new(super::tests::ReporterHandle(Arc::clone(&reporter)));
         let st = state(&playlist, None);
         let err = m
             .start_ffmpeg(&FailingSeam, ffmpeg_req(&st, &playlist, vec![]))
             .await
             .unwrap_err();
-        assert_eq!(err, "boom");
-        // Failed start removes the job (OnTranscodeFailedToStart).
+        assert_eq!(err.to_string(), "boom");
+        // Failed start removes the job and clears the device's transcoding
+        // info (OnTranscodeFailedToStart), after the start had published it.
         assert_eq!(m.active_job_count(), 0);
+        assert_eq!(reporter.started.lock().unwrap().len(), 1);
+        assert_eq!(*reporter.failed.lock().unwrap(), vec!["dev".to_owned()]);
     }
 
     #[tokio::test]
@@ -2284,7 +2753,7 @@ mod start_ffmpeg_tests {
             .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
             .await
             .unwrap_err();
-        assert!(err.contains("exited with code 1"), "got: {err}");
+        assert!(err.to_string().contains("exited with code 1"), "got: {err}");
         assert_eq!(m.active_job_count(), 0);
     }
 
@@ -2352,20 +2821,81 @@ mod start_ffmpeg_tests {
         assert!(!m.wait_for_segment(&handle, &playlist, 3).await);
     }
 
-    /// A [`FileCleaner`] that records the deletions it was asked to perform, and
-    /// still performs them, so kill/cleanup is observable over a temp dir.
+    #[tokio::test]
+    async fn wait_for_segment_arms_no_watch_for_a_segment_already_on_disk() {
+        // A client reading behind ffmpeg asks for segments already written:
+        // that wait must not pay for a watcher (a thread, inotify, epoll and
+        // an eventfd) it never parks on.
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("s").join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+        let armed = crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get);
+        assert!(m.wait_for_segment(&handle, &playlist, 0).await);
+        assert_eq!(
+            crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get),
+            armed,
+            "a watch was armed for a segment already on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_segment_arms_a_watch_and_finds_a_segment_written_later() {
+        // The job is running and segment 1 is not written yet: the wait arms
+        // its watch and returns once ffmpeg writes the file.
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("s");
+        let playlist = out_dir.join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let handle = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![]))
+            .await
+            .unwrap();
+        let armed = crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get);
+        let later = out_dir.join("out1.ts");
+        // On this current-thread runtime the writer runs only once the wait
+        // parks, i.e. after its first check and the watch being armed.
+        tokio::spawn(async move { std::fs::write(later, b"seg").unwrap() });
+        assert!(m.wait_for_segment(&handle, &playlist, 1).await);
+        assert_eq!(
+            crate::transcoding::fs_wait::ARMED.with(std::cell::Cell::get),
+            armed + 1
+        );
+    }
+
+    /// A [`FileCleaner`] that records the deletions it was asked to perform (and
+    /// the thread each ran on), and still performs them, so kill/cleanup is
+    /// observable over a temp dir.
     #[derive(Clone)]
     struct RecordingCleaner {
-        calls: Arc<Mutex<Vec<(std::path::PathBuf, String)>>>,
+        calls: Arc<Mutex<Vec<(std::path::PathBuf, String, std::thread::ThreadId)>>>,
     }
 
     impl FileCleaner for RecordingCleaner {
         fn delete_partial_stream_files(&self, output_dir: &Path, playlist_stem: &str) {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((output_dir.to_path_buf(), playlist_stem.to_owned()));
             FsFileCleaner.delete_partial_stream_files(output_dir, playlist_stem);
+            // Recorded once the files are gone, so a kill that returned before
+            // its deletion finished leaves no call behind.
+            self.calls.lock().unwrap().push((
+                output_dir.to_path_buf(),
+                playlist_stem.to_owned(),
+                std::thread::current().id(),
+            ));
         }
     }
 
@@ -2397,6 +2927,9 @@ mod start_ffmpeg_tests {
         let calls = cleaner.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].1, "out"); // playlist stem
+        // The current-thread runtime's only worker is this thread: the scan and
+        // unlinks ran on the blocking pool instead.
+        assert_ne!(calls[0].2, std::thread::current().id());
         // The partial files (containing the stem "out") are gone.
         assert!(!out_dir.join("out0.ts").exists());
         assert!(!playlist.exists());
@@ -2441,7 +2974,8 @@ mod start_ffmpeg_tests {
             .unwrap();
 
         // Registration counts as recent activity: nothing to reap yet.
-        assert!(m.reap_idle_jobs().await.is_empty());
+        let reaped = m.reap_idle_jobs().await;
+        assert!(reaped.is_empty(), "{reaped:?}");
         assert_eq!(m.active_job_count(), 1);
 
         // Expire the idle window (a fake clock via ping_timeout_ms = -1, which
@@ -2454,7 +2988,8 @@ mod start_ffmpeg_tests {
         let guard = m
             .begin_request_guard(&handle.path, handle.job_type)
             .expect("job registered");
-        assert!(m.reap_idle_jobs().await.is_empty());
+        let reaped = m.reap_idle_jobs().await;
+        assert!(reaped.is_empty(), "{reaped:?}");
         drop(guard);
 
         // The guard drop restarted the countdown; re-expire and reap.
@@ -2561,7 +3096,7 @@ mod start_ffmpeg_tests {
             .await
             .expect("the startup wait ended with its job")
             .expect_err("a killed job is not a started transcode");
-        assert!(error.contains("stopped"), "{error}");
+        assert!(error.to_string().contains("stopped"), "{error}");
     }
 
     #[tokio::test]
@@ -2593,7 +3128,8 @@ mod start_ffmpeg_tests {
             Some(HLS_PING_TIMEOUT_MS),
             "ping restored the job-type default timeout"
         );
-        assert!(m.reap_idle_jobs().await.is_empty());
+        let reaped = m.reap_idle_jobs().await;
+        assert!(reaped.is_empty(), "{reaped:?}");
         assert_eq!(m.active_job_count(), 1);
 
         // Re-expire WITHOUT a ping: the countdown runs out and the job dies.
@@ -2618,6 +3154,35 @@ mod start_ffmpeg_tests {
         assert_eq!(segment_file_extension(Some("MP4")), ".mp4");
         assert_eq!(segment_file_extension(Some("  ")), ".ts");
         assert_eq!(segment_file_extension(None), ".ts");
+    }
+
+    /// The debug line follows `arguments`, which the spawn still gets whole.
+    #[test]
+    fn the_ffmpeg_args_line_names_a_remote_source_by_its_host() {
+        use crate::configuration::reader::tests::CapturedLogs;
+
+        let source = "http://USER:SECRET@127.0.0.1:9/live/USER/SECRET/1.m3u8";
+        let arguments: Vec<String> = ["-user_agent", "Box/1 SECRET", "-i", source, "-c:v", "copy"]
+            .map(str::to_owned)
+            .into();
+        let logs = CapturedLogs::default();
+        let st = state(Path::new("/t/out.m3u8"), None);
+        {
+            let _guard = logs.install();
+            super::trace_transcode_start("ffmpeg", &st, &arguments);
+        }
+        let lines = logs.lines_at("DEBUG");
+        let line = lines
+            .iter()
+            .find(|line| line.contains("ffmpeg_args"))
+            .expect("the debug line");
+        assert!(
+            line.contains(
+                r#"["-user_agent", "<redacted>", "-i", "http://127.0.0.1:9", "-c:v", "copy"]"#
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("SECRET"), "{line}");
     }
 
     #[test]
@@ -2719,7 +3284,8 @@ mod start_ffmpeg_tests {
             let mut jobs = m.jobs.lock().unwrap();
             jobs[0].ping_timeout_ms = 60_000;
         }
-        assert!(m.reap_idle_jobs().await.is_empty());
+        let reaped = m.reap_idle_jobs().await;
+        assert!(reaped.is_empty(), "{reaped:?}");
         assert_eq!(m.active_job_count(), 1);
 
         // The playlist file itself resolves to the same job...
@@ -2727,9 +3293,20 @@ mod start_ffmpeg_tests {
             m.begin_request_guard_for_file(&playlist, TranscodingJobType::Hls)
                 .is_some()
         );
-        // ...an unrelated stem does not, and neither does the wrong job type.
+        // ...so does a segment named in another case (upstream finds the
+        // playlist by its id, `OrdinalIgnoreCase`)...
+        assert!(
+            m.begin_request_guard_for_file(&out_dir.join("A1B2C37.ts"), TranscodingJobType::Hls)
+                .is_some()
+        );
+        // ...an unrelated stem does not, nor one shorter than the playlist's,
+        // and neither does the wrong job type.
         assert!(
             m.begin_request_guard_for_file(&out_dir.join("deadbeef0.ts"), TranscodingJobType::Hls)
+                .is_none()
+        );
+        assert!(
+            m.begin_request_guard_for_file(&out_dir.join("a1b2.ts"), TranscodingJobType::Hls)
                 .is_none()
         );
         assert!(
@@ -2942,7 +3519,10 @@ pub(super) mod throttle_tests {
         progress: Mutex<Option<FfmpegProgress>>,
         events: Mutex<Vec<Vec<u8>>>,
         fail_write: AtomicBool,
+        fail_kill: AtomicBool,
         exited: AtomicBool,
+        /// How many more progress reads panic.
+        panics: AtomicUsize,
     }
     struct ControlledChild(Arc<ChildState>);
     #[async_trait]
@@ -2959,10 +3539,23 @@ pub(super) mod throttle_tests {
         }
         async fn kill(&self) -> Result<(), String> {
             self.0.events.lock().unwrap().push(b"kill".to_vec());
+            if self.0.fail_kill.load(Ordering::SeqCst) {
+                return Err("fixture kill failure".to_owned());
+            }
             self.0.exited.store(true, Ordering::SeqCst);
             Ok(())
         }
         fn progress(&self) -> Option<FfmpegProgress> {
+            if self
+                .0
+                .panics
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                panic!("reading ffmpeg progress failed");
+            }
             *self.0.progress.lock().unwrap()
         }
         async fn write_stdin(&self, bytes: &[u8]) -> Result<(), String> {
@@ -3005,6 +3598,7 @@ pub(super) mod throttle_tests {
             input_container: None,
             is_input_video: true,
             subtitle_delivery_method: ferrofin_model::dlna::SubtitleDeliveryMethod::Encode,
+            trimmed_subtitle_path: None,
             run_time_ticks: Some(600 * TICKS_PER_SECOND),
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
@@ -3064,6 +3658,7 @@ pub(super) mod throttle_tests {
                     arguments: Vec::new(),
                     log_dir: directory.path().join("logs"),
                     working_dir: None,
+                    user_id: None,
                     env: Vec::new(),
                     hardware_acceleration_type: HardwareAccelerationType::none,
                 },
@@ -3270,6 +3865,27 @@ pub(super) mod throttle_tests {
         assert_eq!(manager.active_job_count(), 0);
     }
 
+    /// A kill that fails at teardown is logged: ffmpeg may still be running.
+    #[tokio::test]
+    async fn a_failed_kill_at_teardown_is_logged() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let (_directory, manager, child, handle) = fixture(None).await;
+        child.fail_kill.store(true, Ordering::SeqCst);
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        manager.kill_and_remove(&handle, false, false).await;
+        drop(guard);
+        let errors = logs.lines_at("ERROR");
+        assert!(
+            errors
+                .iter()
+                .any(|line| line.contains("killing ffmpeg at teardown failed")
+                    && line.contains("fixture kill failure")),
+            "{errors:#?}"
+        );
+        assert_eq!(manager.active_job_count(), 0);
+    }
+
     #[tokio::test]
     async fn stdin_failures_keep_state_retry_and_teardown_still_kills() {
         let (_directory, manager, child, handle) = fixture(Some(PauseKeys::Legacy)).await;
@@ -3345,6 +3961,7 @@ pub(super) mod throttle_tests {
                     arguments: Vec::new(),
                     log_dir: directory.path().join("logs"),
                     working_dir: None,
+                    user_id: None,
                     env: Vec::new(),
                     hardware_acceleration_type: HardwareAccelerationType::none,
                 },
@@ -3404,6 +4021,7 @@ pub(super) mod throttle_tests {
                     arguments: Vec::new(),
                     log_dir: directory.path().join("logs"),
                     working_dir: None,
+                    user_id: None,
                     env: Vec::new(),
                     hardware_acceleration_type: HardwareAccelerationType::none,
                 },
@@ -3434,6 +4052,59 @@ pub(super) mod throttle_tests {
             .filter(|line| line.contains("cannot read the encoding configuration"))
             .count();
         assert_eq!(repeats, 2);
+    }
+
+    /// A tick that panics ends that tick only: the controls loop logs it with
+    /// its `task` and pumps the job's progress at the next one.
+    #[tokio::test]
+    async fn a_panicking_tick_is_logged_and_the_controls_loop_carries_on() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let (_directory, manager, child, handle) = fixture(None).await;
+        encoded(&child, 200);
+        child.panics.store(1, Ordering::SeqCst);
+        tokio::time::pause();
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        let controls = tokio::spawn(TranscodeManagerImpl::run_transcode_controls(
+            Arc::downgrade(&manager),
+        ));
+        for _ in 0..10 {
+            if progress(&manager, &handle)
+                .lock()
+                .unwrap()
+                .encoded
+                .framerate
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        drop(guard);
+
+        assert!(
+            !controls.is_finished(),
+            "the controls loop ended at its first panic"
+        );
+        controls.abort();
+        assert_eq!(
+            progress(&manager, &handle)
+                .lock()
+                .unwrap()
+                .encoded
+                .framerate,
+            Some(25.0)
+        );
+        let errors: Vec<_> = logs
+            .lines_at("ERROR")
+            .into_iter()
+            .filter(|line| line.contains("task=\"transcode_controls\""))
+            .collect();
+        assert!(
+            errors.len() == 1 && errors[0].contains("reading ffmpeg progress failed"),
+            "{errors:#?}"
+        );
     }
 
     #[tokio::test]
@@ -3468,6 +4139,7 @@ pub(super) mod throttle_tests {
                     arguments: Vec::new(),
                     log_dir: directory.path().join("logs"),
                     working_dir: None,
+                    user_id: None,
                     env: Vec::new(),
                     hardware_acceleration_type: HardwareAccelerationType::none,
                 },
@@ -3577,6 +4249,7 @@ pub(super) mod throttle_tests {
                     arguments: Vec::new(),
                     log_dir: directory.path().join("logs"),
                     working_dir: None,
+                    user_id: None,
                     env: Vec::new(),
                     hardware_acceleration_type: HardwareAccelerationType::none,
                 },

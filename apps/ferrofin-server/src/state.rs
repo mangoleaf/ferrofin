@@ -40,6 +40,7 @@ use ferrofin_core::{
 use ferrofin_db::Database;
 use ferrofin_drawing::{ImageCrateEncoder, ImageProcessor};
 use ferrofin_livetv::FerrofinLiveTvManager;
+use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_mediaencoding::{
     MediaEncoderConfig, MediaEncoderImpl, TokioTranscoder, TrickplayFrameExtractorImpl,
 };
@@ -49,6 +50,39 @@ use ferrofin_traits::system::ServerApplicationPaths as _;
 use crate::bootstrap::FfmpegPaths;
 use crate::config::Config;
 use crate::media_encoding::build_media_encoding;
+
+/// Starts the task that reads the network interfaces again after the
+/// operating system reports a network change ([`ferrofin_networking::network_change`]).
+/// Where the listener cannot be opened the server goes on without it, as
+/// with the setting off, and says so.
+fn start_network_change_monitor(
+    network: &Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    use ferrofin_networking::network_change;
+    match network_change::os_source() {
+        Ok(source) => Some(tokio::spawn(tracing::Instrument::instrument(
+            network_change::monitor(
+                source,
+                Arc::clone(network),
+                network_change::NETWORK_CHANGE_DELAY,
+            ),
+            tracing::info_span!(
+                parent: None,
+                "network_change_monitor",
+                task = "network_change_monitor",
+                trigger = "startup"
+            ),
+        ))),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "cannot listen for network changes: network interfaces are read again only \
+                 when the network settings are saved or the server restarts"
+            );
+            None
+        }
+    }
+}
 
 /// Reads the saved network configuration, or the default when there is none.
 ///
@@ -95,14 +129,15 @@ fn num_cpus_for_analysis() -> usize {
 const PACKAGE_NAME: &str = "ferrofin-server";
 
 /// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
-/// (`Version`): the Jellyfin release Ferrofin targets for adoption and schema
-/// (12.2.0; handlers are ported from `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
+/// (`Version`): the newest Jellyfin release Ferrofin adopts (12.4.0, whose database
+/// carries 12.2's migration-id set and adopts as generation `12.2.0`; handlers are
+/// ported from `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
 /// build/log lines). Clients gate on it: jellyfin-web's SDK refuses any server below
 /// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
 /// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`
 /// as unsupported. The route gate stays pinned to the 10.11.8 contract, which covers
 /// every 12.x operation except `GET /Items/{itemId}/Collections` (added in 12.1).
-const JELLYFIN_API_VERSION: &str = "12.2.0";
+const JELLYFIN_API_VERSION: &str = "12.4.0";
 
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
@@ -130,6 +165,10 @@ pub struct WiredApp {
     /// hold — do not outlive it (Jellyfin disposes its `CoreAppHost` per
     /// `StartServer` iteration).
     pub background: Vec<tokio::task::JoinHandle<()>>,
+    /// The scheduled-task registry behind `state.tasks`: the composition root
+    /// shuts it down when the lifetime ends, recording each run it cuts off as
+    /// `Aborted` (Jellyfin disposes its `TaskManager` with the host).
+    pub task_manager: FerrofinTaskManager,
     /// HTTPS for this lifetime, when the server listens with it
     /// (`ListenWithHttps`): the certificate the HTTPS listeners serve.
     pub https: Option<crate::tls::HttpsServing>,
@@ -213,11 +252,14 @@ struct VirtualFolderStorage(Arc<dyn ferrofin_traits::library::VirtualFolderManag
 #[async_trait::async_trait]
 impl ferrofin_core::system_manager::LibraryStorageProvider for VirtualFolderStorage {
     async fn libraries(&self) -> Vec<(uuid::Uuid, String, Vec<String>)> {
-        self.0
-            .get_virtual_folders()
+        // The snapshot, not `get_virtual_folders`: only the ids, names and
+        // locations are reported, and the full listing re-reads every library.
+        let mut libraries: Vec<_> = self
+            .0
+            .library_folders()
             .await
             .unwrap_or_default()
-            .into_iter()
+            .iter()
             // C# `SystemManager.GetSystemStorageInfo` filters
             // `.Where(e => !string.IsNullOrWhiteSpace(e.ItemId))` before parsing
             // the guid ("this should not be null but for some users it is"), so
@@ -230,9 +272,17 @@ impl ferrofin_core::system_manager::LibraryStorageProvider for VirtualFolderStor
                     .map(str::trim)
                     .filter(|s| !s.is_empty())?;
                 let id = uuid::Uuid::parse_str(id).ok()?;
-                Some((id, vf.name.unwrap_or_default(), vf.locations))
+                Some((
+                    id,
+                    vf.name.clone().unwrap_or_default(),
+                    vf.locations.clone(),
+                ))
             })
-            .collect()
+            .collect();
+        ferrofin_core::virtual_folder_manager::sort_locations_in_current_culture(
+            libraries.iter_mut().map(|(_, _, locations)| locations),
+        );
+        libraries
     }
 }
 
@@ -351,10 +401,12 @@ pub async fn build_app_state(
     );
     // A database whose program-data directory moved (an adopted Debian
     // `/var/lib/jellyfin`, or a relocated data_dir) keeps its ids but stores
-    // stale absolute paths for the library root and artwork.
+    // stale absolute paths for the library root and artwork. Before `ensure()`,
+    // which re-paths the aggregate root: the repair reads the old directory
+    // from the root rows.
     if let Some(rebased) = ferrofin_core::adoption_repairs::rebase_program_data_paths(
         db,
-        aggregate_store.id(),
+        &id_derivation,
         &ferrofin_core::adoption_repairs::ProgramDataDirs {
             root: paths.root_folder_path(),
             metadata: paths.internal_metadata_path(),
@@ -366,10 +418,10 @@ pub async fn build_app_state(
     .context("failed to rebase paths under the previous program-data directory")?
     {
         tracing::info!(
-            from = %rebased.from,
+            from = ?rebased.from,
             to = %paths.program_data_path(),
             rows = rebased.rows,
-            "rebased stored paths from the previous program-data directory"
+            "rewrote stored paths under a previous program-data directory"
         );
     }
     let root_folder_ids = aggregate_store
@@ -377,8 +429,9 @@ pub async fn build_app_state(
         .await
         .context("failed to provision the aggregate root folder")?;
     // Adopted Jellyfin rows store the metadata/data directories as
-    // `%MetadataPath%`/`%AppDataPath%`; every reader of image paths expands
-    // them against this server's directories (`BaseItemRepository.Map`).
+    // `%MetadataPath%`/`%AppDataPath%`; every reader of item and image paths
+    // expands them against this server's directories (`BaseItemRepository.Map`),
+    // and the item save keeps a stored token the path it writes expands from.
     let virtual_paths =
         ferrofin_core::virtual_paths::VirtualPathExpander::from_paths(Arc::clone(&paths));
     // Live TV is built after the repository and must not be owned by it, so the
@@ -398,9 +451,12 @@ pub async fn build_app_state(
     let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> = Arc::new(
         FerrofinItemCountService::new(db.clone())
             .with_root_ids(root_folder_ids)
-            .with_visibility(Arc::clone(&scope_visibility)),
+            .with_visibility(Arc::clone(&scope_visibility))
+            .with_virtual_paths(virtual_paths.clone()),
     );
-    let item_persistence_impl = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    let item_persistence_impl = Arc::new(
+        FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(virtual_paths.clone()),
+    );
     let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
         Arc::clone(&item_persistence_impl) as _;
     // One-shot (12.0 `RefreshCleanNamesAndValues`): move every stored
@@ -513,6 +569,7 @@ pub async fn build_app_state(
             tracing::warn!(%err, "person metadata repair failed; person sort order and Path may diverge until the next scan");
         }
     }
+    let people_validation_repository = (*people_repository_impl).clone();
     let people_repository: Arc<dyn ferrofin_traits::persistence::PeopleRepository> =
         people_repository_impl;
     let media_stream_repository: Arc<dyn ferrofin_traits::persistence::MediaStreamRepository> =
@@ -527,7 +584,7 @@ pub async fn build_app_state(
     let linked_children_service: Arc<dyn ferrofin_traits::persistence::LinkedChildrenService> =
         Arc::new(FerrofinLinkedChildrenService::new(db.clone()));
     let next_up_service: Arc<dyn ferrofin_traits::persistence::NextUpService> =
-        Arc::new(FerrofinNextUpService::new(db.clone()));
+        Arc::new(FerrofinNextUpService::new(db.clone()).with_virtual_paths(virtual_paths.clone()));
 
     let image_encoding_limit = parallel_image_encoding_limit(
         server_config.parallel_image_encoding_limit,
@@ -543,7 +600,15 @@ pub async fn build_app_state(
     // honoured instead of serving the full-size original.
     // One encoder for the processor, trickplay and the scan's splashscreen
     // pass, which writes `{data}/splashscreen.png`.
-    let image_encoder = Arc::new(ImageCrateEncoder::new().with_data_path(paths.data_path()));
+    let image_encoder = Arc::new(
+        ImageCrateEncoder::new()
+            .with_data_path(paths.data_path())
+            .with_limits(ferrofin_drawing::ImageLimits::from_settings(
+                config.image_decode_max_megapixels,
+                config.image_decode_max_memory_mb,
+                config.image_resize_budget_mb,
+            )),
+    );
     let image_processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
         ImageProcessor::new(Arc::clone(&image_encoder) as _, cache_root.child("images"))
             .with_encoding_limit(image_encoding_limit),
@@ -556,6 +621,16 @@ pub async fn build_app_state(
     // environment): the end-to-end scan test points every provider a scan
     // reaches at its mock server. Unset, each client keeps its public host.
     let endpoints = &config.provider_endpoints;
+    // Every provider limiter's timeout, longest wait and largest download, set
+    // before any request of this lifetime, so a changed `config.toml` applies on
+    // an in-process restart (the image limiters live for the whole process).
+    ferrofin_providers::rate_limit::set_request_limits(
+        ferrofin_providers::rate_limit::RequestLimits::from_settings(
+            config.provider_timeout_seconds,
+            config.provider_max_wait_seconds,
+            config.image_download_max_mb,
+        ),
+    );
     let mut tmdb_client = ferrofin_providers::TmdbClient::new();
     if let Some(base) = endpoints.tmdb.as_deref() {
         tmdb_client = tmdb_client.with_base_url(base);
@@ -869,14 +944,21 @@ pub async fn build_app_state(
             .with_server_id(server_id.clone())
             // Upstream `PostUserImage`: `{UserConfigurationDirectoryPath}/{Username}/`.
             .with_profile_image_dir(paths.user_configuration_directory_path())
+            // Upstream `DefaultPasswordResetProvider`: PIN files in `ProgramDataPath`.
+            .with_password_reset_dir(paths.program_data_path())
             .with_auth_cache(Arc::clone(&auth_cache))
+            .with_login_backoff(config.login_backoff_settings())
             // A lockout is a dashboard Alert, not just a log line.
             .with_activity(Arc::clone(&activity))
+            // A rename or policy save is announced (`UserUpdated`).
+            .with_events(Arc::clone(&event_manager))
             // Resolves each user's CastReceiverId against the configured
             // receivers — jellyfin-web shows no cast devices without one.
             .with_configuration(Arc::clone(&config_trait)),
     );
-    let users: Arc<dyn ferrofin_traits::library::UserManager> = users_impl;
+    // Kept concrete until the extensions exist: their authentication providers
+    // join it late (`register_auth_providers`, below).
+    let users: Arc<dyn ferrofin_traits::library::UserManager> = users_impl.clone();
     // Kept concrete until the session manager exists: the versions a
     // played-state change propagates to are announced through it (below).
     let user_data_impl = Arc::new(FerrofinUserDataManager::new(
@@ -973,6 +1055,33 @@ pub async fn build_app_state(
         }),
     );
     let live_tv: Arc<dyn ferrofin_traits::stubs::LiveTvManager> = live_tv_impl.clone();
+    // What image downloads may reach beyond the public internet (gl-1096):
+    // the configuration's allow-list, and the configured tuners' hosts, read
+    // when a private address needs them so that a tuner added later counts at
+    // once. Weak, so this lifetime's manager goes on an in-process restart.
+    ferrofin_providers::destination::set_image_destinations(
+        ferrofin_providers::destination::ImageDestinations::new(
+            config.image_private_allow_list(),
+        )
+        .with_tuner_hosts({
+            let live_tv = Arc::downgrade(&live_tv);
+            Arc::new(move || {
+                let live_tv = live_tv.upgrade();
+                Box::pin(async move {
+                    let Some(live_tv) = live_tv else {
+                        return Vec::new();
+                    };
+                    match live_tv.get_tuner_hosts().await {
+                        Ok(tuners) => tuners.iter().filter_map(tuner_host).collect(),
+                        Err(error) => {
+                            tracing::debug!(%error, "tuner hosts unreadable; no tuner's host exempts an image download");
+                            Vec::new()
+                        }
+                    }
+                })
+            })
+        }),
+    );
     let recording_source = Arc::downgrade(&live_tv);
     active_recordings
         .set(Arc::new(move || {
@@ -988,12 +1097,13 @@ pub async fn build_app_state(
     let devices: Arc<dyn ferrofin_traits::devices::DeviceManager> =
         Arc::new(FerrofinDeviceManager::new(db.clone()).with_auth_cache(Arc::clone(&auth_cache)));
     let api_keys: Arc<dyn ferrofin_traits::security::ApiKeyManager> =
-        Arc::new(FerrofinApiKeyManager::new(db.clone()));
+        Arc::new(FerrofinApiKeyManager::new(db.clone()).with_auth_cache(Arc::clone(&auth_cache)));
     let display_preferences: Arc<dyn ferrofin_traits::configuration::DisplayPreferencesManager> =
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
     let search: Arc<dyn ferrofin_traits::library::SearchManager> = Arc::new(
         FerrofinSearchManager::new(Arc::clone(&item_repository), Arc::clone(&users))
-            .with_image_processor(Arc::clone(&image_processor)),
+            .with_image_processor(Arc::clone(&image_processor))
+            .with_metadata_root(metadata_root.clone()),
     );
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
     // inherent `move_generated_trickplay_data` helper.
@@ -1033,6 +1143,12 @@ pub async fn build_app_state(
         )),
     );
     let trickplay: Arc<dyn ferrofin_traits::trickplay::TrickplayManager> = trickplay_impl.clone();
+    // The first boot after upgrading records the trickplay settings the images
+    // on disk are taken to match, so only a later change makes the Generate
+    // Trickplay Images task check them.
+    if let Err(err) = trickplay_impl.record_trickplay_settings_once().await {
+        tracing::warn!(%err, "cannot read the trickplay settings of the last pass; the next Generate Trickplay Images run records them");
+    }
 
     // ---- library + media-sources (consume repositories/services) ----------
     // The virtual-folder manager (shared with `with_virtual_folders` below) and
@@ -1077,6 +1193,17 @@ pub async fn build_app_state(
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
     trickplay_impl.attach_virtual_folders(Arc::clone(&virtual_folders));
+    // A bare `CollectionFolder` an older build made for the Collections library
+    // becomes the real library: before any scan, and before the sweep below
+    // reads the libraries' locations.
+    ferrofin_core::adoption_repairs::run_merge_legacy_collections_library(
+        db,
+        &virtual_folders_impl,
+        &id_derivation,
+        (&paths.data_path(), &paths.root_folder_path()),
+        &virtual_paths,
+    )
+    .await;
     // One-shot (Jellyfin 12.2 `20260915120000_MigrateRatingLevels`): recompute
     // every row's inherited parental-rating columns from its OWN
     // `OfficialRating` through `GetRatingScore`, so a rating string an older
@@ -1170,6 +1297,18 @@ pub async fn build_app_state(
     );
     let nfo_listener: Arc<dyn ferrofin_traits::library::UserDataSaveListener> = nfo_saver.clone();
     user_data_impl.set_save_listener(Arc::downgrade(&nfo_listener))?;
+    let item_visibility = Arc::new(
+        ferrofin_core::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::clone(&item_repository),
+            Arc::clone(&localization),
+            ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
+        )
+        .with_virtual_paths(virtual_paths.clone()),
+    );
+    // Held weakly by the repository and the count service: the evaluator owns
+    // the repository. `set` fails only if already set, which nothing else does.
+    let _ = scope_visibility.set(Arc::downgrade(&item_visibility));
     let providers: Arc<dyn ferrofin_traits::providers::ProviderManager> = Arc::new(
         LocalProviderManager::new(Vec::new())
             .with_image_saver(Arc::clone(&image_saver))
@@ -1178,7 +1317,10 @@ pub async fn build_app_state(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),
             )
-            .with_remote_image_cache(cache_root.child("remote-images"))
+            .with_remote_image_cache(
+                cache_root.child("remote-images"),
+                std::time::Duration::from_secs(config.image_negative_cache_ttl_secs),
+            )
             .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
             .with_remote_search_providers(search_providers)
             .with_dynamic_fetchers(wasm_host.provider_names())
@@ -1199,6 +1341,9 @@ pub async fn build_app_state(
             .with_people(Arc::clone(&people_repository))
             // A box set's or playlist's refresh takes its members' rating.
             .with_linked_children(Arc::clone(&linked_children_service))
+            // Every refresh stores the item's parental score by the rule the
+            // scan and a metadata edit use (`BaseItem.OnMetadataChanged`).
+            .with_rating_scorer(Arc::clone(&item_visibility) as _)
             // A genre's, music genre's or playlist's refresh redraws its
             // generated Primary, as the scan's closing pass draws it.
             .with_generated_images(Arc::new(
@@ -1251,18 +1396,6 @@ pub async fn build_app_state(
             }),
     );
 
-    let item_visibility = Arc::new(
-        ferrofin_core::item_visibility::ItemVisibility::new(
-            db.clone(),
-            Arc::clone(&item_repository),
-            Arc::clone(&localization),
-            ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref()),
-        )
-        .with_virtual_paths(virtual_paths.clone()),
-    );
-    // Held weakly by the repository and the count service: the evaluator owns
-    // the repository. `set` fails only if already set, which nothing else does.
-    let _ = scope_visibility.set(Arc::downgrade(&item_visibility));
     // The virtual-folder manager gives `/Items/Latest` each library's collection
     // type (C# `CollectionFolder.CollectionType`), which is why the user-view
     // manager is built after it.
@@ -1273,8 +1406,8 @@ pub async fn build_app_state(
             // The playlists folder it lists is `aggregate_store.ensure()`'s,
             // made once above, as `CreateRootFolder` makes it once per process.
             .with_item_store(Arc::clone(&item_persistence_service))
-            // Settles the `UserRootFolder` row on the first
-            // `GET /Library/MediaFolders`, memoized by the store.
+            // Settles the `UserRootFolder` row on the first read of the root
+            // folders, memoized by the store.
             .with_user_root(user_root_store.clone())
             .with_metadata_path(metadata_root.clone())
             .with_id_derivation(id_derivation.clone())
@@ -1357,6 +1490,14 @@ pub async fn build_app_state(
             .with_users(Arc::clone(&users))
             .with_by_name_store(by_name_store.clone()),
     );
+    // What a deleted item leaves on disk besides its media — its metadata
+    // folders and extracted data — removed before its rows by the library
+    // manager's delete and by every scan removal alike
+    // (`LibraryManager.DeleteItem`). The extracted-data half is bound once
+    // its managers exist, below.
+    let item_data_cleanup = Arc::new(ferrofin_core::item_data_cleanup::ItemDataCleanup::new(
+        Arc::clone(&paths),
+    ));
     let mut scanner = ferrofin_core::LibraryScanner::new(
         Arc::clone(&virtual_folders),
         Arc::clone(&file_system),
@@ -1365,6 +1506,16 @@ pub async fn build_app_state(
     .with_metadata_savers(Arc::clone(&providers))
     .with_image_saver(image_saver)
     .with_self_writes(Arc::clone(&self_writes_guard))
+    // A file being recorded is left alone until its capture ends.
+    .with_recording_paths({
+        let live_tv = Arc::downgrade(&live_tv);
+        Arc::new(move || {
+            live_tv
+                .upgrade()
+                .map(|live_tv| live_tv.paths_being_recorded())
+                .unwrap_or_default()
+        })
+    })
     .with_trickplay(Arc::clone(&trickplay), {
         let config_mgr = Arc::clone(&config_mgr);
         move || config_mgr.snapshot_shared().trickplay_options.scan_behavior
@@ -1375,6 +1526,8 @@ pub async fn build_app_state(
     .with_virtual_paths(virtual_paths.clone())
     // An item moved to a new id (its kind changed) takes its folders along.
     .with_path_manager(Arc::clone(&path_manager))
+    // A row the scan removes takes its metadata folders and extracted data.
+    .with_item_data_cleanup(Arc::clone(&item_data_cleanup))
     // Each library location is the `Folder` row Jellyfin keeps for it, under
     // the aggregate root, and what it holds hangs off it (owner decision D1).
     .with_root_folder(root_folder_ids.aggregate)
@@ -1506,7 +1659,8 @@ pub async fn build_app_state(
         scanner = scanner.with_probe_concurrency(concurrency as usize);
     }
     // The bounds of each scan's directory listings (bootstrap knobs, both
-    // validated positive); unset keeps upstream's `DirectoryService` values.
+    // clamped to positive ranges); unset keeps upstream's `DirectoryService`
+    // values.
     {
         let mut limits = ferrofin_core::library_scan::DirectoryCacheLimits::default();
         if let Some(records) = config
@@ -1588,12 +1742,16 @@ pub async fn build_app_state(
         .with_by_name_store(by_name_store)
         // A stacked video's parts are found by the ids their paths derive to.
         .with_id_derivation(id_derivation)
-        // `DELETE /Items` removes the item's files (`DeleteFileLocation`):
-        // the internal metadata root whose per-item folders it cleans, and
-        // the `%AppDataPath%` expansion of a stored path (an adopted
+        // `DELETE /Items` removes the item's files (`DeleteFileLocation`),
+        // expanding a stored `%AppDataPath%` path first (an adopted
         // collection's or playlist's folder). Nothing confines the delete to
         // the library locations, as upstream.
-        .with_app_paths(Arc::clone(&paths)),
+        .with_app_paths(Arc::clone(&paths))
+        // Every delete removes the deleted rows' metadata folders and
+        // extracted data first.
+        .with_item_data_cleanup(Arc::clone(&item_data_cleanup))
+        // How many items' links one transaction of a batched save rewrites.
+        .with_item_values_write_chunk(config.item_values_write_chunk as usize),
     );
     let library: Arc<dyn ferrofin_traits::library::LibraryManager> = library_impl.clone();
     // Marking a series, season, box set or folder played marks the items
@@ -1614,7 +1772,10 @@ pub async fn build_app_state(
         .with_providers(Arc::clone(&providers))
         .with_self_writes(Arc::clone(&self_writes_guard))
         // …and names a new Collections library in the server's language.
-        .with_localization(Arc::clone(&localization)),
+        .with_localization(Arc::clone(&localization))
+        // …which the first box set makes, like any library.
+        .with_virtual_folders(Arc::clone(&virtual_folders))
+        .with_virtual_paths(virtual_paths.clone()),
     );
     library_impl.attach_collections(&collections);
     library_scanner.attach_collections(&collections);
@@ -1646,8 +1807,23 @@ pub async fn build_app_state(
     );
     // From here the writers' bracketed writes reach the monitor.
     self_writes.set(library_monitor_impl.clone());
+    // Its watch lifecycle, spawned below.
+    let monitor_lifecycle = (*library_monitor_impl).clone();
     let library_monitor: Arc<dyn ferrofin_traits::library::LibraryMonitor> = library_monitor_impl;
+    // Close the Live TV <-> library cycle: the recording folders become
+    // libraries through this, on the lock a `livetv` save over the API holds.
+    let configuration_write_lock = Arc::new(tokio::sync::Mutex::new(()));
+    live_tv_impl.set_recording_library(
+        Arc::new(crate::recording_library::ServerRecordingLibrary {
+            virtual_folders: Arc::clone(&virtual_folders),
+            library: Arc::clone(&library),
+            monitor: Arc::clone(&library_monitor),
+        }),
+        Arc::clone(&configuration_write_lock),
+    );
     let mut background = Vec::new();
+    // For the network-change monitor, started once nothing below can fail.
+    let changing_network = Arc::clone(&network);
     if let Some(mut rx) = fs_events {
         let monitor = Arc::clone(&library_monitor);
         background.push(tokio::spawn(async move {
@@ -1658,30 +1834,6 @@ pub async fn build_app_state(
             }
         }));
     }
-    // Establishing the watches is a FILESYSTEM WALK, not a registration: an
-    // inotify recursive watch adds one kernel watch per directory under every
-    // library root, so its cost scales with the library's directory count and
-    // with how slow that filesystem is (measured on warm tmpfs: 10 ms at 1,000
-    // directories, 21 ms at 5,000, 60 ms at 20,000 — a cold network mount is
-    // far worse). Awaiting it here put that walk *before* the listener binds,
-    // where every millisecond is a client getting connection-refused rather
-    // than a slow response.
-    //
-    // Nothing needs the watches to exist before the server serves: they only
-    // feed realtime change detection, which is already blind for the whole of
-    // boot, and a change arriving during the walk is picked up by the next
-    // scheduled scan exactly as one arriving a moment earlier would be. So it
-    // is spawned and boot continues. It is a background task like the event
-    // pump, so an in-process restart's teardown stops the walk rather than
-    // letting the old lifetime keep adding watches (upstream's
-    // `ApplicationStopping` disposes the monitor). Nothing calls `start`
-    // after teardown: the requests have drained and the pump is stopped.
-    let monitor_start = Arc::clone(&library_monitor);
-    background.push(tokio::spawn(async move {
-        if let Err(err) = monitor_start.start().await {
-            tracing::warn!(%err, "failed to start library monitor");
-        }
-    }));
     // Scheduled tasks: the registry + trigger scheduler behind the dashboard's
     // "Scheduled Tasks" page. Trigger overrides persist across restarts; the
     // full Library/Maintenance task set is registered below once its backing
@@ -1698,6 +1850,9 @@ pub async fn build_app_state(
     // Failed runs also land in the dashboard's activity feed as `TaskFailed`
     // Alerts (port of upstream's `TaskCompletedLogger`).
     task_manager.set_activity_manager(Arc::clone(&activity));
+    // Core task names, descriptions and categories are shown in the request's
+    // UI culture, else the live server `UICulture`.
+    task_manager.set_localization_manager(Arc::clone(&localization));
     task_manager.register(Arc::new(ferrofin_core::RefreshLibraryTask::new(
         Arc::clone(&library),
     )));
@@ -1705,15 +1860,17 @@ pub async fn build_app_state(
     // feed the plugin manager below (so they appear in `/Plugins`); their tasks
     // are registered once `media_segments` exists, and the `task_manager` is
     // wrapped into the `tasks` seam after that.
-    // Suppressed wholesale when `disable_extensions` is set: no descriptors in
+    // Suppressed when `disable_extensions` is set: no descriptors in
     // `/Plugins`, no scheduled tasks, no event hooks. A benchmark leg must
-    // compare like with like, and the Jellyfin leg runs with no plugins.
-    let extensions = if config.disable_extensions {
-        tracing::info!("extensions disabled by configuration");
-        Vec::new()
-    } else {
-        ferrofin_extensions::builtin_extensions()
-    };
+    // compare like with like, and the Jellyfin leg runs with no plugins. The
+    // Ferrofin settings extension stays (owner decision D4): it ports no
+    // plugin and has no tasks or hooks, only the server's own settings page.
+    if config.disable_extensions {
+        tracing::info!(
+            "extensions disabled by configuration; the Ferrofin settings extension stays"
+        );
+    }
+    let extensions = ferrofin_extensions::registered_extensions(config.disable_extensions);
     let media_sources: Arc<dyn ferrofin_traits::library::MediaSourceManager> = Arc::new(
         FerrofinMediaSourceManager::new(
             Arc::clone(&item_repository),
@@ -1875,24 +2032,32 @@ pub async fn build_app_state(
         )
         .map_err(|e| anyhow::anyhow!("wasm artifact validator init: {e}"))?,
     );
+    // Which items the "Plugin media analysis" pass offered to which plugin:
+    // the pass reads and writes it, an uninstall forgets the plugin's.
+    let plugin_offered_items: Arc<dyn ferrofin_traits::plugins::PluginOfferedItemStore> = Arc::new(
+        ferrofin_core::plugin_offered_item_repository::FerrofinPluginOfferedItemStore::new(
+            db.clone(),
+        ),
+    );
+    // Where the plugin manager keeps each plugin's state and `config.json`; the
+    // LDAP-Auth import below checks the same directory.
+    let plugin_state_dir = config.config_dir.join("plugins");
     let plugins: Arc<dyn ferrofin_traits::plugins::PluginManager> = Arc::new(
-        ferrofin_core::FerrofinPluginManager::new(
-            registered_plugins,
-            config.config_dir.join("plugins"),
-        )
-        .with_installer(
-            config.data_dir.join("plugins"),
-            Arc::clone(&wasm_validator),
-            Arc::clone(&lifecycle),
-        )
-        .with_download_cap_mb(config.max_plugin_download_mb)
-        // The package repositories live in the server configuration — the single
-        // store upstream keeps them in — so `/Repositories`, `/Packages` and
-        // `/System/Configuration` can never disagree.
-        .with_configuration(Arc::clone(&config_trait))
-        .with_application_version(JELLYFIN_API_VERSION)
-        // A saved configuration is announced in-process (`ConfigurationChanged`).
-        .with_events(Arc::clone(&event_manager)),
+        ferrofin_core::FerrofinPluginManager::new(registered_plugins, plugin_state_dir.clone())
+            .with_offered_items(Arc::clone(&plugin_offered_items))
+            .with_installer(
+                config.data_dir.join("plugins"),
+                Arc::clone(&wasm_validator),
+                Arc::clone(&lifecycle),
+            )
+            .with_download_cap_mb(config.max_plugin_download_mb)
+            // The package repositories live in the server configuration — the single
+            // store upstream keeps them in — so `/Repositories`, `/Packages` and
+            // `/System/Configuration` can never disagree.
+            .with_configuration(Arc::clone(&config_trait))
+            .with_application_version(JELLYFIN_API_VERSION)
+            // A saved configuration is announced in-process (`ConfigurationChanged`).
+            .with_events(Arc::clone(&event_manager)),
     );
     // Jellyfin's five in-tree provider plugins read their settings through
     // `Plugin.Instance.Configuration` at call time, so an admin's save on a
@@ -1907,7 +2072,11 @@ pub async fn build_app_state(
     audiodb_client.attach_plugin_manager(Arc::clone(&plugins));
     studios_client.attach_plugin_manager(Arc::clone(&plugins));
 
-    let mut opensubtitles = ferrofin_providers::OpenSubtitlesProvider::new(Arc::clone(&plugins));
+    // The download link OpenSubtitles answers with refuses private addresses
+    // but those its own allow-list names (gl-1160); the image list does not
+    // apply to it.
+    let mut opensubtitles = ferrofin_providers::OpenSubtitlesProvider::new(Arc::clone(&plugins))
+        .with_link_destinations(config.subtitle_private_allow_list());
     if let Some(endpoint) = &config.provider_endpoints.opensubtitles {
         opensubtitles = opensubtitles.with_base_url(endpoint);
     }
@@ -1993,7 +2162,33 @@ pub async fn build_app_state(
         intro_skipper_runtime: Arc::default(),
         virtual_folders: Arc::clone(&virtual_folders),
         chapters: Arc::clone(&chapters),
+        users: Arc::clone(&users),
+        external_identities: Arc::new(
+            ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(
+                db.clone(),
+            ),
+        ),
+        // The providers' own download path, so an extension's image fetch keeps
+        // the destination policy and size limit set above.
+        remote_images: Arc::new(ferrofin_providers::remote_images::LimitedImageFetcher),
     };
+    // The user manager was built long before the extensions: their
+    // authentication and password-reset providers fill its late slots now,
+    // before the server takes a request. Every clone of the manager shares them.
+    ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, &users_impl);
+    // One-shot, before the server takes a request: an adopted Jellyfin's
+    // LDAP-Auth settings and uid map come across from the plugin's XML, so its
+    // directory users sign in with no admin action (B7).
+    ferrofin_extensions::ldap_auth::adoption::import_adopted_config(
+        &std::path::Path::new(&paths.plugins_path())
+            .join("configurations")
+            .join(ferrofin_extensions::ldap_auth::adoption::CONFIGURATION_FILE_NAME),
+        &plugin_state_dir,
+        plugins.as_ref(),
+        users.as_ref(),
+        extension_cx.external_identities.as_ref(),
+    )
+    .await;
     let intro_skipper_analysis = ferrofin_extensions::intro_skipper::analysis(&extension_cx);
     subscribe_intro_skipper(&event_bus, &intro_skipper_analysis);
     // Register actual loaded producers before the core "Media Segment Scan"
@@ -2040,7 +2235,9 @@ pub async fn build_app_state(
         .with_providers(Arc::clone(&providers))
         .with_self_writes(Arc::clone(&self_writes_guard))
         // Each playlist change announced as `ItemAdded`/`ItemUpdated`.
-        .with_item_persistence(Arc::clone(&item_persistence_service)),
+        .with_item_persistence(Arc::clone(&item_persistence_service))
+        // A new playlist's folder stored as `%AppDataPath%/playlists/<name>`.
+        .with_virtual_paths(virtual_paths.clone()),
     );
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),
@@ -2085,6 +2282,7 @@ pub async fn build_app_state(
             db.clone(),
             Arc::clone(&providers),
             Arc::clone(&library),
+            people_validation_repository,
         )));
         task_manager.register(Arc::new(lib_tasks::SubtitleDownloadTask::new(
             Arc::clone(&library),
@@ -2159,9 +2357,10 @@ pub async fn build_app_state(
         ));
     }
     let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
-    // Every item delete removes the deleted rows' extracted data
-    // (`LibraryManager.DeleteItem` → `DeleteExternalItemFiles`); the library
-    // manager is built before the chapter and segment managers this needs.
+    // Every item delete and scan removal removes the deleted rows' extracted
+    // data (`LibraryManager.DeleteItem` → `DeleteExternalItemFiles`); the
+    // library manager and the scanner are built before the chapter and
+    // segment managers this needs.
     let external_data: Arc<dyn ferrofin_traits::system::ExternalDataManager> =
         Arc::new(FerrofinExternalDataManager::new(
             Arc::clone(&path_manager),
@@ -2170,7 +2369,7 @@ pub async fn build_app_state(
             Arc::clone(&trickplay),
             Arc::clone(&chapters),
         ));
-    library_impl.set_external_data(external_data);
+    item_data_cleanup.set_external_data(external_data);
     // Jellyfin 12.0's sweeps of a 10.11 database's items whose library or
     // file is gone delete through the library manager, so they run once it
     // removes extracted data too, and before a startup trigger can scan.
@@ -2184,6 +2383,21 @@ pub async fn build_app_state(
     )
     .await
     .context("failed to remove items whose library or file is gone")?;
+    // Jellyfin 12.0's `CleanupOrphanedExternalData`, once per database: the
+    // extracted data and chapter images left behind for items no longer
+    // stored (every earlier Ferrofin left them when a scan removed an item).
+    // After the sweeps that delete items, and before a startup trigger can
+    // scan; under the configured metadata path.
+    ferrofin_core::adoption_repairs::run_cleanup_orphaned_external_data(
+        db,
+        &ferrofin_core::adoption_repairs::ExtractedDataRoots {
+            data: std::path::PathBuf::from(paths.data_path()),
+            trickplay: std::path::PathBuf::from(paths.trickplay_path()),
+            internal_metadata: std::path::PathBuf::from(paths.internal_metadata_path()),
+        },
+    )
+    .await
+    .context("failed to remove extracted data of items that no longer exist")?;
     // The trigger scheduler: fires startup triggers now, then evaluates
     // daily/weekly/interval triggers for the life of this host.
     background.push(task_manager.start_scheduler());
@@ -2205,6 +2419,7 @@ pub async fn build_app_state(
         // Jellyfin's link providers use the plugin's configured server.
         .with_musicbrainz_server(&config.musicbrainz_base_url)
         .with_virtual_paths(virtual_paths)
+        .with_metadata_root(metadata_root.clone())
         // The `MediaSources`' default-stream selection normalizes languages
         // through the same localization the media-source manager does.
         .with_localization(Arc::clone(&localization))
@@ -2225,6 +2440,14 @@ pub async fn build_app_state(
     if let Err(err) = live_tv.start_dvr().await {
         tracing::warn!(%err, "could not restart the Live TV recording timers");
     }
+    // `RecordingsHost.StartAsync`'s other half. A folder it adds becomes a
+    // library (written to disk, the library monitor's restart asked for, a
+    // scan queued), none of which boot waits for.
+    let recordings = Arc::clone(&live_tv);
+    background.push(tokio::spawn(tracing::Instrument::instrument(
+        async move { recordings.create_recording_folders().await },
+        tracing::info_span!(parent: None, "recording_folders", trigger = "startup"),
+    )));
 
     // ---- sessions + tv_series (consume dto) -------------------------------
     // The session message bus is created here (not with SyncPlay below) because
@@ -2252,10 +2475,13 @@ pub async fn build_app_state(
         // `SendPlayCommand` -> `TranslateItemForInstantMix`).
         .with_music_manager(Arc::clone(&music)),
     );
-    // The idle-playback and inactive-session checks (C# `StartCheckTimers`),
-    // for this host's lifetime.
+    // The idle-playback and inactive-session checks (C# `StartCheckTimers`)
+    // and the idle-session sweep, for this host's lifetime.
     background.push(tokio::spawn(tracing::Instrument::instrument(
-        Arc::clone(&sessions_impl).run_playback_checks(Arc::clone(&config_trait)),
+        Arc::clone(&sessions_impl).run_playback_checks(
+            Arc::clone(&config_trait),
+            std::time::Duration::from_hours(u64::from(config.session_idle_hours)),
+        ),
         tracing::info_span!(
             parent: None,
             "playback_checks",
@@ -2286,6 +2512,17 @@ pub async fn build_app_state(
         persistence: Arc::clone(&item_persistence_service),
         visibility: Arc::clone(&item_visibility),
     }));
+
+    // Every rename and policy save the user manager announces, whoever made
+    // it, reaches the user's sessions and then the device check (upstream's
+    // `UserUpdatedNotifier` and `DeviceAccessHost`). Attachable only now that
+    // the session manager exists.
+    ferrofin_core::user_updated::subscribe(
+        &event_bus,
+        Arc::clone(&users),
+        Arc::clone(&sessions),
+        Arc::clone(&devices),
+    );
 
     // Forward domain events to client sessions over the WebSocket — the Rust
     // shape of Jellyfin's notifier entry points (`LibraryChangedNotifier`,
@@ -2393,8 +2630,16 @@ pub async fn build_app_state(
                         // *before* publishing AuthenticationSucceeded, so the two
                         // rows land in that order. A spawned write always lost that
                         // race and showed the dashboard's login pair backwards.
+                        // A failed write is logged here at warn rather than returned
+                        // to the bus, which logs at error: logins set its volume.
                         Box::pin(async move {
-                            let _ = activity.create_entry(entry).await;
+                            if let Err(error) = activity.create_entry(entry).await {
+                                tracing::warn!(
+                                    %error,
+                                    activity_type = type_,
+                                    "could not write the activity entry"
+                                );
+                            }
                             Ok(())
                         })
                     }),
@@ -2428,7 +2673,7 @@ pub async fn build_app_state(
         // Port of `PlaybackStartLogger` / `PlaybackStopLogger`, on the same
         // awaited bus, so every route that reports playback (the obsolete
         // `/PlayingItems/{itemId}` forms included) writes its entry.
-        ferrofin_core::playback_activity::subscribe(&event_bus, &activity, &library);
+        ferrofin_core::playback_activity::subscribe(&event_bus, &activity);
     }
 
     // These two maintenance tasks gate on active playback, so they register
@@ -2488,7 +2733,7 @@ pub async fn build_app_state(
     });
     // The analysis driver (offers new items to analyzer plugins) exists
     // only when some loaded plugin declares scan-targets.
-    if let Some(task) = wasm_host.analysis_task(&plugins) {
+    if let Some(task) = wasm_host.analysis_task(&plugins, plugin_offered_items) {
         task_manager.register(task);
     }
 
@@ -2591,8 +2836,8 @@ pub async fn build_app_state(
     let sync_play_users = Arc::clone(&users);
     let sync_play_library = Arc::clone(&library);
 
-    // The policy and library row caches (ferrofin_db::row_cache), on only now: the boot repairs
-    // above write those rows outside the managers that invalidate them.
+    // The policy, library and tuner-presence row caches (ferrofin_db::row_cache), on only now: the
+    // boot repairs above write those rows outside the managers that invalidate them.
     db.enable_row_cache(
         config
             .row_cache_ttl_secs
@@ -2611,7 +2856,7 @@ pub async fn build_app_state(
         sessions,
         system,
         app_host_trait,
-        config_trait,
+        Arc::clone(&config_trait),
         providers,
         music,
         similar_items,
@@ -2638,9 +2883,6 @@ pub async fn build_app_state(
     );
 
     let state = state.with_request_culture(&server_config.ui_culture)?;
-    let state = state.with_websocket_min_stream_period(std::time::Duration::from_millis(
-        u64::from(config.websocket_min_stream_period_ms),
-    ));
 
     // ---- media-encoding pair (real transcode/HLS + attachments) -----------
     // Replace the disabled stubs `AppState::new` installed with the
@@ -2663,6 +2905,10 @@ pub async fn build_app_state(
             sessions: Some(me_sessions),
             // Remux playlists are cut on the stored or extracted keyframes.
             keyframes: Some(Arc::clone(&keyframe_repository)),
+            transcode_limits: TranscodeLimits {
+                server: config.max_transcodes,
+                per_user: config.max_transcodes_per_user,
+            },
         },
     );
     let state = state
@@ -2729,6 +2975,7 @@ pub async fn build_app_state(
     // built above, so `POST /Library/*/{Added,Updated}` actually refreshes.
     let state = state
         .with_library_monitor(library_monitor)
+        .with_configuration_write_lock(configuration_write_lock)
         .with_intro_skipper_store(intro_skipper)
         .with_intro_skipper_analysis(intro_skipper_analysis);
 
@@ -2739,6 +2986,18 @@ pub async fn build_app_state(
     // list and per-plugin configuration under `{config}/plugins/` and stages WASM
     // installs for the next start; `docs/EXTENSIONS.md` describes the two tiers.
     let state = state.with_plugins(Arc::clone(&plugins));
+
+    // ---- Ferrofin settings -----------------------------------------------
+    // `GET /Ferrofin/Settings`: the bootstrap configuration this lifetime runs
+    // with and where each value comes from, and the settings stored in the
+    // server configuration, while the Ferrofin plugin is enabled in the plugin
+    // manager.
+    let state = state.with_server_settings(Arc::new(crate::settings::FerrofinServerSettings::new(
+        config.clone(),
+        Arc::clone(&lifecycle),
+        Arc::clone(&plugins),
+        Arc::clone(&config_trait),
+    )));
 
     // ---- SyncPlay ---------------------------------------------------------
     // The SyncPlay manager shares the session message bus (created with the
@@ -2816,6 +3075,15 @@ pub async fn build_app_state(
     let plugin_routes: Arc<dyn ferrofin_traits::plugins::PluginRequestHandler> = Arc::new(
         ferrofin_wasm::WasmRequestDispatcher::new(&wasm_host, Arc::clone(&plugins)),
     );
+    // The LDAP-Auth extension's service behind the `/Ldap/*` routes. It reads
+    // the plugin's enabled flag and configuration through the plugin manager,
+    // so the routes answer 404 while the plugin is disabled or unregistered
+    // (`FERROFIN_DISABLE_EXTENSIONS`).
+    let ldap: Arc<dyn ferrofin_traits::ldap::LdapManager> =
+        Arc::new(ferrofin_extensions::ldap_auth::LdapAuthService::new(
+            Arc::clone(&plugins),
+            Arc::new(ferrofin_extensions::ldap_auth::directory::Ldap3Directory::default()),
+        ));
     let state = state
         .with_plugin_request_handler(plugin_routes)
         .with_session_bus(Arc::clone(&session_bus))
@@ -2823,7 +3091,43 @@ pub async fn build_app_state(
         .with_live_tv(live_tv)
         .with_file_transformations(Arc::clone(&file_transformations))
         .with_merge_versions(merge_versions)
+        .with_ldap(ldap)
         .with_playback_metrics(playback_metrics);
+
+    // Establishing the watches is a FILESYSTEM WALK, not a registration: an
+    // inotify recursive watch adds one kernel watch per directory under every
+    // library root, so its cost scales with the library's directory count and
+    // with how slow that filesystem is (measured on warm tmpfs: 10 ms at 1,000
+    // directories, 21 ms at 5,000, 60 ms at 20,000 — a cold network mount is
+    // far worse). Awaiting it here put that walk *before* the listener binds,
+    // where every millisecond is a client getting connection-refused rather
+    // than a slow response.
+    //
+    // Nothing needs the watches to exist before the server serves: they only
+    // feed realtime change detection, which is already blind for the whole of
+    // boot, and a change arriving during the walk is picked up by the next
+    // scheduled scan exactly as one arriving a moment earlier would be. So it
+    // is spawned and boot continues. The same holds after a library-structure
+    // change, so the restart it asks for runs on this task too, and the
+    // request answers first. It is a background task like the event pump, so
+    // an in-process restart's teardown stops the walk rather than letting the
+    // old lifetime keep adding watches (upstream's `ApplicationStopping`
+    // disposes the monitor). Started last, as the network-change monitor
+    // below is: it never ends on its own, and a restart asked for before it
+    // runs waits for it.
+    background.push(tokio::spawn(tracing::Instrument::instrument(
+        monitor_lifecycle.run(),
+        // The first start and each restart have spans of their own.
+        tracing::info_span!(parent: None, "library_monitor", task = "library_monitor"),
+    )));
+    // `DetectNetworkChange`: the OS's network changes refresh the shared
+    // network manager for this lifetime (upstream subscribes in the
+    // `NetworkManager` constructor and unsubscribes in `Dispose`). Started
+    // last: a `background` handle dropped by an early return would not stop
+    // a task that never ends on its own.
+    if config.detect_network_change {
+        background.extend(start_network_change_monitor(&changing_network));
+    }
 
     Ok(WiredApp {
         server_id,
@@ -2833,6 +3137,7 @@ pub async fn build_app_state(
         file_transformations,
         lifecycle: lifecycle_concrete,
         background,
+        task_manager,
         https,
     })
 }
@@ -2863,12 +3168,9 @@ struct SessionLibraryAudience {
 #[async_trait::async_trait]
 impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
     async fn active_user_ids(&self) -> Result<Vec<Uuid>, ferrofin_traits::error::ServiceError> {
-        // The admin view of the session table (`_sessionManager.Sessions`):
-        // a nil user id with the api-key flag is the unfiltered enumeration.
-        let sessions = self
-            .sessions
-            .get_sessions(Uuid::nil(), None, None, None, true)
-            .await?;
+        // The session table itself (`_sessionManager.Sessions`): only the
+        // user ids are read, so no session DTO is copied out.
+        let sessions = self.sessions.get_session_summaries().await?;
         let mut seen = std::collections::HashSet::new();
         Ok(sessions
             .into_iter()
@@ -3063,6 +3365,22 @@ fn sort_rules(
     }
 }
 
+/// The host a tuner's images may come from: its URL's, with the scheme an
+/// HDHomeRun's leaves out (`HdHomerunHost.GetApiUrl`). `None` for an M3U
+/// tuner read from a file.
+fn tuner_host(info: &ferrofin_model::live_tv::TunerHostInfo) -> Option<String> {
+    let url = if info
+        .type_
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("hdhomerun"))
+    {
+        ferrofin_livetv::hdhomerun::host::get_api_url(info).ok()?
+    } else {
+        info.url.clone()?
+    };
+    ferrofin_providers::destination::url_host(&url)
+}
+
 /// The server's stable id (`ApplicationHost.SystemId`), persisted across
 /// restarts. Jellyfin persists its SystemId and the web client keys stored
 /// sessions by it, so regenerating it on every boot breaks reconnect:
@@ -3155,6 +3473,77 @@ async fn load_server_id(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use ferrofin_core::system_manager::LibraryStorageProvider as _;
+
+    /// The storage page lists the libraries from the snapshot, not the full
+    /// listing that re-reads every library from disk, and still orders each
+    /// library's locations in the current culture, as `GetVirtualFolders` does.
+    #[tokio::test]
+    async fn storage_lists_the_library_snapshot_in_culture_order() {
+        let id = uuid::Uuid::new_v4();
+        let folders = Arc::new(ferrofin_api::test_support::FakeVirtualFolders::seeded(
+            vec![
+                ferrofin_model::entities_media::VirtualFolderInfo {
+                    name: Some("Movies".to_owned()),
+                    locations: vec!["/media/B".to_owned(), "/media/a".to_owned()],
+                    item_id: Some(id.simple().to_string()),
+                    ..Default::default()
+                },
+                // No id: dropped, as upstream filters a blank `ItemId`.
+                ferrofin_model::entities_media::VirtualFolderInfo {
+                    name: Some("Broken".to_owned()),
+                    locations: vec!["/media/c".to_owned()],
+                    ..Default::default()
+                },
+            ],
+        ));
+        let libraries = super::VirtualFolderStorage(folders.clone())
+            .libraries()
+            .await;
+        assert_eq!(folders.listings(), 0, "a full listing was asked for");
+        assert_eq!(
+            libraries,
+            vec![(
+                id,
+                "Movies".to_owned(),
+                vec!["/media/a".to_owned(), "/media/B".to_owned()]
+            )]
+        );
+    }
+
+    /// The hosts that exempt a tuner's own artwork from the image downloads'
+    /// private-address refusal (gl-1096).
+    #[test]
+    fn a_tuner_host_is_its_urls() {
+        let tuner = |kind: &str, url: &str| ferrofin_model::live_tv::TunerHostInfo {
+            type_: Some(kind.to_owned()),
+            url: Some(url.to_owned()),
+            ..Default::default()
+        };
+        for (kind, url, host) in [
+            ("hdhomerun", "192.168.1.50", Some("192.168.1.50")),
+            ("hdhomerun", "http://HDHR.lan:80", Some("hdhr.lan")),
+            (
+                "m3u",
+                "http://tvh.lan:9981/playlist/channels",
+                Some("tvh.lan"),
+            ),
+            ("m3u", "/config/channels.m3u", None),
+        ] {
+            assert_eq!(
+                super::tuner_host(&tuner(kind, url)).as_deref(),
+                host,
+                "{kind} {url}"
+            );
+        }
+        assert_eq!(
+            super::tuner_host(&ferrofin_model::live_tv::TunerHostInfo::default()),
+            None
+        );
+    }
+
     /// The server id on first boot over an adopted Jellyfin install is
     /// Jellyfin's own (`DeviceId`: `{DataPath}/device.txt`), so clients keep
     /// recognising the server; Ferrofin's `system_id`, once written, wins; and

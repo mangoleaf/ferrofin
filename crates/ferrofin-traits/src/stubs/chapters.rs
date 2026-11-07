@@ -52,7 +52,8 @@ mod tests {
     async fn there_are_no_chapters() {
         let id = Uuid::from_u128(1);
         assert!(!NoChapters.supports(id).await.unwrap());
-        assert!(NoChapters.get_chapters(id).await.unwrap().is_empty());
+        let chapters = NoChapters.get_chapters(id).await.unwrap();
+        assert!(chapters.is_empty(), "{chapters:?}");
         assert!(NoChapters.get_chapter(id, 0).await.unwrap().is_none());
         assert!(NoChapters.save_chapters(id, &[]).await.is_err());
         assert!(NoChapters.delete_chapter_data(id).await.is_err());

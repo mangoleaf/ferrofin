@@ -11,8 +11,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::Context as _;
 
-/// What `axum::serve` accepts: a TCP listener with Nagle's algorithm off on
-/// every accepted connection.
+/// What `axum::serve` accepts: a TCP listener that sets the socket options of
+/// every accepted connection ([`crate::configure_accepted`]).
 pub type Listener = axum::serve::TapIo<tokio::net::TcpListener, fn(&mut tokio::net::TcpStream)>;
 
 pub use ferrofin_api::forwarded_headers::Transport;
@@ -242,7 +242,7 @@ pub fn bind(address: SocketAddr) -> std::io::Result<Listener> {
     let listener = tokio::net::TcpListener::from_std(socket.into())?;
     Ok(axum::serve::ListenerExt::tap_io(
         listener,
-        crate::disable_nagle as fn(&mut tokio::net::TcpStream),
+        crate::configure_accepted as fn(&mut tokio::net::TcpStream),
     ))
 }
 
@@ -278,7 +278,8 @@ mod tests {
             plan_addresses(None, 80, &[any6]),
             ["[::]:80".parse::<SocketAddr>().unwrap()]
         );
-        assert!(plan_addresses(None, 8096, &[]).is_empty());
+        let found = plan_addresses(None, 8096, &[]);
+        assert!(found.is_empty(), "{found:?}");
         // A link-local IPv6 address binds on its interface.
         let link_local = interface("fe80::1".parse().unwrap(), 3);
         let planned = plan_addresses(None, 8096, &[link_local]);

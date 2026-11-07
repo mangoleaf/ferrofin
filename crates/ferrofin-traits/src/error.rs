@@ -14,10 +14,10 @@ use thiserror::Error;
 ///
 /// A deliberately small, transport-agnostic taxonomy: the HTTP layer maps each
 /// variant to a status code (`NotFound` → 404, `Unauthorized` → 401, `Forbidden` → 403,
-/// `InvalidInput` → 400, `Conflict` → 409, `Unavailable` → 503, `Db`/`Backend` →
-/// 500). Keep it flat — richer, domain-specific context belongs in the message
-/// strings, not new variants (a variant is only added for a genuinely distinct
-/// HTTP semantic).
+/// `InvalidInput` → 400, `Conflict` → 409, `Unavailable` → 503, `Busy` → 503 with
+/// `Retry-After`, `Db`/`Backend` → 500). Keep it flat — richer, domain-specific
+/// context belongs in the message strings, not new variants (a variant is only
+/// added for a genuinely distinct HTTP semantic).
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ServiceError {
@@ -49,6 +49,19 @@ pub enum ServiceError {
     /// failure, and the caller may retry.
     #[error("unavailable: {0}")]
     Unavailable(String),
+
+    /// The service refuses this now because a limit is full, and the client
+    /// should try again after `retry_after_secs`. Maps to HTTP `503` with a
+    /// `Retry-After` header, which is what sets it apart from
+    /// [`Unavailable`](Self::Unavailable), and its message reaches the client:
+    /// keep it free of internals.
+    #[error("busy: {message}")]
+    Busy {
+        /// What is full, in words a client may show.
+        message: String,
+        /// The `Retry-After` value, in seconds.
+        retry_after_secs: u32,
+    },
 
     /// A persistence-layer failure surfaced from [`ferrofin_db`].
     #[error("database error: {0}")]
@@ -101,6 +114,14 @@ impl ServiceError {
         Self::Unavailable(why.into())
     }
 
+    /// Constructs a [`ServiceError::Busy`] from anything string-like.
+    pub fn busy(why: impl Into<String>, retry_after_secs: u32) -> Self {
+        Self::Busy {
+            message: why.into(),
+            retry_after_secs,
+        }
+    }
+
     /// Constructs a [`ServiceError::Backend`] from anything string-like.
     pub fn backend(why: impl Into<String>) -> Self {
         Self::Backend(why.into())
@@ -111,6 +132,17 @@ impl ServiceError {
     pub fn backend_source(source: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::BackendSource(Box::new(source))
     }
+}
+
+/// Wraps a `sqlx` error as a [`ServiceError::Db`], keeping it as the source.
+///
+/// The one `sqlx` → [`ServiceError`] conversion for every crate that runs
+/// `ferrofin-db` queries (`ferrofin-core`, `ferrofin-livetv`, …), for
+/// `.map_err(db_err)`. A [`ferrofin_db::Result`] needs no helper: `?`
+/// converts it.
+#[must_use]
+pub fn db_err(err: sqlx::Error) -> ServiceError {
+    ServiceError::Db(err.into())
 }
 
 #[cfg(test)]
@@ -173,5 +205,17 @@ mod tests {
         // …and keeps its `#[source]` cause reachable through the chain.
         assert_eq!(err.source().unwrap().to_string(), "missing file");
         assert!(matches!(err, ServiceError::BackendSource(_)));
+    }
+
+    #[test]
+    fn db_err_keeps_the_sqlx_error_as_the_source() {
+        use std::error::Error as _;
+
+        let err = super::db_err(sqlx::Error::PoolClosed);
+        assert!(err.source().is_some());
+        assert!(matches!(
+            err,
+            ServiceError::Db(ferrofin_db::DbError::Sqlx(sqlx::Error::PoolClosed))
+        ));
     }
 }

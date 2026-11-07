@@ -375,5 +375,5 @@ fn a_profile_the_transcoder_cannot_encode_leaves_a_bare_transcode() {
     let stream = optimal(&options(profile, source("ogg", "vorbis", 2, 160_000))).unwrap();
     assert_eq!(stream.play_method, PlayMethod::Transcode);
     assert!(stream.container.is_none(), "{:?}", stream.container);
-    assert!(stream.audio_codecs.is_empty());
+    assert!(stream.audio_codecs.is_empty(), "{:?}", stream.audio_codecs);
 }

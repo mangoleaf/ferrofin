@@ -58,6 +58,10 @@ pub struct ChannelRow {
     pub image_url: Option<String>,
     /// Whether the guide airs a movie on this channel (upstream
     /// `LiveTvChannel.IsMovie`, aggregated from the programmes at refresh).
+    ///
+    /// This and the two kinds below are derived only by
+    /// [`crate::guide_repository::channel_rows`], and only for the kinds its
+    /// query filters on; everywhere else they read `false`.
     #[sqlx(default)]
     pub is_movie: bool,
     /// Whether the guide airs a series episode on this channel.
@@ -194,11 +198,12 @@ pub fn filter_channel_rows(
 /// prepends `(IsFavoriteOrLiked, Desc)`, and `(SortName, Asc)` is appended
 /// unless already requested.
 ///
-/// Sort keys the channel cache has no column for keep the lineup order (the
-/// appended `SortName` still breaks ties); `IsFavoriteOrLiked` sorts on the
-/// `IsFavorite` bit, exactly like the item repository's `translate_query`.
+/// Any other key (`DatePlayed`, `PlayCount`, …) compares equal, so the
+/// appended `SortName` decides; upstream's `OrderMapper` sorts on them, and
+/// gl-1354 tracks porting them. `IsFavoriteOrLiked` sorts on the `IsFavorite`
+/// bit, exactly like the item repository's `translate_query`.
 pub fn sort_channel_rows(
-    rows: &mut [ChannelRow],
+    rows: &mut Vec<ChannelRow>,
     query: &ferrofin_traits::stubs::LiveTvChannelQuery,
     user_data: &ChannelUserData,
 ) {
@@ -217,19 +222,27 @@ pub fn sort_channel_rows(
     if !order.iter().any(|(s, _)| *s == ItemSortBy::SortName) {
         order.push((ItemSortBy::SortName, SortOrder::Ascending));
     }
-    let is_favorite = |row: &ChannelRow| user_data.get(&row.id).is_some_and(|d| d.0);
-    rows.sort_by(|a, b| {
+    // Each row's keys are built once: rebuilding the padded sort name on both
+    // sides of every comparison dominated the sort of a large lineup.
+    let mut keyed: Vec<(String, String, bool, ChannelRow)> = rows
+        .drain(..)
+        .map(|row| {
+            (
+                channel_sort_name(row.number.as_deref(), &row.name).to_lowercase(),
+                row.name.to_lowercase(),
+                user_data.get(&row.id).is_some_and(|d| d.0),
+                row,
+            )
+        })
+        .collect();
+    keyed.sort_by(|(a_key, a_name, a_fav, a), (b_key, b_name, b_fav, b)| {
         for (sort, direction) in &order {
             let ordering = match sort {
-                ItemSortBy::SortName | ItemSortBy::Default => {
-                    channel_sort_name(a.number.as_deref(), &a.name)
-                        .to_lowercase()
-                        .cmp(&channel_sort_name(b.number.as_deref(), &b.name).to_lowercase())
-                }
+                ItemSortBy::SortName | ItemSortBy::Default => a_key.cmp(b_key),
                 // Upstream maps `ItemSortBy.Name` to `CleanName` — the plain
                 // display name, not the number-padded channel sort key.
-                ItemSortBy::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-                ItemSortBy::IsFavoriteOrLiked => is_favorite(a).cmp(&is_favorite(b)),
+                ItemSortBy::Name => a_name.cmp(b_name),
+                ItemSortBy::IsFavoriteOrLiked => a_fav.cmp(b_fav),
                 ItemSortBy::DateCreated => a.date_created.cmp(&b.date_created),
                 _ => std::cmp::Ordering::Equal,
             };
@@ -243,6 +256,7 @@ pub fn sort_channel_rows(
         }
         std::cmp::Ordering::Equal
     });
+    rows.extend(keyed.into_iter().map(|(.., row)| row));
 }
 
 /// `LiveTvChannel.MediaType`: radio channels are audio, everything else video.
@@ -386,6 +400,18 @@ pub fn channel_item_update(
     (item != *stored).then_some(item)
 }
 
+/// Whether a tuner's or guide's artwork value may become an image row: an
+/// absolute `http` or `https` URL.
+///
+/// Upstream's `SetImagePath` also accepts a local file path here; Ferrofin keeps
+/// only URLs. Jellyfin bug not ported; see the `images` row of
+/// `handlers::VERIFIED_SUBSYSTEMS`. Every source's artwork (M3U, XMLTV, Schedules
+/// Direct; an HDHomeRun lineup has none) reaches an image row only through
+/// [`channel_images_update`] and [`program_images_update`], which apply this.
+pub(crate) fn is_artwork_url(value: &str) -> bool {
+    crate::fetch::has_scheme(value, &["http", "https"])
+}
+
 /// A remote image row for `url`: upstream's `new ItemImageInfo { Path = url,
 /// Type = type }`. The image routes serve it through the remote-image cache.
 fn remote_image(image_type: ImageType, url: &str) -> ItemImageInfo {
@@ -419,19 +445,34 @@ fn set_first_image(images: &mut Vec<ItemImageInfo>, image: ItemImageInfo) {
 /// downloaded logo, or one set in the metadata editor) never equals the URL,
 /// so it is replaced by the tuner's or guide's logo, as upstream replaces it
 /// on every refresh.
+///
+/// A logo that is not a URL ([`is_artwork_url`]) sets nothing. A Primary an
+/// earlier version stored from that same value is removed: the image routes
+/// no longer serve it, and the old version can store it again beside this one
+/// during a rolling update, so it goes on a refresh, not once.
 #[must_use]
 pub fn channel_images_update(
     current: &[ItemImageInfo],
     image_url: Option<&str>,
 ) -> Option<Vec<ItemImageInfo>> {
     let url = image_url.filter(|url| !url.trim().is_empty())?;
-    let primary = current.iter().find(|i| i.image_type == ImageType::Primary);
-    if primary.is_some_and(|p| p.path == url) {
-        return None;
+    let primary = current
+        .iter()
+        .position(|i| i.image_type == ImageType::Primary);
+    let stored = primary.filter(|&index| current[index].path == url);
+    match (is_artwork_url(url), stored) {
+        (true, Some(_)) | (false, None) => None,
+        (true, None) => {
+            let mut images = current.to_vec();
+            set_first_image(&mut images, remote_image(ImageType::Primary, url));
+            Some(images)
+        }
+        (false, Some(index)) => {
+            let mut images = current.to_vec();
+            images.remove(index);
+            Some(images)
+        }
     }
-    let mut images = current.to_vec();
-    set_first_image(&mut images, remote_image(ImageType::Primary, url));
-    Some(images)
 }
 
 /// The artwork a listing supplies for one programme: `ProgramInfo.ImageUrl`
@@ -447,6 +488,28 @@ pub struct ProgramImages {
     pub backdrop: Option<String>,
 }
 
+impl ProgramImages {
+    /// The listing's URLs, in `UpdateImages` order, with a value that is no URL
+    /// ([`is_artwork_url`]) read as none.
+    fn urls(&self) -> [(ImageType, Option<&str>); 3] {
+        [
+            (ImageType::Primary, &self.primary),
+            (ImageType::Thumb, &self.thumb),
+            (ImageType::Backdrop, &self.backdrop),
+        ]
+        .map(|(image_type, url)| (image_type, url.as_deref().filter(|url| is_artwork_url(url))))
+    }
+
+    /// How many of the listing's values are neither blank nor a URL.
+    pub(crate) fn refused(&self) -> usize {
+        [&self.primary, &self.thumb, &self.backdrop]
+            .into_iter()
+            .flatten()
+            .filter(|value| !value.trim().is_empty() && !is_artwork_url(value))
+            .count()
+    }
+}
+
 /// The programme's image list after `GuideManager.UpdateImages`, or `None`
 /// when nothing is to be written.
 ///
@@ -457,7 +520,8 @@ pub struct ProgramImages {
 /// a programme's Logo goes too. A removal alone does not mark the programme
 /// updated upstream (`UpdateImage` returns `false`), so it is only written
 /// when the programme's other fields changed (`item_updated`) — then the item,
-/// removal included, is saved.
+/// removal included, is saved. A listing value that is not a URL
+/// ([`is_artwork_url`]) counts as none.
 #[must_use]
 pub fn program_images_update(
     current: &[ItemImageInfo],
@@ -467,12 +531,8 @@ pub fn program_images_update(
     let mut images = current.to_vec();
     let mut updated = false;
     let mut removed = false;
-    for (image_type, url) in [
-        (ImageType::Primary, listing.primary.as_deref()),
-        (ImageType::Thumb, listing.thumb.as_deref()),
-        (ImageType::Logo, None),
-        (ImageType::Backdrop, listing.backdrop.as_deref()),
-    ] {
+    let [primary, thumb, backdrop] = listing.urls();
+    for (image_type, url) in [primary, thumb, (ImageType::Logo, None), backdrop] {
         let first = images.iter().position(|i| i.image_type == image_type);
         let same = first
             .zip(url)
@@ -480,7 +540,7 @@ pub fn program_images_update(
         if same {
             continue;
         }
-        match (url.filter(|url| !url.trim().is_empty()), first) {
+        match (url, first) {
             (Some(url), _) => {
                 set_first_image(&mut images, remote_image(image_type, url));
                 updated = true;
@@ -864,6 +924,73 @@ mod tests {
         assert_eq!(channel_images_update(&[], None), None);
     }
 
+    /// Artwork is an absolute `http` or `https` URL and nothing else.
+    #[rstest::rstest]
+    #[case::absolute_path("/var/lib/art.png", false)]
+    #[case::relative_path("art/logo.png", false)]
+    #[case::parent_path("../art.png", false)]
+    #[case::windows_path(r"C:\art\logo.png", false)]
+    #[case::file_url("file:///var/lib/art.png", false)]
+    #[case::file_url_without_authority("file:/var/lib/art.png", false)]
+    #[case::another_scheme("ftp://img/a.png", false)]
+    #[case::starts_like_http("httpfoo/a.png", false)]
+    #[case::scheme_without_slashes("http:/a.png", false)]
+    #[case::padded(" http://img/a.png", false)]
+    #[case::scheme_relative("//img/a.png", false)]
+    #[case::blank("  ", false)]
+    #[case::http("http://img/a.png", true)]
+    #[case::https("https://img/a.png", true)]
+    #[case::any_case("HTTPS://IMG/A.PNG", true)]
+    fn artwork_is_a_url(#[case] value: &str, #[case] expected: bool) {
+        assert_eq!(is_artwork_url(value), expected);
+    }
+
+    /// A logo that is no URL sets nothing, and takes the row an earlier version
+    /// stored from it, but no other.
+    #[test]
+    fn a_channel_logo_that_is_no_url_sets_nothing() {
+        let refused = "/var/lib/art.png";
+        assert_eq!(channel_images_update(&[], Some(refused)), None);
+        // A logo from the metadata editor, or a URL, stays.
+        for path in ["/meta/library/primary.png", "http://img/a.png"] {
+            let primary = image(ImageType::Primary, path);
+            assert_eq!(channel_images_update(&[primary], Some(refused)), None);
+        }
+        let backdrop = image(ImageType::Backdrop, "/meta/b.jpg");
+        assert_eq!(
+            channel_images_update(
+                &[image(ImageType::Primary, refused), backdrop.clone()],
+                Some(refused)
+            ),
+            Some(vec![backdrop])
+        );
+    }
+
+    /// A listing value that is no URL is a listing without that image.
+    #[test]
+    fn a_programme_value_that_is_no_url_counts_as_none() {
+        let refused = "file:///var/lib/art.png";
+        let listing = ProgramImages {
+            primary: Some(refused.to_owned()),
+            thumb: Some("  ".to_owned()),
+            backdrop: Some("http://img/b.jpg".to_owned()),
+        };
+        assert_eq!(listing.refused(), 1);
+        let backdrop = image(ImageType::Backdrop, "http://img/b.jpg");
+        assert_eq!(
+            program_images_update(&[], &listing, false),
+            Some(vec![backdrop.clone()])
+        );
+        // The row an earlier version stored from it goes as a removal does:
+        // only with a programme that is written anyway.
+        let stored = [image(ImageType::Primary, refused), backdrop.clone()];
+        assert_eq!(program_images_update(&stored, &listing, false), None);
+        assert_eq!(
+            program_images_update(&stored, &listing, true),
+            Some(vec![backdrop])
+        );
+    }
+
     /// `GuideManager.UpdateImages`/`UpdateImage`.
     #[test]
     fn a_programmes_images_follow_its_listing() {
@@ -1156,7 +1283,7 @@ mod tests {
         // A renamed channel IS a write, and carries the edit through.
         let renamed = ChannelRow {
             name: "Parity One HD".to_owned(),
-            ..row.clone()
+            ..row
         };
         let fresh = channel_entity(&renamed, parse, Some(view));
         let updated = channel_item_update(&stored, &fresh).expect("the rename is a write");
@@ -1173,7 +1300,7 @@ mod tests {
         assert_eq!(updated.date_created, stored.date_created);
 
         // A user-forced sort key is not a property the refresh owns.
-        let mut forced = stored.clone();
+        let mut forced = stored;
         forced.forced_sort_name = Some("zzz".to_owned());
         forced.sort_name = Some("zzz".to_owned());
         let updated = channel_item_update(&forced, &fresh).expect("the rename is still a write");
@@ -1196,6 +1323,85 @@ mod tests {
         // title sorts as ASCII and interleaves with the rest of the library
         // instead of landing after it under SQLite's BINARY collation.
         assert_eq!(item_sort_name("Café Größe"), "cafe grosse");
+    }
+
+    /// Every key the lineup sorts on, in both directions, with favourite-first
+    /// and the appended `SortName`; ties keep the stored order.
+    #[test]
+    fn the_lineup_sorts_on_each_requested_key() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+        use ferrofin_traits::stubs::LiveTvChannelQuery;
+
+        let row = |id: &str, number: Option<&str>, name: &str, created: &str| ChannelRow {
+            id: id.to_owned(),
+            tvg_id: String::new(),
+            external_id: String::new(),
+            name: name.to_owned(),
+            number: number.map(str::to_owned),
+            channel_type: "Tv".to_owned(),
+            date_created: Some(created.to_owned()),
+            image_url: None,
+            is_movie: false,
+            is_series: false,
+            is_kids: false,
+        };
+        // `e` and `c` share the sort key "0000000002.00000-alpha".
+        let lineup = vec![
+            row("e", Some("2.0"), "ALPHA", "2026-01-02"),
+            row("a", Some("10"), "bravo", "2026-01-03"),
+            row("b", Some("2"), "Charlie", "2026-01-01"),
+            row("c", Some("2"), "alpha", "2026-01-02"),
+            row("d", None, "Delta", "2026-01-01"),
+        ];
+        let favourites: ChannelUserData = [("c".to_owned(), (true, None))].into();
+        let sorted = |sort_by: &[ItemSortBy], order: Option<SortOrder>, favourite_first: bool| {
+            let mut rows = lineup.clone();
+            let query = LiveTvChannelQuery {
+                sort_by: sort_by.to_vec(),
+                sort_order: order,
+                enable_favorite_sorting: favourite_first,
+                ..LiveTvChannelQuery::default()
+            };
+            sort_channel_rows(&mut rows, &query, &favourites);
+            rows.into_iter().map(|r| r.id).collect::<Vec<_>>()
+        };
+        let desc = Some(SortOrder::Descending);
+        assert_eq!(sorted(&[], None, false), ["d", "e", "c", "b", "a"]);
+        assert_eq!(
+            sorted(&[ItemSortBy::Default], desc, false),
+            ["a", "b", "e", "c", "d"]
+        );
+        assert_eq!(
+            sorted(&[ItemSortBy::SortName], desc, false),
+            ["a", "b", "e", "c", "d"]
+        );
+        assert_eq!(
+            sorted(&[ItemSortBy::Name], None, false),
+            ["e", "c", "a", "b", "d"]
+        );
+        assert_eq!(
+            sorted(&[ItemSortBy::Name], desc, false),
+            ["d", "b", "a", "e", "c"]
+        );
+        assert_eq!(
+            sorted(&[ItemSortBy::DateCreated], None, false),
+            ["d", "b", "e", "c", "a"]
+        );
+        assert_eq!(
+            sorted(&[ItemSortBy::DateCreated], desc, false),
+            ["a", "e", "c", "d", "b"]
+        );
+        assert_eq!(sorted(&[], None, true), ["c", "d", "e", "b", "a"]);
+        assert_eq!(
+            sorted(&[ItemSortBy::Name], desc, true),
+            ["c", "d", "b", "a", "e"]
+        );
+        // A key the lineup has no column for leaves it to `SortName`.
+        assert_eq!(
+            sorted(&[ItemSortBy::DatePlayed], desc, false),
+            ["d", "e", "c", "b", "a"]
+        );
     }
 
     #[test]

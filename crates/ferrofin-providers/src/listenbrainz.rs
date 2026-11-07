@@ -306,7 +306,8 @@ mod tests {
             ..ListenBrainzConfig::default()
         });
         assert_eq!(client.similar_artists("seed").await, ["other"]);
-        assert!(client.similar_artists("seed").await.is_empty());
+        let similar_artists = client.similar_artists("seed").await;
+        assert!(similar_artists.is_empty(), "{similar_artists:?}");
     }
 
     #[test]
@@ -332,6 +333,7 @@ mod tests {
             labs_server: "http://127.0.0.1:1".to_owned(),
             ..ListenBrainzConfig::default()
         });
-        assert!(client.similar_artists("  ").await.is_empty());
+        let similar_artists = client.similar_artists("  ").await;
+        assert!(similar_artists.is_empty(), "{similar_artists:?}");
     }
 }

@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::error::ServiceError;
 use crate::media_encoding::{
     AttachmentExtractor, ExtractedAttachment, HlsStreamManager, HlsStreamRequest, ServedFile,
-    SubtitleEncoder,
+    SubtitleEncoder, TranscodingJobHandle, TrimmedSubtitle,
 };
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities_media::MediaStream;
@@ -98,6 +98,14 @@ impl HlsStreamManager for DisabledHlsStreamManager {
             return Err(ServiceError::invalid_input("playSessionId is empty"));
         }
         Ok(())
+    }
+
+    async fn get_transcoding_job(
+        &self,
+        _play_session_id: &str,
+    ) -> Result<Option<TranscodingJobHandle>, ServiceError> {
+        // No transcode runtime, so no job: a reported `Transcode` is `DirectPlay`.
+        Ok(None)
     }
 }
 
@@ -189,6 +197,15 @@ impl SubtitleEncoder for DisabledSubtitleEncoder {
         &self,
         _media_source: &MediaSourceInfo,
     ) -> Result<(), ServiceError> {
+        Err(Self::unavailable())
+    }
+
+    async fn get_trimmed_subtitles(
+        &self,
+        _subtitle_stream: &MediaStream,
+        _media_source: &MediaSourceInfo,
+        _start_time_ticks: i64,
+    ) -> Result<TrimmedSubtitle, ServiceError> {
         Err(Self::unavailable())
     }
 }

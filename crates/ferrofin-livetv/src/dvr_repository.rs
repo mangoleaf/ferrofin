@@ -11,7 +11,7 @@ use ferrofin_model::live_tv::{RecordingQuery, RecordingStatus, SeriesTimerInfoDt
 use sqlx::{QueryBuilder, Sqlite};
 use uuid::Uuid;
 
-use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::error::{ServiceError, db_err};
 
 use crate::projection::RecordingRow;
 
@@ -209,6 +209,41 @@ pub async fn timers_for_program(
     .map_err(db_err)
 }
 
+/// The `(Id, Data)` rows of the timers that are not `Completed` and whose
+/// `ProgramId` is one of `program_ids` (ignoring ASCII case), unparsed, in
+/// `StartDate` order (ties in insertion order, as upstream's stable `OrderBy`
+/// over `timers.json`).
+///
+/// The slice of `GetTimersAsync` a programme page's `AddRecordingInfo` can
+/// match, read with the promoted columns so the rest of the table (every
+/// completed recording's timer, every other programme's) is never parsed.
+///
+/// # Errors
+///
+/// Fails when the read fails, or when the ids cannot be serialized.
+pub async fn scheduled_timers_for_programs(
+    db: &Database,
+    program_ids: &[&str],
+) -> Result<Vec<(String, String)>, ServiceError> {
+    let ids = serde_json::to_string(program_ids).map_err(|e| {
+        ServiceError::from(crate::error::LiveTvError::serialize(
+            "serialize program ids",
+            e,
+        ))
+    })?;
+    // One JSON-array bind, not one per id: a guide page has no row limit.
+    sqlx::query_as(
+        r#"SELECT "Id","Data" FROM "FerrofinLiveTvTimers"
+           WHERE "Status" <> 'Completed'
+             AND "ProgramId" COLLATE NOCASE IN (SELECT value FROM json_each(?1))
+           ORDER BY "StartDate", rowid"#,
+    )
+    .bind(ids)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)
+}
+
 /// Inserts the row a capture is about to fill.
 ///
 /// # Errors
@@ -299,6 +334,31 @@ pub async fn delete_recording(db: &Database, recording_id: Uuid) -> Result<(), S
         .execute(db.writer())
         .await
         .map_err(db_err)?;
+    Ok(())
+}
+
+/// Deletes the finished recordings whose file is `path` or under it. A capture
+/// in progress keeps its row, and a blank or root `path` names nothing: it
+/// would otherwise match every recording.
+///
+/// # Errors
+///
+/// Fails when the write fails.
+pub async fn delete_recordings_at(db: &Database, path: &str) -> Result<(), ServiceError> {
+    let path = path.trim_end_matches('/');
+    if path.trim().is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        r#"DELETE FROM "FerrofinLiveTvRecordings"
+           WHERE "Status" <> 'InProgress'
+             AND ("Path" = ?1 OR substr("Path", 1, length(?2)) = ?2)"#,
+    )
+    .bind(path)
+    .bind(format!("{path}/"))
+    .execute(db.writer())
+    .await
+    .map_err(db_err)?;
     Ok(())
 }
 
@@ -400,11 +460,6 @@ pub async fn recording_rows(
 #[must_use]
 pub fn status_name(status: RecordingStatus) -> String {
     status.json_name().into_owned()
-}
-
-/// Maps a `sqlx` error into a [`ServiceError`] via `ferrofin-db`'s `DbError`.
-fn db_err(e: sqlx::Error) -> ServiceError {
-    ServiceError::from(ferrofin_db::DbError::from(e))
 }
 
 /// Fault-injection helpers for the manager's timer tests (they live here so

@@ -57,12 +57,16 @@ pub fn episode_image_order(order: &str, season: i32) -> (&str, i32) {
 /// SeriesDisplayOrder`): empty when the row has none.
 #[must_use]
 pub fn display_order_of(data: Option<&str>) -> String {
-    data.and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
-        .and_then(|data| {
-            data.get("DisplayOrder")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
+    /// The one member read. Deserializing into it skips the blob's other
+    /// members without building a `serde_json::Value` tree for them: a Series
+    /// DTO reads this on every list page.
+    #[derive(Deserialize)]
+    struct DisplayOrderOnly {
+        #[serde(rename = "DisplayOrder")]
+        display_order: Option<String>,
+    }
+    data.and_then(|data| serde_json::from_str::<DisplayOrderOnly>(data).ok())
+        .and_then(|data| data.display_order)
         .unwrap_or_default()
 }
 
@@ -765,6 +769,14 @@ impl TvdbClient {
         self
     }
 
+    /// How long this client reuses what it resolved: the plugin's
+    /// `CacheDurationInHours`, the one duration its `TvdbClientManager`
+    /// keeps every response for.
+    #[must_use]
+    pub fn cache_duration(&self) -> std::time::Duration {
+        self.cache_duration
+    }
+
     /// Sets how old the bearer token may get before the client logs in again
     /// ([`DEFAULT_TOKEN_MAX_AGE`] unless set).
     #[must_use]
@@ -866,12 +878,11 @@ impl TvdbClient {
         language: &str,
         three_letter_names: &[String],
     ) -> Vec<TvdbSearchHit> {
-        let options = crate::provider_manager::naming_options();
-        let parsed = ferrofin_naming::video::video_resolver::clean_date_time(name, options);
-        let parsed_year = parsed.year;
-        let parsed_name =
-            ferrofin_naming::video::video_resolver::try_clean_string(Some(&parsed.name), options)
-                .unwrap_or(parsed.name);
+        let parsed = ferrofin_naming::video::video_resolver::parse_name(
+            name,
+            crate::provider_manager::naming_options(),
+        );
+        let (parsed_name, parsed_year) = (parsed.name, parsed.year);
         let comparable = comparable_name(&parsed_name);
         let query = vec![
             ("query", comparable.clone()),
@@ -1270,8 +1281,7 @@ impl TvdbClient {
 
     /// Downloads an image by absolute URL, returning its bytes.
     pub async fn download(&self, url: &str) -> Option<Vec<u8>> {
-        let resp = crate::image_download::send(&self.http, url).await.ok()?;
-        resp.counted_bytes().await.ok()
+        crate::image_download::download_bytes(url).await
     }
 }
 
@@ -1518,6 +1528,22 @@ mod tests {
         );
         assert_eq!(super::display_order_of(Some("not json")), "");
         assert_eq!(super::display_order_of(None), "");
+        // The blob's other members are skipped, whatever their shape.
+        assert_eq!(
+            super::display_order_of(Some(
+                r#"{"AirDays":["Monday"],"Status":"Ended","Nested":{"A":[1,2,{"B":null}]},"DisplayOrder":"absolute","AirTime":"20:00"}"#
+            )),
+            "absolute"
+        );
+        assert_eq!(super::display_order_of(Some("{}")), "");
+        assert_eq!(super::display_order_of(Some("")), "");
+        // An escaped string reads as its text; a value that is not a string
+        // reads as none, as `Value::as_str` did.
+        assert_eq!(
+            super::display_order_of(Some(r#"{"DisplayOrder":"dvd"}"#)),
+            "dvd"
+        );
+        assert_eq!(super::display_order_of(Some(r#"{"DisplayOrder":3}"#)), "");
         assert_eq!(super::season_lookup_order(""), "official");
         assert_eq!(super::season_lookup_order("  "), "official");
         assert_eq!(super::season_lookup_order("dvd"), "dvd");
@@ -1852,7 +1878,7 @@ mod tests {
                 "/people/",
                 r#"{"data":{"biography":"An actress.","birthDate":"1986-10-23","birthPlace":"London"}}"#.to_owned(),
             ),
-            ("/img.jpg", "IMAGEBYTES".to_owned()),
+            ("/img.jpg", "GIF89aIMAGEBYTES".to_owned()),
         ])
         .await;
         let c = TvdbClient::new().with_base_url(&server.base_url);
@@ -1885,7 +1911,7 @@ mod tests {
             .download(&format!("{}/img.jpg", server.base_url))
             .await
             .expect("download");
-        assert_eq!(bytes, b"IMAGEBYTES");
+        assert_eq!(bytes, b"GIF89aIMAGEBYTES");
     }
 
     #[tokio::test]
@@ -1894,7 +1920,8 @@ mod tests {
         // No /login route → token() fails → every call returns None/empty.
         let server = MockServer::start(vec![("/search", "{}".to_owned())]).await;
         let c = TvdbClient::new().with_base_url(&server.base_url);
-        assert!(c.search("x", None, "en", &[]).await.is_empty());
+        let results = c.search("x", None, "en", &[]).await;
+        assert!(results.is_empty(), "{results:?}");
         assert!(c.series_details(1, "usa").await.is_none());
     }
 
@@ -2111,6 +2138,7 @@ mod tests {
             assert_eq!((images[0].width, images[0].height), (Some(800), Some(0)));
         }
         assert!(client.artwork_types.lock().unwrap().is_some());
-        assert!(client.season_images(5, "official", 99).await.is_empty());
+        let season_images = client.season_images(5, "official", 99).await;
+        assert!(season_images.is_empty(), "{season_images:?}");
     }
 }

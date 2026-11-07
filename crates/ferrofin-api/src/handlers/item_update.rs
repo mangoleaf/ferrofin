@@ -38,6 +38,7 @@ use ferrofin_model::entities::{MetadataField, SeriesStatus, Video3DFormat};
 use ferrofin_traits::library::ScanTarget;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, RefreshPriority};
+use ferrofin_util::finite::finite_or_none;
 use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 
 use crate::handlers::refresh_scan_path;
@@ -72,7 +73,7 @@ pub(crate) async fn update_item(
 ) -> Result<StatusCode, ApiError> {
     let mut item = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     // `var isLockedChanged = item.IsLocked != (request.LockData ?? false)`.
@@ -402,8 +403,11 @@ fn apply_update(
         .map(|value| {
             ferrofin_traits::localization::normalize_original_language(Some(localization), value)
         });
-    item.critic_rating = request.critic_rating.map(f64::from);
-    item.community_rating = request.community_rating.map(f64::from);
+    // The `BaseItem` setters run `FiniteOrNull` (`ItemUpdateController.cs`
+    // v12.4 :247-249): the binder reads `"NaN"` and `"Infinity"`, and the
+    // item keeps no rating for them.
+    item.critic_rating = finite_or_none(request.critic_rating).map(f64::from);
+    item.community_rating = finite_or_none(request.community_rating).map(f64::from);
     item.index_number = request.index_number.map(i64::from);
     item.parent_index_number = request.parent_index_number.map(i64::from);
     item.overview.clone_from(&request.overview);
@@ -942,7 +946,7 @@ async fn update_item_content_type(
 ) -> Result<StatusCode, ApiError> {
     let item = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let folder = state.library.containing_folder_path(&item).await;
@@ -1203,7 +1207,7 @@ async fn refresh_item(
 ) -> Result<StatusCode, ApiError> {
     let item = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
 
@@ -1217,8 +1221,8 @@ async fn refresh_item(
     // Every refresh runs with the request's options: both modes (`None`
     // when omitted, `ItemRefreshController.cs:64-65`), the replace flags,
     // `ForceSave` and `RemoveOldMetadata` as the controller sets them
-    // (`:76-89`), and `RegenerateTrickplay` (which the scan carries but does
-    // not act on yet: see the `TrickplayProvider` work item in the scanner).
+    // (`:76-89`), and `RegenerateTrickplay`, which a `FullRefresh` honours
+    // (`TrickplayProvider`).
     let options = MetadataRefreshOptions::for_item_refresh(
         metadata_refresh_mode,
         image_refresh_mode,
@@ -1302,7 +1306,7 @@ async fn get_metadata_editor(
 ) -> Result<Json<MetadataEditorInfo>, ApiError> {
     let item = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
 
@@ -1594,6 +1598,35 @@ mod tests {
             crate::extract::deserialize_mvc::<UpdateItemRequest>(r#"{"LockedFields": ["Plot"]}"#)
                 .is_err()
         );
+    }
+
+    /// The body binder reads `"NaN"`, `"Infinity"` and `"-Infinity"` as .NET
+    /// does, and `UpdateItem`'s assignments run the `BaseItem` setters'
+    /// `FiniteOrNull` (`ItemUpdateController.cs` v12.4 :247-249): the item
+    /// keeps no rating.
+    #[test]
+    fn a_non_finite_rating_is_stored_as_no_value() {
+        for (critic, community) in [
+            (r#""Infinity""#, r#""NaN""#),
+            (r#""-Infinity""#, r#""Infinity""#),
+        ] {
+            let request: UpdateItemRequest = crate::extract::deserialize_mvc(&format!(
+                r#"{{"Name":"Movie","CriticRating":{critic},"CommunityRating":{community}}}"#
+            ))
+            .expect("the named literals bind");
+            let mut item = crate::test_support::minimal_base_item(
+                uuid::Uuid::new_v4(),
+                "Movie",
+                ferrofin_model::data::BaseItemKind::Movie
+                    .stored_type_name()
+                    .expect("stored name"),
+            );
+            item.critic_rating = Some(80.0);
+            item.community_rating = Some(7.5);
+            super::apply_update(&mut item, &request, &crate::test_support::FakeLocalization);
+            assert_eq!(item.critic_rating, None, "{critic}");
+            assert_eq!(item.community_rating, None, "{community}");
+        }
     }
 
     #[test]

@@ -7,7 +7,9 @@ with the table and key named. Rows only the later database holds are not failure
 login legitimately adds them (a first 12.x scan makes music-artist credits).
 
 The normaliser removes only what the migration chain rewrites by design. Every rule below is a
-change the check stops seeing, so a rule needs a migration to point at.
+change the check stops seeing, so a rule needs a migration to point at. A baseline taken before an
+adoption into other directories (snapshot --moved) also records each path under a previous
+directory as the boot repair rebase_program_data_paths must leave it (program_data_move.py).
 """
 
 import argparse
@@ -23,6 +25,7 @@ import uuid
 
 from clean_value import repaired_clean_value
 from metadata import CheckError
+from program_data_move import moved_path
 from watch_history import timestamp
 
 
@@ -107,21 +110,24 @@ def reauthenticated_devices(users, passwordless):
     }
 
 
-def identities(conn):
-    """{item id: 'path:<Path>'} for every owned item whose path no other item shares."""
-    items = [(normalize(item), path, normalize(owner))
+def identities(conn, moves=()):
+    """{item id: 'path:<Path>'} for every owned item whose path no other item shares; with `moves`
+    (a baseline before an adoption into other directories), the path it must read after the move."""
+    items = [(normalize(item), moved_path(path, moves) if moves else path, normalize(owner))
              for item, path, owner in conn.execute('SELECT "Id", "Path", "OwnerId" FROM "BaseItems"')]
     counts = Counter(path for _, path, _ in items)
     return {item: "path:" + path for item, path, owner in items
             if path and counts[path] == 1 and owner and owner not in NO_OWNER}
 
 
-def table_rows(conn, table, only=None, identity=None, users=None, reauthenticated=frozenset()):
+def table_rows(conn, table, only=None, identity=None, users=None, reauthenticated=frozenset(), moves=()):
     """(columns, {key: sorted row hashes}, {key: [stored, derived]}) of one table, normalised.
 
     `only` limits the hashed columns. Rows that share a key are kept as a multiset so losing one
     of them still fails. The third map carries a re-derived column (DERIVED) and the value its
-    source column derives to, so compare() can tell a rewrite from damage.
+    source column derives to, so compare() can tell a rewrite from damage. `moves` (a baseline of
+    a database adopted into other directories, program_data_move.py) records each path under a
+    previous directory as what it must read after the move.
     """
     info = list(conn.execute(f'PRAGMA table_info("{table}")'))
     if not info:
@@ -137,7 +143,7 @@ def table_rows(conn, table, only=None, identity=None, users=None, reauthenticate
     for record in conn.execute(f'SELECT * FROM "{table}"'):
         if table in USER_OWNED and record["UserId"] is not None and normalize(record["UserId"]) not in users:
             continue
-        row = {name: normalize(record[name]) for name in columns}
+        row = {name: normalize(moved_path(record[name], moves) if moves else record[name]) for name in columns}
         if table == "Devices" and record["DeviceId"] in reauthenticated:
             for name in REAUTH_VOLATILE:
                 row.pop(name, None)
@@ -166,20 +172,22 @@ def table_rows(conn, table, only=None, identity=None, users=None, reauthenticate
     return columns, {key: sorted(digests) for key, digests in rows.items()}, clean
 
 
-def snapshot(db, baseline=None, reauthenticated=frozenset()):
+def snapshot(db, baseline=None, reauthenticated=frozenset(), moves=()):
     """Every table's rows. With a baseline, only the columns it holds (0032 adds some).
     `reauthenticated` names the DeviceIds the harness logs in from (reauthenticated_devices);
-    on a path that re-authenticates, baseline and comparison snapshots must pass the same set."""
+    on a path that re-authenticates, baseline and comparison snapshots must pass the same set.
+    `moves` is [(old, new, host)] for a baseline taken before an adoption into other directories:
+    a path under `old` is recorded as program_data_move.moved_path gives it."""
     reauthenticated = frozenset(reauthenticated)
     with closing(sqlite3.connect(f"file:{db}?mode=ro", uri=True)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("BEGIN")
-        identity = identities(conn)
+        identity = identities(conn, moves)
         users = {normalize(user) for (user,) in conn.execute('SELECT "Id" FROM "Users"')}
         return {"version": SNAPSHOT_VERSION, "tables": {
             table: dict(zip(("columns", "rows", "clean"), table_rows(
                 conn, table, baseline and baseline["tables"][table]["columns"], identity, users,
-                reauthenticated))) for table in TABLES}}
+                reauthenticated, moves))) for table in TABLES}}
 
 
 def compare(before, after):
@@ -222,12 +230,14 @@ def main(argv=None):
     parser.add_argument("mode", choices=("snapshot", "check"))
     parser.add_argument("db")
     parser.add_argument("baseline")
+    parser.add_argument("--moved", nargs=3, action="append", default=[], metavar=("OLD", "NEW", "HOST"),
+                        help="snapshot: a previous directory, the one it moved to, and the copy on this host")
     args = parser.parse_args(argv)
     try:
         if args.mode == "snapshot":
             fd = os.open(args.baseline, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as output:
-                json.dump(snapshot(args.db), output, sort_keys=True)
+                json.dump(snapshot(args.db, moves=[tuple(move) for move in args.moved]), output, sort_keys=True)
             return 0
         before = json.loads(Path(args.baseline).read_text())
         if before.get("version") != SNAPSHOT_VERSION:

@@ -66,6 +66,16 @@ use ferrofin_traits::library::ScanProgressSink;
 /// `00000000-0000-0000-0000-000000000001`).
 const PLACEHOLDER_ITEM_ID: Uuid = Uuid::from_u128(1);
 
+/// How many items' `ItemValues` one writer transaction of
+/// [`FerrofinLibraryManager::update_items`] rewrites, unless the composition
+/// root sets another ([`FerrofinLibraryManager::with_item_values_write_chunk`]).
+/// Upstream's `UpdateItemsAsync` writes a whole batch in one transaction
+/// (`UpdateOrInsertItems`), but its metadata-edit cascades save item by item;
+/// `1` writes each item's links in its own transaction as those saves do. The
+/// chunk bounds how long a large cascade (a lock over every descendant of a
+/// folder) holds the single writer.
+pub const DEFAULT_ITEM_VALUES_WRITE_CHUNK: u32 = 500;
+
 /// The concrete library manager.
 ///
 /// Holds cheaply-cloneable `Arc<dyn _>` handles to the four persistence traits it
@@ -128,25 +138,27 @@ pub struct FerrofinLibraryManager {
     /// (`Video.GetAdditionalPartIds`). Unset, it is Jellyfin's derivation
     /// with no program-data path, which is the same for every media path.
     id_derivation: crate::item_type_lookup::IdDerivation,
-    /// The server's directories, which a delete reads twice: the internal
-    /// metadata root whose per-item folders it removes, and the
+    /// The server's directories, which a file-deleting delete reads: the
     /// `%AppDataPath%`/`%MetadataPath%` expansion of a stored path (an
     /// adopted collection's or playlist's folder) before its files are
     /// deleted. A file delete is never confined to the library locations —
     /// as upstream, whatever path the item names goes. Set by the
-    /// composition root; `None` (unit tests) removes no metadata folder and
-    /// takes stored paths as they are.
+    /// composition root; `None` (unit tests) takes stored paths as they are.
     app_paths: Option<Arc<crate::app_paths::FerrofinServerApplicationPaths>>,
-    /// The extracted-data cleanup `DeleteItem` runs for every deleted row
-    /// (`IExternalDataManager.DeleteExternalItemFiles`). Late-bound: the
-    /// manager is built before the chapter and segment managers it needs.
-    external_data: std::sync::OnceLock<Arc<dyn ferrofin_traits::system::ExternalDataManager>>,
+    /// The metadata-folder and extracted-data cleanup `DeleteItem` runs for
+    /// every deleted row, shared with the scan's removals. Set by the
+    /// composition root; `None` (unit tests) removes neither.
+    item_data: Option<Arc<crate::item_data_cleanup::ItemDataCleanup>>,
+    /// How many items' `ItemValues` one writer transaction of `update_items`
+    /// rewrites; at least 1. [`DEFAULT_ITEM_VALUES_WRITE_CHUNK`] unless set.
+    item_values_write_chunk: usize,
 }
 
 /// `Folder.QueryRecursive`'s post-filter gate (v12.2 Folder.cs:1008-1014): a
 /// user's recursive query for box sets and/or playlists only. Their per-user
 /// access (shares, open access, owner) lives in the item data, so SQL cannot
-/// decide it.
+/// decide it. Any other query has the playlists the user cannot see excluded
+/// by the repository ([`crate::item_visibility::ItemVisibility::hidden_playlists`]).
 fn post_filters_containers(query: &InternalItemsQuery) -> bool {
     query.user.is_some()
         && !query.include_item_types.is_empty()
@@ -313,7 +325,9 @@ fn episode_air_order(item: &BaseItemEntity) -> ferrofin_model::entities_media::A
 /// season belongs to it — and sorted in aired order (season 0 keeps the
 /// series' `SortName` order). Empty when the season has no series.
 /// `season_id` is the season's id; `query` supplies the user and the DTO
-/// options the series query runs with.
+/// options the series query runs with. The series' rows are read with only
+/// the columns the selection reads, and the full rows of the season's
+/// episodes after it (gl-1259).
 #[allow(clippy::too_many_lines)] // source relation resolution, then selection
 pub(crate) async fn season_episode_rows(
     items: &dyn ItemRepository,
@@ -333,7 +347,7 @@ pub(crate) async fn season_episode_rows(
         return Ok(Vec::new());
     };
     let rows = items
-        .get_item_list(&InternalItemsQuery {
+        .get_episode_order_rows(&InternalItemsQuery {
             user: query.user.clone(),
             series_presentation_unique_key: Some(episode_presentation_key(&series)),
             include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Season],
@@ -432,7 +446,17 @@ pub(crate) async fn season_episode_rows(
         // comparer is not a total order, on which `sort_by` may panic.
         stable_sort_by(&mut matches, |(left, _), (right, _)| left.compare(right));
     }
-    Ok(matches.into_iter().map(|(_, row)| row).collect())
+    let ids: Vec<Uuid> = matches
+        .iter()
+        .filter_map(|(_, row)| Uuid::parse_str(&row.id).ok())
+        .collect();
+    let mut full: HashMap<Uuid, BaseItemEntity> = items
+        .retrieve_items(&ids)
+        .await?
+        .into_iter()
+        .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
+        .collect();
+    Ok(ids.iter().filter_map(|id| full.remove(id)).collect())
 }
 
 /// One scan request: what it covers, the options its items refresh with,
@@ -1022,8 +1046,13 @@ impl ScanWorker {
             self.progress.send_modify(|n| *n = n.wrapping_add(1));
         }
         let elapsed_ms = started.elapsed().as_millis();
-        let (created, updated, unchanged, removed) =
-            (total.created, total.updated, total.unchanged, total.removed);
+        let (created, updated, unchanged, removed, skipped) = (
+            total.created,
+            total.updated,
+            total.unchanged,
+            total.removed,
+            total.skipped,
+        );
         // A drain that included a stopped pass did not complete.
         if total.stopped {
             tracing::info!(
@@ -1031,6 +1060,7 @@ impl ScanWorker {
                 updated,
                 unchanged,
                 removed,
+                skipped,
                 elapsed_ms,
                 "library scan stopped"
             );
@@ -1040,6 +1070,7 @@ impl ScanWorker {
                 updated,
                 unchanged,
                 removed,
+                skipped,
                 elapsed_ms,
                 "library scan complete"
             );
@@ -1098,6 +1129,7 @@ impl ScanWorker {
                     updated = pass.updated,
                     unchanged = pass.unchanged,
                     removed = pass.removed,
+                    skipped = pass.skipped,
                     "library scan stopped before it finished"
                 );
                 (ScanResult::Stopped, Some(pass))
@@ -1112,6 +1144,7 @@ impl ScanWorker {
                     updated = pass.updated,
                     unchanged = pass.unchanged,
                     removed = pass.removed,
+                    skipped = pass.skipped,
                     "library scan pass complete"
                 );
                 (ScanResult::Completed, Some(pass))
@@ -1189,6 +1222,7 @@ impl PriorityLane for QueueLane {
                     updated = pass.updated,
                     unchanged = pass.unchanged,
                     removed = pass.removed,
+                    skipped = pass.skipped,
                     "item refresh served inside the running scan"
                 );
                 ScanResult::Completed
@@ -1332,8 +1366,19 @@ impl FerrofinLibraryManager {
             by_name: None,
             changed: None,
             app_paths: None,
-            external_data: std::sync::OnceLock::new(),
+            item_data: None,
+            item_values_write_chunk: DEFAULT_ITEM_VALUES_WRITE_CHUNK as usize,
         }
+    }
+
+    /// Sets how many items' `ItemValues` one writer transaction of
+    /// `update_items` rewrites (a value below 1 is taken as 1). The
+    /// composition root sets it from the server's settings; unit tests keep
+    /// [`DEFAULT_ITEM_VALUES_WRITE_CHUNK`].
+    #[must_use]
+    pub fn with_item_values_write_chunk(mut self, chunk: usize) -> Self {
+        self.item_values_write_chunk = chunk.max(1);
+        self
     }
 
     /// Configure live dashboard display options for controller folder browses.
@@ -1383,7 +1428,7 @@ impl FerrofinLibraryManager {
         let mut resolved = query.clone();
         if resolved.parent_type.is_none()
             && !resolved.parent_id.is_nil()
-            && let Some(parent) = self.items.retrieve_item(resolved.parent_id).await?
+            && let Some(parent) = self.parent_item(&resolved).await?
         {
             resolved.parent_type = serde_json::from_value(serde_json::Value::String(
                 parent
@@ -1478,6 +1523,24 @@ impl FerrofinLibraryManager {
         self.folder_post_filter_result(items, query).await.map(Some)
     }
 
+    /// The query's parent: the row its caller already read
+    /// ([`InternalItemsQuery::known_parent_row`]), else read now. Upstream's
+    /// folder is the item the controller read, so a browse reads its parent
+    /// once.
+    async fn parent_item(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Option<Arc<BaseItemEntity>>, ServiceError> {
+        if let Some(row) = query.known_parent_row() {
+            return Ok(Some(Arc::clone(row)));
+        }
+        Ok(self
+            .items
+            .retrieve_item(query.parent_id)
+            .await?
+            .map(Arc::new))
+    }
+
     /// Season.GetItemsInternal: select aired episodes before Filter and paging.
     /// The existing LibraryManager traits query seam keeps API independent of core.
     async fn season_display_result(
@@ -1485,13 +1548,13 @@ impl FerrofinLibraryManager {
         query: &InternalItemsQuery,
         include_specials: bool,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
-        let season = self.items.retrieve_item(query.parent_id).await?;
+        let season = self.parent_item(query).await?;
         let episodes = match season {
             Some(season) => {
                 season_episode_rows(
                     self.items.as_ref(),
                     query.parent_id,
-                    season,
+                    Arc::unwrap_or_clone(season),
                     query,
                     include_specials,
                 )
@@ -1512,6 +1575,7 @@ impl FerrofinLibraryManager {
             user: resolved.user.clone(),
             parent_id: resolved.parent_id,
             parent_type: resolved.parent_type,
+            parent_row: resolved.parent_row.clone(),
             group_by_presentation_unique_key: false,
             ..InternalItemsQuery::default()
         };
@@ -1612,6 +1676,7 @@ impl FerrofinLibraryManager {
                 user: resolved.user.clone(),
                 parent_id: resolved.parent_id,
                 parent_type: resolved.parent_type,
+                parent_row: resolved.parent_row.clone(),
                 group_by_presentation_unique_key: false,
                 ..InternalItemsQuery::default()
             })
@@ -1646,7 +1711,7 @@ impl FerrofinLibraryManager {
         {
             return Ok(());
         }
-        let Some(set) = self.items.retrieve_item(query.parent_id).await? else {
+        let Some(set) = self.parent_item(query).await? else {
             return Ok(());
         };
         let data = crate::item_data::parse_data(set.data.as_deref());
@@ -1682,7 +1747,7 @@ impl FerrofinLibraryManager {
             })
         };
         let mut items = collections
-            .collapse_items_within_box_sets(&eligible, query.user.as_ref())
+            .collapse_items_within_box_sets(&eligible, query.user.as_deref())
             .await?;
         items.extend(remaining);
         Ok(items)
@@ -1701,6 +1766,7 @@ impl FerrofinLibraryManager {
         let unpaged = InternalItemsQuery {
             start_index: None,
             limit: None,
+            checks_playlist_visibility: true,
             ..query.clone()
         };
         let mut items = self.items.get_item_list(&unpaged).await?;
@@ -1775,13 +1841,15 @@ impl FerrofinLibraryManager {
         self
     }
 
-    /// Late-binds the extracted-data cleanup every delete runs. A second call
-    /// is ignored.
-    pub fn set_external_data(
-        &self,
-        external: Arc<dyn ferrofin_traits::system::ExternalDataManager>,
-    ) {
-        let _ = self.external_data.set(external);
+    /// Attaches the metadata-folder and extracted-data cleanup every delete
+    /// runs before the rows go, the one the scanner's removals share.
+    #[must_use]
+    pub fn with_item_data_cleanup(
+        mut self,
+        cleanup: Arc<crate::item_data_cleanup::ItemDataCleanup>,
+    ) -> Self {
+        self.item_data = Some(cleanup);
+        self
     }
 
     /// Attach library options for request-time series grouping decisions.
@@ -2041,8 +2109,9 @@ impl FerrofinLibraryManager {
 /// handled, is [`crate::item_deletion`]'s.
 impl FerrofinLibraryManager {
     /// A stored path with Jellyfin's `%AppDataPath%`/`%MetadataPath%` tokens
-    /// expanded (an adopted collection's or playlist's folder is stored that
-    /// way); Ferrofin's own rows carry resolved paths.
+    /// expanded (a collection's or playlist's folder is stored that way, an
+    /// adopted one's and one Ferrofin created alike); Ferrofin's other rows
+    /// carry resolved paths.
     fn expand_path(&self, stored: &str) -> String {
         self.app_paths.as_ref().map_or_else(
             || stored.to_owned(),
@@ -2051,50 +2120,6 @@ impl FerrofinLibraryManager {
                     .expand(stored)
             },
         )
-    }
-
-    /// `GetMetadataPaths(item, children)` (`:569-580`, `:694-743`), deleted
-    /// before the item's files: each row's internal metadata folder
-    /// (`{metadata}/library/{id2}/{id}`), Ferrofin's own
-    /// `{metadata}/library/{GUID}`, and the lower-cased one older scans also
-    /// wrote art to ([`crate::item_folders::item_art_folders`]). A folder that
-    /// cannot be removed is logged and passed over, as upstream.
-    ///
-    /// Upstream's list also names a video's internal extracted data
-    /// (trickplay tiles, chapter images, subtitle and attachment caches);
-    /// those go with [`Self::delete_external_files`] after the files, which
-    /// removes every one of them, so a delete whose files cannot be removed
-    /// keeps them.
-    async fn delete_metadata_paths(&self, rows: &[&BaseItemEntity]) {
-        if let Some(paths) = &self.app_paths {
-            use ferrofin_traits::system::ServerApplicationPaths as _;
-            // Every layout: Ferrofin's `{metadata}/library/{GUID}` (and its
-            // older lower-cased spelling) and Jellyfin's
-            // `{metadata}/library/{xx}/{idN}` an adopted item has.
-            let art_root = std::path::Path::new(&paths.internal_metadata_path()).join("library");
-            let folders: Vec<std::path::PathBuf> = rows
-                .iter()
-                .filter_map(|row| Uuid::parse_str(&row.id).ok())
-                .flat_map(|id| crate::item_folders::item_art_folders(&art_root, id))
-                .collect();
-            let removed = tokio::task::spawn_blocking(move || {
-                for folder in folders {
-                    match std::fs::remove_dir_all(&folder) {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(err) => tracing::warn!(
-                            path = %folder.display(),
-                            %err,
-                            "could not delete a deleted item's metadata folder"
-                        ),
-                    }
-                }
-            })
-            .await;
-            if let Err(err) = removed {
-                tracing::error!(%err, "deleting item metadata folders panicked");
-            }
-        }
     }
 
     /// `if ((options.DeleteFileLocation && item.IsFileProtocol) || …)`: the
@@ -2151,37 +2176,6 @@ impl FerrofinLibraryManager {
         .map_err(|e| ServiceError::Backend(format!("deleting item {id}'s files: {e}")))?
         .map_err(|e| ServiceError::Backend(format!("deleting item {id}'s files: {e}")))
     }
-
-    /// `externalDataManager.DeleteExternalItemFiles` for the item and its
-    /// children (`:597-602`), before the rows: each one's extracted data,
-    /// with the trickplay folder saved beside its media.
-    async fn delete_external_files(&self, rows: &[&BaseItemEntity]) {
-        let Some(external) = self.external_data.get() else {
-            return;
-        };
-        for row in rows {
-            let Ok(id) = Uuid::parse_str(&row.id) else {
-                continue;
-            };
-            let path = row
-                .path
-                .as_deref()
-                .map(|p| self.expand_path(p))
-                .unwrap_or_default();
-            let containing_folder = if path.is_empty() {
-                String::new()
-            } else {
-                crate::video_versions::containing_folder_path_at(row, &path)
-            };
-            let media = ferrofin_traits::system::MediaLocation {
-                path: &path,
-                containing_folder: &containing_folder,
-            };
-            if let Err(err) = external.delete_external_item_files(id, media).await {
-                tracing::warn!(item_id = %id, %err, "could not delete a deleted item's extracted data");
-            }
-        }
-    }
 }
 
 impl FerrofinLibraryManager {
@@ -2207,11 +2201,17 @@ impl FerrofinLibraryManager {
         // then the files — the first path's failure stops the delete here,
         // with every row in place — then the extracted data
         // (`DeleteExternalItemFiles`, `:597-602`), then the rows (`:604`).
-        self.delete_metadata_paths(&affected).await;
+        if let Some(item_data) = &self.item_data {
+            item_data.delete_metadata_folders(&affected).await;
+        }
         if options.delete_file_location {
             self.delete_item_files(id, row, kind).await?;
         }
-        self.delete_external_files(&affected).await;
+        if let Some(item_data) = &self.item_data {
+            // An explicit delete takes the trickplay folder beside the media
+            // whoever else names that file, as upstream's does.
+            item_data.delete_extracted_data(&affected, &|_| false).await;
+        }
         let removed = self.persistence.delete_items(&[id]).await?;
         // `ItemRemoved` (LibraryChangedNotifier): the item, then everything
         // the delete took with it, which have no rows left to read.
@@ -2868,14 +2868,14 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items.get_image_infos(item_id).await
     }
 
-    async fn get_item_images_with_auto_orient(
+    async fn get_item_images_to_serve(
         &self,
         item_id: Uuid,
-    ) -> Result<(Vec<ferrofin_traits::options::ItemImageInfo>, bool), ServiceError> {
+    ) -> Result<ferrofin_traits::options::ItemImagesToServe, ServiceError> {
         if item_id.is_nil() {
-            return Ok((Vec::new(), false));
+            return Ok(ferrofin_traits::options::ItemImagesToServe::default());
         }
-        self.items.get_image_infos_with_auto_orient(item_id).await
+        self.items.get_image_infos_to_serve(item_id).await
     }
 
     async fn get_chapter_image(
@@ -2987,6 +2987,13 @@ impl LibraryManager for FerrofinLibraryManager {
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         self.items.get_item_list(query).await
+    }
+
+    async fn get_episode_order_rows(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.items.get_episode_order_rows(query).await
     }
 
     fn empty_by_name_item(&self, kind: BaseItemKind) -> BaseItemEntity {
@@ -3161,13 +3168,19 @@ impl LibraryManager for FerrofinLibraryManager {
         // Re-index each item's genre/tag/studio/artist links: the filter
         // facets and by-name browses read `ItemValues`, not the row columns,
         // so a metadata edit that only saved the row was invisible to them
-        // until the next full scan.
-        for item in items {
-            let Ok(id) = Uuid::parse_str(&item.id) else {
-                continue;
-            };
-            let values = crate::library_scan::item_values_of(item);
-            self.persistence.save_item_values(id, &values).await?;
+        // until the next full scan. Batched, as `UpdateOrInsertItems` saves
+        // every item's values in its one transaction
+        // (`ItemPersistenceService.cs:334`), but in chunks, so a cascade over
+        // a large folder does not hold the single writer for all of it.
+        let values: Vec<(Uuid, Vec<(i32, String)>)> = items
+            .iter()
+            .filter_map(|item| {
+                let id = Uuid::parse_str(&item.id).ok()?;
+                Some((id, crate::library_scan::item_values_of(item)))
+            })
+            .collect();
+        for chunk in values.chunks(self.item_values_write_chunk) {
+            self.persistence.save_item_values_for_items(chunk).await?;
         }
         // `Video.UpdateToRepositoryAsync` (`Video.cs:704-726`): a saved
         // primary's local versions take its metadata. Only a video whose
@@ -5049,10 +5062,7 @@ mod tests {
             request(paths(&["/m/z"]), MetadataRefreshOptions::default()),
             true,
         );
-        let late_l = queue.enqueue(
-            request(lib.clone(), MetadataRefreshOptions::default()),
-            true,
-        );
+        let late_l = queue.enqueue(request(lib, MetadataRefreshOptions::default()), true);
         assert_eq!(queue.pending.len(), 2);
         assert_eq!(
             queue.pending[1].waiters.tickets,
@@ -5702,6 +5712,137 @@ mod tests {
         assert_eq!(facets.tags, vec!["4K".to_owned(), "Christmas".to_owned()]);
     }
 
+    /// One `save_item_values_for_items` call's items, each with its values.
+    type ItemValuesBatch = Vec<(Uuid, Vec<(i32, String)>)>;
+
+    /// An item store that records how `ItemValues` were written: each batched
+    /// call's items with their values, and how many single-item calls came
+    /// through.
+    #[derive(Default)]
+    struct ItemValueWrites {
+        batches: std::sync::Mutex<Vec<ItemValuesBatch>>,
+        singles: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ItemPersistenceService for ItemValueWrites {
+        async fn delete_items(&self, _: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn deletion_closure(&self, _: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn save_items(&self, _: &[BaseItemEntity]) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn set_primary_version_id(
+            &self,
+            _: Uuid,
+            _: Option<Uuid>,
+        ) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn set_parent_id(&self, _: Uuid, _: Uuid) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn set_collection_type(&self, _: Uuid, _: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn save_item_values(&self, _: Uuid, _: &[(i32, String)]) -> Result<(), ServiceError> {
+            self.singles
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn save_item_values_for_items(
+            &self,
+            items: &[(Uuid, Vec<(i32, String)>)],
+        ) -> Result<(), ServiceError> {
+            self.batches.lock().expect("batches").push(items.to_vec());
+            Ok(())
+        }
+        async fn item_exists(&self, _: Uuid) -> Result<bool, ServiceError> {
+            Ok(true)
+        }
+        async fn set_ancestors(&self, _: Uuid, _: &[Uuid]) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn save_images(&self, _: &BaseItemEntity) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn reattach_user_data(&self, _: &BaseItemEntity) -> Result<(), ServiceError> {
+            Ok(())
+        }
+        async fn update_inherited_values(&self) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// A batch edit (a lock or rating cascade over a series) re-indexes the
+    /// items' `ItemValues` in batched writes, as `UpdateOrInsertItems` saves
+    /// them in its one transaction, not one writer transaction per item; the
+    /// chunk size splits the batch. Each item keeps its own values, in the
+    /// caller's order, and a row whose id is not a GUID is still skipped.
+    #[tokio::test]
+    async fn update_items_writes_the_item_values_in_batches() {
+        let row = |id: u128, genres: &str| BaseItemEntity {
+            id: Uuid::from_u128(id).to_string(),
+            type_: "MediaBrowser.Controller.Entities.TV.Episode".to_owned(),
+            genres: Some(genres.to_owned()),
+            ..BaseItemEntity::default()
+        };
+        let not_a_guid = BaseItemEntity {
+            id: "not-a-guid".to_owned(),
+            ..row(0, "Drama")
+        };
+        let items = [
+            row(0xE2, "Drama"),
+            not_a_guid,
+            row(0xE1, "Comedy|Drama"),
+            row(0xE3, "News"),
+        ];
+        let written: ItemValuesBatch = [&items[0], &items[2], &items[3]]
+            .into_iter()
+            .map(|item| {
+                (
+                    Uuid::parse_str(&item.id).expect("guid"),
+                    crate::library_scan::item_values_of(item),
+                )
+            })
+            .collect();
+        let db = test_db().await;
+        for (chunk, expected) in [
+            (None, vec![written.clone()]),
+            (Some(2), vec![written[..2].to_vec(), written[2..].to_vec()]),
+            (
+                Some(0),
+                written.iter().map(|one| vec![one.clone()]).collect(),
+            ),
+        ] {
+            let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+                Arc::new(ItemTypeLookup::new());
+            let store = Arc::new(ItemValueWrites::default());
+            let mut mgr = FerrofinLibraryManager::new(
+                Arc::new(FerrofinItemRepository::new(db.clone(), lookup)),
+                Arc::new(FerrofinItemCountService::new(db.clone())),
+                Arc::clone(&store) as _,
+                Arc::new(FerrofinPeopleRepository::new(db.clone())),
+            );
+            if let Some(chunk) = chunk {
+                mgr = mgr.with_item_values_write_chunk(chunk);
+            }
+
+            mgr.update_items(&items, None).await.expect("update");
+
+            assert_eq!(
+                store.singles.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "no per-item write"
+            );
+            let batches = store.batches.lock().expect("batches").clone();
+            assert_eq!(batches, expected, "chunk {chunk:?}");
+        }
+    }
+
     /// C# re-derives `SortName` on every save of a loaded item: the mapper
     /// sets `ForcedSortName` after `SortName`, and that setter (like `Name`'s)
     /// nulls the cached key, so the save reads it back from `ForcedSortName` or
@@ -5915,12 +6056,8 @@ mod tests {
                 .expect("missing")
                 .is_none()
         );
-        assert!(
-            mgr.get_visible_item_ids(&[], &user)
-                .await
-                .expect("empty")
-                .is_empty()
-        );
+        let visible_item_ids = mgr.get_visible_item_ids(&[], &user).await.expect("empty");
+        assert!(visible_item_ids.is_empty(), "{visible_item_ids:?}");
         assert!(mgr.get_visible_item_ids(&[id], &user).await.is_err());
     }
 
@@ -5968,12 +6105,13 @@ mod tests {
                 .unwrap(),
             [shown]
         );
+        let parentally_allowed_item_ids = library
+            .get_parentally_allowed_item_ids(&[], &user, true)
+            .await
+            .unwrap();
         assert!(
-            library
-                .get_parentally_allowed_item_ids(&[], &user, true)
-                .await
-                .unwrap()
-                .is_empty()
+            parentally_allowed_item_ids.is_empty(),
+            "{parentally_allowed_item_ids:?}"
         );
     }
 
@@ -6280,12 +6418,11 @@ mod tests {
         );
 
         // Empty input yields an empty result without a query.
-        assert!(
-            mgr.get_named_items(BaseItemKind::Genre, &[])
-                .await
-                .expect("empty")
-                .is_empty()
-        );
+        let named_items = mgr
+            .get_named_items(BaseItemKind::Genre, &[])
+            .await
+            .expect("empty");
+        assert!(named_items.is_empty(), "{named_items:?}");
     }
 
     /// Two rows of the SAME kind sharing a `CleanName` must resolve to the same
@@ -6386,12 +6523,11 @@ mod tests {
 
         // Empty input yields an empty result without a query; a blank name is a
         // slot that resolves to nothing rather than a dropped slot.
-        assert!(
-            mgr.get_named_item_ids(BaseItemKind::Genre, &[])
-                .await
-                .expect("empty")
-                .is_empty()
-        );
+        let named_item_ids = mgr
+            .get_named_item_ids(BaseItemKind::Genre, &[])
+            .await
+            .expect("empty");
+        assert!(named_item_ids.is_empty(), "{named_item_ids:?}");
         assert_eq!(
             mgr.get_named_item_ids(BaseItemKind::Genre, &[String::new(), " ".to_owned()])
                 .await
@@ -6439,7 +6575,7 @@ mod tests {
             .await
             .expect("ancestors")
             .expect("item exists");
-        assert!(roots.is_empty());
+        assert!(roots.is_empty(), "{roots:?}");
 
         // A missing item yields None so the API maps it to 404.
         assert!(
@@ -7271,7 +7407,7 @@ mod tests {
         }
         library.persistence.save_items(&rows).await.unwrap();
         let query = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             parent_id: one,
             parent_type: Some(BaseItemKind::Season),
             apply_folder_display_options: true,
@@ -7399,7 +7535,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert!(orphan_result.items.is_empty());
+            assert!(orphan_result.items.is_empty(), "{:?}", orphan_result.items);
             for recursive in [false, true] {
                 let direct = library
                     .query_items(&InternalItemsQuery {
@@ -7588,7 +7724,7 @@ mod tests {
             crate::test_support::save_item(&db, &row).await;
         }
         let listing = |user: &ferrofin_db::entities::users::UserEntity, limit| InternalItemsQuery {
-            user: Some(user.clone()),
+            user: Some(Arc::new(user.clone())),
             recursive: true,
             include_item_types: vec![BaseItemKind::Playlist],
             apply_folder_display_options: true,
@@ -7737,7 +7873,7 @@ mod tests {
 
         let result = library
             .query_items(&InternalItemsQuery {
-                user: Some(user),
+                user: Some(Arc::new(user)),
                 recursive: true,
                 include_item_types: vec![BaseItemKind::BoxSet],
                 apply_folder_display_options: true,
@@ -7766,7 +7902,7 @@ mod tests {
         );
         let result = library
             .query_items(&InternalItemsQuery {
-                user: Some(fixture.user),
+                user: Some(Arc::new(fixture.user)),
                 parent_id: fixture.set,
                 parent_type: Some(BaseItemKind::BoxSet),
                 apply_folder_display_options: true,
@@ -7865,7 +8001,7 @@ mod tests {
         };
         let list = |recursive: bool, order: Vec<(ItemSortBy, SortOrder)>| {
             let query = InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 parent_id: set_id,
                 parent_type: Some(BaseItemKind::BoxSet),
                 recursive,
@@ -7923,7 +8059,7 @@ mod tests {
         // sits between Zeta and Mid, and Beta falls outside its window.
         let around = library
             .query_items(&InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 parent_id: set_id,
                 parent_type: Some(BaseItemKind::BoxSet),
                 apply_folder_display_options: true,
@@ -8032,7 +8168,7 @@ mod tests {
                 .unwrap();
         }
         let query = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             parent_id: folder,
             parent_type: Some(BaseItemKind::CollectionFolder),
             recursive: true,
@@ -8216,17 +8352,15 @@ mod tests {
             .unwrap();
         assert_eq!(adjacent.total_record_count, 2);
         assert_eq!(names(adjacent), ["Charlie video", "Zulu movie collection"]);
-        assert!(
-            library
-                .query_items(&InternalItemsQuery {
-                    adjacent_to: Some(Uuid::new_v4()),
-                    ..plain.clone()
-                })
-                .await
-                .unwrap()
-                .items
-                .is_empty()
-        );
+        let items = library
+            .query_items(&InternalItemsQuery {
+                adjacent_to: Some(Uuid::new_v4()),
+                ..plain.clone()
+            })
+            .await
+            .unwrap()
+            .items;
+        assert!(items.is_empty(), "{items:?}");
 
         assert_eq!(
             names(library.query_items(&plain).await.unwrap()),
@@ -8256,7 +8390,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outside.total_record_count, 3);
-        assert!(outside.items.is_empty());
+        assert!(outside.items.is_empty(), "{:?}", outside.items);
         assert!(
             library
                 .query_items(&InternalItemsQuery {

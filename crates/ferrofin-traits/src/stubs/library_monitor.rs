@@ -34,6 +34,8 @@ impl LibraryMonitor for NoopLibraryMonitor {
         Ok(())
     }
 
+    fn restart(&self) {}
+
     async fn report_file_system_change_beginning(&self, path: &str) -> Result<(), ServiceError> {
         if path.is_empty() {
             return Err(ServiceError::invalid_input("path can't be empty"));
@@ -69,6 +71,7 @@ mod tests {
     async fn lifecycle_is_a_noop() {
         let monitor = NoopLibraryMonitor;
         monitor.start().await.expect("start");
+        monitor.restart();
         monitor.stop().await.expect("stop");
     }
 

@@ -443,7 +443,8 @@ mod tests {
         assert_eq!(tags.album_artists, ["Solo"]);
         assert_eq!(credits(&tags, false), [("Solo".to_owned(), "Artist")]);
         // No tags, no credits.
-        assert!(credits(&for_library(&info(&[]), None), false).is_empty());
+        let found = credits(&for_library(&info(&[]), None), false);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     fn info_without_album_artist() -> MediaInfo {
@@ -524,7 +525,7 @@ mod tests {
             &info(&[("artist", "Standard"), ("artists", " ")]),
             Some(&options),
         );
-        assert!(tags.artists.is_empty());
+        assert!(tags.artists.is_empty(), "{:?}", tags.artists);
         let tags = for_library(
             &info(&[
                 ("track.artists", "First\u{001f}Second"),
@@ -534,11 +535,8 @@ mod tests {
         );
         assert_eq!(tags.artists, ["First", "Second"]);
         assert_eq!(tags.album_artists, ["Album"]);
-        assert!(
-            for_library(&info(&[("artists", "Ignored")]), None)
-                .artists
-                .is_empty()
-        );
+        let artists = for_library(&info(&[("artists", "Ignored")]), None).artists;
+        assert!(artists.is_empty(), "{artists:?}");
     }
 
     #[test]

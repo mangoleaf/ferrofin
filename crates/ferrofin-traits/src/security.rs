@@ -1,7 +1,10 @@
-//! Security-layer traits — pluggable authentication and Quick Connect.
+//! Security-layer traits — pluggable authentication, password reset and Quick
+//! Connect.
 //!
 //! Port of `MediaBrowser.Controller.Authentication.IAuthenticationProvider`
-//! (surfaced here as [`AuthenticationManager`]) and
+//! (surfaced here as [`AuthenticationManager`]),
+//! `MediaBrowser.Controller.Authentication.IPasswordResetProvider`
+//! ([`PasswordResetManager`]) and
 //! `MediaBrowser.Controller.QuickConnect.IQuickConnect` ([`QuickConnect`]).
 //!
 //! Port rules applied throughout:
@@ -12,19 +15,22 @@
 //!   pre-resolved user, and [`AuthenticationManager::new_user_policy`] exposes
 //!   the default policy. `ProviderAuthenticationResult` is ported as
 //!   [`ProviderAuthenticationResult`].
+//! - The C# `GetType().FullName` a user's `AuthenticationProviderId` stores
+//!   becomes [`AuthenticationManager::id`], beside the display
+//!   [`name`](AuthenticationManager::name).
 //! - [`QuickConnect::get_authorized_request`] returns the
 //!   [`AuthenticationResultData`] (session and token) of the C#
 //!   `AuthenticationResult`; the API layer adds its `User` and `ServerId`.
 //! - `Task<T>` → `async fn -> Result<T, ServiceError>`; the `IsEnabled` property
 //!   becomes an `async fn` so implementations may consult live configuration.
 //!
-//! Both traits are object-safe and carry `_assert_object_safe_*` assertions.
+//! Every trait is object-safe and carries an `_assert_object_safe_*` assertion.
 
 use async_trait::async_trait;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::quick_connect::QuickConnectResult;
 use ferrofin_model::security::AuthenticationInfo;
-use ferrofin_model::users::UserPolicy;
+use ferrofin_model::users::{ForgotPasswordResult, PinRedeemResult, UserPolicy};
 use uuid::Uuid;
 
 use crate::error::ServiceError;
@@ -34,7 +40,8 @@ use crate::session::AuthenticationResultData;
 /// The result of a successful provider authentication.
 ///
 /// Port of `ProviderAuthenticationResult`: the resolved canonical username plus
-/// an optional display name.
+/// an optional display name, and an administrator flag the C# result does not
+/// carry ([`administrator`](Self::administrator)).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProviderAuthenticationResult {
     /// The canonical username the credentials resolved to.
@@ -42,6 +49,22 @@ pub struct ProviderAuthenticationResult {
 
     /// An optional display name supplied by the provider.
     pub display_name: Option<String>,
+
+    /// Whether the signed-in user should be an administrator, or `None` to
+    /// leave their flag as it is. Once this provider has authenticated the
+    /// user, before the account checks (disabled, remote access, schedule),
+    /// the user manager applies it through
+    /// [`UserManager::apply_external_administrator`](crate::library::UserManager::apply_external_administrator),
+    /// which never demotes the last administrator: the user stays one and a
+    /// warning is logged.
+    ///
+    /// Upstream's LDAP plugin sets the flag itself, calling
+    /// `IUserManager.UpdateUserAsync` from inside `Authenticate`, which works
+    /// because upstream's user lock nests. The login lock Ferrofin holds
+    /// across a provider does not, so a provider that saved the policy of the
+    /// user it is signing in would wait on that lock forever. It reports the
+    /// flag here instead.
+    pub administrator: Option<bool>,
 }
 
 /// A pluggable authentication backend (built-in, LDAP, …).
@@ -51,8 +74,18 @@ pub struct ProviderAuthenticationResult {
 /// grouping; concrete providers register in `ferrofin-core`.
 #[async_trait]
 pub trait AuthenticationManager: Send + Sync {
-    /// The provider's display name.
+    /// The provider's display name, the `Name` `GET /Auth/Providers` lists.
     fn name(&self) -> &str;
+
+    /// The id a user's `AuthenticationProviderId` stores to select this
+    /// provider, the `Id` `GET /Auth/Providers` lists (C# `GetType().FullName`).
+    ///
+    /// Defaults to [`name`](Self::name). A provider whose display name and
+    /// stored id differ overrides it: LDAP-Auth shows `LDAP-Authentication`
+    /// and stores `Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin`.
+    fn id(&self) -> &str {
+        self.name()
+    }
 
     /// Whether the provider is currently enabled.
     async fn is_enabled(&self) -> Result<bool, ServiceError>;
@@ -82,6 +115,52 @@ pub trait AuthenticationManager: Send + Sync {
 }
 
 fn _assert_object_safe_authentication_manager(_: &dyn AuthenticationManager) {}
+
+/// A pluggable password-reset backend: the built-in PIN file, or a
+/// directory's reset page (LDAP-Auth).
+///
+/// Port of `IPasswordResetProvider`. A user's `PasswordResetProviderId`
+/// stores the [`id`](Self::id) that selects it for their forgotten-password
+/// requests (`UserManager.GetPasswordResetProviders(User)`), and every provider
+/// is offered a PIN in turn until one redeems it
+/// (`UserManager.RedeemPasswordResetPin`).
+#[async_trait]
+pub trait PasswordResetManager: Send + Sync {
+    /// The provider's display name, the `Name` `GET /Auth/PasswordResetProviders`
+    /// lists.
+    fn name(&self) -> &str;
+
+    /// The id a user's `PasswordResetProviderId` stores to select this
+    /// provider, the `Id` `GET /Auth/PasswordResetProviders` lists (C#
+    /// `GetType().FullName`). Defaults to [`name`](Self::name).
+    fn id(&self) -> &str {
+        self.name()
+    }
+
+    /// Whether the provider is currently enabled.
+    async fn is_enabled(&self) -> Result<bool, ServiceError>;
+
+    /// Starts a forgotten-password request for `entered_username`: `user` is
+    /// the account it names, or `None` when it names none, and
+    /// `is_in_network` whether the request came from the local network.
+    async fn start_forgot_password_process(
+        &self,
+        user: Option<&UserEntity>,
+        entered_username: &str,
+        is_in_network: bool,
+    ) -> Result<ForgotPasswordResult, ServiceError>;
+
+    /// Redeems a PIN this provider issued.
+    ///
+    /// A provider with no request matching `pin`, or one that issues no PINs,
+    /// answers a [`PinRedeemResult`] with `success` false, never an error: an
+    /// error stops the redemption, so it would keep a later provider from
+    /// redeeming its own PIN. (Upstream's LDAP provider throws
+    /// `NotImplementedException` here.)
+    async fn redeem_password_reset_pin(&self, pin: &str) -> Result<PinRedeemResult, ServiceError>;
+}
+
+fn _assert_object_safe_password_reset_manager(_: &dyn PasswordResetManager) {}
 
 /// Drives the Quick Connect pairing flow.
 ///
@@ -151,8 +230,9 @@ mod tests {
     #[test]
     fn provider_result_default_is_empty() {
         let r = ProviderAuthenticationResult::default();
-        assert!(r.username.is_empty());
+        assert_eq!(r.username, "");
         assert_eq!(r.display_name, None);
+        assert_eq!(r.administrator, None, "no flag leaves the user's alone");
     }
 
     #[test]
@@ -160,8 +240,10 @@ mod tests {
         let r = ProviderAuthenticationResult {
             username: "alice".to_owned(),
             display_name: Some("Alice".to_owned()),
+            administrator: Some(true),
         };
         assert_eq!(r.username, "alice");
         assert_eq!(r.display_name.as_deref(), Some("Alice"));
+        assert_eq!(r.administrator, Some(true));
     }
 }

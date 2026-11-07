@@ -119,7 +119,9 @@ pub(crate) async fn load_keys_for_items(
 ///
 /// The page's rows are already read, so a child that names its series seeds the
 /// walk with that series instead of being read again; only a child without one
-/// is read, for its parents. One walk for the page (gl-982).
+/// is read, for its parents (and, should its stored row name a series by now,
+/// for that series, which `resolve_series` then follows). One walk for the
+/// page (gl-982).
 pub(crate) async fn load_child_series_keys(
     conn: &mut sqlx::SqliteConnection,
     children: &[&BaseItemEntity],
@@ -165,11 +167,13 @@ pub(crate) struct StoredIdentity {
     pub retention_keys: Vec<String>,
 }
 
+/// Each item's keys and retention keys, by its stored id, from one read: the items, the series a
+/// season or an episode names, and the parents one without a series walks ([`KEY_ROWS_SQL`]).
 pub(crate) async fn load_identities(
     conn: &mut sqlx::SqliteConnection,
     ids: &[String],
 ) -> Result<Vec<StoredIdentity>, ServiceError> {
-    let rows = identity_rows(conn, ids).await?;
+    let rows = key_rows(conn, ids).await?;
     Ok(ids
         .iter()
         .filter_map(|id| {
@@ -183,27 +187,6 @@ pub(crate) async fn load_identities(
             })
         })
         .collect())
-}
-
-/// Reuse the two existing SQL statement nodes for both page and write reads.
-/// The identity query includes only necessary fallback parents; explicit Series
-/// pointers are loaded together in a second batch if they were not on the page.
-async fn identity_rows(
-    conn: &mut sqlx::SqliteConnection,
-    ids: &[String],
-) -> Result<std::collections::HashMap<String, KeyRow>, ServiceError> {
-    let mut rows = key_rows(conn, ids).await?;
-    let mut series: Vec<String> = ids
-        .iter()
-        .filter_map(|id| rows.get(id))
-        .filter(|row| matches!(row.kind, BaseItemKind::Season | BaseItemKind::Episode))
-        .filter_map(|row| row.series_id.filter(|id| !id.is_nil()).map(guid_to_db))
-        .filter(|id| !rows.contains_key(id))
-        .collect();
-    series.sort_unstable();
-    series.dedup();
-    rows.extend(key_rows(conn, &series).await?);
-    Ok(rows)
 }
 
 fn resolve_series<'a>(
@@ -233,12 +216,26 @@ fn resolve_series<'a>(
     None
 }
 
-/// [`key_rows`]' read: the items, the series/season chain an episode or season walks for its key,
-/// and their provider ids, joined through `BaseItemProviders`' primary key (one row per provider).
+/// [`key_rows`]' read: the items, the series a season or an episode names in its `SeriesId`, the
+/// series/season chain one with an empty or nil `SeriesId` walks for its key instead, and their
+/// provider ids, joined through `BaseItemProviders`' primary key (one row per provider).
+///
+/// The named series comes in the same walk as the items (gl-988): it is read by its key from the
+/// item's own row, `json_each` first and then the item and its series by `Id`, an order the
+/// `CROSS JOIN`s pin. A filter on `Type` left to the planner would read the items through
+/// `IX_BaseItems_Type_TopParentId_StartDate` instead. The series does not walk its own parents
+/// (`WalkParents` 0): a named pointer counts only when it is a `Series`, and an item that walks
+/// to its nearest `Series` reads every ancestor in its own walk. Like the `ParentId` hop, the
+/// pointer is matched in its stored hyphenated form, whatever its case.
 pub(crate) const KEY_ROWS_SQL: &str = r#"WITH RECURSIVE identity_ids("Id", "WalkParents") AS (
                SELECT "Id", CASE WHEN "Type" IN (?2, ?3)
                    AND ("SeriesId" IS NULL OR "SeriesId" = ?4) THEN 1 ELSE 0 END
                FROM "BaseItems" WHERE "Id" IN (SELECT value FROM json_each(?1))
+               UNION
+               SELECT series."Id", 0 FROM json_each(?1) AS seed
+               CROSS JOIN "BaseItems" AS seeded ON seeded."Id" = seed.value
+               CROSS JOIN "BaseItems" AS series ON series."Id" = upper(seeded."SeriesId")
+               WHERE seeded."Type" IN (?2, ?3) AND seeded."SeriesId" <> ?4
                UNION
                SELECT parent."Id", 1 FROM identity_ids AS current
                JOIN "BaseItems" AS child ON child."Id" = current."Id"
@@ -374,8 +371,9 @@ mod tests {
     use super::*;
     use crate::test_support::test_db;
 
-    /// The items, their walk and their providers come in one read, the providers through
-    /// `BaseItemProviders`' key, never a scan (`EXPLAIN QUERY PLAN`).
+    /// The items, the series they name, their walk and their providers come in one read, the
+    /// providers through `BaseItemProviders`' key and the named series through the item's and the
+    /// series' own, never a scan or the `Type` index (`EXPLAIN QUERY PLAN`).
     #[tokio::test]
     async fn the_key_read_joins_the_providers_by_their_key() {
         let db = test_db().await;
@@ -401,6 +399,26 @@ mod tests {
             !steps
                 .iter()
                 .any(|s| s.starts_with("SCAN p") || s.starts_with("SCAN b")),
+            "{steps:?}"
+        );
+        for alias in ["seeded", "series"] {
+            assert!(
+                steps.iter().any(
+                    |s| s.starts_with(&format!("SEARCH {alias} USING")) && s.contains("(Id=?)")
+                ),
+                "{alias} is read by its key: {steps:?}"
+            );
+            assert!(
+                !steps
+                    .iter()
+                    .any(|s| s.starts_with(&format!("SCAN {alias}"))),
+                "{steps:?}"
+            );
+        }
+        assert!(
+            !steps
+                .iter()
+                .any(|s| s.contains("IX_BaseItems_Type_TopParentId_StartDate")),
             "{steps:?}"
         );
     }

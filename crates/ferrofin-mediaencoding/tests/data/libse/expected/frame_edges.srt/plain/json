@@ -1,0 +1,1 @@
+{"TrackEvents":[{"Id":"1","Text":"well-formed, so ffprobe opens the file","StartPositionTicks":4170000,"EndPositionTicks":8340000},{"Id":"2","Text":"a negative start read as frames","StartPositionTicks":0,"EndPositionTicks":28340000},{"Id":"3","Text":"past 99:59:59.999, so read as zero","StartPositionTicks":0,"EndPositionTicks":0}]}

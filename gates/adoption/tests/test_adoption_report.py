@@ -124,7 +124,7 @@ class Page(Scratch):
 
     def test_the_messy_shapes_show_both_end_states_and_where_the_expectation_comes_from(self):
         page = self.full_run()
-        self.assertIn("Messy shapes: Ferrofin's end state against Jellyfin 12.2", page)
+        self.assertIn("Messy shapes: Ferrofin's end state against Jellyfin's", page)
         self.assertIn("deleted_user", page)
         self.assertIn("written divergence: 0045 re-spells it", page)
         self.assertIn("&quot;owner&quot;: &quot;lower&quot;", page)

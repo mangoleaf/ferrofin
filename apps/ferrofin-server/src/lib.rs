@@ -3,8 +3,8 @@
 //! Loads bootstrap [`config`], opens + migrates the SQLite DB, discovers ffmpeg,
 //! constructs the concrete `ferrofin-core` managers and injects them as the
 //! `Arc<dyn Trait>` fields of `ferrofin-api`'s `AppState`, seeds a default
-//! administrator on a fresh install, mounts the router, and serves with graceful
-//! shutdown.
+//! administrator (and the `library_roots` libraries) on a fresh install, mounts
+//! the router, and serves with graceful shutdown.
 //!
 //! The bring-up is split into small, independently-callable pieces so the binary
 //! (`main.rs`) and the First-Light integration test can each sequence them:
@@ -12,7 +12,8 @@
 //! - [`config`] — bootstrap configuration resolution (CLI > env > file > default).
 //! - [`bootstrap`] — startup side-effects (logging, database, ffmpeg discovery).
 //! - [`state::build_app_state`] — the manager-wiring composition root.
-//! - [`seed::seed_default_admin`] — fresh-install administrator seeding.
+//! - [`seed::seed_default_admin`] — fresh-install administrator seeding, and
+//!   [`seed::seed_library_roots`], the libraries `library_roots` names.
 //! - [`media_encoding`] — the ffmpeg-backed transcode/HLS + attachment pair.
 //! - [`run`] — the end-to-end boot-and-serve entry point the binary calls.
 //!
@@ -21,6 +22,7 @@
 mod base_url;
 pub mod bootstrap;
 pub mod config;
+mod connection_limits;
 mod encoding_options;
 mod existing_database;
 pub mod listen;
@@ -28,7 +30,9 @@ mod log_lines;
 pub mod media_encoding;
 pub mod metrics_wiring;
 pub mod planner;
+mod recording_library;
 pub mod seed;
+pub mod settings;
 mod startup;
 pub mod state;
 #[cfg(test)]
@@ -56,7 +60,7 @@ use crate::bootstrap::{
     FfmpegPaths, discover_ffmpeg, init_tracing, open_database, shutdown_tracing,
 };
 use crate::config::Config;
-use crate::seed::{SeedOutcome, seed_default_admin};
+use crate::seed::{SeedOutcome, seed_default_admin, seed_library_roots};
 use crate::state::{WiredApp, build_app_state};
 
 /// The version Ferrofin reports for itself (startup log line and the session
@@ -86,6 +90,8 @@ fn log_startup_banner(config: &Config) {
     );
     tracing::info!(
         data_dir = %config.data_dir.display(),
+        config_file = %config.config_file.display(),
+        config_file_found = config.config_file_found,
         config_dir = %config.config_dir.display(),
         cache_dir = %config.cache_dir.display(),
         web_dir = %config.web_dir.display(),
@@ -102,7 +108,7 @@ fn log_startup_banner(config: &Config) {
     tracing::info!(
         library_roots = config.library_roots.len(),
         admin_user = %config.admin_user,
-        admin_password_set = !config.admin_password.is_empty(),
+        admin_password_set = !config.admin_password.trim().is_empty(),
         "library & admin"
     );
 }
@@ -230,12 +236,12 @@ async fn shutdown_signal(
 
 /// The graceful-shutdown future handed to axum: waits for the first shutdown
 /// trigger, then tells connected clients before the socket drains, so they
-/// show "server unavailable" instead of silently hanging (C# sends
-/// `ServerShuttingDown` for restart and shutdown alike — 10.11.8 has no
-/// `ServerRestarting` push — so both drain the same way), and closes every
-/// WebSocket: an upgraded connection is outside axum's drain, and a socket
-/// that survived would stay bound to the OLD host's session manager after an
-/// in-process restart (Kestrel closes them on stop; clients reconnect).
+/// show "server unavailable" instead of silently hanging (`ServerShuttingDown`
+/// for restart and shutdown alike, where C# sends `ServerRestarting` for a
+/// restart: gl-1123), and closes every WebSocket: an upgraded connection is
+/// outside axum's drain, and a socket that survived would stay bound to the OLD
+/// host's session manager after an in-process restart (Kestrel closes them on
+/// stop; clients reconnect).
 async fn announce_shutdown(
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     sessions: Arc<dyn ferrofin_traits::session::SessionManager>,
@@ -271,10 +277,11 @@ async fn announce_shutdown(
 ///
 /// `POST /System/Restart` (and a scheduled backup restore) re-create the host
 /// IN-PROCESS: the server drains, the state is dropped, and [`serve_once`] runs
-/// again on the same configuration — Jellyfin's `Program.Main`
-/// `do { … } while (_restartOnShutdown)`. A container therefore survives a
-/// restart without a supervisor, exactly as a Jellyfin container does. Shutdown
-/// and signals return from here and the process exits.
+/// again — Jellyfin's `Program.Main` `do { … } while (_restartOnShutdown)`. A
+/// container therefore survives a restart without a supervisor, exactly as a
+/// Jellyfin container does. Shutdown and signals return from here and the
+/// process exits. Every lifetime here runs on `config`; the binary runs
+/// [`run_reloading`] instead, which loads `config.toml` again for each one.
 ///
 /// # Errors
 ///
@@ -283,10 +290,43 @@ async fn announce_shutdown(
 /// fails, seeding fails, the listener cannot bind the configured address, or the
 /// server loop errors.
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    run_lifetimes(config, None).await
+}
+
+/// [`run`], with `reload` called for the configuration of each in-process
+/// restart, as Jellyfin's restart loop builds a new host that reads its XML
+/// configuration again. The binary passes a [`Config::load`] of its command
+/// line, so a changed `config.toml` applies on `POST /System/Restart`.
+///
+/// What the process holds for its whole life (the directories, the log
+/// filter and format, the scan-duration histogram buckets) keeps its running
+/// value, with a warning naming each such setting that changed
+/// ([`Config::for_restart`]). A reload that fails (a `config.toml` that no
+/// longer parses or validates) is logged as an error naming the file, and the
+/// next lifetime runs on the configuration this one ran on: a server with no
+/// supervisor must not stop over an edit. A cold boot still fails fast, in
+/// `main`, before this is called.
+///
+/// # Errors
+///
+/// As [`run`].
+pub async fn run_reloading(
+    config: Config,
+    mut reload: impl FnMut() -> anyhow::Result<Config> + Send,
+) -> anyhow::Result<()> {
+    run_lifetimes(config, Some(&mut reload)).await
+}
+
+/// The restart loop behind [`run`] and [`run_reloading`].
+async fn run_lifetimes(
+    mut config: Config,
+    mut reload: Option<&mut (dyn FnMut() -> anyhow::Result<Config> + Send)>,
+) -> anyhow::Result<()> {
     // Hold the log-writer guard until after the server drains so the last
     // buffered file-log lines flush rather than being discarded on exit.
     let _log_guard = init_tracing(&config);
     log_startup_banner(&config);
+    log_load_warnings(&config);
     // The Prometheus pipeline is process-global (OTel meter provider + the
     // set-once HTTP instruments), so it lives across in-process restarts.
     let mut metrics = None;
@@ -297,7 +337,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     loop {
         let started = std::time::Instant::now();
         match serve_once(&config, started, &mut metrics, &signals).await {
-            Ok(true) => tracing::info!("restart requested — re-creating the host in-process"),
+            Ok(true) => {
+                tracing::info!("restart requested — re-creating the host in-process");
+                if let Some(reload) = reload.as_deref_mut() {
+                    // A small file read on the loop's own task, once per restart.
+                    config = next_lifetime_config(&config, reload());
+                }
+            }
             Ok(false) => break,
             // The one place a failed boot or serve is logged, so it reaches the
             // log file as well as the exit status `main` reports.
@@ -315,6 +361,49 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // loses the last spans is a bug. No-op when trace export is disabled.
     shutdown_tracing();
     Ok(())
+}
+
+/// The configuration the next in-process lifetime runs on: `reloaded`, with
+/// what the process holds for its life kept at its running value
+/// ([`Config::for_restart`]); or `running` again when the reload failed.
+fn next_lifetime_config(running: &Config, reloaded: anyhow::Result<Config>) -> Config {
+    match reloaded {
+        Ok(reloaded) => {
+            let (next, kept) = running.for_restart(reloaded);
+            tracing::info!(
+                path = %next.config_file.display(),
+                config_file_found = next.config_file_found,
+                "configuration loaded again for the restart"
+            );
+            log_load_warnings(&next);
+            if !kept.is_empty() {
+                tracing::warn!(
+                    settings = ?kept,
+                    "these settings changed but apply only when the server process restarts; \
+                     the in-process restart keeps their running values"
+                );
+            }
+            next
+        }
+        Err(error) => {
+            tracing::error!(
+                path = %running.config_file.display(),
+                error = format!("{error:#}"),
+                "the configuration could not be loaded again; restarting on the one already running"
+            );
+            running.clone()
+        }
+    }
+}
+
+/// Logs what loading `config` set aside ([`Config::load_warnings`]): loading
+/// runs before tracing is installed, so its findings are logged here instead.
+/// Each names its key or variable; `config_file` is the file in use, as
+/// context (a warning about a variable is not about that file).
+fn log_load_warnings(config: &Config) {
+    for warning in &config.load_warnings {
+        tracing::warn!(config_file = %config.config_file.display(), "{warning}");
+    }
 }
 
 /// Marks setup complete when the wizard flag says it is not but a configured
@@ -406,9 +495,9 @@ async fn apply_scheduled_restore_off_runtime(
 }
 
 /// Applies a restore scheduled by `POST /Backup/Restore`, before the database
-/// is opened. Returns the failure of a restore rejected before it wrote
-/// anything (to be recorded once the activity log exists); a restore that
-/// failed part-way aborts the boot.
+/// is opened. Returns the failure of a restore that replaced nothing (to be
+/// recorded once the activity log exists); a restore that failed part-way
+/// through moving its files into place aborts the boot.
 ///
 /// First it runs [`check_storage_capacity`], whose failure aborts the boot, as
 /// Jellyfin does: once per process (`Program.cs:138`), and again when a restore
@@ -432,28 +521,30 @@ fn apply_scheduled_restore(
                 None
             }
             Ok(None) => None,
-            // Extraction began and failed: the trees may be half replaced. Jellyfin
-            // throws out of startup here; booting on them would let the web client
-            // (which reads "the server answers again" as success) announce a
-            // restore that did not happen.
+            // Moving the extracted files into place began and failed: the trees are
+            // partly replaced. Jellyfin throws out of startup here; booting on them
+            // would let the web client (which reads "the server answers again" as
+            // success) announce a restore that did not happen. The marker is gone, so
+            // the next boot starts on them, as a restarted Jellyfin does.
             Err(failure) if failure.partially_applied => {
                 return Err(anyhow::anyhow!(
                     "the scheduled backup restore failed part-way and the data directory may be \
                  partly restored: {failure}"
                 ));
             }
-            // Rejected before anything was written (missing or foreign archive):
-            // the server boots on its untouched data and records the failure in the
-            // activity log, where an administrator will see it.
+            // Nothing was replaced (a missing or foreign archive, a marker that could
+            // not be removed, or an extraction that failed and removed what it
+            // wrote): the server boots on its untouched data and records the failure
+            // in the activity log, where an administrator will see it.
             Err(failure) => {
-                tracing::error!(error = %failure, "scheduled backup restore was rejected");
+                tracing::error!(error = %failure, "scheduled backup restore failed and replaced nothing");
                 Some(failure)
             }
         },
     )
 }
 
-/// Records a rejected restore in the activity log: the only durable,
+/// Records a restore that replaced nothing in the activity log: the only durable,
 /// administrator-visible trace of it.
 async fn record_restore_failure(
     activity: &dyn ferrofin_traits::activity::ActivityManager,
@@ -577,10 +668,11 @@ async fn serve_once(
     // Fresh-install seeding: on a database with no users, create the configured
     // default administrator (port of `UserManager.InitializeAsync` +
     // startup-wizard `UpdateStartupUser`). A no-op once any user exists.
-    match seed_default_admin(wired.state.users.as_ref(), config)
+    let seeded = seed_default_admin(wired.state.users.as_ref(), config)
         .await
-        .context("failed to seed the default administrator")?
-    {
+        .context("failed to seed the default administrator")?;
+    let fresh_install = seeded.is_fresh_install();
+    match seeded {
         SeedOutcome::AlreadyInitialized => {
             tracing::info!("existing users found — skipping fresh-install seeding");
         }
@@ -600,6 +692,22 @@ async fn serve_once(
                  wizard at /web, or set FERROFIN_ADMIN_PASSWORD for a headless install"
             );
         }
+    }
+    // `library_roots` seeds the libraries of that same fresh install, and never
+    // a later one: a library its administrator removed must stay removed.
+    if fresh_install {
+        seed_library_roots(
+            wired.state.virtual_folders.as_ref(),
+            wired.state.library_monitor.as_ref(),
+            wired.state.library.as_ref(),
+            &config.library_roots,
+        )
+        .await;
+    } else if !config.library_roots.is_empty() {
+        tracing::info!(
+            library_roots = config.library_roots.len(),
+            "library_roots is ignored: it only seeds a fresh install, and this server already has users"
+        );
     }
 
     ensure_startup_wizard_integrity(wired.state.users.as_ref(), wired.state.config.as_ref())
@@ -717,7 +825,7 @@ async fn tear_down_host(
     sampler: Option<tokio::task::JoinHandle<()>>,
 ) {
     stop_background_tasks(discovery.into_iter().chain(sampler).collect()).await;
-    cancel_running_tasks(wired.state.tasks.as_ref()).await;
+    wired.task_manager.shutdown().await;
     wired.state.library.shutdown_scans().await;
     stop_background_tasks(wired.background).await;
 }
@@ -799,6 +907,7 @@ fn lifetime_app(
 struct Serving {
     servers: tokio::task::JoinSet<std::io::Result<()>>,
     stop: tokio::sync::watch::Sender<bool>,
+    limits: connection_limits::ConnectionLimits,
 }
 
 impl Serving {
@@ -807,10 +916,20 @@ impl Serving {
         listeners: impl IntoIterator<Item = listen::ServedListener>,
         app: &axum::Router,
     ) -> Self {
+        Self::start_with_limits(listeners, app, connection_limits::KESTREL_LIMITS)
+    }
+
+    /// Starts serving `app` on every listener, under `limits`.
+    fn start_with_limits(
+        listeners: impl IntoIterator<Item = listen::ServedListener>,
+        app: &axum::Router,
+        limits: connection_limits::ConnectionLimits,
+    ) -> Self {
         let (stop, _) = tokio::sync::watch::channel(false);
         let mut serving = Self {
             servers: tokio::task::JoinSet::new(),
             stop,
+            limits,
         };
         serving.serve(listeners, app);
         serving
@@ -825,15 +944,20 @@ impl Serving {
         for listener in listeners {
             let mut stop = self.stop.subscribe();
             let app = app.clone();
+            let listener = connection_limits::LimitedListener::new(listener, self.limits);
             self.servers.spawn(async move {
                 // Each connection's peer (`ConnectInfo`, which handlers read, e.g.
                 // `GET /System/Endpoint`) and the address it was accepted on, which
                 // the IP gate compares with it (C# `IsLocal()`).
                 let make_service = tower::service_fn(
-                    move |stream: axum::serve::IncomingStream<'_, listen::ServedListener>| {
+                    move |stream: axum::serve::IncomingStream<
+                        '_,
+                        connection_limits::LimitedListener<listen::ServedListener>,
+                    >| {
                         let peer = *stream.remote_addr();
-                        let local = stream.io().local_addr().ok();
-                        let transport = stream.io().transport();
+                        let local = stream.io().inner().local_addr().ok();
+                        let transport = stream.io().inner().transport();
+                        let requests = stream.io().requests();
                         let app = app.clone();
                         async move {
                             let service = tower::ServiceBuilder::new()
@@ -849,7 +973,9 @@ impl Serving {
                                     request
                                 })
                                 .service(app);
-                            Ok::<_, std::convert::Infallible>(service)
+                            Ok::<_, std::convert::Infallible>(connection_limits::track_requests(
+                                requests, service,
+                            ))
                         }
                     },
                 );
@@ -873,7 +999,9 @@ impl Serving {
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
         timeout_secs: u32,
     ) -> anyhow::Result<()> {
-        let Self { mut servers, stop } = self;
+        let Self {
+            mut servers, stop, ..
+        } = self;
         let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             shutdown.await;
@@ -1002,22 +1130,6 @@ fn listen_addresses(
     )
 }
 
-/// Cancels every scheduled task currently running (best-effort: a task that
-/// finishes in between is simply no longer running).
-async fn cancel_running_tasks(tasks: &dyn ferrofin_traits::tasks::TaskManager) {
-    let Ok(list) = tasks.get_tasks().await else {
-        return;
-    };
-    for task in list {
-        if task.state == ferrofin_model::tasks::TaskState::Running
-            && let Some(id) = task.id.as_deref()
-            && let Err(e) = tasks.cancel_task(id).await
-        {
-            tracing::debug!(task = id, error = %e, "could not cancel a running task on shutdown");
-        }
-    }
-}
-
 /// The on-disk roots a scheduled backup restore writes to, resolved before the
 /// configuration manager exists: the configured data/config dirs and database
 /// file, plus `MetadataPath` read straight from `system.json` so a relocated
@@ -1082,6 +1194,25 @@ impl Signals {
     }
 }
 
+/// Sets the socket options of an accepted connection.
+pub(crate) fn configure_accepted(stream: &mut tokio::net::TcpStream) {
+    disable_nagle(stream);
+    enable_keepalive(stream);
+}
+
+/// Turns TCP keep-alive on (`SO_KEEPALIVE`), so the kernel ends a connection
+/// whose peer vanished without a FIN or RST. Nothing else would end one that is
+/// running a request with no data to send, such as a stalled upload. Probe
+/// timing stays the host's (`net.ipv4.tcp_keepalive_*`).
+///
+/// Kestrel sets no such option. A failure is logged and ignored, as
+/// [`disable_nagle`]'s is.
+fn enable_keepalive(stream: &tokio::net::TcpStream) {
+    if let Err(error) = socket2::SockRef::from(stream).set_keepalive(true) {
+        tracing::debug!(%error, "failed to set SO_KEEPALIVE on an accepted connection");
+    }
+}
+
 /// Turns Nagle's algorithm off on every accepted connection (`TCP_NODELAY`).
 ///
 /// Kestrel — the server Jellyfin runs on — sets `NoDelay` on accepted sockets by
@@ -1101,7 +1232,7 @@ impl Signals {
 /// A failure to set the option is logged and ignored: it is an optimisation, not
 /// a correctness requirement, and a connection that cannot take the sockopt must
 /// still be served.
-pub(crate) fn disable_nagle(stream: &mut tokio::net::TcpStream) {
+fn disable_nagle(stream: &tokio::net::TcpStream) {
     if let Err(error) = stream.set_nodelay(true) {
         tracing::debug!(%error, "failed to set TCP_NODELAY on an accepted connection");
     }
@@ -1145,7 +1276,7 @@ fn enable_metrics_endpoint(
         }
     }
     let process = process.as_ref()?;
-    *router = metrics_wiring::mount(std::mem::take(router), &process.handle);
+    *router = metrics_wiring::mount(std::mem::take(router), &process.handle, state);
     Some(metrics_wiring::spawn_sampler(
         process.gauges.clone(),
         Arc::clone(&state.sessions),
@@ -1250,6 +1381,7 @@ fn mount_web(
         .route("/", get(|| async { Redirect::permanent("/web/") }))
         .layer(axum::middleware::from_fn(redirect_bare_web))
         .layer(transform_layer)
+        .layer(axum::middleware::from_fn(no_cache_web_index))
         // Jellyfin's `UseResponseCompression()` sits above BOTH its API and its
         // static-file middleware, and jellyfin-web's bundles are the payloads
         // that gain most from it. `nest_service` mounts a service the API
@@ -1319,6 +1451,38 @@ fn web_file_mime(path: &str) -> &'static str {
         "svg" => "image/svg+xml",
         _ => "text/plain; charset=utf-8",
     }
+}
+
+/// Sends `/web`'s `index.html` with `Cache-Control: no-cache`, as Jellyfin's
+/// static-file `OnPrepareResponse` does (`Jellyfin.Server/Startup.cs`), so a
+/// browser revalidates the page instead of running a heuristically cached copy
+/// after an upgrade. A directory request is an `index.html` request.
+///
+/// Upstream sets it on every status its static-file middleware answers with
+/// (`200`, `206`, `304`, `412`, `416`), never on a miss that falls through.
+async fn no_cache_web_index(req: Request, next: Next) -> Response {
+    let index = req
+        .uri()
+        .path()
+        .strip_prefix("/web/")
+        .is_some_and(|rel| matches!(rel.rsplit('/').next(), Some("" | "index.html")));
+    let mut response = next.run(req).await;
+    let status = response.status();
+    if index
+        && (status.is_success()
+            || matches!(
+                status,
+                axum::http::StatusCode::NOT_MODIFIED
+                    | axum::http::StatusCode::PRECONDITION_FAILED
+                    | axum::http::StatusCode::RANGE_NOT_SATISFIABLE
+            ))
+    {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+    }
+    response
 }
 
 /// Redirects the exact path `/web` (no trailing slash) to `/web/`, so
@@ -1748,6 +1912,97 @@ mod tests {
         );
     }
 
+    /// `index.html` goes out with `Cache-Control: no-cache` on every status
+    /// Jellyfin's static-file middleware answers it with (measured on 12.4), so
+    /// a browser revalidates the page after an upgrade instead of running a
+    /// cached one that names chunks the new bundle no longer has. Other files
+    /// and misses carry no `Cache-Control`, as upstream.
+    #[rstest::rstest]
+    #[case::directory("/web/", None, StatusCode::OK, true)]
+    #[case::file("/web/index.html", None, StatusCode::OK, true)]
+    #[case::range("/web/index.html", Some(("range", "bytes=0-3")), StatusCode::PARTIAL_CONTENT, true)]
+    #[case::bad_range(
+        "/web/index.html",
+        Some(("range", "bytes=9999-")),
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        true
+    )]
+    #[case::precondition(
+        "/web/index.html",
+        Some(("if-match", "\"other\"")),
+        StatusCode::PRECONDITION_FAILED,
+        true
+    )]
+    #[case::asset("/web/bundle.js", None, StatusCode::OK, false)]
+    #[case::nested("/web/sub/index.html", None, StatusCode::OK, true)]
+    #[case::missing("/web/nope/index.html", None, StatusCode::NOT_FOUND, false)]
+    #[tokio::test]
+    async fn web_index_is_sent_no_cache(
+        #[case] uri: &str,
+        #[case] header: Option<(&str, &str)>,
+        #[case] status: StatusCode,
+        #[case] no_cache: bool,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<!doctype html>ferrofin").unwrap();
+        std::fs::write(dir.path().join("bundle.js"), "//js").unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/index.html"), "<!doctype html>").unwrap();
+        let app = mount_web(Router::new(), dir.path(), transformations(dir.path()));
+
+        let mut request = Request::builder().uri(uri);
+        if let Some((name, value)) = header {
+            request = request.header(name, value);
+        }
+        let response = app
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .map(axum::http::HeaderValue::as_bytes),
+            no_cache.then_some(&b"no-cache"[..]),
+        );
+    }
+
+    /// The `no-cache` page survives revalidation (a `304`) and the File
+    /// Transformation pipeline, which upstream also serves through
+    /// `OnPrepareResponse`.
+    #[tokio::test]
+    async fn web_index_stays_no_cache_when_revalidated_or_transformed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), "<body></body>").unwrap();
+        let service = transformations(dir.path());
+        let app = mount_web(Router::new(), dir.path(), Arc::clone(&service));
+        let get = |headers: &[(&str, &str)]| {
+            let mut request = Request::builder().uri("/web/");
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            app.clone().oneshot(request.body(Body::empty()).unwrap())
+        };
+
+        let first = get(&[]).await.unwrap();
+        let etag = first.headers()["etag"].to_str().unwrap().to_owned();
+        let revalidated = get(&[("if-none-match", etag.as_str())]).await.unwrap();
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(revalidated.headers()["cache-control"], "no-cache");
+
+        service
+            .add_transformation(uuid::Uuid::from_u128(12), "index.html", Arc::new(Upper))
+            .await;
+        let transformed = get(&[]).await.unwrap();
+        assert_eq!(transformed.status(), StatusCode::OK);
+        assert_eq!(transformed.headers()["cache-control"], "no-cache");
+        let body = axum::body::to_bytes(transformed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"<BODY></BODY>");
+    }
+
     #[tokio::test]
     async fn api_only_when_no_bundle() {
         let dir = tempfile::tempdir().unwrap();
@@ -1861,7 +2116,7 @@ mod tests {
     /// Discriminating: a plain `TcpListener` accepts with `TCP_NODELAY` **off**
     /// (asserted first, so the test fails loudly if the platform ever changes
     /// that premise and makes the assertion below vacuous), and `axum::serve`
-    /// adds nothing of its own. Drop the `.tap_io(disable_nagle)` from
+    /// adds nothing of its own. Drop the `.tap_io(configure_accepted)` from
     /// [`listen::bind`] — or stub `disable_nagle` out — and the second
     /// assertion fails.
     #[tokio::test]
@@ -1892,6 +2147,39 @@ mod tests {
         assert!(
             served.nodelay().expect("nodelay"),
             "accepted connections must have TCP_NODELAY set"
+        );
+        drop((served, client));
+    }
+
+    /// The listener `run` binds turns TCP keep-alive on, which a raw accepted
+    /// socket has off.
+    #[tokio::test]
+    async fn accepted_connections_have_tcp_keepalive_enabled() {
+        use axum::serve::Listener as _;
+
+        let plain = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let client = tokio::net::TcpStream::connect(plain.local_addr().expect("addr"))
+            .await
+            .expect("connect");
+        let (raw, _) = plain.accept().await.expect("accept");
+        assert!(
+            !socket2::SockRef::from(&raw).keepalive().expect("keepalive"),
+            "a raw accepted socket is expected to have SO_KEEPALIVE off; if it is on by \
+             default this test can no longer discriminate"
+        );
+        drop((raw, client, plain));
+
+        let mut listener = super::listen::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (served, _) = listener.accept().await;
+        assert!(
+            socket2::SockRef::from(&served)
+                .keepalive()
+                .expect("keepalive"),
+            "accepted connections must have SO_KEEPALIVE set"
         );
         drop((served, client));
     }

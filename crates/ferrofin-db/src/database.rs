@@ -13,6 +13,10 @@ use crate::error::Result;
 ///
 /// `sqlx::migrate!()` reads the directory at **compile time**, so building
 /// this crate needs no live database or `DATABASE_URL`.
+///
+/// A migration runs while the previous version can still be writing the same
+/// database: read "Migrations and one-shot repairs" in `CONTRIBUTING.md` before
+/// adding one.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The version of the last migration in this build's chain: a database
@@ -52,17 +56,22 @@ pub struct ImageParentRow {
     pub album_artists: Option<String>,
     /// The on-disk path (`Path`), if any.
     pub path: Option<String>,
-    /// The integrated loudness in LUFS (`LUFS`), if measured.
-    #[sqlx(rename = "LUFS")]
+    /// The integrated loudness in LUFS (`LUFS`), if measured (a non-finite
+    /// value reads as `None`).
+    #[sqlx(rename = "LUFS", try_from = "crate::entities::finite_real::FiniteReal")]
     pub lufs: Option<f64>,
-    /// The stored normalization gain (`NormalizationGain`), if any.
+    /// The stored normalization gain (`NormalizationGain`), if any (a
+    /// non-finite one reads as `None`).
+    #[sqlx(try_from = "crate::entities::finite_real::FiniteReal")]
     pub normalization_gain: Option<f64>,
 }
 
 /// A handle to Ferrofin's SQLite database, wrapping two connection pools: a
 /// multi-connection **reader** pool ([`Database::pool`]) and a
-/// single-connection **writer** pool ([`Database::writer`]), plus a private
-/// one-connection pool for [`Database::snapshot_to`].
+/// single-connection **writer** pool ([`Database::writer`]), plus private
+/// one-connection pools for [`Database::snapshot_to`] and for the WAL
+/// checkpoints, which a background task runs so that no commit on the writer
+/// waits for one.
 ///
 /// SQLite under WAL serves many concurrent readers but exactly one writer at a
 /// time. Funnelling every write through a 1-connection pool turns would-be
@@ -81,11 +90,18 @@ pub struct Database {
     /// a long `VACUUM INTO` holds neither the writer nor a reader slot and
     /// [`Database::close`] still waits for it.
     snapshotter: SqlitePool,
+    /// One connection, opened on first use, for the WAL checkpoints the
+    /// writer's commits leave to [`crate::wal_checkpoints::run`], so no write
+    /// waits on a checkpoint's syncs.
+    pub(crate) checkpointer: SqlitePool,
+    /// What the writer's WAL hook, the checkpoint task and
+    /// [`Database::truncate_wal`] share.
+    pub(crate) checkpoints: Arc<crate::wal_checkpoints::WalCheckpoints>,
     /// One snapshot or one vacuum-and-checkpoint pass at a time
     /// ([`Database::try_maintenance_turn`]), shared by every clone.
     maintenance: Arc<tokio::sync::Mutex<()>>,
-    /// The cross-request caches of policy and library rows ([`crate::row_cache`]), shared by
-    /// every clone.
+    /// The cross-request caches of policy and library rows and of whether a tuner host exists
+    /// ([`crate::row_cache`]), shared by every clone.
     rows: Arc<crate::row_cache::RowCache>,
     /// The on-disk database file, when file-backed (`None` for in-memory).
     /// Lets [`Database::run_migrations`] snapshot the file before a
@@ -108,17 +124,34 @@ impl Database {
         Self::connect_sized(url, None).await
     }
 
-    /// [`Database::connect`] with an explicit pool size.
-    ///
-    /// `Some(n)` pins the pool at exactly `n` connections; `None` uses the
-    /// sizing formula ([`default_pool_size`]). The composition root resolves
-    /// its config layers (`FERROFIN_DB_POOL` env / `db_pool` in `config.toml`)
-    /// into this parameter — this crate no longer reads the environment.
+    /// [`Database::connect_tuned`] with the default statement cache
+    /// ([`DEFAULT_STATEMENT_CACHE_CAPACITY`]).
     ///
     /// # Errors
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the URL is invalid or
     /// the pool cannot be opened.
     pub async fn connect_sized(url: &str, pool_size: Option<u32>) -> Result<Self> {
+        Self::connect_tuned(url, pool_size, None).await
+    }
+
+    /// [`Database::connect`] with an explicit pool size and statement cache.
+    ///
+    /// `pool_size` `Some(n)` pins the pool at exactly `n` connections; `None`
+    /// uses the sizing formula ([`default_pool_size`]). `statement_cache` is
+    /// how many prepared statements each connection keeps, reader and writer
+    /// pools alike; `None` keeps [`DEFAULT_STATEMENT_CACHE_CAPACITY`]. The
+    /// composition root resolves its config layers (`FERROFIN_DB_POOL` /
+    /// `db_pool`, `FERROFIN_DB_STATEMENT_CACHE` / `db_statement_cache`) into
+    /// these parameters — this crate does not read the environment.
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the URL is invalid or
+    /// the pool cannot be opened.
+    pub async fn connect_tuned(
+        url: &str,
+        pool_size: Option<u32>,
+        statement_cache: Option<u32>,
+    ) -> Result<Self> {
         // Readers keep the full 30s busy timeout: WAL readers normally never
         // block on the writer, but VACUUM / wal_checkpoint(TRUNCATE) take
         // EXCLUSIVE locks — a 5s reader timeout turned a long vacuum into hard
@@ -132,7 +165,14 @@ impl Database {
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(30))
             .pragma("mmap_size", MMAP_SIZE_BYTES.to_string())
-            .foreign_keys(true);
+            .foreign_keys(true)
+            .statement_cache_capacity(
+                statement_cache.map_or(DEFAULT_STATEMENT_CACHE_CAPACITY, |n| {
+                    usize::try_from(n).unwrap_or(DEFAULT_STATEMENT_CACHE_CAPACITY)
+                }),
+            );
+        // The writer, the snapshot pool and the migration connection below
+        // inherit the read options, statement cache included.
         let write_options = read_options
             .clone()
             .busy_timeout(std::time::Duration::from_secs(30));
@@ -192,27 +232,35 @@ impl Database {
         // pool's connection would have no `ferrofin_random()` and every
         // random-ordered query would fail with "no such function".
         init_sqlite();
-        let options = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")?
+            .foreign_keys(true)
+            .statement_cache_capacity(DEFAULT_STATEMENT_CACHE_CAPACITY);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(options)
             .await?;
         // Reader and writer are the SAME 1-connection pool: a second pool
         // would open its own, empty in-memory database.
+        // An in-memory database has no WAL, so nothing checkpoints on it.
         let writer = pool.clone();
         let snapshotter = pool.clone();
+        let checkpointer = pool.clone();
         Ok(Self {
             pool,
             writer,
             snapshotter,
+            checkpointer,
+            checkpoints: Arc::default(),
             maintenance: Arc::default(),
             rows: Arc::new(crate::row_cache::RowCache::new()),
             file_path: None,
         })
     }
 
-    /// Builds the reader, writer and snapshot pools from fully-formed connect
-    /// options.
+    /// Builds the reader, writer, snapshot and checkpoint pools from
+    /// fully-formed connect options, and spawns the checkpoint task
+    /// ([`crate::wal_checkpoints::run`]) the writer's commits hand their
+    /// checkpoints to.
     ///
     /// `pool_size` `None` selects [`default_pool_size`] for the reader pool;
     /// the writer pool is always exactly one connection (SQLite allows one
@@ -229,14 +277,30 @@ impl Database {
         let snapshotter = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_lazy_with(read_options.clone());
+        let checkpointer = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(read_options.clone());
+        let checkpoints = Arc::new(crate::wal_checkpoints::WalCheckpoints::default());
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect_with(read_options)
             .await?;
+        // Every writer connection hands its automatic checkpoints to the task.
+        // The callback owns `checkpoints` for the pool's life, which is what
+        // keeps the hook's context alive under every connection.
+        let take_over = Arc::clone(&checkpoints);
         let writer = SqlitePoolOptions::new()
             .max_connections(1)
+            .after_connect(move |conn, _| {
+                let checkpoints = Arc::clone(&take_over);
+                Box::pin(async move { checkpoints.take_over(conn).await })
+            })
             .connect_with(write_options)
             .await?;
+        tokio::spawn(tracing::Instrument::instrument(
+            crate::wal_checkpoints::run(checkpointer.clone(), Arc::clone(&checkpoints)),
+            tracing::info_span!(parent: None, "wal_checkpoints"),
+        ));
         // One-time at startup: the reader pool size is the concurrent-read thread
         // count (each sqlx SQLite connection owns a dedicated OS thread), the
         // single operational knob behind read throughput.
@@ -249,6 +313,8 @@ impl Database {
             pool,
             writer,
             snapshotter,
+            checkpointer,
+            checkpoints,
             maintenance: Arc::default(),
             rows: Arc::new(crate::row_cache::RowCache::new()),
             file_path,
@@ -398,13 +464,14 @@ impl Database {
     }
 
     /// Drops the cached library set. Called after a committed write that adds, removes, renames
-    /// or edits a library, its row or its options.
+    /// or edits a library, its row or its options, or a view's or the playlists folder's row.
     pub fn invalidate_libraries(&self) {
         self.rows.invalidate_libraries();
     }
 
     /// Called after a committed write to the `BaseItems` rows `ids` (stored GUID form): drops the
-    /// cached library set if one of them is a library row.
+    /// cached library set if one of them is in it (a library, a row above one, a view or the
+    /// playlists folder).
     pub fn note_items_written<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
         self.rows.note_items_written(ids);
     }
@@ -426,12 +493,7 @@ impl Database {
         Ok(rows)
     }
 
-    /// How many Live TV tuner hosts are configured.
-    ///
-    /// The Live TV availability gate reads this — C#
-    /// `LiveTvManager.IsLiveTvEnabled` tests `TunerHosts.Length > 0`, and with
-    /// no tuner Jellyfin leaves the Live TV view out of `GetUserViews`
-    /// entirely.
+    /// How many Live TV tuner hosts are configured, read from the database.
     ///
     /// # Errors
     ///
@@ -441,6 +503,31 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
         Ok(count)
+    }
+
+    /// Whether any Live TV tuner host is configured, from the cross-request cache or, on a miss,
+    /// [`Database::live_tv_tuner_count`] ([`crate::row_cache`]).
+    ///
+    /// The Live TV availability gate reads this — C# `LiveTvManager.IsLiveTvEnabled` tests
+    /// `TunerHosts.Length > 0` on the `LiveTvOptions` it holds in memory, and with no tuner
+    /// Jellyfin leaves the Live TV view out of `GetUserViews` entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read fails.
+    pub async fn live_tv_tuner_hosts_exist(&self) -> Result<bool> {
+        if let Some(hit) = self.rows.tuner_hosts_exist() {
+            return Ok(hit);
+        }
+        let generation = self.rows.tuner_generation();
+        let exist = self.live_tv_tuner_count().await? > 0;
+        Ok(self.rows.put_tuner_hosts_exist(generation, exist))
+    }
+
+    /// Drops the cached answer of [`Database::live_tv_tuner_hosts_exist`]. Called after a
+    /// committed write to `FerrofinLiveTvTunerHosts`.
+    pub fn invalidate_live_tv_tuner_hosts(&self) {
+        self.rows.invalidate_tuner_hosts();
     }
 
     /// Writes a `FerrofinMeta` value, replacing any existing one.
@@ -584,7 +671,7 @@ impl Database {
     ///
     /// Deliberately unconditional rather than `#[cfg(test)]`: its caller is a
     /// test in ANOTHER crate, and `cfg(test)` only applies while this one is
-    /// being tested.
+    /// being tested. Drops the cached answer of [`Database::live_tv_tuner_hosts_exist`].
     ///
     /// # Errors
     ///
@@ -593,10 +680,12 @@ impl Database {
         sqlx::query(r#"DELETE FROM "FerrofinLiveTvTunerHosts""#)
             .execute(&self.writer)
             .await?;
+        self.invalidate_live_tv_tuner_hosts();
         Ok(())
     }
 
-    /// Writes a Live TV tuner host, replacing any row with the same id.
+    /// Writes a Live TV tuner host, replacing any row with the same id, then drops the cached
+    /// answer of [`Database::live_tv_tuner_hosts_exist`].
     ///
     /// # Errors
     ///
@@ -618,6 +707,7 @@ impl Database {
         .bind(data)
         .execute(&self.writer)
         .await?;
+        self.invalidate_live_tv_tuner_hosts();
         Ok(())
     }
 
@@ -632,11 +722,8 @@ impl Database {
         ids: &[String],
     ) -> Result<Vec<(String, String, String)>> {
         let mut out = Vec::new();
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+        for chunk in crate::padded_in_chunks(ids) {
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
                    WHERE "ItemId" IN ({placeholders})"#,
@@ -662,11 +749,8 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn item_data_blobs(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+        for chunk in crate::padded_in_chunks(ids) {
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Data" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "Data" IS NOT NULL"#,
@@ -693,11 +777,8 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn item_studios(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+        for chunk in crate::padded_in_chunks(ids) {
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Studios" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "Studios" IS NOT NULL AND "Studios" <> ''"#,
@@ -724,11 +805,8 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn item_original_languages(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+        for chunk in crate::padded_in_chunks(ids) {
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "OriginalLanguage" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "OriginalLanguage" IS NOT NULL"#,
@@ -759,11 +837,8 @@ impl Database {
         primary_ids: &[String],
     ) -> Result<Vec<(String, i64)>> {
         let mut out = Vec::new();
-        for chunk in primary_ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+        for chunk in crate::padded_in_chunks(primary_ids) {
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             // The seeded placeholder row is excluded exactly as the full-row
             // read (`get_items_by_primary_version_batch`) excludes it.
             let sql = format!(
@@ -794,11 +869,8 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn image_parent_rows(&self, ids: &[String]) -> Result<Vec<ImageParentRow>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+        for chunk in crate::padded_in_chunks(ids) {
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Type", "ParentId", "OwnerId", "SeriesId", "SeasonId",
                           "AlbumArtists", "Path", "LUFS", "NormalizationGain"
@@ -852,11 +924,8 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn photo_album_names(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+        for chunk in crate::padded_in_chunks(ids) {
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Name" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders})
@@ -882,11 +951,8 @@ impl Database {
     /// Returns an error if the query fails.
     pub async fn playlist_owners(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+        for chunk in crate::padded_in_chunks(ids) {
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "PlaylistId", "OwnerUserId" FROM "FerrofinPlaylists"
                    WHERE "PlaylistId" IN ({placeholders}) AND "OwnerUserId" IS NOT NULL"#,
@@ -1037,6 +1103,44 @@ impl Database {
         self.pool.close().await;
         self.writer.close().await;
         self.snapshotter.close().await;
+        // After the writer, whose commits start checkpoints. It waits for a
+        // running one, and the checkpoint task ends with it.
+        self.checkpointer.close().await;
+    }
+
+    /// Folds the whole write-ahead log back into the database file and empties
+    /// it (`PRAGMA wal_checkpoint(TRUNCATE)`), as the optimization task does
+    /// after its vacuum.
+    ///
+    /// It takes its turn with the checkpoint task, so it waits for a
+    /// checkpoint the writer's commits started, however long that takes,
+    /// instead of answering busy against it: SQLite never waits for another
+    /// connection's checkpoint, and the `VACUUM` of a database larger than the
+    /// checkpoint threshold starts one. It runs on the writer, so writes queue
+    /// behind it in the pool rather than inside SQLite, where a transaction
+    /// that read before it writes would fail busy at once. Like any truncating
+    /// checkpoint, it waits through the busy timeout for every reader to step
+    /// off the log. When they do not in time, SQLite folds back what it can and
+    /// leaves the log in place; that is logged, not an error.
+    ///
+    /// # Errors
+    /// Returns the error when the writer cannot be acquired or the checkpoint
+    /// fails.
+    pub async fn truncate_wal(&self) -> Result<()> {
+        let _turn = self.checkpoints.turn.lock().await;
+        // (busy, frames in the log, frames checkpointed)
+        let (busy, log, checkpointed): (i64, i64, i64) =
+            sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_one(&self.writer)
+                .await?;
+        if busy != 0 {
+            tracing::warn!(
+                log_frames = log,
+                checkpointed_frames = checkpointed,
+                "the write-ahead log was still in use, so it was not emptied"
+            );
+        }
+        Ok(())
     }
 
     /// Whether [`Database::close`] has run.
@@ -1420,7 +1524,8 @@ pub struct JellyfinGeneration {
 /// on every path, as must the Ferrofin-own `0035`–`0038`. A 12.x generation
 /// matches both an upgraded install and a fresh one (see
 /// [`JellyfinGeneration::optional_ids`]); `0041` gives a fresh install the one
-/// index it lacks.
+/// index it lacks. Releases that share a set share the name: 10.11.9 logs
+/// `10.11.8`, and 12.3 and 12.4, which add no migration, log `12.2.0`.
 pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 5] = [
     JellyfinGeneration {
         name: "10.11.8",
@@ -1786,10 +1891,32 @@ fn discard_snapshot(snapshot: &std::path::Path) {
 /// consistent view, log included, and waits for no other process; a warning
 /// says why. Refusing the boot instead could leave a rolling update waiting
 /// forever on a pod that never becomes ready (owner decision, 2026-10-25).
+///
+/// A finished checkpoint does not hold that process back. It can commit while
+/// the file is being copied, and its automatic checkpoint then writes into the
+/// file under the copy, which ends up with some pages from before and some from
+/// after: a corrupt database that nothing reports. Every commit puts frames in
+/// the log the checkpoint just emptied, so a log that is not empty when the copy
+/// ends means the copy cannot be trusted, and it is taken again the same way.
+/// (Only a `TRUNCATE` checkpoint of its own would empty the log again, which a
+/// running server takes at the end of its database optimization task.)
 async fn copy_database_file(
     conn: &mut sqlx::SqliteConnection,
     path: &std::path::Path,
     backup: &std::path::Path,
+) -> Result<()> {
+    copy_database_file_with(conn, path, backup, async |from, to| {
+        std::fs::copy(from, to).map(drop)
+    })
+    .await
+}
+
+/// [`copy_database_file`], with the byte-for-byte file copy passed in.
+async fn copy_database_file_with(
+    conn: &mut sqlx::SqliteConnection,
+    path: &std::path::Path,
+    backup: &std::path::Path,
+    copy_file: impl AsyncFnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
 ) -> Result<()> {
     let partial = start_snapshot(backup)?;
     let written = async {
@@ -1799,19 +1926,32 @@ async fn copy_database_file(
             sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
                 .fetch_one(&mut *conn)
                 .await?;
-        if busy == 0 && log == checkpointed {
-            std::fs::copy(path, &partial).map_err(|source| crate::DbError::Backup {
-                path: backup.display().to_string(),
-                source,
-            })?;
+        let distrusted = if busy == 0 && log == checkpointed {
+            copy_file(path, &partial)
+                .await
+                .map_err(|source| crate::DbError::Backup {
+                    path: backup.display().to_string(),
+                    source,
+                })?;
+            (!log_is_empty(path)).then_some(
+                "another process wrote to the database during the copy, which may hold half of a checkpoint",
+            )
         } else {
+            Some(
+                "another process has the database open, so its write-ahead log could not be folded in",
+            )
+        };
+        if let Some(cause) = distrusted {
             tracing::warn!(
                 database = %path.display(),
                 backup = %backup.display(),
                 log_frames = log,
                 checkpointed_frames = checkpointed,
-                "another process has the database open, so its write-ahead log could not be folded in: copying it with VACUUM INTO instead"
+                cause,
+                "copying the database with VACUUM INTO instead of the file"
             );
+            // `VACUUM INTO` refuses a file that is already there.
+            start_snapshot(backup)?;
             sqlx::query(sqlx::AssertSqlSafe(vacuum_into(&partial)))
                 .execute(&mut *conn)
                 .await?;
@@ -1820,6 +1960,18 @@ async fn copy_database_file(
     }
     .await;
     abandon_on_error(&partial, written)
+}
+
+/// Whether the write-ahead log of the database at `path` holds nothing, as a
+/// finished `wal_checkpoint(TRUNCATE)` leaves it. A log that cannot be looked at
+/// counts as holding something: the caller then takes the safe way.
+fn log_is_empty(path: &std::path::Path) -> bool {
+    let mut log = path.as_os_str().to_owned();
+    log.push("-wal");
+    match std::fs::metadata(log) {
+        Ok(metadata) => metadata.len() == 0,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// The temporary name a snapshot is written under until it is complete
@@ -2070,6 +2222,19 @@ async fn log_dangling_row_cleanup(conn: &mut sqlx::SqliteConnection) -> Result<(
         .await?;
     Ok(())
 }
+
+/// How many prepared statements each pooled connection keeps when the
+/// composition root does not say (`db_statement_cache`; owner decisions,
+/// gl-1071 and gl-1243). sqlx's own default is 100, which evicted statements
+/// still in use: every size of an `IN (…)` list was its own text. Each
+/// connection keeps its own statements, so every slot costs memory on each
+/// connection of the pool: before the lists were padded, 200 held 30 to 36 MiB
+/// more than 100 on the bench library. With the lists padded
+/// ([`crate::padded_in_list`]) a browse of that library runs 146 distinct read
+/// statements instead of 465, and 150 holds them all, for 6 to 13 MiB more than
+/// 100: a repeat browse prepares none on a connection, against 724 at 200
+/// without the padding.
+pub const DEFAULT_STATEMENT_CACHE_CAPACITY: usize = 150;
 
 /// The `auto` reader-pool size: **usable-core count** — the min of the CPU
 /// affinity mask (`available_parallelism`) and the cgroup CFS quota.
@@ -2416,6 +2581,104 @@ mod tests {
             .expect("count");
         assert_eq!(rows, 2, "the copy must hold the commit still in the WAL");
         assert!(!dir.path().join("jellyfin.db.pre-0007.partial").exists());
+    }
+
+    /// Another process that commits while the file is being copied can
+    /// checkpoint into it (its automatic checkpoint runs every 1000 pages):
+    /// the copy then holds the first half of the file from before that
+    /// checkpoint and the second half from after it. Nothing reports that, so
+    /// the log is looked at once the copy is done, and a copy it cannot vouch
+    /// for is taken again with `VACUUM INTO`.
+    #[tokio::test]
+    async fn a_copy_another_process_wrote_through_is_taken_again() {
+        use sqlx::ConnectOptions as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let mut conn = options.clone().connect().await.expect("connect");
+        sqlx::raw_sql(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+             CREATE INDEX t_v ON t (v);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+             INSERT INTO t SELECT i, printf('%0100d', i) FROM n;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed");
+        let mut other = options.connect().await.expect("the other process");
+
+        let backup = dir.path().join("jellyfin.db.pre-0044");
+        copy_database_file_with(&mut conn, &path, &backup, async |from, to| {
+            let before = std::fs::read(from)?;
+            sqlx::raw_sql(
+                "UPDATE t SET v = printf('%0100d', 9999 - id);
+                 PRAGMA wal_checkpoint(PASSIVE);",
+            )
+            .execute(&mut other)
+            .await
+            .expect("a commit and a checkpoint during the copy");
+            let after = std::fs::read(from)?;
+            let middle = before.len() / 2;
+            std::fs::write(to, [&before[..middle], &after[middle..]].concat())
+        })
+        .await
+        .expect("copy");
+
+        let mut copy = SqliteConnectOptions::new()
+            .filename(&backup)
+            .read_only(true)
+            .connect()
+            .await
+            .expect("open the copy");
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check(1)")
+            .fetch_one(&mut copy)
+            .await
+            .expect("integrity check");
+        assert_eq!(integrity, "ok", "the copy must not be torn");
+        let first: String = sqlx::query_scalar("SELECT v FROM t WHERE id = 1")
+            .fetch_one(&mut copy)
+            .await
+            .expect("read the copy");
+        assert_eq!(
+            first,
+            format!("{:0100}", 9998),
+            "the copy is taken again, so it holds the commit made during the first one"
+        );
+    }
+
+    /// With nothing else on the database the copy is the file itself, not a
+    /// `VACUUM INTO` of it: a rewritten copy is not the file the operator had.
+    #[tokio::test]
+    async fn a_copy_nothing_wrote_through_is_the_file_itself() {
+        use sqlx::ConnectOptions as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .connect()
+            .await
+            .expect("connect");
+        sqlx::raw_sql("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .execute(&mut conn)
+            .await
+            .expect("seed");
+
+        let backup = dir.path().join("jellyfin.db.pre-0044");
+        copy_database_file_with(&mut conn, &path, &backup, async |_, to| {
+            std::fs::write(to, "what the file copy wrote")
+        })
+        .await
+        .expect("copy");
+
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read the copy"),
+            "what the file copy wrote"
+        );
     }
 
     /// Seeds a database file with every migration up to `last` applied and
@@ -4080,11 +4343,22 @@ mod tests {
     /// `20260910…` (108), and 12.1-from-12.0 → 12.2 keeps both (109). All four
     /// are the 12.2 generation, and `0040` is baselined: the database already has
     /// the partial `OwnerId` pair.
+    ///
+    /// Jellyfin 12.3 and 12.4 add no EF migration and no code routine (`v12.2`
+    /// to `v12.4` changes no `Migrations/` file), so a database they upgrade
+    /// keeps the set of the route it came by: 12.3 on the 12.1-from-12.0 → 12.2
+    /// database and 12.4 on that 12.3 one keep 109 ids, and either release
+    /// straight from 10.11 keeps 107, as the adoption fixtures record. Releases
+    /// sharing a set share the logged generation, so each adopts as `12.2.0`.
     #[rstest::rstest]
     #[case::from_10_11(false, false, 107)]
     #[case::from_12_0(true, false, 108)]
     #[case::from_12_1_of_10_11(false, true, 108)]
     #[case::from_12_1_of_12_0(true, true, 109)]
+    #[case::jellyfin_12_3_from_12_2(true, true, 109)]
+    #[case::jellyfin_12_3_from_10_11(false, false, 107)]
+    #[case::jellyfin_12_4_from_12_3(true, true, 109)]
+    #[case::jellyfin_12_4_from_10_11(false, false, 107)]
     #[tokio::test]
     async fn adopts_a_jellyfin_12_2_database_on_every_upgrade_route(
         #[case] passed_through_12_0: bool,
@@ -4506,11 +4780,15 @@ mod tests {
     /// A fresh 12.x install records only the routines its code base still has, so
     /// it lacks the retired 10.11-era ids every upgraded database carries, and its
     /// schema lacks `IX_CustomItemDisplayPreferences_UserId`. It is still its own
-    /// generation, and `0041` gives it the index.
+    /// generation, and `0041` gives it the index. A fresh 12.3 or 12.4 install
+    /// records 12.2's fresh set and schema (neither release adds a migration), so
+    /// it adopts as `12.2.0`.
     #[rstest::rstest]
     #[case::fresh_12_0("12.0.0", SCHEMA_12_0, &FRESH_12_0)]
     #[case::fresh_12_1("12.1.0", SCHEMA_12_0, &FRESH_12_1)]
     #[case::fresh_12_2("12.2.0", SCHEMA_12_2, &FRESH_12_2)]
+    #[case::fresh_12_3("12.2.0", SCHEMA_12_2, &FRESH_12_2)]
+    #[case::fresh_12_4("12.2.0", SCHEMA_12_2, &FRESH_12_2)]
     #[tokio::test]
     async fn adopts_a_fresh_jellyfin_12_x_install(
         #[case] generation: &str,

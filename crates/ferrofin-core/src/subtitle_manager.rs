@@ -185,8 +185,12 @@ impl FerrofinSubtitleManager {
                 // SubtitleManager.Normalize: namespace every candidate id with
                 // the MD5 id of the candidate's own provider name.
                 for result in &mut found {
-                    let namespace =
-                        provider_id(result.provider_name.as_deref().unwrap_or(provider.name()));
+                    let namespace = provider_id(
+                        result
+                            .provider_name
+                            .as_deref()
+                            .unwrap_or_else(|| provider.name()),
+                    );
                     result.id = Some(format!(
                         "{namespace}_{}",
                         result.id.as_deref().unwrap_or("")
@@ -922,17 +926,15 @@ mod tests {
             Err(ServiceError::InvalidInput(_))
         ));
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
-        assert!(
-            FerrofinMediaStreamRepository::new(db)
-                .get_media_streams(&MediaStreamQuery {
-                    item_id: item,
-                    stream_type: None,
-                    index: None,
-                })
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let media_streams = FerrofinMediaStreamRepository::new(db)
+            .get_media_streams(&MediaStreamQuery {
+                item_id: item,
+                stream_type: None,
+                index: None,
+            })
+            .await
+            .unwrap();
+        assert!(media_streams.is_empty(), "{media_streams:?}");
     }
 
     #[tokio::test]
@@ -1006,17 +1008,15 @@ mod tests {
             Err(ServiceError::Backend(_))
         ));
         assert!(!mgr.item_metadata_dir(item).exists());
-        assert!(
-            FerrofinMediaStreamRepository::new(db)
-                .get_media_streams(&MediaStreamQuery {
-                    item_id: item,
-                    stream_type: None,
-                    index: None,
-                })
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let media_streams = FerrofinMediaStreamRepository::new(db)
+            .get_media_streams(&MediaStreamQuery {
+                item_id: item,
+                stream_type: None,
+                index: None,
+            })
+            .await
+            .unwrap();
+        assert!(media_streams.is_empty(), "{media_streams:?}");
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1370,7 +1370,8 @@ mod tests {
             "skip a nonmatching provider result"
         );
         request.disabled_subtitle_fetchers = vec!["SECOND".to_owned()];
-        assert!(mgr.search_subtitles(&request).await.unwrap().is_empty());
+        let subtitles = mgr.search_subtitles(&request).await.unwrap();
+        assert!(subtitles.is_empty(), "{subtitles:?}");
         request.is_perfect_match = None;
         request.disabled_subtitle_fetchers.clear();
         request.is_automated = false;
@@ -1484,7 +1485,8 @@ mod tests {
             "failed".to_owned(),
             "empty".to_owned(),
         ];
-        assert!(mgr.search_subtitles(&request).await.unwrap().is_empty());
+        let subtitles = mgr.search_subtitles(&request).await.unwrap();
+        assert!(subtitles.is_empty(), "{subtitles:?}");
         assert!(calls.lock().unwrap().is_empty());
     }
 
@@ -1530,22 +1532,18 @@ mod tests {
             assert_eq!(descriptors.len(), 1);
             assert_eq!(descriptors[0].name.as_deref(), Some(expected));
         }
-        assert!(
-            mgr.search_subtitles(&SubtitleSearchRequest {
+        let subtitles = mgr
+            .search_subtitles(&SubtitleSearchRequest {
                 item_id: audio,
                 ..Default::default()
             })
             .await
-            .unwrap()
-            .is_empty()
-        );
-        assert!(mgr.get_supported_providers(audio).await.unwrap().is_empty());
-        assert!(
-            mgr.get_supported_providers(Uuid::new_v4())
-                .await
-                .unwrap()
-                .is_empty()
-        );
+            .unwrap();
+        assert!(subtitles.is_empty(), "{subtitles:?}");
+        let supported_providers = mgr.get_supported_providers(audio).await.unwrap();
+        assert!(supported_providers.is_empty(), "{supported_providers:?}");
+        let supported_providers = mgr.get_supported_providers(Uuid::new_v4()).await.unwrap();
+        assert!(supported_providers.is_empty(), "{supported_providers:?}");
         assert_eq!(*calls.lock().unwrap(), ["Movies", "Episodes"]);
     }
 
@@ -1634,15 +1632,14 @@ mod tests {
         let item = Uuid::new_v4();
         seed_item(&db, item, BaseItemKind::Movie).await;
         let mgr = manager(db, Vec::new());
-        assert!(
-            mgr.search_subtitles(&SubtitleSearchRequest {
+        let subtitles = mgr
+            .search_subtitles(&SubtitleSearchRequest {
                 item_id: item,
                 ..Default::default()
             })
             .await
-            .expect("search")
-            .is_empty()
-        );
+            .expect("search");
+        assert!(subtitles.is_empty(), "{subtitles:?}");
     }
 
     #[tokio::test]

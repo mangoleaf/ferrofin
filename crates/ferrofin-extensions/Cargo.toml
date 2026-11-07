@@ -16,13 +16,28 @@ sha2.workspace = true
 futures-util.workspace = true
 fancy-regex.workspace = true
 ferrofin-chromaprint.workspace = true
+ferrofin-common.workspace = true
 ferrofin-traits.workspace = true
 ferrofin-core.workspace = true
 ferrofin-model.workspace = true
+ferrofin-naming.workspace = true
 ferrofin-db.workspace = true
+# The Ferrofin plugin's version: the server's release (`build_version`).
+ferrofin-health.workspace = true
 async-trait.workspace = true
 regex.workspace = true
 reqwest.workspace = true
+# The LDAP-Auth extension's directory client, its TLS configuration and errors.
+ldap3.workspace = true
+# Decoding the DN and filter of the LDAP URLs a referral names.
+percent-encoding.workspace = true
+# LDAP-Auth's profile images: Base64 attributes and avatar hashes, URL attributes.
+base64.workspace = true
+url.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+thiserror.workspace = true
+x509-parser.workspace = true
 tokio = { workspace = true }
 uuid.workspace = true
 serde.workspace = true
@@ -33,3 +48,6 @@ tempfile.workspace = true
 [dev-dependencies]
 rstest.workspace = true
 tracing-subscriber.workspace = true
+# Certificates and in-process TLS servers for the LDAP-Auth connection tests.
+rcgen.workspace = true
+tokio-rustls.workspace = true
