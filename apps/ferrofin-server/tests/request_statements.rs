@@ -52,6 +52,10 @@
 //!   ids and the key of the user data the user never wrote come from the
 //!   page's `BaseItemProviders` rows, read once, as upstream's both come from
 //!   the item's `Provider` navigation.
+//! - `POST /Items/{id}/PlaybackInfo` on a movie in two versions (gl-1317).
+//!   The group's streams and attachments are read in one statement each, the
+//!   user's remembered tracks once for the item, not once per source, and the
+//!   forced-probe check works from the row the handler read.
 //! - A series' episodes and seasons with `ExternalUrls` (gl-1390): with and
 //!   without user data, with `ProviderIds`, an episode's own page, and a page
 //!   listing the series too, in both orders. The links come from the series'
@@ -68,9 +72,12 @@ use std::sync::Mutex;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use ferrofin_db::Database;
+use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
+use ferrofin_model::entities::MediaStreamType;
 use ferrofin_server::config::Config;
 use ferrofin_server::state::{WiredApp, build_app_state};
 use ferrofin_traits::library::ScanTrigger;
+use ferrofin_traits::persistence::MediaStreamRepository as _;
 use tower::ServiceExt as _;
 use tracing::Instrument as _;
 use tracing_subscriber::layer::{Context, SubscriberExt as _};
@@ -103,6 +110,8 @@ const VIEW_ROWS_SPAN: &str = "gl1322_view_rows_read";
 
 /// The span the recorded item reads with provider ids run in.
 const PROVIDERS_SPAN: &str = "gl1323_provider_ids_request";
+/// The span the recorded playback info request runs in.
+const PLAYBACK_INFO_SPAN: &str = "gl1317_playback_info_request";
 
 /// The span the recorded episode listings with links run in.
 const SERIES_PROVIDERS_SPAN: &str = "gl1390_series_provider_ids_request";
@@ -137,6 +146,7 @@ where
                     SESSIONS_SPAN,
                     VIEW_ROWS_SPAN,
                     PROVIDERS_SPAN,
+                    PLAYBACK_INFO_SPAN,
                     SERIES_PROVIDERS_SPAN,
                     UNSCOPED_SPAN,
                 ]
@@ -1413,6 +1423,136 @@ async fn an_item_page_reads_its_provider_ids_once() {
             1,
             "{uri} reads the provider ids once: {statements:#?}"
         );
+    }
+}
+
+/// `POST /Items/{id}/PlaybackInfo` on a movie in two versions. Upstream's
+/// `GetStaticMediaSources` (`MediaSourceManager.cs:383-423`) builds each
+/// version's source from the streams its item holds, and runs
+/// `SetDefaultAudioAndSubtitleStreamIndices` once per source over the same
+/// item and user, its `GetUserData` answered from the user-data cache. Here
+/// the group's streams and attachments are read in one statement each, the
+/// user's remembered tracks once for the item, and the forced-probe check
+/// (`GetPlaybackMediaSources`' `.strm` or missing-stream test) works from the
+/// row the handler read rather than reading it again.
+#[tokio::test]
+async fn a_playback_info_reads_a_version_group_once() {
+    record_statements();
+    let harness = boot(&[
+        "Film Gamma (2010)/Film Gamma (2010) - 1080p.mkv",
+        "Film Gamma (2010)/Film Gamma (2010) - 2160p.mkv",
+    ])
+    .await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let (status, films) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!(
+            "/Items?userId={user_id}&recursive=true&includeItemTypes=Movie&fields=MediaSources"
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "films: {films}");
+    let film = films["Items"][0]["Id"]
+        .as_str()
+        .expect("the film")
+        .to_owned();
+    let versions: Vec<uuid::Uuid> = films["Items"][0]["MediaSources"]
+        .as_array()
+        .expect("media sources")
+        .iter()
+        .map(|source| uuid::Uuid::parse_str(source["Id"].as_str().expect("id")).expect("a GUID"))
+        .collect();
+    assert_eq!(versions.len(), 2, "the film lists both versions: {films}");
+    // The test files hold no streams: give each version its video and audio,
+    // so the playback does not force a probe of them.
+    save_video_and_audio(&harness.db, &versions).await;
+
+    let uri = format!("/Items/{film}/PlaybackInfo?userId={user_id}");
+    let (status, warm) = send(
+        &router,
+        &auth_header,
+        "POST",
+        &uri,
+        Some(serde_json::json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "playback info: {warm}");
+    clear_statements(PLAYBACK_INFO_SPAN);
+    let (status, info) = send(
+        &router,
+        &auth_header,
+        "POST",
+        &uri,
+        Some(serde_json::json!({})),
+    )
+    .instrument(tracing::info_span!(PLAYBACK_INFO_SPAN))
+    .await;
+    assert_eq!(status, StatusCode::OK, "playback info: {info}");
+    let sources = info["MediaSources"].as_array().expect("media sources");
+    assert_eq!(sources.len(), 2, "both versions are sources: {info}");
+    assert!(
+        sources
+            .iter()
+            .all(|source| source["DefaultAudioStreamIndex"] == 1),
+        "each source still has its audio default: {info}"
+    );
+    let statements = statements_in(PLAYBACK_INFO_SPAN);
+    let listing = statements.join("\n");
+    let reads = |table: &str| {
+        statements
+            .iter()
+            .filter(|s| s.starts_with(&format!(r#"SELECT * FROM "{table}""#)))
+            .count()
+    };
+    assert_eq!(
+        reads("MediaStreamInfos"),
+        1,
+        "the versions' streams are read in one statement:\n{listing}"
+    );
+    assert_eq!(
+        reads("AttachmentStreamInfos"),
+        1,
+        "the versions' attachments are read in one statement:\n{listing}"
+    );
+    assert_eq!(
+        statements
+            .iter()
+            .filter(|s| s.contains(r#"FROM "UserData" WHERE "ItemId" = ?1 AND "UserId" = ?2"#))
+            .count(),
+        1,
+        "the remembered tracks are read once, for the item:\n{listing}"
+    );
+    assert_eq!(
+        row_reads_by_id(&statements),
+        0,
+        "the probe check reads no row the handler holds:\n{listing}"
+    );
+}
+
+/// Stores a video and an audio stream on each of `items`.
+async fn save_video_and_audio(db: &Database, items: &[uuid::Uuid]) {
+    let streams = ferrofin_core::FerrofinMediaStreamRepository::new(db.clone());
+    for item in items {
+        let stream = |index, stream_type: MediaStreamType| MediaStreamInfoEntity {
+            item_id: ferrofin_db::store::guid_to_db(*item),
+            stream_index: index,
+            stream_type: stream_type.json_value(),
+            ..MediaStreamInfoEntity::default()
+        };
+        streams
+            .save_media_streams(
+                *item,
+                &[
+                    stream(0, MediaStreamType::Video),
+                    stream(1, MediaStreamType::Audio),
+                ],
+            )
+            .await
+            .expect("save streams");
     }
 }
 
