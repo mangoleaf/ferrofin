@@ -51,8 +51,9 @@
 //!   [`NextUpEpisodeBatchResult`](ferrofin_traits::persistence::NextUpEpisodeBatchResult)
 //!   output is consumed by `TvSeriesManager` in a later unit.
 //!
-//! The shared [`db_error`] module holds the single `sqlx` → `ServiceError`
-//! mapping and the `MediaStreamType` discriminant helper reused across units.
+//! The shared [`db_error`] module re-exports the single `sqlx` → `ServiceError`
+//! mapping (`ferrofin_traits::error::db_err`) and holds the `MediaStreamType`
+//! discriminant helper reused across units.
 //!
 //! ## Unit 5 — library manager, media sources, views, search, music
 //!

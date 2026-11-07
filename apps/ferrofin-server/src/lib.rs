@@ -495,9 +495,9 @@ async fn apply_scheduled_restore_off_runtime(
 }
 
 /// Applies a restore scheduled by `POST /Backup/Restore`, before the database
-/// is opened. Returns the failure of a restore rejected before it wrote
-/// anything (to be recorded once the activity log exists); a restore that
-/// failed part-way aborts the boot.
+/// is opened. Returns the failure of a restore that replaced nothing (to be
+/// recorded once the activity log exists); a restore that failed part-way
+/// through moving its files into place aborts the boot.
 ///
 /// First it runs [`check_storage_capacity`], whose failure aborts the boot, as
 /// Jellyfin does: once per process (`Program.cs:138`), and again when a restore
@@ -521,28 +521,30 @@ fn apply_scheduled_restore(
                 None
             }
             Ok(None) => None,
-            // Extraction began and failed: the trees may be half replaced. Jellyfin
-            // throws out of startup here; booting on them would let the web client
-            // (which reads "the server answers again" as success) announce a
-            // restore that did not happen.
+            // Moving the extracted files into place began and failed: the trees are
+            // partly replaced. Jellyfin throws out of startup here; booting on them
+            // would let the web client (which reads "the server answers again" as
+            // success) announce a restore that did not happen. The marker is gone, so
+            // the next boot starts on them, as a restarted Jellyfin does.
             Err(failure) if failure.partially_applied => {
                 return Err(anyhow::anyhow!(
                     "the scheduled backup restore failed part-way and the data directory may be \
                  partly restored: {failure}"
                 ));
             }
-            // Rejected before anything was written (missing or foreign archive):
-            // the server boots on its untouched data and records the failure in the
-            // activity log, where an administrator will see it.
+            // Nothing was replaced (a missing or foreign archive, a marker that could
+            // not be removed, or an extraction that failed and removed what it
+            // wrote): the server boots on its untouched data and records the failure
+            // in the activity log, where an administrator will see it.
             Err(failure) => {
-                tracing::error!(error = %failure, "scheduled backup restore was rejected");
+                tracing::error!(error = %failure, "scheduled backup restore failed and replaced nothing");
                 Some(failure)
             }
         },
     )
 }
 
-/// Records a rejected restore in the activity log: the only durable,
+/// Records a restore that replaced nothing in the activity log: the only durable,
 /// administrator-visible trace of it.
 async fn record_restore_failure(
     activity: &dyn ferrofin_traits::activity::ActivityManager,

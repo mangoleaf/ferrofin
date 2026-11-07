@@ -1,19 +1,15 @@
-//! Shared mapping from a `sqlx` error to a [`ServiceError`].
+//! The `sqlx` → [`ServiceError`](ferrofin_traits::error::ServiceError) mapping
+//! for this crate, and the `MediaStreamType` discriminant helpers.
 //!
 //! Every repository/service in this crate runs `ferrofin-db` queries and needs to
-//! surface `sqlx::Error` as the trait-level [`ServiceError`]. Rather than each
-//! module defining its own private `db_err`, the single conversion lives here
-//! (per `RULES_CODE_REUSE`): route through `ferrofin-db`'s `DbError` so the error
-//! text and variant are consistent across the crate.
+//! surface `sqlx::Error` as the trait-level `ServiceError`. The one conversion is
+//! [`ferrofin_traits::error::db_err`], shared with the crates below this one
+//! (`ferrofin-livetv`); it is re-exported here so this crate's modules import it
+//! as `crate::db_error::db_err`. A `ferrofin_db::Result` needs no helper: `?`
+//! converts it to `ServiceError::Db`, keeping the database error as the source.
 
 use ferrofin_model::entities::MediaStreamType;
-use ferrofin_traits::error::ServiceError;
-
-/// Wraps a `sqlx` error as a [`ServiceError`] via the `ferrofin-db` error type.
-#[must_use]
-pub fn db_err(err: sqlx::Error) -> ServiceError {
-    ServiceError::from(ferrofin_db::DbError::from(err))
-}
+pub use ferrofin_traits::error::db_err;
 
 /// The stored `MediaStreamInfos.StreamType` discriminant for a wire
 /// [`MediaStreamType`].

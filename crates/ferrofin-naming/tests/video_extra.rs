@@ -178,3 +178,37 @@ fn test_extra_info_invalid_rule_type() {
 
     assert_eq!(res.rule, Some(rule));
 }
+
+// Not upstream: the token regex is compiled once and cached, so a repeat lookup must give the
+// same answer, case-insensitively, and an invalid token must keep never matching.
+#[test]
+fn test_extra_info_regex_rule_repeat_lookups() {
+    let valid = ExtraRule::new(
+        ExtraType::Unknown,
+        ExtraRuleType::Regex,
+        r"^bonus-\d+\.",
+        MediaType::Video,
+    );
+    let other = ExtraRule::new(
+        ExtraType::Unknown,
+        ExtraRuleType::Regex,
+        r"^clip-\d+\.",
+        MediaType::Video,
+    );
+    let invalid = ExtraRule::new(
+        ExtraType::Unknown,
+        ExtraRuleType::Regex,
+        "bonus(",
+        MediaType::Video,
+    );
+    let mut options = NamingOptions::new();
+    options.video_extra_rules = vec![invalid, valid.clone(), other.clone()];
+    for _ in 0..2 {
+        let res = extra_rule_resolver::get_extra_info("BONUS-1.mkv", &options, None);
+        assert_eq!(res.rule.as_ref(), Some(&valid));
+        let res = extra_rule_resolver::get_extra_info("Clip-2.mkv", &options, None);
+        assert_eq!(res.rule.as_ref(), Some(&other));
+        let res = extra_rule_resolver::get_extra_info("bonus(.mkv", &options, None);
+        assert_eq!(res.rule, None);
+    }
+}

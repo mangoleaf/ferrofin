@@ -344,8 +344,8 @@ impl FerrofinUserManager {
                 "account locked out after repeated failed logins"
             );
             // The admin needs to see this without reading the server log.
-            if let Some(activity) = &self.activity {
-                let _ = activity
+            if let Some(activity) = &self.activity
+                && let Err(error) = activity
                     .create_entry(ferrofin_traits::activity::ActivityLogCreate {
                         name: format!("User {} has been locked out", user.username),
                         type_: "UserLockedOut".to_owned(),
@@ -353,7 +353,9 @@ impl FerrofinUserManager {
                         severity: ferrofin_model::activity::LogLevel::Error,
                         ..Default::default()
                     })
-                    .await;
+                    .await
+            {
+                tracing::warn!(user_id = %user.id, %error, "could not record the lockout in the activity log");
             }
         }
         sqlx::query(r#"UPDATE "Users" SET "InvalidLoginAttemptCount" = ?2 WHERE "Id" = ?1"#)

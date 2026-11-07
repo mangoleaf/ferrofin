@@ -11,7 +11,7 @@ use ferrofin_model::live_tv::{RecordingQuery, RecordingStatus, SeriesTimerInfoDt
 use sqlx::{QueryBuilder, Sqlite};
 use uuid::Uuid;
 
-use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::error::{ServiceError, db_err};
 
 use crate::projection::RecordingRow;
 
@@ -460,11 +460,6 @@ pub async fn recording_rows(
 #[must_use]
 pub fn status_name(status: RecordingStatus) -> String {
     status.json_name().into_owned()
-}
-
-/// Maps a `sqlx` error into a [`ServiceError`] via `ferrofin-db`'s `DbError`.
-fn db_err(e: sqlx::Error) -> ServiceError {
-    ServiceError::from(ferrofin_db::DbError::from(e))
 }
 
 /// Fault-injection helpers for the manager's timer tests (they live here so

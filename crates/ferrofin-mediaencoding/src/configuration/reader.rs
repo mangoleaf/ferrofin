@@ -19,11 +19,12 @@ use ferrofin_traits::configuration::ServerConfigurationManager;
 /// Reads the `encoding` named configuration for a caller that reads it again
 /// and again, falling back to the defaults when the document cannot be read.
 ///
-/// The document is reread on every call; a `warn` on each failed read would
-/// follow the request or timer rate, which LOGGING.md §1 rules out. So a
-/// failure is logged at `warn` the first time it is seen and at `debug` while
-/// the same failure repeats. A successful read re-arms the warning, so a file
-/// that breaks again later is reported again.
+/// Every call checks the file again and rereads it when it changed, and a
+/// failed read is never kept: a `warn` on each failed read would follow the
+/// request or timer rate, which LOGGING.md §1 rules out. So a failure is
+/// logged at `warn` the first time it is seen and at `debug` while the same
+/// failure repeats. A successful read re-arms the warning, so a file that
+/// breaks again later is reported again.
 #[derive(Debug)]
 pub struct EncodingOptionsReader {
     /// What reads the options, named in the log line.

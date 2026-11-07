@@ -1,30 +1,29 @@
 //! Port of `Emby.Naming.Audio.AlbumParser`.
 
+use std::sync::OnceLock;
+
 use ferrofin_util::string_extensions::left_part;
 use regex::Regex;
 
 use crate::common::NamingOptions;
 use crate::path;
 
+/// Upstream's `[GeneratedRegex(@"[-\.\(\)\s]+")] CleanRegex()`, compiled once per process.
+fn clean_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[-\.\(\)\s]+").expect("AlbumParser clean regex is valid"))
+}
+
 /// Helper to determine whether an album directory is multipart.
 pub struct AlbumParser<'a> {
     options: &'a NamingOptions,
-    clean_regex: Regex,
 }
 
 impl<'a> AlbumParser<'a> {
     /// Creates a new [`AlbumParser`] bound to the given options.
-    ///
-    /// # Panics
-    ///
-    /// Never in practice — the clean regex is a fixed literal.
     #[must_use]
     pub fn new(options: &'a NamingOptions) -> Self {
-        let clean_regex = Regex::new(r"[-\.\(\)\s]+").expect("AlbumParser clean regex is valid");
-        Self {
-            options,
-            clean_regex,
-        }
+        Self { options }
     }
 
     /// Determines whether the album at `path_str` is multipart.
@@ -36,7 +35,7 @@ impl<'a> AlbumParser<'a> {
         }
 
         // Normalize: collapse whitespace/punctuation runs to a single space.
-        let filename = self.clean_regex.replace_all(filename, " ");
+        let filename = clean_regex().replace_all(filename, " ");
         let trimmed_filename = filename.trim_start();
 
         for prefix in &self.options.album_stacking_prefixes {

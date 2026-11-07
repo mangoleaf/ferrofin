@@ -94,10 +94,12 @@ use crate::item_type_lookup::kind_from_type_name;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowRead {
     /// `RetrieveItem`: one row by id, provider ids always included
-    /// (`BaseItemRepository.cs:825-829`); projected as `GetBaseItemDto`.
+    /// (v12.4 `BaseItemRepository.Querying.cs:568-574`); projected as
+    /// `GetBaseItemDto`.
     ById,
     /// A list query: provider ids only for `ItemFields.ProviderIds`
-    /// (`ApplyNavigations`, :442-445); projected as `GetBaseItemDtos`.
+    /// (`ApplyNavigations`, v12.4 `BaseItemRepository.QueryBuilding.cs:257-260`);
+    /// projected as `GetBaseItemDtos`.
     List,
     /// A playlist's or box set's members: `Folder.ResolveLinkedChildren` with
     /// every field (v12.2 Folder.cs:1819-1873), or a box set's per-member
@@ -805,7 +807,7 @@ fn collection_type_of(item: &BaseItemEntity, kind: BaseItemKind) -> Option<Colle
 
 /// Splits a stored pipe-delimited multi-value column into a list, dropping
 /// empties. Jellyfin joins `Genres`/`Studios`/`Artists`/… with `|`.
-fn split_multi(stored: Option<&str>) -> Vec<String> {
+pub(crate) fn split_multi(stored: Option<&str>) -> Vec<String> {
     split_multi_str(stored).map(str::to_owned).collect()
 }
 
@@ -1540,11 +1542,7 @@ impl FerrofinDtoService {
                 break;
             }
             let stored: Vec<String> = wanted.iter().copied().map(guid_to_db).collect();
-            let fetched = self
-                .db
-                .image_parent_rows(&stored)
-                .await
-                .map_err(|e| ServiceError::Backend(e.to_string()))?;
+            let fetched = self.db.image_parent_rows(&stored).await?;
             let mut next: Vec<Uuid> = Vec::new();
             for fetched_row in &fetched {
                 let Ok(id) = Uuid::parse_str(&fetched_row.id) else {
@@ -1597,12 +1595,7 @@ impl FerrofinDtoService {
             })
             .collect();
         if !artist_ids.is_empty() {
-            for fetched_row in self
-                .db
-                .image_parent_rows(&artist_ids)
-                .await
-                .map_err(|e| ServiceError::Backend(e.to_string()))?
-            {
+            for fetched_row in self.db.image_parent_rows(&artist_ids).await? {
                 if let Ok(id) = Uuid::parse_str(&fetched_row.id) {
                     graph
                         .rows
@@ -1652,11 +1645,7 @@ impl FerrofinDtoService {
                 })
                 .collect());
         }
-        let rows = self
-            .db
-            .rows_of_type(type_name)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?;
+        let rows = self.db.rows_of_type(type_name).await?;
         Ok(rows
             .into_iter()
             .filter_map(|(id, path, data)| {
@@ -3515,12 +3504,7 @@ impl FerrofinDtoService {
             return Ok(map);
         }
         let stored: Vec<String> = series_ids.iter().copied().map(guid_to_db).collect();
-        for (item_id, data) in self
-            .db
-            .item_data_blobs(&stored)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?
-        {
+        for (item_id, data) in self.db.item_data_blobs(&stored).await? {
             if let Ok(id) = Uuid::parse_str(&item_id)
                 && let Some(order) = crate::item_data::read_data_string(
                     &crate::item_data::parse_data(Some(&data)),
@@ -3548,12 +3532,7 @@ impl FerrofinDtoService {
             return Ok(map);
         }
         let stored: Vec<String> = series_ids.iter().copied().map(guid_to_db).collect();
-        for (item_id, studios) in self
-            .db
-            .item_studios(&stored)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?
-        {
+        for (item_id, studios) in self.db.item_studios(&stored).await? {
             if let Ok(id) = Uuid::parse_str(&item_id) {
                 map.insert(id, studios);
             }
@@ -3578,8 +3557,7 @@ impl FerrofinDtoService {
         Ok(self
             .db
             .item_original_languages(&stored)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?
+            .await?
             .into_iter()
             .filter_map(|(id, language)| Uuid::parse_str(&id).ok().map(|id| (id, language)))
             .collect())
@@ -3603,12 +3581,7 @@ impl FerrofinDtoService {
         // library's collection folder, and calling that an album would send the
         // client somewhere that is not one. The filter lives in the query.
         let stored: Vec<String> = album_ids.iter().copied().map(guid_to_db).collect();
-        for (item_id, name) in self
-            .db
-            .photo_album_names(&stored)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?
-        {
+        for (item_id, name) in self.db.photo_album_names(&stored).await? {
             if let Ok(id) = Uuid::parse_str(&item_id) {
                 map.insert(id, name);
             }
@@ -3952,8 +3925,9 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         //
         // `retrieved_by_id: true` — this is the projection of a row the caller
         // fetched by id, and C# `BaseItemRepository.RetrieveItem` unconditionally
-        // `.Include(e => e.Provider)`s (BaseItemRepository.cs:825-829) where a
-        // list query only does so for `ItemFields.ProviderIds` (:442-445). That
+        // `.Include(e => e.Provider)`s (v12.4 `BaseItemRepository.Querying.cs:569`)
+        // where a list query only does so for `ItemFields.ProviderIds`
+        // (`ApplyNavigations`, `BaseItemRepository.QueryBuilding.cs:257-260`). That
         // difference is observable: it decides whether a movie's `UserData.Key`
         // is its IMDb id or its guid.
         self.project(
@@ -4424,6 +4398,22 @@ impl FerrofinDtoService {
         let want_external_urls = options.contains_field(ItemFields::ExternalUrls);
         let want_provider_ids =
             options.contains_field(ItemFields::ProviderIds) || want_external_urls;
+        // A season/episode's links come from its series' ids, and its
+        // `SeriesStudio` from the same series rows, so the distinct series on
+        // the page are collected once, and only when one of those fields is
+        // asked for.
+        let mut series_ids: Vec<Uuid> = Vec::new();
+        let want_series_studio = options.contains_field(ItemFields::SeriesStudio);
+        if want_external_urls || want_series_studio {
+            series_ids = items
+                .iter()
+                .filter(|i| matches!(row_kind(i), BaseItemKind::Season | BaseItemKind::Episode))
+                .filter_map(|i| i.series_id.as_deref())
+                .filter_map(|id| Uuid::parse_str(id).ok())
+                .collect();
+            series_ids.sort_unstable();
+            series_ids.dedup();
+        }
         // User-data and the page's credits are independent; run them concurrently.
         // Images wait for the credits, because the cast's by-name Person rows
         // want images too and both id sets go in ONE `BaseItemImageInfos` read
@@ -4432,9 +4422,18 @@ impl FerrofinDtoService {
         // The page's provider ids are read first, in the user-data branch:
         // a hydrated row's user-data key derives from the same rows the DTO's
         // `ProviderIds` and `ExternalUrls` show, so the page reads them once.
+        // The series' ids the links are built from come in the same read
+        // (gl-1390); the key ignores them, as it takes the series' from its
+        // own walk whatever the fields.
         let user_data_fut = async {
             let providers = if want_provider_ids {
-                self.load_provider_ids_batch(&ids).await?
+                let series: &[Uuid] = if want_external_urls { &series_ids } else { &[] };
+                let mut wanted: Vec<Uuid> = ids.iter().chain(series).copied().collect();
+                // An id bound twice (a series also on the page, a repeated
+                // playlist entry) would repeat its pairs across two chunks.
+                wanted.sort_unstable();
+                wanted.dedup();
+                self.load_provider_ids_batch(&wanted).await?
             } else {
                 HashMap::new()
             };
@@ -4447,8 +4446,10 @@ impl FerrofinDtoService {
                 // Provider ids participate in that derivation only when the
                 // row's own query hydrated them — `.Include(e => e.Provider)`
                 // runs for `ItemFields.ProviderIds`
-                // (`BaseItemRepository.ApplyNavigations`, :442-445) and
-                // unconditionally in `RetrieveItem` (:825-829). Measured on
+                // (`ApplyNavigations`, v12.4
+                // `BaseItemRepository.QueryBuilding.cs:257-260`) and
+                // unconditionally in `RetrieveItem`
+                // (`BaseItemRepository.Querying.cs:569`). Measured on
                 // 10.11.8: the same movie's key is its guid in a plain list and
                 // `tt0111161` with `Fields=ProviderIds` or by id.
                 let hydrate_providers =
@@ -4552,12 +4553,7 @@ impl FerrofinDtoService {
             count_ids.dedup();
             if !count_ids.is_empty() {
                 let stored: Vec<String> = count_ids.iter().copied().map(guid_to_db).collect();
-                for (primary, count) in self
-                    .db
-                    .alternate_version_counts(&stored)
-                    .await
-                    .map_err(|e| ServiceError::Backend(e.to_string()))?
-                {
+                for (primary, count) in self.db.alternate_version_counts(&stored).await? {
                     if let (Ok(primary), Ok(count)) =
                         (Uuid::parse_str(&primary), usize::try_from(count))
                     {
@@ -4805,28 +4801,15 @@ impl FerrofinDtoService {
         // read while projecting that item — it cannot be drained by its own.
         let alt_referenced: std::collections::HashSet<Uuid> = versions.ids().collect();
         let provider_ids = provider_id_maps(provider_rows);
-        // A season/episode's links come from its series' ids, so collect the
-        // distinct series on the page and read their ids in the same batched
-        // way (one extra query for a page of episodes, none otherwise).
         let mut series_display_order: HashMap<Uuid, String> = HashMap::new();
-        // `SeriesStudio` reads the same set of series rows, so the id list is
-        // built once and each half runs only when its own field was asked for
-        // — a page with neither field costs no query at all.
-        let mut series_ids: Vec<Uuid> = Vec::new();
-        let want_series_studio = options.contains_field(ItemFields::SeriesStudio);
-        if want_external_urls || want_series_studio {
-            series_ids = items
-                .iter()
-                .filter(|i| matches!(row_kind(i), BaseItemKind::Season | BaseItemKind::Episode))
-                .filter_map(|i| i.series_id.as_deref())
-                .filter_map(|id| Uuid::parse_str(id).ok())
-                .collect();
-            series_ids.sort_unstable();
-            series_ids.dedup();
-        }
+        // The series' ids were read with the page's own; copied apart, since
+        // projecting a series on the page takes its entry out of `provider_ids`.
         let series_provider_ids = if want_external_urls {
             series_display_order = self.load_series_display_order(&series_ids).await?;
-            provider_id_maps(self.load_provider_ids_batch(&series_ids).await?)
+            series_ids
+                .iter()
+                .filter_map(|id| Some((*id, provider_ids.get(id)?.clone())))
+                .collect()
         } else {
             HashMap::new()
         };
@@ -4972,8 +4955,7 @@ impl FerrofinDtoService {
         } else {
             self.db
                 .image_parent_rows(&tagged_persons)
-                .await
-                .map_err(|e| ServiceError::Backend(e.to_string()))?
+                .await?
                 .into_iter()
                 .filter_map(|row| {
                     let id = Uuid::parse_str(&row.id).ok()?;
@@ -5372,12 +5354,7 @@ impl FerrofinDtoService {
             .map(|item| guid_to_db(row_id(item)))
             .collect();
         if !playlists.is_empty() {
-            for (playlist, owner) in self
-                .db
-                .playlist_owners(&playlists)
-                .await
-                .map_err(|e| ServiceError::Backend(e.to_string()))?
-            {
+            for (playlist, owner) in self.db.playlist_owners(&playlists).await? {
                 if let (Ok(playlist), Ok(owner)) =
                     (Uuid::parse_str(&playlist), Uuid::parse_str(&owner))
                 {
@@ -5496,12 +5473,7 @@ impl FerrofinDtoService {
         if wanted.is_empty() {
             return Ok(());
         }
-        for fetched in self
-            .db
-            .image_parent_rows(&wanted)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?
-        {
+        for fetched in self.db.image_parent_rows(&wanted).await? {
             if let Ok(id) = Uuid::parse_str(&fetched.id) {
                 rows.insert(id, LibraryHop::from_row(fetched));
             }

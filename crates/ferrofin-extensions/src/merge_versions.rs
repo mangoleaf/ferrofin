@@ -72,7 +72,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_core::{PluginConfigPage, ScheduledTask, TaskProgress};
@@ -868,9 +868,6 @@ fn percent(index: usize, total: usize) -> f64 {
     100.0 * (index + 1) as f64 / total.max(1) as f64
 }
 
-/// The naming rules [`episode_merge_key`] reads an episode's file name with.
-static NAMING: LazyLock<NamingOptions> = LazyLock::new(NamingOptions::new);
-
 /// The upstream 12.0 `GetEpisodeMergeKey`: the first non-blank provider id
 /// (`Tvdb` → `Tmdb` → `Imdb`), else season/episode numbers, else title
 /// fields and — unlike upstream — the file name's version key (its air date,
@@ -944,7 +941,7 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
     let Some(path) = ep.path.as_deref() else {
         return key;
     };
-    match VideoListResolver::new(&NAMING).episode_version_key(path) {
+    match VideoListResolver::new(NamingOptions::shared()).episode_version_key(path) {
         Some(version) => format!("{key}:{version}"),
         None => match Path::new(path).file_stem().and_then(|stem| stem.to_str()) {
             Some(stem) => format!("{key}:file:{stem}"),

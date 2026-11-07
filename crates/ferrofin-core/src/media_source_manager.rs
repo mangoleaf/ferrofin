@@ -785,9 +785,15 @@ impl FerrofinMediaSourceManager {
             extract_chapters: false,
             media_is_audio: false,
         };
-        let Ok(probed) = self.encoder.get_media_info(&request).await else {
-            tracing::warn!("live tv: probing the live stream failed; using the tuner's own info");
-            return false;
+        let probed = match self.encoder.get_media_info(&request).await {
+            Ok(probed) => probed,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "live tv: probing the live stream failed; using the tuner's own info"
+                );
+                return false;
+            }
         };
         if let Some(key) = cache_key {
             let mut cache = self
@@ -2400,7 +2406,12 @@ mod tests {
         }
     }
 
-    /// A stub encoder whose probe returns a fixed source (no ffmpeg needed).
+    /// A source path the stub encoder fails to probe, as ffprobe does an
+    /// input it cannot read.
+    const UNREADABLE: &str = "http://tuner.example/gone.ts";
+
+    /// A stub encoder whose probe returns a fixed source (no ffmpeg needed),
+    /// or fails for [`UNREADABLE`].
     pub(super) struct StubEncoder;
 
     #[async_trait]
@@ -2418,6 +2429,11 @@ mod tests {
             &self,
             request: &MediaInfoRequest,
         ) -> Result<MediaSourceInfo, ServiceError> {
+            if request.media_source.path.as_deref() == Some(UNREADABLE) {
+                return Err(ServiceError::backend(
+                    "ffprobe failed - streams and format are both null",
+                ));
+            }
             Ok(MediaSourceInfo {
                 id: request.media_source.id.clone(),
                 container: Some("mkv".to_owned()),
@@ -4039,6 +4055,33 @@ mod tests {
             "the aged-out probe nobody opened again is dropped"
         );
         assert_eq!(cache["tuned"].1.container.as_deref(), Some("mkv"));
+    }
+
+    /// `OpenLiveStreamInternal` catches a failed probe: the source keeps the
+    /// tuner's own info and nothing is cached, so the next open of the token
+    /// probes again (gl-1372).
+    #[tokio::test]
+    async fn a_failed_live_stream_probe_keeps_the_tuners_info_and_caches_nothing() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let tuned = MediaSourceInfo {
+            path: Some(UNREADABLE.to_owned()),
+            container: Some("ts".to_owned()),
+            media_streams: vec![MediaStream {
+                stream_type: MediaStreamType::Video,
+                index: -1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut source = tuned.clone();
+        assert!(
+            !mgr.add_media_info_with_probe(&mut source, Some("token"), false)
+                .await
+        );
+        assert_eq!(source.container, tuned.container);
+        assert_eq!(source.media_streams, tuned.media_streams);
+        assert!(mgr.probe_cache.lock().expect("cache").is_empty());
     }
 }
 

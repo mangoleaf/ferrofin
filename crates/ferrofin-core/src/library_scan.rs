@@ -13,10 +13,9 @@
 //! ([`prune_deleted`](LibraryScanner::prune_deleted)), so deleted media stops
 //! being served after the next scan.
 //!
-//! Two passes: a **synchronous plan** (walk + filename resolution — this is where
-//! the `!Sync` [`NamingOptions`] lazy-regex cells live, so they never cross an
-//! `.await`), then an **async persist**. The filesystem seam is synchronous, so
-//! the whole walk fits the sync pass.
+//! Two passes: a **synchronous plan** (walk + filename resolution by the shared
+//! [`NamingOptions`]), then an **async persist**. The filesystem seam is
+//! synchronous, so the whole walk fits the sync pass.
 
 use ferrofin_traits::providers::ItemUpdateType;
 use ferrofin_util::directory_path::DirectoryPath;
@@ -3474,7 +3473,7 @@ impl<'a> PlanScope<'a> {
 
 /// What every resolver of one plan pass shares.
 struct PlanCtx<'a> {
-    /// The naming rules (`!Sync`, so the pass stays off the async path).
+    /// The naming rules.
     naming: &'a NamingOptions,
     /// The paths the pass resolves.
     scope: PlanScope<'a>,
@@ -5407,7 +5406,7 @@ impl LibraryScanner {
             ScanTarget::Library(id) => self.scan_libraries(Some(*id), run).await,
             ScanTarget::Paths(paths) => {
                 let scope = PathScope::of(paths, true).requested();
-                self.scan_scoped(scope, None, paths.len(), run).await
+                self.scan_scoped(scope, None, paths.len(), None, run).await
             }
             ScanTarget::Changed(paths) => Box::pin(self.scan_changed(paths, run)).await,
             ScanTarget::Items(paths) => {
@@ -5429,7 +5428,7 @@ impl LibraryScanner {
                 // `plan_paths_tests`, plus a prune of only the `ExtraType`
                 // rows under that folder.
                 let scope = PathScope::of(paths, false).requested();
-                self.scan_scoped(scope, None, paths.len(), run).await
+                self.scan_scoped(scope, None, paths.len(), None, run).await
             }
             ScanTarget::Artist { id, path, folders } => {
                 // `RefreshArtist`: the artist folders' children, and the
@@ -5440,7 +5439,7 @@ impl LibraryScanner {
                     ..PathScope::of(folders, true)
                 };
                 let mut outcome = if path.is_some() || !folders.is_empty() {
-                    self.scan_scoped(scope, path.as_deref(), folders.len(), run)
+                    self.scan_scoped(scope, path.as_deref(), folders.len(), None, run)
                         .await?
                 } else {
                     ScanOutcome::default()
@@ -5857,8 +5856,14 @@ impl LibraryScanner {
     ) -> Result<ScanOutcome, ServiceError> {
         let folders = self.virtual_folders.get_virtual_folders().await?;
         let roots = self.changed_roots(&folders, changed).await;
-        self.scan_scoped(PathScope::of(&roots, true), None, changed.len(), run)
-            .await
+        self.scan_scoped(
+            PathScope::of(&roots, true),
+            None,
+            changed.len(),
+            Some(folders),
+            run,
+        )
+        .await
     }
 
     /// Port of `FileRefresher.ProcessPathChanges` (`FileRefresher.cs:
@@ -6088,16 +6093,21 @@ impl LibraryScanner {
     /// libraries holding `scope.roots` (or `also_path`, the extra item's own
     /// folder) and keeps the items at or under a root, the folders above
     /// them, and the item at `also_path`. `changed` is how many paths the
-    /// request named, for the log.
+    /// request named, for the log. `listed` is the run's library listing when
+    /// the caller has already read it; otherwise the libraries are listed here.
     async fn scan_scoped(
         &self,
         scope: PathScope<'_>,
         also_path: Option<&str>,
         changed: usize,
+        listed: Option<Vec<VirtualFolderInfo>>,
         run: ScanRun<'_>,
     ) -> Result<ScanOutcome, ServiceError> {
         let (roots, prune) = (scope.roots, scope.prune);
-        let folders = self.virtual_folders.get_virtual_folders().await?;
+        let folders = match listed {
+            Some(folders) => folders,
+            None => self.virtual_folders.get_virtual_folders().await?,
+        };
         let affected = affected_libraries(&folders, roots, also_path);
         if affected.is_empty() {
             if prune {
@@ -10879,7 +10889,7 @@ impl LibraryScanner {
             });
             ExternalProbeSeam {
                 resolvers: Arc::new(ExternalStreamResolvers::new(
-                    Arc::new(NamingOptions::new()),
+                    Arc::clone(NamingOptions::shared()),
                     localization,
                     Arc::clone(encoder),
                     dirs.map_or_else(
@@ -11621,22 +11631,13 @@ impl LibraryScanner {
             return RemoteMetadata::default();
         }
         let mut lookup = lookup.clone();
-        match self
+        let locale = self
             .resolve_metadata_locale(entity, &lookup, policy, cache)
-            .await
-        {
-            Ok(locale) => {
-                cache
-                    .resolved_locales
-                    .insert(entity.id.clone(), locale.clone());
-                lookup.locale = Some(locale);
-            }
-            Err(err) => {
-                tracing::warn!(%err, item_id = entity.id, "could not resolve metadata locale");
-                ferrofin_providers::rate_limit::note_request_failure();
-                return RemoteMetadata::default();
-            }
-        }
+            .await;
+        cache
+            .resolved_locales
+            .insert(entity.id.clone(), locale.clone());
+        lookup.locale = Some(locale);
         let lookup = &lookup;
         let preferred_language = lookup.metadata_language(policy);
         let mut fold = RemoteFold::new(known_ids, &preferred_language);
@@ -11679,8 +11680,11 @@ impl LibraryScanner {
     /// [`Stored::Undecodable`]) counts as none, so the child keeps its own
     /// values (`series is null ? SeriesName`, `FindSeriesName`), and is asked
     /// for once per pass: every child of the row would otherwise read it and
-    /// warn, and all a transient error costs is this pass's names, which the
-    /// next scan puts right.
+    /// warn. A transient error costs this pass's names, which the next scan
+    /// puts right. It also costs any metadata locale the row or its parents
+    /// override, which no later scan puts right: the children refreshed this
+    /// pass are fetched, and stamped, in the collection folder's, the
+    /// library's or the server's, as for a parent that is not there.
     async fn parent_row(&self, id: &str, cache: &mut ArtworkCache) -> Option<BaseItemEntity> {
         let items = self.item_repository.as_ref()?;
         let parsed = parse_id(id)?;
@@ -11838,13 +11842,15 @@ impl LibraryScanner {
 
     /// `BaseItem.GetPreferredMetadataLanguage/CountryCode`: own override,
     /// nearest parent, collection folder, library options, then server defaults.
+    /// The parent walk ends at a row that fails to read as at one that is not
+    /// there ([`parent_row`](Self::parent_row)).
     async fn resolve_metadata_locale(
         &self,
         row: &BaseItemEntity,
         lookup: &ResolverGuesses,
         policy: FetcherPolicy<'_>,
         cache: &mut ArtworkCache,
-    ) -> Result<(String, String), ServiceError> {
+    ) -> (String, String) {
         let mut language = lookup.own_language.clone();
         let mut country = lookup.own_country.clone();
         let mut next = row.parent_id.clone();
@@ -11853,7 +11859,7 @@ impl LibraryScanner {
             if !visited.insert(id.clone()) {
                 break;
             }
-            let parent = self.locale_parent(&id, cache).await?;
+            let parent = self.locale_parent(&id, cache).await;
             language = language.or(parent.language);
             country = country.or(parent.country);
             next = parent.parent;
@@ -11861,40 +11867,32 @@ impl LibraryScanner {
         if let Some(id) = policy.collection_folder
             && (language.is_none() || country.is_none())
         {
-            let collection = self.locale_parent(&guid_to_db(id), cache).await?;
+            let collection = self.locale_parent(&guid_to_db(id), cache).await;
             language = language.or(collection.language);
             country = country.or(collection.country);
         }
-        Ok((
+        (
             language.unwrap_or_else(|| policy.metadata_language()),
             country
                 .unwrap_or_else(|| policy.country_code())
                 .to_ascii_uppercase(),
-        ))
+        )
     }
 
-    async fn locale_parent(
-        &self,
-        id: &str,
-        cache: &mut ArtworkCache,
-    ) -> Result<LocaleParent, ServiceError> {
+    async fn locale_parent(&self, id: &str, cache: &mut ArtworkCache) -> LocaleParent {
         if let Some(parent) = cache.locale_parents.get(id) {
-            return Ok(parent.clone());
+            return parent.clone();
         }
-        let parent = if let Some(items) = &self.item_repository
-            && let Some(id) = parse_id(id)
-            && let Some(row) = items.retrieve_item(id).await?
-        {
-            LocaleParent {
+        let parent = self
+            .parent_row(id, cache)
+            .await
+            .map_or_else(LocaleParent::default, |row| LocaleParent {
                 parent: row.parent_id,
                 language: own_language(row.preferred_metadata_language.as_deref()),
                 country: own_language(row.preferred_metadata_country_code.as_deref()),
-            }
-        } else {
-            LocaleParent::default()
-        };
+            });
         cache.locale_parents.insert(id.to_owned(), parent.clone());
-        Ok(parent)
+        parent
     }
 
     /// The photo embedded-information pass — port of `Emby.Photos.PhotoProvider`.
@@ -12037,7 +12035,7 @@ impl LibraryScanner {
                         // `&t=` gets `ParseName`'s title, as it is (no TMDb
                         // `CleanName`), and `&y=` the year in the name when the
                         // item has none.
-                        let parsed = video_resolver::parse_name(name, &PATH_NAMING);
+                        let parsed = video_resolver::parse_name(name, NamingOptions::shared());
                         omdb.find_by_title(kind, &parsed.name, year.or(parsed.year))
                             .await
                     }
@@ -12140,7 +12138,7 @@ impl LibraryScanner {
             // `TmdbSeriesProvider.cs:201-208`): the name is a file or folder
             // name (`Movie (2016)`), so the search and the match go by the
             // parsed title, and by the year in the name when the item has none.
-            let parsed = video_resolver::parse_name(&lookup.name(row)?, &PATH_NAMING);
+            let parsed = video_resolver::parse_name(&lookup.name(row)?, NamingOptions::shared());
             let year = lookup.year(row).or(parsed.year);
             let cleaned = ferrofin_providers::tmdb::clean_name(&parsed.name);
             let results = tmdb
@@ -12728,7 +12726,7 @@ impl LibraryScanner {
         server_locale: &(String, String),
         folders: &[ferrofin_model::entities_media::VirtualFolderInfo],
         cache: &mut ArtworkCache,
-    ) -> Result<Option<String>, ServiceError> {
+    ) -> Option<String> {
         let fallback = BaseItemEntity::default();
         let row = row.unwrap_or(&fallback);
         let lookup = ResolverGuesses {
@@ -12755,11 +12753,8 @@ impl LibraryScanner {
                 },
                 cache,
             )
-            .await?;
-        Ok(ferrofin_providers::tmdb::normalize_language(
-            Some(&locale.0),
-            Some(&locale.1),
-        ))
+            .await;
+        ferrofin_providers::tmdb::normalize_language(Some(&locale.0), Some(&locale.1))
     }
 
     /// Enriches credited people: downloads each one's TMDB profile image as their
@@ -12867,21 +12862,14 @@ impl LibraryScanner {
                 if lock.is_some_and(|lock| lock.row.is_locked) {
                     continue;
                 }
-                let language = match self
+                let language = self
                     .person_metadata_language(
                         lock.map(|lock| &lock.row),
                         &server_locale,
                         folders,
                         &mut locale_cache,
                     )
-                    .await
-                {
-                    Ok(language) => language,
-                    Err(error) => {
-                        tracing::warn!(%error, person = %id, "could not resolve person metadata locale");
-                        continue;
-                    }
-                };
+                    .await;
                 let Some(details) = tmdb
                     .person_details_for_language(tmdb_id, language.as_deref())
                     .await
@@ -14508,17 +14496,8 @@ impl LibraryScanner {
                 own_country: own_language(entity.preferred_metadata_country_code.as_deref()),
                 ..Default::default()
             };
-            match self
-                .resolve_metadata_locale(entity, &lookup, policy, cache)
+            self.resolve_metadata_locale(entity, &lookup, policy, cache)
                 .await
-            {
-                Ok(locale) => locale,
-                Err(err) => {
-                    tracing::warn!(%err, item_id = entity.id, "could not resolve artwork locale");
-                    ferrofin_providers::rate_limit::note_request_failure();
-                    return Vec::new();
-                }
-            }
         };
         let policy = FetcherPolicy {
             effective_locale: Some(&locale),
@@ -15203,7 +15182,7 @@ impl LibraryScanner {
     }
 
     /// The synchronous plan pass: resolve every library's files into [`Planned`]
-    /// items. Owns the `NamingOptions` so its `!Sync` cells stay off the async path.
+    /// items, by the process's shared [`NamingOptions`].
     ///
     /// Dispatches by the library's collection type: `tvshows` builds the
     /// Series→Season→Episode hierarchy, `music` builds MusicAlbum→Audio, and the
@@ -15258,13 +15237,13 @@ impl LibraryScanner {
         cancel: Option<&ScanCancel>,
         dirs: Option<&Arc<DirectoryCache>>,
     ) -> PlanOutput {
-        let naming = NamingOptions::new();
+        let naming = NamingOptions::shared();
         let content_types = self
             .content_types
             .as_ref()
             .map(|read| read())
             .unwrap_or_default();
-        let mut ctx = PlanCtx::new(&naming, scope)
+        let mut ctx = PlanCtx::new(naming, scope)
             .with_locations(plan_folders)
             .with_key_folders(key_folders)
             .with_date_added(date_added)
@@ -19734,7 +19713,7 @@ fn set_3d_format(entity: &mut BaseItemEntity) {
     let Some(path) = entity.path.as_deref() else {
         return;
     };
-    let parsed = ferrofin_naming::video::format_3d_parser::parse(path, &PATH_NAMING);
+    let parsed = ferrofin_naming::video::format_3d_parser::parse(path, NamingOptions::shared());
     if !parsed.is_3d {
         return;
     }
@@ -21659,7 +21638,9 @@ impl ResolverGuesses {
                 is_series
                     .then_some(name.as_deref())
                     .flatten()
-                    .and_then(|name| video_resolver::clean_date_time(name, &PATH_NAMING).year)
+                    .and_then(|name| {
+                        video_resolver::clean_date_time(name, NamingOptions::shared()).year
+                    })
                     .map(i64::from)
             });
         Self {
@@ -22039,7 +22020,7 @@ fn before_metadata_refresh(
         row.name = Some(name.to_string_lossy().into_owned());
     }
     let year_in = |name: &str| {
-        video_resolver::clean_date_time(name, &PATH_NAMING)
+        video_resolver::clean_date_time(name, NamingOptions::shared())
             .year
             .map(i64::from)
     };
@@ -22160,7 +22141,7 @@ fn resolve_episode_path(
     path: &str,
     naming: EpisodeNaming<'_>,
 ) -> Option<ferrofin_naming::tv::EpisodeInfo> {
-    EpisodeResolver::new(&PATH_NAMING).resolve(
+    EpisodeResolver::new(NamingOptions::shared()).resolve(
         below_library(path, naming.library),
         false,
         None,
@@ -22467,11 +22448,6 @@ fn embedded_video_people(info: &MediaInfo) -> Vec<PeopleEntity> {
         })
         .collect()
 }
-
-/// The naming rules [`before_metadata_refresh`] reads a path by, and the
-/// remote lookups parse a name by (`LibraryManager.ParseName`'s `_namingOptions`).
-static PATH_NAMING: std::sync::LazyLock<NamingOptions> =
-    std::sync::LazyLock::new(NamingOptions::new);
 
 /// The row a scanned item is saved as. A new item (or one whose stored row
 /// could not be read) is the pipeline's row with the resolver's guesses
@@ -23456,8 +23432,8 @@ fn name_is_placeholder(name: Option<&str>, path: Option<&str>) -> bool {
             // part of it is real without running a regex.
             stem.contains(name)
                 && (name == stem
-                    || name == video_resolver::parse_name(&stem, &PATH_NAMING).name
-                    || PATH_NAMING
+                    || name == video_resolver::parse_name(&stem, NamingOptions::shared()).name
+                    || NamingOptions::shared()
                         .video_file_stacking_rules
                         .iter()
                         .filter_map(|rule| rule.match_input(entry_name(path)))
@@ -27580,7 +27556,7 @@ mod tests {
         let vf = Arc::new(FerrofinVirtualFolderManager::new(tmp.path().join("views")));
         let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
             .with_items(Arc::new(crate::FerrofinItemRepository::new(
-                db,
+                db.clone(),
                 Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
             )));
         let options = LibraryOptions {
@@ -27608,24 +27584,21 @@ mod tests {
         assert_eq!(
             scanner
                 .resolve_metadata_locale(&row, &own, policy, &mut cache)
-                .await
-                .unwrap(),
+                .await,
             ("pt".into(), "BR".into())
         );
         let lookup = ResolverGuesses::default();
         assert_eq!(
             scanner
                 .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
-                .await
-                .unwrap(),
+                .await,
             ("de".into(), "AT".into())
         );
         let row = BaseItemEntity::default();
         assert_eq!(
             scanner
                 .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
-                .await
-                .unwrap(),
+                .await,
             ("it".into(), "IT".into())
         );
         let policy = FetcherPolicy {
@@ -27635,8 +27608,7 @@ mod tests {
         assert_eq!(
             scanner
                 .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
-                .await
-                .unwrap(),
+                .await,
             ("fr".into(), "FR".into())
         );
         let blank = LibraryOptions {
@@ -27649,11 +27621,43 @@ mod tests {
             assert_eq!(
                 scanner
                     .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
-                    .await
-                    .unwrap(),
+                    .await,
                 ("ja".into(), "JP".into())
             );
         }
+        // A parent whose row fails to read ends the walk as one that is not
+        // there: the collection folder's locale (read above), and the row is
+        // not asked for again this pass.
+        db.close().await;
+        let unread = ferrofin_db::store::guid_to_db(uuid::Uuid::from_u128(73));
+        let row = BaseItemEntity {
+            parent_id: Some(unread.clone()),
+            ..Default::default()
+        };
+        let policy = FetcherPolicy {
+            collection_folder: Some(collection),
+            ..policy
+        };
+        assert_eq!(
+            scanner
+                .resolve_metadata_locale(&row, &lookup, policy, &mut cache)
+                .await,
+            ("it".into(), "IT".into())
+        );
+        assert!(cache.unread_parents.contains(&unread));
+        assert!(cache.locale_parents.contains_key(&unread));
+        // So does a collection folder row that fails to read: the library's.
+        assert_eq!(
+            scanner
+                .resolve_metadata_locale(
+                    &BaseItemEntity::default(),
+                    &lookup,
+                    policy,
+                    &mut ArtworkCache::default()
+                )
+                .await,
+            ("fr".into(), "FR".into())
+        );
     }
 
     /// `MatchesPreferredLanguage`: the language subtags compare, and an
@@ -28817,6 +28821,24 @@ mod tests {
         assert_eq!(folders.counts(), (0, 1), "the snapshot, once");
         let row = items.retrieve_item(person).await.unwrap().unwrap();
         assert_eq!(row.overview.as_deref(), Some("TMDB bio."), "fetched");
+    }
+
+    /// gl-1287: a watcher scan lists the libraries once. The listing that maps
+    /// the changed paths to the items they refresh is the one it plans by.
+    #[tokio::test]
+    async fn a_changed_path_scan_lists_the_libraries_once() {
+        let db = crate::test_support::test_db().await;
+        let folders = std::sync::Arc::new(CountingFolders::default());
+        let scanner = LibraryScanner::new(
+            folders.clone(),
+            std::sync::Arc::new(FerrofinFileSystem::new()),
+            std::sync::Arc::new(FerrofinItemPersistenceService::new(db)),
+        );
+        scanner
+            .scan_paths(&["/nowhere/Heat (1995).mkv".to_owned()])
+            .await
+            .expect("scan");
+        assert_eq!(folders.counts().0, 1, "full listings");
     }
 
     /// gl-1084: the artwork destination saver runs for every item a scan saves,

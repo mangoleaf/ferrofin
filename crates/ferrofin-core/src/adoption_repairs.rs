@@ -178,21 +178,16 @@ pub async fn sync_child_parent_names(db: &Database) -> Result<u64, ServiceError>
     Ok(changed)
 }
 
-/// A `ferrofin-db` error on the bookkeeping tables, as a service error.
-fn meta_err(err: impl std::fmt::Display) -> ServiceError {
-    ServiceError::Backend(err.to_string())
-}
-
 /// Whether `key` still has to run.
 async fn once(db: &Database, key: &str) -> Result<bool, ServiceError> {
-    if db.meta_get(key).await.map_err(meta_err)?.is_some() {
+    if db.meta_get(key).await?.is_some() {
         return Ok(false);
     }
     Ok(true)
 }
 
 async fn done(db: &Database, key: &str) -> Result<(), ServiceError> {
-    db.meta_set(key, "1").await.map_err(meta_err)
+    Ok(db.meta_set(key, "1").await?)
 }
 
 /// A row [`import_membership_once`] reads: `Id`, `Type`, `Path`, `IsFolder`, `Data`.
@@ -217,7 +212,7 @@ pub async fn import_membership_once(
     db: &Database,
     paths: &VirtualPathExpander,
 ) -> Result<usize, ServiceError> {
-    let Some(state) = db.adoption_state().await.map_err(meta_err)? else {
+    let Some(state) = db.adoption_state().await? else {
         return Ok(0);
     };
     // Every 10.11.x release keeps membership only in `Data` JSON; 12.0's
@@ -1204,11 +1199,7 @@ pub async fn rehome_local_versions(
     }
     // It rewrites rows users made something of: the file as it was goes
     // aside first, as before a table-rebuilding migration.
-    if let Some(backup) = db
-        .snapshot_once(SNAPSHOT_EXTENSION)
-        .await
-        .map_err(meta_err)?
-    {
+    if let Some(backup) = db.snapshot_once(SNAPSHOT_EXTENSION).await? {
         tracing::info!(
             backup = %backup.display(),
             "database snapshot taken before re-homing local versions and stacked parts"
@@ -1229,9 +1220,7 @@ pub async fn rehome_local_versions(
         }
     }
     if copies.len() != owed {
-        db.meta_set(COPY_KEY, &encode_copies(&copies))
-            .await
-            .map_err(meta_err)?;
+        db.meta_set(COPY_KEY, &encode_copies(&copies)).await?;
     }
     // Local versions first: a version's own stack is owned by its new id.
     let (versions, rekeyed, versions_moved) =
@@ -1261,7 +1250,7 @@ const COPY_KEY: &str = "rehome_local_versions_v12_copies";
 /// The primaries an earlier [`rehome_local_versions`] still owes a copy
 /// ([`COPY_KEY`]).
 async fn pending_copies(db: &Database) -> Result<BTreeSet<Uuid>, ServiceError> {
-    let Some(value) = db.meta_get(COPY_KEY).await.map_err(meta_err)? else {
+    let Some(value) = db.meta_get(COPY_KEY).await? else {
         return Ok(BTreeSet::new());
     };
     value
@@ -1426,11 +1415,7 @@ pub async fn rekey_virtual_seasons(
     }
     // It rewrites rows users made something of: the file as it was goes
     // aside first, as before a table-rebuilding migration.
-    if let Some(backup) = db
-        .snapshot_once(SEASON_SNAPSHOT_EXTENSION)
-        .await
-        .map_err(meta_err)?
-    {
+    if let Some(backup) = db.snapshot_once(SEASON_SNAPSHOT_EXTENSION).await? {
         tracing::info!(
             backup = %backup.display(),
             "database snapshot taken before re-keying seasons with no folder"
@@ -1546,11 +1531,7 @@ pub async fn rekey_pathless_playlists(
     }
     // It rewrites rows users made something of: the file as it was goes
     // aside first, as before a table-rebuilding migration.
-    if let Some(backup) = db
-        .snapshot_once(PLAYLIST_SNAPSHOT_EXTENSION)
-        .await
-        .map_err(meta_err)?
-    {
+    if let Some(backup) = db.snapshot_once(PLAYLIST_SNAPSHOT_EXTENSION).await? {
         tracing::info!(
             backup = %backup.display(),
             "database snapshot taken before giving playlists their folders"
@@ -1712,11 +1693,7 @@ pub async fn merge_legacy_collections_library(
     };
     let retired = parse_id(&legacy)?;
     let name = legacy.name.as_deref().unwrap_or("Collections");
-    if let Some(backup) = db
-        .snapshot_once(COLLECTIONS_SNAPSHOT_EXTENSION)
-        .await
-        .map_err(meta_err)?
-    {
+    if let Some(backup) = db.snapshot_once(COLLECTIONS_SNAPSHOT_EXTENSION).await? {
         tracing::info!(
             backup = %backup.display(),
             "database snapshot taken before moving the collections library"
@@ -1854,7 +1831,7 @@ pub async fn sweep_missing_items(
     user_views: &str,
 ) -> Result<SweptItems, ServiceError> {
     const KEY: &str = "missing_item_sweeps_v12";
-    let Some(adoption) = db.adoption_state().await.map_err(meta_err)? else {
+    let Some(adoption) = db.adoption_state().await? else {
         return Ok(SweptItems::default());
     };
     if !adoption.generation.starts_with("10.11.") || !once(db, KEY).await? {
@@ -2524,11 +2501,7 @@ async fn delete_swept(
     if items.is_empty() {
         return Ok(0);
     }
-    if let Some(backup) = db
-        .snapshot_once(SWEEP_SNAPSHOT_EXTENSION)
-        .await
-        .map_err(meta_err)?
-    {
+    if let Some(backup) = db.snapshot_once(SWEEP_SNAPSHOT_EXTENSION).await? {
         tracing::info!(
             backup = %backup.display(),
             "database snapshot taken before removing items whose library or file is gone"
@@ -3502,11 +3475,7 @@ async fn harmonize_in_partitions(db: &Database, partition: i64) -> Result<usize,
         done(db, HARMONIZE_KEY).await?;
         return Ok(0);
     }
-    if let Some(backup) = db
-        .snapshot_once(HARMONIZE_SNAPSHOT_EXTENSION)
-        .await
-        .map_err(meta_err)?
-    {
+    if let Some(backup) = db.snapshot_once(HARMONIZE_SNAPSHOT_EXTENSION).await? {
         tracing::info!(
             backup = %backup.display(),
             "database snapshot taken before harmonizing conflicting user data"
@@ -7169,11 +7138,7 @@ async fn plan_rebase(
 async fn apply_rebase(db: &Database, plan: &RebasePlan) -> Result<Option<Rebased>, ServiceError> {
     // It rewrites paths users' artwork hangs on: the file as it was goes aside
     // first, as before the other row-rewriting repairs.
-    if let Some(backup) = db
-        .snapshot_once(PROGRAM_DATA_SNAPSHOT_EXTENSION)
-        .await
-        .map_err(meta_err)?
-    {
+    if let Some(backup) = db.snapshot_once(PROGRAM_DATA_SNAPSHOT_EXTENSION).await? {
         tracing::info!(
             backup = %backup.display(),
             "database snapshot taken before rewriting paths under a previous program-data directory"

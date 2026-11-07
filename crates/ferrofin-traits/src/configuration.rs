@@ -150,12 +150,17 @@ fn _assert_object_safe_server_configuration_manager(_: &dyn ServerConfigurationM
 
 /// Stores and retrieves per-user, per-client display preferences.
 ///
-/// Port of `IDisplayPreferencesManager`. Getters create the row if absent but do
-/// not auto-persist (matching the C# contract); the `update_*` methods commit.
+/// Port of `IDisplayPreferencesManager`, following upstream's implementation
+/// rather than the interface's remarks, which say the getters do not save.
+/// On a miss each getter stores a row of default values, as upstream's `Add` +
+/// `SaveChanges` does, and returns it, so a first read writes to the database.
+/// Concurrent first reads of the same user/item/client store one row and all
+/// return it. The `update_*` methods save the caller's changes to a row a
+/// getter returned.
 #[async_trait]
 pub trait DisplayPreferencesManager: Send + Sync {
-    /// Gets the display preferences for a user/item/client (creating a default
-    /// row in memory if none exists).
+    /// Gets the display preferences for a user/item/client, first storing a row
+    /// of default values if none exists.
     async fn get_display_preferences(
         &self,
         user_id: Uuid,
@@ -163,7 +168,8 @@ pub trait DisplayPreferencesManager: Send + Sync {
         client: &str,
     ) -> Result<DisplayPreferencesEntity, ServiceError>;
 
-    /// Gets the item display preferences for a user/item/client.
+    /// Gets the item display preferences for a user/item/client, first storing a
+    /// row of default values if none exists.
     async fn get_item_display_preferences(
         &self,
         user_id: Uuid,
@@ -195,13 +201,17 @@ pub trait DisplayPreferencesManager: Send + Sync {
         custom_preferences: &HashMap<String, Option<String>>,
     ) -> Result<(), ServiceError>;
 
-    /// Creates or updates a display-preferences row.
+    /// Saves the changes to an existing display-preferences row, matched by its
+    /// user/item/client. It creates no row (nor does upstream's
+    /// `EntityState.Modified` attach), so get the row first.
     async fn update_display_preferences(
         &self,
         display_preferences: &DisplayPreferencesEntity,
     ) -> Result<(), ServiceError>;
 
-    /// Creates or updates an item display-preferences row.
+    /// Saves the changes to an existing item display-preferences row, matched
+    /// by its `Id`. It creates no row (nor does upstream's
+    /// `EntityState.Modified` attach), so get the row first.
     async fn update_item_display_preferences(
         &self,
         item_display_preferences: &ItemDisplayPreferencesEntity,

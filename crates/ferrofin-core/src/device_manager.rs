@@ -59,9 +59,10 @@ pub struct FerrofinDeviceManager {
     ///   across a session that ended, before it re-posts
     ///   `/Sessions/Capabilities/Full`.
     ///
-    /// Growth is bounded by the number of device ids that ever authenticated —
-    /// the same population as the persisted `Devices` table, at a few hundred
-    /// bytes each — so this is not a leak that outruns the database.
+    /// The key is the request's `DeviceId` header, which needs no `Devices`
+    /// row, so the map grows by one entry per device id that ever reported
+    /// capabilities until the server restarts, as upstream's does (the owner
+    /// kept upstream's unpruned map, gl-1267, 2026-11-06).
     capabilities: Arc<RwLock<HashMap<String, ClientCapabilities>>>,
     /// The shared token-resolution cache — a created or deleted device's token
     /// is dropped from it and an update clears it, so a deleted/rewritten token

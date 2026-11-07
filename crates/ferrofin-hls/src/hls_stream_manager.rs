@@ -629,18 +629,21 @@ where
             .ok()
             .flatten()
         {
-            // `current` sees in-progress `.tmp` segments too, so a live job that
-            // is still encoding its first segment reads as progress, not absence.
-            // Listed on the blocking pool: the directory holds every segment of
-            // every live transcode (gl-1255).
+            // `current` is the front of this job's own run of segments, from its
+            // `-start_number`: killed jobs leave theirs on disk (gl-52). It sees
+            // in-progress `.tmp` segments too, so a live job that is still
+            // encoding reads as progress, not absence. Listed on the blocking
+            // pool: the directory holds every segment of every live transcode
+            // (gl-1255).
+            let start = self.manager.segment_start_number(&handle).unwrap_or(0);
             let listed = playlist_path.clone();
             let current =
-                tokio::task::spawn_blocking(move || current_transcoding_index(&listed, ext))
+                tokio::task::spawn_blocking(move || current_transcoding_index(&listed, ext, start))
                     .await
                     .map_err(|error| {
                         ServiceError::backend(format!("list transcode segments: {error}"))
                     })?;
-            if should_wait_for_running_job(current, segment_id) {
+            if should_wait_for_running_job(start, current, segment_id) {
                 // The wait is an active consumer: the guard keeps the idle
                 // reaper away and self-releases if the client disconnects.
                 let _guard = self
@@ -733,8 +736,8 @@ where
             let failures = self.record_restart_failure(&playlist_key);
             Err(ServiceError::backend(format!(
                 "transcode exited before producing segment {segment_id} \
-                 (consecutive failures: {failures}); see {}",
-                playlist_path.with_extension("log").display()
+                 (consecutive failures: {failures}); see the FFmpeg.* logs in {}",
+                self.paths.log_directory_path()
             )))
         }
     }
@@ -749,6 +752,7 @@ where
     /// nothing, and "the start segment exists" proves the init is complete and
     /// closed. This gates on the latter — upstream's `WaitForPath = segment 0`
     /// for `segmentId == -1` — and never sleeps on a size-stability poll.
+    #[allow(clippy::too_many_lines)]
     async fn resolve_init_segment(
         &self,
         request: &HlsStreamRequest,
@@ -808,7 +812,11 @@ where
         let lock = self.playlist_lock(&playlist_key);
         let _guard = lock.lock().await;
 
+        // Only the request that starts a job counts it in the restart breaker,
+        // so a job this one merely waited on is never counted twice.
+        let mut started = false;
         if !start_segment.exists() {
+            let mut delivered = false;
             if let Some(handle) = self
                 .manager
                 .get_transcoding_job_by_path(&playlist_key, TranscodingJobType::Hls)
@@ -823,11 +831,17 @@ where
                 let _rg = self
                     .manager
                     .begin_request_guard(&playlist_key, TranscodingJobType::Hls);
-                let _ = self
+                delivered = self
                     .manager
                     .wait_for_segment(&handle, &plan.playlist_path, start)
                     .await;
-            } else {
+                if !delivered {
+                    // The job exited without it: drop it and start afresh, as a
+                    // segment request does, or every retry waits on the dead job.
+                    self.manager.kill_and_remove(&handle, false, false).await;
+                }
+            }
+            if !delivered {
                 if self.restart_breaker_open(&playlist_key) {
                     return Err(ServiceError::backend(format!(
                         "transcode for this stream died {RESTART_FAILURE_LIMIT}+ times in a row \
@@ -861,11 +875,12 @@ where
                 {
                     return Err(self.failed_start(&playlist_key, e));
                 }
-                self.clear_restart_failures(&playlist_key);
+                started = true;
             }
         }
 
         if init_is_complete(&init_path, &start_segment) {
+            self.clear_restart_failures(&playlist_key);
             let mut file = served(&init_path, ext);
             file.progress = self.manager.segment_progress(
                 &plan.playlist_path.to_string_lossy(),
@@ -876,9 +891,19 @@ where
             );
             Ok(file)
         } else {
-            Err(ServiceError::NotFound(
-                "fmp4 init segment did not materialise".to_owned(),
-            ))
+            // A 5xx, not a 404, as for a segment: hls.js gives up on a 404'd
+            // init, while a server error makes it retry with backoff.
+            let failures = if started {
+                let count = self.record_restart_failure(&playlist_key);
+                format!(" (consecutive failures: {count})")
+            } else {
+                String::new()
+            };
+            Err(ServiceError::backend(format!(
+                "transcode did not produce the fmp4 init segment{failures}; \
+                 see the FFmpeg.* logs in {}",
+                self.paths.log_directory_path()
+            )))
         }
     }
 
@@ -1419,14 +1444,24 @@ fn segment_containing(starts: &[i64], ticks: i64) -> (i32, i64) {
     }
 }
 
-/// The highest segment index a transcode has written for `playlist` on disk.
-///
-/// Scans the output directory for `{stem}{n}{ext}` files and returns the max
-/// `n` — the running job's progress front. `None` when nothing has been
-/// produced yet. Port of `GetCurrentTranscodingIndex`; used to decide whether a
+/// The progress front of the running job for `playlist` that writes from
+/// segment `start` (its `-start_number`): the last segment of the unbroken run
+/// of `{stem}{n}{ext}` files from the lowest one at or past `start`. `None`
+/// when nothing at or past `start` is on disk yet. Used to decide whether a
 /// segment request is a read-ahead (wait) or a seek (evict + restart).
-/// Blocking: an async caller runs it on the blocking pool.
-fn current_transcoding_index(playlist: &Path, ext: &str) -> Option<i32> {
+///
+/// Port of `GetCurrentTranscodingIndex`, which takes the newest file by
+/// `LastWriteTimeUtc`; a deliberate divergence. Killed jobs leave their
+/// segments behind, so the highest index on disk is often not the running
+/// job's (gl-52), and the newest-file test is unreliable where mtimes are
+/// coarse (some filesystems, NFS): a killed job's last segment and its
+/// replacement's first are written within the same second. A segment below
+/// `start` or past a gap in the run is an earlier job's. Leftovers that adjoin
+/// the run count toward its front: the job writes over them before it reaches
+/// anything past them, so a request there waits rather than restarts. The run
+/// can begin past `start` once rolling deletion removed the job's first
+/// segments. Blocking: an async caller runs it on the blocking pool.
+fn current_transcoding_index(playlist: &Path, ext: &str, start: i32) -> Option<i32> {
     let folder = playlist.parent()?;
     let stem = playlist.file_stem()?.to_string_lossy().into_owned();
     let suffix = if ext.starts_with('.') {
@@ -1434,7 +1469,7 @@ fn current_transcoding_index(playlist: &Path, ext: &str) -> Option<i32> {
     } else {
         format!(".{ext}")
     };
-    std::fs::read_dir(folder)
+    let indices: std::collections::BTreeSet<i32> = std::fs::read_dir(folder)
         .ok()?
         .flatten()
         .filter_map(|entry| {
@@ -1451,7 +1486,13 @@ fn current_transcoding_index(playlist: &Path, ext: &str) -> Option<i32> {
                 .parse::<i32>()
                 .ok()
         })
-        .max()
+        .filter(|&index| index >= start)
+        .collect();
+    let mut front = *indices.first()?;
+    while let Some(next) = front.checked_add(1).filter(|next| indices.contains(next)) {
+        front = next;
+    }
+    Some(front)
 }
 
 /// Whether the fMP4 init at `init` is complete: ffmpeg fills it in the flush
@@ -1462,20 +1503,21 @@ fn init_is_complete(init: &Path, start_segment: &Path) -> bool {
     start_segment.exists() && std::fs::metadata(init).is_ok_and(|m| m.len() > 0)
 }
 
-/// Whether a segment request should wait on the running job rather than kill
-/// and restart it (`GetDynamicSegment`'s current-index decision).
+/// Whether a segment request should wait on the running job, which writes
+/// from segment `start`, rather than kill and restart it
+/// (`GetDynamicSegment`'s current-index decision). `current` is the job's
+/// front ([`current_transcoding_index`]).
 ///
-/// `None` (no segment on disk yet, not even a `.tmp`) means the job only just
-/// spawned: wait — a client retry during the first-segment encode must not
-/// kill a healthy job (the cast-receiver kill/restart storm). Otherwise wait
-/// when the request is at or just ahead of the encoder's front (upstream also
-/// waits on `segment_id == current`); behind it, or more than
-/// [`SEGMENT_WAIT_GAP`] ahead, is a real seek → restart.
-fn should_wait_for_running_job(current: Option<i32>, segment_id: i32) -> bool {
-    match current {
-        None => true,
-        Some(c) => segment_id >= c && segment_id - c <= SEGMENT_WAIT_GAP,
-    }
+/// `None` (nothing of the job's on disk yet, not even a `.tmp`) means it is
+/// still encoding segment `start`: a client retry of that first encode must not
+/// kill a healthy job (the cast-receiver kill/restart storm). Wait when the
+/// request is at or at most [`SEGMENT_WAIT_GAP`] ahead of the front (upstream
+/// also waits on `segment_id == current`). Behind it, which includes a segment
+/// before `start` that the job never writes, or further ahead, is a real seek →
+/// restart.
+fn should_wait_for_running_job(start: i32, current: Option<i32>, segment_id: i32) -> bool {
+    let front = current.unwrap_or(start);
+    segment_id >= front && segment_id - front <= SEGMENT_WAIT_GAP
 }
 
 /// Builds a [`ServedFile`] for `path`, choosing the MIME type from `ext`.
@@ -1652,6 +1694,10 @@ mod tests {
             let mut arguments = vec!["-i".to_owned(), "in.mkv".to_owned()];
             if kind == PlaylistKind::Event {
                 arguments.extend(["-hls_playlist_type".to_owned(), "event".to_owned()]);
+            }
+            // As the real planner numbers a job's segments from the one asked for.
+            if let Some(id) = segment_id {
+                arguments.extend(["-start_number".to_owned(), id.to_string()]);
             }
             Ok(TranscodePlan {
                 ffmpeg_env: Vec::new(),
@@ -2095,6 +2141,119 @@ mod tests {
         assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
     }
 
+    /// The consecutive dead transcodes recorded for the test playlist.
+    fn restart_failures(mgr: &Mgr, dir: &Path) -> u32 {
+        let key = dir.join("out.m3u8").to_string_lossy().into_owned();
+        mgr.restart_failures
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map_or(0, |(count, _)| *count)
+    }
+
+    #[tokio::test]
+    async fn a_dead_init_transcode_is_a_backend_error_that_feeds_the_breaker() {
+        let tmp = tempfile::tempdir().unwrap();
+        // ffmpeg exits 0 without writing the init or its start segment (a cold
+        // NFS read). fMP4 is every HEVC/AV1 transcode and the init is its first
+        // request, so the init path must count the dead job like a segment.
+        let script = FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, _, spawns) = manager_full(tmp.path(), script, "mp4");
+        let init_req = HlsStreamRequest {
+            segment_container: Some("mp4".to_owned()),
+            ..req()
+        };
+
+        // Each retry replaces the dead job with a fresh transcode and counts it.
+        for attempt in 1..=RESTART_FAILURE_LIMIT {
+            let err = mgr.dynamic_segment(&init_req, -1, false).await.unwrap_err();
+            assert_eq!(restart_failures(&mgr, tmp.path()), attempt, "{err:?}");
+            assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+        }
+        let spawned = spawns.requests.lock().unwrap().len();
+        assert_eq!(spawned, RESTART_FAILURE_LIMIT as usize);
+
+        // Breaker open: the next init request fails fast with no new spawn.
+        let err = mgr.dynamic_segment(&init_req, -1, false).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+        assert_eq!(spawns.requests.lock().unwrap().len(), spawned);
+    }
+
+    #[tokio::test]
+    async fn an_init_waiting_on_a_dead_job_counts_only_its_own_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            extra_files: vec!["out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, _, spawns) = manager_full(tmp.path(), script, "mp4");
+        let init_req = HlsStreamRequest {
+            segment_container: Some("mp4".to_owned()),
+            ..req()
+        };
+
+        // The segment request starts the job, which dies; it counts it.
+        let err = mgr.dynamic_segment(&init_req, 0, false).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+        assert_eq!(restart_failures(&mgr, tmp.path()), 1);
+
+        // The init request finds that dead job, which it must not count again:
+        // it replaces it with a fresh transcode and counts that one.
+        let err = mgr.dynamic_segment(&init_req, -1, false).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+        assert_eq!(spawns.requests.lock().unwrap().len(), 2);
+        assert_eq!(restart_failures(&mgr, tmp.path()), 2);
+    }
+
+    #[tokio::test]
+    async fn an_init_that_materialises_clears_the_breaker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out0.mp4".to_owned()],
+            extra_files: vec!["out-1.mp4".to_owned(), "out.m3u8".to_owned()],
+            exits_immediately: true,
+            ..FakeScript::default()
+        };
+        let (mgr, _) = manager_with(tmp.path(), script, "mp4");
+        let key = tmp.path().join("out.m3u8").to_string_lossy().into_owned();
+        for _ in 1..RESTART_FAILURE_LIMIT {
+            mgr.record_restart_failure(&key);
+        }
+        let init_req = HlsStreamRequest {
+            segment_container: Some("mp4".to_owned()),
+            ..req()
+        };
+
+        mgr.dynamic_segment(&init_req, -1, false).await.unwrap();
+
+        // The failures before it are no longer consecutive.
+        assert_eq!(restart_failures(&mgr, tmp.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_init_beside_its_start_segment_is_a_backend_error_left_uncounted() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A later job recreated the init empty at its header and died, while an
+        // earlier job's start segment stays on disk. No job of this request's.
+        std::fs::write(tmp.path().join("out0.mp4"), b"seg").unwrap();
+        std::fs::write(tmp.path().join("out-1.mp4"), b"").unwrap();
+        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "mp4");
+        let init_req = HlsStreamRequest {
+            segment_container: Some("mp4".to_owned()),
+            ..req()
+        };
+
+        let err = mgr.dynamic_segment(&init_req, -1, false).await.unwrap_err();
+
+        assert!(matches!(err, ServiceError::Backend(_)), "got {err:?}");
+        assert_eq!(restart_failures(&mgr, tmp.path()), 0);
+    }
+
     #[tokio::test]
     async fn restart_breaker_stops_the_spawn_storm_and_half_opens() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2432,17 +2591,31 @@ mod tests {
     /// A missing segment waits for the running job or restarts it at that
     /// segment, by where the job's front is on disk: Ferrofin's variant of
     /// `GetDynamicSegment`'s decision (its own wait gap, and `.tmp` segments
-    /// count). A seek behind the front or past the wait gap restarts, and a
-    /// request at or just ahead of it waits, also when the front is a `.tmp`
-    /// segment still being encoded after a seek.
+    /// count). A seek behind the job's start or past the wait gap restarts, and
+    /// a request at or just ahead of the front waits, also when the front is a
+    /// `.tmp` segment still being encoded. Segments an earlier, killed job left
+    /// on disk are not the running job's front (gl-52).
     #[rstest::rstest]
-    #[case::just_ahead_waits(&[], 1, false)]
-    #[case::at_the_wait_gap_waits(&[], SEGMENT_WAIT_GAP, false)]
-    #[case::a_seek_past_the_wait_gap_restarts(&[], SEGMENT_WAIT_GAP + 1, true)]
-    #[case::a_seek_behind_the_front_restarts(&["out10.ts", "out11.ts"], 5, true)]
-    #[case::a_retry_during_a_seeks_first_segment_waits(&["out20.ts.tmp"], 20, false)]
+    #[case::just_ahead_waits(0, &[], 1, false)]
+    #[case::at_the_wait_gap_waits(0, &[], SEGMENT_WAIT_GAP, false)]
+    #[case::a_seek_past_the_wait_gap_restarts(0, &[], SEGMENT_WAIT_GAP + 1, true)]
+    #[case::a_seek_behind_the_jobs_start_restarts(10, &["out11.ts"], 5, true)]
+    #[case::the_segment_being_encoded_is_the_front(
+        0,
+        &["out1.ts", "out2.ts.tmp"],
+        2 + SEGMENT_WAIT_GAP,
+        false
+    )]
+    #[case::leftovers_past_a_gap_are_not_the_front(5, &["out15.ts", "out16.ts"], 6, false)]
+    #[case::leftovers_below_the_jobs_start_are_not_the_front(
+        15,
+        &["out0.ts", "out1.ts", "out2.ts"],
+        16,
+        false
+    )]
     #[tokio::test]
     async fn the_running_jobs_front_decides_between_waiting_and_restarting(
+        #[case] start: i32,
         #[case] written: &[&str],
         #[case] segment: i32,
         #[case] restarts: bool,
@@ -2450,12 +2623,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // The child keeps running, so the job stays live between requests.
         let script = FakeScript {
-            segment_files: vec!["out0.ts".to_owned()],
+            segment_files: vec![format!("out{start}.ts")],
             extra_files: vec!["out.m3u8".to_owned()],
             ..FakeScript::default()
         };
         let (mgr, _, spawns) = manager_full(tmp.path(), script, "ts");
-        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        mgr.dynamic_segment(&req(), start, false).await.unwrap();
         for name in written {
             std::fs::write(tmp.path().join(name), b"seg").unwrap();
         }
@@ -2932,44 +3105,58 @@ mod tests {
     }
 
     #[test]
-    fn current_transcoding_index_is_the_max_produced_segment() {
+    fn current_transcoding_index_is_the_end_of_the_jobs_own_run() {
         let dir = tempfile::tempdir().unwrap();
         let playlist = dir.path().join("abc123.m3u8");
+        let write = |name: &str| std::fs::write(dir.path().join(name), b"x").unwrap();
         // Nothing produced yet.
-        assert_eq!(current_transcoding_index(&playlist, ".ts"), None);
-        // A running job wrote segments 0,1,2 plus its playlist + a foreign file.
+        assert_eq!(current_transcoding_index(&playlist, ".ts", 0), None);
+        // A job from 0 wrote segments 0,1,2 beside its playlist and a foreign file.
         for n in [0, 1, 2] {
-            std::fs::write(dir.path().join(format!("abc123{n}.ts")), b"x").unwrap();
+            write(&format!("abc123{n}.ts"));
         }
-        std::fs::write(&playlist, b"#EXTM3U").unwrap();
-        std::fs::write(dir.path().join("other9.ts"), b"x").unwrap(); // different stem
-        assert_eq!(current_transcoding_index(&playlist, ".ts"), Some(2));
-        // After a seek restart wrote 20,21, the front is the highest index.
-        std::fs::write(dir.path().join("abc12320.ts"), b"x").unwrap();
-        std::fs::write(dir.path().join("abc12321.ts"), b"x").unwrap();
-        assert_eq!(current_transcoding_index(&playlist, ".ts"), Some(21));
+        write("abc123.m3u8");
+        write("other9.ts"); // different stem
+        assert_eq!(current_transcoding_index(&playlist, ".ts", 0), Some(2));
         // An in-progress `temp_file` segment counts as the encoder's front —
         // during the first-segment encode the job must not read as "no progress".
-        std::fs::write(dir.path().join("abc12322.ts.tmp"), b"x").unwrap();
-        assert_eq!(current_transcoding_index(&playlist, ".ts"), Some(22));
+        write("abc1233.ts.tmp");
+        assert_eq!(current_transcoding_index(&playlist, ".ts", 0), Some(3));
+        // A killed job's 20 and 21 lie past a gap: not this job's front (gl-52).
+        write("abc12320.ts");
+        write("abc12321.ts");
+        assert_eq!(current_transcoding_index(&playlist, ".ts", 0), Some(3));
+        // For the job that started at 20, 0 to 3 are an earlier job's.
+        assert_eq!(current_transcoding_index(&playlist, ".ts", 20), Some(21));
+        // A job started at 19 whose first segment rolling deletion removed.
+        assert_eq!(current_transcoding_index(&playlist, ".ts", 19), Some(21));
+        // Nothing of a job started at 30 is on disk yet.
+        assert_eq!(current_transcoding_index(&playlist, ".ts", 30), None);
+        // The fMP4 init (`{stem}-1.mp4`) is not a segment of any job.
+        write("abc123-1.mp4");
+        assert_eq!(current_transcoding_index(&playlist, ".mp4", 0), None);
     }
 
     #[test]
-    fn wait_vs_restart_decision_matches_upstream() {
+    fn the_wait_or_restart_decision_reads_the_running_jobs_range() {
         use super::should_wait_for_running_job;
-        // Job just spawned, nothing on disk (not even a .tmp): wait, never kill
-        // — a retry in the first-segment window used to kill/restart-loop the
-        // cast receiver's playback.
-        assert!(should_wait_for_running_job(None, 0));
-        assert!(should_wait_for_running_job(None, 5));
+        // Job just spawned at 5, nothing on disk (not even a .tmp): wait for
+        // what it is about to write, never kill — a retry in the first-segment
+        // window used to kill/restart-loop the cast receiver's playback.
+        assert!(should_wait_for_running_job(5, None, 5));
+        assert!(should_wait_for_running_job(5, None, 5 + SEGMENT_WAIT_GAP));
+        // A segment before its start is one it never writes, and one past the
+        // gap is a seek.
+        assert!(!should_wait_for_running_job(5, None, 4));
+        assert!(!should_wait_for_running_job(5, None, 6 + SEGMENT_WAIT_GAP));
         // At the encoder's front: wait (upstream waits on ==, Ferrofin used to
         // restart here).
-        assert!(should_wait_for_running_job(Some(3), 3));
+        assert!(should_wait_for_running_job(0, Some(3), 3));
         // Just ahead (within the read-ahead gap): wait.
-        assert!(should_wait_for_running_job(Some(3), 5));
+        assert!(should_wait_for_running_job(0, Some(3), 5));
         // Behind the front (backward seek) or far ahead (forward seek): restart.
-        assert!(!should_wait_for_running_job(Some(3), 2));
-        assert!(!should_wait_for_running_job(Some(3), 6));
+        assert!(!should_wait_for_running_job(0, Some(3), 2));
+        assert!(!should_wait_for_running_job(0, Some(3), 6));
     }
 
     #[tokio::test]

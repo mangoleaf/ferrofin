@@ -993,9 +993,14 @@ impl PeopleValidationTask {
 
     /// Refreshes the person items `ids` with the options `options_for`
     /// builds for each, reporting progress over `base..base + span`; returns
-    /// how many were refreshed. Stops at the first failure: a provider-manager
-    /// failure (no network, no image store) repeats identically for every
-    /// person, and the next scheduled run retries.
+    /// how many were refreshed. A person whose refresh fails is logged and
+    /// skipped, as upstream's per-person `catch` does. A refresh fails only
+    /// on a store or file step (a provider or network failure just leaves
+    /// the person unstamped), and such a failure can be one person's row;
+    /// both lists are in `Id` order, so stopping there would block everyone
+    /// after that person on every run. Upstream logs each failure as an
+    /// error; here the first of a pass is one and the rest go to debug, so
+    /// the log does not grow with the library (LOGGING.md).
     async fn refresh_people(
         &self,
         ids: &[String],
@@ -1006,6 +1011,7 @@ impl PeopleValidationTask {
     ) -> usize {
         let total = ids.len().max(1);
         let mut refreshed = 0usize;
+        let mut failed = false;
         for (index, id) in ids.iter().enumerate() {
             if let Ok(item_id) = Uuid::parse_str(id) {
                 match self
@@ -1014,9 +1020,12 @@ impl PeopleValidationTask {
                     .await
                 {
                     Ok(_) => refreshed += 1,
+                    Err(e) if failed => {
+                        tracing::debug!(%item_id, error = %e, "error refreshing person");
+                    }
                     Err(e) => {
-                        tracing::warn!(person = id, error = %e, "person refresh failed");
-                        break;
+                        failed = true;
+                        tracing::error!(%item_id, error = %e, "error refreshing person");
                     }
                 }
             }
@@ -3796,6 +3805,60 @@ mod tests {
         assert_eq!(refreshed[0].1.image_refresh_mode, FullRefresh);
     }
 
+    /// `PeopleValidator.Run` and `RefreshPersonAsync` log a person's failed
+    /// refresh and go on to the next, so the people sorted after a failing
+    /// one (here the two lowest ids, first in both passes) still refresh.
+    /// Only a pass's first failure is an error, so the log does not grow
+    /// with the library.
+    #[tokio::test]
+    async fn a_failing_person_does_not_stop_the_people_after_it() {
+        let db = test_db().await;
+        let people = [0xE1, 0xE2, 0xE3].map(Uuid::from_u128);
+        for (id, name) in people.iter().zip(["Ann", "Bob", "Cy"]) {
+            seed_named_item(&db, *id, BaseItemKind::Person, name).await;
+        }
+        let providers = Arc::new(RecordingProviders {
+            failing: people[..2].to_vec(),
+            ..RecordingProviders::default()
+        });
+        let task = unwired_people_task(&db, providers.clone());
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .finish(),
+        );
+
+        task.refresh_new_person_items(&TaskProgress::default(), 0.0, 1.0)
+            .await
+            .expect("new people");
+        task.refresh_person_items(&TaskProgress::default(), 0.0, 1.0)
+            .await
+            .expect("image pass");
+
+        let refreshed: Vec<Uuid> = providers
+            .refreshed
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            refreshed,
+            [people, people].concat(),
+            "both passes reach every person"
+        );
+        let text = logs.text();
+        let failures = |level: &str| {
+            text.lines()
+                .filter(|line| line.contains(level) && line.contains("error refreshing person"))
+                .count()
+        };
+        assert_eq!((failures(" ERROR "), failures(" DEBUG ")), (2, 2), "{text}");
+    }
+
     /// The task over a people repository with no identity seam: a credit
     /// derives no id, so only names say which items it calls for.
     fn unwired_people_task(
@@ -4018,10 +4081,12 @@ mod tests {
         );
     }
 
-    /// A [`ProviderManager`] fake recording `refresh_single_item` calls.
+    /// A [`ProviderManager`] fake recording `refresh_single_item` calls; the
+    /// refresh of an item in `failing` errors, as a store write would.
     #[derive(Default)]
     struct RecordingProviders {
         refreshed: Mutex<Vec<(Uuid, MetadataRefreshOptions)>>,
+        failing: Vec<Uuid>,
     }
 
     #[async_trait]
@@ -4050,6 +4115,9 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .push((item_id, options.clone()));
+            if self.failing.contains(&item_id) {
+                return Err(ServiceError::backend("disk I/O error"));
+            }
             Ok(ferrofin_traits::providers::ItemUpdateType::default())
         }
         async fn save_image_from_url(

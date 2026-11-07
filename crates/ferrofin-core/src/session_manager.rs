@@ -37,14 +37,20 @@
 //!   (`SessionInfo.StartAutomaticProgress`) is tracked as a flag on the
 //!   in-memory session. TODO(gl-803): port its one-second position estimate,
 //!   keeping the client-reported position the idle stop saves.
-//! - **The session pool is evicted exactly where upstream evicts it**, never on
-//!   a timer: [`SessionManager::report_session_ended`] (`/Sessions/Logout`, and
-//!   the C# `WebSocketController.OnConnectionClosed` -> `CloseIfNeededAsync`
-//!   path the API layer's `/socket` handler calls when a session's last socket
-//!   closes) and [`SessionManager::logout`]. A client that only ever speaks
-//!   HTTP therefore keeps its entry until the server restarts — same as
-//!   upstream, where `/Sessions` filters the stale ones by `activeWithinSeconds`
-//!   rather than reaping them; its playback is stopped by the idle check.
+//! - **The session pool is evicted where upstream evicts it, and also on an
+//!   idle timer** (a divergence, owner decision on gl-1267, 2026-11-05):
+//!   [`SessionManager::report_session_ended`] (`/Sessions/Logout`, and the C#
+//!   `WebSocketController.OnConnectionClosed` -> `CloseIfNeededAsync` path the
+//!   API layer's `/socket` handler calls when a session's last socket closes)
+//!   and [`SessionManager::logout`], as upstream; and
+//!   [`FerrofinSessionManager::evict_idle_sessions`], which the one-minute loop
+//!   runs: a session with no live socket, nothing playing and no request for
+//!   longer than the `session_idle_hours` setting ends through the
+//!   socket-close path. Upstream keeps a socketless session until the server
+//!   restarts (`/Sessions` filters the stale ones by `activeWithinSeconds`),
+//!   so a client that sends a new `DeviceId` on every run grew the pool
+//!   without bound. The device manager's capabilities map stays unpruned, as
+//!   upstream's `_capabilitiesMap` (owner decision, 2026-11-06).
 //! - **Exceptions → `Result<_, ServiceError>`**: `SecurityException` /
 //!   `AuthenticationException` → [`ServiceError::Unauthorized`]; a missing
 //!   session / user → [`ServiceError::NotFound`]; bad arguments →
@@ -57,7 +63,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ferrofin_db::Database;
@@ -65,6 +71,7 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::PermissionKind;
+use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, SessionInfoDto, SortOrder};
 use ferrofin_model::live_tv::ItemSortBy;
@@ -746,15 +753,67 @@ impl FerrofinSessionManager {
         }
     }
 
-    /// Runs [`Self::check_for_idle_playback`] and
-    /// [`Self::check_for_inactive_streams`] for as long as the host lives: the
-    /// port of `SessionManager.StartCheckTimers`' two timers. Every minute the
-    /// inactive check runs while `InactiveSessionThreshold` (read live) is
-    /// above 0, and every [`IDLE_PLAYBACK_MINUTES`] minutes the idle check
-    /// runs. Upstream starts both with a playback and stops them while nothing
-    /// plays; here they then find nothing to do. The composition root spawns
-    /// this and aborts it when the host is torn down.
-    pub async fn run_playback_checks(self: Arc<Self>, config: Arc<dyn ServerConfigurationManager>) {
+    /// Ends every session that has no live socket, plays nothing and made no
+    /// request for longer than `window` before `now`, through the path a
+    /// closed socket takes ([`SessionManager::close_if_needed`]: `SessionEnded`
+    /// and its activity-log entry). The device's capabilities are kept, so a
+    /// returning client's new session inherits them. Ferrofin only: upstream
+    /// never ends a socketless session (see the module docs).
+    pub async fn evict_idle_sessions(&self, window: chrono::TimeDelta, now: DateTime<Utc>) {
+        let is_idle = |s: &SessionInfo| {
+            s.now_playing_item_id.is_none()
+                && now - s.last_activity_date > window
+                && !self.session_is_active(s)
+        };
+        let candidates: Vec<String> = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .iter()
+                .filter(|(_, s)| is_idle(s))
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        for key in candidates {
+            // Checked again just before it ends, since ending each earlier
+            // one awaits its `SessionEnded` consumers: a request or a socket
+            // since the snapshot keeps the session. This narrows the race
+            // with a returning client to the close itself, which only makes
+            // its next request start the session again.
+            let Some(session_id) = self
+                .sessions
+                .lock()
+                .await
+                .get(&key)
+                .filter(|s| is_idle(s))
+                .map(|s| s.id.clone())
+            else {
+                continue;
+            };
+            debug!(session_id, "ending an idle session with no socket");
+            if let Err(err) = self.close_if_needed(&session_id).await {
+                warn!(session_id, %err, "error ending an idle session");
+            }
+        }
+    }
+
+    /// Runs [`Self::check_for_idle_playback`],
+    /// [`Self::check_for_inactive_streams`] and [`Self::evict_idle_sessions`]
+    /// for as long as the host lives: the port of
+    /// `SessionManager.StartCheckTimers`' two timers, plus the idle-session
+    /// sweep upstream does not have. Every minute the inactive check runs
+    /// while `InactiveSessionThreshold` (read live) is above 0 and sessions
+    /// idle past `idle_session_window` end, and every
+    /// [`IDLE_PLAYBACK_MINUTES`] minutes the idle check runs. Upstream starts
+    /// its timers with a playback and stops them while nothing plays; here
+    /// they then find nothing to do. The composition root spawns this and
+    /// aborts it when the host is torn down.
+    pub async fn run_playback_checks(
+        self: Arc<Self>,
+        config: Arc<dyn ServerConfigurationManager>,
+        idle_session_window: std::time::Duration,
+    ) {
+        let idle_session_window =
+            chrono::TimeDelta::from_std(idle_session_window).unwrap_or(chrono::TimeDelta::MAX);
         let mut minutes = tokio::time::interval_at(
             tokio::time::Instant::now() + PLAYBACK_CHECK_PERIOD,
             PLAYBACK_CHECK_PERIOD,
@@ -771,20 +830,27 @@ impl FerrofinSessionManager {
                     0
                 }
             };
-            self.run_playback_checks_at(minute, threshold, Utc::now())
+            self.run_playback_checks_at(minute, threshold, idle_session_window, Utc::now())
                 .await;
         }
     }
 
     /// One tick of [`Self::run_playback_checks`]: the `minute`-th, with the
-    /// `InactiveSessionThreshold` in force, at `now`.
-    async fn run_playback_checks_at(&self, minute: u64, threshold: i32, now: DateTime<Utc>) {
+    /// `InactiveSessionThreshold` and idle-session window in force, at `now`.
+    async fn run_playback_checks_at(
+        &self,
+        minute: u64,
+        threshold: i32,
+        idle_session_window: chrono::TimeDelta,
+        now: DateTime<Utc>,
+    ) {
         if threshold > 0 {
             self.check_for_inactive_streams(threshold, now).await;
         }
         if idle_check_due(minute) {
             self.check_for_idle_playback(now).await;
         }
+        self.evict_idle_sessions(idle_session_window, now).await;
     }
 
     /// Computes the session key the pool is indexed by (C# `GetSessionKey`:
@@ -896,8 +962,8 @@ impl FerrofinSessionManager {
             // A newly created session inherits the device's last reported
             // capabilities (C# `OnSessionStarted` -> `ReportCapabilities(info,
             // caps, saveCapabilities: false)`). That is what makes the device
-            // manager's never-evicted capabilities map load-bearing: a session
-            // recreated after its socket closed still advertises
+            // manager's capabilities map load-bearing: a session recreated
+            // after its socket closed still advertises
             // `SupportsRemoteControl`, so the client does not vanish from the
             // cast menu until it re-posts `/Sessions/Capabilities/Full`.
             let device_capabilities = self
@@ -1058,6 +1124,25 @@ impl FerrofinSessionManager {
         Ok(users)
     }
 
+    /// The users, primary and additional, of every session [`Self::broadcast`]
+    /// can deliver to: one with an open connection or a registered bus sink.
+    async fn receiving_user_ids(&self) -> Vec<Uuid> {
+        let sessions = self.sessions.lock().await;
+        let mut ids = Vec::new();
+        for session in sessions.values().filter(|s| {
+            s.is_active() || self.bus.as_ref().is_some_and(|bus| bus.is_connected(&s.id))
+        }) {
+            let users = std::iter::once(session.user_id)
+                .chain(session.additional_users.iter().map(|u| u.user_id));
+            for id in users {
+                if !id.is_nil() && !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
+    }
+
     /// Sends a pre-serialized message to a set of sessions, matching them with a
     /// predicate over a snapshot.
     ///
@@ -1086,8 +1171,8 @@ impl FerrofinSessionManager {
         // connection nor a registered bus sink is dropped here: `bus.send` would
         // miss the map and return `false`, so skipping it delivers the same
         // messages to the same clients while costing nothing. That matters
-        // because the session pool holds every device that ever authenticated,
-        // live or not.
+        // because the session pool holds every client active within the idle
+        // window (`session_idle_hours`), live or not.
         let targets: Vec<(String, Vec<Arc<dyn WebSocketConnection>>)> = {
             let sessions = self.sessions.lock().await;
             sessions
@@ -1772,22 +1857,6 @@ impl SessionManager for FerrofinSessionManager {
             self.library_manager.get_item_by_id(info.item_id).await?
         };
 
-        // C# `OnPlaybackStart`: "User {0} started playback of '{1}' ({2} {3})",
-        // logged here so every route that reports a start logs it once.
-        if let Some(item) = &item {
-            info!(
-                user = session.user_name.as_deref(),
-                user_id = %session.user_id,
-                item_id = %info.item_id,
-                item = item.name.as_deref(),
-                device = session.device_name.as_deref(),
-                device_id = %session.device_id,
-                client = session.client.as_deref(),
-                application_version = session.application_version.as_deref(),
-                "user started playback",
-            );
-        }
-
         // The row moves into the now-playing item, which a listing builds.
         let is_library_item = item.is_some();
         let now_playing = item.map(|row| {
@@ -1795,6 +1864,27 @@ impl SessionManager for FerrofinSessionManager {
                 .kept_now_playing_item(info.item_id)
                 .unwrap_or_else(|| NowPlayingItem::new(row, NowPlaying::of(info)))
         });
+
+        // C# `OnPlaybackStart`: "User {0} started playback of '{1}' ({2} {3})",
+        // logged here so every route that reports a start logs it once, named
+        // from `info.Item`, the now-playing item, kept or new.
+        if let Some(item) = &now_playing {
+            info!(
+                user = session.user_name.as_deref(),
+                user_id = %session.user_id,
+                item_id = %info.item_id,
+                item = item.row.name.as_deref(),
+                device = session.device_name.as_deref(),
+                device_id = %session.device_id,
+                client = session.client.as_deref(),
+                application_version = session.application_version.as_deref(),
+                "user started playback",
+            );
+        }
+        // C# `MediaInfo = info.Item`.
+        let media_info = now_playing
+            .as_deref()
+            .map(|item| playback_media_info(&item.row));
 
         // Record the now-playing item + mark automatic progress started.
         {
@@ -1826,7 +1916,12 @@ impl SessionManager for FerrofinSessionManager {
             }
         }
 
-        let payload = playback_event_payload(&session, info.item_id, info.position_ticks);
+        let payload = playback_event_payload(
+            &session,
+            info.item_id,
+            info.position_ticks,
+            media_info.as_ref(),
+        );
         let _ = self.event_manager.publish("PlaybackStart", &payload).await;
         self.raise(SessionEvent::PlaybackStart);
         Ok(())
@@ -1868,6 +1963,9 @@ impl SessionManager for FerrofinSessionManager {
                 .map(|row| NowPlayingItem::new(row, NowPlaying::of(info)))
         };
         let is_library_item = now_playing.is_some();
+        let media_info = now_playing
+            .as_deref()
+            .map(|item| playback_media_info(&item.row));
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
@@ -1904,7 +2002,12 @@ impl SessionManager for FerrofinSessionManager {
             }
         }
 
-        let payload = playback_event_payload(&session, info.item_id, info.position_ticks);
+        let payload = playback_event_payload(
+            &session,
+            info.item_id,
+            info.position_ticks,
+            media_info.as_ref(),
+        );
         let _ = self
             .event_manager
             .publish("PlaybackProgress", &payload)
@@ -1971,33 +2074,29 @@ impl SessionManager for FerrofinSessionManager {
         // The save's outcome is kept, not returned at once: the live stream is
         // released and the stop published whatever it was. Upstream skips the
         // release when the save throws; releasing anyway closes that leak.
-        let saved = match library_item {
-            Ok(Some(_)) if !info.failed => self.save_stopped_play_state(&session, info).await,
-            // No library item, or the playback failed: nothing to save.
-            Ok(_) => Ok(()),
-            Err(error) => Err(error),
+        let (stopped_item, saved) = match library_item {
+            Ok(Some(item)) if !info.failed => (
+                Some(item),
+                self.save_stopped_play_state(&session, info).await,
+            ),
+            // No library item, or the playback failed: nothing to save, but a
+            // failed playback's item is still named below.
+            Ok(item) => (item, Ok(())),
+            Err(error) => (None, Err(error)),
         };
 
+        // C# `info.Item`: the item the session shows when the stop names it
+        // (`info.Item = current`), else the row read above; none when the
+        // library no longer has it.
+        let kept = session.kept_now_playing_item(info.item_id);
+        let stopped_item = stopped_item
+            .as_ref()
+            .map(|row| kept.as_ref().map_or(row, |item| &item.row));
+
         // C# `OnPlaybackStopped`: "User {0} stopped playback of '{1}' at {2}ms
-        // ({3} {4})", for a stop whose item resolves. `position_ms` is left out
-        // when the client sent no position (upstream writes "unknown"; a numeric
-        // field cannot). The lookup only names the item in this line, so its
-        // failure must not fail the stop report.
-        let stopped_item = if info.item_id.is_nil() {
-            None
-        } else {
-            match self.library_manager.get_item_by_id(info.item_id).await {
-                Ok(item) => item,
-                Err(error) => {
-                    tracing::debug!(
-                        item_id = %info.item_id,
-                        %error,
-                        "playback stop: item lookup failed"
-                    );
-                    None
-                }
-            }
-        };
+        // ({3} {4})", for a stop whose item resolves, named from `info.Item`.
+        // `position_ms` is left out when the client sent no position (upstream
+        // writes "unknown"; a numeric field cannot).
         if let Some(item) = stopped_item {
             info!(
                 user = session.user_name.as_deref(),
@@ -2024,7 +2123,14 @@ impl SessionManager for FerrofinSessionManager {
             None => Ok(()),
         };
 
-        let payload = playback_event_payload(&session, info.item_id, info.position_ticks);
+        // C# `MediaInfo = info.Item`.
+        let media_info = stopped_item.map(playback_media_info);
+        let payload = playback_event_payload(
+            &session,
+            info.item_id,
+            info.position_ticks,
+            media_info.as_ref(),
+        );
         let _ = self
             .event_manager
             .publish("PlaybackStopped", &payload)
@@ -2172,11 +2278,15 @@ impl SessionManager for FerrofinSessionManager {
         message_type: SessionMessageType,
         data: &str,
     ) -> Result<(), ServiceError> {
-        // Resolve the admin user ids, then broadcast to their sessions.
+        // C# takes every administrator, then the sessions holding one. Only the
+        // users of a session that can receive decide who gets it, so only theirs
+        // are read, from the policy cache: a scan pushes RefreshProgress once a
+        // second per library (gl-1312).
         let mut admin_ids = Vec::new();
-        for user in self.user_manager.get_users().await? {
-            if has_permission(self.db.pool(), &user.id, PermissionKind::IsAdministrator).await? {
-                admin_ids.push(parse_user_id(&user.id)?);
+        for id in self.receiving_user_ids().await {
+            if cached_permission(&self.db, &guid_to_db(id), PermissionKind::IsAdministrator).await?
+            {
+                admin_ids.push(id);
             }
         }
         self.broadcast(message_type, data, |s| {
@@ -3068,13 +3178,16 @@ const TICKS_PER_MILLISECOND: i64 = 10_000;
 
 /// The JSON payload for a playback event. The user name, device name and
 /// client stand for `PlaybackProgressEventArgs`' `Users`, `DeviceName` and
-/// `ClientName`: the playback activity loggers read the first two
-/// ([`crate::playback_activity`]), and plugins receive all three, as
+/// `ClientName`, and `MediaInfo` ([`playback_media_info`], `null` for an item
+/// the library does not have) for its `MediaInfo` and `Item`: the playback
+/// activity loggers read the user and device names and the item
+/// ([`crate::playback_activity`]), and plugins receive them all, as
 /// upstream's event consumers do.
 fn playback_event_payload(
     session: &PlaybackSession,
     item_id: Uuid,
     position_ticks: Option<i64>,
+    media_info: Option<&serde_json::Value>,
 ) -> String {
     serde_json::json!({
         "SessionId": session.id,
@@ -3084,8 +3197,23 @@ fn playback_event_payload(
         "ClientName": session.client,
         "ItemId": item_id,
         "PositionTicks": position_ticks,
+        "MediaInfo": media_info,
     })
     .to_string()
+}
+
+/// A playback event's `MediaInfo`, from the row the report read: the
+/// `BaseItemDto` fields upstream's `PlaybackStartLogger` and
+/// `PlaybackStopLogger` read from `eventArgs.MediaInfo` (and `ExtraType` for
+/// `eventArgs.Item.IsThemeMedia`), so the loggers read no row of their own.
+fn playback_media_info(row: &BaseItemEntity) -> serde_json::Value {
+    serde_json::json!({
+        "Name": row.name,
+        "SeriesName": row.series_name,
+        "Artists": crate::dto_service::split_multi(row.artists.as_deref()),
+        "MediaType": row.media_type,
+        "ExtraType": row.extra_type.and_then(crate::dto_service::extra_type_from_disc),
+    })
 }
 
 /// Tests for the **bus-fallback exclusivity** rule of [`FerrofinSessionManager::broadcast`]:
@@ -3414,7 +3542,7 @@ mod bus_fallback_tests {
         }
     }
 
-    /// The session pool keeps every device that ever authenticated, so a
+    /// The session pool keeps every client active within the idle window, so a
     /// broadcast's predicate routinely matches sessions that have no live socket
     /// at all. Those must cost nothing: no bus delivery is attempted for them.
     #[tokio::test]

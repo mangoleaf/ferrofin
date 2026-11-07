@@ -464,13 +464,14 @@ impl Database {
     }
 
     /// Drops the cached library set. Called after a committed write that adds, removes, renames
-    /// or edits a library, its row or its options.
+    /// or edits a library, its row or its options, or a view's or the playlists folder's row.
     pub fn invalidate_libraries(&self) {
         self.rows.invalidate_libraries();
     }
 
     /// Called after a committed write to the `BaseItems` rows `ids` (stored GUID form): drops the
-    /// cached library set if one of them is a library row.
+    /// cached library set if one of them is in it (a library, a row above one, a view or the
+    /// playlists folder).
     pub fn note_items_written<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
         self.rows.note_items_written(ids);
     }

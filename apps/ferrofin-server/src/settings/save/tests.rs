@@ -644,6 +644,10 @@ fn a_value_outside_a_settings_range_is_refused_naming_it() {
         ),
         ("tvdb_cache_hours", json!(169), "from 1 to 168"),
         ("shutdown_timeout_secs", json!(4), "from 5 to 600"),
+        ("item_values_write_chunk", json!(0), "from 1 to 5000"),
+        ("item_values_write_chunk", json!(5001), "from 1 to 5000"),
+        ("session_idle_hours", json!(0), "from 1 to 168"),
+        ("session_idle_hours", json!(169), "from 1 to 168"),
     ] {
         let err = saved(&data, &env, &[(key, value.clone())]).expect_err("refused");
         let message = refused(err);
