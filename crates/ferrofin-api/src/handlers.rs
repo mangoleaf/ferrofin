@@ -1580,6 +1580,17 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              logged and leaves the other widths as upstream's catch does. Order and the \
              number of decodes only: the widths made, and each width's checks, frames and \
              tiles, are unchanged (gl-1228).",
+            "A set wider than 320 is made at a smaller tile grid than TileWidth x TileHeight \
+             (options_at_width): each is multiplied by 320 / width, rounded down, at least 1, \
+             so 640 gets 5 x 5 at the default 10 x 10 and a tile holds no more pixels than a \
+             320 tile until an axis is down to 1. The grid names the set's folder and is \
+             stored in its row, as upstream's configured grid is (RefreshTrickplayDataInternal, \
+             CreateTiles), so a set at another grid is regenerated without a Replace, as \
+             after a tile size change upstream. Upstream packs every width at the configured \
+             grid. Deliberate \
+             divergence (owner decision 2026-11-05, gl-1400): clients decode a whole tile to \
+             show one preview, and Wholphin was seen decoding a 6400 x 3600 tile again on \
+             every scrub. jellyfin-web and Wholphin read each width's own grid.",
         ],
     },
     VerifiedSubsystem {
