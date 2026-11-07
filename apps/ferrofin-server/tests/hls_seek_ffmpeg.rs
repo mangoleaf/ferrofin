@@ -1,7 +1,9 @@
 //! A seeked HLS segment through a real ffmpeg, over HTTP: with the video
 //! transcoded and the audio copied, a job started mid-file (a resume here; a
 //! seek restarts the job with the same `-ss`) writes segments carrying both
-//! streams, the audio starting with the video (gl-1018).
+//! streams, the audio starting with the video (gl-1018); and a seek-restarted
+//! fMP4 segment carries the timestamps the job that played up to it wrote
+//! (gl-1244).
 //!
 //! Needs `ffmpeg` 5.0 or later (with libx264) and `ffprobe` on `PATH`:
 //!
@@ -83,6 +85,25 @@ fn generate_movie(ffmpeg: &Path, folder: &Path) {
     assert!(status.success(), "generating the movie");
 }
 
+/// Thirty seconds of H.264 at 24 fps with two frames of B-frame reorder
+/// delay (`has_b_frames=2`) and a keyframe every 6 s, and AAC audio: a client
+/// asking for H.264 and AAC gets both copied, in 6 s segments.
+fn generate_b_frame_movie(ffmpeg: &Path, folder: &Path) {
+    std::fs::create_dir_all(folder).unwrap();
+    let status = Command::new(ffmpeg)
+        .args(["-loglevel", "error", "-y"])
+        .args(["-f", "lavfi", "-i", "testsrc2=s=320x180:r=24:d=30"])
+        .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=30"])
+        .args(["-map", "0:v", "-map", "1:a"])
+        .args(["-c:v", "libx264", "-preset", "veryfast", "-bf", "3"])
+        .args(["-g", "144", "-keyint_min", "144", "-sc_threshold", "0"])
+        .args(["-c:a", "aac"])
+        .arg(folder.join("Movie (2020).mkv"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "generating the movie");
+}
+
 /// The first presentation time of each stream in `path`, (video, audio).
 fn first_times(ffprobe: &Path, path: &Path) -> (Option<f64>, Option<f64>) {
     let output = Command::new(ffprobe)
@@ -157,26 +178,28 @@ impl Api {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::too_many_lines)]
-async fn a_seeked_segment_with_copied_audio_starts_both_streams_at_the_seek() {
-    let Some((ffmpeg, ffprobe)) = tools() else {
-        return;
-    };
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    let movies = root.join("media").join("movies");
-    generate_movie(&ffmpeg, &movies.join("Movie (2020)"));
-
+/// A server on `root` with `movies` scanned as a movie library, logged in as
+/// the seeded admin, with the id of the one movie and of its media source.
+async fn serve_movies(
+    root: &Path,
+    movies: &Path,
+    ffmpeg: &Path,
+    ffprobe: &Path,
+) -> (
+    std::thread::JoinHandle<anyhow::Result<()>>,
+    Api,
+    String,
+    String,
+) {
     // Bounded: a stalled transcode must fail the test, not hang it.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
         .unwrap();
-    let (_server, base, _) = boot::spawn_server(&client, |port| Config {
+    let (server, base, _) = boot::spawn_server(&client, |port| Config {
         port,
-        ffmpeg_path: Some(ffmpeg.clone()),
-        ffprobe_path: Some(ffprobe.clone()),
+        ffmpeg_path: Some(ffmpeg.to_owned()),
+        ffprobe_path: Some(ffprobe.to_owned()),
         ..Config::test_stub(root)
     })
     .await;
@@ -213,7 +236,7 @@ async fn a_seeked_segment_with_copied_audio_starts_both_streams_at_the_seek() {
     )
     .await;
     let deadline = Instant::now() + Duration::from_secs(120);
-    let (item, source) = loop {
+    loop {
         let items = api
             .get("/Items?Recursive=true&IncludeItemTypes=Movie&Fields=MediaSources")
             .await;
@@ -222,7 +245,9 @@ async fn a_seeked_segment_with_copied_audio_starts_both_streams_at_the_seek() {
             .as_array()
             .is_some_and(|streams| streams.len() == 2)
         {
-            break (
+            return (
+                server,
+                api,
                 movie["Id"].as_str().unwrap().to_owned(),
                 movie["MediaSources"][0]["Id"].as_str().unwrap().to_owned(),
             );
@@ -232,7 +257,20 @@ async fn a_seeked_segment_with_copied_audio_starts_both_streams_at_the_seek() {
             "the movie was not scanned: {items}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seeked_segment_with_copied_audio_starts_both_streams_at_the_seek() {
+    let Some((ffmpeg, ffprobe)) = tools() else {
+        return;
     };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let movies = root.join("media").join("movies");
+    generate_movie(&ffmpeg, &movies.join("Movie (2020)"));
+
+    let (_server, api, item, source) = serve_movies(root, &movies, &ffmpeg, &ffprobe).await;
 
     let start = u64::from(SEGMENT) * 30_000_000;
     for container in ["mp4", "ts"] {
@@ -290,4 +328,94 @@ async fn a_seeked_segment_with_copied_audio_starts_both_streams_at_the_seek() {
             assert!((video - 12.0).abs() < 0.1, "on the movie's clock: {video}");
         }
     }
+}
+
+/// fMP4 segment N carries the same timestamps whether the job that wrote it
+/// played every segment before it or was restarted at N by a seek (gl-1244).
+/// The copied video's first DTS is the reorder delay (83 ms here) below zero,
+/// and without upstream's `-avoid_negative_ts disabled` the muxer shifted
+/// every stream of the continuous job later by that much; a seek-restarted
+/// job, already past zero, was never shifted.
+///
+/// TS segments still differ by the delay, as Jellyfin 12.4's do: ffmpeg's HLS
+/// muxer writes each one through an mpegts muxer of its own, which shifts
+/// them again, and only upstream's flag is ported (owner decision on
+/// gl-1244). They are not compared here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seek_restarted_fmp4_segment_keeps_the_continuous_jobs_timestamps() {
+    /// The segment the seek restarts at: 18 s into the movie.
+    const SEEK: u32 = 3;
+    let Some((ffmpeg, ffprobe)) = tools() else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let movies = root.join("media").join("movies");
+    generate_b_frame_movie(&ffmpeg, &movies.join("Movie (2020)"));
+    let (_server, api, item, source) = serve_movies(root, &movies, &ffmpeg, &ffprobe).await;
+
+    let url = |session: &str, segment: i64, query: &str| {
+        format!(
+            "/Videos/{item}/hls1/main/{segment}.mp4?mediaSourceId={source}\
+             &videoCodec=h264&audioCodec=aac&segmentContainer=mp4\
+             &playSessionId={session}{query}"
+        )
+    };
+    let at = |segment: u32| {
+        format!(
+            "&runtimeTicks={}&actualSegmentLengthTicks=60000000",
+            u64::from(segment) * 60_000_000
+        )
+    };
+    let get = |path: String| {
+        let api = &api;
+        async move { api.send(reqwest::Method::GET, &path, None).await }
+    };
+
+    // One job from the start: the init, then every segment up to N in order.
+    let init = get(url(
+        "continuous",
+        -1,
+        "&runtimeTicks=0&actualSegmentLengthTicks=0",
+    ))
+    .await;
+    let mut segments = Vec::new();
+    for segment in 0..=SEEK {
+        segments.push(get(url("continuous", segment.into(), &at(segment))).await);
+    }
+    // Segment N first starts a job there, with the seek's `-ss`. A player
+    // seeking mid-stream keeps the init it has, so that is the one read here.
+    let seeked = get(url("seek", SEEK.into(), &at(SEEK))).await;
+
+    let mut times = Vec::new();
+    for (name, media) in [
+        ("first", &segments[0]),
+        ("continuous", segments.last().unwrap()),
+        ("seek", &seeked),
+    ] {
+        let body = [init.as_slice(), media.as_slice()].concat();
+        assert!(
+            boxes(&body).iter().any(|k| k == "mdat"),
+            "{name}: the segment holds media"
+        );
+        let path = root.join(format!("{name}.mp4"));
+        std::fs::write(&path, body).unwrap();
+        let (video, audio) = first_times(&ffprobe, &path);
+        times.push((
+            video.unwrap_or_else(|| panic!("{name}: no video")),
+            audio.unwrap_or_else(|| panic!("{name}: no audio")),
+        ));
+    }
+    let [(first, _), (video, audio), (seek_video, seek_audio)] = times[..] else {
+        unreachable!()
+    };
+    // The one segment whose timestamps start below zero now, unshifted.
+    assert!(first.abs() < 0.01, "segment 0's video from {first} s");
+    // Within a quarter of a frame (the mp4 timescale rounds to 1 ms); the
+    // shift was two frames.
+    assert!(
+        (video - seek_video).abs() < 0.01 && (audio - seek_audio).abs() < 0.01,
+        "continuous video / audio from {video} / {audio} s, seek-restarted from {seek_video} / {seek_audio} s"
+    );
+    assert!((video - 18.0).abs() < 0.01, "on the movie's clock: {video}");
 }
