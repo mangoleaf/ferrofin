@@ -19,6 +19,7 @@
 
 use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use ferrofin_traits::plugins::PluginManager;
@@ -43,7 +44,9 @@ const MANIFEST_MAX_AGE: std::time::Duration = std::time::Duration::from_hours(24
 struct CachedManifest {
     repo_url: String,
     fetched_at: std::time::SystemTime,
-    names: Vec<String>,
+    /// The studio names by [`StudiosClient::match_key`], built once per fetch
+    /// and shared, so a lookup neither copies the list nor normalises it.
+    names: Arc<HashMap<String, String>>,
 }
 
 impl CachedManifest {
@@ -70,10 +73,11 @@ pub struct StudiosClient {
     configured_repo_url: Option<String>,
     /// The Studio Images plugin's dashboard settings (`RepositoryUrl`).
     plugin: ConfigSource,
-    /// The cached `thumbs.txt` studio-name list, keyed by the repository URL it
-    /// was fetched from — the URL is now a runtime setting, so a cache that did
-    /// not remember which repo it came from would serve the old repo's names
-    /// after an admin changed it — and fetched again once a day old.
+    /// The cached `thumbs.txt` studio names, indexed by [`Self::match_key`],
+    /// keyed by the repository URL they were fetched from — the URL is now a
+    /// runtime setting, so a cache that did not remember which repo it came
+    /// from would serve the old repo's names after an admin changed it — and
+    /// fetched again once a day old.
     ///
     /// Upstream also keeps the list on disk
     /// (`{cache}/imagesbyname/remotestudiothumbs.txt`), so a restart reuses a
@@ -162,9 +166,28 @@ impl StudiosClient {
             .collect()
     }
 
-    /// The repository manifest (`thumbs.txt`) as a list of studio folder names,
-    /// fetched and cached for a day (`StudiosImageProvider.EnsureList`). Any
-    /// failure yields an empty list (best-effort).
+    /// The manifest lookup key: [`Self::comparable_name`] lowercased in ASCII,
+    /// so equal keys are exactly the names `eq_ignore_ascii_case` matches.
+    fn match_key(name: &str) -> String {
+        let mut key = Self::comparable_name(name);
+        key.make_ascii_lowercase();
+        key
+    }
+
+    /// Indexes manifest entries by [`Self::match_key`], keeping the first entry
+    /// for each key: `FindMatch` is `FirstOrDefault` over the list.
+    fn index(entries: Vec<String>) -> HashMap<String, String> {
+        let mut by_key = HashMap::with_capacity(entries.len());
+        for entry in entries {
+            by_key.entry(Self::match_key(&entry)).or_insert(entry);
+        }
+        by_key
+    }
+
+    /// The repository manifest (`thumbs.txt`): its studio folder names by
+    /// [`Self::match_key`], fetched and cached for a day
+    /// (`StudiosImageProvider.EnsureList`). Any failure yields an empty
+    /// manifest (best-effort).
     ///
     /// Only an answer is cached — the manifest, or a `404` saying the
     /// repository has none (so a repo that 404s is not re-hit on every
@@ -175,42 +198,43 @@ impl StudiosClient {
     /// next studio asks again and the scan does not record every studio as
     /// "the repository has nothing for it" (owner decision D1 of
     /// `PLAN_SCAN_CHANGE_DETECTION`: a failure is retried, a miss is not).
-    async fn manifest(&self, repo_url: &str) -> Vec<String> {
+    async fn manifest(&self, repo_url: &str) -> Arc<HashMap<String, String>> {
         if let Ok(guard) = self.manifest.lock()
             && let Some(cached) = guard.as_ref()
             && cached.serves(repo_url, std::time::SystemTime::now())
         {
-            return cached.names.clone();
+            return Arc::clone(&cached.names);
         }
         let url = format!("{repo_url}/thumbs.txt");
         let list = match self.http.get(&url).send_limited(&self.limiter).await {
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => Vec::new(),
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => Arc::default(),
             Ok(resp) if !resp.status().is_success() => {
                 tracing::debug!(status = %resp.status(), "studios: manifest fetch failed");
-                return Vec::new();
+                return Arc::default();
             }
             Ok(resp) => match resp.counted_text().await {
-                Ok(body) => body
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
+                Ok(body) => Arc::new(Self::index(
+                    body.lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                )),
                 Err(e) => {
                     tracing::warn!(url, error = %e, "studios: manifest body read failed");
-                    return Vec::new();
+                    return Arc::default();
                 }
             },
             Err(e) => {
                 tracing::debug!(error = %e, "studios: manifest fetch failed");
-                return Vec::new();
+                return Arc::default();
             }
         };
         if let Ok(mut guard) = self.manifest.lock() {
             *guard = Some(CachedManifest {
                 repo_url: repo_url.to_owned(),
                 fetched_at: std::time::SystemTime::now(),
-                names: list.clone(),
+                names: Arc::clone(&list),
             });
         }
         list
@@ -237,7 +261,7 @@ impl StudiosClient {
         *self.manifest.lock().expect("manifest lock") = Some(CachedManifest {
             repo_url,
             fetched_at,
-            names,
+            names: Arc::new(Self::index(names)),
         });
     }
 
@@ -250,15 +274,13 @@ impl StudiosClient {
     /// The thumb URL for `studio_name`, or `None` when the repository has no
     /// matching studio. Port of `FindMatch` + `GetUrl`.
     pub async fn thumb_url(&self, studio_name: &str) -> Option<String> {
-        let target = Self::comparable_name(studio_name);
+        let target = Self::match_key(studio_name);
         if target.is_empty() {
             return None;
         }
         let repo_url = self.repo_url().await;
         let manifest = self.manifest(&repo_url).await;
-        let matched = manifest
-            .into_iter()
-            .find(|entry| Self::comparable_name(entry).eq_ignore_ascii_case(&target))?;
+        let matched = manifest.get(&target)?;
         Some(format!("{repo_url}/images/{matched}/thumb.jpg"))
     }
 }
@@ -313,7 +335,7 @@ mod tests {
         *client.manifest.lock().unwrap() = Some(CachedManifest {
             repo_url: DEFAULT_REPO_URL.to_owned(),
             fetched_at: std::time::SystemTime::now(),
-            names: vec!["Netflix".to_owned()],
+            names: Arc::new(StudiosClient::index(vec!["Netflix".to_owned()])),
         });
         // The lookup goes to the configured repo, whose manifest is unreachable
         // (example.test does not resolve), so no stale match leaks through.
@@ -355,6 +377,58 @@ mod tests {
         assert!(client.thumb_url("A Nonexistent Studio").await.is_none());
         // A name that normalizes to empty → no lookup.
         assert!(client.thumb_url(" / ").await.is_none());
+    }
+
+    /// `FindMatch` is `FirstOrDefault`: when several entries share a comparable
+    /// name (the default repository lists both `Lions Gate` and `Lionsgate`,
+    /// `BBC 1` and `BBC1`), the one listed first wins.
+    #[tokio::test]
+    async fn the_first_of_several_entries_with_one_comparable_name_wins() {
+        let thumb = |name: &str| format!("{DEFAULT_REPO_URL}/images/{name}/thumb.jpg");
+        let client = StudiosClient::new();
+        client.seed_manifest(vec![
+            "Lions Gate".to_owned(),
+            "Lionsgate".to_owned(),
+            "LIONSGATE".to_owned(),
+        ]);
+        assert_eq!(
+            client.thumb_url("lionsgate").await,
+            Some(thumb("Lions Gate"))
+        );
+        assert_eq!(
+            client.thumb_url("LIONSGATE").await,
+            Some(thumb("Lions Gate"))
+        );
+
+        client.seed_manifest(vec!["Lionsgate".to_owned(), "Lions Gate".to_owned()]);
+        assert_eq!(
+            client.thumb_url("Lions Gate").await,
+            Some(thumb("Lionsgate"))
+        );
+    }
+
+    /// Each lookup shares the cached manifest instead of copying it.
+    #[tokio::test]
+    async fn a_lookup_shares_the_cached_manifest() {
+        let client = StudiosClient::new();
+        client.seed_manifest(vec!["Netflix".to_owned()]);
+        let first = client.manifest(DEFAULT_REPO_URL).await;
+        assert!(Arc::ptr_eq(
+            &first,
+            &client.manifest(DEFAULT_REPO_URL).await
+        ));
+    }
+
+    /// A name with non-ASCII letters keeps them in its key and still matches
+    /// with its ASCII letters in another case.
+    #[tokio::test]
+    async fn a_non_ascii_name_matches_with_its_ascii_letters_folded() {
+        let client = StudiosClient::new();
+        client.seed_manifest(vec!["Société".to_owned()]);
+        assert_eq!(
+            client.thumb_url("SOCIéTé").await,
+            Some(format!("{DEFAULT_REPO_URL}/images/Société/thumb.jpg"))
+        );
     }
 
     #[tokio::test]
@@ -466,6 +540,18 @@ mod tests {
             "over a day: fetched again"
         );
         assert_eq!(client.thumb_url("Old Studio").await, None);
+    }
+
+    /// The first of several entries with one comparable name wins on a
+    /// fetched manifest too, not only a seeded one.
+    #[tokio::test]
+    async fn a_fetched_manifest_keeps_the_first_entry_for_a_name() {
+        let base = serve_manifest(Some("Lions Gate\r\nLionsgate\r\n")).await;
+        let client = StudiosClient::with_repo_url(&base);
+        assert_eq!(
+            client.thumb_url("Lionsgate").await,
+            Some(format!("{base}/images/Lions Gate/thumb.jpg"))
+        );
     }
 
     /// A cached `404` expires the same way: a repository that comes back is
