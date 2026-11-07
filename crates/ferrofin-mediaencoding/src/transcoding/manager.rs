@@ -1465,7 +1465,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     }
                 }
             }
-            let _ = running.child.kill().await;
+            if let Err(error) = running.child.kill().await {
+                tracing::error!(path = %handle.path, %error, "killing ffmpeg at teardown failed; it may still be running");
+            }
             drop(controller);
             if delete_files {
                 let stem = running
@@ -3517,6 +3519,7 @@ pub(super) mod throttle_tests {
         progress: Mutex<Option<FfmpegProgress>>,
         events: Mutex<Vec<Vec<u8>>>,
         fail_write: AtomicBool,
+        fail_kill: AtomicBool,
         exited: AtomicBool,
         /// How many more progress reads panic.
         panics: AtomicUsize,
@@ -3536,6 +3539,9 @@ pub(super) mod throttle_tests {
         }
         async fn kill(&self) -> Result<(), String> {
             self.0.events.lock().unwrap().push(b"kill".to_vec());
+            if self.0.fail_kill.load(Ordering::SeqCst) {
+                return Err("fixture kill failure".to_owned());
+            }
             self.0.exited.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -3855,6 +3861,27 @@ pub(super) mod throttle_tests {
         assert_eq!(
             &child.events.lock().unwrap()[5..],
             &[b"u".to_vec(), b"kill".to_vec()]
+        );
+        assert_eq!(manager.active_job_count(), 0);
+    }
+
+    /// A kill that fails at teardown is logged: ffmpeg may still be running.
+    #[tokio::test]
+    async fn a_failed_kill_at_teardown_is_logged() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let (_directory, manager, child, handle) = fixture(None).await;
+        child.fail_kill.store(true, Ordering::SeqCst);
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        manager.kill_and_remove(&handle, false, false).await;
+        drop(guard);
+        let errors = logs.lines_at("ERROR");
+        assert!(
+            errors
+                .iter()
+                .any(|line| line.contains("killing ffmpeg at teardown failed")
+                    && line.contains("fixture kill failure")),
+            "{errors:#?}"
         );
         assert_eq!(manager.active_job_count(), 0);
     }

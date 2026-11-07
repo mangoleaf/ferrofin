@@ -228,10 +228,15 @@ pub(crate) async fn assert_can_update_user(
 }
 
 /// Writes a dashboard activity-log entry (best-effort — the feed must never
-/// fail the request that produced it). Names/types mirror upstream's
-/// `Jellyfin.Server.Implementations.Events.Consumers` loggers.
+/// fail the request that produced it, so a failure is logged instead, as
+/// upstream's `EventManager` logs a failed consumer). Names/types mirror
+/// upstream's `Jellyfin.Server.Implementations.Events.Consumers` loggers.
 async fn log_activity(state: &AppState, entry: ferrofin_traits::activity::ActivityLogCreate) {
-    let _ = state.activity.create_entry(entry).await;
+    let activity_type = entry.type_.clone();
+    if let Err(error) = state.activity.create_entry(entry).await {
+        // Warn, not error: its volume follows the request rate.
+        tracing::warn!(%error, activity_type, "could not write the activity entry");
+    }
 }
 
 /// `POST /Users/AuthenticateByName` — authenticate by username + password.

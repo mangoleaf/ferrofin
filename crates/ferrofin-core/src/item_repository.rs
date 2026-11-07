@@ -3707,19 +3707,30 @@ async fn folder_preference(
 }
 
 /// `ManagedFileSystem.SwapFiles`: exchanges the contents of two files through a
-/// temporary copy of the first. A failure part-way restores the first file.
+/// temporary copy of the first. A failure part-way restores the first file;
+/// when the restore fails too, the temporary copy is kept, since it may hold the
+/// only copy of the original, and the error names it.
 fn swap_image_files(first: &std::path::Path, second: &std::path::Path) -> std::io::Result<()> {
     let temp = first.with_file_name(format!(".ferrofin-swap-{}", Uuid::new_v4().simple()));
     std::fs::copy(first, &temp)?;
-    let result = std::fs::copy(second, first)
-        .and_then(|_| std::fs::rename(&temp, second))
-        .inspect_err(|_| {
-            // Put the first file back; the temporary copy is its only other
-            // holder of the original content.
-            let _ = std::fs::copy(&temp, first);
-        });
-    let _ = std::fs::remove_file(&temp);
-    result
+    let Err(error) = std::fs::copy(second, first).and_then(|_| std::fs::rename(&temp, second))
+    else {
+        return Ok(());
+    };
+    if let Err(restore) = std::fs::copy(&temp, first) {
+        return Err(std::io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; restoring {} failed too ({restore}), its original content is kept in {}",
+                first.display(),
+                temp.display()
+            ),
+        ));
+    }
+    if let Err(remove) = std::fs::remove_file(&temp) {
+        tracing::debug!(path = %temp.display(), error = %remove, "could not remove the swap's temporary copy");
+    }
+    Err(error)
 }
 
 /// `!ItemImageInfo.IsLocalFile`: upstream's case-insensitive `StartsWith("http")`.
@@ -8256,6 +8267,69 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         let images = repository.get_image_infos(item).await.expect("images");
         assert!(images.iter().all(|image| image.width == 1920));
+    }
+
+    /// When putting the first file back fails too, the temporary copy may be
+    /// the only copy of its original content: it is kept, and the error names
+    /// it.
+    #[tokio::test]
+    async fn swap_item_images_keeps_the_backup_when_the_restore_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let db = test_db().await;
+        let repository = repo(&db);
+        let item = Uuid::from_u128(0x9370);
+        seed_named_item(&db, item, BaseItemKind::Movie, "Unwritable").await;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked.jpg");
+        let other = dir.path().join("other.jpg");
+        std::fs::write(&locked, "LOCKED").unwrap();
+        std::fs::write(&other, "OTHER").unwrap();
+        for (n, path) in [(0_u128, &locked), (1, &other)] {
+            sqlx::query(
+                r#"INSERT INTO "BaseItemImageInfos"
+                    ("Id", "Blurhash", "DateModified", "Height", "ImageType", "ItemId", "Path", "Width")
+                    VALUES (?1, NULL, NULL, 1080, 2, ?2, ?3, 1920)"#,
+            )
+            .bind(guid_to_db(Uuid::from_u128(0x9380 + n)))
+            .bind(guid_to_db(item))
+            .bind(path.to_string_lossy().as_ref())
+            .execute(db.writer())
+            .await
+            .expect("insert backdrop");
+        }
+        // A read-only first file fails both the swap's write and the restore.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&locked)
+            .is_ok()
+        {
+            eprintln!("skipped: the read-only file is still writable (running as root?)");
+            return;
+        }
+
+        let error = repository
+            .swap_item_images(item, ImageType::Backdrop, 0, 1)
+            .await
+            .expect_err("the swap fails");
+        let backups: Vec<std::path::PathBuf> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".ferrofin-swap-"))
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "{backups:?}");
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), "LOCKED");
+        assert!(
+            error
+                .to_string()
+                .contains(backups[0].to_string_lossy().as_ref()),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "OTHER");
     }
 
     #[tokio::test]

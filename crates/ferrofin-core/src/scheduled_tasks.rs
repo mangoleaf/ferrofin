@@ -918,9 +918,12 @@ impl FerrofinTaskManager {
             overview: result.error_message.clone(),
             ..Default::default()
         };
+        let task = result.key.clone().unwrap_or_default();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let _ = activity.create_entry(entry).await;
+                if let Err(error) = activity.create_entry(entry).await {
+                    tracing::warn!(task, %error, "could not record the failed task in the activity log");
+                }
             });
         }
     }
