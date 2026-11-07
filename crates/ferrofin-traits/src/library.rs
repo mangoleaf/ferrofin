@@ -2144,8 +2144,9 @@ pub trait UserDataManager: Send + Sync {
     /// key of a movie/series/album is a provider id when the query that loaded
     /// the row ran `.Include(e => e.Provider)`, which
     /// `BaseItemRepository.ApplyNavigations` does only for
-    /// `ItemFields.ProviderIds` (:442-445) while `RetrieveItem` always does
-    /// (:825-829). Pass `false` and the derivation behaves as it does on a plain
+    /// `ItemFields.ProviderIds` (v12.4 `BaseItemRepository.QueryBuilding.cs:257-260`)
+    /// while `RetrieveItem` always does (`BaseItemRepository.Querying.cs:569`).
+    /// Pass `false` and the derivation behaves as it does on a plain
     /// list query, which is what Jellyfin answers there.
     async fn get_user_data_dtos_for_rows(
         &self,
@@ -2169,7 +2170,9 @@ pub trait UserDataManager: Send + Sync {
     /// anyway, so the page reads the table once.
     ///
     /// The map may hold items whose kind keys no user data by provider; they
-    /// are ignored as the derivation ignores them. The default reads the rows
+    /// are ignored as the derivation ignores them. It may also hold ids that
+    /// are not in `items` (the page's series, read in the same query for their
+    /// links); only the ids of `items` are looked up. The default reads the rows
     /// again through the hydrating form, so fakes and impls that have not
     /// overridden it answer as before.
     async fn get_user_data_dtos_for_rows_with_providers(

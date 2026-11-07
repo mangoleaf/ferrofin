@@ -2655,16 +2655,18 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetNamedConfiguration",
         ferrofin: "handlers/config.rs get_named_configuration → ferrofin-core \
                configuration_manager.rs get_named_configuration and get_encoding_options \
-               (read_named; BaseConfigurationManager.GetConfiguration and \
-               LoadConfiguration, the seven ConfigurationStore registrations) → \
-               encoding_response for encoding, the Live TV manager's tuner and provider rows \
-               for livetv, blank_for_non_administrator for livetv and network",
+               (read_named, through read_named_kept for branding and encoding; \
+               BaseConfigurationManager.GetConfiguration and LoadConfiguration, the seven \
+               ConfigurationStore registrations) → encoding_response for encoding, the Live \
+               TV manager's tuner and provider rows for livetv, blank_for_non_administrator \
+               for livetv and network",
         date: "2026-10-23",
         divergences: &[
-            "The stored document is reread on every call instead of cached from the first load \
-         until a save, so a hand-edited file applies without a restart, and a document that \
-         does not parse is logged at warn once per change of the file where upstream logs it \
-         at error once.",
+            "The stored document is not cached from the first load until a save: branding and \
+         encoding are kept until their file's stamp changes, and the other stored documents \
+         are reread on every call. So a hand-edited file applies without a restart, and a \
+         document that does not parse is logged at warn once per change of the file where \
+         upstream logs it at error once.",
             "A stored document that exists but cannot be read is a 500, and so is a save of \
          encoding (the one store with a validator) over it. LoadConfiguration catches every \
          exception but IOException, so upstream serves the defaults for a permission-denied \
