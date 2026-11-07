@@ -15,6 +15,8 @@ ferrofin-model.workspace = true
 ferrofin-common.workspace = true
 ferrofin-util = { workspace = true, features = ["tokio"] }
 async-trait.workspace = true
+# `catch_unwind` on a future: a transcode loop pass that panics ends alone.
+futures-util.workspace = true
 tokio = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true

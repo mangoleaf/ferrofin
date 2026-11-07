@@ -1531,6 +1531,7 @@ dependencies = [
  "ferrofin-model",
  "ferrofin-traits",
  "ferrofin-util",
+ "futures-util",
  "image",
  "notify",
  "quick-xml",
