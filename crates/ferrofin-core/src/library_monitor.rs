@@ -95,6 +95,27 @@ impl PendingChanges {
         self.groups.iter().map(|group| group.deadline).min()
     }
 
+    /// The first open group whose path is equal to `reported`, contains it,
+    /// is contained by it or is its sibling: where `CreateRefresher`'s loop
+    /// stops.
+    fn related(&self, reported: &Path) -> Option<usize> {
+        let folder = reported.parent();
+        self.groups.iter().position(|group| {
+            let anchor = Path::new(&group.anchor);
+            reported.starts_with(anchor)
+                || anchor.starts_with(reported)
+                || (folder.is_some() && anchor.parent() == folder)
+        })
+    }
+
+    /// Whether the group `path` joins already holds it. Every path a group
+    /// holds lies under its path (a rebase only moves that path up), so
+    /// joining it again changes nothing but the group's window.
+    fn holds(&self, path: &str) -> bool {
+        self.related(Path::new(path))
+            .is_some_and(|index| self.groups[index].paths.contains(path))
+    }
+
     /// The settle group `path` joins, opening one if no group is related to
     /// it: the port of `LibraryMonitor.CreateRefresher`. The first group whose
     /// path is equal to `path`, contains it, is contained by it (the group is
@@ -117,13 +138,7 @@ impl PendingChanges {
     ) -> &mut PendingGroup {
         let reported = Path::new(path);
         let folder = reported.parent();
-        let related = self.groups.iter().position(|group| {
-            let anchor = Path::new(&group.anchor);
-            reported.starts_with(anchor)
-                || anchor.starts_with(reported)
-                || (folder.is_some() && anchor.parent() == folder)
-        });
-        if let Some(index) = related {
+        if let Some(index) = self.related(reported) {
             let group = &mut self.groups[index];
             let anchor = Path::new(&group.anchor);
             let rebased = if reported.starts_with(anchor) {
@@ -761,6 +776,20 @@ impl FerrofinLibraryMonitor {
             tracing::trace!(path, "change ignored (ignore patterns)");
             return Ok(());
         }
+        if self.is_path_suppressed(path) {
+            tracing::trace!(path, "change suppressed (server-initiated write)");
+            return Ok(());
+        }
+        let delay = self.debounce_delay().await;
+        // A path its settle group already holds only re-arms the group's
+        // window ("Path is already being refreshed", `CreateRefresher`). Its
+        // `.ignore` lookup ran when it joined: repeating it per event (each
+        // write of a file being copied is one) cost a 300-file extraction
+        // 120,000 lookups. Upstream's cached lookup skips the walk too.
+        if !delay.is_zero() && self.settle(path, trigger, delay, true) {
+            tracing::trace!(path, "change re-arms its settle window");
+            return Ok(());
+        }
         // `DotIgnoreIgnoreRule.ShouldIgnore` (`LibraryMonitor.cs:389`): nor
         // does a path a `.ignore` file hides. The lookup stats the path's
         // folders, so it stays off the async workers.
@@ -778,10 +807,6 @@ impl FerrofinLibraryMonitor {
             tracing::trace!(path, "change ignored (.ignore file)");
             return Ok(());
         }
-        if self.is_path_suppressed(path) {
-            tracing::trace!(path, "change suppressed (server-initiated write)");
-            return Ok(());
-        }
         tracing::debug!(
             path,
             trigger = trigger.as_str(),
@@ -791,7 +816,6 @@ impl FerrofinLibraryMonitor {
         // the items touched by the reported path (a deleted path prunes its
         // rows), so one new file does not re-walk the whole library. Overlapping
         // reports fold via the debounce window and the scan's in-flight guard.
-        let delay = self.debounce_delay().await;
         if delay.is_zero() {
             if let Some(library) = &self.refresh_target {
                 library
@@ -800,18 +824,27 @@ impl FerrofinLibraryMonitor {
             }
             return Ok(());
         }
-        // Accumulate the path into its settle group and (re)arm the group's
-        // window; the single worker task dispatches each group once its own
-        // window lapses with no further reports.
-        //
-        // The re-arm is clamped two ways, because a purely sliding window is
-        // unbounded in both time and memory: a source that keeps reporting
-        // holds the batch open forever, so the scan never runs and `paths`
-        // grows for the life of the process (measured: 60,000 reported paths
-        // held 27 MB resident, released only once the reports stopped). The
-        // clamps dispatch the batch — they never drop a path.
+        self.settle(path, trigger, delay, false);
+        Ok(())
+    }
+
+    /// Accumulates `path` into its settle group and (re)arms the group's
+    /// window; the single worker task dispatches each group once its own
+    /// window lapses with no further reports. With `held_only`, only when
+    /// the group already holds `path`. Returns whether it did.
+    ///
+    /// The re-arm is clamped two ways, because a purely sliding window is
+    /// unbounded in both time and memory: a source that keeps reporting
+    /// holds the batch open forever, so the scan never runs and `paths`
+    /// grows for the life of the process (measured: 60,000 reported paths
+    /// held 27 MB resident, released only once the reports stopped). The
+    /// clamps dispatch the batch — they never drop a path.
+    fn settle(&self, path: &str, trigger: ScanTrigger, delay: Duration, held_only: bool) -> bool {
         let (spawn_worker, wake_worker) = {
             let mut pending = self.pending.lock().expect("pending set not poisoned");
+            if held_only && !pending.holds(path) {
+                return false;
+            }
             let now = Instant::now();
             let previous = pending.next_deadline();
             let group = pending.group_for(path, trigger, now, delay);
@@ -830,7 +863,7 @@ impl FerrofinLibraryMonitor {
         } else if wake_worker {
             self.flush.notify_one();
         }
-        Ok(())
+        true
     }
 }
 
@@ -1753,5 +1786,93 @@ mod tests {
             .await
             .expect("report");
         assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// A report of a path already settling in its group only re-arms the
+    /// group's window (`CreateRefresher`: "Path is already being
+    /// refreshed"), without the `.ignore` lookup it had when it joined, so a
+    /// file being written costs one lookup, not one per event. Like
+    /// upstream's cached lookup, a `.ignore` created after the first report
+    /// therefore does not stop the re-arm; the path is in the batch either
+    /// way, and the scan reads the `.ignore` again. A group rebased to the
+    /// folder by a sibling still holds the path.
+    #[rstest::rstest]
+    #[case::alone(None)]
+    #[case::rebased_by_a_sibling(Some("Heat (1995).en.srt"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_settling_path_rearms_its_window_without_a_new_ignore_lookup(
+        #[case] sibling: Option<&str>,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let folder = tmp.path().join("movies/Heat (1995)");
+        std::fs::create_dir_all(&folder).expect("mkdir");
+        let file = folder
+            .join("Heat (1995).mkv")
+            .to_string_lossy()
+            .into_owned();
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_mins(1));
+        let mut expected = vec![file.clone()];
+        expected.extend(sibling.map(|name| folder.join(name).to_string_lossy().into_owned()));
+        for path in &expected {
+            monitor
+                .report_file_system_changed(path)
+                .await
+                .expect("report");
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        std::fs::write(folder.join(".ignore"), "").expect(".ignore");
+        monitor
+            .report_file_system_changed(&file)
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        assert_eq!(library.batches.lock().unwrap().len(), 0, "re-armed at 30s");
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let mut batches = library.batches.lock().unwrap().clone();
+        for batch in &mut batches {
+            batch.sort();
+        }
+        expected.sort();
+        assert_eq!(batches, vec![expected]);
+    }
+
+    /// The re-arm is only for a path its group already holds: a new path
+    /// joining an open group still has its `.ignore` lookup, and a
+    /// server-written path does not re-arm the window it is settling in.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_path_skips_only_the_ignore_lookup() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let movies = tmp.path().join("movies");
+        std::fs::create_dir_all(&movies).expect("mkdir");
+        std::fs::write(movies.join(".ignore"), "*.part\n").expect(".ignore");
+        let heat = movies.join("Heat.mkv").to_string_lossy().into_owned();
+        let part = movies.join("Ronin.mkv.part").to_string_lossy().into_owned();
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_mins(1));
+        monitor
+            .report_file_system_changed(&heat)
+            .await
+            .expect("report");
+        monitor
+            .report_file_system_changed(&part)
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        SelfWriteGuard::begin(&monitor, &heat);
+        monitor
+            .report_file_system_changed(&heat)
+            .await
+            .expect("report");
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        assert_eq!(
+            *library.batches.lock().unwrap(),
+            vec![vec![heat]],
+            "settled at 60s, without the hidden sibling"
+        );
     }
 }
