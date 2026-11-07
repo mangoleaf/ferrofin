@@ -1062,6 +1062,89 @@ async fn broadcast_pushes_to_attached_connections() {
     assert_eq!(frame["MessageType"], "RestartRequired");
 }
 
+/// C# `SendMessageToAdminSessions` reaches every session holding an
+/// administrator, as its primary or an additional user, over either delivery
+/// route, and no other; a policy saved through the server reaches the next push.
+#[tokio::test]
+async fn an_admin_push_reaches_the_sessions_holding_an_administrator() {
+    let db = test_db().await;
+    // As the server runs: the permission is read from the policy cache.
+    db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+    let (mgr, bus) = cast_manager(&db);
+    let admin = seed_named_user(&db, Uuid::new_v4(), "admin").await;
+    let viewer = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
+    let (_, admin_pushes) = cast_target(&mgr, bus.as_ref(), &admin, "admin").await;
+    let (_, viewer_pushes) = cast_target(&mgr, bus.as_ref(), &viewer, "viewer").await;
+    // The viewer's TV, which the admin joined, attached directly.
+    let shared = mgr
+        .log_session_activity("Web", "1.0", "shared", "TV", "e", Some(&viewer))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    mgr.add_additional_user(&shared, Uuid::parse_str(&admin.id).unwrap())
+        .await
+        .unwrap();
+    let socket = FakeConnection::new(AuthorizationInfo::default());
+    mgr.add_web_socket(&shared, socket.clone() as Arc<dyn WebSocketConnection>)
+        .await
+        .unwrap();
+
+    for administrator in [true, false] {
+        set_permission(
+            &db,
+            &admin.id,
+            PermissionKind::IsAdministrator,
+            administrator,
+        )
+        .await
+        .unwrap();
+        mgr.send_message_to_admin_sessions(SessionMessageType::RefreshProgress, "{}")
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        admin_pushes.lock().unwrap().len(),
+        1,
+        "only while an administrator"
+    );
+    assert_eq!(socket.sent_count(), 1, "an additional administrator counts");
+    assert!(viewer_pushes.lock().unwrap().is_empty());
+}
+
+/// A scan pushes RefreshProgress once a second per library (gl-1312): the push
+/// reads no policy of a user it cannot reach, and none it has cached.
+#[tokio::test]
+async fn an_admin_push_reads_only_the_uncached_policies_it_can_reach() {
+    let db = test_db().await;
+    db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+    let (mgr, bus) = cast_manager(&db);
+    let admin = seed_named_user(&db, Uuid::new_v4(), "admin").await;
+    let away = seed_named_user(&db, Uuid::new_v4(), "away").await;
+    for user in [&admin, &away] {
+        set_permission(&db, &user.id, PermissionKind::IsAdministrator, true)
+            .await
+            .unwrap();
+    }
+    let (_, pushes) = cast_target(&mgr, bus.as_ref(), &admin, "admin").await;
+    // An administrator's session nobody listens on, its policy not cached.
+    mgr.log_session_activity("Web", "1.0", "away", "TV", "e", Some(&away))
+        .await
+        .unwrap();
+    db.invalidate_user_policy(&away.id);
+    assert!(
+        crate::user_entity_ext::cached_permission(&db, &admin.id, PermissionKind::IsAdministrator)
+            .await
+            .unwrap()
+    );
+    db.pool().close().await;
+
+    mgr.send_message_to_admin_sessions(SessionMessageType::RefreshProgress, "{}")
+        .await
+        .expect("the push reads nothing from the database");
+    assert_eq!(pushes.lock().unwrap().len(), 1);
+}
+
 /// [`manager`] whose user-data manager announces its saves to the manager's
 /// sessions, as the composition root wires them.
 fn manager_announcing_user_data(db: &Database) -> Arc<FerrofinSessionManager> {

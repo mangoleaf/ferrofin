@@ -71,6 +71,7 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::PermissionKind;
+use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, SessionInfoDto, SortOrder};
 use ferrofin_model::live_tv::ItemSortBy;
@@ -1121,6 +1122,25 @@ impl FerrofinSessionManager {
             }
         }
         Ok(users)
+    }
+
+    /// The users, primary and additional, of every session [`Self::broadcast`]
+    /// can deliver to: one with an open connection or a registered bus sink.
+    async fn receiving_user_ids(&self) -> Vec<Uuid> {
+        let sessions = self.sessions.lock().await;
+        let mut ids = Vec::new();
+        for session in sessions.values().filter(|s| {
+            s.is_active() || self.bus.as_ref().is_some_and(|bus| bus.is_connected(&s.id))
+        }) {
+            let users = std::iter::once(session.user_id)
+                .chain(session.additional_users.iter().map(|u| u.user_id));
+            for id in users {
+                if !id.is_nil() && !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
     }
 
     /// Sends a pre-serialized message to a set of sessions, matching them with a
@@ -2258,11 +2278,15 @@ impl SessionManager for FerrofinSessionManager {
         message_type: SessionMessageType,
         data: &str,
     ) -> Result<(), ServiceError> {
-        // Resolve the admin user ids, then broadcast to their sessions.
+        // C# takes every administrator, then the sessions holding one. Only the
+        // users of a session that can receive decide who gets it, so only theirs
+        // are read, from the policy cache: a scan pushes RefreshProgress once a
+        // second per library (gl-1312).
         let mut admin_ids = Vec::new();
-        for user in self.user_manager.get_users().await? {
-            if has_permission(self.db.pool(), &user.id, PermissionKind::IsAdministrator).await? {
-                admin_ids.push(parse_user_id(&user.id)?);
+        for id in self.receiving_user_ids().await {
+            if cached_permission(&self.db, &guid_to_db(id), PermissionKind::IsAdministrator).await?
+            {
+                admin_ids.push(id);
             }
         }
         self.broadcast(message_type, data, |s| {
