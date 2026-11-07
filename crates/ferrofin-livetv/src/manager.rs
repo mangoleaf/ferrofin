@@ -892,7 +892,8 @@ struct ProgramClass {
 }
 
 /// The listings provider's category lists (`ListingsProviderInfo`), each
-/// falling back to Jellyfin's defaults when the provider carries none.
+/// falling back to Jellyfin's defaults when the provider carries none, held
+/// folded by `upper_invariant` so an airing folds only its own categories.
 struct CategoryClasses {
     news: Vec<String>,
     sports: Vec<String>,
@@ -904,7 +905,14 @@ impl CategoryClasses {
     fn from_provider(provider: &ListingsProviderInfo) -> Self {
         let defaults = ListingsProviderInfo::default();
         let pick = |own: &Option<Vec<String>>, default: &Option<Vec<String>>| {
-            own.clone().or_else(|| default.clone()).unwrap_or_default()
+            own.as_ref()
+                .or(default.as_ref())
+                .map(|list| {
+                    list.iter()
+                        .map(|entry| ferrofin_util::string_extensions::upper_invariant(entry))
+                        .collect()
+                })
+                .unwrap_or_default()
         };
         Self {
             news: pick(&provider.news_categories, &defaults.news_categories),
@@ -914,13 +922,11 @@ impl CategoryClasses {
         }
     }
 
-    /// `programCategories.Any(c => list.Contains(c, OrdinalIgnoreCase))` —
-    /// per-character case folding, so non-ASCII names compare as .NET does.
+    /// `programCategories.Any(c => list.Contains(c, OrdinalIgnoreCase))`, over
+    /// a list and categories both already folded by `upper_invariant` (.NET's
+    /// per-character invariant simple uppercase, which `OrdinalIgnoreCase` uses).
     fn any_in(list: &[String], categories: &[String]) -> bool {
-        let fold = |s: &str| s.chars().flat_map(char::to_uppercase).collect::<String>();
-        categories
-            .iter()
-            .any(|c| list.iter().any(|l| fold(l) == fold(c)))
+        categories.iter().any(|c| list.contains(c))
     }
 
     /// `ProgramInfo.ShowId` for one airing, as
@@ -958,7 +964,7 @@ impl CategoryClasses {
             .categories
             .iter()
             .filter(|c| !c.trim().is_empty())
-            .cloned()
+            .map(|c| ferrofin_util::string_extensions::upper_invariant(c))
             .collect();
         let (season_number, episode_number) = (prog.season_number, prog.episode_number);
         let is_movie = Self::any_in(&self.movie, &categories);
@@ -16040,5 +16046,74 @@ mod guide_window_tests {
             start_day("2026-08-30T01:00:00.0000000Z"),
             start_day("2026-08-30T23:00:00.0000000Z")
         );
+    }
+}
+
+/// Tests for the guide category classes (`XmlTvListingsProvider.GetProgramInfo`).
+#[cfg(test)]
+mod category_class_tests {
+    use ferrofin_model::live_tv::ListingsProviderInfo;
+    use rstest::rstest;
+
+    use super::CategoryClasses;
+
+    /// `programCategories.Any(c => info.SportsCategories.Contains(c,
+    /// StringComparison.OrdinalIgnoreCase))` (v12.4 XmlTvListingsProvider.cs:278-281):
+    /// each character through .NET's invariant simple uppercase mapping, so a
+    /// mapping that changes length (`ß` → `SS`) or folds dotless `ı` onto `I`
+    /// does not apply, and blank categories are dropped first.
+    #[rstest]
+    #[case(&["football"], &["FOOTBALL"], true)]
+    #[case(&["football"], &["Movie", "Football"], true)]
+    #[case(&["éclair"], &["ÉCLAIR"], true)]
+    #[case(&["FUSSBALL"], &["Fußball"], false)]
+    #[case(&["kids"], &["Kıds"], false)]
+    #[case(&["football"], &["foot ball"], false)]
+    #[case(&["football"], &["  "], false)]
+    #[case(&["  "], &["  "], false)]
+    #[case(&[], &["football"], false)]
+    fn a_category_matches_ordinal_ignore_case(
+        #[case] list: &[&str],
+        #[case] categories: &[&str],
+        #[case] expected: bool,
+    ) {
+        let owned = |values: &[&str]| values.iter().map(|&v| v.to_owned()).collect();
+        let classes = CategoryClasses::from_provider(&ListingsProviderInfo {
+            sports_categories: Some(owned(list)),
+            ..ListingsProviderInfo::default()
+        });
+        let class = classes.classify(&crate::xmltv::XmltvProgramme {
+            categories: owned(categories),
+            ..crate::xmltv::XmltvProgramme::default()
+        });
+        assert_eq!(class.is_sports, expected);
+    }
+
+    /// A provider without a list takes Jellyfin's default for it; each class
+    /// reads its own list.
+    #[test]
+    fn missing_lists_take_the_defaults() {
+        let classes = CategoryClasses::from_provider(&ListingsProviderInfo {
+            news_categories: None,
+            sports_categories: None,
+            kids_categories: None,
+            movie_categories: None,
+            ..ListingsProviderInfo::default()
+        });
+        let class = |category: &str| {
+            classes.classify(&crate::xmltv::XmltvProgramme {
+                categories: vec![category.to_owned()],
+                ..crate::xmltv::XmltvProgramme::default()
+            })
+        };
+        let flags = |c: &super::ProgramClass| (c.is_movie, c.is_news, c.is_kids, c.is_sports);
+        assert_eq!(flags(&class("MOVIE")), (true, false, false, false));
+        assert_eq!(
+            flags(&class("Current Affairs")),
+            (false, true, false, false)
+        );
+        assert_eq!(flags(&class("Childrens")), (false, false, true, false));
+        assert_eq!(flags(&class("Baseball")), (false, false, false, true));
+        assert_eq!(flags(&class("Drama")), (false, false, false, false));
     }
 }
