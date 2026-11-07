@@ -35,6 +35,10 @@
 //! - `POST /Sessions/Playing`, then `GET /Sessions` twice (gl-1242). The start
 //!   report builds no `NowPlayingItem`: the first listing builds it, from the
 //!   row the report read, and the second copies it.
+//! - `POST /Sessions/Playing` and `/Sessions/Playing/Stopped` (gl-1392). Each
+//!   reads the item's row once: the playback activity entry is written from
+//!   the event's `MediaInfo`, as upstream's `PlaybackStartLogger` and
+//!   `PlaybackStopLogger` read `eventArgs.MediaInfo` and query nothing.
 //! - `GET /Sessions`, plain and with `controllableByUserId`, from an
 //!   administrator and from a user (gl-1265). The permissions the listing
 //!   checks come from the policy cache, as upstream reads them from the user
@@ -967,6 +971,87 @@ async fn a_playback_start_leaves_the_now_playing_item_to_the_first_read() {
         .and_then(|list| list.iter().find_map(|s| s["NowPlayingItem"]["Id"].as_str()))
         .expect("a session shows the film");
     assert_eq!(shown, film);
+}
+
+/// A start and a stop each read the item's row once, in the session manager:
+/// the playback loggers write their entries from the event's `MediaInfo`
+/// instead of reading the row again, and name the item as before (gl-1392).
+#[tokio::test]
+async fn a_playback_start_and_stop_read_the_item_s_row_once() {
+    record_statements();
+    let harness = boot(&["Film Alpha (1999)/Film Alpha (1999).mkv"]).await;
+    let router = ferrofin_api::create_router(harness.wired.state.clone());
+    let (auth_header, user_id) = sign_in_and_scan(&harness, &router).await;
+    let (status, films) = send(
+        &router,
+        &auth_header,
+        "GET",
+        &format!("/Items?userId={user_id}&recursive=true&includeItemTypes=Movie"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "films: {films}");
+    let film = films["Items"][0]["Id"].as_str().expect("the film");
+
+    let start = playing_statements(
+        &router,
+        &auth_header,
+        "POST",
+        "/Sessions/Playing",
+        Some(serde_json::json!({"ItemId": film})),
+    )
+    .await;
+    assert_eq!(row_reads_by_id(&start), 1, "{start:#?}");
+    let stop = playing_statements(
+        &router,
+        &auth_header,
+        "POST",
+        "/Sessions/Playing/Stopped",
+        Some(serde_json::json!({"ItemId": film, "PositionTicks": 600_000_000})),
+    )
+    .await;
+    assert_eq!(row_reads_by_id(&stop), 1, "{stop:#?}");
+
+    let (status, page) = send(
+        &router,
+        &auth_header,
+        "GET",
+        "/System/ActivityLog/Entries?limit=100",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let playback: Vec<(&str, &str, &str)> = page["Items"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter_map(|entry| {
+            let type_ = entry["Type"].as_str()?;
+            type_.contains("Playback").then(|| {
+                (
+                    type_,
+                    entry["Name"].as_str().unwrap_or_default(),
+                    entry["ItemId"].as_str().unwrap_or_default(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        playback,
+        [
+            (
+                "VideoPlaybackStopped",
+                "admin has finished playing Film Alpha (1999) on Test Rig",
+                film
+            ),
+            (
+                "VideoPlayback",
+                "admin is playing Film Alpha (1999) on Test Rig",
+                film
+            ),
+        ],
+        "{page}"
+    );
 }
 
 /// Sends a request inside [`PLAYING_SPAN`] and returns its statements.

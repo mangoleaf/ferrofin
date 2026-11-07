@@ -1893,9 +1893,10 @@ pub const VERIFIED: &[Verified] = &[
                update_live_stream_session_mapping, update_now_playing for UpdateNowPlayingItem \
                with the NowPlayingItem kept or named on the row it read, the ClearTranscodingInfo \
                of a report that does not transcode, record_playback_start per session user on \
-               progress_item for GetProgressItem, the log line, the PlaybackStart event) → \
-               playback_activity.rs (PlaybackStartLogger)",
-        date: "2026-11-04",
+               progress_item for GetProgressItem, the log line and the PlaybackStart event's \
+               MediaInfo (playback_media_info) named from info.Item, the now-playing item) → \
+               playback_activity.rs (PlaybackStartLogger, from that MediaInfo, reading nothing)",
+        date: "2026-11-06",
         divergences: PLAYBACK_START_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -1925,8 +1926,9 @@ pub const VERIFIED: &[Verified] = &[
                for GetNowPlayingItem, update_now_playing with the check-in only when not automated, \
                the ClearTranscodingInfo of a report that does not transcode, update_play_progress \
                per session user for OnPlaybackProgress(user, item, info), \
-               update_live_stream_session_mapping, the PlaybackProgress event)",
-        date: "2026-11-04",
+               update_live_stream_session_mapping, the PlaybackProgress event carrying the \
+               now-playing item's playback_media_info for MediaInfo = info.Item)",
+        date: "2026-11-06",
         divergences: PLAYBACK_PROGRESS_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -1953,9 +1955,12 @@ pub const VERIFIED: &[Verified] = &[
                (SessionManager.OnPlaybackStopped: the negative-position refusal after releasing the \
                live stream, the reported NowPlayingQueue and PlaylistItemId, RemoveNowPlayingItem's \
                PlayState reset and ClearTranscodingInfo, save_stopped_play_state per session user \
-               unless the playback failed, the log line, close_live_stream_if_needed, the \
-               PlaybackStopped event) → playback_activity.rs (PlaybackStopLogger)",
-        date: "2026-11-02",
+               unless the playback failed, close_live_stream_if_needed, the log line and the \
+               PlaybackStopped event's MediaInfo (playback_media_info) named from info.Item: the \
+               kept now-playing item when the stop names it (info.Item = current), else the row \
+               the stop read, none once the library no longer has it) → \
+               playback_activity.rs (PlaybackStopLogger, from that MediaInfo, reading nothing)",
+        date: "2026-11-06",
         divergences: PLAYBACK_STOP_DIVERGENCES,
         refs: &["user-data"],
     },
@@ -3718,7 +3723,8 @@ const PLAYBACK_STOP_DIVERGENCES: &[&str] = &[
     "A stop naming no PlaySessionId kills every transcode on the caller's device; upstream \
      kills none. Fix path: gl-1184.",
     "A report's own Item is not used: the log line and the activity entry name the library \
-     item. Fix path: gl-1062.",
+     item, as the session shows it or, for an item it does not show, as the stop read it. Fix \
+     path: gl-1062.",
     "The activity entry is written in English, not the server's UI culture. Fix path: gl-429.",
     "The live stream is released and the stop published even when the user-data save fails, \
      and the item is always read again rather than taken from the session, so an item deleted \

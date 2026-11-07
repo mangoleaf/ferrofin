@@ -4643,5 +4643,8 @@ mod play_state;
 /// What a playback report reads from the library.
 mod report_reads;
 
+/// The item a playback event carries for its consumers.
+mod playback_events;
+
 /// The session DTO members that do not follow the playback state.
 mod session_dto;
