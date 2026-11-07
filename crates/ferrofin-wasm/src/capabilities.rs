@@ -19,6 +19,7 @@ use ferrofin_providers::destination::{
 use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_util::file_helper::FileStamp;
 
 use crate::bindings::types::{HttpRequest, HttpResponse, ItemQuery, ItemSummary, MediaSegment};
 
@@ -1043,7 +1044,7 @@ pub fn get_state(path: Option<&std::path::Path>, key: &str) -> Option<Vec<u8>> {
     let mut kept = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(stamp) = StateStamp::of(path) else {
+    let Some(stamp) = state_stamp(path) else {
         // Missing (an uninstall removes it), or no modified time to check a
         // kept map against: read it and keep nothing.
         *kept = None;
@@ -1072,38 +1073,24 @@ pub fn set_state(
     set_state_capped(path, key, value, STATE_TOTAL_DEFAULT)
 }
 
-/// A state file's length, modified time and (on unix) inode: what
-/// [`get_state`] checks a kept map against before using it. A write made
-/// here replaces the kept map itself ([`set_state_capped`]), so the stamp
-/// only has to notice the file changing elsewhere: a backup restore rewrites
-/// it, an uninstall removes it, and while a rolling update runs two servers
-/// the other one's `set-state` renames a new file over it, which the inode
-/// tells apart even inside one modified-time tick.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct StateStamp {
-    len: u64,
-    modified: std::time::SystemTime,
-    #[cfg(unix)]
-    inode: u64,
-}
-
-impl StateStamp {
-    /// The stamp of the file at `path`; `None` when it is missing or has no
-    /// modified time.
-    fn of(path: &Path) -> Option<Self> {
-        let meta = std::fs::metadata(path).ok()?;
-        Some(Self {
-            len: meta.len(),
-            modified: meta.modified().ok()?,
-            #[cfg(unix)]
-            inode: std::os::unix::fs::MetadataExt::ino(&meta),
-        })
-    }
+/// The stamp of the state file at `path`, without its change time (a write
+/// stamps its temporary file before the rename, which moves it): what
+/// [`get_state`] checks a kept map against before using it. `None` when the
+/// file is missing or has no modified time.
+///
+/// A write made here replaces the kept map itself ([`set_state_capped`]), so
+/// the stamp only has to notice the file changing elsewhere: a backup restore
+/// rewrites it, an uninstall removes it, and while a rolling update runs two
+/// servers the other one's `set-state` renames a new file over it, which the
+/// inode tells apart even inside one modified-time tick.
+fn state_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    meta.modified().is_ok().then(|| FileStamp::of(&meta))
 }
 
 /// A state map as read from, or last written to, the file with `stamp`.
 struct KeptState {
-    stamp: StateStamp,
+    stamp: FileStamp,
     /// The CRC-32 of the file bytes `map` was parsed from or serialised to.
     /// A write builds on `map` only while the file's bytes have this CRC (an
     /// equal CRC is taken as equal bytes), so it still sees a change the
@@ -1164,7 +1151,7 @@ pub fn set_state_capped(
     // Stamped before the rename, which keeps length, modified time and
     // inode: the stamp is this write's file even if another server renames
     // its own over it straight after.
-    let stamp = StateStamp::of(&tmp);
+    let stamp = state_stamp(&tmp);
     std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))?;
     // Keep what was just written: the next read or write needs no parse, and a
     // rewrite inside one modified-time tick cannot pass for the old file.

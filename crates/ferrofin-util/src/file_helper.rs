@@ -1,10 +1,58 @@
 //! Port of `FileHelper.cs` — create-or-truncate a file at a path, plus the
 //! directory-writability probe the extraction paths pre-flight with — and the
 //! atomic and private (`0600` on Unix) writes Ferrofin's config, state and
-//! backup files go through.
+//! backup files go through, and the [`FileStamp`] a cache of a file's parsed
+//! contents is checked against.
 
 use std::io;
 use std::path::Path;
+
+/// A file's length, modified time and, on unix, inode: what a cache of the
+/// file's parsed contents is checked against before it is used again. A save
+/// that renames a new file in shows as a new inode even within one
+/// modified-time tick, and a rename keeps the stamp of the file it moves.
+/// [`Self::with_change_time`] adds the change time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed: Option<(i64, i64)>,
+}
+
+impl FileStamp {
+    /// The stamp of the file `meta` describes; a missing modified time is
+    /// `None` in it, equal to another `None`.
+    #[must_use]
+    pub fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            inode: meta.ino(),
+            #[cfg(unix)]
+            changed: None,
+        }
+    }
+
+    /// [`Self::of`] with the change time too (on unix), which a chmod or an
+    /// edit in place also moves. Not for a stamp taken before a rename: the
+    /// rename moves the change time on ext4, btrfs and tmpfs.
+    #[must_use]
+    pub fn with_change_time(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            #[cfg(unix)]
+            changed: Some((meta.ctime(), meta.ctime_nsec())),
+            ..Self::of(meta)
+        }
+    }
+}
 
 /// Replaces a file only after its complete new contents have reached disk.
 ///
@@ -300,6 +348,47 @@ mod tests {
 
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("restore");
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A rename keeps the stamp of the file it moves (the WASM state is
+    /// stamped before its rename), and a file renamed in over another of the
+    /// same length and modified time has a stamp of its own, by its inode.
+    #[cfg(unix)]
+    #[test]
+    fn a_stamp_survives_a_rename_and_tells_a_renamed_in_file_apart() {
+        let dir = temp_dir().join(format!("ferrofin-stamp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, new) = (dir.join("state.json"), dir.join("state.tmp"));
+        let write = |path: &Path| {
+            std::fs::write(path, b"same").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+                .unwrap();
+            FileStamp::of(&std::fs::metadata(path).unwrap())
+        };
+        let before = write(&new);
+        std::fs::rename(&new, &path).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(FileStamp::of(&meta), before);
+        assert_eq!(
+            FileStamp::with_change_time(&meta),
+            FileStamp::with_change_time(&std::fs::metadata(&path).unwrap()),
+            "an untouched file keeps its stamp with the change time"
+        );
+        assert_ne!(
+            FileStamp::with_change_time(&meta),
+            FileStamp::of(&meta),
+            "the change time is opted in"
+        );
+
+        let other = write(&new);
+        std::fs::rename(&new, &path).unwrap();
+        assert_ne!(other, before);
+        assert_eq!(FileStamp::of(&std::fs::metadata(&path).unwrap()), other);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

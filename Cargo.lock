@@ -1765,6 +1765,7 @@ dependencies = [
  "ferrofin-model",
  "ferrofin-providers",
  "ferrofin-traits",
+ "ferrofin-util",
  "regex",
  "reqwest",
  "rstest",
