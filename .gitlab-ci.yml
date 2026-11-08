@@ -60,7 +60,7 @@ request-release:
   stage: .pre
   image: alpine:3
   script:
-    - echo "Release requested — create-release runs once lint + dependencies + coverage pass."
+    - echo "Release requested — create-release runs once lint + dependencies + vet + coverage pass."
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       when: manual
@@ -68,7 +68,7 @@ request-release:
 
 # ---------------------------------------------------------------------------
 # create-release — main only. GATED by the manual request-release job above plus
-# lint + dependencies + coverage (via needs): it is SKIPPED unless you clicked request-release
+# lint + dependencies + vet + coverage (via needs): it is SKIPPED unless you clicked request-release
 # AND all the checks passed. This is how a release is triggered early WITHOUT waiting
 # — click request-release any time; this then runs automatically once the checks
 # go green, or is skipped/cancelled if they fail. It never auto-releases: no
@@ -91,6 +91,7 @@ create-release:
     - job: request-release
     - job: lint
     - job: dependencies
+    - job: vet
     - job: coverage
       parallel:
         matrix:
@@ -137,7 +138,7 @@ create-release:
       fi
   rules:
     # No `when:` -> on_success. The manual gate is request-release (a need above);
-    # this runs automatically once request-release + lint + dependencies + coverage all succeed,
+    # this runs automatically once request-release + lint + dependencies + vet + coverage all succeed,
     # and is skipped otherwise — so it never releases without a request-release click.
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
@@ -403,6 +404,26 @@ dependencies:
       cargo machete apps crates || rc=1   # vendor/ holds upstream code as published
       scripts/check-workspace-deps.py || rc=1
       exit $rc
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
+
+# cargo-vet, the same check as the `vet` job in .github/workflows/ci.yml: every crate in Cargo.lock
+# needs an audit or an exemption in supply-chain/ (CONTRIBUTING.md, "Dependencies"). --locked reads
+# the committed supply-chain/imports.lock instead of fetching the imports, so the result changes only
+# with the branch. create-release needs it.
+vet:
+  stage: test
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # cargo-vet baked in (ci/Dockerfile)
+  needs:
+    - job: ci-image   # as in `dependencies`
+      optional: true
+  variables:
+    CARGO_TERM_COLOR: always
+  script:
+    - cargo vet --locked
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       interruptible: true
