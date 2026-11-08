@@ -167,7 +167,9 @@ fn a_vendored_pattern_has_a_guard_exactly_when_fancy_regex_would_backtrack_on_it
     // Any other pattern fancy-regex hands whole to the same linear-time engine
     // the guard uses, so a guard would compile it twice and scan each match
     // twice. (`internal` is fancy-regex's doc-hidden analysis, pinned by
-    // Cargo.lock: if a bump moves it, re-check this another way.)
+    // Cargo.lock: if a bump moves it, re-check this another way. Re-checked for
+    // 0.20, which stopped marking word boundaries hard outside a lookbehind: no
+    // vendored fancy pattern uses one, and lookaround is still always hard.)
     let options = NamingOptions::new();
     let (mut with, mut without) = (0, 0);
     for pattern in vendored_patterns(&options) {
