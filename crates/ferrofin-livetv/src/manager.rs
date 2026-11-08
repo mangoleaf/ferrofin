@@ -6354,6 +6354,24 @@ impl FerrofinLiveTvManager {
                 timer.status = RecordingStatus::Completed;
                 self.persist_timer(&timer).await?;
                 tracing::info!(timer_id = info.id, path = %target.display(), "live tv: recording completed");
+                // Jellyfin v12.4 RecordingsManager.RecordStream calls
+                // PostProcessRecording only after retaining the capture and
+                // persisting Completed. A script failure must not retry capture
+                // or remove an otherwise successful recording.
+                let options = self.live_tv_options().await;
+                match crate::recording_postprocess::run(&options, target).await {
+                    Ok(Some(status)) => {
+                        tracing::info!(
+                            timer_id = info.id,
+                            exit_code = status.code(),
+                            "live tv: recording post-processing completed"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(timer_id = info.id, path = %target.display(), %error, "live tv: recording post-processing failed");
+                    }
+                }
             }
             // Nothing was captured: the row and the timer both go, as upstream
             // deletes a timer whose file never appeared.
@@ -10421,6 +10439,139 @@ mod tests {
             });
         mgr.set_local_api_access(Arc::new(LoopbackApi));
         mgr
+    }
+
+    /// The completion path, including partial captures retained after the last
+    /// retry, runs the hook exactly once. Neither a failing hook nor a failed
+    /// spawn may turn a retained recording into another capture attempt.
+    #[cfg(unix)]
+    #[rstest::rstest]
+    #[case(true, false, false, false)]
+    #[case(true, true, false, false)]
+    #[case(true, false, true, false)]
+    #[case(false, false, false, false)]
+    #[case(true, true, false, true)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one recorder fixture, every completion outcome
+    #[allow(clippy::fn_params_excessive_bools)] // independent capture, spawn and retry cases
+    async fn recording_postprocess_follows_retained_completion(
+        #[case] recorded: bool,
+        #[case] capture_failed: bool,
+        #[case] spawn_failed: bool,
+        #[case] retry: bool,
+    ) {
+        let dir = tempfile::tempdir().expect("directory");
+        let mgr = manager_with_dvr(dir.path()).await;
+        let target = dir.path().join("recording with 'quotes'.ts");
+        let marker = dir.path().join("processed");
+        let script = dir.path().join("processor.sh");
+        std::fs::write(&target, b"retained capture").expect("capture");
+        std::fs::write(&script, "printf '%s' \"$1\" >> \"$2\"\nexit 37\n").expect("script");
+        let options = ferrofin_model::live_tv::LiveTvOptions {
+            recording_post_processor: Some(if spawn_failed {
+                dir.path().join("missing").display().to_string()
+            } else {
+                "/bin/sh".to_owned()
+            }),
+            recording_post_processor_arguments: Some(format!(
+                "{} \"{{path}}\" {}",
+                script.display(),
+                marker.display()
+            )),
+            ..ferrofin_model::live_tv::LiveTvOptions::default()
+        };
+        std::fs::create_dir_all(dir.path().join("named")).expect("named directory");
+        std::fs::write(
+            dir.path().join("named/livetv.json"),
+            serde_json::to_vec(&options).expect("options"),
+        )
+        .expect("write options");
+        let info = crate::dvr::TimerRecordingInfo {
+            id: "postprocess-test".to_owned(),
+            // A failed capture after its end is retained, rather than retried.
+            end_date: Utc::now() + chrono::Duration::seconds(if retry { 600 } else { -1 }),
+            ..crate::dvr::TimerRecordingInfo::default()
+        };
+        let timer = TimerInfoDto {
+            base: BaseTimerInfoDto {
+                id: Some(info.id.clone()),
+                ..BaseTimerInfoDto::default()
+            },
+            status: RecordingStatus::InProgress,
+            ..TimerInfoDto::default()
+        };
+        mgr.persist_timer(&timer).await.expect("timer");
+        let recording_id = Uuid::new_v4();
+        crate::dvr_repository::insert_recording(&mgr.db, recording_id, &info, &target, Utc::now())
+            .await
+            .expect("recording");
+        let outcome = if capture_failed {
+            Err(ServiceError::backend("capture failed".to_owned()))
+        } else {
+            Ok(())
+        };
+        mgr.settle_timer(timer, &info, Some(recording_id), &target, recorded, outcome)
+            .await
+            .expect("settled regardless of hook failure");
+        if retry {
+            mgr.disarm_timer(&info.id);
+            assert_eq!(
+                mgr.get_timer(&info.id)
+                    .await
+                    .expect("timer")
+                    .expect("retry")
+                    .status,
+                RecordingStatus::New
+            );
+            assert!(
+                crate::dvr_repository::recording_row(&mgr.db, recording_id)
+                    .await
+                    .expect("row")
+                    .is_none()
+            );
+            assert!(
+                !marker.exists(),
+                "a retried capture must not invoke the hook"
+            );
+        } else if recorded {
+            assert_eq!(
+                mgr.get_timer(&info.id)
+                    .await
+                    .expect("timer")
+                    .expect("retained")
+                    .status,
+                RecordingStatus::Completed
+            );
+            let row = crate::dvr_repository::recording_row(&mgr.db, recording_id)
+                .await
+                .expect("row")
+                .expect("retained");
+            assert_eq!(row.status, "Completed");
+            assert_eq!(
+                std::fs::read(&target).expect("capture retained"),
+                b"retained capture"
+            );
+            if spawn_failed {
+                assert!(!marker.exists());
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(&marker).expect("hook ran once"),
+                    target.to_string_lossy()
+                );
+            }
+        } else {
+            assert!(mgr.get_timer(&info.id).await.expect("timer").is_none());
+            assert!(
+                crate::dvr_repository::recording_row(&mgr.db, recording_id)
+                    .await
+                    .expect("row")
+                    .is_none()
+            );
+            assert!(
+                !marker.exists(),
+                "an empty capture must not invoke the hook"
+            );
+        }
     }
 
     /// A manager whose `LiveTvOptions` file holds `guide_days`, or none at all.

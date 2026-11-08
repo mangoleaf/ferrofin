@@ -949,7 +949,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// HLS routes;
 /// `video-stream-copy` is whether a transcode job copies the source video and
 /// what dynamic HDR metadata the copy strips, which the HLS and stream routes
-/// share.
+/// share; `recording-postprocessing` is the executable run after a retained
+/// DVR capture, which no HTTP response describes.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -963,6 +964,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "trickplay-extraction",
     "trickplay",
     "video-stream-copy",
+    "recording-postprocessing",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -990,6 +992,25 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "recording-postprocessing",
+        upstream_file: "src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs",
+        upstream_method: "PostProcessRecording",
+        ferrofin: "ferrofin-livetv manager.rs settle_timer (RecordStream: only the retained \
+                   capture branch, after persisting Completed, including a failed capture \
+                   whose retry window is exhausted) -> recording_postprocess.rs run: read \
+                   current LiveTvOptions, skip a blank executable, expand {path} ignoring \
+                   case, launch without a shell, await exit, log spawn/argument errors \
+                   without changing recording success. Compared with RecordStream and \
+                   PostProcessRecording at the pinned v12.4 tag.",
+        date: "2026-11-08",
+        divergences: &[
+            "Arguments use POSIX shell-word quoting without shell execution; the template \
+             is split before replacing {path}, so spaces, quotes and metacharacters in \
+             recording names remain literal argument contents instead of changing parsing.",
+            "Argument values are not logged because a configured template can contain secrets.",
+        ],
+    },
     VerifiedSubsystem {
         key: "scan-failure-isolation",
         upstream_file: "MediaBrowser.Controller/Entities/TV/Episode.cs",
