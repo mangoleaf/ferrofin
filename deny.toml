@@ -1,4 +1,4 @@
-# cargo-deny: the supply-chain gate. CI's `dependencies` job runs `cargo deny --locked check`
+# cargo-deny: the supply-chain gate. CI's `dependencies` job (GitHub and GitLab) runs `cargo deny --locked check`
 # on every push and PR, and release.yml re-checks the advisories before it tags a release.
 # What to do when it fails is in CONTRIBUTING.md, "Dependencies".
 
