@@ -1,5 +1,6 @@
 # cargo-deny: the supply-chain gate. CI's `dependencies` job (GitHub and GitLab) runs `cargo deny --locked check`
-# on every push and PR, and release.yml re-checks the advisories before it tags a release.
+# on every push and PR, for the workspace and for the workspace-excluded examples/wasm-hello guest (its own
+# Cargo.lock, same policy), and release.yml re-checks the workspace's advisories before it tags a release.
 # What to do when it fails is in CONTRIBUTING.md, "Dependencies".
 
 [graph]
@@ -8,12 +9,13 @@ all-features = true
 
 [advisories]
 # Every RustSec advisory against a crate the workspace builds fails the gate: vulnerabilities,
-# and the unmaintained and unsound notices of transitive crates too (a yanked version only
-# warns). Cargo.lock also records optional crates no feature turns on (quinn, for reqwest's
-# unused HTTP/3); the gate does not see those, so keep them patched with `cargo update` too.
-# An entry here needs a reason, and goes once its crate is upgraded or dropped.
+# and the unmaintained and unsound notices of transitive crates too. So does a version its
+# publisher yanked from crates.io. Cargo.lock also records optional crates no feature turns on
+# (quinn, for reqwest's unused HTTP/3); the gate does not see those, so keep them patched with
+# `cargo update` too. An entry here needs a reason, and goes once its crate is upgraded or dropped.
 unmaintained = "all"
 unsound = "all"
+yanked = "deny"
 ignore = [
     # A proc-macro lofty (tag and lyrics reading) builds with; every 0.25 release, 0.25.5
     # included, depends on it. Not a vulnerability, and no code of it ships in the binary.
