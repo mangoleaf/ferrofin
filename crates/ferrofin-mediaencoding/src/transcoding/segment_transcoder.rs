@@ -134,6 +134,9 @@ pub struct FakeScript {
     /// Whether the child has already exited when handed back. When `false`, the
     /// child stays running until [`FakeTranscodeChild::finish`] is called.
     pub exits_immediately: bool,
+    /// Files to write when a still-running child is killed: what ffmpeg's
+    /// graceful `q` exit finalises, cut short.
+    pub kill_files: Vec<String>,
 }
 
 /// A [`SegmentTranscoder`] that writes fake segment files instead of spawning
@@ -275,7 +278,12 @@ impl TranscodeChild for FakeTranscodeChild {
 
     async fn kill(&self) -> Result<(), String> {
         self.killed.store(true, Ordering::SeqCst);
-        self.exited.store(true, Ordering::SeqCst);
+        if !self.exited.swap(true, Ordering::SeqCst) {
+            for name in &self.fake.script.kill_files {
+                std::fs::write(self.output_dir.join(name), b"cut short\n")
+                    .map_err(|e| format!("fake write {name}: {e}"))?;
+            }
+        }
         Ok(())
     }
 }
