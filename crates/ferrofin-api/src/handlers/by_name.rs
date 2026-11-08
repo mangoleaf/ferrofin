@@ -37,7 +37,10 @@ use crate::state::AppState;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ByNameListQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     pub user_id: Option<uuid::Uuid>,
     /// The index of the first record to return.
     #[serde(default)]
@@ -58,7 +61,10 @@ pub(crate) struct ByNameListQuery {
     #[serde(default)]
     pub name_less_than: Option<String>,
     /// Localizes the browse to a specific parent item/folder when set.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     pub parent_id: Option<uuid::Uuid>,
     /// When non-empty, the aggregated counts are folded onto each DTO.
     #[serde(default)]
@@ -393,7 +399,10 @@ fn parse_csv_i32(raw: Option<&str>) -> Result<Vec<i32>, ApiError> {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ByNameItemQuery {
     /// The target user; defaults to the authenticated caller when absent.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     pub user_id: Option<uuid::Uuid>,
 }
 

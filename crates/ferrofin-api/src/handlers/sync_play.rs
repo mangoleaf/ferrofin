@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{JsonBody, ProblemDetails};
+use crate::extract::{DotnetGuid, JsonBody, ProblemDetails};
 use crate::handlers::items::{resolve_user_opt, user_uuid};
 use crate::handlers::session_ctx::current_session;
 use crate::state::AppState;
@@ -274,7 +274,7 @@ async fn list_groups(
 async fn get_group(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
-    Path(group_id): Path<Uuid>,
+    Path(DotnetGuid(group_id)): Path<DotnetGuid>,
 ) -> Result<Json<GroupInfoDto>, ApiError> {
     require_access(&state, &auth, SyncPlayAccess::JoinGroup).await?;
     let mgr = manager(&state)?;

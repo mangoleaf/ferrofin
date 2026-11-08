@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::{JsonSeqBody, Query};
+use crate::extract::{DotnetGuid, JsonSeqBody, Query};
 use crate::state::AppState;
 
 /// Ports Jellyfin's `RequiresElevation` policy for the plugin-mutating
@@ -218,7 +218,7 @@ async fn get_plugins(
 async fn get_plugin_configuration(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(plugin_id): Path<Uuid>,
+    Path(DotnetGuid(plugin_id)): Path<DotnetGuid>,
 ) -> Result<Response, ApiError> {
     // A plugin's configuration is where its credentials live; the C# gates this
     // read at class level (PluginsController.cs:25).
@@ -288,7 +288,7 @@ fn without_nulls(bytes: Vec<u8>) -> Vec<u8> {
 async fn update_plugin_configuration(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(plugin_id): Path<Uuid>,
+    Path(DotnetGuid(plugin_id)): Path<DotnetGuid>,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
@@ -317,7 +317,7 @@ async fn update_plugin_configuration(
 async fn enable_plugin(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((plugin_id, version)): Path<(Uuid, String)>,
+    Path((DotnetGuid(plugin_id), version)): Path<(DotnetGuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
     plugin_at_version(&state, plugin_id, &version).await?;
@@ -343,7 +343,7 @@ async fn enable_plugin(
 async fn disable_plugin(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((plugin_id, version)): Path<(Uuid, String)>,
+    Path((DotnetGuid(plugin_id), version)): Path<(DotnetGuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
     plugin_at_version(&state, plugin_id, &version).await?;
@@ -374,7 +374,7 @@ async fn disable_plugin(
 async fn uninstall_plugin(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(plugin_id): Path<Uuid>,
+    Path(DotnetGuid(plugin_id)): Path<DotnetGuid>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
     state.plugins.remove_plugin(plugin_id).await?;
@@ -399,7 +399,7 @@ async fn uninstall_plugin(
 async fn uninstall_plugin_by_version(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((plugin_id, version)): Path<(Uuid, String)>,
+    Path((DotnetGuid(plugin_id), version)): Path<(DotnetGuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
     // A staged WASM plugin is removable before it is in the registry (the
@@ -430,7 +430,7 @@ async fn uninstall_plugin_by_version(
 )]
 async fn get_plugin_image(
     State(state): State<AppState>,
-    Path((plugin_id, version)): Path<(Uuid, String)>,
+    Path((DotnetGuid(plugin_id), version)): Path<(DotnetGuid, String)>,
 ) -> Result<Response, ApiError> {
     // No auth extractor: this is the ONE action upstream marks
     // `[AllowAnonymous]` (v10.11.8 PluginsController.cs:221), against the
@@ -469,7 +469,7 @@ async fn get_plugin_image(
 async fn get_plugin_manifest(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(plugin_id): Path<Uuid>,
+    Path(DotnetGuid(plugin_id)): Path<DotnetGuid>,
 ) -> Result<Json<PluginManifest>, ApiError> {
     require_admin(&state, &auth).await?;
     let Some(d) = state.plugins.get_plugin(plugin_id).await? else {
@@ -700,7 +700,7 @@ async fn install_package(
 async fn cancel_package_installation(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path(package_id): Path<Uuid>,
+    Path(DotnetGuid(package_id)): Path<DotnetGuid>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
     // TODO(gl-844): track an install while its `POST /Packages/Installed/{name}`
@@ -760,7 +760,7 @@ const PLUGIN_REQUEST_BODY_MAX: usize = 1024 * 1024;
 async fn plugin_web_request(
     axum::extract::State(state): axum::extract::State<AppState>,
     method: axum::http::Method,
-    Path((plugin_id, rest)): Path<(Uuid, String)>,
+    Path((DotnetGuid(plugin_id), rest)): Path<(DotnetGuid, String)>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
     request: axum::extract::Request,

@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::hls::nullable_enum_value;
 use crate::handlers::media_info::universal_audio_source;
 use crate::handlers::streaming::{
@@ -37,7 +37,7 @@ use crate::state::AppState;
 async fn get_audio_stream(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<crate::handlers::hls::HlsQueryPub>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -60,7 +60,7 @@ async fn get_audio_stream(
 async fn get_audio_stream_by_container(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((item_id, container)): Path<(Uuid, String)>,
+    Path((DotnetGuid(item_id), container)): Path<(DotnetGuid, String)>,
     Query(query): Query<crate::handlers::hls::HlsQueryPub>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -262,7 +262,7 @@ const HLS_SEGMENT_CONTAINERS: [&str; 2] = ["ts", "mp4"];
 async fn get_universal_audio_stream(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<UniversalAudioQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {

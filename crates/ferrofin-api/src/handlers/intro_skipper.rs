@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::state::AppState;
 
 /// The compiled-in Intro Skipper extension id (mirrors `EXTENSION_ID` in
@@ -270,7 +270,7 @@ async fn timestamps_for(state: &AppState, item_id: Uuid) -> Result<TimeStamps, A
 async fn update_timestamps(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(id): Path<Uuid>,
+    Path(DotnetGuid(id)): Path<DotnetGuid>,
     JsonBody(timestamps): JsonBody<TimeStamps>,
 ) -> Result<StatusCode, ApiError> {
     let Some(item) = state.library.get_item_by_id(id).await? else {
@@ -316,7 +316,7 @@ async fn update_timestamps(
 async fn get_timestamps(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    Path(id): Path<Uuid>,
+    Path(DotnetGuid(id)): Path<DotnetGuid>,
 ) -> Result<Json<TimeStamps>, ApiError> {
     let Some(item) = state.library.get_item_by_id(id).await? else {
         return Err(ApiError::NotFound(format!("item {id}")));
@@ -334,7 +334,7 @@ async fn get_timestamps(
 async fn get_skippable_segments(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
-    Path(id): Path<Uuid>,
+    Path(DotnetGuid(id)): Path<DotnetGuid>,
 ) -> Result<Json<std::collections::BTreeMap<AnalysisMode, Segment>>, ApiError> {
     let segments = state.intro_skipper.segments(id).await?;
     let out = intro_store::timestamps(&segments)
@@ -428,7 +428,7 @@ async fn segment_editor_metadata(
 async fn create_segment(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<CreateSegmentQuery>,
     JsonBody(segment): JsonBody<SegmentInput>,
 ) -> Result<StatusCode, ApiError> {
@@ -520,7 +520,10 @@ async fn publish_edit(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeleteSegmentQuery {
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
+    )]
     item_id: Option<Uuid>,
     #[serde(default, rename = "type")]
     type_: Option<String>,
@@ -537,7 +540,7 @@ struct DeleteSegmentQuery {
 async fn delete_segment(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(segment_id): Path<Uuid>,
+    Path(DotnetGuid(segment_id)): Path<DotnetGuid>,
     Query(query): Query<DeleteSegmentQuery>,
 ) -> Result<StatusCode, ApiError> {
     let (Some(item_id), Some(type_)) = (query.item_id, query.type_) else {
@@ -894,7 +897,7 @@ fn episode_visualizations(episodes: Vec<BaseItemEntity>) -> Vec<EpisodeVisualiza
 async fn get_season_episodes(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path((_series_id, season_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(_series_id), DotnetGuid(season_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<Json<Vec<EpisodeVisualization>>, ApiError> {
     let episodes = season_episodes(&state, season_id).await?;
     if episodes.is_empty() {
@@ -910,7 +913,7 @@ async fn get_season_episodes(
 async fn erase_season(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path((_series_id, season_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(_series_id), DotnetGuid(season_id))): Path<(DotnetGuid, DotnetGuid)>,
     Query(query): Query<EraseSeasonQuery>,
 ) -> Result<StatusCode, ApiError> {
     let episodes = season_episodes(&state, season_id).await?;
@@ -960,7 +963,7 @@ async fn erase_items(
 async fn erase_movie(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(movie_id): Path<Uuid>,
+    Path(DotnetGuid(movie_id)): Path<DotnetGuid>,
     Query(query): Query<EraseSeasonQuery>,
 ) -> Result<StatusCode, ApiError> {
     let is_movie = state
@@ -995,7 +998,7 @@ struct GuidList(#[serde(with = "ferrofin_model::json::guid::vec")] Vec<Uuid>);
 async fn get_disabled_episodes(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(season_id): Path<Uuid>,
+    Path(DotnetGuid(season_id)): Path<DotnetGuid>,
 ) -> Result<Json<GuidList>, ApiError> {
     let mut ids: Vec<Uuid> = state
         .intro_skipper
@@ -1118,7 +1121,7 @@ async fn clear_excluded_timestamps(
 async fn get_analyzer_actions(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path(season_id): Path<Uuid>,
+    Path(DotnetGuid(season_id)): Path<DotnetGuid>,
 ) -> Result<Json<std::collections::BTreeMap<AnalysisMode, AnalyzerAction>>, ApiError> {
     if season_episodes(&state, season_id).await?.is_empty()
         && !state
@@ -1183,7 +1186,7 @@ async fn update_analyzer_actions(
 async fn scan_season(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    Path((_series_id, season_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(_series_id), DotnetGuid(season_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<StatusCode, ApiError> {
     if state.intro_skipper_analysis.rescan(season_id).await? {
         Ok(StatusCode::ACCEPTED)

@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::state::AppState;
 
 /// Query parameters for `GET /Items/{itemId}/RemoteImages`.
@@ -71,7 +71,7 @@ struct RemoteImagesQuery {
 async fn get_remote_images(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<RemoteImagesQuery>,
 ) -> Result<Json<RemoteImageResult>, ApiError> {
     require_item(&state, item_id, &auth).await?;
@@ -130,7 +130,7 @@ async fn get_remote_images(
 async fn get_remote_image_providers(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
 ) -> Result<Json<Vec<ImageProviderInfo>>, ApiError> {
     require_item(&state, item_id, &auth).await?;
     let providers = state
@@ -173,7 +173,7 @@ struct DownloadQuery {
 async fn download_remote_image(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<DownloadQuery>,
 ) -> Result<StatusCode, ApiError> {
     require_item(&state, item_id, &auth).await?;

@@ -623,6 +623,53 @@ where
     }
 }
 
+/// A route or query `Guid`, bound the way ASP.NET binds one. Extract it as
+/// `Path(DotnetGuid(id)): Path<DotnetGuid>`, or by position in a tuple.
+///
+/// ASP.NET converts a `[FromRoute]` or `[FromQuery]` `Guid` with
+/// `GuidConverter`, which is `Guid.Parse`
+/// ([`parse_dotnet_guid`](ferrofin_util::guid_extensions::parse_dotnet_guid)):
+/// the value is trimmed, and the D, N, B, P and X formats bind. `Uuid`'s own
+/// `Deserialize` is `Uuid::parse_str`, which refuses P, X and padding and
+/// takes an `urn:uuid:` prefix .NET has no format for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DotnetGuid(pub uuid::Uuid);
+
+impl DotnetGuid {
+    /// Parses `value` as `Guid.Parse` does. The error is `Uuid::parse_str`'s
+    /// complaint, so a spelling both parsers refuse keeps the 400 body it had
+    /// when ids were parsed that way.
+    pub(crate) fn parse(value: &str) -> Result<uuid::Uuid, String> {
+        ferrofin_util::guid_extensions::parse_dotnet_guid(value).ok_or_else(|| {
+            match uuid::Uuid::parse_str(value) {
+                Err(error) => error.to_string(),
+                // A spelling `Uuid` takes and .NET does not (today, `urn:uuid:`).
+                Ok(_) => "not a .NET GUID format".to_owned(),
+            }
+        })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DotnetGuid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct GuidVisitor;
+        impl serde::de::Visitor<'_> for GuidVisitor {
+            type Value = DotnetGuid;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a GUID string")
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<DotnetGuid, E> {
+                DotnetGuid::parse(value)
+                    .map(DotnetGuid)
+                    .map_err(|reason| E::custom(format_args!("UUID parsing failed: {reason}")))
+            }
+        }
+        // `deserialize_str` and `Uuid`'s message prefix, as `Uuid` has: axum's
+        // path rejection then names the parameter and its value as before.
+        deserializer.deserialize_str(GuidVisitor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

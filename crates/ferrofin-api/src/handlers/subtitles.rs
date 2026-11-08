@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireSubtitleManagement};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query, upload_body_limit};
+use crate::extract::{DotnetGuid, JsonBody, Query, upload_body_limit};
 use crate::handlers::image_upload::decode_base64;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::queue_high_priority_refresh;
@@ -132,7 +132,7 @@ async fn require_video(
 async fn delete_subtitle(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path((item_id, index)): Path<(Uuid, i32)>,
+    Path((DotnetGuid(item_id), index)): Path<(DotnetGuid, i32)>,
 ) -> Result<StatusCode, ApiError> {
     require_item(&state, item_id, &auth).await?;
     state.subtitles.delete_subtitles(item_id, index).await?;
@@ -179,7 +179,7 @@ struct UploadSubtitleDto {
 async fn upload_subtitle(
     State(state): State<AppState>,
     RequireSubtitleManagement(auth): RequireSubtitleManagement,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     JsonBody(body): JsonBody<UploadSubtitleDto>,
 ) -> Result<StatusCode, ApiError> {
     require_video(&state, item_id, &auth).await?;
@@ -227,7 +227,7 @@ struct RemoteSearchQuery {
 async fn search_remote_subtitles(
     State(state): State<AppState>,
     RequireSubtitleManagement(auth): RequireSubtitleManagement,
-    Path((item_id, language)): Path<(Uuid, String)>,
+    Path((DotnetGuid(item_id), language)): Path<(DotnetGuid, String)>,
     Query(query): Query<RemoteSearchQuery>,
 ) -> Result<Json<Vec<RemoteSubtitleInfo>>, ApiError> {
     require_video(&state, item_id, &auth).await?;
@@ -266,7 +266,7 @@ async fn search_remote_subtitles(
 async fn download_remote_subtitles(
     State(state): State<AppState>,
     RequireSubtitleManagement(auth): RequireSubtitleManagement,
-    Path((item_id, subtitle_id)): Path<(Uuid, String)>,
+    Path((DotnetGuid(item_id), subtitle_id)): Path<(DotnetGuid, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_video(&state, item_id, &auth).await?;
     // The C# logs-and-continues on a provider failure, still returning 204, then
@@ -507,7 +507,12 @@ async fn serve_graphical_subtitle(
 async fn get_subtitle(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((item_id, media_source_id, index, route_format)): Path<(Uuid, String, i32, String)>,
+    Path((DotnetGuid(item_id), media_source_id, index, route_format)): Path<(
+        DotnetGuid,
+        String,
+        i32,
+        String,
+    )>,
     Query(query): Query<SubtitleStreamQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -554,13 +559,9 @@ async fn get_subtitle(
 async fn get_subtitle_with_ticks(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((item_id, media_source_id, index, start_position_ticks, route_format)): Path<(
-        Uuid,
-        String,
-        i32,
-        i64,
-        String,
-    )>,
+    Path((DotnetGuid(item_id), media_source_id, index, start_position_ticks, route_format)): Path<
+        (DotnetGuid, String, i32, i64, String),
+    >,
     Query(mut query): Query<SubtitleStreamQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -625,7 +626,7 @@ async fn get_subtitle_playlist(
     // The subtitle stream index is part of the URL but does not affect the
     // playlist body (the segments all point at the same `stream.vtt`); the C#
     // suppresses the same unused parameter (CA1801).
-    Path((item_id, media_source_id, _index)): Path<(Uuid, String, i32)>,
+    Path((DotnetGuid(item_id), media_source_id, _index)): Path<(DotnetGuid, String, i32)>,
     Query(query): Query<SubtitlePlaylistQuery>,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
