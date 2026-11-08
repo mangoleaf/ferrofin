@@ -1534,18 +1534,50 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         idle.into_iter().map(|(handle, _)| handle).collect()
     }
 
-    /// Runs [`Self::reap_idle_jobs`] forever, sweeping every `interval`. The
-    /// composition root spawns this once next to the manager.
+    /// Runs [`Self::reap_idle_jobs`], sweeping every `interval`, until the
+    /// manager drops. The composition root spawns this once next to the manager.
+    ///
+    /// The weak reference lets a server lifetime's manager, and the session
+    /// graph its reporter holds, go when an in-process restart drops it
+    /// (gl-141), as [`Self::run_transcode_controls`] does.
     ///
     /// A sweep that panics is logged and ends alone (`survive_panic`): the
     /// jobs it had not reached are still registered, so the next sweep reaps
     /// them. The job it was tearing down is already out of the registry and
     /// is not retried.
-    pub async fn run_idle_reaper(self: std::sync::Arc<Self>, interval: Duration) {
+    pub async fn run_idle_reaper(manager: std::sync::Weak<Self>, interval: Duration) {
         let mut failing = false;
         loop {
             tokio::time::sleep(interval).await;
-            survive_panic("transcode_idle_reaper", &mut failing, self.reap_idle_jobs()).await;
+            let Some(manager) = manager.upgrade() else {
+                return;
+            };
+            survive_panic(
+                "transcode_idle_reaper",
+                &mut failing,
+                manager.reap_idle_jobs(),
+            )
+            .await;
+        }
+    }
+
+    /// Kills every job at the end of a server lifetime, deleting its partial
+    /// output and releasing its tuner, whether or not a consumer is still on it.
+    ///
+    /// The drain has already disconnected every client, and the next lifetime
+    /// clears the transcode cache before it starts a job, so nothing could
+    /// read these jobs' output again. Upstream leaves them to their kill
+    /// timers; killing them here stops an ffmpeg writing into a directory
+    /// the next lifetime purges (gl-141).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal job-registry mutex has been poisoned.
+    pub async fn shutdown(&self) {
+        let jobs = std::mem::take(&mut *self.jobs.lock().expect("jobs lock poisoned"));
+        for job in jobs {
+            self.tear_down(&job.handle, &job.display, job.running, true, true)
+                .await;
         }
     }
 
@@ -2376,8 +2408,10 @@ mod tests {
 
         let logs = CapturedLogs::default();
         let guard = logs.install();
-        let reaper =
-            tokio::spawn(Arc::clone(&m).run_idle_reaper(std::time::Duration::from_secs(10)));
+        let reaper = tokio::spawn(TranscodeManagerImpl::run_idle_reaper(
+            Arc::downgrade(&m),
+            std::time::Duration::from_secs(10),
+        ));
         // Each sweep reaches one job: the first two panic in its teardown.
         for _ in 0..60 {
             if m.active_job_count() == 0 && !reporter.killed.lock().unwrap().is_empty() {
@@ -2409,6 +2443,54 @@ mod tests {
         );
         let recovered = reaper_lines("INFO");
         assert_eq!(recovered.len(), 1, "{recovered:#?}");
+    }
+
+    /// gl-141: the reaper holds its manager weakly, so dropping a server
+    /// lifetime's manager ends the reaper instead of keeping the manager, and
+    /// the session graph its reporter holds, alive across an in-process restart.
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_reaper_ends_once_its_manager_is_dropped() {
+        let m = Arc::new(manager());
+        let reaper = tokio::spawn(TranscodeManagerImpl::run_idle_reaper(
+            Arc::downgrade(&m),
+            std::time::Duration::from_secs(10),
+        ));
+        drop(m);
+        tokio::time::timeout(std::time::Duration::from_secs(60), reaper)
+            .await
+            .expect("the reaper outlived its manager")
+            .expect("the reaper panicked");
+    }
+
+    /// gl-141: the end of a server lifetime kills every job, busy or idle,
+    /// deleting its partial output and releasing its tuner, so no ffmpeg
+    /// outlives the lifetime that started it.
+    #[tokio::test]
+    async fn shutdown_kills_and_removes_every_job() {
+        let reporter = Arc::new(RecordingReporter::default());
+        let m = TranscodeManagerImpl::new(ReporterHandle(Arc::clone(&reporter)));
+        m.register_job(handle("s1", "/t/a.m3u8", TranscodingJobType::Hls, "dev1"));
+        m.register_job(handle(
+            "s2",
+            "/t/b.mkv",
+            TranscodingJobType::Progressive,
+            "dev2",
+        ));
+        // A consumer mid-request keeps a job off the idle reaper's list.
+        m.jobs.lock().unwrap()[0].active_request_count = 1;
+
+        m.shutdown().await;
+
+        assert_eq!(m.active_job_count(), 0);
+        let mut killed = reporter.killed.lock().unwrap().clone();
+        killed.sort();
+        assert_eq!(
+            killed,
+            [
+                ("/t/a.m3u8".to_owned(), true, true),
+                ("/t/b.mkv".to_owned(), true, true)
+            ]
+        );
     }
 }
 

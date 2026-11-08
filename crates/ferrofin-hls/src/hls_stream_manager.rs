@@ -1226,6 +1226,10 @@ where
             .get_transcoding_job_by_session(play_session_id)
             .await
     }
+
+    async fn shutdown(&self) {
+        self.manager.shutdown().await;
+    }
 }
 
 impl<P, T, C, S> HlsStreamManagerImpl<P, T, C, S>

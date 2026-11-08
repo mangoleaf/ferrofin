@@ -40,7 +40,7 @@ const COPY_BUFFER_BYTES: usize = 81_920;
 ///
 /// Port of `ProgressiveFileStream`'s `Task.Delay(50)` — the recorder reads the
 /// live-stream buffer through the same tail-follow as an HTTP consumer.
-const COPY_POLL_MS: u64 = 50;
+pub(crate) const COPY_POLL_MS: u64 = 50;
 
 /// How long the recorder tolerates a source that stops producing before it
 /// gives up on the recording, in milliseconds.
