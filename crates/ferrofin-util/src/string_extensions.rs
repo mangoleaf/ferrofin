@@ -322,7 +322,7 @@ pub fn lower_invariant(text: &str) -> String {
     text.chars()
         // .NET ChangeCaseInvariant preserves capital dotted I.
         .map(|c| {
-            if c == '\u{0130}' {
+            if c == '\u{0130}' || NEWER_UNICODE_CASE_PAIRS.binary_search(&c).is_ok() {
                 c
             } else {
                 mapper.simple_lowercase(c)
@@ -333,12 +333,63 @@ pub fn lower_invariant(text: &str) -> String {
 
 fn to_upper_invariant(c: char) -> char {
     // .NET ChangeCaseInvariant preserves dotless i, unlike Unicode's default.
-    if c == '\u{0131}' {
+    if c == '\u{0131}' || NEWER_UNICODE_CASE_PAIRS.binary_search(&c).is_ok() {
         c
     } else {
         icu_casemap::CaseMapper::new().simple_uppercase(c)
     }
 }
+
+/// The 20 case pairs Unicode 18 added, which ICU4X 2.4 maps and .NET's invariant
+/// casing does not: .NET cases through the system ICU, and every ICU before 79
+/// (Jellyfin's runtimes, and the ICU 78.3 behind `tests/data/dotnet-invariant-casing.tsv`)
+/// predates them. Sorted for `binary_search`.
+// shortcut: covers Unicode 18's new pairs only (a later ICU4X adds more, and the casing oracle test
+// fails on the first one it meets), revisit at the dependency freeze sweep (gl-1370) or when Jellyfin's runtime ICU
+// reaches 79. Dropping an entry changes stored keys built with these functions
+// (`Users.NormalizedUsername`, CleanName, SortName), so it needs a backfill migration.
+const NEWER_UNICODE_CASE_PAIRS: [char; 40] = [
+    '\u{0277}',
+    '\u{027c}',
+    '\u{a7dd}',
+    '\u{a7e2}',
+    '\u{ab4b}',
+    '\u{ab4c}',
+    '\u{ab6c}',
+    '\u{ab6d}',
+    '\u{1df40}',
+    '\u{1df41}',
+    '\u{1df48}',
+    '\u{1df49}',
+    '\u{1df4a}',
+    '\u{1df4b}',
+    '\u{1df4d}',
+    '\u{1df4e}',
+    '\u{1df51}',
+    '\u{1df52}',
+    '\u{1df68}',
+    '\u{1df69}',
+    '\u{1df6a}',
+    '\u{1df6b}',
+    '\u{1df6c}',
+    '\u{1df6d}',
+    '\u{1df6e}',
+    '\u{1df6f}',
+    '\u{1df72}',
+    '\u{1df73}',
+    '\u{1df74}',
+    '\u{1df75}',
+    '\u{1df76}',
+    '\u{1df77}',
+    '\u{1df78}',
+    '\u{1df79}',
+    '\u{1df7a}',
+    '\u{1df7b}',
+    '\u{1df7c}',
+    '\u{1df7d}',
+    '\u{1df7e}',
+    '\u{1df7f}',
+];
 
 #[cfg(test)]
 mod tests {
