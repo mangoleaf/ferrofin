@@ -213,36 +213,45 @@ details are in [`docs/UPGRADING.md`](docs/UPGRADING.md).
 <!-- BEGIN GENERATED RESULTS — do not edit by hand. Regenerate with: make publish-results (gates/publish.py) -->
 ### Speed and memory against Jellyfin
 
-Ferrofin **v1.4.0** against **Jellyfin 12.2.0**: the median of 3 runs on one host (32 cores, 125 GiB), each server alone in its container, over the same library, 2026-10-26. One host and one library: other hardware and libraries give other numbers.
+Ferrofin **v1.5.0** against **Jellyfin 12.4.0**: the median of 3 runs on one host (32 cores, 125 GiB), each server alone in its container, over the same library (3,001 movies, 250 series, 7,490 episodes, 50 HDR videos), 2026-11-08. One host and one library: other hardware and libraries give other numbers.
 
-**12.1× faster cold start** · **2.2–4.1× the speed on 5 screens at 5 screens/s** · **2.6× lighter peak memory under load** · **2.6× lighter idle memory**
+**13.0× faster cold start** · **2.6–5.2× the speed on 5 screens at 5 screens/s** · **2.4× lighter peak memory under load** · **2.1× lighter idle memory**
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/screens-loaded-dark.svg">
-  <img alt="Screens at 5 screens/s (loaded): p50 latency: Ferrofin against Jellyfin 12.2.0 on 5 comparable cells, as fast or faster on 5; from 2.2× faster to 4.1× faster." src="docs/results/v1.4.0/screens-loaded.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.5.0/screens-loaded-dark.svg">
+  <img alt="Screens at 5 screens/s (loaded): p50 latency: Ferrofin against Jellyfin 12.4.0 on 5 comparable cells, as fast or faster on 5; from 2.6× faster to 5.2× faster." src="docs/results/v1.5.0/screens-loaded.svg">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/startup-dark.svg">
-  <img alt="Time to first screen: speed-up: Ferrofin against Jellyfin 12.2.0 on 3 comparable cells, as fast or faster on 3; from 2.3× faster to 12.1× faster." src="docs/results/v1.4.0/startup.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.5.0/startup-dark.svg">
+  <img alt="Time to first screen: speed-up: Ferrofin against Jellyfin 12.4.0 on 3 comparable cells, as fast or faster on 3; from 2.0× faster to 13.0× faster." src="docs/results/v1.5.0/startup.svg">
 </picture>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/memory-dark.svg">
-  <img alt="Memory: Ferrofin against Jellyfin 12.2.0 on 2 comparable cells, as fast or faster on 2; from 2.6× lighter to 2.6× lighter." src="docs/results/v1.4.0/memory.svg">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.5.0/memory-dark.svg">
+  <img alt="Memory: Ferrofin against Jellyfin 12.4.0 on 2 comparable cells, as fast or faster on 2; from 2.1× lighter to 2.4× lighter." src="docs/results/v1.5.0/memory.svg">
 </picture>
 
 Not compared in this release, because the two servers did different work there or the evidence is incomplete: the search screen, the search endpoints, the image endpoints, CPU per screen. The search screen therefore has no comparison yet.
 
-Measured from commit `5112240e`. Every graph and table, the withheld cells and the sources: [docs/results/v1.4.0/README.md](docs/results/v1.4.0/README.md); every number with its range: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+Measured from commit `961c0b412`. Every graph and table, the withheld cells and the sources: [docs/results/v1.5.0/README.md](docs/results/v1.5.0/README.md); every number with its range: [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ### Adopting an existing Jellyfin database
 
-Each supported Jellyfin version and upgrade route, adopted in place by Ferrofin **v1.4.0** (commit `5112240e1923`, 2026-10-26): **13 of 14 passed**. Adoption is one-way; see [Migrating from Jellyfin](#migrating-from-jellyfin). Every route: [docs/results/v1.4.0/README.md](docs/results/v1.4.0/README.md).
+Each supported Jellyfin version and upgrade route, adopted in place by Ferrofin **v1.5.0** (commit `961c0b412329`, 2026-11-08): **21 of 21 passed**. Adoption is one-way; see [Migrating from Jellyfin](#migrating-from-jellyfin). Every route: [docs/results/v1.5.0/README.md](docs/results/v1.5.0/README.md).
 
 ### Answering like Jellyfin
 
-The parity gate replays the **2,353** requests jellyfin-web makes against Jellyfin 12.2.0 and Ferrofin **v1.4.0** (commit `5112240e`, 2026-10-26) and compares the answers. Of the 2,307 it could compare, **1,242 are identical** and **1,051 are known differences**, each recorded in the parity ledger with the issue that tracks it, or the parity row that accepts it; **2 are filed as issues** and **12 are new**. 46 were not compared because Jellyfin itself failed them. **The parity gate did not pass** (new differences): 14 requests differ in ways the ledger does not cover yet. Every API area: [docs/results/v1.4.0/README.md](docs/results/v1.4.0/README.md).
+The parity gate replays the **2,353** requests jellyfin-web makes against Jellyfin 12.4.0 and Ferrofin **v1.5.0** (commit `961c0b412`, 2026-11-08) and compares the answers. Of the 2,307 it could compare, **2,198 are identical**, **1 hold the same answer in another order** (each order recorded in the ledger), and **107 are known differences**, each recorded in the parity ledger with the issue that tracks it, or the parity row that accepts it; **0 are filed as issues** and **1 is new**. 46 were not compared because Jellyfin itself failed them. **The parity gate did not pass** (new differences): 1 request differs in ways the ledger does not cover yet. Every API area: [docs/results/v1.5.0/README.md](docs/results/v1.5.0/README.md).
+
+### Release over release
+
+The same headline numbers for every release published so far (v1.4.0, v1.5.0), each against the Jellyfin release it was measured with. Only releases measured on the same host class and fixture are joined by a line.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/history-dark.svg">
+  <img alt="Release over release: 2 releases, v1.4.0 to v1.5.0, on 1 host and fixture series; the latest, v1.5.0 against Jellyfin 12.4.0: cold start 250 ms vs 3257 ms, screens at 5 screens/s 6 ms vs 31 ms, peak memory under load 245 MiB vs 598 MiB, idle memory 197 MiB vs 404 MiB." src="docs/results/history.svg">
+</picture>
 
 <!-- END GENERATED RESULTS -->
 
