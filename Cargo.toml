@@ -115,6 +115,8 @@ sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "run
 # Direct handle on the SQLite C API, pinned to the exact version sqlx resolves so
 # cargo unifies them to ONE linked copy — a second copy would mean a second,
 # unconfigured SQLite. Used only to call sqlite3_config() before any connection.
+# Held at 0.37 (latest 0.39.1): sqlx-sqlite 0.9.0, still the latest sqlx, requires
+# `>=0.30.1, <0.38.0`. Lift it when a sqlx release widens that bound.
 libsqlite3-sys = "0.37.0"
 
 # ── serde / errors ─────────────────────────────────────────────────
