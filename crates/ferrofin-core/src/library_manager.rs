@@ -3130,14 +3130,21 @@ impl LibraryManager for FerrofinLibraryManager {
         if items.is_empty() {
             return Ok(());
         }
+        // v12.2 `CreateItems` runs `OnMetadataChanged` on each item first: the
+        // parental filters read the stored score, so it must match the ratings
+        // saved.
+        let mut rated = items.to_vec();
+        if let Some(visibility) = &self.visibility {
+            visibility.update_rating_scores(&mut rated).await?;
+        }
         // The parent linkage is already carried on each row's ParentId column; the
         // upsert is the single persistence path (C# CreateItems == save + register).
-        self.persistence.save_items(items).await?;
+        self.persistence.save_items(&rated).await?;
         // `ItemAdded` (LibraryChangedNotifier): announce only after the write
         // succeeded, so a failed save never tells clients to fetch a row that
         // is not there.
         if let Some(changed) = &self.changed {
-            changed.record_added(items);
+            changed.record_added(&rated);
         }
         Ok(())
     }
@@ -5688,6 +5695,68 @@ mod tests {
             .is_empty(),
             "no row was written on the id path"
         );
+    }
+
+    /// v12.2 `CreateItems` and `UpdateItemsAsync` run `OnMetadataChanged` on
+    /// each item before it is saved (`ParentalRatingScoreTests`): a created
+    /// item stores its score, a custom rating wins over the official one, and
+    /// clearing the ratings clears the score.
+    #[tokio::test]
+    async fn saved_items_store_the_score_of_their_ratings() {
+        let db = test_db().await;
+        let data = tempfile::tempdir().unwrap();
+        let base = manager(&db);
+        let localization = Arc::new(crate::LocalizationManager::new("US"));
+        let score = |rating| {
+            localization
+                .get_rating_score(rating, None)
+                .map(|score| i64::from(score.score))
+        };
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            localization.clone(),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let mgr = base.with_visibility(visibility);
+        let id = Uuid::from_u128(0x7a01);
+        let stored = || async { mgr.get_item_by_id(id).await.expect("read").expect("row") };
+
+        let movie = BaseItemEntity {
+            id: guid_to_db(id),
+            type_: crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+                .expect("movie")
+                .to_owned(),
+            name: Some("Up".to_owned()),
+            official_rating: Some("G".to_owned()),
+            custom_rating: Some("NC-17".to_owned()),
+            ..BaseItemEntity::default()
+        };
+        mgr.create_items(&[movie], None).await.expect("create");
+        assert_eq!(
+            stored().await.inherited_parental_rating_value,
+            score("NC-17")
+        );
+        assert_ne!(score("NC-17"), score("G"));
+
+        let mut row = stored().await;
+        row.custom_rating = None;
+        mgr.update_items(&[row], None).await.expect("official");
+        assert_eq!(stored().await.inherited_parental_rating_value, score("G"));
+
+        let mut row = stored().await;
+        row.custom_rating = Some("NC-17".to_owned());
+        mgr.update_items(&[row], None).await.expect("custom");
+        assert_eq!(
+            stored().await.inherited_parental_rating_value,
+            score("NC-17")
+        );
+
+        let mut row = stored().await;
+        row.custom_rating = None;
+        row.official_rating = None;
+        mgr.update_items(&[row], None).await.expect("cleared");
+        assert_eq!(stored().await.inherited_parental_rating_value, None);
     }
 
     #[tokio::test]

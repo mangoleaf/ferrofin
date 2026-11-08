@@ -18,9 +18,8 @@ use ferrofin_db::store::{datetime_to_db, guid_to_db, opt_datetime_to_db};
 use sqlx::{QueryBuilder, Row, Sqlite};
 use uuid::Uuid;
 
-use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::base_items::{BaseItemEntity, item_values_of};
 use ferrofin_db::entities::users::UserEntity;
-use ferrofin_db::enums::ItemValueType;
 use ferrofin_model::data::{BaseItemKind, MediaType};
 use ferrofin_model::dto::{
     BaseItemDto, DayOfWeek, MediaSourceInfo, MediaSourceType, NameIdPair, NameValuePair, SortOrder,
@@ -41,8 +40,8 @@ use ferrofin_traits::error::{ServiceError, db_err};
 use ferrofin_traits::library::{RecordingLibrary, SelfWrite, SelfWriteGuard, UserViewManager};
 use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, ItemImageInfo};
-use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
-use ferrofin_traits::providers::ProviderManager;
+use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, ParentalRestrictions};
+use ferrofin_traits::providers::{ParentalRatingScorer, ProviderManager};
 use ferrofin_traits::stubs::{
     LiveStreamFile, LiveTvChannelQuery, LiveTvManager, RecordingVisibility,
 };
@@ -608,6 +607,12 @@ struct LiveTvItemStore {
     items: Arc<dyn ItemRepository>,
     /// Resolves (and provisions) the Live TV `UserView` the rows parent to.
     views: Arc<dyn UserViewManager>,
+    /// Stores each programme's parental score with its rating, as v12.2's
+    /// `CreateItems` and `UpdateItemsAsync` do (`OnMetadataChanged`).
+    scorer: Arc<dyn ParentalRatingScorer>,
+    /// A user's parental restrictions, which the guide reads apply over the
+    /// programme items as upstream's `InternalItemsQuery(user)` does.
+    restrictions: Arc<dyn ParentalRestrictions>,
 }
 
 /// The image services the guide uses; see [`FerrofinLiveTvManager::images`].
@@ -1389,22 +1394,27 @@ impl FerrofinLiveTvManager {
 
     /// Attaches the item layer the guide refresh mirrors channels into: the
     /// persistence service that writes the rows, the repository that reads back
-    /// the ones already stored, and the user-view manager that resolves the
-    /// Live TV `UserView` they parent to.
+    /// the ones already stored, the user-view manager that resolves the
+    /// Live TV `UserView` they parent to, the scorer that stores a programme's
+    /// parental score, and the parental restrictions the guide reads apply.
     ///
     /// The composition-root form (a second call is ignored), for the same
-    /// reason [`set_dto`](Self::set_dto) exists: all three are constructed
+    /// reason [`set_dto`](Self::set_dto) exists: all of them are constructed
     /// after this manager.
     pub fn set_item_store(
         &self,
         persistence: Arc<dyn ItemPersistenceService>,
         items: Arc<dyn ItemRepository>,
         views: Arc<dyn UserViewManager>,
+        scorer: Arc<dyn ParentalRatingScorer>,
+        restrictions: Arc<dyn ParentalRestrictions>,
     ) {
         let _ = self.item_store.set(LiveTvItemStore {
             persistence,
             items,
             views,
+            scorer,
+            restrictions,
         });
     }
 
@@ -1777,7 +1787,8 @@ impl FerrofinLiveTvManager {
             }
             kept.extend(rows.iter().filter_map(|row| Uuid::parse_str(&row.id).ok()));
             let written =
-                Self::sync_channel_program_items(store, &rows, view_id, &mut listings).await?;
+                Self::sync_channel_program_items(&self.db, store, &rows, view_id, &mut listings)
+                    .await?;
             if !written.is_empty() {
                 refreshed.push(written);
             }
@@ -1815,8 +1826,12 @@ impl FerrofinLiveTvManager {
     /// One channel's turn of [`Self::sync_program_items`]: `GetProgram` over
     /// the channel's guide `rows` against the items already stored for them,
     /// then `CreateItems` / `UpdateItemsAsync` and `UpdateImages` for what
-    /// changed. Returns the programmes it created or updated, with their end.
+    /// changed. Every airing is scored as those calls score it: a stored row
+    /// whose score moved is written too, and one whose tags were never
+    /// indexed has its values written. Returns the programmes it created or
+    /// updated, with their end.
     async fn sync_channel_program_items(
+        db: &Database,
         store: &LiveTvItemStore,
         rows: &[GuideProgramRow],
         view_id: Option<Uuid>,
@@ -1838,13 +1853,23 @@ impl FerrofinLiveTvManager {
             .filter(|row| row.type_ == crate::projection::PROGRAM_TYPE_NAME)
             .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
             .collect();
-        let mut save: Vec<BaseItemEntity> = Vec::new();
-        // The genres to (re)write as `ItemValues`, for the rows whose genre list
-        // actually moved. A guide's genres are what make `GET /Genres` list a
-        // by-name row a library never produced ("News"), and re-writing all of
-        // them every refresh would be several statements per airing on a table
-        // that is O(channels x guide-hours).
-        let mut genres_to_write: Vec<(Uuid, Vec<(i32, String)>)> = Vec::new();
+        let tagged: Vec<Uuid> = stored
+            .iter()
+            .filter(|(_, row)| row.tags.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        let indexed = crate::guide_repository::programs_with_tag_values(db, &tagged).await?;
+        // Every airing as `CreateItems`/`UpdateItemsAsync` would save it, with
+        // the row stored for it.
+        let mut items: Vec<(BaseItemEntity, Option<&BaseItemEntity>)> = Vec::new();
+        // The genres and tags to (re)write as `ItemValues`, for the rows whose
+        // lists actually moved. A guide's genres are what make `GET /Genres`
+        // list a by-name row a library never produced ("News"), its tags what
+        // a user's blocked and allowed tags match, and re-writing all of them
+        // every refresh would be several statements per airing on a table that
+        // is O(channels x guide-hours). An airing stored before its tags were
+        // indexed has them written once.
+        let mut values_to_write: Vec<(Uuid, Vec<(i32, String)>)> = Vec::new();
         // The programmes `CreateItems`/`UpdateItemsAsync` would write, with
         // their end.
         let mut written: HashSet<Uuid> = HashSet::new();
@@ -1853,30 +1878,18 @@ impl FerrofinLiveTvManager {
             let fresh = program_entity(row, parse_dt, view_id);
             let id = Uuid::parse_str(&fresh.id).ok();
             let stored_row = id.and_then(|id| stored.get(&id));
-            // A new airing without genres has no links to replace and none to
-            // write; on a first import that is most of the guide.
-            let genres_changed = stored_row.map_or_else(
-                || fresh.genres.as_deref().is_some_and(|g| !g.is_empty()),
-                |prev| prev.genres != fresh.genres,
+            // A new airing without genres or tags has no links to replace and
+            // none to write.
+            let values_changed = stored_row.map_or_else(
+                || fresh.genres.is_some() || fresh.tags.is_some(),
+                |prev| {
+                    prev.genres != fresh.genres
+                        || prev.tags != fresh.tags
+                        || (prev.tags.is_some() && id.is_some_and(|id| !indexed.contains(&id)))
+                },
             );
             if let Some(id) = id {
                 ends.insert(id, fresh.end_date);
-                if genres_changed {
-                    genres_to_write.push((
-                        id,
-                        fresh
-                            .genres
-                            .as_deref()
-                            .map(|g| {
-                                g.split('|')
-                                    .map(|genre| {
-                                        (i32::from(ItemValueType::Genre), genre.to_owned())
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    ));
-                }
             }
             let item = match stored_row {
                 // `isNew` — `CreateItems` stores the item whole.
@@ -1886,19 +1899,37 @@ impl FerrofinLiveTvManager {
                 // them actually changed.
                 Some(prev) => program_item_update(prev, &fresh),
             };
-            if let Some(item) = item {
-                if let Some(id) = id {
+            if let Some(id) = id {
+                if item.is_some() {
                     written.insert(id);
                 }
-                save.push(item);
+                // The merged row's values: an editor's studios stay linked.
+                if values_changed && let Some(saved) = item.as_ref().or(stored_row) {
+                    values_to_write.push((id, item_values_of(saved)));
+                }
+            }
+            if let Some(item) = item.or_else(|| stored_row.cloned()) {
+                items.push((item, stored_row));
             }
         }
+        // `OnMetadataChanged` in `CreateItems`/`UpdateItemsAsync` (v12.2):
+        // the parental filters read the stored score, so it follows the
+        // rating. Every airing is scored, not only the changed ones, so a row
+        // stored before programmes were scored takes its score once.
+        let (mut candidates, previous): (Vec<BaseItemEntity>, Vec<_>) = items.into_iter().unzip();
+        store.scorer.update_rating_scores(&mut candidates).await?;
+        let save: Vec<BaseItemEntity> = candidates
+            .into_iter()
+            .zip(previous)
+            .filter(|(item, prev)| prev.is_none_or(|prev| item != prev))
+            .map(|(item, _)| item)
+            .collect();
         drop(stored);
         for chunk in save.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
             store.persistence.save_items(chunk).await?;
         }
         drop(save);
-        for chunk in genres_to_write.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
+        for chunk in values_to_write.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
             store.persistence.save_item_values_for_items(chunk).await?;
         }
         // `UpdateImages`, for the airings the listings returned. An image
@@ -3455,7 +3486,13 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // between them and report a total the page cannot contain.
         let now = Utc::now();
         let start_index = query.start_index.unwrap_or(0);
-        let rows = self.query_program_rows(query, now).await?;
+        let restrictions = self.program_restrictions(query).await?;
+        let restrictions = restrictions.as_ref();
+        let rows: Vec<GuideProgramRow> = program_rows_query(query, now, restrictions)
+            .build_query_as()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
         let mut list_options = options.clone();
         remove_fields(&mut list_options);
         let items = self
@@ -3467,7 +3504,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let total = if query.enable_total_record_count && (query.limit.is_some() || start_index > 0)
         {
             let mut cb: QueryBuilder<Sqlite> = QueryBuilder::new(PROGRAM_COUNT);
-            push_program_filters(&mut cb, query, now);
+            push_program_filters(&mut cb, query, now, restrictions);
             let count: i64 = cb
                 .build_query_scalar()
                 .fetch_one(self.db.pool())
@@ -4782,11 +4819,30 @@ impl FerrofinLiveTvManager {
         query: &InternalItemsQuery,
         now: DateTime<Utc>,
     ) -> Result<Vec<GuideProgramRow>, ServiceError> {
-        program_rows_query(query, now)
+        let restrictions = self.program_restrictions(query).await?;
+        program_rows_query(query, now, restrictions.as_ref())
             .build_query_as()
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)
+    }
+
+    /// The parental restrictions of `query`'s user, which a guide read applies
+    /// over the programme items, as upstream's `new InternalItemsQuery(user)`
+    /// in `GetPrograms`, `GetRecommendedProgramsInternal` and `AddChannelInfo`
+    /// does; `None` without a user, a user nothing restricts, or an item layer.
+    async fn program_restrictions(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Option<(&dyn ParentalRestrictions, InternalItemsQuery)>, ServiceError> {
+        let Some(store) = self.item_store.get() else {
+            return Ok(None);
+        };
+        Ok(store
+            .restrictions
+            .resolve(query)
+            .await?
+            .map(|resolved| (store.restrictions.as_ref(), resolved)))
     }
 
     /// Projects guide programme rows into `BaseItemDto`s: the synthetic
@@ -6824,9 +6880,13 @@ fn series_programs_query(stored: &StoredSeriesTimer, now: DateTime<Utc>) -> Inte
 
 /// The statement [`FerrofinLiveTvManager::query_program_rows`] runs for
 /// `query`: [`PROGRAM_SELECT`] with its filters, order and page.
-fn program_rows_query(query: &InternalItemsQuery, now: DateTime<Utc>) -> QueryBuilder<Sqlite> {
+fn program_rows_query(
+    query: &InternalItemsQuery,
+    now: DateTime<Utc>,
+    restrictions: ProgramRestrictions<'_>,
+) -> QueryBuilder<Sqlite> {
     let mut qb = QueryBuilder::new(PROGRAM_SELECT);
-    push_program_filters(&mut qb, query, now);
+    push_program_filters(&mut qb, query, now, restrictions);
     push_program_order(&mut qb, &query.order_by);
     push_program_paging(&mut qb, query.limit, query.start_index.unwrap_or(0));
     qb
@@ -6853,10 +6913,14 @@ fn push_separator(qb: &mut QueryBuilder<Sqlite>, first: &mut bool) {
 /// guide cache does not hold — and `SeriesTimerId` never reaches this builder:
 /// `get_programs` answers it with the empty result upstream returns when the
 /// series-timer scope cannot be built.
+///
+/// `restrictions` are the user's parental restrictions, from
+/// [`FerrofinLiveTvManager::program_restrictions`].
 fn push_program_filters(
     qb: &mut QueryBuilder<Sqlite>,
     query: &InternalItemsQuery,
     now: DateTime<Utc>,
+    restrictions: ProgramRestrictions<'_>,
 ) {
     let mut first = true;
     let now_db = datetime_to_db(now);
@@ -6975,7 +7039,29 @@ fn push_program_filters(
         }
         qb.push("))");
     }
+
+    push_program_restrictions(qb, &mut first, restrictions);
 }
+
+/// The user's maximum rating, blocked unrated kinds and inherited tags, as
+/// `TranslateQuery` applies them to the programme items upstream lists. An
+/// airing whose item is not stored yet is not shown to such a user.
+fn push_program_restrictions(
+    qb: &mut QueryBuilder<Sqlite>,
+    first: &mut bool,
+    restrictions: ProgramRestrictions<'_>,
+) {
+    if let Some((filter, user)) = restrictions {
+        push_separator(qb, first);
+        qb.push(r#"EXISTS (SELECT 1 FROM "BaseItems" bi WHERE bi."Id" = p."Id""#);
+        filter.push_restrictions(qb, user, "bi");
+        qb.push(")");
+    }
+}
+
+/// A user's parental restrictions for a guide read: the item layer's
+/// predicate and the query its user's preferences were loaded onto.
+type ProgramRestrictions<'a> = Option<&'a (&'a dyn ParentalRestrictions, InternalItemsQuery)>;
 
 /// The guide column a sort key reads, or `None` when the guide cache holds
 /// nothing to sort by (those keys are skipped rather than faked).
@@ -9173,9 +9259,17 @@ mod tests {
         let persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> = Arc::new(
             ferrofin_core::FerrofinItemPersistenceService::new(mgr.db.clone()),
         );
-        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
-            ferrofin_core::FerrofinItemRepository::new(mgr.db.clone(), item_type_lookup),
-        );
+        let repository = Arc::new(ferrofin_core::FerrofinItemRepository::new(
+            mgr.db.clone(),
+            item_type_lookup,
+        ));
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> = repository.clone();
+        let scorer = Arc::new(ferrofin_core::item_visibility::ItemVisibility::new(
+            mgr.db.clone(),
+            Arc::clone(&items),
+            Arc::new(ferrofin_core::LocalizationManager::new("US")),
+            String::new(),
+        ));
         // The parent row has to exist: `BaseItems.ParentId` is a real foreign
         // key, which is exactly why upstream's `GetInternalLiveTvFolder()`
         // CREATES the view before a channel is stored under it.
@@ -9193,6 +9287,8 @@ mod tests {
             Arc::clone(&persistence),
             wrap(Arc::clone(&items)),
             Arc::new(FixedLiveTvView(view)),
+            scorer,
+            repository,
         );
         let tuner = mgr
             .save_tuner_host(TunerHostInfo {
@@ -9563,6 +9659,8 @@ mod tests {
         assert_eq!(kept.genres.as_deref(), Some("News"));
         assert!(kept.is_virtual_item);
         assert_eq!(kept.unrated_type.as_deref(), Some("LiveTvProgram"));
+        // `OnMetadataChanged` scores the merged item: the editor's rating.
+        assert_eq!(kept.inherited_parental_rating_value, Some(us_score("PG")));
     }
 
     /// Each airing's genres become its `ItemValues` links, written in the
@@ -9672,6 +9770,365 @@ mod tests {
     /// provider whose XMLTV covers the lineup.
     async fn program_item_lab() -> ChannelItemLab {
         item_lab(M3U, Some(dated(XMLTV))).await
+    }
+
+    /// One airing of [`RATED_AIRINGS`]: `(channel, from, to, title, category,
+    /// rating)`, offsets in minutes from now.
+    type RatedAiring = (
+        &'static str,
+        i64,
+        i64,
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+    );
+
+    /// Two airings on now, one of them rated TV-MA, and the rest of Channel
+    /// One's evening, one of it unrated and one News.
+    const RATED_AIRINGS: &[RatedAiring] = &[
+        ("one.tv", -10, 50, "Late Thriller", "Drama", Some("TV-MA")),
+        ("one.tv", 120, 180, "Adult Drama", "Drama", Some("TV-MA")),
+        ("one.tv", 180, 240, "Cartoon Hour", "Comedy", Some("TV-G")),
+        ("one.tv", 240, 300, "Mystery Feature", "Drama", None),
+        ("one.tv", 300, 360, "Evening News", "News", Some("TV-G")),
+        ("two.tv", -5, 55, "Garden Hour", "Lifestyle", Some("TV-G")),
+    ];
+
+    /// [`RATED_AIRINGS`] as an XMLTV guide over the two [`M3U`] channels.
+    fn rated_guide() -> String {
+        use std::fmt::Write as _;
+        let now = chrono::Utc::now();
+        let mut xml = String::from(
+            "<tv><channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+             <channel id=\"two.tv\"><display-name>Channel Two</display-name></channel>",
+        );
+        for &(channel, from, to, title, category, rating) in RATED_AIRINGS {
+            let start = (now + chrono::Duration::minutes(from)).format("%Y%m%d%H%M%S");
+            let stop = (now + chrono::Duration::minutes(to)).format("%Y%m%d%H%M%S");
+            let rating = rating.map_or_else(String::new, |rating| {
+                format!("<rating system=\"VCHIP\"><value>{rating}</value></rating>")
+            });
+            let _ = write!(
+                xml,
+                "<programme start=\"{start} +0000\" stop=\"{stop} +0000\" channel=\"{channel}\">\
+                 <title>{title}</title><category>{category}</category>{rating}</programme>"
+            );
+        }
+        xml.push_str("</tv>");
+        xml
+    }
+
+    /// The US score of `rating`, as the lab's scorer reads it.
+    fn us_score(rating: &str) -> i64 {
+        i64::from(
+            ferrofin_core::LocalizationManager::new("US")
+                .get_rating_score(rating, None)
+                .expect("a US rating")
+                .score,
+        )
+    }
+
+    /// The stored programme items, by name.
+    async fn programmes_by_name(lab: &ChannelItemLab) -> HashMap<String, BaseItemEntity> {
+        let mut by_name = HashMap::new();
+        for (id, ..) in stored_program_items(&lab.mgr).await {
+            let row = channel_item(&lab.items, Uuid::parse_str(&id).expect("guid")).await;
+            by_name.insert(row.name.clone().unwrap_or_default(), row);
+        }
+        by_name
+    }
+
+    /// v12.2 `CreateItems`/`UpdateItemsAsync` score each item they save
+    /// (`OnMetadataChanged`, jellyfin/jellyfin#18279), which is how a guide
+    /// programme gets the score the parental filters read. A row stored
+    /// before that, unscored and with no tags in `ItemValues`, takes both on
+    /// the next refresh though its listing did not change.
+    #[tokio::test]
+    async fn a_guide_refresh_stores_each_airings_parental_score() {
+        let lab = item_lab(M3U, Some(rated_guide())).await;
+        lab.mgr.refresh_guide().await.expect("refresh");
+        let stored = programmes_by_name(&lab).await;
+        assert_eq!(stored.len(), RATED_AIRINGS.len());
+        for (name, rating) in [("Adult Drama", "TV-MA"), ("Cartoon Hour", "TV-G")] {
+            assert_eq!(
+                stored[name].inherited_parental_rating_value,
+                Some(us_score(rating)),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            stored["Mystery Feature"].inherited_parental_rating_value,
+            None
+        );
+
+        let unscored = BaseItemEntity {
+            inherited_parental_rating_value: None,
+            ..stored["Adult Drama"].clone()
+        };
+        lab.persistence
+            .save_items(&[unscored])
+            .await
+            .expect("an unscored row");
+        let news = Uuid::parse_str(&stored["Evening News"].id).expect("guid");
+        let genre = i32::from(ferrofin_db::enums::ItemValueType::Genre);
+        lab.persistence
+            .save_item_values_for_items(&[(news, vec![(genre, "News".to_owned())])])
+            .await
+            .expect("genres only");
+        let news_ids = [news];
+        let tagged = || crate::guide_repository::programs_with_tag_values(&lab.mgr.db, &news_ids);
+        assert!(tagged().await.expect("read").is_empty());
+        let db = &lab.mgr.db;
+        crate::guide_repository::test_support::count_program_writes(db)
+            .await
+            .expect("count writes");
+        let writes = || crate::guide_repository::test_support::take_program_writes(db);
+
+        lab.mgr.refresh_guide().await.expect("second refresh");
+        let (rows, links) = writes().await.expect("writes");
+        assert_eq!(rows, 1, "the unscored row, and only it");
+        assert!(links > 0, "the unindexed row's values");
+        assert_eq!(
+            programmes_by_name(&lab).await["Adult Drama"].inherited_parental_rating_value,
+            Some(us_score("TV-MA")),
+            "rescored"
+        );
+        assert!(
+            tagged().await.expect("read").contains(&news),
+            "tags indexed"
+        );
+
+        // Nothing changed since: the refresh scores every airing and writes none.
+        lab.mgr.refresh_guide().await.expect("third refresh");
+        assert_eq!(writes().await.expect("writes"), (0, 0));
+    }
+
+    /// The names a guide read as `user` lists, in guide order.
+    async fn guide_names(mgr: &FerrofinLiveTvManager, user: &Arc<UserEntity>) -> Vec<String> {
+        mgr.get_programs(
+            &InternalItemsQuery {
+                user: Some(Arc::clone(user)),
+                order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
+                ..InternalItemsQuery::default()
+            },
+            &DtoOptions::default(),
+        )
+        .await
+        .expect("programs")
+        .items
+        .into_iter()
+        .filter_map(|dto| dto.name)
+        .collect()
+    }
+
+    /// [`RATED_AIRINGS`] in start order.
+    const EVERY_AIRING: [&str; 6] = [
+        "Late Thriller",
+        "Garden Hour",
+        "Adult Drama",
+        "Cartoon Hour",
+        "Mystery Feature",
+        "Evening News",
+    ];
+
+    /// [`EVERY_AIRING`] without `hidden`.
+    fn airings_but(hidden: &[&str]) -> Vec<String> {
+        EVERY_AIRING
+            .iter()
+            .filter(|name| !hidden.contains(name))
+            .map(|name| (*name).to_owned())
+            .collect()
+    }
+
+    /// An item lab whose guide holds [`RATED_AIRINGS`], refreshed, and a user
+    /// nothing restricts yet, whom the guide shows every airing.
+    async fn rated_guide_lab() -> (ChannelItemLab, Arc<UserEntity>) {
+        let lab = item_lab(M3U, Some(rated_guide())).await;
+        lab.mgr.refresh_guide().await.expect("refresh");
+        let users = ferrofin_core::user_manager::FerrofinUserManager::new(lab.mgr.db.clone());
+        let kid = ferrofin_traits::library::UserManager::create_user(&users, "kid")
+            .await
+            .expect("user");
+        let kid = Arc::new(kid);
+        assert_eq!(guide_names(&lab.mgr, &kid).await, airings_but(&[]));
+        (lab, kid)
+    }
+
+    /// Saves one of `user`'s list-valued preferences.
+    async fn set_preference(
+        mgr: &FerrofinLiveTvManager,
+        user: &UserEntity,
+        kind: ferrofin_db::enums::PreferenceKind,
+        values: &[&str],
+    ) {
+        let values: Vec<String> = values.iter().map(|value| (*value).to_owned()).collect();
+        ferrofin_core::user_entity_ext::set_preference(&mgr.db, &user.id, kind, &values)
+            .await
+            .expect("preference");
+    }
+
+    /// `user` with a TV-PG maximum rating.
+    fn tv_pg(user: &UserEntity) -> Arc<UserEntity> {
+        Arc::new(UserEntity {
+            max_parental_rating_score: Some(us_score("TV-PG")),
+            ..user.clone()
+        })
+    }
+
+    /// Upstream's guide reads (`GetPrograms`, `GetRecommendedProgramsInternal`,
+    /// `AddChannelInfo`) query the programme items with
+    /// `new InternalItemsQuery(user)`, so a TV-PG limit hides the TV-MA
+    /// airings from the guide, before its page is cut (the first row and the
+    /// total are the visible ones), from the "On Now" pool before it is
+    /// ranked, and from a channel's current programme.
+    #[tokio::test]
+    async fn the_guide_hides_what_a_users_maximum_rating_hides() {
+        let (lab, kid) = rated_guide_lab().await;
+        let mgr = &lab.mgr;
+        let limited = tv_pg(&kid);
+        let within = airings_but(&["Late Thriller", "Adult Drama"]);
+        assert_eq!(guide_names(mgr, &limited).await, within);
+
+        let page = mgr
+            .get_programs(
+                &InternalItemsQuery {
+                    user: Some(Arc::clone(&limited)),
+                    order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
+                    limit: Some(1),
+                    enable_total_record_count: true,
+                    ..InternalItemsQuery::default()
+                },
+                &DtoOptions::default(),
+            )
+            .await
+            .expect("page");
+        assert_eq!(page.total_record_count, 4);
+        let first: Vec<_> = page.items.into_iter().filter_map(|dto| dto.name).collect();
+        assert_eq!(first, ["Garden Hour"]);
+
+        let on_now = mgr
+            .get_recommended_programs(
+                &InternalItemsQuery {
+                    user: Some(Arc::clone(&limited)),
+                    is_airing: Some(true),
+                    limit: Some(10),
+                    ..InternalItemsQuery::default()
+                },
+                &DtoOptions::default(),
+            )
+            .await
+            .expect("on now");
+        let on_now: Vec<_> = on_now
+            .items
+            .into_iter()
+            .filter_map(|dto| dto.name)
+            .collect();
+        assert_eq!(on_now, ["Garden Hour"]);
+
+        let mut channels = mgr
+            .get_channels(&LiveTvChannelQuery::default(), &DtoOptions::default())
+            .await
+            .expect("channels")
+            .items;
+        mgr.add_channel_info(&mut channels, &DtoOptions::default(), Some(&limited))
+            .await
+            .expect("channel info");
+        let current: Vec<_> = channels
+            .iter()
+            .map(|channel| {
+                let program = channel.current_program.as_ref();
+                program.and_then(|program| program.name.clone())
+            })
+            .collect();
+        assert_eq!(current, [None, Some("Garden Hour".to_owned())]);
+    }
+
+    /// The same reads apply the user's blocked unrated kinds (the one airing
+    /// with no rating) and blocked and allowed tags (the News airing carries
+    /// the guide's News tag).
+    #[tokio::test]
+    async fn the_guide_hides_unrated_airings_and_blocked_tags() {
+        use ferrofin_db::enums::PreferenceKind;
+        let (lab, kid) = rated_guide_lab().await;
+        let mgr = &lab.mgr;
+        set_preference(
+            mgr,
+            &kid,
+            PreferenceKind::BlockUnratedItems,
+            &["LiveTvProgram"],
+        )
+        .await;
+        assert_eq!(
+            guide_names(mgr, &kid).await,
+            airings_but(&["Mystery Feature"])
+        );
+
+        set_preference(mgr, &kid, PreferenceKind::BlockUnratedItems, &[]).await;
+        set_preference(mgr, &kid, PreferenceKind::BlockedTags, &["News"]).await;
+        assert_eq!(guide_names(mgr, &kid).await, airings_but(&["Evening News"]));
+
+        // Allowed tags keep only the airings that carry one.
+        set_preference(mgr, &kid, PreferenceKind::BlockedTags, &[]).await;
+        set_preference(mgr, &kid, PreferenceKind::AllowedTags, &["News"]).await;
+        assert_eq!(guide_names(mgr, &kid).await, ["Evening News"]);
+    }
+
+    /// A restricted guide read and its count probe each candidate airing's
+    /// item by its key, with every rule on (a maximum rating, a blocked
+    /// unrated kind, a blocked tag), and keep every step of the unrestricted
+    /// plan: the restriction is a correlated `EXISTS`, never a scan.
+    #[tokio::test]
+    async fn a_restricted_guide_read_probes_the_programme_item_by_key() {
+        use ferrofin_db::enums::PreferenceKind;
+        let (lab, kid) = rated_guide_lab().await;
+        let mgr = &lab.mgr;
+        set_preference(
+            mgr,
+            &kid,
+            PreferenceKind::BlockUnratedItems,
+            &["LiveTvProgram"],
+        )
+        .await;
+        set_preference(mgr, &kid, PreferenceKind::BlockedTags, &["News"]).await;
+        let now = Utc::now();
+        let query = InternalItemsQuery {
+            user: Some(tv_pg(&kid)),
+            channel_ids: channel_ids(mgr).await,
+            min_end_date: Some(now),
+            max_start_date: Some(now + chrono::Duration::hours(4)),
+            order_by: vec![(ItemSortBy::StartDate, SortOrder::Ascending)],
+            ..InternalItemsQuery::default()
+        };
+        let restrictions = mgr.program_restrictions(&query).await.expect("resolve");
+        let restrictions = restrictions.expect("a restricted user");
+        let count = |restrictions| {
+            let mut qb = sqlx::QueryBuilder::new(super::PROGRAM_COUNT);
+            super::push_program_filters(&mut qb, &query, now, restrictions);
+            qb
+        };
+        let plan = |qb| crate::guide_repository::test_support::plan(&mgr.db, qb);
+        for (restricted, unrestricted) in [
+            (
+                super::program_rows_query(&query, now, Some(&restrictions)),
+                super::program_rows_query(&query, now, None),
+            ),
+            (count(Some(&restrictions)), count(None)),
+        ] {
+            let restricted = plan(restricted).await.expect("plan");
+            for step in plan(unrestricted).await.expect("plan") {
+                assert!(restricted.contains(&step), "{step} kept: {restricted:?}");
+            }
+            assert!(
+                restricted.iter().any(
+                    |d| d == "SEARCH bi EXISTS USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"
+                ),
+                "{restricted:?}"
+            );
+            assert!(
+                !restricted.iter().any(|d| d.starts_with("SCAN")),
+                "{restricted:?}"
+            );
+        }
     }
 
     /// An item's image rows, as `(type, path)`.
@@ -11308,7 +11765,7 @@ mod tests {
                 ..InternalItemsQuery::default()
             };
             let mut qb = sqlx::QueryBuilder::new(super::PROGRAM_SELECT);
-            super::push_program_filters(&mut qb, &query, now);
+            super::push_program_filters(&mut qb, &query, now, None);
             super::push_program_order(&mut qb, &query.order_by);
             super::push_program_paging(&mut qb, query.limit, 0);
             let plan = crate::guide_repository::test_support::plan(&mgr.db, qb)
@@ -11366,7 +11823,7 @@ mod tests {
         };
         let plan = crate::guide_repository::test_support::plan(
             &mgr.db,
-            super::program_rows_query(&query, Utc::now()),
+            super::program_rows_query(&query, Utc::now(), None),
         )
         .await
         .expect("plan");
@@ -11407,7 +11864,7 @@ mod tests {
             let query = super::series_programs_query(&stored, now);
             let plan = crate::guide_repository::test_support::plan(
                 &mgr.db,
-                super::program_rows_query(&query, now),
+                super::program_rows_query(&query, now, None),
             )
             .await
             .expect("plan");

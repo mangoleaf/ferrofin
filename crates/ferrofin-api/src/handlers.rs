@@ -1442,9 +1442,10 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              cannot open (library, rating or tag rules) answers like an id that is no series: \
              IsSeries stays forced and its title is not searched for. Upstream's \
              GetItemById<Series> reads it with no user. A POST body naming no user keeps the \
-             query without one, as upstream, so its DTOs carry no user data; only a request \
-             with no user at all (an API key naming none) still reads the row as upstream \
-             does. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; gl-1113, \
+             query without one, as upstream, so its DTOs carry no user data and no user's \
+             parental restrictions filter its airings (gl-1475 asks whether to diverge); only \
+             a request with no user at all (an API key naming none) still reads the row as \
+             upstream does. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; gl-1113, \
              gl-1130).",
         ],
     },

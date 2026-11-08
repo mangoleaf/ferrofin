@@ -441,13 +441,15 @@ pub async fn build_app_state(
     // scope (`AddUserToQuery`'s playlists and box-set gate) reaches it through
     // this late slot, filled once the evaluator exists.
     let scope_visibility = ferrofin_core::VisibilitySlot::default();
-    let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> = Arc::new(
+    let item_repository_impl = Arc::new(
         FerrofinItemRepository::new(db.clone(), Arc::clone(&item_type_lookup))
             .with_root_ids(root_folder_ids)
             .with_virtual_paths(virtual_paths.clone())
             .with_active_recordings(Arc::clone(&active_recordings))
             .with_visibility(Arc::clone(&scope_visibility)),
     );
+    let item_repository: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
+        Arc::clone(&item_repository_impl) as _;
     let item_count_service: Arc<dyn ferrofin_traits::persistence::ItemCountService> = Arc::new(
         FerrofinItemCountService::new(db.clone())
             .with_root_ids(root_folder_ids)
@@ -1427,6 +1429,8 @@ pub async fn build_app_state(
         Arc::clone(&item_persistence_service),
         Arc::clone(&item_repository),
         Arc::clone(&user_views),
+        Arc::clone(&item_visibility) as _,
+        item_repository_impl,
     );
     // Channel logos and guide artwork are remote image rows: the refresh warms
     // their cache and tags a channel's logo for programme DTOs.

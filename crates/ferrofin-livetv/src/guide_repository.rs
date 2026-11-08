@@ -392,6 +392,41 @@ pub async fn delete_programs(db: &Database, ids: &[String]) -> Result<(), Servic
     delete_by_id(db, "FerrofinLiveTvPrograms", ids).await
 }
 
+/// The programme items among `ids` that have a tag in `ItemValues`, which the
+/// blocked and allowed tag rules read. An airing stored before the guide
+/// indexed its tags has none, so the guide refresh writes them once.
+///
+/// # Errors
+///
+/// Fails when the database read fails.
+pub(crate) async fn programs_with_tag_values(
+    db: &Database,
+    ids: &[Uuid],
+) -> Result<std::collections::HashSet<Uuid>, ServiceError> {
+    let mut out = std::collections::HashSet::new();
+    for chunk in ferrofin_db::padded_in_chunks(ids) {
+        let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(
+            r#"SELECT DISTINCT m."ItemId" FROM "ItemValuesMap" m
+               JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+               WHERE v."Type" = "#,
+        );
+        qb.push_bind(i32::from(ferrofin_db::enums::ItemValueType::Tags))
+            .push(r#" AND m."ItemId" IN ("#);
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(guid_to_db(*id));
+        }
+        qb.push(")");
+        let rows: Vec<String> = qb
+            .build_query_scalar()
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+        out.extend(rows.iter().filter_map(|id| Uuid::parse_str(id).ok()));
+    }
+    Ok(out)
+}
+
 /// The ids of the airings stored on one channel, read on `conn`: inside a
 /// guide write's transaction, which removes those it did not re-emit.
 ///
@@ -672,6 +707,48 @@ pub async fn channel_stream_source(
 pub mod test_support {
     use super::{Database, PROGRAM_SELECT, ProgramRow, db_err};
     use ferrofin_traits::error::ServiceError;
+
+    /// From now on, counts each programme row written to `BaseItems` (an
+    /// insert, or an upsert that updates the stored row) and each
+    /// `ItemValuesMap` link written or removed. Call it once per database.
+    pub async fn count_program_writes(db: &Database) -> Result<(), ServiceError> {
+        for statement in [
+            r#"CREATE TABLE "TestProgramWrites" ("Kind" TEXT, "Id" TEXT)"#,
+            r#"CREATE TRIGGER "TestProgramInserted" AFTER INSERT ON "BaseItems"
+               WHEN NEW."Type" = 'MediaBrowser.Controller.LiveTv.LiveTvProgram'
+               BEGIN INSERT INTO "TestProgramWrites" VALUES ('item', NEW."Id"); END"#,
+            r#"CREATE TRIGGER "TestProgramUpdated" AFTER UPDATE ON "BaseItems"
+               WHEN NEW."Type" = 'MediaBrowser.Controller.LiveTv.LiveTvProgram'
+               BEGIN INSERT INTO "TestProgramWrites" VALUES ('item', NEW."Id"); END"#,
+            r#"CREATE TRIGGER "TestValueLinked" AFTER INSERT ON "ItemValuesMap"
+               BEGIN INSERT INTO "TestProgramWrites" VALUES ('value', NEW."ItemId"); END"#,
+            r#"CREATE TRIGGER "TestValueUnlinked" AFTER DELETE ON "ItemValuesMap"
+               BEGIN INSERT INTO "TestProgramWrites" VALUES ('value', OLD."ItemId"); END"#,
+        ] {
+            sqlx::query(statement)
+                .execute(db.writer())
+                .await
+                .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// The writes [`count_program_writes`] has counted since it started, or
+    /// since the last call: `(programme rows, value links)`.
+    pub async fn take_program_writes(db: &Database) -> Result<(i64, i64), ServiceError> {
+        let counts = sqlx::query_as(
+            r#"SELECT COALESCE(SUM("Kind" = 'item'), 0), COALESCE(SUM("Kind" = 'value'), 0)
+               FROM "TestProgramWrites""#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .map_err(db_err)?;
+        sqlx::query(r#"DELETE FROM "TestProgramWrites""#)
+            .execute(db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(counts)
+    }
 
     /// Every stored guide programme, channel-joined, in one read.
     pub async fn program_rows(db: &Database) -> Result<Vec<ProgramRow>, ServiceError> {
