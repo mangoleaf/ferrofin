@@ -382,7 +382,7 @@ version = "5.4.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.fancy-regex]]
-version = "0.19.2"
+version = "0.20.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.fastrand]]
