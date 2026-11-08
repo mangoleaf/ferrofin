@@ -29,8 +29,9 @@ on:
 permissions: {} # each job grants only what it needs
 
 jobs:
-  # The CI run create-release requires may be days old: an advisory published since then
-  # blocks the release too. A job of its own, so the tools it installs never run beside
+  # The CI run create-release requires may be days old: an advisory published, or a version
+  # yanked, since then against a crate the workspace builds blocks the release too (the WASM
+  # guest never ships). A job of its own, so the tools it installs never run beside
   # create-release's RELEASE_TOKEN.
   release-advisories:
     if: >-

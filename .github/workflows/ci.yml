@@ -182,13 +182,13 @@ jobs:
           df -h /
           du -sh target || true # absent when the job failed before building
 
-  # The supply chain, without a build: cargo-deny checks the crates the workspace builds
-  # against the RustSec advisory database and deny.toml's license, ban and source rules,
-  # cargo-machete looks for declared but unused dependencies, and check-workspace-deps.py for
-  # a dependency a crate declares itself instead of taking the workspace's. Outside `lint`, so
-  # an advisory published today turns every branch red without blocking merges; it does block
-  # a release, which needs this whole run green and re-checks the advisories before tagging
-  # (release.yml).
+  # The supply chain, without a build: cargo-deny checks the crates the workspace and the
+  # wasm-hello guest build against the RustSec advisory database (yanked versions included) and
+  # deny.toml's license, ban and source rules, cargo-machete looks for declared but unused
+  # dependencies, and check-workspace-deps.py for a dependency a crate declares itself instead
+  # of taking the workspace's. Outside `lint`, so an advisory published today turns every branch
+  # red without blocking merges; it does block a release, which needs this whole run green and
+  # re-checks the advisories before tagging (release.yml).
   dependencies:
     if: *not-release-pr
     runs-on: ubuntu-latest
@@ -209,6 +209,10 @@ jobs:
           tool: cargo-deny@0.20.2,cargo-machete@0.9.2
       # Each check runs whatever the one before found, so an advisory never hides the rest.
       - run: cargo deny --locked check
+      # The wasm-hello guest is outside the workspace, with its own Cargo.lock. Run from the root, so the
+      # root's deny.toml applies (cargo-deny reads its config from the directory it starts in).
+      - if: ${{ !cancelled() }}
+        run: cargo deny --manifest-path examples/wasm-hello/Cargo.toml --locked check
       - if: ${{ !cancelled() }}
         run: cargo machete apps crates # vendor/ holds upstream code as published
       - if: ${{ !cancelled() }}

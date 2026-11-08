@@ -27,6 +27,7 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --workspace          # + cargo test --workspace --doc for doctests
 cargo deny --locked check              # advisories, licenses, bans, sources (deny.toml)
+cargo deny --manifest-path examples/wasm-hello/Cargo.toml --locked check   # the same for the WASM guest
 cargo machete apps crates              # declared but unused dependencies
 scripts/check-workspace-deps.py        # every dependency through [workspace.dependencies]
 ```
@@ -55,8 +56,13 @@ advisory, even one published after your change, upgrade the crate if a fixed ver
 (`cargo update -p <crate> --precise <version>`, or a manifest bump for a new major). An
 advisory with no fix, or one that does not reach Ferrofin's use of the crate, goes into
 `deny.toml`'s `[advisories] ignore` with its reason, and leaves it once the crate is fixed.
-The release workflow's `cargo audit bin` on the built binaries (`scripts/audit-bin.py`) takes
-the same ignores, so an entry names the advisory by its `id`.
+The release workflow's `cargo audit bin` on the built binaries (`scripts/audit-bin.py`) applies
+the same `[advisories]` rules and ignores, so an ignore entry names the advisory by its `id`.
+A version yanked from crates.io fails `cargo deny` too: `cargo update -p <crate>` moves off
+it, or a manifest bump when no compatible release is left. The WASM guest
+(`examples/wasm-hello/`) has its own manifest and `Cargo.lock`, outside the workspace: fix a
+finding there with `cargo update --manifest-path examples/wasm-hello/Cargo.toml -p <crate>`
+or a bump in its `Cargo.toml`.
 A new license is a compatibility decision against GPL-3.0-only, not a fix.
 
 **Coverage gate — ≥80% line coverage, per crate:**
