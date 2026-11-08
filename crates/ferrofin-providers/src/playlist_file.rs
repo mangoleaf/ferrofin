@@ -65,9 +65,15 @@ pub fn decode_playlist(bytes: &[u8]) -> String {
     if let Ok(text) = std::str::from_utf8(bytes) {
         return text.to_owned();
     }
-    let mut detector = chardetng::EncodingDetector::new();
+    // `Allow` keeps chardetng's pre-1.0 candidate set. It is inert today: 7-bit
+    // ISO-2022-JP is valid UTF-8, so the check above already decoded it.
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
     detector.feed(bytes, true);
-    detector.guess(None, true).decode(bytes).0.into_owned()
+    detector
+        .guess(None, chardetng::Utf8Detection::Allow)
+        .decode(bytes)
+        .0
+        .into_owned()
 }
 
 /// Where a playlist's `playlist.xml` metadata lives — port of
