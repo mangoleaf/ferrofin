@@ -254,15 +254,15 @@ percent-encoding = "2.3.2"
 base64 = "0.23.1"
 # CLDR root collation — the port of .NET `StringComparison.InvariantCulture`
 # used by the Live TV name sort. ICU4X 2.x is already in the tree (icu_normalizer
-# 2.2 via idna), so this shares icu_collections/icu_provider/zerovec.
-icu_collator = "2.3.1"
-icu_casemap = "2.3.0"
-icu_locale_core = "2.3.0"
-icu_collections = "2.3.0"
-icu_locale_fallback = "2.3.0"
-icu_normalizer = "2.3.0"
-icu_provider = "2.3.1"
-zerovec = "0.11.8"
+# via idna), so this shares icu_collections/icu_provider/zerovec.
+icu_collator = "2.4.0"
+icu_casemap = "2.4.0"
+icu_locale_core = "2.4.0"
+icu_collections = "2.4.0"
+icu_locale_fallback = "2.4.0"
+icu_normalizer = "2.4.0"
+icu_provider = "2.4.0"
+zerovec = "0.11.9"
 fancy-regex = "0.19.2"    # for C# regexes that use lookaround
 quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
 # Embedded lyric tags read from the file (ID3v2 SYLT, frame order), which
@@ -282,6 +282,6 @@ inherits = "release"
 debug = true
 strip = false
 
-# Exact ICU4X2.3.1 with a reviewed Jamo dispatch correction for search data.
+# Exact ICU4X 2.4.0 with a reviewed Jamo dispatch correction for search data.
 [patch.crates-io]
 icu_collator = { path = "vendor/icu_collator" }

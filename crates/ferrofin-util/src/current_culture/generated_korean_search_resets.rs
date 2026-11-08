@@ -1,4 +1,4 @@
-// @generated from pinned CLDR48.2 root/search and ko/search equality rules.
+// @generated from pinned CLDR 49 root/search and ko/search equality rules.
 // SPDX-License-Identifier: Unicode-3.0
 // Only the archaic conjoining Jamo removed by the official ICU exporter.
 // Replacements expand imported root equality resets; U1197 is transitive.

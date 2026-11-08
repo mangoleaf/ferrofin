@@ -1,13 +1,13 @@
 {
-  "archive_sha256": "486751335ea00fb12cb3b4d52ddefd3df9b61ff81e1546ba506d3c41cec45a54",
-  "generator_sha256": "669fb899bc51f7ab4e5f1ed605e3b704c79473a3456f1e47e5e3d60e23120402",
-  "output_sha256": "b40e091befa37baae06f17121953edaff4d7a0ba95bebc80942852dabaed1741",
+  "archive_sha256": "ba95a2b748772a4984bcead9bc556f834448ef46e375c4163f27929d8c2d98c9",
+  "generator_sha256": "78c983c83374ee71488aa29c05db2ab1427ef082575dc0a1074b2232b00c616f",
+  "output_sha256": "0841dfdea88df123c8b0df47c408716ecfd70bb7a85083e52fa98d5c79b8528c",
   "search_entries": 22,
   "input_files": [
     {
       "name": "collation/implicithan/az_search_data.toml",
-      "sha256": "a4379c0ab171425b90285f4bdce48d1ea4236bbae1b38d5cb75ebf7b42a94e7c",
-      "bytes": 8589
+      "sha256": "ef7ccd8ffbe64028c956a1c496c5f171ff637c34fe12a2b8927a495a4130ffd7",
+      "bytes": 8894
     },
     {
       "name": "collation/implicithan/az_search_meta.toml",
@@ -16,8 +16,8 @@
     },
     {
       "name": "collation/implicithan/bs_search_data.toml",
-      "sha256": "205dee17af3e54b16e42959c75f44659207b9490b2c82b43a863dc44f452468b",
-      "bytes": 8787
+      "sha256": "61692b44cc9782711af8c79d53faf237ab41f7e8dda9eef4299e72c62268c54d",
+      "bytes": 9086
     },
     {
       "name": "collation/implicithan/bs_search_meta.toml",
@@ -26,8 +26,8 @@
     },
     {
       "name": "collation/implicithan/ca_search_data.toml",
-      "sha256": "00456cf4dd0ddab69d1d1f343ac8a57bd1e29484210ab16dfe6bcd56664917e8",
-      "bytes": 7800
+      "sha256": "906b8b159e4415b789c8776d56c66f11297051a74cd40ea0404fd16222f5a258",
+      "bytes": 8099
     },
     {
       "name": "collation/implicithan/ca_search_meta.toml",
@@ -36,8 +36,8 @@
     },
     {
       "name": "collation/implicithan/da_search_data.toml",
-      "sha256": "b9892124c01a8ea27ffee35f86e1a7ba34299d9d2aa82ee59f0d89eff116a838",
-      "bytes": 9093
+      "sha256": "ed5726e9ec134c92fd5c4d06ed59c6df11596c86722d52e01fbe7788ec2aeb08",
+      "bytes": 9447
     },
     {
       "name": "collation/implicithan/da_search_meta.toml",
@@ -46,8 +46,8 @@
     },
     {
       "name": "collation/implicithan/de_search_data.toml",
-      "sha256": "73f3411224af4f70fdfa6aef4201ef7163d9a526aded4ae93b45df5114ac66ad",
-      "bytes": 7697
+      "sha256": "f65423132afec89ce1345a27fa553c7ed834368f069d3c1de5926573cb2df13e",
+      "bytes": 8022
     },
     {
       "name": "collation/implicithan/de_search_meta.toml",
@@ -56,8 +56,8 @@
     },
     {
       "name": "collation/implicithan/es_search_data.toml",
-      "sha256": "69572b99218bb0b4fb55a1b59bafe37c5443a383abea167493f61fe51d9e286e",
-      "bytes": 7371
+      "sha256": "8238bd769fd3b5e35b9c6d16c5344b5c15bfee2dfef2ca7fa0ef2f4066827493",
+      "bytes": 7696
     },
     {
       "name": "collation/implicithan/es_search_meta.toml",
@@ -66,8 +66,8 @@
     },
     {
       "name": "collation/implicithan/fi_search_data.toml",
-      "sha256": "4e40bca00a6efddc0592f453ef6e4e0665811cecb4a5a37c8b122f50084303b6",
-      "bytes": 9858
+      "sha256": "edc6eb4c8be607cee243d7a1b1679761177273c9f3644fc87d30858a6f3e3a89",
+      "bytes": 10310
     },
     {
       "name": "collation/implicithan/fi_search_meta.toml",
@@ -76,8 +76,8 @@
     },
     {
       "name": "collation/implicithan/fo_search_data.toml",
-      "sha256": "0f2fcaaca89c1adee3ce0da578143467dfc371ad0f293d39a12db9047db44f10",
-      "bytes": 9206
+      "sha256": "8900a174b249c2ba3637ca19095b84b30c4fb78f35901c7d1a2bdb15110c1112",
+      "bytes": 9560
     },
     {
       "name": "collation/implicithan/fo_search_meta.toml",
@@ -86,8 +86,8 @@
     },
     {
       "name": "collation/implicithan/gl_search_data.toml",
-      "sha256": "6d70d53206d96b17ef3b8ab188727b6d4c704fbaa301357dd135f1aa7b497a3c",
-      "bytes": 7371
+      "sha256": "2c540ba2fc65998f5964b0fba31564a6b0117a75bea22322a4ff431870e03b8b",
+      "bytes": 7696
     },
     {
       "name": "collation/implicithan/gl_search_meta.toml",
@@ -96,8 +96,8 @@
     },
     {
       "name": "collation/implicithan/hr_search_data.toml",
-      "sha256": "78ec59a36086e505ebb0ca87c0d886418169c03884a2f4b2d8ea24d6d362bcdb",
-      "bytes": 8787
+      "sha256": "3f3c1221c58a4021299c5f215f02163a9c4159bf9d0d680c514aafcaa7a830ed",
+      "bytes": 9086
     },
     {
       "name": "collation/implicithan/hr_search_meta.toml",
@@ -106,8 +106,8 @@
     },
     {
       "name": "collation/implicithan/is_search_data.toml",
-      "sha256": "15fb620d7b2eaf07b5fcd24e29f09ec4bf22506152d1338f35e792aa73fcfef4",
-      "bytes": 8820
+      "sha256": "c3e943182b0dea6aa91c48b7a6a0c49c1431217350e6dff9091b2e43bf9c1e15",
+      "bytes": 8972
     },
     {
       "name": "collation/implicithan/is_search_meta.toml",
@@ -116,8 +116,8 @@
     },
     {
       "name": "collation/implicithan/kl_search_data.toml",
-      "sha256": "c20f1ad243ec8fcb37391d93c5c24d363ed546eb1dba2be771acc85d25c02f7a",
-      "bytes": 9200
+      "sha256": "3f53890bd54cea6d4095e17113de26a9d7a4f143eb3d6ad15c1d05a08b21daa9",
+      "bytes": 9554
     },
     {
       "name": "collation/implicithan/kl_search_meta.toml",
@@ -126,8 +126,8 @@
     },
     {
       "name": "collation/implicithan/ko_search_data.toml",
-      "sha256": "341aab63244abd6d69bb2c63af134bc85acdf6d9bec7a3bf3f3a056e2fa0e30d",
-      "bytes": 9541
+      "sha256": "08fb1e8d159a0a3b25d6225567fdadf4b3303e316eb9d5c8704d5a562b4f5a88",
+      "bytes": 9800
     },
     {
       "name": "collation/implicithan/ko_search_meta.toml",
@@ -146,8 +146,8 @@
     },
     {
       "name": "collation/implicithan/no_search_data.toml",
-      "sha256": "857795ef9dd609438dbec8046e73f730131a969ca9c5a7c62e22f590d74a455e",
-      "bytes": 9206
+      "sha256": "7b567f7f55a262169175db77324c64f779fee9c0dcfa89ebd76ebcbab7069494",
+      "bytes": 9560
     },
     {
       "name": "collation/implicithan/no_search_meta.toml",
@@ -156,8 +156,8 @@
     },
     {
       "name": "collation/implicithan/root_search_data.toml",
-      "sha256": "677660b5107562521e4dab47fff3fb98155a4cda56dba36045d2bbd923be0f37",
-      "bytes": 7006
+      "sha256": "93208a1c1df08dbe6ca5180101e8b5ab07607cf8c69731b21f8812610a2a4fef",
+      "bytes": 7265
     },
     {
       "name": "collation/implicithan/root_search_meta.toml",
@@ -166,8 +166,8 @@
     },
     {
       "name": "collation/implicithan/se_search_data.toml",
-      "sha256": "2aa08751f6aa75bf910d954d49e05a331c1c6a63444ff2c8d3b37463c9ef9eb5",
-      "bytes": 11017
+      "sha256": "84118249c9a6b933569d0a2ca7d6eea6552a941123f654be97d7a59a06bde6b0",
+      "bytes": 11469
     },
     {
       "name": "collation/implicithan/se_search_meta.toml",
@@ -176,8 +176,8 @@
     },
     {
       "name": "collation/implicithan/sk_search_data.toml",
-      "sha256": "408e4af66675b8b5bf886c7597d5812094b04dea52de2a65c1dd4f1db3f9d1c5",
-      "bytes": 8890
+      "sha256": "cdf413448f7c2b8a55f6fa69e973399cabe78c7c8e60a9ce27e61c0472d0337f",
+      "bytes": 9211
     },
     {
       "name": "collation/implicithan/sk_search_meta.toml",
@@ -186,8 +186,8 @@
     },
     {
       "name": "collation/implicithan/smn_search_data.toml",
-      "sha256": "cbd32626f86eaa8cc3c0f033ed460ce14dd808b13f9bfc83bedd4113f91de304",
-      "bytes": 8968
+      "sha256": "f948157b35e3646bf990aab64a6c32ad25c2067f37297738a3aeeb2fe3ab876b",
+      "bytes": 9313
     },
     {
       "name": "collation/implicithan/smn_search_meta.toml",
@@ -196,8 +196,8 @@
     },
     {
       "name": "collation/implicithan/sr_Latn_search_data.toml",
-      "sha256": "7fe2ae696e0c682ef5c5ffcbc7c8f708713c560129fd1f8814b60aca13d156b0",
-      "bytes": 8792
+      "sha256": "0777c71e276d86741e0fcdf1cdc25b3485df10d799ae7d77cbf2abcea0829124",
+      "bytes": 9091
     },
     {
       "name": "collation/implicithan/sr_Latn_search_meta.toml",
@@ -206,8 +206,8 @@
     },
     {
       "name": "collation/implicithan/sv_search_data.toml",
-      "sha256": "b2dc12ed87baee22124b9f8bd5ca2fb17e4853ce8f1ee53db12eba0526e4fe1c",
-      "bytes": 9173
+      "sha256": "89635a13cffbc567a716abc3ea5c93ba2e540d44cb7c85a70f965c1d99c1cecc",
+      "bytes": 9527
     },
     {
       "name": "collation/implicithan/sv_search_meta.toml",
@@ -216,8 +216,8 @@
     },
     {
       "name": "collation/implicithan/tr_search_data.toml",
-      "sha256": "8d80247dc55e224b11a1834560439902f6a0a555c062174b19b08adc08c9f5b3",
-      "bytes": 8087
+      "sha256": "025ff6e9c7b2dd2514ff661bb1f9b1a8f1157da0cf3b80765ade204cab0fdff1",
+      "bytes": 8385
     },
     {
       "name": "collation/implicithan/tr_search_meta.toml",
@@ -229,21 +229,21 @@
   "generator": "tools/generate-search-collation-data.py",
   "output": "generated_search_data.rs",
   "source_urls": {
-    "archive": "https://github.com/unicode-org/icu/releases/download/release-78.1rc/icu4x-icuexportdata-78.1rc.zip",
-    "root_search": "https://raw.githubusercontent.com/unicode-org/cldr/release-48-2/common/collation/root.xml",
-    "korean_search": "https://raw.githubusercontent.com/unicode-org/cldr/release-48-2/common/collation/ko.xml",
-    "exporter": "https://raw.githubusercontent.com/unicode-org/icu/release-78.1rc/icu4c/source/tools/genrb/parse.cpp",
-    "builder": "https://raw.githubusercontent.com/unicode-org/icu/release-78.1rc/icu4c/source/i18n/collationdatabuilder.cpp"
+    "archive": "https://github.com/unicode-org/icu/releases/download/release-79.1rc/icu4x-icuexportdata-79.1rc.zip",
+    "root_search": "https://raw.githubusercontent.com/unicode-org/cldr/release-49/common/collation/root.xml",
+    "korean_search": "https://raw.githubusercontent.com/unicode-org/cldr/release-49/common/collation/ko.xml",
+    "exporter": "https://raw.githubusercontent.com/unicode-org/icu/release-79.1rc/icu4c/source/tools/genrb/parse.cpp",
+    "builder": "https://raw.githubusercontent.com/unicode-org/icu/release-79.1rc/icu4c/source/i18n/collationdatabuilder.cpp"
   },
   "korean_source_sha256": "d4c35933a28bd6712138e92528f4c6fe0e2d150b296dcaaa0fdde10c7ba8ca34",
-  "root_search_source_sha256": "af6784292b2ec2576efcfdc5e1073f272edc1265a2dc5286ba9bd16b2d7a1ed9",
+  "root_search_source_sha256": "1e41099d7d5b99d20b47726e86d9412600325373798b25f146fff3e278ff1a4e",
   "dependency_versions": {
-    "icu_collator": "2.3.1 exact vendored source with one Jamo dispatch condition",
-    "icu_collections": "2.3.0",
-    "icu_locale_fallback": "2.3.0",
-    "icu_normalizer": "2.3.0",
-    "icu_provider": "2.3.1",
-    "zerovec": "0.11.8"
+    "icu_collator": "2.4.0 exact vendored source with one Jamo dispatch condition",
+    "icu_collections": "2.4.0",
+    "icu_locale_fallback": "2.4.0",
+    "icu_normalizer": "2.4.0",
+    "icu_provider": "2.4.0",
+    "zerovec": "0.11.9"
   },
   "unit_dotnet_oracle": {
     "framework": "10.0.12",
@@ -254,6 +254,6 @@
     "row_count": 29,
     "output_sha256": "ed12718a63390e79a81aadde2937ad4350818de0880cd27f8697b2da2d223826"
   },
-  "vendor_original_vcs_commit": "898d79c69f37da7b45a15a5714663c9b59b3d928",
-  "latest_check": "Existing locked versions were independently checked against official crates.io records; no unrelated version upgrades."
+  "vendor_original_vcs_commit": "031d9e89f6a3fd26a14491e090729d46094328fd",
+  "latest_check": "2026-11-07: the ICU4X family moved to 2.4.0 and zerovec to 0.11.9 (the latest releases, checked against crates.io); the export and CLDR sources moved with them to ICU 79.1rc and CLDR 49."
 }
