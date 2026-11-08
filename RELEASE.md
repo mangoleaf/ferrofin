@@ -246,11 +246,14 @@ from.
    `binaries` → `audit-binaries` → `github-release` (which also waits for `docker-image`).
    `scripts/audit-bin.py` runs `cargo audit bin`, under `deny.toml`'s advisory rules, on the
    image's binary before the image is pushed and on every archive and package before the
-   Release is created. A vulnerability, or a binary without its cargo-auditable record, fails
-   that check: in `docker-image` nothing is pushed and neither chart nor Release follows; in
-   `audit-binaries` only the Release is withheld, since the image and chart do not wait for
-   it. Fix it as for a `cargo deny` advisory (CONTRIBUTING.md, "Dependencies") and release
-   the next patch version: the tag stays.
+   Release is created. A vulnerability, a notice or yanked crate `deny.toml` denies, or a binary
+   without its cargo-auditable record fails that check: in `docker-image` nothing is pushed and
+   neither chart nor Release follows; in `audit-binaries` only the Release is withheld, since
+   the image and chart do not wait for it. Fix it as for a `cargo deny` advisory
+   (CONTRIBUTING.md, "Dependencies") and release the next patch version: the tag stays. When
+   it failed only because cargo-audit could not check for yanked crates, nothing was found
+   wrong with the binaries: re-run the failed job, and if it fails the same way, read the
+   cargo-audit lines in its log.
    Watch it finish, then verify (below). `github-release` creates the GitHub Release as a
    **draft** with git-cliff placeholder notes, so nobody sees them. It stays a draft, and
    `releases/latest` (what `docs/INSTALL.md` reads) keeps pointing at the previous release,

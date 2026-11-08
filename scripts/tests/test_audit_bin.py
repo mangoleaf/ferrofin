@@ -16,23 +16,26 @@ audit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(audit)
 
 # Prints the status line cargo-audit prints for a binary carrying a record, for each
-# argument named in $FOUND, records its arguments, and exits with $RC.
+# argument named in $FOUND, then $EXTRA, records its arguments, and exits with $RC.
 FAKE = """#!/bin/sh
 printf '%s\\n' "$@" > "$CALLS"
 for b in $FOUND; do echo "       Found 'cargo auditable' data in $b (412 dependencies)"; done
+[ -z "$EXTRA" ] || echo "$EXTRA"
 exit "${RC:-0}"
 """
+INDEX_DOWN = "warning: couldn't update crates.io index: failed to fetch"
 
 
 class AuditCommand(unittest.TestCase):
     def test_deny_toml_rules_become_flags(self):
         cmd = audit.audit_command({
             "unmaintained": "all",
+            "yanked": "deny",
             "ignore": [{"id": "RUSTSEC-2024-0436", "reason": "r"}, "RUSTSEC-2023-0071"],
         }, ["a", "b"])
         self.assertEqual(cmd, [
             "cargo-audit", "audit", "--color", "never",
-            "--deny", "unmaintained", "--deny", "unsound",
+            "--deny", "unmaintained", "--deny", "unsound", "--deny", "yanked",
             "--ignore", "RUSTSEC-2024-0436", "--ignore", "RUSTSEC-2023-0071",
             "bin", "--max-binary-size", "18446744073709551615", "a", "b",
         ])
@@ -41,6 +44,12 @@ class AuditCommand(unittest.TestCase):
         cmd = audit.audit_command({"unmaintained": "none", "unsound": "workspace"}, ["a"])
         self.assertNotIn("unmaintained", cmd)
         self.assertIn("unsound", cmd)
+
+    def test_a_yanked_crate_fails_only_when_deny_toml_denies_it(self):
+        denied = audit.audit_command({"yanked": "deny"}, ["a"])
+        self.assertEqual(denied[denied.index("yanked") - 1], "--deny")
+        for setting in ({}, {"yanked": "warn"}, {"yanked": "allow"}):
+            self.assertNotIn("yanked", audit.audit_command(setting, ["a"]))
 
     def test_an_ignore_by_crate_has_no_cargo_audit_equivalent(self):
         with self.assertRaises(SystemExit):
@@ -59,11 +68,29 @@ class Main(unittest.TestCase):
         self.calls = tmp / "calls"
         self.env = {"PATH": f"{tmp}:{os.environ['PATH']}", "CALLS": str(self.calls)}
 
+        self.deny = tmp / "deny.toml"
+        self.deny.write_text('[advisories]\nyanked = "deny"\n')
+
     def run_main(self, binaries, **env):
         out = io.StringIO()
         with mock.patch.dict(os.environ, {**self.env, **env}), \
+                mock.patch.object(audit, "DENY_TOML", self.deny), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             return audit.main(binaries), out.getvalue()
+
+    def test_a_yanked_check_that_could_not_run_fails_when_yanked_is_denied(self):
+        for line in (INDEX_DOWN,
+                     "warning: couldn't open crates.io index: lock timeout",
+                     "error: couldn't check if the package is yanked: not found"):
+            with self.subTest(line=line):
+                rc, out = self.run_main(["bin/a"], FOUND="bin/a", EXTRA=line)
+                self.assertEqual(rc, 1)
+                self.assertIn("could not check for yanked crates", out)
+
+    def test_a_yanked_check_that_could_not_run_only_warns_when_yanked_warns(self):
+        self.deny.write_text('[advisories]\nyanked = "warn"\n')
+        rc, out = self.run_main(["bin/a"], FOUND="bin/a", EXTRA=INDEX_DOWN)
+        self.assertEqual(rc, 0, out)
 
     def test_binaries_with_records_and_no_findings_pass(self):
         rc, out = self.run_main(["bin/a", "bin/b"], FOUND="bin/a bin/b")
