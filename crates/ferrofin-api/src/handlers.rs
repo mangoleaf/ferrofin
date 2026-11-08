@@ -3557,9 +3557,19 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "RestartApplication",
         ferrofin: "handlers/system.rs restart_application (auth.rs RequireAdmin) → ferrofin-core \
                system_manager.rs restart → apps/ferrofin-server state.rs \
-               FerrofinLifecycleController stop, lib.rs announce_shutdown",
-        date: "2026-11-01",
+               FerrofinLifecycleController stop, lib.rs announce_shutdown, tear_down_host \
+               (HlsStreamManager::shutdown, LiveTvManager::shutdown: Program.cs disposes the \
+               host, RecordingsManager.Dispose, MediaSourceManager.Dispose)",
+        date: "2026-11-08",
         divergences: &[
+            "The host teardown goes further than upstream's disposal (gl-141). It does four things. \
+         It kills every transcode: upstream's TranscodeManager.Dispose kills no job, and each \
+         dies at its own kill timer, into a transcode cache the next host has already purged. \
+         It closes every open live stream: MediaSourceManager.Dispose releases one consumer \
+         per stream. It stops the pending recording timers: upstream does not dispose its \
+         TimerManager. And it waits for the recordings RecordingsManager.Dispose cancels to \
+         settle, which upstream does not, because here they settle into a database the host \
+         closes next. No client can tell: the drain has already disconnected them all.",
             "Stricter than upstream by owner decision (gl-1103), not a gap to port: an \
          administrator or API key is required whatever the source address, as on \
          /System/Shutdown. Upstream's LocalAccessOrRequiresElevation also admits any caller \

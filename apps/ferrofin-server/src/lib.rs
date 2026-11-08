@@ -801,7 +801,7 @@ async fn serve_once(
     // every background task, then close the pools so nothing from this lifetime
     // still holds the database file when the next one opens — or restores — it.
     let restart = wired.lifecycle.restart_requested() && !signals.fired();
-    tear_down_host(wired, discovery, sampler).await;
+    tear_down_host(wired, discovery, sampler, config.shutdown_timeout_secs).await;
     db.close().await;
     serve_result?;
     tracing::info!(
@@ -819,14 +819,36 @@ async fn serve_once(
 /// never cuts a scan mid-item with the pool closing under it, and a backup
 /// restore (applied by the next lifetime, after this one's teardown) never
 /// races a scan writing into the tree it replaces.
+///
+/// The transcodes are killed and the DVR stopped the same way (gl-141), so no
+/// ffmpeg writes into the transcode cache the next lifetime purges, and every
+/// capture in flight has settled before its database closes: otherwise the
+/// next lifetime would re-arm its timer and record the showing twice. They get
+/// `shutdown_timeout_secs` between them, as upstream's hosted services get the
+/// host's `ShutdownTimeout` to stop in, so a stuck tuner cannot hold a restart.
 async fn tear_down_host(
     wired: WiredApp,
     discovery: Option<tokio::task::JoinHandle<()>>,
     sampler: Option<tokio::task::JoinHandle<()>>,
+    timeout_secs: u32,
 ) {
     stop_background_tasks(discovery.into_iter().chain(sampler).collect()).await;
     wired.task_manager.shutdown().await;
     wired.state.library.shutdown_scans().await;
+    // Transcodes first: a live one holds a tuner stream that Live TV then closes.
+    let playback = async {
+        wired.state.hls.shutdown().await;
+        if let Some(live_tv) = &wired.state.live_tv {
+            live_tv.shutdown().await;
+        }
+    };
+    let timeout = std::time::Duration::from_secs(u64::from(timeout_secs));
+    if tokio::time::timeout(timeout, playback).await.is_err() {
+        tracing::warn!(
+            timeout_secs,
+            "transcodes or recordings were still stopping when the shutdown timeout ran out; going on without them"
+        );
+    }
     stop_background_tasks(wired.background).await;
 }
 

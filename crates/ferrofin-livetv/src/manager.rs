@@ -495,6 +495,10 @@ pub struct FerrofinLiveTvManager {
     /// The timers whose fire is checking for, or starting, their capture —
     /// see [`FiringClaim`].
     firing: Arc<Mutex<HashSet<String>>>,
+    /// Set once the host has torn the DVR down: a pending fire wakes and ends,
+    /// and a timer that fires afterwards starts no capture — see
+    /// [`LiveTvManager::shutdown`].
+    stopped: Arc<tokio::sync::watch::Sender<bool>>,
     /// The stored rows already reported as unparseable, by table — see
     /// [`FerrofinLiveTvManager::parse_stored_row`].
     unparseable_rows: Arc<Mutex<HashMap<&'static str, HashSet<String>>>>,
@@ -1241,6 +1245,7 @@ impl FerrofinLiveTvManager {
             retry_counts: Arc::new(Mutex::new(HashMap::new())),
             read_retry_counts: Arc::new(Mutex::new(HashMap::new())),
             firing: Arc::new(Mutex::new(HashSet::new())),
+            stopped: Arc::new(tokio::sync::watch::Sender::new(false)),
             unparseable_rows: Arc::new(Mutex::new(HashMap::new())),
             options_warned: Arc::new(Mutex::new(None)),
             encoder: None,
@@ -4757,6 +4762,56 @@ impl LiveTvManager for FerrofinLiveTvManager {
         Ok(())
     }
 
+    async fn shutdown(&self) {
+        // The flag wakes every pending fire, which then ends (`spawn_fire`);
+        // upstream's `TimerManager` is not disposed with the host, so its
+        // timers are stopped here as `StopTimers` would.
+        self.stopped.send_replace(true);
+        self.stop_timers();
+        // `RecordingsManager.Dispose` cancels every active recording, but does
+        // not wait for it: here its settle writes to a database the host closes
+        // next, so the wait is what keeps the next lifetime from re-arming its
+        // timer. A fire past its arm already may register its capture a few
+        // awaits later, so the cancel repeats until no fire holds a claim, which
+        // it keeps until its timer has settled. The recorders look at their
+        // cancel flag at this same interval.
+        let cancelled = self.active_recordings_lock().len();
+        loop {
+            for recording in self.active_recordings_lock().values() {
+                recording.cancel();
+            }
+            if self
+                .firing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(crate::dvr::COPY_POLL_MS)).await;
+        }
+        // A settle that scheduled a retry armed it after the first stop.
+        self.stop_timers();
+        // `MediaSourceManager.Dispose`, which releases one consumer of each
+        // stream: here every stream still open is closed.
+        let open: Vec<LiveStreamHandle> = self
+            .live_streams_lock()
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect();
+        let closed = open.len();
+        for handle in open {
+            handle.close().await;
+        }
+        if cancelled > 0 || closed > 0 {
+            tracing::info!(
+                recordings = cancelled,
+                live_streams = closed,
+                "live tv: stopped the recordings and live streams for the server's shutdown"
+            );
+        }
+    }
+
     async fn get_schedules_direct_countries(&self) -> Result<Vec<u8>, ServiceError> {
         self.schedules_direct.get_available_countries().await
     }
@@ -5772,7 +5827,13 @@ impl FerrofinLiveTvManager {
         let manager = self.clone();
         tokio::spawn(async move {
             if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+                // A shutdown wakes the wait, so a timer due in days does not
+                // keep this lifetime's manager alive until then (gl-141).
+                let mut stopped = manager.stopped.subscribe();
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    _ = stopped.wait_for(|stopped| *stopped) => return,
+                }
             }
             // The system timer is one-shot: once it has fired it is no longer
             // armed, and — crucially — cancelling the recording timer from
@@ -5800,6 +5861,13 @@ impl FerrofinLiveTvManager {
     /// the capture it started.
     fn disarm_timer(&self, id: &str) {
         if let Some(cancelled) = self.armed_timers_lock().remove(id) {
+            cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Cancels the pending fire of every timer (C# `TimerManager.StopTimers`).
+    fn stop_timers(&self) {
+        for (_, cancelled) in self.armed_timers_lock().drain() {
             cancelled.store(true, Ordering::SeqCst);
         }
     }
@@ -5905,6 +5973,15 @@ impl FerrofinLiveTvManager {
             tracing::info!(timer_id, "live tv: that recording is already in progress");
             return;
         };
+        // Checked under the claim: `shutdown` either sees the claim and
+        // cancels this capture, or this fire sees the flag and stands down.
+        if *self.stopped.borrow() {
+            tracing::debug!(
+                timer_id,
+                "live tv: a recording timer fired as its server stopped; ignoring it"
+            );
+            return;
+        }
         if self.active_recordings_lock().contains_key(&timer_id) {
             tracing::info!(timer_id, "live tv: that recording is already in progress");
             return;
@@ -10785,6 +10862,115 @@ mod tests {
             settled.is_some(),
             "nothing may still report itself as recording"
         );
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    /// gl-141: the end of a server lifetime disarms the pending timers, stops
+    /// the capture in flight and has settled it when `shutdown` returns, before
+    /// the database closes: upstream's `RecordingsManager.Dispose` cancels it,
+    /// and `RecordStream` settles a cancelled capture as `Completed`. The next
+    /// lifetime's `start_dvr` then finds nothing to re-arm into a second
+    /// capture of the same showing. Every open live stream is closed, a
+    /// pending fire ends at once instead of holding the manager until it is
+    /// due, and a timer that fires afterwards records nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_stops_the_lifetimes_captures_and_timers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mgr = manager_with_dvr(dir.path()).await;
+        let rows = mgr
+            .query_program_rows(&InternalItemsQuery::default(), chrono::Utc::now())
+            .await
+            .expect("rows");
+        let mut timer_ids = Vec::new();
+        for title in ["Now Playing", "Later"] {
+            let program = rows.iter().find(|r| r.title == title).expect(title);
+            let defaults = mgr
+                .get_new_timer_defaults(Some(Uuid::parse_str(&program.id).expect("guid")))
+                .await
+                .expect("defaults");
+            timer_ids.push(
+                mgr.create_timer(timer_from_defaults(&defaults))
+                    .await
+                    .expect("create"),
+            );
+        }
+        let path = wait_for(|| async {
+            mgr.get_active_recording_path(&timer_ids[0])
+                .await
+                .ok()
+                .flatten()
+        })
+        .await
+        .expect("the capture must start");
+        wait_for(|| async {
+            tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .filter(|m| m.len() > 0)
+        })
+        .await
+        .expect("the capture must write");
+        assert!(mgr.armed_timers_lock().contains_key(&timer_ids[1]));
+        // A consumer outside the DVR: only the shutdown closes its stream.
+        let channel = first_channel_id(&mgr).await;
+        let source = mgr
+            .get_channel_media_sources(channel)
+            .await
+            .expect("sources")[0]
+            .id
+            .clone();
+        mgr.open_channel_stream(channel, source.as_deref())
+            .await
+            .expect("open");
+
+        mgr.shutdown().await;
+
+        assert!(mgr.active_recordings_lock().is_empty());
+        assert!(mgr.armed_timers_lock().is_empty());
+        assert!(mgr.live_streams_lock().is_empty());
+        let status = |timers: &[TimerInfoDto], id: &str| {
+            timers
+                .iter()
+                .find(|t| t.base.id.as_deref() == Some(id))
+                .map(|t| t.status)
+        };
+        let timers = mgr.all_timers().await.expect("timers");
+        assert_eq!(
+            status(&timers, &timer_ids[0]),
+            Some(RecordingStatus::Completed),
+            "{timers:?}"
+        );
+        // The pending fire woke and ended, letting its manager clone go.
+        assert!(
+            wait_for(|| async { (Arc::strong_count(&mgr.stopped) == 1).then_some(()) })
+                .await
+                .is_some(),
+            "a pending fire still holds the manager"
+        );
+
+        // A timer that fires after the shutdown starts no capture.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mgr.on_timer_fired(timer_ids[1].clone()),
+        )
+        .await
+        .expect("a fire after the shutdown must stand down");
+        assert!(mgr.active_recordings_lock().is_empty());
+        let timers = mgr.all_timers().await.expect("timers");
+        assert_ne!(
+            status(&timers, &timer_ids[1]),
+            Some(RecordingStatus::InProgress)
+        );
+        let recordings = mgr
+            .get_recordings_matching(
+                &ferrofin_model::live_tv::RecordingQuery::default(),
+                None,
+                &DtoOptions::default(),
+                None,
+            )
+            .await
+            .expect("recordings");
+        assert_eq!(recordings.items.len(), 1, "{:?}", recordings.items);
         let _ = tokio::fs::remove_file(path).await;
     }
 

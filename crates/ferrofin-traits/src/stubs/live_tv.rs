@@ -782,6 +782,24 @@ pub trait LiveTvManager: Send + Sync {
         Ok(())
     }
 
+    /// Stops the DVR and closes the open live streams as the host tears down
+    /// (gl-141): disarms every pending timer, stops every capture in flight,
+    /// and returns once those captures have settled, before the database they
+    /// write to closes.
+    ///
+    /// Port of what disposing upstream's host does to Live TV:
+    /// `RecordingsManager.Dispose` cancels each active recording, which then
+    /// settles as `Completed`, and `MediaSourceManager.Dispose` closes the
+    /// open live streams. Two steps go beyond it:
+    /// - the pending timers are stopped (`TimerManager.StopTimers`), since
+    ///   upstream does not dispose its `TimerManager`;
+    /// - the call waits for the cancelled captures to settle, since their writes
+    ///   go to a database the host closes next.
+    ///
+    /// A capture stuck on its tuner holds the wait, so the caller bounds it.
+    /// The default has no timer, capture or stream to stop.
+    async fn shutdown(&self) {}
+
     /// The folders recordings are written to, each as the library it should
     /// be: "Recordings", "Recorded Movies" and "Recorded Shows", as far as
     /// they are configured and their directories exist.
