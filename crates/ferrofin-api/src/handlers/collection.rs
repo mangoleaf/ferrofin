@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireCollectionManagement;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::state::AppState;
 
@@ -110,7 +110,7 @@ async fn create_collection(
 async fn add_to_collection(
     State(state): State<AppState>,
     RequireCollectionManagement(_auth): RequireCollectionManagement,
-    Path(collection_id): Path<Uuid>,
+    Path(DotnetGuid(collection_id)): Path<DotnetGuid>,
     Query(query): Query<CollectionItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
     let ids = parse_csv_uuids(query.ids.as_deref())?;
@@ -134,7 +134,7 @@ async fn add_to_collection(
 async fn remove_from_collection(
     State(state): State<AppState>,
     RequireCollectionManagement(_auth): RequireCollectionManagement,
-    Path(collection_id): Path<Uuid>,
+    Path(DotnetGuid(collection_id)): Path<DotnetGuid>,
     Query(query): Query<CollectionItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
     let ids = parse_csv_uuids(query.ids.as_deref())?;

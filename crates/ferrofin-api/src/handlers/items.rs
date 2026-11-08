@@ -38,7 +38,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::query_parse::{
     parse_csv_enums_lenient, parse_csv_strings, parse_csv_uuids, parse_pipe_strings,
 };
@@ -1178,7 +1178,7 @@ struct ItemQuery {
 async fn get_item(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<ItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
@@ -1454,7 +1454,7 @@ where
 async fn delete_item(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
 ) -> Result<StatusCode, ApiError> {
     // `if (user is null && !isApiKey) return NotFound();`
     if auth.user.is_none() && !auth.is_api_key {
@@ -1668,7 +1668,7 @@ async fn translate_parent_item(
 async fn get_ancestors(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<AncestorsQuery>,
 ) -> Result<Json<Vec<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
@@ -2346,7 +2346,7 @@ fn reroot_to_user_root(internal: &mut ferrofin_traits::options::InternalItemsQue
 async fn get_items_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path(user_id): Path<Uuid>,
+    Path(DotnetGuid(user_id)): Path<DotnetGuid>,
     Query(mut query): Query<ItemsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     query.user_id = Some(user_id);
@@ -2363,7 +2363,7 @@ async fn get_items_for_user(
 async fn get_resume_items_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path(user_id): Path<Uuid>,
+    Path(DotnetGuid(user_id)): Path<DotnetGuid>,
     Query(mut query): Query<ResumeQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     query.user_id = Some(user_id);
@@ -2375,11 +2375,11 @@ async fn get_resume_items_for_user(
 async fn get_item_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    Path((user_id, item_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(user_id), DotnetGuid(item_id))): Path<(DotnetGuid, DotnetGuid)>,
     Query(mut query): Query<ItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     query.user_id = Some(user_id);
-    get_item(state, auth, Path(item_id), Query(query)).await
+    get_item(state, auth, Path(DotnetGuid(item_id)), Query(query)).await
 }
 
 /// Registers this controller's real routes onto `router`.

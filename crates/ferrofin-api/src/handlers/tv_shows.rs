@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::{resolve_user, resolve_user_opt, user_uuid};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
@@ -669,7 +669,7 @@ struct EpisodesParams {
 async fn get_episodes(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(series_id): Path<Uuid>,
+    Path(DotnetGuid(series_id)): Path<DotnetGuid>,
     Query(query): Query<EpisodesParams>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
@@ -1000,7 +1000,7 @@ struct SeasonsParams {
 async fn get_seasons(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(series_id): Path<Uuid>,
+    Path(DotnetGuid(series_id)): Path<DotnetGuid>,
     Query(query): Query<SeasonsParams>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;

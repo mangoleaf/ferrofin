@@ -42,7 +42,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::streaming::require_streamable_item;
 use crate::state::AppState;
 
@@ -726,7 +726,7 @@ async fn require_query_item(
 async fn get_video_master_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
@@ -742,7 +742,7 @@ async fn get_video_master_playlist(
 async fn get_video_variant_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
@@ -758,7 +758,7 @@ async fn get_video_variant_playlist(
 async fn get_video_live_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
@@ -775,7 +775,7 @@ async fn get_video_live_playlist(
 async fn get_audio_master_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
@@ -791,7 +791,7 @@ async fn get_audio_master_playlist(
 async fn get_audio_variant_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
@@ -827,7 +827,7 @@ pub(super) fn parse_segment_index(segment_id: &str) -> Result<i32, ApiError> {
 async fn get_video_hls_segment(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
+    Path((DotnetGuid(item_id), _playlist_id, segment_id)): Path<(DotnetGuid, String, String)>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     request: Request,
@@ -847,7 +847,7 @@ async fn get_video_hls_segment(
 async fn get_audio_hls_segment(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
+    Path((DotnetGuid(item_id), _playlist_id, segment_id)): Path<(DotnetGuid, String, String)>,
     Query(query): Query<HlsQuery>,
     RawQuery(raw): RawQuery,
     request: Request,
@@ -883,6 +883,7 @@ fn path_extension(uri_path: &str) -> String {
 /// cache; `400` on a traversal/miss (mapped from [`ServiceError::InvalidInput`]).
 async fn get_hls_video_segment_legacy(
     State(state): State<AppState>,
+    // Upstream binds an unused `string itemId` here, not a `Guid`: kept on `Uuid`.
     Path((_item_id, _playlist_id, segment_id)): Path<(Uuid, String, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -903,6 +904,7 @@ async fn get_hls_video_segment_legacy(
 async fn get_hls_playlist_legacy(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
+    // Upstream binds an unused `string itemId` here, not a `Guid`: kept on `Uuid`.
     Path((_item_id, playlist_id)): Path<(Uuid, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -918,6 +920,7 @@ async fn get_hls_playlist_legacy(
 /// segment serve (`HlsSegmentController.GetHlsAudioSegmentLegacy`).
 async fn get_hls_audio_segment_legacy(
     State(state): State<AppState>,
+    // Upstream binds an unused `string itemId` here, not a `Guid`: kept on `Uuid`.
     Path((_item_id, segment_id)): Path<(Uuid, String)>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -969,7 +972,7 @@ async fn stop_encoding_process(
 async fn get_video_attachment(
     State(state): State<AppState>,
     axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
-    Path((video_id, media_source_id, index)): Path<(Uuid, String, i32)>,
+    Path((DotnetGuid(video_id), media_source_id, index)): Path<(DotnetGuid, String, i32)>,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
     // No token on a font URL: anonymous, as upstream.

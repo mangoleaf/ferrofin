@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::{parse_csv_enums_lenient, parse_csv_uuids};
 use crate::handlers::session_ctx::current_session_id;
@@ -363,7 +363,7 @@ async fn send_message_command(
 async fn add_user_to_session(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((session_id, user_id)): Path<(String, Uuid)>,
+    Path((session_id, DotnetGuid(user_id))): Path<(String, DotnetGuid)>,
 ) -> Result<StatusCode, ApiError> {
     let controlling_id = controlling_session_id(&state, &auth).await?;
     state
@@ -406,7 +406,7 @@ async fn add_user_to_session(
 async fn remove_user_from_session(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((session_id, user_id)): Path<(String, Uuid)>,
+    Path((session_id, DotnetGuid(user_id))): Path<(String, DotnetGuid)>,
 ) -> Result<StatusCode, ApiError> {
     let controlling_id = controlling_session_id(&state, &auth).await?;
     state

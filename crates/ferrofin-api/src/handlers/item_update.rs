@@ -47,7 +47,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAdmin;
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::state::AppState;
 
 /// `POST /Items/{itemId}` — applies an edited item and persists it.
@@ -68,7 +68,7 @@ use crate::state::AppState;
 pub(crate) async fn update_item(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     JsonBody(request): JsonBody<Box<UpdateItemRequest>>,
 ) -> Result<StatusCode, ApiError> {
     let mut item = state
@@ -941,7 +941,7 @@ struct ContentTypeQuery {
 async fn update_item_content_type(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<ContentTypeQuery>,
 ) -> Result<StatusCode, ApiError> {
     let item = state
@@ -1202,7 +1202,7 @@ impl From<RefreshMode> for MetadataRefreshMode {
 async fn refresh_item(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<StatusCode, ApiError> {
     let item = state
@@ -1302,7 +1302,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 async fn get_metadata_editor(
     State(state): State<AppState>,
     RequireAdmin(auth): RequireAdmin,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
 ) -> Result<Json<MetadataEditorInfo>, ApiError> {
     let item = state
         .library

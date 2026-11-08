@@ -899,12 +899,11 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     // gl-1034: a nil parentId is an empty page, not GetItemById's 400.
     ("get", "/Shows/NextUp", "v12.2"),
     // gl-1037: a malformed minCommunityRating is ignored, not a 400; gl-884: a
-    // malformed genreIds/studioIds token is a 400, not dropped; gl-1038: a
-    // padded parentId/userId is a 400, not trimmed.
+    // malformed genreIds/studioIds token is a 400, not dropped.
     ("get", "/Artists", "v12.2"),
     ("get", "/Artists/AlbumArtists", "v12.2"),
     // gl-408: parameters these actions do not declare are bound (a 400 on a
-    // bad value); gl-1038: a padded parentId/userId is a 400, not trimmed.
+    // bad value).
     ("get", "/Genres", "v12.2"),
     ("get", "/MusicGenres", "v12.2"),
     ("get", "/Studios", "v12.2"),
@@ -2818,14 +2817,13 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "GetUserById",
         ferrofin: "handlers/users.rs get_user_by_id (RequireAuthIgnoringSchedule: \
-               IgnoreParentalControl; load_user: GetUserById's 400 for a nil id) → ferrofin-core \
-               user_manager.rs get_user_dto; strip_other_accounts",
-        date: "2026-11-01",
+               IgnoreParentalControl; the route id binds through extract::DotnetGuid, \
+               GuidConverter's trimmed Guid.Parse; load_user: GetUserById's 400 for a nil id) → \
+               ferrofin-core user_manager.rs get_user_dto; strip_other_accounts",
+        date: "2026-11-08",
         divergences: &[
             USER_FIELDS_STRIPPED,
             USER_LYRIC_MANAGEMENT,
-            "A route id padded with spaces is a 400; upstream's GuidConverter trims it. Fix \
-         path: gl-1038.",
             "The 400 (a nil or malformed user id) and 404 (unknown user) bodies are Ferrofin's \
          error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -3450,7 +3448,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Playlists/{itemId}/Items/{itemId}/Move/{newIndex}",
         upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
         upstream_method: "MoveItem",
-        ferrofin: "handlers/playlists.rs move_item (get_playlist_access + require_edit: \
+        ferrofin: "handlers/playlists.rs move_item (the playlist id parses through \
+               DotnetGuid::parse, Guid.Parse and MoveItemAsync's new Guid; \
+               get_playlist_access + require_edit: \
                GetPlaylistForUser and the owner-or-editing-share check) → ferrofin-core \
                collection_manager.rs FerrofinPlaylistManager::move_item \
                (PlaylistManager.MoveItemAsync: the first occurrence moves, the index counts \

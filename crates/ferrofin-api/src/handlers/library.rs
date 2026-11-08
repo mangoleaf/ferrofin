@@ -54,7 +54,7 @@ use uuid::Uuid;
 
 use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::handlers::streaming::serve_static_file;
@@ -215,7 +215,7 @@ async fn theme_media(
 async fn get_theme_songs(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<ThemeMediaQuery>,
 ) -> Result<Json<ThemeMediaResult>, ApiError> {
     Ok(Json(
@@ -245,7 +245,7 @@ async fn get_theme_songs(
 async fn get_theme_videos(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<ThemeMediaQuery>,
 ) -> Result<Json<ThemeMediaResult>, ApiError> {
     Ok(Json(
@@ -277,7 +277,7 @@ async fn get_theme_videos(
 async fn get_theme_media(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<ThemeMediaQuery>,
 ) -> Result<Json<AllThemeMediaResult>, ApiError> {
     let theme_songs_result =
@@ -340,7 +340,7 @@ struct ItemCollectionsQuery {
 async fn get_item_collections(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<ItemCollectionsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     use ferrofin_util::string_extensions::compare_ordinal_ignore_case;
@@ -418,7 +418,7 @@ async fn get_item_collections(
 async fn get_file(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     request: Request,
 ) -> Result<Response, ApiError> {
     let item = state

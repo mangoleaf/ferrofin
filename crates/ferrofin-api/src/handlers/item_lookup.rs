@@ -34,13 +34,12 @@ use ferrofin_traits::providers::{
     MetadataRefreshMode, MetadataRefreshOptions, RemoteSearchRequest,
 };
 use serde::Deserialize;
-use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
 
 use crate::auth::{RequireAdminWithDefault, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::state::AppState;
 
 /// `GET /Items/{itemId}/ExternalIdInfos` — the item's external-id descriptors.
@@ -61,7 +60,7 @@ use crate::state::AppState;
 async fn get_external_id_infos(
     State(state): State<AppState>,
     RequireAdminWithDefault(auth): RequireAdminWithDefault,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
 ) -> Result<Json<Vec<ExternalIdInfo>>, ApiError> {
     if state
         .library
@@ -311,7 +310,7 @@ fn default_true() -> bool {
 async fn apply_search_criteria(
     State(state): State<AppState>,
     RequireAdminWithDefault(auth): RequireAdminWithDefault,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<ApplyQuery>,
     JsonBody(search_result): JsonBody<RemoteSearchResult>,
 ) -> Result<axum::http::StatusCode, ApiError> {
