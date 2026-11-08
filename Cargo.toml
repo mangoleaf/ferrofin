@@ -92,14 +92,14 @@ tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compressio
 httpdate = "1.0.3"
 # Decoders for the response-compression tests only (the server never decodes a
 # response it just encoded). Streaming readers validate the wire response.
-flate2 = "1.1.10"
+flate2 = "1.1.11"
 zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-api, which adds `time`)
 tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
-sevenz-rust2 = { version = "0.24.1", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
-brotli = "9.0.0"
+sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
+brotli = "9.1.1"
 tokio = { version = "1", features = ["full"] }
 socket2 = "0.6"
-http-body = "1.0"
+http-body = "1.1"
 # The `Stream` trait `axum::body::Body::from_stream` takes — the progressive
 # (tail-following) response bodies the Live TV live-stream/recording routes serve.
 futures-core = "0.3.34"
@@ -115,6 +115,8 @@ sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "run
 # Direct handle on the SQLite C API, pinned to the exact version sqlx resolves so
 # cargo unifies them to ONE linked copy — a second copy would mean a second,
 # unconfigured SQLite. Used only to call sqlite3_config() before any connection.
+# Held at 0.37 (latest 0.39.1): sqlx-sqlite 0.9.0, still the latest sqlx, requires
+# `>=0.30.1, <0.38.0`. Lift it when a sqlx release widens that bound.
 libsqlite3-sys = "0.37.0"
 
 # ── serde / errors ─────────────────────────────────────────────────
@@ -126,7 +128,7 @@ serde_urlencoded = "0.7"
 indexmap = { version = "2.14", features = ["serde"] }
 # Edits config.toml in place, keeping its comments and layout: the settings
 # page's save (ferrofin-server `settings::save`).
-toml_edit = { version = "0.25.17", default-features = false, features = ["parse", "display"] }
+toml_edit = { version = "0.25.19", default-features = false, features = ["parse", "display"] }
 # The `$.Field[0]` path in a body-binder rejection: serde's own error names the
 # type, not the member that failed, and ASP.NET's ValidationProblemDetails keys
 # its `errors` dictionary by path. ferrofin-api's JsonBody extractor only.
@@ -174,11 +176,11 @@ utoipa = "6.0.0"
 # metrics → prometheus exposition (ferrofin-metrics only); traces → OTLP gRPC
 # (ferrofin-server only). The 0.34 tracing-opentelemetry pairs with otel 0.33
 # (the expected +1 offset); bump both together if otel ever moves.
-opentelemetry = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
-opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
-opentelemetry-prometheus = "0.33.0"
+opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["metrics", "trace"] }
+opentelemetry-prometheus = "0.33.1"
 # TLS for an https collector: aws-lc as everywhere else, roots from the system store.
-opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["grpc-tonic", "trace", "tls-aws-lc", "tls-roots"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["grpc-tonic", "trace", "tls-aws-lc", "tls-roots"] }
 tracing-opentelemetry = "0.34.0"
 # encode-only; ferrofin-metrics ONLY — the 0.32 exporter exposes no render helper,
 # so `Registry` + `TextEncoder` come from a direct dep (dedupes with the exporter's ^0.14).
@@ -204,16 +206,16 @@ wasmtime = { version = "49.0.5", default-features = false, features = [
 ] }
 # Locked-down empty WASI ctx (no preopens/sockets) so std guests link.
 wasmtime-wasi = { version = "49.0.5", default-features = false, features = ["p2"] }
-wat = "1.259.0"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
+wat = "1.263.0"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
 
 # ── domain helpers ─────────────────────────────────────────────────
-uuid = { version = "1.26.1", features = ["v4", "serde"] }
+uuid = { version = "1.29.1", features = ["v4", "serde"] }
 url = "2.5.8"
 chrono = { version = "0.4", features = ["serde"] }
-unicode-normalization = "0.1.25"
+unicode-normalization = "0.1.26"
 rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`), password salts (ferrofin-common)
 # Legacy text encodings (subtitles, playlist files) — C# `UtfUnknown`.
-encoding_rs = "0.8.35"
+encoding_rs = "0.8.44"
 chardetng = "0.1.17"
 shlex = "2"              # ffmpeg command strings → argv (ferrofin-mediaencoding `split_args`)
 async-trait = "0.1.92"
@@ -226,7 +228,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_Threading",
 ] }
 pbkdf2 = "0.13.0"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
-sha2 = "0.11.0"            # PBKDF2-HMAC-SHA512 (default hash id)
+sha2 = "0.11.1"            # PBKDF2-HMAC-SHA512 (default hash id)
 sha1 = "0.11.0"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp", "ico"] }
 kamadak-exif = "0.6.2"                                      # photo EXIF (ferrofin-drawing PhotoProvider)
@@ -234,7 +236,7 @@ webp = { version = "0.3", default-features = false }  # LOSSY WebP encode via li
 jpeg-encoder = "0.7"     # JPEG encode with 4:2:0 chroma subsampling — the `image` crate's encoder is hardcoded 4:4:4; Skia's SkJpegEncoder defaults to 4:2:0
 jpeg-decoder = { version = "0.3.2", default-features = false }  # DCT-scaled JPEG decode (1/2, 1/4, 1/8) for blur hashes and thumbnails, like Skia's GetScaledDimensions; zune-jpeg (the `image` crate's decoder) cannot scale. In maintenance mode upstream. No rayon: without it a decode wider than 128 px runs one short-lived thread per colour component, inside the encode permits that bound concurrent decodes to the cores (a failed spawn falls back to the full decode)
 blurhash = "0.2"         # ImageBlurHashes — functionally-valid hashes (not byte-identical to Jellyfin's Skia)
-config = { version = "0.15.26", default-features = false, features = ["toml"] }   # config.toml is TOML only
+config = { version = "0.15.27", default-features = false, features = ["toml"] }   # config.toml is TOML only
 clap = { version = "4.6.7", features = ["derive"] }
 clap_mangen = "0.3.3"      # renders the .deb man page from the clap definition (test-maintained)
 bitflags = "2.13.2"
@@ -244,7 +246,7 @@ bitflags = "2.13.2"
 # transitive dependency of flate2/zip, so it adds no new compilation. The WASM
 # host also uses it to tell whether a plugin's state file still holds the bytes
 # its kept map came from.
-crc32fast = "1.5.2"
+crc32fast = "1.5.4"
 regex = "1"
 percent-encoding = "2.3.2"
 # Base64 with .NET's rules (`Base64.IsValid`, `Convert.FromBase64String`) for
@@ -265,7 +267,7 @@ fancy-regex = "0.19.2"    # for C# regexes that use lookaround
 quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metadata parsing (ferrofin-providers)
 # Embedded lyric tags read from the file (ID3v2 SYLT, frame order), which
 # ffprobe's tag map cannot give — the scan's port of ATL's `Track.Lyrics`.
-lofty = "0.25.4"
+lofty = "0.25.5"
 
 # ── dev / test ─────────────────────────────────────────────────────
 rstest = "0.27.0"         # [Theory]/[InlineData] → #[case] transliteration
