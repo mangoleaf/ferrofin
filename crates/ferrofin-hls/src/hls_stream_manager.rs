@@ -668,12 +668,27 @@ where
             // A seek (or the running job died mid-wait): drop the stale job before
             // restarting so the two don't write the same files. Keep its produced
             // segments (delete_files = false) — a later backward seek serves them
-            // straight from disk via the fast path.
+            // straight from disk via the fast path — but the one its exit cut short.
             // `DynamicHlsController` kills the old job with `closeLiveStream:
             // false` — the restart below re-opens ffmpeg on the SAME live stream,
             // so releasing the tuner here would make it read a closed source.
             plan = Some(self.segment_plan(request, is_audio, segment_id).await?);
+            // Listed just before the kill, so what its exit finalises shows.
+            let listed = playlist_path.clone();
+            let before = tokio::task::spawn_blocking(move || segment_writes(&listed, ext, start))
+                .await
+                .map_err(|error| {
+                    ServiceError::backend(format!("list transcode segments: {error}"))
+                })?;
             self.manager.kill_and_remove(&handle, false, false).await;
+            let listed = playlist_path.clone();
+            tokio::task::spawn_blocking(move || {
+                delete_cut_short_segment(&listed, ext, start, before);
+            })
+            .await
+            .map_err(|error| {
+                ServiceError::backend(format!("delete a cut-short segment: {error}"))
+            })?;
         }
         let plan = match plan {
             Some(plan) => plan,
@@ -1466,30 +1481,14 @@ fn segment_containing(starts: &[i64], ticks: i64) -> (i32, i64) {
 /// can begin past `start` once rolling deletion removed the job's first
 /// segments. Blocking: an async caller runs it on the blocking pool.
 fn current_transcoding_index(playlist: &Path, ext: &str, start: i32) -> Option<i32> {
-    let folder = playlist.parent()?;
-    let stem = playlist.file_stem()?.to_string_lossy().into_owned();
-    let suffix = if ext.starts_with('.') {
-        ext.to_owned()
-    } else {
-        format!(".{ext}")
-    };
-    let indices: std::collections::BTreeSet<i32> = std::fs::read_dir(folder)
+    // `-hls_flags temp_file` writes the in-progress segment as `<name>.tmp`
+    // and renames on completion; counting it keeps the encoder's front visible
+    // during the (possibly long) first-segment encode — otherwise a retry
+    // arriving in that window reads "no progress" and kills a healthy job.
+    let indices: std::collections::BTreeSet<i32> = segment_entries(playlist, ext)
         .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_str()?;
-            // `-hls_flags temp_file` writes the in-progress segment as
-            // `<name>.tmp` and renames on completion; counting it keeps the
-            // encoder's front visible during the (possibly long) first-segment
-            // encode — otherwise a retry arriving in that window reads "no
-            // progress" and kills a healthy job.
-            let name = name.strip_suffix(".tmp").unwrap_or(name);
-            name.strip_prefix(&stem)?
-                .strip_suffix(&suffix)?
-                .parse::<i32>()
-                .ok()
-        })
+        .into_iter()
+        .map(|(index, _, _)| index)
         .filter(|&index| index >= start)
         .collect();
     let mut front = *indices.first()?;
@@ -1497,6 +1496,119 @@ fn current_transcoding_index(playlist: &Path, ext: &str, start: i32) -> Option<i
         front = next;
     }
     Some(front)
+}
+
+/// Every `{stem}{n}{ext}` segment of `playlist` in its folder, finished or an
+/// in-progress `{stem}{n}{ext}.tmp`: its index, whether it is the `.tmp`, and
+/// its entry. An error when the folder cannot be read. Blocking.
+fn segment_entries(
+    playlist: &Path,
+    ext: &str,
+) -> std::io::Result<Vec<(i32, bool, std::fs::DirEntry)>> {
+    let (Some(folder), Some(stem)) = (playlist.parent(), playlist.file_stem()) else {
+        return Ok(Vec::new());
+    };
+    let stem = stem.to_string_lossy().into_owned();
+    let suffix = if ext.starts_with('.') {
+        ext.to_owned()
+    } else {
+        format!(".{ext}")
+    };
+    let entries = std::fs::read_dir(folder)?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            let (name, in_progress) = name
+                .strip_suffix(".tmp")
+                .map_or((name, false), |name| (name, true));
+            let index = name
+                .strip_prefix(&stem)?
+                .strip_suffix(&suffix)?
+                .parse::<i32>()
+                .ok()?;
+            Some((index, in_progress, entry))
+        })
+        .collect();
+    Ok(entries)
+}
+
+/// What tells one write of a segment file from the next: its length and
+/// modification time.
+type SegmentWrite = (u64, Option<std::time::SystemTime>);
+
+/// The segment files of the job writing from `start`, keyed by index and
+/// whether the file is the in-progress `.tmp`, each with its [`SegmentWrite`].
+type SegmentWrites = std::collections::BTreeMap<(i32, bool), SegmentWrite>;
+
+/// The [`SegmentWrites`] of the job writing from `start`. An error when the
+/// folder cannot be read. Blocking.
+fn segment_writes(playlist: &Path, ext: &str, start: i32) -> std::io::Result<SegmentWrites> {
+    let writes = segment_entries(playlist, ext)?
+        .into_iter()
+        .filter(|&(index, _, _)| index >= start)
+        .filter_map(|(index, in_progress, entry)| {
+            let meta = entry.metadata().ok()?;
+            Some(((index, in_progress), (meta.len(), meta.modified().ok())))
+        })
+        .collect();
+    Ok(writes)
+}
+
+/// Deletes the segment a seek restart's killed job was encoding: the `q` exit
+/// finalises it, cut short, under its normal name, and every later request
+/// would serve it as complete (gl-1396). Port of `GetDynamicSegment`'s
+/// `DeleteLastFile`, which takes the newest file by mtime; this takes the
+/// highest segment the job finished since `before`, its [`segment_writes`]
+/// just before the kill, because where mtimes are coarse the newest file can
+/// be an earlier job's (gl-52). A job killed hard (no exit within the `q`
+/// timeout) still has the `.tmp` after that segment, which is then whole, and
+/// nothing is deleted. Blocking.
+fn delete_cut_short_segment(
+    playlist: &Path,
+    ext: &str,
+    start: i32,
+    before: std::io::Result<SegmentWrites>,
+) {
+    let (before, after) = match (before, segment_writes(playlist, ext, start)) {
+        (Ok(before), Ok(after)) => (before, after),
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::warn!(
+                path = %playlist.display(),
+                %error,
+                "cannot list a killed transcode's segments; one it cut short may be served short"
+            );
+            return;
+        }
+    };
+    let written: Vec<(i32, bool)> = after
+        .into_iter()
+        .filter(|(key, write)| before.get(key) != Some(write))
+        .map(|(key, _)| key)
+        .collect();
+    let Some(index) = written
+        .iter()
+        .filter(|&&(_, in_progress)| !in_progress)
+        .map(|&(index, _)| index)
+        .max()
+    else {
+        return;
+    };
+    if written.contains(&(index.saturating_add(1), true)) {
+        return;
+    }
+    let path = segment_file(playlist, index, ext);
+    tracing::debug!(path = %path.display(), "deleting a killed transcode's cut-short segment");
+    match std::fs::remove_file(&path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "deleting a killed transcode's cut-short segment failed; it is served short"
+            );
+        }
+        _ => {}
+    }
 }
 
 /// Whether the fMP4 init at `init` is complete: ffmpeg fills it in the flush
@@ -2653,6 +2765,62 @@ mod tests {
             if restarts { 2 } else { 1 },
             "segment {segment} restarted the transcode: {restarts}"
         );
+    }
+
+    /// A seek restart deletes the segment the killed job's graceful `q` exit
+    /// finalised, cut short, and nothing else: `GetDynamicSegment`'s
+    /// `DeleteLastFile` after `KillTranscodingJobs`, choosing the job's own last
+    /// write rather than the newest file (gl-1396). What the job finished
+    /// before the kill, and an earlier job's segment it did not rewrite, stay
+    /// to be served. A job killed hard leaves the `.tmp` it was writing, and
+    /// every segment it finished is whole.
+    #[rstest::rstest]
+    #[case::the_segment_it_was_encoding(&[], &["out1.ts"], &["out1.ts"])]
+    #[case::only_the_last_of_two_it_finalised(&[], &["out1.ts", "out2.ts"], &["out2.ts"])]
+    #[case::an_earlier_jobs_segment_it_rewrote(&["out1.ts"], &["out1.ts"], &["out1.ts"])]
+    #[case::not_an_earlier_jobs_segment_past_it(&["out2.ts"], &["out1.ts"], &["out1.ts"])]
+    #[case::not_when_an_earlier_jobs_tmp_follows_it(&["out2.ts.tmp"], &["out1.ts"], &["out1.ts"])]
+    #[case::the_tmp_it_had_open_at_the_kill(&["out1.ts.tmp"], &["out1.ts"], &["out1.ts"])]
+    #[case::nothing_when_killed_hard_mid_segment(&[], &["out1.ts", "out2.ts.tmp"], &[])]
+    #[tokio::test]
+    async fn a_seek_restart_deletes_the_segment_the_killed_job_cut_short(
+        #[case] leftovers: &[&str],
+        #[case] finalised_on_kill: &[&str],
+        #[case] deleted: &[&str],
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            kill_files: finalised_on_kill
+                .iter()
+                .map(|&name| name.to_owned())
+                .collect(),
+            ..FakeScript::default()
+        };
+        let (mgr, _, spawns) = manager_full(tmp.path(), script, "ts");
+        mgr.dynamic_segment(&req(), 0, false).await.unwrap();
+        for name in leftovers {
+            std::fs::write(tmp.path().join(name), b"complete segment\n").unwrap();
+        }
+
+        // A seek past the wait gap: the job is killed and one starts at 10,
+        // whose segment never appears.
+        let parked = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            mgr.dynamic_segment(&req(), 10, false),
+        )
+        .await;
+        assert!(parked.is_err(), "segment 10 was answered: {parked:?}");
+        assert_eq!(spawns.requests.lock().unwrap().len(), 2, "no restart");
+
+        for name in ["out0.ts"].iter().chain(leftovers).chain(finalised_on_kill) {
+            assert_eq!(
+                tmp.path().join(name).exists(),
+                !deleted.contains(name),
+                "{name} after the restart"
+            );
+        }
     }
 
     #[tokio::test]
