@@ -356,6 +356,10 @@ jobs:
           # /System/Info/Public reports the Jellyfin API version (10.11.8) for client
           # compatibility; Ferrofin's own build version is the `build` field of /health/live.
           grep -q "\"build\":\"$GITHUB_REF_NAME\"" live.json || { echo "version mismatch"; cat smoke.log; exit 1; }
+          # The CLI names the release too; it once printed the manifest's placeholder version.
+          cli_version=$("$bin" --version)
+          echo "$cli_version"
+          printf '%s\n' "$cli_version" | grep -qF -- "$GITHUB_REF_NAME" || { echo "--version does not name $GITHUB_REF_NAME"; exit 1; }
       - name: package
         shell: bash
         run: |
