@@ -95,7 +95,7 @@ httpdate = "1.0.3"
 flate2 = "1.1.11"
 zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-api, which adds `time`)
 tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
-sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
 brotli = "9.1.1"
 tokio = { version = "1", features = ["full"] }
 socket2 = "0.6"
