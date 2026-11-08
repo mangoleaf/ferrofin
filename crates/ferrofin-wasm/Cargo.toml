@@ -14,11 +14,13 @@ ferrofin-traits.workspace = true
 ferrofin-core.workspace = true
 ferrofin-db.workspace = true
 ferrofin-providers.workspace = true
+ferrofin-util.workspace = true
 chrono.workspace = true
 ferrofin-model.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 serde_json.workspace = true
+crc32fast.workspace = true
 regex.workspace = true
 tracing.workspace = true
 uuid.workspace = true

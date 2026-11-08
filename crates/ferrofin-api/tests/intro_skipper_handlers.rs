@@ -680,7 +680,8 @@ async fn editor_and_rebuild_routes_validate_like_upstream() {
         .unwrap();
     let (status, _) = send(app.clone(), "POST", "/Intros/RebuildDatabase", "").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(app.intro_skipper.segments(item).await.unwrap().is_empty());
+    let segments = app.intro_skipper.segments(item).await.unwrap();
+    assert!(segments.is_empty(), "{segments:?}");
 
     let body = r#"{"Type":"Intro","StartTicks":0,"EndTicks":10}"#;
     let (status, _) = send(

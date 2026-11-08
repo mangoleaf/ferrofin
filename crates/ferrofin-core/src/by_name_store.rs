@@ -83,6 +83,23 @@ impl ByNameStore {
         ))
     }
 
+    /// The path a by-name item at `path` is rebased to (`GetRebasedPath`:
+    /// `GetPath(Path.GetFileName(Path), false)`, the kind's metadata directory
+    /// joined with the path's last component as it is, as `Path.Combine`
+    /// joins them), or [`None`] for a kind this store does not provision.
+    #[must_use]
+    pub fn rebased_path(&self, kind: BaseItemKind, path: &str) -> Option<String> {
+        let root = self.roots.get(&kind)?.to_string_lossy();
+        let file_name = path.rsplit('/').next().unwrap_or(path);
+        Some(if file_name.is_empty() {
+            root.into_owned()
+        } else if root.ends_with('/') {
+            format!("{root}{file_name}")
+        } else {
+            format!("{root}/{file_name}")
+        })
+    }
+
     /// `CreateItemByName<T>(name)`: the id of `name`'s row for `kind`, creating
     /// the metadata directory and the row when nothing matches yet.
     ///
@@ -167,6 +184,35 @@ mod tests {
             meta.join("artists"),
         );
         (db, s)
+    }
+
+    /// `MusicArtist.GetRebasedPath`: the artists directory and the stored
+    /// path's file name, joined as `Path.Combine` does.
+    #[rstest::rstest]
+    #[case::in_place("/meta/artists/Miles Davis", "/meta/artists/Miles Davis")]
+    #[case::moved("/old/metadata/artists/Miles Davis", "/meta/artists/Miles Davis")]
+    #[case::raw_name("/old/artists/AC_DC", "/meta/artists/AC_DC")]
+    #[case::trailing_separator("/old/artists/", "/meta/artists")]
+    #[case::bare_name("Miles Davis", "/meta/artists/Miles Davis")]
+    #[tokio::test]
+    async fn the_rebased_path_keeps_the_file_name_under_the_artists_directory(
+        #[case] path: &str,
+        #[case] rebased: &str,
+    ) {
+        let store = ByNameStore::new(
+            Arc::new(FerrofinItemPersistenceService::new(test_db().await)),
+            "/meta/Genre",
+            "/meta/MusicGenre",
+            "/meta/Studio",
+            "/meta/artists",
+        );
+        assert_eq!(
+            store
+                .rebased_path(BaseItemKind::MusicArtist, path)
+                .as_deref(),
+            Some(rebased)
+        );
+        assert_eq!(store.rebased_path(BaseItemKind::Year, path), None);
     }
 
     #[tokio::test]

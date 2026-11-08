@@ -17,7 +17,9 @@ use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::parse_csv_uuids;
-use crate::handlers::streaming::{serve_static_file, static_or_transcode};
+use crate::handlers::streaming::{
+    require_streamable_item, serve_static_file, static_or_transcode, stream_route_container,
+};
 use crate::state::AppState;
 
 /// `GET`/`HEAD /Videos/{itemId}/stream` — stream the requested video source.
@@ -35,6 +37,15 @@ async fn get_video_stream(
 ) -> Result<Response, ApiError> {
     let raw = request.uri().query().map(ToOwned::to_owned);
     let req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
+    require_streamable_item(
+        &state,
+        &auth,
+        request.extensions(),
+        request.headers(),
+        item_id,
+        req.media_source_id.as_deref(),
+    )
+    .await?;
     crate::handlers::hls::validate_stream_request(&req)?;
     static_or_transcode(&state, item_id, false, req, request).await
 }
@@ -50,12 +61,19 @@ async fn get_video_stream_by_container(
     let raw = request.uri().query().map(ToOwned::to_owned);
     let mut req = crate::handlers::hls::request_from_query(item_id, query, raw, &auth);
     req.output_container = Some(
-        container
-            .strip_prefix("stream.")
-            .filter(|value| !value.is_empty())
+        stream_route_container(&container)
             .ok_or_else(|| ApiError::NotFound("stream route".to_owned()))?
             .to_owned(),
     );
+    require_streamable_item(
+        &state,
+        &auth,
+        request.extensions(),
+        request.headers(),
+        item_id,
+        req.media_source_id.as_deref(),
+    )
+    .await?;
     crate::handlers::hls::validate_stream_request(&req)?;
     static_or_transcode(&state, item_id, false, req, request).await
 }
@@ -109,10 +127,10 @@ async fn get_additional_parts(
     }
     // `GetItemById<BaseItem>(itemId, user)`: an item the user cannot see is
     // `null`, a `404`.
-    let video = require_visible_item(&state, item_id, user.as_ref()).await?;
+    let video = require_visible_item(&state, item_id, user.as_deref()).await?;
     let parts = state
         .library
-        .get_additional_parts(&video, user.as_ref())
+        .get_additional_parts(&video, user.as_deref())
         .await?;
     if parts.is_empty() {
         return Ok(empty());
@@ -124,7 +142,7 @@ async fn get_additional_parts(
         .get_base_item_dtos(
             &parts,
             &DtoOptions::default(),
-            user.as_ref(),
+            user.as_deref(),
             Some(item_id),
             true,
         )
@@ -167,7 +185,7 @@ async fn merge_versions(
     for id in parse_csv_uuids(Some(&query.ids))? {
         if state
             .library
-            .get_item_by_id_for_user(id, auth.user.as_ref())
+            .get_item_by_id_for_user(id, auth.user.as_deref())
             .await?
             .is_some_and(|item| is_video(&item))
         {
@@ -207,7 +225,7 @@ async fn delete_alternate_sources(
     RequireAdmin(auth): RequireAdmin,
     Path(item_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
-    let item = require_visible_item(&state, item_id, auth.user.as_ref()).await?;
+    let item = require_visible_item(&state, item_id, auth.user.as_deref()).await?;
     if !is_video(&item) {
         return Err(ApiError::NotFound(format!("video {item_id}")));
     }
@@ -240,7 +258,7 @@ async fn get_download(
 ) -> Result<Response, ApiError> {
     let item = state
         .library
-        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .get_item_by_id_for_user(item_id, auth.user.as_deref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     // The controller's CanDownload(user) check follows the policy check.

@@ -48,7 +48,7 @@ use ferrofin_core::{
     FerrofinEventManager, PluginConfigPage, RegisteredPlugin, ScheduledTask, TaskProgress,
 };
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
+use ferrofin_traits::plugins::{PluginDescriptor, PluginManager, PluginOfferedItemStore};
 
 use crate::bindings::HostState;
 use crate::runtime::{EPOCH_TICK, InstanceSpec, RuntimeHandle};
@@ -278,8 +278,9 @@ pub struct LoadedPlugin {
     /// The `.wasm` file the plugin was loaded from, under whatever name it was
     /// dropped in as; uninstalling the plugin deletes it.
     pub artifact: std::path::PathBuf,
-    /// Where the plugin's KV state persists — the analysis driver keeps its
-    /// offer-once watermark there under a host-reserved key.
+    /// Where the plugin's KV state persists. The analysis pass's host-reserved
+    /// keys sit there too: the watermark it kept before recording each offer,
+    /// which it reads once to switch over.
     state_path: std::path::PathBuf,
     /// The plugin's parsed declared-egress policy — the artwork-download
     /// path re-checks it host-side (the guest only names URLs).
@@ -1667,35 +1668,141 @@ async fn plugin_pass_prelude(
     Ok(Some((config, kinds)))
 }
 
-/// The host-reserved KV key holding the analysis driver's offer-once
-/// watermark (unix microseconds of the newest item already offered).
+/// The host-reserved state key under which the analysis pass kept its
+/// offer-once watermark before `FerrofinPluginOfferedItems` (migration 0049):
+/// unix microseconds of the newest DateCreated it had offered. This version
+/// only reads it, to switch over ([`WasmMediaAnalysisTask::switch_from_watermark`]),
+/// and never writes it, so a previous version still running beside this one
+/// (a rolling update) keeps its own place instead of starting from scratch.
 const SCAN_WATERMARK_KEY: &str = "host:scan-watermark";
 
-// Library-disabled items must remain eligible after another library advances the watermark.
+/// The host-reserved state key holding the items the watermark pass had put
+/// aside (their library turned the plugin's segments off, or the plugin's
+/// segment write was refused) to offer again although the watermark had moved
+/// past them. Read only by the switch-over, which leaves them unoffered. Never
+/// removed: a previous version running beside this one still reads it.
 const SEGMENT_POLICY_PENDING_KEY: &str = "host:segment-policy-pending";
 
+/// The host-reserved state key recording the last [`SCAN_WATERMARK_KEY`]
+/// value switched over, so a pass switches each value once: a previous
+/// version running beside this one can still move the watermark on.
+const SWITCHED_WATERMARK_KEY: &str = "host:scan-watermark-switched";
+
 /// Library items the analysis pass loads per page (the upstream
-/// `QueryPageLimit` the library tasks page with).
+/// `QueryPageLimit` the library tasks page with). The items a page offered
+/// are recorded together, once the page is done.
 const ANALYSIS_PAGE_SIZE: usize = 100;
 
 /// The dashboard task driving every analyzer plugin's `scan-media` pass:
-/// for each ENABLED plugin with non-empty `scan-targets`, offers each item
-/// newer than the plugin's watermark once (host-tracked, in the plugin's
-/// own state file under a reserved key, unreadable and unwritable from the
-/// guest), oldest first and a page at a time. An orderly guest error is
-/// logged (aggregated per pass) and never retried; TRAPS — not orderly
-/// errors — count toward the plugin's breaker, like every other guest call.
-/// Once the runtime refuses a call (breaker open, runtime gone), the pass
-/// offers nothing more and the watermark stays below every item it did not
-/// reach; the plugin is skipped until the restart, whose first pass offers
-/// those. That pass can offer again an item sharing the cut-off item's
-/// DateCreated, and every item of a first pass cut short before its undated
-/// items. The task itself never fails on a plugin's behavior.
+/// for each ENABLED plugin with non-empty `scan-targets`, offers each item of
+/// those kinds that the plugin has not been offered yet, oldest first and a
+/// page at a time. The host records each item it offered to each plugin
+/// (`FerrofinPluginOfferedItems`, through the [`PluginOfferedItemStore`]), a
+/// page at a time, and the item query leaves out the recorded ones, so an
+/// item is offered whatever its DateCreated says. The record is the host's,
+/// out of the guest's reach. An item is left unrecorded, and offered on a
+/// later pass, while its library turns the plugin's segments off or when the
+/// plugin's segment write for it was refused (`policy_skipped`). An orderly
+/// guest error is logged (aggregated per pass) and never retried; TRAPS —
+/// not orderly errors — count toward the plugin's breaker, like every other
+/// guest call. Once the runtime refuses a call (breaker open, runtime gone),
+/// the pass offers nothing more; the plugin is skipped until the restart,
+/// whose first pass offers the items this one did not reach. A server that
+/// stops partway through a page offers that page's items again. The task
+/// itself never fails on a plugin's behavior.
 struct WasmMediaAnalysisTask {
     plugins: Vec<Arc<LoadedPlugin>>,
     plugin_manager: Arc<dyn PluginManager>,
     collaborators: Arc<std::sync::OnceLock<capabilities::Collaborators>>,
+    offered_items: Arc<dyn PluginOfferedItemStore>,
     state_total_cap: usize,
+}
+
+impl WasmMediaAnalysisTask {
+    /// The switch from the DateCreated watermark the pass kept before
+    /// `FerrofinPluginOfferedItems`: the items it had offered by that rule
+    /// (those of `kinds` created at or before the watermark, an undated one
+    /// counting as the epoch) are recorded as offered, except the ones it had
+    /// put aside, so the switch offers nothing twice.
+    ///
+    /// A previous version running beside this one (a rolling update) can move
+    /// the watermark on, offering what it reached: the next pass switches
+    /// again, for the items after the watermark it switched last only, so the
+    /// items this version left unrecorded on purpose (their library turns the
+    /// plugin's segments off) stay unrecorded.
+    ///
+    /// `false` when the switch cannot be noted in the plugin's state (full or
+    /// unwritable): the pass then offers the plugin nothing, as an item it left
+    /// unrecorded on purpose would be recorded by the repeat.
+    async fn switch_from_watermark(
+        &self,
+        plugin: &LoadedPlugin,
+        kinds: &[ferrofin_model::data::BaseItemKind],
+    ) -> Result<bool, ServiceError> {
+        let read = |key: &str| -> Option<i64> {
+            capabilities::get_state(Some(&plugin.state_path), key)
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .and_then(|text| text.parse().ok())
+        };
+        let Some(watermark) = read(SCAN_WATERMARK_KEY) else {
+            return Ok(true);
+        };
+        let switched = read(SWITCHED_WATERMARK_KEY);
+        if switched.is_some_and(|last| last >= watermark) {
+            return Ok(true);
+        }
+        // A watermark was a DateCreated in whole microseconds, so "at or
+        // before it" is "before the next microsecond", and "after it" is
+        // "from the next microsecond".
+        let after = |micros: i64| chrono::DateTime::from_timestamp_micros(micros.saturating_add(1));
+        // Nothing switched yet: no lower bound (`Some(None)`); a last value
+        // that is not a time: `None`.
+        let created_from = switched.map_or(Some(None), |last| after(last).map(Some));
+        let (Some(created_before), Some(created_from)) = (after(watermark), created_from) else {
+            warn!(
+                plugin = plugin.descriptor.name,
+                watermark, "the old analysis watermark is not a time; not switched over"
+            );
+            return Ok(true);
+        };
+        let put_aside: Vec<Uuid> =
+            capabilities::get_state(Some(&plugin.state_path), SEGMENT_POLICY_PENDING_KEY)
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+        let recorded = self
+            .offered_items
+            .mark_offered_created_between(
+                plugin.descriptor.id,
+                kinds,
+                created_from,
+                created_before,
+                // Undated items count as the epoch: at or before the first
+                // watermark switched, never after one.
+                switched.is_none() && watermark >= 0,
+                &put_aside,
+            )
+            .await?;
+        info!(
+            plugin = plugin.descriptor.name,
+            recorded,
+            put_aside = put_aside.len(),
+            "analysis offers are now recorded per item: the items up to the old watermark count as offered"
+        );
+        if let Err(error) = capabilities::set_state_capped(
+            Some(&plugin.state_path),
+            SWITCHED_WATERMARK_KEY,
+            Some(watermark.to_string().into_bytes()),
+            self.state_total_cap,
+        ) {
+            warn!(
+                plugin = plugin.descriptor.name,
+                %error,
+                "could not note the analysis watermark switch-over in the plugin's state; the plugin is offered nothing until it can be"
+            );
+            return Ok(false);
+        }
+        Ok(true)
+    }
 }
 
 #[allow(clippy::unnecessary_literal_bound)] // the trait pins `-> &str`
@@ -1714,7 +1821,6 @@ impl ScheduledTask for WasmMediaAnalysisTask {
         "Library"
     }
 
-    #[allow(clippy::too_many_lines)] // one pass per plugin: paging, the refusal stop and the pending items share its state
     async fn execute(&self, _progress: &TaskProgress) -> Result<(), ServiceError> {
         let Some(cx) = self.collaborators.get() else {
             return Err(ServiceError::backend(
@@ -1731,196 +1837,163 @@ impl ScheduledTask for WasmMediaAnalysisTask {
             else {
                 continue;
             };
-            let watermark: i64 =
-                capabilities::get_state(Some(&plugin.state_path), SCAN_WATERMARK_KEY)
-                    .and_then(|b| String::from_utf8(b).ok())
-                    .and_then(|t| t.parse().ok())
-                    .unwrap_or(i64::MIN);
+            if !self.switch_from_watermark(plugin, &kinds).await? {
+                continue;
+            }
             let query = ferrofin_traits::options::InternalItemsQuery {
                 include_item_types: kinds,
-                // Oldest first, so a pass cut short leaves a tight watermark.
+                // The anti-join: only the items not offered to this plugin
+                // yet, so a pass reads what is new, not the whole library.
+                not_offered_to_plugin: Some(plugin.descriptor.id),
                 order_by: vec![(
                     ferrofin_model::live_tv::ItemSortBy::DateCreated,
                     ferrofin_model::dto::SortOrder::Ascending,
                 )],
-                // Push the watermark into the QUERY — materializing the
-                // whole library per pass per plugin would defeat the point.
-                // FIRST pass (no watermark yet) stays UNFILTERED so items
-                // with a NULL DateCreated get their one offer (SQL `>=`
-                // would exclude them forever); afterwards the filter
-                // applies and NULL-dated items sit behind the watermark. A
-                // NULL-dated item added AFTER the first pass is never
-                // offered — the scanner always stamps DateCreated, so that
-                // is a non-case in practice.
-                min_date_created: (watermark > i64::MIN)
-                    .then(|| chrono::DateTime::from_timestamp_micros(watermark))
-                    .flatten(),
                 ..Default::default()
             };
-            // Ids first and rows a page at a time: the first pass covers
-            // every item of the target kinds.
-            let mut ids = cx
+            // Ids first and rows a page at a time.
+            let ids = cx
                 .library
                 .get_item_ids(&query)
                 .await
                 .map_err(|e| ServiceError::backend(format!("analysis item query: {e}")))?;
-            let pending: std::collections::HashSet<Uuid> =
-                capabilities::get_state(Some(&plugin.state_path), SEGMENT_POLICY_PENDING_KEY)
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                    .unwrap_or_default();
-            let mut pending_ids: Vec<Uuid> = pending.iter().copied().collect();
-            pending_ids.sort_unstable();
-            ids.extend(pending_ids);
-            let mut still_pending = std::collections::HashSet::new();
-            let mut seen = std::collections::HashSet::new();
-            let mut new_watermark = watermark;
-            // Set once the runtime refuses a call. The pass then offers
-            // nothing more but still reads the rest of its items, so
-            // `unreached` (the oldest one not offered) holds the watermark
-            // below every one of them.
-            let mut refused: Option<String> = None;
-            let mut unreached = i64::MAX;
-            let mut offered = 0u32;
-            let mut failed = 0u32;
-            let mut first_failure: Option<String> = None;
-            for page_ids in ids.chunks(ANALYSIS_PAGE_SIZE) {
-                let mut page = cx
-                    .library
-                    .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
-                        item_ids: page_ids.to_vec(),
-                        ..Default::default()
-                    })
-                    .await
-                    .map_err(|e| ServiceError::backend(format!("analysis item page: {e}")))?;
-                page.sort_by_key(|entity| entity.date_created);
-                for entity in page {
-                    // NULL-dated items read as epoch: offered on the first
-                    // (unfiltered) pass, then permanently behind the watermark.
-                    let created = entity.date_created.map_or(0, |d| d.timestamp_micros());
-                    let item_id = uuid::Uuid::parse_str(&entity.id)
-                        .map_err(|error| ServiceError::backend(error.to_string()))?;
-                    if !seen.insert(item_id)
-                        || (created <= watermark && !pending.contains(&item_id))
-                    {
-                        continue;
-                    }
-                    if refused.is_none() {
-                        if cx.media_segments.is_registered_segment_provider(&format!(
-                            "wasm:{}",
-                            plugin.descriptor.id
-                        )) && !cx
-                            .media_segments
-                            .is_provider_enabled(item_id, &plugin.descriptor.name)
-                            .await?
-                        {
-                            still_pending.insert(item_id);
-                            new_watermark = new_watermark.max(created);
-                            continue;
-                        }
-                        let item = capabilities::summarize(&entity, None);
-                        match plugin.runtime.scan_media(item, config.clone()).await {
-                            Ok(outcome) => {
-                                if outcome.policy_skipped {
-                                    still_pending.insert(item_id);
-                                }
-                                if let Err(e) = outcome.result {
-                                    // Per-item detail stays at debug (volume
-                                    // scales with library size); one
-                                    // aggregated warn per pass below.
-                                    tracing::debug!(
-                                        plugin = plugin.descriptor.name,
-                                        item = %entity.id,
-                                        error = %e,
-                                        "scan-media failed for one item (offered once; not retried)"
-                                    );
-                                    failed += 1;
-                                    if first_failure.is_none() {
-                                        first_failure = Some(format!("{} -> {e}", entity.id));
-                                    }
-                                }
-                                offered += 1;
-                                new_watermark = new_watermark.max(created);
-                                continue;
-                            }
-                            // The runtime refused the call (breaker open,
-                            // runtime gone): the guest did not analyze it.
-                            Err(error) => refused = Some(error),
-                        }
-                    }
-                    // Not reached this pass: the item stays eligible.
-                    if pending.contains(&item_id) {
-                        still_pending.insert(item_id);
-                    } else {
-                        // Only an unfiltered first pass holds undated items,
-                        // and a date filter would exclude them for good: the
-                        // next pass stays unfiltered.
-                        unreached = unreached.min(
-                            entity
-                                .date_created
-                                .map_or(i64::MIN, |d| d.timestamp_micros()),
-                        );
-                    }
-                }
-            }
-            if let Some(error) = &refused {
-                new_watermark = new_watermark.min(unreached.saturating_sub(1));
+            let outcome = self.offer(cx, plugin, &config, &ids).await?;
+            if let Some(error) = &outcome.refused {
                 warn!(
                     plugin = plugin.descriptor.name,
                     %error,
-                    offered,
+                    offered = outcome.offered,
                     "analysis pass stopped: the plugin runtime refused a call; items not reached are offered after the restart"
                 );
             }
-            if failed > 0 {
+            if outcome.failed > 0 {
                 warn!(
                     plugin = plugin.descriptor.name,
-                    failed,
-                    offered,
-                    first = first_failure.as_deref().unwrap_or(""),
+                    failed = outcome.failed,
+                    offered = outcome.offered,
+                    first = outcome.first_failure.as_deref().unwrap_or(""),
                     "scan-media failures this pass (items offered once; not retried)"
                 );
             }
-            if still_pending != pending {
-                let bytes = if still_pending.is_empty() {
-                    None
-                } else {
-                    let mut pending_ids: Vec<_> = still_pending.into_iter().collect();
-                    pending_ids.sort_unstable();
-                    Some(
-                        serde_json::to_vec(&pending_ids)
-                            .map_err(|error| ServiceError::backend(error.to_string()))?,
-                    )
-                };
-                // Persist deferred identities before the watermark can move past them.
-                if let Err(error) = capabilities::set_state_capped(
-                    Some(&plugin.state_path),
-                    SEGMENT_POLICY_PENDING_KEY,
-                    bytes,
-                    self.state_total_cap,
-                ) {
-                    warn!(plugin=plugin.descriptor.name, %error, "could not persist library-disabled analysis items; watermark retained");
-                    continue;
-                }
-            }
-            if new_watermark > watermark
-                && let Err(e) = capabilities::set_state_capped(
-                    Some(&plugin.state_path),
-                    SCAN_WATERMARK_KEY,
-                    Some(new_watermark.to_string().into_bytes()),
-                    self.state_total_cap,
-                )
-            {
-                warn!(
-                    plugin = plugin.descriptor.name,
-                    error = %e,
-                    "could not persist the analysis watermark; items will re-offer"
-                );
-            }
-            if offered > 0 {
+            if outcome.offered > 0 {
                 info!(
                     plugin = plugin.descriptor.name,
-                    offered, "analysis pass offered new items"
+                    offered = outcome.offered,
+                    "analysis pass offered new items"
                 );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What one plugin's analysis pass did.
+#[derive(Default)]
+struct OfferOutcome {
+    /// Items offered to the guest (its orderly errors included).
+    offered: u32,
+    /// Offers the guest answered with an orderly error.
+    failed: u32,
+    /// The first of those, as `item -> error`.
+    first_failure: Option<String>,
+    /// Why the runtime refused a call, which ended the pass.
+    refused: Option<String>,
+}
+
+impl WasmMediaAnalysisTask {
+    /// Offers `ids` to `plugin` a page at a time and records the ones it
+    /// offered, each page once it is done (or fails partway).
+    async fn offer(
+        &self,
+        cx: &capabilities::Collaborators,
+        plugin: &LoadedPlugin,
+        config: &str,
+        ids: &[Uuid],
+    ) -> Result<OfferOutcome, ServiceError> {
+        let mut outcome = OfferOutcome::default();
+        for page_ids in ids.chunks(ANALYSIS_PAGE_SIZE) {
+            let mut offered = Vec::with_capacity(page_ids.len());
+            let page =
+                Self::offer_page(cx, plugin, config, page_ids, &mut outcome, &mut offered).await;
+            // Recorded even when the page failed partway: those items were
+            // offered.
+            self.offered_items
+                .mark_offered(plugin.descriptor.id, &offered)
+                .await?;
+            page?;
+            if outcome.refused.is_some() {
+                break;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Offers one page of `ids`, oldest first, pushing each item to record
+    /// onto `offered`. Stops at the first call the runtime refuses.
+    async fn offer_page(
+        cx: &capabilities::Collaborators,
+        plugin: &LoadedPlugin,
+        config: &str,
+        page_ids: &[Uuid],
+        outcome: &mut OfferOutcome,
+        offered: &mut Vec<Uuid>,
+    ) -> Result<(), ServiceError> {
+        let mut page = cx
+            .library
+            .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                item_ids: page_ids.to_vec(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| ServiceError::backend(format!("analysis item page: {e}")))?;
+        page.sort_by_key(|entity| entity.date_created);
+        let provider_id = format!("wasm:{}", plugin.descriptor.id);
+        for entity in page {
+            let item_id = Uuid::parse_str(&entity.id)
+                .map_err(|error| ServiceError::backend(error.to_string()))?;
+            // Its library turns this plugin's segments off: not offered, and
+            // not recorded, so a later pass offers it once allowed.
+            if cx
+                .media_segments
+                .is_registered_segment_provider(&provider_id)
+                && !cx
+                    .media_segments
+                    .is_provider_enabled(item_id, &plugin.descriptor.name)
+                    .await?
+            {
+                continue;
+            }
+            let item = capabilities::summarize(&entity, None);
+            match plugin.runtime.scan_media(item, config.to_owned()).await {
+                Ok(answer) => {
+                    // A segment write the host refused leaves the item
+                    // unrecorded, to be offered again.
+                    if !answer.policy_skipped {
+                        offered.push(item_id);
+                    }
+                    if let Err(e) = answer.result {
+                        // Per-item detail stays at debug (volume scales with
+                        // library size); one aggregated warn per pass.
+                        tracing::debug!(
+                            plugin = plugin.descriptor.name,
+                            item = %entity.id,
+                            error = %e,
+                            "scan-media failed for one item (offered once; not retried)"
+                        );
+                        outcome.failed += 1;
+                        if outcome.first_failure.is_none() {
+                            outcome.first_failure = Some(format!("{} -> {e}", entity.id));
+                        }
+                    }
+                    outcome.offered += 1;
+                }
+                // The runtime refused the call (breaker open, runtime gone):
+                // the guest did not analyze it, and nothing after it is
+                // offered. Unrecorded, they are offered after the restart.
+                Err(error) => {
+                    outcome.refused = Some(error);
+                    break;
+                }
             }
         }
         Ok(())
@@ -1942,10 +2015,12 @@ impl WasmPluginHost {
 
     /// The analysis driver task, when any loaded plugin declares
     /// `scan-targets` (`None` otherwise — no task registered, no overhead).
+    /// `offered_items` records which items it offered to which plugin.
     #[must_use]
     pub fn analysis_task(
         &self,
         plugin_manager: &Arc<dyn PluginManager>,
+        offered_items: Arc<dyn PluginOfferedItemStore>,
     ) -> Option<Arc<dyn ScheduledTask>> {
         let analyzers: Vec<Arc<LoadedPlugin>> = self
             .plugins
@@ -1960,6 +2035,7 @@ impl WasmPluginHost {
             plugins: analyzers,
             plugin_manager: Arc::clone(plugin_manager),
             collaborators: Arc::clone(&self.collaborators),
+            offered_items,
             state_total_cap: self.settings.state_limit_mb as usize * 1024 * 1024,
         }))
     }

@@ -2,12 +2,12 @@
 //! page reads the DTO service and the image walk lean on instead of a full row
 //! per item.
 //!
-//! Every lookup binds its ids in `IN (…)` chunks of [`BATCH_BIND_CHUNK`], keys
+//! Every lookup binds its ids in padded `IN (…)` chunks of [`PADDED_LIST_MAX`], keys
 //! its result by the stored (uppercase, hyphenated) GUID, and silently omits
 //! ids that have nothing to report — the caller joins the result back onto its
 //! page, so a missing key must mean "nothing here", never an error.
 
-use ferrofin_db::{BATCH_BIND_CHUNK, Database, ImageParentRow, PLACEHOLDER_ITEM_ID};
+use ferrofin_db::{Database, ImageParentRow, PADDED_LIST_MAX, PLACEHOLDER_ITEM_ID};
 
 /// A migrated in-memory database.
 async fn db() -> Database {
@@ -88,11 +88,10 @@ async fn provider_ids_come_back_per_item_and_skip_items_without_any() {
     );
 
     // An empty id list is a no-op, not a malformed `IN ()`.
+    let provider_ids_for_items = db.provider_ids_for_items(&[]).await.expect("empty lookup");
     assert!(
-        db.provider_ids_for_items(&[])
-            .await
-            .expect("empty lookup")
-            .is_empty()
+        provider_ids_for_items.is_empty(),
+        "{provider_ids_for_items:?}"
     );
 }
 
@@ -102,14 +101,11 @@ async fn provider_ids_come_back_per_item_and_skip_items_without_any() {
 async fn a_page_wider_than_one_bind_chunk_is_read_in_full() {
     let db = db().await;
     // One past the chunk (after the seeded placeholder id drops out).
-    let ids: Vec<String> = (0..=u16::try_from(BATCH_BIND_CHUNK + 1).expect("small chunk"))
+    let ids: Vec<String> = (0..=u16::try_from(PADDED_LIST_MAX + 1).expect("small chunk"))
         .map(|n| format!("00000000-0000-0000-0000-00000000{n:04X}"))
         .filter(|id| id != PLACEHOLDER_ITEM_ID)
         .collect();
-    assert!(
-        ids.len() > BATCH_BIND_CHUNK,
-        "the page must span two chunks"
-    );
+    assert!(ids.len() > PADDED_LIST_MAX, "the page must span two chunks");
 
     let mut tx = db.writer().begin().await.expect("begin");
     for id in &ids {
@@ -183,10 +179,18 @@ async fn alternate_version_counts_group_by_primary_and_ignore_the_placeholder() 
     set_text(&db, PLACEHOLDER_ITEM_ID, "PrimaryVersionId", Some(&primary)).await;
 
     let counts = db
-        .alternate_version_counts(&[primary.clone(), lonely])
+        .alternate_version_counts(&[primary.clone(), lonely.clone()])
         .await
         .expect("counts");
-    assert_eq!(counts, vec![(primary, 2)]);
+    assert_eq!(counts, vec![(primary.clone(), 2)]);
+
+    // Three ids pad to four by repeating the last, the primary: its two
+    // alternates still count once each (gl-1243).
+    let padded = db
+        .alternate_version_counts(&[lonely, guid(0x34), primary.clone()])
+        .await
+        .expect("padded counts");
+    assert_eq!(padded, vec![(primary, 2)]);
 }
 
 #[tokio::test]
@@ -279,12 +283,11 @@ async fn rows_of_type_match_the_stored_type_exactly() {
             Some(r#"{"PhysicalLocationsList":["/media/movies"]}"#.to_owned()),
         )]
     );
-    assert!(
-        db.rows_of_type("MediaBrowser.Controller.Entities.Nothing")
-            .await
-            .expect("unknown type")
-            .is_empty()
-    );
+    let rows_of_type = db
+        .rows_of_type("MediaBrowser.Controller.Entities.Nothing")
+        .await
+        .expect("unknown type");
+    assert!(rows_of_type.is_empty(), "{rows_of_type:?}");
 }
 
 #[tokio::test]

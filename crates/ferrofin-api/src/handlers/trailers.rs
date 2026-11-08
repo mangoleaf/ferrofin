@@ -12,6 +12,8 @@
 //! including 12.1's `audioLanguages` / `subtitleLanguages` stream filters and
 //! the media-stream rules `GetItems` applies to them.
 
+use std::sync::Arc;
+
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -134,11 +136,11 @@ fn parse_order_by(sort_by: Option<&str>, sort_order: Option<&str>) -> Vec<(ItemS
 /// `Trailer` kind, applying `GetItems`' controller rules in upstream order.
 ///
 /// The user row moves into the query and is borrowed back out for the DTO
-/// projection — `resolve_user` already cloned it off the auth context, and a
-/// second full copy of every string on it buys nothing.
+/// projection — it is the auth context's shared row (`resolve_user`), and
+/// the query holds the same handle rather than a copy.
 fn trailers_query_options(
     query: &TrailersQuery,
-    user: UserEntity,
+    user: Arc<UserEntity>,
 ) -> Result<InternalItemsQuery, ApiError> {
     let mut internal = InternalItemsQuery {
         user: Some(user),
@@ -199,7 +201,17 @@ async fn get_trailers(
     Query(query): Query<TrailersQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let internal = trailers_query_options(&query, user)?;
+    let mut internal = trailers_query_options(&query, user)?;
+    crate::handlers::items::require_scope_id_visible(
+        &state,
+        &auth,
+        Some(internal.parent_id),
+        internal.user.as_deref(),
+    )
+    .await?;
+    if !crate::handlers::items::retain_visible_ids(&state, &auth, &mut internal).await? {
+        return Ok(Json(crate::handlers::items::empty_page(&internal)));
+    }
 
     let mut result = state.library.query_items(&internal).await?;
     // `GetItems` answers explicit ids through `Folder.GetItems`.
@@ -207,7 +219,13 @@ async fn get_trailers(
     let options = DtoOptions::with_all_fields(false);
     let dtos = state
         .dto
-        .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
+        .get_base_item_dtos(
+            &result.items,
+            &options,
+            internal.user.as_deref(),
+            None,
+            true,
+        )
         .await?;
     Ok(Json(QueryResult::new(
         Some(result.start_index),
@@ -254,7 +272,8 @@ mod tests {
                 &format!("/Trailers?{q}").parse().expect("uri"),
             )
             .expect(q);
-            trailers_query_options(&query, crate::test_support::sample_user()).expect("maps")
+            trailers_query_options(&query, Arc::new(crate::test_support::sample_user()))
+                .expect("maps")
         };
         let internal = bind("audioLanguages=eng,ger&audioLanguages=fre&subtitleLanguages=spa");
         assert_eq!(internal.include_item_types, [BaseItemKind::Trailer]);
@@ -263,8 +282,16 @@ mod tests {
         assert!(internal.include_owned_items);
 
         let internal = bind("recursive=true");
-        assert!(internal.audio_languages.is_empty());
-        assert!(internal.subtitle_languages.is_empty());
+        assert!(
+            internal.audio_languages.is_empty(),
+            "{:?}",
+            internal.audio_languages
+        );
+        assert!(
+            internal.subtitle_languages.is_empty(),
+            "{:?}",
+            internal.subtitle_languages
+        );
         assert!(!internal.include_owned_items);
     }
 
@@ -280,7 +307,7 @@ mod tests {
                 &format!("/Trailers?{q}").parse().expect("uri"),
             )
             .expect(q);
-            trailers_query_options(&query, crate::test_support::sample_user())
+            trailers_query_options(&query, Arc::new(crate::test_support::sample_user()))
                 .expect("maps")
                 .order_by
         };

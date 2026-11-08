@@ -123,10 +123,13 @@ Open `http://host:8096/web`.
 ### Migrate an existing Jellyfin installation
 
 Ferrofin supports database adoption from **Jellyfin 10.11.8, 10.11.9, 10.11.10, 10.11.11,
-12.0.0, 12.1.0 and 12.2.0**. The 10.11–12.1 releases passed the live adoption suite on
-2026-09-16; the 12.2 paths passed synthetic tests on 2026-10-13. The
+12.0.0, 12.1.0, 12.2.0, 12.3.0 and 12.4.0**. The 10.11–12.1 releases passed the live adoption
+suite on 2026-09-16; the three 12.2 upgrade paths passed it on synthetic fixtures on 2026-10-17
+(the fresh 12.2 install on 2026-10-21). A 12.3 or 12.4 database records 12.2's migration set and
+adopts as that generation; the 12.3 and 12.4 paths passed the live suite on synthetic fixtures on
+2026-10-29. The
 [support matrix and test record](../gates/adoption/README.md#supported-and-tested-versions)
-identify the nine tested fixture paths and the server images used.
+identify the tested fixture paths and the server images used.
 
 The gate checks the exact migration history and refuses unknown or incomplete histories;
 support does not extend automatically to other 10.11.x or 12.x releases. Upgrade an older
@@ -149,13 +152,16 @@ holds the database, playlists and collections:
 | `/var/lib/jellyfin/root/default/` | `{data_dir}/root/default/` | library definitions |
 | `/var/lib/jellyfin/metadata/` | `{data_dir}/metadata/` | images and downloaded metadata |
 | `/etc/jellyfin/` | `{config_dir}/` | XML configuration |
+| `/var/lib/jellyfin/plugins/configurations/LDAP-Auth.xml` | `{data_dir}/plugins/configurations/` | LDAP-Auth's settings, if Jellyfin used it |
 
 The script reads `data_dir` and `config_dir` from `/etc/ferrofin/config.toml`. The package
 sets only `data_dir`, so `config_dir` is `{data_dir}/config`; `/etc/ferrofin` keeps just
 `config.toml` and stays read-only to the service.
 
 The rest of Jellyfin's `data/` (subtitle and attachment extraction caches, backups, task
-history) is not copied, nor are `plugins/` and `Subtitle Edit/`. `root/default/` holds
+history) is not copied, nor are `plugins/` and `Subtitle Edit/`, except
+`plugins/configurations/LDAP-Auth.xml`, the LDAP-Auth plugin's settings, which Ferrofin's
+LDAP-Auth imports on the first start. `root/default/` holds
 only the library definitions (`.mblink` files naming each media path); media stays where
 it is.
 
@@ -199,6 +205,11 @@ scanning. If Jellyfin used a custom metadata directory, copy its contents into t
 Machine-specific encoder, cache, and certificate paths are also not automatically carried
 over; configure those for this host, including HTTPS if your deployment requires it.
 
+The database still names `/var/lib/jellyfin` and `/etc/jellyfin` for the library folders,
+artwork and profile images. The first start points each of those paths at the copy under
+Ferrofin's directories, but only where the copy exists; a path whose file is missing keeps
+its old value. So copy everything before that start.
+
 ```sh
 sudo systemctl enable --now ferrofin
 journalctl -u ferrofin -f
@@ -208,6 +219,11 @@ Verify the following before resuming normal use:
 
 - The journal reports database adoption and the `jellyfin.db.pre-ferrofin` backup beside
   the adopted database. Investigate any configuration-import warnings.
+- The journal reports "rewrote stored paths under a previous program-data directory", after
+  a snapshot (`jellyfin.db.pre-program-data-move`). That copy holds the database just before
+  the rewrite, already adopted and migrated, so it is not a way back to Jellyfin:
+  `jellyfin.db.pre-ferrofin` is.
+  Moving Ferrofin's own data directory later is handled the same way.
 - Your existing users can log in, and watch history, libraries, library settings, and
   artwork are present. Library `options.xml` files are imported into `options.json`.
 - The server keeps Jellyfin's identity: `/System/Info/Public` reports the same `Id` as

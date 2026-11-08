@@ -15,6 +15,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{
     AttachmentExtractor, ExtractedAttachment, MediaEncoder, MediaInfoRequest,
 };
+use ferrofin_util::source_url::redact_urls_in;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
@@ -310,7 +311,8 @@ where
         failed = failed || missing.iter().any(|path| !self.io.file_exists(path));
         if failed {
             return Err(ServiceError::backend(format!(
-                "ffmpeg attachment extraction failed for {input_path} to {folder}"
+                "ffmpeg attachment extraction failed for {} to {folder}",
+                redact_urls_in(&input_path)
             )));
         }
         Ok(())
@@ -351,7 +353,8 @@ where
 
         if exit_code != 0 && (has_av || exit_code != 1) {
             return Err(ServiceError::backend(format!(
-                "ffmpeg attachment extraction failed for {input_path} to {folder}"
+                "ffmpeg attachment extraction failed for {} to {folder}",
+                redact_urls_in(input_path)
             )));
         }
         Ok(())
@@ -454,7 +457,8 @@ where
             failed = failed || !self.io.file_exists(&attachment_path);
             if failed {
                 return Err(ServiceError::backend(format!(
-                    "ffmpeg attachment extraction failed for {input_path} to {attachment_path}"
+                    "ffmpeg attachment extraction failed for {} to {attachment_path}",
+                    redact_urls_in(&input_path)
                 )));
             }
         }
@@ -937,7 +941,8 @@ mod tests {
         assert_eq!(ex_io.working_dir.lock().unwrap().as_deref(), Some("/cache"));
         // The media names the batch dump's files, so a cancelled run has none
         // it could delete.
-        assert!(ex_io.outputs().is_empty());
+        let outputs = ex_io.outputs();
+        assert!(outputs.is_empty(), "{outputs:?}");
     }
 
     /// The batch dump used to collapse every run of whitespace in the whole
@@ -1207,5 +1212,46 @@ mod tests {
                 .unwrap()
                 .starts_with("-dump_attachment:3 \"/cache/3\" -i ")
         );
+    }
+
+    /// A failed extraction names a remote source by its scheme and host:
+    /// `ApiError` logs the error, and a `.strm` target can carry an account
+    /// (gl-1121). Per attachment, batch and single.
+    #[tokio::test]
+    async fn a_failed_extraction_names_a_remote_source_by_its_host() {
+        const URL: &str = "http://acct-user:info-secret@origin.example/live/path-secret/1.ts?password=query-secret";
+        let remote = |mut source: MediaSourceInfo| {
+            source.path = Some(URL.to_owned());
+            source.protocol = MediaProtocol::Http;
+            source
+                .media_streams
+                .push(ferrofin_model::entities_media::MediaStream {
+                    stream_type: ferrofin_model::entities::MediaStreamType::Video,
+                    ..ferrofin_model::entities_media::MediaStream::default()
+                });
+            source
+        };
+        let mut errors = Vec::new();
+        for name in ["../a.ttf", "font.ttf"] {
+            let source = remote(source_with(vec![attachment(3, Some(name))]));
+            let ex = extractor(Some(source.clone()), FakeIo::new(Some("/cache"), 1));
+            errors.push(ex.extract_all_attachments(URL, &source).await.unwrap_err());
+        }
+        let ex = extractor(
+            Some(remote(source_with_attachment())),
+            FakeIo::new(Some("/cache"), 1),
+        );
+        errors.push(
+            ex.get_attachment(Uuid::nil(), "0f2c8d1e-1111-2222-3333-444455556666", 3)
+                .await
+                .unwrap_err(),
+        );
+        for error in errors {
+            let text = error.to_string();
+            assert!(text.contains("http://origin.example"), "{text}");
+            for secret in ["acct-user", "info-secret", "path-secret", "query-secret"] {
+                assert!(!text.contains(secret), "{secret} shown in: {text}");
+            }
+        }
     }
 }

@@ -8,6 +8,8 @@
 //! each source's play method against them; the `GET` form returns the static
 //! sources, matching Jellyfin's two actions.
 
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
@@ -173,7 +175,7 @@ struct PlaybackRequest {
     /// The requested user (before the administrator gate).
     user_id: Option<Uuid>,
     /// The client's device profile; [`None`] keeps the static sources.
-    profile: Option<DeviceProfile>,
+    profile: Option<Arc<DeviceProfile>>,
     /// The client's maximum streaming bitrate.
     max_streaming_bitrate: Option<i32>,
     /// The media source (version) the client asked for.
@@ -368,7 +370,7 @@ async fn playback_info(
     request: PlaybackRequest,
 ) -> Result<PlaybackInfoResponse, ApiError> {
     let user = resolve_user_opt(state, auth, request.user_id).await?;
-    let item = require_visible_item(state, item_id, user.as_ref()).await?;
+    let item = require_visible_item(state, item_id, user.as_deref()).await?;
     let resolved_user_id = match &user {
         Some(user) => user_uuid(user)?,
         None => effective_user_id(state, auth, request.user_id).await?,
@@ -376,7 +378,7 @@ async fn playback_info(
     let mut media_sources = resolve_playback_media_sources(
         state,
         &item,
-        user.as_ref(),
+        user.as_deref(),
         resolved_user_id,
         request.media_source_id.as_deref(),
         request.live_stream_id.as_deref(),
@@ -423,7 +425,7 @@ async fn playback_info(
         let decisions = set_device_specific_data(
             state,
             auth,
-            user.as_ref(),
+            user.as_deref(),
             resolved_user_id,
             item_id,
             item.media_type.as_deref(),
@@ -442,7 +444,7 @@ async fn playback_info(
             decisions
                 .into_iter()
                 .find(|(id, _)| *id == first.id)
-                .map(|(_, decision)| (decision, first.clone()))
+                .map(|(_, decision)| (decision, first))
         });
         if let (Some((decision, source)), Some(metrics)) =
             (first_decision, state.playback_metrics.as_ref())
@@ -495,7 +497,7 @@ async fn playback_info(
                     .always_burn_in_subtitle_when_transcoding,
                 // Upstream passes the posted profile and `OpenMediaSource` falls
                 // back to the device's; this is that profile already resolved.
-                device_profile: request.profile.clone(),
+                device_profile: request.profile.as_deref().cloned(),
                 direct_play_protocols: vec![ferrofin_model::media_info::MediaProtocol::Http],
             };
             // The same open as `POST /LiveStreams/Open` (`OpenMediaSource`).
@@ -536,7 +538,7 @@ async fn open_media_source(
             .device_profile;
         stored.as_ref()
     };
-    if let Some(profile) = profile {
+    if let Some(shared) = profile.cloned().map(Arc::new) {
         let item = state
             .library
             .get_item_by_id(request.item_id)
@@ -566,12 +568,12 @@ async fn open_media_source(
         set_device_specific_data(
             state,
             auth,
-            user.as_ref(),
+            user.as_deref(),
             request.user_id,
             request.item_id,
             item.media_type.as_deref(),
             std::slice::from_mut(&mut source),
-            profile,
+            &shared,
             &negotiation,
             request.play_session_id.as_deref().unwrap_or_default(),
         )
@@ -596,8 +598,9 @@ async fn open_media_source(
 
 /// `MediaInfoHelper.SetDeviceSpecificData` over every source of an item: the
 /// user's policy and bitrate limit, then one [`apply_stream_decision`] each,
-/// with the track picks applied only to the version `request` names. Returns
-/// each decided source's id with its decision.
+/// with the track picks applied only to the version `request` names, and the
+/// source's attachment URLs ([`set_attachment_delivery_urls`]). Returns each
+/// decided source's id with its decision.
 #[allow(clippy::too_many_arguments)] // mirrors the C# parameter surface
 async fn set_device_specific_data(
     state: &AppState,
@@ -607,7 +610,7 @@ async fn set_device_specific_data(
     item_id: Uuid,
     media_type: Option<&str>,
     media_sources: &mut [MediaSourceInfo],
-    profile: &DeviceProfile,
+    profile: &Arc<DeviceProfile>,
     request: &PlaybackRequest,
     play_session_id: &str,
 ) -> Result<Vec<(Option<String>, StreamDecision)>, ApiError> {
@@ -661,8 +664,24 @@ async fn set_device_specific_data(
         if let Some(decision) = decision {
             decisions.push((source.id.clone(), decision));
         }
+        set_attachment_delivery_urls(source, item_id);
     }
     Ok(decisions)
+}
+
+/// The tail of `SetDeviceSpecificData`: every attachment of a negotiated
+/// source is served at `/Videos/{item.Id}/{mediaSource.Id}/Attachments/{Index}`
+/// (`MediaInfoHelper.cs:350-358`), the item id in .NET's default `Guid`
+/// spelling. jellyfin-web hands each font's URL to its subtitle renderer.
+fn set_attachment_delivery_urls(source: &mut MediaSourceInfo, item_id: Uuid) {
+    let source_id = source.id.as_deref().unwrap_or_default();
+    for attachment in &mut source.media_attachments {
+        attachment.delivery_url = Some(format!(
+            "/Videos/{}/{source_id}/Attachments/{}",
+            item_id.as_hyphenated(),
+            attachment.index
+        ));
+    }
 }
 
 /// The media source `UniversalAudioController.GetUniversalAudioStream` acts
@@ -689,14 +708,14 @@ pub(crate) async fn universal_audio_source(
     item_id: Uuid,
     user_id: Option<Uuid>,
     media_source_id: Option<&str>,
-    profile: &DeviceProfile,
+    profile: &Arc<DeviceProfile>,
     max_streaming_bitrate: Option<i32>,
     max_audio_channels: Option<i32>,
     transcoding_container: Option<&str>,
     transcoding_protocol: Option<MediaStreamProtocol>,
 ) -> Result<Option<UniversalAudioSource>, ApiError> {
     let user = resolve_user_opt(state, auth, user_id).await?;
-    let item = require_visible_item(state, item_id, user.as_ref()).await?;
+    let item = require_visible_item(state, item_id, user.as_deref()).await?;
     let resolved_user_id = match &user {
         Some(user) => user_uuid(user)?,
         None => effective_user_id(state, auth, user_id).await?,
@@ -704,7 +723,7 @@ pub(crate) async fn universal_audio_source(
     // Every version (the universal route takes no live stream id), narrowed
     // below rather than by the helper's exact match.
     let mut media_sources =
-        resolve_playback_media_sources(state, &item, user.as_ref(), resolved_user_id, None, None)
+        resolve_playback_media_sources(state, &item, user.as_deref(), resolved_user_id, None, None)
             .await?;
     // The version is matched in either GUID spelling, as the static stream
     // routes match it (`MediaSourceInfo::id_matches`): the universal URL's
@@ -736,7 +755,7 @@ pub(crate) async fn universal_audio_source(
     set_device_specific_data(
         state,
         auth,
-        user.as_ref(),
+        user.as_deref(),
         resolved_user_id,
         item_id,
         item.media_type.as_deref(),
@@ -747,6 +766,9 @@ pub(crate) async fn universal_audio_source(
     )
     .await?;
     sort_media_sources(&mut media_sources, max_streaming_bitrate, item_id);
+    // The response is a redirect to a remote source's `Path` when it may be
+    // direct played, so a tuner's never gets that far for a non-administrator.
+    hide_live_source_urls(state, auth, &mut media_sources).await?;
     Ok(media_sources
         .into_iter()
         .next()
@@ -915,7 +937,7 @@ fn optimal_stream(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // mirrors SetDeviceSpecificData
 fn apply_stream_decision(
     source: &mut MediaSourceInfo,
-    profile: &DeviceProfile,
+    profile: &Arc<DeviceProfile>,
     item_id: Uuid,
     max_streaming_bitrate: Option<i32>,
     token: Option<&str>,
@@ -950,7 +972,7 @@ fn apply_stream_decision(
     if !is_audio {
         source.supports_direct_stream &= policy.enable_playback_remuxing;
     }
-    let mut options = MediaOptions::new(profile.clone());
+    let mut options = MediaOptions::new(Arc::clone(profile));
     options.item_id = item_id;
     options.media_source_id.clone_from(&source.id);
     options.device_id = device_id.map(str::to_owned);
@@ -977,9 +999,15 @@ fn apply_stream_decision(
     options.max_audio_channels = stream_selection.max_audio_channels;
     options.always_burn_in_subtitle_when_transcoding =
         stream_selection.always_burn_in_subtitle_when_transcoding;
-    options.media_sources = vec![source.clone()];
+    // Lent to the builder, which only reads it (it works on its own copy), and
+    // taken back before anything below writes to `source`.
+    options.media_sources = vec![std::mem::take(source)];
+    let negotiated = optimal_stream(support, &options, is_audio);
+    if let Some(lent) = options.media_sources.pop() {
+        *source = lent;
+    }
 
-    let Some(mut stream) = optimal_stream(support, &options, is_audio)? else {
+    let Some(mut stream) = negotiated? else {
         return Ok(None);
     };
     stream.start_position_ticks = stream_selection.start_time_ticks.unwrap_or(0);
@@ -1212,9 +1240,9 @@ async fn get_playback_info(
         ..PlaybackRequest::default()
     };
     let client = super::system::context_from_parts(&state, &parts);
-    Ok(Json(
-        playback_info(&state, &auth, &client, item_id, request).await?,
-    ))
+    let mut response = playback_info(&state, &auth, &client, item_id, request).await?;
+    hide_live_source_urls(&state, &auth, &mut response.media_sources).await?;
+    Ok(Json(response))
 }
 
 /// The `POST /Items/{itemId}/PlaybackInfo` body — the client's device profile,
@@ -1331,13 +1359,16 @@ async fn post_playback_info(
     };
     let request = PlaybackRequest {
         user_id: query.user_id.or(body.user_id),
-        profile,
+        profile: profile.map(Arc::new),
         max_streaming_bitrate: query.max_streaming_bitrate.or(body.max_streaming_bitrate),
         media_source_id: query
             .media_source_id
             .clone()
-            .or(body.media_source_id.take()),
-        live_stream_id: query.live_stream_id.clone().or(body.live_stream_id.take()),
+            .or_else(|| body.media_source_id.take()),
+        live_stream_id: query
+            .live_stream_id
+            .clone()
+            .or_else(|| body.live_stream_id.take()),
         auto_open_live_stream: query
             .auto_open_live_stream
             .or(body.auto_open_live_stream)
@@ -1355,9 +1386,9 @@ async fn post_playback_info(
         flags: flags_from(&query, Some(&body)),
     };
     let client = super::system::context_from_parts(&state, &parts);
-    Ok(Json(
-        playback_info(&state, &auth, &client, item_id, request).await?,
-    ))
+    let mut response = playback_info(&state, &auth, &client, item_id, request).await?;
+    hide_live_source_urls(&state, &auth, &mut response.media_sources).await?;
+    Ok(Json(response))
 }
 
 /// Query parameters for `POST /LiveStreams/Open`.
@@ -1494,8 +1525,46 @@ async fn open_live_stream(
     let effective = effective_user_id(&state, &auth, query.user_id.or(dto.user_id)).await?;
     let request = live_stream_request(query, dto, effective);
     let client = super::system::context_from_parts(&state, &parts);
-    let media_source = open_media_source(&state, &auth, &client, &request).await?;
+    let mut media_source = open_media_source(&state, &auth, &client, &request).await?;
+    hide_live_source_urls(&state, &auth, std::slice::from_mut(&mut media_source)).await?;
     Ok(Json(LiveStreamResponse::new(media_source)))
+}
+
+/// Takes, from a caller who is not an administrator, the `Path` of every
+/// HTTP M3U tuner source and its direct play, opened or not
+/// ([`path_is_private`](MediaSourceInfo::path_is_private)). The client streams
+/// through `/Videos/{id}/stream`, which the server relays from the source it
+/// holds, or through the source's `TranscodingUrl`.
+///
+/// That `Path` is the tuner's upstream channel URL, and an IPTV service's
+/// usually carries the account's user name and password
+/// (`http://host/live/USER/PASS/1.ts`). Upstream hands it to every user with
+/// Live TV access; this diverges on purpose, as the `livetv` configuration
+/// blanking does. An opened source is treated alike: a stream that is not
+/// shared keeps the tuner URL. Direct play goes with the `Path` because
+/// jellyfin-web plays `Path` as it stands while `SupportsDirectPlay` is set,
+/// and a source that could be direct played stays direct streamable, or it
+/// would have no way left to play.
+///
+/// An administrator keeps both, and so does an API key
+/// ([`is_administrator_identity`](crate::auth::is_administrator_identity)).
+/// Only the response changes: the source the server reads keeps its URL.
+async fn hide_live_source_urls(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    sources: &mut [MediaSourceInfo],
+) -> Result<(), ApiError> {
+    if !sources.iter().any(|source| source.path_is_private)
+        || crate::auth::is_administrator_identity(state, auth).await?
+    {
+        return Ok(());
+    }
+    for source in sources.iter_mut().filter(|source| source.path_is_private) {
+        source.path = Some(String::new());
+        source.supports_direct_stream |= source.supports_direct_play;
+        source.supports_direct_play = false;
+    }
+    Ok(())
 }
 
 /// Folds the query and the posted body into one [`LiveStreamRequest`].
@@ -1709,7 +1778,7 @@ mod published_live_stream_path_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::FerrofinTranscoderSupport;
+    use super::{Arc, FerrofinTranscoderSupport};
     use ferrofin_model::data::MediaStreamProtocol;
     use ferrofin_model::dlna::{
         DeviceProfile, DlnaProfileType, TranscoderSupport, TranscodingProfile,
@@ -1868,11 +1937,48 @@ mod tests {
         }
     }
 
+    /// A source the builder has nothing to offer for keeps everything it came
+    /// with, the vetoes aside: the negotiation only reads it.
+    #[test]
+    fn a_source_the_builder_declines_comes_back_whole() {
+        let policy = ferrofin_model::users::UserPolicy {
+            enable_audio_playback_transcoding: true,
+            ..ferrofin_model::users::UserPolicy::default()
+        };
+        let mut source = MediaSourceInfo {
+            id: Some("version".to_owned()),
+            container: Some("flac".to_owned()),
+            supports_direct_play: true,
+            supports_transcoding: true,
+            ..MediaSourceInfo::default()
+        };
+        let decision = super::apply_stream_decision(
+            &mut source,
+            &Arc::new(DeviceProfile::default()),
+            uuid::Uuid::from_u128(1),
+            None,
+            None,
+            None,
+            super::StreamSelection::default(),
+            "session",
+            super::PlaybackFlags::default(),
+            &policy,
+            true,
+            &support(),
+        )
+        .expect("a profile the builder can evaluate");
+        assert!(decision.is_none());
+        assert_eq!(source.id.as_deref(), Some("version"));
+        assert_eq!(source.container.as_deref(), Some("flac"));
+        assert!(source.supports_direct_play);
+        assert!(source.supports_transcoding);
+    }
+
     #[test]
     fn transcode_carries_the_start_position_burn_in_and_channel_limit() {
         use ferrofin_model::dlna::DirectPlayProfile;
         // AC3 6ch is outside the profile, so the source is transcoded.
-        let profile = DeviceProfile {
+        let profile = Arc::new(DeviceProfile {
             direct_play_profiles: vec![DirectPlayProfile {
                 container: "mp4".to_owned(),
                 video_codec: Some("h264".to_owned()),
@@ -1888,7 +1994,7 @@ mod tests {
                 ..TranscodingProfile::default()
             }],
             ..DeviceProfile::default()
-        };
+        });
         let policy = ferrofin_model::users::UserPolicy {
             enable_audio_playback_transcoding: true,
             enable_video_playback_transcoding: true,
@@ -1988,7 +2094,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // one source/profile fixture and policy matrix
     fn remote_source_forcing_is_live_scoped_and_preserves_policy_vetoes() {
         use ferrofin_model::dlna::DirectPlayProfile;
-        let profile = DeviceProfile {
+        let profile = Arc::new(DeviceProfile {
             direct_play_profiles: vec![DirectPlayProfile {
                 container: "mp4".to_owned(),
                 video_codec: Some("h264".to_owned()),
@@ -2004,7 +2110,7 @@ mod tests {
                 ..TranscodingProfile::default()
             }],
             ..DeviceProfile::default()
-        };
+        });
         for is_remote in [false, true] {
             for force in [false, true, false] {
                 for direct in [false, true] {
@@ -2128,7 +2234,7 @@ mod tests {
                         ..MediaStream::default()
                     });
                 }
-                let profile = DeviceProfile {
+                let profile = Arc::new(DeviceProfile {
                     transcoding_profiles: vec![TranscodingProfile {
                         container: "ts".to_owned(),
                         video_codec: "h264".to_owned(),
@@ -2142,7 +2248,7 @@ mod tests {
                         ..TranscodingProfile::default()
                     }],
                     ..DeviceProfile::default()
-                };
+                });
                 for client_allows in [false, true] {
                     let mut source = MediaSourceInfo {
                         media_streams: streams.clone(),
@@ -2242,7 +2348,7 @@ mod tests {
             ],
             ..MediaSourceInfo::default()
         };
-        let profile = DeviceProfile {
+        let profile = Arc::new(DeviceProfile {
             direct_play_profiles: vec![DirectPlayProfile {
                 container: "mkv".to_owned(),
                 video_codec: Some("h264".to_owned()),
@@ -2273,7 +2379,7 @@ mod tests {
                 },
             ],
             ..DeviceProfile::default()
-        };
+        });
         // DirectPlay vetoed so the builder negotiates the transcode.
         let flags = super::PlaybackFlags {
             enable_direct_play: false,
@@ -2363,7 +2469,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // one profile fixture and its scenarios
     fn music_is_negotiated_by_the_audio_builder_not_the_video_one() {
         use ferrofin_model::dlna::{DirectPlayProfile, TranscodingProfile};
-        let profile = DeviceProfile {
+        let profile = Arc::new(DeviceProfile {
             direct_play_profiles: vec![DirectPlayProfile {
                 container: "mp3".to_owned(),
                 audio_codec: Some("mp3".to_owned()),
@@ -2379,7 +2485,7 @@ mod tests {
                 ..TranscodingProfile::default()
             }],
             ..DeviceProfile::default()
-        };
+        });
         let track = |container: &str, codec: &str, cover_art: bool| {
             let mut streams = vec![MediaStream {
                 stream_type: MediaStreamType::Audio,
@@ -2507,7 +2613,7 @@ mod tests {
         #[case] audio_codec: Option<&str>,
     ) {
         use ferrofin_model::dlna::{DirectPlayProfile, EncodingContext};
-        let profile = DeviceProfile {
+        let profile = Arc::new(DeviceProfile {
             direct_play_profiles: vec![DirectPlayProfile {
                 container: "mp3".to_owned(),
                 audio_codec: Some("mp3".to_owned()),
@@ -2523,7 +2629,7 @@ mod tests {
                 ..TranscodingProfile::default()
             }],
             ..DeviceProfile::default()
-        };
+        });
         let mut source = MediaSourceInfo {
             id: Some("0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a".to_owned()),
             container: Some("mkv".to_owned()),

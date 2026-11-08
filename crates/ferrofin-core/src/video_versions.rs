@@ -620,6 +620,34 @@ impl VersionRows {
         order_media_sources(&mut sources, row_id(queried));
         sources
     }
+
+    /// The ids of the media sources `queried` lists that are not remote, in
+    /// the order [`Self::media_sources`] lists them: the sources
+    /// `TrickplayManager.GetTrickplayManifest` (`TrickplayManager.cs:741-758`)
+    /// reads trickplay rows for, over `GetMediaSources(false)` and skipping
+    /// `IsRemote` (a video `.strm` naming a remote target). As upstream's,
+    /// the group is not filtered by what a user may see.
+    #[must_use]
+    pub fn local_media_source_ids(&self, queried: &BaseItemEntity) -> Vec<Uuid> {
+        let own = row_id(queried);
+        let mut sources: Vec<(Uuid, (bool, bool, bool))> = self
+            .items_for_media_sources(queried)
+            .into_iter()
+            .filter(|(row, _)| !crate::media_source_manager::is_remote_shortcut(row))
+            .map(|(row, _)| {
+                let id = row_id(row);
+                let format = crate::media_source_manager::source_video_format(row);
+                let key = source_order(
+                    id == own,
+                    format.map(|f| f.video_type),
+                    format.is_some_and(|f| f.video3d_format.is_some()),
+                );
+                (id, key)
+            })
+            .collect();
+        sources.sort_by_key(|(_, key)| *key);
+        sources.into_iter().map(|(id, _)| id).collect()
+    }
 }
 
 /// Puts the version the user is part-way through first — port of
@@ -758,15 +786,21 @@ pub fn resume_user_data<'a>(
 pub fn order_media_sources(sources: &mut [MediaSourceInfo], queried: Uuid) {
     let own = queried.simple().to_string();
     sources.sort_by_key(|source| {
-        (
-            !source
+        source_order(
+            source
                 .id
                 .as_deref()
                 .is_some_and(|id| id.eq_ignore_ascii_case(&own)),
-            source.video_type != Some(VideoType::VideoFile),
+            source.video_type,
             source.video3d_format.is_some(),
         )
     });
+}
+
+/// The [`order_media_sources`] sort key of one source: its own first, then a
+/// video file, then 2D.
+fn source_order(own: bool, video_type: Option<VideoType>, is_3d: bool) -> (bool, bool, bool) {
+    (!own, video_type != Some(VideoType::VideoFile), is_3d)
 }
 
 /// The file name without its extension (`Path.GetFileNameWithoutExtension`).

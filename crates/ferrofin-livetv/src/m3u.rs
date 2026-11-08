@@ -137,8 +137,10 @@ impl ParseState {
             // that volume scales with the playlist, so one count is warned in
             // `finish`.
             if !is_valid_channel_url(line) {
+                // The line is the playlist's own text. A path-shaped one can
+                // hold the account as well as a URL can, so it is not logged.
                 tracing::debug!(
-                    path = line,
+                    channel = ?parse_extinf(&extinf, line).name,
                     "live tv: skipping M3U channel entry with an invalid stream URL"
                 );
                 self.skipped += 1;
@@ -169,11 +171,8 @@ const EXTINF: &str = "#EXTINF:";
 /// quoted argument.
 #[must_use]
 pub fn is_valid_channel_url(url: &str) -> bool {
-    url.split_once("://").is_some_and(|(scheme, _)| {
-        ["http", "https", "rtsp", "rtp", "udp"]
-            .iter()
-            .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
-    }) && !url.contains(['"', '\\'])
+    crate::fetch::has_scheme(url, &["http", "https", "rtsp", "rtp", "udp"])
+        && !url.contains(['"', '\\'])
         && !url.contains(|c: char| c.is_control())
         && reqwest::Url::parse(url).is_ok()
 }
@@ -535,8 +534,10 @@ mod tests {
 
     #[test]
     fn empty_input_yields_no_channels() {
-        assert!(parse_m3u("").is_empty());
-        assert!(parse_m3u("#EXTM3U\n").is_empty());
+        let found = parse_m3u("");
+        assert!(found.is_empty(), "{found:?}");
+        let found = parse_m3u("#EXTM3U\n");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `ReadLineAsync` ends a line at a lone `\r` too, and `StreamReader`

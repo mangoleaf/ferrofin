@@ -151,7 +151,7 @@ async fn a_mixed_folder_set_to_movies_scans_as_a_movie() {
 
 /// An override applies below its folder too (`ResolvePath` passes
 /// `inherit: true`), and a mixed library's other folders keep resolving
-/// without a type.
+/// without a type: a series there hangs off its plain folder.
 #[tokio::test]
 async fn an_override_applies_to_the_folders_below_it() {
     let files = [
@@ -168,7 +168,11 @@ async fn an_override_applies_to_the_folders_below_it() {
         tree.contains(&row("Movie", "Heat (1995)", "Films")),
         "{tree:?}"
     );
-    assert!(tree.contains(&row("Series", "Show", "Library")), "{tree:?}");
+    assert!(
+        tree.contains(&row("Folder", "Other", "Library")),
+        "{tree:?}"
+    );
+    assert!(tree.contains(&row("Series", "Show", "Other")), "{tree:?}");
     assert!(
         !tree
             .iter()
@@ -179,11 +183,13 @@ async fn an_override_applies_to_the_folders_below_it() {
 
 /// "Content type: Shows" on a folder of a mixed library makes the folder
 /// itself a plain folder (its own override is `tvshows`) and each of its
-/// subfolders a series, which hangs off it.
+/// subfolders a series, which hangs off it. A series' extra keeps an extra's
+/// shape: owned, with no parent and so no folder above it.
 #[tokio::test]
 async fn a_mixed_folder_set_to_shows_holds_series() {
     let files = [
         "Anime/Show A/Show A S01E01.mkv",
+        "Anime/Show A/trailers/Teaser.mkv",
         "Anime/Show B/Season 1/Show B S01E01.mkv",
     ];
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -201,6 +207,26 @@ async fn a_mixed_folder_set_to_shows_holds_series() {
         "{tree:?}"
     );
     assert!(!tree.iter().any(|(kind, _, _)| kind == "Movie"), "{tree:?}");
+
+    let owner: Option<String> = sqlx::query_scalar(
+        r#"SELECT o."Name" FROM "BaseItems" t JOIN "BaseItems" o ON o."Id" = t."OwnerId"
+           WHERE t."Type" = 'MediaBrowser.Controller.Entities.Trailer'"#,
+    )
+    .fetch_optional(db.pool())
+    .await
+    .expect("trailer");
+    assert_eq!(owner.as_deref(), Some("Show A"));
+    let folders_above: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM "AncestorIds" a
+           JOIN "BaseItems" t ON t."Id" = a."ItemId"
+           JOIN "BaseItems" f ON f."Id" = a."ParentItemId"
+           WHERE t."Type" = 'MediaBrowser.Controller.Entities.Trailer'
+             AND f."Type" = 'MediaBrowser.Controller.Entities.Folder'"#,
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("ancestors");
+    assert_eq!(folders_above, 0, "the trailer is below no plain folder");
 }
 
 /// A tvshows library's `SeriesResolver` rule: every folder is a series,

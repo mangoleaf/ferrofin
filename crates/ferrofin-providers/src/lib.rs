@@ -12,10 +12,12 @@ pub mod books;
 pub mod builtin_plugins;
 pub mod chapter_names;
 pub mod container_types;
+pub mod destination;
 pub mod episode;
 pub mod error;
 pub mod external_ids;
 pub mod fanart;
+mod guarded_http;
 mod image_download;
 pub mod image_policy;
 pub mod image_save;
@@ -40,6 +42,7 @@ pub mod plugin_config;
 pub mod provider_manager;
 pub mod rate_limit;
 pub mod refresh_plan;
+pub mod remote_images;
 pub mod season;
 pub mod similarity;
 pub mod studios;
@@ -68,7 +71,10 @@ pub use opensubtitles::{OpenSubtitlesConfig, OpenSubtitlesProvider};
 
 pub use audiodb::{AudioDbAlbum, AudioDbArtist, AudioDbClient};
 pub use fanart::FanartClient;
-pub use image_download::{ArtworkDownload, ArtworkDownloadFailure, sniff_image_ext};
+pub use image_download::{
+    ArtworkDownload, ArtworkDownloadFailure, DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS,
+    IMAGE_NEGATIVE_CACHE_TTL_SECS, sniff_image_ext,
+};
 pub use listenbrainz::{ListenBrainzClient, ListenBrainzConfig, SimilarityAlgorithm};
 pub use musicbrainz::{
     AlbumDetails, AlbumIds, ArtistDetails, ArtistHit, MusicBrainzClient, PartialDate,

@@ -1,0 +1,1845 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>Ferrofin Settings</title>
+</head>
+
+<body>
+    <!--
+        The Ferrofin Settings plugin's page, authored in this repository (not
+        vendored from a Jellyfin plugin). jellyfin-web keeps only the
+        `data-role="page"` element and runs the scripts inside it, so the
+        styles and the script live in it too.
+
+        The page is served anonymously (`GET /web/ConfigurationPage`), so it
+        holds no setting: everything it shows comes from the admin-only
+        `GET /Ferrofin/Settings`, and every string from that response is set
+        as text or as an attribute, never parsed as HTML. Save posts the
+        changed settings to `POST /Ferrofin/Settings`, which judges them: the
+        form is `novalidate`, so the browser never answers for the server.
+    -->
+    <div data-role="page" class="page type-interior pluginConfigurationPage ferrofinSettingsPage"
+        data-require="emby-input,emby-button,emby-checkbox,emby-select">
+        <div data-role="content">
+            <div class="content-primary">
+                <div class="verticalSection">
+                    <div class="sectionTitleContainer ferrofinTitle">
+                        <h2 class="sectionTitle">Ferrofin Settings</h2>
+                        <p class="ferrofinConfigFile hide">
+                            Settings file: <code class="ferrofinConfigFilePath"></code>
+                            <span class="ferrofinConfigFileLocked hide">(the server cannot write it, so a save will fail)</span>
+                        </p>
+                    </div>
+                    <p class="fieldDescription">
+                        Saved changes apply after a restart, except those marked "Applies at once".
+                    </p>
+                </div>
+                <div class="ferrofinNotice ferrofinWarning ferrofinRestartPending hide" role="status">
+                    <span class="material-icons restart_alt" aria-hidden="true"></span>
+                    <div class="ferrofinRestartBody">
+                        <div class="ferrofinRestartText"></div>
+                        <p class="ferrofinProcessRestartKeys fieldDescription hide"></p>
+                        <button is="emby-button" type="button" class="raised ferrofinRestartNow">
+                            <span>Restart now</span>
+                        </button>
+                    </div>
+                </div>
+                <div class="ferrofinNotice ferrofinError hide" role="alert">
+                    <span class="material-icons error" aria-hidden="true"></span>
+                    <span class="ferrofinErrorText"></span>
+                </div>
+                <form class="ferrofinForm hide" novalidate>
+                    <!-- The search and the filters over every tab, then the tabs in a pane on the left
+                         with the settings beside them. -->
+                    <div class="ferrofinFinder">
+                        <div class="inputContainer">
+                            <input is="emby-input" type="search" class="ferrofinSearch"
+                                label="Search settings" autocomplete="off" spellcheck="false" />
+                        </div>
+                        <div class="ferrofinFilters" role="group" aria-label="Filters">
+                            <div class="checkboxContainer">
+                                <label>
+                                    <input is="emby-checkbox" type="checkbox" class="ferrofinFilterChanged" />
+                                    <span>Changed</span>
+                                </label>
+                            </div>
+                            <div class="checkboxContainer">
+                                <label>
+                                    <input is="emby-checkbox" type="checkbox" class="ferrofinFilterLocked" />
+                                    <span>Hide read-only</span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="ferrofinShell">
+                        <div class="ferrofinTabs" role="tablist" aria-orientation="vertical"
+                            aria-label="Setting groups"></div>
+                        <div class="ferrofinMain">
+                            <p class="ferrofinNoMatch fieldDescription hide" role="status"></p>
+                            <div class="ferrofinGroups"></div>
+                        </div>
+                    </div>
+                    <button is="emby-button" type="submit" class="raised button-submit block ferrofinSave" disabled>
+                        <span>Save</span>
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <style>
+            /* jellyfin-web caps every form at 54em, which the tab pane would
+               leave the settings too little of. The page's content (the title,
+               the notices and the form) is capped at 80em instead. */
+            .ferrofinSettingsPage .content-primary {
+                max-width: 80em;
+            }
+
+            .ferrofinSettingsPage .ferrofinForm {
+                max-width: none;
+            }
+
+            /* The settings file beside the page's title, wrapping below it on a narrow screen. */
+            .ferrofinSettingsPage .ferrofinTitle {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: baseline;
+                gap: 0 1.2em;
+            }
+
+            .ferrofinSettingsPage .ferrofinConfigFile {
+                margin: 0;
+                font-size: 0.9em;
+                opacity: 0.8;
+            }
+
+            .ferrofinSettingsPage .ferrofinNotice {
+                display: flex;
+                align-items: flex-start;
+                gap: 0.6em;
+                margin: 1em 0;
+                padding: 0.8em 1em;
+                border-radius: 0.3em;
+                background: rgba(128, 128, 128, 0.15);
+            }
+
+            /* A restart is needed for saved changes: a warning, as on Intro Skipper's page. */
+            .ferrofinSettingsPage .ferrofinWarning {
+                border: 1px solid rgba(232, 168, 54, 0.45);
+                background: rgba(232, 168, 54, 0.1);
+            }
+
+            .ferrofinSettingsPage .ferrofinWarning > .material-icons {
+                color: #e8a836;
+            }
+
+            /* The tabs in a pane on the left, as Intro Skipper's page has them; a
+               row above the settings on a narrow screen. */
+            .ferrofinSettingsPage .ferrofinShell {
+                display: grid;
+                grid-template-columns: 12em minmax(0, 1fr);
+                gap: 0 2em;
+                margin-top: 1.5em;
+            }
+
+            .ferrofinSettingsPage .ferrofinMain {
+                min-width: 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinFinder {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: flex-end;
+                gap: 0.5em 1.5em;
+            }
+
+            .ferrofinSettingsPage .ferrofinFinder .inputContainer {
+                flex: 0 1 30em;
+                margin: 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinFilters {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 0 1.2em;
+            }
+
+            .ferrofinSettingsPage .ferrofinFilters .checkboxContainer {
+                margin: 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinTabs {
+                display: flex;
+                flex-direction: column;
+                gap: 0.15em;
+                padding-right: 0.5em;
+                border-right: 1px solid rgba(128, 128, 128, 0.35);
+            }
+
+            .ferrofinSettingsPage .ferrofinTab {
+                display: flex;
+                align-items: center;
+                width: 100%;
+                padding: 0.6em 1em;
+                border: 0;
+                border-radius: 0.3em;
+                background: none;
+                color: inherit;
+                font: inherit;
+                text-align: left;
+                opacity: 0.8;
+                cursor: pointer;
+            }
+
+            .ferrofinSettingsPage .ferrofinTab:hover {
+                background: rgba(128, 128, 128, 0.12);
+                opacity: 1;
+            }
+
+            .ferrofinSettingsPage .ferrofinTab[aria-selected="true"] {
+                background: color-mix(in srgb, var(--jf-palette-primary-main, #00a4dc) 15%, transparent);
+                color: var(--jf-palette-primary-main, #00a4dc);
+                font-weight: bold;
+                opacity: 1;
+            }
+
+            .ferrofinSettingsPage .ferrofinTabName {
+                flex: 1 1 auto;
+            }
+
+            /* While a search or a filter lists every tab, a tab with no match. */
+            .ferrofinSettingsPage .ferrofinTab.ferrofinTabMatchless {
+                opacity: 0.4;
+            }
+
+            @media (max-width: 48em) {
+                .ferrofinSettingsPage .ferrofinShell {
+                    grid-template-columns: minmax(0, 1fr);
+                }
+
+                .ferrofinSettingsPage .ferrofinTabs {
+                    flex-direction: row;
+                    overflow-x: auto;
+                    margin-bottom: 1em;
+                    padding: 0 0 0.3em;
+                    border-right: 0;
+                    border-bottom: 1px solid rgba(128, 128, 128, 0.35);
+                }
+
+                .ferrofinSettingsPage .ferrofinTab {
+                    width: auto;
+                    white-space: nowrap;
+                }
+            }
+
+            .ferrofinSettingsPage .ferrofinTabCount {
+                margin-left: 0.4em;
+                padding: 0 0.45em;
+                border-radius: 1em;
+                background: rgba(128, 128, 128, 0.35);
+                font-size: 0.8em;
+                font-weight: bold;
+            }
+
+            /* Red wins over the open tab's accent: a refusal opens its tab. */
+            .ferrofinSettingsPage .ferrofinTab.ferrofinTabRefused,
+            .ferrofinSettingsPage .ferrofinFieldError {
+                color: #e04b4b;
+            }
+
+            .ferrofinSettingsPage .ferrofinTabMark {
+                margin-left: 0.3em;
+                vertical-align: text-bottom;
+            }
+
+            .ferrofinSettingsPage .ferrofinGroup {
+                margin-top: 0.5em;
+            }
+
+            /* A tab's name over its matches while a search lists every tab. */
+            .ferrofinSettingsPage .ferrofinGroupTitle {
+                display: flex;
+                align-items: baseline;
+                gap: 0.6em;
+                margin: 1.5em 0 0;
+                padding-bottom: 0.3em;
+                border-bottom: 1px solid rgba(128, 128, 128, 0.35);
+                color: var(--jf-palette-primary-main, #00a4dc);
+            }
+
+            .ferrofinSettingsPage .ferrofinGroupCount {
+                font-size: 0.75em;
+                font-weight: normal;
+                opacity: 0.8;
+            }
+
+            .ferrofinSettingsPage .ferrofinNoMatch {
+                margin: 1.5em 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinSetting {
+                padding: 0.9em 0;
+                border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+            }
+
+            /* The name and description, with the value beside them, wrapping below on a narrow screen. */
+            .ferrofinSettingsPage .ferrofinSettingLine {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 0.5em 1.5em;
+            }
+
+            .ferrofinSettingsPage .ferrofinSettingText {
+                flex: 1 1 22em;
+                min-width: 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinField,
+            .ferrofinSettingsPage .ferrofinLocked,
+            .ferrofinSettingsPage .ferrofinCountOrAuto {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 0.5em 0.8em;
+            }
+
+            .ferrofinSettingsPage .ferrofinField .inputContainer {
+                width: 9em;
+                margin: 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinFieldWide .inputContainer {
+                width: 22em;
+                max-width: 100%;
+            }
+
+            .ferrofinSettingsPage .ferrofinField .checkboxContainer {
+                margin: 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinField .selectContainer {
+                min-width: 12em;
+                margin: 0;
+            }
+
+            /* The field's label names it for a screen reader; the row's heading names it on screen. */
+            .ferrofinSettingsPage .ferrofinField .inputLabel,
+            .ferrofinSettingsPage .ferrofinField .selectLabel,
+            .ferrofinSettingsPage .ferrofinVisuallyHidden {
+                position: absolute;
+                width: 1px;
+                height: 1px;
+                overflow: hidden;
+                clip: rect(0 0 0 0);
+                white-space: nowrap;
+            }
+
+            .ferrofinSettingsPage .ferrofinDefaulted {
+                opacity: 0.6;
+            }
+
+            .ferrofinSettingsPage .ferrofinHint {
+                font-size: 0.85em;
+                opacity: 0.7;
+            }
+
+            /* A note keeps the line breaks it is written with; jellyfin-web's
+               `.fieldDescription` sets `white-space: normal !important`. */
+            .ferrofinSettingsPage .ferrofinSettingNote,
+            .ferrofinSettingsPage .ferrofinOptionNote {
+                white-space: pre-line !important;
+            }
+
+            .ferrofinSettingsPage .ferrofinSettingNote {
+                margin-top: 0.4em;
+            }
+
+            .ferrofinSettingsPage .ferrofinOptionNote {
+                margin: 0.4em 0 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinSettingHeader {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 0.5em;
+            }
+
+            .ferrofinSettingsPage .ferrofinSettingName {
+                margin: 0;
+                font-size: 1.05em;
+            }
+
+            .ferrofinSettingsPage .ferrofinSettingIds {
+                margin: 0.15em 0 0.3em;
+                font-size: 0.85em;
+                opacity: 0.7;
+            }
+
+            .ferrofinSettingsPage .ferrofinBadge {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.25em;
+                padding: 0.1em 0.6em;
+                border: 1px solid currentColor;
+                border-radius: 1em;
+                font-size: 0.8em;
+                opacity: 0.85;
+            }
+
+            .ferrofinSettingsPage .ferrofinBadgeSecret {
+                border-style: dashed;
+            }
+
+            .ferrofinSettingsPage .material-icons {
+                font-size: 1.2em;
+            }
+
+            .ferrofinSettingsPage .ferrofinBadge .material-icons {
+                font-size: 1.1em;
+            }
+
+            .ferrofinSettingsPage code {
+                font-family: monospace;
+                overflow-wrap: anywhere;
+            }
+
+            .ferrofinSettingsPage .ferrofinListItem {
+                display: block;
+            }
+
+            .ferrofinSettingsPage .ferrofinSecretValue {
+                padding: 0 0.3em;
+                border: 1px dashed currentColor;
+                border-radius: 0.2em;
+            }
+
+            .ferrofinSettingsPage .ferrofinUnset {
+                font-style: italic;
+                opacity: 0.7;
+            }
+
+            .ferrofinSettingsPage .ferrofinNote {
+                display: flex;
+                align-items: flex-start;
+                gap: 0.5em;
+                margin: 0.6em 0 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinReset {
+                margin: 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinReset:disabled {
+                opacity: 0.4;
+                cursor: default;
+            }
+
+            .ferrofinSettingsPage .ferrofinRestartNow {
+                margin: 0.5em 0 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinLockedReason {
+                margin: 0.4em 0 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinSave {
+                margin-top: 2em;
+            }
+        </style>
+
+        <script type="text/javascript">
+            (function () {
+                'use strict';
+
+                // The sources the server names, as the page titles them. A
+                // name missing here is shown as the server sends it, so a new
+                // source needs no page change (`titled`). The default has no
+                // badge: an unset setting shows its default instead. The tabs
+                // are named as the server names its groups.
+                var SOURCE_NAMES = {
+                    ConfigFile: 'config.toml',
+                    Environment: 'Environment',
+                    Flag: 'Flag',
+                    ServerConfiguration: 'Server configuration'
+                };
+                // The kinds whose field is short; the others hold text, a
+                // path or a list, and get a wide one.
+                var NARROW_KINDS = { Bool: true, Integer: true, CountOrAuto: true, Choice: true };
+                // A save of this page's settings waits for a restart; or the
+                // server waits for one for another reason (a plugin install).
+                var RESTART_REQUIRED = 'A restart is required to apply the changed settings.';
+                var RESTART_PENDING = 'A server restart is pending.';
+                // How often the page asks whether a restart has finished, and
+                // how long before it says the server has not come back.
+                var RESTART_POLL_MS = 1000;
+                var RESTART_WAIT_MS = 120000;
+
+                /** `names[name]` when the page titles that name, else `name` itself. */
+                function titled(names, name) {
+                    return Object.prototype.hasOwnProperty.call(names, name) ? names[name] : name;
+                }
+
+                /** A new `tag` element with `className` and, if given, `text` as its text. */
+                function element(tag, className, text) {
+                    var node = document.createElement(tag);
+                    if (className) {
+                        node.className = className;
+                    }
+                    if (text !== undefined && text !== null) {
+                        node.textContent = String(text);
+                    }
+                    return node;
+                }
+
+                /** A material icon (jellyfin-web ships the font). */
+                function icon(name) {
+                    var node = element('span', 'material-icons ' + name);
+                    node.setAttribute('aria-hidden', 'true');
+                    return node;
+                }
+
+                /** Appends `text` to `node`, each `quoted` name in it as code, all as text. */
+                function withCode(node, text) {
+                    String(text).split('`').forEach(function (part, index) {
+                        if (part) {
+                            node.appendChild(index % 2 === 1 ? element('code', null, part) : document.createTextNode(part));
+                        }
+                    });
+                    return node;
+                }
+
+                function clear(node) {
+                    while (node.firstChild) {
+                        node.removeChild(node.firstChild);
+                    }
+                }
+
+                function badge(text, className, iconName) {
+                    var node = element('span', 'ferrofinBadge' + (className ? ' ' + className : ''));
+                    if (iconName) {
+                        node.appendChild(icon(iconName));
+                    }
+                    node.appendChild(element('span', null, text));
+                    return node;
+                }
+
+                /** One value (a list's item) as text; an object as its JSON. */
+                function scalar(value) {
+                    if (typeof value === 'string') {
+                        return value;
+                    }
+                    if (value !== null && typeof value === 'object') {
+                        return JSON.stringify(value);
+                    }
+                    return String(value);
+                }
+
+                /** `unit` as it reads after `value`: "1 hour", "2 hours", "1 MiB". */
+                function unitText(value, unit) {
+                    return Number(value) === 1 && /s$/.test(unit) ? unit.slice(0, -1) : unit;
+                }
+
+                /** `node` followed by `unit`, when there is one, as it reads after `value`. */
+                function withUnit(node, value, unit) {
+                    if (!unit) {
+                        return node;
+                    }
+                    var wrapper = element('span');
+                    wrapper.appendChild(node);
+                    wrapper.appendChild(document.createTextNode(' ' + unitText(value, unit)));
+                    return wrapper;
+                }
+
+                /**
+                 * A value as the page shows it, in `unit` when it has one; a
+                 * secret's is marked as one.
+                 */
+                function valueNode(value, secret, unit) {
+                    var node = element('span');
+                    var items = Array.isArray(value) ? value : [value];
+                    if (items.length === 0) {
+                        node.appendChild(element('span', 'ferrofinUnset', 'An empty list'));
+                        return node;
+                    }
+                    if (unit && items.every(function (item) { return typeof item === 'number'; })) {
+                        // Numbers in a unit read on one line, the unit after the last.
+                        items.forEach(function (item, index) {
+                            if (index > 0) {
+                                node.appendChild(document.createTextNode(', '));
+                            }
+                            node.appendChild(element('code', null, scalar(item)));
+                        });
+                        return withUnit(node, items[items.length - 1], unit);
+                    }
+                    items.forEach(function (item) {
+                        if (item === '') {
+                            node.appendChild(element('span', 'ferrofinUnset', 'Empty'));
+                            return;
+                        }
+                        var code = element('code', secret ? 'ferrofinSecretValue' : null, scalar(item));
+                        if (Array.isArray(value)) {
+                            code.classList.add('ferrofinListItem');
+                        }
+                        node.appendChild(code);
+                    });
+                    return node;
+                }
+
+                /** The option of a choice whose value is `value`, if one is. */
+                function optionOf(setting, value) {
+                    return (setting.Options || []).filter(function (option) {
+                        return option.Value === value;
+                    })[0];
+                }
+
+                /** A choice's `value` as the page names it: its option's label, else Custom. */
+                function choiceText(setting, value) {
+                    var option = optionOf(setting, value);
+                    return option ? option.Label : 'Custom: ' + scalar(value);
+                }
+
+                /** Whether a default is a bare number, rather than described. */
+                function plainNumber(text) {
+                    return /^\d+(\.\d+)?$/.test(text);
+                }
+
+                /**
+                 * The default as the page shows it: a bare number in the
+                 * unit, a described one ("8, capped at the cores") as it is.
+                 */
+                function defaultText(setting) {
+                    if (setting.Kind === 'Choice') {
+                        return choiceText(setting, setting.Default);
+                    }
+                    return plainNumber(setting.Default) && setting.Unit
+                        ? setting.Default + ' ' + unitText(setting.Default, setting.Unit)
+                        : setting.Default;
+                }
+
+                function note(iconName, text, className) {
+                    var node = element('p', 'ferrofinNote fieldDescription' + (className ? ' ' + className : ''));
+                    node.appendChild(icon(iconName));
+                    node.appendChild(withCode(element('span'), text));
+                    return node;
+                }
+
+                /** Where the `config.toml` value of a setting stands beside the one in use. */
+                function savedNote(setting) {
+                    if (setting.Source === 'Environment') {
+                        return 'not used while the environment variable sets it';
+                    }
+                    if (setting.Source === 'Flag') {
+                        return 'not used while the command-line flag sets it';
+                    }
+                    return setting.Applies === 'ProcessRestart' ? 'applies after a full process restart' : 'applies after restart';
+                }
+
+                /** A flat button that jellyfin-web upgrades once it is in the document. */
+                function button(text, className) {
+                    var node = element('button', 'button-flat ' + className);
+                    node.setAttribute('is', 'emby-button');
+                    node.setAttribute('type', 'button');
+                    node.appendChild(element('span', null, text));
+                    return node;
+                }
+
+                /**
+                 * A labelled input. Its `is` is set rather than passed to
+                 * `createElement`: `emby-input` puts its label beside the input,
+                 * so jellyfin-web must upgrade it once it has a parent.
+                 */
+                function textInput(type, label, text) {
+                    var input = element('input');
+                    input.setAttribute('is', 'emby-input');
+                    input.setAttribute('type', type);
+                    input.setAttribute('label', label);
+                    input.setAttribute('autocomplete', 'off');
+                    input.setAttribute('spellcheck', 'false');
+                    input.value = text;
+                    var node = element('div', 'inputContainer');
+                    node.appendChild(input);
+                    return { node: node, input: input };
+                }
+
+                function checkbox(label, checked) {
+                    var input = element('input');
+                    input.setAttribute('is', 'emby-checkbox');
+                    input.setAttribute('type', 'checkbox');
+                    input.checked = checked;
+                    var wrapper = element('label');
+                    wrapper.appendChild(input);
+                    wrapper.appendChild(element('span', null, label));
+                    var node = element('div', 'checkboxContainer');
+                    node.appendChild(wrapper);
+                    return { node: node, input: input };
+                }
+
+                /** `value` as an input's text: a list's items separated by commas. */
+                function inputText(value) {
+                    if (value === undefined || value === null) {
+                        return '';
+                    }
+                    return Array.isArray(value) ? value.map(scalar).join(', ') : scalar(value);
+                }
+
+                /** `text` as a number, or as it is, for the server to refuse. */
+                function number(text) {
+                    var parsed = Number(text);
+                    return text.trim() === '' || !isFinite(parsed) ? text : parsed;
+                }
+
+                /**
+                 * A number box's value. The browser hides what was typed when it
+                 * is no number and reports an empty value, which would pass for
+                 * no change, so that is sent for the server to refuse.
+                 */
+                function numberBox(input) {
+                    return input.validity.badInput ? 'not a number' : number(input.value);
+                }
+
+                function listItems(text) {
+                    return text.split(',').map(function (item) {
+                        return item.trim();
+                    }).filter(function (item) {
+                        return item !== '';
+                    });
+                }
+
+                /**
+                 * A control is its `node`, the value it would save (`read`),
+                 * `disable`, `clear`, which puts it back to showing the
+                 * default, and `hold`, which returns a function that puts back
+                 * what it shows now. A text field shows the default as its
+                 * placeholder, muted, while it is empty.
+                 */
+                function textControl(type, setting, value, parse) {
+                    var field = textInput(type, fieldLabel(setting), inputText(value));
+                    if (setting.Default) {
+                        field.input.setAttribute('placeholder', setting.Default);
+                    }
+                    return {
+                        node: field.node,
+                        input: field.input,
+                        read: function () {
+                            return parse(field.input.value);
+                        },
+                        disable: function (off) {
+                            field.input.disabled = off;
+                        },
+                        clear: function () {
+                            field.input.value = '';
+                        },
+                        hold: function () {
+                            var text = field.input.value;
+                            return function () {
+                                field.input.value = text;
+                            };
+                        }
+                    };
+                }
+
+                /**
+                 * A field's label, for a screen reader (the row's heading
+                 * names it on screen): the setting's name, then its unit.
+                 */
+                function fieldLabel(setting) {
+                    var name = setting.Label || setting.Key;
+                    return setting.Unit ? name + ', in ' + setting.Unit : name;
+                }
+
+                /**
+                 * A checkbox of `setting` that shows a default, muted, until
+                 * it is changed: `muted(on)` marks it so, and `muted()` says
+                 * whether it is. A screen reader hears the setting's name with
+                 * the `label` shown.
+                 */
+                function defaultCheckbox(setting, label, checked, unset) {
+                    var box = checkbox(label, checked);
+                    box.input.setAttribute('aria-label', (setting.Label || setting.Key) + ': ' + label);
+                    box.muted = function (on) {
+                        if (on !== undefined) {
+                            box.node.classList.toggle('ferrofinDefaulted', on);
+                        }
+                        return box.node.classList.contains('ferrofinDefaulted');
+                    };
+                    box.muted(unset);
+                    box.input.addEventListener('change', function () {
+                        box.muted(false);
+                    });
+                    return box;
+                }
+
+                function integerControl(setting, value) {
+                    var control = textControl('number', setting, value, String);
+                    control.read = function () {
+                        return numberBox(control.input);
+                    };
+                    control.input.setAttribute('step', '1');
+                    if (setting.Min !== undefined) {
+                        control.input.setAttribute('min', String(setting.Min));
+                    }
+                    if (setting.Max !== undefined) {
+                        control.input.setAttribute('max', String(setting.Max));
+                    }
+                    return control;
+                }
+
+                /** Whether an on/off setting is on by default. */
+                function defaultOn(setting) {
+                    if (setting.Default === 'true' || setting.Default === 'false') {
+                        return setting.Default === 'true';
+                    }
+                    // A described default is the value in use while nothing sets it.
+                    return setting.Source === 'Default' && setting.Value === true;
+                }
+
+                /** On or off; an unset one shows its default, muted. */
+                function boolControl(setting, value) {
+                    var unset = value === undefined || value === null;
+                    var box = defaultCheckbox(setting, 'On', unset ? defaultOn(setting) : value === true, unset);
+                    return {
+                        node: box.node,
+                        read: function () {
+                            return box.input.checked;
+                        },
+                        disable: function (off) {
+                            box.input.disabled = off;
+                        },
+                        clear: function () {
+                            box.input.checked = defaultOn(setting);
+                            box.muted(true);
+                        },
+                        hold: function () {
+                            var checked = box.input.checked;
+                            var muted = box.muted();
+                            return function () {
+                                box.input.checked = checked;
+                                box.muted(muted);
+                            };
+                        }
+                    };
+                }
+
+                /** An "auto" checkbox and a count. An unset count is auto, its default, muted. */
+                function countOrAutoControl(setting, value) {
+                    var unset = value === undefined || value === null;
+                    var isAuto = unset || value === 'auto';
+                    var auto = defaultCheckbox(setting, 'Auto', isAuto, unset);
+                    var count = textInput('number', fieldLabel(setting), isAuto ? '' : inputText(value));
+                    var off = false;
+                    function sync() {
+                        auto.input.disabled = off;
+                        count.input.disabled = off || auto.input.checked;
+                    }
+                    auto.input.addEventListener('change', sync);
+                    sync();
+                    var node = element('div', 'ferrofinCountOrAuto');
+                    node.appendChild(auto.node);
+                    node.appendChild(count.node);
+                    return {
+                        node: node,
+                        input: count.input,
+                        read: function () {
+                            return auto.input.checked ? 'auto' : numberBox(count.input);
+                        },
+                        disable: function (disabled) {
+                            off = disabled;
+                            sync();
+                        },
+                        clear: function () {
+                            auto.input.checked = true;
+                            auto.muted(true);
+                            count.input.value = '';
+                            sync();
+                        },
+                        hold: function () {
+                            var checked = auto.input.checked;
+                            var muted = auto.muted();
+                            var text = count.input.value;
+                            return function () {
+                                auto.input.checked = checked;
+                                auto.muted(muted);
+                                count.input.value = text;
+                                sync();
+                            };
+                        }
+                    };
+                }
+
+                /**
+                 * A select of `setting`'s options, the picked one's note below
+                 * it (`below`). Unset, it shows the default option, muted. A
+                 * stored value that fits no option is a Custom entry, which a
+                 * save leaves as it is until another option is picked.
+                 */
+                function choiceControl(setting, value) {
+                    var unset = value === undefined || value === null;
+                    var picked = unset ? setting.Default : scalar(value);
+                    var select = element('select');
+                    select.setAttribute('is', 'emby-select');
+                    select.setAttribute('label', fieldLabel(setting));
+                    (setting.Options || []).forEach(function (option) {
+                        var node = element('option', null, option.Label);
+                        node.value = option.Value;
+                        select.appendChild(node);
+                    });
+                    if (!unset && setting.Custom) {
+                        var custom = element('option', null, choiceText(setting, picked));
+                        custom.value = picked;
+                        select.appendChild(custom);
+                    }
+                    select.value = picked;
+                    var node = element('div', 'selectContainer');
+                    node.appendChild(select);
+                    var note = element('p', 'fieldDescription ferrofinOptionNote');
+                    function muted(on) {
+                        node.classList.toggle('ferrofinDefaulted', on);
+                    }
+                    function showNote() {
+                        var option = optionOf(setting, select.value);
+                        var text = option ? option.Note || '' : 'Fits no option: kept as it is until another is picked.';
+                        clear(note);
+                        withCode(note, text);
+                        note.classList.toggle('hide', text === '');
+                    }
+                    select.addEventListener('change', function () {
+                        muted(false);
+                        showNote();
+                    });
+                    muted(unset);
+                    showNote();
+                    return {
+                        node: node,
+                        below: note,
+                        read: function () {
+                            return select.value;
+                        },
+                        disable: function (off) {
+                            select.disabled = off;
+                        },
+                        clear: function () {
+                            select.value = setting.Default;
+                            muted(true);
+                            showNote();
+                        },
+                        hold: function () {
+                            var held = select.value;
+                            var wasMuted = node.classList.contains('ferrofinDefaulted');
+                            return function () {
+                                select.value = held;
+                                muted(wasMuted);
+                                showNote();
+                            };
+                        }
+                    };
+                }
+
+                /** The control of `setting`'s kind; a kind it does not know is text. */
+                function controlFor(setting, value) {
+                    switch (setting.Kind) {
+                        case 'Choice':
+                            return choiceControl(setting, value);
+                        case 'Bool':
+                            return boolControl(setting, value);
+                        case 'Integer':
+                            return integerControl(setting, value);
+                        case 'CountOrAuto':
+                            return countOrAutoControl(setting, value);
+                        case 'PathList':
+                            return textControl('text', setting, value, listItems);
+                        case 'NumberList':
+                            return textControl('text', setting, value, function (text) {
+                                return listItems(text).map(number);
+                            });
+                        default:
+                            return textControl('text', setting, value, String);
+                    }
+                }
+
+                /**
+                 * Whether the store of `setting` holds a value for it now:
+                 * `config.toml`, or the server configuration with another
+                 * value than a new server's.
+                 */
+                function isHeld(setting, state) {
+                    if (setting.Store === 'ServerConfiguration') {
+                        return setting.Source === 'ServerConfiguration';
+                    }
+                    return !state.resets[setting.Key] && (setting.SavedValue !== undefined || setting.Source === 'ConfigFile');
+                }
+
+                /**
+                 * What the control of `setting` starts from: the value its
+                 * store holds, not the one in use, or `null` when it holds
+                 * none, so the field shows the default.
+                 */
+                function editedValue(setting, state) {
+                    if (setting.SavedValue !== undefined) {
+                        return setting.SavedValue;
+                    }
+                    return isHeld(setting, state) ? setting.Value : null;
+                }
+
+                /** The last of a list's items, which the unit reads after. */
+                function lastItem(text) {
+                    return String(text).split(',').pop().trim();
+                }
+
+                /**
+                 * The control of an editable `setting`, its unit and Reset to
+                 * default, which go on one line; what goes below the line
+                 * (`below`, a choice's note); and the note a reset shows. The
+                 * field joins `state.fields`, which Save reads.
+                 */
+                function renderField(setting, state) {
+                    var control = controlFor(setting, editedValue(setting, state));
+                    var node = element('div', 'ferrofinField');
+                    // A described default ("8, capped at the cores") needs room
+                    // as the placeholder of a number box too.
+                    var described = Boolean(setting.Default) && !plainNumber(setting.Default);
+                    if (NARROW_KINDS[setting.Kind] !== true || (described && setting.Kind === 'Integer')) {
+                        node.classList.add('ferrofinFieldWide');
+                    }
+                    node.appendChild(control.node);
+
+                    // The unit reads after the number shown: the field's, else the default.
+                    var unit = null;
+                    if (setting.Unit && control.input) {
+                        unit = element('span', 'ferrofinUnit');
+                        node.appendChild(unit);
+                    }
+                    if (setting.Kind === 'PathList' || setting.Kind === 'NumberList') {
+                        node.appendChild(element('span', 'ferrofinHint', 'separated by commas'));
+                    }
+                    var reset = button('Reset to default', 'ferrofinReset');
+                    node.appendChild(reset);
+                    var resetNote = note('settings_backup_restore',
+                        setting.Store === 'ServerConfiguration'
+                            ? 'Saving puts back a new server\'s value, which applies at once.'
+                            : 'Saving removes it from `config.toml`, so the default applies after the restart.',
+                        'ferrofinResetNote hide');
+
+                    var held = isHeld(setting, state);
+                    var undo = null;
+                    var field = {
+                        key: setting.Key,
+                        group: setting.Group,
+                        row: null,
+                        read: control.read,
+                        saved: JSON.stringify(control.read()),
+                        resetting: false,
+                        edited: function () {
+                            return JSON.stringify(control.read()) !== field.saved;
+                        }
+                    };
+                    function sync() {
+                        if (unit) {
+                            var shown = control.input.value !== '' ? control.input.value : setting.Default || '';
+                            unit.textContent = unitText(lastItem(shown), setting.Unit);
+                        }
+                        // Reset is for a value the store holds or an unsaved
+                        // edit; with neither, the field already shows the default.
+                        reset.disabled = !field.resetting && !held && !field.edited();
+                    }
+                    reset.addEventListener('click', function () {
+                        if (field.resetting) {
+                            field.resetting = false;
+                            undo();
+                        } else if (held) {
+                            field.resetting = true;
+                            undo = control.hold();
+                            control.clear();
+                        } else {
+                            // Only an unsaved edit to drop: the default shows again.
+                            control.clear();
+                        }
+                        control.disable(field.resetting);
+                        reset.querySelector('span').textContent = field.resetting ? 'Undo reset' : 'Reset to default';
+                        resetNote.classList.toggle('hide', !field.resetting);
+                        node.dispatchEvent(new Event('change', { bubbles: true }));
+                    });
+                    node.addEventListener('input', sync);
+                    node.addEventListener('change', sync);
+                    sync();
+                    state.fields.push(field);
+                    return { node: node, below: control.below || null, note: resetNote, field: field };
+                }
+
+                /**
+                 * The small line under the name: the `config.toml` key, the
+                 * variable (one with no key is its own key), the flag and the
+                 * default.
+                 */
+                function idsLine(setting) {
+                    var parts = [element('code', null, setting.Key)];
+                    if (setting.EnvVar && setting.EnvVar !== setting.Key) {
+                        parts.push(element('code', null, setting.EnvVar));
+                    }
+                    if (setting.Flag) {
+                        parts.push(element('code', null, setting.Flag));
+                    }
+                    if (setting.Default) {
+                        parts.push(element('span', null, 'default: ' + defaultText(setting)));
+                    }
+                    var ids = element('div', 'ferrofinSettingIds');
+                    parts.forEach(function (part, index) {
+                        if (index > 0) {
+                            ids.appendChild(document.createTextNode(' · '));
+                        }
+                        ids.appendChild(part);
+                    });
+                    return ids;
+                }
+
+                /** Whether `value` holds nothing: none, an empty text or an empty list. */
+                function empty(value) {
+                    return value === undefined || value === null || value === '' ||
+                        (Array.isArray(value) && value.length === 0);
+                }
+
+                /**
+                 * A locked setting's value, as text with a lock: a variable, a
+                 * flag or the server sets it. An empty one nothing sets shows
+                 * the default instead.
+                 */
+                function lockedValue(setting, secret) {
+                    var node = element('div', 'ferrofinLocked');
+                    node.appendChild(icon('lock'));
+                    node.appendChild(element('span', 'ferrofinVisuallyHidden', 'Read-only: '));
+                    if (setting.Value === undefined || setting.Value === null ||
+                        (setting.Source === 'Default' && empty(setting.Value))) {
+                        node.appendChild(element('span', 'ferrofinUnset', setting.Default ? defaultText(setting) : 'Not set'));
+                    } else {
+                        node.appendChild(shownValue(setting, setting.Value, secret));
+                    }
+                    return node;
+                }
+
+                /** `value` of `setting` as text: a choice by its option's label. */
+                function shownValue(setting, value, secret) {
+                    return setting.Kind === 'Choice'
+                        ? element('span', null, choiceText(setting, value))
+                        : valueNode(value, secret, setting.Unit);
+                }
+
+                /**
+                 * What `config.toml` holds that is not in use yet, and the
+                 * value in use beside it: a saved value, or a key a save
+                 * removed. `null` when there is neither.
+                 */
+                function savedLine(setting, state, secret) {
+                    var removed = setting.SavedValue === undefined && state.resets[setting.Key];
+                    if (setting.SavedValue === undefined && !removed) {
+                        return null;
+                    }
+                    var body = element('span');
+                    if (removed) {
+                        // The report cannot show a removed key: it has no value.
+                        body.appendChild(document.createTextNode('Saved: removed, so the default ' + savedNote(setting)));
+                    } else {
+                        body.appendChild(document.createTextNode('Saved: '));
+                        body.appendChild(shownValue(setting, setting.SavedValue, secret));
+                        body.appendChild(document.createTextNode(' (' + savedNote(setting) + ')'));
+                    }
+                    if (setting.Value !== undefined && setting.Value !== null) {
+                        body.appendChild(document.createTextNode('; in use now: '));
+                        body.appendChild(shownValue(setting, setting.Value, secret));
+                    } else if (!removed) {
+                        // The report has no value while the default applies.
+                        body.appendChild(document.createTextNode('; in use now: the default' +
+                            (setting.Default ? ' (' + defaultText(setting) + ')' : '')));
+                    }
+                    var node = element('p', 'ferrofinNote fieldDescription ferrofinSaved');
+                    node.appendChild(icon('save'));
+                    node.appendChild(body);
+                    return node;
+                }
+
+                /**
+                 * One setting's row: its name, the small line and the
+                 * description, with its field (or its locked value) beside
+                 * them, and its notes below. The row joins `state.rows`, which
+                 * the search and the filters read.
+                 */
+                function renderSetting(setting, state) {
+                    var secret = setting.Kind === 'Secret';
+                    var row = element('div', 'ferrofinSetting');
+                    row.setAttribute('data-key', setting.Key);
+
+                    var text = element('div', 'ferrofinSettingText');
+                    var header = element('div', 'ferrofinSettingHeader');
+                    header.appendChild(element('h4', 'ferrofinSettingName', setting.Label || setting.Key));
+                    if (setting.Source !== 'Default') {
+                        header.appendChild(badge(titled(SOURCE_NAMES, setting.Source), 'ferrofinBadgeSource'));
+                    }
+                    if (secret) {
+                        header.appendChild(badge('Secret', 'ferrofinBadgeSecret', 'key'));
+                    }
+                    // Saved to the server configuration: no restart.
+                    if (setting.Applies === 'Immediately') {
+                        header.appendChild(badge('Applies at once', 'ferrofinBadgeImmediate', 'bolt'));
+                    }
+                    text.appendChild(header);
+                    text.appendChild(idsLine(setting));
+                    if (setting.Description) {
+                        text.appendChild(withCode(element('div', 'fieldDescription'), setting.Description));
+                    }
+                    if (setting.Note) {
+                        text.appendChild(withCode(element('div', 'fieldDescription ferrofinSettingNote'), setting.Note));
+                    }
+                    var line = element('div', 'ferrofinSettingLine');
+                    line.appendChild(text);
+                    row.appendChild(line);
+
+                    var rendered = null;
+                    if (setting.Editable) {
+                        rendered = renderField(setting, state);
+                        rendered.field.row = row;
+                        line.appendChild(rendered.node);
+                        if (rendered.below) {
+                            row.appendChild(rendered.below);
+                        }
+                    } else {
+                        line.appendChild(lockedValue(setting, secret));
+                        if (setting.LockedReason) {
+                            row.appendChild(withCode(element('p', 'fieldDescription ferrofinLockedReason'), setting.LockedReason));
+                        }
+                    }
+                    var saved = savedLine(setting, state, secret);
+                    if (saved) {
+                        row.appendChild(saved);
+                    }
+                    if (rendered) {
+                        row.appendChild(rendered.note);
+                    }
+                    if (setting.Applies === 'ProcessRestart') {
+                        row.appendChild(note('restart_alt',
+                            'Needs a full process restart: the dashboard\'s restart keeps the value the process started with.',
+                            'ferrofinProcessRestart'));
+                    }
+                    state.rows.push({
+                        setting: setting,
+                        group: setting.Group,
+                        node: row,
+                        field: rendered && rendered.field,
+                        // What the search reads, in lower case.
+                        text: [
+                            setting.Label || '',
+                            setting.Description || '',
+                            setting.Key || '',
+                            setting.EnvVar || '',
+                            setting.Flag || ''
+                        ].join('\n').toLowerCase()
+                    });
+                    return row;
+                }
+
+                /** The unsaved changes: each key with its new value, `null` to remove it. */
+                function changes(state) {
+                    var changed = {};
+                    state.fields.forEach(function (field) {
+                        if (field.resetting) {
+                            changed[field.key] = null;
+                        } else if (field.edited()) {
+                            changed[field.key] = field.read();
+                        }
+                    });
+                    return changed;
+                }
+
+                /** Each tab's count of unsaved edits, and the mark of a refusal on it. */
+                function updateTabs(page, state) {
+                    var counts = Object.create(null);
+                    state.fields.forEach(function (field) {
+                        if (field.resetting || field.edited()) {
+                            counts[field.group] = (counts[field.group] || 0) + 1;
+                        }
+                    });
+                    page.querySelectorAll('.ferrofinTab').forEach(function (tab) {
+                        var group = tab.getAttribute('data-group');
+                        var count = counts[group] || 0;
+                        var refused = tab.classList.contains('ferrofinTabRefused');
+                        var shown = tab.querySelector('.ferrofinTabCount');
+                        shown.textContent = String(count);
+                        shown.classList.toggle('hide', count === 0);
+                        tab.querySelector('.ferrofinTabMark').classList.toggle('hide', !refused);
+                        var label = group;
+                        if (count > 0) {
+                            label += ', ' + count + (count === 1 ? ' unsaved edit' : ' unsaved edits');
+                        }
+                        if (refused) {
+                            label += ', a change refused';
+                        }
+                        tab.setAttribute('aria-label', label);
+                    });
+                }
+
+                /** A save and a restart never overlap: either one holds both buttons. */
+                function updateButtons(page, state) {
+                    var busy = state.saving || state.restarting;
+                    page.querySelector('.ferrofinSave').disabled = busy || Object.keys(changes(state)).length === 0;
+                    page.querySelector('.ferrofinRestartNow').disabled = busy;
+                }
+
+                /**
+                 * The restart notice: shown while the server has a restart
+                 * pending or `config.toml` holds a value not in use yet (a
+                 * save, or an edit by hand), saying which; the keys only a
+                 * full process restart applies; and Restart now, unless only
+                 * such keys wait, which the in-process restart cannot apply.
+                 */
+                function renderRestartNotice(page, state, pending, settings) {
+                    if (!pending) {
+                        state.resets = Object.create(null);
+                        state.processRestart = Object.create(null);
+                    }
+                    var processKeys = Object.create(null);
+                    Object.keys(state.processRestart).forEach(function (key) {
+                        processKeys[key] = true;
+                    });
+                    var required = false;
+                    var restartable = pending;
+                    settings.forEach(function (setting) {
+                        if (awaitsRestart(state, setting)) {
+                            required = true;
+                            if (setting.Applies === 'ProcessRestart') {
+                                processKeys[setting.Key] = true;
+                            } else {
+                                restartable = true;
+                            }
+                        }
+                    });
+                    state.restartText = required ? RESTART_REQUIRED : RESTART_PENDING;
+                    page.querySelector('.ferrofinRestartPending').classList.toggle('hide', !pending && !required);
+                    page.querySelector('.ferrofinRestartNow').classList.toggle('hide', !restartable);
+                    page.querySelector('.ferrofinRestartText').textContent = state.restartText;
+                    var list = page.querySelector('.ferrofinProcessRestartKeys');
+                    var keys = Object.keys(processKeys).sort();
+                    clear(list);
+                    list.classList.toggle('hide', keys.length === 0);
+                    if (keys.length > 0) {
+                        withCode(list, '`' + keys.join('`, `') + '`: needs a full process restart (restart the container or service).');
+                    }
+                }
+
+                /** What the search box and the filters ask for. */
+                function finder(page) {
+                    return {
+                        terms: page.querySelector('.ferrofinSearch').value.toLowerCase().split(/\s+/).filter(Boolean),
+                        changed: page.querySelector('.ferrofinFilterChanged').checked,
+                        hideLocked: page.querySelector('.ferrofinFilterLocked').checked
+                    };
+                }
+
+                /** Whether `find` lists the matches of every tab, rather than the open tab. */
+                function finding(find) {
+                    return find.terms.length > 0 || find.changed;
+                }
+
+                /**
+                 * Changed: something sets a value (a variable, a flag or
+                 * `config.toml`, whether or not it is in use yet), or the row
+                 * holds an unsaved edit.
+                 */
+                function isChanged(row) {
+                    var setting = row.setting;
+                    return setting.Source !== 'Default' || setting.SavedValue !== undefined ||
+                        Boolean(row.field && (row.field.resetting || row.field.edited()));
+                }
+
+                /**
+                 * Whether a restart applies a saved change to `setting`:
+                 * `config.toml` holds a value not in use yet, or a save removed
+                 * one still in use. A variable or a flag outranks the file
+                 * across a restart too.
+                 */
+                function awaitsRestart(state, setting) {
+                    if (setting.Source === 'Environment' || setting.Source === 'Flag') {
+                        return false;
+                    }
+                    return setting.SavedValue !== undefined || Boolean(state.resets[setting.Key]);
+                }
+
+                /** Whether `row` shows under `find`. A refused change always does, to be corrected. */
+                function matches(row, find) {
+                    if (row.node.querySelector('.ferrofinFieldError')) {
+                        return true;
+                    }
+                    if (find.hideLocked && !row.setting.Editable) {
+                        return false;
+                    }
+                    if (find.changed && !isChanged(row)) {
+                        return false;
+                    }
+                    return find.terms.every(function (term) {
+                        return row.text.indexOf(term) !== -1;
+                    });
+                }
+
+                /**
+                 * Shows what the tabs, the search and the filters ask for. A
+                 * search or Changed lists the matches of every tab under its
+                 * tab's name, with their count, and dims the tabs with none;
+                 * otherwise the open tab shows. Hide read-only narrows either.
+                 */
+                function applyView(page, state) {
+                    var find = finder(page);
+                    var across = finding(find);
+                    var shown = Object.create(null);
+                    state.rows.forEach(function (row) {
+                        var visible = matches(row, find);
+                        row.node.classList.toggle('hide', !visible);
+                        if (visible) {
+                            shown[row.group] = (shown[row.group] || 0) + 1;
+                        }
+                    });
+                    var any = false;
+                    page.querySelectorAll('.ferrofinGroup').forEach(function (section) {
+                        var group = section.getAttribute('data-group');
+                        var count = shown[group] || 0;
+                        var open = across ? count > 0 : group === state.tab;
+                        section.classList.toggle('hide', !open);
+                        section.querySelector('.ferrofinGroupTitle').classList.toggle('hide', !across);
+                        section.querySelector('.ferrofinGroupCount').textContent =
+                            count + (count === 1 ? ' setting' : ' settings');
+                        any = any || (open && count > 0);
+                    });
+                    page.querySelectorAll('.ferrofinTab').forEach(function (tab) {
+                        var group = tab.getAttribute('data-group');
+                        var current = group === state.tab;
+                        tab.setAttribute('aria-selected', !across && current ? 'true' : 'false');
+                        tab.classList.toggle('ferrofinTabMatchless', across && !shown[group]);
+                        tab.tabIndex = current ? 0 : -1;
+                    });
+                    var noMatch = page.querySelector('.ferrofinNoMatch');
+                    if (state.rows.length === 0) {
+                        noMatch.textContent = 'The server reports no settings.';
+                    } else {
+                        // Only Hide read-only can empty the open tab.
+                        noMatch.textContent = across ? 'No setting matches.' : 'Every setting on this tab is read-only.';
+                    }
+                    noMatch.classList.toggle('hide', any);
+                }
+
+                /** Opens the tab of `group`, ending a search or a filter that lists every tab. */
+                function selectTab(page, state, group) {
+                    state.tab = group;
+                    page.querySelector('.ferrofinSearch').value = '';
+                    page.querySelector('.ferrofinFilterChanged').checked = false;
+                    applyView(page, state);
+                }
+
+                /**
+                 * The arrow keys, Home and End move between the tabs, as in a
+                 * tab list: up and down in the pane, left and right in the row
+                 * a narrow screen shows.
+                 */
+                function moveTab(page, state, event) {
+                    var tabs = Array.prototype.slice.call(page.querySelectorAll('.ferrofinTab'));
+                    var at = tabs.indexOf(event.target);
+                    var to = {
+                        ArrowUp: at - 1,
+                        ArrowDown: at + 1,
+                        ArrowLeft: at - 1,
+                        ArrowRight: at + 1,
+                        Home: 0,
+                        End: tabs.length - 1
+                    }[event.key];
+                    if (at === -1 || to === undefined) {
+                        return;
+                    }
+                    event.preventDefault();
+                    var tab = tabs[(to + tabs.length) % tabs.length];
+                    selectTab(page, state, tab.getAttribute('data-group'));
+                    tab.focus();
+                }
+
+                function clearTabs(page) {
+                    clear(page.querySelector('.ferrofinTabs'));
+                    clear(page.querySelector('.ferrofinGroups'));
+                }
+
+                /** A tab: its group's name, its count of unsaved edits, and a mark for a refusal. */
+                function tabFor(group) {
+                    var tab = element('button', 'ferrofinTab');
+                    tab.setAttribute('type', 'button');
+                    tab.setAttribute('role', 'tab');
+                    tab.setAttribute('data-group', group);
+                    tab.appendChild(element('span', 'ferrofinTabName', group));
+                    tab.appendChild(element('span', 'ferrofinTabCount hide'));
+                    var mark = icon('error');
+                    mark.classList.add('ferrofinTabMark', 'hide');
+                    tab.appendChild(mark);
+                    return tab;
+                }
+
+                function render(page, state, response) {
+                    var tabs = page.querySelector('.ferrofinTabs');
+                    var groups = page.querySelector('.ferrofinGroups');
+                    clearTabs(page);
+                    state.fields = [];
+                    state.rows = [];
+                    page.querySelector('.ferrofinError').classList.add('hide');
+                    renderRestartNotice(page, state, response.RestartPending, response.Settings || []);
+                    page.querySelector('.ferrofinConfigFilePath').textContent = response.ConfigFile || '';
+                    page.querySelector('.ferrofinConfigFile').classList.toggle('hide', !response.ConfigFile);
+                    page.querySelector('.ferrofinConfigFileLocked').classList.toggle('hide', response.ConfigFileWritable !== false);
+                    page.querySelector('.ferrofinForm').classList.remove('hide');
+
+                    // One tab per group, in the order the server lists them.
+                    var sections = Object.create(null);
+                    var order = [];
+                    (response.Settings || []).forEach(function (setting) {
+                        var section = sections[setting.Group];
+                        if (!section) {
+                            tabs.appendChild(tabFor(setting.Group));
+                            section = element('div', 'verticalSection ferrofinGroup');
+                            section.setAttribute('role', 'tabpanel');
+                            section.setAttribute('aria-label', setting.Group);
+                            section.setAttribute('data-group', setting.Group);
+                            // Shown, with the count of its matches, while a
+                            // search lists every tab's matches.
+                            var title = element('h3', 'ferrofinGroupTitle hide');
+                            title.appendChild(element('span', null, setting.Group));
+                            title.appendChild(element('span', 'ferrofinGroupCount'));
+                            section.appendChild(title);
+                            sections[setting.Group] = section;
+                            order.push(setting.Group);
+                            groups.appendChild(section);
+                        }
+                        section.appendChild(renderSetting(setting, state));
+                    });
+                    // The tab open before a reload stays open, and so do the
+                    // search and the filters; the first tab opens by default.
+                    if (order.indexOf(state.tab) === -1) {
+                        state.tab = order[0];
+                    }
+                    applyView(page, state);
+                    updateTabs(page, state);
+                    updateButtons(page, state);
+                }
+
+                /** Shows `text` above the settings, which stay as they are. */
+                function showNotice(page, text) {
+                    var message = page.querySelector('.ferrofinErrorText');
+                    clear(message);
+                    withCode(message, text);
+                    var notice = page.querySelector('.ferrofinError');
+                    notice.classList.remove('hide');
+                    notice.scrollIntoView({ block: 'center' });
+                }
+
+                function showError(page, state, text) {
+                    clearTabs(page);
+                    state.fields = [];
+                    state.rows = [];
+                    page.querySelector('.ferrofinForm').classList.add('hide');
+                    page.querySelector('.ferrofinConfigFile').classList.add('hide');
+                    page.querySelector('.ferrofinRestartPending').classList.add('hide');
+                    showNotice(page, text);
+                }
+
+                /**
+                 * The message for a failed `verb` ("load" or "save"); `failure`
+                 * is the fetch's Response, or an Error. A refused save's own
+                 * message stands alone: it says what to change.
+                 */
+                function failureText(failure, verb) {
+                    var action = verb === 'save' ? 'change' : 'see';
+                    if (failure instanceof Error) {
+                        return Promise.resolve('Could not ' + verb + ' the Ferrofin settings: ' + failure.message);
+                    }
+                    if (!failure || typeof failure.status !== 'number') {
+                        return Promise.resolve('Could not ' + verb + ' the Ferrofin settings: the server did not answer.');
+                    }
+                    switch (failure.status) {
+                        case 401:
+                            return Promise.resolve('Sign in again to ' + action + ' the Ferrofin settings.');
+                        case 403:
+                            return Promise.resolve('Only administrators can ' + action + ' the Ferrofin settings.');
+                        case 404:
+                            return Promise.resolve('The Ferrofin Settings plugin is disabled. Enable it under Dashboard → Plugins to ' + action + ' its settings.');
+                        default: {
+                            var prefix = 'Could not ' + verb + ' the Ferrofin settings (HTTP ' + failure.status + ')';
+                            return failure.json().then(function (body) {
+                                if (!body || !body.error) {
+                                    return prefix + '.';
+                                }
+                                return verb === 'save' && failure.status < 500 ? body.error : prefix + ': ' + body.error;
+                            }, function () {
+                                return prefix + '.';
+                            });
+                        }
+                    }
+                }
+
+                function load(page, state) {
+                    Dashboard.showLoadingMsg();
+                    return ApiClient.fetch({
+                        url: ApiClient.getUrl('Ferrofin/Settings'),
+                        type: 'GET',
+                        dataType: 'json'
+                    }).then(function (response) {
+                        render(page, state, response);
+                    }).catch(function (failure) {
+                        return failureText(failure, 'load').then(function (text) {
+                            showError(page, state, text);
+                        });
+                    }).finally(function () {
+                        Dashboard.hideLoadingMsg();
+                    });
+                }
+
+                /** The field of the first of the sent `keys` that the server's `message` names. */
+                function fieldNamedBy(state, keys, message) {
+                    var named = message.split(/[^A-Za-z0-9_]+/).filter(function (word) {
+                        return keys.indexOf(word) !== -1;
+                    })[0];
+                    return state.fields.filter(function (field) {
+                        return field.key === named;
+                    })[0];
+                }
+
+                /** Shows why nothing was saved: next to the setting it names, else at the top. */
+                function showRefusal(page, state, keys, status, text) {
+                    var field = status === 400 ? fieldNamedBy(state, keys, text) : undefined;
+                    if (!field) {
+                        showNotice(page, text);
+                        return;
+                    }
+                    var refusal = note('error', text, 'ferrofinFieldError');
+                    refusal.setAttribute('role', 'alert');
+                    field.row.appendChild(refusal);
+                    // The setting may be on another tab than the one open: its
+                    // tab is marked, and opens unless a search lists every tab.
+                    page.querySelectorAll('.ferrofinTab').forEach(function (tab) {
+                        if (tab.getAttribute('data-group') === field.group) {
+                            tab.classList.add('ferrofinTabRefused');
+                        }
+                    });
+                    if (!finding(finder(page))) {
+                        state.tab = field.group;
+                    }
+                    applyView(page, state);
+                    updateTabs(page, state);
+                    field.row.scrollIntoView({ block: 'center' });
+                }
+
+                /** Keeps what a save did that the report cannot show until the restart. */
+                function remember(state, sent, result) {
+                    (result.Changed || []).forEach(function (key) {
+                        if (sent[key] === null) {
+                            state.resets[key] = true;
+                        } else {
+                            delete state.resets[key];
+                        }
+                    });
+                    (result.ProcessRestartRequired || []).forEach(function (key) {
+                        state.processRestart[key] = true;
+                    });
+                }
+
+                /**
+                 * Saves the changed settings, all or nothing. A refusal leaves
+                 * the page as it is, so the admin's edits stay to correct.
+                 */
+                function save(page, state) {
+                    var sent = changes(state);
+                    var keys = Object.keys(sent);
+                    if (state.saving || state.restarting || keys.length === 0) {
+                        return;
+                    }
+                    page.querySelector('.ferrofinError').classList.add('hide');
+                    page.querySelectorAll('.ferrofinFieldError').forEach(function (refusal) {
+                        refusal.parentNode.removeChild(refusal);
+                    });
+                    page.querySelectorAll('.ferrofinTabRefused').forEach(function (tab) {
+                        tab.classList.remove('ferrofinTabRefused');
+                    });
+                    // A row shown only for its refusal follows the filters again.
+                    applyView(page, state);
+                    updateTabs(page, state);
+                    state.saving = true;
+                    updateButtons(page, state);
+                    Dashboard.showLoadingMsg();
+                    ApiClient.fetch({
+                        url: ApiClient.getUrl('Ferrofin/Settings'),
+                        type: 'POST',
+                        data: JSON.stringify({ Changes: sent }),
+                        contentType: 'application/json',
+                        dataType: 'json'
+                    }).then(function (result) {
+                        remember(state, sent, result);
+                        Dashboard.processPluginConfigurationUpdateResult();
+                        return load(page, state).then(function () {
+                            // A save to the server configuration alone applied
+                            // at once: there is no restart to point to.
+                            if (result.RestartRequired) {
+                                page.querySelector('.ferrofinRestartPending').scrollIntoView({ block: 'center' });
+                            }
+                        });
+                    }, function (failure) {
+                        return failureText(failure, 'save').then(function (text) {
+                            showRefusal(page, state, keys, failure && failure.status, text);
+                        });
+                    }).finally(function () {
+                        state.saving = false;
+                        updateButtons(page, state);
+                        Dashboard.hideLoadingMsg();
+                    });
+                }
+
+                /**
+                 * Whether a restart has finished: the server answers, and has
+                 * none pending. A refusal counts, for `load` to show. Plain
+                 * `fetch`: a failed GET through ApiClient starts its reconnect,
+                 * which may move it to another of the server's addresses.
+                 */
+                function restartFinished() {
+                    var headers = { accept: 'application/json' };
+                    ApiClient.setRequestHeaders(headers);
+                    return fetch(ApiClient.getUrl('Ferrofin/Settings'), { headers: headers, cache: 'no-store' }).then(function (response) {
+                        if (!response.ok) {
+                            return response.status < 500;
+                        }
+                        return response.json().then(function (settings) {
+                            return !settings.RestartPending;
+                        });
+                    }).catch(function () {
+                        return false;
+                    });
+                }
+
+                /** Resolves to whether the restart finished before `deadline`. */
+                function waitForRestart(deadline) {
+                    return restartFinished().then(function (finished) {
+                        if (finished || Date.now() >= deadline) {
+                            return finished;
+                        }
+                        return new Promise(function (resolve) {
+                            setTimeout(resolve, RESTART_POLL_MS);
+                        }).then(function () {
+                            return waitForRestart(deadline);
+                        });
+                    });
+                }
+
+                /** Puts the notice back after a restart that did not finish. */
+                function endRestart(page, state, text) {
+                    state.restarting = false;
+                    updateButtons(page, state);
+                    page.querySelector('.ferrofinRestartText').textContent = state.restartText;
+                    showNotice(page, text);
+                }
+
+                /** Restarts the server and shows the settings it comes back with. */
+                function restart(page, state) {
+                    state.restarting = true;
+                    updateButtons(page, state);
+                    page.querySelector('.ferrofinRestartText').textContent = 'Restarting the server…';
+                    ApiClient.restartServer().catch(function (failure) {
+                        // A dropped connection may be the restart itself.
+                        if (failure && failure.status) {
+                            throw failure;
+                        }
+                    }).then(function () {
+                        return waitForRestart(Date.now() + RESTART_WAIT_MS);
+                    }).then(function (finished) {
+                        if (!finished) {
+                            endRestart(page, state, 'The server has not finished restarting. Reload this page once it answers.');
+                            return;
+                        }
+                        state.restarting = false;
+                        load(page, state);
+                    }, function (failure) {
+                        endRestart(page, state, 'Could not restart the server (HTTP ' + failure.status + ').');
+                    });
+                }
+
+                function bind(page) {
+                    // `resets` and `processRestart` hold what this page saved
+                    // since the last restart; `tab` is the group whose tab is
+                    // open; `rows` are the settings shown, `fields` the
+                    // editable ones.
+                    var state = {
+                        fields: [],
+                        rows: [],
+                        resets: Object.create(null),
+                        processRestart: Object.create(null),
+                        saving: false,
+                        restarting: false,
+                        restartText: RESTART_PENDING,
+                        tab: null
+                    };
+                    page.setAttribute('data-ferrofin-bound', 'true');
+                    page.addEventListener('pageshow', function () {
+                        if (!state.restarting) {
+                            load(page, state);
+                        }
+                    });
+                    var tabs = page.querySelector('.ferrofinTabs');
+                    tabs.addEventListener('click', function (event) {
+                        var tab = event.target.closest('.ferrofinTab');
+                        if (tab) {
+                            selectTab(page, state, tab.getAttribute('data-group'));
+                        }
+                    });
+                    tabs.addEventListener('keydown', function (event) {
+                        moveTab(page, state, event);
+                    });
+                    // The search and the filters apply as they change; an edit
+                    // never hides the row it is made in.
+                    var find = page.querySelector('.ferrofinFinder');
+                    find.addEventListener('input', function () {
+                        applyView(page, state);
+                    });
+                    find.addEventListener('change', function () {
+                        applyView(page, state);
+                    });
+                    page.querySelector('.ferrofinSearch').addEventListener('keydown', function (event) {
+                        // Enter searches; it does not save.
+                        if (event.key === 'Enter') {
+                            event.preventDefault();
+                        }
+                    });
+                    var form = page.querySelector('.ferrofinForm');
+                    function changed() {
+                        updateTabs(page, state);
+                        updateButtons(page, state);
+                    }
+                    form.addEventListener('input', changed);
+                    form.addEventListener('change', changed);
+                    form.addEventListener('submit', function (event) {
+                        event.preventDefault();
+                        save(page, state);
+                    });
+                    page.querySelector('.ferrofinRestartNow').addEventListener('click', function () {
+                        if (Object.keys(changes(state)).length === 0) {
+                            restart(page, state);
+                            return;
+                        }
+                        Dashboard.confirm('The changes you have not saved will be lost.', 'Restart now', function (confirmed) {
+                            if (confirmed) {
+                                restart(page, state);
+                            }
+                        });
+                    });
+                }
+
+                // jellyfin-web keeps earlier views in the document, so this
+                // script binds only the page it was loaded with: the one not
+                // bound yet. `pageshow` fires on each visit, a return to the
+                // cached view included, and reloads the settings.
+                document.querySelectorAll('.ferrofinSettingsPage').forEach(function (page) {
+                    if (page.getAttribute('data-ferrofin-bound') !== 'true') {
+                        bind(page);
+                    }
+                });
+            }());
+        </script>
+    </div>
+</body>
+
+</html>

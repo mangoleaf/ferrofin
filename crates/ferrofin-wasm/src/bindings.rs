@@ -272,9 +272,9 @@ impl host::Host for HostState {
 
     fn get_state(&mut self, key: String) -> Option<Vec<u8>> {
         // `host:`-prefixed keys are the HOST'S bookkeeping (e.g. the
-        // analysis watermark) — invisible and unwritable from the guest,
-        // or a plugin could rewind its own offer-once cursor and re-burn
-        // the shared decode budget on every pass.
+        // analysis pass's switch-over from its old watermark) — invisible
+        // and unwritable from the guest, or a plugin could steer which items
+        // the host counts as offered to it.
         if key.starts_with("host:") {
             return None;
         }

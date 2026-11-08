@@ -143,26 +143,59 @@ pub struct NextUpEpisodeUserData {
     pub last_played_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// An episode a next-up batch names: what `DetermineNextEpisode` reads of it,
+/// not its row.
+///
+/// C# hands back whole `BaseItem`s, but the manager only compares these
+/// episodes and dates them: a series' last watched episode is never shown, and
+/// its pick, a special included, is shown only when it lands on the requested
+/// page. So the batch carries this much, and the manager reads the full rows of
+/// the page's picks afterwards with [`NextUpService::get_next_up_episode_rows`].
+///
+/// A special (season 0) also carries the three `Airs*` members of its `Data`
+/// blob, which place it among the regular episodes in `AiredEpisodeOrder`. The
+/// other episodes come from pools that leave season 0 out, and carry none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NextUpEpisode {
+    /// The stored id, as [`BaseItemEntity::id`].
+    pub id: String,
+    /// `ParentIndexNumber`: the season number.
+    pub parent_index_number: Option<i64>,
+    /// `IndexNumber`: the episode number.
+    pub index_number: Option<i64>,
+    /// `PremiereDate`: breaks a tie between two episodes in aired order.
+    pub premiere_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// `Episode.AirsBeforeSeasonNumber`, a special's: the season it airs
+    /// before. `None` for any other episode.
+    pub airs_before_season_number: Option<i64>,
+    /// `Episode.AirsAfterSeasonNumber`, a special's: the season it airs after.
+    /// `None` for any other episode.
+    pub airs_after_season_number: Option<i64>,
+    /// `Episode.AirsBeforeEpisodeNumber`, a special's: the episode it airs
+    /// before. `None` for any other episode.
+    pub airs_before_episode_number: Option<i64>,
+}
+
 /// Result of a batched next-up query for a single series.
 ///
 /// Port of `MediaBrowser.Controller.Persistence.NextUpEpisodeBatchResult`. Each
-/// `BaseItem?` field becomes an `Option<BaseItemEntity>` (repository rows), and
-/// the specials list becomes `Vec<BaseItemEntity>`.
+/// `BaseItem?` field becomes an `Option<NextUpEpisode>`, and the specials list
+/// a `Vec<NextUpEpisode>` (see [`NextUpEpisode`] for why neither is the row).
 #[derive(Debug, Clone, Default)]
 pub struct NextUpEpisodeBatchResult {
     /// The highest played season/episode.
-    pub last_watched: Option<BaseItemEntity>,
+    pub last_watched: Option<NextUpEpisode>,
     /// The next unwatched episode after the last watched position.
-    pub next_up: Option<BaseItemEntity>,
+    pub next_up: Option<NextUpEpisode>,
     /// Specials that may air between episodes (only when specials were requested).
-    pub specials: Vec<BaseItemEntity>,
+    pub specials: Vec<NextUpEpisode>,
     /// The most recently played episode, for rewatching mode.
-    pub last_watched_for_rewatching: Option<BaseItemEntity>,
+    pub last_watched_for_rewatching: Option<NextUpEpisode>,
     /// The next played episode, for rewatching mode.
-    pub next_played_for_rewatching: Option<BaseItemEntity>,
-    /// The user-data facts for every row this result carries, keyed by the
-    /// row's stored id ([`BaseItemEntity::id`]). Not a C# field: it stands in
-    /// for the `IUserDataManager` reads the C# manager makes per episode.
+    pub next_played_for_rewatching: Option<NextUpEpisode>,
+    /// The user-data facts for every episode this result names, keyed by its
+    /// stored id ([`NextUpEpisode::id`]). Not a C# field: it stands in for the
+    /// `IUserDataManager` reads the C# manager makes per episode.
     pub user_data: HashMap<String, NextUpEpisodeUserData>,
 }
 
@@ -208,7 +241,8 @@ pub trait ItemRepository: Send + Sync {
     async fn retrieve_item(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError>;
 
     /// The stored rows of the given items, in as few queries as the
-    /// host-variable limit allows (`ferrofin_db::BATCH_BIND_CHUNK` ids each).
+    /// host-variable limit allows (padded chunks of `ferrofin_db::PADDED_LIST_MAX`
+    /// ids each).
     ///
     /// The batch twin of [`retrieve_item`](Self::retrieve_item), for the
     /// library scan: it needs what is already stored for the items it planned
@@ -340,6 +374,25 @@ pub trait ItemRepository: Send + Sync {
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
+    /// [`Self::get_item_list`]'s rows, in its order, carrying only what a
+    /// season's episode filter and the aired-order sort read: `Id`, `Type`,
+    /// `ParentId`, `SeasonId`, `ChannelId`, `Path`, `IndexNumber`,
+    /// `ParentIndexNumber`, `PremiereDate`, `PresentationUniqueKey`, and `Data`
+    /// where it names an `Airs*` member. A repository may leave every other
+    /// column at its default; this default returns the full rows.
+    ///
+    /// A series' episode listing reads all of its rows to place one season's,
+    /// then [`Self::retrieve_items`] the full rows of those it lists.
+    ///
+    /// # Errors
+    /// Propagates the repository failure.
+    async fn get_episode_order_rows(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_item_list(filter).await
+    }
+
     /// Returns `(Id, CleanName)` for every row matching the query, in the same
     /// order — and under the same predicates, ordering and paging — as
     /// [`Self::get_item_list`].
@@ -363,10 +416,11 @@ pub trait ItemRepository: Send + Sync {
             .collect())
     }
 
-    /// The "latest media" rows of a **tvshows, music or movies** library — port
-    /// of C# `BaseItemRepository.GetLatestItemList`.
+    /// The "latest media" rows of a **tvshows, music or movies** library, or of
+    /// a parent set with no collection type (**unknown**) — port of C#
+    /// `BaseItemRepository.GetLatestItemList`.
     ///
-    /// The three types answer differently (all v12):
+    /// The four types answer differently (all v12):
     ///
     /// - **tvshows** (`GetLatestTvShowItems`) — ONE row for each of the newest
     ///   `filter.limit` series (by the newest row the filter matches, grouped
@@ -383,12 +437,14 @@ pub trait ItemRepository: Send + Sync {
     /// - **movies** (`GetLatestMovieItems`) — the rows the filter matches that
     ///   carry a presentation key, newest first (`DateCreated DESC, Id DESC`),
     ///   the first of each key, `filter.limit` of them. The filter's `order_by`
-    ///   and `start_index` play no part, and the caller groups the rows.
+    ///   and `start_index` play no part, and the caller groups the rows;
+    /// - **unknown** — the movies answer over the rows with no `SeriesName`
+    ///   and the tvshows answer, `filter.limit` of each, merged by each row's
+    ///   own `DateCreated` (then `Id`), newest first, and cut to
+    ///   `filter.limit`. The caller groups the rows.
     ///
-    /// Any other collection type returns an empty list and the caller uses
-    /// [`get_item_list`](Self::get_item_list) for it. Note that is wider than
-    /// the C# early exit, which also has an `unknown` arm (a mixed library's
-    /// latest movies and shows): not ported yet, gl-383.
+    /// Any other collection type returns an empty list, as the C# early exit
+    /// does, and the caller uses [`get_item_list`](Self::get_item_list) for it.
     async fn get_latest_item_list(
         &self,
         filter: &InternalItemsQuery,
@@ -514,19 +570,22 @@ pub trait ItemRepository: Send + Sync {
         Ok(map)
     }
 
-    /// [`Self::get_image_infos`] in the same read as whether the item's images
-    /// are auto-oriented when served: `ImageProcessor.ProcessImage`'s
-    /// `autoOrient`, true for a `Photo` whose stored orientation is unknown or
-    /// not `TopLeft`. The default reads the rows and orients nothing.
+    /// [`Self::get_image_infos`] in the same read as what the item's owner
+    /// decides about serving them. The default reads the rows alone: nothing
+    /// oriented, no Live TV owner, so a repository that stores Live TV items
+    /// must override it.
     ///
     /// # Errors
     ///
     /// [`ServiceError`] on a storage failure.
-    async fn get_image_infos_with_auto_orient(
+    async fn get_image_infos_to_serve(
         &self,
         item_id: Uuid,
-    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
-        Ok((self.get_image_infos(item_id).await?, false))
+    ) -> Result<crate::options::ItemImagesToServe, ServiceError> {
+        Ok(crate::options::ItemImagesToServe {
+            images: self.get_image_infos(item_id).await?,
+            ..Default::default()
+        })
     }
 
     /// Swaps the two `image_type` images at `index1` and `index2` for an item,
@@ -731,6 +790,22 @@ pub trait ItemPersistenceService: Send + Sync {
     ///
     /// [`ServiceError::Backend`] on a storage failure.
     async fn deletion_closure(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
+    /// The ids of [`Self::deletion_closure`]'s rows, in the same order,
+    /// without reading the rows: a caller that cleans a large deletion (a
+    /// removed library) reads the rows a batch at a time.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn deletion_closure_ids(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(self
+            .deletion_closure(ids)
+            .await?
+            .iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect())
+    }
 
     /// Persists (inserts or updates) the given item rows.
     ///
@@ -1124,15 +1199,18 @@ pub trait ItemPersistenceService: Send + Sync {
     }
 
     /// The stored dimensions/blurhash of every image row attached to
-    /// `item_ids`, read in one batch.
+    /// `item_ids`, read in one batch, with each row's item and type, so a
+    /// caller can also tell whether an item's rows already match what it
+    /// would write.
     ///
     /// This is the read half of C#'s `LibraryManager.ImageNeedsRefresh`: an
     /// image whose stored `Width`/`Height`/`BlurHash` are already filled and
     /// whose stored `DateModified` still matches the file's mtime is *not*
     /// refreshed, so upstream never re-decodes an unchanged poster. Ferrofin
     /// holds its image rows in the database rather than on an in-memory
-    /// `BaseItem`, so the scan reads them back — once for the whole run, in the
-    /// same shape as the other scan prereads, never once per item.
+    /// `BaseItem`, so the scan reads them back in batches — one stored-row
+    /// window of its plan at a time, and its albums' once for their covers —
+    /// never once per item.
     ///
     /// The default returns nothing (stub/fake services), which is safe: a
     /// caller that finds no stored metadata simply recomputes.
@@ -1439,7 +1517,9 @@ pub trait ItemPersistenceService: Send + Sync {
     /// row the item already has for the same user and key kept by the later
     /// `LastPlayedDate`, then the higher `PlayCount`), its playlist and
     /// collection entries and every other row's reference to it follow, and
-    /// the row is deleted. Returns the moves made.
+    /// the row is deleted. Each user's user-data rows of the item then take
+    /// the values of the row its DTO reads, so the list filters agree with
+    /// it. Returns the moves made.
     ///
     /// The default (a stub/fake service) moves nothing; the scan then plans
     /// the item anew and the old row is pruned.
@@ -1698,6 +1778,52 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(0)
     }
 
+    /// Clears `item_id`'s `DateLastRefreshed`, so the next scan takes it as
+    /// never refreshed: its refresh failed after the row was saved, and the
+    /// saved row no longer shows what is left to do. Nothing else on the row
+    /// moves. Returns whether there is such a row.
+    ///
+    /// The default clears nothing and answers `false` (for stub/fake
+    /// services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn clear_date_last_refreshed(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let _ = item_id;
+        Ok(false)
+    }
+
+    /// `item_id`'s stored `PresentationUniqueKey`, read as that one column so
+    /// a row the decoder rejects still answers. `None` for no row or no key.
+    ///
+    /// The default answers `None` (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn presentation_unique_key(&self, item_id: Uuid) -> Result<Option<String>, ServiceError> {
+        let _ = item_id;
+        Ok(None)
+    }
+
+    /// `item_id`'s stored `InheritedParentalRatingValue` and
+    /// `InheritedParentalRatingSubValue`, read as those two columns so a row
+    /// the decoder rejects still answers. `None` for no row or no score.
+    ///
+    /// The default answers `None` (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn stored_rating_score(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Option<(i64, Option<i64>)>, ServiceError> {
+        let _ = item_id;
+        Ok(None)
+    }
+
     /// The locked metadata fields (`BaseItemMetadataFields`, upstream's
     /// `BaseItem.LockedFields`) of each of `item_ids`, in field order. An
     /// item with none is absent from the map.
@@ -1811,7 +1937,8 @@ pub trait ItemPersistenceService: Send + Sync {
 
     /// The external ids already recorded for each of `item_ids`, keyed by item.
     ///
-    /// A scanner reads these once up front so a re-scan resolves each item by
+    /// A scanner reads these in batches ahead of its walk (one stored-row
+    /// window of its plan at a time) so a re-scan resolves each item by
     /// the id a previous pass matched — C# `info.GetProviderId` — instead of
     /// searching by title again. The default is an empty map, for stub
     /// services with no store behind them.
@@ -2499,9 +2626,14 @@ pub struct ItemChildLink {
 ///
 /// Returned by
 /// [`ItemPersistenceService::image_metadata_for_items`] and consumed by the
-/// scan's port of C#'s `LibraryManager.ImageNeedsRefresh`.
+/// scan's port of C#'s `LibraryManager.ImageNeedsRefresh`, and by its credited
+/// people's image write, which compares each person's whole row set.
 #[derive(Debug, Clone)]
 pub struct StoredImageMetadata {
+    /// The item the row belongs to.
+    pub item_id: Uuid,
+    /// The row's image type.
+    pub image_type: ImageType,
     /// The image file's path — the identity of the artwork on disk.
     pub path: String,
     /// The stored pixel width (`0` when never probed).
@@ -2718,6 +2850,14 @@ pub trait NextUpService: Send + Sync {
         include_specials: bool,
         include_watched_for_rewatching: bool,
     ) -> Result<HashMap<String, NextUpEpisodeBatchResult>, ServiceError>;
+
+    /// Reads the full rows of the given episodes, keyed by id: the picks of
+    /// the requested page, specials included, once the batch has decided and
+    /// ordered them. An id with no row has no entry.
+    async fn get_next_up_episode_rows(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, BaseItemEntity>, ServiceError>;
 }
 
 fn _assert_object_safe_next_up_service(_: &dyn NextUpService) {}
@@ -2765,7 +2905,7 @@ mod tests {
         let r = NextUpEpisodeBatchResult::default();
         assert!(r.last_watched.is_none());
         assert!(r.next_up.is_none());
-        assert!(r.specials.is_empty());
+        assert!(r.specials.is_empty(), "{:?}", r.specials);
         assert!(r.user_data.is_empty());
         let ud = NextUpEpisodeUserData::default();
         assert!(!ud.played);

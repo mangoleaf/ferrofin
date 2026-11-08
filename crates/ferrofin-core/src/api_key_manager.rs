@@ -17,6 +17,8 @@
 //! - `DeleteApiKey` deletes by access token; deleting an absent token is a no-op
 //!   (the C# `ExecuteDeleteAsync` affects zero rows).
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use ferrofin_db::Database;
@@ -28,12 +30,16 @@ use ferrofin_model::security::AuthenticationInfo;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::security::ApiKeyManager;
 
+use crate::auth_cache::AuthCache;
 use crate::db_error::db_err;
 
 /// The concrete API-key manager over the `ApiKeys` table.
 #[derive(Clone)]
 pub struct FerrofinApiKeyManager {
     db: Database,
+    /// The shared token-resolution cache: a created or deleted key's token is
+    /// dropped from it, so a deleted key stops authenticating at once.
+    auth_cache: Arc<AuthCache>,
 }
 
 impl std::fmt::Debug for FerrofinApiKeyManager {
@@ -47,7 +53,18 @@ impl FerrofinApiKeyManager {
     /// Creates an API-key manager over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            auth_cache: Arc::new(AuthCache::default()),
+        }
+    }
+
+    /// Installs the shared [`AuthCache`] (composition root only) — must be the
+    /// instance the authorization context reads through.
+    #[must_use]
+    pub fn with_auth_cache(mut self, auth_cache: Arc<AuthCache>) -> Self {
+        self.auth_cache = auth_cache;
+        self
     }
 }
 
@@ -93,6 +110,9 @@ impl ApiKeyManager for FerrofinApiKeyManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        // A fresh random token cannot be cached yet; dropping it keeps the
+        // cache's contract literal: every write of a token drops it.
+        self.auth_cache.invalidate_token(&access_token);
         Ok(())
     }
 
@@ -102,6 +122,8 @@ impl ApiKeyManager for FerrofinApiKeyManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        // Revocation: the deleted key must stop authenticating NOW.
+        self.auth_cache.invalidate_token(access_token);
         Ok(())
     }
 }

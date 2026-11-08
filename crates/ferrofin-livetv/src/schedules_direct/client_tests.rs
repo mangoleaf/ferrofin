@@ -147,7 +147,7 @@ async fn get_lineups_valid_credentials_returns_lineups() {
         .await
         .expect("lineups");
 
-    assert!(!lineups.is_empty());
+    assert!(!lineups.is_empty(), "{lineups:?}");
     assert!(
         lineups
             .iter()
@@ -189,7 +189,8 @@ async fn get_lineups_login_fails_throws() {
             .await
             .is_err()
     );
-    assert!(fake.sent("/headends").is_empty());
+    let sent = fake.sent("/headends");
+    assert!(sent.is_empty(), "{sent:?}");
 }
 
 #[tokio::test]
@@ -227,12 +228,11 @@ async fn validate_after_account_error_recovers_without_restart() {
     // server restart.
     fake.login_ok();
     sd.validate(&info(), true, false).await.expect("validate");
-    assert!(
-        !sd.get_lineups(&info(), Some("USA"), Some("90210"))
-            .await
-            .expect("lineups")
-            .is_empty()
-    );
+    let lineups = sd
+        .get_lineups(&info(), Some("USA"), Some("90210"))
+        .await
+        .expect("lineups");
+    assert!(!lineups.is_empty(), "{lineups:?}");
 }
 
 /// An account error disables SD outright: no further login is attempted until

@@ -7,7 +7,7 @@
 //! via [`From`] so handlers can use `?` directly on trait-method results.
 
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use ferrofin_traits::error::ServiceError;
 use serde::Serialize;
@@ -51,9 +51,9 @@ pub enum ApiError {
     #[error("conflict: {0}")]
     Conflict(String),
 
-    /// Account policy or permissions forbid the operation → `403`. Covers
-    /// disabled-account logins and the controllers' `StatusCode(403, …)` returns
-    /// (e.g. updating another user without elevation, disabling the last admin).
+    /// Account policy or permissions forbid the operation → `403`. Covers the
+    /// controllers' `StatusCode(403, …)` returns (e.g. updating another user
+    /// without elevation, disabling the last admin).
     #[error("forbidden: {0}")]
     Forbidden(String),
 
@@ -167,9 +167,8 @@ impl ApiError {
             }
             Self::Service(ServiceError::Conflict(_)) | Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Service(ServiceError::Forbidden(_)) | Self::Forbidden(_) => StatusCode::FORBIDDEN,
-            Self::Service(ServiceError::Unavailable(_)) | Self::ServiceUnavailable(_) => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::Service(ServiceError::Unavailable(_) | ServiceError::Busy { .. })
+            | Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             Self::Problem(p) => p.status(),
             // `Db`/`Backend` (and any future non-exhaustive variant) are internal
@@ -192,12 +191,24 @@ impl IntoResponse for ApiError {
         let status = self.status();
         // 5xx messages can leak internals, so log the detail server-side but
         // return a generic body; 4xx/501 messages are safe to surface.
-        if let Self::Service(ServiceError::Unavailable(_)) = self {
+        if let Self::Service(ServiceError::Unavailable(_) | ServiceError::Busy { .. }) = self {
             // Load shedding, not a failure. Its volume follows the request
             // rate (an anonymous flood), so it is debug, not error.
             tracing::debug!(error = %self, "request shed");
         } else if status.is_server_error() {
             tracing::error!(error = %self, "handler failed");
+        }
+        if let Self::Service(ServiceError::Busy {
+            message,
+            retry_after_secs,
+        }) = self
+        {
+            return (
+                status,
+                [(header::RETRY_AFTER, retry_after_secs.to_string())],
+                Json(ErrorBody { error: message }),
+            )
+                .into_response();
         }
         if let Self::Problem(problem) = self {
             return (
@@ -221,8 +232,30 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, ProblemStatus, StatusCode};
+    use super::{ApiError, ProblemStatus, StatusCode, header};
+    use axum::response::IntoResponse;
     use ferrofin_traits::error::ServiceError;
+
+    /// A refused transcode tells the client when to come back, and in words:
+    /// it is not an internal error, and the generic 5xx body would say it is.
+    #[tokio::test]
+    async fn busy_is_a_503_with_retry_after_and_its_message() {
+        let response = ApiError::from(ServiceError::busy("at the limit", 10)).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "10");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), br#"{"error":"at the limit"}"#);
+    }
+
+    /// `Retry-After` is for the refusal that names a wait, not any 503.
+    #[test]
+    fn unavailable_stays_without_retry_after() {
+        let response = ApiError::from(ServiceError::unavailable("x")).into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.headers().contains_key(header::RETRY_AFTER));
+    }
 
     #[test]
     fn service_variants_map_to_expected_status() {

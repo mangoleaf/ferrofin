@@ -302,7 +302,11 @@ mod tests {
                 .expect("sparse manifest parses");
         assert_eq!(packages[0].name, "Sparse");
         assert_eq!(packages[0].owner, "");
-        assert!(packages[0].versions.is_empty());
+        assert!(
+            packages[0].versions.is_empty(),
+            "{:?}",
+            packages[0].versions
+        );
         assert!(packages[0].id.is_nil());
     }
 

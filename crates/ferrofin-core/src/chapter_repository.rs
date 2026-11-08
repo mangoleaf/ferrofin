@@ -24,6 +24,10 @@ use ferrofin_traits::persistence::ChapterRepository;
 
 use crate::db_error::db_err;
 
+/// The columns a `Chapters` insert writes, in bind order.
+const CHAPTER_COLUMNS: &str =
+    r#""ItemId", "ChapterIndex", "ImageDateModified", "ImagePath", "Name", "StartPositionTicks""#;
+
 /// The concrete chapter repository.
 #[derive(Clone)]
 pub struct FerrofinChapterRepository {
@@ -67,23 +71,30 @@ impl ChapterRepository for FerrofinChapterRepository {
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        for (index, chapter) in chapters.iter().enumerate() {
-            let chapter_index = i64::try_from(index).unwrap_or(i64::MAX);
-            sqlx::query(
-                r#"INSERT INTO "Chapters"
-                   ("ItemId", "ChapterIndex", "ImageDateModified", "ImagePath",
-                    "Name", "StartPositionTicks")
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
-            )
-            .bind(guid_to_db(item_id))
-            .bind(chapter_index)
-            .bind(opt_datetime_to_db(chapter.image_date_modified))
-            .bind(&chapter.image_path)
-            .bind(&chapter.name)
-            .bind(chapter.start_position_ticks)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
+        // Many rows per statement (gl-1181): a scan saves every item's
+        // chapters, one awaited statement per chapter otherwise.
+        let item_id = guid_to_db(item_id);
+        let columns = CHAPTER_COLUMNS.split(',').count();
+        let mut index = 0_i64;
+        for chunk in
+            ferrofin_db::power_of_two_chunks(chapters, ferrofin_db::BATCH_BIND_CHUNK / columns)
+        {
+            let sql = format!(
+                r#"INSERT INTO "Chapters" ({CHAPTER_COLUMNS}) VALUES {}"#,
+                ferrofin_db::values_rows(chunk.len(), columns)
+            );
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for chapter in chunk {
+                query = query
+                    .bind(&item_id)
+                    .bind(index)
+                    .bind(opt_datetime_to_db(chapter.image_date_modified))
+                    .bind(&chapter.image_path)
+                    .bind(&chapter.name)
+                    .bind(chapter.start_position_ticks);
+                index += 1;
+            }
+            query.execute(&mut *tx).await.map_err(db_err)?;
         }
         tx.commit().await.map_err(db_err)?;
         Ok(())
@@ -109,11 +120,8 @@ impl ChapterRepository for FerrofinChapterRepository {
         if item_ids.is_empty() {
             return Ok(map);
         }
-        for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let ph = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+        for chunk in ferrofin_db::padded_in_chunks(item_ids) {
+            let ph = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT * FROM "Chapters" WHERE "ItemId" IN ({ph})
                    ORDER BY "ItemId", "StartPositionTicks""#,
@@ -209,6 +217,28 @@ mod tests {
         assert!(repo.get_chapter(item, 9).await.expect("miss").is_none());
 
         repo.delete_chapters(item).await.expect("delete");
-        assert!(repo.get_chapters(item).await.expect("get").is_empty());
+        let chapters = repo.get_chapters(item).await.expect("get");
+        assert!(chapters.is_empty(), "{chapters:?}");
+    }
+
+    /// More chapters than one statement's rows are saved whole, each at its
+    /// position (gl-1181).
+    #[tokio::test]
+    async fn a_long_chapter_list_is_saved_whole_and_in_order() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinChapterRepository::new(db);
+        let chapters: Vec<ChapterEntity> = (0..200)
+            .map(|i| chapter(&format!("Chapter {i}"), i * 10))
+            .collect();
+        repo.save_chapters(item, &chapters).await.expect("save");
+        let got = repo.get_chapters(item).await.expect("get");
+        let got: Vec<(i64, Option<String>)> =
+            got.into_iter().map(|c| (c.chapter_index, c.name)).collect();
+        let expected: Vec<(i64, Option<String>)> = (0..200)
+            .map(|i| (i, Some(format!("Chapter {i}"))))
+            .collect();
+        assert_eq!(got, expected);
     }
 }

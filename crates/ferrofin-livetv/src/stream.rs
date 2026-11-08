@@ -172,12 +172,16 @@ impl TunerStreamSource for ReqwestTunerSource {
         url: &str,
         headers: &HashMap<String, String>,
     ) -> Result<Box<dyn TunerStreamBody>, ServiceError> {
+        let failed = |e| {
+            let source = crate::fetch::redact_url(url);
+            LiveTvError::http(format!("open tuner stream {source}"), e)
+        };
         let response = Self::with_headers(self.client.get(url), headers)
             .send()
             .await
-            .map_err(|e| LiveTvError::http(format!("open tuner stream {url}"), e))?
+            .map_err(failed)?
             .error_for_status()
-            .map_err(|e| LiveTvError::http(format!("open tuner stream {url}"), e))?;
+            .map_err(failed)?;
         Ok(Box::new(ReqwestTunerBody { response }))
     }
 
@@ -283,6 +287,10 @@ pub(crate) fn url_host(url: &str) -> Option<&str> {
 /// container, fallback bitrate, user agent). `is_remote` is whether the URL's
 /// host is off the local network (`!IsInLocalNetwork(uri.Host)`, and remote
 /// when the URL has no host), which the caller decides.
+///
+/// An HTTP source is marked [`path_is_private`](MediaSourceInfo::path_is_private)
+/// wherever its host is, a deliberate divergence: whether a provider's URL
+/// holds credentials cannot be told from the URL.
 #[must_use]
 pub fn create_media_source_info(
     path: &str,
@@ -311,6 +319,7 @@ pub fn create_media_source_info(
 
     let mut source = MediaSourceInfo {
         path: Some(path.to_owned()),
+        path_is_private: protocol == MediaProtocol::Http,
         protocol,
         media_streams: vec![
             MediaStream {
@@ -600,7 +609,8 @@ pub async fn open_shared_http_stream(
         task.abort();
         let _ = tokio::fs::remove_file(&temp_path).await;
         Err(ServiceError::backend(format!(
-            "zero bytes copied from live stream {url}"
+            "zero bytes copied from live stream {}",
+            crate::fetch::redact_url(url)
         )))
     }
 }
@@ -788,6 +798,24 @@ pub(crate) mod tests {
         assert!(!is_manifest_path("http://tuner/live.ts"));
         assert!(!is_manifest_path("http://tuner/live"));
         assert!(!is_manifest_path("http://tuner/live.mkv"));
+    }
+
+    /// Every HTTP source is private wherever its host is: a LAN address is no
+    /// sign that a URL holds no credentials.
+    #[rstest::rstest]
+    #[case("http://iptv.example/live/user/pass/1.ts", false, true)]
+    #[case("https://iptv.example/live/user/pass/1.ts", false, true)]
+    #[case("http://192.168.1.20:5004/auto/v1", true, true)]
+    #[case("rtsp://192.168.1.20/stream", true, false)]
+    #[case("udp://239.0.0.1:1234", true, false)]
+    fn an_http_source_is_private(
+        #[case] path: &str,
+        #[case] is_local: bool,
+        #[case] private: bool,
+    ) {
+        let tuner = TunerHostInfo::default();
+        let source = create_media_source_info(path, &tuner, !is_local);
+        assert_eq!(source.path_is_private, private);
     }
 
     #[test]

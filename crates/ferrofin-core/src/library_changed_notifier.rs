@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities_media::LibraryUpdateInfo;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::events::{EventManager, LibraryChangeAudience};
@@ -154,6 +155,11 @@ pub struct LibraryChangedNotifier {
     /// before wiring completes — falls back to publishing one payload on the
     /// event bus, which nothing forwards to clients.
     audience: std::sync::OnceLock<Arc<dyn LibraryChangeAudience>>,
+    /// Held while a batch is published. Each batch's per-user filter reads its
+    /// items' whole rows, and a scan's chunks fill batches faster than they go
+    /// out, so batches filtered together would hold a first scan's every row
+    /// in memory at once.
+    publishing: tokio::sync::Mutex<()>,
 }
 
 impl LibraryChangedNotifier {
@@ -169,6 +175,7 @@ impl LibraryChangedNotifier {
             pending: Mutex::new(Pending::default()),
             next_window: AtomicU64::new(0),
             audience: std::sync::OnceLock::new(),
+            publishing: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -196,16 +203,49 @@ impl LibraryChangedNotifier {
     /// A non-folder with no path has no `HasPathProtocol` and is skipped; a
     /// by-name item (genre, studio, person, year) is skipped unless it is a
     /// `MusicArtist`, which Jellyfin exempts because artists are browsable
-    /// library content rather than a facet.
+    /// library content rather than a facet; and so is anything whose
+    /// `SourceType` is not `Library`.
     fn filter_item(item: &BaseItemEntity) -> bool {
         if !item.is_folder && item.path.as_deref().unwrap_or_default().is_empty() {
             return false;
         }
-        let Some(kind) = crate::item_type_lookup::kind_from_type_name(&item.type_) else {
-            return true;
-        };
-        !crate::kinds::is_item_by_name(kind)
-            || kind == ferrofin_model::data::BaseItemKind::MusicArtist
+        let kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
+        if kind.is_some_and(|kind| {
+            crate::kinds::is_item_by_name(kind) && kind != BaseItemKind::MusicArtist
+        }) {
+            return false;
+        }
+        Self::source_type_is_library(item, kind)
+    }
+
+    /// `BaseItem.SourceType == SourceType.Library`, which no row stores: Live TV
+    /// channels and programmes are `LiveTV`, and a channel and anything with a
+    /// `ChannelId` are `Channel`.
+    ///
+    /// TODO(parity, open work item — NOT an accepted divergence; gl-1077):
+    /// `Video.SourceType` is also `LiveTV` while its file is being recorded.
+    /// No check is needed yet: a scan leaves such a file out
+    /// ([`LibraryScanner::with_recording_paths`]), so no scan makes a row to
+    /// announce until the capture ends. Un-defer path: when a recording gets
+    /// its item as it starts, this check has to come with it.
+    ///
+    /// [`LibraryScanner::with_recording_paths`]: crate::library_scan::LibraryScanner::with_recording_paths
+    fn source_type_is_library(item: &BaseItemEntity, kind: Option<BaseItemKind>) -> bool {
+        let live_tv_or_channel = matches!(
+            kind,
+            Some(
+                BaseItemKind::Channel
+                    | BaseItemKind::LiveTvChannel
+                    | BaseItemKind::TvChannel
+                    | BaseItemKind::LiveTvProgram
+                    | BaseItemKind::TvProgram
+            )
+        );
+        let in_a_channel = item
+            .channel_id
+            .as_deref()
+            .is_some_and(|id| Uuid::parse_str(id).is_ok_and(|id| !id.is_nil()));
+        !live_tv_or_channel && !in_a_channel
     }
 
     fn changed_of(item: &BaseItemEntity) -> Option<Changed> {
@@ -336,8 +376,10 @@ impl LibraryChangedNotifier {
     }
 
     /// Folds one taken batch and publishes it, per user when an audience is
-    /// wired.
+    /// wired. One batch at a time ([`Self::publishing`]): a later batch waits
+    /// for this one's consumers and its sends.
     async fn publish(&self, pending: Pending) {
+        let _one_batch_at_a_time = self.publishing.lock().await;
         let folded = fold(&pending);
         if folded.info.is_empty {
             return;
@@ -743,12 +785,43 @@ mod tests {
         genre.type_ = "MediaBrowser.Controller.Entities.Genre".to_owned();
         assert!(!LibraryChangedNotifier::filter_item(&genre));
 
-        let mut artist = genre.clone();
+        let mut artist = genre;
         artist.type_ = "MediaBrowser.Controller.Entities.Audio.MusicArtist".to_owned();
         assert!(
             LibraryChangedNotifier::filter_item(&artist),
             "C# exempts MusicArtist from the IItemByName skip"
         );
+    }
+
+    /// `return item.SourceType == SourceType.Library;`, for rows a path or a
+    /// folder flag would otherwise let through.
+    #[rstest::rstest]
+    #[case::live_tv_channel("MediaBrowser.Controller.LiveTv.LiveTvChannel")]
+    #[case::live_tv_program("MediaBrowser.Controller.LiveTv.LiveTvProgram")]
+    #[case::channel("MediaBrowser.Controller.Channels.Channel")]
+    fn a_kind_outside_the_library_is_not_announced(#[case] type_name: &str) {
+        let mut item = movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        item.type_ = type_name.to_owned();
+        assert!(!LibraryChangedNotifier::filter_item(&item));
+    }
+
+    #[test]
+    fn only_a_real_channel_id_puts_an_item_in_a_channel() {
+        let mut item = movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        item.channel_id = Some(Uuid::new_v4().to_string());
+        assert!(!LibraryChangedNotifier::filter_item(&item));
+        let mut unknown = item.clone();
+        unknown.type_ = "Not.A.Known.Type".to_owned();
+        assert!(!LibraryChangedNotifier::filter_item(&unknown));
+
+        for empty in [
+            Uuid::nil().to_string(),
+            String::new(),
+            "not-a-guid".to_owned(),
+        ] {
+            item.channel_id = Some(empty);
+            assert!(LibraryChangedNotifier::filter_item(&item));
+        }
     }
 
     /// Jellyfin 12's window (jellyfin/jellyfin#17762): it runs from the first
@@ -840,6 +913,63 @@ mod tests {
         assert_eq!(pushed[4].items_added.len(), 1);
     }
 
+    /// Counts how many batches are being filtered for a user at once.
+    #[derive(Default)]
+    struct OverlapAudience {
+        library: Uuid,
+        filtering: AtomicU64,
+        most_at_once: AtomicU64,
+        filtered: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl LibraryChangeAudience for OverlapAudience {
+        async fn active_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(vec![Uuid::nil()])
+        }
+        async fn visible_library_ids(&self, _: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(vec![self.library])
+        }
+        async fn library_top_parents(&self, libraries: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(libraries.to_vec())
+        }
+        async fn visible_item_ids(&self, _: Uuid, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+            let now = self.filtering.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_at_once.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            self.filtering.fetch_sub(1, Ordering::SeqCst);
+            self.filtered.fetch_add(1, Ordering::SeqCst);
+            Ok(ids.to_vec())
+        }
+        async fn deliver(&self, _: Uuid, _: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// Each batch's per-user filter reads its items' whole rows. A scan records
+    /// its changes a chunk at a time, so the batches it fills would otherwise
+    /// all be filtered together, with every row of a first scan in memory at
+    /// once on top of the scan's own plan.
+    #[tokio::test(start_paused = true)]
+    async fn full_batches_recorded_apart_are_filtered_one_at_a_time() {
+        let (n, _events) = notifier(Duration::from_secs(30));
+        let (parent, library) = (Uuid::new_v4(), Uuid::new_v4());
+        let audience = Arc::new(OverlapAudience {
+            library,
+            ..OverlapAudience::default()
+        });
+        n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);
+        for _ in 0..3 {
+            let items: Vec<BaseItemEntity> = (0..MAX_BATCH_SIZE)
+                .map(|_| movie(Uuid::new_v4(), parent, library))
+                .collect();
+            n.record_added(&items);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(audience.filtered.load(Ordering::SeqCst), 3);
+        assert_eq!(audience.most_at_once.load(Ordering::SeqCst), 1);
+    }
+
     /// `LibraryUpdateDuration` is read as each window opens
     /// (`OnLibraryChange`), so a configuration change applies to the next
     /// batch without a restart; zero, or a negative value, sends it at once.
@@ -864,7 +994,8 @@ mod tests {
 
         add();
         tokio::time::sleep(Duration::from_secs(9)).await;
-        assert!(events.library_updates().is_empty());
+        let library_updates = events.library_updates();
+        assert!(library_updates.is_empty(), "{library_updates:?}");
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(events.library_updates().len(), 1, "a 10 s window");
 
@@ -1181,8 +1312,16 @@ mod tests {
 
         let delivered = audience.delivered.lock().expect("lock");
         assert_eq!(delivered.len(), 1);
-        assert!(delivered[0].1.items_added.is_empty());
-        assert!(delivered[0].1.folders_removed_from.is_empty());
+        assert!(
+            delivered[0].1.items_added.is_empty(),
+            "{:?}",
+            delivered[0].1.items_added
+        );
+        assert!(
+            delivered[0].1.folders_removed_from.is_empty(),
+            "{:?}",
+            delivered[0].1.folders_removed_from
+        );
         assert_eq!(delivered[0].1.items_removed.len(), 1);
     }
 
@@ -1400,6 +1539,7 @@ mod tests {
         genre.type_ = "MediaBrowser.Controller.Entities.Genre".to_owned();
         n.record_updated(&[genre]);
         tokio::time::sleep(Duration::from_secs(31)).await;
-        assert!(events.library_updates().is_empty());
+        let library_updates = events.library_updates();
+        assert!(library_updates.is_empty(), "{library_updates:?}");
     }
 }

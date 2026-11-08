@@ -93,21 +93,32 @@ struct SplashscreenQuery {
     format: Option<String>,
 }
 
+/// `File.Exists`: whether `path` names an existing file (a directory is not one).
+///
+/// The stat goes through `tokio::fs` (the blocking pool), never `std::fs` inline:
+/// the login page fetches the splashscreen anonymously, and a cold stat on a
+/// network-mounted data directory can park the worker thread.
+async fn is_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Resolves the splashscreen file path from the branding options.
 ///
 /// Port of `GetSplashscreen`'s path resolution: the configured
 /// `SplashscreenLocation` when it names an existing file, else
 /// `<data>/splashscreen.png`. Returns `None` when neither exists.
-fn resolve_splashscreen_path(location: Option<&str>, data_path: &str) -> Option<String> {
+async fn resolve_splashscreen_path(location: Option<&str>, data_path: &str) -> Option<String> {
     if let Some(loc) = location
         && !loc.trim().is_empty()
-        && Path::new(loc).is_file()
+        && is_file(Path::new(loc)).await
     {
         return Some(loc.to_owned());
     }
     let default = Path::new(data_path).join("splashscreen.png");
-    default
-        .is_file()
+    is_file(&default)
+        .await
         .then(|| default.to_string_lossy().into_owned())
 }
 
@@ -149,6 +160,7 @@ async fn get_splashscreen(
     }
     let data_path = state.config.application_paths().data_path();
     let path = resolve_splashscreen_path(branding.splashscreen_location.as_deref(), &data_path)
+        .await
         .ok_or_else(|| ApiError::NotFound("no splashscreen file".to_owned()))?;
     // The same tail as every image route: the processor converts to the
     // requested `format`, and a `tag` earns the year-long immutable caching
@@ -174,7 +186,7 @@ async fn get_splashscreen(
         &image,
         0,
         false,
-        &ImageQuery::tagged(query.tag, query.format),
+        &ImageQuery::splashscreen(query.tag, query.format),
         request,
     )
     .await
@@ -251,7 +263,7 @@ async fn delete_splashscreen(
     let mut branding = state.config.get_branding().await?;
     if let Some(loc) = branding.splashscreen_location.clone()
         && !loc.trim().is_empty()
-        && Path::new(&loc).is_file()
+        && is_file(Path::new(&loc)).await
     {
         tokio::fs::remove_file(&loc).await.map_err(|e| {
             ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(

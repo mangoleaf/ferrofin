@@ -435,7 +435,7 @@ pub struct ArtistNameMatch {
 /// serializes requests behind a ≥1s throttle.
 pub struct MusicBrainzClient {
     http: reqwest::Client,
-    /// The operator's explicit server override (`FERROFIN_MUSICBRAINZ_BASE_URL`
+    /// The operator's explicit server override (`FERROFIN_MUSICBRAINZ_URL`
     /// / config `musicbrainz_base_url`). `None` when the operator set nothing,
     /// which is when the dashboard's `Server` governs.
     configured_base_url: Option<String>,
@@ -487,7 +487,7 @@ impl MusicBrainzClient {
     /// `MusicBrainzArtistProvider.ReloadConfig` re-points the shared `Query`
     /// at `Configuration.Server` whenever the settings page is saved; reading
     /// per call is the same observable behaviour without an event bus. An
-    /// operator who set `FERROFIN_MUSICBRAINZ_BASE_URL` still wins over the
+    /// operator who set `FERROFIN_MUSICBRAINZ_URL` still wins over the
     /// dashboard (an explicit env/file setting is the more specific
     /// instruction, and that knob shipped before this plugin had an identity).
     pub(crate) async fn settings(&self) -> crate::plugin_config::MusicBrainzConfig {
@@ -1156,7 +1156,11 @@ mod tests {
         assert!(c.lookup_artist("{not-an-mbid}").await.is_none());
         assert!(c.artist_details("rel-1").await.is_none());
         assert!(c.first_release_of("").await.is_none());
-        assert!(c.release_group_releases("rg").await.is_empty());
+        let release_group_releases = c.release_group_releases("rg").await;
+        assert!(
+            release_group_releases.is_empty(),
+            "{release_group_releases:?}"
+        );
     }
 
     /// `MusicBrainzAlbumProvider.Populate` (`:268-320`) over a release and

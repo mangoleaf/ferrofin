@@ -304,7 +304,7 @@ async fn count_children(
     ids: &[Uuid],
 ) -> Result<HashMap<Uuid, i64>, ServiceError> {
     let mut counts = HashMap::new();
-    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ids.chunks(ferrofin_db::PADDED_LIST_MAX) {
         let rows: Vec<(String, i64)> = count_children_query(column, kind, chunk)
             .build_query_as()
             .fetch_all(db.pool())
@@ -326,7 +326,7 @@ fn count_children_query(column: &str, kind: BaseItemKind, ids: &[Uuid]) -> Query
     qb.push_bind(stored_type_name(kind).unwrap_or_default());
     qb.push(format!(r#" AND b."{column}" IN ("#));
     let mut list = qb.separated(", ");
-    for id in ids {
+    for id in ferrofin_db::padded_in_list(ids) {
         list.push_bind(guid_to_db(*id));
     }
     qb.push(format!(r#") GROUP BY b."{column}""#));
@@ -341,7 +341,7 @@ async fn allowed_ids(
     ids: &[Uuid],
 ) -> Result<HashSet<Uuid>, ServiceError> {
     let mut allowed = HashSet::new();
-    for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+    for chunk in ferrofin_db::padded_in_chunks(ids) {
         let mut qb: QueryBuilder<Sqlite> =
             QueryBuilder::new(r#"SELECT bi."Id" FROM "BaseItems" AS bi WHERE bi."Id" IN ("#);
         let mut list = qb.separated(", ");

@@ -54,7 +54,7 @@ impl<'a> ImageAcquisitionPolicy<'a> {
                 .find(|option| option.type_ == image_type)
             })
             .copied()
-            .unwrap_or(ImageOption {
+            .unwrap_or_else(|| ImageOption {
                 type_: image_type,
                 ..Default::default()
             })

@@ -89,7 +89,7 @@ impl AuthService for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_authenticated: true,
             ..Default::default()
         })
@@ -104,7 +104,7 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_authenticated: true,
             ..Default::default()
         })
@@ -246,6 +246,17 @@ struct StubDisplayPreferences {
     sections: Mutex<Option<Vec<(i32, i32)>>>,
     /// The item id the last `get_display_preferences` asked for.
     asked_item: Mutex<Option<Uuid>>,
+    /// When set, each of the GET's three independent reads waits here for the
+    /// other two, so a handler that awaits them one after another never returns.
+    reads_together: Option<Arc<tokio::sync::Barrier>>,
+}
+
+impl StubDisplayPreferences {
+    async fn wait_for_the_other_reads(&self) {
+        if let Some(barrier) = &self.reads_together {
+            barrier.wait().await;
+        }
+    }
 }
 
 fn canned_prefs() -> DisplayPreferencesEntity {
@@ -292,6 +303,7 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for StubDisplayPr
         _client: &str,
     ) -> Result<DisplayPreferencesEntity, ServiceError> {
         *self.asked_item.lock().unwrap() = Some(item_id);
+        self.wait_for_the_other_reads().await;
         Ok(canned_prefs())
     }
     async fn get_item_display_preferences(
@@ -300,6 +312,7 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for StubDisplayPr
         _item_id: Uuid,
         _client: &str,
     ) -> Result<ItemDisplayPreferencesEntity, ServiceError> {
+        self.wait_for_the_other_reads().await;
         Ok(canned_item_prefs())
     }
     async fn list_item_display_preferences(
@@ -315,6 +328,7 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for StubDisplayPr
         _item_id: Uuid,
         _client: &str,
     ) -> Result<std::collections::HashMap<String, Option<String>>, ServiceError> {
+        self.wait_for_the_other_reads().await;
         let mut m = std::collections::HashMap::new();
         m.insert("customKey".to_owned(), Some("customVal".to_owned()));
         Ok(m)
@@ -444,6 +458,28 @@ async fn send(
 
 fn json(bytes: &[u8]) -> serde_json::Value {
     serde_json::from_slice(bytes).expect("valid JSON body")
+}
+
+/// The GET's row, item-prefs and custom-prefs reads are independent, so they
+/// run together rather than one after another (each stub read waits until all
+/// three have started).
+#[tokio::test]
+async fn display_preferences_get_runs_its_independent_reads_together() {
+    let prefs = StubDisplayPreferences {
+        reads_together: Some(Arc::new(tokio::sync::Barrier::new(3))),
+        ..StubDisplayPreferences::default()
+    };
+    let app = state_with_display_prefs(Arc::new(prefs));
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        get(app, "/DisplayPreferences/home?client=web"),
+    )
+    .await
+    .expect("the three reads ran one after another");
+    assert_eq!(status, StatusCode::OK);
+    let v = json(&body);
+    assert_eq!(v["CustomPrefs"]["customKey"], "customVal");
+    assert_eq!(v["SortOrder"], "Descending");
 }
 
 #[tokio::test]
@@ -1118,6 +1154,62 @@ async fn display_preferences_refuse_a_blank_client(#[case] method: &str, #[case]
     assert!(prefs.asked_item.lock().unwrap().is_none());
 }
 
+/// gl-1028: `[FromRoute, Required] string displayPreferencesId` on both
+/// actions. ASP.NET's `SimpleTypeModelBinder` reads a route value of nothing
+/// but white space as null, `[Required]` fails, and model validation answers a
+/// `400` `ValidationProblemDetails` keyed `displayPreferencesId` before the
+/// action runs, so ahead of `GetUserId`'s `403` and before any row is read.
+/// Ferrofin hashed the blank id with MD5 and served it (`GET` 200, `POST` 204).
+#[rstest::rstest]
+#[case::get_space("GET", "%20", "")]
+#[case::get_tab("GET", "%09", "")]
+#[case::get_spaces("GET", "%20%20%20", "")]
+#[case::get_no_break_space("GET", "%C2%A0", "")]
+#[case::get_for_another_user("GET", "%20", "&userId=OTHER")]
+#[case::post_space("POST", "%20", "")]
+#[case::post_line_feed("POST", "%0A", "")]
+#[case::post_for_another_user("POST", "%20", "&userId=OTHER")]
+#[tokio::test]
+async fn display_preferences_refuse_a_blank_route_id(
+    #[case] method: &str,
+    #[case] id: &str,
+    #[case] user: &str,
+) {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let app = state_with_display_prefs(prefs.clone());
+    let body = if method == "POST" {
+        Body::from(r#"{"CustomPrefs":{}}"#)
+    } else {
+        Body::empty()
+    };
+    let (status, body) = send(
+        app,
+        method,
+        &format!(
+            "/DisplayPreferences/{id}?client=web{}",
+            user.replace("OTHER", &OTHER_USER_ID.to_string())
+        ),
+        body,
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        problem,
+        serde_json::json!({
+            "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+            "title": "One or more validation errors occurred.",
+            "status": 400,
+            "errors": {
+                "displayPreferencesId": ["The displayPreferencesId field is required."],
+            },
+        })
+    );
+    assert!(prefs.asked_item.lock().unwrap().is_none());
+    assert!(prefs.row.lock().unwrap().is_none());
+}
+
 /// The other half of the rule: an **administrator** naming another user's id is
 /// still served. A gate that refuses everyone is not a port of `GetUserId`.
 #[tokio::test]
@@ -1204,6 +1296,9 @@ async fn display_preferences_self_as_non_admin_is_allowed() {
 )]
 #[case::urn("urn:uuid:01234567-89ab-cdef-0123-456789abcdef", None)]
 #[case::name("usersettings", None)]
+// The binder drops only an all-white-space id (gl-1028): a padded name is
+// hashed as sent.
+#[case::padded_name("%20usersettings%20", None)]
 #[tokio::test]
 async fn display_preferences_id_is_read_as_guid_try_parse_reads_it(
     #[case] raw: &str,

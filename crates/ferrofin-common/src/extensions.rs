@@ -34,6 +34,13 @@ pub fn strip_html(html_string: &str) -> String {
         .to_owned()
 }
 
+/// The MD5 digest of raw bytes, as .NET's `MD5.HashData(bytes)` returns it.
+/// Change detection only, never security (MD5 is broken).
+#[must_use]
+pub fn md5_digest(bytes: &[u8]) -> [u8; 16] {
+    md5::compute(bytes)
+}
+
 /// Lowercase hex MD5 of raw bytes — the checksum format Jellyfin plugin
 /// repository manifests use. Integrity only, NOT authenticity: transport
 /// security (HTTPS) is the trust root for downloads.
@@ -96,6 +103,17 @@ mod md5_hex_tests {
         assert_eq!(
             super::md5_hex(b"message digest"),
             "f96b697d7cb7938d525a2f31aaf161d0"
+        );
+    }
+
+    #[test]
+    fn md5_digest_is_the_raw_rfc1321_digest() {
+        assert_eq!(
+            super::md5_digest(b"abc"),
+            [
+                0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1,
+                0x7f, 0x72
+            ]
         );
     }
 

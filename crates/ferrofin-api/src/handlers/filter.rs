@@ -15,6 +15,8 @@
 //! with no scope. The genre facet dispatches to the music-genre aggregate for
 //! a music-only type set and to the plain-genre aggregate otherwise.
 
+use std::sync::Arc;
+
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -142,7 +144,7 @@ async fn get_query_filters_legacy(
     if is_trailer_or_program(&include_item_types) {
         return Ok(Json(QueryFiltersLegacy::default()));
     }
-    resolve_parent(&state, query.parent_id).await?;
+    resolve_parent(&state, &auth, query.parent_id, user.as_deref()).await?;
     let ancestor_ids: Vec<Uuid> = query.parent_id.into_iter().collect();
 
     let internal = InternalItemsQuery {
@@ -323,6 +325,15 @@ async fn get_query_filters(
                 return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
             }
             let parent = state.library.get_item_by_id(id).await?;
+            if let Some(parent) = &parent {
+                crate::handlers::items::require_scope_visible(
+                    &state,
+                    &auth,
+                    parent,
+                    user.as_deref(),
+                )
+                .await?;
+            }
             parent_scope(id, parent.as_ref(), query.recursive)
         }
         _ => (Vec::new(), Uuid::nil()),
@@ -335,12 +346,12 @@ async fn get_query_filters(
         // `DtoOptions { Fields = [], EnableImages = false, EnableUserData =
         // false }` (v12 `FilterController.cs:147-152`): no `ItemCounts`, so
         // the by-name repository computes no per-kind counts for a facet list.
-        dto_options: DtoOptions {
+        dto_options: Arc::new(DtoOptions {
             fields: Vec::new(),
             enable_images: false,
             enable_user_data: false,
             ..DtoOptions::default()
-        },
+        }),
         is_airing: query.is_airing,
         is_movie: query.is_movie,
         is_sports: query.is_sports,

@@ -5,8 +5,9 @@
 //! and the subset of `MediaBrowser.Model.IO.IFileSystem.GetFiles` they call for
 //! image-extension-filtered listings. Both are folded into one small
 //! [`DirectoryService`] trait so the un-mockable filesystem I/O lives behind a
-//! seam: production uses [`FsDirectoryService`] (real `std::fs`), and the unit
-//! tests drive an in-memory / temp-dir fake.
+//! seam: the scan implements it over its shared directory cache, everything
+//! else uses [`FsDirectoryService`] (real `std::fs`), and the unit tests drive an
+//! in-memory / temp-dir fake.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -60,9 +61,11 @@ pub fn is_supported_image_extension(extension: &str) -> bool {
 pub trait DirectoryService {
     /// Lists every entry (files *and* subdirectories) directly under `path`.
     ///
-    /// Port of `IDirectoryService.GetFileSystemEntries(path)`. Returns an empty
-    /// list when `path` does not exist or is not a directory.
-    fn file_system_entries(&self, path: &str) -> Vec<FileSystemMetadata>;
+    /// Port of `IDirectoryService.GetFileSystemEntries(path)`, which returns
+    /// the cached array itself: a memoizing implementation hands out the
+    /// listing it holds rather than a copy. Returns an empty list when `path`
+    /// does not exist or is not a directory.
+    fn file_system_entries(&self, path: &str) -> Arc<[FileSystemMetadata]>;
 
     /// Lists the files (not subdirectories) directly under `path`.
     ///
@@ -70,8 +73,9 @@ pub trait DirectoryService {
     /// `path` does not exist or is not a directory.
     fn files(&self, path: &str) -> Vec<FileSystemMetadata> {
         self.file_system_entries(path)
-            .into_iter()
+            .iter()
             .filter(|e| !e.is_directory)
+            .cloned()
             .collect()
     }
 
@@ -81,8 +85,9 @@ pub trait DirectoryService {
     /// when `path` does not exist or is not a directory.
     fn directories(&self, path: &str) -> Vec<FileSystemMetadata> {
         self.file_system_entries(path)
-            .into_iter()
+            .iter()
             .filter(|e| e.is_directory)
+            .cloned()
             .collect()
     }
 
@@ -93,7 +98,7 @@ pub trait DirectoryService {
     /// Returns an empty list when `path` does not exist.
     fn image_files(&self, path: &str, recursive: bool) -> Vec<FileSystemMetadata> {
         let mut out: Vec<FileSystemMetadata> = Vec::new();
-        for entry in self.file_system_entries(path) {
+        for entry in self.file_system_entries(path).iter() {
             if entry.is_directory {
                 if recursive {
                     out.extend(self.image_files(&entry.full_name, recursive));
@@ -105,7 +110,7 @@ pub trait DirectoryService {
                 .as_deref()
                 .is_some_and(is_supported_image_extension)
             {
-                out.push(entry);
+                out.push(entry.clone());
             }
         }
         out
@@ -118,17 +123,18 @@ pub trait DirectoryService {
 /// reads directories off disk and **memoizes each listing for the lifetime of
 /// the instance**, exactly like the upstream `DirectoryService._cache`
 /// (`ConcurrentDictionary<string, FileSystemMetadata[]>`). The memo is the
-/// reason that class exists: the image providers ask the same folder for its
-/// files and then for its subdirectories, so a cache-less service pays two
-/// `readdir` sweeps — plus a `stat` per entry each time — for every item in a
-/// folder. A missing directory memoizes as an empty listing, matching the
-/// upstream `DirectoryNotFoundException → []` branch.
+/// reason that class exists: every lookup of a folder within the instance's
+/// lifetime shares one `readdir` sweep (plus a `stat` per entry), so a caller
+/// that looks a folder up more than once lists it once. A missing directory
+/// memoizes as an empty listing, matching the upstream
+/// `DirectoryNotFoundException → []` branch.
 ///
 /// Lifetime is the instance, so callers scope freshness by scoping the service:
-/// upstream constructs one per refresh operation, and so does Ferrofin's
-/// scanner (one per item). This is the only place real filesystem I/O happens,
-/// so the parity/coverage numbers exercise [`DirectoryService`]'s default logic
-/// through an in-memory fake instead.
+/// upstream constructs one per refresh operation. Ferrofin's scan shares its own
+/// directory cache across a run instead, and builds one of these per item only
+/// where it has none. Real filesystem I/O happens here, so the parity/coverage
+/// numbers exercise [`DirectoryService`]'s default logic through an in-memory
+/// fake instead.
 #[derive(Debug, Default)]
 pub struct FsDirectoryService {
     /// Memoized `path → entries`, mirroring the upstream `_cache`.
@@ -161,18 +167,17 @@ impl FsDirectoryService {
 }
 
 impl DirectoryService for FsDirectoryService {
-    fn file_system_entries(&self, path: &str) -> Vec<FileSystemMetadata> {
+    fn file_system_entries(&self, path: &str) -> Arc<[FileSystemMetadata]> {
         // A poisoned lock must not fail a scan: fall back to an uncached read.
         let Ok(mut cache) = self.cache.lock() else {
-            return Self::read_entries(path);
+            return Self::read_entries(path).into();
         };
         if let Some(hit) = cache.get(path) {
-            return hit.to_vec();
+            return Arc::clone(hit);
         }
         let entries: Arc<[FileSystemMetadata]> = Self::read_entries(path).into();
-        let out = entries.to_vec();
-        cache.insert(path.to_owned(), entries);
-        out
+        cache.insert(path.to_owned(), Arc::clone(&entries));
+        entries
     }
 }
 

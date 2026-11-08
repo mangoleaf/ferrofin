@@ -27,9 +27,9 @@ Publicly reachable base URL advertised to clients (overrides `FERROFIN_PUBLISHED
 Explicit path to the `ffmpeg` executable (overrides `FERROFIN_FFMPEG_PATH`)
 .TP
 \fB\-\-config\fR \fI<FILE>\fR
-Path to an optional `config.toml` bootstrap file.
+Path to an optional `config.toml` bootstrap file (overrides `FERROFIN_CONFIG_FILE`).
 
-When omitted, `{data_dir}/config.toml` is consulted if present.
+When omitted, `config.toml` in the data directory (`\-\-data\-dir`, else `FERROFIN_DATA_DIR`, else the default location) is read if present.
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

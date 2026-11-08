@@ -67,18 +67,33 @@ pub async fn spawn_server(
     client: &reqwest::Client,
     make_config: impl Fn(u16) -> Config,
 ) -> (std::thread::JoinHandle<anyhow::Result<()>>, String, Config) {
+    spawn_server_with(client, make_config, ferrofin_server::run).await
+}
+
+/// [`spawn_server`], starting the server with `start` (handed the config)
+/// instead of [`ferrofin_server::run`]: a test of
+/// [`ferrofin_server::run_reloading`] passes a closure calling it.
+pub async fn spawn_server_with<F>(
+    client: &reqwest::Client,
+    make_config: impl Fn(u16) -> Config,
+    start: impl Fn(Config) -> F + Clone + Send + 'static,
+) -> (std::thread::JoinHandle<anyhow::Result<()>>, String, Config)
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
     for _ in 0..BOOT_ATTEMPTS {
         let mut config = make_config(free_port());
         config.server_name = unique_name(&config.server_name);
         let base = format!("http://127.0.0.1:{}", config.port);
         let run_config = config.clone();
+        let start = start.clone();
         // `run`'s future trips rustc's higher-ranked `Send` inference under
         // `tokio::spawn`; the binary drives it from `main`, so give it its own
         // thread and runtime here too.
         let server = std::thread::spawn(move || {
             tokio::runtime::Runtime::new()
                 .expect("server runtime")
-                .block_on(ferrofin_server::run(run_config))
+                .block_on(start(run_config))
         });
         let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
         let mut lost_the_port = false;

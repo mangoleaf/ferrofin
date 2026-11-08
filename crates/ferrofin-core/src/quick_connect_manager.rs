@@ -32,6 +32,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
+use ferrofin_common::cryptography::constant_time_eq;
 use ferrofin_model::quick_connect::QuickConnectResult;
 use uuid::Uuid;
 
@@ -292,11 +293,13 @@ impl QuickConnect for FerrofinQuickConnect {
             .current_requests
             .lock()
             .map_err(|_| ServiceError::backend("quick connect state poisoned"))?;
-        // ponytail: O(n) secret scan under the lock, bounded per IP by the pending cap;
-        // add a secret→code index if the map ever grows large.
+        // Constant-time, so the anonymous poll's timing says nothing about how much of a
+        // guess matched (upstream's `Secret == secret` is a plain ordinal compare).
+        // ponytail: O(n) secret scan under the lock, bounded per IP by the pending cap but
+        // not across addresses (gl-1379); add a secret→code index if the map ever grows large.
         requests
             .values()
-            .find(|p| p.result.secret.expose() == secret)
+            .find(|p| constant_time_eq(p.result.secret.expose().as_bytes(), secret.as_bytes()))
             .map(|p| p.result.clone())
             .ok_or_else(|| ServiceError::not_found("unable to find request with provided secret"))
     }
@@ -894,6 +897,41 @@ mod tests {
             mgr.get_authorized_request("nope").await.expect_err("auth"),
             ServiceError::NotFound(_)
         ));
+    }
+
+    /// The constant-time poll matches exactly what upstream's ordinal `==` does.
+    #[tokio::test]
+    async fn the_status_poll_finds_only_the_exact_secret() {
+        let mgr = manager(true);
+        let request = mgr.try_connect(&auth_info()).await.expect("connect");
+        let secret = request.secret.expose();
+        let last_flipped = format!(
+            "{}{}",
+            &secret[..secret.len() - 1],
+            if secret.ends_with('0') { '1' } else { '0' }
+        );
+        for near_miss in [
+            &secret[..secret.len() - 1],
+            &format!("{secret}0"),
+            &last_flipped,
+            &secret.to_ascii_lowercase(),
+            "",
+        ] {
+            if near_miss == secret {
+                continue; // an all-digit secret has no lowercase twin
+            }
+            assert!(
+                matches!(
+                    mgr.check_request_status(near_miss).await,
+                    Err(ServiceError::NotFound(_))
+                ),
+                "{near_miss:?} matched"
+            );
+        }
+        assert_eq!(
+            mgr.check_request_status(secret).await.expect("exact").code,
+            request.code
+        );
     }
 
     fn auth_from(ip: &str) -> AuthorizationInfo {

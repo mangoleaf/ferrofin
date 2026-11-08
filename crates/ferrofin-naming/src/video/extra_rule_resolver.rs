@@ -1,5 +1,8 @@
 //! Port of `Emby.Naming.Video.ExtraRuleResolver`.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
 use regex::Regex;
 
 use crate::audio;
@@ -44,7 +47,7 @@ pub fn get_extra_info(
                 ends_with_ignore_ascii_case(trimmed_file_name_without_extension, &rule.token)
             }
             ExtraRuleType::Regex => {
-                Regex::new(&format!("(?i){}", rule.token)).is_ok_and(|re| re.is_match(file_name))
+                token_regex(&rule.token).is_some_and(|re| re.is_match(file_name))
             }
             ExtraRuleType::DirectoryName => {
                 directory_name.eq_ignore_ascii_case(&rule.token)
@@ -62,6 +65,25 @@ pub fn get_extra_info(
     }
 
     result
+}
+
+/// Compiles a `Regex` rule's token case-insensitively once per distinct token, as upstream's
+/// static `Regex.IsMatch(…, RegexOptions.IgnoreCase | RegexOptions.Compiled)` does through
+/// .NET's process-wide regex cache. An invalid token is cached as `None` and never matches.
+fn token_regex(token: &str) -> Option<Arc<Regex>> {
+    // Unbounded on purpose: the keys are rule tokens, which only come from `NamingOptions` built in code.
+    // `Arc`, not a `Regex` clone: a cloned `Regex` starts with an empty scratch pool.
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<Regex>>>>> = OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(re) = cache.get(token) {
+        return re.clone();
+    }
+    let re = Regex::new(&format!("(?i){token}")).ok().map(Arc::new);
+    cache.insert(token.to_owned(), re.clone());
+    re
 }
 
 fn ends_with_ignore_ascii_case(haystack: &str, needle: &str) -> bool {

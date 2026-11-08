@@ -342,11 +342,11 @@ fn fake_paths_are_empty_except_the_writable_data_root() {
         p.cache_path(),
         p.log_directory_path(),
     ] {
-        assert!(s.is_empty());
+        assert_eq!(s, "");
     }
     // `program_data_path`/`data_path` return a real temp dir so path-backed
     // handlers (Backup) have somewhere writable to work in tests.
-    assert!(!p.program_data_path().is_empty());
+    assert_ne!(p.program_data_path(), "");
     assert_eq!(p.data_path(), p.program_data_path());
 }
 

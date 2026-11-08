@@ -1002,10 +1002,13 @@ fn get_aspect_ratio(info: &MediaStreamInfo) -> Option<String> {
         && height > 0;
 
     if !parsed {
-        // master dereferences `info.Width.Value` here
-        // (`ProbeResultNormalizer.cs:1101-1102`), which throws on a null; `0`
-        // is the non-panicking equivalent, since the `> 0` guard below then
-        // rejects it and the ratio comes back null either way.
+        // Live TV and other early probes can report neither a usable display
+        // aspect ratio nor the frame size. v12.4 then returns the original
+        // value (`ProbeResultNormalizer.cs:1113-1117`, the `info.Width is not
+        // > 0 || info.Height is not > 0` guard). A missing size reads as `0`
+        // here, which fails the `> 0` check below, so this returns `original`
+        // too, e.g. `None` or `"0:1"` (the `video_ts_no_dimensions*.json`
+        // cases).
         width = info.width.unwrap_or(0).into();
         height = info.height.unwrap_or(0).into();
     }

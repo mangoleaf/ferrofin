@@ -57,7 +57,10 @@ async fn provider(
         }
         _ => {}
     }
-    let image_path = uri.path().strip_prefix("/original").unwrap_or(uri.path());
+    let image_path = uri
+        .path()
+        .strip_prefix("/original")
+        .unwrap_or_else(|| uri.path());
     if matches!(
         image_path,
         "/large.png"
@@ -328,6 +331,11 @@ async fn saved_locales_change_provider_requests_without_restarting() {
         },
         studios_repo_url: endpoint.clone(),
         musicbrainz_base_url: endpoint.clone(),
+        // The mock serves its images on loopback, which image downloads refuse
+        // unless the allow-list names it.
+        image_private_http_allow: Some("127.0.0.1".to_owned()),
+        // Its subtitle links too, which have their own list (gl-1160).
+        subtitle_private_http_allow: Some("127.0.0.1".to_owned()),
         ..Config::test_stub(tmp.path())
     })
     .await;
@@ -541,13 +549,8 @@ async fn saved_locales_change_provider_requests_without_restarting() {
             1,
             "{available}"
         );
-        assert!(
-            api.get(&format!("/Items/{id}/Images"))
-                .await
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        let images = api.get(&format!("/Items/{id}/Images")).await;
+        assert!(images.as_array().unwrap().is_empty(), "{images}");
     }
     tv_options["TypeOptions"][1]["ImageFetchers"] = json!(["TheTVDB"]);
     api.post(
@@ -620,7 +623,7 @@ async fn verify_root_library_location(api: &Api) {
         .unwrap();
     assert_eq!(root["Locations"], json!(["/"]));
     assert_eq!(root["LibraryOptions"]["PathInfos"][0]["Path"], "/");
-    assert!(!root["ItemId"].as_str().unwrap().is_empty());
+    assert_ne!(root["ItemId"].as_str().unwrap(), "");
     api.client
         .delete(format!(
             "{}/Library/VirtualFolders/Paths?name=Root-fixture&path=%2F&refreshLibrary=false",
@@ -3742,7 +3745,8 @@ async fn verify_special_episode_display(api: &Api, root: &std::path::Path) {
                 "/Items?parentId={season_id}&includeItemTypes=Movie"
             ))
             .await;
-        assert!(names(&wrong_kind).is_empty());
+        let found = names(&wrong_kind);
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(wrong_kind["TotalRecordCount"], 0);
         let descending = api
             .get(&format!(
@@ -3792,12 +3796,13 @@ async fn verify_special_episode_display(api: &Api, root: &std::path::Path) {
             ),
             ["Other"]
         );
+        let episodes = api
+            .get(&format!("/Shows/{series_id}/Episodes?season=99"))
+            .await;
         assert!(
-            api.get(&format!("/Shows/{series_id}/Episodes?season=99"))
-                .await["Items"]
-                .as_array()
-                .unwrap()
-                .is_empty()
+            episodes["Items"].as_array().unwrap().is_empty(),
+            "{}",
+            episodes["Items"]
         );
         let all = api.get(&format!("/Shows/{series_id}/Episodes")).await;
         assert_eq!(
@@ -3903,18 +3908,13 @@ async fn verify_special_episode_display(api: &Api, root: &std::path::Path) {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let result: Value = response.json().await.unwrap();
-    assert_eq!(
-        names(&result),
-        ["One", "Two"],
-        "Items checks the season's own visibility, not standalone library access: {result}"
-    );
-    assert_eq!(result["TotalRecordCount"], 2);
+    // A season in a library the user cannot open is closed to them too
+    // (gl-1091), unlike upstream's parent gate.
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
 
-    // A season is not ICollectionFolder: its own parent gate does not apply
-    // EnabledFolders. An inherited/own parental-policy block does apply, even
-    // when the request authenticates as admin and selects another user.
+    // With library access restored, an inherited/own parental-policy block
+    // still applies, even when the request authenticates as admin and selects
+    // another user.
     let mut season = api.get(&format!("/Items/{season_id}")).await;
     season["Tags"] = json!(["hidden-season-parent"]);
     api.post(&format!("/Items/{season_id}"), &season).await;
@@ -3925,7 +3925,7 @@ async fn verify_special_episode_display(api: &Api, root: &std::path::Path) {
     for (path, expected) in [
         (
             format!("/Items?parentId={season_id}&userId={hidden_id}"),
-            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
         ),
         (
             format!("/Shows/{series_id}/Episodes?seasonId={season_id}&userId={hidden_id}"),

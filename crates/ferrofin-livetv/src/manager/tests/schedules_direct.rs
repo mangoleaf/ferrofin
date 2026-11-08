@@ -208,7 +208,8 @@ async fn a_refused_login_stores_nothing() {
             .await
             .is_err()
     );
-    assert!(mgr.get_listing_providers().await.expect("list").is_empty());
+    let listing_providers = mgr.get_listing_providers().await.expect("list");
+    assert!(listing_providers.is_empty(), "{listing_providers:?}");
 }
 
 /// `ListingsManager.GetProvider`: a missing or unknown `Type` is no provider

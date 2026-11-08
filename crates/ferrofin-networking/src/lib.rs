@@ -11,6 +11,9 @@
 //!   `MediaBrowser.Common.Net.RemoteAccessPolicyResult`.
 //! - [`manager`] — `Jellyfin.Networking.Manager.NetworkManager`, the
 //!   bind-address / published-URL resolver (First-Light target).
+//! - [`network_change`] — the OS network-change notifications
+//!   (`System.Net.NetworkInformation.NetworkChange`) and the monitor that
+//!   refreshes the manager after them (`HandleNetworkChange`).
 //! - [`config_keys`] — the two startup keys inlined from
 //!   `MediaBrowser.Controller.Extensions.ConfigurationExtensions`.
 //! - [`logger`] — a minimal `ILogger` seam so the ported warning-substring
@@ -32,12 +35,15 @@ mod macos_interfaces;
 pub mod manager;
 pub mod net_constants;
 pub mod net_utils;
+pub mod network_change;
 pub mod network_configuration;
 pub mod remote_access_policy_result;
 
 pub use error::NetworkingError;
 pub use known_proxies::KnownProxies;
 pub use logger::{Logger, NullLogger};
-pub use manager::{HostLookup, NetworkManager, StartupConfig, published_urls_missing_base_url};
+pub use manager::{
+    HostLookup, InterfaceEnumerator, NetworkManager, StartupConfig, published_urls_missing_base_url,
+};
 pub use network_configuration::{NetworkConfiguration, normalize_base_url};
 pub use remote_access_policy_result::RemoteAccessPolicyResult;

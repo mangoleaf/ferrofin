@@ -87,7 +87,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1176,6 +1176,9 @@ struct Harness {
     log_dir: PathBuf,
     /// Library name → CollectionFolder id.
     libraries: BTreeMap<String, String>,
+    /// The library-structure changes made so far: each asks the library
+    /// monitor for one restart ([`Self::change_structure`]).
+    restarts: AtomicUsize,
     server: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     _temp: tempfile::TempDir,
 }
@@ -1210,6 +1213,11 @@ impl Harness {
             },
             // A passwordless administrator: no PBKDF2 round in a debug build.
             admin_password: String::new(),
+            // The mock serves its images on loopback, which image downloads refuse
+            // unless the allow-list names it.
+            image_private_http_allow: Some("127.0.0.1".to_owned()),
+            // Its subtitle links too, which have their own list (gl-1160).
+            subtitle_private_http_allow: Some("127.0.0.1".to_owned()),
             ..Config::test_stub(temp.path())
         };
         let (server, base, config) = boot::spawn_server(&client, make_config).await;
@@ -1225,6 +1233,7 @@ impl Harness {
             writes,
             log_dir: config.data_dir.join("log"),
             libraries: BTreeMap::new(),
+            restarts: AtomicUsize::new(0),
             server: Some(server),
             _temp: temp,
         };
@@ -1372,7 +1381,7 @@ impl Harness {
                 "EnableRealtimeMonitor": realtime,
                 "TypeOptions": type_options,
             }});
-            self.post(
+            self.change_structure(
                 &format!(
                     "/Library/VirtualFolders?name={name}&collectionType={kind}&refreshLibrary=false"
                 ),
@@ -1393,29 +1402,67 @@ impl Harness {
         self.writes.reset().await;
     }
 
-    /// Waits until the watcher logs that it watches `root` (the Live
-    /// library, rows 5 and 6), failing at once when it logs that it could
-    /// not (inotify limits) — rather than timing out in row 5.
-    async fn await_watch(&self, root: &str) {
+    /// POSTs a library-structure change, then waits until the library
+    /// monitor has served the restart it asked for: the request answers
+    /// first, and the rows after it must not race the restart's re-walk
+    /// (rows 5 and 6 need the Live library watched).
+    async fn change_structure(&self, path: &str, body: Option<&Value>) {
+        self.post(path, body).await;
+        self.restarts.fetch_add(1, Ordering::SeqCst);
+        self.await_monitor().await;
+    }
+
+    /// Waits until the library monitor has served every restart the
+    /// structure changes so far asked for, and returns the log since the
+    /// last one asked. A start counts once a "library monitor started"
+    /// line follows the last "restart requested" line: the monitor logs
+    /// "started" only for a start that began after the last request.
+    ///
+    /// The count of "requested" lines can stand for this harness's own
+    /// changes because nothing else in its server asks for a restart: it
+    /// seeds no `library_roots` and configures no Live TV recordings.
+    async fn await_monitor(&self) -> String {
+        const REQUESTED: &str = "library monitor restart requested";
+        let restarts = self.restarts.load(Ordering::SeqCst);
         let deadline = Instant::now() + STARTUP_DEADLINE;
         loop {
             let log = self.log();
-            let about_root =
-                |needle: &str| log.lines().any(|l| l.contains(needle) && l.contains(root));
-            assert!(
-                !about_root("failed to watch library root")
-                    && !log.contains("filesystem watcher unavailable"),
-                "rows 5 and 6 need the inotify watcher on {root}, which the server could not start"
-            );
-            if about_root("watching library root for changes") {
-                return;
+            let requested = log.matches(REQUESTED).count();
+            if let Some(last) = log.rfind(REQUESTED)
+                && requested >= restarts
+                && log[last..].contains("library monitor started")
+            {
+                return log[last..].to_owned();
             }
             assert!(
                 Instant::now() < deadline,
-                "the watcher never reported watching {root}"
+                "the library monitor never served its restarts ({requested} of {restarts} \
+                 restarts requested)"
             );
             tokio::time::sleep(POLL).await;
         }
+    }
+
+    /// Asserts that the library monitor watches `root` (the Live library,
+    /// rows 5 and 6) since the last structure change, failing at once when
+    /// the watcher logs that it could not (inotify limits) — rather than
+    /// timing out in row 5.
+    async fn await_watch(&self, root: &str) {
+        let since = self.await_monitor().await;
+        let about_root = |needle: &str| {
+            since
+                .lines()
+                .any(|l| l.contains(needle) && l.contains(root))
+        };
+        assert!(
+            !about_root("failed to watch library root")
+                && !self.log().contains("filesystem watcher unavailable"),
+            "rows 5 and 6 need the inotify watcher on {root}, which the server could not start"
+        );
+        assert!(
+            about_root("watching library root for changes"),
+            "the library monitor restarted without watching {root}"
+        );
     }
 
     fn library(&self, name: &str) -> &str {
@@ -2544,7 +2591,8 @@ async fn movie_metadata_survives_provider_outage(h: &Harness) {
     })
     .await;
     let before = h.item(&alpha).await;
-    assert!(!before["People"].as_array().expect("cast").is_empty());
+    let people = before["People"].as_array().expect("cast");
+    assert!(!people.is_empty(), "{people:?}");
     assert!(before["ImageTags"]["Primary"].is_string());
     let name = before["Name"].as_str().expect("movie name");
     let stored = h.writes.row(name).await;
@@ -2631,7 +2679,9 @@ async fn movie_metadata_survives_provider_outage(h: &Harness) {
 /// refreshes, deletion, disabled providers, and provider outages over real HTTP.
 #[allow(clippy::too_many_lines)]
 async fn subtitles_are_downloaded_during_scan(h: &Harness) {
-    assert!(of(&h.providers.all(), "opensubtitles").is_empty());
+    let provider_calls = h.providers.all();
+    let found = of(&provider_calls, "opensubtitles");
+    assert!(found.is_empty(), "{found:?}");
     h.post(
         "/Plugins/4a3f8e216c944d17a2b80f5e9c3d7a10/Configuration",
         Some(&json!({"Username":"test", "Password":"test"})),
@@ -2648,7 +2698,7 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
         "RequirePerfectSubtitleMatch":true,
         "TypeOptions":[{"Type":"Movie", "MetadataFetchers":[], "ImageFetchers":[]}]
     });
-    h.post(
+    h.change_structure(
         "/Library/VirtualFolders?name=Subtitles&collectionType=movies&refreshLibrary=false",
         Some(&json!({"LibraryOptions":options})),
     )
@@ -2702,7 +2752,8 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
         let mark = h.mark().await;
         h.refresh(library, mode, mode == "FullRefresh").await;
         let seen = h.settle(mark, &[("api", 1.0)]).await;
-        assert!(of(&seen.requests, "opensubtitles").is_empty());
+        let found = of(&seen.requests, "opensubtitles");
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(std::fs::read(&english).unwrap(), content);
         if mode == "Default" {
             assert!(
@@ -2740,7 +2791,7 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
 
     options["DisabledSubtitleFetchers"] = json!(["opensubtitles"]);
     options["SubtitleDownloadLanguages"] = json!(["spa"]);
-    h.post(
+    h.change_structure(
         "/Library/VirtualFolders/LibraryOptions",
         Some(&json!({"Id":library,"LibraryOptions":options})),
     )
@@ -2749,10 +2800,11 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(library, "FullRefresh", false).await;
     let disabled = h.settle(mark, &[("api", 1.0)]).await;
-    assert!(of(&disabled.requests, "opensubtitles").is_empty());
+    let found = of(&disabled.requests, "opensubtitles");
+    assert!(found.is_empty(), "{found:?}");
 
     options["DisabledSubtitleFetchers"] = json!([]);
-    h.post(
+    h.change_structure(
         "/Library/VirtualFolders/LibraryOptions",
         Some(&json!({"Id":library,"LibraryOptions":options})),
     )
@@ -2778,8 +2830,9 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(library, "Default", false).await;
     let quiet = h.settle(mark, &[("api", 1.0)]).await;
-    assert!(of(&quiet.requests, "opensubtitles").is_empty());
-    assert!(quiet.spawns.is_empty());
+    let found = of(&quiet.requests, "opensubtitles");
+    assert!(found.is_empty(), "{found:?}");
+    assert!(quiet.spawns.is_empty(), "{:?}", quiet.spawns);
     for mode in ["ValidationOnly", "None"] {
         set_mtime(&movie, 5);
         let mark = h.mark().await;
@@ -2802,7 +2855,8 @@ async fn subtitle_probe_failure_is_quiet(h: &Harness) {
     h.refresh(&id, "FullRefresh", false).await;
     let seen = h.settle(mark, &[("api", 1.0)]).await;
     assert!(seen.probes.get("failed").copied().unwrap_or_default() > 0.0);
-    assert!(of(&seen.requests, "opensubtitles").is_empty());
+    let found = of(&seen.requests, "opensubtitles");
+    assert!(found.is_empty(), "{found:?}");
     assert_eq!(
         std::fs::read(movie.with_extension("eng.srt")).unwrap(),
         before
@@ -2824,7 +2878,7 @@ async fn omdb_works_without_an_operator_key(h: &Harness) {
         "TypeOptions": [{"Type":"Movie", "MetadataFetchers":["The Open Movie Database"],
                          "ImageFetchers":[]}]
     });
-    h.post(
+    h.change_structure(
         "/Library/VirtualFolders?name=OMDb&collectionType=movies&refreshLibrary=false",
         Some(&json!({"LibraryOptions": options})),
     )
@@ -2843,7 +2897,8 @@ async fn omdb_works_without_an_operator_key(h: &Harness) {
     h.refresh(library, "FullRefresh", false).await;
     let seen = h.settle(mark, &[("api", 1.0)]).await;
     assert_eq!(of(&seen.requests, "omdb").len(), 1);
-    assert!(of(&seen.requests, "tmdb").is_empty());
+    let found = of(&seen.requests, "tmdb");
+    assert!(found.is_empty(), "{found:?}");
     let id = h.id(&movie).await;
     let dto = h.item(&id).await;
     assert_eq!(dto["Overview"], "Fetched with the shared key.");
@@ -2851,7 +2906,7 @@ async fn omdb_works_without_an_operator_key(h: &Harness) {
     assert_eq!(dto["ProviderIds"]["Imdb"], "tt1234567");
 
     options["TypeOptions"][0]["MetadataFetchers"] = json!([]);
-    h.post(
+    h.change_structure(
         "/Library/VirtualFolders/LibraryOptions",
         Some(&json!({
             "Id": library, "LibraryOptions": options
@@ -2862,7 +2917,8 @@ async fn omdb_works_without_an_operator_key(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(library, "FullRefresh", true).await;
     let disabled = h.settle(mark, &[("api", 1.0)]).await;
-    assert!(of(&disabled.requests, "omdb").is_empty());
+    let found = of(&disabled.requests, "omdb");
+    assert!(found.is_empty(), "{found:?}");
 }
 
 /// External identities, newly mapped fields, artwork order and quiet rescans
@@ -2878,7 +2934,7 @@ async fn provider_identity_fields_and_artwork(h: &Harness) {
     );
     let mut options = json!({"PathInfos":[{"Path":movie_root}],"EnableRealtimeMonitor":false,
         "TypeOptions":[{"Type":"Movie","MetadataFetchers":["TheMovieDb"],"ImageFetchers":["TheMovieDb","FanArt"]}]});
-    h.post(
+    h.change_structure(
         "/Library/VirtualFolders?name=ProviderMovies&collectionType=movies&refreshLibrary=false",
         Some(&json!({"LibraryOptions":options})),
     )
@@ -2929,7 +2985,7 @@ async fn provider_identity_fields_and_artwork(h: &Harness) {
     // Movie providers default to TMDB before FanArt (pinned intrinsic order).
     // An explicit reversed library order overrides that on replacement.
     options["TypeOptions"][0]["ImageFetcherOrder"] = json!(["FanArt", "TheMovieDb"]);
-    h.post(
+    h.change_structure(
         "/Library/VirtualFolders/LibraryOptions",
         Some(&json!({"Id":library,"LibraryOptions":options})),
     )
@@ -2958,7 +3014,7 @@ async fn provider_identity_fields_and_artwork(h: &Harness) {
         {"Type":"Series","MetadataFetchers":["TheTVDB"],"ImageFetchers":["TheTVDB","FanArt"]},
         {"Type":"Season","MetadataFetchers":[],"ImageFetchers":[]},
         {"Type":"Episode","MetadataFetchers":["TheTVDB"],"ImageFetchers":[]}]});
-    h.post(
+    h.change_structure(
         "/Library/VirtualFolders?name=ProviderSeries&collectionType=tvshows&refreshLibrary=false",
         Some(&json!({"LibraryOptions":options})),
     )

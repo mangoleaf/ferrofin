@@ -60,7 +60,10 @@ resources:
 # -----------------------------------------------------------------------------
 # Scheduling. REQUIRED when your PVs are node-local (e.g. StorageClass backed by
 # a local disk): pin the pod to the node that physically holds the volumes.
-# Delete this block if your storage is network-attached (NFS/Ceph/cloud disks).
+# On network-attached storage (NFS/Ceph/cloud disks), delete this block only if
+# you also set `strategy.type: Recreate` below or keep both pods of a rolling
+# update on one node some other way. A surge pod on a second node over RWX
+# storage can corrupt the SQLite database (see the chart README).
 # -----------------------------------------------------------------------------
 affinity:
   nodeAffinity:
@@ -70,6 +73,15 @@ affinity:
             - key: kubernetes.io/hostname
               operator: In
               values: ["<storage-node>"]
+
+# -----------------------------------------------------------------------------
+# Upgrades. The default rolling update keeps playback going, and the old version
+# keeps writing the database while the new one migrates it. Recreate stops the old
+# pod first, and playback stops for the whole boot (see "Upgrades and the
+# database" in the chart README).
+# -----------------------------------------------------------------------------
+# strategy:
+#   type: Recreate
 
 # -----------------------------------------------------------------------------
 # Persistence — TWO separate volumes on purpose (see the volumes block below):
@@ -166,13 +178,40 @@ ferrofin:
     # FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS: "100000"
     # FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS: "300"
     # Seconds a resolved access token, and a user's permissions with the libraries'
-    # rows and options, are served from memory (5-300, default 30 each). Changes
-    # made through the server apply at once; these only bound changes made outside it.
+    # rows and options and whether a Live TV tuner exists, are served from memory
+    # (5-300, default 30 each). Changes made through the server apply at once; these
+    # only bound changes made outside it.
     # FERROFIN_AUTH_CACHE_TTL_SECS: "30"
     # FERROFIN_ROW_CACHE_TTL_SECS: "30"
-    # How many trickplay images are generated at once (default: auto, up to the
-    # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
-    # hardware acceleration holds GPU memory; "1" matches Jellyfin.
+    # Read the network interfaces again 2 s after the OS reports a network change
+    # (Jellyfin's DetectNetworkChange, on by default).
+    # FERROFIN_DETECT_NETWORK_CHANGE: "true"
+    # Failed logins an account or a client address may make before its next attempts
+    # wait (1 s, doubling to the maximum; the backoff never disables an account). Add the
+    # ingress to Known proxies, or every client shares its address and one
+    # guesser can get everyone's logins refused.
+    # FERROFIN_LOGIN_BACKOFF: "true"
+    # FERROFIN_LOGIN_BACKOFF_ATTEMPTS: "5"
+    # FERROFIN_LOGIN_BACKOFF_MAX_DELAY_SECS: "30"
+    # FERROFIN_LOGIN_BACKOFF_WINDOW_MINS: "15"
+    # FERROFIN_LOGIN_BACKOFF_MAX_TRACKED: "100000"
+    # Hours a session with no WebSocket that plays nothing is kept after its last
+    # request (1 to 168, default 24). Jellyfin keeps such a session until it
+    # restarts, so a client sending a new device id on every run grows memory.
+    # FERROFIN_SESSION_IDLE_HOURS: "24"
+    # Prepared statements each SQLite connection keeps (100-1024, default 150).
+    # Each connection of the pool keeps its own, so a larger value costs memory
+    # on every connection: 150 held 6-13 MiB more than 100 on an 8-core server.
+    # FERROFIN_DB_STATEMENT_CACHE: "150"
+    # Items whose genre, studio, tag and artist links one database transaction
+    # rewrites when a metadata edit saves many at once (1-5000, default 500). A
+    # smaller value holds the database writer for shorter stretches; "1" writes
+    # each item's links on their own, as Jellyfin's per-item saves do.
+    # FERROFIN_ITEM_VALUES_WRITE_CHUNK: "500"
+    # How many videos generate trickplay images at once, each one's widths in
+    # turn (default: auto, up to the image-encoding limit, one per CPU). Each
+    # generation is an ffmpeg process, and with hardware acceleration holds GPU
+    # memory; "1" matches Jellyfin.
     # FERROFIN_TRICKPLAY_CONCURRENCY: "1"
     # Trade frame quality for speed when extracting chapter images, video
     # thumbnails and embedded pictures: keyframes only, no 24-frame sampling
@@ -189,6 +228,32 @@ ferrofin:
     # Off unless set; stdout stays structured JSON with a trace_id on each line.
     # OTEL_EXPORTER_OTLP_ENDPOINT: "http://<otel-collector>.<namespace>.svc.cluster.local:4317"
     # OTEL_TRACES_SAMPLER_ARG: "0.25"
+
+    # What one image may cost in memory; past a limit, clients get the original
+    # file instead of a thumbnail. Lower them for a small memory limit: the
+    # decode limit is per image, the resize budget is shared.
+    # FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS: "200"
+    # FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB: "512"
+    # FERROFIN_IMAGE_RESIZE_BUDGET_MB: "2048"
+
+    # The largest remote image downloaded, and how long a URL that gave no image
+    # (a channel logo that is gone, say) is left alone before it is tried again.
+    # FERROFIN_IMAGE_DOWNLOAD_MAX_MB: "64"
+    # FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS: "3600"
+    # Image downloads refuse private/LAN addresses, a Live TV tuner's host
+    # aside. List the LAN hosts or networks that serve your artwork:
+    # FERROFIN_IMAGE_PRIVATE_HTTP_ALLOW: "nas.lan,192.168.1.0/24"
+    # OpenSubtitles download links refuse private/LAN addresses too, with a list
+    # of their own (the image list does not apply). Only a LAN mirror of the
+    # download host needs it:
+    # FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW: "subtitles.lan"
+
+    # The most jobs re-encoding a stream the server runs at once, and one user
+    # runs at once. Past either cap the user's idle job on the same device is
+    # ended first; with none to end, the client gets 503 with Retry-After. 0
+    # means no cap.
+    # FERROFIN_MAX_TRANSCODES: "0"
+    # FERROFIN_MAX_TRANSCODES_PER_USER: "0"
 
     # WASM plugins (sandboxed, runtime-installed): install from a plugin
     # repository in the dashboard (Plugins → Repositories → Catalog), or place

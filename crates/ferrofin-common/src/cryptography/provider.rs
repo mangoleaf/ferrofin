@@ -10,6 +10,7 @@
 //! hashes produced by an existing Jellyfin server (user-DB migration works).
 
 use pbkdf2::pbkdf2_hmac;
+use rand::RngExt as _;
 use sha1::Sha1;
 use sha2::Sha512;
 
@@ -160,17 +161,13 @@ impl CryptoProvider for CryptographyProvider {
     }
 
     fn generate_salt_with_length(&self, length: usize) -> Vec<u8> {
-        // C# uses RandomNumberGenerator.GetNonZeroBytes; we source entropy from
-        // v4 UUIDs (uuid pulls getrandom, a CSPRNG) and replace any zero byte
-        // with 1 so the result matches the "non-zero" contract.
-        let mut salt = Vec::with_capacity(length);
-        while salt.len() < length {
-            salt.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
-        }
-        salt.truncate(length);
+        // Port of RandomNumberGenerator.GetNonZeroBytes: CSPRNG bytes with each
+        // zero redrawn, so every byte is uniform over 1..=255.
+        let mut rng = rand::rng();
+        let mut salt = vec![0u8; length];
         for b in &mut salt {
-            if *b == 0 {
-                *b = 1;
+            while *b == 0 {
+                *b = rng.random();
             }
         }
         salt
@@ -178,7 +175,11 @@ impl CryptoProvider for CryptographyProvider {
 }
 
 /// Length-checked constant-time byte comparison (mirrors `SequenceEqual`).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+///
+/// Unequal lengths return `false` at once, so only the contents of
+/// equal-length inputs are compared in constant time.
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -200,6 +201,17 @@ mod tests {
             let _ = write!(s, "{b:02x}");
             s
         })
+    }
+
+    #[rstest::rstest]
+    #[case::equal(b"abc", b"abc", true)]
+    #[case::last_byte(b"abc", b"abd", false)]
+    #[case::shorter(b"ab", b"abc", false)]
+    #[case::longer(b"abcd", b"abc", false)]
+    #[case::both_empty(b"", b"", true)]
+    #[case::one_empty(b"", b"a", false)]
+    fn constant_time_eq_is_plain_equality(#[case] a: &[u8], #[case] b: &[u8], #[case] equal: bool) {
+        assert_eq!(constant_time_eq(a, b), equal);
     }
 
     // RFC 6070 known-answer vectors for PBKDF2-HMAC-SHA1 (dkLen=20). These lock
@@ -262,6 +274,23 @@ mod tests {
         assert_eq!(hash.id(), "PBKDF2-SHA512");
         assert!(provider.verify(&hash, "hunter2").unwrap());
         assert!(!provider.verify(&hash, "wrong").unwrap());
+    }
+
+    // GetNonZeroBytes draws every byte uniformly from 1..=255: none is zero,
+    // bytes 6 and 8 do not always carry a v4 UUID's version nibble and variant
+    // bits, and 1 is no likelier than any other value.
+    #[test]
+    fn salt_bytes_are_uniform_and_non_zero() {
+        let provider = CryptographyProvider::new();
+        let salts: Vec<Vec<u8>> = (0..4096).map(|_| provider.generate_salt()).collect();
+        let zero = salts.iter().find(|s| s.contains(&0));
+        assert!(zero.is_none(), "{zero:?}");
+        let fixed = |i: usize, shift: u8, bits: u8| salts.iter().all(|s| s[i] >> shift == bits);
+        assert!(!fixed(6, 4, 0x4), "byte 6 is always 0x4_");
+        assert!(!fixed(8, 6, 0b10), "byte 8 is always 0b10__");
+        // 65,536 bytes: ~257 ones (sd 16) when uniform, ~512 with zeros mapped to 1.
+        let ones = salts.iter().flatten().filter(|&&b| b == 1).count();
+        assert!(ones < 384, "{ones} ones: zeros are being mapped to 1");
     }
 
     #[test]

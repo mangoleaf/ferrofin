@@ -54,6 +54,8 @@ fn video() -> FileFacts {
         is_shortcut: false,
         is_file_protocol: true,
         is_placeholder: false,
+        path_rebased: false,
+        locations_changed: false,
     }
 }
 
@@ -761,6 +763,8 @@ fn test_item_fs() -> FileFacts {
         is_shortcut: false,
         is_file_protocol: true,
         is_placeholder: false,
+        path_rebased: false,
+        locations_changed: false,
     }
 }
 
@@ -922,6 +926,62 @@ fn refresh_metadata_local_image_validation_threw_leaves_refresh_date_alone() {
     false,
     RefreshReason::MissingMediaInfo
 )]
+#[case::rebased_path(
+    Some(current()),
+    FileFacts { path_rebased: true, ..video() },
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::PathRebased
+)]
+#[case::rebased_path_before_the_file(
+    Some(current()),
+    FileFacts { path_rebased: true, mtime: Some(mtime() + TimeDelta::seconds(5)), ..video() },
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::PathRebased
+)]
+#[case::rebased_path_before_the_runtime(
+    Some(StoredState { run_time_ticks: None, ..current() }),
+    FileFacts {
+        probe: ProbeKind::None,
+        supports_cumulative_run_time: true,
+        path_rebased: true,
+        ..video()
+    },
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::PathRebased
+)]
+#[case::the_file_before_the_locations(
+    Some(current()),
+    FileFacts {
+        mtime: Some(mtime() + TimeDelta::seconds(5)),
+        locations_changed: true,
+        ..video()
+    },
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::Modified
+)]
+#[case::changed_locations(
+    Some(current()),
+    FileFacts { locations_changed: true, ..video() },
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::Locations
+)]
+#[case::the_folder_before_the_locations(
+    Some(StoredState { run_time_ticks: None, ..current() }),
+    FileFacts {
+        probe: ProbeKind::None,
+        supports_cumulative_run_time: true,
+        locations_changed: true,
+        ..video()
+    },
+    MetadataRefreshOptions::default(),
+    false,
+    RefreshReason::NoRuntime
+)]
 #[case::backfill(
     Some(current()),
     video(),
@@ -1014,4 +1074,57 @@ fn a_file_changed_when_its_mtime_drifted_past_a_second(
 ) {
     let stored = stored_offset_ms.map(|ms| mtime() + TimeDelta::milliseconds(ms));
     assert_eq!(file_changed(stored, mtime()), changed);
+}
+
+// --- The `CollectionFolder` and `MusicArtist` overrides ---
+
+/// A library as the tile pass sees it: a directory with no `DateModified`
+/// (D2) and no prober.
+fn library() -> FileFacts {
+    FileFacts {
+        mtime: None,
+        probe: ProbeKind::None,
+        ..test_item_fs()
+    }
+}
+
+/// `CollectionFolder.RequiresRefresh` (`CollectionFolder.cs:206-230`) and
+/// `MusicArtist.RequiresRefresh` (`MusicArtist.cs:186-198`) make the refresh
+/// required in every mode `RefreshMetadata` asks them in (`MetadataService.cs:
+/// 98-110`: all but `None`). A required refresh runs every provider from
+/// `Default` up (`GetProviders`' `runAllProviders`) and is saved
+/// (`SaveInternal`); `ValidationOnly` saves it without running them.
+#[rstest]
+#[case::library_default(FileFacts { locations_changed: true, ..library() }, Default, true, true)]
+#[case::library_validation(
+    FileFacts { locations_changed: true, ..library() },
+    ValidationOnly,
+    true,
+    false
+)]
+#[case::library_none(FileFacts { locations_changed: true, ..library() }, NoRefresh, false, false)]
+#[case::library_unchanged(library(), Default, false, false)]
+#[case::artist_default(FileFacts { path_rebased: true, ..library() }, Default, true, true)]
+#[case::artist_validation(
+    FileFacts { path_rebased: true, ..library() },
+    ValidationOnly,
+    true,
+    false
+)]
+#[case::artist_none(FileFacts { path_rebased: true, ..library() }, NoRefresh, false, false)]
+fn a_changed_library_or_a_moved_artist_requires_its_refresh(
+    #[case] fs: FileFacts,
+    #[case] mode: MetadataRefreshMode,
+    #[case] requires: bool,
+    #[case] runs_all: bool,
+) {
+    let opts = options(mode, mode);
+    let stored = StoredState {
+        date_modified: None,
+        ..current()
+    };
+    let p = plan(Some(&stored), &fs, &opts);
+    assert_eq!(p.requires_refresh, requires, "{:?}", p.reason);
+    assert_eq!(p.run_all_providers, runs_all);
+    assert_eq!(save(p, &opts, false).save, requires);
 }

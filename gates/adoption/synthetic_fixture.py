@@ -329,16 +329,18 @@ def seed_database(db, manifest):
     leaves the same state.
 
     1. Non-US ratings on the five movies (SEEDED_RATINGS). Only OfficialRating changes;
-       each release scores it its own way, and Jellyfin 12.2's scores are the oracle.
+       each release scores it its own way, and the scores Jellyfin 12.2's tables give (which
+       12.3 and 12.4 keep) are the oracle.
     2. Conflicting user data: the locked movie's adult rows become exactly two, one per
-       provider key, that disagree (CONFLICT). Jellyfin 12.2 and Ferrofin harmonize them.
+       provider key, that disagree (CONFLICT). Jellyfin 12.2 and later and Ferrofin harmonize them.
     3. A dangling parent chain: two copies of an episode, the first under a parent that
        does not exist, the second under the first, with play state on the second. Jellyfin
        (12.1+ from 10.11, or its post-scan clean-up) and Ferrofin's migration 0042 delete
        them and keep the play state on the placeholder item. They carry no series, season
        or top parent and no real path, so no browse list treats them as library content.
        Jellyfin 12.0 cannot migrate the chain, so its lineage drops it first
-       (drop_dangling_chain); only 10.11.x, 12.1-from-10 and 12.2-from-10 carry it.
+       (drop_dangling_chain); only 10.11.x and the 12.x routes straight from 10.11.8
+       (12.1-from-10 to 12.4-from-10) carry it.
     4. Legacy LinkedChildren entries on the three "linked" containers, beside the live member
        10.11.8 wrote (collection_entries, playlist_entries, pathless_entries). 12.x's
        MigrateLinkedChildren.ResolveChildId and Ferrofin's membership import must resolve

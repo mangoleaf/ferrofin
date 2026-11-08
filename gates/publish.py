@@ -33,6 +33,7 @@ import re
 import statistics
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -84,6 +85,19 @@ def shown(v, whole):
 def load(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def utc_date(stamp):
+    """The UTC calendar date (YYYY-MM-DD) of an ISO 8601 timestamp, or None. Every published date is read in
+    UTC: a gate's result.json is stamped in UTC, but session.json in the host's local time, whose date
+    differs from the UTC one for part of every day."""
+    if not stamp:
+        return None
+    try:
+        when = datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return str(stamp)[:10] or None
+    return (when.astimezone(timezone.utc) if when.tzinfo else when).date().isoformat()
 
 
 def bench_results(runs):
@@ -180,7 +194,7 @@ def bench_summary(docs, names, min_runs=MIN_RUNS):
               "oracle_image": first["source"]["oracle"], "host_class": first["source"]["host_class"],
               "fixture": first["source"]["fixture"],
               "library": (first["detail"].get("conditions") or {}).get("fixture_counts"),
-              "date": max((d["started"] or "")[:10] for d in docs) or None}
+              "date": max(utc_date(d["started"]) or "" for d in docs) or None}
     return {"source": source, "levels": levels,
             "ttfs": combine_rows(docs, lambda d: d["ttfs"], False),
             "memory": [r for r in combine_rows(docs, lambda d: d["memory"], False) if r["name"] in MEMORY],
@@ -221,7 +235,7 @@ def adoption_summary(session, bench_commit=None, publishing=True):
             for r in doc["detail"]["rows"]]
     source = {"session": os.path.basename(os.path.normpath(session)), "commit": commit,
               "image_digest": (record.get("image") or {}).get("id"), "oracle": doc["source"]["oracle"],
-              "date": (record.get("started") or "")[:10] or None}
+              "date": utc_date(doc.get("started") or record.get("started"))}
     return {"source": source, "verdict": doc["verdict"], "rows": rows}
 
 
@@ -283,7 +297,7 @@ def parity_summary(session, commit, publishing=True):
     record = load(os.path.join(session, "session.json"))
     return {"source": {"session": os.path.basename(os.path.normpath(session)), "commit": commit,
                        "oracle": f"Jellyfin {detail.get('oracle_version')}" if detail.get("oracle_version") else None,
-                       "date": (record.get("started") or "")[:10] or None},
+                       "date": utc_date(doc.get("started") or record.get("started"))},
             "verdict": doc["verdict"], "counts": {k: doc["counts"][k] for k in PARITY_OUTCOMES if k in doc["counts"]},
             "sent": detail["sent"], "planned": detail.get("planned", 0), "new_differences": detail.get("new_differences", 0),
             "filed_issues": detail.get("filed_issues", []),
@@ -322,7 +336,7 @@ def ab_summary(path):
         raise Refused(f"{d} ran {pairs} pair{'s' if pairs != 1 else ''}: a release A/B gate is at least {MIN_RUNS}")
     return {"source": {"session": os.path.basename(os.path.normpath(path)), "previous": (images.get("a") or {}).get("ref"),
                        "candidate": (images.get("b") or {}).get("ref"), "commit": doc["source"].get("commit"),
-                       "pairs": pairs, "date": (doc.get("started") or "")[:10] or None},
+                       "pairs": pairs, "date": utc_date(doc.get("started"))},
             "verdict": doc["verdict"], "blocking": detail.get("blocking", []), "cells": cells}
 
 

@@ -152,8 +152,16 @@ fn build_video_item_simple_test(
         }
     } else if play_method == Some(PlayMethod::Transcode) {
         assert!(stream_info.container.is_some());
-        assert!(!stream_info.video_codecs.is_empty());
-        assert!(!stream_info.audio_codecs.is_empty());
+        assert!(
+            !stream_info.video_codecs.is_empty(),
+            "{:?}",
+            stream_info.video_codecs
+        );
+        assert!(
+            !stream_info.audio_codecs.is_empty(),
+            "{:?}",
+            stream_info.audio_codecs
+        );
 
         if transcode_protocol == "http" {
             assert_eq!(
@@ -2122,7 +2130,7 @@ fn build_video_item_with_secondary_audio_and_external_graphical_subtitle_keeps_v
     subtitle_stream.supports_external_stream = true;
     subtitle_stream.path = None;
     let subtitle_index = subtitle_stream.index;
-    options.profile.subtitle_profiles = vec![SubtitleProfile {
+    std::sync::Arc::make_mut(&mut options.profile).subtitle_profiles = vec![SubtitleProfile {
         format: Some(subtitle_codec.to_owned()),
         container: subtitle_container.map(str::to_owned),
         method: SubtitleDeliveryMethod::External,

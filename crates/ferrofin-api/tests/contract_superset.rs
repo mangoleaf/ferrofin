@@ -286,7 +286,9 @@ fn extension_routes_have_no_duplicates() {
 /// `list`) must each name a distinct row of `dates` (row key → its `date`),
 /// carry a release tag other than `UPSTREAM_TAG`, and belong to a row dated
 /// before `UPSTREAM_PIN_DATE` (a later row was compared against the current
-/// pin).
+/// pin). Conversely, every row dated before `UPSTREAM_PIN_DATE` must be listed:
+/// it was compared before the pin moved, so counting it against the current
+/// pin would claim a comparison nobody made.
 fn earlier_pin_problems<K: Ord + Copy + std::fmt::Debug>(
     dates: &BTreeMap<K, &str>,
     earlier: impl IntoIterator<Item = (K, &'static str)>,
@@ -311,6 +313,15 @@ fn earlier_pin_problems<K: Ord + Copy + std::fmt::Debug>(
         if !tag.starts_with('v') || tag == UPSTREAM_TAG {
             out.push(format!(
                 "{key:?}: {tag:?} is not an earlier jellyfin release tag"
+            ));
+        }
+    }
+    for (key, date) in dates {
+        if *date < UPSTREAM_PIN_DATE && !seen.contains(key) {
+            out.push(format!(
+                "{key:?}: dated {date}, before the move to {UPSTREAM_TAG} \
+                 ({UPSTREAM_PIN_DATE}), but not in {list}: list it under the tag it \
+                 was compared against, or re-check it and move its date"
             ));
         }
     }
@@ -649,7 +660,8 @@ fn upstream_problems_name_the_row_with_a_missing_file_or_method() {
     )
     .expect("write");
 
-    assert!(upstream_problems(dir.path(), [("ok".to_string(), file, "GetItems")]).is_empty());
+    let found = upstream_problems(dir.path(), [("ok".to_string(), file, "GetItems")]);
+    assert!(found.is_empty(), "{found:?}");
     let problems = upstream_problems(
         dir.path(),
         [
@@ -677,6 +689,19 @@ fn earlier_pin_rejects_a_row_dated_on_or_after_the_pin_move() {
 }
 
 #[test]
+fn earlier_pin_requires_every_row_dated_before_the_pin_move() {
+    use ferrofin_api::handlers::UPSTREAM_PIN_DATE;
+
+    let dates = BTreeMap::from([("before", "2026-01-01"), ("after", UPSTREAM_PIN_DATE)]);
+    let problems = earlier_pin_problems(&dates, [], "EARLIER");
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(
+        problems[0].starts_with("\"before\": dated 2026-01-01, before the move"),
+        "{problems:?}"
+    );
+}
+
+#[test]
 fn refs_must_name_a_subsystem_row_with_a_known_key() {
     let subsystem = |key| VerifiedSubsystem {
         key,
@@ -698,7 +723,8 @@ fn refs_must_name_a_subsystem_row_with_a_known_key() {
     };
 
     let subsystems = [subsystem("query-translation"), subsystem("user-data")];
-    assert!(ref_problems(std::slice::from_ref(&op), &subsystems).is_empty());
+    let found = ref_problems(std::slice::from_ref(&op), &subsystems);
+    assert!(found.is_empty(), "{found:?}");
     let problems = ref_problems(
         std::slice::from_ref(&op),
         &[subsystem("query-translation"), subsystem("bogus")],

@@ -40,6 +40,7 @@ use ferrofin_traits::persistence::{
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, ProviderManager};
 
 use crate::db_error::media_stream_type_from_disc;
+use crate::scheduled_tasks::maintenance::CACHE_FILE_MAX_AGE;
 
 /// The concrete media-source manager.
 ///
@@ -89,14 +90,20 @@ pub struct FerrofinMediaSourceManager {
     /// Refreshes an item's file with the remote content probe on
     /// (`GetPlaybackMediaSources`' forced `FullRefresh`), awaiting the result.
     remote_probe: Option<RemoteProbe>,
-    /// What a live stream's probe found, keyed by the open token that names it.
+    /// What a live stream's probe found and when, keyed by the open token that
+    /// names it.
     ///
     /// Port of `LiveStreamHelper`'s `{cache}/mediainfo/{md5(cacheKey)}.json`
     /// cache: probing costs a 3 s wait plus an ffprobe against a live stream,
     /// and without the cache every channel change and every extra viewer pays
-    /// it again. Ferrofin keeps it in memory rather than on disk — a restart
-    /// re-probes once per channel, which is the only difference.
-    probe_cache: Arc<Mutex<HashMap<String, MediaSourceInfo>>>,
+    /// it again. Upstream writes the file once and the daily "Clean Cache
+    /// Directory" deletes it once it is more than [`CACHE_FILE_MAX_AGE`] old,
+    /// so an entry here is as good as gone past that age, and storing a probe
+    /// drops every entry past it. Ferrofin keeps it in memory rather than on
+    /// disk, so a restart re-probes once per channel, and an entry ages out at
+    /// exactly that age, not at the next sweep (nor never, with that task
+    /// disabled).
+    probe_cache: Arc<Mutex<HashMap<String, (tokio::time::Instant, MediaSourceInfo)>>>,
 }
 
 impl std::fmt::Debug for FerrofinMediaSourceManager {
@@ -137,9 +144,11 @@ impl FerrofinMediaSourceManager {
     /// The path of the item a playback must refresh with the remote probe
     /// first (`GetPlaybackMediaSources`): a `.strm`, or a video/audio item whose
     /// first source (never a placeholder) has no stream of its main type.
+    /// Works from the item's row when the caller has read it (`known`).
     async fn playback_probe_path(
         &self,
         item_id: Uuid,
+        known: Option<&BaseItemEntity>,
         sources: &[MediaSourceInfo],
     ) -> Result<Option<String>, ServiceError> {
         let Some(first) = sources
@@ -148,8 +157,16 @@ impl FerrofinMediaSourceManager {
         else {
             return Ok(None);
         };
-        let Some(item) = self.items.retrieve_item(item_id).await? else {
-            return Ok(None);
+        let read;
+        let item = match known {
+            Some(item) => item,
+            None => match self.items.retrieve_item(item_id).await? {
+                Some(row) => {
+                    read = row;
+                    &read
+                }
+                None => return Ok(None),
+            },
         };
         let Some(path) = item.path.clone().filter(|path| !path.is_empty()) else {
             return Ok(None);
@@ -225,7 +242,7 @@ impl FerrofinMediaSourceManager {
     async fn playback_sources(
         &self,
         item_id: Uuid,
-        known: Option<ferrofin_db::entities::base_items::BaseItemEntity>,
+        known: Option<&BaseItemEntity>,
         user: Option<&ferrofin_db::entities::users::UserEntity>,
         user_id: Uuid,
         allow_media_probe: bool,
@@ -248,7 +265,7 @@ impl FerrofinMediaSourceManager {
         // before it is played, and its sources are read again.
         if allow_media_probe
             && let Some(probe) = &self.remote_probe
-            && let Some(path) = self.playback_probe_path(item_id, &sources).await?
+            && let Some(path) = self.playback_probe_path(item_id, known, &sources).await?
         {
             probe(path).await?;
             sources = self
@@ -273,14 +290,17 @@ impl FerrofinMediaSourceManager {
     async fn static_sources(
         &self,
         item_id: Uuid,
-        known: Option<ferrofin_db::entities::base_items::BaseItemEntity>,
+        known: Option<&BaseItemEntity>,
         enable_path_substitution: bool,
         user_id: Option<Uuid>,
         user: Option<&ferrofin_db::entities::users::UserEntity>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        let stored = match known {
-            Some(item) => Some(item),
-            None => self.items.retrieve_item(item_id).await?,
+        let read;
+        let stored = if known.is_some() {
+            known
+        } else {
+            read = self.items.retrieve_item(item_id).await?;
+            read.as_ref()
         };
         // The Live TV branch is chosen by what the id IS, not by whether a row
         // was found. A channel is a real `BaseItems` row (the guide refresh
@@ -335,20 +355,12 @@ impl FerrofinMediaSourceManager {
         let item_id = Uuid::parse_str(&item.id).unwrap_or(item_id);
         let versions = crate::video_versions::VersionRows::load(
             &crate::video_versions::RepositoryVersionReader(self.items.as_ref()),
-            &[&item],
+            &[item],
         )
         .await?;
-        let group = versions.items_for_media_sources(&item);
-        let mut built: HashMap<Uuid, MediaSourceInfo> = HashMap::with_capacity(group.len());
-        for (row, _) in &group {
-            let Ok(row_id) = Uuid::parse_str(&row.id) else {
-                continue;
-            };
-            let streams = self.streams_dto(row_id).await?;
-            let attachments = self.get_media_attachments(row_id).await?;
-            built.insert(row_id, Self::static_source(row, streams, attachments));
-        }
-        let mut sources = versions.media_sources(&item, |row| {
+        let group = versions.items_for_media_sources(item);
+        let mut built = self.version_sources(&group).await?;
+        let mut sources = versions.media_sources(item, |row| {
             Uuid::parse_str(&row.id)
                 .ok()
                 .and_then(|id| built.remove(&id))
@@ -371,14 +383,12 @@ impl FerrofinMediaSourceManager {
                 });
             }
         }
-        // `SetDefaultAudioAndSubtitleStreamIndices` (MediaSourceManager.cs:401):
+        // `SetDefaultAudioAndSubtitleStreamIndices` (MediaSourceManager.cs:407):
         // when a user was supplied, each source gets per-user audio/subtitle
         // defaults based on their preferences and remembered selections.
         if let Some(uid) = user_id {
-            for source in &mut sources {
-                self.set_default_audio_and_subtitle_stream_indices(&item, source, uid, user)
-                    .await?;
-            }
+            self.set_default_audio_and_subtitle_stream_indices(item, &mut sources, uid, user)
+                .await?;
         }
         // `GetStaticMediaSources(item, enablePathSubstitution, user)`'s tail
         // (v10.11.8 MediaSourceManager.cs:355-372): when a user was supplied,
@@ -398,7 +408,7 @@ impl FerrofinMediaSourceManager {
                 .filter_map(|s| s.id.as_deref().and_then(|id| Uuid::parse_str(id).ok()))
                 .collect();
             let data = user_data.get_user_data_batch(&ids, user_id).await?;
-            crate::video_versions::put_resumed_version_first(&item, &mut sources, |id| {
+            crate::video_versions::put_resumed_version_first(item, &mut sources, |id| {
                 data.get(&id)
             });
         }
@@ -406,6 +416,33 @@ impl FerrofinMediaSourceManager {
             self.substitute_paths(&mut sources).await?;
         }
         Ok(sources)
+    }
+
+    /// Each of `group`'s rows' static source by id, the whole group's streams
+    /// and attachments read in one statement each.
+    async fn version_sources(
+        &self,
+        group: &[(&BaseItemEntity, MediaSourceType)],
+    ) -> Result<HashMap<Uuid, MediaSourceInfo>, ServiceError> {
+        let ids: Vec<Uuid> = group
+            .iter()
+            .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
+            .collect();
+        let mut streams = self.get_media_streams_batch(&ids).await?;
+        let mut attachments = self.get_media_attachments_batch(&ids).await?;
+        let mut built = HashMap::with_capacity(group.len());
+        for (row, _) in group {
+            let Ok(row_id) = Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            let row_streams = streams.remove(&row_id).unwrap_or_default();
+            let row_attachments = attachments.remove(&row_id).unwrap_or_default();
+            built.insert(
+                row_id,
+                Self::static_source(row, row_streams, row_attachments),
+            );
+        }
+        Ok(built)
     }
 
     /// The versions among `ids` the user may open — `GetStaticMediaSources`'
@@ -570,16 +607,18 @@ impl FerrofinMediaSourceManager {
         }
     }
 
-    /// Port of `MediaSourceManager.SetDefaultAudioAndSubtitleStreamIndices`.
+    /// Port of `MediaSourceManager.SetDefaultAudioAndSubtitleStreamIndices`,
+    /// over each of the item's `sources`.
     ///
-    /// Reads what the selection needs for one item — the user, their
-    /// remembered stream indices and the item's inherited original language —
-    /// and hands it to [`StreamDefaults::apply`]. Only a video reads anything:
+    /// Upstream calls it once per source with the same item and user, so what
+    /// the selection needs — the user, their remembered stream indices and the
+    /// item's inherited original language — is read once here and handed to
+    /// [`StreamDefaults::apply`] for every source. Only a video reads anything:
     /// an audio item's default is its first audio stream whoever asks.
     async fn set_default_audio_and_subtitle_stream_indices(
         &self,
         item: &BaseItemEntity,
-        source: &mut MediaSourceInfo,
+        sources: &mut [MediaSourceInfo],
         user_id: Uuid,
         known_user: Option<&ferrofin_db::entities::users::UserEntity>,
     ) -> Result<(), ServiceError> {
@@ -589,10 +628,14 @@ impl FerrofinMediaSourceManager {
             let Some(users) = &self.users else {
                 return Ok(());
             };
+            let read;
             let user = match known_user {
-                Some(user) => user.clone(),
+                Some(user) => user,
                 None => match users.get_user_by_id(user_id).await? {
-                    Some(user) => user,
+                    Some(user) => {
+                        read = user;
+                        &read
+                    }
                     None => return Ok(()),
                 },
             };
@@ -604,15 +647,19 @@ impl FerrofinMediaSourceManager {
             };
 
             let original_language = self.inherited_original_language(item).await?;
-            self.stream_defaults().apply(
-                Some(media_type),
-                source,
-                &user,
-                remembered,
-                original_language.as_deref(),
-            );
+            for source in sources {
+                self.stream_defaults().apply(
+                    Some(media_type),
+                    source,
+                    user,
+                    remembered,
+                    original_language.as_deref(),
+                );
+            }
         } else if media_type == "Audio" {
-            StreamDefaults::set_first_audio_default(source);
+            for source in sources {
+                StreamDefaults::set_first_audio_default(source);
+            }
         }
         Ok(())
     }
@@ -715,7 +762,8 @@ impl FerrofinMediaSourceManager {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(key)
-                .cloned()
+                .filter(|(probed_at, _)| probed_at.elapsed() <= CACHE_FILE_MAX_AGE)
+                .map(|(_, probed)| probed.clone())
         }) {
             apply_probed_media_info(source, &cached, cache_key.is_some());
             return true;
@@ -737,15 +785,27 @@ impl FerrofinMediaSourceManager {
             extract_chapters: false,
             media_is_audio: false,
         };
-        let Ok(probed) = self.encoder.get_media_info(&request).await else {
-            tracing::warn!("live tv: probing the live stream failed; using the tuner's own info");
-            return false;
+        let probed = match self.encoder.get_media_info(&request).await {
+            Ok(probed) => probed,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "live tv: probing the live stream failed; using the tuner's own info"
+                );
+                return false;
+            }
         };
         if let Some(key) = cache_key {
-            self.probe_cache
+            let mut cache = self
+                .probe_cache
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(key.to_owned(), probed.clone());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // What "Clean Cache Directory" would have deleted by now goes.
+            cache.retain(|_, (probed_at, _)| probed_at.elapsed() <= CACHE_FILE_MAX_AGE);
+            cache.insert(
+                key.to_owned(),
+                (tokio::time::Instant::now(), probed.clone()),
+            );
         }
         apply_probed_media_info(source, &probed, cache_key.is_some());
         true
@@ -778,8 +838,7 @@ impl FerrofinMediaSourceManager {
         // `Video3DFormat` (`BaseItem.GetVersionInfo`, `BaseItem.cs:1231-1237`),
         // read off `Data` — `VideoFile` when it names none, `Video.VideoType`'s
         // default; audio/other sources leave them unset.
-        let format = (item.media_type.as_deref() == Some("Video"))
-            .then(|| crate::item_data::video_format(item.data.as_deref()));
+        let format = source_video_format(item);
 
         // User-agnostic audio fallback: the default-flagged audio stream,
         // else the first. `SetDefaultAudioAndSubtitleStreamIndices` overwrites
@@ -855,30 +914,68 @@ impl FerrofinMediaSourceManager {
 /// on the local file protocol is never followed — a `.strm` could otherwise
 /// name any file the server can read — so the source keeps the `.strm` path.
 fn apply_remote_shortcut(source: &mut MediaSourceInfo, item: &BaseItemEntity) {
-    if item.media_type.as_deref() != Some("Video") {
-        return;
-    }
-    let data = crate::item_data::parse_data(item.data.as_deref());
-    if data.get("IsShortcut").and_then(serde_json::Value::as_bool) != Some(true) {
-        return;
-    }
-    let Some(target) = crate::item_data::read_data_string(&data, "ShortcutPath")
-        .filter(|target| !target.is_empty())
-    else {
+    let Some(remote) = remote_shortcut(item) else {
         return;
     };
-    let protocol = crate::shortcut::path_protocol(&target);
-    if protocol == MediaProtocol::File {
-        return;
-    }
     source.is_remote = true;
-    source.path = Some(target);
-    source.protocol = protocol;
-    if let Some(container) =
-        crate::item_data::read_data_string(&data, "Container").filter(|c| !c.is_empty())
-    {
+    source.path = Some(remote.target);
+    source.protocol = remote.protocol;
+    if let Some(container) = remote.container {
         source.container = Some(container);
     }
+}
+
+/// The `VideoType`, `IsoType` and `Video3DFormat` `item`'s media source
+/// reports (`BaseItem.GetVersionInfo`, `BaseItem.cs:1231-1237`): a video's, read
+/// off `Data`; `None` for audio and other items.
+pub(crate) fn source_video_format(item: &BaseItemEntity) -> Option<crate::item_data::VideoFormat> {
+    (item.media_type.as_deref() == Some("Video"))
+        .then(|| crate::item_data::video_format(item.data.as_deref()))
+}
+
+/// Whether `item`'s media source is remote (`MediaSourceInfo.IsRemote`): a
+/// video `.strm` whose `ShortcutPath` names a remote target
+/// ([`apply_remote_shortcut`]).
+pub(crate) fn is_remote_shortcut(item: &BaseItemEntity) -> bool {
+    remote_shortcut(item).is_some()
+}
+
+/// The remote target a video `.strm` is served from.
+struct RemoteShortcut {
+    target: String,
+    protocol: MediaProtocol,
+    /// The container the remote probe stored, if any.
+    container: Option<String>,
+}
+
+/// `item`'s [`RemoteShortcut`], when it is a video `.strm` naming a target
+/// off the local file protocol. A `Data` blob that never names `IsShortcut`
+/// is not parsed.
+fn remote_shortcut(item: &BaseItemEntity) -> Option<RemoteShortcut> {
+    if item.media_type.as_deref() != Some("Video") {
+        return None;
+    }
+    let text = item
+        .data
+        .as_deref()
+        .filter(|t| t.contains("\"IsShortcut\""))?;
+    let data = crate::item_data::parse_data(Some(text));
+    if data.get("IsShortcut").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let target = crate::item_data::read_data_string(&data, "ShortcutPath")
+        .filter(|target| !target.is_empty())?;
+    let protocol = crate::shortcut::path_protocol(&target);
+    if protocol == MediaProtocol::File {
+        return None;
+    }
+    let container =
+        crate::item_data::read_data_string(&data, "Container").filter(|c| !c.is_empty());
+    Some(RemoteShortcut {
+        target,
+        protocol,
+        container,
+    })
 }
 
 /// Refreshes the item at a path with the remote content probe enabled.
@@ -1786,7 +1883,7 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             .map_err(|_| ServiceError::invalid_input("the item's id is not a GUID"))?;
         self.playback_sources(
             item_id,
-            Some(item.clone()),
+            Some(item),
             user,
             user_id,
             allow_media_probe,
@@ -1824,6 +1921,18 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
         self.static_sources(item_id, None, enable_path_substitution, user_id, None)
+            .await
+    }
+
+    async fn get_static_media_sources_for(
+        &self,
+        item: &BaseItemEntity,
+        enable_path_substitution: bool,
+        user_id: Option<Uuid>,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        let item_id = Uuid::parse_str(&item.id)
+            .map_err(|_| ServiceError::invalid_input("the item's id is not a GUID"))?;
+        self.static_sources(item_id, Some(item), enable_path_substitution, user_id, None)
             .await
     }
 
@@ -1877,25 +1986,12 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
             return Ok(source);
         }
 
-        // Not a Live TV token: probe the item and register it under a fresh id.
-        let request_info = ferrofin_traits::media_encoding::MediaInfoRequest {
-            media_source: MediaSourceInfo {
-                id: Some(request.item_id.to_string()),
-                ..Default::default()
-            },
-            extract_chapters: false,
-            media_is_audio: false,
-        };
-        let mut source = self.encoder.get_media_info(&request_info).await?;
-        derive_stream_getters(&mut source.media_streams);
-        let live_id = Uuid::new_v4().to_string();
-        source.live_stream_id = Some(live_id.clone());
-        source.requires_closing = true;
-        self.open_streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(stream_key(&live_id), source.clone());
-        Ok(source)
+        // Only a Live TV channel token opens anything: upstream's `GetProvider`
+        // throws on a missing token, and no provider opens any other one.
+        // There is no fallback that probes the item instead.
+        Err(ServiceError::invalid_input(
+            "the open token is missing or is not a Live TV channel token",
+        ))
     }
 
     async fn get_live_stream(&self, id: &str) -> Result<MediaSourceInfo, ServiceError> {
@@ -2310,7 +2406,12 @@ mod tests {
         }
     }
 
-    /// A stub encoder whose probe returns a fixed source (no ffmpeg needed).
+    /// A source path the stub encoder fails to probe, as ffprobe does an
+    /// input it cannot read.
+    const UNREADABLE: &str = "http://tuner.example/gone.ts";
+
+    /// A stub encoder whose probe returns a fixed source (no ffmpeg needed),
+    /// or fails for [`UNREADABLE`].
     pub(super) struct StubEncoder;
 
     #[async_trait]
@@ -2328,6 +2429,11 @@ mod tests {
             &self,
             request: &MediaInfoRequest,
         ) -> Result<MediaSourceInfo, ServiceError> {
+            if request.media_source.path.as_deref() == Some(UNREADABLE) {
+                return Err(ServiceError::backend(
+                    "ffprobe failed - streams and format are both null",
+                ));
+            }
             Ok(MediaSourceInfo {
                 id: request.media_source.id.clone(),
                 container: Some("mkv".to_owned()),
@@ -2693,11 +2799,23 @@ mod tests {
         assert_eq!(sources[0].path.as_deref(), Some("http://origin/a.mp4"));
         assert!(sources[0].is_remote);
 
+        // From the caller's row (PlaybackInfo's entry point): the probe still
+        // fires, and the sources come from the refreshed row, not the held one.
+        let mut held = crate::test_support::fetch_item(&db, strm).await;
+        held.data = Some(r#"{"IsShortcut":true}"#.to_owned());
+        crate::test_support::save_item(&db, &held).await;
+        let sources = mgr
+            .get_playback_media_sources_for(&held, None, user, true, false)
+            .await
+            .unwrap();
+        assert_eq!(probed.lock().unwrap().len(), 2);
+        assert_eq!(sources[0].path.as_deref(), Some("http://origin/a.mp4"));
+
         // A video with no video stream is refreshed too; one with a stream is not.
         mgr.get_playback_media_sources(streamless, user, true, false)
             .await
             .unwrap();
-        assert_eq!(probed.lock().unwrap().len(), 2);
+        assert_eq!(probed.lock().unwrap().len(), 3);
         FerrofinMediaStreamRepository::new(db.clone())
             .save_media_streams(
                 streamless,
@@ -2712,7 +2830,7 @@ mod tests {
         mgr.get_playback_media_sources(streamless, user, true, false)
             .await
             .unwrap();
-        assert_eq!(probed.lock().unwrap().len(), 2, "its stream is present");
+        assert_eq!(probed.lock().unwrap().len(), 3, "its stream is present");
     }
 
     /// The tuner URL every fake channel plays.
@@ -3444,6 +3562,40 @@ mod tests {
         assert_eq!(estimated_video_bitrate(320), None);
     }
 
+    /// A report's media source is resolved from the row the caller read
+    /// (upstream's `GetMediaSource(BaseItem item, …)`), not from a second
+    /// read of it: the source follows the row it is given (gl-1242).
+    #[tokio::test]
+    async fn a_reported_media_source_is_found_on_the_row_given() {
+        let db = test_db().await;
+        let id = Uuid::from_u128(0x103);
+        seed_item(&db, id, BaseItemKind::Movie).await;
+        let mut row = crate::test_support::fetch_item(&db, id).await;
+        row.path = Some("/media/as-read.mkv".to_owned());
+        let mgr = manager(&db);
+        let own = id.simple().to_string();
+
+        let found = mgr
+            .get_media_source(&row, &own, None, false)
+            .await
+            .expect("lookup")
+            .expect("the item's own source");
+        assert_eq!(found.id.as_deref(), Some(own.as_str()));
+        assert_eq!(found.path.as_deref(), Some("/media/as-read.mkv"));
+        assert!(
+            mgr.get_media_source(
+                &row,
+                &Uuid::from_u128(0x104).simple().to_string(),
+                None,
+                false
+            )
+            .await
+            .expect("lookup")
+            .is_none(),
+            "an id naming no source is no source"
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn static_source_carries_path_and_streams() {
@@ -3776,15 +3928,59 @@ mod tests {
             .get_static_media_sources(Uuid::from_u128(99), false, None)
             .await
             .expect("sources");
-        assert!(sources.is_empty());
+        assert!(sources.is_empty(), "{sources:?}");
+    }
+
+    /// `OpenLiveStreamInternal` opens only through the provider the token
+    /// names (`GetProvider`): a missing or empty token is an
+    /// `ArgumentException` upstream, and a whitespace-only token or one naming
+    /// no provider opens nothing. No path probes the item instead.
+    #[tokio::test]
+    async fn an_open_token_naming_no_provider_opens_nothing() {
+        let db = test_db().await;
+        let mgr = manager(&db).with_live_tv(Arc::new(FakeLiveTv::default()));
+        let channel = Uuid::from_u128(7);
+        for open_token in [
+            None,
+            Some(String::new()),
+            Some("  ".to_owned()),
+            Some(format!("someprovider_LiveTvChannel_{}", channel.simple())),
+        ] {
+            let request = LiveStreamRequest {
+                open_token: open_token.clone(),
+                item_id: channel,
+                ..Default::default()
+            };
+            let err = mgr
+                .open_live_stream(&request)
+                .await
+                .expect_err("nothing opens this token");
+            assert!(
+                matches!(err, ServiceError::InvalidInput(_)),
+                "{open_token:?}: {err:?}"
+            );
+        }
+        assert!(
+            mgr.open_streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "a refused open registers no stream"
+        );
     }
 
     #[tokio::test]
     async fn live_stream_open_get_close_round_trips() {
         let db = test_db().await;
-        let mgr = manager(&db);
+        let mgr = manager(&db).with_live_tv(Arc::new(FakeLiveTv::default()));
+        let channel = Uuid::from_u128(7);
         let request = LiveStreamRequest {
-            item_id: Uuid::from_u128(7),
+            open_token: Some(format!(
+                "{}_LiveTvChannel_{}_source-1",
+                live_tv_provider_key(),
+                channel.simple()
+            )),
+            item_id: channel,
             ..Default::default()
         };
 
@@ -3807,6 +4003,85 @@ mod tests {
 
         mgr.close_live_stream(&shouted).await.expect("close");
         assert!(mgr.get_live_stream(&id).await.is_err());
+    }
+
+    /// Upstream's probe cache file is written once and deleted by "Clean
+    /// Cache Directory" once it is more than `CACHE_FILE_MAX_AGE` old: until
+    /// then every open of the token reuses the probe, after it the next open
+    /// probes again, and storing that probe drops the other aged-out entries.
+    #[tokio::test]
+    async fn a_cached_live_stream_probe_ages_out_with_the_cache_directory() {
+        async fn probed_container(mgr: &FerrofinMediaSourceManager, key: &str) -> Option<String> {
+            let mut source = MediaSourceInfo::default();
+            assert!(
+                mgr.add_media_info_with_probe(&mut source, Some(key), false)
+                    .await
+            );
+            source.container
+        }
+
+        let db = test_db().await;
+        let mgr = manager(&db);
+        // Nothing below touches the database, so the paused clock cannot time
+        // out a pool acquire.
+        tokio::time::pause();
+        let earlier = MediaSourceInfo {
+            container: Some("ts".to_owned()),
+            ..Default::default()
+        };
+        for key in ["tuned", "abandoned"] {
+            mgr.probe_cache.lock().expect("cache").insert(
+                key.to_owned(),
+                (tokio::time::Instant::now(), earlier.clone()),
+            );
+        }
+
+        tokio::time::advance(CACHE_FILE_MAX_AGE).await;
+        assert_eq!(
+            probed_container(&mgr, "tuned").await.as_deref(),
+            Some("ts"),
+            "not past the sweep's age yet: the cached probe"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert_eq!(
+            probed_container(&mgr, "tuned").await.as_deref(),
+            Some("mkv"),
+            "aged out: probed again (the stub encoder answers mkv)"
+        );
+        let cache = mgr.probe_cache.lock().expect("cache");
+        assert_eq!(
+            cache.keys().collect::<Vec<_>>(),
+            ["tuned"],
+            "the aged-out probe nobody opened again is dropped"
+        );
+        assert_eq!(cache["tuned"].1.container.as_deref(), Some("mkv"));
+    }
+
+    /// `OpenLiveStreamInternal` catches a failed probe: the source keeps the
+    /// tuner's own info and nothing is cached, so the next open of the token
+    /// probes again (gl-1372).
+    #[tokio::test]
+    async fn a_failed_live_stream_probe_keeps_the_tuners_info_and_caches_nothing() {
+        let db = test_db().await;
+        let mgr = manager(&db);
+        let tuned = MediaSourceInfo {
+            path: Some(UNREADABLE.to_owned()),
+            container: Some("ts".to_owned()),
+            media_streams: vec![MediaStream {
+                stream_type: MediaStreamType::Video,
+                index: -1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut source = tuned.clone();
+        assert!(
+            !mgr.add_media_info_with_probe(&mut source, Some("token"), false)
+                .await
+        );
+        assert_eq!(source.container, tuned.container);
+        assert_eq!(source.media_streams, tuned.media_streams);
+        assert!(mgr.probe_cache.lock().expect("cache").is_empty());
     }
 }
 

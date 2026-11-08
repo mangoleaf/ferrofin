@@ -442,12 +442,12 @@ async fn an_anonymous_caller_is_unauthorized_not_forbidden() {
 type ClientSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Reads text frames until one of type `until` arrives, returning the types of
-/// every frame read on the way, `until` included.
-async fn read_until(socket: &mut ClientSocket, until: &str) -> Vec<String> {
+/// Reads text frames until one of type `until` arrives, returning every frame
+/// read on the way, `until` included.
+async fn read_until(socket: &mut ClientSocket, until: &str) -> Vec<serde_json::Value> {
     use futures_util::StreamExt as _;
-    let mut seen = Vec::new();
-    while seen.last().is_none_or(|t| t != until) {
+    let mut seen: Vec<serde_json::Value> = Vec::new();
+    while seen.last().is_none_or(|f| f["MessageType"] != until) {
         let frame = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
             .await
             .unwrap_or_else(|_| panic!("no {until} frame in time; saw {seen:?}"))
@@ -455,8 +455,7 @@ async fn read_until(socket: &mut ClientSocket, until: &str) -> Vec<String> {
             .expect("readable frame");
         match frame {
             tokio_tungstenite::tungstenite::Message::Text(text) => {
-                let v: serde_json::Value = serde_json::from_str(&text).expect("json frame");
-                seen.push(v["MessageType"].as_str().unwrap_or_default().to_owned());
+                seen.push(serde_json::from_str(&text).expect("json frame"));
             }
             tokio_tungstenite::tungstenite::Message::Close(_) => {
                 panic!("the server closed the socket; saw {seen:?}")
@@ -487,11 +486,13 @@ async fn subscribe_to_activity(addr: std::net::SocketAddr, token: &str) -> Clien
     socket
 }
 
-/// `ActivityLogEntryStart` streams the activity log over the session socket, so
-/// it must apply the same gate as `GET /System/ActivityLog/Entries` (C#
+/// `ActivityLogEntryStart` signals each new activity-log entry over the session
+/// socket, so it applies the same gate as `GET /System/ActivityLog/Entries` (C#
 /// `ActivityLogWebSocketListener.Start`): the administrator's subscription is
 /// served, the ordinary account's is refused, and its socket stays open. The
-/// entry used is a failed sign-in, which carries the caller's IP address.
+/// entry used is a failed sign-in, which carries the caller's IP address; the
+/// administrator's frame carries none of it, only upstream's `Data: []`
+/// refresh signal (`ActivityLogWebSocketListener.GetDataToSend`).
 #[tokio::test]
 async fn an_ordinary_account_cannot_stream_the_activity_log() {
     use futures_util::SinkExt as _;
@@ -534,28 +535,58 @@ async fn an_ordinary_account_cannot_stream_the_activity_log() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "the sign-in fails");
 
-    read_until(&mut admin, "ActivityLogEntry").await;
-    // Give an armed stream several periods to fire before the probe, whose
-    // answer also proves the refused socket stayed open.
+    let frames = read_until(&mut admin, "ActivityLogEntry").await;
+    assert_eq!(
+        frames.last().expect("the activity frame")["Data"],
+        serde_json::json!([])
+    );
+    // A grace window for a leaked activity frame to reach the refused socket
+    // before the probe, whose answer also proves that socket stayed open.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     user.send(Message::text(r#"{"MessageType":"KeepAlive"}"#))
         .await
         .expect("send the probe");
     let seen = read_until(&mut user, "KeepAlive").await;
     assert!(
-        !seen.iter().any(|t| t == "ActivityLogEntry"),
+        !seen.iter().any(|f| f["MessageType"] == "ActivityLogEntry"),
         "the ordinary account received the activity log: {seen:?}"
     );
 }
 
-// The other half of the restart gate, against the real `UserManager`: an
-// ordinary account calling from off-network. `call_as` inserts no
-// `ConnectInfo`, which the policy treats as remote, so this resolves the
-// caller's role through the composition root's real
-// `get_user_dto().policy.is_administrator` rather than a fake — and asserts the
-// deny, so it never actually restarts the server.
+/// `POST /System/Restart` from `peer`, with `token` if any.
+async fn restart_from(router: &axum::Router, token: Option<&str>, peer: &str) -> StatusCode {
+    let ident = r#"Client="test", Device="d", DeviceId="elev-restart", Version="1""#;
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/System/Restart")
+        .header(
+            header::AUTHORIZATION,
+            match token {
+                Some(t) => format!(r#"MediaBrowser Token="{t}", {ident}"#),
+                None => format!("MediaBrowser {ident}"),
+            },
+        )
+        .body(Body::empty())
+        .expect("request");
+    req.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<std::net::SocketAddr>().expect("peer"),
+    ));
+    router
+        .clone()
+        .oneshot(req)
+        .await
+        .expect("response")
+        .status()
+}
+
+// `POST /System/Restart` is admin only, by owner decision (gl-1103), against
+// the real `UserManager`: the caller's role comes from the composition root's
+// `get_user_dto().policy.is_administrator` rather than a fake. Upstream's
+// `LocalAccessOrRequiresElevation` admits a local caller; here the address
+// decides nothing. It asserts the deny, so it never actually restarts the
+// server.
 #[tokio::test]
-async fn an_ordinary_account_cannot_restart_from_off_network() {
+async fn an_ordinary_account_cannot_restart_from_any_address() {
     let harness = boot().await;
     let router = ferrofin_api::create_router(harness.wired.state.clone());
     let admin_token = login(&router, ADMIN_USER, ADMIN_PASSWORD, "elev-admin").await;
@@ -571,6 +602,7 @@ async fn an_ordinary_account_cannot_restart_from_off_network() {
     assert_eq!(status, StatusCode::OK);
     let user_token = login(&router, USER_NAME, USER_PASSWORD, "elev-user").await;
 
+    // `call_as` inserts no `ConnectInfo`: a request with no address to ask.
     let (status, _) = call_as(
         &router,
         "POST",
@@ -583,15 +615,20 @@ async fn an_ordinary_account_cannot_restart_from_off_network() {
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "an ordinary account off-network must not restart the server"
+        "an ordinary account must not restart the server"
     );
+    for peer in ["127.0.0.1:5000", "192.168.1.5:5000", "203.0.113.9:5000"] {
+        assert_eq!(
+            restart_from(&router, Some(&user_token), peer).await,
+            StatusCode::FORBIDDEN,
+            "{peer}: an ordinary account must not restart the server"
+        );
+    }
 }
 
-// `POST /System/Restart` is `LocalAccessOrRequiresElevation`, so being on the
-// LAN is enough — but Ferrofin still demands a token, which is the one place it
-// is deliberately stricter than upstream. C# registers the policy with only the
-// local-or-admin requirement, so nothing in it asks for an authenticated user
-// and a LAN caller with no token satisfies it outright.
+// C# registers `LocalAccessOrRequiresElevation` with only the local-or-admin
+// requirement, so nothing in it asks for an authenticated user and a LAN caller
+// with no token satisfies it outright. Ferrofin always demands one.
 //
 // This runs against the composition root's real auth stack rather than a stub,
 // because "does an unauthenticated request get in" is exactly the question a
@@ -601,24 +638,8 @@ async fn restart_still_needs_a_token_even_from_the_local_network() {
     let harness = boot().await;
     let router = ferrofin_api::create_router(harness.wired.state.clone());
 
-    let mut req = Request::builder()
-        .method("POST")
-        .uri("/System/Restart")
-        .header(
-            header::AUTHORIZATION,
-            r#"MediaBrowser Client="test", Device="d", DeviceId="elev-restart", Version="1""#,
-        )
-        .body(Body::empty())
-        .expect("request");
-    req.extensions_mut().insert(axum::extract::ConnectInfo(
-        "127.0.0.1:5000"
-            .parse::<std::net::SocketAddr>()
-            .expect("peer"),
-    ));
-
-    let status = router.oneshot(req).await.expect("response").status();
     assert_eq!(
-        status,
+        restart_from(&router, None, "127.0.0.1:5000").await,
         StatusCode::UNAUTHORIZED,
         "a tokenless loopback caller must not be able to restart the server"
     );

@@ -380,7 +380,11 @@ fn colliding_provider_names_are_refused_at_load() {
         .as_ref()
         .expect("the surviving plugin is the named provider");
     assert_eq!(info.name, "AcmeDb");
-    assert!(info.supported_kinds.is_empty());
+    assert!(
+        info.supported_kinds.is_empty(),
+        "{:?}",
+        info.supported_kinds
+    );
 }
 
 #[test]
@@ -757,10 +761,10 @@ async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
     // slot is filled, but the call proves the full adapter → guest path.
     let wanted = [ferrofin_model::entities::ImageType::Primary];
     let contributed = providers[0].images(&lookup, &wanted).await.unwrap();
-    assert!(contributed.is_empty());
+    assert!(contributed.is_empty(), "{contributed:?}");
     // An empty wanted list short-circuits without a guest call.
     let contributed = providers[0].images(&lookup, &[]).await.unwrap();
-    assert!(contributed.is_empty());
+    assert!(contributed.is_empty(), "{contributed:?}");
 }
 
 #[test]
@@ -1046,149 +1050,90 @@ async fn web_requests_hold_at_most_half_the_plugin_queue() {
     assert_eq!(reply.status, 200);
 }
 
+/// Each item of the plugin's scan targets is offered once, undated ones too,
+/// and the record of what was offered is the host's, in the database: nothing
+/// goes to the plugin's state file.
 #[tokio::test(flavor = "multi_thread")]
 async fn analysis_driver_offers_each_item_once() {
+    use ferrofin_traits::persistence::ItemPersistenceService;
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("fixture.wasm"),
-        wat::parse_str(ferrofin_wasm::TEST_FIXTURE_WAT).unwrap(),
-    )
-    .unwrap();
+    write_fixture(dir.path(), "analyzer", &counting_analyzer_wat());
+    let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    let movie = uuid::Uuid::new_v4();
+    ferrofin_core::FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[dated_movie(movie, &dir.path().join("movie.mkv"), None)])
+        .await
+        .unwrap();
     let load_dir = dir.path().to_path_buf();
     let host = tokio::task::spawn_blocking(move || {
-        ferrofin_wasm::WasmPluginHost::load(
-            &load_dir,
-            &ferrofin_wasm::WasmSettings::resolve(None, None, None, None),
-        )
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
     })
     .await
     .unwrap()
     .unwrap();
-    let plugins: std::sync::Arc<dyn ferrofin_traits::plugins::PluginManager> =
-        std::sync::Arc::new(common::EnabledStub(b"{}".to_vec()));
-    let library = std::sync::Arc::new(common::OneMovieLibrary {
-        seen: std::sync::Mutex::new(None),
-    });
-    host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
-        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
-        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
-        collections: std::sync::Arc::new(common::StubCollections::default()),
-
-        media_streams: std::sync::Arc::new(common::StubStreams),
-        extractor: std::sync::Arc::new(common::StubExtractor::default()),
-        analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-        users: std::sync::Arc::new(common::StubUsers),
-        user_data: std::sync::Arc::new(common::StubUserData),
-        tv: std::sync::Arc::new(common::StubTv),
-        handle: tokio::runtime::Handle::current(),
-        library: library.clone(),
-        media_segments: std::sync::Arc::new(common::RecordingSegments::default()),
-        plugins: std::sync::Arc::new(common::EnabledStub(b"{}".to_vec())),
-    });
+    let plugin_id = host.plugins()[0].descriptor.id;
+    host.set_runtime_collaborators(analysis_collaborators(db_library(&db)));
+    let plugins: Arc<dyn PluginManager> = Arc::new(common::EnabledStub(b"{}".to_vec()));
     // The fixture declares scan-targets ["Movie"], so the driver exists.
     let task = host
-        .analysis_task(&plugins)
+        .analysis_task(&plugins, offered_store(&db))
         .expect("fixture is an analyzer");
     let progress = ferrofin_core::TaskProgress::default();
     task.execute(&progress).await.expect("first pass");
-    // The FIRST pass must be unfiltered (NULL-DateCreated items get their
-    // one offer; SQL `>=` would exclude them forever)…
-    assert!(
-        library
-            .seen
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("query recorded")
-            .min_date_created
-            .is_none(),
-        "first pass runs without a date filter"
-    );
+    assert_eq!(offers(&host).await, 1);
+    assert_eq!(offered_to(&db, plugin_id).await, [movie]);
 
-    // The offer-once watermark landed in the plugin's own state file under
-    // the host-reserved key (the canned item has no date-created → epoch).
-    let state_path = dir
-        .path()
-        .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff.state.json");
-    let mark = ferrofin_wasm::capabilities::get_state(Some(&state_path), "host:scan-watermark")
-        .expect("watermark persisted");
-    assert_eq!(mark, b"0");
-
-    // Second pass: nothing newer than the watermark — it must not move,
-    // and the run still succeeds.
     task.execute(&progress).await.expect("second pass");
-    // …and later passes push the watermark INTO the query.
-    assert!(
-        library
-            .seen
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("query recorded")
-            .min_date_created
-            .is_some(),
-        "later passes carry the date filter"
-    );
-    let mark2 = ferrofin_wasm::capabilities::get_state(Some(&state_path), "host:scan-watermark")
-        .expect("watermark still there");
-    assert_eq!(mark2, b"0");
+    assert_eq!(offers(&host).await, 1, "offered once");
+    let state = dir.path().join(format!("{plugin_id}.state.json"));
+    assert!(!state.exists(), "nothing written to the plugin's state");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn analysis_driver_skips_disabled_plugins_and_guests_cannot_touch_the_watermark() {
+async fn analysis_driver_skips_disabled_plugins() {
+    use ferrofin_traits::persistence::ItemPersistenceService;
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("fixture.wasm"),
-        wat::parse_str(ferrofin_wasm::TEST_FIXTURE_WAT).unwrap(),
-    )
-    .unwrap();
+    write_fixture(dir.path(), "analyzer", &counting_analyzer_wat());
+    let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    ferrofin_core::FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[dated_movie(
+            uuid::Uuid::new_v4(),
+            &dir.path().join("movie.mkv"),
+            Some(10),
+        )])
+        .await
+        .unwrap();
     let load_dir = dir.path().to_path_buf();
     let host = tokio::task::spawn_blocking(move || {
-        ferrofin_wasm::WasmPluginHost::load(
-            &load_dir,
-            &ferrofin_wasm::WasmSettings::resolve(None, None, None, None),
-        )
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
     })
     .await
     .unwrap()
     .unwrap();
-    let disabled: std::sync::Arc<dyn ferrofin_traits::plugins::PluginManager> =
-        std::sync::Arc::new(common::DisabledStub(b"{}".to_vec()));
-    host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
-        lyrics: std::sync::Arc::new(common::StubLyrics::default()),
-        subtitles: std::sync::Arc::new(common::StubSubtitles::default()),
-        collections: std::sync::Arc::new(common::StubCollections::default()),
-
-        media_streams: std::sync::Arc::new(common::StubStreams),
-        extractor: std::sync::Arc::new(common::StubExtractor::default()),
-        analysis: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-        users: std::sync::Arc::new(common::StubUsers),
-        user_data: std::sync::Arc::new(common::StubUserData),
-        tv: std::sync::Arc::new(common::StubTv),
-        handle: tokio::runtime::Handle::current(),
-        library: std::sync::Arc::new(common::OneMovieLibrary {
-            seen: std::sync::Mutex::new(None),
-        }),
-        media_segments: std::sync::Arc::new(common::RecordingSegments::default()),
-        plugins: std::sync::Arc::new(common::DisabledStub(b"{}".to_vec())),
-    });
-    let task = host.analysis_task(&disabled).expect("analyzer exists");
+    let plugin_id = host.plugins()[0].descriptor.id;
+    let disabled: Arc<dyn PluginManager> = Arc::new(common::DisabledStub(b"{}".to_vec()));
+    let mut collaborators = analysis_collaborators(db_library(&db));
+    collaborators.plugins = disabled.clone();
+    host.set_runtime_collaborators(collaborators);
+    let task = host
+        .analysis_task(&disabled, offered_store(&db))
+        .expect("analyzer exists");
     task.execute(&ferrofin_core::TaskProgress::default())
         .await
         .expect("pass succeeds");
-    // Disabled plugin: never offered — no watermark was ever written.
-    let state_path = dir
-        .path()
-        .join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff.state.json");
-    assert!(
-        ferrofin_wasm::capabilities::get_state(Some(&state_path), "host:scan-watermark").is_none(),
-        "disabled plugins are skipped by the analysis pass"
-    );
+    // Disabled plugin: never offered, so nothing recorded either.
+    assert_eq!(offers(&host).await, 0);
+    assert_eq!(offered_to(&db, plugin_id).await, Vec::<uuid::Uuid>::new());
 }
 
+/// An item whose library turns the plugin's segments off is not offered, nor
+/// recorded, while another library's is: it is offered, once, when its
+/// library allows the plugin.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
-async fn library_disabled_analyzer_items_reoffer_after_another_library_advances_watermark() {
+async fn a_library_disabled_analyzer_item_is_offered_once_its_library_allows_it() {
     use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
     use ferrofin_traits::media_segments::MediaSegmentManager;
     use ferrofin_traits::persistence::ItemPersistenceService;
@@ -1276,6 +1221,8 @@ async fn library_disabled_analyzer_items_reoffer_after_another_library_advances_
         )
         .await
         .unwrap();
+    let offered = offered_store(&db);
+    let records = db.clone();
     let manager = Arc::new(
         ferrofin_core::FerrofinMediaSegmentManager::new(db, library.clone())
             .with_virtual_folders(folders.clone()),
@@ -1312,7 +1259,7 @@ async fn library_disabled_analyzer_items_reoffer_after_another_library_advances_
         user_data: Arc::new(common::StubUserData),
         tv: Arc::new(common::StubTv),
     });
-    let task = host.analysis_task(&plugins).unwrap();
+    let task = host.analysis_task(&plugins, offered).unwrap();
     let progress = ferrofin_core::TaskProgress::default();
     task.execute(&progress).await.unwrap();
     let count = host.plugins()[0]
@@ -1320,17 +1267,13 @@ async fn library_disabled_analyzer_items_reoffer_after_another_library_advances_
         .await
         .unwrap_err();
     assert!(count.contains('1'), "{count}");
-    let state = dir.path().join(format!("{plugin_id}.state.json"));
-    assert_eq!(
-        ferrofin_wasm::capabilities::get_state(Some(&state), "host:scan-watermark").unwrap(),
-        b"20"
-    );
-    let pending: Vec<uuid::Uuid> = serde_json::from_slice(
-        &ferrofin_wasm::capabilities::get_state(Some(&state), "host:segment-policy-pending")
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(pending, [blocked]);
+    assert_eq!(offered_to(&records, plugin_id).await, [allowed]);
+    task.execute(&progress).await.unwrap();
+    let count = host.plugins()[0]
+        .run_task_for_test("count".to_owned())
+        .await
+        .unwrap_err();
+    assert!(count.contains('1'), "still off in its library: {count}");
     options.disabled_media_segment_providers.clear();
     folders
         .update_library_options("Blocked", &options)
@@ -1342,16 +1285,47 @@ async fn library_disabled_analyzer_items_reoffer_after_another_library_advances_
         .await
         .unwrap_err();
     assert!(count.contains('2'), "{count}");
-    assert!(
-        ferrofin_wasm::capabilities::get_state(Some(&state), "host:segment-policy-pending")
-            .is_none()
-    );
+    let mut both = vec![blocked, allowed];
+    both.sort_unstable();
+    assert_eq!(offered_to(&records, plugin_id).await, both);
     task.execute(&progress).await.unwrap();
     let count = host.plugins()[0]
         .run_task_for_test("count".to_owned())
         .await
         .unwrap_err();
     assert!(count.contains('2'), "{count}");
+}
+
+/// The record of the analysis pass's offers, over `db`.
+fn offered_store(
+    db: &ferrofin_db::Database,
+) -> Arc<dyn ferrofin_traits::plugins::PluginOfferedItemStore> {
+    Arc::new(
+        ferrofin_core::plugin_offered_item_repository::FerrofinPluginOfferedItemStore::new(
+            db.clone(),
+        ),
+    )
+}
+
+/// The movies in `db` recorded as offered to `plugin`, sorted: every movie
+/// but the ones the pass's own anti-join still returns.
+async fn offered_to(db: &ferrofin_db::Database, plugin: uuid::Uuid) -> Vec<uuid::Uuid> {
+    let library = db_library(db);
+    let movies = |not_offered_to_plugin| ferrofin_traits::options::InternalItemsQuery {
+        include_item_types: vec![ferrofin_model::data::BaseItemKind::Movie],
+        not_offered_to_plugin,
+        ..Default::default()
+    };
+    let not_offered = library.get_item_ids(&movies(Some(plugin))).await.unwrap();
+    let mut ids: Vec<uuid::Uuid> = library
+        .get_item_ids(&movies(None))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|id| !not_offered.contains(id))
+        .collect();
+    ids.sort_unstable();
+    ids
 }
 
 /// The analysis collaborators over `library`, every other seam stubbed.
@@ -1397,25 +1371,21 @@ fn count_in_three_digits(wat: &str) -> String {
 }
 
 /// A breaker trip mid-pass must not burn the items the pass never reached:
-/// they are offered after the restart (gl-70). Items are saved newest first,
-/// so only a pass ordered by DateCreated offers the three oldest before the
-/// breaker trips, and the dated cases offer those three only once.
+/// they are offered after the restart (gl-70), and the ones it did offer are
+/// not offered again. Items are saved newest first, so only a pass ordered by
+/// DateCreated offers the three oldest (undated first) before the breaker
+/// trips.
 /// - 250 items span three pages.
-/// - An undated item the pass never reached keeps the first pass unfiltered,
-///   so it still gets its one offer, and the three that trapped are offered
-///   again.
+/// - Undated items are offered like any other, once.
 #[rstest::rstest]
-#[case::dated(vec![Some(50), Some(40), Some(30), Some(20), Some(10)], Some(&b"30"[..]), 2, b"50")]
-#[case::over_three_pages((1..=250).rev().map(Some).collect(), Some(&b"3"[..]), 247, b"250")]
-#[case::undated_not_reached(vec![Some(10), None, None, None, None], None, 5, b"10")]
+#[case::dated(vec![Some(50), Some(40), Some(30), Some(20), Some(10)], 2)]
+#[case::over_three_pages((1..=250).rev().map(Some).collect(), 247)]
+#[case::undated(vec![Some(10), None, None, None, None], 2)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dead_analyzer_leaves_the_items_it_never_reached_for_after_the_restart(
     #[case] dates: Vec<Option<i64>>,
-    #[case] watermark_after_the_trip: Option<&[u8]>,
     #[case] offered_after_the_restart: u32,
-    #[case] final_watermark: &[u8],
 ) {
-    use ferrofin_traits::library::LibraryManager;
     use ferrofin_traits::persistence::ItemPersistenceService;
     let dir = tempfile::tempdir().unwrap();
     let scan_media = "(func (export \"scan-media\") (param i32) (result i32)";
@@ -1427,43 +1397,21 @@ async fn a_dead_analyzer_leaves_the_items_it_never_reached_for_after_the_restart
     );
     let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
     db.run_migrations().await.unwrap();
-    let persistence = Arc::new(ferrofin_core::FerrofinItemPersistenceService::new(
-        db.clone(),
-    ));
-    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
-        Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
-    let library: Arc<dyn LibraryManager> = Arc::new(ferrofin_core::FerrofinLibraryManager::new(
-        Arc::new(ferrofin_core::FerrofinItemRepository::new(
-            db.clone(),
-            lookup,
-        )),
-        Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
-        persistence.clone(),
-        Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db)),
-    ));
     let movies: Vec<_> = dates
         .iter()
         .enumerate()
-        .map(
-            |(index, date)| ferrofin_db::entities::base_items::BaseItemEntity {
-                id: ferrofin_db::store::guid_to_db(uuid::Uuid::new_v4()),
-                type_: ferrofin_core::item_type_lookup::stored_type_name(
-                    ferrofin_model::data::BaseItemKind::Movie,
-                )
-                .unwrap()
-                .to_owned(),
-                path: Some(
-                    dir.path()
-                        .join(format!("{index}.mkv"))
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-                date_created: date.and_then(chrono::DateTime::from_timestamp_micros),
-                ..Default::default()
-            },
-        )
+        .map(|(index, date)| {
+            dated_movie(
+                uuid::Uuid::new_v4(),
+                &dir.path().join(format!("{index}.mkv")),
+                *date,
+            )
+        })
         .collect();
-    persistence.save_items(&movies).await.unwrap();
+    ferrofin_core::FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&movies)
+        .await
+        .unwrap();
     let plugins: Arc<dyn PluginManager> = Arc::new(common::EnabledStub(b"{}".to_vec()));
     let load_dir = dir.path().to_path_buf();
     let host = tokio::task::spawn_blocking(move || {
@@ -1473,48 +1421,38 @@ async fn a_dead_analyzer_leaves_the_items_it_never_reached_for_after_the_restart
     .unwrap()
     .unwrap();
     let plugin_id = host.plugins()[0].descriptor.id;
-    host.set_runtime_collaborators(analysis_collaborators(library.clone()));
+    host.set_runtime_collaborators(analysis_collaborators(db_library(&db)));
     let progress = ferrofin_core::TaskProgress::default();
-    let task = host.analysis_task(&plugins).unwrap();
+    let task = host.analysis_task(&plugins, offered_store(&db)).unwrap();
     task.execute(&progress)
         .await
         .expect("a dead plugin never fails the task");
-    let state = dir.path().join(format!("{plugin_id}.state.json"));
-    assert_eq!(
-        ferrofin_wasm::capabilities::get_state(Some(&state), "host:scan-watermark").as_deref(),
-        watermark_after_the_trip,
-        "the watermark stops below the first item the dead plugin never saw"
+    // The three it offered (they trapped) are recorded: the oldest three.
+    let date_of = |id: &uuid::Uuid| {
+        movies
+            .iter()
+            .find(|m| m.id == ferrofin_db::store::guid_to_db(*id))
+            .unwrap()
+            .date_created
+    };
+    let recorded = offered_to(&db, plugin_id).await;
+    assert_eq!(recorded.len(), 3, "offered before the trip");
+    let newest_recorded = recorded.iter().map(date_of).max().unwrap();
+    assert!(
+        movies
+            .iter()
+            .filter(|m| !recorded.contains(&uuid::Uuid::parse_str(&m.id).unwrap()))
+            .all(|m| m.date_created >= newest_recorded),
+        "the oldest first"
     );
-    // Another pass before the restart leaves the watermark where it is.
+    // Another pass before the restart offers nothing: the runtime is dead.
     task.execute(&progress).await.unwrap();
-    assert_eq!(
-        ferrofin_wasm::capabilities::get_state(Some(&state), "host:scan-watermark").as_deref(),
-        watermark_after_the_trip
-    );
+    assert_eq!(offered_to(&db, plugin_id).await, recorded);
     drop(task);
     drop(host);
 
     // The restart: the same plugin, now healthy and counting its offers.
-    // Each offer copies the item, temp-dir path included, into the fixture's
-    // one-page memory, whose bump allocator never frees. So every offer
-    // starts again at the allocator's first address. Otherwise a few hundred
-    // offers fill the page (fewer under a long TMPDIR), and the trap
-    // restarts the guest and its count.
-    assert!(
-        FIXTURE_WAT.contains("(global $bump (mut i32) (i32.const 4096))"),
-        "the fixture's allocator start moved"
-    );
-    write_fixture(
-        dir.path(),
-        "analyzer",
-        &count_in_three_digits(&FIXTURE_WAT.replace(
-            scan_media,
-            &format!(
-                "{scan_media} (global.set $bump (i32.const 4096)) \
-                 (global.set $events (i32.add (global.get $events) (i32.const 1)))"
-            ),
-        )),
-    );
+    write_fixture(dir.path(), "analyzer", &counting_analyzer_wat());
     let load_dir = dir.path().to_path_buf();
     let host = tokio::task::spawn_blocking(move || {
         WasmPluginHost::load(&load_dir, &WasmSettings::default())
@@ -1522,24 +1460,273 @@ async fn a_dead_analyzer_leaves_the_items_it_never_reached_for_after_the_restart
     .await
     .unwrap()
     .unwrap();
-    host.set_runtime_collaborators(analysis_collaborators(library));
-    host.analysis_task(&plugins)
+    host.set_runtime_collaborators(analysis_collaborators(db_library(&db)));
+    host.analysis_task(&plugins, offered_store(&db))
         .unwrap()
         .execute(&progress)
         .await
         .unwrap();
-    let count = host.plugins()[0]
-        .run_task_for_test("count".to_owned())
-        .await
-        .unwrap_err();
     assert_eq!(
-        count.parse::<u32>().unwrap(),
+        offers(&host).await,
         offered_after_the_restart,
         "offers after the restart"
     );
+    assert_eq!(offered_to(&db, plugin_id).await.len(), dates.len());
+}
+
+/// The fixture with `scan-media` counting its offers, read back in three
+/// digits through the `count` task. Each offer copies the item, temp-dir path
+/// included, into the fixture's one-page memory, whose bump allocator never
+/// frees, so every offer starts again at the allocator's first address.
+/// Otherwise a few hundred offers fill the page (fewer under a long TMPDIR),
+/// and the trap restarts the guest and its count.
+fn counting_analyzer_wat() -> String {
+    assert!(
+        FIXTURE_WAT.contains("(global $bump (mut i32) (i32.const 4096))"),
+        "the fixture's allocator start moved"
+    );
+    let scan_media = "(func (export \"scan-media\") (param i32) (result i32)";
+    count_in_three_digits(&FIXTURE_WAT.replace(
+        scan_media,
+        &format!(
+            "{scan_media} (global.set $bump (i32.const 4096)) \
+             (global.set $events (i32.add (global.get $events) (i32.const 1)))"
+        ),
+    ))
+}
+
+/// How many items the counting analyzer loaded first in `host` was offered.
+async fn offers(host: &WasmPluginHost) -> u32 {
+    host.plugins()[0]
+        .run_task_for_test("count".to_owned())
+        .await
+        .unwrap_err()
+        .parse()
+        .unwrap()
+}
+
+/// The library manager over `db`, as the composition root builds it.
+fn db_library(db: &ferrofin_db::Database) -> Arc<dyn ferrofin_traits::library::LibraryManager> {
+    let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+        Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+    Arc::new(ferrofin_core::FerrofinLibraryManager::new(
+        Arc::new(ferrofin_core::FerrofinItemRepository::new(
+            db.clone(),
+            lookup,
+        )),
+        Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+        Arc::new(ferrofin_core::FerrofinItemPersistenceService::new(
+            db.clone(),
+        )),
+        Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+    ))
+}
+
+/// A movie row at `path`, created at `date` (unix microseconds; `None` is
+/// undated).
+fn dated_movie(
+    id: uuid::Uuid,
+    path: &std::path::Path,
+    date: Option<i64>,
+) -> ferrofin_db::entities::base_items::BaseItemEntity {
+    ferrofin_db::entities::base_items::BaseItemEntity {
+        id: ferrofin_db::store::guid_to_db(id),
+        type_: ferrofin_core::item_type_lookup::stored_type_name(
+            ferrofin_model::data::BaseItemKind::Movie,
+        )
+        .unwrap()
+        .to_owned(),
+        path: Some(path.to_string_lossy().into_owned()),
+        date_created: date.and_then(chrono::DateTime::from_timestamp_micros),
+        ..Default::default()
+    }
+}
+
+/// The pass remembers which items it offered, not the newest DateCreated
+/// (gl-733). An item that reaches the library after a pass with an older
+/// DateCreated than the items that pass offered (moved or copied in with its
+/// old file times, unpacked from an archive, a photo's EXIF date) is still
+/// offered, and only once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_added_after_a_pass_with_an_older_date_created_is_still_offered() {
+    use ferrofin_traits::persistence::ItemPersistenceService;
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "analyzer", &counting_analyzer_wat());
+    let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    let persistence = ferrofin_core::FerrofinItemPersistenceService::new(db.clone());
+    persistence
+        .save_items(&[dated_movie(
+            uuid::Uuid::new_v4(),
+            &dir.path().join("new.mkv"),
+            Some(2_000_000),
+        )])
+        .await
+        .unwrap();
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    host.set_runtime_collaborators(analysis_collaborators(db_library(&db)));
+    let plugins: Arc<dyn PluginManager> = Arc::new(common::EnabledStub(b"{}".to_vec()));
+    let task = host.analysis_task(&plugins, offered_store(&db)).unwrap();
+    let progress = ferrofin_core::TaskProgress::default();
+    task.execute(&progress).await.unwrap();
+    assert_eq!(offers(&host).await, 1);
+
+    // Brought in after the pass, with file times older than the movie's.
+    persistence
+        .save_items(&[dated_movie(
+            uuid::Uuid::new_v4(),
+            &dir.path().join("old.mkv"),
+            Some(1_000_000),
+        )])
+        .await
+        .unwrap();
+    task.execute(&progress).await.unwrap();
+    assert_eq!(offers(&host).await, 2, "the older item is offered");
+    task.execute(&progress).await.unwrap();
+    assert_eq!(offers(&host).await, 2, "and only once");
+}
+
+/// The upgrade from the watermark pass (gl-733): the items it had offered,
+/// those created at or before its watermark and the undated ones, count as
+/// offered and are not offered again; the ones it had put aside and the ones
+/// after it are. The watermark is left as it was, for a previous version still
+/// running beside this one, and when that version moves it on (offering what
+/// it reached), the next pass counts those as offered too.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_switch_from_the_watermark_offers_nothing_twice() {
+    use ferrofin_traits::persistence::ItemPersistenceService;
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "analyzer", &counting_analyzer_wat());
+    let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    let persistence = ferrofin_core::FerrofinItemPersistenceService::new(db.clone());
+    let movie = |name: &str, date| dated_movie(uuid::Uuid::new_v4(), &dir.path().join(name), date);
+    let put_aside = uuid::Uuid::new_v4();
+    persistence
+        .save_items(&[
+            movie("before.mkv", Some(10)),
+            movie("at.mkv", Some(20)),
+            movie("undated.mkv", None),
+            dated_movie(put_aside, &dir.path().join("put-aside.mkv"), Some(15)),
+            movie("after.mkv", Some(21)),
+        ])
+        .await
+        .unwrap();
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || {
+        WasmPluginHost::load(&load_dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let plugin_id = host.plugins()[0].descriptor.id;
+    // What the watermark pass left in the plugin's state.
+    let state = dir.path().join(format!("{plugin_id}.state.json"));
+    let set = |key: &str, value: Vec<u8>| {
+        ferrofin_wasm::capabilities::set_state(Some(&state), key, Some(value)).unwrap();
+    };
+    set("host:scan-watermark", b"20".to_vec());
+    set(
+        "host:segment-policy-pending",
+        serde_json::to_vec(&[put_aside]).unwrap(),
+    );
+    host.set_runtime_collaborators(analysis_collaborators(db_library(&db)));
+    let plugins: Arc<dyn PluginManager> = Arc::new(common::EnabledStub(b"{}".to_vec()));
+    let task = host.analysis_task(&plugins, offered_store(&db)).unwrap();
+    let progress = ferrofin_core::TaskProgress::default();
+    task.execute(&progress).await.unwrap();
     assert_eq!(
-        ferrofin_wasm::capabilities::get_state(Some(&state), "host:scan-watermark").unwrap(),
-        final_watermark
+        offers(&host).await,
+        2,
+        "the put-aside item and the newer one"
+    );
+    assert_eq!(offered_to(&db, plugin_id).await.len(), 5);
+    task.execute(&progress).await.unwrap();
+    assert_eq!(offers(&host).await, 2, "nothing twice");
+    let get = |key: &str| ferrofin_wasm::capabilities::get_state(Some(&state), key);
+    assert_eq!(get("host:scan-watermark").as_deref(), Some(&b"20"[..]));
+    assert_eq!(
+        get("host:scan-watermark-switched").as_deref(),
+        Some(&b"20"[..])
+    );
+
+    // A previous version still running beside this one offers a new item
+    // and moves its watermark on; a newer item arrives after that, and one
+    // copied in with old file times, which neither version offered.
+    persistence
+        .save_items(&[
+            movie("beside.mkv", Some(30)),
+            movie("newest.mkv", Some(40)),
+            movie("old-copy.mkv", Some(5)),
+        ])
+        .await
+        .unwrap();
+    set("host:scan-watermark", b"30".to_vec());
+    task.execute(&progress).await.unwrap();
+    assert_eq!(
+        offers(&host).await,
+        4,
+        "the newest and the old copy: the second switch takes only what is after the first"
+    );
+    assert_eq!(offered_to(&db, plugin_id).await.len(), 8);
+    assert_eq!(
+        get("host:scan-watermark-switched").as_deref(),
+        Some(&b"30"[..])
+    );
+}
+
+/// When the switch-over cannot be noted in the plugin's state (here, full),
+/// the pass offers the plugin nothing: a repeat of the switch would count as
+/// offered an item the pass had left for later. Once the state has room, the
+/// switch is noted and the items after the watermark are offered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switch_that_cannot_be_noted_offers_nothing_yet() {
+    use ferrofin_traits::persistence::ItemPersistenceService;
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "analyzer", &counting_analyzer_wat());
+    let db = ferrofin_db::Database::connect_in_memory().await.unwrap();
+    db.run_migrations().await.unwrap();
+    let movie = |name: &str, date| dated_movie(uuid::Uuid::new_v4(), &dir.path().join(name), date);
+    ferrofin_core::FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[movie("before.mkv", Some(10)), movie("after.mkv", Some(30))])
+        .await
+        .unwrap();
+    let settings = WasmSettings::default().with_state_limit_mb(Some(1));
+    let load_dir = dir.path().to_path_buf();
+    let host = tokio::task::spawn_blocking(move || WasmPluginHost::load(&load_dir, &settings))
+        .await
+        .unwrap()
+        .unwrap();
+    let plugin_id = host.plugins()[0].descriptor.id;
+    let state = dir.path().join(format!("{plugin_id}.state.json"));
+    let set = |key: &str, value: Option<Vec<u8>>| {
+        ferrofin_wasm::capabilities::set_state(Some(&state), key, value).unwrap();
+    };
+    set("host:scan-watermark", Some(b"20".to_vec()));
+    // The guest's own data leaves 10 bytes of the 1 MiB cap: too few for the note.
+    let filler = 1024 * 1024 - "filler".len() - "host:scan-watermark".len() - 2 - 10;
+    set("filler", Some(vec![0; filler]));
+    host.set_runtime_collaborators(analysis_collaborators(db_library(&db)));
+    let plugins: Arc<dyn PluginManager> = Arc::new(common::EnabledStub(b"{}".to_vec()));
+    let task = host.analysis_task(&plugins, offered_store(&db)).unwrap();
+    let progress = ferrofin_core::TaskProgress::default();
+    task.execute(&progress).await.unwrap();
+    assert_eq!(offers(&host).await, 0, "nothing offered");
+    assert_eq!(offered_to(&db, plugin_id).await.len(), 1, "the switch ran");
+
+    set("filler", None);
+    task.execute(&progress).await.unwrap();
+    assert_eq!(offers(&host).await, 1, "the item after the watermark");
+    assert_eq!(
+        ferrofin_wasm::capabilities::get_state(Some(&state), "host:scan-watermark-switched")
+            .as_deref(),
+        Some(&b"20"[..])
     );
 }
 
@@ -1767,6 +1954,8 @@ async fn analyzer_retains_a_host_skipped_write_even_when_library_is_reenabled_be
         reads: std::sync::atomic::AtomicUsize::new(0),
         provider_name: host.plugins()[0].descriptor.name.clone(),
     });
+    let offered = offered_store(&db);
+    let records = db.clone();
     let manager = Arc::new(
         ferrofin_core::FerrofinMediaSegmentManager::new(db, library.clone())
             .with_virtual_folders(folders),
@@ -1810,23 +1999,23 @@ async fn analyzer_retains_a_host_skipped_write_even_when_library_is_reenabled_be
         user_data: Arc::new(common::StubUserData),
         tv: Arc::new(common::StubTv),
     });
-    let task = host.analysis_task(&plugins).unwrap();
+    let task = host.analysis_task(&plugins, offered).unwrap();
     let progress = ferrofin_core::TaskProgress::default();
-    let state = dir
-        .path()
-        .join(format!("{}.state.json", host.plugins()[0].descriptor.id));
+    let plugin_id = host.plugins()[0].descriptor.id;
     let snapshot = dir.path().join(format!(
         "{}.segments/{item}.json",
         host.plugins()[0].descriptor.id
     ));
     task.execute(&progress).await.unwrap();
+    let virtual_folders = inner.get_virtual_folders().await.unwrap();
+    let disabled_media_segment_providers = &virtual_folders[0]
+        .library_options
+        .as_ref()
+        .unwrap()
+        .disabled_media_segment_providers;
     assert!(
-        inner.get_virtual_folders().await.unwrap()[0]
-            .library_options
-            .as_ref()
-            .unwrap()
-            .disabled_media_segment_providers
-            .is_empty()
+        disabled_media_segment_providers.is_empty(),
+        "{disabled_media_segment_providers:?}"
     );
     let retained: Vec<ferrofin_model::media_segments::MediaSegmentDto> =
         serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
@@ -1835,12 +2024,11 @@ async fn analyzer_retains_a_host_skipped_write_even_when_library_is_reenabled_be
         1,
         "the real host suppressed the first guest's empty replacement"
     );
-    let pending: Vec<uuid::Uuid> = serde_json::from_slice(
-        &ferrofin_wasm::capabilities::get_state(Some(&state), "host:segment-policy-pending")
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(pending, [item]);
+    assert_eq!(
+        offered_to(&records, plugin_id).await,
+        Vec::<uuid::Uuid>::new(),
+        "a refused write leaves the item to be offered again"
+    );
     let count = host.plugins()[0]
         .run_task_for_test("count".to_owned())
         .await
@@ -1849,11 +2037,8 @@ async fn analyzer_retains_a_host_skipped_write_even_when_library_is_reenabled_be
     task.execute(&progress).await.unwrap();
     let replaced: Vec<ferrofin_model::media_segments::MediaSegmentDto> =
         serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
-    assert!(replaced.is_empty());
-    assert!(
-        ferrofin_wasm::capabilities::get_state(Some(&state), "host:segment-policy-pending")
-            .is_none()
-    );
+    assert!(replaced.is_empty(), "{replaced:?}");
+    assert_eq!(offered_to(&records, plugin_id).await, [item]);
     let count = host.plugins()[0]
         .run_task_for_test("count".to_owned())
         .await
@@ -1918,6 +2103,7 @@ async fn state_only_analyzer_is_not_advertised_or_blocked_as_a_segment_producer(
         )
         .await
         .unwrap();
+    let records = db.clone();
     let manager = Arc::new(
         ferrofin_core::FerrofinMediaSegmentManager::new(db, library.clone())
             .with_virtual_folders(folders),
@@ -1930,10 +2116,14 @@ async fn state_only_analyzer_is_not_advertised_or_blocked_as_a_segment_producer(
                 .unwrap()
         );
     }
-    assert!(manager.registered_segment_providers().is_empty());
+    let registered_segment_providers = manager.registered_segment_providers();
+    assert!(
+        registered_segment_providers.is_empty(),
+        "{registered_segment_providers:?}"
+    );
     host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
         handle: tokio::runtime::Handle::current(),
-        library,
+        library: db_library(&records),
         media_segments: manager.clone(),
         plugins: plugins.clone(),
         lyrics: Arc::new(common::StubLyrics::default()),
@@ -1946,7 +2136,9 @@ async fn state_only_analyzer_is_not_advertised_or_blocked_as_a_segment_producer(
         user_data: Arc::new(common::StubUserData),
         tv: Arc::new(common::StubTv),
     });
-    let task = host.analysis_task(&plugins).unwrap();
+    let task = host
+        .analysis_task(&plugins, offered_store(&records))
+        .unwrap();
     task.execute(&ferrofin_core::TaskProgress::default())
         .await
         .unwrap();
@@ -1963,5 +2155,9 @@ async fn state_only_analyzer_is_not_advertised_or_blocked_as_a_segment_producer(
         .await
         .unwrap_err();
     assert!(count.contains('1'), "{count}");
-    assert!(manager.registered_segment_providers().is_empty());
+    let registered_segment_providers = manager.registered_segment_providers();
+    assert!(
+        registered_segment_providers.is_empty(),
+        "{registered_segment_providers:?}"
+    );
 }

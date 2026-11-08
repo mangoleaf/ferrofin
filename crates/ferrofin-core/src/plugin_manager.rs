@@ -213,7 +213,7 @@ const DEFAULT_PLUGIN_DOWNLOAD_MB: u32 = 128;
 /// It is the left-hand side of upstream's compatibility test
 /// `_applicationHost.ApplicationVersion < targetAbi`, so it decides which
 /// manifest versions a client is offered.
-const DEFAULT_APPLICATION_VERSION: &str = "12.2.0";
+const DEFAULT_APPLICATION_VERSION: &str = "12.4.0";
 
 /// Whether `url` points at a loopback host (`localhost`, `127.x`, `[::1]`).
 fn is_loopback_url(url: &str) -> bool {
@@ -462,6 +462,10 @@ pub struct FerrofinPluginManager {
     /// construction, so these ids are skipped by every lookup instead, which
     /// also stops the host running them until the restart.
     removed: Mutex<HashSet<Uuid>>,
+    /// The record of the items the "Plugin media analysis" pass offered to
+    /// each analyzer plugin; an uninstall forgets the plugin's, as it removes
+    /// the plugin's state file. `None` only at the unit-test seam.
+    offered_items: Option<Arc<dyn ferrofin_traits::plugins::PluginOfferedItemStore>>,
 }
 
 /// The in-process event a plugin configuration save publishes, with
@@ -520,7 +524,21 @@ impl FerrofinPluginManager {
             legacy_repositories_migrated: tokio::sync::OnceCell::new(),
             events: None,
             removed: Mutex::default(),
+            offered_items: None,
         }
+    }
+
+    /// Attaches the record of the items the "Plugin media analysis" pass
+    /// offered to each plugin, so an uninstall forgets the plugin's and the
+    /// plugin installed again is offered the whole library. Called once by the
+    /// composition root.
+    #[must_use]
+    pub fn with_offered_items(
+        mut self,
+        offered_items: Arc<dyn ferrofin_traits::plugins::PluginOfferedItemStore>,
+    ) -> Self {
+        self.offered_items = Some(offered_items);
+        self
     }
 
     /// Announces configuration saves on `events` (see
@@ -694,7 +712,13 @@ impl FerrofinPluginManager {
     fn record_installed_egress(&self, guid: Uuid, declared: Vec<String>) {
         let mut state = self.state.lock().expect("plugin state lock poisoned");
         state.installed_egress.insert(guid.to_string(), declared);
-        let _ = self.persist(&state);
+        if let Err(error) = self.persist(&state) {
+            tracing::warn!(
+                plugin = %guid,
+                %error,
+                "could not save the plugin's declared egress; after a restart, an upgrade's new egress goes unwarned"
+            );
+        }
     }
 
     /// Records an installed artifact's digest (best-effort persist — the
@@ -706,7 +730,14 @@ impl FerrofinPluginManager {
             .entry(guid.to_string())
             .or_default()
             .insert(version.to_owned(), digest);
-        let _ = self.persist(&state);
+        if let Err(error) = self.persist(&state) {
+            tracing::warn!(
+                plugin = %guid,
+                version,
+                %error,
+                "could not save the installed artifact's digest; after a restart, different bytes for this version are not refused"
+            );
+        }
     }
 
     /// Flips a plugin's enabled flag, persisting the change.
@@ -950,6 +981,17 @@ impl PluginManager for FerrofinPluginManager {
                 let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.state.json")));
                 let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.segments")));
                 let _ = std::fs::remove_dir_all(self.plugins_dir.join(id.to_string()));
+                // The items the analysis pass offered it go with its state,
+                // so the plugin installed again is offered the whole library.
+                if let Some(offered_items) = &self.offered_items
+                    && let Err(error) = offered_items.forget_plugin(id).await
+                {
+                    tracing::warn!(
+                        plugin = %id,
+                        %error,
+                        "could not forget the items offered to the uninstalled plugin; installed again, it is offered only the items added since"
+                    );
+                }
                 // `DeletePlugin`'s `_plugins.Remove`: gone from every lookup,
                 // so it no longer runs, until the restart that drops it.
                 self.removed
@@ -960,7 +1002,13 @@ impl PluginManager for FerrofinPluginManager {
                     let mut state = self.state.lock().expect("plugin state lock poisoned");
                     state.enabled.remove(&id.to_string());
                     state.installed_egress.remove(&id.to_string());
-                    let _ = self.persist(&state);
+                    if let Err(error) = self.persist(&state) {
+                        tracing::warn!(
+                            plugin = %id,
+                            %error,
+                            "could not save the plugin state after the uninstall; its enabled flag and egress record stay in state.json"
+                        );
+                    }
                 }
                 if let Some(lifecycle) = &self.lifecycle {
                     lifecycle.mark_restart_required();
@@ -1599,7 +1647,7 @@ fn project_config(
         return serde_json::to_vec(body)
             .map_err(|e| ServiceError::backend(format!("serialize plugin config: {e}")));
     }
-    let mut out = schema.clone();
+    let mut out = schema;
     for (key, value) in body {
         let Some(slot) = out.get_mut(key) else {
             continue; // unknown key: the deserializer drops it
@@ -1862,7 +1910,8 @@ mod tests {
     #[tokio::test]
     async fn empty_manager_lists_nothing() {
         let (mgr, _dir) = manager(Vec::new());
-        assert!(mgr.list_plugins().await.expect("list").is_empty());
+        let plugins = mgr.list_plugins().await.expect("list");
+        assert!(plugins.is_empty(), "{plugins:?}");
         assert!(mgr.get_plugin(Uuid::new_v4()).await.expect("get").is_none());
     }
 
@@ -2016,10 +2065,38 @@ mod tests {
         );
     }
 
+    /// A digest `state.json` cannot take is warned about: after a restart the
+    /// published-version check no longer knows it.
+    #[test]
+    fn a_digest_that_cannot_be_saved_is_warned_about() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A file where the plugins directory should be fails every write.
+        let not_a_dir = dir.path().join("plugins");
+        std::fs::write(&not_a_dir, b"").expect("write");
+        let mgr = FerrofinPluginManager::new(Vec::new(), not_a_dir);
+        let logs = crate::test_support::CapturedLogs::default();
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            mgr.record_installed_digest(Uuid::from_u128(7), "1.0.0", "ab".to_owned());
+        }
+        let text = logs.text();
+        assert!(
+            text.contains("WARN")
+                && text.contains("could not save the installed artifact's digest"),
+            "{text}"
+        );
+    }
+
     #[tokio::test]
     async fn repositories_persist() {
         let (mgr, _dir) = manager(Vec::new());
-        assert!(mgr.get_repositories().await.expect("repos").is_empty());
+        let repositories = mgr.get_repositories().await.expect("repos");
+        assert!(repositories.is_empty(), "{repositories:?}");
         let repo = RepositoryInfo {
             name: Some("Main".to_owned()),
             url: Some("https://example.test/manifest.json".to_owned()),
@@ -2784,6 +2861,67 @@ mod tests {
         ));
     }
 
+    /// Uninstalling a WASM plugin forgets the items the analysis pass offered
+    /// it (and only it), as it removes the plugin's state file, so the plugin
+    /// installed again is offered the whole library. A store that fails does
+    /// not fail the uninstall.
+    #[tokio::test]
+    async fn an_uninstall_forgets_the_items_offered_to_the_plugin() {
+        use crate::plugin_offered_item_repository::FerrofinPluginOfferedItemStore;
+        use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+        use ferrofin_traits::plugins::PluginOfferedItemStore;
+        let db = crate::test_support::test_db().await;
+        let item = Uuid::from_u128(0x0FFE);
+        crate::FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[ferrofin_db::entities::base_items::BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(item),
+                type_: crate::item_type_lookup::stored_type_name(
+                    ferrofin_model::data::BaseItemKind::Movie,
+                )
+                .expect("movie")
+                .to_owned(),
+                ..Default::default()
+            }])
+            .await
+            .expect("item");
+        let store = Arc::new(FerrofinPluginOfferedItemStore::new(db.clone()));
+        let other = Uuid::from_u128(0x0123);
+        for plugin in [PKG_ID, other] {
+            store.mark_offered(plugin, &[item]).await.expect("offered");
+        }
+        let mut rig = update_rig("0.9.0", true, true).await;
+        rig.mgr = rig.mgr.with_offered_items(store.clone());
+
+        rig.mgr.remove_plugin(PKG_ID).await.expect("uninstall");
+        let repository = crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let not_offered = |plugin| ferrofin_traits::options::InternalItemsQuery {
+            include_item_types: vec![ferrofin_model::data::BaseItemKind::Movie],
+            not_offered_to_plugin: Some(plugin),
+            ..ferrofin_traits::options::InternalItemsQuery::default()
+        };
+        assert_eq!(
+            repository.get_item_ids(&not_offered(PKG_ID)).await.unwrap(),
+            [item],
+            "forgotten: offered again"
+        );
+        assert_eq!(
+            repository.get_item_ids(&not_offered(other)).await.unwrap(),
+            Vec::<Uuid>::new(),
+            "the other plugin's offers stay"
+        );
+
+        let mut rig = update_rig("0.9.0", true, true).await;
+        rig.mgr = rig.mgr.with_offered_items(store);
+        db.close().await;
+        rig.mgr
+            .remove_plugin(PKG_ID)
+            .await
+            .expect("uninstalled even when the store fails");
+    }
+
     /// A plugin dropped in by hand under its own file name (the documented
     /// air-gapped install) is uninstalled by that file, not a guessed
     /// `{id}.wasm`.
@@ -2855,33 +2993,27 @@ mod tests {
 
         // Already on the newest catalog version → nothing to do.
         let rig = update_rig("0.10.0", true, true).await;
+        let available_plugin_updates = rig.mgr.available_plugin_updates().await.expect("updates");
         assert!(
-            rig.mgr
-                .available_plugin_updates()
-                .await
-                .expect("updates")
-                .is_empty()
+            available_plugin_updates.is_empty(),
+            "{available_plugin_updates:?}"
         );
 
         // A compiled-in extension (no staged artifact) is never offered an
         // update — `install_package` refuses its id outright.
         let rig = update_rig("0.9.0", false, true).await;
+        let available_plugin_updates = rig.mgr.available_plugin_updates().await.expect("updates");
         assert!(
-            rig.mgr
-                .available_plugin_updates()
-                .await
-                .expect("updates")
-                .is_empty()
+            available_plugin_updates.is_empty(),
+            "{available_plugin_updates:?}"
         );
 
         // A disabled plugin is skipped, matching upstream's gate.
         let rig = update_rig("0.9.0", true, false).await;
+        let available_plugin_updates = rig.mgr.available_plugin_updates().await.expect("updates");
         assert!(
-            rig.mgr
-                .available_plugin_updates()
-                .await
-                .expect("updates")
-                .is_empty()
+            available_plugin_updates.is_empty(),
+            "{available_plugin_updates:?}"
         );
     }
 
@@ -2941,11 +3073,10 @@ mod tests {
             vec![RegisteredPlugin::new(d, None)],
             dir.path().to_path_buf(),
         );
+        let available_plugin_updates = bare.available_plugin_updates().await.expect("updates");
         assert!(
-            bare.available_plugin_updates()
-                .await
-                .expect("updates")
-                .is_empty()
+            available_plugin_updates.is_empty(),
+            "{available_plugin_updates:?}"
         );
     }
 
@@ -3081,11 +3212,10 @@ mod tests {
         .await
         .unwrap();
 
+        let available_plugin_updates = mgr.available_plugin_updates().await.expect("updates");
         assert!(
-            mgr.available_plugin_updates()
-                .await
-                .expect("updates")
-                .is_empty()
+            available_plugin_updates.is_empty(),
+            "{available_plugin_updates:?}"
         );
         assert_eq!(
             hits.load(Ordering::SeqCst),
@@ -3322,7 +3452,8 @@ mod tests {
         // Disabled: gone from discovery AND from the (unauthenticated)
         // content endpoint — Disable must disarm the browser-side surface.
         mgr.disable_plugin(PKG_ID).await.unwrap();
-        assert!(mgr.get_configuration_pages().await.unwrap().is_empty());
+        let configuration_pages = mgr.get_configuration_pages().await.unwrap();
+        assert!(configuration_pages.is_empty(), "{configuration_pages:?}");
         assert!(
             mgr.get_configuration_page("paged-settings")
                 .await

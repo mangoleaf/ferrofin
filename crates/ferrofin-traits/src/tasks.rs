@@ -32,6 +32,10 @@ pub struct TaskSubscription {
     pub snapshot: Vec<TaskInfo>,
     /// Subsequent lifecycle transitions in registry order.
     pub updates: tokio::sync::broadcast::Receiver<Vec<TaskInfo>>,
+    /// One `()` each time a running task reported progress (upstream's
+    /// `IScheduledTaskWorker.TaskProgress` event); the progress itself is read
+    /// through [`TaskManager::get_tasks`].
+    pub progress: tokio::sync::broadcast::Receiver<()>,
 }
 
 /// Enumerates the server's scheduled tasks and runs one on demand.
@@ -40,11 +44,24 @@ pub struct TaskSubscription {
 /// held as `Arc<dyn TaskManager>`.
 #[async_trait]
 pub trait TaskManager: Send + Sync {
-    /// Subscribes to captured task-start and terminal snapshots in transition order.
-    /// Periodic progress remains available through `get_tasks`. Implementations
-    /// without live transitions return `None` and retain periodic polling.
+    /// Subscribes to captured task-start and terminal snapshots in transition
+    /// order, and to the running tasks' progress reports. Implementations
+    /// without live transitions return `None`: the `ScheduledTasksInfo`
+    /// stream then sends only its subscribe snapshot, read from `get_tasks`.
     fn subscribe_task_updates(&self) -> Option<TaskSubscription> {
         None
+    }
+
+    /// Re-resolves the names, descriptions and categories of a captured
+    /// transition snapshot in the ambient UI culture, and re-orders it by name.
+    ///
+    /// A transition snapshot is built in the culture of the run that
+    /// published it and shared by every subscriber, where upstream builds each
+    /// connection's payload in that connection's own culture
+    /// (`BasePeriodicWebSocketListener` calls `ApplyRequestCulture` before
+    /// `GetDataToSend`). The default returns the snapshot unchanged.
+    fn localize_tasks(&self, tasks: Vec<TaskInfo>) -> Vec<TaskInfo> {
+        tasks
     }
 
     /// Lists every registered task as a wire [`TaskInfo`].
@@ -256,6 +273,11 @@ const CSHARP_TASK_TYPE_NAMES: &[(&str, &str)] = &[
         "MergeEpisodesTask",
         "Jellyfin.Plugin.MergeVersions.ScheduledTasks.MergeEpisodesTask",
     ),
+    // jellyfin-plugin-ldapauth @ d11c86a — LDAP-Auth/LdapProfileImageSyncTask.cs.
+    (
+        "LdapProfileImageSync",
+        "Jellyfin.Plugin.LDAP_Auth.LdapProfileImageSyncTask",
+    ),
 ];
 
 /// The wire id of the task registered under `key` — the port of
@@ -335,6 +357,17 @@ mod task_id_tests {
         assert_eq!(
             task_id_for_key("TmdbRefreshUpcomingEpisodes"),
             "1ee23a5dd39fb4225715375c91bc2990"
+        );
+    }
+
+    /// LDAP-Auth's profile-image task: the MD5 of
+    /// `Jellyfin.Plugin.LDAP_Auth.LdapProfileImageSyncTask` as a .NET `Guid`,
+    /// computed outside the code under test.
+    #[test]
+    fn the_ldap_profile_image_task_has_the_plugins_id() {
+        assert_eq!(
+            task_id_for_key("LdapProfileImageSync"),
+            "76cba34af0fabda24dffccae78f7aaf8"
         );
     }
 

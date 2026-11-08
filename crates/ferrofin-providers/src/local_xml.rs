@@ -283,7 +283,7 @@ mod tests {
               </CollectionItems></Item>",
         )
         .expect("parse");
-        assert!(parsed.children.is_empty());
+        assert!(parsed.children.is_empty(), "{:?}", parsed.children);
     }
 
     #[test]

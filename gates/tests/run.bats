@@ -24,8 +24,8 @@ print('{"checked_cpus": [0]}' if sys.argv[1] == "--topology" else os.environ.get
 EOS
   # The real oracle check (gates/bench/oracle.py) on a pin of the copy's own, with a git whose ls-remote
   # lists $FAKE_LATEST_TAG as the latest Jellyfin release instead of asking the network.
-  mkdir -p repo/crates/ferrofin-api/src/handlers
-  echo 'pub const UPSTREAM_TAG: &str = "v12.2";' > repo/crates/ferrofin-api/src/handlers/mod.rs
+  mkdir -p repo/crates/ferrofin-api/src
+  echo 'pub const UPSTREAM_TAG: &str = "v12.2";' > repo/crates/ferrofin-api/src/handlers.rs
   cat > bin/git <<EOS
 #!/usr/bin/env bash
 if [ "\$1" = ls-remote ]; then
@@ -65,7 +65,7 @@ EOS
   # the inputs the preflight looks for
   fixtures=$(bash -c '. "$1"; adoption_fixtures_dir test' _ repo/gates/adoption/lib.sh)
   mkdir -p "$fixtures/oracle" "$fixtures/media" "$ROOT/fixtures/bench-testdata/jellyfin"
-  touch "$fixtures/oracle/smoke-jellyfin-12.2.txt" "$ROOT/fixtures/bench-testdata/ids.json" \
+  touch "$fixtures/oracle/smoke-jellyfin-12.4.txt" "$ROOT/fixtures/bench-testdata/ids.json" \
     "$ROOT/fixtures/bench-testdata/jellyfin/preparation.json"
   unset FAKE_RC_verify FAKE_RC_adoption FAKE_RC_parity FAKE_RC_bench FAKE_SLEEP FAKE_IDLE FAKE_LEFT FAKE_DOCKER_DOWN FAKE_MOVE \
     FERROFIN_ADOPTION_FIXTURES ADOPTION_ORACLE ADOPTION_WORK_DIR FERROFIN_BENCH_IMAGE PARITY_PIN   # a developer's own exports
@@ -285,7 +285,7 @@ session() { # the one session directory made under the root
 }
 
 @test "gates/run: the release A/B gate's refusals stop the preflight: an unreadable pin, a missing previous image, --previous without bench" {
-  echo 'pub const UPSTREAM_TAG: &str = "v12.3-rc1";' > repo/crates/ferrofin-api/src/handlers/mod.rs
+  echo 'pub const UPSTREAM_TAG: &str = "v12.3-rc1";' > repo/crates/ferrofin-api/src/handlers.rs
   run repo/gates/run bench --image ferrofin:test --previous ferrofin:old --dry-run
   [ "$status" -eq 2 ]
   [[ "$output" == *"UPSTREAM_TAG v12.3-rc1"*"is not a Jellyfin release tag"* ]]

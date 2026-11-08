@@ -36,6 +36,11 @@ The endpoint is unauthenticated when enabled
 (Jellyfin parity); the bounded-cardinality label rules are what keep that safe —
 nothing user-identifying appears in the exposition.
 
+It sits behind the same network rules as the API, as in Jellyfin. A scraper on the
+local network (the private address ranges, or `LocalNetworkSubnets` if set) is
+always allowed, as are loopback and the machine itself. One outside it gets `503`
+with `EnableRemoteAccess` off, and is judged by the remote IP filter with it on.
+
 ```bash
 curl http://localhost:8096/metrics
 ```
@@ -108,7 +113,8 @@ OTEL_TRACES_SAMPLER_ARG=0.25 \
 
 With export on, stdout is structured JSON by default and every log line emitted
 inside a **sampled** request carries the request's `trace_id` (unsampled requests
-carry none — no dead links). `FERROFIN_LOG_FORMAT=text` restores the legacy
+carry none — no dead links). `FERROFIN_LOG_FORMAT=text` (`log_format = "text"` in
+`config.toml`) restores the legacy
 human-readable stdout for interactive dev; the rotating log **file** is always
 plain text regardless (it feeds the `GET /System/Logs` dashboard viewer).
 
@@ -189,7 +195,7 @@ used — a metrics setting never stops the server. Like the sampler interval it 
 | Metric | Type | Labels | What it counts |
 |---|---|---|---|
 | `ferrofin_library_scans_total` | counter | `trigger`, `result` (`completed`/`stopped`/`failed`) | Scan passes the scan queue ran. A pass is one queued request: a full or library scan, a folder or item refresh, a watcher/webhook batch. `stopped` = cancelled (shutdown, a replacing scan). |
-| `ferrofin_library_scan_items_total` | counter | `trigger`, `outcome` (`created`/`updated`/`unchanged`/`removed`) | The items each pass processed (a stopped pass's partial counts included), plus those of item refreshes served inside a running scan. `unchanged` = a stored item the scan left untouched. |
+| `ferrofin_library_scan_items_total` | counter | `trigger`, `outcome` (`created`/`updated`/`unchanged`/`removed`/`skipped`) | The items each pass processed (a stopped pass's partial counts included), plus those of item refreshes served inside a running scan. `unchanged` = a stored item the scan left untouched; `skipped` = an item it could not read or write, which the next scan retries. |
 | `ferrofin_library_scan_duration_seconds` | histogram | `trigger` | Duration of **completed** passes. Default buckets: 1–2.5–5 per decade, 0.001 … 5000 s (21 buckets; configurable, above): a watcher scan is 20–60 ms, an unchanged 20k-item rescan ~2 s, a first scan of a big library tens of minutes. |
 | `ferrofin_library_scan_in_progress` | gauge | — | 1 while the scan queue is running a scan. |
 | `ferrofin_library_scan_last_completed_timestamp_seconds` | gauge | `trigger` | Unix time the last pass of that trigger completed (absent until one has). |
@@ -197,7 +203,7 @@ used — a metrics setting never stops the server. Like the sampler interval it 
 | `ferrofin_library_scan_pass_duration_seconds` | histogram | `pass` (`music`, `album_covers`, `years`, `artists`, `dead_by_name`, `aggregates`, `by_name_paths`, `studios`, `library_images`, `dynamic_images`, `collections`, `splashscreen`) | Each closing pass of a completed library validation — the fields of the `post-scan passes complete` log line. Same buckets. Watcher, webhook and item refreshes run only the touched items' passes, which are not recorded here. |
 | `ferrofin_library_scan_lane_refreshes_total` | counter | `result` | Item refreshes (refresh, Identify → Apply) a running scan served between its own items instead of making the caller wait. Their items count in `…_items_total{trigger="api"}`; they are not passes. |
 | `ferrofin_media_probe_total` | counter | `result` (`ok`/`failed`/`cancelled`) | ffprobe runs of the scan's media probe, one per new or changed media file (its sidecar subtitle/audio probes are not counted separately). `cancelled` = the scan stopped mid-probe and the child was killed. **~0 on an unchanged rescan.** |
-| `ferrofin_metadata_provider_requests_total` | counter | `provider`, `result` (`ok`/`not_found`/`failed`/`skipped`) | One per logical request through a provider's rate limiter, retries excluded (the `metadata provider request` debug line). `not_found` = a 404 answer; `failed` = transport error, another error status, or a request that went out and then gave up (a 429 whose `Retry-After` outlasts the wait for its retry); `skipped` = never sent (cooldown or open circuit). |
+| `ferrofin_metadata_provider_requests_total` | counter | `provider`, `result` (`ok`/`not_found`/`failed`/`skipped`) | One per logical request through a provider's rate limiter, retries excluded (the `metadata provider request` debug line). `not_found` = a 404 answer; `failed` = transport error, another error status, or a request that went out and then gave up (a 429 whose `Retry-After` outlasts the wait for its retry); `skipped` = never sent (cooldown or open circuit). An image download follows redirects itself, to check where each one leads: each hop is a request of its own, and a redirect it follows is `ok`. |
 | `ferrofin_metadata_provider_retries_total` | counter | `provider` | Retry attempts beyond each request's first (408/429/5xx, timeouts). |
 
 Label sets:

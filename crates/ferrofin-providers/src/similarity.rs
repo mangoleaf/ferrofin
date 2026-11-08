@@ -216,7 +216,7 @@ mod tests {
                 1,
             )
             .await;
-        assert!(page.references.is_empty());
+        assert!(page.references.is_empty(), "{:?}", page.references);
     }
 
     /// One call is one TMDB page: the page the manager asks for, with the
@@ -263,7 +263,7 @@ mod tests {
                 2,
             )
             .await;
-        assert!(page.references.is_empty());
+        assert!(page.references.is_empty(), "{:?}", page.references);
     }
 
     #[test]
@@ -295,6 +295,6 @@ mod tests {
                 1,
             )
             .await;
-        assert!(page.references.is_empty());
+        assert!(page.references.is_empty(), "{:?}", page.references);
     }
 }

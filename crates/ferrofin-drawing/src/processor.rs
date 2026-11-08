@@ -24,9 +24,12 @@
 //!   plus [`Uuid::simple`] (32-char lowercase hex, identical to .NET `"N"`).
 //! - The filesystem reads the pipeline needs (`File.Exists`, `GetLastWriteTimeUtc`)
 //!   sit behind the small [`FileMeta`] seam so tests use a fake and the real
-//!   `std::fs` stat stays out of the parity/coverage numbers.
+//!   `std::fs` stat stays out of the parity/coverage numbers. Its calls block,
+//!   so the processor makes them on the blocking pool, never on the runtime
+//!   worker serving the request.
 
 use ferrofin_util::directory_path::DirectoryPath;
+use ferrofin_util::keyed_locks::KeyedLocks;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -83,6 +86,11 @@ const DOTNET_EPOCH_UNIX_OFFSET_SECS: i64 = 62_135_596_800;
 /// `File.Exists(path)` and `IFileSystem.GetLastWriteTimeUtc(path)`; keeping them
 /// behind a trait means the real `std::fs` stat stays out of the parity and
 /// coverage numbers and unit tests stay hermetic.
+///
+/// Both methods may block, for as long as a stat on a cold or hung network
+/// share takes. [`ImageProcessor`] only calls them through
+/// [`tokio::task::spawn_blocking`], so an implementation never needs to be
+/// async.
 pub trait FileMeta: Send + Sync {
     /// Whether a file exists at `path`. Port of `File.Exists`.
     fn exists(&self, path: &str) -> bool;
@@ -124,12 +132,16 @@ pub struct ImageProcessor<F = StdFileMeta> {
     encoder: Arc<dyn ImageEncoder>,
     /// Held until actual pixel work finishes, including after request cancellation.
     encoding_slots: Arc<tokio::sync::Semaphore>,
+    /// One lock per cache file being encoded, held as long as an encoding slot,
+    /// so concurrent misses for one resized image encode it once (gl-1300).
+    cache_file_locks: KeyedLocks,
 
     /// The base image-cache directory (`IServerApplicationPaths.ImageCachePath`).
     image_cache_path: DirectoryPath,
 
-    /// The filesystem-metadata seam (`File.Exists` / `GetLastWriteTimeUtc`).
-    file_meta: F,
+    /// The filesystem-metadata seam (`File.Exists` / `GetLastWriteTimeUtc`),
+    /// shared with the blocking-pool tasks that call it.
+    file_meta: Arc<F>,
 
     /// The cache-invalidation version stamped into every cache key. Defaults to
     /// [`DEFAULT_CACHE_VERSION`]; a configurable setting so a host can force a
@@ -148,8 +160,9 @@ impl ImageProcessor<StdFileMeta> {
             encoding_slots: Arc::new(tokio::sync::Semaphore::new(
                 std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
             )),
+            cache_file_locks: KeyedLocks::new(),
             image_cache_path: image_cache_path.into(),
-            file_meta: StdFileMeta,
+            file_meta: Arc::new(StdFileMeta),
             cache_version: DEFAULT_CACHE_VERSION,
         }
     }
@@ -169,8 +182,9 @@ impl<F: FileMeta> ImageProcessor<F> {
             encoding_slots: Arc::new(tokio::sync::Semaphore::new(
                 std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
             )),
+            cache_file_locks: KeyedLocks::new(),
             image_cache_path: image_cache_path.into(),
-            file_meta,
+            file_meta: Arc::new(file_meta),
             cache_version: DEFAULT_CACHE_VERSION,
         }
     }
@@ -321,6 +335,19 @@ impl<F: FileMeta> ImageProcessor<F> {
         if options.auto_orient {
             filename.push_str(",autoorient");
         }
+        // Ferrofin-local too: earlier builds re-encoded a `blur` request
+        // unblurred under the same key (gl-805), so a drawn blur needs its own.
+        if options.blur.is_some_and(|blur| blur > 0) {
+            filename.push_str(",blurdrawn");
+        }
+        // And earlier builds wrote a JPEG of an image with alpha with its
+        // straight colour, where Skia's (and now Ferrofin's) is premultiplied:
+        // any source but a JPEG may carry alpha.
+        if format == ImageFormat::Jpg
+            && !matches!(extension_of(original_path).as_str(), ".jpg" | ".jpeg")
+        {
+            filename.push_str(",premultiplied");
+        }
 
         filename.push_str(",v=");
         filename.push(self.cache_version);
@@ -408,9 +435,9 @@ fn extension_of(path: &str) -> String {
 ///
 /// `InvalidInput` is the requested size or the file's content as the encoder
 /// sees it: a size that rounds an axis to 0, a source the decoder rejects
-/// (corrupt, truncated, a read error mid-decode, over the `image` crate's
-/// allocation limit), a JPEG output past 65535 px, or a WebP output past
-/// 16383 px. A failed encode writes no
+/// (corrupt, truncated, a read error mid-decode), one over the
+/// [`ImageLimits`](crate::ImageLimits), a resize past their budget, a JPEG
+/// output past 65535 px, or a WebP output past 16383 px. A failed encode writes no
 /// cache file, so it recurs on every request for that image and its volume
 /// grows with items × requests; LOGGING.md §1 keeps that at `debug`.
 /// Everything else (cache-dir I/O, an unreadable or removed source, codec or
@@ -502,16 +529,16 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
         self.encoder.get_image_blur_hash(x_comp, y_comp, path).await
     }
 
-    /// Port of `GetImageCacheTag(BaseItem/BaseItemDto, ItemImageInfo)`: folds onto
-    /// the path-plus-`DateModified` form. Returns `None` only when the underlying
-    /// path tag cannot be produced (never, here — the C# item overloads always
-    /// tag).
+    /// Port of `GetImageCacheTag(BaseItem/BaseItemDto, ItemImageInfo) =>
+    /// GetImageCacheTag(item.Path, image.DateModified)`: the owning item's
+    /// path (a `null` one concatenates as the empty string) with the image's
+    /// modification time. Always tags, as the C# item overloads do.
     async fn get_image_cache_tag(
         &self,
-        _item_id: Uuid,
+        item_path: Option<&str>,
         image: &ItemImageInfo,
     ) -> Result<Option<String>, ServiceError> {
-        self.get_image_cache_tag_for_path(&image.path, image.date_modified)
+        self.get_image_cache_tag_for_path(item_path.unwrap_or_default(), image.date_modified)
             .await
     }
 
@@ -564,10 +591,41 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
         let supported = Self::supported_image(&original_image_path, date_modified);
         original_image_path = supported.0;
 
-        // Original file doesn't exist, or original file is gif.
-        if !self.file_meta.exists(&original_image_path)
-            || mime_type.eq_ignore_ascii_case(GIF_MIME_TYPE)
-        {
+        let requires_transparency =
+            TRANSPARENT_IMAGE_TYPES.contains(&extension_of(&original_image_path).as_str());
+
+        // `autoOrient` for a Photo; the caller, which read the item, sets it.
+        let auto_orient = options.auto_orient;
+        let default_options = options
+            .has_default_options(&original_image_path, original_image_size)
+            && (!auto_orient || !options.requires_auto_orientation);
+        let output_format =
+            self.output_format(&options.supported_output_formats, requires_transparency);
+        // The cache key is known before any stat, so `File.Exists(original)`,
+        // then `File.Exists(cacheFilePath)` and its time, take one blocking-pool
+        // hop (gl-1258). The cache file is stat'd only where upstream does: the
+        // original exists and the options are not default.
+        let cache_file_path = (!default_options).then(|| {
+            self.cache_file_path(
+                &original_image_path,
+                options,
+                options.quality,
+                supported.1,
+                output_format,
+            )
+        });
+        // Original file is gif, or original file doesn't exist. Either way the
+        // original is served, so the GIF test goes first and a GIF costs no stat.
+        let (original_exists, cached) = if mime_type.eq_ignore_ascii_case(GIF_MIME_TYPE) {
+            (false, None)
+        } else {
+            self.stat_original_and_cache(
+                &original_image_path,
+                cache_file_path.as_ref().and_then(|path| path.as_ref().ok()),
+            )
+            .await?
+        };
+        if !original_exists {
             return Ok(ProcessedImage {
                 path: original_image_path,
                 mime_type: Some(mime_type),
@@ -576,33 +634,15 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
         }
 
         date_modified = supported.1;
-        let requires_transparency =
-            TRANSPARENT_IMAGE_TYPES.contains(&extension_of(&original_image_path).as_str());
-
-        // `autoOrient` for a Photo; the caller, which read the item, sets it.
-        let auto_orient = options.auto_orient;
-
-        if options.has_default_options(&original_image_path, original_image_size)
-            && (!auto_orient || !options.requires_auto_orientation)
-        {
+        let Some(cache_file_path) = cache_file_path else {
             // Just spit out the original file if all the options are default.
             return Ok(ProcessedImage {
                 path: original_image_path.clone(),
                 mime_type: Some(get_mime_type(&original_image_path).to_owned()),
                 date_modified,
             });
-        }
-
-        let quality = options.quality;
-        let output_format =
-            self.output_format(&options.supported_output_formats, requires_transparency);
-        let cache_file_path = self.cache_file_path(
-            &original_image_path,
-            options,
-            quality,
-            date_modified,
-            output_format,
-        )?;
+        };
+        let cache_file_path = cache_file_path?;
 
         // The whole tail is the C# try/catch: any error returns the original.
         match self
@@ -610,8 +650,9 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
                 &original_image_path,
                 date_modified,
                 &cache_file_path,
+                cached,
                 auto_orient,
-                quality,
+                options.quality,
                 options,
                 output_format,
             )
@@ -660,9 +701,47 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
     }
 }
 
-impl<F: FileMeta> ImageProcessor<F> {
+impl<F: FileMeta + 'static> ImageProcessor<F> {
+    /// Runs `call` against the [`FileMeta`] seam on the blocking pool, so a stat
+    /// that hangs (a cold or unreachable network share) parks a blocking-pool
+    /// thread rather than the runtime worker, and every other request scheduled
+    /// on that worker. `tokio::fs`, which serves the image afterwards, does the
+    /// same. Fails only when `call` panicked or the runtime shutting down
+    /// cancelled it.
+    async fn stat<T: Send + 'static>(
+        &self,
+        call: impl FnOnce(&F) -> T + Send + 'static,
+    ) -> Result<T, ServiceError> {
+        let meta = Arc::clone(&self.file_meta);
+        tokio::task::spawn_blocking(move || call(&meta))
+            .await
+            .map_err(ServiceError::backend_source)
+    }
+
+    /// `File.Exists(original)`, and when it holds and `cache` is given,
+    /// `File.Exists(cache)` with its `GetLastWriteTimeUtc`: one [`Self::stat`].
+    async fn stat_original_and_cache(
+        &self,
+        original: &str,
+        cache: Option<&String>,
+    ) -> Result<(bool, Option<DateTime<Utc>>), ServiceError> {
+        let original = original.to_owned();
+        let cache = cache.cloned();
+        self.stat(move |meta| {
+            let exists = meta.exists(&original);
+            let cached = cache
+                .filter(|_| exists)
+                .and_then(|path| meta.exists(&path).then(|| meta.last_write_time_utc(&path)));
+            (exists, cached)
+        })
+        .await
+    }
+
     /// The cache-write half of [`process_image`](ImageProcessorTrait::process_image),
     /// factored out so its fallible I/O is a single `?`-chain the pipeline wraps.
+    ///
+    /// `cached` is the cache file's `GetLastWriteTimeUtc` when
+    /// `File.Exists(cacheFilePath)`, which the caller stat'd with the original.
     ///
     /// Returns `Ok(Some(processed))` for a fresh or cached resized file,
     /// `Ok(None)` when the encoder short-circuited to the original path, and
@@ -673,12 +752,38 @@ impl<F: FileMeta> ImageProcessor<F> {
         original_image_path: &str,
         date_modified: DateTime<Utc>,
         cache_file_path: &str,
+        cached: Option<DateTime<Utc>>,
         auto_orient: bool,
         quality: i32,
         options: &ImageProcessingOptions,
         output_format: ImageFormat,
     ) -> Result<Option<ProcessedImage>, ServiceError> {
-        if !self.file_meta.exists(cache_file_path) {
+        // `None` is a cache miss: encode, then read the new file's time.
+        let date_written = 'written: {
+            if let Some(date_written) = cached {
+                break 'written date_written;
+            }
+            // One encode per cache file at a time (gl-1300). A miss that finds
+            // the file's lock held waits for that encode, then serves the file
+            // it wrote, or encodes for itself when it wrote none (it failed, or
+            // served the original). Upstream has no such lock.
+            // shortcut: an uncontended lock trusts the stat made with the
+            // original (one hop, gl-1258), so an encode that ended in between
+            // runs again, as before this lock; re-stat here too if that shows.
+            let lock = self.cache_file_locks.get(cache_file_path);
+            let guard = if let Ok(guard) = Arc::clone(&lock).try_lock_owned() {
+                guard
+            } else {
+                let guard = lock.lock_owned().await;
+                let path = cache_file_path.to_owned();
+                let written = self
+                    .stat(move |meta| meta.exists(&path).then(|| meta.last_write_time_utc(&path)))
+                    .await?;
+                if let Some(date_written) = written {
+                    break 'written date_written;
+                }
+                guard
+            };
             let permit = Arc::clone(&self.encoding_slots)
                 .acquire_owned()
                 .await
@@ -688,9 +793,10 @@ impl<F: FileMeta> ImageProcessor<F> {
             let output = cache_file_path.to_owned();
             let options = options.clone();
             // Dropping a request cannot stop spawn_blocking pixel work. Keep
-            // its permit in an independent task until the encoder really ends.
+            // its permit and the file's lock in an independent task until the
+            // encoder really ends, so a waiter never starts a second encode.
             let result_path = tokio::spawn(async move {
-                let _permit = permit;
+                let _held = (permit, guard);
                 encoder
                     .encode_image(
                         &input,
@@ -710,12 +816,15 @@ impl<F: FileMeta> ImageProcessor<F> {
             if result_path.eq_ignore_ascii_case(original_image_path) {
                 return Ok(None);
             }
-        }
+            let path = cache_file_path.to_owned();
+            self.stat(move |meta| meta.last_write_time_utc(&path))
+                .await?
+        };
 
         Ok(Some(ProcessedImage {
             path: cache_file_path.to_owned(),
             mime_type: Some(output_format.mime_type().to_owned()),
-            date_modified: self.file_meta.last_write_time_utc(cache_file_path),
+            date_modified: date_written,
         }))
     }
 }
@@ -823,18 +932,25 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(work) = &self.work {
                 work.entered.add_permits(1);
-                let work = Arc::clone(work);
+                let gate = Arc::clone(work);
                 tokio::task::spawn_blocking(move || {
-                    let released = work.release.0.lock().unwrap();
-                    let _released = work.release.1.wait_while(released, |v| !*v).unwrap();
+                    let released = gate.release.0.lock().unwrap();
+                    let _released = gate.release.1.wait_while(released, |v| !*v).unwrap();
                 })
                 .await
                 .unwrap();
+                if work.fail.load(Ordering::SeqCst) {
+                    return Err(ServiceError::invalid_input("corrupt source"));
+                }
             }
-            match &self.return_original {
-                Some(p) => Ok(p.clone()),
-                None => Ok(output_path.to_owned()),
+            if let Some(p) = &self.return_original {
+                return Ok(p.clone());
             }
+            // Written, so a processor on the real filesystem finds the file.
+            let output = Path::new(output_path);
+            std::fs::create_dir_all(output.parent().expect("parent")).expect("mkdir");
+            std::fs::write(output, b"encoded").expect("write");
+            Ok(output_path.to_owned())
         }
         async fn create_image_collage(
             &self,
@@ -856,6 +972,7 @@ mod tests {
             _quality: i32,
             _img_width: i32,
             _img_height: Option<i32>,
+            _full_chroma: bool,
         ) -> Result<i32, ServiceError> {
             Ok(0)
         }
@@ -929,26 +1046,74 @@ mod tests {
         assert_ne!(base, diff_ticks);
     }
 
+    /// gl-849: `GetImageCacheTag(item, image)` hashes the OWNING item's path
+    /// with the image's `DateModified` ticks, never the image file's path.
+    /// Oracles recomputed from a Jellyfin 12.2 database and matching the tags
+    /// Jellyfin served for it: a movie (its Primary, at
+    /// `/media/movies/Burning Dance (1953)/poster.jpg`, and its Backdrop share
+    /// a date, so one tag), and the genre "Action", whose stored
+    /// `%MetadataPath%/Genre/Action` is hashed expanded, not as the token,
+    /// nor as its poster's path.
+    #[rstest::rstest]
+    #[case::movie(
+        Some("/media/movies/Burning Dance (1953)/Burning Dance (1953).mkv"),
+        "/media/movies/Burning Dance (1953)/poster.jpg",
+        1_792_815_355,
+        335_431_200,
+        "e79799f797e91bedf7e11ed8fbf41656"
+    )]
+    #[case::genre(
+        Some("/config/metadata/Genre/Action"),
+        "/config/metadata/library/ce/ce06903d834d2c3417e0889dd4049f3b/poster.png",
+        1_788_387_607,
+        559_763_800,
+        "0184e30b688e2995b166eda5317c526c"
+    )]
     #[tokio::test]
-    async fn item_cache_tag_folds_onto_path_form() {
+    async fn item_cache_tag_hashes_the_item_path(
+        #[case] item_path: Option<&str>,
+        #[case] image_path: &str,
+        #[case] secs: i64,
+        #[case] nanos: u32,
+        #[case] expected: &str,
+    ) {
+        let proc = ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), "/cache");
+        let info = ItemImageInfo {
+            path: image_path.into(),
+            date_modified: Utc.timestamp_opt(secs, nanos).single().expect("ts"),
+            ..Default::default()
+        };
+        let tag = proc
+            .get_image_cache_tag(item_path, &info)
+            .await
+            .expect("tag")
+            .expect("some");
+        assert_eq!(tag, expected);
+        let image_path_tag = proc
+            .get_image_cache_tag_for_path(image_path, info.date_modified)
+            .await
+            .expect("tag")
+            .expect("some");
+        assert_ne!(tag, image_path_tag, "the image's own path is not hashed");
+    }
+
+    /// A path-less item hashes `null + ticks`, which C# concatenates as the
+    /// ticks alone.
+    #[tokio::test]
+    async fn item_cache_tag_of_a_path_less_item_hashes_the_ticks_alone() {
         let proc = ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), "/cache");
         let dt = Utc.timestamp_opt(1_500_000_000, 0).single().expect("ts");
         let info = ItemImageInfo {
-            path: "/library/poster.jpg".into(),
+            path: "https://example.org/logo.png".into(),
             date_modified: dt,
             ..Default::default()
         };
-        let via_item = proc
-            .get_image_cache_tag(Uuid::nil(), &info)
-            .await
-            .expect("tag")
-            .expect("some");
-        let via_path = proc
-            .get_image_cache_tag_for_path("/library/poster.jpg", dt)
-            .await
-            .expect("tag")
-            .expect("some");
-        assert_eq!(via_item, via_path);
+        assert_eq!(
+            proc.get_image_cache_tag(None, &info).await.expect("tag"),
+            proc.get_image_cache_tag_for_path("", dt)
+                .await
+                .expect("tag"),
+        );
     }
 
     #[tokio::test]
@@ -1030,7 +1195,8 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let cache = TempDir::new().expect("cache");
         // A real jpeg the encoder can probe; high quality + matching format +
-        // fill bounds covering it → HasDefaultOptions holds.
+        // fill bounds covering it → HasDefaultOptions holds (as an unset fill
+        // would: see `bounds_the_image_already_meets_serve_the_original`).
         let input = fixture(&dir, "orig.jpg", 640, 480);
         let encoder = Arc::new(CountingEncoder {
             work: None,
@@ -1073,6 +1239,71 @@ mod tests {
             proc.cache_file_path(&input, &oriented, 95, dt, ImageFormat::Jpg)
                 .expect("key")
         );
+    }
+
+    /// Earlier builds cached a `blur` request unblurred, and a transparent
+    /// image's JPEG with its straight colour, under upstream's key: a drawn
+    /// blur and a premultiplied JPEG each take a token of their own.
+    #[test]
+    fn drawn_blurs_and_premultiplied_jpegs_have_their_own_keys() {
+        let proc = ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), "/cache");
+        let dt = Utc.timestamp_opt(1_500_000_000, 0).single().expect("ts");
+        let key = |path: &str, blur: Option<i32>| {
+            let options = ImageProcessingOptions {
+                blur,
+                ..Default::default()
+            };
+            proc.cache_file_path(path, &options, 90, dt, ImageFormat::Jpg)
+                .expect("key")
+        };
+        let upstream = |path: &str, blur: &str| {
+            let ticks = ImageProcessor::<StdFileMeta>::dotnet_ticks(dt);
+            let filename = format!(
+                "{path},quality=90,datemodified={ticks},f=Jpg{blur},v={DEFAULT_CACHE_VERSION}"
+            );
+            ImageProcessor::<StdFileMeta>::cache_path_unique(
+                Path::new("/cache/resized-images"),
+                &filename,
+                ".jpg",
+            )
+            .expect("key")
+        };
+        assert_eq!(key("/a.jpg", None), upstream("/a.jpg", ""));
+        assert_eq!(key("/a.jpg", Some(0)), upstream("/a.jpg", ",blur=0"));
+        assert_ne!(key("/a.jpg", Some(3)), upstream("/a.jpg", ",blur=3"));
+        assert_ne!(key("/a.png", None), upstream("/a.png", ""));
+    }
+
+    #[tokio::test]
+    async fn bounds_the_image_already_meets_serve_the_original() {
+        // gl-1117: `?maxWidth=2000` on a 640-wide poster, no fill requested.
+        // Upstream's lifted `int?` fill comparison passes, so ProcessImage
+        // serves the stored file without an encode.
+        let dir = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let input = fixture(&dir, "poster.jpg", 640, 480);
+        let encoder = Arc::new(CountingEncoder {
+            work: None,
+            calls: AtomicUsize::new(0),
+            return_original: None,
+        });
+        let proc = processor_with(encoder.clone(), &cache, FakeFs::with(&[&input]));
+
+        let options = ImageProcessingOptions {
+            image: ItemImageInfo {
+                path: input.clone(),
+                width: 640,
+                height: 480,
+                ..Default::default()
+            },
+            quality: 96,
+            supported_output_formats: vec![ImageFormat::Jpg],
+            max_width: Some(2000),
+            ..Default::default()
+        };
+        let processed = proc.process_image(&options).await.expect("process");
+        assert_eq!(processed.path, input);
+        assert_eq!(encoder.calls.load(Ordering::SeqCst), 0);
     }
 
     #[rstest::rstest]
@@ -1344,6 +1575,7 @@ mod tests {
                 _q: i32,
                 _w: i32,
                 _h: Option<i32>,
+                _c: bool,
             ) -> Result<i32, ServiceError> {
                 Ok(0)
             }
@@ -1387,7 +1619,7 @@ mod tests {
             .get_image_blur_hash_sized("/a.png", ImageDimensions::new(0, 0))
             .await
             .expect("hash");
-        assert!(empty.is_empty());
+        assert_eq!(empty, "");
     }
 
     #[tokio::test]
@@ -1445,6 +1677,18 @@ mod tests {
     struct EncodingWork {
         entered: tokio::sync::Semaphore,
         release: (Mutex<bool>, std::sync::Condvar),
+        /// Every encode fails once released, as a corrupt source does.
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl EncodingWork {
+        fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                entered: tokio::sync::Semaphore::new(0),
+                release: (Mutex::new(false), std::sync::Condvar::new()),
+                fail: fail.into(),
+            })
+        }
     }
 
     struct ReleaseWork(Arc<EncodingWork>);
@@ -1458,10 +1702,7 @@ mod tests {
     #[tokio::test]
     async fn encoding_limit_survives_request_cancellation_until_pixel_work_finishes() {
         for limit in [1, 2] {
-            let work = Arc::new(EncodingWork {
-                entered: tokio::sync::Semaphore::new(0),
-                release: (Mutex::new(false), std::sync::Condvar::new()),
-            });
+            let work = EncodingWork::new(false);
             let release = ReleaseWork(Arc::clone(&work));
             let encoder = Arc::new(CountingEncoder {
                 work: Some(Arc::clone(&work)),
@@ -1473,22 +1714,29 @@ mod tests {
                 processor_with(encoder.clone(), &cache, FakeFs::with(&["/input.jpg"]))
                     .with_encoding_limit(limit),
             );
-            let mut tasks = Vec::new();
-            for _ in 0..=limit {
-                let processor = Arc::clone(&processor);
-                tasks.push(tokio::spawn(async move {
+            // Each request asks for its own width, so its own cache file: one
+            // file's encodes run one at a time (gl-1300).
+            let request = |processor: Arc<ImageProcessor<FakeFs>>, width: i32| {
+                tokio::spawn(async move {
                     processor
                         .process_image(&ImageProcessingOptions {
                             image: ItemImageInfo {
                                 path: "/input.jpg".into(),
                                 ..Default::default()
                             },
-                            width: Some(100),
+                            width: Some(width),
                             ..Default::default()
                         })
                         .await
-                }));
-            }
+                })
+            };
+            // Fill every slot before the extra request starts. Each request
+            // stats on the blocking pool before it takes a slot, so requests
+            // spawned together take the slots in no fixed order, and the one
+            // aborted below could be the queued one rather than an encode.
+            let mut tasks: Vec<_> = (0..limit)
+                .map(|i| request(Arc::clone(&processor), 100 + i32::try_from(i).unwrap()))
+                .collect();
             tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 work.entered.acquire_many(u32::try_from(limit).unwrap()),
@@ -1497,6 +1745,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .forget();
+            tasks.push(request(Arc::clone(&processor), 99));
             let first = tasks.remove(0);
             first.abort();
             let _ = first.await;
@@ -1522,5 +1771,317 @@ mod tests {
             .unwrap();
             assert_eq!(encoder.calls.load(Ordering::SeqCst), limit + 1);
         }
+    }
+
+    /// gl-1300: concurrent misses for one cache file encode it once. The others
+    /// wait for that encode, even after its request is dropped, and serve the
+    /// file it wrote. When it wrote none, each encodes for itself, as it would
+    /// alone: a failure reaches every request and is not kept for the next.
+    #[rstest::rstest]
+    #[case::encoded(false, false)]
+    #[case::encoded_after_the_first_request_is_dropped(false, true)]
+    #[case::failed(true, false)]
+    #[case::failed_after_the_first_request_is_dropped(true, true)]
+    #[tokio::test]
+    async fn concurrent_misses_for_one_cache_file_encode_it_once(
+        #[case] fail: bool,
+        #[case] drop_first: bool,
+    ) {
+        const WAITERS: usize = 3;
+        let wait = std::time::Duration::from_secs(3);
+        let work = EncodingWork::new(fail);
+        let release = ReleaseWork(Arc::clone(&work));
+        let encoder = Arc::new(CountingEncoder {
+            work: Some(Arc::clone(&work)),
+            calls: AtomicUsize::new(0),
+            return_original: None,
+        });
+        let dir = TempDir::new().unwrap();
+        let cache = TempDir::new().unwrap();
+        let input = dir.path().join("input.jpg").to_string_lossy().into_owned();
+        std::fs::write(&input, b"source").unwrap();
+        // A slot for every request: only the cache file's lock holds one back.
+        let processor = Arc::new(
+            ImageProcessor::new(encoder.clone(), cache.path().to_path_buf())
+                .with_encoding_limit(WAITERS + 1),
+        );
+        let request = |width: i32| {
+            let processor = Arc::clone(&processor);
+            let input = input.clone();
+            tokio::spawn(async move {
+                processor
+                    .process_image(&ImageProcessingOptions {
+                        image: ItemImageInfo {
+                            path: input,
+                            ..Default::default()
+                        },
+                        width: Some(width),
+                        ..Default::default()
+                    })
+                    .await
+            })
+        };
+
+        let first = request(100);
+        tokio::time::timeout(wait, work.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let mut waiters: Vec<_> = (0..WAITERS).map(|_| request(100)).collect();
+        let mut first = Some(first);
+        if drop_first {
+            let first = first.take().unwrap();
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), work.entered.acquire())
+                .await
+                .is_err(),
+            "a second encode of the same file started"
+        );
+        // A request dropped while it waits changes nothing for the others.
+        let dropped = waiters.remove(0);
+        dropped.abort();
+        assert!(dropped.await.unwrap_err().is_cancelled());
+        drop(release);
+
+        let mut served = Vec::new();
+        for task in first.into_iter().chain(waiters) {
+            served.push(
+                tokio::time::timeout(wait, task)
+                    .await
+                    .expect("a waiter hung")
+                    .unwrap()
+                    .unwrap()
+                    .path,
+            );
+        }
+        let encodes = if fail { 1 + WAITERS - 1 } else { 1 };
+        assert_eq!(encoder.calls.load(Ordering::SeqCst), encodes);
+        if fail {
+            assert!(served.iter().all(|path| *path == input), "{served:?}");
+        } else {
+            assert!(served.iter().all(|path| path.contains("resized-images")));
+            assert!(served.windows(2).all(|pair| pair[0] == pair[1]));
+        }
+
+        work.fail.store(false, Ordering::SeqCst);
+        let again = request(100).await.unwrap().unwrap();
+        assert!(again.path.contains("resized-images"));
+        assert_eq!(
+            encoder.calls.load(Ordering::SeqCst),
+            encodes + usize::from(fail),
+            "a failure is retried, a written file is served"
+        );
+        // Every lock taken above was released, so another file's encode sweeps
+        // them out: the map holds only the files being encoded.
+        request(101).await.unwrap().unwrap();
+        assert_eq!(processor.cache_file_locks.len(), 1);
+    }
+
+    /// A [`FileMeta`] whose `held`-th call (counting `exists` and
+    /// `last_write_time_utc` together) blocks its thread, as a stat on a hung
+    /// network share does, until the test releases it. The release comes from a
+    /// task on the same current-thread runtime, so it can only arrive in time
+    /// when the stat runs off the runtime's one worker.
+    struct HeldFs {
+        inner: FakeFs,
+        held: usize,
+        calls: AtomicUsize,
+        entered: Arc<tokio::sync::Notify>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        released: std::sync::atomic::AtomicBool,
+    }
+
+    impl HeldFs {
+        fn new(inner: FakeFs, held: usize, release: std::sync::mpsc::Receiver<()>) -> Self {
+            Self {
+                inner,
+                held,
+                calls: AtomicUsize::new(0),
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Mutex::new(release),
+                released: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// Blocks the `held`-th call until the release, or for at most 30
+        /// seconds: on a runtime worker the release can never come in time, and
+        /// the test fails instead of hanging.
+        fn maybe_hold(&self) {
+            if self.calls.fetch_add(1, Ordering::SeqCst) != self.held {
+                return;
+            }
+            self.entered.notify_one();
+            let rx = self.release.lock().expect("lock");
+            if rx.recv_timeout(std::time::Duration::from_secs(30)).is_ok() {
+                self.released.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    impl FileMeta for HeldFs {
+        fn exists(&self, path: &str) -> bool {
+            self.maybe_hold();
+            self.inner.exists(path)
+        }
+
+        fn last_write_time_utc(&self, path: &str) -> DateTime<Utc> {
+            self.maybe_hold();
+            self.inner.last_write_time_utc(path)
+        }
+    }
+
+    /// gl-1216: every stat `process_image` makes runs off the runtime worker.
+    /// Each case holds one of them on its thread; the request's runtime (a
+    /// single worker) must stay free to run the task that releases it.
+    #[rstest::rstest]
+    #[case::original_exists(0)]
+    #[case::cache_exists(1)]
+    #[case::cache_written_time(2)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_stats_run_off_the_runtime_worker(#[case] held: usize) {
+        let cache = TempDir::new().expect("cache");
+        let encoder = Arc::new(CountingEncoder {
+            work: None,
+            calls: AtomicUsize::new(0),
+            return_original: None,
+        });
+        let (release, rx) = std::sync::mpsc::channel();
+        let fs = HeldFs::new(FakeFs::with(&["/input.jpg"]), held, rx);
+        let entered = Arc::clone(&fs.entered);
+        let processor = Arc::new(ImageProcessor::with_file_meta(
+            encoder.clone(),
+            cache.path().to_path_buf(),
+            fs,
+        ));
+        let task = tokio::spawn({
+            let processor = Arc::clone(&processor);
+            async move {
+                processor
+                    .process_image(&ImageProcessingOptions {
+                        image: ItemImageInfo {
+                            path: "/input.jpg".into(),
+                            ..Default::default()
+                        },
+                        width: Some(100),
+                        ..Default::default()
+                    })
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        release.send(()).expect("the held stat is waiting");
+        let processed = task.await.expect("join").expect("process");
+
+        assert!(
+            processor.file_meta.released.load(Ordering::SeqCst),
+            "stat {held} ran on the runtime worker and blocked it"
+        );
+        assert!(processed.path.contains("resized-images"));
+        assert_eq!(encoder.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(processor.file_meta.calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A [`FakeFs`] that records the blocking-pool task each call ran on, so a
+    /// test counts the hops `process_image` makes.
+    #[derive(Default)]
+    struct HopFs {
+        inner: FakeFs,
+        hops: Mutex<Vec<Option<tokio::task::Id>>>,
+    }
+
+    impl HopFs {
+        /// The calls since the last take, and the distinct tasks they ran on.
+        fn take(&self) -> (usize, usize) {
+            let hops = std::mem::take(&mut *self.hops.lock().expect("lock"));
+            let tasks: std::collections::HashSet<_> = hops.iter().collect();
+            assert!(hops.iter().all(Option::is_some), "a stat ran on no task");
+            (hops.len(), tasks.len())
+        }
+    }
+
+    impl FileMeta for HopFs {
+        fn exists(&self, path: &str) -> bool {
+            self.hops.lock().expect("lock").push(tokio::task::try_id());
+            self.inner.exists(path)
+        }
+
+        fn last_write_time_utc(&self, path: &str) -> DateTime<Utc> {
+            self.hops.lock().expect("lock").push(tokio::task::try_id());
+            self.inner.last_write_time_utc(path)
+        }
+    }
+
+    /// gl-1258: the original's existence and the cached file's existence and
+    /// time are one blocking-pool hop, so a cached poster costs one hop; a miss
+    /// adds only the written file's time. A missing original and a request
+    /// with default options stat the original alone.
+    #[tokio::test]
+    async fn the_original_and_cache_stats_share_one_hop() {
+        let cache = TempDir::new().expect("cache");
+        let encoder = Arc::new(CountingEncoder {
+            work: None,
+            calls: AtomicUsize::new(0),
+            return_original: None,
+        });
+        let fs = HopFs {
+            inner: FakeFs::with(&["/input.jpg"]),
+            ..Default::default()
+        };
+        let processor =
+            ImageProcessor::with_file_meta(encoder.clone(), cache.path().to_path_buf(), fs);
+        let resize = |path: &str| ImageProcessingOptions {
+            image: ItemImageInfo {
+                path: path.into(),
+                ..Default::default()
+            },
+            width: Some(100),
+            ..Default::default()
+        };
+
+        let miss = processor
+            .process_image(&resize("/input.jpg"))
+            .await
+            .expect("miss");
+        assert_eq!(processor.file_meta.take(), (3, 2), "miss");
+        processor.file_meta.inner.add(&miss.path);
+        let hit = processor
+            .process_image(&resize("/input.jpg"))
+            .await
+            .expect("hit");
+        assert_eq!(hit, miss);
+        assert_eq!(processor.file_meta.take(), (3, 1), "hit");
+        assert_eq!(encoder.calls.load(Ordering::SeqCst), 1);
+
+        let missing = processor
+            .process_image(&resize("/missing.jpg"))
+            .await
+            .expect("missing");
+        assert_eq!(missing.path, "/missing.jpg");
+        assert_eq!(processor.file_meta.take(), (1, 1), "missing original");
+        let original = processor
+            .process_image(&ImageProcessingOptions {
+                image: ItemImageInfo {
+                    path: "/input.jpg".into(),
+                    ..Default::default()
+                },
+                quality: 100,
+                supported_output_formats: vec![ImageFormat::Jpg],
+                ..Default::default()
+            })
+            .await
+            .expect("default options");
+        assert_eq!(original.path, "/input.jpg");
+        assert_eq!(processor.file_meta.take(), (1, 1), "default options");
+        let gif = processor
+            .process_image(&resize("/input.gif"))
+            .await
+            .expect("gif");
+        assert_eq!(gif.path, "/input.gif");
+        assert_eq!(processor.file_meta.take(), (0, 0), "gif");
     }
 }

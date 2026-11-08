@@ -10,6 +10,7 @@ use axum::{
 use ferrofin_api::auth::{
     RequireAdmin, RequireAdminWithDefault, RequireAuth, RequireAuthIgnoringSchedule,
 };
+use ferrofin_api::router::create_router;
 use ferrofin_api::state::AppState;
 use ferrofin_api::test_support::{authed_fake_state_with_policy, elevated_fake_state};
 use ferrofin_model::users::{AccessSchedule, DynamicDayOfWeek, UserPolicy};
@@ -156,5 +157,36 @@ async fn forwarded_clients_use_only_trusted_proxies_and_live_lan_settings() {
         probe(&router, "/normal", "127.0.0.1:9000", Some("203.0.113.8")).await,
         StatusCode::OK,
         "an untrusted forwarded header is ignored"
+    );
+}
+
+/// Through the whole router the remote-access check reads the address the IP
+/// gate resolved, so behind a known proxy it judges the forwarded client and not
+/// the proxy.
+#[tokio::test]
+async fn the_remote_access_check_behind_the_gate_judges_the_forwarded_client() {
+    let network = NetworkManager::with_defaults(
+        NetworkConfiguration {
+            known_proxies: vec!["127.0.0.1".into()],
+            ..Default::default()
+        },
+        "127.0.0.1,1,lo",
+    );
+    let router = create_router(
+        authed_fake_state_with_policy(UserPolicy {
+            enable_remote_access: false,
+            ..Default::default()
+        })
+        .with_network(Arc::new(RwLock::new(network))),
+    );
+    assert_eq!(
+        probe(&router, "/Users/Me", "127.0.0.1:9000", Some("203.0.113.8")).await,
+        StatusCode::FORBIDDEN,
+        "a remote client through the proxy"
+    );
+    assert_ne!(
+        probe(&router, "/Users/Me", "127.0.0.1:9000", None).await,
+        StatusCode::FORBIDDEN,
+        "the proxy's own request"
     );
 }

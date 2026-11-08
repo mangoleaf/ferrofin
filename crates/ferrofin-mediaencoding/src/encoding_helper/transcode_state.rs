@@ -61,6 +61,14 @@ pub trait EncoderCapabilities: Send + Sync {
     fn is_vaapi_device_intel_ihd(&self) -> bool {
         false
     }
+
+    /// Whether a bitstream filter accepts `option`, the Dolby Vision and HDR10+
+    /// removals the stream-copy decision depends on. Port of
+    /// `IMediaEncoder.SupportsBitStreamFilterWithOption`; `false` (the default)
+    /// when nothing was probed, so such a copy transcodes.
+    fn supports_bsf_with_option(&self, _option: super::hw::capabilities::BsfOption) -> bool {
+        false
+    }
 }
 
 /// [`EncoderCapabilities`] that reports no optional encoders available.
@@ -310,6 +318,13 @@ pub struct EncodingJobInfo {
     pub is_input_video: bool,
     /// The subtitle delivery method (`SubtitleDeliveryMethod`).
     pub subtitle_delivery_method: SubtitleDeliveryMethod,
+    /// A copy of the embedded external text subtitle that the server cut to
+    /// the job's start, read in place of the sidecar and not seeked, since its
+    /// cues already start at the start (gl-1199). Ferrofin's own: the planner
+    /// writes it where ffmpeg cannot cut a seeked sidecar itself
+    /// ([`embedded_sidecar_needs_trimmed_copy`](crate::encoding_helper::bitstream::embedded_sidecar_needs_trimmed_copy)).
+    /// `None` reads the sidecar itself.
+    pub trimmed_subtitle_path: Option<PathBuf>,
     /// The runtime, in ticks (`RunTimeTicks`); `None` marks an open-ended
     /// (segmented) live stream.
     pub run_time_ticks: Option<i64>,
@@ -348,6 +363,35 @@ impl EncodingJobInfo {
     #[must_use]
     pub fn is_copy_codec(codec: Option<&str>) -> bool {
         codec.is_some_and(|c| c.eq_ignore_ascii_case("copy"))
+    }
+
+    /// Whether a progressive job keeps the source's timestamps (`-copyts`):
+    /// the client asked for it (`CopyTimestamps`) and the runtime is known, as
+    /// upstream's progressive command requires (`state.RunTimeTicks.HasValue &&
+    /// state.BaseRequest.CopyTimestamps`). Not the HLS rule: upstream's HLS
+    /// command copies timestamps whatever the request says.
+    #[must_use]
+    pub fn copies_timestamps(&self) -> bool {
+        self.base_request.copy_timestamps && self.run_time_ticks.is_some()
+    }
+
+    /// Whether this job re-encodes any stream, video or audio: what the
+    /// [`TranscodeLimits`](crate::transcoding::TranscodeLimits) caps count.
+    ///
+    /// Only a job copying every stream is free, so a copied video with
+    /// re-encoded audio counts and so does a music transcode. A stream the job
+    /// does not carry takes no part: the audio routes leave
+    /// [`video_stream`](Self::video_stream) empty, and
+    /// [`output_audio_codec`](Self::output_audio_codec) names a codec even for
+    /// a source with no audio. With neither stream known, ffmpeg picks the
+    /// streams and their encoders itself, so the job cannot be called a copy.
+    #[must_use]
+    pub fn encodes_any_stream(&self) -> bool {
+        let video = self.video_stream.is_some();
+        let audio = self.audio_stream.is_some();
+        !(video || audio)
+            || (video && !Self::is_copy_codec(self.output_video_codec.as_deref()))
+            || (audio && !Self::is_copy_codec(self.output_audio_codec.as_deref()))
     }
 
     /// The effective output video codec: the source codec when the output is a
@@ -678,6 +722,7 @@ mod derived_state_tests {
             input_container: None,
             is_input_video: true,
             subtitle_delivery_method: SubtitleDeliveryMethod::Encode,
+            trimmed_subtitle_path: None,
             run_time_ticks: Some(1),
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),

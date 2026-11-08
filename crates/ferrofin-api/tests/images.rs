@@ -31,7 +31,7 @@ use ferrofin_model::providers::{ImageProviderInfo, RemoteImageInfo, RemoteImageQ
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
-use ferrofin_traits::options::{AuthorizationInfo, ItemImageInfo};
+use ferrofin_traits::options::{AuthorizationInfo, ItemImageInfo, ItemImagesToServe};
 use ferrofin_traits::providers::{
     ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority,
 };
@@ -234,7 +234,7 @@ impl AuthService for OkAuth {
             return Err(ServiceError::unauthorized("no credentials"));
         }
         Ok(AuthorizationInfo {
-            user: self.caller(),
+            user: self.caller().map(Arc::new),
             is_api_key: self.elevated || self.userless,
             is_authenticated: true,
             ..ferrofin_api::test_support::authenticated_user_info()
@@ -256,7 +256,7 @@ impl AuthorizationContext for OkAuth {
             return Err(ServiceError::unauthorized("no credentials"));
         }
         Ok(AuthorizationInfo {
-            user: self.caller(),
+            user: self.caller().map(Arc::new),
             is_api_key: self.elevated || self.userless,
             is_authenticated: true,
             ..ferrofin_api::test_support::authenticated_user_info()
@@ -280,6 +280,8 @@ struct StubLibrary {
     item_reads: Mutex<usize>,
     /// Whether [`ITEM_ID`] is a photo whose images are auto-oriented.
     photo: bool,
+    /// Whether [`ITEM_ID`] is a Live TV channel.
+    live_tv: bool,
 }
 
 impl StubLibrary {
@@ -309,6 +311,13 @@ impl LibraryManager for StubLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         *self.item_reads.lock().expect("lock") += 1;
         Ok(match id {
+            _ if id == ITEM_ID && self.live_tv => Some(item_entity(
+                ITEM_ID,
+                "Channel",
+                BaseItemKind::LiveTvChannel
+                    .stored_type_name()
+                    .expect("stored name"),
+            )),
             _ if id == ITEM_ID => Some(item_entity(ITEM_ID, "Imaged Movie", "Movie")),
             _ if id == GENRE_ID => Some(item_entity(GENRE_ID, "Drama", "Genre")),
             _ => None,
@@ -322,14 +331,15 @@ impl LibraryManager for StubLibrary {
         Ok(id == ITEM_ID || id == GENRE_ID)
     }
 
-    async fn get_item_images_with_auto_orient(
+    async fn get_item_images_to_serve(
         &self,
         item_id: Uuid,
-    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
-        Ok((
-            self.get_item_images(item_id).await?,
-            self.photo && item_id == ITEM_ID,
-        ))
+    ) -> Result<ItemImagesToServe, ServiceError> {
+        Ok(ItemImagesToServe {
+            images: self.get_item_images(item_id).await?,
+            auto_orient: self.photo && item_id == ITEM_ID,
+            live_tv: self.live_tv && item_id == ITEM_ID,
+        })
     }
 
     async fn get_item_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
@@ -811,11 +821,14 @@ struct Stubs {
 }
 
 /// An image processor that records each request (its `auto_orient`, and the
-/// whole options) and serves the original file.
+/// whole options) and serves the original file, typed `mime_type` and dated
+/// `date_modified` when they are set (the image's own date otherwise).
 #[derive(Default)]
 struct RecordingProcessor {
     auto_orient: Mutex<Vec<bool>>,
     asked: Mutex<Vec<ferrofin_traits::options::ImageProcessingOptions>>,
+    mime_type: Option<&'static str>,
+    date_modified: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[async_trait]
@@ -854,7 +867,7 @@ impl ferrofin_traits::drawing::ImageProcessor for RecordingProcessor {
     }
     async fn get_image_cache_tag(
         &self,
-        _item_id: Uuid,
+        _item_path: Option<&str>,
         _image: &ItemImageInfo,
     ) -> Result<Option<String>, ServiceError> {
         Ok(None)
@@ -877,8 +890,8 @@ impl ferrofin_traits::drawing::ImageProcessor for RecordingProcessor {
         self.asked.lock().expect("lock").push(options.clone());
         Ok(ferrofin_traits::drawing::ProcessedImage {
             path: options.image.path.clone(),
-            mime_type: None,
-            date_modified: options.image.date_modified,
+            mime_type: self.mime_type.map(str::to_owned),
+            date_modified: self.date_modified.unwrap_or(options.image.date_modified),
         })
     }
     async fn create_image_collage(
@@ -899,6 +912,7 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
             swaps: Mutex::new(Vec::new()),
             item_reads: Mutex::new(0),
             photo: false,
+            live_tv: false,
         }),
         users: Arc::new(StubUsers {
             profile_path,
@@ -1049,8 +1063,8 @@ async fn get_item_image_serves_the_local_file() {
 }
 
 /// `ImageProcessor.ProcessImage`: a photo's image goes through the processor
-/// with `autoOrient` even when nothing else is asked for, and so does a
-/// resize; another item's plain request still serves the file untouched.
+/// with `autoOrient`; another item's goes through it without, plain request and
+/// resize alike (gl-1118).
 #[tokio::test]
 async fn a_photos_image_is_processed_with_auto_orientation() {
     let img = TempImage::new(b"JPEGDATA");
@@ -1065,9 +1079,9 @@ async fn a_photos_image_is_processed_with_auto_orientation() {
         (status, body.as_slice()),
         (StatusCode::OK, &b"JPEGDATA"[..])
     );
-    assert!(processor.auto_orient.lock().expect("lock").is_empty());
-    send(&s, "GET", &resized, None).await;
     assert_eq!(*processor.auto_orient.lock().expect("lock"), [false]);
+    send(&s, "GET", &resized, None).await;
+    assert_eq!(*processor.auto_orient.lock().expect("lock"), [false, false]);
 
     let photo = Arc::new(RecordingProcessor::default());
     let s = Stubs {
@@ -1076,6 +1090,7 @@ async fn a_photos_image_is_processed_with_auto_orientation() {
             swaps: Mutex::new(Vec::new()),
             item_reads: Mutex::new(0),
             photo: true,
+            live_tv: false,
         }),
         processor: Some(photo.clone()),
         ..stubs(img.path(), String::new())
@@ -1087,6 +1102,314 @@ async fn a_photos_image_is_processed_with_auto_orientation() {
     );
     send(&s, "GET", &resized, None).await;
     assert_eq!(*photo.auto_orient.lock().expect("lock"), [true, true]);
+}
+
+/// gl-1118: `GetImageResult` calls `ProcessImage` on every request, so an
+/// item or by-name request naming no transform reaches the processor, a lone
+/// `quality` is passed on, and the response takes the processor's type and
+/// date (`Age`).
+#[rstest::rstest]
+#[case::item("/Items/{item}/Images/Primary")]
+#[case::indexed("/Items/{item}/Images/Primary/0")]
+#[case::by_name("/Genres/Drama/Images/Primary")]
+#[tokio::test]
+async fn a_plain_image_request_reaches_the_processor(
+    #[case] route: &str,
+    #[values("", "?quality=50")] query: &str,
+) {
+    let img = TempImage::new(b"BMPDATA");
+    let processor = Arc::new(RecordingProcessor {
+        mime_type: Some("image/jpeg"),
+        date_modified: Some(chrono::Utc::now() - chrono::Duration::seconds(5000)),
+        ..Default::default()
+    });
+    let mut s = stubs(img.path(), String::new());
+    s.processor = Some(processor.clone());
+    let uri = format!("{}{query}", route.replace("{item}", &ITEM_ID.to_string()));
+
+    let (status, headers, body) = send_with_headers(&s, &uri, &[]).await;
+
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::OK, &b"BMPDATA"[..]),
+        "{uri}"
+    );
+    assert_eq!(headers["content-type"], "image/jpeg", "{uri}");
+    let age: i64 = headers["age"].to_str().expect("age").parse().expect("age");
+    assert!((5000..5100).contains(&age), "{uri}: age {age}");
+    let asked = processor.asked.lock().expect("asked lock");
+    let options = asked.first().expect("the image was processed");
+    let quality = if query.is_empty() { 100 } else { 50 };
+    assert_eq!(options.quality, quality, "{uri}");
+}
+
+/// gl-805: `backgroundColor`, `foregroundLayer` and `blur` each reach the
+/// processor on their own.
+#[rstest::rstest]
+#[case::background("backgroundColor=%23FF0000", Some("#FF0000"), None, None)]
+#[case::foreground("foregroundLayer=0.6", None, Some("0.6"), None)]
+#[case::blur("blur=4", None, None, Some(4))]
+#[tokio::test]
+async fn compositing_parameters_reach_the_processor(
+    #[case] query: &str,
+    #[case] background: Option<&str>,
+    #[case] foreground: Option<&str>,
+    #[case] blur: Option<i32>,
+) {
+    let img = TempImage::new(b"PNGDATA");
+    let processor = Arc::new(RecordingProcessor::default());
+    let mut s = stubs(img.path(), String::new());
+    s.processor = Some(processor.clone());
+    let uri = format!("/Items/{ITEM_ID}/Images/Primary?{query}");
+
+    let (status, _) = send(&s, "GET", &uri, None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let options = processor
+        .asked
+        .lock()
+        .expect("asked lock")
+        .first()
+        .cloned()
+        .expect("the image was processed");
+    assert_eq!(options.background_color.as_deref(), background);
+    assert_eq!(options.foreground_layer.as_deref(), foreground);
+    assert_eq!(options.blur, blur);
+}
+
+/// `GetItemImage` declares `percentPlayed` and `unplayedCount`, so a malformed
+/// one is `[ApiController]`'s `400`, and a valid one is accepted (its overlay
+/// is gl-806).
+#[tokio::test]
+async fn overlay_parameters_are_bound() {
+    let img = TempImage::new(b"PNGDATA");
+    let s = stubs(img.path(), String::new());
+    for (query, expected) in [
+        ("percentPlayed=40&unplayedCount=3", StatusCode::OK),
+        ("percentPlayed=x", StatusCode::BAD_REQUEST),
+        ("unplayedCount=1.5", StatusCode::BAD_REQUEST),
+    ] {
+        let uri = format!("/Items/{ITEM_ID}/Images/Primary?{query}");
+        let (status, _) = send(&s, "GET", &uri, None).await;
+        assert_eq!(status, expected, "{query}");
+    }
+}
+
+/// `GetImageResult` sets the content type and `Last-Modified` from
+/// `ProcessImage`'s answer before its `ETag` check, so a `304` carries both.
+#[tokio::test]
+async fn a_not_modified_image_keeps_its_type_and_date() {
+    let img = TempImage::new(b"PNGDATA");
+    let date = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+        .expect("date")
+        .with_timezone(&chrono::Utc);
+    let processor = Arc::new(RecordingProcessor {
+        mime_type: Some("image/webp"),
+        date_modified: Some(date),
+        ..Default::default()
+    });
+    let mut s = stubs(img.path(), String::new());
+    s.processor = Some(processor);
+
+    let (status, headers, _) = send_with_headers(
+        &s,
+        &format!("/Items/{ITEM_ID}/Images/Primary?tag=abc"),
+        &[("If-None-Match", "\"abc\"")],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert_eq!(headers["content-type"], "image/webp");
+    assert_eq!(headers["last-modified"], "Fri, 02 Jan 2026 03:04:05 GMT");
+    assert_eq!(headers["transfermode.dlna.org"], "Interactive");
+}
+
+/// `GetImageResult` answers `304` when `If-Modified-Since` is at or after
+/// `ProcessImage`'s date, before the file is read; earlier, the file's own
+/// date decides, as `PhysicalFile` checks it.
+#[tokio::test]
+async fn if_modified_since_is_checked_against_the_processed_date() {
+    let img = TempImage::new(b"PNGDATA");
+    let date = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+        .expect("date")
+        .with_timezone(&chrono::Utc);
+    let mut s = stubs(img.path(), String::new());
+    s.processor = Some(Arc::new(RecordingProcessor {
+        mime_type: Some("image/png"),
+        date_modified: Some(date),
+        ..Default::default()
+    }));
+    let uri = format!("/Items/{ITEM_ID}/Images/Primary");
+
+    for (since, expected) in [
+        ("Fri, 02 Jan 2026 03:04:05 GMT", StatusCode::NOT_MODIFIED),
+        ("Fri, 02 Jan 2026 03:04:04 GMT", StatusCode::OK),
+    ] {
+        let (status, headers, _) =
+            send_with_headers(&s, &uri, &[("If-Modified-Since", since)]).await;
+        assert_eq!(status, expected, "{since}");
+        assert!(headers.contains_key("last-modified"), "{since}");
+    }
+}
+
+/// Under `Cache-Control: no-cache` upstream skips its own checks, and
+/// `PhysicalFile` still answers an `If-Modified-Since` at or after the file's
+/// date (not one in the future), and `Age` is still sent. A value other than
+/// exactly `no-cache` does not count (all measured on 12.4).
+#[tokio::test]
+async fn no_cache_skips_the_own_checks_and_keeps_age() {
+    let img = TempImage::new(b"PNGDATA");
+    let s = stubs(img.path(), String::new());
+    let uri = format!("/Items/{ITEM_ID}/Images/Primary?tag=abc");
+    let file_date = httpdate::fmt_http_date(
+        std::fs::metadata(img.path())
+            .and_then(|m| m.modified())
+            .expect("mtime"),
+    );
+
+    for (cache_control, since, expected) in [
+        ("no-cache", "Fri, 01 Jan 2100 00:00:00 GMT", StatusCode::OK),
+        ("no-cache", file_date.as_str(), StatusCode::NOT_MODIFIED),
+        (
+            "no-cache, max-age=0",
+            "Fri, 01 Jan 2100 00:00:00 GMT",
+            StatusCode::NOT_MODIFIED,
+        ),
+    ] {
+        let (status, headers, _) = send_with_headers(
+            &s,
+            &uri,
+            &[
+                ("Cache-Control", cache_control),
+                ("If-Modified-Since", since),
+                ("If-None-Match", "\"abc\""),
+            ],
+        )
+        .await;
+        assert_eq!(status, expected, "{cache_control} / {since}");
+        assert!(headers.contains_key("age"), "{headers:?}");
+        let disabled = cache_control == "no-cache";
+        assert_eq!(headers.get("etag").is_none(), disabled, "{headers:?}");
+    }
+
+    // `StringValues.Contains` looks at every `Cache-Control` line.
+    let (status, headers, _) = send_with_headers(
+        &s,
+        &uri,
+        &[
+            ("Cache-Control", "max-age=0"),
+            ("Cache-Control", "no-cache"),
+            ("If-None-Match", "\"abc\""),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{headers:?}");
+    assert_eq!(
+        headers["cache-control"],
+        "no-cache, no-store, must-revalidate"
+    );
+}
+
+/// `PhysicalFile` answers a stale `If-Unmodified-Since` with `412`, carrying the
+/// served file's `Last-Modified` and `GetImageResult`'s headers.
+#[tokio::test]
+async fn a_stale_if_unmodified_since_is_412_with_the_image_headers() {
+    let img = TempImage::new(b"PNGDATA");
+    let s = stubs(img.path(), String::new());
+    let file_date = httpdate::fmt_http_date(
+        std::fs::metadata(img.path())
+            .and_then(|m| m.modified())
+            .expect("mtime"),
+    );
+
+    let (status, headers, _) = send_with_headers(
+        &s,
+        &format!("/Items/{ITEM_ID}/Images/Primary"),
+        &[("If-Unmodified-Since", "Mon, 01 Jan 2001 00:00:00 GMT")],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(headers["last-modified"], file_date.as_str());
+    assert!(headers.contains_key("age"), "{headers:?}");
+    assert_eq!(headers["transfermode.dlna.org"], "Interactive");
+}
+
+/// `GetImageResult` answers with `PhysicalFile`, whose range processing is off,
+/// so a `Range` gets the whole image and no `Accept-Ranges` is sent (measured on
+/// 12.4).
+#[tokio::test]
+async fn an_image_ignores_a_range() {
+    let img = TempImage::new(b"0123456789ABCDEF");
+    let s = stubs(img.path(), String::new());
+
+    let (status, headers, body) = send_with_headers(
+        &s,
+        &format!("/Items/{ITEM_ID}/Images/Primary"),
+        &[("Range", "bytes=0-3")],
+    )
+    .await;
+
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::OK, &b"0123456789ABCDEF"[..])
+    );
+    assert!(headers.get("accept-ranges").is_none(), "{headers:?}");
+    assert!(headers.get("content-range").is_none(), "{headers:?}");
+}
+
+/// `BaseItem.GetImageInfo` is `GetImages(type).ElementAtOrDefault(index)`, so
+/// a negative index finds no image: a `404`, not the first image.
+#[tokio::test]
+async fn a_negative_image_index_is_not_found() {
+    let img = TempImage::new(b"IDX0");
+    let s = stubs(img.path(), String::new());
+    for uri in [
+        format!("/Items/{ITEM_ID}/Images/Primary/-1"),
+        format!("/Items/{ITEM_ID}/Images/Primary?imageIndex=-1"),
+    ] {
+        let (status, _) = send(&s, "GET", &uri, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+}
+
+/// Only the actions with no index in their route declare `[FromQuery] int?
+/// imageIndex`: there a malformed one is a `400`, and the indexed routes, which
+/// do not bind it, ignore it.
+#[tokio::test]
+async fn only_the_unindexed_routes_bind_a_query_image_index() {
+    let img = TempImage::new(b"IDX0");
+    let s = stubs(img.path(), String::new());
+    for (uri, expected) in [
+        (
+            format!("/Items/{ITEM_ID}/Images/Primary?imageIndex=x"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            format!("/Items/{ITEM_ID}/Images/Primary?imageIndex="),
+            StatusCode::OK,
+        ),
+        // The binder's hex forms, measured on 12.4.
+        (
+            format!("/Items/{ITEM_ID}/Images/Primary?imageIndex=0x0"),
+            StatusCode::OK,
+        ),
+        (
+            format!("/Items/{ITEM_ID}/Images/Primary/0?imageIndex=x"),
+            StatusCode::OK,
+        ),
+        (
+            "/Genres/Drama/Images/Primary?imageIndex=x".to_owned(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/Genres/Drama/Images/Primary/0?imageIndex=x".to_owned(),
+            StatusCode::OK,
+        ),
+    ] {
+        let (status, _) = send(&s, "GET", &uri, None).await;
+        assert_eq!(status, expected, "{uri}");
+    }
 }
 
 #[tokio::test]
@@ -1101,7 +1424,7 @@ async fn head_item_image_is_ok_without_body() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.is_empty());
+    assert!(body.is_empty(), "{body:?}");
 }
 
 #[tokio::test]
@@ -1303,6 +1626,58 @@ async fn remote_image_backdrop_is_served_from_its_local_copy() {
         *asked.lock().expect("lock"),
         ["https://remote.example/backdrop.jpg"]
     );
+}
+
+/// A Live TV item's row outside the metadata directory is not served and not
+/// listed, though the file exists and another item's row may point at it; a URL
+/// is served from its copy as on any item. `FakeConfig` has no metadata
+/// directory, so here every local row is outside it.
+#[tokio::test]
+async fn a_live_tv_items_local_row_is_not_served_outside_the_metadata_directory() {
+    let img = TempImage::new(b"X");
+    let copy = TempImage::new(b"REMOTE");
+    let s = Stubs {
+        library: Arc::new(StubLibrary {
+            image_path: img.path(),
+            swaps: Mutex::new(Vec::new()),
+            item_reads: Mutex::new(0),
+            photo: false,
+            live_tv: true,
+        }),
+        providers: Arc::new(StubProviders {
+            saved: Arc::new(Mutex::new(Vec::new())),
+            deleted: Arc::new(Mutex::new(Vec::new())),
+            updates: Arc::new(Mutex::new(Vec::new())),
+            remote_copy: Some(copy.path()),
+            remote_asked: Arc::new(Mutex::new(Vec::new())),
+        }),
+        ..stubs(img.path(), String::new())
+    };
+    for method in ["GET", "HEAD"] {
+        let (status, body) = send(
+            &s,
+            method,
+            &format!("/Items/{ITEM_ID}/Images/Primary"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method}");
+        assert_ne!(body, b"X", "{method}");
+    }
+    let (status, body) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/Backdrop"),
+        None,
+    )
+    .await;
+    assert_eq!((status, body.as_slice()), (StatusCode::OK, &b"REMOTE"[..]));
+
+    let (status, body) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(listed.as_array().expect("infos").len(), 1, "{listed}");
+    assert_eq!(listed[0]["ImageType"], "Backdrop");
 }
 
 #[tokio::test]
@@ -1548,6 +1923,19 @@ async fn delete_item_image_by_index_returns_204() {
         s.providers.deleted.lock().expect("lock").as_slice(),
         [(ITEM_ID, 1)]
     );
+}
+
+/// `DeleteItemImage` binds `imageIndex`, so a malformed one is the binder's
+/// `400`, which comes before the item is read: a missing item is a `400` too.
+#[tokio::test]
+async fn delete_item_image_with_a_malformed_index_is_400() {
+    let s = elevated_stubs(String::new(), String::new());
+    for item in [ITEM_ID, MISSING_ID] {
+        let uri = format!("/Items/{item}/Images/Primary?imageIndex=x");
+        let (status, _) = send(&s, "DELETE", &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+    assert!(s.providers.deleted.lock().expect("lock").is_empty());
 }
 
 #[tokio::test]
@@ -2046,7 +2434,7 @@ async fn legacy_user_image_routes_forward() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.is_empty());
+    assert!(body.is_empty(), "{body:?}");
     let (status, body) = send(
         &s,
         "HEAD",
@@ -2055,7 +2443,7 @@ async fn legacy_user_image_routes_forward() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.is_empty());
+    assert!(body.is_empty(), "{body:?}");
 }
 
 #[tokio::test]
@@ -2270,6 +2658,276 @@ async fn anonymous_profile_image_requires_a_nonempty_user_id() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+}
+
+/// `GetUserImage` passes `GetImageInternal` no sizes and a quality of 90, and the
+/// legacy forms drop what they declare, so nothing in the URL sizes an avatar.
+/// `GetImageResult` calls `ProcessImage` on every request, which re-encodes a
+/// source format the client's output formats do not list, so a plain request
+/// reaches the processor too (gl-1114).
+#[rstest::rstest]
+#[tokio::test]
+async fn user_images_reach_the_processor_with_upstreams_fixed_options(
+    #[values(
+        "/UserImage",
+        "/Users/{user}/Images/Primary",
+        "/Users/{user}/Images/Primary/0"
+    )]
+    route: &str,
+    #[values(
+        "",
+        "?width=40&height=30&maxWidth=20&maxHeight=10&fillWidth=50&fillHeight=60&blur=2&quality=60"
+    )]
+    query: &str,
+) {
+    let img = TempImage::new(b"PROFILE");
+    let processor = Arc::new(RecordingProcessor::default());
+    let mut s = stubs(String::new(), img.path());
+    s.processor = Some(processor.clone());
+    let uri = format!("{}{query}", route.replace("{user}", &USER_ID.to_string()));
+
+    let (status, body) = send(&s, "GET", &uri, None).await;
+
+    assert_eq!(
+        (status, body.as_slice()),
+        (StatusCode::OK, &b"PROFILE"[..]),
+        "{uri}"
+    );
+    let asked = processor.asked.lock().expect("asked lock");
+    let options = asked.first().expect("the image was processed");
+    assert_eq!(options.quality, 90, "{uri}");
+    assert_eq!(
+        (
+            options.width,
+            options.height,
+            options.max_width,
+            options.max_height
+        ),
+        (None, None, None, None),
+        "{uri}"
+    );
+    assert_eq!(
+        (options.fill_width, options.fill_height, options.blur),
+        (None, None, None),
+        "{uri}"
+    );
+}
+
+/// `tag` and `format` are what all three routes pass on to `GetImageInternal`.
+#[rstest::rstest]
+#[case::user_image("/UserImage")]
+#[case::legacy("/Users/{user}/Images/Primary")]
+#[case::indexed_legacy("/Users/{user}/Images/Primary/0")]
+#[tokio::test]
+async fn user_images_keep_their_tag_and_format(#[case] route: &str) {
+    let img = TempImage::new(b"PROFILE");
+    let processor = Arc::new(RecordingProcessor::default());
+    let mut s = stubs(String::new(), img.path());
+    s.processor = Some(processor.clone());
+    let uri = format!(
+        "{}?tag=abc&format=jpg",
+        route.replace("{user}", &USER_ID.to_string())
+    );
+
+    let (status, headers, _) = send_with_headers(&s, &uri, &[]).await;
+
+    assert_eq!(status, StatusCode::OK, "{uri}");
+    assert_eq!(headers["etag"], "\"abc\"", "{uri}");
+    assert_eq!(
+        headers["cache-control"], "public, max-age=31536000, immutable",
+        "{uri}"
+    );
+    let asked = processor.asked.lock().expect("asked lock");
+    assert_eq!(
+        asked
+            .first()
+            .expect("the image was processed")
+            .supported_output_formats,
+        [ferrofin_model::drawing::ImageFormat::Jpg],
+        "{uri}"
+    );
+}
+
+/// `GetUserImage` binds `userId`, `tag` and `format` and nothing else, so a
+/// malformed size is never seen, while the legacy forms take `userId` from the
+/// route and `imageIndex` is a query member only on the form with no index in
+/// its route. `format` is a nullable enum: an unparseable one binds null, and an
+/// undefined number throws once `ProcessImage` reads it, so a user with no image
+/// is still a `404`. Each row was measured on Jellyfin 12.4 (gl-1114).
+#[rstest::rstest]
+#[case::size_is_not_bound("/UserImage?width=x", StatusCode::OK)]
+#[case::quality_is_not_bound("/UserImage?quality=x", StatusCode::OK)]
+#[case::blur_is_not_bound("/UserImage?blur=x", StatusCode::OK)]
+#[case::empty_size("/UserImage?width=", StatusCode::OK)]
+#[case::user_id_is_bound("/UserImage?userId=junk", StatusCode::BAD_REQUEST)]
+#[case::unparseable_format("/UserImage?format=bogus", StatusCode::OK)]
+#[case::undefined_format("/UserImage?format=6", StatusCode::BAD_REQUEST)]
+#[case::undefined_format_with_no_image(
+    "/UserImage?userId={missing}&format=6",
+    StatusCode::NOT_FOUND
+)]
+#[case::legacy_image_index("/Users/{user}/Images/Primary?imageIndex=x", StatusCode::BAD_REQUEST)]
+#[case::legacy_user_id_is_the_routes("/Users/{user}/Images/Primary?userId=junk", StatusCode::OK)]
+#[case::legacy_background_color_is_a_string(
+    "/Users/{user}/Images/Primary?backgroundColor=zz",
+    StatusCode::OK
+)]
+#[case::legacy_undefined_format("/Users/{user}/Images/Primary?format=6", StatusCode::BAD_REQUEST)]
+#[case::indexed_image_index_is_the_routes(
+    "/Users/{user}/Images/Primary/0?imageIndex=x",
+    StatusCode::OK
+)]
+#[case::indexed_user_id_is_the_routes("/Users/{user}/Images/Primary/0?userId=junk", StatusCode::OK)]
+#[tokio::test]
+async fn user_image_routes_bind_what_their_actions_declare(
+    #[case] route: &str,
+    #[case] expected: StatusCode,
+) {
+    let img = TempImage::new(b"PROFILE");
+    let mut s = stubs(String::new(), img.path());
+    s.processor = Some(Arc::new(RecordingProcessor::default()));
+    let uri = route
+        .replace("{user}", &USER_ID.to_string())
+        .replace("{missing}", &MISSING_ID.to_string());
+    let (status, _) = send(&s, "GET", &uri, None).await;
+    assert_eq!(status, expected, "{uri}");
+}
+
+/// The legacy forms declare these numbers and drop them, and ASP.NET binds what
+/// is declared: a malformed one is `[ApiController]`'s `400`, and an empty or a
+/// valid one has no effect. Measured on Jellyfin 12.4 (gl-1114).
+#[rstest::rstest]
+#[tokio::test]
+async fn legacy_user_image_forms_bind_every_number_they_declare(
+    #[values("/Users/{user}/Images/Primary", "/Users/{user}/Images/Primary/0")] route: &str,
+    #[values(
+        "width",
+        "height",
+        "maxWidth",
+        "maxHeight",
+        "fillWidth",
+        "fillHeight",
+        "quality",
+        "blur",
+        "percentPlayed",
+        "unplayedCount"
+    )]
+    member: &str,
+) {
+    let img = TempImage::new(b"PROFILE");
+    let s = stubs(String::new(), img.path());
+    let route = route.replace("{user}", &USER_ID.to_string());
+    for (value, expected) in [
+        ("x", StatusCode::BAD_REQUEST),
+        ("12", StatusCode::OK),
+        ("", StatusCode::OK),
+    ] {
+        let uri = format!("{route}?{member}={value}");
+        assert_eq!(send(&s, "GET", &uri, None).await.0, expected, "{uri}");
+    }
+}
+
+/// `PostUserImage` and `DeleteUserImage` bind `userId` alone, so an undeclared
+/// member is never parsed. Their legacy forms take `userId` from the route and
+/// bind no query member, except `DeleteUserImageLegacy`'s `[FromQuery] int?
+/// index`: the indexed delete takes `index` from its route, and the uploads
+/// declare none. Each row was measured on Jellyfin 12.4 (gl-1031).
+#[rstest::rstest]
+#[case::post_size("POST", "/UserImage?maxWidth=x", StatusCode::NO_CONTENT)]
+#[case::delete_size("DELETE", "/UserImage?maxWidth=x", StatusCode::NO_CONTENT)]
+#[case::post_image_index("POST", "/UserImage?imageIndex=x", StatusCode::NO_CONTENT)]
+#[case::delete_image_index("DELETE", "/UserImage?imageIndex=x", StatusCode::NO_CONTENT)]
+#[case::post_user_id("POST", "/UserImage?userId=junk", StatusCode::BAD_REQUEST)]
+#[case::delete_user_id("DELETE", "/UserImage?userId=junk", StatusCode::BAD_REQUEST)]
+#[case::post_legacy_size(
+    "POST",
+    "/Users/{user}/Images/Primary?maxWidth=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_legacy_size(
+    "DELETE",
+    "/Users/{user}/Images/Primary?maxWidth=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::post_legacy_user_id(
+    "POST",
+    "/Users/{user}/Images/Primary?userId=junk",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_legacy_user_id(
+    "DELETE",
+    "/Users/{user}/Images/Primary?userId=junk",
+    StatusCode::NO_CONTENT
+)]
+#[case::post_legacy_index("POST", "/Users/{user}/Images/Primary?index=x", StatusCode::NO_CONTENT)]
+#[case::delete_legacy_index(
+    "DELETE",
+    "/Users/{user}/Images/Primary?index=x",
+    StatusCode::BAD_REQUEST
+)]
+#[case::post_indexed_size(
+    "POST",
+    "/Users/{user}/Images/Primary/0?maxWidth=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_indexed_size(
+    "DELETE",
+    "/Users/{user}/Images/Primary/0?maxWidth=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::post_indexed_user_id(
+    "POST",
+    "/Users/{user}/Images/Primary/0?userId=junk",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_indexed_user_id(
+    "DELETE",
+    "/Users/{user}/Images/Primary/0?userId=junk",
+    StatusCode::NO_CONTENT
+)]
+#[case::post_indexed_index(
+    "POST",
+    "/Users/{user}/Images/Primary/0?index=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_indexed_index(
+    "DELETE",
+    "/Users/{user}/Images/Primary/0?index=x",
+    StatusCode::NO_CONTENT
+)]
+#[tokio::test]
+async fn user_image_writes_bind_what_their_actions_declare(
+    #[case] method: &str,
+    #[case] route: &str,
+    #[case] expected: StatusCode,
+) {
+    let s = stubs(String::new(), String::new());
+    let uri = route.replace("{user}", &USER_ID.to_string());
+    let body = (method == "POST").then_some(("image/png", "aGk="));
+    let (status, _) = send(&s, method, &uri, body).await;
+    assert_eq!(status, expected, "{method} {uri}");
+}
+
+/// No item image action declares `userId`, so a malformed one is never seen.
+/// Measured on Jellyfin 12.4 (gl-1031).
+#[rstest::rstest]
+#[case::get("GET", "/Items/{item}/Images/Primary", StatusCode::OK)]
+#[case::get_indexed("GET", "/Items/{item}/Images/Primary/0", StatusCode::OK)]
+#[case::delete("DELETE", "/Items/{item}/Images/Primary", StatusCode::NO_CONTENT)]
+#[tokio::test]
+async fn item_image_routes_ignore_a_user_id(
+    #[case] method: &str,
+    #[case] route: &str,
+    #[case] expected: StatusCode,
+) {
+    let img = TempImage::new(b"POSTER");
+    let s = elevated_stubs(img.path(), String::new());
+    let uri = format!(
+        "{}?userId=junk",
+        route.replace("{item}", &ITEM_ID.to_string())
+    );
+    let (status, _) = send(&s, method, &uri, None).await;
+    assert_eq!(status, expected, "{method} {uri}");
 }
 
 /// `GetItemImage2` takes `width`, `height`, `quality`, `fillWidth`,

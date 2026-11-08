@@ -67,6 +67,21 @@ pub(super) fn save_path(row: &BaseItemEntity) -> Option<PathBuf> {
     }
 }
 
+/// A season whose `season.nfo` exists: `SeasonNfoSaver.IsEnabledFor` saves it
+/// on any update from `MetadataImport` up.
+fn existing_season(kind: NfoItemKind, path: &Path) -> bool {
+    kind == NfoItemKind::Season && path.is_file()
+}
+
+/// The part of the saver's `IsEnabledFor` that needs no option: whether
+/// `update` can never save `kind`'s sidecar at `path`, whatever the library
+/// and server options say. [`enabled`] refuses it too; a caller asks this
+/// first to skip reading the options.
+pub(super) fn update_refused(kind: NfoItemKind, update: ItemUpdateType, path: &Path) -> bool {
+    update == ItemUpdateType::None
+        || (update == ItemUpdateType::MetadataImport && !existing_season(kind, path))
+}
+
 pub(super) fn enabled(
     library: Option<&LibraryOptions>,
     global: Option<&MetadataOptions>,
@@ -75,10 +90,8 @@ pub(super) fn enabled(
     save_images: bool,
     path: &Path,
 ) -> bool {
-    let existing_season = kind == NfoItemKind::Season && path.is_file();
-    if update == ItemUpdateType::None
-        || (update == ItemUpdateType::MetadataImport && !existing_season)
-        || (update == ItemUpdateType::ImageUpdate && !save_images && !existing_season)
+    if update_refused(kind, update, path)
+        || (update == ItemUpdateType::ImageUpdate && !save_images && !existing_season(kind, path))
     {
         return false;
     }
@@ -333,5 +346,47 @@ mod tests {
             true,
             &path
         ));
+    }
+
+    /// The early refusal (gl-1084) is exactly what [`enabled`] refuses under
+    /// options that allow everything: it never skips a save the options could
+    /// make, and catches every update type the saver refuses on its own.
+    #[rstest]
+    fn update_refused_is_the_complement_of_enabled_under_permissive_options(
+        #[values(
+            NfoItemKind::Video,
+            NfoItemKind::Movie,
+            NfoItemKind::MusicVideo,
+            NfoItemKind::Series,
+            NfoItemKind::Season,
+            NfoItemKind::Episode,
+            NfoItemKind::MusicAlbum,
+            NfoItemKind::MusicArtist
+        )]
+        kind: NfoItemKind,
+        #[values(
+            ItemUpdateType::None,
+            ItemUpdateType::MetadataImport,
+            ItemUpdateType::MetadataDownload,
+            ItemUpdateType::MetadataEdit,
+            ItemUpdateType::ImageUpdate
+        )]
+        update: ItemUpdateType,
+        #[values(false, true)] sidecar_exists: bool,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("item.nfo");
+        if sidecar_exists {
+            std::fs::write(&path, "<item />").unwrap();
+        }
+        let everything = LibraryOptions {
+            save_local_metadata: true,
+            metadata_savers: Some(vec!["Nfo".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            update_refused(kind, update, &path),
+            !enabled(Some(&everything), None, kind, update, true, &path)
+        );
     }
 }

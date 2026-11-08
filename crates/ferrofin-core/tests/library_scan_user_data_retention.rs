@@ -6,7 +6,8 @@
 //! - A fold (`merge_one`) MOVES the loser's history onto the kept row —
 //!   upstream's best-of-duplicates rule per (user, key) — so nothing is
 //!   detached to the placeholder or snapshotted: a later recovery pass can
-//!   never resurrect a second copy.
+//!   never resurrect a second copy. Each user's rows of the kept row then
+//!   agree with the one its DTO reads, so its lists say what its DTO says.
 //! - A row a rip swallows is pruned through `delete_items`, which detaches
 //!   its history; the file coming back at its path recovers it.
 //! - A part or version released from a pruned owner keeps its row, and so
@@ -18,18 +19,22 @@ use std::sync::Arc;
 use ferrofin_core::file_system::FerrofinFileSystem;
 use ferrofin_core::item_type_lookup::{ItemTypeLookup, derive_item_id, stored_type_name};
 use ferrofin_core::{
-    FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinVirtualFolderManager,
+    FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinServerApplicationPaths,
+    FerrofinServerConfigurationManager, FerrofinUserDataManager, FerrofinVirtualFolderManager,
     LibraryScanner,
 };
 use ferrofin_db::Database;
 use ferrofin_db::PLACEHOLDER_ITEM_ID;
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::CollectionTypeOptions;
-use ferrofin_traits::library::VirtualFolderManager;
-use ferrofin_traits::persistence::ItemPersistenceService as _;
+use ferrofin_traits::configuration::ServerConfigurationManager;
+use ferrofin_traits::library::{UserDataManager as _, VirtualFolderManager};
+use ferrofin_traits::options::InternalItemsQuery;
+use ferrofin_traits::persistence::{ItemPersistenceService as _, ItemRepository as _};
 use uuid::Uuid;
 
 /// One movie library over a temporary media folder, scanned by a real
@@ -265,6 +270,185 @@ async fn a_folds_loser_history_moves_once_and_is_never_detached() {
     f.scanner.scan_all().await.unwrap();
     assert_eq!(f.user_data(later).await, on_rip(5, 42));
     assert_eq!(f.user_data(only).await, on_rip(3, 33));
+}
+
+/// Lets `user` see every library (`EnableAllFolders`): a user with no
+/// `Permissions` row sees none, so no list would hold anything.
+async fn grant_all_folders(db: &Database, user: Uuid) {
+    sqlx::query(
+        r#"INSERT INTO "Permissions" ("Kind", "RowVersion", "UserId", "Value")
+           VALUES (?1, 1, ?2, 1)"#,
+    )
+    .bind(i32::from(
+        ferrofin_db::enums::PermissionKind::EnableAllFolders,
+    ))
+    .bind(guid_to_db(user))
+    .execute(db.writer())
+    .await
+    .unwrap();
+}
+
+/// The user data manager over the fixture's database, with a stock
+/// configuration kept in `config`.
+async fn user_data_manager(f: &Fixture, config: &std::path::Path) -> FerrofinUserDataManager {
+    let paths = Arc::new(FerrofinServerApplicationPaths::new(
+        config.join("program"),
+        config.join("log"),
+        config.join("config"),
+        config.join("cache"),
+        config.join("web"),
+    ));
+    let config = FerrofinServerConfigurationManager::load(paths)
+        .await
+        .unwrap();
+    FerrofinUserDataManager::new(
+        f.db.clone(),
+        Arc::new(config) as Arc<dyn ServerConfigurationManager>,
+    )
+}
+
+/// Whether item `id` is in `user`'s Played, Favorites and Continue Watching
+/// lists (the `IsPlayed`, `IsFavorite` and `IsResumable` filters), and what
+/// its DTO says of each: played, a favourite, a resume position.
+async fn lists_and_dto(
+    f: &Fixture,
+    users: &FerrofinUserDataManager,
+    id: Uuid,
+    user: Uuid,
+) -> ([bool; 3], [bool; 3]) {
+    let entity: UserEntity = sqlx::query_as(r#"SELECT * FROM "Users" WHERE "Id" = ?1"#)
+        .bind(guid_to_db(user))
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap();
+    let entity = Arc::new(entity);
+    let mut lists = [false; 3];
+    for (listed, filter) in lists.iter_mut().zip([
+        InternalItemsQuery {
+            is_played: Some(true),
+            ..InternalItemsQuery::default()
+        },
+        InternalItemsQuery {
+            is_favorite: Some(true),
+            ..InternalItemsQuery::default()
+        },
+        InternalItemsQuery {
+            is_resumable: Some(true),
+            ..InternalItemsQuery::default()
+        },
+    ]) {
+        let filter = InternalItemsQuery {
+            user: Some(Arc::clone(&entity)),
+            ..filter
+        };
+        *listed = f.repo.get_item_ids(&filter).await.unwrap().contains(&id);
+    }
+    let dto = users.get_user_data_dto(id, user).await.unwrap().unwrap();
+    (
+        lists,
+        [dto.played, dto.is_favorite, dto.playback_position_ticks > 0],
+    )
+}
+
+/// A fold resolves history per key, so the rip can come out of it with a
+/// user's rows disagreeing: its own guid-keyed row half-watched and the older
+/// row's play (and favourite) under a provider key the rip does not report,
+/// or the other way round. The rip's DTO reads its guid-keyed row (it has no
+/// provider ids), and the list filters match any row, so it would sit in a
+/// list its DTO contradicts. The fold brings each user's rows into agreement
+/// with the one the DTO reads, deleting none; a quiet rescan changes nothing.
+#[tokio::test]
+async fn a_fold_leaves_the_kept_rows_lists_agreeing_with_its_dto() {
+    const VOB: &str = "Alien (1979)/VTS_01_1.VOB";
+    const IMDB: &str = "tt0078748";
+    let f = Fixture::movies(&["Alien (1979)/VIDEO_TS.IFO", VOB]).await;
+    f.scanner.scan_all().await.unwrap();
+    let rip = f.row("Alien (1979)").await;
+    let rip_id = Uuid::parse_str(&rip.id).unwrap();
+    let loser = f.older_movie(&rip, VOB).await;
+    let own_key = rip_id.to_string();
+    let own = own_key.as_str();
+    let (resuming, finished) = (seed_user(&f.db).await, seed_user(&f.db).await);
+    // (user, item, key, favourite, played, play count, ticks, the month of
+    // 2026 it was last played)
+    for (user, item, key, favourite, played, count, ticks, month) in [
+        // Half-watched on the rip; played and a favourite on the older row.
+        (resuming, rip_id, own, false, false, 1, 42, 6),
+        (resuming, loser, IMDB, true, true, 2, 0, 1),
+        // Played on the rip; half-watched on the older row.
+        (finished, rip_id, own, false, true, 1, 0, 6),
+        (finished, loser, IMDB, false, false, 1, 300, 1),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "IsFavorite",
+               "Played", "PlayCount", "PlaybackPositionTicks", "LastPlayedDate")
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(guid_to_db(user))
+        .bind(key)
+        .bind(favourite)
+        .bind(played)
+        .bind(count)
+        .bind(ticks)
+        .bind(format!("2026-{month:02}-01 00:00:00.0000000"))
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    }
+
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.rows_at(VOB).await, 0, "the older row folded");
+    let config = tempfile::tempdir().unwrap();
+    let users = user_data_manager(&f, config.path()).await;
+    let expected = [
+        (resuming, [false, false, true]),
+        (finished, [true, false, false]),
+    ];
+    for (user, dto) in expected {
+        grant_all_folders(&f.db, user).await;
+        assert_eq!(
+            lists_and_dto(&f, &users, rip_id, user).await,
+            (dto, dto),
+            "lists, then DTO: played, favourite, resumable"
+        );
+        let rows = user_fields(&f.db, user).await;
+        let keys: Vec<&str> = rows.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, [own, IMDB], "no row is deleted");
+        assert_eq!(rows[0].1, rows[1].1, "the rows agree");
+    }
+
+    let before = [
+        user_fields(&f.db, resuming).await,
+        user_fields(&f.db, finished).await,
+    ];
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        [
+            user_fields(&f.db, resuming).await,
+            user_fields(&f.db, finished).await
+        ],
+        before,
+        "a quiet rescan changes nothing"
+    );
+    for (user, dto) in expected {
+        assert_eq!(lists_and_dto(&f, &users, rip_id, user).await, (dto, dto));
+    }
+}
+
+/// Every `UserData` row of `user`: its key and its nine user fields as one
+/// JSON array, sorted by item and key.
+async fn user_fields(db: &Database, user: Uuid) -> Vec<(String, String)> {
+    sqlx::query_as(
+        r#"SELECT "CustomDataKey", json_array("AudioStreamIndex", "IsFavorite",
+             "LastPlayedDate", "Likes", "PlaybackPositionTicks", "PlayCount", "Played",
+             "Rating", "SubtitleStreamIndex")
+           FROM "UserData" WHERE "UserId" = ?1 ORDER BY "ItemId", "CustomDataKey""#,
+    )
+    .bind(guid_to_db(user))
+    .fetch_all(db.pool())
+    .await
+    .unwrap()
 }
 
 /// A row a rip swallows (a loose video beside its `VIDEO_TS`) is pruned

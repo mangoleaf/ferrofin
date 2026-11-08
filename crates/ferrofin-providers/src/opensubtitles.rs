@@ -18,12 +18,22 @@
 //! `Api-Key` header and a descriptive `User-Agent`; `POST /login` exchanges the
 //! account for a bearer token, `GET /subtitles` searches, and `POST /download`
 //! turns a `file_id` into a one-time download link whose body is the subtitle.
+//!
+//! That link is a destination OpenSubtitles chose, so it is fetched through
+//! the guard image downloads use ([`GuardedHttp`]): a private address is
+//! refused on the link and on every redirect from it, unless the server's
+//! `subtitle_private_http_allow` lists it
+//! ([`with_link_destinations`](OpenSubtitlesProvider::with_link_destinations)).
+//! The plugin downloads it with a default `HttpClient`; the guard is a
+//! divergence (owner decision 2026-11-03, gl-1160).
 
 use crate::rate_limit::CountedBody as _;
-use crate::rate_limit::{LimitedRequest as _, RateLimiter, RequestError};
+use crate::rate_limit::{BodyError, LimitedRequest as _, RateLimiter, RequestError};
 use std::sync::Arc;
 
+use crate::destination::PrivateAllowList;
 use crate::error::ProvidersError;
+use crate::guarded_http::{FetchKind, GuardedHttp, SendError};
 use async_trait::async_trait;
 use ferrofin_model::providers::RemoteSubtitleInfo;
 use ferrofin_traits::error::ServiceError;
@@ -49,6 +59,15 @@ const DEFAULT_API_KEY: &str = "gUCLWGoAg2PmyseoTM0INFFVPcDCeDlT";
 
 /// The `User-Agent` OpenSubtitles requires (they reject generic agents).
 const USER_AGENT: &str = concat!("Ferrofin/", env!("CARGO_PKG_VERSION"));
+
+/// The download link's fetch, for its limiter and log lines.
+static LINK_FETCH: FetchKind = FetchKind::new(
+    "opensubtitles",
+    "subtitle",
+    "subtitle downloads",
+    "subtitle_private_http_allow (FERROFIN_SUBTITLE_PRIVATE_HTTP_ALLOW) lists it",
+    Some(USER_AGENT),
+);
 
 /// The dashboard-managed OpenSubtitles credentials (the plugin configuration).
 ///
@@ -462,6 +481,9 @@ fn three_to_two_letter(code: &str) -> &str {
 /// The OpenSubtitles-backed subtitle provider.
 pub struct OpenSubtitlesProvider {
     http: reqwest::Client,
+    /// The download link's client: refuses the private destinations the
+    /// server's `subtitle_private_http_allow` does not list.
+    link_http: GuardedHttp,
     limiter: RateLimiter,
     plugins: Arc<dyn PluginManager>,
     base_url: String,
@@ -477,16 +499,34 @@ impl std::fmt::Debug for OpenSubtitlesProvider {
 }
 
 impl OpenSubtitlesProvider {
-    /// Builds the provider, reading its credentials from the plugin config store.
+    /// Builds the provider, reading its credentials from the plugin config
+    /// store. Its download links may reach no private address until
+    /// [`with_link_destinations`](Self::with_link_destinations) lists some.
     #[must_use]
     pub fn new(plugins: Arc<dyn PluginManager>) -> Self {
         Self {
             http: reqwest::Client::new(),
+            link_http: Self::link_http(PrivateAllowList::default()),
             limiter: RateLimiter::new("opensubtitles"),
             plugins,
             base_url: API_BASE.to_owned(),
             state: tokio::sync::Mutex::new(DownloadState::default()),
         }
+    }
+
+    /// Lets the download links reach the private hosts and networks `allowed`
+    /// lists (`subtitle_private_http_allow`); every other private address
+    /// stays refused, on the link and on every redirect from it.
+    #[must_use]
+    pub fn with_link_destinations(mut self, allowed: PrivateAllowList) -> Self {
+        self.link_http = Self::link_http(allowed);
+        self
+    }
+
+    /// The download links' client under `allowed`, through the environment's
+    /// proxy if it configures one.
+    fn link_http(allowed: PrivateAllowList) -> GuardedHttp {
+        GuardedHttp::with_environment_proxy(Arc::new(allowed), &LINK_FETCH)
     }
 
     /// Overrides the REST endpoint for local integration tests.
@@ -625,7 +665,7 @@ impl OpenSubtitlesProvider {
             tracing::debug!(%status, "OpenSubtitles refused the quota read");
             return Ok(false);
         }
-        let body = response.counted_bytes().await.map_err(net_err)?;
+        let body = response.counted_bytes().await.map_err(body_err)?;
         let Ok(info) = serde_json::from_slice::<UserInfoResponse>(&body) else {
             tracing::debug!("OpenSubtitles sent an unreadable quota");
             return Ok(false);
@@ -782,8 +822,33 @@ fn request_err(error: RequestError) -> ServiceError {
     }
 }
 
+/// Why the download link gave no response. A refusal names the setting but
+/// not the host or its address, which the client has no use for: the log
+/// line of the refusal carries them for the admin.
+fn link_err(error: SendError) -> ServiceError {
+    match error {
+        SendError::Refused => ServiceError::backend(
+            "OpenSubtitles download link refused: it is at a private address, which subtitle \
+             downloads may not reach unless subtitle_private_http_allow lists it",
+        ),
+        SendError::Request(error) => request_err(error),
+        SendError::Failed(reason) => {
+            ServiceError::backend(format!("OpenSubtitles download link not fetched: {reason}"))
+        }
+    }
+}
+
 fn net_err(e: reqwest::Error) -> ServiceError {
     ProvidersError::http("OpenSubtitles request failed", e).into()
+}
+
+fn body_err(e: BodyError) -> ServiceError {
+    match e {
+        BodyError::Read(e) => net_err(e),
+        BodyError::TooLarge => {
+            ServiceError::backend("OpenSubtitles sent more than image_download_max_mb")
+        }
+    }
 }
 
 /// The plugin's `RateLimitExceededException`.
@@ -965,7 +1030,7 @@ impl SubtitleProvider for OpenSubtitlesProvider {
                 .await
                 .map_err(request_err)?;
             let status = response.status();
-            let body = response.counted_bytes().await.map_err(net_err)?;
+            let body = response.counted_bytes().await.map_err(body_err)?;
             let info: DownloadResponse = serde_json::from_slice(&body).unwrap_or_default();
             let mut state = self.state.lock().await;
             if let Some(reset) = info.reset_time {
@@ -1009,19 +1074,19 @@ impl SubtitleProvider for OpenSubtitlesProvider {
                 })?;
         };
 
-        // Fetch the subtitle bytes from the link.
+        // Fetch the subtitle bytes from the link, a destination OpenSubtitles
+        // chose: vetted on every hop (gl-1160).
         let content = self
-            .http
-            .get(&link)
-            .header(reqwest::header::USER_AGENT, USER_AGENT)
-            .send_limited(&crate::image_download::limiter_for(&link, "opensubtitles"))
+            .link_http
+            .send(&link)
             .await
-            .map_err(request_err)?
+            .map_err(link_err)?
+            .response
             .error_for_status()
             .map_err(net_err)?
             .counted_bytes()
             .await
-            .map_err(net_err)?;
+            .map_err(body_err)?;
 
         Ok(SubtitleResponse {
             language: parsed.language,
@@ -1294,13 +1359,16 @@ mod tests {
                             routes
                                 .iter_mut()
                                 .find(|(route, _)| path.contains(route))
-                                .map_or((404, "{}".to_owned()), |(_, replies)| {
-                                    if replies.len() > 1 {
-                                        replies.pop_front().unwrap()
-                                    } else {
-                                        replies.front().cloned().unwrap()
-                                    }
-                                })
+                                .map_or_else(
+                                    || (404, "{}".to_owned()),
+                                    |(_, replies)| {
+                                        if replies.len() > 1 {
+                                            replies.pop_front().unwrap()
+                                        } else {
+                                            replies.front().cloned().unwrap()
+                                        }
+                                    },
+                                )
                         };
                         let response = format!(
                             "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1363,7 +1431,8 @@ mod tests {
 
     const SRT: &str = "1\n00:00:01,000 --> 00:00:02,000\nhi\n";
 
-    /// A provider over `mock` with an account configured.
+    /// A provider over `mock` with an account configured, whose download
+    /// links may reach `127.0.0.1`, where the mocks serve them.
     fn account_provider(
         mock: &ApiMock,
         username: &str,
@@ -1371,8 +1440,9 @@ mod tests {
         let config = format!(r#"{{"Username":"{username}","Password":"secret"}}"#);
         let plugins =
             crate::plugin_config::tests_support::manager_with(PLUGIN_ID, config.into_bytes());
-        let provider =
-            OpenSubtitlesProvider::new(Arc::clone(&plugins)).with_base_url(&mock.base_url);
+        let provider = OpenSubtitlesProvider::new(Arc::clone(&plugins))
+            .with_base_url(&mock.base_url)
+            .with_link_destinations(PrivateAllowList::parse("127.0.0.1").0);
         (provider, plugins)
     }
 
@@ -1423,6 +1493,133 @@ mod tests {
         }
 
         assert_eq!(mock.count("POST /login"), 2);
+    }
+
+    /// gl-1160: the link OpenSubtitles answers with is a destination a third
+    /// party chose. With no `subtitle_private_http_allow`, a link at a
+    /// private address (loopback here) is refused and never fetched, even
+    /// while image downloads may reach loopback: the image allow-list does
+    /// not apply to subtitles.
+    #[tokio::test]
+    async fn a_link_to_a_private_address_is_refused_unfetched() {
+        crate::destination::test_support::allow_loopback_images();
+        let mock = ApiMock::start(|base| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(20, "2100-01-01T00:00:00Z")]),
+                ("/download", vec![download_reply(base, 19)]),
+                ("/file/", vec![(200, SRT.to_owned())]),
+            ]
+        })
+        .await;
+        let plugins = crate::plugin_config::tests_support::manager_with(
+            PLUGIN_ID,
+            br#"{"Username":"user","Password":"secret"}"#.to_vec(),
+        );
+        let provider = OpenSubtitlesProvider::new(plugins).with_base_url(&mock.base_url);
+
+        let error = provider
+            .get_subtitles("srt-en-1")
+            .await
+            .expect_err("a private link is refused");
+
+        assert!(
+            error.to_string().contains("subtitle_private_http_allow"),
+            "{error}"
+        );
+        assert_eq!(mock.count("POST /download"), 1);
+        assert_eq!(mock.count("GET /file/"), 0, "the link was never fetched");
+    }
+
+    /// A link at an address `subtitle_private_http_allow` lists is fetched,
+    /// with the `User-Agent` OpenSubtitles requires.
+    #[tokio::test]
+    async fn a_listed_link_is_fetched_with_the_user_agent() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let link = format!("http://{}/file/1.srt", listener.local_addr().unwrap());
+        let file = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            let n = socket.read(&mut bytes).await.unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{SRT}",
+                        SRT.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&bytes[..n]).to_ascii_lowercase()
+        });
+        let mock = ApiMock::start(move |_| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(20, "2100-01-01T00:00:00Z")]),
+                (
+                    "/download",
+                    vec![(200, format!(r#"{{"link":"{link}","remaining":19}}"#))],
+                ),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+
+        let response = provider.get_subtitles("srt-en-1").await.expect("download");
+
+        assert_eq!(response.content, SRT.as_bytes());
+        let request = file.await.unwrap();
+        assert!(
+            request.contains(&format!("user-agent: {}", USER_AGENT.to_ascii_lowercase())),
+            "{request}"
+        );
+    }
+
+    /// A link on a listed host that redirects to a private address the list
+    /// does not name is refused at the hop, and nothing reaches that address.
+    #[tokio::test]
+    async fn a_redirect_from_a_listed_link_to_a_private_address_is_refused() {
+        use crate::mock_http::MockServer;
+        let secret = MockServer::start_raw(vec![MockServer::raw_ok("", SRT.as_bytes())]).await;
+        let secret_port = secret.base_url.rsplit(':').next().unwrap().to_owned();
+        let hop = format!(
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{secret_port}/secret\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let source = MockServer::start_raw(vec![hop.into_bytes()]).await;
+        let source_port = source.base_url.rsplit(':').next().unwrap().to_owned();
+        let mock = ApiMock::start(move |_| {
+            vec![
+                ("/login", vec![login_reply(FUTURE_PAYLOAD)]),
+                ("/infos/user", vec![user_reply(20, "2100-01-01T00:00:00Z")]),
+                (
+                    "/download",
+                    vec![(
+                        200,
+                        format!(
+                            r#"{{"link":"http://localhost:{source_port}/file/1.srt","remaining":19}}"#
+                        ),
+                    )],
+                ),
+            ]
+        })
+        .await;
+        let (provider, _) = account_provider(&mock, "user");
+        let provider = provider.with_link_destinations(PrivateAllowList::parse("localhost").0);
+
+        let error = provider
+            .get_subtitles("srt-en-1")
+            .await
+            .expect_err("the hop is refused");
+
+        assert!(
+            error.to_string().contains("subtitle_private_http_allow"),
+            "{error}"
+        );
+        assert_eq!(source.requests(), 1, "the listed link was fetched");
+        assert_eq!(secret.requests(), 0, "the hop was never sent");
     }
 
     /// `HttpStatusCode.Unauthorized` on `/download`: the token is dropped and

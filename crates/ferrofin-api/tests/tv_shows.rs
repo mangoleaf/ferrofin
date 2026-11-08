@@ -215,7 +215,7 @@ impl AuthService for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -229,7 +229,7 @@ impl AuthorizationContext for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(user_entity(USER_ID, "alice")),
+            user: Some(Arc::new(user_entity(USER_ID, "alice"))),
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -392,6 +392,39 @@ struct StubLibrary {
     chain: bool,
     /// How many times `get_item_by_id` read the series.
     series_reads: std::sync::atomic::AtomicUsize,
+    /// How many full rows `get_item_list` handed out.
+    full_rows: std::sync::atomic::AtomicUsize,
+}
+
+/// The rows [`StubLibrary`] lists for `query`, whatever its columns.
+fn listing(query: &InternalItemsQuery) -> Vec<BaseItemEntity> {
+    use ferrofin_model::data::BaseItemKind;
+    if query.series_presentation_unique_key.as_deref() == Some("key-The Long Series") {
+        return long_season_rows();
+    }
+    let mut items = Vec::new();
+    if query.include_item_types.contains(&BaseItemKind::Season) {
+        items.extend([
+            season_entity(SEASON_ID, 1),
+            season_entity(Uuid::from_u128(0x02), 2),
+        ]);
+    }
+    if query.include_item_types.contains(&BaseItemKind::Episode) {
+        items.extend((1..=3).map(|index| {
+            let mut item = item_entity(
+                Uuid::from_u128(0xE0 + index),
+                &format!("Episode {index}"),
+                "Episode",
+            );
+            item.parent_index_number = Some(1);
+            item.index_number = Some(i64::try_from(index).unwrap());
+            item.season_id = Some(Uuid::nil().to_string());
+            item.parent_id = Some(SERIES_ID.to_string());
+            item.path = Some(format!("/media/episode{index}.mkv"));
+            item
+        }));
+    }
+    items
 }
 
 #[async_trait]
@@ -445,33 +478,22 @@ impl LibraryManager for StubLibrary {
         &self,
         query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        use ferrofin_model::data::BaseItemKind;
-        if query.series_presentation_unique_key.as_deref() == Some("key-The Long Series") {
-            return Ok(long_season_rows());
+        let mut items = listing(query);
+        if !query.item_ids.is_empty() {
+            items.extend(long_season_rows());
+            items.retain(|item| {
+                Uuid::parse_str(&item.id).is_ok_and(|id| query.item_ids.contains(&id))
+            });
         }
-        let mut items = Vec::new();
-        if query.include_item_types.contains(&BaseItemKind::Season) {
-            items.extend([
-                season_entity(SEASON_ID, 1),
-                season_entity(Uuid::from_u128(0x02), 2),
-            ]);
-        }
-        if query.include_item_types.contains(&BaseItemKind::Episode) {
-            items.extend((1..=3).map(|index| {
-                let mut item = item_entity(
-                    Uuid::from_u128(0xE0 + index),
-                    &format!("Episode {index}"),
-                    "Episode",
-                );
-                item.parent_index_number = Some(1);
-                item.index_number = Some(i64::try_from(index).unwrap());
-                item.season_id = Some(Uuid::nil().to_string());
-                item.parent_id = Some(SERIES_ID.to_string());
-                item.path = Some(format!("/media/episode{index}.mkv"));
-                item
-            }));
-        }
+        self.full_rows
+            .fetch_add(items.len(), std::sync::atomic::Ordering::SeqCst);
         Ok(items)
+    }
+    async fn get_episode_order_rows(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        Ok(listing(query))
     }
 
     async fn query_items(
@@ -480,8 +502,9 @@ impl LibraryManager for StubLibrary {
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
         unimplemented!()
     }
-    async fn get_item_ids(&self, _q: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!()
+    /// The `Random` order of the ids asked for: reversed.
+    async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(query.item_ids.iter().rev().copied().collect())
     }
     async fn get_latest_item_list(
         &self,
@@ -802,6 +825,49 @@ async fn episodes_paginate_with_start_and_limit() {
     assert_eq!(result.items[0].name.as_deref(), Some("Episode 2"));
 }
 
+/// The listing reads the series' rows narrowly and full rows for the page
+/// alone (gl-1259): a one-episode page of a five-row series reads one.
+#[tokio::test]
+async fn an_episode_page_reads_full_rows_for_the_page_alone() {
+    let library = Arc::new(StubLibrary::default());
+    let (status, body) = get_with(
+        state_with(Arc::clone(&library)),
+        &format!("/Shows/{SERIES_ID}/Episodes?seasonId={SEASON_ID}&startIndex=1&limit=1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("episodes");
+    assert_eq!(result.total_record_count, 3);
+    assert_eq!(result.start_index, 1);
+    let names: Vec<_> = result.items.iter().filter_map(|i| i.name.clone()).collect();
+    assert_eq!(names, ["Episode 2"]);
+    assert_eq!(
+        library.full_rows.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+/// `sortBy=Random` takes the repository's order of the listed episodes, then
+/// pages it and reads the page's rows in that order.
+#[tokio::test]
+async fn a_random_episode_page_follows_the_repository_order() {
+    let library = Arc::new(StubLibrary::default());
+    let (status, body) = get_with(
+        state_with(Arc::clone(&library)),
+        &format!("/Shows/{SERIES_ID}/Episodes?sortBy=Random&startIndex=0&limit=2"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("episodes");
+    assert_eq!(result.total_record_count, 3);
+    let names: Vec<_> = result.items.iter().filter_map(|i| i.name.clone()).collect();
+    assert_eq!(names, ["Episode 3", "Episode 2"]);
+    assert_eq!(
+        library.full_rows.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}
+
 #[tokio::test]
 async fn episodes_start_item_id_returns_the_tail_slice() {
     // The regression: lowercase Uuid::to_string() vs UPPERCASE stored ids
@@ -898,7 +964,7 @@ async fn similar_rows_always_carry_provider_ids() {
 async fn unknown_season_number_has_no_episodes_and_existing_number_resolves_its_season() {
     let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?season=99")).await;
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
-    assert!(result.items.is_empty());
+    assert!(result.items.is_empty(), "{:?}", result.items);
     let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?season=1")).await;
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
     assert_eq!(result.items.len(), 3);
@@ -917,7 +983,7 @@ async fn episode_adjacency_is_applied_after_start_filter_before_paging() {
     let absent = Uuid::new_v4();
     let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?adjacentTo={absent}")).await;
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
-    assert!(result.items.is_empty());
+    assert!(result.items.is_empty(), "{:?}", result.items);
 }
 
 #[tokio::test]

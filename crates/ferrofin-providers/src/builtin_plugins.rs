@@ -49,7 +49,7 @@
 //! | Studio Images | `RepositoryUrl` | the artwork repository (`StudiosImageProvider.cs:190`) |
 //!
 //! For `Server`, `RepositoryUrl` and the OMDb key, an operator who set the
-//! pre-existing server config (`FERROFIN_MUSICBRAINZ_BASE_URL`,
+//! pre-existing server config (`FERROFIN_MUSICBRAINZ_URL`,
 //! `FERROFIN_STUDIOS_REPO_URL`, `FERROFIN_OMDB_KEY`) still wins over the
 //! dashboard — an explicit env/file setting is the more specific instruction,
 //! and those knobs shipped before these plugins had an identity.

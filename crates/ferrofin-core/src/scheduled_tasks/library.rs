@@ -1,8 +1,9 @@
 //! The Library-category scheduled tasks.
 //!
-//! Faithful ports of the upstream library `IScheduledTask`s (names, keys,
-//! categories, descriptions and default triggers match the upstream classes and
-//! en-US localization strings):
+//! Faithful ports of the upstream library `IScheduledTask`s (keys, default
+//! triggers and the localization keys of their names, categories and
+//! descriptions match the upstream classes; the TMDb task keeps upstream's
+//! literals):
 //!
 //! - [`KeyframeExtractionTask`] — `KeyframeExtractionScheduledTask`
 //!   (`KeyframeExtraction`)
@@ -66,11 +67,13 @@ use super::{ScheduledTask, TaskProgress};
 /// 100-nanosecond ticks per second (the `TaskTriggerInfo` time unit).
 const TICKS_PER_SECOND: i64 = 10_000_000;
 
-/// The upstream Library category display string (`TasksLibraryCategory`).
-const LIBRARY: &str = "Library";
+/// The upstream Library category's localization key.
+pub(super) const LIBRARY: &str = "TasksLibraryCategory";
 
-/// Items examined per page (the upstream `QueryPageLimit`).
-const PAGE_SIZE: i32 = 100;
+/// Items examined per page (the upstream `QueryPageLimit`). The extensions'
+/// library walks (Intro Skipper's queue, Merge Versions) read their rows in
+/// pages of the same size.
+pub const PAGE_SIZE: i32 = 100;
 
 /// An interval trigger firing every `hours` hours.
 fn interval_hours(hours: i64) -> TaskTriggerInfo {
@@ -150,14 +153,16 @@ impl ScheduledTask for KeyframeExtractionTask {
         "KeyframeExtraction"
     }
     fn name(&self) -> &str {
-        "Keyframe Extractor"
+        "TaskKeyframeExtractor"
     }
     fn description(&self) -> &str {
-        "Extracts keyframes from video files to create more precise HLS playlists. This task \
-         may run for a long time."
+        "TaskKeyframeExtractorDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         // `KeyframeExtractionScheduledTask.cs:55-65`: every library video,
@@ -243,7 +248,10 @@ impl FfmpegRunner for TokioFfmpegRunner {
             .wait_with_output()
             .await
             .map_err(|e| ServiceError::backend(format!("failed to run {program}: {e}")))?;
-        Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+        // ffmpeg's log is UTF-8 unless a tag in it is not, so normally this keeps
+        // the buffer rather than copying it: a long file's `framelog` is megabytes.
+        Ok(String::from_utf8(output.stderr)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
     }
 }
 
@@ -347,7 +355,9 @@ impl AudioNormalizationTask {
         if lufs.is_none() {
             tracing::warn!("failed to find LUFS value in ffmpeg output");
         }
-        Ok(lufs)
+        // The reading is assigned to `BaseItem.LUFS`, whose setter runs
+        // `FiniteOrNull`: a `nan` or infinite one is no measurement.
+        Ok(ferrofin_util::finite::finite_or_none(lufs))
     }
 
     /// Stores a measured LUFS value on an item.
@@ -511,13 +521,16 @@ impl ScheduledTask for AudioNormalizationTask {
         "AudioNormalization"
     }
     fn name(&self) -> &str {
-        "Audio Normalization"
+        "TaskAudioNormalization"
     }
     fn description(&self) -> &str {
-        "Scans files for audio normalization data."
+        "TaskAudioNormalizationDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(24)]
@@ -581,17 +594,28 @@ impl ChapterImagesTask {
         }
     }
 
+    /// Reconciles one video's chapters and images, with its stored `streams`
+    /// as read for its page.
     async fn refresh_video(
         &self,
         video: &BaseItemEntity,
+        item_id: Uuid,
+        streams: &[ferrofin_db::entities::base_items::MediaStreamInfoEntity],
         extract: bool,
     ) -> Result<bool, ServiceError> {
-        let item_id = Uuid::parse_str(&video.id)
-            .map_err(|error| ServiceError::invalid_input(error.to_string()))?;
+        // Read just before the refresh, as upstream does: a scan may rewrite
+        // a video's chapters while the run works through the page, and the
+        // save and the prune below must not undo that.
         let mut chapters = self.chapters.get_chapters(item_id).await?;
         let outcome = self
             .extractor
-            .refresh(video, &mut chapters, extract, &crate::ScanCancel::default())
+            .refresh(
+                video,
+                &mut chapters,
+                Some(streams),
+                extract,
+                &crate::ScanCancel::default(),
+            )
             .await?;
         if outcome.changed {
             // ChapterManager.SaveChapters retains only markers inside runtime.
@@ -654,13 +678,16 @@ impl ScheduledTask for ChapterImagesTask {
         "RefreshChapterImages"
     }
     fn name(&self) -> &str {
-        "Extract Chapter Images"
+        "TaskRefreshChapterImages"
     }
     fn description(&self) -> &str {
-        "Creates thumbnails for videos that have chapters."
+        "TaskRefreshChapterImagesDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![TaskTriggerInfo {
@@ -733,10 +760,25 @@ impl ScheduledTask for ChapterImagesTask {
             if videos.is_empty() {
                 break;
             }
+            // The page's streams in one read rather than one per video
+            // (gl-1279); like the page's rows, they are not written back.
+            // The filter is the loop's skips below.
+            let ids: Vec<Uuid> = videos
+                .iter()
+                .filter(|video| video.path.as_deref().is_some_and(|path| !path.is_empty()))
+                .filter_map(|video| Uuid::parse_str(&video.id).ok())
+                .collect();
+            let streams = self.extractor.streams_batch(&ids).await?;
             for video in &videos {
                 progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
                 done += 1;
                 let Some(path) = video.path.as_deref().filter(|path| !path.is_empty()) else {
+                    continue;
+                };
+                // Neither Jellyfin nor Ferrofin writes a non-GUID id, so only a
+                // damaged row reaches this: skip it, or it fails every run.
+                let Ok(item_id) = Uuid::parse_str(&video.id) else {
+                    tracing::warn!(item_id = %video.id, path, "skipping a video whose id is not a GUID");
                     continue;
                 };
                 let modified =
@@ -746,7 +788,12 @@ impl ScheduledTask for ChapterImagesTask {
                 // errors: those fail the run and blocklist nothing. Only an
                 // attempted extraction can fail, so a key is never appended twice.
                 let success = self
-                    .refresh_video(video, !failed.contains(&history_key))
+                    .refresh_video(
+                        video,
+                        item_id,
+                        streams.get(&item_id).map_or(&[], Vec::as_slice),
+                        !failed.contains(&history_key),
+                    )
                     .await?;
                 if !success {
                     append_failure_history(&fail_history_path, &history_key)?;
@@ -805,9 +852,14 @@ const PERSON_TYPE: &str = "MediaBrowser.Controller.Entities.Person";
 ///
 /// 1. deduplicates `Peoples` rows sharing (name, type), re-pointing their item
 ///    links to one survivor, and removes people with no item links;
-/// 2. `PeopleValidator`: removes `Person` items whose people row is gone,
-///    and refreshes the new and never-refreshed ones (`isNew ||
-///    neverRefreshed`, `PeopleValidator.cs:76-80`) with the default options;
+/// 2. `PeopleValidator`: removes the unlocked `Person` items no credit calls
+///    for, creates one for each credit with none
+///    (`partition_credits_by_person_id` has the liveness rule), and refreshes
+///    the new and never-refreshed ones (`isNew || neverRefreshed`) with the
+///    default options. Upstream deletes last; here the deletion follows its
+///    read directly, so a scan starting during the refreshes cannot have
+///    credited a person the deletion still takes for dead, and the refresh
+///    walks every never-refreshed row, which would include the dead ones;
 /// 3. `RefreshPeopleImagesAsync`: refreshes the `Person` items missing a
 ///    primary image or overview that were not refreshed in the last 30 days,
 ///    fetching only what each lacks (a `FullRefresh` of the missing half,
@@ -816,22 +868,26 @@ pub struct PeopleValidationTask {
     db: Database,
     providers: Arc<dyn ProviderManager>,
     library: Arc<dyn LibraryManager>,
+    people: crate::people_repository::FerrofinPeopleRepository,
 }
 
 impl PeopleValidationTask {
-    /// Builds the task over the database and provider-manager seams, and the
+    /// Builds the task over the database and provider-manager seams, the
     /// library manager (the run is skipped, as upstream, while a library scan
-    /// runs).
+    /// runs) and the people repository, whose identity seam says which item
+    /// each credit calls for.
     #[must_use]
     pub fn new(
         db: Database,
         providers: Arc<dyn ProviderManager>,
         library: Arc<dyn LibraryManager>,
+        people: crate::people_repository::FerrofinPeopleRepository,
     ) -> Self {
         Self {
             db,
             providers,
             library,
+            people,
         }
     }
 
@@ -886,11 +942,30 @@ impl PeopleValidationTask {
         Ok(())
     }
 
-    /// Phase 2: drop `Person` items whose people row no longer exists.
+    /// Phase 2: drop the unlocked `Person` items no credit calls for and
+    /// create the ones credits lack, which the refresh below then picks up as
+    /// never refreshed.
     async fn validate_person_items(&self) -> Result<(), ServiceError> {
-        let removed =
-            crate::item_persistence_service::remove_orphaned_person_items(&self.db).await?;
-        tracing::info!(removed, "removed dead person items");
+        let partition = self.people.partition_person_items().await?;
+        for person in &partition.dead {
+            tracing::debug!(
+                item_id = %person.id,
+                name = person.name.as_deref().unwrap_or_default(),
+                "deleting dead person"
+            );
+        }
+        let dead: Vec<Uuid> = partition.dead.iter().map(|person| person.id).collect();
+        let removed = crate::item_persistence_service::remove_person_items(&self.db, &dead).await?;
+        let created = self
+            .people
+            .create_person_items(&partition.new_names)
+            .await?;
+        tracing::info!(
+            removed,
+            created,
+            locked = partition.locked,
+            "validated person items"
+        );
         Ok(())
     }
 
@@ -918,9 +993,14 @@ impl PeopleValidationTask {
 
     /// Refreshes the person items `ids` with the options `options_for`
     /// builds for each, reporting progress over `base..base + span`; returns
-    /// how many were refreshed. Stops at the first failure: a provider-manager
-    /// failure (no network, no image store) repeats identically for every
-    /// person, and the next scheduled run retries.
+    /// how many were refreshed. A person whose refresh fails is logged and
+    /// skipped, as upstream's per-person `catch` does. A refresh fails only
+    /// on a store or file step (a provider or network failure just leaves
+    /// the person unstamped), and such a failure can be one person's row;
+    /// both lists are in `Id` order, so stopping there would block everyone
+    /// after that person on every run. Upstream logs each failure as an
+    /// error; here the first of a pass is one and the rest go to debug, so
+    /// the log does not grow with the library (LOGGING.md).
     async fn refresh_people(
         &self,
         ids: &[String],
@@ -931,6 +1011,7 @@ impl PeopleValidationTask {
     ) -> usize {
         let total = ids.len().max(1);
         let mut refreshed = 0usize;
+        let mut failed = false;
         for (index, id) in ids.iter().enumerate() {
             if let Ok(item_id) = Uuid::parse_str(id) {
                 match self
@@ -939,9 +1020,12 @@ impl PeopleValidationTask {
                     .await
                 {
                     Ok(_) => refreshed += 1,
+                    Err(e) if failed => {
+                        tracing::debug!(%item_id, error = %e, "error refreshing person");
+                    }
                     Err(e) => {
-                        tracing::warn!(person = id, error = %e, "person refresh failed");
-                        break;
+                        failed = true;
+                        tracing::error!(%item_id, error = %e, "error refreshing person");
                     }
                 }
             }
@@ -1011,13 +1095,16 @@ impl ScheduledTask for PeopleValidationTask {
     }
 
     fn name(&self) -> &str {
-        "Refresh People"
+        "TaskRefreshPeople"
     }
     fn description(&self) -> &str {
-        "Updates metadata for actors and directors in your media library."
+        "TaskRefreshPeopleDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(7 * 24)]
@@ -1079,13 +1166,16 @@ impl ScheduledTask for SubtitleDownloadTask {
         "DownloadSubtitles"
     }
     fn name(&self) -> &str {
-        "Download missing subtitles"
+        "TaskDownloadMissingSubtitles"
     }
     fn description(&self) -> &str {
-        "Searches the internet for missing subtitles based on metadata configuration."
+        "TaskDownloadMissingSubtitlesDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(24)]
@@ -1184,13 +1274,16 @@ impl ScheduledTask for LyricDownloadTask {
         "DownloadLyrics"
     }
     fn name(&self) -> &str {
-        "Download missing lyrics"
+        "TaskDownloadMissingLyrics"
     }
     fn description(&self) -> &str {
-        "Downloads lyrics for songs"
+        "TaskDownloadMissingLyricsDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(24)]
@@ -1384,8 +1477,9 @@ impl ScheduledTask for TmdbUpcomingEpisodesTask {
     fn description(&self) -> &str {
         "Checks TheMovieDb for newly announced episodes and creates virtual entries for unaired and missing episodes, according to the TMDb plugin settings. When both options are disabled, removes any virtual entries previously created."
     }
+    // Upstream's literal, not `TasksLibraryCategory`: this task is not localized.
     fn category(&self) -> &str {
-        LIBRARY
+        "Library"
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         let days = self
@@ -1497,13 +1591,16 @@ impl ScheduledTask for TrickplayImagesTask {
         "RefreshTrickplayImages"
     }
     fn name(&self) -> &str {
-        "Generate Trickplay Images"
+        "TaskRefreshTrickplayImages"
     }
     fn description(&self) -> &str {
-        "Creates trickplay previews for videos in enabled libraries."
+        "TaskRefreshTrickplayImagesDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![TaskTriggerInfo {
@@ -1522,6 +1619,23 @@ impl ScheduledTask for TrickplayImagesTask {
             recursive: true,
             ..InternalItemsQuery::default()
         };
+        // After a settings change this run checks every video's images (a
+        // Ferrofin addition); it is recorded as done only when every item
+        // came through, so an interrupted or failing pass checks again.
+        let check = self
+            .trickplay
+            .begin_trickplay_pass()
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "cannot read the trickplay settings of the last pass; generating without checking");
+                None
+            });
+        if check.is_some() {
+            tracing::info!(
+                "trickplay settings changed: replacing every video's images that no longer match"
+            );
+        }
+        let mut complete = true;
         let total = self.library.get_count(&query).await?.max(0);
         let mut done = 0i32;
         let mut start_index = 0i32;
@@ -1546,17 +1660,36 @@ impl ScheduledTask for TrickplayImagesTask {
                 )
                 .and_then(|folder| folder.library_options.clone())
                 .unwrap_or_default();
-                if let Ok(item_id) = Uuid::parse_str(&item.id)
-                    && let Err(e) = self
-                        .trickplay
-                        .refresh_trickplay_data(item_id, false, &options)
-                        .await
-                {
-                    tracing::warn!(item = %item.id, error = %e, "trickplay generation failed");
+                if let Ok(item_id) = Uuid::parse_str(&item.id) {
+                    let refreshed = match &check {
+                        Some(check) => self
+                            .trickplay
+                            .check_trickplay_data(item_id, check, &options)
+                            .await
+                            .map(|matched| complete &= matched),
+                        None => {
+                            self.trickplay
+                                .refresh_trickplay_data(item_id, false, &options)
+                                .await
+                        }
+                    };
+                    if let Err(e) = refreshed {
+                        complete = false;
+                        tracing::warn!(item_id = %item.id, error = %e, "trickplay generation failed");
+                    }
                 }
                 progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
             }
             start_index += PAGE_SIZE;
+        }
+        if let Some(check) = check {
+            if complete {
+                self.trickplay.finish_trickplay_pass(&check).await?;
+            } else {
+                tracing::info!(
+                    "some trickplay images could not be replaced; the next run checks again"
+                );
+            }
         }
         progress.report(100.0);
         Ok(())
@@ -1606,13 +1739,16 @@ impl ScheduledTask for MediaSegmentExtractionTask {
         "TaskExtractMediaSegments"
     }
     fn name(&self) -> &str {
-        "Media Segment Scan"
+        "TaskExtractMediaSegments"
     }
     fn description(&self) -> &str {
-        "Extracts or obtains media segments from MediaSegment enabled plugins."
+        "TaskExtractMediaSegmentsDescription"
     }
     fn category(&self) -> &str {
         LIBRARY
+    }
+    fn is_localized(&self) -> bool {
+        true
     }
     fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
         vec![interval_hours(12)]
@@ -1737,6 +1873,25 @@ mod tests {
             .await
             .expect("sh runs");
         assert_eq!(stderr.trim().parse::<i32>().expect("a number"), expected);
+    }
+
+    /// ffmpeg's log is text, and a stray byte in it (a tag in a legacy encoding)
+    /// must not cost the summary after it.
+    #[tokio::test]
+    async fn stderr_with_a_stray_byte_is_still_read() {
+        let script = r"printf 'title: caf\351\n    I: -23.1 LUFS\n' >&2";
+        let stderr = super::TokioFfmpegRunner
+            .run_stderr("sh", &["-c".to_owned(), script.to_owned()])
+            .await
+            .expect("sh runs");
+        assert_eq!(stderr, "title: caf\u{fffd}\n    I: -23.1 LUFS\n");
+        assert_eq!(parse_lufs(&stderr), Some(-23.1));
+
+        let clean = super::TokioFfmpegRunner
+            .run_stderr("sh", &["-c".to_owned(), "printf 'ok' >&2".to_owned()])
+            .await
+            .expect("sh runs");
+        assert_eq!(clean, "ok");
     }
 
     // -- pure helpers -------------------------------------------------------
@@ -1893,8 +2048,25 @@ mod tests {
         }
     }
 
-    /// A [`MediaStreamRepository`] fake serving canned stream rows.
-    struct FakeStreams(Vec<MediaStreamInfoEntity>);
+    /// A [`MediaStreamRepository`] fake serving canned stream rows, recording
+    /// how they are read.
+    struct FakeStreams {
+        rows: Vec<MediaStreamInfoEntity>,
+        /// How many single-item reads were made.
+        single_reads: std::sync::atomic::AtomicUsize,
+        /// The ids of each batch read.
+        batches: Mutex<Vec<Vec<Uuid>>>,
+    }
+
+    impl FakeStreams {
+        fn new(rows: Vec<MediaStreamInfoEntity>) -> Self {
+            Self {
+                rows,
+                single_reads: std::sync::atomic::AtomicUsize::new(0),
+                batches: Mutex::new(Vec::new()),
+            }
+        }
+    }
 
     #[async_trait]
     impl MediaStreamRepository for FakeStreams {
@@ -1902,8 +2074,10 @@ mod tests {
             &self,
             filter: &MediaStreamQuery,
         ) -> Result<Vec<MediaStreamInfoEntity>, ServiceError> {
+            self.single_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self
-                .0
+                .rows
                 .iter()
                 .filter(|s| {
                     filter
@@ -1912,6 +2086,15 @@ mod tests {
                 })
                 .cloned()
                 .collect())
+        }
+        /// Every canned row for each id.
+        async fn get_media_streams_batch(
+            &self,
+            item_ids: &[Uuid],
+        ) -> Result<std::collections::HashMap<Uuid, Vec<MediaStreamInfoEntity>>, ServiceError>
+        {
+            self.batches.lock().expect("lock").push(item_ids.to_vec());
+            Ok(item_ids.iter().map(|id| (*id, self.rows.clone())).collect())
         }
         async fn get_media_stream_languages(
             &self,
@@ -2059,6 +2242,15 @@ mod tests {
         /// `(item, library option "extraction enabled")` per refresh call.
         refreshed: Mutex<Vec<(Uuid, bool)>>,
         after_refresh: Option<(Arc<dyn VirtualFolderManager>, String, LibraryOptions)>,
+        /// What `begin_trickplay_pass` returns, unless it fails.
+        check: Option<ferrofin_traits::trickplay::TrickplayCheck>,
+        begin_fails: bool,
+        /// The item a checking pass cannot bring to match, and whether its
+        /// check fails outright instead.
+        unmatched: Option<(Uuid, bool)>,
+        /// Items checked, then passes finished.
+        checked: Mutex<Vec<Uuid>>,
+        finished: Mutex<Vec<ferrofin_traits::trickplay::TrickplayCheck>>,
     }
 
     #[async_trait]
@@ -2076,6 +2268,36 @@ mod tests {
             if let Some((folders, name, options)) = &self.after_refresh {
                 folders.update_library_options(name, options).await?;
             }
+            Ok(())
+        }
+        async fn begin_trickplay_pass(
+            &self,
+        ) -> Result<Option<ferrofin_traits::trickplay::TrickplayCheck>, ServiceError> {
+            if self.begin_fails {
+                return Err(ServiceError::backend("FerrofinMeta is locked"));
+            }
+            Ok(self.check.clone())
+        }
+        async fn check_trickplay_data(
+            &self,
+            item_id: Uuid,
+            _check: &ferrofin_traits::trickplay::TrickplayCheck,
+            _library_options: &LibraryOptions,
+        ) -> Result<bool, ServiceError> {
+            self.checked.lock().expect("lock").push(item_id);
+            match self.unmatched {
+                Some((unmatched, true)) if unmatched == item_id => {
+                    Err(ServiceError::backend("check failed"))
+                }
+                Some((unmatched, false)) => Ok(unmatched != item_id),
+                _ => Ok(true),
+            }
+        }
+        async fn finish_trickplay_pass(
+            &self,
+            check: &ferrofin_traits::trickplay::TrickplayCheck,
+        ) -> Result<(), ServiceError> {
+            self.finished.lock().expect("lock").push(check.clone());
             Ok(())
         }
         async fn get_trickplay_resolutions(
@@ -2102,21 +2324,6 @@ mod tests {
             unimplemented!("fake")
         }
         async fn delete_trickplay_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
-            unimplemented!("fake")
-        }
-        async fn get_trickplay_manifest(
-            &self,
-            _item_id: Uuid,
-        ) -> Result<
-            std::collections::HashMap<
-                String,
-                std::collections::HashMap<
-                    i32,
-                    ferrofin_db::entities::playback::TrickplayInfoEntity,
-                >,
-            >,
-            ServiceError,
-        > {
             unimplemented!("fake")
         }
         async fn get_hls_playlist(
@@ -2463,6 +2670,46 @@ mod tests {
         let calls = runner.calls.lock().expect("lock");
         assert_eq!(calls.len(), 3);
         assert!(calls[0].iter().any(|a| a == "concat"));
+    }
+
+    /// The measured value is assigned to `BaseItem.LUFS`, whose setter runs
+    /// `FiniteOrNull`: a `nan` or infinite reading is no measurement, so
+    /// nothing is stored and the next run measures again.
+    #[tokio::test]
+    async fn a_non_finite_lufs_reading_is_no_measurement() {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        for (reading, expected) in [
+            ("nan", None),
+            ("-inf", None),
+            ("inf", None),
+            ("-21.5", Some(-21.5)),
+        ] {
+            let task = AudioNormalizationTask::new(
+                db.clone(),
+                library_manager_over(db.clone()),
+                Arc::new(FakeFolders(Vec::new())),
+                Arc::new(FakeEncoder {
+                    fail_extract: false,
+                }),
+                Arc::new(FakeRunner {
+                    stderr: format!("    I:         {reading} LUFS\n"),
+                    calls: Mutex::new(Vec::new()),
+                }),
+                Arc::new(crate::FerrofinServerApplicationPaths::new(
+                    media.path().join("data"),
+                    media.path().join("logs"),
+                    media.path().join("config"),
+                    media.path().join("cache"),
+                    media.path().join("web"),
+                )),
+            );
+            let measured = task
+                .measure(vec!["-i".to_owned(), "t.flac".to_owned()])
+                .await
+                .expect("measure");
+            assert_eq!(measured, expected, "{reading}");
+        }
     }
 
     #[tokio::test]
@@ -2846,7 +3093,7 @@ mod tests {
 
         // A German audio track satisfies "ger" via skip-if-audio-matches;
         // "eng" has nothing and must be searched + downloaded.
-        let streams = FakeStreams(vec![MediaStreamInfoEntity {
+        let streams = FakeStreams::new(vec![MediaStreamInfoEntity {
             item_id: movie.to_string(),
             stream_index: 0,
             stream_type: media_stream_type_disc(StreamTypeEnum::Audio),
@@ -2911,7 +3158,7 @@ mod tests {
             )),
             Arc::new(crate::subtitle_downloader::SubtitleDownloader::new(
                 &(subtitles.clone() as Arc<dyn SubtitleManager>),
-                Arc::new(FakeStreams(Vec::new())),
+                Arc::new(FakeStreams::new(Vec::new())),
             )),
         );
         task.execute(&TaskProgress::default()).await.expect("run");
@@ -2966,8 +3213,9 @@ mod tests {
 
     // -- Generate Trickplay Images -------------------------------------------
 
+    #[rstest::rstest]
     #[tokio::test]
-    async fn trickplay_task_refreshes_every_video() {
+    async fn trickplay_task_refreshes_every_video(#[values(false, true)] begin_fails: bool) {
         let db = test_db().await;
         let library = library_manager_over(db.clone());
         let (v1, v2) = (Uuid::from_u128(0x71), Uuid::from_u128(0x72));
@@ -2981,7 +3229,11 @@ mod tests {
         set_path(&db, v1, "/media/movies/a.mkv").await;
         set_path(&db, v2, "/elsewhere/b.mkv").await;
 
-        let trickplay = Arc::new(FakeTrickplay::default());
+        // A pass whose settings cannot be read still generates, unchecked.
+        let trickplay = Arc::new(FakeTrickplay {
+            begin_fails,
+            ..FakeTrickplay::default()
+        });
         let task = TrickplayImagesTask::new(
             library,
             Arc::new(folder_with(
@@ -3004,6 +3256,55 @@ mod tests {
         let mut refreshed = trickplay.refreshed.lock().expect("lock").clone();
         refreshed.sort();
         assert_eq!(refreshed, vec![(v1, true), (v2, false)]);
+        assert!(trickplay.checked.lock().expect("lock").is_empty());
+        assert!(trickplay.finished.lock().expect("lock").is_empty());
+    }
+
+    /// After a settings change every video is checked, and the pass is
+    /// recorded only when every one of them came through.
+    #[rstest::rstest]
+    #[case::all_match(None, 1)]
+    #[case::one_unfinished(Some((Uuid::from_u128(0x72), false)), 0)]
+    #[case::one_failing(Some((Uuid::from_u128(0x71), true)), 0)]
+    #[tokio::test]
+    async fn a_checking_pass_is_recorded_only_when_every_video_matches(
+        #[case] unmatched: Option<(Uuid, bool)>,
+        #[case] recorded: usize,
+    ) {
+        let db = test_db().await;
+        let (v1, v2) = (Uuid::from_u128(0x71), Uuid::from_u128(0x72));
+        for (v, path) in [(v1, "/media/movies/a.mkv"), (v2, "/media/movies/b.mkv")] {
+            seed_item(&db, v, BaseItemKind::Movie).await;
+            set_media_type(&db, v, "Video").await;
+            set_path(&db, v, path).await;
+        }
+        let trickplay = Arc::new(FakeTrickplay {
+            check: Some(ferrofin_traits::trickplay::TrickplayCheck {
+                previous_widths: vec![320],
+                settings: "new".to_owned(),
+            }),
+            unmatched,
+            ..FakeTrickplay::default()
+        });
+        let task = TrickplayImagesTask::new(
+            library_manager_over(db.clone()),
+            Arc::new(folder_with(
+                LibraryOptions {
+                    enable_trickplay_image_extraction: true,
+                    ..LibraryOptions::default()
+                },
+                None,
+                "/media/movies",
+            )),
+            trickplay.clone(),
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        let mut checked = trickplay.checked.lock().expect("lock").clone();
+        checked.sort();
+        assert_eq!(checked, vec![v1, v2]);
+        assert!(trickplay.refreshed.lock().expect("lock").is_empty());
+        assert_eq!(trickplay.finished.lock().expect("lock").len(), recorded);
     }
 
     async fn trickplay_nested_libraries(
@@ -3257,12 +3558,9 @@ mod tests {
         let task = MediaSegmentExtractionTask::new(library, segments.clone());
 
         assert_eq!(task.key(), "TaskExtractMediaSegments");
-        assert_eq!(task.name(), "Media Segment Scan");
-        assert_eq!(task.category(), "Library");
-        assert_eq!(
-            task.description(),
-            "Extracts or obtains media segments from MediaSegment enabled plugins."
-        );
+        assert_eq!(task.name(), "TaskExtractMediaSegments");
+        assert_eq!(task.category(), "TasksLibraryCategory");
+        assert_eq!(task.description(), "TaskExtractMediaSegmentsDescription");
         let triggers = task.default_triggers();
         assert_eq!(triggers.len(), 1);
         assert_eq!(triggers[0].type_, TaskTriggerInfoType::IntervalTrigger);
@@ -3382,11 +3680,7 @@ mod tests {
         .await;
 
         let providers = Arc::new(RecordingProviders::default());
-        let task = PeopleValidationTask::new(
-            db.clone(),
-            providers.clone(),
-            crate::test_support::library_manager_over(db.clone()),
-        );
+        let task = unwired_people_task(&db, providers.clone());
         assert_eq!(task.key(), "RefreshPeople");
         task.execute(&TaskProgress::default()).await.expect("run");
 
@@ -3457,6 +3751,7 @@ mod tests {
             db.clone(),
             providers.clone(),
             crate::test_support::library_manager_mid_scan(db.clone()).await,
+            crate::people_repository::FerrofinPeopleRepository::new(db.clone()),
         );
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("skip is Ok");
@@ -3492,11 +3787,7 @@ mod tests {
         )
         .await;
         let providers = Arc::new(RecordingProviders::default());
-        let task = PeopleValidationTask::new(
-            db.clone(),
-            providers.clone(),
-            crate::test_support::library_manager_over(db.clone()),
-        );
+        let task = unwired_people_task(&db, providers.clone());
         task.refresh_new_person_items(&TaskProgress::default(), 0.0, 1.0)
             .await
             .expect("new people");
@@ -3514,10 +3805,288 @@ mod tests {
         assert_eq!(refreshed[0].1.image_refresh_mode, FullRefresh);
     }
 
-    /// A [`ProviderManager`] fake recording `refresh_single_item` calls.
+    /// `PeopleValidator.Run` and `RefreshPersonAsync` log a person's failed
+    /// refresh and go on to the next, so the people sorted after a failing
+    /// one (here the two lowest ids, first in both passes) still refresh.
+    /// Only a pass's first failure is an error, so the log does not grow
+    /// with the library.
+    #[tokio::test]
+    async fn a_failing_person_does_not_stop_the_people_after_it() {
+        let db = test_db().await;
+        let people = [0xE1, 0xE2, 0xE3].map(Uuid::from_u128);
+        for (id, name) in people.iter().zip(["Ann", "Bob", "Cy"]) {
+            seed_named_item(&db, *id, BaseItemKind::Person, name).await;
+        }
+        let providers = Arc::new(RecordingProviders {
+            failing: people[..2].to_vec(),
+            ..RecordingProviders::default()
+        });
+        let task = unwired_people_task(&db, providers.clone());
+        let logs = crate::test_support::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .finish(),
+        );
+
+        task.refresh_new_person_items(&TaskProgress::default(), 0.0, 1.0)
+            .await
+            .expect("new people");
+        task.refresh_person_items(&TaskProgress::default(), 0.0, 1.0)
+            .await
+            .expect("image pass");
+
+        let refreshed: Vec<Uuid> = providers
+            .refreshed
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            refreshed,
+            [people, people].concat(),
+            "both passes reach every person"
+        );
+        let text = logs.text();
+        let failures = |level: &str| {
+            text.lines()
+                .filter(|line| line.contains(level) && line.contains("error refreshing person"))
+                .count()
+        };
+        assert_eq!((failures(" ERROR "), failures(" DEBUG ")), (2, 2), "{text}");
+    }
+
+    /// The task over a people repository with no identity seam: a credit
+    /// derives no id, so only names say which items it calls for.
+    fn unwired_people_task(
+        db: &Database,
+        providers: Arc<RecordingProviders>,
+    ) -> PeopleValidationTask {
+        PeopleValidationTask::new(
+            db.clone(),
+            providers,
+            crate::test_support::library_manager_over(db.clone()),
+            crate::people_repository::FerrofinPeopleRepository::new(db.clone()),
+        )
+    }
+
+    /// A Refresh People run over a wired identity seam, the production shape.
+    struct PeopleRun {
+        db: Database,
+        providers: Arc<RecordingProviders>,
+        task: PeopleValidationTask,
+        people_root: tempfile::TempDir,
+    }
+
+    impl PeopleRun {
+        async fn new() -> Self {
+            let db = test_db().await;
+            let people_root = tempfile::tempdir().expect("people root");
+            let people = crate::people_repository::FerrofinPeopleRepository::new(db.clone())
+                .with_identity(Self::mode(), Self::root(&people_root));
+            let providers = Arc::new(RecordingProviders::default());
+            let task = PeopleValidationTask::new(
+                db.clone(),
+                providers.clone(),
+                crate::test_support::library_manager_over(db.clone()),
+                people,
+            );
+            Self {
+                db,
+                providers,
+                task,
+                people_root,
+            }
+        }
+
+        fn mode() -> crate::item_type_lookup::IdDerivation {
+            crate::item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: None,
+            }
+        }
+
+        fn root(people_root: &tempfile::TempDir) -> String {
+            people_root.path().to_string_lossy().into_owned()
+        }
+
+        /// The id `name`'s credit calls for.
+        fn id_of(&self, name: &str) -> Uuid {
+            crate::item_type_lookup::person_item_id(
+                &Self::mode(),
+                &Self::root(&self.people_root),
+                name,
+            )
+            .expect("person id")
+        }
+
+        /// A movie crediting `names`, none of them with an item.
+        async fn credit(&self, movie: u128, names: &[&str]) {
+            let item = Uuid::from_u128(movie);
+            seed_item(&self.db, item, BaseItemKind::Movie).await;
+            for (offset, name) in (1u128..).zip(names) {
+                let credit = Uuid::from_u128(movie + offset);
+                crate::people_repository::seed_credit(&self.db, item, credit, name).await;
+            }
+        }
+
+        async fn run(&self) {
+            self.task
+                .execute(&TaskProgress::default())
+                .await
+                .expect("run");
+        }
+
+        /// The names of the stored `Person` rows, sorted.
+        async fn names(&self) -> Vec<String> {
+            crate::people_repository::person_names(&self.db).await
+        }
+
+        fn refreshed(&self) -> Vec<Uuid> {
+            let refreshed = self.providers.refreshed.lock().expect("lock");
+            refreshed.iter().map(|(id, _)| *id).collect()
+        }
+
+        /// As a refresh that finds everything leaves `id`.
+        async fn mark_refreshed(&self, id: Uuid) {
+            crate::item_persistence_service::seed_refreshed_overview(
+                &self.db,
+                id,
+                &datetime_to_db(Utc::now()),
+                "Bio.",
+            )
+            .await;
+        }
+    }
+
+    /// `PeopleValidator.Run`: "A person somebody locked is theirs, not ours,
+    /// however little the library still credits them." The unlocked orphan
+    /// beside it still goes.
+    #[tokio::test]
+    async fn refresh_people_keeps_a_locked_person_nothing_credits() {
+        let run = PeopleRun::new().await;
+        let (locked, orphan) = (Uuid::from_u128(0xD1), Uuid::from_u128(0xD2));
+        seed_named_item(&run.db, locked, BaseItemKind::Person, "Locked Lena").await;
+        seed_named_item(&run.db, orphan, BaseItemKind::Person, "Orphan Otto").await;
+        crate::people_repository::lock_item(&run.db, locked).await;
+
+        run.run().await;
+
+        assert_eq!(run.names().await, ["Locked Lena"]);
+    }
+
+    /// The credit still says `AURORA`; a provider renamed the item it made.
+    /// The item is the credit's by id, so nothing is deleted or created. The
+    /// name-keyed sweep deleted it, and the next people write made it again.
+    #[tokio::test]
+    async fn refresh_people_keeps_a_person_renamed_away_from_their_credit() {
+        let run = PeopleRun::new().await;
+        run.credit(0xE0, &["AURORA"]).await;
+        let id = run.id_of("AURORA");
+        seed_named_item(&run.db, id, BaseItemKind::Person, "Aurora Aksnes").await;
+        run.mark_refreshed(id).await;
+
+        run.run().await;
+
+        assert_eq!(run.names().await, ["Aurora Aksnes"]);
+    }
+
+    /// `GetOrCreatePerson` for a credit with no item: the row the people write
+    /// makes, its folder, and one first refresh with the default options. The
+    /// next run has nothing to do, so a refreshed person costs no more
+    /// requests.
+    #[tokio::test]
+    async fn refresh_people_creates_an_item_for_a_credit_with_none() {
+        use ferrofin_traits::providers::MetadataRefreshMode::Default as DefaultMode;
+        let run = PeopleRun::new().await;
+        run.credit(0xF0, &["Wanted Person"]).await;
+        let id = run.id_of("Wanted Person");
+
+        run.run().await;
+
+        assert_eq!(run.names().await, ["Wanted Person"]);
+        let row = crate::test_support::item_repository_over(run.db.clone())
+            .retrieve_item(id)
+            .await
+            .expect("read")
+            .expect("the credit's item exists");
+        assert_eq!(row.clean_name.as_deref(), Some("wanted person"));
+        assert_eq!(row.sort_name.as_deref(), Some("Wanted Person"));
+        assert_eq!(
+            row.presentation_unique_key.as_deref(),
+            Some("Person-Wanted Person")
+        );
+        let path = row.path.expect("the row has its metadata path");
+        assert!(Path::new(&path).is_dir(), "{path} is created");
+        let first = run.providers.refreshed.lock().expect("lock")[0].clone();
+        assert_eq!(first.0, id);
+        assert_eq!(first.1.metadata_refresh_mode, DefaultMode);
+
+        run.mark_refreshed(id).await;
+        crate::item_persistence_service::seed_primary_image(
+            &run.db,
+            Uuid::from_u128(0xF9),
+            id,
+            "/p.jpg",
+        )
+        .await;
+        run.providers.refreshed.lock().expect("lock").clear();
+        run.run().await;
+        assert_eq!(run.names().await, ["Wanted Person"]);
+        assert_eq!(
+            run.refreshed(),
+            Vec::<Uuid>::new(),
+            "a refreshed person costs nothing more"
+        );
+    }
+
+    /// Spellings sharing a clean name are one person on one row: it survives
+    /// the loss of the spelling it carries, as the credit left still resolves
+    /// to it, and no second item appears. The name-keyed sweep deleted it.
+    #[tokio::test]
+    async fn refresh_people_keeps_the_item_a_second_spelling_resolves_to() {
+        let run = PeopleRun::new().await;
+        run.credit(0xA10, &["H Jon Benjamin"]).await;
+        let first = run.id_of("H. Jon Benjamin");
+        seed_named_item(&run.db, first, BaseItemKind::Person, "H. Jon Benjamin").await;
+        crate::test_support::set_clean_name(&run.db, first, "H. Jon Benjamin").await;
+        run.mark_refreshed(first).await;
+
+        run.run().await;
+
+        assert_eq!(run.names().await, ["H. Jon Benjamin"]);
+    }
+
+    /// An item whose id is not the derived one, as in a database whose metadata
+    /// moved: its exact-name credit keeps it, and no second item is made for
+    /// the credit, which would refresh every person of such a library.
+    #[tokio::test]
+    async fn refresh_people_keeps_a_credited_name_under_another_id() {
+        let run = PeopleRun::new().await;
+        run.credit(0xA20, &["Moved Mary"]).await;
+        let moved = Uuid::from_u128(0xA2F);
+        seed_named_item(&run.db, moved, BaseItemKind::Person, "Moved Mary").await;
+        run.mark_refreshed(moved).await;
+
+        run.run().await;
+
+        assert_eq!(run.names().await, ["Moved Mary"]);
+        assert_ne!(moved, run.id_of("Moved Mary"));
+        assert_eq!(
+            run.refreshed(),
+            Vec::<Uuid>::new(),
+            "nothing new to refresh"
+        );
+    }
+
+    /// A [`ProviderManager`] fake recording `refresh_single_item` calls; the
+    /// refresh of an item in `failing` errors, as a store write would.
     #[derive(Default)]
     struct RecordingProviders {
         refreshed: Mutex<Vec<(Uuid, MetadataRefreshOptions)>>,
+        failing: Vec<Uuid>,
     }
 
     #[async_trait]
@@ -3546,6 +4115,9 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .push((item_id, options.clone()));
+            if self.failing.contains(&item_id) {
+                return Err(ServiceError::backend("disk I/O error"));
+            }
             Ok(ferrofin_traits::providers::ItemUpdateType::default())
         }
         async fn save_image_from_url(
@@ -3655,7 +4227,8 @@ mod tests {
         );
         let task = KeyframeExtractionTask::with_extractors(library, vec![Arc::new(probe)]);
         assert_eq!(task.key(), "KeyframeExtraction");
-        assert!(task.default_triggers().is_empty());
+        let default_triggers = task.default_triggers();
+        assert!(default_triggers.is_empty(), "{default_triggers:?}");
         task.execute(&TaskProgress::default()).await.expect("run");
 
         assert_eq!(*log.lock().expect("log"), ["probe:fresh.mkv"]);
@@ -3664,13 +4237,8 @@ mod tests {
         assert_eq!(kept[0].total_duration, 42);
         assert_eq!(kept[0].keyframe_ticks.as_deref(), Some("[1,2,3]"));
         // The failed probe stored nothing for the new item.
-        assert!(
-            keyframes
-                .get_keyframe_data(fresh)
-                .await
-                .expect("read")
-                .is_empty()
-        );
+        let keyframe_data = keyframes.get_keyframe_data(fresh).await.expect("read");
+        assert!(keyframe_data.is_empty(), "{keyframe_data:?}");
     }
 
     /// A keyframe extractor that logs `name:file` for each call and answers
@@ -3841,6 +4409,22 @@ mod tests {
         Arc<FakeChapters>,
         ChapterImagesTask,
     ) {
+        let (media, movie, chapters, _streams, task) =
+            chapter_task_parts(fail_extract, files).await;
+        (media, movie, chapters, task)
+    }
+
+    /// [`chapter_task_fixture_for`], with the streams fake the task reads.
+    async fn chapter_task_parts(
+        fail_extract: bool,
+        files: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        Uuid,
+        Arc<FakeChapters>,
+        Arc<FakeStreams>,
+        ChapterImagesTask,
+    ) {
         let db = test_db().await;
         let media = tempfile::tempdir().expect("tempdir");
         let library: Arc<dyn LibraryManager> =
@@ -3868,13 +4452,13 @@ mod tests {
             reads: std::sync::atomic::AtomicUsize::new(0),
             stalled: tokio::sync::Notify::new(),
         });
-        let streams = FakeStreams(vec![MediaStreamInfoEntity {
+        let streams = Arc::new(FakeStreams::new(vec![MediaStreamInfoEntity {
             item_id: movie.to_string(),
             stream_index: 0,
             stream_type: media_stream_type_disc(StreamTypeEnum::Video),
             codec: Some("h264".to_owned()),
             ..MediaStreamInfoEntity::default()
-        }]);
+        }]));
         let app_paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
             media.path().join("data"),
             media.path().join("logs"),
@@ -3894,7 +4478,7 @@ mod tests {
         ));
         let extractor = Arc::new(crate::chapter_image_extractor::ChapterImageExtractor::new(
             Arc::clone(&folders),
-            Arc::new(streams),
+            Arc::clone(&streams) as Arc<dyn MediaStreamRepository>,
             Arc::new(FakeEncoder { fail_extract }),
             path_manager,
         ));
@@ -3905,22 +4489,55 @@ mod tests {
             extractor,
             app_paths,
         );
-        (media, movie, chapters, task)
+        (media, movie, chapters, streams, task)
     }
 
     #[tokio::test]
     async fn chapter_images_page_past_the_first_page() {
         let files: Vec<String> = (0..past_one_page()).map(|n| format!("{n}.mkv")).collect();
         let names: Vec<&str> = files.iter().map(String::as_str).collect();
-        let (media, _movie, chapters, task) = chapter_task_fixture_for(false, &names).await;
+        let (media, _movie, chapters, streams, task) = chapter_task_parts(false, &names).await;
         task.execute(&TaskProgress::default()).await.expect("run");
 
         let reads = chapters.reads.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(reads, files.len(), "every video was reconciled");
+        // Each page's streams in one read (gl-1279), none per video.
+        let batches: Vec<usize> = streams
+            .batches
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(Vec::len)
+            .collect();
+        let page = usize::try_from(PAGE_SIZE).expect("page size");
+        assert_eq!(batches, [page, files.len() - page]);
+        assert_eq!(
+            streams
+                .single_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
         drop(media);
     }
 
     #[tokio::test]
+    async fn chapter_task_skips_a_video_whose_id_is_not_a_guid() {
+        let (media, movie, chapters, task) = chapter_task_fixture(false).await;
+        let mut damaged = task.library.get_item_by_id(movie).await.unwrap().unwrap();
+        damaged.id = "not-a-guid".to_owned();
+        task.library.create_items(&[damaged], None).await.unwrap();
+
+        task.execute(&TaskProgress::default())
+            .await
+            .expect("one damaged row does not fail the run");
+        let reads = chapters.reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reads, 1, "the valid video was still reconciled");
+        drop(media);
+    }
+
+    // A multi-thread runtime, so the extractor's file work runs through
+    // `block_in_place`.
+    #[tokio::test(flavor = "multi_thread")]
     async fn chapter_images_are_extracted_and_stored() {
         let (media, _movie, chapters, task) = chapter_task_fixture(false).await;
         assert_eq!(task.key(), "RefreshChapterImages");

@@ -36,10 +36,12 @@
 //! - `ServerId` is the server's system id: the user manager sets it on every
 //!   `UserDto` it builds, and the authentication result takes it from the
 //!   session.
+//! - A refused login answers as upstream's `ExceptionMiddleware` does, with no
+//!   reason in the body ([`login_failure`]).
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -48,19 +50,21 @@ use ferrofin_model::configuration::UserConfiguration;
 use ferrofin_model::dto::UserDto;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::AuthenticationResult;
-use ferrofin_model::users::{
-    ForgotPasswordAction, ForgotPasswordResult, PinRedeemResult, UserPolicy,
-};
+use ferrofin_model::users::{ForgotPasswordResult, PinRedeemResult, UserPolicy};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData};
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth, RequireAuthIgnoringSchedule};
+use crate::auth::{
+    AuthenticatedIdentity, RequireAdmin, RequireAuth, RequireAuthIgnoringSchedule,
+    is_administrator_identity,
+};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, ProblemDetails, Query};
+use crate::extract::{JsonBody, ProblemDetails, Query, RequiredString};
 use crate::handlers::items::user_uuid;
+use crate::panic_boundary::ERROR_BODY;
 use crate::state::AppState;
 
 /// The `AuthenticateByName` request body.
@@ -119,148 +123,32 @@ struct UpdateUserPassword {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ForgotPasswordDto {
-    /// The username whose password should be reset.
+    /// The username whose password should be reset (upstream's
+    /// `[Required] public required string`).
     #[serde(default)]
-    entered_username: String,
+    entered_username: RequiredString,
 }
 
 /// The `POST /Users/ForgotPassword/Pin` request body.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ForgotPasswordPinDto {
-    /// The entered pin.
+    /// The entered pin (upstream's `[Required] public required string`).
     #[serde(default)]
-    pin: String,
+    pin: RequiredString,
 }
 
-/// Filename prefix for a pending password-reset record under the data dir
-/// (`passwordreset-<userId>.json`). Port of C#
-/// `DefaultPasswordResetProvider._passwordResetFileBase`.
-const PASSWORD_RESET_PREFIX: &str = "passwordreset";
-
-/// How long an issued forgot-password pin stays valid. Port of C#
-/// `DefaultPasswordResetProvider` (30 minutes).
-const PIN_TTL_MINUTES: i64 = 30;
-
-/// The on-disk record of an in-progress forgot-password reset.
-///
-/// Port of C# `DefaultPasswordResetProvider.SerializablePasswordReset`, written
-/// to the program-data directory when a pin is issued and consumed by
-/// the `/Pin` redemption.
-#[derive(Debug, serde::Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct SerializablePasswordReset {
-    /// When the pin expires.
-    expiration_date: chrono::DateTime<chrono::Utc>,
-    /// The issued pin (dash-grouped uppercase hex, e.g. `1A-2B-3C-4D`).
-    pin: String,
-    /// The absolute path of this record (echoed to the client as `PinFile`).
-    pin_file: String,
-    /// The username this reset belongs to.
-    user_name: String,
-}
-
-/// Generates a fresh reset pin from 4 random bytes, formatted like C#'s
-/// `BitConverter.ToString` (`1A-2B-3C-4D`).
-///
-/// ponytail: seeds from a v4 UUID's random bytes instead of pulling in a
-/// dedicated RNG crate — 32 bits of entropy over a 30-minute window is ample for
-/// a single-use, admin-visible reset pin.
-fn generate_reset_pin() -> String {
-    let b = Uuid::new_v4().into_bytes();
-    format!("{:02X}-{:02X}-{:02X}-{:02X}", b[0], b[1], b[2], b[3])
-}
-
-/// Comparison ignores grouping dashes, but preserves case (C# Ordinal).
-fn normalize_pin(pin: &str) -> String {
-    pin.replace('-', "")
-}
-
-/// Every username receives the same response shape. Only a known local user
-/// gets a recovery file; the path uses the entered name's invariant-uppercase
-/// UTF-16 MD5, matching Jellyfin's built-in provider.
-fn issue_reset_pin(
-    data_dir: &std::path::Path,
-    entered_username: &str,
-    user_name: Option<&str>,
-) -> Result<ForgotPasswordResult, ServiceError> {
-    let expiration = chrono::Utc::now() + chrono::Duration::minutes(PIN_TTL_MINUTES);
-    let hash = ferrofin_common::extensions::get_md5(
-        &ferrofin_util::string_extensions::upper_invariant(entered_username),
-    );
-    let path = data_dir.join(format!("{PASSWORD_RESET_PREFIX}{}.json", hash.simple()));
-    let pin_file = path.to_string_lossy().into_owned();
-    if let Some(user_name) = user_name {
-        let record = SerializablePasswordReset {
-            expiration_date: expiration,
-            pin: generate_reset_pin(),
-            pin_file: pin_file.clone(),
-            user_name: user_name.to_owned(),
-        };
-        std::fs::create_dir_all(data_dir)
-            .map_err(|e| ServiceError::backend(format!("create reset directory: {e}")))?;
-        let bytes = serde_json::to_vec(&record)
-            .map_err(|e| ServiceError::backend(format!("serialize reset record: {e}")))?;
-        ferrofin_util::file_helper::atomic_write(&path, &bytes)
-            .map_err(|e| ServiceError::backend(format!("write reset record: {e}")))?;
-    }
-    Ok(ForgotPasswordResult {
-        action: ForgotPasswordAction::PinCode,
-        pin_file: Some(pin_file),
-        pin_expiration_date: Some(expiration),
-    })
-}
-
-/// Find matches and purge expired records. Matching files remain until their
-/// password update succeeds, so a failed update does not consume recovery.
-fn redeem_reset_pins(
-    data_dir: &std::path::Path,
-    entered_pin: &str,
-) -> Result<Vec<(String, std::path::PathBuf)>, ServiceError> {
-    let entered = normalize_pin(entered_pin);
-    let mut matches = Vec::new();
-    let entries = match std::fs::read_dir(data_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(matches),
-        Err(e) => return Err(ServiceError::backend(format!("read reset directory: {e}"))),
-    };
-    for entry in entries {
-        let path = entry
-            .map_err(|e| ServiceError::backend(format!("read reset entry: {e}")))?
-            .path();
-        if !path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(PASSWORD_RESET_PREFIX))
-            || !path.is_file()
-        {
-            continue;
-        }
-        let bytes = std::fs::read(&path)
-            .map_err(|e| ServiceError::backend(format!("read reset record: {e}")))?;
-        let record = serde_json::from_slice::<Option<SerializablePasswordReset>>(&bytes)
-            .map_err(|e| ServiceError::backend(format!("parse reset record: {e}")))?
-            .ok_or_else(|| ServiceError::not_found("invalid reset record"))?;
-        if record.expiration_date < chrono::Utc::now() {
-            std::fs::remove_file(&path)
-                .map_err(|e| ServiceError::backend(format!("remove expired reset: {e}")))?;
-        } else if normalize_pin(&record.pin) == entered {
-            matches.push((record.user_name, path));
-        }
-    }
-    Ok(matches)
-}
-
-/// Query parameters carrying an optional `userId` (the update/password routes).
+/// Query parameters carrying an optional `userId` (the update, password and
+/// user-image write routes).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UserIdQuery {
+pub(crate) struct UserIdQuery {
     /// The target user; defaults to the authenticated caller when absent.
     #[serde(
         default,
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
-    user_id: Option<Uuid>,
+    pub(crate) user_id: Option<Uuid>,
 }
 
 /// Query parameters for `GET /Users` (hidden/disabled filters).
@@ -340,10 +228,15 @@ pub(crate) async fn assert_can_update_user(
 }
 
 /// Writes a dashboard activity-log entry (best-effort — the feed must never
-/// fail the request that produced it). Names/types mirror upstream's
-/// `Jellyfin.Server.Implementations.Events.Consumers` loggers.
+/// fail the request that produced it, so a failure is logged instead, as
+/// upstream's `EventManager` logs a failed consumer). Names/types mirror
+/// upstream's `Jellyfin.Server.Implementations.Events.Consumers` loggers.
 async fn log_activity(state: &AppState, entry: ferrofin_traits::activity::ActivityLogCreate) {
-    let _ = state.activity.create_entry(entry).await;
+    let activity_type = entry.type_.clone();
+    if let Err(error) = state.activity.create_entry(entry).await {
+        // Warn, not error: its volume follows the request rate.
+        tracing::warn!(%error, activity_type, "could not write the activity entry");
+    }
 }
 
 /// `POST /Users/AuthenticateByName` — authenticate by username + password.
@@ -364,7 +257,7 @@ async fn authenticate_by_name(
     State(state): State<AppState>,
     parts: Parts,
     JsonBody(body): JsonBody<AuthenticateByNameRequest>,
-) -> Result<Json<AuthenticationResult>, ApiError> {
+) -> Result<Response, ApiError> {
     Box::pin(authenticate(&state, &parts, body)).await
 }
 
@@ -389,7 +282,7 @@ async fn authenticate_by_id(
     Path(user_id): Path<Uuid>,
     Query(query): Query<AuthenticateByIdQuery>,
     parts: Parts,
-) -> Result<Json<AuthenticationResult>, ApiError> {
+) -> Result<Response, ApiError> {
     // `GetUserById(Guid.Empty)` throws `ArgumentException`: a `400`.
     if user_id.is_nil() {
         return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
@@ -404,12 +297,35 @@ async fn authenticate_by_id(
     Box::pin(authenticate(&state, &parts, body)).await
 }
 
+/// Answers a failed login: a `401` or `403` as upstream's `ExceptionMiddleware`
+/// answers an `AuthenticationException` or a `SecurityException` outside
+/// Development, with the status, `text/plain` and [`ERROR_BODY`].
+///
+/// The reason stays out of the body, which would otherwise tell a caller which
+/// usernames exist and name a disabled account. jellyfin-web and the Kotlin SDK
+/// read only the status: `401` is bad credentials, `403` an account that may
+/// not sign in. The core logs each refused login with its `reason`, at `warn`,
+/// or at `debug` for an attempt its login backoff refused; the debug line here
+/// adds the text, and is the only record of Quick Connect being off.
+///
+/// Every other failure is the caller's to answer as before, so a login's `400`
+/// or `500` keeps the shared [`ApiError`] body.
+fn login_failure(error: ServiceError) -> Result<Response, ApiError> {
+    let error = ApiError::from(error);
+    let status = error.status();
+    if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
+        return Err(error);
+    }
+    tracing::debug!(%status, %error, "login refused");
+    Ok((status, [(header::CONTENT_TYPE, "text/plain")], ERROR_BODY).into_response())
+}
+
 /// `UserController.AuthenticateUserByName`'s body, shared by both login routes.
 async fn authenticate(
     state: &AppState,
     parts: &Parts,
     body: AuthenticateByNameRequest,
-) -> Result<Json<AuthenticationResult>, ApiError> {
+) -> Result<Response, ApiError> {
     let auth = auth_info(parts);
     // C# `UserController.AuthenticateUserByName` sets
     // `RemoteEndPoint = HttpContext.GetNormalizedRemoteIP().ToString()`. It ends
@@ -446,7 +362,7 @@ async fn authenticate(
                 },
             )
             .await;
-            return Err(e.into());
+            return login_failure(e);
         }
     };
     // The `AuthenticationSucceeded` entry is NOT written here: C# raises it from
@@ -455,7 +371,7 @@ async fn authenticate(
     // handler instead put it before the (spawned) SessionStarted row and showed
     // the dashboard's login pair backwards. The consumer lives beside the
     // SessionStarted one in the composition root.
-    Ok(Json(authentication_result(state, result).await))
+    Ok(Json(authentication_result(state, result).await).into_response())
 }
 
 /// `POST /Users/AuthenticateWithQuickConnect` — finish a Quick Connect login.
@@ -482,10 +398,14 @@ async fn authenticate_with_quick_connect(
                 .into_response(),
         );
     };
-    let result = state
+    let result = match state
         .quick_connect
         .get_authorized_request(secret.expose())
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => return login_failure(e),
+    };
     Ok(Json(authentication_result(&state, result).await).into_response())
 }
 
@@ -529,7 +449,8 @@ async fn authentication_result(
 /// `GET /Users` — list users, optionally filtered by hidden/disabled.
 ///
 /// Port of `UserController.GetUsers`: applies the hidden/disabled filters, sorts
-/// by username, and projects each to a [`UserDto`].
+/// by username, and projects each to a [`UserDto`]. [`strip_other_accounts`] goes
+/// beyond upstream.
 #[utoipa::path(
     get,
     path = "/Users",
@@ -542,10 +463,11 @@ async fn authentication_result(
 )]
 async fn get_users(
     State(state): State<AppState>,
-    RequireAuth(_auth): RequireAuth,
+    RequireAuth(auth): RequireAuth,
     Query(query): Query<GetUsersQuery>,
 ) -> Result<Json<Vec<UserDto>>, ApiError> {
-    let dtos = filtered_user_dtos(&state, query.is_hidden, query.is_disabled, None).await?;
+    let mut dtos = filtered_user_dtos(&state, query.is_hidden, query.is_disabled, None).await?;
+    strip_other_accounts(&state, Some(&auth), &mut dtos).await?;
     Ok(Json(dtos))
 }
 
@@ -555,6 +477,8 @@ async fn get_users(
 /// are returned in both wizard states. After setup, remote callers only see
 /// accounts that allow remote access, using the shared live network policy.
 /// Authenticated callers also filter by their device after setup.
+/// [`strip_other_accounts`] goes beyond upstream. It runs after the filters that
+/// read `Policy`, and a login screen, signed out, sees neither field on any row.
 #[utoipa::path(
     get,
     path = "/Users/Public",
@@ -585,7 +509,36 @@ async fn get_public_users(
                 .is_some_and(|policy| policy.enable_remote_access)
         });
     }
+    strip_other_accounts(&state, auth.as_ref(), &mut dtos).await?;
     Ok(Json(dtos))
+}
+
+/// Clears `Policy` and `Configuration` from the rows of accounts `caller` may not
+/// read them for: every row but the caller's own, unless the caller is an
+/// administrator or an API key. A signed-out caller (`None`, `/Users/Public` on a
+/// login screen) has no own row.
+///
+/// An owner decision that goes beyond Jellyfin, which strips nothing (gl-1102).
+/// Both fields are nullable in the contract, and a cleared one is left out of the
+/// JSON, as Jellyfin writes any null.
+async fn strip_other_accounts(
+    state: &AppState,
+    caller: Option<&AuthorizationInfo>,
+    dtos: &mut [UserDto],
+) -> Result<(), ApiError> {
+    if let Some(auth) = caller
+        && is_administrator_identity(state, auth).await?
+    {
+        return Ok(());
+    }
+    let own_id = caller
+        .map(AuthorizationInfo::user_id)
+        .filter(|id| !id.is_nil());
+    for dto in dtos.iter_mut().filter(|dto| Some(dto.id) != own_id) {
+        dto.policy = None;
+        dto.configuration = None;
+    }
+    Ok(())
 }
 
 /// Lists users matching the optional hidden/disabled filters, ordered by name and
@@ -597,7 +550,7 @@ async fn filtered_user_dtos(
     device_id: Option<&str>,
 ) -> Result<Vec<UserDto>, ApiError> {
     let mut users = state.users.get_users().await?;
-    users.sort_by(|a, b| a.username.cmp(&b.username));
+    sort_by_username(&mut users);
 
     let mut dtos = Vec::with_capacity(users.len());
     for user in &users {
@@ -623,10 +576,22 @@ async fn filtered_user_dtos(
     Ok(dtos)
 }
 
+/// Upstream's `OrderBy(u => u.Username)`, which compares by the current culture.
+fn sort_by_username(users: &mut [UserEntity]) {
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture()).ok();
+    users.sort_by(|a, b| {
+        comparer.as_ref().map_or_else(
+            || a.username.cmp(&b.username),
+            |comparer| comparer.compare(&a.username, &b.username),
+        )
+    });
+}
+
 /// `GET /Users/{userId}` — a single user by id.
 ///
 /// Port of `UserController.GetUserById`: a nil id is a `400`, a missing user
-/// a `404`.
+/// a `404`. [`strip_other_accounts`] goes beyond upstream.
 #[utoipa::path(
     get,
     path = "/Users/{userId}",
@@ -640,11 +605,13 @@ async fn filtered_user_dtos(
 )]
 async fn get_user_by_id(
     State(state): State<AppState>,
-    RequireAuthIgnoringSchedule(_auth): RequireAuthIgnoringSchedule,
+    RequireAuthIgnoringSchedule(auth): RequireAuthIgnoringSchedule,
     Path(user_id): Path<Uuid>,
 ) -> Result<Json<UserDto>, ApiError> {
     let user = load_user(&state, user_id).await?;
-    Ok(Json(state.users.get_user_dto(&user, None).await?))
+    let mut dto = state.users.get_user_dto(&user, None).await?;
+    strip_other_accounts(&state, Some(&auth), std::slice::from_mut(&mut dto)).await?;
+    Ok(Json(dto))
 }
 
 /// `DELETE /Users/{userId}` — delete a user.
@@ -709,30 +676,6 @@ async fn delete_user(
     }
     state.playlists.remove_playlists(user_id).await?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Pushes a `UserUpdated` message carrying the refreshed [`UserDto`] to the
-/// user's sessions (port of `UserUpdatedNotifier`, the consumer of the
-/// `UserUpdatedEventArgs` that only `UserManager.RenameUser` and
-/// `UpdatePolicyAsync` publish: a rename and a policy save). Best-effort: a
-/// delivery failure must not fail the mutating request.
-async fn notify_user_updated(state: &AppState, user_id: Uuid) {
-    let Ok(user) = load_user(state, user_id).await else {
-        return;
-    };
-    let Ok(dto) = state.users.get_user_dto(&user, None).await else {
-        return;
-    };
-    if let Ok(data) = serde_json::to_string(&dto) {
-        let _ = state
-            .sessions
-            .send_message_to_user_sessions(
-                &[user_id],
-                ferrofin_model::session::SessionMessageType::UserUpdated,
-                &data,
-            )
-            .await;
-    }
 }
 
 /// `POST /Users/New` — create a user.
@@ -810,17 +753,14 @@ async fn update_user(
     // C# renames whenever `updateUser.Name` differs from the stored name, so a
     // missing or null name reaches `RenameUser` too, and its
     // `ThrowIfInvalidUsername` refuses it (400) as it refuses a blank one.
+    // The user manager announces the rename (`UserUpdated`, then the device
+    // check) before it returns, so ahead of the configuration save.
     let new_name = body.name.as_deref().unwrap_or_default();
     if new_name != user.username {
         state
             .users
             .rename_user(user_id, &user.username, new_name)
             .await?;
-        // `RenameUser` publishes `UserUpdated` before it raises
-        // `OnUserUpdated` for the device check, ahead of the configuration
-        // save.
-        notify_user_updated(&state, user_id).await;
-        refresh_device_access(&state, user_id).await;
     }
     // A body without `Configuration` binds `UserDto`'s constructor default, so
     // the save resets the user's settings as upstream's does; `null` (a 500
@@ -831,66 +771,16 @@ async fn update_user(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Port of `DeviceAccessHost.OnUserUpdated`, registered since Jellyfin 12.1:
-/// `UserManager.RenameUser` and `UpdatePolicyAsync` raise `OnUserUpdated`, and
-/// the host then logs out every device of the user that the saved policy no
-/// longer allows ([`update_device_access`]). A configuration save raises no
-/// such event.
-///
-/// The change it follows is already saved, so a failure is logged and not
-/// answered, as upstream's handler catches and logs it.
-async fn refresh_device_access(state: &AppState, user_id: Uuid) {
-    let refreshed = async {
-        let user = load_user(state, user_id).await?;
-        update_device_access(state, &user).await
-    }
-    .await;
-    if let Err(error) = refreshed {
-        tracing::error!(user_id = %user_id, %error, "error updating device access for user");
-    }
-}
-
-/// `DeviceAccessHost.UpdateDeviceAccess`: unless the user may use every device
-/// (`EnableAllDevices`), logs out (`Logout(Device)`) each of their devices
-/// `CanAccessDevice` refuses.
-async fn update_device_access(state: &AppState, user: &UserEntity) -> Result<(), ApiError> {
-    if user_policy(state, user)
-        .await?
-        .is_some_and(|p| p.enable_all_devices)
-    {
-        return Ok(());
-    }
-    let devices = state
-        .devices
-        .get_devices(&ferrofin_traits::devices::DeviceQuery {
-            user_id: Some(user_uuid(user)?),
-            ..Default::default()
-        })
-        .await?
-        .items;
-    // Empty IDs are explicitly skipped by upstream's event handler.
-    for device in &devices {
-        if !device.device_id.is_empty()
-            && !state
-                .devices
-                .can_access_device(user, &device.device_id)
-                .await?
-        {
-            state.sessions.logout_device(device).await?;
-        }
-    }
-    Ok(())
-}
-
 /// `POST /Users/{userId}/Policy` — update a user's policy.
 ///
 /// Port of `UserController.UpdateUserPolicy`, including the guards: the last
 /// administrator may not be demoted, an administrator may not be disabled, and
 /// the last enabled user may not be disabled. The guards are read inside the
 /// save's transaction ([`UserManager::update_policy_guarded`]), so concurrent
-/// saves cannot both pass one. On a successful disable, the user's tokens are
-/// revoked, and after every save the devices the saved policy no longer allows
-/// are logged out (Jellyfin 12.1's `DeviceAccessHost`).
+/// saves cannot both pass one. The save itself announces `UserUpdated`, which
+/// pushes the user's DTO to their sessions and logs out the devices the saved
+/// policy no longer allows (Jellyfin 12.1's `DeviceAccessHost`). On a
+/// successful disable, the user's tokens are revoked after that.
 ///
 /// [`UserManager::update_policy_guarded`]: ferrofin_traits::library::UserManager::update_policy_guarded
 #[utoipa::path(
@@ -920,7 +810,9 @@ async fn update_user_policy(
     // The guards run inside the save's transaction (`update_policy_guarded`),
     // so the tokens of a user it disabled go once it committed. Upstream
     // revokes first, which is the same once its guards have passed; here a
-    // refused or failed save logs nobody out.
+    // refused or failed save logs nobody out. The save's `UserUpdated` push
+    // and device check have run by then, so a newly disabled user's open
+    // sessions hear `UserUpdated` just before they are signed out.
     let saved = state
         .users
         .update_policy_guarded(user_id, &new_policy)
@@ -928,10 +820,6 @@ async fn update_user_policy(
     if saved.newly_disabled {
         state.sessions.revoke_user_tokens(user_id, "").await?;
     }
-    // `UpdatePolicyAsync` publishes `UserUpdated` before it raises
-    // `OnUserUpdated` for the device check.
-    notify_user_updated(&state, user_id).await;
-    refresh_device_access(&state, user_id).await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -1079,77 +967,88 @@ async fn log_password_changed(state: &AppState, user_id: Uuid, username: &str) {
     .await;
 }
 
-/// `POST /Users/ForgotPassword` — begin built-in password recovery.
-/// Known users on the local network get a PIN file in ProgramDataPath. All
-/// callers receive PinCode and the computed path, without disclosing account
-/// existence. Unknown reset-provider IDs fall back to this built-in provider,
-/// which is the only currently registered choice, matching Jellyfin.
+/// `POST /Users/ForgotPassword` — begin password recovery.
+///
+/// Port of `UserController.ForgotPassword`: the user manager hands the request
+/// to the account's saved password-reset provider
+/// (`UserManager.StartForgotPasswordProcess`), the built-in PIN file for most.
+/// Every caller gets the same answer, whether the name exists or not.
+///
+/// A missing or blank `EnteredUsername` is a `400` before anything else runs.
+/// The request is local when its connection was accepted on the client's own
+/// address (`HttpContext.IsLocal()`) or the client is on the local network.
+/// A request from elsewhere is logged at warn with the client's address.
 #[utoipa::path(
     post,
     path = "/Users/ForgotPassword",
-    responses((status = 200, description = "Forgot-password process started", body = ForgotPasswordResult)),
+    responses(
+        (status = 200, description = "Forgot-password process started", body = ForgotPasswordResult),
+        (status = 400, description = "A missing or blank EnteredUsername")
+    ),
     tag = "ferrofin"
 )]
 async fn forgot_password(
     State(state): State<AppState>,
     parts: Parts,
     JsonBody(body): JsonBody<ForgotPasswordDto>,
-) -> Result<Json<ForgotPasswordResult>, ApiError> {
-    let _guard = state.password_reset_lock.lock().await;
-    let user = if body.entered_username.trim().is_empty() {
-        None
-    } else {
-        state.users.get_user_by_name(&body.entered_username).await?
+) -> Result<Response, ApiError> {
+    let entered_username = match body.entered_username.require(
+        "Jellyfin.Api.Models.UserDtos.ForgotPasswordDto",
+        "EnteredUsername",
+    ) {
+        Ok(name) => name,
+        Err(problem) => return Ok(problem.into_response()),
     };
-    let local = state.is_in_local_network(state.client_address(&parts));
-    let username = user
-        .as_ref()
-        .filter(|_| local)
-        .map(|user| user.username.as_str());
-    let dir = std::path::PathBuf::from(state.config.application_paths().program_data_path());
-    Ok(Json(issue_reset_pin(
-        &dir,
-        &body.entered_username,
-        username,
-    )?))
+    let ip = state.client_address(&parts);
+    let local = crate::ip_access::is_local_connection(&parts.extensions, ip)
+        || state.is_in_local_network(ip);
+    if !local {
+        // One line per remote request with no volume guard, as upstream's, and
+        // as the IP gate logs each request it refuses.
+        tracing::warn!(
+            remote_ip = %ip,
+            "password reset process initiated from outside the local network"
+        );
+    }
+    Ok(Json(
+        state
+            .users
+            .start_forgot_password_process(&entered_username, local)
+            .await?,
+    )
+    .into_response())
 }
 
-/// `POST /Users/ForgotPassword/Pin` — redeem a case-sensitive recovery PIN.
-/// Dashes are ignored for comparison. The password becomes the exact entered
-/// PIN, and the file is consumed only after a successful password update.
+/// `POST /Users/ForgotPassword/Pin` — redeem a recovery PIN.
+///
+/// Port of `UserController.ForgotPasswordPin`: each password-reset provider is
+/// offered the PIN in turn (`UserManager.RedeemPasswordResetPin`). With the
+/// built-in provider the PIN is case-sensitive with its dashes ignored, the
+/// password becomes the PIN as entered, and the file is consumed only once the
+/// password is saved. No provider redeeming it is a `404`, and a missing or
+/// blank `Pin` is a `400` before any provider is asked.
 #[utoipa::path(
     post,
     path = "/Users/ForgotPassword/Pin",
-    responses((status = 200, description = "Pin redemption result", body = PinRedeemResult)),
+    responses(
+        (status = 200, description = "Pin redemption result", body = PinRedeemResult),
+        (status = 400, description = "A missing or blank Pin"),
+        (status = 404, description = "No provider redeemed the PIN")
+    ),
     tag = "ferrofin"
 )]
 async fn forgot_password_pin(
     State(state): State<AppState>,
     JsonBody(body): JsonBody<ForgotPasswordPinDto>,
-) -> Result<Json<PinRedeemResult>, ApiError> {
-    let _guard = state.password_reset_lock.lock().await;
-    let dir = std::path::PathBuf::from(state.config.application_paths().program_data_path());
-    let mut users_reset = Vec::new();
-    for (user_name, path) in redeem_reset_pins(&dir, &body.pin)? {
-        let user = state
-            .users
-            .get_user_by_name(&user_name)
-            .await?
-            .ok_or_else(|| ServiceError::not_found("user for recovery record"))?;
-        let user_id = user_uuid(&user)?;
-        state.users.change_password(user_id, &body.pin).await?;
-        log_password_changed(&state, user_id, &user.username).await;
-        users_reset.push(user.username);
-        std::fs::remove_file(path)
-            .map_err(|e| ServiceError::backend(format!("remove consumed reset: {e}")))?;
-    }
-    if users_reset.is_empty() {
-        return Err(ServiceError::not_found("no matching password reset request").into());
-    }
-    Ok(Json(PinRedeemResult {
-        success: true,
-        users_reset,
-    }))
+) -> Result<Response, ApiError> {
+    let pin = match body
+        .pin
+        .require("Jellyfin.Api.Models.UserDtos.ForgotPasswordPinDto", "Pin")
+    {
+        Ok(pin) => pin,
+        Err(problem) => return Ok(problem.into_response()),
+    };
+    Ok(Json(state.users.redeem_password_reset_pin(&pin).await?).into_response())
 }
 
 /// `GET /Users/Me` — the authenticated caller's user record.
@@ -1276,101 +1175,60 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 }
 
 crate::query::query_parameters! {
-    UserIdQuery {} => [("post", "/Users"), ("post", "/Users/Configuration"), ("post", "/Users/Password")];
+    UserIdQuery {} => [("post", "/Users"), ("post", "/Users/Configuration"), ("post", "/Users/Password"), ("post", "/UserImage"), ("delete", "/UserImage")];
     GetUsersQuery {} => [("get", "/Users")];
     AuthenticateByIdQuery {} => [];
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PASSWORD_RESET_PREFIX, SerializablePasswordReset, generate_reset_pin, issue_reset_pin,
-        normalize_pin, redeem_reset_pins,
-    };
+    use super::{ApiError, ERROR_BODY, ServiceError, StatusCode, header, login_failure};
 
-    #[test]
-    fn reset_pin_format_and_normalization() {
-        let pin = generate_reset_pin();
-        // `XX-XX-XX-XX`: 8 hex digits in four dash-separated pairs.
-        let parts: Vec<&str> = pin.split('-').collect();
-        assert_eq!(parts.len(), 4);
-        assert!(
-            parts
-                .iter()
-                .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
-        );
-        assert_eq!(normalize_pin("1a-2b"), "1a2b");
-        assert_ne!(normalize_pin("AA-BB"), normalize_pin("aa-bb"));
-    }
-
-    #[test]
-    fn issue_then_redeem_round_trips() {
-        let dir = tempfile::tempdir().unwrap();
-        let result = issue_reset_pin(dir.path(), "aLiCe", Some("alice")).unwrap();
-        assert_eq!(result.action, super::ForgotPasswordAction::PinCode);
-        assert!(result.pin_expiration_date.is_some());
-        let file = std::path::PathBuf::from(result.pin_file.unwrap());
-        let expected = dir.path().join(format!(
-            "{PASSWORD_RESET_PREFIX}{}.json",
-            ferrofin_common::extensions::get_md5("ALICE").simple()
-        ));
-        assert_eq!(file, expected);
-        let record: SerializablePasswordReset =
-            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        assert!(redeem_reset_pins(dir.path(), "wrong").unwrap().is_empty());
-        assert!(redeem_reset_pins(dir.path(), "").unwrap().is_empty());
+    /// `ExceptionMiddleware`'s answer, whatever the failure says. The server's
+    /// `login_failures` test drives the real refusals; a remote-access one needs
+    /// a client outside the local network, so its error is pinned here.
+    #[rstest::rstest]
+    #[case::bad_credentials(
+        ServiceError::unauthorized("Invalid username or password entered."),
+        StatusCode::UNAUTHORIZED
+    )]
+    #[case::remote_access(
+        ServiceError::Forbidden("remote access is not permitted for this user".to_owned()),
+        StatusCode::FORBIDDEN
+    )]
+    #[tokio::test]
+    async fn login_failure_answers_the_status_and_the_plain_body(
+        #[case] error: ServiceError,
+        #[case] status: StatusCode,
+    ) {
+        let response = login_failure(error).expect("a refusal is answered here");
+        assert_eq!(response.status(), status);
         assert_eq!(
-            redeem_reset_pins(dir.path(), &record.pin.replace('-', "")).unwrap(),
-            vec![("alice".to_owned(), file.clone())]
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain"
         );
-        assert!(
-            file.exists(),
-            "only the handler consumes a successfully applied reset"
-        );
-        let absent = issue_reset_pin(dir.path(), "unknown", None).unwrap();
-        assert_eq!(absent.action, super::ForgotPasswordAction::PinCode);
-        assert!(!std::path::Path::new(&absent.pin_file.unwrap()).exists());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(body, ERROR_BODY);
     }
 
-    #[test]
-    fn expired_record_is_deleted_and_never_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        let record = SerializablePasswordReset {
-            expiration_date: chrono::Utc::now() - chrono::Duration::minutes(1),
-            pin: "AA-BB-CC-DD".to_owned(),
-            pin_file: String::new(),
-            user_name: "bob".to_owned(),
-        };
-        let file = dir
-            .path()
-            .join(format!("{PASSWORD_RESET_PREFIX}user-2.json"));
-        std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
-
-        // Even with the correct pin, an expired record yields no match and is purged.
-        assert!(
-            redeem_reset_pins(dir.path(), "AA-BB-CC-DD")
-                .unwrap()
-                .is_empty()
-        );
-        assert!(!file.exists());
-    }
-
-    #[test]
-    fn redeem_on_missing_dir_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("does-not-exist");
-        assert!(
-            redeem_reset_pins(&missing, "AA-BB-CC-DD")
-                .unwrap()
-                .is_empty()
-        );
+    /// Only a `401` or `403` is a refused login; the rest keep the shared body.
+    #[rstest::rstest]
+    #[case::invalid_input(
+        ServiceError::invalid_input("app is required"),
+        "invalid input: app is required"
+    )]
+    #[case::not_found(
+        ServiceError::not_found("unable to find request"),
+        "not found: unable to find request"
+    )]
+    #[case::backend(ServiceError::backend("disk"), "backend error: disk")]
+    fn login_failure_leaves_other_errors_to_the_caller(
+        #[case] error: ServiceError,
+        #[case] message: &str,
+    ) {
+        let error: ApiError = login_failure(error).expect_err("not a refused login");
+        assert_eq!(error.to_string(), message);
     }
 }

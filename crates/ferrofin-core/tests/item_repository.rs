@@ -205,7 +205,7 @@ async fn movie_page_fixture() -> (Database, InternalItemsQuery) {
         .expect("nullable sort keys");
 
     let base = InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         recursive: true,
         top_parent_ids: vec![library],
         include_item_types: vec![BaseItemKind::Movie],
@@ -296,7 +296,7 @@ async fn movie_page_hydration_plan_materializes_keys_before_primary_key_fetches(
     let db = fresh_db().await;
     let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
     let filter = InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         include_item_types: vec![BaseItemKind::Movie],
         limit: Some(100),
         start_index: Some(1500),
@@ -345,7 +345,7 @@ async fn grouped_browse_plan_computes_representatives_once() {
     let db = fresh_db().await;
     let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
     let filter = InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         recursive: true,
         include_item_types: vec![BaseItemKind::Movie],
         limit: Some(100),
@@ -399,7 +399,7 @@ async fn person_type_filter_plan_stays_on_the_items_credits() {
     let db = fresh_db().await;
     let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB10)).await;
     let by_name = InternalItemsQuery {
-        user: Some(user.clone()),
+        user: Some(Arc::new(user.clone())),
         include_item_types: vec![BaseItemKind::Movie],
         person: Some("Chris Maker".to_owned()),
         person_types: vec!["Director".to_owned()],
@@ -521,7 +521,7 @@ async fn movie_page_hydration_leaves_other_query_plans_unchanged() {
     let db = fresh_db().await;
     let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
     let filter = InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         include_item_types: vec![BaseItemKind::Movie],
         limit: Some(100),
         order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
@@ -660,13 +660,8 @@ async fn locked_item_ids_is_empty_when_nothing_is_locked() {
         .await
         .expect("save");
 
-    assert!(
-        repository
-            .locked_item_ids()
-            .await
-            .expect("locked ids")
-            .is_empty()
-    );
+    let locked_item_ids = repository.locked_item_ids().await.expect("locked ids");
+    assert!(locked_item_ids.is_empty(), "{locked_item_ids:?}");
 }
 
 #[tokio::test]
@@ -693,7 +688,7 @@ async fn retrieve_items_reads_across_chunks_and_skips_missing_ids() {
     let persist = FerrofinItemPersistenceService::new(db.clone());
     let repository = repo(&db);
 
-    // Two and a half chunks of stored rows, with a missing id after each one.
+    // Several read chunks of stored rows (1,250), with a missing id after each one.
     let stored_count = ferrofin_db::BATCH_BIND_CHUNK * 2 + ferrofin_db::BATCH_BIND_CHUNK / 2;
     let mut rows = Vec::new();
     let mut asked = Vec::new();
@@ -740,20 +735,13 @@ async fn retrieve_items_reads_across_chunks_and_skips_missing_ids() {
     assert!(seventh.is_locked);
 
     // Nothing asked, nothing read; only missing ids, nothing returned.
-    assert!(
-        repository
-            .retrieve_items(&[])
-            .await
-            .expect("empty")
-            .is_empty()
-    );
-    assert!(
-        repository
-            .retrieve_items(&[Uuid::from_u128(0xDEAD)])
-            .await
-            .expect("missing")
-            .is_empty()
-    );
+    let items = repository.retrieve_items(&[]).await.expect("empty");
+    assert!(items.is_empty(), "{items:?}");
+    let items = repository
+        .retrieve_items(&[Uuid::from_u128(0xDEAD)])
+        .await
+        .expect("missing");
+    assert!(items.is_empty(), "{items:?}");
 }
 
 #[tokio::test]
@@ -1310,7 +1298,7 @@ async fn user_data_sorts_order_by_play_state() {
     for sort in [ItemSortBy::PlayCount, ItemSortBy::DatePlayed] {
         let rows = repository
             .get_item_list(&InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 order_by: vec![(sort, SortOrder::Descending)],
                 ..Default::default()
             })
@@ -1360,7 +1348,7 @@ async fn user_data_sorts_order_by_play_state() {
     ] {
         let rows = repository
             .get_item_list(&InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 include_item_types: vec![BaseItemKind::Movie],
                 order_by: vec![(sort, direction)],
                 ..Default::default()
@@ -1511,7 +1499,7 @@ async fn paged_user_data_sort_with_total_count_works() {
     ] {
         let result = repository
             .get_items(&InternalItemsQuery {
-                user: Some(user.clone()),
+                user: Some(Arc::new(user.clone())),
                 parent_id: library,
                 recursive: true,
                 include_item_types: vec![BaseItemKind::Movie],
@@ -1803,8 +1791,10 @@ async fn a_created_collection_survives_an_unscoped_user_query() {
         .await
         .expect("save");
 
-    // …and a collection made through the real manager.
-    let collections = collection_manager_over(&db);
+    // …and a collection made through the real manager, with a real
+    // Collections library to make.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let collections = collection_manager_over(&db, tmp.path()).await;
     collections
         .create_collection(&CollectionCreationOptions {
             name: "My Collection".to_owned(),
@@ -1816,7 +1806,7 @@ async fn a_created_collection_survives_an_unscoped_user_query() {
     let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xABCD)).await;
     let rows = repository
         .get_item_list(&InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             recursive: true,
             ..Default::default()
         })
@@ -1851,7 +1841,7 @@ async fn a_created_collection_survives_an_unscoped_user_query() {
             .fetch_one(db.pool())
             .await
             .expect("container row");
-    assert_eq!(container.0.as_deref(), Some("Collections"));
+    assert_eq!(container.0.as_deref(), Some("collections"));
     assert!(
         container.1.is_some_and(|p| p.ends_with("/collections")),
         "the container is the folder under the data directory"
@@ -1901,29 +1891,49 @@ async fn seed_user_who_sees_everything(
 }
 
 /// The real collection manager over `db`, with throwaway application paths.
-fn collection_manager_over(db: &ferrofin_db::Database) -> ferrofin_core::FerrofinCollectionManager {
+async fn collection_manager_over(
+    db: &ferrofin_db::Database,
+    dir: &std::path::Path,
+) -> ferrofin_core::FerrofinCollectionManager {
+    let paths = Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
+        dir,
+        dir.join("log"),
+        dir.join("config"),
+        dir.join("cache"),
+        dir.join("web"),
+    ));
+    let mode = ferrofin_core::item_type_lookup::IdDerivation::from_meta(
+        None,
+        Some(dir.to_string_lossy().into_owned()),
+    );
+    ferrofin_core::AggregateFolderStore::new(
+        db.clone(),
+        mode.clone(),
+        dir.join("root"),
+        dir.join("data"),
+    )
+    .ensure()
+    .await
+    .expect("roots");
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
     ferrofin_core::FerrofinCollectionManager::new(
         db.clone(),
-        std::sync::Arc::new(ferrofin_core::FerrofinLibraryManager::new(
-            std::sync::Arc::new(ferrofin_core::FerrofinItemRepository::new(
-                db.clone(),
-                std::sync::Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new()),
-            )),
-            std::sync::Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
-            std::sync::Arc::new(FerrofinItemPersistenceService::new(db.clone())),
-            std::sync::Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+        Arc::new(ferrofin_core::FerrofinLibraryManager::new(
+            Arc::new(repo(db)),
+            Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+            persistence.clone(),
+            Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
         )),
-        std::sync::Arc::new(ferrofin_core::FerrofinLinkedChildrenService::new(
+        Arc::new(ferrofin_core::FerrofinLinkedChildrenService::new(
             db.clone(),
         )),
-        std::sync::Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
-            "/tmp/ferrofin-test",
-            "/tmp/ferrofin-test/log",
-            "/tmp/ferrofin-test/config",
-            "/tmp/ferrofin-test/cache",
-            "/tmp/ferrofin-test/web",
-        )),
+        paths,
     )
+    .with_virtual_folders(Arc::new(
+        ferrofin_core::FerrofinVirtualFolderManager::new(dir.join("root/default"))
+            .with_item_store(persistence)
+            .with_id_derivation(mode),
+    ))
 }
 
 /// v12.2 `BuildMaxParentalRatingFilter` (45d7760a14): a container is only as
@@ -1962,7 +1972,8 @@ async fn maximum_rating_gates_every_container_on_its_members() {
         ..Default::default()
     };
     // Every member over the limit hides the rated container as well.
-    assert!(repo(&db).get_item_list(&query).await.unwrap().is_empty());
+    let item_list = repo(&db).get_item_list(&query).await.unwrap();
+    assert!(item_list.is_empty(), "{item_list:?}");
     // A member within the limit admits both.
     let mut child = item(Uuid::from_u128(0x990), BaseItemKind::Movie, "child");
     child.inherited_parental_rating_value = Some(12);
@@ -2168,7 +2179,7 @@ async fn series_date_played_orders_series_by_their_newest_finished_episode() {
         async move {
             repo(&db)
                 .get_item_list(&InternalItemsQuery {
-                    user,
+                    user: user.map(Arc::new),
                     search_term,
                     include_item_types: vec![BaseItemKind::Series],
                     order_by,
@@ -2255,7 +2266,7 @@ async fn series_date_played_plan_groups_the_users_plays_once() {
     let db = fresh_db().await;
     let user = series_play_fixture(&db).await;
     let filter = InternalItemsQuery {
-        user: Some(user),
+        user: Some(Arc::new(user)),
         include_item_types: vec![BaseItemKind::Series],
         order_by: vec![
             (ItemSortBy::SeriesDatePlayed, SortOrder::Descending),
@@ -2285,11 +2296,12 @@ async fn series_date_played_plan_groups_the_users_plays_once() {
 
 /// `ImageProcessor.ProcessImage`'s `autoOrient` comes back with the image
 /// rows: a photo is oriented unless its stored orientation is `TopLeft`, and
-/// nothing else is; the rows are those `get_image_infos` reads.
+/// nothing else is. So does whether the owner is a Live TV channel or
+/// programme. The rows are those `get_image_infos` reads.
 #[tokio::test]
-async fn image_infos_carry_the_photo_auto_orientation() {
+async fn image_infos_carry_what_their_owner_decides_about_serving_them() {
     use ferrofin_model::entities::ImageType;
-    use ferrofin_traits::options::ItemImageInfo;
+    use ferrofin_traits::options::{ItemImageInfo, ItemImagesToServe};
 
     let db = fresh_db().await;
     let persist = FerrofinItemPersistenceService::new(db.clone());
@@ -2297,6 +2309,8 @@ async fn image_infos_carry_the_photo_auto_orientation() {
     let upright = Uuid::new_v4();
     let unknown = Uuid::new_v4();
     let movie = Uuid::new_v4();
+    let channel = Uuid::new_v4();
+    let program = Uuid::new_v4();
     // Stored the way the image rows' foreign key reads it.
     let with_data = |id: Uuid, kind, data: Option<&str>| BaseItemEntity {
         id: id.to_string().to_uppercase(),
@@ -2321,10 +2335,12 @@ async fn image_infos_carry_the_photo_auto_orientation() {
                 BaseItemKind::Movie,
                 Some(r#"{"Orientation":"RightTop"}"#),
             ),
+            with_data(channel, BaseItemKind::LiveTvChannel, None),
+            with_data(program, BaseItemKind::LiveTvProgram, None),
         ])
         .await
         .expect("save");
-    for id in [rotated, upright, unknown, movie] {
+    for id in [rotated, upright, unknown, movie, channel, program] {
         let image = |image_type| ItemImageInfo {
             path: format!("/media/{id}.jpg"),
             image_type,
@@ -2343,26 +2359,27 @@ async fn image_infos_carry_the_photo_auto_orientation() {
         (upright, false),
         (unknown, true),
         (movie, false),
+        (channel, false),
+        (program, false),
     ] {
-        let (images, auto_orient) = repo
-            .get_image_infos_with_auto_orient(id)
-            .await
-            .expect("read");
-        assert_eq!(auto_orient, expected, "{id}");
-        assert_eq!(images, repo.get_image_infos(id).await.expect("read"));
+        let served = repo.get_image_infos_to_serve(id).await.expect("read");
+        assert_eq!(served.auto_orient, expected, "{id}");
+        assert_eq!(served.live_tv, id == channel || id == program, "{id}");
+        assert_eq!(served.images, repo.get_image_infos(id).await.expect("read"));
     }
-    let (images, auto_orient) = repo
-        .get_image_infos_with_auto_orient(Uuid::new_v4())
+    let served = repo
+        .get_image_infos_to_serve(Uuid::new_v4())
         .await
         .expect("read");
-    assert!(images.is_empty() && !auto_orient);
+    assert_eq!(served, ItemImagesToServe::default());
 
     // The owner is read by primary key beside the image rows' own index, and
     // that index already yields the order: no scan, no sort.
     let shown = plan(
         &db,
         r#"SELECT ii.*, bi."Type" = 'x' AS "IsPhoto",
-                CASE WHEN bi."Type" = 'x' THEN bi."Data" END AS "PhotoData"
+                CASE WHEN bi."Type" = 'x' THEN bi."Data" END AS "PhotoData",
+                bi."Type" IN ('a', 'b') AS "IsLiveTv"
             FROM "BaseItemImageInfos" ii
             JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
             WHERE ii."ItemId" = 'y'
@@ -2459,20 +2476,16 @@ async fn album_and_artist_filters_and_the_unresolved_name_id() {
             .unwrap(),
         [in_first]
     );
-    assert!(
-        repository
-            .get_item_ids(&tracks(vec![Uuid::nil()], Vec::new()))
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        repository
-            .get_item_ids(&tracks(Vec::new(), vec![Uuid::nil()]))
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let item_ids = repository
+        .get_item_ids(&tracks(vec![Uuid::nil()], Vec::new()))
+        .await
+        .unwrap();
+    assert!(item_ids.is_empty(), "{item_ids:?}");
+    let item_ids = repository
+        .get_item_ids(&tracks(Vec::new(), vec![Uuid::nil()]))
+        .await
+        .unwrap();
+    assert!(item_ids.is_empty(), "{item_ids:?}");
     let artist = repository
         .get_item_ids(&InternalItemsQuery {
             include_item_types: vec![BaseItemKind::MusicArtist],

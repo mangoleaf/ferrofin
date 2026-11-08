@@ -36,6 +36,8 @@ use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::providers::ItemUpdateType;
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -198,19 +200,30 @@ pub struct PhotoExif {
 }
 
 impl PhotoItem {
-    /// Sets the path of the [`ImageType::Primary`] image, inserting the entry if
-    /// absent. Port of `BaseItem.SetImagePath(ImageType.Primary, path)`.
-    fn set_image_path(&mut self, image_type: ImageType, path: &str) {
+    /// Points the `image_type` image at the file `path`, last written at
+    /// `date_modified`, inserting the entry if absent. Port of
+    /// `BaseItem.SetImagePath(ImageType, int, FileSystemMetadata)`: an
+    /// existing image has its size reset, which leaves the file to be
+    /// measured again, and keeps its blurhash until that happens.
+    ///
+    /// The `http` arm of the C# string overload has no caller here: the scan's
+    /// photos are files.
+    fn set_image_path(&mut self, image_type: ImageType, path: &str, date_modified: DateTime<Utc>) {
         if let Some(existing) = self
             .images
             .iter_mut()
             .find(|info| info.image_type == image_type)
         {
             path.clone_into(&mut existing.path);
+            existing.date_modified = date_modified;
+            // "reset these values"
+            existing.width = 0;
+            existing.height = 0;
         } else {
             self.images.push(ItemImageInfo {
                 path: path.to_owned(),
                 image_type,
+                date_modified,
                 ..Default::default()
             });
         }
@@ -223,6 +236,16 @@ impl PhotoItem {
             .iter()
             .find(|info| info.image_type == image_type)
     }
+}
+
+/// `path`'s last write time: the value `file_date_modified` in
+/// `ferrofin-providers` stores for every other local image, the current time
+/// when the file cannot be read included, so the scan's
+/// `image_metadata_is_current` compares like with like.
+fn last_write_time(path: &str) -> DateTime<Utc> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
 }
 
 /// Metadata provider for photos — the embedded-information provider.
@@ -275,8 +298,9 @@ impl PhotoProvider {
     /// Refreshes the item's embedded information, returning what changed. Port of
     /// `FetchAsync`.
     ///
-    /// Always-on behaviour: set the [`ImageType::Primary`] image path to the
-    /// item's path, then — when the stored width or height is `<= 0` — probe the
+    /// Always-on behaviour: point the [`ImageType::Primary`] image at the
+    /// item's file, dated by its last write time and with an existing image's
+    /// size reset, then — when the stored width or height is `<= 0` — probe the
     /// primary image's dimensions through the
     /// [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor) and write back
     /// any positive result. A "format not supported" probe error
@@ -295,7 +319,13 @@ impl PhotoProvider {
     /// reason other than an unsupported format.
     pub async fn fetch(&self, item: &mut PhotoItem) -> Result<ItemUpdateType, ServiceError> {
         let path = item.path.clone();
-        item.set_image_path(ImageType::Primary, &path);
+        // On the blocking pool like the EXIF read below: a stalled mount holds
+        // a stat as long as it holds an open.
+        let owned = path.clone();
+        let modified = tokio::task::spawn_blocking(move || last_write_time(&owned))
+            .await
+            .unwrap_or_else(|_| Utc::now());
+        item.set_image_path(ImageType::Primary, &path, modified);
 
         // The EXIF branch, gated on the extension set (C#: "other extensions
         // might cause taglib to hang"). A file that cannot be read or carries no
@@ -373,22 +403,420 @@ pub struct ExifTags {
 /// case — while an IO error yields `None`, the leave-alone case.
 fn read_exif(path: &str) -> Option<ExifTags> {
     let file = std::fs::File::open(path).ok()?;
-    let mut reader = std::io::BufReader::new(file);
-    Some(
-        exif::Reader::new()
-            .read_from_container(&mut reader)
-            .as_ref()
-            .map_or_else(|_| ExifTags::default(), tags_from),
-    )
+    // A failed stat skips the IFD walk and leaves the full read to decide. A
+    // file cut short after this stat can still read as it was; its new write
+    // time has it read again on the next scan.
+    let len = file.metadata().map_or(0, |meta| meta.len());
+    Some(exif_tags(&mut BufReader::new(Metered::new(file)), len))
+}
+
+/// A reader that counts the bytes it returns, so the IFD walk knows what it
+/// really read through the buffer in front of it.
+struct Metered<R> {
+    /// The file.
+    inner: R,
+    /// The bytes read from it so far.
+    read: u64,
+}
+
+impl<R> Metered<R> {
+    /// `inner`, with nothing read yet.
+    fn new(inner: R) -> Self {
+        Self { inner, read: 0 }
+    }
+}
+
+impl<R: Read> Read for Metered<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read = self
+            .read
+            .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        Ok(n)
+    }
+
+    // Forwarded so the full read keeps the file's own `read_to_end`, which
+    // sizes its buffer from the file's length once.
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        let n = self.inner.read_to_end(buf)?;
+        self.read = self
+            .read
+            .saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+        Ok(n)
+    }
+}
+
+impl<R: Seek> Seek for Metered<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// [`read_exif`] over an open file of `len` bytes.
+///
+/// A TIFF-based file (`.tiff`, `.cr2`) goes through [`primary_tiff`], which
+/// reads its IFDs instead of the whole file. Any other container, and any
+/// TIFF that walk turns down, goes through kamadak-exif's own reader.
+fn exif_tags<R: Read + Seek>(reader: &mut BufReader<Metered<R>>, len: u64) -> ExifTags {
+    // A peek leaves the reader at the start, so a JPEG, PNG or WebP is read
+    // exactly as before.
+    let is_tiff = reader
+        .fill_buf()
+        .is_ok_and(|head| head.starts_with(b"II\x2a\x00") || head.starts_with(b"MM\x00\x2a"));
+    let walked = is_tiff
+        .then(|| primary_tiff(reader, len))
+        .flatten()
+        .and_then(|tiff| exif::Reader::new().read_raw(tiff).ok());
+    let parsed = match walked {
+        Some(exif) => Ok(exif),
+        // The walk moved the reader: the full read starts from the top.
+        None if is_tiff => reader
+            .rewind()
+            .map_err(exif::Error::from)
+            .and_then(|()| exif::Reader::new().read_from_container(reader)),
+        None => exif::Reader::new().read_from_container(reader),
+    };
+    parsed
+        .as_ref()
+        .map_or_else(|_| ExifTags::default(), tags_from)
+}
+
+/// The most IFDs kamadak-exif 0.6.1's parser reads in one chain before it
+/// rejects the file (`tiff.rs`, `parse_body`).
+const PARSER_IFD_LIMIT: u16 = 8;
+
+/// The TIFF `LONG` field type, the type of a sub-IFD pointer.
+const TIFF_LONG: u16 = 4;
+
+/// Copies a TIFF-based file's [`PRIMARY_TAGS`] into a small TIFF of their
+/// own, reading only the file's IFDs and those tags' values.
+///
+/// kamadak-exif loads a whole TIFF into memory before it parses one, and a
+/// RAW or scanned TIFF runs to tens or hundreds of megabytes, while its tags
+/// sit in a few kilobytes of IFDs, often after the pixel data (libtiff and
+/// ffmpeg write IFD0 last). This walks the IFD chain with seeks, making every
+/// check kamadak-exif 0.6.1's parser makes against the whole file (0.6.2 only
+/// adds a refusal of an IFD reached twice, which this walk declines too), and
+/// keeps the listed entries of IFD0 and of its Exif and GPS IFDs, which parse
+/// to the same fields.
+///
+/// `None` hands the file back to the full read: not a TIFF, an I/O error, a
+/// check the parser would fail, a shape this walk does not follow (a sub-IFD
+/// pointer that is not one `LONG`, an IFD reached twice), or a walk that would
+/// cost more than reading the whole file (overlapping or scattered IFDs and
+/// values). The full read then decides as it always has.
+///
+/// `reader` must be at the start of the file.
+fn primary_tiff<R: Read + Seek>(reader: &mut BufReader<Metered<R>>, len: u64) -> Option<Vec<u8>> {
+    let mut walk = TiffWalk {
+        reader,
+        position: 0,
+        len,
+        budget: len,
+        little_endian: false,
+        seen: HashSet::new(),
+        kept: Vec::new(),
+    };
+    let header = walk.read_at(0, 8)?;
+    walk.little_endian = match header.get(..4)? {
+        b"II\x2a\x00" => true,
+        b"MM\x00\x2a" => false,
+        _ => return None,
+    };
+    let mut next = walk.load_u32(&header[4..]);
+    let mut ifd_num = 0;
+    while next != 0 {
+        if ifd_num == PARSER_IFD_LIMIT {
+            return None;
+        }
+        next = walk.ifd(next, exif::Context::Tiff, ifd_num)?;
+        ifd_num += 1;
+    }
+    walk.compact()
+}
+
+/// One kept IFD entry: its tag, field type, count and value bytes (the four
+/// inline bytes, or the out-of-line value).
+type KeptEntry = (exif::Tag, u16, u32, Vec<u8>);
+
+/// The state of one [`primary_tiff`] walk.
+struct TiffWalk<'a, R> {
+    /// The file.
+    reader: &'a mut BufReader<Metered<R>>,
+    /// Where `reader` is, so a read near the last one can stay inside its
+    /// buffer.
+    position: u64,
+    /// The file's length, which every offset is checked against.
+    len: u64,
+    /// What the walk may still ask for: the file's length, the cost of the
+    /// full read it replaces.
+    budget: u64,
+    /// The file's byte order.
+    little_endian: bool,
+    /// The offsets of the IFDs walked so far.
+    seen: HashSet<u32>,
+    /// The [`PRIMARY_TAGS`] entries found, one per tag: the last one, which
+    /// is the one the parser returns.
+    kept: Vec<KeptEntry>,
+}
+
+impl<R: Read + Seek> TiffWalk<'_, R> {
+    /// The `size` bytes at `offset`, or `None` when they run past the end of
+    /// the file, would take the walk past its budget or cannot be read.
+    fn read_at(&mut self, offset: u64, size: u64) -> Option<Vec<u8>> {
+        let end = offset.checked_add(size)?;
+        if end > self.len {
+            return None;
+        }
+        // Every read is charged its size, which a file's disjoint IFDs and
+        // values keep within its length.
+        self.budget = self.budget.checked_sub(size)?;
+        let step = i64::try_from(offset).ok()? - i64::try_from(self.position).ok()?;
+        self.reader.seek_relative(step).ok()?;
+        let mut bytes = vec![0; usize::try_from(size).ok()?];
+        self.reader.read_exact(&mut bytes).ok()?;
+        self.position = end;
+        // Neither may what the file gave up, the buffer's refills included.
+        if self.reader.get_ref().read > self.len {
+            return None;
+        }
+        Some(bytes)
+    }
+
+    /// The `u16` at the start of `bytes`, in the file's byte order.
+    fn load_u16(&self, bytes: &[u8]) -> u16 {
+        let bytes = [bytes[0], bytes[1]];
+        if self.little_endian {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        }
+    }
+
+    /// The `u32` at the start of `bytes`, in the file's byte order.
+    fn load_u32(&self, bytes: &[u8]) -> u32 {
+        let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
+        if self.little_endian {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        }
+    }
+
+    /// Walks the IFD at `offset`, read in context `ctx` as part of IFD
+    /// `ifd_num`, and the sub-IFDs it points to. Returns the offset of the
+    /// next IFD in the chain.
+    fn ifd(&mut self, offset: u32, ctx: exif::Context, ifd_num: u16) -> Option<u32> {
+        if !self.seen.insert(offset) {
+            return None;
+        }
+        let count = self.read_at(offset.into(), 2)?;
+        let count = u64::from(self.load_u16(&count));
+        let body = self.read_at(u64::from(offset) + 2, count * 12 + 4)?;
+        let (entries, next) = body.split_at(body.len() - 4);
+        for entry in entries.as_chunks::<12>().0 {
+            let tag = exif::Tag(ctx, self.load_u16(entry));
+            let kind = self.load_u16(&entry[2..]);
+            let count = self.load_u32(&entry[4..]);
+            let inline = &entry[8..];
+            let child = match tag {
+                exif::Tag::ExifIFDPointer => Some(exif::Context::Exif),
+                exif::Tag::GPSInfoIFDPointer => Some(exif::Context::Gps),
+                exif::Tag::InteropIFDPointer => Some(exif::Context::Interop),
+                _ => None,
+            };
+            if let Some(child) = child {
+                // The parser takes any unsigned integer here; this follows
+                // the single LONG that writers use.
+                if kind != TIFF_LONG || count != 1 {
+                    return None;
+                }
+                let pointer = self.load_u32(inline);
+                // A sub-IFD that chains on is an error to the parser.
+                if self.ifd(pointer, child, ifd_num)? != 0 {
+                    return None;
+                }
+                continue;
+            }
+            let keep = ifd_num == 0 && PRIMARY_TAGS.contains(&tag);
+            let size = field_unit_len(kind) * u64::from(count);
+            let value = if size <= 4 {
+                inline.to_vec()
+            } else {
+                let at = u64::from(self.load_u32(inline));
+                // The parser rejects the whole file for any value past its
+                // end, read or not.
+                if at + size > self.len {
+                    return None;
+                }
+                if !keep {
+                    continue;
+                }
+                self.read_at(at, size)?
+            };
+            if keep {
+                self.kept.retain(|(kept, ..)| *kept != tag);
+                self.kept.push((tag, kind, count, value));
+            }
+        }
+        Some(self.load_u32(next))
+    }
+
+    /// The kept entries as a TIFF of their own, in the file's byte order:
+    /// IFD0 holding the TIFF tags and pointers to an Exif and a GPS IFD
+    /// holding theirs, then the out-of-line values.
+    fn compact(self) -> Option<Vec<u8>> {
+        let little_endian = self.little_endian;
+        let (mut ifd0, mut exif, mut gps) = (Vec::new(), Vec::new(), Vec::new());
+        for (tag, kind, count, value) in self.kept {
+            let rows = match tag.0 {
+                exif::Context::Tiff => &mut ifd0,
+                exif::Context::Exif => &mut exif,
+                exif::Context::Gps => &mut gps,
+                // No Interop tag is read; one listed would need its own IFD.
+                _ => return None,
+            };
+            rows.push((tag.1, kind, count, value));
+        }
+
+        let ifd_len = |rows: usize| 2 + 12 * rows + 4;
+        let pointers = usize::from(!exif.is_empty()) + usize::from(!gps.is_empty());
+        let exif_at = 8 + ifd_len(ifd0.len() + pointers);
+        let gps_at = exif_at
+            + if exif.is_empty() {
+                0
+            } else {
+                ifd_len(exif.len())
+            };
+        let mut values_at = gps_at
+            + if gps.is_empty() {
+                0
+            } else {
+                ifd_len(gps.len())
+            };
+        let children = [
+            (exif::Tag::ExifIFDPointer.1, &exif, exif_at),
+            (exif::Tag::GPSInfoIFDPointer.1, &gps, gps_at),
+        ];
+        for (pointer, rows, at) in children {
+            if !rows.is_empty() {
+                let at = u32_bytes(little_endian, u32::try_from(at).ok()?);
+                ifd0.push((pointer, TIFF_LONG, 1, at.to_vec()));
+            }
+        }
+
+        let mut tiff = Vec::from(if little_endian {
+            b"II\x2a\x00"
+        } else {
+            b"MM\x00\x2a"
+        });
+        tiff.extend_from_slice(&u32_bytes(little_endian, 8));
+        let children = [exif, gps].into_iter().filter(|rows| !rows.is_empty());
+        let directories: Vec<_> = std::iter::once(ifd0).chain(children).collect();
+        for rows in &directories {
+            tiff.extend_from_slice(&u16_bytes(little_endian, u16::try_from(rows.len()).ok()?));
+            for (tag, kind, count, value) in rows {
+                tiff.extend_from_slice(&u16_bytes(little_endian, *tag));
+                tiff.extend_from_slice(&u16_bytes(little_endian, *kind));
+                tiff.extend_from_slice(&u32_bytes(little_endian, *count));
+                if value.len() <= 4 {
+                    tiff.extend_from_slice(value);
+                } else {
+                    tiff.extend_from_slice(&u32_bytes(
+                        little_endian,
+                        u32::try_from(values_at).ok()?,
+                    ));
+                    values_at += value.len();
+                }
+            }
+            tiff.extend_from_slice(&u32_bytes(little_endian, 0));
+        }
+        // The out-of-line values, in the order their offsets were handed out.
+        for (.., value) in directories.iter().flatten() {
+            if value.len() > 4 {
+                tiff.extend_from_slice(value);
+            }
+        }
+        Some(tiff)
+    }
+}
+
+/// `value` in the byte order `little_endian` picks.
+fn u16_bytes(little_endian: bool, value: u16) -> [u8; 2] {
+    if little_endian {
+        value.to_le_bytes()
+    } else {
+        value.to_be_bytes()
+    }
+}
+
+/// `value` in the byte order `little_endian` picks.
+fn u32_bytes(little_endian: bool, value: u32) -> [u8; 4] {
+    if little_endian {
+        value.to_le_bytes()
+    } else {
+        value.to_be_bytes()
+    }
+}
+
+/// The size of one value of TIFF field type `kind` as kamadak-exif 0.6.1's
+/// parser sizes it (`value.rs`, `get_type_info`): a type it does not know takes none.
+fn field_unit_len(kind: u16) -> u64 {
+    match kind {
+        1 | 2 | 6 | 7 => 1,
+        3 | 8 => 2,
+        4 | 9 | 11 => 4,
+        5 | 10 | 12 => 8,
+        _ => 0,
+    }
+}
+
+/// Every primary-image tag [`tags_from`] reads. [`primary_tiff`] keeps only
+/// these, so a TIFF-based file's other values are never loaded.
+const PRIMARY_TAGS: [exif::Tag; 23] = [
+    exif::Tag::Make,
+    exif::Tag::Model,
+    exif::Tag::Software,
+    exif::Tag::Orientation,
+    exif::Tag::ImageDescription,
+    exif::Tag::DateTime,
+    XP_TITLE,
+    RATING,
+    exif::Tag::ApertureValue,
+    exif::Tag::ShutterSpeedValue,
+    exif::Tag::ExposureTime,
+    exif::Tag::FocalLength,
+    exif::Tag::PhotographicSensitivity,
+    exif::Tag::UserComment,
+    exif::Tag::DateTimeOriginal,
+    exif::Tag::PixelXDimension,
+    exif::Tag::PixelYDimension,
+    exif::Tag::GPSLatitude,
+    exif::Tag::GPSLatitudeRef,
+    exif::Tag::GPSLongitude,
+    exif::Tag::GPSLongitudeRef,
+    exif::Tag::GPSAltitude,
+    exif::Tag::GPSAltitudeRef,
+];
+
+/// The primary image's `tag`. Every lookup [`tags_from`] makes goes through
+/// here, so a tag read without being listed in [`PRIMARY_TAGS`] (and so
+/// missing from every TIFF-based file) fails the tests.
+fn primary(exif: &exif::Exif, tag: exif::Tag) -> Option<&exif::Field> {
+    debug_assert!(
+        PRIMARY_TAGS.contains(&tag),
+        "{tag} is read but missing from PRIMARY_TAGS"
+    );
+    exif.get_field(tag, exif::In::PRIMARY)
 }
 
 /// Projects an [`exif::Exif`] onto [`ExifTags`]. Pure — the seam the mapping
 /// tests drive with a synthetic in-memory image.
 fn tags_from(exif: &exif::Exif) -> ExifTags {
-    use exif::{In, Tag};
+    use exif::Tag;
 
     let rational = |tag: Tag| -> Option<f64> {
-        match exif.get_field(tag, In::PRIMARY)?.value {
+        match primary(exif, tag)?.value {
             exif::Value::Rational(ref v) => v.first().map(exif::Rational::to_f64),
             exif::Value::SRational(ref v) => v.first().map(exif::SRational::to_f64),
             _ => None,
@@ -398,7 +826,7 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
     // quoted with every non-ASCII byte escaped (`café` → `caf\xc3\xa9`), and
     // renders an unknown BYTE field as a comma-separated list of numbers.
     let text = |tag: Tag| -> Option<String> {
-        let field = exif.get_field(tag, In::PRIMARY)?;
+        let field = primary(exif, tag)?;
         let value = match &field.value {
             exif::Value::Ascii(parts) => {
                 let bytes: Vec<u8> = parts.concat();
@@ -413,7 +841,7 @@ fn tags_from(exif: &exif::Exif) -> ExifTags {
         (!value.is_empty()).then(|| value.to_owned())
     };
     let integer = |tag: Tag| -> Option<i32> {
-        exif.get_field(tag, In::PRIMARY)?
+        primary(exif, tag)?
             .value
             .get_uint(0)
             .and_then(|v| i32::try_from(v).ok())
@@ -542,7 +970,7 @@ fn gps_degrees(
     ref_tag: exif::Tag,
     negative_ref: char,
 ) -> Option<f64> {
-    let field = exif.get_field(tag, exif::In::PRIMARY)?;
+    let field = primary(exif, tag)?;
     let exif::Value::Rational(ref dms) = field.value else {
         return None;
     };
@@ -550,9 +978,7 @@ fn gps_degrees(
         return None;
     };
     let degrees = d.to_f64() + m.to_f64() / 60.0 + sec.to_f64() / 3600.0;
-    let hemisphere = exif
-        .get_field(ref_tag, exif::In::PRIMARY)
-        .map(|f| f.display_value().to_string());
+    let hemisphere = primary(exif, ref_tag).map(|f| f.display_value().to_string());
     let negative = hemisphere
         .as_deref()
         .is_some_and(|h| h.trim().starts_with(negative_ref));
@@ -561,15 +987,13 @@ fn gps_degrees(
 
 /// GPS altitude in metres; `GPSAltitudeRef == 1` means below sea level.
 fn gps_altitude(exif: &exif::Exif) -> Option<f64> {
-    let field = exif.get_field(exif::Tag::GPSAltitude, exif::In::PRIMARY)?;
+    let field = primary(exif, exif::Tag::GPSAltitude)?;
     let exif::Value::Rational(ref v) = field.value else {
         return None;
     };
     let metres = v.first()?.to_f64();
-    let below = exif
-        .get_field(exif::Tag::GPSAltitudeRef, exif::In::PRIMARY)
-        .and_then(|f| f.value.get_uint(0))
-        == Some(1);
+    let below =
+        primary(exif, exif::Tag::GPSAltitudeRef).and_then(|f| f.value.get_uint(0)) == Some(1);
     Some(if below { -metres } else { metres })
 }
 
@@ -578,7 +1002,7 @@ fn gps_altitude(exif: &exif::Exif) -> Option<f64> {
 /// stamps it as UTC so the value round-trips unchanged.
 fn exif_datetime(exif: &exif::Exif) -> Option<DateTime<Utc>> {
     for tag in [exif::Tag::DateTimeOriginal, exif::Tag::DateTime] {
-        let Some(field) = exif.get_field(tag, exif::In::PRIMARY) else {
+        let Some(field) = primary(exif, tag) else {
             continue;
         };
         let raw = field.display_value().to_string();
@@ -708,7 +1132,7 @@ mod tests {
         }
         async fn get_image_cache_tag(
             &self,
-            _item_id: Uuid,
+            _item_path: Option<&str>,
             _image: &ItemImageInfo,
         ) -> Result<Option<String>, ServiceError> {
             Ok(None)
@@ -948,6 +1372,73 @@ mod tests {
         assert_eq!(provider.name(), "Embedded Information");
     }
 
+    /// A file on disk whose last write time is `modified`.
+    fn file_modified_at(dir: &tempfile::TempDir, modified: DateTime<Utc>) -> String {
+        // `.gif` stays out of the EXIF branch: these tests are about the image row.
+        let path = write_temp(dir, "photo.gif", b"GIF89a");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(modified.into())
+            .expect("set mtime");
+        path
+    }
+
+    #[tokio::test]
+    async fn fetch_dates_a_new_primary_image_by_the_files_last_write_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modified = ts(1_700_000_000);
+        let path = file_modified_at(&dir, modified);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(10, 20)));
+        let mut item = PhotoItem {
+            path: path.clone(),
+            ..Default::default()
+        };
+
+        provider.fetch(&mut item).await.expect("fetch");
+
+        let image = item.image_info(ImageType::Primary).expect("primary");
+        assert_eq!(image.path, path);
+        assert_eq!(image.date_modified, modified);
+        assert_eq!((image.width, image.height), (0, 0));
+    }
+
+    /// `BaseItem.SetImagePath`: "reset these values". The blurhash is not one
+    /// of them: it stands until the image pass measures the file.
+    #[tokio::test]
+    async fn fetch_resets_the_size_of_an_existing_primary_image() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modified = ts(1_700_000_000);
+        let path = file_modified_at(&dir, modified);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(10, 20)));
+        let mut item = PhotoItem {
+            path: path.clone(),
+            images: vec![ItemImageInfo {
+                path: "/moved/from/here.gif".to_owned(),
+                image_type: ImageType::Primary,
+                date_modified: ts(1_000),
+                width: 6000,
+                height: 4000,
+                blur_hash: Some("stale".to_owned()),
+            }],
+            ..Default::default()
+        };
+
+        provider.fetch(&mut item).await.expect("fetch");
+
+        let [image] = item.images.as_slice() else {
+            panic!(
+                "the existing row is updated, not added to: {:?}",
+                item.images
+            );
+        };
+        assert_eq!(image.path, path);
+        assert_eq!(image.date_modified, modified);
+        assert_eq!((image.width, image.height), (0, 0));
+        assert_eq!(image.blur_hash.as_deref(), Some("stale"));
+    }
+
     /// A minimal but real JPEG carrying an EXIF APP1 segment built from
     /// `entries` — `(tag, type, count, value-or-offset)` little-endian IFD0
     /// rows plus the raw bytes any of them point at.
@@ -1041,6 +1532,30 @@ mod tests {
         assert_eq!(item.exif, PhotoExif::default());
         // The always-on dimension backfill still runs.
         assert_eq!((item.width, item.height), (4, 3));
+    }
+
+    #[tokio::test]
+    async fn a_file_reaching_one_ifd_twice_reads_as_no_exif() {
+        // IFD0 points twice at one Exif IFD holding ISO 400. kamadak-exif
+        // 0.6.1 read that IFD again for every pointer, which nested pointers
+        // multiply (GHSA-53gf-vqf6-qvp8); 0.6.2 refuses the file.
+        const EXIF_IFD_TWICE: &[u8] = b"MM\x00\x2a\x00\x00\x00\x08\
+            \x00\x02\x87\x69\x00\x04\x00\x00\x00\x01\x00\x00\x00\x26\
+            \x87\x69\x00\x04\x00\x00\x00\x01\x00\x00\x00\x26\x00\x00\x00\x00\
+            \x00\x01\x88\x27\x00\x03\x00\x00\x00\x01\x01\x90\x00\x00\x00\x00\x00\x00";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, "twice.tiff", EXIF_IFD_TWICE);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(1, 1)));
+        let mut item = PhotoItem {
+            path,
+            width: 1,
+            height: 1,
+            ..Default::default()
+        };
+        provider.fetch(&mut item).await.expect("fetch");
+        assert_eq!(item.exif, PhotoExif::default());
+        // Read as an unparsable EXIF block (fields cleared), not an I/O error.
+        assert!(item.exif_was_read);
     }
 
     #[tokio::test]
@@ -1206,5 +1721,433 @@ mod tests {
         };
         apply_exif(&mut item, &tags);
         assert_eq!((item.width, item.height), (800, 600));
+    }
+
+    /// One IFD row for [`tiff_file`]: tag, type, count and the value's bytes,
+    /// placed out of line when over four bytes, as TIFF does.
+    type Row = (u16, u16, u32, Vec<u8>);
+
+    /// A TIFF laid out the way libtiff and ffmpeg write one: the header, then
+    /// `image` bytes of pixel data, then the values and IFDs, so IFD0 comes
+    /// last. IFD0 holds `ifd0` plus pointers to an Exif IFD (`exif`, which
+    /// points on to an Interop IFD) and a GPS IFD (`gps`); IFD1 holds `ifd1`.
+    fn tiff_file(
+        little_endian: bool,
+        image: usize,
+        ifd0: &[Row],
+        exif: &[Row],
+        gps: &[Row],
+        ifd1: &[Row],
+    ) -> Vec<u8> {
+        let pointer = |tag: u16, at: u32| (tag, 4, 1, u32_bytes(little_endian, at).to_vec());
+        let mut file = Vec::from(if little_endian {
+            b"II\x2a\x00"
+        } else {
+            b"MM\x00\x2a"
+        });
+        file.extend_from_slice(&[0; 4]); // IFD0's offset, patched below
+        file.resize(file.len() + image, 0x5a);
+
+        let interop = append_ifd(
+            &mut file,
+            little_endian,
+            &[(0x0001, 2, 4, b"R98\0".to_vec())],
+            0,
+        );
+        let exif = [exif, &[pointer(0xa005, interop)]].concat();
+        let exif = append_ifd(&mut file, little_endian, &exif, 0);
+        let gps = append_ifd(&mut file, little_endian, gps, 0);
+        let ifd1 = append_ifd(&mut file, little_endian, ifd1, 0);
+        let ifd0 = [ifd0, &[pointer(0x8769, exif), pointer(0x8825, gps)]].concat();
+        let ifd0 = append_ifd(&mut file, little_endian, &ifd0, ifd1);
+        file[4..8].copy_from_slice(&u32_bytes(little_endian, ifd0));
+        file
+    }
+
+    /// Appends `rows`' out-of-line values and then their IFD, chained to
+    /// `next`, and returns the IFD's offset.
+    fn append_ifd(file: &mut Vec<u8>, little_endian: bool, rows: &[Row], next: u32) -> u32 {
+        let mut fields = Vec::new();
+        for (tag, kind, count, value) in rows {
+            let inline = if value.len() <= 4 {
+                let mut inline = value.clone();
+                inline.resize(4, 0);
+                inline
+            } else {
+                let at = u32::try_from(file.len()).unwrap();
+                file.extend_from_slice(value);
+                u32_bytes(little_endian, at).to_vec()
+            };
+            fields.extend_from_slice(&u16_bytes(little_endian, *tag));
+            fields.extend_from_slice(&u16_bytes(little_endian, *kind));
+            fields.extend_from_slice(&u32_bytes(little_endian, *count));
+            fields.extend_from_slice(&inline);
+        }
+        let at = u32::try_from(file.len()).unwrap();
+        file.extend_from_slice(&u16_bytes(
+            little_endian,
+            u16::try_from(rows.len()).unwrap(),
+        ));
+        file.extend_from_slice(&fields);
+        file.extend_from_slice(&u32_bytes(little_endian, next));
+        at
+    }
+
+    /// RATIONAL (or SRATIONAL) values in the file's byte order.
+    fn rationals(little_endian: bool, values: &[(u32, u32)]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|&(n, d)| [u32_bytes(little_endian, n), u32_bytes(little_endian, d)])
+            .flatten()
+            .collect()
+    }
+
+    /// A camera file carrying every tag [`tags_from`] reads, beside the bulky
+    /// ones it does not (an ICC profile, Photoshop's layers, a maker note,
+    /// strip offsets) and an IFD1 thumbnail with its own make, after `image`
+    /// bytes of pixel data.
+    fn camera_tiff(little_endian: bool, image: usize) -> Vec<u8> {
+        let short = |v: u16| u16_bytes(little_endian, v).to_vec();
+        let long = |v: u32| u32_bytes(little_endian, v).to_vec();
+        let xp_title: Vec<u8> = "Harbour"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let ifd0: Vec<Row> = vec![
+            (0x010f, 2, 6, b"Wrong\0".to_vec()), // a duplicate: the last Make wins
+            (0x010f, 2, 6, b"Canon\0".to_vec()),
+            (0x0110, 2, 13, b"Canon EOS R5\0".to_vec()),
+            (0x0111, 4, 64, vec![0x11; 256]), // StripOffsets, not read
+            (0x0112, 3, 1, short(6)),
+            (0x010e, 2, 14, b"A description\0".to_vec()),
+            (0x0131, 2, 15, b"Firmware 1.8.1\0".to_vec()),
+            (0x0132, 2, 20, b"2024:05:06 07:08:09\0".to_vec()),
+            (0x4746, 3, 1, short(4)),
+            (0x8773, 7, 200_000, vec![0x22; 200_000]), // ICC profile, not read
+            (0x935c, 7, 2 << 20, vec![0x44; 2 << 20]), // Photoshop layers, not read
+            (0x9c9b, 1, u32::try_from(xp_title.len()).unwrap(), xp_title),
+        ];
+        let exif: Vec<Row> = vec![
+            (0x829a, 5, 1, rationals(little_endian, &[(1, 250)])),
+            (0x8827, 3, 1, short(100)), // a duplicate: the last ISO wins
+            (0x8827, 3, 1, short(400)),
+            (0x9003, 2, 20, b"2023:01:02 03:04:05\0".to_vec()),
+            (0x9201, 10, 1, rationals(little_endian, &[(8, 1)])),
+            (0x9202, 5, 1, rationals(little_endian, &[(4, 1)])),
+            (0x920a, 5, 1, rationals(little_endian, &[(50, 1)])),
+            (0x927c, 7, 100_000, vec![0x33; 100_000]), // MakerNote, not read
+            (0x9286, 7, 13, b"ASCII\0\0\0Hello".to_vec()),
+            (0xa002, 4, 1, long(8192)),
+            (0xa003, 4, 1, long(5464)),
+        ];
+        let gps: Vec<Row> = vec![
+            (0x0001, 2, 2, b"S\0".to_vec()),
+            (
+                0x0002,
+                5,
+                3,
+                rationals(little_endian, &[(33, 1), (52, 1), (12, 1)]),
+            ),
+            (0x0003, 2, 2, b"W\0".to_vec()),
+            (
+                0x0004,
+                5,
+                3,
+                rationals(little_endian, &[(151, 1), (12, 1), (36, 1)]),
+            ),
+            (0x0005, 1, 1, vec![1]),
+            (0x0006, 5, 1, rationals(little_endian, &[(12, 1)])),
+        ];
+        let ifd1: Vec<Row> = vec![(0x010f, 2, 6, b"Thumb\0".to_vec()), (0x0201, 4, 1, long(8))];
+        tiff_file(little_endian, image, &ifd0, &exif, &gps, &ifd1)
+    }
+
+    /// The tags kamadak-exif's own reader finds when it loads the whole file:
+    /// the behaviour every streamed read must reproduce.
+    fn whole_file_tags(file: &[u8]) -> ExifTags {
+        exif::Reader::new()
+            .read_from_container(&mut std::io::Cursor::new(file))
+            .as_ref()
+            .map_or_else(|_| ExifTags::default(), tags_from)
+    }
+
+    /// [`exif_tags`] over `file`, with the number of bytes it read.
+    fn streamed_tags(file: &[u8]) -> (ExifTags, usize) {
+        let mut reader = BufReader::new(Metered::new(std::io::Cursor::new(file)));
+        let tags = exif_tags(&mut reader, u64::try_from(file.len()).unwrap());
+        (tags, usize::try_from(reader.get_ref().read).unwrap())
+    }
+
+    #[test]
+    fn a_tiff_is_read_through_its_ifds_not_loaded_whole() {
+        // gl-1276: a 10 MiB TIFF with IFD0 after the pixel data, as libtiff
+        // writes it, read for a few kilobytes of tags.
+        let file = camera_tiff(true, 8 << 20);
+        let (tags, read) = streamed_tags(&file);
+
+        assert_eq!(tags, whole_file_tags(&file));
+        assert_eq!(tags.exif.camera_make.as_deref(), Some("Canon"));
+        assert_eq!(tags.exif.camera_model.as_deref(), Some("Canon EOS R5"));
+        assert_eq!(tags.exif.exposure_time, Some(1.0 / 250.0));
+        assert_eq!(tags.exif.iso_speed_rating, Some(400));
+        assert_eq!(tags.exif.altitude, Some(-12.0));
+        assert!(tags.exif.latitude.is_some_and(|lat| lat < 0.0));
+        assert_eq!(tags.title.as_deref(), Some("Harbour"));
+        assert_eq!(tags.comment.as_deref(), Some("Hello"));
+        assert_eq!(tags.rating, Some(4.0));
+        assert_eq!((tags.width, tags.height), (Some(8192), Some(5464)));
+        // The IFDs and the values read (in 8 KiB buffer fills, about 64 KiB),
+        // not the pixel data, the 2 MiB of layers, the ICC profile or the
+        // maker note.
+        assert!(read < 128 << 10, "read {read} of {} bytes", file.len());
+    }
+
+    /// A big-endian TIFF whose Exif pointer is a SHORT, which kamadak-exif
+    /// follows like a LONG: header, IFD0 at 8, the Exif IFD at 26 holding
+    /// ExposureTime 1/250 at 44.
+    const SHORT_EXIF_POINTER: &[u8] = b"MM\x00\x2a\x00\x00\x00\x08\
+        \x00\x01\x87\x69\x00\x03\x00\x00\x00\x01\x00\x1a\x00\x00\x00\x00\x00\x00\
+        \x00\x01\x82\x9a\x00\x05\x00\x00\x00\x01\x00\x00\x00\x2c\x00\x00\x00\x00\
+        \x00\x00\x00\x01\x00\x00\x00\xfa";
+
+    /// IFD0 holds an inline Make and an ICC profile whose 1000 bytes run past
+    /// the end of the file, so kamadak-exif rejects the whole file.
+    const TRUNCATED_UNREAD_VALUE: &[u8] = b"MM\x00\x2a\x00\x00\x00\x08\
+        \x00\x02\x01\x0f\x00\x02\x00\x00\x00\x03AB\x00\x00\
+        \x87\x73\x00\x07\x00\x00\x03\xe8\x00\x00\x01\x00\x00\x00\x00\x00";
+
+    /// IFD0 points twice at one Exif IFD holding ISO 400 (kamadak-exif 0.6.2's
+    /// `already_visited_ifd` case, which 0.6.1 reads).
+    const EXIF_IFD_TWICE: &[u8] = b"MM\x00\x2a\x00\x00\x00\x08\
+        \x00\x02\x87\x69\x00\x04\x00\x00\x00\x01\x00\x00\x00\x26\
+        \x87\x69\x00\x04\x00\x00\x00\x01\x00\x00\x00\x26\x00\x00\x00\x00\
+        \x00\x01\x88\x27\x00\x03\x00\x00\x00\x01\x01\x90\x00\x00\x00\x00\x00\x00";
+
+    /// IFD0 holds Make "AB" and points at an Exif IFD that chains on to
+    /// another IFD, which kamadak-exif rejects.
+    const EXIF_IFD_CHAINS_ON: &[u8] = b"MM\x00\x2a\x00\x00\x00\x08\
+        \x00\x02\x01\x0f\x00\x02\x00\x00\x00\x03AB\x00\x00\
+        \x87\x69\x00\x04\x00\x00\x00\x01\x00\x00\x00\x26\x00\x00\x00\x00\
+        \x00\x01\x88\x27\x00\x03\x00\x00\x00\x01\x01\x90\x00\x00\x00\x00\x00\x08";
+
+    /// IFD0 points at two Exif IFDs, holding ISO 100 and then ISO 400.
+    const TWO_EXIF_IFDS: &[u8] = b"MM\x00\x2a\x00\x00\x00\x08\
+        \x00\x02\x87\x69\x00\x04\x00\x00\x00\x01\x00\x00\x00\x26\
+        \x87\x69\x00\x04\x00\x00\x00\x01\x00\x00\x00\x38\x00\x00\x00\x00\
+        \x00\x01\x88\x27\x00\x03\x00\x00\x00\x01\x00\x64\x00\x00\x00\x00\x00\x00\
+        \x00\x01\x88\x27\x00\x03\x00\x00\x00\x01\x01\x90\x00\x00\x00\x00\x00\x00";
+
+    /// IFD0's Exif pointer is two LONGs, out of line at 26, which kamadak-exif
+    /// follows by the first: the Exif IFD at 34 holding ISO 400.
+    const EXIF_POINTER_COUNT_TWO: &[u8] = b"II\x2a\x00\x08\x00\x00\x00\
+        \x01\x00\x69\x87\x04\x00\x02\x00\x00\x00\x1a\x00\x00\x00\x00\x00\x00\x00\
+        \x22\x00\x00\x00\x00\x00\x00\x00\
+        \x01\x00\x27\x88\x03\x00\x01\x00\x00\x00\x90\x01\x00\x00\x00\x00\x00\x00";
+
+    /// IFD0's Exif IFD holds ISO 400; IFD1 (a thumbnail) has an Exif IFD of
+    /// its own holding ISO 100, which is not the primary image's.
+    const EXIF_IFD_UNDER_IFD1: &[u8] = b"II\x2a\x00\x08\x00\x00\x00\
+        \x01\x00\x69\x87\x04\x00\x01\x00\x00\x00\x1a\x00\x00\x00\x2c\x00\x00\x00\
+        \x01\x00\x27\x88\x03\x00\x01\x00\x00\x00\x90\x01\x00\x00\x00\x00\x00\x00\
+        \x01\x00\x69\x87\x04\x00\x01\x00\x00\x00\x3e\x00\x00\x00\x00\x00\x00\x00\
+        \x01\x00\x27\x88\x03\x00\x01\x00\x00\x00\x64\x00\x00\x00\x00\x00\x00\x00";
+
+    /// A TIFF whose `ifd1` or `gps` rows (as [`tiff_file`] takes them) hold a
+    /// value claiming 100 000 bytes, past the end of the file, beside a
+    /// readable Make.
+    fn value_past_the_end_in(ifd1: bool) -> Vec<u8> {
+        let make = [(0x010f, 2, 3, b"AB\0".to_vec())];
+        let past_the_end = [(0x8773, 7, 100_000, vec![0; 8])];
+        let (ifd1, gps): (&[Row], &[Row]) = if ifd1 {
+            (&past_the_end, &[])
+        } else {
+            (&[], &past_the_end)
+        };
+        tiff_file(true, 0, &make, &[], gps, ifd1)
+    }
+
+    /// The little-endian start of a TIFF whose IFD0 holds Make "AB" inline,
+    /// up to IFD0's next-IFD offset.
+    const MAKE_AB: &[u8] =
+        b"II\x2a\x00\x08\x00\x00\x00\x01\x00\x0f\x01\x02\x00\x03\x00\x00\x00AB\x00\x00";
+
+    /// Nine chained IFDs, one more than kamadak-exif reads, IFD0 holding
+    /// Make "AB".
+    fn nine_ifds() -> Vec<u8> {
+        let mut file = MAKE_AB.to_vec();
+        for _ in 1..9 {
+            // The next IFD starts straight after this offset: no entries.
+            let next = u32::try_from(file.len() + 4).unwrap();
+            file.extend_from_slice(&next.to_le_bytes());
+            file.extend_from_slice(&[0, 0]);
+        }
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file
+    }
+
+    #[rstest::rstest]
+    #[case::little_endian_camera_file(camera_tiff(true, 4096))]
+    #[case::big_endian_camera_file(camera_tiff(false, 4096))]
+    #[case::exif_pointer_typed_short(SHORT_EXIF_POINTER.to_vec())]
+    #[case::unread_value_past_the_end(TRUNCATED_UNREAD_VALUE.to_vec())]
+    #[case::exif_ifd_reached_twice(EXIF_IFD_TWICE.to_vec())]
+    // IFD0 chains to itself, past the parser's limit of 8 IFDs.
+    #[case::ifd_chain_loops(b"MM\x00\x2a\x00\x00\x00\x08\x00\x00\x00\x00\x00\x08".to_vec())]
+    #[case::exif_ifd_past_the_end(
+        b"II\x2a\x00\x08\x00\x00\x00\x01\x00\x69\x87\x04\x00\x01\x00\x00\x00\xff\x00\x00\x00\x00\x00\x00\x00"
+            .to_vec()
+    )]
+    #[case::exif_ifd_chains_on(EXIF_IFD_CHAINS_ON.to_vec())]
+    #[case::nine_ifds(nine_ifds())]
+    #[case::two_exif_ifds(TWO_EXIF_IFDS.to_vec())]
+    #[case::exif_ifd_under_ifd1(EXIF_IFD_UNDER_IFD1.to_vec())]
+    #[case::exif_pointer_count_two(EXIF_POINTER_COUNT_TWO.to_vec())]
+    #[case::value_past_the_end_in_ifd1(value_past_the_end_in(true))]
+    #[case::value_past_the_end_in_the_gps_ifd(value_past_the_end_in(false))]
+    // Make of a type the parser does not know, Model with no characters.
+    #[case::read_tags_of_odd_types(tiff_file(
+        true,
+        0,
+        &[
+            (0x010f, 13, 5, vec![1, 2, 3, 4]),
+            (0x0110, 2, 0, Vec::new()),
+            (0x0131, 2, 3, b"V1\0".to_vec()),
+        ],
+        &[],
+        &[],
+        &[],
+    ))]
+    #[case::no_ifd(b"II\x2a\x00\x00\x00\x00\x00".to_vec())]
+    #[case::header_only(b"II\x2a\x00".to_vec())]
+    #[case::jpeg(jpeg_with_exif(&[(0x0110, 2, 3, *b"X1\0\0")], b"", 26))]
+    fn a_streamed_read_finds_what_the_whole_file_read_finds(#[case] file: Vec<u8>) {
+        assert_eq!(streamed_tags(&file).0, whole_file_tags(&file));
+    }
+
+    #[test]
+    fn every_field_type_is_sized_as_the_parser_sizes_it() {
+        // Beside Make "AB", an unread tag of each type whose value, if it does
+        // not fit inline, would run past the end of the file: the parser
+        // rejects the file exactly when the type and count make the value
+        // longer than four bytes. Counts 1, 2, 3 and 5 tell every size apart.
+        for kind in 0..=13u16 {
+            for count in [1u32, 2, 3, 5] {
+                let mut file = MAKE_AB.to_vec();
+                file[8] = 2; // two entries
+                file.extend_from_slice(&0x9999u16.to_le_bytes());
+                file.extend_from_slice(&kind.to_le_bytes());
+                file.extend_from_slice(&count.to_le_bytes());
+                file.extend_from_slice(&0xffffu32.to_le_bytes());
+                file.extend_from_slice(&0u32.to_le_bytes());
+                assert_eq!(
+                    streamed_tags(&file).0,
+                    whole_file_tags(&file),
+                    "type {kind}, count {count}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_reads_a_tiff_whose_ifds_follow_the_pixel_data() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_temp(&dir, "photo.TIFF", &camera_tiff(true, 1 << 20));
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(0, 0)));
+        let mut item = PhotoItem {
+            path,
+            ..Default::default()
+        };
+
+        provider.fetch(&mut item).await.expect("fetch");
+
+        assert!(item.exif_was_read);
+        assert_eq!(item.exif.camera_make.as_deref(), Some("Canon"));
+        assert_eq!(item.exif.orientation, Some(ImageOrientation::RightTop));
+        assert_eq!((item.width, item.height), (8192, 5464));
+        assert_eq!(item.name.as_deref(), Some("Harbour"));
+        assert_eq!(item.production_year, Some(2023));
+    }
+
+    /// A little-endian TIFF whose IFD0 holds `makes` ASCII Make entries of
+    /// `size` bytes, the n-th pointing at `at(n)` in the `area` bytes after
+    /// the IFD (`at` counts from the area's start).
+    fn many_makes(makes: u16, size: u32, area: usize, at: impl Fn(u16) -> u32) -> Vec<u8> {
+        let area_at = 8 + 2 + 12 * u32::from(makes) + 4;
+        let mut file = b"II\x2a\x00\x08\x00\x00\x00".to_vec();
+        file.extend_from_slice(&makes.to_le_bytes());
+        for n in 0..makes {
+            file.extend_from_slice(&0x010fu16.to_le_bytes());
+            file.extend_from_slice(&2u16.to_le_bytes());
+            file.extend_from_slice(&size.to_le_bytes());
+            file.extend_from_slice(&(area_at + at(n)).to_le_bytes());
+        }
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.resize(file.len() + area, b'A');
+        file
+    }
+
+    #[rstest::rstest]
+    // 2000 Makes all claiming one 100 000-byte value: reading each would read
+    // 200 MB of a 124 KB file.
+    #[case::one_bulky_value_many_times(many_makes(2000, 100_000, 100_000, |_| 0))]
+    // 20 000 five-byte Makes alternating between two values 64 KiB apart:
+    // each read refills the reader's 8 KiB buffer, 160 MB in all.
+    #[case::small_values_far_apart(many_makes(20_000, 5, 70_000, |n| (u32::from(n) % 2) << 16))]
+    fn a_walk_never_reads_more_than_the_file(#[case] file: Vec<u8>) {
+        let (tags, read) = streamed_tags(&file);
+
+        assert_eq!(tags, whole_file_tags(&file));
+        // Past the file's length the walk hands over to the full read: at most
+        // both, with buffer slack.
+        assert!(read < 3 * file.len(), "read {read} of {} bytes", file.len());
+    }
+
+    #[test]
+    fn a_failed_stat_falls_back_to_the_full_read() {
+        let file = camera_tiff(true, 4096);
+        let tags = exif_tags(
+            &mut BufReader::new(Metered::new(std::io::Cursor::new(&file))),
+            0,
+        );
+        assert_eq!(tags, whole_file_tags(&file));
+        assert_eq!(tags.exif.camera_make.as_deref(), Some("Canon"));
+    }
+
+    /// A reader whose reads fail from `fail_at` on, as a dying disk or a
+    /// dropped mount does.
+    struct FailingReader {
+        inner: std::io::Cursor<Vec<u8>>,
+        fail_at: u64,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let left = self.fail_at.saturating_sub(self.inner.position());
+            if left == 0 {
+                return Err(std::io::Error::other("injected read error"));
+            }
+            let len = buf.len().min(usize::try_from(left).unwrap());
+            self.inner.read(&mut buf[..len])
+        }
+    }
+
+    impl Seek for FailingReader {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    #[test]
+    fn a_read_error_during_the_walk_reads_as_the_full_read_does() {
+        // IFD0 sits after the pixel data, past the point reads start failing:
+        // the walk gives up and the full read fails as it always did.
+        let file = camera_tiff(true, 64 << 10);
+        let len = u64::try_from(file.len()).unwrap();
+        let mut reader = BufReader::new(Metered::new(FailingReader {
+            inner: std::io::Cursor::new(file),
+            fail_at: 32 << 10,
+        }));
+        assert_eq!(exif_tags(&mut reader, len), ExifTags::default());
     }
 }

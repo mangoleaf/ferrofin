@@ -55,17 +55,20 @@ impl EpisodeLocalImageProvider {
             return Vec::new();
         };
 
-        let parent_files = directory_service.files(parent_path);
+        // `GetFiles(parentPath)` and `GetDirectories(parentPath)` both read the
+        // one cached listing, so it is read once and shared rather than copied
+        // per view. `image_files_from_folder` passes over directories, as the
+        // files-only view would have left them out.
+        let parent_entries = directory_service.file_system_entries(parent_path);
         let name_without_extension = file_name_without_extension(item_path);
 
-        let mut images = Self::image_files_from_folder(name_without_extension, &parent_files);
+        let mut images = Self::image_files_from_folder(name_without_extension, &parent_entries);
 
-        if let Some(metadata_dir) = directory_service
-            .directories(parent_path)
-            .into_iter()
-            .find(|d| d.name == "metadata")
+        if let Some(metadata_dir) = parent_entries
+            .iter()
+            .find(|d| d.is_directory && d.name == "metadata")
         {
-            let files = directory_service.files(&metadata_dir.full_name);
+            let files = directory_service.file_system_entries(&metadata_dir.full_name);
             images.extend(Self::image_files_from_folder(
                 name_without_extension,
                 &files,

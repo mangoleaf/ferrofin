@@ -15,6 +15,7 @@ use ferrofin_traits::collections::{CollectionManager, PlaylistManager};
 use ferrofin_traits::configuration::{DisplayPreferencesManager, ServerConfigurationManager};
 use ferrofin_traits::devices::DeviceManager;
 use ferrofin_traits::dto::DtoService;
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::events::ClientEventLogger;
 use ferrofin_traits::filesystem::FileSystem;
 use ferrofin_traits::library::{
@@ -28,6 +29,7 @@ use ferrofin_traits::net::{AuthService, AuthorizationContext};
 use ferrofin_traits::plugins::{DisabledPluginManager, PluginManager};
 use ferrofin_traits::providers::ProviderManager;
 use ferrofin_traits::security::{ApiKeyManager, QuickConnect};
+use ferrofin_traits::server_settings::{DisabledServerSettings, ServerSettingsManager};
 use ferrofin_traits::session::SessionManager;
 use ferrofin_traits::stubs::DisabledHlsStreamManager;
 use ferrofin_traits::stubs::DisabledSubtitleEncoder;
@@ -39,6 +41,8 @@ use ferrofin_traits::system::{ServerApplicationHost, SystemManager};
 use ferrofin_traits::tasks::TaskManager;
 use ferrofin_traits::trickplay::TrickplayManager;
 use ferrofin_traits::tv::TvSeriesManager;
+
+use crate::error::ApiError;
 
 /// C# `GetNormalizedRemoteIP`: an IPv4-mapped IPv6 peer is compared as the IPv4
 /// address it actually is.
@@ -100,10 +104,9 @@ pub(crate) fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
 /// object so the concrete type is chosen at the composition root, not baked into
 /// this crate.
 pub struct Inner {
-    /// Serializes named saves through validation, persistence and live updates.
-    pub configuration_write_lock: tokio::sync::Mutex<()>,
-    /// Serializes issuing and consuming recovery files through password updates.
-    pub password_reset_lock: tokio::sync::Mutex<()>,
+    /// Serializes named saves through validation, persistence and live updates,
+    /// and with the Live TV manager's own write of `livetv`.
+    pub configuration_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Store validators registered by the composition root, keyed case-insensitively.
     pub configuration_validators: std::collections::HashMap<
         String,
@@ -122,14 +125,6 @@ pub struct Inner {
     /// `NetworkManager::update_settings` rewrites its caches when an admin
     /// saves the network configuration.
     pub network: Option<Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>>,
-    /// Floor for a dashboard WebSocket stream's push period (Sessions /
-    /// ScheduledTasksInfo / ActivityLogEntry). The client names the period in
-    /// its `*Start` subscription and it is clamped up to this value, because
-    /// Ferrofin drives these streams on a timer rather than off events. Set by
-    /// the composition root from `FERROFIN_WS_MIN_STREAM_PERIOD_MS` via
-    /// [`AppState::with_websocket_min_stream_period`]; defaults to
-    /// [`crate::handlers::websocket::DEFAULT_WS_MIN_STREAM_PERIOD`].
-    pub websocket_min_stream_period: std::time::Duration,
     /// Library catalogue queries and item resolution.
     pub library: Arc<dyn LibraryManager>,
     /// User accounts, authentication policy, and profiles.
@@ -251,6 +246,12 @@ pub struct Inner {
     /// the registry-backed `FerrofinPluginManager` via [`AppState::with_plugins`].
     pub plugins: Arc<dyn PluginManager>,
 
+    /// The Ferrofin bootstrap settings behind `GET /Ferrofin/Settings`, the
+    /// Ferrofin plugin's settings page. Defaults to the disabled stub (every
+    /// call `404`s); the composition root injects the real manager via
+    /// [`AppState::with_server_settings`].
+    pub server_settings: Arc<dyn ServerSettingsManager>,
+
     /// Synchronized group playback (`/SyncPlay/*`). `None` until the composition
     /// root wires a manager via [`AppState::with_sync_play`]; the SyncPlay routes
     /// return `501` while unset.
@@ -289,7 +290,19 @@ pub struct Inner {
     /// the plugin unavailable (`404`, like a Jellyfin server without the
     /// plugin's controller).
     pub merge_versions: Option<Arc<dyn ferrofin_traits::merge_versions::MergeVersionsManager>>,
+
+    /// The LDAP-Auth extension's service backing the `/Ldap/*` routes. `None`
+    /// until the composition root wires it via [`AppState::with_ldap`]; while
+    /// unset those routes report the plugin unavailable (`404`, like a
+    /// Jellyfin server without the plugin's controller).
+    pub ldap: Option<Arc<dyn ferrofin_traits::ldap::LdapManager>>,
 }
+
+/// How many [`FileSystem`] calls handlers may have on the blocking pool at once
+/// ([`AppState::blocking_file_system`]). Well above the few a browse click or a
+/// font takes, and well below the pool's 512. A candidate setting, recorded
+/// with the owner on gl-26.
+pub const MAX_BLOCKING_FILE_SYSTEM_CALLS: usize = 32;
 
 /// The shared application state passed to every axum handler as
 /// [`axum::extract::State`].
@@ -301,6 +314,7 @@ pub struct Inner {
 pub struct AppState {
     inner: Arc<Inner>,
     request_culture: Arc<crate::request_culture::RequestCultureOptions>,
+    file_system_calls: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -318,7 +332,47 @@ impl AppState {
         Self {
             inner: Arc::new(inner),
             request_culture: Arc::new(request_culture),
+            file_system_calls: Arc::new(tokio::sync::Semaphore::new(
+                MAX_BLOCKING_FILE_SYSTEM_CALLS,
+            )),
         }
+    }
+
+    /// Runs `work` against the [`FileSystem`] on the blocking pool, the one way
+    /// a handler reaches it, since every one of its calls blocks.
+    ///
+    /// A call on a hung network mount sleeps uninterruptibly and takes its
+    /// thread with it, whatever becomes of the request: the pool's 512 threads
+    /// would go one browse click or ASS playback at a time, and with them every
+    /// `tokio::fs` read the server's direct play depends on. So at most
+    /// [`MAX_BLOCKING_FILE_SYSTEM_CALLS`] run at once. Past that a request
+    /// waits here, holding no thread, until a call returns or its client
+    /// gives up. A hung call keeps its slot until the mount answers, so with
+    /// every slot hung, every path behind this method waits, the local disk's
+    /// too: the browser, the log routes and the fallback fonts stop and
+    /// everything else goes on. `/Environment/Drives` and a body already
+    /// streaming take no slot.
+    ///
+    /// # Errors
+    /// [`ApiError`] when the call panicked.
+    pub(crate) async fn blocking_file_system<R>(
+        &self,
+        work: impl FnOnce(&dyn FileSystem) -> R + Send + 'static,
+    ) -> Result<R, ApiError>
+    where
+        R: Send + 'static,
+    {
+        let slot = Arc::clone(&self.file_system_calls)
+            .acquire_owned()
+            .await
+            .map_err(|error| ServiceError::backend(format!("filesystem call: {error}")))?;
+        let file_system = Arc::clone(&self.inner.file_system);
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            work(file_system.as_ref())
+        })
+        .await
+        .map_err(|error| ServiceError::backend(format!("filesystem call: {error}")).into())
     }
 
     /// Snapshots Startup's request-localization culture and supported UI list.
@@ -342,22 +396,6 @@ impl AppState {
 
     pub(crate) fn request_culture(&self) -> Arc<crate::request_culture::RequestCultureOptions> {
         Arc::clone(&self.request_culture)
-    }
-
-    /// Sets the floor for dashboard WebSocket stream periods (see
-    /// [`Inner::websocket_min_stream_period`]). The composition root resolves it
-    /// from `FERROFIN_WS_MIN_STREAM_PERIOD_MS`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the inner state is already shared (cloned), as the other
-    /// `with_*` builders do — it must run before the state is handed out.
-    #[must_use]
-    pub fn with_websocket_min_stream_period(mut self, period: std::time::Duration) -> Self {
-        let inner = Arc::get_mut(&mut self.inner)
-            .expect("with_websocket_min_stream_period must be called before the state is shared");
-        inner.websocket_min_stream_period = period;
-        self
     }
 
     /// Builds an [`AppState`] from each manager trait object.
@@ -402,16 +440,11 @@ impl AppState {
         tasks: Arc<dyn TaskManager>,
     ) -> Self {
         Self::from_inner(Inner {
-            configuration_write_lock: tokio::sync::Mutex::new(()),
-            password_reset_lock: tokio::sync::Mutex::new(()),
+            configuration_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             configuration_validators: std::collections::HashMap::new(),
             committed_configuration_checks: Vec::new(),
             // Wired by the composition root via `with_network`.
             network: None,
-            // Overridden by the composition root via
-            // `with_websocket_min_stream_period`; this fallback floors
-            // client-chosen stream periods even on a bare state.
-            websocket_min_stream_period: crate::handlers::websocket::DEFAULT_WS_MIN_STREAM_PERIOD,
             library,
             users,
             user_views,
@@ -430,6 +463,7 @@ impl AppState {
             plugin_routes: None,
             playback_metrics: None,
             merge_versions: None,
+            ldap: None,
             music,
             similar_items,
             search,
@@ -474,6 +508,9 @@ impl AppState {
             // Default to the disabled plugin manager; the composition root injects
             // the registry-backed `FerrofinPluginManager` via `with_plugins`.
             plugins: Arc::new(DisabledPluginManager),
+            // Default to the disabled settings manager; the composition root
+            // injects the real one via `with_server_settings`.
+            server_settings: Arc::new(DisabledServerSettings),
         })
     }
 
@@ -615,6 +652,20 @@ impl AppState {
         self
     }
 
+    /// Shares the named-configuration save lock with whoever else writes those
+    /// files. Called once by the composition root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state has already been shared.
+    #[must_use]
+    pub fn with_configuration_write_lock(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_configuration_write_lock must be called before the state is shared");
+        inner.configuration_write_lock = lock;
+        self
+    }
+
     /// Replaces the dependency checks run by `/health` and `/health/ready`.
     ///
     /// # Panics
@@ -648,6 +699,21 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_plugins must be called before the state is shared");
         inner.plugins = plugins;
+        self
+    }
+
+    /// Replaces the default [`DisabledServerSettings`] with the composition
+    /// root's server settings manager, which backs `GET /Ferrofin/Settings`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_server_settings(mut self, server_settings: Arc<dyn ServerSettingsManager>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_server_settings must be called before the state is shared");
+        inner.server_settings = server_settings;
         self
     }
 
@@ -768,15 +834,32 @@ impl AppState {
     ///
     /// Falls back to loopback when there is no peer at all, exactly as C#
     /// `GetNormalizedRemoteIP` defaults it.
+    ///
+    /// A request that came through the IP gate already carries the answer
+    /// (`ip_access::ResolvedClientAddress`), which saves walking the
+    /// forwarded chain again for each check behind it.
     #[must_use]
     pub fn client_address(&self, parts: &axum::http::request::Parts) -> std::net::IpAddr {
-        let peer = parts
-            .extensions
+        self.client_address_of(&parts.extensions, &parts.headers)
+    }
+
+    /// [`Self::client_address`] for a caller that holds a request's extensions
+    /// and headers rather than its `Parts`.
+    #[must_use]
+    pub(crate) fn client_address_of(
+        &self,
+        extensions: &axum::http::Extensions,
+        headers: &axum::http::HeaderMap,
+    ) -> std::net::IpAddr {
+        if let Some(resolved) = extensions.get::<crate::ip_access::ResolvedClientAddress>() {
+            return resolved.0;
+        }
+        let peer = extensions
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), |ci| {
                 normalize_ip(ci.0.ip())
             });
-        self.client_address_for(peer, &forwarded_for(&parts.headers))
+        self.client_address_for(peer, &forwarded_for(headers))
     }
 
     /// [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers)
@@ -987,6 +1070,23 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_merge_versions must be called before the state is shared");
         inner.merge_versions = Some(merge_versions);
+        self
+    }
+
+    /// Wires the LDAP-Auth extension's service behind the `/Ldap/*` routes.
+    ///
+    /// [`new`](Self::new) leaves it unset (the routes report the plugin
+    /// unavailable); the composition root calls this with the
+    /// `ferrofin-extensions` implementation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned).
+    #[must_use]
+    pub fn with_ldap(mut self, ldap: Arc<dyn ferrofin_traits::ldap::LdapManager>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_ldap must be called before the state is shared");
+        inner.ldap = Some(ldap);
         self
     }
 

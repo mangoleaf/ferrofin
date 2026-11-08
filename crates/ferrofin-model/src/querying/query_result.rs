@@ -95,7 +95,7 @@ mod tests {
     #[test]
     fn default_is_empty() {
         let value = QueryResult::<i32>::default();
-        assert!(value.items.is_empty());
+        assert!(value.items.is_empty(), "{:?}", value.items);
         assert_eq!(value.total_record_count, 0);
         assert_eq!(value.start_index, 0);
     }

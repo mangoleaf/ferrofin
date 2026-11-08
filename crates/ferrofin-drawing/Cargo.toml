@@ -10,7 +10,7 @@ description = "Image processing for Ferrofin (port of Jellyfin.Drawing + Emby.Ph
 workspace = true
 
 [dependencies]
-ferrofin-util.workspace = true
+ferrofin-util = { workspace = true, features = ["tokio"] }
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-common.workspace = true
@@ -20,6 +20,7 @@ image.workspace = true
 kamadak-exif.workspace = true
 webp.workspace = true
 jpeg-encoder.workspace = true
+jpeg-decoder.workspace = true
 blurhash.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

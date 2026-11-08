@@ -849,19 +849,28 @@ impl ImageProcessor for FakeImages {
     ) -> Result<String, ServiceError> {
         Ok("blur".into())
     }
+    /// `tag:<image path>`, then `@<item path>` when the owner has one, so a
+    /// test sees which image was tagged under which owner's path.
     async fn get_image_cache_tag(
         &self,
-        _item_id: Uuid,
+        item_path: Option<&str>,
         image: &ItemImageInfo,
     ) -> Result<Option<String>, ServiceError> {
-        Ok(Some(format!("tag:{}", image.path)))
+        Ok(Some(match item_path {
+            Some(owner) => format!("tag:{}@{owner}", image.path),
+            None => format!("tag:{}", image.path),
+        }))
     }
+    /// `path:<base item path>@<unix seconds>`, the chapter tags' form.
     async fn get_image_cache_tag_for_path(
         &self,
-        _base_item_path: &str,
-        _image_date_modified: DateTime<Utc>,
+        base_item_path: &str,
+        image_date_modified: DateTime<Utc>,
     ) -> Result<Option<String>, ServiceError> {
-        Ok(None)
+        Ok(Some(format!(
+            "path:{base_item_path}@{}",
+            image_date_modified.timestamp()
+        )))
     }
     async fn process_image(
         &self,

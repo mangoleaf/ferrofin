@@ -7,6 +7,7 @@
 //! engines over a corpus that deliberately includes inputs which only the
 //! lookarounds reject.
 
+use fancy_regex::internal::AnalyzeContext;
 use ferrofin_naming::common::{GuardedRegex, NamingOptions};
 
 /// Every pattern the crate runs through `GuardedRegex`, with its raw source.
@@ -22,6 +23,12 @@ fn vendored_patterns(options: &NamingOptions) -> Vec<String> {
         out.push(format!("(?i){e}"));
     }
     for e in &options.clean_strings {
+        out.push(format!("(?i){e}"));
+    }
+    for e in &options.audio_book_parts_expressions {
+        out.push(format!("(?i){e}"));
+    }
+    for e in &options.audio_book_names_expressions {
         out.push(format!("(?i){e}"));
     }
     out
@@ -154,18 +161,33 @@ fn guard_never_changes_the_match() {
 }
 
 #[test]
-fn every_vendored_pattern_actually_gets_a_guard() {
-    // If a pattern silently lost its guard the crate would still be correct but
-    // would quietly fall back to the slow backtracking path, which is the
-    // regression this whole type exists to prevent.
+fn a_vendored_pattern_has_a_guard_exactly_when_fancy_regex_would_backtrack_on_it() {
+    // A pattern that runs on fancy-regex's backtracking engine must get a guard,
+    // or it quietly falls back to the slow path this type exists to prevent.
+    // Any other pattern fancy-regex hands whole to the same linear-time engine
+    // the guard uses, so a guard would compile it twice and scan each match
+    // twice. (`internal` is fancy-regex's doc-hidden analysis, pinned by
+    // Cargo.lock: if a bump moves it, re-check this another way.)
     let options = NamingOptions::new();
+    let (mut with, mut without) = (0, 0);
     for pattern in vendored_patterns(&options) {
         let guarded = GuardedRegex::new(&pattern).expect("vendored pattern compiles");
-        assert!(
-            guarded.has_guard(),
-            "no rejection guard built for {pattern:?}"
-        );
+        let tree = fancy_regex::Expr::parse_tree(&pattern).expect("vendored pattern parses");
+        let backtracks = fancy_regex::internal::analyze(&tree, AnalyzeContext::default())
+            .expect("vendored pattern analyses")
+            .hard;
+        assert_eq!(guarded.has_guard(), backtracks, "guard for {pattern:?}");
+        if backtracks {
+            with += 1;
+        } else {
+            without += 1;
+        }
     }
+    // Both kinds are in the tables, so neither half of the check is vacuous.
+    assert!(
+        with > 0 && without > 0,
+        "{with} guarded, {without} unguarded"
+    );
 }
 
 #[test]

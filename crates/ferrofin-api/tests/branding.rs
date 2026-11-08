@@ -193,14 +193,14 @@ impl AuthService for Caller {
         Ok(match self {
             Self::Key => AuthorizationInfo {
                 token: Some("tok".into()),
-                user: Some(user()),
+                user: Some(Arc::new(user())),
                 is_api_key: true,
                 is_authenticated: true,
                 ..Default::default()
             },
             Self::Regular => AuthorizationInfo {
                 token: Some("tok".into()),
-                user: Some(user()),
+                user: Some(Arc::new(user())),
                 user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy::default())),
                 is_authenticated: true,
                 ..Default::default()
@@ -556,6 +556,39 @@ async fn splashscreen_delete_no_location_is_204() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
+/// `GetSplashscreen` and `DeleteCustomSplashscreen` test `SplashscreenLocation`
+/// with `File.Exists`, which is false for a directory: GET falls back to
+/// `{DataPath}/splashscreen.png` and DELETE leaves the directory and the
+/// recorded location alone, as for a missing file.
+#[tokio::test]
+async fn a_splashscreen_location_that_is_not_a_file_is_ignored() {
+    let dir = std::env::temp_dir().join(format!("ferrofin-splash-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("splashscreen.png"), b"default-bytes").expect("splash");
+    for location in [dir.clone(), dir.join("missing.png")] {
+        let location = location.to_string_lossy().into_owned();
+        let mut branding = default_branding();
+        branding.splashscreen_enabled = true;
+        branding.splashscreen_location = Some(location.clone());
+        let config = make_config(branding, &dir.to_string_lossy());
+
+        let (status, _, body) =
+            get_as(config.clone(), &Caller::Anonymous, "/Branding/Splashscreen").await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (StatusCode::OK, &b"default-bytes"[..]),
+            "{location}"
+        );
+
+        let (status, _) = send(config.clone(), "DELETE", "/Branding/Splashscreen", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{location}");
+        let recorded = config.get_branding().await.expect("branding");
+        assert_eq!(recorded.splashscreen_location, Some(location));
+    }
+    assert!(dir.is_dir());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Drives one GET as `caller`, returning the status, headers and body.
 async fn get_as(
     config: Arc<StubConfig>,
@@ -609,6 +642,31 @@ async fn a_disabled_splashscreen_is_visible_to_administrators_only() {
         let (status, ..) = get_as(config.clone(), &caller, "/Branding/Splashscreen").await;
         assert_eq!(status, StatusCode::OK);
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `GetSplashscreen` passes `GetImageResult` no response headers, so it sends
+/// neither of the DLNA headers every other image route carries (gl-1118).
+#[tokio::test]
+async fn a_splashscreen_sends_no_dlna_headers() {
+    let dir = std::env::temp_dir().join(format!("ferrofin-splash-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(dir.join("splashscreen.png"), b"png-bytes").expect("splash");
+    let mut branding = default_branding();
+    branding.splashscreen_enabled = true;
+    let config = make_config(branding, &dir.to_string_lossy());
+
+    let (status, headers, _) = get_as(config, &Caller::Anonymous, "/Branding/Splashscreen").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers.get("transfermode.dlna.org").is_none(),
+        "{headers:?}"
+    );
+    assert!(
+        headers.get("realtimeinfo.dlna.org").is_none(),
+        "{headers:?}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -520,10 +520,10 @@ mod tests {
             "<?xml version=\"1.0\"?><Item><LocalTitle>Mix</LocalTitle></Item>",
         )
         .expect("write");
-        let roots = vec![root.clone()];
+        let roots = vec![root];
         let member = PlaylistMember {
             item_id: None,
-            path: Some(track.clone()),
+            path: Some(track),
         };
         assert_eq!(
             read_members(&m3u, &roots),

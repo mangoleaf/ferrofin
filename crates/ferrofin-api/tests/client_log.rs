@@ -99,7 +99,7 @@ impl AuthService for OkAuth {
             client: Some("Test Client".to_owned()),
             version: Some("9.9.9".to_owned()),
             is_api_key: self.is_api_key,
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_authenticated: true,
             ..Default::default()
         })
@@ -117,7 +117,7 @@ impl AuthorizationContext for OkAuth {
             client: Some("Test Client".to_owned()),
             version: Some("9.9.9".to_owned()),
             is_api_key: self.is_api_key,
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_authenticated: true,
             ..Default::default()
         })

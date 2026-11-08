@@ -34,7 +34,7 @@ impl Budget {
     pub(super) fn try_acquire(self: &Arc<Self>) -> Option<Permit> {
         let extras = effective_limit((self.read)(), self.processors) - 1;
         self.extra_workers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < extras).then_some(active + 1)
             })
             .ok()
@@ -50,9 +50,10 @@ impl Drop for Permit {
     }
 }
 
-/// Only Send data crosses into a worker; each constructs its own !Sync naming rules.
+/// Only Send data crosses into a worker; the naming rules are the plan's own.
 #[derive(Clone)]
 struct Seed<'a> {
+    naming: &'a super::NamingOptions,
     scope: super::PlanScope<'a>,
     key_folders: &'a [super::VirtualFolderInfo],
     tv_library: bool,
@@ -73,6 +74,7 @@ struct Seed<'a> {
 impl<'a> Seed<'a> {
     fn of(ctx: &super::PlanCtx<'a>) -> Self {
         Self {
+            naming: ctx.naming,
             scope: ctx.scope,
             key_folders: ctx.key_folders,
             tv_library: ctx.tv_library.get(),
@@ -91,11 +93,8 @@ impl<'a> Seed<'a> {
         }
     }
 
-    fn context<'b>(self, naming: &'b super::NamingOptions) -> super::PlanCtx<'b>
-    where
-        'a: 'b,
-    {
-        let mut ctx = super::PlanCtx::new(naming, self.scope)
+    fn context(self) -> super::PlanCtx<'a> {
+        let mut ctx = super::PlanCtx::new(self.naming, self.scope)
             .with_date_added(self.date_added)
             .with_key_folders(self.key_folders)
             .with_content_types(self.content_types);
@@ -223,8 +222,7 @@ pub(super) fn map<T: Sync, R: Send + Default>(
                     .name("library-folder".into())
                     .spawn_scoped(scope, move || {
                         let _permit = permit;
-                        let naming = super::NamingOptions::new();
-                        let worker_ctx = seed.context(&naming);
+                        let worker_ctx = seed.context();
                         let result = run_chunk(chunk, &worker_ctx, run);
                         (result, Effects::of(worker_ctx))
                     });
@@ -372,6 +370,25 @@ mod tests {
             assert_eq!(effects, rows.concat());
             assert_eq!(budget.extra_workers.load(Ordering::Acquire), 0);
         }
+    }
+
+    #[test]
+    fn folder_workers_share_the_plans_naming_rules() {
+        let naming = super::super::NamingOptions::new();
+        let mut ctx = super::super::PlanCtx::new(&naming, super::super::PlanScope::ALL);
+        ctx.fanout = Some(Budget::new(|| 4));
+        let caller = std::thread::current().id();
+        let seen = map(&[0, 1, 2, 3], &ctx, |_, ctx| {
+            (
+                std::thread::current().id() != caller,
+                std::ptr::eq(ctx.naming, &raw const naming),
+            )
+        });
+        assert!(
+            seen.iter().any(|(worker, _)| *worker),
+            "no folder worker ran"
+        );
+        assert!(seen.iter().all(|(_, same)| *same), "{seen:?}");
     }
 
     #[test]

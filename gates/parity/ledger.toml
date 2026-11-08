@@ -382,21 +382,6 @@ kind = "value"
 issue = 848
 reason = "Paths of by-name items are answered with %MetadataPath% unexpanded."
 
-# Grouped Latest lacks v12's movies and mixed-library branches.
-[[entry]]
-request = "GetLatestMedia*"
-path = "$"
-kind = "length"
-issue = 383
-reason = "Grouped Latest lacks v12's movies and mixed-library branches."
-
-[[entry]]
-request = "GetLatestMedia*"
-path = "[].ChildCount"
-kind = "value"
-issue = 383
-reason = "Grouped Latest lacks v12's movies and mixed-library branches."
-
 # The latest-episode container is loaded without its provider ids.
 [[entry]]
 request = "GetLatestMedia.includeItemTypes.episode"
@@ -592,6 +577,14 @@ kind = "value"
 issue = 220
 reason = "The bundled ListenBrainz plugin and its two settings pages are missing, so the pages shift."
 
+# Ferrofin's own plugin lists its settings page, the one in the dashboard menu, after the in-tree ones.
+[[entry]]
+request = "GetConfigurationPages"
+path = "[].EnableInMainMenu"
+kind = "value"
+issue = 540
+reason = "Ferrofin's own plugin lists its settings page, the one in the dashboard menu, after the in-tree ones."
+
 # The HLS ffmpeg arguments lack upstream's -map_metadata -1 -map_chapters -1 and -max_delay 5000000.
 [[entry]]
 request = "GetHlsAudioSegment"
@@ -599,6 +592,17 @@ path = "$"
 kind = "value"
 issue = 832
 reason = "The HLS ffmpeg arguments lack upstream's -map_metadata -1 -map_chapters -1 and -max_delay 5000000."
+
+# Owner decision 2026-11-04, an accepted divergence: the transcode output name keys on the output shape.
+# The playlist is not JSON, so `$` accepts the whole live playlist body, not only the segment names.
+# The request carries an oracle_trap: a run whose Jellyfin stalls on it lists this entry under
+# "matched nothing", which is not a reason to delete it.
+[[entry]]
+request = "GetLiveHlsStream"
+path = "$"
+kind = "value"
+issue = 860
+reason = "Transcode output names hash the output shape (tracks, codecs, bitrates, subtitles), not upstream's MD5 of MediaPath-UserAgent-DeviceId-PlaySessionId, so the live playlist names other segment files."
 
 # Owner decision 2026-10-24, a Jellyfin bug not ported: with no parent, upstream answers empty lists.
 [[entry]]
@@ -968,6 +972,14 @@ kind = "value"
 issue = 220
 reason = "The bundled ListenBrainz plugin is missing, so the plugin rows shift."
 
+# Ferrofin's own plugin, its settings, is listed beside the in-tree ones, so the list is one longer.
+[[entry]]
+request = "GetPlugins"
+path = "$"
+kind = "length"
+issue = 539
+reason = "Ferrofin's own plugin, its settings, is listed beside the in-tree ones, so the list is one longer."
+
 # Ferrofin does not read the task history an adopted Jellyfin data directory keeps.
 [[entry]]
 request = "GetTasks"
@@ -1161,43 +1173,6 @@ kind = "status"
 issue = 846
 reason = "Deleting a non-subtitle stream answers 204 where upstream answers 400."
 
-# Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have.
-[[entry]]
-request = "AuthenticateUserByName"
-path = "SessionInfo.LastPlaybackCheckIn"
-kind = "value"
-issue = 837
-reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
-
-[[entry]]
-request = "AuthenticateUserByName"
-path = "SessionInfo.NowPlayingQueueFullItems"
-kind = "extra"
-issue = 837
-reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
-
-# The same two session fields in every session list the sweep reads back (GET /Sessions and the setup reads of the session commands).
-[[entry]]
-request = "GetSessions"
-path = "[].LastPlaybackCheckIn"
-kind = "value"
-issue = 837
-reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
-
-[[entry]]
-request = "*/session"
-path = "[].LastPlaybackCheckIn"
-kind = "value"
-issue = 837
-reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
-
-[[entry]]
-request = "*"
-path = "[].NowPlayingQueueFullItems"
-kind = "extra"
-issue = 837
-reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
-
 # Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo).
 [[entry]]
 request = "screen-playback-start/sessions"
@@ -1304,28 +1279,6 @@ path = "[].NowPlayingItem.ImageTags.Primary"
 kind = "value"
 issue = 849
 reason = "Image cache tags hash the image file's path where Jellyfin hashes the item's path, so every image tag differs."
-
-# Ferrofin's session PlayState does not carry the reported MediaSourceId, PlayMethod and VolumeLevel (SessionManager.UpdateNowPlayingItem).
-[[entry]]
-request = "screen-playback-start/sessions"
-path = "[].PlayState.MediaSourceId"
-kind = "missing"
-issue = 119
-reason = "Ferrofin's session PlayState does not carry the reported MediaSourceId, PlayMethod and VolumeLevel (SessionManager.UpdateNowPlayingItem)."
-
-[[entry]]
-request = "screen-playback-start/sessions"
-path = "[].PlayState.PlayMethod"
-kind = "missing"
-issue = 119
-reason = "Ferrofin's session PlayState does not carry the reported MediaSourceId, PlayMethod and VolumeLevel (SessionManager.UpdateNowPlayingItem)."
-
-[[entry]]
-request = "screen-playback-start/sessions"
-path = "[].PlayState.VolumeLevel"
-kind = "missing"
-issue = 119
-reason = "Ferrofin's session PlayState does not carry the reported MediaSourceId, PlayMethod and VolumeLevel (SessionManager.UpdateNowPlayingItem)."
 
 # A Jellyfin bug not ported: a never-written item's UserData.Key is the key Jellyfin cached for the item's first request (its GUID when that request loaded no provider ids); Ferrofin computes it from the item's provider ids.
 [[entry]]

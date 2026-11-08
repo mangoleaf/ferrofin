@@ -23,6 +23,7 @@ use ferrofin_mediaencoding::subtitles::{
     SubtitleEditParser, SubtitleEncoder as PureSubtitleEncoder, SubtitleEncoderImpl, SubtitleIo,
     subtitle_extraction_timeout,
 };
+use ferrofin_mediaencoding::transcoding::TranscodeLimits;
 use ferrofin_mediaencoding::{
     AttachmentExtractorImpl, EncodingHelper, NoopSessionReporter, TokioSegmentTranscoder,
     TranscodeManagerImpl,
@@ -68,6 +69,9 @@ pub struct MediaEncodingExtras {
     /// playlist generator has no keyframe extractor, and every playlist uses
     /// equal-length segments.
     pub keyframes: Option<Arc<dyn KeyframeRepository>>,
+    /// The caps on concurrent re-encoding jobs; see
+    /// [`crate::config::Config::max_transcodes`].
+    pub transcode_limits: TranscodeLimits,
 }
 
 /// The playlist generator's encoding options: the live configuration, as
@@ -121,6 +125,10 @@ trait LiveStreamReleaser: Send + Sync {
         device_id: &str,
         info: &ferrofin_model::session::TranscodingInfo,
     ) -> Result<(), ServiceError>;
+
+    /// Withdraws what [`Self::publish_transcoding_info`] published for
+    /// `device_id` (`ISessionManager.ClearTranscodingInfo`).
+    async fn clear_transcoding_info(&self, device_id: &str) -> Result<(), ServiceError>;
 }
 
 #[async_trait]
@@ -131,6 +139,11 @@ impl LiveStreamReleaser for Arc<dyn ferrofin_traits::session::SessionManager> {
         info: &ferrofin_model::session::TranscodingInfo,
     ) -> Result<(), ServiceError> {
         self.report_transcoding_info(device_id, info).await
+    }
+
+    async fn clear_transcoding_info(&self, device_id: &str) -> Result<(), ServiceError> {
+        ferrofin_traits::session::SessionManager::clear_transcoding_info(self.as_ref(), device_id)
+            .await
     }
 
     async fn release(&self, live_stream_id: &str, session_id: &str) -> Result<(), ServiceError> {
@@ -183,6 +196,21 @@ impl<R: LiveStreamReleaser> ferrofin_mediaencoding::SessionReporter
         {
             // Best effort: a dashboard panel is not worth failing a transcode.
             tracing::warn!(%device_id, %error, "reporting the transcode to the session failed");
+        }
+    }
+
+    /// `OnTranscodeFailedToStart`: `if (!string.IsNullOrWhiteSpace(
+    /// state.Request.DeviceId)) ClearTranscodingInfo(state.Request.DeviceId)`.
+    async fn on_job_failed_to_start(
+        &self,
+        job: &ferrofin_traits::media_encoding::TranscodingJobHandle,
+    ) {
+        let Some(device_id) = job.device_id.as_deref().filter(|d| !d.trim().is_empty()) else {
+            return;
+        };
+        if let Err(error) = self.releaser.clear_transcoding_info(device_id).await {
+            // Best effort, as publishing it was: the transcode already failed.
+            tracing::warn!(%device_id, %error, "clearing the failed transcode from the session failed");
         }
     }
 
@@ -349,7 +377,11 @@ pub fn build_media_encoding(
     if cleared > 0 {
         tracing::info!(deleted = cleared, "cleared the transcode cache");
     }
-    let manager = Arc::new(TranscodeManagerImpl::new(reporter).with_encoding_configuration(config));
+    let manager = Arc::new(
+        TranscodeManagerImpl::new(reporter)
+            .with_encoding_configuration(config)
+            .with_transcode_limits(extras.transcode_limits),
+    );
     // The idle reaper kills any transcode whose consumers vanished without a
     // stop report (a disconnected cast receiver, a killed browser tab): no
     // active segment request and no session ping within the job's ping timeout
@@ -383,6 +415,21 @@ pub fn build_media_encoding(
     (hls, attachments, subtitles)
 }
 
+/// `GET url`, its body or what went wrong, which names only the URL's host.
+async fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let source = ferrofin_util::source_url::redact_url(url);
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("GET {source}: {}", e.without_url()))?;
+    if !resp.status().is_success() {
+        return Err(format!("GET {source}: HTTP {}", resp.status()));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("GET {source} body: {}", e.without_url()))
+}
+
 /// The real ffmpeg + filesystem [`SubtitleIo`] for the subtitle encoder.
 ///
 /// Mirrors [`FfmpegAttachmentIo`]: cache paths come from the [`PathManager`],
@@ -406,16 +453,7 @@ impl SubtitleIo for FfmpegSubtitleIo {
     }
 
     async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
-        let resp = reqwest::get(url)
-            .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("GET {url}: HTTP {}", resp.status()));
-        }
-        resp.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("GET {url} body: {e}"))
+        http_get_bytes(url).await
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {
@@ -729,6 +767,18 @@ mod tests {
     use ferrofin_model::entities_media::MediaAttachment;
     use ferrofin_model::media_info::LiveStreamRequest;
 
+    /// The text ends up in a log, and the URL can carry an account.
+    #[tokio::test]
+    async fn a_failed_remote_subtitle_names_only_the_host() {
+        let error = http_get_bytes(
+            "http://acct-user:info-secret@127.0.0.1:0/path-secret/en.srt?token=query-secret",
+        )
+        .await
+        .expect_err("nothing listens there");
+
+        assert_eq!(error, "GET http://127.0.0.1:0: error sending request");
+    }
+
     /// A fake [`MediaSourceManager`] returning fixed sources + attachments.
     struct FakeSources {
         sources: Vec<MediaSourceInfo>,
@@ -1008,6 +1058,7 @@ mod tests {
                 trickplay: None,
                 sessions: None,
                 keyframes: None,
+                transcode_limits: TranscodeLimits::default(),
             },
         );
     }
@@ -1053,6 +1104,7 @@ mod tests {
                 trickplay: None,
                 sessions: None,
                 keyframes: None,
+                transcode_limits: TranscodeLimits::default(),
             },
         );
         assert!(!job.join("0123abcd0.mp4").exists());
@@ -1068,6 +1120,8 @@ mod tests {
         /// `(device_id, hardware_acceleration_type)`.
         reported:
             std::sync::Mutex<Vec<(String, ferrofin_model::entities::HardwareAccelerationType)>>,
+        /// Every device whose transcoding info was cleared.
+        cleared: std::sync::Mutex<Vec<String>>,
         fail: bool,
     }
 
@@ -1083,6 +1137,14 @@ mod tests {
                 info.hardware_acceleration_type
                     .unwrap_or(ferrofin_model::entities::HardwareAccelerationType::none),
             ));
+            Ok(())
+        }
+
+        async fn clear_transcoding_info(&self, device_id: &str) -> Result<(), ServiceError> {
+            self.cleared
+                .lock()
+                .expect("lock")
+                .push(device_id.to_owned());
             Ok(())
         }
 
@@ -1225,6 +1287,25 @@ mod tests {
         assert!(reporter.releaser.reported.lock().expect("lock").is_empty());
     }
 
+    #[tokio::test]
+    async fn a_transcode_that_fails_to_start_is_cleared_from_its_device() {
+        use ferrofin_mediaencoding::SessionReporter as _;
+        let reporter = LiveStreamReleasingReporter {
+            releaser: RecordingReleaser::default(),
+        };
+        let mut job = killed_job(None, Some("sess"));
+        reporter.on_job_failed_to_start(&job).await;
+        // `IsNullOrWhiteSpace`: a blank device has nothing to clear.
+        job.device_id = Some("  ".to_owned());
+        reporter.on_job_failed_to_start(&job).await;
+        job.device_id = None;
+        reporter.on_job_failed_to_start(&job).await;
+        assert_eq!(
+            *reporter.releaser.cleared.lock().expect("lock"),
+            vec!["dev".to_owned()]
+        );
+    }
+
     /// A [`TrickplayManager`](ferrofin_traits::trickplay::TrickplayManager) with
     /// one canned resolution for every item, so a master playlist that reached
     /// it says so. Every other method is unused by this test.
@@ -1276,21 +1357,6 @@ mod tests {
             unimplemented!("fake")
         }
         async fn delete_trickplay_data(&self, _item_id: uuid::Uuid) -> Result<(), ServiceError> {
-            unimplemented!("fake")
-        }
-        async fn get_trickplay_manifest(
-            &self,
-            _item_id: uuid::Uuid,
-        ) -> Result<
-            std::collections::HashMap<
-                String,
-                std::collections::HashMap<
-                    i32,
-                    ferrofin_db::entities::playback::TrickplayInfoEntity,
-                >,
-            >,
-            ServiceError,
-        > {
             unimplemented!("fake")
         }
         async fn get_hls_playlist(
@@ -1360,6 +1426,7 @@ mod tests {
                 trickplay: Some(Arc::new(FakeTrickplay)),
                 sessions: None,
                 keyframes: None,
+                transcode_limits: TranscodeLimits::default(),
             },
         );
 
@@ -1569,7 +1636,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(alt.media_attachments.is_empty());
+        assert!(
+            alt.media_attachments.is_empty(),
+            "{:?}",
+            alt.media_attachments
+        );
     }
 
     #[tokio::test]

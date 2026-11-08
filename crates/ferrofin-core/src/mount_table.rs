@@ -469,7 +469,8 @@ shm /dev/shm tmpfs rw,nosuid,nodev,noexec,relatime,size=65536k 0 0
 
     #[test]
     fn skips_short_rows() {
-        assert!(parse_mount_table("garbage\n\n/dev x\n").is_empty());
+        let found = parse_mount_table("garbage\n\n/dev x\n");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

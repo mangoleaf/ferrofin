@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(answer.item.premiere_date, None);
         assert_eq!(answer.item.production_year, None);
         assert!(answer.people.is_none());
-        assert!(answer.provider_ids.is_empty());
+        assert!(answer.provider_ids.is_empty(), "{:?}", answer.provider_ids);
     }
 
     fn translation(language: &str, text: Option<&str>) -> TvdbTranslation {
@@ -373,7 +373,8 @@ mod tests {
         };
         assert_eq!(record.translated_overview("es", &["spa".to_owned()]), None);
         assert_eq!(record.translated_overview("en", &["eng".to_owned()]), None);
-        assert!(tvdb_answer(&record, 2, "en", &[]).provider_ids.is_empty());
+        let provider_ids = tvdb_answer(&record, 2, "en", &[]).provider_ids;
+        assert!(provider_ids.is_empty(), "{provider_ids:?}");
     }
 
     /// `TvdbSdkExtensions.IsMatch` (`:103-127`): TVDB's own codes for three

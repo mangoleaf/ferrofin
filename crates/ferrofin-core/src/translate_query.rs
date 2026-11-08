@@ -139,7 +139,23 @@ pub enum QueryShape {
     /// Select `bi."Type", COUNT(*)` grouped by type — the per-type counts in one
     /// query, without materializing every matching row. No `ORDER BY` / paging.
     TypeCounts,
+    /// Select the columns of [`EPISODE_ORDER_SELECT`]: the rows and order of
+    /// [`QueryShape::FullRows`], with only the columns a season's episode
+    /// filter and the aired-order sort read.
+    EpisodeOrder,
 }
+
+/// The [`QueryShape::EpisodeOrder`] projection: what `FilterEpisodesBySeason`
+/// and `AiredEpisodeOrderComparer` read of an episode or season row. `Data` is
+/// read only for its `Airs*` members, so a blob that spells no `"Airs` key
+/// literally is left out: both parsers read all three as absent from it,
+/// valid or not. (A key written with a `\u` escape would be missed; no
+/// writer, serde_json or System.Text.Json, escapes a letter.)
+const EPISODE_ORDER_SELECT: &str = r#"SELECT bi."Id", bi."Type", bi."ParentId", bi."SeasonId",
+    bi."ChannelId", bi."Path", bi."IndexNumber", bi."ParentIndexNumber", bi."PremiereDate",
+    bi."PresentationUniqueKey",
+    CASE WHEN instr(bi."Data", '"Airs') > 0 THEN bi."Data" END AS "Data"
+    FROM "BaseItems" AS bi WHERE "#;
 
 /// Whether this query collapses merged versions into one row — C#
 /// `BaseItemRepository.EnableGroupByPresentationUniqueKey`.
@@ -245,8 +261,9 @@ pub(crate) fn build_folder_children_query(
 ///
 /// The returned [`QueryBuilder`] is ready to `.build_query_as()` /
 /// `.build_query_scalar()`. Ordering and paging are appended for
-/// [`QueryShape::FullRows`], [`QueryShape::IdsOnly`] and
-/// [`QueryShape::IdAndCleanName`]; the count shapes stop after the `WHERE`
+/// [`QueryShape::FullRows`], [`QueryShape::IdsOnly`],
+/// [`QueryShape::IdAndCleanName`] and [`QueryShape::EpisodeOrder`]; the count
+/// shapes stop after the `WHERE`
 /// clause.
 #[must_use]
 pub fn build_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryBuilder<Sqlite> {
@@ -271,6 +288,7 @@ pub fn build_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryBuild
             r#"SELECT COUNT(*) FROM "BaseItems" AS bi WHERE "#
         }
         QueryShape::TypeCounts => r#"SELECT bi."Type", COUNT(*) FROM "BaseItems" AS bi WHERE "#,
+        QueryShape::EpisodeOrder => EPISODE_ORDER_SELECT,
     };
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(projection);
 
@@ -293,7 +311,10 @@ pub fn build_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryBuild
         QueryShape::TypeCounts => {
             qb.push(r#" GROUP BY bi."Type""#);
         }
-        QueryShape::FullRows | QueryShape::IdsOnly | QueryShape::IdAndCleanName => {
+        QueryShape::FullRows
+        | QueryShape::IdsOnly
+        | QueryShape::IdAndCleanName
+        | QueryShape::EpisodeOrder => {
             append_order_by(&mut qb, filter);
             append_paging(&mut qb, filter);
         }
@@ -471,14 +492,24 @@ pub(crate) fn build_latest_tv_series_query(filter: &InternalItemsQuery) -> Query
 /// builds its base query with `TranslateQuery` alone, and the de-duplication
 /// is what the limit counts. The caller's `order_by` and `start_index` play no
 /// part, as upstream.
+///
+/// `without_series` keeps only the rows with no `SeriesName`: the movies half
+/// of the `unknown` arm (`Querying.cs:136`, `baseQuery.Where(e => e.SeriesName
+/// == null)`).
 #[must_use]
-pub(crate) fn build_latest_movies_query(filter: &InternalItemsQuery) -> QueryBuilder<Sqlite> {
+pub(crate) fn build_latest_movies_query(
+    filter: &InternalItemsQuery,
+    without_series: bool,
+) -> QueryBuilder<Sqlite> {
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
         r#"SELECT bi."Id" AS "Id", bi."PresentationUniqueKey" AS "PresentationUniqueKey"
            FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
     );
     qb.push_bind(PLACEHOLDER_ID);
     append_predicates(&mut qb, filter);
+    if without_series {
+        qb.push(r#" AND bi."SeriesName" IS NULL"#);
+    }
     qb.push(
         r#" AND bi."PresentationUniqueKey" IS NOT NULL ORDER BY bi."DateCreated" DESC, bi."Id" DESC"#,
     );
@@ -531,7 +562,7 @@ pub(crate) fn build_latest_tv_episodes_query(
     }
     qb.push(r#" AND bi."SeriesName" IN ("#);
     let mut names = qb.separated(", ");
-    for name in series_names {
+    for name in ferrofin_db::padded_in_list(series_names) {
         names.push_bind(name.clone());
     }
     qb.push(")");
@@ -905,7 +936,18 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
     }
 
     if filter.parent_id != Uuid::nil() {
-        if filter.recursive {
+        if filter.recursive && filter.drive_from_parent_subtree {
+            // The same closure as below, as a set the statement is driven by
+            // (`IX_AncestorIds_ParentItemId`, then `BaseItems` by id). The
+            // probe below lets SQLite seed from `IX_BaseItems_IsFolder_…` for
+            // an `IsFolder` order and read every row in the table per call.
+            // Other callers keep the probe, which their own plans may use.
+            qb.push(
+                r#" AND bi."Id" IN (SELECT a."ItemId" FROM "AncestorIds" a WHERE a."ParentItemId" = "#,
+            )
+            .push_bind(guid_to_db(filter.parent_id))
+            .push(")");
+        } else if filter.recursive {
             // Recursive browse (e.g. a library's "Episodes" tab): match any
             // descendant via the `AncestorIds` closure, not just direct children.
             // Port of Jellyfin translating a recursive `ParentId` into an ancestor
@@ -1617,18 +1659,14 @@ fn append_name_predicates(
         .map(get_clean_value)
         .collect();
     if !clean_names.is_empty() {
-        qb.push(r#" AND bi."CleanName" IN ("#);
-        let mut sep = qb.separated(", ");
-        for clean in &clean_names {
-            sep.push_bind(clean.clone());
-        }
-        qb.push(")");
+        qb.push(" AND ");
+        push_in_list(qb, r#"bi."CleanName""#, &clean_names);
     }
 
     if let Some(contains) = non_blank(filter.name_contains.as_ref()) {
         let clean = format!("%{}%", get_clean_value(contains).trim_matches('%'));
         qb.push(r#" AND (bi."CleanName" LIKE "#)
-            .push_bind(clean.clone())
+            .push_bind(clean)
             .push(r#" OR ferrofin_lower_invariant(bi."OriginalTitle") LIKE "#)
             .push_bind(format!("%{}%", lower_invariant(contains).trim_matches('%')))
             .push(")");
@@ -1741,6 +1779,7 @@ fn build_box_set_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryB
             r#"SELECT bi."Id", bi."CleanName" FROM "BaseItems" bi WHERE "#
         }
         QueryShape::GroupedCount => r#"SELECT COUNT(*) FROM "BaseItems" bi WHERE "#,
+        QueryShape::EpisodeOrder => EPISODE_ORDER_SELECT,
         QueryShape::Count | QueryShape::TypeCounts => unreachable!("raw count shapes do not group"),
     });
     qb.push(r#"bi."Id" IN (SELECT "Id" FROM collapsed_ids)"#);
@@ -1753,12 +1792,13 @@ fn build_box_set_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryB
 }
 
 /// Appends the media-attribute predicates: subtitle presence, chapter
-/// images, image types, owned-extra presence (trailer / theme song / theme
-/// video / special feature), then the `Data`-blob matches
-/// ([`append_data_blob_predicates`]).
+/// images, the plugin analysis pass's not-offered anti-join, image types,
+/// owned-extra presence (trailer / theme song / theme video / special
+/// feature), then the `Data`-blob matches ([`append_data_blob_predicates`]).
 ///
 /// Ports of C# `TranslateQuery`'s `HasSubtitles`, `HasChapterImages`,
-/// `ImageTypes` and the `ExtraIds`-backed extra filters.
+/// `ImageTypes` and the `ExtraIds`-backed extra filters; the anti-join
+/// (`not_offered_to_plugin`) is Ferrofin's own.
 fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     // Subtitle presence (v12 `TranslateQuery.cs:897-918`, criteria
     // `HasSubtitles`): an item matches on its own subtitle streams or an
@@ -1783,6 +1823,18 @@ fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Int
         push_item_version_or_folder_matching(qb, MediaTable::Chapters, &|qb, alias| {
             qb.push(format!(r#"{alias}."ImagePath" IS NOT NULL"#));
         });
+    }
+    // The plugin media-analysis pass's anti-join (Ferrofin's own; Jellyfin has
+    // no such pass): the items not offered to this plugin yet. One primary-key
+    // probe per row, as the table's key leads with `ItemId`
+    // (`not_offered_items_probe_the_offered_key` pins it).
+    if let Some(plugin) = filter.not_offered_to_plugin {
+        qb.push(
+            r#" AND NOT EXISTS (SELECT 1 FROM "FerrofinPluginOfferedItems" po
+                WHERE po."ItemId" = bi."Id" AND po."PluginId" = "#,
+        )
+        .push_bind(guid_to_db(plugin))
+        .push(")");
     }
 
     // Image presence: an `EXISTS` over the item's image rows whose `ImageType`
@@ -3539,7 +3591,8 @@ fn append_paging(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
 
 /// Pushes `<column> IN (?, ?, …)` binding each value, or `1 = 0` for an empty
 /// list (an empty `IN ()` is a SQL syntax error and, like C# `Contains` over an
-/// empty set, matches nothing).
+/// empty set, matches nothing). The binds are padded to a power of two
+/// ([`ferrofin_db::padded_in_list`]), so a list's text is one of a few lengths.
 ///
 /// Values are cloned into the builder, so the source slice need not outlive it;
 /// the cloned owned values (`String`/`i64`/`bool`) satisfy the `'a` encode bound.
@@ -3553,7 +3606,7 @@ where
     }
     qb.push(column).push(" IN (");
     let mut sep = qb.separated(", ");
-    for v in values {
+    for v in ferrofin_db::padded_in_list(values) {
         sep.push_bind(v.clone());
     }
     qb.push(")");
@@ -3592,6 +3645,23 @@ mod tests {
     use ferrofin_model::dto::SortOrder;
     use ferrofin_model::live_tv::ItemSortBy;
     use ferrofin_traits::options::InternalItemsQuery;
+
+    /// `push_in_list` binds a list padded to a power of two, so its text is one
+    /// of a few lengths whatever the count (gl-1243); an empty list matches
+    /// nothing.
+    #[rstest::rstest]
+    #[case(0, "1 = 0")]
+    #[case(1, "c IN (?)")]
+    #[case(3, "c IN (?, ?, ?, ?)")]
+    #[case(4, "c IN (?, ?, ?, ?)")]
+    #[case(5, "c IN (?, ?, ?, ?, ?, ?, ?, ?)")]
+    fn an_in_list_is_padded_to_a_power_of_two(#[case] count: i64, #[case] sql: &str) {
+        use sqlx::{QueryBuilder, Sqlite};
+        let values: Vec<i64> = (0..count).collect();
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("");
+        super::push_in_list(&mut qb, "c", &values);
+        assert_eq!(qb.sql().as_str(), sql);
+    }
 
     /// `push_access_filter`'s text: no library term for an empty scope, a
     /// plain or `+` term by [`super::TopParentTerm`], and no version or owner
@@ -3661,10 +3731,15 @@ mod tests {
 
     /// The movies arm of the grouped Latest (`build_latest_movies_query`), as
     /// the user-view manager sends it for a movies library and for the unscoped
-    /// home row: the libraries' rows come off an index seek by top parent,
-    /// never a scan of every item.
+    /// home row, and its `without_series` form, the movies half of a mixed
+    /// library's `unknown` arm (whose shows half is the TV arm's statements,
+    /// pinned in `latest_tv_repository`): the libraries' rows come off an index
+    /// seek by top parent, never a scan of every item.
+    #[rstest::rstest]
+    #[case::movies_arm(false)]
+    #[case::unknown_arm_movies_half(true)]
     #[tokio::test]
-    async fn latest_movies_rows_seek_the_libraries() {
+    async fn latest_movies_rows_seek_the_libraries(#[case] without_series: bool) {
         use ferrofin_model::data::MediaType;
         use sqlx::{Execute, Row};
         let db = crate::test_support::test_db().await;
@@ -3676,7 +3751,7 @@ mod tests {
             limit: Some(20),
             ..InternalItemsQuery::default()
         };
-        let mut builder = super::build_latest_movies_query(&filter);
+        let mut builder = super::build_latest_movies_query(&filter, without_series);
         let mut query = builder.build();
         let args = query.take_arguments().expect("arguments").expect("binds");
         let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
@@ -3839,6 +3914,53 @@ mod tests {
         }
     }
 
+    /// A mixed listing excludes the playlists its user cannot see by id
+    /// ([`crate::item_visibility::ItemVisibility::hidden_playlists`]). That is a
+    /// residual check on rows the statement already reached: every step of the
+    /// plan, page and count, stays the one the listing has without it, and only
+    /// the listings holding such a playlist carry the predicate.
+    #[rstest::rstest]
+    #[case::page(QueryShape::FullRows)]
+    #[case::count(QueryShape::GroupedCount)]
+    #[tokio::test]
+    async fn excluding_hidden_playlists_keeps_the_listing_plan(#[case] shape: QueryShape) {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let user =
+            crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5511)).await;
+        let plan = async |exclude_item_ids: Vec<uuid::Uuid>| {
+            let filter = InternalItemsQuery {
+                user: Some(std::sync::Arc::new(user.clone())),
+                recursive: true,
+                top_parent_ids: vec![uuid::Uuid::from_u128(0x5512), uuid::Uuid::from_u128(0x5513)],
+                exclude_item_ids,
+                order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+                limit: Some(50),
+                ..InternalItemsQuery::default()
+            };
+            let mut builder = build_query(&filter, shape);
+            let mut query = builder.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain query plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<String>>()
+        };
+        let plain = plan(Vec::new()).await;
+        assert_eq!(
+            plan((0x6000..0x6000 + 500).map(uuid::Uuid::from_u128).collect()).await,
+            plain
+        );
+        assert!(
+            plain.iter().any(|step| step.contains("TopParentId=?")),
+            "the listing seeks its libraries: {plain:?}"
+        );
+    }
+
     /// The folder arm of `push_is_played`, as a Series / BoxSet browse
     /// filters and sorts on it: the page keeps the unfiltered browse's
     /// `(Type, TopParentId)` seek, and each of the three descendant arms seeks
@@ -3855,7 +3977,7 @@ mod tests {
         let user =
             crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5511)).await;
         let browse = InternalItemsQuery {
-            user: Some(user),
+            user: Some(std::sync::Arc::new(user)),
             recursive: true,
             include_item_types: vec![BaseItemKind::Series, BaseItemKind::BoxSet],
             top_parent_ids: vec![uuid::Uuid::from_u128(0x5512)],
@@ -3946,7 +4068,7 @@ mod tests {
         let user =
             crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5521)).await;
         let browse = InternalItemsQuery {
-            user: Some(user),
+            user: Some(std::sync::Arc::new(user)),
             recursive: true,
             include_item_types: vec![
                 BaseItemKind::Movie,
@@ -4007,7 +4129,7 @@ mod tests {
         let user =
             crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5531)).await;
         let browse = InternalItemsQuery {
-            user: Some(user),
+            user: Some(std::sync::Arc::new(user)),
             recursive: true,
             include_item_types: vec![
                 BaseItemKind::Movie,

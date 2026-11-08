@@ -131,6 +131,7 @@ mod tests {
         assert_eq!(got[0].total_duration, 500);
 
         repo.delete_keyframe_data(item).await.expect("delete");
-        assert!(repo.get_keyframe_data(item).await.expect("get").is_empty());
+        let keyframe_data = repo.get_keyframe_data(item).await.expect("get");
+        assert!(keyframe_data.is_empty(), "{keyframe_data:?}");
     }
 }

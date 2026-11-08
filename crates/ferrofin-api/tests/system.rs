@@ -5,6 +5,7 @@
 //! stub `ferrofin-traits` impls that authenticate and return canned data. Managers
 //! a given handler never touches reuse the `test_support` panic fakes.
 
+use std::io::Read as _;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -30,7 +31,7 @@ use ferrofin_model::system::{FolderStorageInfo, PublicSystemInfo, SystemInfo, Sy
 use ferrofin_traits::activity::{ActivityLogQuery, ActivityManager};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::filesystem::{FileMetadata, FileSystem};
+use ferrofin_traits::filesystem::{FileMetadata, FileSystem, OpenedFile};
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::system::{ServerApplicationPaths, SystemManager};
@@ -79,12 +80,8 @@ fn user() -> UserEntity {
 
 /// An auth stub that authenticates as [`USER_ID`].
 /// `elevated` authenticates as an API key, satisfying `RequiresElevation` on
-/// `Info/Storage`, `Logs`, `Logs/Log` and `Shutdown`. Off by default so
-/// `Info/Public`, `Ping` and `Endpoint` keep proving they work unelevated.
-///
-/// `Restart` is gated too, but by `LocalAccessOrRequiresElevation` — the
-/// caller's peer address decides, and `elevated` only matters off-network. Its
-/// tests inject `ConnectInfo` rather than relying on this flag.
+/// `Info/Storage`, `Logs`, `Logs/Log`, `Restart` and `Shutdown`. Off by default
+/// so `Info/Public`, `Ping` and `Endpoint` keep proving they work unelevated.
 struct OkAuth {
     elevated: bool,
 }
@@ -97,7 +94,7 @@ impl AuthService for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_api_key: self.elevated,
             is_authenticated: true,
             ..Default::default()
@@ -113,7 +110,7 @@ impl AuthorizationContext for OkAuth {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             token: Some("tok".into()),
-            user: Some(user()),
+            user: Some(Arc::new(user())),
             is_api_key: self.elevated,
             is_authenticated: true,
             ..Default::default()
@@ -379,8 +376,8 @@ fn full_state() -> AppState {
     full_state_with(false)
 }
 
-/// The elevated state, for `Info/Storage`, `Logs`, `Logs/Log`, `Shutdown` and
-/// the dashboard configuration pages.
+/// The elevated state, for `Info/Storage`, `Logs`, `Logs/Log`, `Restart`,
+/// `Shutdown` and the dashboard configuration pages.
 fn elevated_full_state() -> AppState {
     full_state_with(true)
 }
@@ -388,6 +385,11 @@ fn elevated_full_state() -> AppState {
 /// Builds an [`AppState`] whose system/filesystem/config/activity managers are
 /// stubs and the rest are panic fakes.
 fn full_state_with(elevated: bool) -> AppState {
+    state_with_file_system(elevated, Arc::new(StubFileSystem))
+}
+
+/// [`full_state_with`] over another filesystem.
+fn state_with_file_system(elevated: bool, file_system: Arc<dyn FileSystem>) -> AppState {
     let auth = Arc::new(OkAuth { elevated });
     AppState::new(
         Arc::new(FakeLibrary),
@@ -420,7 +422,7 @@ fn full_state_with(elevated: bool) -> AppState {
         Arc::new(FakeLocalization),
         Arc::new(FakeDisplayPreferences),
         Arc::new(StubActivity::default()),
-        Arc::new(StubFileSystem),
+        file_system,
         Arc::new(FakeTasks),
     )
 }
@@ -611,6 +613,212 @@ async fn system_logs_list_and_fetch() {
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
 }
 
+/// A log folder of one file, `big.log`, whose open the test scripts.
+struct OneLog(fn() -> Result<OpenedFile, ServiceError>);
+
+impl FileSystem for OneLog {
+    fn get_file_system_entries(&self, _path: &str) -> Vec<FileSystemEntryInfo> {
+        unimplemented!("unused")
+    }
+    fn get_drives(&self) -> Vec<FileSystemEntryInfo> {
+        unimplemented!("unused")
+    }
+    fn file_exists(&self, _path: &str) -> bool {
+        unimplemented!("unused")
+    }
+    fn directory_exists(&self, _path: &str) -> bool {
+        unimplemented!("unused")
+    }
+    fn validate_writable(&self, _path: &str) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    fn get_files(&self, _path: &str, _extensions: &[&str]) -> Vec<FileMetadata> {
+        vec![FileMetadata {
+            name: "big.log".to_owned(),
+            full_name: "/logs/big.log".to_owned(),
+            length: 0,
+            date_created: chrono::DateTime::UNIX_EPOCH,
+            date_modified: chrono::DateTime::UNIX_EPOCH,
+        }]
+    }
+    fn read_file(&self, _path: &str) -> Result<Vec<u8>, ServiceError> {
+        unimplemented!("a response streams")
+    }
+    fn open_file(&self, _path: &str) -> Result<OpenedFile, ServiceError> {
+        (self.0)()
+    }
+}
+
+/// `bytes` zeros for a log `length` long; the reader outrunning the length
+/// is a log still being written.
+fn opened(length: u64, bytes: u64) -> OpenedFile {
+    OpenedFile {
+        path: "/logs/big.log".to_owned(),
+        length,
+        reader: Box::new(std::io::repeat(b'x').take(bytes)),
+    }
+}
+
+async fn get_log(file_system: OneLog, headers: &[(&str, &str)]) -> axum::response::Response {
+    let mut request = Request::builder()
+        .uri("/System/Logs/Log?name=BIG.LOG")
+        .header("X-Emby-Token", "tok");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    create_router(state_with_file_system(true, Arc::new(file_system)))
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn body_of(response: axum::response::Response) -> Vec<u8> {
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+/// Oracle: Jellyfin 12.4 on a 5000-byte log. `File(stream, type)` sends the
+/// length and takes no notice of `Range` or `If-Modified-Since`.
+#[tokio::test]
+async fn a_log_answers_as_upstreams_file_stream() {
+    let response = get_log(
+        OneLog(|| Ok(opened(5000, 5000))),
+        &[
+            ("Range", "bytes=0-9"),
+            ("If-Modified-Since", "Fri, 01 Jan 2100 00:00:00 GMT"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
+    assert_eq!(headers["content-length"], "5000");
+    assert!(!headers.contains_key("accept-ranges"));
+    assert!(!headers.contains_key("last-modified"));
+    assert_eq!(body_of(response).await, vec![b'x'; 5000]);
+}
+
+/// An empty log is a 200 with a length of zero and an empty body.
+#[tokio::test]
+async fn an_empty_log_declares_a_length_of_zero() {
+    let response = get_log(OneLog(|| Ok(opened(0, 0))), &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-length"], "0");
+    assert_eq!(body_of(response).await, [] as [u8; 0]);
+}
+
+/// The compression layer sizes a response by its `Content-Length`, so streaming
+/// the log leaves it as it was: a small one plain, a large one encoded.
+#[tokio::test]
+async fn a_streamed_log_compresses_as_the_whole_one_did() {
+    let gzip = [("Accept-Encoding", "gzip")];
+    let large = get_log(OneLog(|| Ok(opened(5000, 5000))), &gzip).await;
+    assert_eq!(large.headers()["content-encoding"], "gzip");
+    assert!(!large.headers().contains_key("content-length"));
+    let small = get_log(OneLog(|| Ok(opened(100, 100))), &gzip).await;
+    assert!(!small.headers().contains_key("content-encoding"));
+    assert_eq!(small.headers()["content-length"], "100");
+    assert_eq!(body_of(small).await.len(), 100);
+}
+
+/// Today's log grows while it is read. The body stops at the length the headers
+/// declared: going past it would abort the response.
+#[tokio::test]
+async fn a_log_growing_under_the_reader_stops_at_the_declared_length() {
+    let response = get_log(OneLog(|| Ok(opened(300_000, 900_000))), &[]).await;
+    assert_eq!(response.headers()["content-length"], "300000");
+    assert_eq!(body_of(response).await.len(), 300_000);
+}
+
+/// A log is read as the client takes it, whatever its size: only the chunks
+/// asked for leave the disk. A log has no size cap.
+#[tokio::test]
+async fn a_log_is_read_as_the_client_takes_it_not_whole() {
+    use axum::body::HttpBody as _;
+
+    static READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    struct Counting;
+    impl std::io::Read for Counting {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            READ.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            Ok(buffer.len())
+        }
+    }
+
+    const HUGE: u64 = 1 << 40;
+    let response = get_log(
+        OneLog(|| {
+            Ok(OpenedFile {
+                path: "/logs/big.log".to_owned(),
+                length: HUGE,
+                reader: Box::new(Counting),
+            })
+        }),
+        &[],
+    )
+    .await;
+    assert_eq!(response.headers()["content-length"], HUGE.to_string());
+    let mut body = response.into_body();
+    let first = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+        .await
+        .expect("a frame")
+        .expect("no error");
+    assert!(first.is_data());
+    assert!(
+        READ.load(std::sync::atomic::Ordering::SeqCst) < 1 << 24,
+        "read {} bytes for one frame",
+        READ.load(std::sync::atomic::Ordering::SeqCst)
+    );
+}
+
+/// A read that fails mid-file ends the body with an error, so the response is
+/// aborted rather than passed off as complete.
+#[tokio::test]
+async fn a_failed_read_aborts_the_body() {
+    struct Failing;
+    impl std::io::Read for Failing {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("input/output error"))
+        }
+    }
+    let response = get_log(
+        OneLog(|| {
+            Ok(OpenedFile {
+                path: "/logs/big.log".to_owned(),
+                length: 10,
+                reader: Box::new(Failing),
+            })
+        }),
+        &[],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .is_err()
+    );
+}
+
+/// Oracle: Jellyfin 12.4. A log gone since the listing is a 404, and one that
+/// cannot be opened a 500.
+#[tokio::test]
+async fn a_log_that_cannot_be_opened_answers_as_upstream_does() {
+    let gone = get_log(OneLog(|| Err(ServiceError::not_found("gone"))), &[]).await;
+    assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    let refused = get_log(OneLog(|| Err(ServiceError::backend("denied"))), &[]).await;
+    assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// `[FromQuery, Required] string name`: a blank value is no value.
+#[tokio::test]
+async fn a_blank_log_name_is_a_bad_request() {
+    let (status, _) = get(elevated_full_state(), "/System/Logs/Log?name=%20").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 /// Listing the log directory and reading a log file run on the blocking pool,
 /// never inline on a runtime worker: with the pool's only thread held busy
 /// neither request can finish, which an inline read would ignore. A debug
@@ -685,8 +893,8 @@ async fn system_restart_and_shutdown_no_content() {
 /// `POST /System/Restart` from `peer`, as the state's user.
 ///
 /// `peer` is injected the way the composition root's `with_connect_info` does
-/// it — as a `ConnectInfo` request extension — so the policy sees a real peer
-/// address. `None` stands for a request with no connection to ask.
+/// it — as a `ConnectInfo` request extension — so a gate that read the address
+/// would see a real one. `None` stands for a request with no connection to ask.
 async fn restart_from(app: AppState, peer: Option<&str>) -> StatusCode {
     let mut request = Request::builder()
         .method("POST")
@@ -702,74 +910,75 @@ async fn restart_from(app: AppState, peer: Option<&str>) -> StatusCode {
     create_router(app).oneshot(request).await.unwrap().status()
 }
 
-// `LocalAccessOrRequiresElevation`: someone at the machine (or on the LAN) may
-// restart it, a stranger may not. Before this gate the route took plain
-// `RequireAuth`, so any account with a token could bounce the server from
-// anywhere.
+// Admin only, by owner decision (gl-1103): stricter than upstream's
+// `LocalAccessOrRequiresElevation`, which also admits any caller on the local
+// network. The source address decides nothing, as on `/System/Shutdown`.
 #[tokio::test]
-async fn restart_is_allowed_from_the_local_network_whoever_asks() {
+async fn restart_requires_an_administrator_from_any_address() {
     for peer in [
-        "127.0.0.1:5000",
-        "[::1]:5000",
-        "192.168.1.5:5000",
-        "10.0.0.7:5000",
+        Some("127.0.0.1:5000"),
+        Some("[::1]:5000"),
+        Some("192.168.1.5:5000"),
+        Some("10.0.0.7:5000"),
+        Some("172.17.0.1:5000"),
+        Some("[::ffff:127.0.0.1]:5000"),
+        Some("[::ffff:192.168.1.5]:5000"),
+        Some("203.0.113.9:5000"),
+        Some("[2001:db8::1]:5000"),
+        Some("[::ffff:203.0.113.9]:5000"),
+        None,
     ] {
         assert_eq!(
-            restart_from(full_state(), Some(peer)).await,
+            restart_from(full_state(), peer).await,
+            StatusCode::FORBIDDEN,
+            "{peer:?}: an ordinary account must not restart the server"
+        );
+        assert_eq!(
+            restart_from(elevated_full_state(), peer).await,
             StatusCode::NO_CONTENT,
-            "{peer} is on the local network — a non-admin may restart from there"
+            "{peer:?}: an administrator may restart from anywhere"
         );
     }
+}
+
+/// `GET /System/Endpoint`'s `IsInNetwork` for a caller at `peer`.
+async fn endpoint_is_in_network(peer: &str) -> bool {
+    let mut request = Request::builder()
+        .uri("/System/Endpoint")
+        .header("X-Emby-Token", "tok")
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    let response = create_router(elevated_full_state())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    json(&body)["IsInNetwork"]
+        .as_bool()
+        .expect("IsInNetwork is a bool")
 }
 
 // A dual-stack bind (`--bind ::`) delivers every IPv4 client as an
 // IPv4-mapped IPv6 address. Left unmapped, `::ffff:127.0.0.1` matches no IPv6
 // local prefix, so the same-machine web client reads as off-network.
 #[tokio::test]
-async fn restart_treats_ipv4_mapped_ipv6_peers_as_the_ipv4_address() {
+async fn endpoint_treats_ipv4_mapped_ipv6_peers_as_the_ipv4_address() {
     for peer in ["[::ffff:127.0.0.1]:5000", "[::ffff:192.168.1.5]:5000"] {
-        assert_eq!(
-            restart_from(full_state(), Some(peer)).await,
-            StatusCode::NO_CONTENT,
+        assert!(
+            endpoint_is_in_network(peer).await,
             "{peer} is a mapped local IPv4 address"
         );
     }
-    assert_eq!(
-        restart_from(full_state(), Some("[::ffff:203.0.113.9]:5000")).await,
-        StatusCode::FORBIDDEN,
+    assert!(
+        !endpoint_is_in_network("[::ffff:203.0.113.9]:5000").await,
         "a mapped PUBLIC IPv4 address must stay remote — unmapping must not \
          make everything local"
-    );
-}
-
-#[tokio::test]
-async fn restart_from_off_network_requires_an_administrator() {
-    for peer in ["203.0.113.9:5000", "[2001:db8::1]:5000"] {
-        assert_eq!(
-            restart_from(full_state(), Some(peer)).await,
-            StatusCode::FORBIDDEN,
-            "{peer} is off-network — an ordinary account must not restart the server"
-        );
-        assert_eq!(
-            restart_from(elevated_full_state(), Some(peer)).await,
-            StatusCode::NO_CONTENT,
-            "{peer} is off-network, but an administrator may still restart"
-        );
-    }
-}
-
-// Deliberate divergence: C# accepts a null peer address as local. Here the
-// address is missing only when there is no connection to ask, so the unknown
-// case is the guarded one rather than the permissive one.
-#[tokio::test]
-async fn restart_treats_an_unknown_peer_as_remote() {
-    assert_eq!(
-        restart_from(full_state(), None).await,
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
-        restart_from(elevated_full_state(), None).await,
-        StatusCode::NO_CONTENT
     );
 }
 
@@ -904,7 +1113,8 @@ async fn activity_log_binds_sorts_and_severity_like_the_model_binder() {
 async fn dashboard_pages_empty_and_page_not_found() {
     let (pages, pb) = get(elevated_full_state(), "/web/ConfigurationPages").await;
     assert_eq!(pages, StatusCode::OK);
-    assert!(json(&pb).as_array().unwrap().is_empty());
+    let page_list = json(&pb);
+    assert!(page_list.as_array().unwrap().is_empty(), "{page_list}");
 
     let (page, _) = get(full_state(), "/web/ConfigurationPage?name=whatever").await;
     assert_eq!(page, StatusCode::NOT_FOUND);

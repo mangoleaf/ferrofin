@@ -13,6 +13,7 @@
 //! does, through `get_played_and_total_count` or its linked sibling.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -238,6 +239,9 @@ pub struct FerrofinItemCountService {
     /// The `IsVisible` evaluator the count's library scope asks about
     /// playlists and box sets (see [`FerrofinItemCountService::with_visibility`]).
     visibility: crate::item_repository::VisibilitySlot,
+    /// Expands a library row stored tokenised before its options are read
+    /// (see [`FerrofinItemCountService::with_virtual_paths`]).
+    virtual_paths: crate::virtual_paths::VirtualPathExpander,
 }
 
 impl std::fmt::Debug for FerrofinItemCountService {
@@ -255,7 +259,20 @@ impl FerrofinItemCountService {
             db,
             roots: None,
             visibility: crate::item_repository::VisibilitySlot::default(),
+            virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
         }
+    }
+
+    /// Installs the server's [`VirtualPathExpander`](crate::virtual_paths::VirtualPathExpander),
+    /// so the count's library scope reads a library stored as
+    /// `%MetadataPath%/…` at its real path, as the item queries do.
+    #[must_use]
+    pub fn with_virtual_paths(
+        mut self,
+        virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    ) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
     }
 
     /// Installs the slot the composition root fills with the server's
@@ -279,6 +296,23 @@ impl FerrofinItemCountService {
     pub fn with_root_ids(mut self, roots: RootFolderIds) -> Self {
         self.roots = Some(roots);
         self
+    }
+
+    /// `AddUserToQuery`'s library scope for `filter`
+    /// ([`crate::item_repository::scope_to_user_libraries`]), as the item
+    /// queries apply it.
+    async fn scope_to_user_libraries(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        let visibility = crate::item_repository::bound_visibility(&self.visibility);
+        crate::item_repository::scope_to_user_libraries(
+            &self.db,
+            &self.virtual_paths,
+            visibility.as_deref(),
+            filter,
+        )
+        .await
     }
 
     /// The countable leaves (`IsCountableLeaf`: neither a folder nor virtual)
@@ -391,7 +425,7 @@ impl FerrofinItemCountService {
             .collect();
 
         let mut by_name: HashMap<String, HashMap<String, i32>> = HashMap::new();
-        for chunk in distinct_names.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(&distinct_names) {
             let sql = people_name_counts_sql(chunk.len(), type_names.len());
 
             let mut query = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql));
@@ -462,7 +496,7 @@ impl FerrofinItemCountService {
             .collect();
 
         let mut by_year: HashMap<i64, HashMap<String, i32>> = HashMap::new();
-        for chunk in distinct_years.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(&distinct_years) {
             let sql = production_year_counts_sql(chunk.len(), type_names.len());
             let mut query = sqlx::query_as::<_, (i64, String, i64)>(sqlx::AssertSqlSafe(sql));
             for year in chunk {
@@ -506,7 +540,7 @@ impl FerrofinItemCountService {
         access_filter: &InternalItemsQuery,
     ) -> Result<HashMap<String, TaggedSeriesEpisodes>, ServiceError> {
         let mut out = HashMap::new();
-        for chunk in cleans.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in cleans.chunks(ferrofin_db::PADDED_LIST_MAX) {
             let mut qb = tagged_series_episodes_query(chunk, value_types, access_filter);
             for (clean, of_tagged, tagged_of_tagged) in qb
                 .build_query_as::<(String, i64, i64)>()
@@ -618,7 +652,7 @@ impl ItemCountService for FerrofinItemCountService {
         owner_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, ExtraCounts>, ServiceError> {
         let mut counts = HashMap::new();
-        for chunk in owner_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(owner_ids) {
             let sql = extra_counts_sql(chunk.len());
             let mut query = sqlx::query_as::<_, (String, i64, i64)>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
@@ -646,13 +680,7 @@ impl ItemCountService for FerrofinItemCountService {
         // see one library must be counted over that library, not the server.
         // Without it `/Items/Counts` handed a restricted account the whole
         // catalogue's totals — numbers it could not then browse to.
-        let visibility = crate::item_repository::bound_visibility(&self.visibility);
-        let scoped = crate::item_repository::scope_to_user_libraries(
-            &self.db,
-            visibility.as_deref(),
-            filter,
-        )
-        .await?;
+        let scoped = self.scope_to_user_libraries(filter).await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         let descendants =
             crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
@@ -674,13 +702,7 @@ impl ItemCountService for FerrofinItemCountService {
         // (type, count) rows — instead of materializing every matching full row
         // (all ~60 columns) and counting them in Rust, which dominated this
         // endpoint's CPU on a large library.
-        let visibility = crate::item_repository::bound_visibility(&self.visibility);
-        let scoped = crate::item_repository::scope_to_user_libraries(
-            &self.db,
-            visibility.as_deref(),
-            filter,
-        )
-        .await?;
+        let scoped = self.scope_to_user_libraries(filter).await?;
         let filter = scoped.as_ref().unwrap_or(filter);
         let descendants =
             crate::item_repository::resolve_descendant_query(&self.db, filter).await?;
@@ -759,13 +781,7 @@ impl ItemCountService for FerrofinItemCountService {
         // `AddUserToQuery` for a user, so the counts cover the libraries that
         // user may open; with no user (an API key) they cover the server.
         // The preferences come resolved with it.
-        let visibility = crate::item_repository::bound_visibility(&self.visibility);
-        let scoped = crate::item_repository::scope_to_user_libraries(
-            &self.db,
-            visibility.as_deref(),
-            access_filter,
-        )
-        .await?;
+        let scoped = self.scope_to_user_libraries(access_filter).await?;
         let access_filter = scoped.as_ref().unwrap_or(access_filter);
 
         // People live in `PeopleBaseItemMap`/`Peoples`, not `ItemValues`, so a Person's
@@ -828,7 +844,7 @@ impl ItemCountService for FerrofinItemCountService {
             .into_iter()
             .collect();
         let mut by_clean: HashMap<String, HashMap<String, i32>> = HashMap::new();
-        for chunk in distinct_cleans.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(&distinct_cleans) {
             let sql = item_value_counts_sql(chunk.len(), type_names.len(), value_types);
 
             let mut query = sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(sql));
@@ -1019,7 +1035,7 @@ impl ItemCountService for FerrofinItemCountService {
         let total_q =
             sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(total_sql)).bind(page.as_str());
         let mut access_filter = InternalItemsQuery::default();
-        access_filter.set_user(user.clone());
+        access_filter.set_user(Arc::new(user.clone()));
         let preferences = crate::query_restrictions::resolve(&self.db, &access_filter).await?;
         let access_filter = preferences.unwrap_or(access_filter);
         let mut total_q = restrict_count_query(total_q, &access_filter, Some(r#"a."ItemId""#))?;
@@ -1132,7 +1148,7 @@ impl ItemCountService for FerrofinItemCountService {
         }
         let mut access_filter = InternalItemsQuery::default();
         if let Some(user) = user {
-            access_filter.set_user(user.clone());
+            access_filter.set_user(Arc::new(user.clone()));
         }
         let has_user = access_filter.user.is_some();
         // `includeVirtual`: missing episodes count for no user, or for one
@@ -1190,7 +1206,7 @@ impl ItemCountService for FerrofinItemCountService {
         // limit (32,766). `restrict_count_query` adds only the parental binds,
         // about four per tag in the user's tag policy plus a few tens, so a
         // chunk overflows only past ~8,000 tags on one user.
-        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(&ids) {
             let n = chunk.len();
             for (sql, into) in [
                 (
@@ -1204,7 +1220,7 @@ impl ItemCountService for FerrofinItemCountService {
                 (linked_count_sql(n, has_user), &mut linked),
             ] {
                 let mut query = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(sql));
-                for id in chunk {
+                for id in &chunk {
                     query = query.bind(id.as_str());
                 }
                 // Every statement reads the child as `bi`, so the parental and
@@ -1282,7 +1298,7 @@ impl ItemCountService for FerrofinItemCountService {
         let ids: Vec<String> = parent_ids.iter().copied().map(guid_to_db).collect();
         let mut grouped: HashMap<String, i64> = HashMap::new();
         // Chunked: an unpaged page can hold more parents than SQLite's bind limit.
-        for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(&ids) {
             let mut sql = String::from(
                 r#"SELECT "ParentId", COUNT(*) FROM "LinkedChildren" WHERE "ParentId" IN ("#,
             );
@@ -1333,7 +1349,7 @@ impl FerrofinItemCountService {
         members.sort_unstable();
         members.dedup();
         let mut keys_by_member: HashMap<String, Vec<String>> = HashMap::new();
-        for chunk in members.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        for chunk in ferrofin_db::padded_in_chunks(&members) {
             for child_of in [ChildOf::Parent, ChildOf::Season] {
                 let sql = merged_children_sql(
                     child_of,
@@ -1343,7 +1359,7 @@ impl FerrofinItemCountService {
                 );
                 let mut query =
                     sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(sql));
-                for id in chunk {
+                for id in &chunk {
                     query = query.bind(id.as_str());
                 }
                 let mut query = restrict_count_query(query, access_filter, None)?;
@@ -1402,7 +1418,7 @@ impl FerrofinItemCountService {
         roots: RootFolderIds,
     ) -> Result<PlayedAndTotal, ServiceError> {
         let mut filter = InternalItemsQuery::default();
-        filter.set_user(user.clone());
+        filter.set_user(Arc::new(user.clone()));
         let preferences = crate::query_restrictions::resolve(&self.db, &filter).await?;
         let filter = preferences.unwrap_or(filter);
         let (aggregate, user_root) = (guid_to_db(roots.aggregate), guid_to_db(roots.user_root));
@@ -1890,18 +1906,15 @@ mod tests {
                 local_trailers: 0
             }
         );
-        let sql = format!("EXPLAIN QUERY PLAN {}", extra_counts_sql(1));
-        let plan = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(sql))
-            .bind(guid_to_db(owner))
-            .fetch_all(db.pool())
-            .await
-            .unwrap();
-        assert!(
-            plan.iter().any(|r| r
-                .3
-                .contains("SEARCH BaseItems USING INDEX IX_BaseItems_OwnerId")),
-            "{plan:?}"
-        );
+        // At every length a padded list takes (gl-1243).
+        for n in (0..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+            let plan = query_plan(&db, &extra_counts_sql(n), n).await;
+            assert!(
+                plan.iter()
+                    .any(|d| d.contains("SEARCH BaseItems USING INDEX IX_BaseItems_OwnerId")),
+                "{n} owners: {plan:?}"
+            );
+        }
         db.close().await;
         assert!(svc.get_extra_counts_batch(&[owner]).await.is_err());
     }
@@ -2086,7 +2099,7 @@ mod tests {
             seed_item_genre(&db, id, "Shared").await;
         }
         let mut filter = InternalItemsQuery::default();
-        filter.set_user(user.clone());
+        filter.set_user(Arc::new(user.clone()));
         let batch = service
             .get_played_and_total_count_batch(&[folder], &user)
             .await
@@ -2178,7 +2191,7 @@ mod tests {
 
         let filter = InternalItemsQuery {
             recursive: true,
-            user: Some(user),
+            user: Some(Arc::new(user)),
             ..Default::default()
         };
 
@@ -2255,7 +2268,7 @@ mod tests {
             seed_user_data(&db, user_id, episode, series == first, None).await;
         }
         let mut filter = InternalItemsQuery::default();
-        filter.set_user(user.clone());
+        filter.set_user(Arc::new(user.clone()));
         let service = svc(&db);
         // The page's batch sums each group too (v12.2
         // `GetPlayedAndTotalCountBatch`), one statement for the groups.
@@ -2344,7 +2357,7 @@ mod tests {
         let service = svc(&db);
         for (viewer, played) in [(user, 4), (stranger, 0)] {
             let mut filter = InternalItemsQuery::default();
-            filter.set_user(viewer);
+            filter.set_user(Arc::new(viewer));
             let counts = service
                 .get_played_and_total_count(&filter, series)
                 .await
@@ -3074,7 +3087,7 @@ mod tests {
         seed_user_data(&db, user, played, true, None).await;
 
         let filter = InternalItemsQuery {
-            user: Some(user_entity),
+            user: Some(Arc::new(user_entity)),
             ..Default::default()
         };
         let res = service
@@ -3145,7 +3158,7 @@ mod tests {
         let res = service
             .get_played_and_total_count_from_linked_children(
                 &InternalItemsQuery {
-                    user: Some(user_entity),
+                    user: Some(Arc::new(user_entity)),
                     ..Default::default()
                 },
                 boxset,
@@ -3839,14 +3852,15 @@ mod tests {
         }
     }
 
-    /// The by-name count path chunks its `IN` list at 500. Seeding 501 distinct
-    /// by-name rows crosses that boundary in the count query
-    /// (`distinct_cleans.chunks`); an off-by-one there silently drops the
-    /// tail's counts.
+    /// The by-name count path reads its names in padded chunks of
+    /// [`ferrofin_db::PADDED_LIST_MAX`]. Seeding one more distinct by-name row
+    /// than that crosses a chunk boundary in the count query; an off-by-one
+    /// there silently drops the tail's counts. Which names land in the tail
+    /// chunk is up to a `HashSet`, so every genre is checked.
     #[tokio::test]
     async fn name_item_counts_span_the_chunk_boundary() {
-        /// One past the 500-item `IN`-chunk size used by the by-name count path.
-        const N: u128 = 501;
+        /// One past the padded `IN`-chunk size of the by-name count path.
+        const N: u128 = ferrofin_db::PADDED_LIST_MAX as u128 + 1;
 
         let db = test_db().await;
         let service = svc(&db);
@@ -3879,9 +3893,6 @@ mod tests {
         for (i, id) in genre_ids.iter().enumerate() {
             assert_eq!(counts[id].movie_count, 1, "genre #{i} counted");
         }
-        // Explicitly pin the elements straddling the 500-item chunk edge.
-        assert_eq!(counts[&genre_ids[499]].movie_count, 1);
-        assert_eq!(counts[&genre_ids[500]].movie_count, 1);
     }
 
     #[tokio::test]
@@ -3972,7 +3983,7 @@ mod tests {
         let mut user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
         user.max_parental_rating_score = Some(12);
         let filter = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             ..Default::default()
         };
         let counts = service
@@ -4073,13 +4084,13 @@ mod tests {
         .await
         .expect("enable the first library only");
         let viewer = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             ..InternalItemsQuery::default()
         };
         let no_library = InternalItemsQuery {
-            user: Some(
+            user: Some(Arc::new(
                 crate::test_support::seed_named_user(&db, Uuid::from_u128(0x7906), "none").await,
-            ),
+            )),
             ..InternalItemsQuery::default()
         };
         let artist = Uuid::from_u128(0x7907);
@@ -4177,10 +4188,10 @@ mod tests {
         set_column(&db, trailer, "ExtraType", Some("2".to_owned())).await;
         let filter = if as_user {
             InternalItemsQuery {
-                user: Some(
+                user: Some(Arc::new(
                     crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0x7929))
                         .await,
-                ),
+                )),
                 ..InternalItemsQuery::default()
             }
         } else {
@@ -4422,7 +4433,7 @@ mod tests {
         .await
         .expect("enable the open library only");
         let viewer = InternalItemsQuery {
-            user: Some(user),
+            user: Some(Arc::new(user)),
             ..InternalItemsQuery::default()
         };
         let related = [BaseItemKind::Episode, BaseItemKind::Series];
@@ -4485,45 +4496,50 @@ mod tests {
     async fn the_child_counts_seek_their_grouped_column() {
         let db = test_db().await;
         let by_key = "USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)";
-        for has_user in [false, true] {
-            for include_virtual in [true, false] {
-                for (child_of, count_index, merged_index) in [
-                    (
-                        ChildOf::Parent,
-                        "COVERING INDEX FerrofinIX_BaseItems_ChildCount (ParentId=?)",
-                        "INDEX IX_BaseItems_ParentId (ParentId=?)",
-                    ),
-                    (
-                        ChildOf::Season,
-                        "INDEX IX_BaseItems_SeasonId (SeasonId=?)",
-                        "INDEX IX_BaseItems_SeasonId (SeasonId=?)",
-                    ),
-                ] {
-                    for (sql, index) in [
+        // At every length a padded list takes (gl-1243).
+        for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+            for has_user in [false, true] {
+                for include_virtual in [true, false] {
+                    for (child_of, count_index, merged_index) in [
                         (
-                            child_count_sql(child_of, 2, has_user, include_virtual),
-                            count_index,
+                            ChildOf::Parent,
+                            "COVERING INDEX FerrofinIX_BaseItems_ChildCount (ParentId=?)",
+                            "INDEX IX_BaseItems_ParentId (ParentId=?)",
                         ),
                         (
-                            merged_children_sql(child_of, 2, has_user, include_virtual),
-                            merged_index,
+                            ChildOf::Season,
+                            "INDEX IX_BaseItems_SeasonId (SeasonId=?)",
+                            "INDEX IX_BaseItems_SeasonId (SeasonId=?)",
                         ),
                     ] {
-                        let plan = query_plan(&db, &sql, 2).await;
-                        assert_eq!(plan[0], format!("SEARCH bi USING {index}"), "{sql}");
-                        assert!(
-                            plan[1..].iter().all(|step| step.contains(by_key)
-                                || step.starts_with("CORRELATED")),
-                            "{plan:?}"
-                        );
+                        for (sql, index) in [
+                            (
+                                child_count_sql(child_of, n, has_user, include_virtual),
+                                count_index,
+                            ),
+                            (
+                                merged_children_sql(child_of, n, has_user, include_virtual),
+                                merged_index,
+                            ),
+                        ] {
+                            let plan = query_plan(&db, &sql, n).await;
+                            assert_eq!(plan[0], format!("SEARCH bi USING {index}"), "{sql}");
+                            assert!(
+                                plan[1..]
+                                    .iter()
+                                    .all(|step| step.contains(by_key)
+                                        || step.starts_with("CORRELATED")),
+                                "{plan:?}"
+                            );
+                        }
                     }
                 }
+                let plan = query_plan(&db, &linked_count_sql(n, has_user), n).await;
+                assert!(plan[0].starts_with("SEARCH lc USING"), "{plan:?}");
+                assert!(plan[0].ends_with("(ParentId=?)"), "{plan:?}");
+                assert_eq!(plan[1], format!("SEARCH bi {by_key}"), "{plan:?}");
+                assert!(!plan.iter().any(|step| step.contains("SCAN")), "{plan:?}");
             }
-            let plan = query_plan(&db, &linked_count_sql(2, has_user), 2).await;
-            assert!(plan[0].starts_with("SEARCH lc USING"), "{plan:?}");
-            assert!(plan[0].ends_with("(ParentId=?)"), "{plan:?}");
-            assert_eq!(plan[1], format!("SEARCH bi {by_key}"), "{plan:?}");
-            assert!(!plan.iter().any(|step| step.contains("SCAN")), "{plan:?}");
         }
     }
 
@@ -4773,31 +4789,36 @@ mod tests {
     async fn by_name_count_aggregates_seek_from_the_name_side() {
         let db = test_db().await;
 
-        let people = people_name_counts_sql(3, 2);
-        let plan = query_plan(&db, &people, 5).await;
-        let outer = plan.first().expect("a plan step");
-        assert!(
-            outer.contains("Peoples") && outer.contains("IX_Peoples_Name"),
-            "person counts must seek Peoples by Name first, got: {plan:?}"
-        );
-        assert!(
-            plan.iter()
-                .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
-            "person counts must reach BaseItems by id, got: {plan:?}"
-        );
+        // At every length a padded name list takes (gl-1243).
+        for n in (1..=ferrofin_db::PADDED_LIST_MAX.ilog2()).map(|k| 1_usize << k) {
+            let people = people_name_counts_sql(n, 2);
+            let plan = query_plan(&db, &people, n + 2).await;
+            let outer = plan.first().expect("a plan step");
+            assert!(
+                outer.contains("Peoples") && outer.contains("IX_Peoples_Name"),
+                "{n} names: person counts must seek Peoples by Name first, got: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
+                "{n} names: person counts must reach BaseItems by id, got: {plan:?}"
+            );
 
-        let values = item_value_counts_sql(3, 2, &[ItemValueType::Genre]);
-        let plan = query_plan(&db, &values, 5).await;
-        let outer = plan.first().expect("a plan step");
-        assert!(
-            outer.starts_with("SCAN iv ") || outer.starts_with("SEARCH iv ") || outer == "SCAN iv",
-            "value counts must start at ItemValues, got: {plan:?}"
-        );
-        assert!(
-            plan.iter()
-                .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
-            "value counts must reach BaseItems by id, got: {plan:?}"
-        );
+            let values = item_value_counts_sql(n, 2, &[ItemValueType::Genre]);
+            let plan = query_plan(&db, &values, n + 2).await;
+            let outer = plan.first().expect("a plan step");
+            assert!(
+                outer.starts_with("SCAN iv ")
+                    || outer.starts_with("SEARCH iv ")
+                    || outer == "SCAN iv",
+                "{n} names: value counts must start at ItemValues, got: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
+                "{n} names: value counts must reach BaseItems by id, got: {plan:?}"
+            );
+        }
     }
 
     /// The folder leaf-count aggregate must be driven by the page's folder ids,
@@ -4897,7 +4918,7 @@ mod tests {
     /// resolves them for a user.
     async fn per_item_leaves(db: &Database) -> InternalItemsQuery {
         let mut filter = InternalItemsQuery::default();
-        filter.set_user(seed_user(db, Uuid::from_u128(0xD0F0)).await);
+        filter.set_user(Arc::new(seed_user(db, Uuid::from_u128(0xD0F0)).await));
         svc(db)
             .countable_leaves_query(&filter, Uuid::from_u128(0xD0F1))
             .await
@@ -5499,7 +5520,7 @@ mod tests {
         );
         // Read by id, the aggregate counts the same whole server.
         let mut filter = InternalItemsQuery::default();
-        filter.set_user(user);
+        filter.set_user(Arc::new(user));
         let by_id = svc(&db)
             .with_root_ids(roots)
             .get_played_and_total_count(&filter, roots.aggregate)

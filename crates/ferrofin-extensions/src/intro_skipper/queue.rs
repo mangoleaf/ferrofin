@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use super::IntroSkipperConfig;
 use crate::ffmpeg::{FfmpegService, ProcessOptions};
+use crate::library_pages::{self, PAGE};
 
 /// The plugin's name, as a library's `DisabledMediaSegmentProviders` lists it.
 const PLUGIN_NAME: &str = "Intro Skipper";
@@ -84,6 +85,18 @@ pub(super) type Queue = Vec<(Uuid, Vec<QueuedEpisode>)>;
 
 /// Builds the queue (`QueueManager.GetMediaItems(includeExcluded)`).
 ///
+/// Each item is queued under the first enabled library one of whose
+/// locations holds its file, the libraries in order and each in the query's
+/// order. Upstream holds each library's list whole; here the rows are read a
+/// page at a time from a snapshot of the ids ([`crate::library_pages`]), so
+/// a first pass places each id in its library and a second queues them,
+/// library by library, in that same order.
+///
+/// With `only`, the queue holds just those seasons (and movies), as the whole
+/// queue filtered to them would (upstream's `AnalyzeItemsAsync` filters it):
+/// only their series' items are read ([`restriction`]) and only their items
+/// probed.
+///
 /// # Errors
 /// A library or virtual-folder read failed.
 pub(super) async fn build(
@@ -92,6 +105,7 @@ pub(super) async fn build(
     folders: &[VirtualFolderInfo],
     config: &IntroSkipperConfig,
     include_excluded: bool,
+    only: Option<&HashSet<Uuid>>,
 ) -> Result<Queue, ServiceError> {
     let policy = ExclusionPolicy::from_config(config);
     let analysis_percent = f64::from(
@@ -99,28 +113,21 @@ pub(super) async fn build(
             .analysis_percent
             .clamp(ANALYSIS_PERCENT.0, ANALYSIS_PERCENT.1),
     ) / 100.0;
-    let items = library
-        .get_item_list(&InternalItemsQuery {
-            include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
-            recursive: true,
-            is_virtual_item: Some(false),
-            order_by: vec![
-                (ItemSortBy::SeriesSortName, SortOrder::Ascending),
-                (ItemSortBy::ParentIndexNumber, SortOrder::Descending),
-                (ItemSortBy::IndexNumber, SortOrder::Ascending),
-            ],
-            ..InternalItemsQuery::default()
-        })
-        .await?;
-    let mut queue = QueueBuilder {
-        queue: Vec::new(),
-        positions: HashMap::new(),
-        anime: HashMap::new(),
+    let query = InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
+        recursive: true,
+        is_virtual_item: Some(false),
+        order_by: vec![
+            (ItemSortBy::SeriesSortName, SortOrder::Ascending),
+            (ItemSortBy::ParentIndexNumber, SortOrder::Descending),
+            (ItemSortBy::IndexNumber, SortOrder::Ascending),
+        ],
+        ..InternalItemsQuery::default()
     };
-    let mut seen = HashSet::new();
+    // "If libraries have been selected for analysis, ensure this library
+    // was selected."
+    let mut enabled: Vec<&VirtualFolderInfo> = Vec::new();
     for folder in folders {
-        // "If libraries have been selected for analysis, ensure this library
-        // was selected."
         if folder.library_options.as_ref().is_some_and(|o| {
             o.disabled_media_segment_providers
                 .iter()
@@ -130,35 +137,113 @@ pub(super) async fn build(
                 library = folder.name.as_deref().unwrap_or_default(),
                 "intro skipper: library disabled for analysis"
             );
-            continue;
+        } else {
+            enabled.push(folder);
         }
-        for item in items.iter().filter(|item| in_folder(item, folder)) {
-            if !seen.insert(item.id.clone()) {
-                continue;
-            }
-            match kind(item) {
-                Some(BaseItemKind::Episode) => {
-                    queue
-                        .episode(
-                            (library, ffmpeg),
-                            item,
-                            &policy,
-                            config,
-                            analysis_percent,
-                            include_excluded,
-                        )
-                        .await;
-                }
-                Some(BaseItemKind::Movie) => {
-                    queue
-                        .movie(ffmpeg, item, &policy, config, include_excluded)
-                        .await;
-                }
-                _ => {}
+    }
+    if enabled.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ids = library.get_item_ids(&query).await?;
+    if let Some(only) = only {
+        // A subsequence of the whole snapshot, so the order holds.
+        let keep = restriction(library, &query, only).await?;
+        ids.retain(|id| keep.contains(id));
+    }
+    let mut placed: Vec<Vec<Uuid>> = vec![Vec::new(); enabled.len()];
+    let mut seen = HashSet::new();
+    for page in ids.chunks(PAGE) {
+        for item in library_pages::rows(library, &query, page).await? {
+            if let Ok(id) = Uuid::parse_str(&item.id)
+                && let Some(index) = enabled.iter().position(|folder| in_folder(&item, folder))
+                && seen.insert(id)
+            {
+                placed[index].push(id);
             }
         }
     }
-    Ok(queue.queue)
+    let mut queue = QueueBuilder {
+        queue: Vec::new(),
+        positions: HashMap::new(),
+        anime: HashMap::new(),
+        only,
+    };
+    for ids in &placed {
+        for page in ids.chunks(PAGE) {
+            for item in library_pages::rows(library, &query, page).await? {
+                match kind(&item) {
+                    Some(BaseItemKind::Episode) => {
+                        queue
+                            .episode(
+                                (library, ffmpeg),
+                                &item,
+                                &policy,
+                                config,
+                                analysis_percent,
+                                include_excluded,
+                            )
+                            .await;
+                    }
+                    Some(BaseItemKind::Movie) => {
+                        queue
+                            .movie(ffmpeg, &item, &policy, config, include_excluded)
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut queue = queue.queue;
+    if let Some(only) = only {
+        queue.retain(|(season, _)| only.contains(season));
+    }
+    Ok(queue)
+}
+
+/// The items a build for the `only` seasons reads: those of every series one
+/// of them belongs to, and the `only` ids themselves (a movie is queued under
+/// its own id). A season's entries depend on nothing outside its series (an
+/// in-season special joins a season of its own series, and a season's first
+/// entry or its series decides the category), so they come out as the whole
+/// build makes them. A series' items are found by ancestry: an episode's
+/// `AncestorIds` hold its `SeriesId` (the scanner's `EpisodeHome::parent`;
+/// Jellyfin's `GetAncestorIds` walks up to the series). The seasons are
+/// ancestors too, for one whose series is unknown.
+async fn restriction(
+    library: &dyn LibraryManager,
+    query: &InternalItemsQuery,
+    only: &HashSet<Uuid>,
+) -> Result<HashSet<Uuid>, ServiceError> {
+    let only: Vec<Uuid> = only.iter().copied().collect();
+    let mut ancestors: HashSet<Uuid> = only.iter().copied().collect();
+    for chunk in only.chunks(PAGE) {
+        let rows = library
+            .get_item_list(&InternalItemsQuery {
+                item_ids: chunk.to_vec(),
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        ancestors.extend(rows.iter().filter_map(|row| {
+            row.series_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok())
+        }));
+    }
+    let ancestors: Vec<Uuid> = ancestors.into_iter().collect();
+    let mut keep: HashSet<Uuid> = only.into_iter().collect();
+    for chunk in ancestors.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+        keep.extend(
+            library
+                .get_item_ids(&InternalItemsQuery {
+                    ancestor_ids: chunk.to_vec(),
+                    order_by: Vec::new(),
+                    ..query.clone()
+                })
+                .await?,
+        );
+    }
+    Ok(keep)
 }
 
 /// Whether `item`'s file lives under one of the folder's locations
@@ -212,15 +297,22 @@ fn aired_season_number(item: &BaseItemEntity) -> Option<i64> {
 }
 
 /// The queue under construction, with the anime lookups it caches per series.
-struct QueueBuilder {
+struct QueueBuilder<'a> {
     queue: Queue,
     /// Each season's index in `queue`, so a large library's queue builds in
     /// linear time (the queue keeps upstream's insertion order).
     positions: HashMap<Uuid, usize>,
     anime: HashMap<Uuid, bool>,
+    /// The seasons kept, when not all ([`build`]'s `only`).
+    only: Option<&'a HashSet<Uuid>>,
 }
 
-impl QueueBuilder {
+impl QueueBuilder<'_> {
+    /// Whether entries queued under `season` are kept: only those are probed.
+    fn keeps(&self, season: Uuid) -> bool {
+        self.only.is_none_or(|only| only.contains(&season))
+    }
+
     fn season(&mut self, id: Uuid) -> &mut Vec<QueuedEpisode> {
         let queue = &mut self.queue;
         let index = *self.positions.entry(id).or_insert_with(|| {
@@ -259,7 +351,7 @@ impl QueueBuilder {
         let aired_season = aired_season_number(item).unwrap_or(0);
         let season_id = self.season_id(item, episode_id, series_id, aired_season);
         let duration = duration(item);
-        let credits_duration = if excluded {
+        let credits_duration = if excluded || !self.keeps(season_id) {
             duration
         } else {
             credits_end(ffmpeg, &path, duration, config).await
@@ -365,7 +457,7 @@ impl QueueBuilder {
             return;
         }
         let duration = duration(item);
-        let credits_duration = if excluded {
+        let credits_duration = if excluded || !self.keeps(movie_id) {
             duration
         } else {
             credits_end(ffmpeg, &path, duration, config).await

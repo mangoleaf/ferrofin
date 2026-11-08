@@ -30,6 +30,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
 use super::encoding_utils::{get_input_argument, quote};
+use super::trickplay_extractor::MIN_FFMPEG_JPEG_MATRIX_CONVERSION;
 use super::{FfmpegVersion, ProcessOutput, Transcoder};
 use crate::encoding_helper::hw::FfmpegCapabilities;
 use crate::probing::dtos::InternalMediaInfoResult;
@@ -86,6 +87,35 @@ pub fn analyze_duration_value(source_ms: Option<i32>, configured: &str) -> Strin
     }
 }
 
+/// The `-threads` count of a probe that decodes its first video frame, when
+/// the encoding options leave the count to ffmpeg.
+///
+/// Upstream passes its automatic `0` here too. That starts frame threading on
+/// every core, and a frame-threaded decoder holds its first frame back until it
+/// has one frame per thread in flight, so a many-core host decodes that many
+/// frames, each on its own copy of the buffers, to report one. Two threads keep
+/// the same frame threading with the least delay. `-threads 1` would not do:
+/// ffprobe then reports the h264 and HEVC decoders' real `refs`, where a
+/// frame-threaded run reports `1`, and clients read that as `RefFrames`. Across
+/// a 10,531-file corpus and samples of AV1, VP9, MPEG-2 and MPEG-4, `2` and `0`
+/// print identical bytes, at half the CPU.
+const FIRST_FRAME_PROBE_THREADS: i32 = 2;
+
+/// The `-threads` count of a probe with `cores` usable cores. A configured
+/// count stands, as upstream passes it. An unset or automatic count changes
+/// only where the probe decodes ([`FIRST_FRAME_PROBE_THREADS`]) and more than
+/// one core is usable. Pinned to one core, ffmpeg's automatic count is a single
+/// thread, which reports `refs` differently from two, so upstream's value
+/// stands there, and under a one-CPU cgroup quota too, where `cores` cannot
+/// tell the two apart.
+fn probe_threads(configured: i32, first_video_frame: bool, cores: usize) -> i32 {
+    if first_video_frame && configured <= 0 && cores > 1 {
+        FIRST_FRAME_PROBE_THREADS
+    } else {
+        configured
+    }
+}
+
 /// Tunable knobs read from the encoding configuration.
 ///
 /// Groups the handful of `IConfiguration`/`EncodingOptions`-derived values the
@@ -107,8 +137,11 @@ pub struct MediaEncoderConfig {
     /// mounts, so extraction output can never go next to the input file.
     pub temp_dir: ferrofin_util::directory_path::DirectoryPath,
     /// The probed ffmpeg version, which decides `-fps_mode` versus the
-    /// deprecated `-vsync` (`GetVideoSyncOption`). `None` means "unprobed" and
-    /// takes `-vsync`, which every supported build still understands.
+    /// deprecated `-vsync` (`GetVideoSyncOption`) and whether an extracted
+    /// image is converted to the JPEG's BT.601 matrix
+    /// ([`MIN_FFMPEG_JPEG_MATRIX_CONVERSION`]). `None` means "unprobed": it
+    /// takes `-vsync`, which every supported build still understands, and
+    /// converts no matrix.
     pub ffmpeg_version: Option<FfmpegVersion>,
     /// `FFmpeg:imgExtractPerfTradeoff` (`GetFFmpegImgExtractPerfTradeoff`,
     /// default `false`): a frame extraction's I-frame attempt decodes
@@ -120,7 +153,8 @@ pub struct MediaEncoderConfig {
 /// request: the probed ffmpeg, the thread count and the startup options.
 #[derive(Debug, Clone, Copy, Default)]
 struct ExtractionSettings {
-    /// Decides `-fps_mode` versus `-vsync`.
+    /// Decides `-fps_mode` versus `-vsync`, and whether the kept frame is
+    /// converted to BT.601 ([`MIN_FFMPEG_JPEG_MATRIX_CONVERSION`]).
     ffmpeg_version: Option<FfmpegVersion>,
     /// The `-threads` count.
     threads: i32,
@@ -155,6 +189,9 @@ pub struct MediaEncoderImpl<T: Transcoder> {
     /// `_proberSupportsFirstVideoFrame`: whether ffprobe accepts
     /// `-only_first_vframe`. Off until the host reports the probed answer.
     prober_first_video_frame: bool,
+    /// The usable cores, read once: a scan probes thousands of files
+    /// ([`probe_threads`]).
+    cores: usize,
 }
 
 impl<T: Transcoder> MediaEncoderImpl<T> {
@@ -293,6 +330,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
             }),
             normalizer: ProbeResultNormalizer::new(Box::new(PassthroughLocalization)),
             prober_first_video_frame: false,
+            cores: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
         }
     }
 
@@ -355,7 +393,8 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     /// A local, non-audio probe also asks for the first video frame
     /// (`-show_frames -only_first_vframe`) when ffprobe supports it, so the
     /// normalizer can read that frame's side data and set
-    /// `Hdr10PlusPresentFlag`.
+    /// `Hdr10PlusPresentFlag`. That decode is the one departure from upstream's
+    /// line: [`probe_threads`].
     fn probe_arguments(
         &self,
         input_path: &str,
@@ -373,7 +412,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         } else {
             ""
         };
-        let threads = self.config.threads;
+        let threads = probe_threads(self.config.threads, first_video_frame, self.cores);
         format!(
             "{extra} -i {input_path} -threads {threads} -v warning -print_format json \
              -show_streams{chapters} -show_format{frames}"
@@ -389,8 +428,10 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     /// offset.
     ///
     /// An HDR video stream is tone-mapped after the sampling
-    /// ([`Self::hdr_tone_map`]). The dashboard's image resolution applies
-    /// after the video filter chain.
+    /// ([`Self::hdr_tone_map`]). The kept frame is then converted to the
+    /// JPEG's BT.601 matrix, a step upstream's chain lacks; audio cover art
+    /// and embedded image streams, which share this line, get it too. The
+    /// dashboard's image resolution applies after the video filter chain.
     #[allow(clippy::too_many_arguments)]
     fn extract_image_arguments(
         input_path: &str,
@@ -418,13 +459,14 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
                 "crop=iw/2:ih:0:0,setdar=dar=a,crop=min(iw\\,ih*dar):min(ih\\,iw/dar):(iw-min(iw\\,iw*sar))/2:(ih - min (ih\\,ih/sar))/2,setsar=sar=1"
             }
             Some(Video3DFormat::HalfTopAndBottom) => {
-                // Accepted divergence: upstream writes `scale=(iw*2):ih)` here,
-                // with one closing bracket too many. ffmpeg's expression parser
-                // rejects it (`[Eval] Invalid chars ')' at the end of expression 'ih)'`) and the extraction fails,
-                // so chapter and thumbnail images cannot be produced for this
-                // 3D layout on Jellyfin. Verified both forms against ffmpeg
-                // n9.0.1. The balanced form below is what the sibling
-                // half-side-by-side case two arms up already has.
+                // The balanced form, as in v12.4's `ExtractImageInternal`
+                // (`MediaEncoder.cs:714`; 12.3 removed the stray `)` it had).
+                // Upstream's transcode copy of this scaler,
+                // `EncodingHelper.GetFixedSwScaleFilter` (v12.4
+                // `EncodingHelper.cs:3647`), still writes `scale=(iw*2):ih)`,
+                // which ffmpeg's expression parser rejects (`[Eval] Invalid
+                // chars ')' at the end of expression 'ih)'`), so never copy
+                // this arm from there (see `fixed_sw_scale_filter`).
                 "crop=iw:ih/2:0:0,scale=(iw*2):ih,setdar=dar=a,crop=min(iw\\,ih*dar):min(ih\\,iw/dar):(iw-min(iw\\,iw*sar))/2:(ih - min (ih\\,ih/sar))/2,setsar=sar=1"
             }
             Some(Video3DFormat::FullTopAndBottom) => {
@@ -445,6 +487,23 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         // after the sampling, on one frame.
         if let Some(tone_map) = Self::hdr_tone_map(video_stream, settings) {
             filters.push(tone_map);
+        }
+        // A JPEG decoder reads Y'CbCr as BT.601, so the frame is converted to
+        // that matrix last, on the one frame kept, as trickplay's are
+        // (gl-1129). The scale reads the matrix from the frame's tag, which
+        // this graph never re-tags: the source's, or BT.709 after a
+        // tone-map. An untagged frame reads as BT.601 and passes unchanged.
+        // An HDR frame no filter here can tone-map is converted from its
+        // BT.2020 matrix and stays un-tone-mapped, as upstream's does.
+        // Upstream converts nothing, so BT.709 video (most HD and 4K) and
+        // every tone-mapped HDR frame shift colour: a Jellyfin bug, not
+        // ported. ffmpeg converts the range for the JPEG encoder itself.
+        // Older ffmpeg lines convert a 4:2:0 frame wrongly, hence the gate.
+        if settings
+            .ffmpeg_version
+            .is_some_and(|v| v >= MIN_FFMPEG_JPEG_MATRIX_CONVERSION)
+        {
+            filters.push("scale=out_color_matrix=bt601".to_owned());
         }
 
         let vf = filters.join(",");
@@ -626,6 +685,15 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             .map_err(MediaEncodingError::process)?;
 
         let data = Self::parse_probe(&output)?;
+        // `GetMediaInfoInternal`: ffprobe prints `{}` when it cannot read its
+        // input, which is a failure, not a file with no streams.
+        if data.streams.is_none() && data.format.is_none() {
+            return Err(MediaEncodingError::process(format!(
+                "ffprobe failed - streams and format are both null: {}",
+                ferrofin_util::source_url::redact_url(input_file)
+            ))
+            .into());
+        }
         let mut info = self.normalizer.get_media_info(
             data,
             source.video_type,
@@ -954,7 +1022,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FfmpegVersion, ProcessOutput};
+    use super::{FfmpegVersion, MIN_FFMPEG_JPEG_MATRIX_CONVERSION, ProcessOutput};
     use ferrofin_model::entities::Video3DFormat;
     use rstest::rstest;
 
@@ -965,7 +1033,9 @@ mod tests {
     use ferrofin_model::media_info::MediaProtocol;
     use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
-    use super::{ExtractionSettings, MediaEncoderConfig, MediaEncoderImpl, TICKS_PER_SECOND};
+    use super::{
+        ExtractionSettings, MediaEncoderConfig, MediaEncoderImpl, TICKS_PER_SECOND, probe_threads,
+    };
     use crate::encoder::Transcoder;
     use crate::encoding_helper::hw::FfmpegCapabilities;
     use async_trait::async_trait;
@@ -1448,7 +1518,7 @@ mod tests {
             self.runs.fetch_add(1, Ordering::SeqCst);
             let hang = self
                 .hangs
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok();
             if hang {
                 let _abandoned = Abandoned(Arc::clone(&self.abandoned));
@@ -2135,6 +2205,69 @@ mod tests {
         }
     }
 
+    /// The kept frame is converted to the JPEG's BT.601 matrix last, behind
+    /// the sampling, a 3D scaler and the tone-map (gl-1158), on an ffmpeg that
+    /// converts a 4:2:0 frame correctly. An older or unprobed one gets
+    /// upstream's graph.
+    #[rstest]
+    #[case::unprobed(None, false)]
+    #[case::ffmpeg_5_0(Some(FfmpegVersion::new(5, 0)), false)]
+    #[case::ffmpeg_5_1(Some(MIN_FFMPEG_JPEG_MATRIX_CONVERSION), true)]
+    #[case::ffmpeg_8_1(Some(FfmpegVersion::with_build(8, 1, 3)), true)]
+    fn the_kept_frame_is_converted_to_the_jpeg_matrix(
+        #[case] ffmpeg_version: Option<FfmpegVersion>,
+        #[case] converted: bool,
+    ) {
+        let hdr = graded_stream(Some("smpte2084"), None);
+        for (stream, threed_format, use_iframe, tonemapx, last) in [
+            (None, None, true, true, "thumbnail=n=24"),
+            (None, None, false, true, "round(ih/2)*2"),
+            (
+                None,
+                Some(Video3DFormat::HalfSideBySide),
+                true,
+                true,
+                "thumbnail=n=24",
+            ),
+            (Some(&hdr), None, true, true, TONEMAPX_100),
+            (Some(&hdr), None, false, true, TONEMAPX_100),
+            (Some(&hdr), None, true, false, ZSCALE),
+        ] {
+            let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+                "file:\"/media/movie.mkv\"",
+                "matroska",
+                stream,
+                None,
+                threed_format,
+                None,
+                use_iframe,
+                "/tmp/out.jpg",
+                ExtractionSettings {
+                    ffmpeg_version,
+                    tonemapx,
+                    zscale: true,
+                    ..ExtractionSettings::default()
+                },
+                ImageResolution::P720,
+            );
+            let tokens = crate::encoder::split_args(&args).unwrap();
+            let graph = &tokens[tokens.iter().position(|a| a == "-vf").unwrap() + 1];
+            let want = if converted {
+                format!("{last},scale=out_color_matrix=bt601")
+            } else {
+                last.to_owned()
+            };
+            assert!(graph.ends_with(&want), "{graph}");
+            assert_eq!(
+                graph.matches("out_color_matrix").count(),
+                usize::from(converted)
+            );
+            // The dashboard's resolution follows the graph, behind the
+            // conversion; its scaler sets no matrix, so it converts nothing.
+            assert!(args.contains("\" -s 1280x720 "), "{args}");
+        }
+    }
+
     /// The probed filters reach a frame extraction: with `zscale` an HDR10
     /// frame is tone-mapped, and an extraction that hangs is given the HDR
     /// default of 20 s per attempt (`DefaultHdrImageExtractionTimeout`).
@@ -2247,8 +2380,9 @@ mod tests {
         "crop=iw/2:ih:0:0,scale=(iw*2):ih,setdar=dar=a,"
     )]
     #[case(Some(Video3DFormat::FullSideBySide), "crop=iw/2:ih:0:0,setdar=dar=a,")]
-    // The corrected bracket: upstream writes `scale=(iw*2):ih)`, which ffmpeg's
-    // expression parser rejects outright, so no image is produced at all.
+    // Balanced, as in v12.4's `ExtractImageInternal`. Upstream's transcode
+    // copy (`EncodingHelper.cs:3647`) still writes `scale=(iw*2):ih)`, which
+    // ffmpeg's expression parser rejects outright.
     #[case(
         Some(Video3DFormat::HalfTopAndBottom),
         "crop=iw:ih/2:0:0,scale=(iw*2):ih,setdar=dar=a,"
@@ -2282,10 +2416,12 @@ mod tests {
 
     #[test]
     fn every_3d_scaler_has_balanced_brackets() {
-        // The failure this guards is a single stray `)` — upstream carries one
-        // in the half-top-and-bottom arm, and ffmpeg refuses the whole filter
-        // graph over it rather than degrading. Any future re-sync from upstream
-        // that reintroduces it fails here.
+        // The failure this guards is a single stray `)`, which ffmpeg refuses
+        // the whole filter graph over rather than degrading. v12.4's
+        // `ExtractImageInternal` is balanced, but its transcode copy in
+        // `EncodingHelper.GetFixedSwScaleFilter` (`EncodingHelper.cs:3647`)
+        // still carries one in the half-top-and-bottom arm. A re-sync of these
+        // scalers from that copy fails here.
         for threed_format in [
             Some(Video3DFormat::HalfSideBySide),
             Some(Video3DFormat::FullSideBySide),
@@ -2495,6 +2631,7 @@ mod tests {
                     allow_hw_accel: false,
                     enable_hw_encoding: false,
                     keyframe_only: false,
+                    full_chroma: false,
                 })
                 .await
         });
@@ -2806,6 +2943,72 @@ mod tests {
         }
     }
 
+    /// A [`Transcoder`] fake whose ffprobe prints `output` and exits non-zero.
+    struct CannedProbe(&'static str);
+
+    #[async_trait]
+    impl Transcoder for CannedProbe {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            _arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            Ok(ProcessOutput {
+                output: self.0.to_owned(),
+                success: false,
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    // `GetMediaInfoInternal` throws when the probe has neither streams nor a
+    // format, which is what ffprobe prints (`{}`) for an input it cannot open;
+    // either one alone is a probe. The error names a `.strm` target by its
+    // host only (gl-1372).
+    #[rstest]
+    #[case::neither("{}", false)]
+    #[case::streams_only(r#"{"streams":[]}"#, true)]
+    #[case::format_only(r#"{"format":{}}"#, true)]
+    #[tokio::test]
+    async fn a_probe_with_neither_streams_nor_format_fails(
+        #[case] output: &'static str,
+        #[case] probed: bool,
+    ) {
+        let enc = MediaEncoderImpl::new(
+            Arc::new(CannedProbe(output)),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig::default(),
+        );
+        let request = MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some(
+                    "http://acct-user:info-secret@tuner.example:8080/live/path-secret/1.ts"
+                        .to_owned(),
+                ),
+                protocol: MediaProtocol::Http,
+                ..MediaSourceInfo::default()
+            },
+            extract_chapters: false,
+            media_is_audio: false,
+        };
+        let result = enc.get_media_info_full(&request).await;
+        assert_eq!(result.is_ok(), probed, "{result:?}");
+        if let Err(e) = result {
+            let message = e.to_string();
+            assert!(message.contains("http://tuner.example:8080"), "{message}");
+            for secret in ["acct-user", "info-secret", "path-secret"] {
+                assert!(!message.contains(secret), "{secret} leaked: {message}");
+            }
+        }
+    }
+
     // Upstream fills the probe line with one `string.Format`, so a file name
     // is never re-scanned for the template's own placeholders. A library file
     // whose name holds `{threads}` or `{input}` must reach ffprobe unchanged,
@@ -2893,5 +3096,65 @@ mod tests {
             "{arguments}"
         );
         assert!(arguments.contains("-show_format"), "{arguments}");
+    }
+
+    /// A probe that decodes its first frame takes two threads when the
+    /// encoding options leave the count to ffmpeg: its automatic count holds
+    /// that frame back behind one decoded frame per core. A configured count
+    /// stands, a probe that decodes nothing keeps upstream's argument, and so
+    /// does a single core, where the automatic count is already one thread.
+    #[rstest]
+    #[case::automatic_with_frame(0, true, 16, 2)]
+    #[case::unset_with_frame(-1, true, 16, 2)]
+    #[case::automatic_on_two_cores(0, true, 2, 2)]
+    #[case::automatic_on_one_core(0, true, 1, 0)]
+    #[case::automatic_without_frame(0, false, 16, 0)]
+    #[case::configured_with_frame(3, true, 16, 3)]
+    #[case::single_with_frame(1, true, 16, 1)]
+    fn a_first_frame_probe_never_decodes_on_every_core(
+        #[case] configured: i32,
+        #[case] first_video_frame: bool,
+        #[case] cores: usize,
+        #[case] expected: i32,
+    ) {
+        assert_eq!(
+            probe_threads(configured, first_video_frame, cores),
+            expected
+        );
+    }
+
+    /// The probe line carries that count, for the cores the encoder read.
+    #[rstest]
+    #[case::many_cores(16, "2")]
+    #[case::one_core(1, "0")]
+    #[tokio::test]
+    async fn a_first_frame_probe_line_carries_the_probe_thread_count(
+        #[case] cores: usize,
+        #[case] expected: &str,
+    ) {
+        let transcoder = Arc::new(RecordingProbe(std::sync::Mutex::new(Vec::new())));
+        let mut enc = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig::default(),
+        )
+        .with_first_video_frame_probe(true);
+        enc.cores = cores;
+        let request = MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some("/media/movie.mkv".to_owned()),
+                protocol: MediaProtocol::File,
+                ..MediaSourceInfo::default()
+            },
+            extract_chapters: false,
+            media_is_audio: false,
+        };
+        enc.get_media_info(&request).await.expect("probe parses");
+
+        let arguments = transcoder.0.lock().unwrap().last().unwrap().clone();
+        let tokens = crate::encoder::split_args(&arguments).unwrap();
+        let threads = tokens.iter().position(|a| a == "-threads").unwrap();
+        assert_eq!(tokens[threads + 1], expected, "{arguments}");
     }
 }

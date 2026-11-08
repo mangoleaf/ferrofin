@@ -813,6 +813,21 @@ impl FakeFfmpeg {
             log.push((call.0, call.1.to_owned(), call.2, call.3, call.4, call.5));
         }
     }
+
+    /// The paths probed for their audio duration since the last call, in
+    /// order; the log is cleared.
+    pub fn take_probes(&self) -> Vec<String> {
+        let Ok(mut log) = self.log.lock() else {
+            return Vec::new();
+        };
+        let probes = log
+            .iter()
+            .filter(|call| call.0 == "probe")
+            .map(|call| call.1.clone())
+            .collect();
+        log.clear();
+        probes
+    }
 }
 
 #[cfg(test)]
@@ -841,7 +856,8 @@ impl FfmpegService for FakeFfmpeg {
         Ok(self.keyframes.clone())
     }
 
-    async fn probe_audio_duration(&self, _path: &str, _options: ProcessOptions) -> Option<f64> {
+    async fn probe_audio_duration(&self, path: &str, options: ProcessOptions) -> Option<f64> {
+        self.record(("probe", path, 0.0, 0.0, 0, options));
         self.audio_duration
     }
 
@@ -1076,7 +1092,8 @@ mod tests {
         );
         let invalid = "[blackdetect @ 0000000000000000] black_start:3.04\n\
                        [blackdetect @ 0000000000000000] black_start:9 black_end:8 black_duration:1\n";
-        assert!(parse_black_intervals(invalid).is_empty());
+        let found = parse_black_intervals(invalid);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `TestParseKeyframeVisuals_*`.

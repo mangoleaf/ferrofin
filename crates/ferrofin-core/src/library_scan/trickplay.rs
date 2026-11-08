@@ -191,7 +191,7 @@ mod tests {
             ),
             "the separate D2 backfill heuristic is not a source remote change-monitor signal"
         );
-        let mut audio = row.clone();
+        let mut audio = row;
         audio.type_ = "MediaBrowser.Controller.Entities.Audio.Audio".to_owned();
         assert!(!selected(
             &audio,
@@ -323,12 +323,6 @@ mod tests {
         }
         async fn delete_trickplay_data(&self, _id: Uuid) -> Result<(), ServiceError> {
             Ok(())
-        }
-        async fn get_trickplay_manifest(
-            &self,
-            _id: Uuid,
-        ) -> Result<HashMap<String, HashMap<i32, TrickplayInfoEntity>>, ServiceError> {
-            Ok(HashMap::new())
         }
         async fn get_hls_playlist(
             &self,

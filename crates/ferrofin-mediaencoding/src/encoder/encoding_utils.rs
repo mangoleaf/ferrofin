@@ -123,13 +123,17 @@ pub fn quote_if_needed(value: &str) -> Cow<'_, str> {
 ///
 /// # Errors
 ///
-/// Returns an error naming the string when its quoting is unbalanced. That is
-/// a builder bug, and guessing at the split could hand part of a path to
-/// ffmpeg as options, so the caller must not guess: it refuses the command,
+/// Returns an error naming the string (any URL in it by its scheme and host)
+/// when its quoting is unbalanced. That is a builder bug, and guessing at the
+/// split could hand part of a path to ffmpeg as options, so the caller must not guess: it refuses the command,
 /// or passes the whole string as one argument, which cannot add an option.
 pub fn split_args(arguments: &str) -> Result<Vec<String>, String> {
-    shlex::split(arguments)
-        .ok_or_else(|| format!("unbalanced quoting in ffmpeg arguments `{arguments}`"))
+    shlex::split(arguments).ok_or_else(|| {
+        format!(
+            "unbalanced quoting in ffmpeg arguments `{}`",
+            ferrofin_util::source_url::redact_urls_in(arguments)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -253,6 +257,19 @@ mod tests {
     fn unbalanced_quoting_fails_closed() {
         let err = split_args(r#"-i file:"/media/a.mkv -y out"#).unwrap_err();
         assert!(err.contains("unbalanced quoting"), "{err}");
+    }
+
+    /// The error shows a URL in the arguments by its scheme and host: a
+    /// `.strm` target can carry an account (gl-1121).
+    #[test]
+    fn unbalanced_quoting_names_a_url_by_its_host() {
+        let err =
+            split_args(r#"-i "http://acct-user:info-secret@host/path-secret?k=query-secret -y"#)
+                .unwrap_err();
+        assert!(err.contains("http://host"), "{err}");
+        for secret in ["acct-user", "info-secret", "path-secret", "query-secret"] {
+            assert!(!err.contains(secret), "{secret} shown in: {err}");
+        }
     }
 
     #[test]

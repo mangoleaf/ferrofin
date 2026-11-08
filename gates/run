@@ -133,7 +133,7 @@ else
   done
 fi
 if wants adoption; then
-  for input in "oracle/smoke-jellyfin-${ADOPTION_ORACLE:-12.2}.txt" media; do   # what gates/adoption/run.sh opens first
+  for input in "oracle/smoke-jellyfin-${ADOPTION_ORACLE:-12.4}.txt" media; do   # what gates/adoption/run.sh opens first
     [ -e "$ADOPTION_FIXTURES/$input" ] \
       || { problem "the adoption fixtures are not built in $ADOPTION_FIXTURES (no $input): gates/adoption/build-fixtures.sh"; break; }
   done

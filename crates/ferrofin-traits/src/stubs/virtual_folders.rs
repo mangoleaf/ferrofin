@@ -103,8 +103,10 @@ mod tests {
     #[tokio::test]
     async fn reads_are_empty_and_mutations_fail() {
         let mgr = DisabledVirtualFolderManager;
-        assert!(mgr.get_virtual_folders().await.unwrap().is_empty());
-        assert!(mgr.get_physical_paths().await.unwrap().is_empty());
+        let virtual_folders = mgr.get_virtual_folders().await.unwrap();
+        assert!(virtual_folders.is_empty(), "{virtual_folders:?}");
+        let physical_paths = mgr.get_physical_paths().await.unwrap();
+        assert!(physical_paths.is_empty(), "{physical_paths:?}");
         assert!(
             mgr.add_virtual_folder("x", None, &LibraryOptions::default())
                 .await

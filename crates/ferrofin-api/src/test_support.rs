@@ -454,7 +454,7 @@ impl AuthService for AuthedAuthService {
 pub fn authenticated_user_info() -> AuthorizationInfo {
     AuthorizationInfo {
         is_authenticated: true,
-        user: Some(sample_user()),
+        user: Some(Arc::new(sample_user())),
         user_policy: Some(Arc::new(UserPolicy {
             enable_remote_access: true,
             ..UserPolicy::default()
@@ -632,6 +632,13 @@ fake_library_manager!(FakeLibrary {
     ) -> Result<bool, ferrofin_traits::error::ServiceError> {
         Ok(true)
     }
+    async fn get_visible_item_ids(
+        &self,
+        ids: &[Uuid],
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(ids.to_vec())
+    }
 });
 
 /// [`FakeLibrary`] in the middle of a full library validation
@@ -657,6 +664,25 @@ fake_library_manager!(CountingScans {
     async fn queue_library_scan(&self) -> Result<(), ServiceError> {
         self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+});
+
+/// [`FakeLibrary`] whose standalone visibility check refuses every item and
+/// counts the times it ran, for the listings that must not ask once per row.
+#[derive(Default)]
+pub struct CountingRefusals(pub std::sync::atomic::AtomicUsize);
+
+fake_library_manager!(CountingRefusals {
+    async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn is_item_visible_standalone(
+        &self,
+        _item: &BaseItemEntity,
+        _user: &UserEntity,
+    ) -> Result<bool, ServiceError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(false)
     }
 });
 
@@ -737,7 +763,7 @@ impl AuthService for AuthedUserService {
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
             is_authenticated: true,
-            user: Some(sample_user()),
+            user: Some(Arc::new(sample_user())),
             ..AuthorizationInfo::default()
         })
     }
@@ -1122,7 +1148,13 @@ impl UserViewManager for FakeUserViews {
     async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_media_folders(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_user_root_children(
+        &self,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
     async fn get_latest_items(
@@ -2160,12 +2192,6 @@ impl TrickplayManager for FakeTrickplay {
     async fn delete_trickplay_data(&self, _item_id: Uuid) -> Result<(), ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_trickplay_manifest(
-        &self,
-        _item_id: Uuid,
-    ) -> Result<HashMap<String, HashMap<i32, TrickplayInfoEntity>>, ServiceError> {
-        unimplemented!("fake")
-    }
     async fn get_hls_playlist(
         &self,
         _item_id: Uuid,
@@ -2581,6 +2607,8 @@ pub struct FakeVirtualFolders {
     folders: std::sync::Mutex<Vec<ferrofin_model::entities_media::VirtualFolderInfo>>,
     /// When set, every method fails with a backend error.
     fail: bool,
+    /// How many full listings (`get_virtual_folders`) were asked for.
+    listings: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeVirtualFolders {
@@ -2594,8 +2622,8 @@ impl FakeVirtualFolders {
     #[must_use]
     pub fn seeded(folders: Vec<ferrofin_model::entities_media::VirtualFolderInfo>) -> Self {
         Self {
-            fail: false,
             folders: std::sync::Mutex::new(folders),
+            ..Self::default()
         }
     }
 
@@ -2604,8 +2632,15 @@ impl FakeVirtualFolders {
     pub fn failing() -> Self {
         Self {
             fail: true,
-            folders: std::sync::Mutex::new(Vec::new()),
+            ..Self::default()
         }
+    }
+
+    /// How many full listings (`get_virtual_folders`) were asked for; the
+    /// snapshot (`library_folders`) is not counted.
+    #[must_use]
+    pub fn listings(&self) -> usize {
+        self.listings.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The `ItemId` this fake projects for `name`.
@@ -2655,7 +2690,16 @@ impl VirtualFolderManager for FakeVirtualFolders {
         &self,
     ) -> Result<Vec<ferrofin_model::entities_media::VirtualFolderInfo>, ServiceError> {
         self.guard()?;
+        self.listings
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(self.folders.lock().expect("lock").clone())
+    }
+
+    async fn library_folders(
+        &self,
+    ) -> Result<Arc<[ferrofin_model::entities_media::VirtualFolderInfo]>, ServiceError> {
+        self.guard()?;
+        Ok(self.folders.lock().expect("lock").as_slice().into())
     }
 
     async fn add_virtual_folder(
@@ -2835,13 +2879,43 @@ pub fn fake_state_with(
     auth: Arc<dyn AuthService>,
     config: Arc<dyn ServerConfigurationManager>,
 ) -> AppState {
+    fake_state_with_sessions(auth, config, Arc::new(FakeSessions))
+}
+
+/// [`fake_state_with`] over the given session manager too, for the session
+/// socket's streams.
+#[must_use]
+pub fn fake_state_with_sessions(
+    auth: Arc<dyn AuthService>,
+    config: Arc<dyn ServerConfigurationManager>,
+    sessions: Arc<dyn SessionManager>,
+) -> AppState {
+    fake_state_with_streams(
+        auth,
+        config,
+        sessions,
+        Arc::new(FakeActivity),
+        Arc::new(FakeTasks),
+    )
+}
+
+/// [`fake_state_with_sessions`] over the given activity and task managers
+/// too: every manager a session socket's dashboard stream subscribes to.
+#[must_use]
+pub fn fake_state_with_streams(
+    auth: Arc<dyn AuthService>,
+    config: Arc<dyn ServerConfigurationManager>,
+    sessions: Arc<dyn SessionManager>,
+    activity: Arc<dyn ActivityManager>,
+    tasks: Arc<dyn TaskManager>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         Arc::new(FakeUsers),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
-        Arc::new(FakeSessions),
+        sessions,
         Arc::new(FakeSystem),
         Arc::new(FakeAppHost),
         config,
@@ -2865,9 +2939,9 @@ pub fn fake_state_with(
         Arc::new(FakeApiKeys),
         Arc::new(FakeLocalization),
         Arc::new(FakeDisplayPreferences),
-        Arc::new(FakeActivity),
+        activity,
         Arc::new(FakeFileSystem),
-        Arc::new(FakeTasks),
+        tasks,
     )
 }
 

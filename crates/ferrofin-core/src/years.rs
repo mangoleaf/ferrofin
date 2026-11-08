@@ -192,7 +192,8 @@ mod tests {
             .save_items(&[store.entity(previous, 2026)])
             .await
             .unwrap();
-        assert!(store.ensure_missing(&[2026]).await.unwrap().is_empty());
+        let created = store.ensure_missing(&[2026]).await.unwrap();
+        assert!(created.is_empty(), "{created:?}");
         let rows = item_repository_over(db)
             .get_item_list(&InternalItemsQuery {
                 include_item_types: vec![BaseItemKind::Year],
@@ -232,7 +233,7 @@ mod tests {
         assert_eq!(row.clean_name.as_deref(), Some("1999"));
         // Idempotent: nothing new for years that already have rows.
         let again = store.ensure_missing(&[1999, 2004]).await.expect("again");
-        assert!(again.is_empty());
+        assert!(again.is_empty(), "{again:?}");
         let years = item_repository_over(db.clone())
             .get_item_list(&InternalItemsQuery {
                 include_item_types: vec![BaseItemKind::Year],

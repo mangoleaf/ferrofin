@@ -11,4 +11,4 @@ pub mod provider;
 
 pub use constants::Constants;
 pub use password_hash::PasswordHash;
-pub use provider::{CryptoProvider, CryptographyProvider};
+pub use provider::{CryptoProvider, CryptographyProvider, constant_time_eq};

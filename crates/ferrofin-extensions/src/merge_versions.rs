@@ -42,10 +42,27 @@
 //!   The bulk episode task also self-heals: links whose key no longer matches
 //!   their primary's are unlinked and regrouped within their own series.
 //! - The episode key's title fallback (no provider id, no episode number)
-//!   also carries the air date: upstream's (season, name, year) is the same
-//!   for every airing of a show whose files are named by date, so the task
-//!   merged a whole season of daily or weekly airings into one episode. The
-//!   self-heal above releases those links on the next run.
+//!   also carries the core resolver's version key read from the file name
+//!   (`D{yyyyMMdd}` for a name by air date, `S{n}E{n}` for one with both
+//!   numbers): upstream's (season, name, year) is the same for every airing
+//!   of a show whose files are named by date, so the task merged a whole
+//!   season of daily or weekly airings into one episode. The stored
+//!   `PremiereDate` is not used: an NFO, or a row adopted from Jellyfin
+//!   (server-local midnight), can store an airing's date on another day. A
+//!   file name with no such key carries the file name without its extension,
+//!   compared case-insensitively: the resolver's name cuts everything after a
+//!   year or release clutter, so unnumbered, undated episodes such as
+//!   `Show (1975) - Guest A` and `Show (1975) - Christmas Special` are both
+//!   "Show", 1975, and upstream's key merged them. Two copies with one such
+//!   name in different folders still merge, whatever their containers;
+//!   copies whose names differ (`Pilot 1080p`, `Pilot 720p`) no longer do.
+//!   Only a row with no path or no file name keeps upstream's key. The
+//!   self-heal above releases the links the older keys made on the next run.
+//!   It also undoes a group made by hand through `POST /Videos/MergeVersions`
+//!   of two airings, of two copies only one of whose file names carries the
+//!   key, or of two unnumbered, undated episodes whose file names differ; the
+//!   playlist and collection entries that merge rerouted to the primary stay
+//!   on it.
 //! - Ferrofin models a version group solely by the `PrimaryVersionId` pointer;
 //!   the upstream `OwnerId`/`LocalAlternateVersions`/`LinkedAlternateVersions`
 //!   columns and the linked-child reroute are Jellyfin-internal representation
@@ -63,6 +80,8 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
+use ferrofin_naming::common::NamingOptions;
+use ferrofin_naming::video::VideoListResolver;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
 use ferrofin_traits::merge_versions::{MergeProgress, MergeVersionsManager};
@@ -72,6 +91,7 @@ use ferrofin_traits::plugins::{PluginDescriptor, PluginManager};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::library_pages::{self, PAGE};
 use crate::{Extension, ExtensionContext};
 
 /// The Merge Versions plugin's stable id — the **upstream plugin's GUID**, so
@@ -273,9 +293,10 @@ pub struct MergeVersionsService {
 
 impl MergeVersionsService {
     /// Builds the service over the item repository/persistence (read + link
-    /// writes), the library manager (group unlinking), the virtual-folder
-    /// manager (the inactive-library check), and the plugin manager (enabled
-    /// flag + `LocationsExcluded` configuration, read live on every scan).
+    /// writes), the library manager (the paged eligible-item reads, group
+    /// unlinking), the virtual-folder manager (the inactive-library check),
+    /// and the plugin manager (enabled flag + `LocationsExcluded`
+    /// configuration, read live on every scan).
     #[must_use]
     pub fn new(
         items: Arc<dyn ItemRepository>,
@@ -315,44 +336,52 @@ impl MergeVersionsService {
         }
     }
 
-    /// Lists every non-virtual item of `kind` that passes the upstream
-    /// `IsEligible` filters (upstream `GetMoviesFromLibrary` /
-    /// `GetEpisodesFromLibrary`): not under an excluded location, and — for
-    /// movies only — not in an inactive library (its parent folder must sit
-    /// under some virtual-folder location).
-    async fn eligible_items(
+    /// Every non-virtual item of `kind` that passes the upstream `IsEligible`
+    /// filters (upstream `GetMoviesFromLibrary` / `GetEpisodesFromLibrary`):
+    /// not under an excluded location, and — for movies only — not in an
+    /// inactive library (its parent folder must sit under some
+    /// virtual-folder location), each as `keep` projects it.
+    ///
+    /// Upstream holds the whole list. Here the rows are read a page at a time
+    /// from a snapshot of the ids ([`crate::library_pages`]) and only what
+    /// `keep` returns is kept, so a large library is never held whole.
+    async fn eligible_items<T: Send>(
         &self,
         kind: BaseItemKind,
-    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        mut keep: impl FnMut(&BaseItemEntity) -> Option<T> + Send,
+    ) -> Result<Vec<T>, ServiceError> {
         let excluded = self.config().await.locations_excluded;
         let folders = self.virtual_folders.get_virtual_folders().await?;
-        let items = self
-            .items
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![kind],
-                is_virtual_item: Some(false),
-                recursive: true,
-                // The general query hides merged alternates (`PrimaryVersionId
-                // IS NULL`); the bulk scans must see them — upstream's query
-                // does — or already-linked versions are invisible to the
-                // existing-primary probe, the movies' any-unmerged filter, and
-                // the episode self-heal pass.
-                include_owned_items: true,
-                ..Default::default()
-            })
-            .await?;
-        Ok(items
-            .into_iter()
-            // Upstream's query keeps owned rows out (`TranslateQuery`'s
-            // `OwnerId == null || ExtraType != null`): a stacked part or a
-            // local alternate belongs to its primary's file group, which the
-            // scan writes, and is never merged on its own.
-            .filter(|item| !is_owned_version(item))
-            .filter(|item| !in_excluded_location(&excluded, item.path.as_deref()))
-            .filter(|item| {
-                kind != BaseItemKind::Movie || !in_inactive_library(&folders, item.path.as_deref())
-            })
-            .collect())
+        let query = InternalItemsQuery {
+            include_item_types: vec![kind],
+            is_virtual_item: Some(false),
+            recursive: true,
+            // The general query hides merged alternates (`PrimaryVersionId
+            // IS NULL`); the bulk scans must see them — upstream's query
+            // does — or already-linked versions are invisible to the
+            // existing-primary probe, the movies' any-unmerged filter, and
+            // the episode self-heal pass.
+            include_owned_items: true,
+            ..Default::default()
+        };
+        let mut kept = Vec::new();
+        for page in self.library.get_item_ids(&query).await?.chunks(PAGE) {
+            for item in library_pages::rows(self.library.as_ref(), &query, page).await? {
+                // Upstream's query keeps owned rows out (`TranslateQuery`'s
+                // `OwnerId == null || ExtraType != null`): a stacked part or a
+                // local alternate belongs to its primary's file group, which
+                // the scan writes, and is never merged on its own.
+                if is_owned_version(&item)
+                    || in_excluded_location(&excluded, item.path.as_deref())
+                    || (kind == BaseItemKind::Movie
+                        && in_inactive_library(&folders, item.path.as_deref()))
+                {
+                    continue;
+                }
+                kept.extend(keep(&item));
+            }
+        }
+        Ok(kept)
     }
 
     /// Expands a set of items to the union of their existing version groups —
@@ -537,6 +566,26 @@ impl MergeVersionsService {
     }
 }
 
+/// What the movie merge reads of an eligible movie.
+struct EligibleMovie {
+    /// Its stored id.
+    id: String,
+    /// The primary it is a version of, if any.
+    primary_version_id: Option<String>,
+    /// Its [`library_key`]: empty for a movie in no library.
+    library: String,
+}
+
+/// What the episode merge reads of an eligible episode.
+struct EligibleEpisode {
+    /// Its id.
+    id: Uuid,
+    /// Its lowercased [`episode_merge_key`].
+    key: String,
+    /// The primary it is a version of, if any.
+    primary_version_id: Option<Uuid>,
+}
+
 /// The library `item` belongs to, as merging scopes it: the configured
 /// library whose collection folder is its `TopParentId` or one of whose
 /// locations holds it (a location's folder is the `TopParentId` of what it
@@ -562,23 +611,30 @@ impl MergeVersionsManager for MergeVersionsService {
         self.ensure_enabled().await?;
         let _bulk_run = self.bulk_run.lock().await;
         tracing::info!("merge versions: scanning for repeated movies");
-        let movies = self.eligible_items(BaseItemKind::Movie).await?;
+        // The owning library per movie ([`library_key`]) — the merge scope. A
+        // movie in no library (never scanned into one) is "unscoped": it
+        // groups under the empty key with its own kind, and is never itself
+        // healed, since it has no library to be in the wrong one of.
+        let folders = self.virtual_folders.get_virtual_folders().await?;
+        let movies = self
+            .eligible_items(BaseItemKind::Movie, |movie| {
+                Some(EligibleMovie {
+                    id: movie.id.clone(),
+                    primary_version_id: movie.primary_version_id.clone(),
+                    library: library_key(&folders, movie),
+                })
+            })
+            .await?;
         let tmdb: HashMap<Uuid, String> = self
             .items
             .get_items_with_provider_id("Tmdb")
             .await?
             .into_iter()
             .collect();
-
-        // The owning library per movie ([`library_key`]) — the merge scope. A
-        // movie in no library (never scanned into one) is "unscoped": it
-        // groups under the empty key with its own kind, and is never itself
-        // healed, since it has no library to be in the wrong one of.
-        let folders = self.virtual_folders.get_virtual_folders().await?;
-        let library_of: HashMap<&str, String> = movies
+        let library_of: HashMap<&str, &str> = movies
             .iter()
-            .map(|m| (m.id.as_str(), library_key(&folders, m)))
-            .filter(|(_, library)| !library.is_empty())
+            .filter(|m| !m.library.is_empty())
+            .map(|m| (m.id.as_str(), m.library.as_str()))
             .collect();
 
         // Self-heal before grouping: unlink any alternate whose library
@@ -594,7 +650,7 @@ impl MergeVersionsManager for MergeVersionsService {
         let mut healed: HashSet<Uuid> = HashSet::new();
         let mut fetched: HashMap<&str, Option<String>> = HashMap::new();
         for movie in &movies {
-            let (Ok(id), Some(lib), Some(pid)) = (
+            let (Ok(id), Some(&lib), Some(pid)) = (
                 Uuid::parse_str(&movie.id),
                 library_of.get(movie.id.as_str()),
                 movie.primary_version_id.as_deref(),
@@ -604,8 +660,8 @@ impl MergeVersionsManager for MergeVersionsService {
             if !tmdb.contains_key(&id) {
                 continue;
             }
-            let primary_lib = if let Some(found) = library_of.get(pid) {
-                Some(found.as_str())
+            let primary_lib = if let Some(&found) = library_of.get(pid) {
+                Some(found)
             } else {
                 if !fetched.contains_key(pid) {
                     let row = match Uuid::parse_str(pid) {
@@ -650,7 +706,10 @@ impl MergeVersionsManager for MergeVersionsService {
             let Some(value) = tmdb.get(&id) else {
                 continue; // no Tmdb id → skipped (`ProviderIds.ContainsKey`)
             };
-            let library = library_of.get(movie.id.as_str()).map_or("", String::as_str);
+            let library = library_of
+                .get(movie.id.as_str())
+                .copied()
+                .unwrap_or_default();
             let entry = groups.entry((library, value.as_str())).or_default();
             entry.0.push(id);
             entry.1 |= movie.primary_version_id.is_none() || healed.contains(&id);
@@ -675,7 +734,9 @@ impl MergeVersionsManager for MergeVersionsService {
         tracing::info!("merge versions: splitting all movies");
         // Upstream `SplitMovies` iterates `GetMoviesFromLibrary`, which keeps
         // only Tmdb-carrying eligible movies — the same set the merge scans.
-        let movies = self.eligible_items(BaseItemKind::Movie).await?;
+        let movies = self
+            .eligible_items(BaseItemKind::Movie, |movie| Uuid::parse_str(&movie.id).ok())
+            .await?;
         let tmdb: HashMap<Uuid, String> = self
             .items
             .get_items_with_provider_id("Tmdb")
@@ -683,8 +744,7 @@ impl MergeVersionsManager for MergeVersionsService {
             .into_iter()
             .collect();
         let ids: Vec<Uuid> = movies
-            .iter()
-            .filter_map(|m| Uuid::parse_str(&m.id).ok())
+            .into_iter()
             .filter(|id| tmdb.contains_key(id))
             .collect();
         self.split_each(&ids, progress).await
@@ -697,7 +757,6 @@ impl MergeVersionsManager for MergeVersionsService {
         self.ensure_enabled().await?;
         let _bulk_run = self.bulk_run.lock().await;
         tracing::info!("merge versions: scanning for repeated episodes");
-        let episodes = self.eligible_items(BaseItemKind::Episode).await?;
 
         // The provider-id maps the merge key consults, in precedence order.
         let mut provider_maps: Vec<(&str, HashMap<Uuid, String>)> = Vec::new();
@@ -714,19 +773,27 @@ impl MergeVersionsManager for MergeVersionsService {
 
         // The (case-insensitive) merge key per episode — the upstream 12.0 key
         // scoped to the series row (see `episode_merge_key`).
-        let mut key_of: HashMap<Uuid, String> = HashMap::new();
-        for ep in &episodes {
-            let Ok(id) = Uuid::parse_str(&ep.id) else {
-                continue;
-            };
-            let key = episode_merge_key(ep, |provider| {
-                provider_maps
-                    .iter()
-                    .find(|(name, _)| *name == provider)
-                    .and_then(|(_, map)| map.get(&id).cloned())
-            });
-            key_of.insert(id, key.to_lowercase());
-        }
+        let episodes = self
+            .eligible_items(BaseItemKind::Episode, |ep| {
+                let id = Uuid::parse_str(&ep.id).ok()?;
+                let key = episode_merge_key(ep, |provider| {
+                    provider_maps
+                        .iter()
+                        .find(|(name, _)| *name == provider)
+                        .and_then(|(_, map)| map.get(&id).cloned())
+                });
+                Some(EligibleEpisode {
+                    id,
+                    key: key.to_lowercase(),
+                    primary_version_id: ep
+                        .primary_version_id
+                        .as_deref()
+                        .and_then(|p| Uuid::parse_str(p).ok()),
+                })
+            })
+            .await?;
+        let key_of: HashMap<Uuid, &str> =
+            episodes.iter().map(|ep| (ep.id, ep.key.as_str())).collect();
 
         // Self-heal before grouping: unlink any alternate whose key no longer
         // matches its primary's (e.g. groups created by the old name-scoped
@@ -736,18 +803,13 @@ impl MergeVersionsManager for MergeVersionsService {
         // group has nothing left to merge, so it is never revisited.
         let mut healed = 0usize;
         for ep in &episodes {
-            let (Ok(id), Some(pid)) = (
-                Uuid::parse_str(&ep.id),
-                ep.primary_version_id
-                    .as_deref()
-                    .and_then(|p| Uuid::parse_str(p).ok()),
-            ) else {
+            let Some(pid) = ep.primary_version_id else {
                 continue;
             };
-            if let (Some(key), Some(primary_key)) = (key_of.get(&id), key_of.get(&pid))
+            if let (Some(key), Some(primary_key)) = (key_of.get(&ep.id), key_of.get(&pid))
                 && key != primary_key
             {
-                self.persistence.set_primary_version_id(id, None).await?;
+                self.persistence.set_primary_version_id(ep.id, None).await?;
                 healed += 1;
             }
         }
@@ -758,12 +820,10 @@ impl MergeVersionsManager for MergeVersionsService {
             );
         }
 
-        let mut groups: HashMap<String, Vec<Uuid>> = HashMap::new();
+        let mut groups: HashMap<&str, Vec<Uuid>> = HashMap::new();
         for ep in &episodes {
-            if let Ok(id) = Uuid::parse_str(&ep.id)
-                && let Some(key) = key_of.get(&id)
-            {
-                groups.entry(key.clone()).or_default().push(id);
+            if let Some(&key) = key_of.get(&ep.id) {
+                groups.entry(key).or_default().push(ep.id);
             }
         }
         let duplicates: Vec<Vec<Uuid>> = groups.into_values().filter(|ids| ids.len() > 1).collect();
@@ -788,11 +848,9 @@ impl MergeVersionsManager for MergeVersionsService {
         self.ensure_enabled().await?;
         let _bulk_run = self.bulk_run.lock().await;
         tracing::info!("merge versions: splitting all episodes");
-        let episodes = self.eligible_items(BaseItemKind::Episode).await?;
-        let ids: Vec<Uuid> = episodes
-            .iter()
-            .filter_map(|e| Uuid::parse_str(&e.id).ok())
-            .collect();
+        let ids = self
+            .eligible_items(BaseItemKind::Episode, |ep| Uuid::parse_str(&ep.id).ok())
+            .await?;
         self.split_each(&ids, progress).await
     }
 }
@@ -812,8 +870,9 @@ fn percent(index: usize, total: usize) -> f64 {
 
 /// The upstream 12.0 `GetEpisodeMergeKey`: the first non-blank provider id
 /// (`Tvdb` → `Tmdb` → `Imdb`), else season/episode numbers, else title
-/// fields and — unlike upstream — the air date. The caller lowercases the key
-/// (`StringComparer.OrdinalIgnoreCase`).
+/// fields and — unlike upstream — the file name's version key (its air date,
+/// or its season and episode numbers), or the file name when it has neither.
+/// The caller lowercases the key (`StringComparer.OrdinalIgnoreCase`).
 fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<String>) -> String {
     // Every branch is scoped to the series *identity* (presentation key), not
     // the series name — a deliberate divergence from upstream, which groups by
@@ -848,29 +907,47 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
         .unwrap_or_default();
         return format!("{series}|number:{parent}:{index}:{end}");
     }
-    // The title fallback also carries the air date — a second deliberate
-    // divergence. Upstream keys it on (series, season, name, year) alone, and
-    // for an episode named by air date (`Show - 2023-12-16 - Guest.ts`) none
-    // of those tell two airings apart: Jellyfin clears its `IndexNumber`
-    // (`LibraryManager.FillMissingEpisodeNumbersFromPath`, `IsByDate`), its
-    // name is the series' and its year the series' or the season's, so every
-    // airing in a season shares one key and the bulk task hid all but one
-    // behind it as "versions". The core resolver groups such files only when
-    // their dates match (`VideoListResolver.GetEpisodeVersionKey`, `D{date}`);
-    // with the date in the key two copies of one airing still merge, two
-    // airings no longer do. An episode with no air date keeps the upstream key
-    // plus an empty component.
-    format!(
-        "{series}|title:{}:{}:{}:{}",
+    // The title fallback also carries the file name's version key — a second
+    // deliberate divergence. Upstream keys it on (series, season, name, year)
+    // alone, and for an episode named by air date (`Show - 2023-12-16 -
+    // Guest.ts`) none of those tell two airings apart: Jellyfin clears its
+    // `IndexNumber` (`LibraryManager.FillMissingEpisodeNumbersFromPath`,
+    // `IsByDate`), its name is the series' and its year the series' or the
+    // season's, so every airing in a season shares one key and the bulk task
+    // hid all but one behind it as "versions". The key is the one the core
+    // resolver groups episode files by (`VideoListResolver.GetEpisodeVersionKey`:
+    // `D{yyyyMMdd}`, or `S{n}E{n}` when the name has both numbers but the row
+    // does not), so two copies of one airing still merge and two airings no
+    // longer do. It is read from the file name, not the stored
+    // `PremiereDate`: that has several writers (the scan's UTC midnight, an
+    // adopted Jellyfin row's server-local midnight, an NFO), so it can put two
+    // airings on one day or one airing on two.
+    //
+    // A file name with no such key carries the file name without its
+    // extension, a third divergence: the resolver's name cuts everything after
+    // a year or release clutter, so `Show (1975) - Guest A.ts` and `Show (1975)
+    // - Christmas Special.ts` are both "Show", 1975, and upstream's key would
+    // merge them. Two copies with one such name in different folders still
+    // share a key (the caller lowercases it). Only a row with no path or no
+    // file name keeps the upstream key unchanged.
+    let key = format!(
+        "{series}|title:{}:{}:{}",
         ep.season_name.as_deref().unwrap_or_default(),
         ep.name.as_deref().unwrap_or_default(),
         ep.production_year
             .map(|y| y.to_string())
-            .unwrap_or_default(),
-        ep.premiere_date
-            .map(|date| date.format("%Y-%m-%d").to_string())
             .unwrap_or_default()
-    )
+    );
+    let Some(path) = ep.path.as_deref() else {
+        return key;
+    };
+    match VideoListResolver::new(NamingOptions::shared()).episode_version_key(path) {
+        Some(version) => format!("{key}:{version}"),
+        None => match Path::new(path).file_stem().and_then(|stem| stem.to_str()) {
+            Some(stem) => format!("{key}:file:{stem}"),
+            None => key,
+        },
+    }
 }
 
 /// Whether `item` is an owned row that is no extra — a stacked part or a
@@ -1123,6 +1200,38 @@ mod tests {
         MergeVersionsService::new(items, persistence, library, folders, plugins)
     }
 
+    /// An enabled service whose reads go through
+    /// [`OnePageAtATime`](crate::library_pages::tests::OnePageAtATime): a
+    /// walk that reads more than a page of rows at once fails.
+    fn paged_service(db: &Database) -> MergeVersionsService {
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+        let items: Arc<dyn ItemRepository> =
+            Arc::new(crate::library_pages::tests::OnePageAtATime::new(Arc::new(
+                FerrofinItemRepository::new(db.clone(), lookup),
+            )));
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let library = Arc::new(FerrofinLibraryManager::new(
+            items.clone(),
+            Arc::new(FerrofinItemCountService::new(db.clone())),
+            persistence.clone(),
+            Arc::new(FerrofinPeopleRepository::new(db.clone())),
+        ));
+        MergeVersionsService::new(
+            items,
+            persistence,
+            library,
+            Arc::new(FakeVirtualFolders::default()),
+            FakePlugins::enabled(),
+        )
+    }
+
+    /// An id whose hex has no letters, so the lowercase text [`seed`] stores
+    /// and the uppercase form the by-id reads bind are the same.
+    fn plain_id(n: usize) -> Uuid {
+        Uuid::parse_str(&format!("00000000-0000-0000-0000-{n:012}")).expect("id")
+    }
+
     fn stored_type(kind: BaseItemKind) -> &'static str {
         ferrofin_core::item_type_lookup::stored_type_name(kind).expect("stored type name")
     }
@@ -1197,7 +1306,11 @@ mod tests {
     fn extension_default_config_round_trips() {
         let bytes = MergeVersionsExtension.default_config();
         let config: MergeVersionsConfig = serde_json::from_slice(&bytes).expect("valid JSON");
-        assert!(config.locations_excluded.is_empty());
+        assert!(
+            config.locations_excluded.is_empty(),
+            "{:?}",
+            config.locations_excluded
+        );
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
         assert!(
             v["LocationsExcluded"].as_array().expect("array").is_empty(),
@@ -1284,43 +1397,118 @@ mod tests {
         // its first half.
         let double = BaseItemEntity {
             data: Some(r#"{"IndexNumberEnd":3,"Container":"mkv"}"#.to_owned()),
-            ..ep.clone()
+            ..ep
         };
         assert_eq!(episode_merge_key(&double, |_| None), "Show|number:1:2:3");
         let ep = episode("Show", "Season 1", "Pilot", None);
         assert_eq!(
             episode_merge_key(&ep, |_| None),
-            "Show|title:Season 1:Pilot:2020:"
+            "Show|title:Season 1:Pilot:2020"
         );
     }
 
-    /// An episode named by air date has no number (`IsByDate` clears it) and
-    /// the series' name, so only its air date tells two airings apart in the
-    /// title fallback; two copies of one airing share the key.
+    /// The title fallback tells date-named airings apart by the date in the
+    /// file name — the core resolver's version key, `D{yyyyMMdd}` — never by
+    /// the stored `PremiereDate`, which has several writers: the scan's UTC
+    /// midnight, an adopted Jellyfin row's server-local midnight, an NFO.
     #[test]
-    fn episode_merge_key_tells_airings_apart_by_date() {
-        let aired = |date: &str| BaseItemEntity {
-            premiere_date: Some(format!("{date}T06:00:00Z").parse().expect("date")),
+    fn episode_merge_key_keys_dated_airings_on_the_file_name() {
+        let aired = |file: &str, stored: &str| BaseItemEntity {
+            path: Some(format!("/tv/Show (1975)/Season 49/{file}")),
+            premiere_date: Some(stored.parse().expect("date")),
             ..episode("Show", "Season 49", "Show", None)
         };
-        let (dec16, dec09) = (aired("2023-12-16"), aired("2023-12-09"));
-        assert_eq!(
-            episode_merge_key(&dec16, |_| None),
-            "Show|title:Season 49:Show:2020:2023-12-16"
+        // Adopted rows from a London server around the March clock change:
+        // Sunday's local midnight is 00:00Z, Monday's is 23:00Z on Sunday.
+        let sunday = aired(
+            "Show (1975) - 2024-03-31 06 00 00 - Guest A.ts",
+            "2024-03-31T00:00:00Z",
+        );
+        let monday = aired(
+            "Show (1975) - 2024-04-01 06 00 00 - Guest B.ts",
+            "2024-03-31T23:00:00Z",
         );
         assert_ne!(
-            episode_merge_key(&dec16, |_| None),
-            episode_merge_key(&dec09, |_| None)
+            episode_merge_key(&sunday, |_| None),
+            episode_merge_key(&monday, |_| None)
         );
         assert_eq!(
-            episode_merge_key(&dec16, |_| None),
-            episode_merge_key(&aired("2023-12-16"), |_| None)
+            episode_merge_key(&sunday, |_| None),
+            "Show|title:Season 49:Show:2020:D20240331"
         );
-        // A provider id or a number still outranks the date.
+        // A copy of Sunday's airing in another folder, stored a day earlier
+        // (Jellyfin's local midnight on a server ahead of UTC): one key.
+        let copy = aired(
+            "HD/Show (1975) - 2024-03-31 06 00 00 - Guest A.mkv",
+            "2024-03-30T23:00:00Z",
+        );
+        assert_eq!(
+            episode_merge_key(&sunday, |_| None),
+            episode_merge_key(&copy, |_| None)
+        );
+        // A provider id still outranks the date.
         let tvdb = |p: &str| (p == "Tvdb").then(|| "6008035".to_owned());
         assert_eq!(
-            episode_merge_key(&dec16, tvdb),
-            episode_merge_key(&dec09, tvdb)
+            episode_merge_key(&sunday, tvdb),
+            episode_merge_key(&monday, tvdb)
+        );
+        // A row with no numbers whose file name has both carries them, as the
+        // core resolver keys it: two different episodes stay apart.
+        let numbered = BaseItemEntity {
+            path: Some("/tv/Show/Season 1/Show - S01E02 - Pilot.mkv".to_owned()),
+            ..episode("Show", "Season 1", "Pilot", None)
+        };
+        assert_eq!(
+            episode_merge_key(&numbered, |_| None),
+            "Show|title:Season 1:Pilot:2020:S1E2"
+        );
+        // No date in the file name: the file name, whatever is stored.
+        let pilot = BaseItemEntity {
+            path: Some("/tv/Show/Season 1/Pilot.mkv".to_owned()),
+            premiere_date: Some("2020-01-05T00:00:00Z".parse().expect("date")),
+            ..episode("Show", "Season 1", "Pilot", None)
+        };
+        assert_eq!(
+            episode_merge_key(&pilot, |_| None),
+            "Show|title:Season 1:Pilot:2020:file:Pilot"
+        );
+    }
+
+    /// With no date and no numbers in the file name, the title fallback
+    /// carries the file name: two files the resolver names alike ("Show",
+    /// 1975, cut at the year) get two keys, two copies of one file name in
+    /// different folders one. A row with no path keeps the plugin's key.
+    #[test]
+    fn episode_merge_key_keys_undated_titles_on_the_file_name() {
+        let at = |file: &str| BaseItemEntity {
+            path: Some(format!("/tv/Show (1975)/Season 49/{file}")),
+            ..episode("Show", "Season 49", "Show", None)
+        };
+        let guest = at("Show (1975) - Guest A.ts");
+        assert_ne!(
+            episode_merge_key(&guest, |_| None),
+            episode_merge_key(&at("Show (1975) - Christmas Special.ts"), |_| None)
+        );
+        assert_eq!(
+            episode_merge_key(&guest, |_| None),
+            "Show|title:Season 49:Show:2020:file:Show (1975) - Guest A"
+        );
+        assert_eq!(
+            episode_merge_key(&guest, |_| None),
+            episode_merge_key(&at("SD/Show (1975) - Guest A.mkv"), |_| None)
+        );
+        let pathless = episode("Show", "Season 49", "Show", None);
+        assert_eq!(
+            episode_merge_key(&pathless, |_| None),
+            "Show|title:Season 49:Show:2020"
+        );
+        let nameless = BaseItemEntity {
+            path: Some("/".to_owned()),
+            ..episode("Show", "Season 49", "Show", None)
+        };
+        assert_eq!(
+            episode_merge_key(&nameless, |_| None),
+            "Show|title:Season 49:Show:2020"
         );
     }
 
@@ -1882,6 +2070,85 @@ mod tests {
         }
     }
 
+    /// gl-1013: the movie merge and split read the library a page at a time,
+    /// and still reach every group: more movies than a page, in Tmdb pairs.
+    #[tokio::test]
+    async fn movie_merge_and_split_read_the_library_a_page_at_a_time() {
+        let db = test_db().await;
+        // More rows than a page, in pairs.
+        let rows = crate::library_pages::PAGE + 38;
+        let pairs = rows / 2;
+        let pair = |n: usize| (plain_id(500_000 + 2 * n), plain_id(500_001 + 2 * n));
+        for n in 0..pairs {
+            let (wide, narrow) = pair(n);
+            seed(&db, wide, BaseItemKind::Movie, None, 1920).await;
+            seed(&db, narrow, BaseItemKind::Movie, None, 640).await;
+            for id in [wide, narrow] {
+                set_provider_id(&db, id, "Tmdb", &n.to_string()).await;
+            }
+        }
+        let svc = paged_service(&db);
+
+        svc.merge_movies(None).await.expect("merge movies");
+        for n in 0..pairs {
+            let (wide, narrow) = pair(n);
+            assert_eq!(primary_of(&db, &svc, wide).await, None);
+            assert_eq!(
+                primary_of(&db, &svc, narrow).await.as_deref(),
+                Some(wide.to_string().as_str())
+            );
+        }
+
+        svc.split_movies(None).await.expect("split movies");
+        for n in 0..pairs {
+            assert_eq!(primary_of(&db, &svc, pair(n).1).await, None);
+        }
+    }
+
+    /// gl-1013: the episode merge and split read the library a page at a
+    /// time too: more episodes than a page, two copies of each number.
+    #[tokio::test]
+    async fn episode_merge_and_split_read_the_library_a_page_at_a_time() {
+        let db = test_db().await;
+        // More rows than a page, in pairs.
+        let rows = crate::library_pages::PAGE + 38;
+        let pairs = rows / 2;
+        let pair = |n: usize| (plain_id(600_000 + 2 * n), plain_id(600_001 + 2 * n));
+        for n in 0..pairs {
+            let (wide, narrow) = pair(n);
+            let number = i64::try_from(n).expect("n") + 1;
+            for (id, width) in [(wide, 1920), (narrow, 640)] {
+                seed(&db, id, BaseItemKind::Episode, None, width).await;
+                set_episode_fields(
+                    &db,
+                    id,
+                    "Show",
+                    "Season 1",
+                    &format!("Episode {number}"),
+                    Some((1, number)),
+                    2020,
+                )
+                .await;
+            }
+        }
+        let svc = paged_service(&db);
+
+        svc.merge_episodes(None).await.expect("merge episodes");
+        for n in 0..pairs {
+            let (wide, narrow) = pair(n);
+            assert_eq!(primary_of(&db, &svc, wide).await, None);
+            assert_eq!(
+                primary_of(&db, &svc, narrow).await.as_deref(),
+                Some(wide.to_string().as_str())
+            );
+        }
+
+        svc.split_episodes(None).await.expect("split episodes");
+        for n in 0..pairs {
+            assert_eq!(primary_of(&db, &svc, pair(n).1).await, None);
+        }
+    }
+
     #[tokio::test]
     async fn merge_episodes_prefers_provider_ids_over_titles() {
         let db = test_db().await;
@@ -1943,8 +2210,9 @@ mod tests {
         assert_eq!(primary_of(&db, &svc, other).await, None);
     }
 
-    /// Sets an episode's air date (read-modify-write, as `set_episode_fields`).
-    async fn set_premiere_date(db: &Database, id: Uuid, date: &str) {
+    /// Sets an episode's stored air date, an RFC 3339 instant
+    /// (read-modify-write, as `set_episode_fields`).
+    async fn set_premiere_date(db: &Database, id: Uuid, instant: &str) {
         let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
         let mut item = FerrofinItemRepository::new(db.clone(), lookup)
@@ -1952,7 +2220,7 @@ mod tests {
             .await
             .expect("read")
             .expect("row");
-        item.premiere_date = Some(format!("{date}T06:00:00Z").parse().expect("date"));
+        item.premiere_date = Some(instant.parse().expect("date"));
         FerrofinItemPersistenceService::new(db.clone())
             .save_items(&[item])
             .await
@@ -1962,32 +2230,64 @@ mod tests {
     // A season of episodes named by air date (`Show - 2023-12-16 - Guest.ts`):
     // no number, no provider id, the series' name and one production year.
     // The airings stay separate episodes, a link an earlier run made between
-    // two airings is released, and two copies of one airing still merge.
+    // two airings is released, and two copies of one airing still merge, all
+    // by the date in the file name. The stored dates are adopted rows: the
+    // airings as a London server stores them around the March clock change
+    // (local midnight is 00:00Z on Sunday, 23:00Z the day before from Monday
+    // on), and the second copy as a server an hour ahead of UTC stores it.
+    // Keyed on them, Sunday and Monday would share a day and the two copies
+    // would not.
     #[tokio::test]
     async fn merge_episodes_keeps_by_date_airings_apart() {
         let db = test_db().await;
-        let (dec02, dec09, dec16) = (
+        let (sun, mon, tue) = (
             Uuid::from_u128(0x481),
             Uuid::from_u128(0x482),
             Uuid::from_u128(0x483),
         );
         let (copy_a, copy_b) = (Uuid::from_u128(0x484), Uuid::from_u128(0x485));
-        for (id, width, date) in [
-            (dec02, 1920, "2023-12-02"),
-            (dec09, 1920, "2023-12-09"),
-            (dec16, 1920, "2023-12-16"),
-            (copy_a, 1920, "2023-11-18"),
-            (copy_b, 640, "2023-11-18"),
+        for (id, width, file, stored) in [
+            (
+                sun,
+                1920,
+                "Show (1975) - 2024-03-31 06 00 00 - Guest A.ts",
+                "2024-03-31T00:00:00Z",
+            ),
+            (
+                mon,
+                1920,
+                "Show (1975) - 2024-04-01 06 00 00 - Guest B.ts",
+                "2024-03-31T23:00:00Z",
+            ),
+            (
+                tue,
+                1920,
+                "Show (1975) - 2024-04-02 06 00 00 - Guest C.ts",
+                "2024-04-01T23:00:00Z",
+            ),
+            (
+                copy_a,
+                1920,
+                "Show (1975) - 2024-03-24 06 00 00 - Guest D.ts",
+                "2024-03-24T00:00:00Z",
+            ),
+            (
+                copy_b,
+                640,
+                "HD/Show (1975) - 2024-03-24 06 00 00 - Guest D.mkv",
+                "2024-03-23T23:00:00Z",
+            ),
         ] {
-            seed(&db, id, BaseItemKind::Episode, None, width).await;
+            let path = format!("/tv/Show (1975)/Season 49/{file}");
+            seed(&db, id, BaseItemKind::Episode, Some(&path), width).await;
             set_episode_fields(&db, id, "Show", "Season 49", "Show", None, 1975).await;
-            set_premiere_date(&db, id, date).await;
+            set_premiere_date(&db, id, stored).await;
         }
         // What the date-blind key left behind: two airings hidden behind a third.
         let persistence = FerrofinItemPersistenceService::new(db.clone());
-        for id in [dec02, dec16] {
+        for id in [sun, tue] {
             persistence
-                .set_primary_version_id(id, Some(dec09))
+                .set_primary_version_id(id, Some(mon))
                 .await
                 .expect("seed stale link");
         }
@@ -1995,13 +2295,60 @@ mod tests {
         let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
         svc.merge_episodes(None).await.expect("merge episodes");
 
-        for id in [dec02, dec09, dec16] {
+        for id in [sun, mon, tue] {
             assert_eq!(primary_of(&db, &svc, id).await, None, "airing {id}");
         }
         assert_eq!(
             primary_of(&db, &svc, copy_b).await,
             Some(copy_a.to_string()),
             "two copies of one airing are one episode"
+        );
+        assert_eq!(primary_of(&db, &svc, copy_a).await, None);
+    }
+
+    // Episodes with no number and no date in their file names reach the title
+    // fallback, and the resolver names them all alike when the show's year
+    // comes before what tells them apart: `Show (1975) - Guest A.ts` and
+    // `Show (1975) - Christmas Special.ts` are both "Show", 1975 (Jellyfin's
+    // name for them, and the scan's). They stay apart, and a link an earlier
+    // run made between them is released; two copies of one file name in two
+    // folders, in any case and container, are still one episode.
+    #[tokio::test]
+    async fn merge_episodes_keeps_undated_episodes_named_alike_apart() {
+        let db = test_db().await;
+        let (special, guest_a, guest_b) = (
+            Uuid::from_u128(0x491),
+            Uuid::from_u128(0x492),
+            Uuid::from_u128(0x493),
+        );
+        let (copy_a, copy_b) = (Uuid::from_u128(0x494), Uuid::from_u128(0x495));
+        for (id, width, file) in [
+            (special, 1920, "Show (1975) - Christmas Special.ts"),
+            (guest_a, 1920, "Show (1975) - Guest A.ts"),
+            (guest_b, 1920, "Show (1975) - Guest B.ts"),
+            (copy_a, 1920, "Show (1975) - Reunion.ts"),
+            (copy_b, 640, "SD/show (1975) - reunion.mkv"),
+        ] {
+            let path = format!("/tv/Show (1975)/Season 49/{file}");
+            seed(&db, id, BaseItemKind::Episode, Some(&path), width).await;
+            set_episode_fields(&db, id, "Show", "Season 49", "Show", None, 1975).await;
+        }
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        persistence
+            .set_primary_version_id(guest_b, Some(guest_a))
+            .await
+            .expect("seed stale link");
+
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+        svc.merge_episodes(None).await.expect("merge episodes");
+
+        for id in [special, guest_a, guest_b] {
+            assert_eq!(primary_of(&db, &svc, id).await, None, "episode {id}");
+        }
+        assert_eq!(
+            primary_of(&db, &svc, copy_b).await,
+            Some(copy_a.to_string()),
+            "two copies of one file name are one episode"
         );
         assert_eq!(primary_of(&db, &svc, copy_a).await, None);
     }
@@ -2189,7 +2536,7 @@ mod tests {
         svc.merge_movies(Some(&sink)).await.expect("merge");
 
         let reported = reported.into_inner().unwrap();
-        assert!(!reported.is_empty());
+        assert!(!reported.is_empty(), "{reported:?}");
         assert_eq!(reported.last().copied(), Some(100.0));
     }
 
@@ -2236,6 +2583,15 @@ mod tests {
                 ferrofin_traits::stubs::virtual_folders::DisabledVirtualFolderManager,
             ),
             chapters: Arc::new(ferrofin_traits::stubs::chapters::NoChapters),
+            users: Arc::new(ferrofin_core::FerrofinUserManager::new(db.clone())),
+            external_identities: Arc::new(
+                ferrofin_core::external_identity_repository::FerrofinExternalIdentityStore::new(
+                    db.clone(),
+                ),
+            ),
+            remote_images: Arc::new(
+                crate::ldap_auth::provider::profile_image::FakeImages::default(),
+            ),
         };
 
         let tasks = MergeVersionsExtension.tasks(&cx);

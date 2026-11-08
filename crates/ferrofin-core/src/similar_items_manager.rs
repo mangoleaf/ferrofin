@@ -338,7 +338,7 @@ const CANDIDATE_OVERSAMPLE: i32 = 3;
 /// 2 of `MovieSimilarItemsProvider.GetBatchSimilarItemsAsync`, or the
 /// `InternalItemsQuery` the `Series`/`MusicAlbum`/`MusicArtist`/`Audio`/
 /// `LiveTvProgram` providers build. The user's library access is added on top
-/// by [`FerrofinSimilarItemsManager::configure_user_access`].
+/// by [`UserAccess::scope`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct LocalFilter {
     /// Which C# provider shape serves this seed's kind.
@@ -383,8 +383,8 @@ struct LocalRequest<'a> {
     kind: BaseItemKind,
     /// The request's `ExcludeArtistIds`.
     exclude_artist_ids: &'a [Uuid],
-    /// The requesting user, when the request is user-scoped.
-    user_id: Option<Uuid>,
+    /// The requesting user's access, when the request is user-scoped.
+    user: Option<&'a UserAccess>,
     /// How many results the request wants in all.
     wanted: i32,
 }
@@ -399,8 +399,35 @@ struct RemoteRequest<'a> {
     query: &'a SimilarItemsQuery,
     /// The seed's kind, the only kind a reference resolves to.
     kind: BaseItemKind,
-    /// The requesting user, when the request is user-scoped.
-    user_id: Option<Uuid>,
+    /// The requesting user's access, when the request is user-scoped.
+    user: Option<&'a UserAccess>,
+}
+
+/// A request's user and the libraries it may see, resolved once per request
+/// and applied to every query it runs (C# `ConfigureUserAccess`, which reads
+/// both from the `User` the request holds).
+struct UserAccess {
+    /// The user row the watch-state predicates key on.
+    user: Arc<UserEntity>,
+    /// The `TopParentId`s the user is confined to; `None` when every library
+    /// is visible.
+    top_parents: Option<Vec<Uuid>>,
+}
+
+impl UserAccess {
+    /// Scopes `query` to the user. Returns `false` when the user can see no
+    /// library at all — C# reaches for a `Guid.NewGuid()` scope there so the
+    /// query matches nothing; the caller skips it instead.
+    fn scope(&self, query: &mut InternalItemsQuery) -> bool {
+        if let Some(scope) = &self.top_parents {
+            if scope.is_empty() {
+                return false;
+            }
+            query.top_parent_ids.clone_from(scope);
+        }
+        query.set_user(Arc::clone(&self.user));
+        true
+    }
 }
 
 impl LocalFilter {
@@ -644,31 +671,23 @@ impl FerrofinSimilarItemsManager {
         }
     }
 
-    /// Scopes `query` to `user_id` the way C# `ConfigureUserAccess`
-    /// (`AddUserToQuery`) does: the user goes on the query, which is what the
-    /// watch-state predicates key on, and a user who may not see every library
-    /// is confined to the `TopParentId`s they may. Returns `false` when the
-    /// user can see no library at all — C# reaches for a `Guid.NewGuid()`
-    /// scope there so the query matches nothing; the caller skips it instead.
+    /// Resolves `user_id`'s [`UserAccess`] the way C# `ConfigureUserAccess`
+    /// (`AddUserToQuery`) derives it: a user who may not see every library is
+    /// confined to the `TopParentId`s they may.
     ///
-    /// An id that resolves to no user leaves the query unscoped, as the C#
-    /// controller hands a null user through.
-    async fn configure_user_access(
-        &self,
-        query: &mut InternalItemsQuery,
-        user_id: Uuid,
-    ) -> Result<bool, ServiceError> {
+    /// An id that resolves to no user leaves the request unscoped (`None`), as
+    /// the C# controller hands a null user through.
+    async fn user_access(&self, user_id: Uuid) -> Result<Option<UserAccess>, ServiceError> {
         let Some(user) = self.repo.fetch_user(user_id).await? else {
-            return Ok(true);
+            return Ok(None);
         };
-        if let Some(scope) = self.repo.accessible_top_parents(&user).await? {
-            if scope.is_empty() {
-                return Ok(false);
-            }
-            query.top_parent_ids = scope;
-        }
-        query.set_user(user);
-        Ok(true)
+        Ok(Some(self.access_of(Arc::new(user)).await?))
+    }
+
+    /// The [`UserAccess`] of an already-loaded `user`.
+    async fn access_of(&self, user: Arc<UserEntity>) -> Result<UserAccess, ServiceError> {
+        let top_parents = self.repo.accessible_top_parents(&user).await?;
+        Ok(UserAccess { user, top_parents })
     }
 
     /// The flat genre-or-tag providers' results for `seed` — one
@@ -727,8 +746,8 @@ impl FerrofinSimilarItemsManager {
             order_by: vec![(ItemSortBy::Random, SortOrder::Ascending)],
             ..InternalItemsQuery::default()
         };
-        if let Some(user_id) = request.user_id
-            && !self.configure_user_access(&mut query, user_id).await?
+        if let Some(user) = request.user
+            && !user.scope(&mut query)
         {
             return Ok(Vec::new());
         }
@@ -797,8 +816,8 @@ impl FerrofinSimilarItemsManager {
             },
             ..InternalItemsQuery::default()
         };
-        if let Some(user_id) = request.user_id
-            && !self.configure_user_access(&mut access, user_id).await?
+        if let Some(user) = request.user
+            && !user.scope(&mut access)
         {
             return Ok(Vec::new());
         }
@@ -870,13 +889,13 @@ impl FerrofinSimilarItemsManager {
         remaining: i32,
         claimed: &mut Seen,
     ) -> Vec<(BaseItemEntity, f32)> {
-        let (kind, user_id) = (request.kind, request.user_id);
+        let (kind, user) = (request.kind, request.user);
         let cache_path = self.cache_path(provider.name(), request.seed);
         if let Some(path) = cache_path.as_deref()
             && let Some(cached) = read_reference_cache(path)
         {
             return self
-                .resolve_remote_references(&cached, provider_order, kind, user_id, claimed)
+                .resolve_remote_references(&cached, provider_order, kind, user, claimed)
                 .await;
         }
         let mut results = Vec::new();
@@ -902,7 +921,7 @@ impl FerrofinSimilarItemsManager {
                         &collected[pending..],
                         provider_order,
                         kind,
-                        user_id,
+                        user,
                         claimed,
                     )
                     .await;
@@ -924,7 +943,7 @@ impl FerrofinSimilarItemsManager {
                     &collected[pending..],
                     provider_order,
                     kind,
-                    user_id,
+                    user,
                     claimed,
                 )
                 .await,
@@ -956,7 +975,7 @@ impl FerrofinSimilarItemsManager {
         )
     }
 
-    /// The rows of `ids` that are of `kind` and that `user_id` may see, keyed
+    /// The rows of `ids` that are of `kind` and that `user` may see, keyed
     /// by id: C#'s `InternalItemsQuery(user) { IncludeItemTypes = [kind] }`.
     ///
     /// With a user, a kind that has versions is grouped by presentation key
@@ -966,7 +985,7 @@ impl FerrofinSimilarItemsManager {
         &self,
         ids: Vec<Uuid>,
         kind: BaseItemKind,
-        user_id: Option<Uuid>,
+        user: Option<&UserAccess>,
     ) -> Result<HashMap<Uuid, BaseItemEntity>, ServiceError> {
         // An empty `item_ids` is no filter at all: it would load every row.
         if ids.is_empty() {
@@ -977,8 +996,8 @@ impl FerrofinSimilarItemsManager {
             include_item_types: vec![kind],
             ..InternalItemsQuery::default()
         };
-        if let Some(user_id) = user_id
-            && !self.configure_user_access(&mut query, user_id).await?
+        if let Some(user) = user
+            && !user.scope(&mut query)
         {
             return Ok(HashMap::new());
         }
@@ -1009,7 +1028,7 @@ impl FerrofinSimilarItemsManager {
         references: &[SimilarItemReference],
         provider_order: usize,
         kind: BaseItemKind,
-        user_id: Option<Uuid>,
+        user: Option<&UserAccess>,
         claimed: &mut Seen,
     ) -> Vec<(BaseItemEntity, f32)> {
         let best = best_reference_per_id(references);
@@ -1060,13 +1079,15 @@ impl FerrofinSimilarItemsManager {
             }
         }
         let ids: Vec<Uuid> = matches.iter().map(|(id, ..)| *id).collect();
-        let mut rows = match self.visible_rows(ids, kind, user_id).await {
+        let mut rows = match self.visible_rows(ids, kind, user).await {
             Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!(
                     %err,
                     kind = ?kind,
-                    user_id = user_id.map(tracing::field::display),
+                    user_id = user
+                        .and_then(|u| Uuid::parse_str(&u.user.id).ok())
+                        .map(tracing::field::display),
                     "loading similar-item references failed"
                 );
                 return Vec::new();
@@ -1121,10 +1142,9 @@ impl FerrofinSimilarItemsManager {
     async fn similar_category(
         &self,
         seed: &BaseItemEntity,
-        user_id: Uuid,
+        user: &UserAccess,
         recommendation_type: RecommendationType,
         item_limit: i32,
-        dto_options: &DtoOptions,
     ) -> Result<Option<SimilarItemsRecommendation>, ServiceError> {
         let Ok(seed_id) = Uuid::parse_str(&seed.id) else {
             return Ok(None);
@@ -1135,13 +1155,12 @@ impl FerrofinSimilarItemsManager {
         // providers never take part, so a category never fans out to TMDB
         // once per baseline — and hands it the user, so the movie provider's
         // unplayed/access filter applies here too.
-        let _ = dto_options;
         let request = LocalRequest {
             seed,
             seed_id,
             kind: kind_of(seed),
             exclude_artist_ids: &[],
-            user_id: Some(user_id),
+            user: Some(user),
             wanted: item_limit,
         };
         let mut claimed = Seen::new(seed_id, seed.presentation_unique_key.as_deref());
@@ -1174,15 +1193,14 @@ impl FerrofinSimilarItemsManager {
     async fn similar_categories(
         &self,
         seeds: impl Iterator<Item = BaseItemEntity> + Send,
-        user_id: Uuid,
+        user: &UserAccess,
         recommendation_type: RecommendationType,
         item_limit: i32,
-        dto_options: &DtoOptions,
     ) -> Result<Vec<SimilarItemsRecommendation>, ServiceError> {
         let mut out = Vec::new();
         for seed in seeds {
             if let Some(rec) = self
-                .similar_category(&seed, user_id, recommendation_type, item_limit, dto_options)
+                .similar_category(&seed, user, recommendation_type, item_limit)
                 .await?
             {
                 out.push(rec);
@@ -1232,7 +1250,7 @@ impl FerrofinSimilarItemsManager {
                 enable_group_by_metadata_key: true,
                 ..Default::default()
             };
-            query.set_user(user.clone());
+            query.set_user(Arc::clone(user));
             let items = self.items.get_item_list(&query).await?;
             let ids: Vec<Uuid> = items
                 .iter()
@@ -1318,7 +1336,7 @@ struct PersonCursor<'a> {
 #[derive(Clone, Copy)]
 struct PersonQuery<'a> {
     item_limit: i32,
-    user: &'a UserEntity,
+    user: &'a Arc<UserEntity>,
     movie_kinds: &'a [BaseItemKind],
 }
 
@@ -1372,12 +1390,17 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             self.repo.provider_ids(item_id).await.unwrap_or_default()
         };
 
+        // Resolved once: every provider's queries share it.
+        let access = match user_id {
+            Some(user_id) => self.user_access(user_id).await?,
+            None => None,
+        };
         let local = LocalRequest {
             seed: &seed,
             seed_id: item_id,
             kind,
             exclude_artist_ids,
-            user_id,
+            user: access.as_ref(),
             wanted,
         };
         let mut claimed = Seen::new(item_id, seed.presentation_unique_key.as_deref());
@@ -1409,7 +1432,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
                 seed_provider_ids: &seed_provider_ids,
                 query: &query,
                 kind,
-                user_id,
+                user: access.as_ref(),
             };
             let remaining = wanted - i32::try_from(scored.len()).unwrap_or(0);
             scored.extend(
@@ -1442,7 +1465,10 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
         parent_id: Uuid,
         category_limit: i32,
         item_limit: i32,
-        dto_options: &DtoOptions,
+        // Upstream sets it on its item queries, where it only picks the columns
+        // the repository loads; rows here are read whole and the caller builds
+        // the DTOs with it.
+        _dto_options: &DtoOptions,
     ) -> Result<Vec<SimilarItemsRecommendation>, ServiceError> {
         // Recommendations are built from the user's watch state (recently-played +
         // liked movies, and the directors/actors of those). With no user, or an
@@ -1454,13 +1480,14 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
         let Some(user) = self.repo.fetch_user(uid).await? else {
             return Ok(Vec::new());
         };
+        let user = Arc::new(user);
         let cat_limit = usize::try_from(category_limit.max(0)).unwrap_or(0);
         if cat_limit == 0 {
             return Ok(Vec::new());
         }
 
         let mut recent_played_q = recently_played_query(parent_id);
-        recent_played_q.set_user(user.clone());
+        recent_played_q.set_user(Arc::clone(&user));
         let recently_played = self.items.get_item_list(&recent_played_q).await?;
 
         // Liked/favorited movies (C#: IsFavoriteOrLiked, Limit 10,
@@ -1471,7 +1498,7 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             .collect();
         let movie_kinds = self.movie_candidate_kinds().await;
         let mut liked_q = liked_query(parent_id, movie_kinds.clone(), played_ids.clone());
-        liked_q.set_user(user.clone());
+        liked_q.set_user(Arc::clone(&user));
         let liked = self.items.get_item_list(&liked_q).await?;
 
         // Directors / actors of the six most-recently-played (C# GetPeopleNames).
@@ -1491,22 +1518,22 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
 
         // One category per baseline (empties skipped). Baselines are capped to
         // category_limit — the round-robin can't use more categories than that.
+        // Every baseline's access filter shares the one resolved access.
+        let access = self.access_of(Arc::clone(&user)).await?;
         let similar_to_played = self
             .similar_categories(
                 recently_played.into_iter().take(cat_limit),
-                uid,
+                &access,
                 RecommendationType::SimilarToRecentlyPlayed,
                 item_limit,
-                dto_options,
             )
             .await?;
         let similar_to_liked = self
             .similar_categories(
                 liked.into_iter().take(cat_limit),
-                uid,
+                &access,
                 RecommendationType::SimilarToLikedItem,
                 item_limit,
-                dto_options,
             )
             .await?;
         let mut directors = PersonCursor::new(
@@ -2778,7 +2805,7 @@ mod tests {
             .await
             .expect("similar")
             .expect("seed resolves");
-        assert!(similar.is_empty());
+        assert!(similar.is_empty(), "{similar:?}");
     }
 
     #[tokio::test]
@@ -3854,7 +3881,7 @@ mod tests {
                     "Plain Program" | "Series Program"
                 ));
             } else {
-                assert!(names.is_empty());
+                assert!(names.is_empty(), "{names:?}");
             }
             // The ordinary Program branch uses its public Program alias; the
             // source storage lookup has no mapping, so it matches nothing.
@@ -4186,7 +4213,7 @@ mod tests {
                 1,
                 &PersonQuery {
                     item_limit: 5,
-                    user: &user,
+                    user: &Arc::new(user),
                     movie_kinds: &kinds,
                 },
             )
