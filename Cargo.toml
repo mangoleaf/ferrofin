@@ -99,7 +99,7 @@ sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["bzip
 brotli = "9.1.1"
 tokio = { version = "1", features = ["full"] }
 socket2 = "0.6"
-http-body = "1.0"
+http-body = "1.1"
 # The `Stream` trait `axum::body::Body::from_stream` takes — the progressive
 # (tail-following) response bodies the Live TV live-stream/recording routes serve.
 futures-core = "0.3.34"
