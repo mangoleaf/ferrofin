@@ -57,6 +57,8 @@ advisory, even one published after your change, upgrade the crate if a fixed ver
 (`cargo update -p <crate> --precise <version>`, or a manifest bump for a new major). An
 advisory with no fix, or one that does not reach Ferrofin's use of the crate, goes into
 `deny.toml`'s `[advisories] ignore` with its reason, and leaves it once the crate is fixed.
+The release workflow's `cargo audit bin` on the built binaries (`scripts/audit-bin.py`) applies
+the same `[advisories]` rules and ignores, so an ignore entry names the advisory by its `id`.
 A version yanked from crates.io fails `cargo deny` too: `cargo update -p <crate>` moves off
 it, or a manifest bump when no compatible release is left. The WASM guest
 (`examples/wasm-hello/`) has its own manifest and `Cargo.lock`, outside the workspace: fix a
