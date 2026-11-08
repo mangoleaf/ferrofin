@@ -838,14 +838,12 @@ fn push_rating_limit(qb: &mut QueryBuilder<Sqlite>, alias: &str, score: i64, sub
 /// Split out so [`build_query`] and the count path share the exact same WHERE.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
-    // TranslateQuery's explicit rating selector bypasses the unrated-kind
-    // clause. Access-only queries (counts and related media) retain it.
-    if filter.has_parental_rating == Some(true) {
-        append_max_parental_rating(qb, filter, "bi");
-        append_inherited_tags(qb, filter, "bi");
-    } else {
-        append_parental_restrictions(qb, filter, "bi");
-    }
+    // Divergence (owner decision 2026-10-31, gl-954): upstream's
+    // `HasParentalRating == true` arm (`TranslateQuery.cs:709-720`) skips
+    // `BlockUnratedItems`, so one request parameter switched a user's unrated
+    // block off. A request may narrow a parental restriction, never widen it
+    // (as `max_parental_limit` clamps `maxOfficialRating`), so every arm keeps it.
+    append_parental_restrictions(qb, filter, "bi");
     // Every arm of the chain applies the minimum. The last one
     // (`TranslateQuery.cs:755-759`) keeps only the unrated items for
     // `hasParentalRating=false`, and only when no bound and no unrated-kind

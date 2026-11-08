@@ -250,9 +250,8 @@ async fn minimum_rating_keeps_unrated_items() {
     );
 }
 
-/// `HasParentalRating`: `true` only picks the branch that applies the rating
-/// bounds without the unrated-kind clause, so on its own it filters nothing;
-/// `false` keeps the unrated items, but only when no other rating rule
+/// `HasParentalRating`: `true` adds nothing of its own, so on its own it
+/// filters nothing; `false` keeps the unrated items, but only when no other rating rule
 /// applies (the last arm of `TranslateQuery.cs:709-759`).
 #[tokio::test]
 async fn has_parental_rating_false_keeps_unrated_items_when_no_bound_applies() {
@@ -369,6 +368,27 @@ async fn has_parental_rating_false_yields_to_the_users_limit_and_unrated_block()
             found.contains(&rated),
             "{rated}: the unrated block, not the null test"
         );
+    }
+    for unrated_movie in [EMPTY_RATING, EXTENDED_CUT] {
+        assert!(!found.contains(&unrated_movie), "{unrated_movie}");
+    }
+}
+
+/// `hasParentalRating=true` keeps an unrated-kind block, where upstream's
+/// `HasParentalRating` arm skips `BlockUnratedItems`: a request may narrow a
+/// parental restriction, never lift it (gl-954).
+#[tokio::test]
+async fn has_parental_rating_true_keeps_the_unrated_block() {
+    use ferrofin_model::data::UnratedItem;
+    let db = seeded().await;
+    let blocked = InternalItemsQuery {
+        block_unrated_items: vec![UnratedItem::Movie],
+        has_parental_rating: Some(true),
+        ..InternalItemsQuery::default()
+    };
+    let found = translated_ids(&db, &blocked).await;
+    for rated in [RATED_EPISODE, ENDED_RATED, STUB] {
+        assert!(found.contains(&rated), "{rated}");
     }
     for unrated_movie in [EMPTY_RATING, EXTENDED_CUT] {
         assert!(!found.contains(&unrated_movie), "{unrated_movie}");
