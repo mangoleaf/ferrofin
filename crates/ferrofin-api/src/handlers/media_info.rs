@@ -200,7 +200,8 @@ fn non_blank(value: Option<&str>) -> Option<&str> {
 /// requested version when the client names one.
 async fn resolve_playback_media_sources(
     state: &AppState,
-    item: &ferrofin_db::entities::base_items::BaseItemEntity,
+    item_id: Uuid,
+    item: Option<&ferrofin_db::entities::base_items::BaseItemEntity>,
     user: Option<&ferrofin_db::entities::users::UserEntity>,
     user_id: Uuid,
     media_source_id: Option<&str>,
@@ -211,10 +212,21 @@ async fn resolve_playback_media_sources(
             state.media_sources.get_live_stream(live_stream_id).await?,
         ]);
     }
-    let mut sources = state
-        .media_sources
-        .get_playback_media_sources_for(item, user, user_id, true, true)
-        .await?;
+    let mut sources = match item {
+        Some(item) => {
+            state
+                .media_sources
+                .get_playback_media_sources_for(item, user, user_id, true, true)
+                .await?
+        }
+        // DVR rows are resolved by id in the media-source manager.
+        None => {
+            state
+                .media_sources
+                .get_playback_media_sources(item_id, user_id, true, true)
+                .await?
+        }
+    };
     if let Some(id) = non_blank(media_source_id) {
         sources.retain(|s| s.id.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(id)));
     }
@@ -370,14 +382,26 @@ async fn playback_info(
     request: PlaybackRequest,
 ) -> Result<PlaybackInfoResponse, ApiError> {
     let user = resolve_user_opt(state, auth, request.user_id).await?;
-    let item = require_visible_item(state, item_id, user.as_deref()).await?;
+    let item = state
+        .library
+        .get_item_by_id_for_user(item_id, user.as_deref())
+        .await?;
+    // Keep hidden library rows hidden even if the id also names a DVR row.
+    if item.is_none()
+        && (super::streaming::recording_access(state, item_id, user.as_deref(), None).await?
+            != Some(true)
+            || state.library.get_item_by_id(item_id).await?.is_some())
+    {
+        return Err(ApiError::NotFound(format!("item {item_id}")));
+    }
     let resolved_user_id = match &user {
         Some(user) => user_uuid(user)?,
         None => effective_user_id(state, auth, request.user_id).await?,
     };
     let mut media_sources = resolve_playback_media_sources(
         state,
-        &item,
+        item_id,
+        item.as_ref(),
         user.as_deref(),
         resolved_user_id,
         request.media_source_id.as_deref(),
@@ -428,7 +452,9 @@ async fn playback_info(
             user.as_deref(),
             resolved_user_id,
             item_id,
-            item.media_type.as_deref(),
+            // DVR entities are projected as Video.
+            item.as_ref()
+                .map_or(Some("Video"), |item| item.media_type.as_deref()),
             &mut media_sources,
             profile,
             &request,
@@ -722,9 +748,16 @@ pub(crate) async fn universal_audio_source(
     };
     // Every version (the universal route takes no live stream id), narrowed
     // below rather than by the helper's exact match.
-    let mut media_sources =
-        resolve_playback_media_sources(state, &item, user.as_deref(), resolved_user_id, None, None)
-            .await?;
+    let mut media_sources = resolve_playback_media_sources(
+        state,
+        item_id,
+        Some(&item),
+        user.as_deref(),
+        resolved_user_id,
+        None,
+        None,
+    )
+    .await?;
     // The version is matched in either GUID spelling, as the static stream
     // routes match it (`MediaSourceInfo::id_matches`): the universal URL's
     // `mediaSourceId` is what a direct-play request for it would carry.

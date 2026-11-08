@@ -1393,7 +1393,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    require_streamable_item at the stream, HLS, universal audio, subtitle and \
                    attachment routes (StreamingHelpers.GetStreamingState, \
                    SubtitleController.GetSubtitle, VideoAttachmentsController.GetAttachment); \
-                   item_repository.rs \
+                   handlers/media_info.rs playback_info (MediaInfoController.GetPlaybackInfo, \
+                   GetPostedPlaybackInfo); item_repository.rs \
                    resolve_views_with_parent and item_visibility.rs hidden_playlists on \
                    listings that can hold a playlist (Folder.QueryRecursive, \
                    Folder.QueryWithPostFiltering, Playlist.IsVisible); dto_service.rs \
@@ -1430,11 +1431,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              same check, as PlaybackInfo does. A DVR recording has no row here, so it takes \
              Live TV access, IsVisibleStandalone over its entity, the libraries holding its \
              file (found as GetCollectionFolders finds them, ignoring case) and then its \
-             channel, a rule GET and DELETE /LiveTv/Recordings/{recordingId} \
-             now share and GET /LiveTv/Recordings lists by; upstream's recording is a library \
-             item, whose library holds it. On the routes upstream leaves anonymous, no \
-             credential, a token that names nobody and an API key stay so, which binds a \
-             client that sends its token. The legacy /hls/ \
+             channel. GET and POST PlaybackInfo use that rule for DVR ids as well, resolving \
+             sources through the recording media-source manager. GET and DELETE \
+             /LiveTv/Recordings/{recordingId} share the visibility check, and GET \
+             /LiveTv/Recordings lists by it. Upstream addresses recordings by their \
+             library item ids and has no separate DVR id to resolve. On the routes upstream \
+             leaves anonymous, no credential, a token that names nobody and an API key \
+             stay so, which binds a client that sends its token. The legacy /hls/ \
              routes are outside this: they serve a transcode's file by its random name, and \
              the item id selects nothing, as upstream. Deliberate divergence (owner decision \
              2026-10-31, gl-1090).",

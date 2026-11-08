@@ -78,7 +78,7 @@ pub(crate) struct StaticSource {
 ///
 /// An id with no `BaseItems` row is no item of a library. A DVR recording's id
 /// has none (a scan gives its file a library item with another id) and answers
-/// to [`recording_refused`]. Anything else is left for the route, which finds an
+/// to [`recording_access`]. Anything else is left for the route, which finds an
 /// unmirrored channel's tuner or answers as it always has. An open live stream
 /// is not checked: its id is a capability, as on `PlaybackInfo`, which reads it
 /// by id once the item passes.
@@ -100,7 +100,9 @@ pub(crate) async fn require_streamable_item(
     let refused = match row_access(state, item_id, user).await? {
         RowAccess::Visible => false,
         RowAccess::Hidden => true,
-        RowAccess::Absent => recording_refused(state, &policy, item_id, user).await?,
+        RowAccess::Absent => {
+            recording_access(state, item_id, Some(user), Some(&policy)).await? == Some(false)
+        }
     };
     if refused {
         return Err(ApiError::NotFound(format!("item {item_id}")));
@@ -146,30 +148,38 @@ async fn row_access(state: &AppState, id: Uuid, user: &UserEntity) -> Result<Row
     })
 }
 
-/// Whether `user` is refused the DVR recording `id`, `false` when it is none.
-///
-/// `PlaybackInfo` finds no item for a recording's id, for any caller, so the
-/// rule is that of the one route that reads it, `GET /LiveTv/Recordings/{id}`:
-/// "Live TV access" ([`RequireLiveTvAccess`](crate::auth::RequireLiveTvAccess)),
-/// which is what shuts an account out of the DVR, and then the recording's own
-/// visibility ([`recording_visible`]), which holds a file inside a library to
-/// that library.
-async fn recording_refused(
+/// Whether the caller may play a DVR recording, or `None` when the id is
+/// not a recording. A request with no user has no user policy to apply.
+pub(crate) async fn recording_access(
     state: &AppState,
-    policy: &UserPolicy,
     id: Uuid,
-    user: &UserEntity,
-) -> Result<bool, ApiError> {
+    user: Option<&UserEntity>,
+    policy: Option<&UserPolicy>,
+) -> Result<Option<bool>, ApiError> {
     let Some(live_tv) = state.live_tv.as_ref() else {
-        return Ok(false);
+        return Ok(None);
     };
     let Some(recording) = live_tv.get_recording_item(id).await? else {
-        return Ok(false);
+        return Ok(None);
+    };
+    let Some(user) = user else {
+        return Ok(Some(true));
+    };
+    let loaded;
+    let policy = match policy {
+        Some(policy) => policy,
+        None => {
+            loaded = super::users::user_policy(state, user).await?;
+            let Some(policy) = loaded.as_ref() else {
+                return Ok(Some(false));
+            };
+            policy
+        }
     };
     if !policy.is_administrator && !policy.enable_live_tv_access {
-        return Ok(true);
+        return Ok(Some(false));
     }
-    Ok(!recording_visible(state, recording, user).await?)
+    Ok(Some(recording_visible(state, recording, user).await?))
 }
 
 /// Resolves the direct-play source a stream request names.
