@@ -236,6 +236,7 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --workspace          # + `cargo test --workspace --doc` for doctests
 cargo deny --locked check              # advisories, licenses, bans, sources (deny.toml)
+cargo deny --manifest-path examples/wasm-hello/Cargo.toml --locked check   # the same for the WASM guest
 cargo machete apps crates              # declared but unused dependencies
 scripts/check-workspace-deps.py        # every dependency through [workspace.dependencies]
 ```

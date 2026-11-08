@@ -379,13 +379,13 @@ lint:
     - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
 
 # The supply chain, without a build: the same three checks as the `dependencies` job in
-# .github/workflows/ci.yml. cargo-deny checks the crates the workspace builds against the RustSec
-# advisory database and deny.toml's license, ban and source rules; cargo-machete looks for declared
-# but unused dependencies; check-workspace-deps.py for a dependency a crate declares itself instead
-# of taking the workspace's. A job of its own, not part of `lint`, so an advisory published today
-# turns the pipeline red without hiding the lint result; create-release needs it, so a release
-# never tags past one. Each check runs whatever the one before found, so an advisory never hides
-# the rest.
+# .github/workflows/ci.yml. cargo-deny checks the crates the workspace and the wasm-hello guest build
+# against the RustSec advisory database (yanked versions included) and deny.toml's license, ban and
+# source rules; cargo-machete looks for declared but unused dependencies; check-workspace-deps.py
+# for a dependency a crate declares itself instead of taking the workspace's. A job of its own, not
+# part of `lint`, so an advisory published today turns the pipeline red without hiding the lint
+# result; create-release needs it, so a release never tags past one. Each check runs whatever the
+# one before found, so an advisory never hides the rest.
 dependencies:
   stage: test
   image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # cargo-deny + cargo-machete baked in (ci/Dockerfile)
@@ -400,6 +400,9 @@ dependencies:
     - |
       rc=0
       cargo deny --locked check || rc=1
+      # The wasm-hello guest is outside the workspace, with its own Cargo.lock. Run from the root, so the
+      # root's deny.toml applies (cargo-deny reads its config from the directory it starts in).
+      cargo deny --manifest-path examples/wasm-hello/Cargo.toml --locked check || rc=1
       cargo machete apps crates || rc=1   # vendor/ holds upstream code as published
       scripts/check-workspace-deps.py || rc=1
       exit $rc
