@@ -2198,7 +2198,32 @@ async fn verify_subtitle_destinations(
     let path = media.join("Locale.pt-br.forced.sdh.srt");
     assert_eq!(std::fs::read(&path).unwrap(), CONTENT);
     expected_paths.push(path);
-    let item = api.get(&format!("/Items/{id}?Fields=MediaStreams")).await;
+    // Each upload records its stream and queues a refresh of the item. A refresh
+    // an earlier upload queued can still be running, listing the folder from
+    // before the newest sidecar, and save the set without it; the refresh queued
+    // behind it (the running scan is never joined) re-lists the folder and saves
+    // it again. So wait for the set to settle rather than read it mid-way
+    // (gl-1408); a stream that never comes back still fails below.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let item = loop {
+        let item = api.get(&format!("/Items/{id}?Fields=MediaStreams")).await;
+        let streams: Vec<_> = item["MediaStreams"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|stream| stream["Type"] == "Subtitle")
+            .collect();
+        let settled = streams.len() == expected_paths.len()
+            && expected_paths.iter().all(|path| {
+                streams
+                    .iter()
+                    .any(|stream| stream["Path"] == path.to_str().unwrap())
+            });
+        if settled || Instant::now() >= deadline {
+            break item;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     let subtitles: Vec<_> = item["MediaStreams"]
         .as_array()
         .unwrap()
