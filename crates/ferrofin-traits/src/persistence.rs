@@ -1212,6 +1212,25 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(())
     }
 
+    /// Adds `image` to the item only while it has no image of that type,
+    /// leaving every other row alone: upstream's `if (!item.HasImage(type))
+    /// item.SetImage(image, 0)`, decided by the write itself so an image
+    /// stored meanwhile is never replaced. Returns whether it was added.
+    ///
+    /// The default adds nothing (stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn add_item_image_if_absent(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+    ) -> Result<bool, ServiceError> {
+        let _ = (item_id, image);
+        Ok(false)
+    }
+
     /// [`Self::save_item_images`] for many items, each with its own image
     /// list. The real service writes a chunk of items per transaction, for a
     /// caller that writes thousands at once (a guide refresh's programmes);
@@ -2659,7 +2678,7 @@ pub struct ItemChildLink {
 /// Returned by
 /// [`ItemPersistenceService::image_metadata_for_items`] and consumed by the
 /// scan's port of C#'s `LibraryManager.ImageNeedsRefresh`, and by its credited
-/// people's image write, which compares each person's whole row set.
+/// people's image write, which looks only for a stored `Primary`.
 #[derive(Debug, Clone)]
 pub struct StoredImageMetadata {
     /// The item the row belongs to.
@@ -2685,11 +2704,11 @@ pub struct StoredImageMetadata {
 pub struct WrittenPerson {
     /// The materialized `Person` item id.
     pub id: Uuid,
-    /// Whether the person's item still lacks a biography — the caller fetches
-    /// details only for these, so a re-scan backfills people scanned before the
-    /// biography feature and never re-fetches an already-enriched person.
+    /// Whether the person's item still lacks a biography. The caller fetches
+    /// details only for these, and only while the person was never refreshed.
     pub needs_details: bool,
-    /// The remote profile-image URL to download, when present.
+    /// The credit's remote profile-image URL, when present: the caller gives
+    /// it to a person that has no `Primary` yet.
     pub image_url: Option<String>,
     /// The remote provider id (TMDB person id) for a biography lookup.
     pub provider_id: Option<i64>,
@@ -2759,8 +2778,7 @@ pub trait PeopleRepository: Send + Sync {
     ///
     /// Returns a [`WrittenPerson`] per credited person so the caller (which has
     /// the HTTP/filesystem access the repository lacks) can download artwork and
-    /// fetch biographies — the `is_new` flag lets it enrich only freshly-created
-    /// people, keeping re-scans cheap.
+    /// fetch biographies for the people still lacking them.
     async fn update_people(
         &self,
         item_id: Uuid,

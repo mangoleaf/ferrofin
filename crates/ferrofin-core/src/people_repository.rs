@@ -937,9 +937,7 @@ async fn person_item_by_clean_name<'e>(
 }
 
 /// What `update_people` hands back for one credited person: the item, whether
-/// it still lacks a biography (new people and those scanned before
-/// biographies existed get one fetched), and the credit's artwork and
-/// provider id.
+/// it still lacks a biography, and the credit's artwork and provider id.
 fn written_person(
     item_id: &str,
     person: &PeopleEntity,
