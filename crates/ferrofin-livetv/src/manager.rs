@@ -6038,7 +6038,7 @@ impl FerrofinLiveTvManager {
         };
         // `ReportFileSystemChangeBeginning(recordingPath)`, completed once the
         // empty-file cleanup and the refresh are done (`RecordingsManager.cs:342,400`).
-        let _write = SelfWrite::begin(self.self_writes.as_ref(), target.to_string_lossy());
+        let write = SelfWrite::begin(self.self_writes.as_ref(), target.to_string_lossy());
 
         let capture = self
             .capture(
@@ -6065,6 +6065,8 @@ impl FerrofinLiveTvManager {
         // a library item.
         self.refresh_recording_path(&target.to_string_lossy()).await;
         let recorded = tokio::fs::try_exists(&target).await.unwrap_or(false);
+        // External post-processors must not remain inside our own-write span.
+        drop(write);
         self.settle_timer(timer, &info, recording_id, &target, recorded, outcome)
             .await
     }
@@ -6366,6 +6368,9 @@ impl FerrofinLiveTvManager {
                             exit_code = status.code(),
                             "live tv: recording post-processing completed"
                         );
+                        // The processor may replace the file, changing codecs or duration.
+                        // Recording libraries need not have a filesystem watcher enabled.
+                        self.refresh_recording_path(&target.to_string_lossy()).await;
                     }
                     Ok(None) => {}
                     Err(error) => {

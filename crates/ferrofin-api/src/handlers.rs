@@ -1009,6 +1009,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              is split before replacing {path}, so spaces, quotes and metacharacters in \
              recording names remain literal argument contents instead of changing parsing.",
             "Argument values are not logged because a configured template can contain secrets.",
+            "After a configured processor exits, refresh the recording again so changed codecs \
+             and duration are discovered even when its library has no filesystem watcher.",
         ],
     },
     VerifiedSubsystem {
