@@ -213,7 +213,7 @@ chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1.26"
 rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`), password salts (ferrofin-common)
 # Legacy text encodings (subtitles, playlist files) — C# `UtfUnknown`.
-encoding_rs = "0.8.35"
+encoding_rs = "0.8.44"
 chardetng = "0.1.17"
 shlex = "2"              # ffmpeg command strings → argv (ferrofin-mediaencoding `split_args`)
 async-trait = "0.1.92"
