@@ -244,7 +244,7 @@ bitflags = "2.13.2"
 # transitive dependency of flate2/zip, so it adds no new compilation. The WASM
 # host also uses it to tell whether a plugin's state file still holds the bytes
 # its kept map came from.
-crc32fast = "1.5.2"
+crc32fast = "1.5.4"
 regex = "1"
 percent-encoding = "2.3.2"
 # Base64 with .NET's rules (`Base64.IsValid`, `Convert.FromBase64String`) for
