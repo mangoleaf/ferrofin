@@ -76,7 +76,9 @@ const DEFAULT_SESSION_IDLE_HOURS: u32 = 24;
 /// exposed as flags; everything else is env / file / default. Each flag, when
 /// present, overrides the corresponding env var and `config.toml` value.
 #[derive(Debug, Default, Clone, Parser)]
-#[command(name = "ferrofin-server", about = "Ferrofin media server", version)]
+// `--version` names the release (tag) the binary was built from, as `/health/live` does,
+// not the manifest's placeholder version. A plain comment: a doc line would become help text.
+#[command(name = "ferrofin-server", about = "Ferrofin media server", version = ferrofin_health::build_version())]
 pub struct Cli {
     /// Program-data root directory (overrides `FERROFIN_DATA_DIR`).
     #[arg(long = "data-dir", value_name = "DIR")]
