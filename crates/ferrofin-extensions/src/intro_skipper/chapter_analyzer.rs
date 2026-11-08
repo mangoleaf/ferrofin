@@ -428,6 +428,28 @@ mod tests {
         assert_eq!(found, Some((60.0, 90.0)));
     }
 
+    /// fancy-regex 0.19 rejected a variable-length lookbehind holding a
+    /// backreference or an atomic group ("Variable length lookbehinds with fancy
+    /// features"), so such an admin pattern matched nothing; 0.20 compiles it, as
+    /// .NET does. For this atomic-group pattern the matches are .NET's too: each
+    /// alternative is a fixed literal, so the direction a lookbehind is read in
+    /// cannot change them.
+    #[test]
+    fn a_variable_length_lookbehind_with_an_atomic_group_compiles_and_matches() {
+        let expression = Some(r"(?<=(?>the|my) )intro");
+        for name in ["The Intro", "My Intro"] {
+            assert_eq!(
+                find_chapter(name, Mode::Introduction, expression, true),
+                Some((60.0, 90.0)),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            find_chapter("Intro", Mode::Introduction, expression, true),
+            None
+        );
+    }
+
     /// An invalid pattern matches nothing (SponsorBlock labels still do).
     #[test]
     fn an_invalid_pattern_matches_nothing() {
