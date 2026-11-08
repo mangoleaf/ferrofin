@@ -1,0 +1,92 @@
+"""scripts/audit-bin.py against a fake cargo-audit:
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'."""
+import contextlib
+import importlib.util
+import io
+import os
+from pathlib import Path
+import tempfile
+import tomllib
+import unittest
+from unittest import mock
+
+spec = importlib.util.spec_from_file_location(
+    "audit_bin", Path(__file__).parents[1] / "audit-bin.py")
+audit = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(audit)
+
+# Prints the status line cargo-audit prints for a binary carrying a record, for each
+# argument named in $FOUND, records its arguments, and exits with $RC.
+FAKE = """#!/bin/sh
+printf '%s\\n' "$@" > "$CALLS"
+for b in $FOUND; do echo "       Found 'cargo auditable' data in $b (412 dependencies)"; done
+exit "${RC:-0}"
+"""
+
+
+class AuditCommand(unittest.TestCase):
+    def test_deny_toml_rules_become_flags(self):
+        cmd = audit.audit_command({
+            "unmaintained": "all",
+            "ignore": [{"id": "RUSTSEC-2024-0436", "reason": "r"}, "RUSTSEC-2023-0071"],
+        }, ["a", "b"])
+        self.assertEqual(cmd, [
+            "cargo-audit", "audit", "--color", "never",
+            "--deny", "unmaintained", "--deny", "unsound",
+            "--ignore", "RUSTSEC-2024-0436", "--ignore", "RUSTSEC-2023-0071",
+            "bin", "--max-binary-size", "18446744073709551615", "a", "b",
+        ])
+
+    def test_only_none_leaves_a_kind_a_warning(self):
+        cmd = audit.audit_command({"unmaintained": "none", "unsound": "workspace"}, ["a"])
+        self.assertNotIn("unmaintained", cmd)
+        self.assertIn("unsound", cmd)
+
+    def test_an_ignore_by_crate_has_no_cargo_audit_equivalent(self):
+        with self.assertRaises(SystemExit):
+            audit.audit_command({"ignore": [{"crate": "paste"}]}, ["a"])
+
+    def test_the_real_deny_toml_translates(self):
+        deny = tomllib.loads((Path(__file__).parents[2] / "deny.toml").read_text())
+        audit.audit_command(deny["advisories"], ["a"])
+
+
+class Main(unittest.TestCase):
+    def setUp(self):
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (tmp / "cargo-audit").write_text(FAKE)
+        (tmp / "cargo-audit").chmod(0o755)
+        self.calls = tmp / "calls"
+        self.env = {"PATH": f"{tmp}:{os.environ['PATH']}", "CALLS": str(self.calls)}
+
+    def run_main(self, binaries, **env):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {**self.env, **env}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            return audit.main(binaries), out.getvalue()
+
+    def test_binaries_with_records_and_no_findings_pass(self):
+        rc, out = self.run_main(["bin/a", "bin/b"], FOUND="bin/a bin/b")
+        self.assertEqual(rc, 0, out)
+        args = self.calls.read_text().split()
+        self.assertEqual(args[:2], ["audit", "--color"])
+        self.assertEqual(args[-2:], ["bin/a", "bin/b"])
+
+    def test_a_binary_without_a_record_fails(self):
+        rc, out = self.run_main(["bin/a", "bin/b"], FOUND="bin/a")
+        self.assertEqual(rc, 1)
+        self.assertIn("bin/b: no cargo-auditable record", out)
+        self.assertNotIn("bin/a: no", out)
+
+    def test_a_finding_fails(self):
+        rc, _ = self.run_main(["bin/a"], FOUND="bin/a", RC="1")
+        self.assertEqual(rc, 1)
+
+    def test_no_binary_is_a_usage_error(self):
+        rc, _ = self.run_main([])
+        self.assertEqual(rc, 2)
+        self.assertFalse(self.calls.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

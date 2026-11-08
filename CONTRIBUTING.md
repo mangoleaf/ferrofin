@@ -55,6 +55,8 @@ advisory, even one published after your change, upgrade the crate if a fixed ver
 (`cargo update -p <crate> --precise <version>`, or a manifest bump for a new major). An
 advisory with no fix, or one that does not reach Ferrofin's use of the crate, goes into
 `deny.toml`'s `[advisories] ignore` with its reason, and leaves it once the crate is fixed.
+The release workflow's `cargo audit bin` on the built binaries (`scripts/audit-bin.py`) takes
+the same ignores, so an entry names the advisory by its `id`.
 A new license is a compatibility decision against GPL-3.0-only, not a fix.
 
 **Coverage gate — ≥80% line coverage, per crate:**
