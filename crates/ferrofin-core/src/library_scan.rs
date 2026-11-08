@@ -4465,6 +4465,18 @@ pub struct LibraryScanner {
     /// [`user_data_detach_epoch`]: ferrofin_traits::persistence::ItemPersistenceService::user_data_detach_epoch
     /// [`recover_user_data`]: Self::recover_user_data
     swept_at_epoch: std::sync::Mutex<Option<i64>>,
+    /// The credited people [`enrich_people`](Self::enrich_people) has asked
+    /// TMDB about and left without a biography, or found already refreshed:
+    /// not asked again. One id per such person, never pruned: bounded by the
+    /// library.
+    ///
+    /// A failed request counts as asked too (`person_details_for_language`
+    /// answers both with `None`): the people task's first refresh fills in
+    /// that person.
+    ///
+    /// shortcut: held in memory, so a restart asks each never-refreshed
+    /// person once more; persist a marker if that ever costs real quota.
+    biographies_asked: std::sync::Mutex<std::collections::HashSet<Uuid>>,
 }
 
 /// The source an album's shared cover was hashed from, with the stamp it had
@@ -4674,6 +4686,7 @@ impl LibraryScanner {
             directory_cache_limits: DirectoryCacheLimits::default(),
             album_cover_sources: std::sync::Mutex::new(HashMap::new()),
             swept_at_epoch: std::sync::Mutex::new(None),
+            biographies_asked: std::sync::Mutex::default(),
         }
     }
 
@@ -12624,46 +12637,35 @@ impl LibraryScanner {
         }
     }
 
-    /// What previous scans stored for the profile images of `written`, in one
-    /// query for the whole credit list: each person's image rows, by person id
-    /// (`None` when they could not be read), and what was probed, by path.
+    /// Which of the people in `written` with a profile image to give already
+    /// have a `Primary`, in one query for the whole credit list (`None` when
+    /// the rows could not be read).
     ///
     /// Built here rather than carried on the scan's `ArtworkCache`: person ids
     /// are only known once `update_people` has written them, which is after the
     /// per-scan prereads have run.
-    async fn stored_person_images(
+    async fn people_with_primary(
         &self,
         written: &[ferrofin_traits::persistence::WrittenPerson],
-    ) -> (Option<HashMap<Uuid, Vec<ItemImageInfo>>>, ProbedImages) {
-        let mut probed = ProbedImages::new();
+    ) -> Option<std::collections::HashSet<Uuid>> {
         let with_art: Vec<Uuid> = written
             .iter()
             .filter(|p| p.image_url.is_some())
             .map(|p| p.id)
             .collect();
         if with_art.is_empty() {
-            return (Some(HashMap::new()), probed);
+            return Some(std::collections::HashSet::new());
         }
         match self.persistence.image_metadata_for_items(&with_art).await {
-            Ok(rows) => {
-                let mut rows_of: HashMap<Uuid, Vec<ItemImageInfo>> = HashMap::new();
-                for row in rows {
-                    let image = ItemImageInfo {
-                        path: row.path,
-                        image_type: row.image_type,
-                        date_modified: row.date_modified,
-                        width: row.width,
-                        height: row.height,
-                        blur_hash: row.blur_hash,
-                    };
-                    remember_settled_image(&mut probed, &image);
-                    rows_of.entry(row.item_id).or_default().push(image);
-                }
-                (Some(rows_of), probed)
-            }
+            Ok(rows) => Some(
+                rows.into_iter()
+                    .filter(|row| row.image_type == ImageType::Primary)
+                    .map(|row| row.item_id)
+                    .collect(),
+            ),
             Err(err) => {
                 tracing::warn!(%err, "could not read stored person image metadata");
-                (None, probed)
+                None
             }
         }
     }
@@ -12757,30 +12759,45 @@ impl LibraryScanner {
         ferrofin_providers::tmdb::normalize_language(Some(&locale.0), Some(&locale.1))
     }
 
-    /// Enriches credited people: downloads each one's TMDB profile image as their
-    /// `Primary` artwork, and fetches a biography (bio/birthday/deathday/birthplace)
-    /// for each *newly-created* person. Best-effort and cached — images skip
-    /// existing files and are written only when the person's stored rows differ,
-    /// and bios only run for new people, so re-scans stay cheap.
+    /// Enriches credited people: gives each one with no `Primary` yet the
+    /// credit's TMDB profile image, and fetches a biography
+    /// (bio/birthday/deathday/birthplace) for each person never refreshed.
     ///
-    /// ponytail: runs serially — a large cast makes the first scan slower, but the
-    /// per-file / new-only guards make re-scans cheap. Batch if first-scan latency
-    /// on huge libraries becomes a problem.
+    /// The image is upstream's `SavePeopleMetadataAsync` (`if (... &&
+    /// !personEntity.HasImage(ImageType.Primary)) SetImage(.., 0)`): a person
+    /// with a Primary, wherever it lives, is left alone, and the one added
+    /// touches no other image. The biography is a Ferrofin head start on the
+    /// person's first refresh (upstream fetches it only there, from
+    /// `PeopleValidator`), so it asks only for a person never refreshed, and
+    /// each person once per process ([`Self::biographies_asked`]).
+    ///
+    /// ponytail: runs serially — a large cast makes the first scan slower, but
+    /// a person already seen costs neither the network nor the writer. Batch if
+    /// first-scan latency on huge libraries becomes a problem.
     #[allow(clippy::too_many_lines)]
     async fn enrich_people(
         &self,
         repo: &dyn ferrofin_traits::persistence::PeopleRepository,
-        written: Vec<ferrofin_traits::persistence::WrittenPerson>,
+        mut written: Vec<ferrofin_traits::persistence::WrittenPerson>,
     ) {
         let (Some(tmdb), Some(meta_root)) = (&self.tmdb, &self.metadata_dir) else {
             return;
         };
-        // The same `ImageNeedsRefresh` gate the item walk applies, batched over
-        // this item's whole credit list: without it every rescan re-decodes and
-        // re-BlurHash-encodes every cast member's profile photo, which on a
-        // library with thousands of credited people is more image work than the
-        // items themselves. One read per credited cast, not one per person.
-        let (mut stored_rows, stored) = self.stored_person_images(&written).await;
+        let asked = || {
+            self.biographies_asked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        {
+            let asked = asked();
+            for person in &mut written {
+                person.needs_details &= !asked.contains(&person.id);
+            }
+        }
+        // Which of this item's cast already has a Primary, in one read per
+        // credited cast, not one per person: without it every rescan would
+        // fetch, decode and BlurHash-encode every cast member's profile photo.
+        let mut with_primary = self.people_with_primary(&written).await;
         let person_locks = self.person_locks(&written).await;
         let server_locale = self.server_metadata_locale();
         // Read only for a biography fetch, which most credits never make (a
@@ -12798,9 +12815,16 @@ impl LibraryScanner {
             Some(Arc::from([]))
         };
         let mut locale_cache = ArtworkCache::default();
+        // A person credited more than once here (a director who also wrote it)
+        // is one person: looked up once.
+        let mut looked_up = std::collections::HashSet::new();
         for person in written {
             let id = person.id.to_string();
-            if let Some(url) = person.image_url {
+            // Rows that could not be read cannot rule a Primary out.
+            let has_primary = with_primary
+                .as_ref()
+                .is_none_or(|people| people.contains(&person.id));
+            if let Some(url) = person.image_url.filter(|_| !has_primary) {
                 let dir = art_dir_for(
                     &meta_root.resolve(),
                     person.id,
@@ -12826,22 +12850,18 @@ impl LibraryScanner {
                 // it writes the result back onto its in-memory BaseItem; Ferrofin
                 // reloads image rows from the DB each time, so the DB is where the
                 // answer has to live.)
-                adopt_stored_image_metadata(&mut infos, &stored);
                 self.fill_image_metadata(&mut infos).await;
-                // Upstream saves a person only when something changed
-                // (`SavePeopleMetadataAsync`'s `saveEntity`). Rows that already
-                // match take no writer transaction, which a recurring cast
-                // would otherwise take once per credit of every saved item.
-                let person_rows = stored_rows
-                    .as_ref()
-                    .map(|rows| rows.get(&person.id).map_or(&[][..], Vec::as_slice));
-                if !infos.is_empty() && images_changed(&infos, person_rows) {
-                    match self.persistence.save_item_images(person.id, &infos).await {
-                        // A person credited more than once here (a director who
-                        // also wrote it) is one person: written once.
-                        Ok(()) => {
-                            if let Some(rows) = &mut stored_rows {
-                                rows.insert(person.id, infos);
+                if let Some(primary) = infos.first() {
+                    // Added only while the person still has no Primary, by the
+                    // write itself: one stored during the download is kept.
+                    match self
+                        .persistence
+                        .add_item_image_if_absent(person.id, primary)
+                        .await
+                    {
+                        Ok(_) => {
+                            if let Some(people) = &mut with_primary {
+                                people.insert(person.id);
                             }
                         }
                         Err(err) => {
@@ -12857,9 +12877,17 @@ impl LibraryScanner {
                 && let Some(person_locks) = &person_locks
                 && let Some(tmdb_id) = person.provider_id
                 && let Some(folders) = &folders
+                && looked_up.insert(person.id)
             {
                 let lock = person_locks.get(&person.id);
                 if lock.is_some_and(|lock| lock.row.is_locked) {
+                    continue;
+                }
+                // `PeopleValidator`'s gate (`isNew || neverRefreshed`): a person
+                // refreshed once has had its own lookup, and the people task
+                // asks again (after 30 days) while it still lacks an overview.
+                if lock.is_some_and(|lock| lock.row.date_last_refreshed.is_some()) {
+                    asked().insert(person.id);
                     continue;
                 }
                 let language = self
@@ -12870,10 +12898,12 @@ impl LibraryScanner {
                         &mut locale_cache,
                     )
                     .await;
-                let Some(details) = tmdb
+                let details = tmdb
                     .person_details_for_language(tmdb_id, language.as_deref())
-                    .await
-                else {
+                    .await;
+                // `None` is also TMDB having nothing on the person: asked once.
+                let Some(details) = details else {
+                    asked().insert(person.id);
                     continue;
                 };
                 let keeps = |field: MetadataField| lock.is_some_and(|l| l.fields.contains(&field));
@@ -12891,6 +12921,10 @@ impl LibraryScanner {
                         details.place_of_birth
                     },
                 };
+                // Left without an overview, the person would be asked again.
+                if metadata.overview.as_deref().is_none_or(str::is_empty) {
+                    asked().insert(person.id);
+                }
                 if let Err(err) = repo.set_person_metadata(person.id, metadata).await {
                     tracing::warn!(%err, person = %id, "failed to persist person biography");
                 }
@@ -24426,6 +24460,8 @@ mod directory_cache_tests;
 #[cfg(test)]
 mod episode_images_tests;
 #[cfg(test)]
+mod person_biography_tests;
+#[cfg(test)]
 mod person_image_tests;
 #[cfg(test)]
 mod plan_paths_tests;
@@ -29073,12 +29109,12 @@ mod tests {
         );
     }
 
-    // Every scan re-runs the credits fetch, so before the `ImageNeedsRefresh`
-    // gate reached the cast, every scan also re-decoded and re-BlurHash-encoded
-    // every credited person's profile photo. A 2-movie live library already
-    // pulls 24 person images; a real one pulls thousands.
+    // Every saved item re-enriches its cast, so a person given a profile photo
+    // must not have it decoded and BlurHash-encoded again on the next credit.
+    // A 2-movie live library already pulls 24 person images; a real one pulls
+    // thousands.
     #[tokio::test(flavor = "multi_thread")]
-    async fn enrich_people_reuses_stored_person_image_metadata_on_a_rescan() {
+    async fn enrich_people_decodes_a_profile_photo_once() {
         use crate::item_persistence_service::FerrofinItemPersistenceService;
         use crate::item_repository::FerrofinItemRepository;
         use crate::item_type_lookup::{ItemTypeLookup, stored_type_name};
@@ -29172,7 +29208,7 @@ mod tests {
                 second[0].blur_hash.clone()
             ),
             (first[0].width, first[0].height, first[0].blur_hash.clone()),
-            "the reused row is identical to the probed one"
+            "the stored row is the probed one, left as it was"
         );
     }
 

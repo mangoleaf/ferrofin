@@ -2055,10 +2055,9 @@ async fn rows(h: &Harness) {
         tmdb.iter().all(|r| r.contains("/movie/101")),
         "row 3: only about Alpha {tmdb:?}"
     );
-    // Only Alpha — and its cast member: `enrich_people` re-saves the image
-    // row of every person a provider pass credits, unchanged or not (an open
-    // work item: an unchanged row should not be rewritten).
-    assert_only_items(&touched, &[&alpha_key], &["Person:Ada Actor"], "3");
+    // Only Alpha: its cast member already has a Primary, so `enrich_people`
+    // leaves them alone (gl-99).
+    assert_only_items(&touched, &[&alpha_key], &[], "3");
     assert_tables_within(&touched, PROVIDER_PASS_TABLES, "3");
 
     // ---- 4: an NFO newer than the last save re-reads only local metadata ----

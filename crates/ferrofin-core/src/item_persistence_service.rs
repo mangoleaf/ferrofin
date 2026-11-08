@@ -3086,6 +3086,35 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(())
     }
 
+    async fn add_item_image_if_absent(
+        &self,
+        item_id: Uuid,
+        image: &ItemImageInfo,
+    ) -> Result<bool, ServiceError> {
+        // One statement: a write takes the lock before it reads, so no image
+        // of the type can be stored between the check and the insert.
+        let added = sqlx::query(
+            r#"INSERT INTO "BaseItemImageInfos"
+               ("Id", "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified")
+               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+               WHERE NOT EXISTS (SELECT 1 FROM "BaseItemImageInfos"
+                                 WHERE "ItemId" = ?2 AND "ImageType" = ?3)"#,
+        )
+        .bind(guid_to_db(Uuid::new_v4()))
+        .bind(guid_to_db(item_id))
+        .bind(image_type_to_disc(image.image_type))
+        .bind(&image.path)
+        .bind(i64::from(image.width))
+        .bind(i64::from(image.height))
+        .bind(image.blur_hash.as_deref().map(str::as_bytes))
+        .bind(datetime_to_db(image.date_modified))
+        .execute(self.db.writer())
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(added > 0)
+    }
+
     async fn save_items_images(
         &self,
         items: &[(Uuid, Vec<ItemImageInfo>)],
