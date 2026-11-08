@@ -20,5 +20,11 @@ RUN curl -LsSf --retry 5 --retry-all-errors --proto '=https' --tlsv1.2 \
  && cargo install --locked cargo-llvm-cov \
  && rm -rf "$CARGO_HOME/registry"
 
+# The `dependencies` job's tools (cargo-deny, cargo-machete), at the versions GitHub's
+# `dependencies` job pins in ci.yml. Built from crates.io for the same reason as cargo-llvm-cov.
+RUN cargo install --locked cargo-deny@0.20.2 cargo-machete@0.9.2 \
+ && rm -rf "$CARGO_HOME/registry"
+
 # Smoke-check the tools exist at build time (fails the image build if any is missing).
-RUN cargo nextest --version && cargo llvm-cov --version && rustfmt --version && cargo clippy --version
+RUN cargo nextest --version && cargo llvm-cov --version && cargo deny --version && cargo machete --version \
+ && rustfmt --version && cargo clippy --version

@@ -60,7 +60,7 @@ request-release:
   stage: .pre
   image: alpine:3
   script:
-    - echo "Release requested — create-release runs once lint + coverage pass."
+    - echo "Release requested — create-release runs once lint + dependencies + coverage pass."
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       when: manual
@@ -68,8 +68,8 @@ request-release:
 
 # ---------------------------------------------------------------------------
 # create-release — main only. GATED by the manual request-release job above plus
-# lint + coverage (via needs): it is SKIPPED unless you clicked request-release
-# AND both checks passed. This is how a release is triggered early WITHOUT waiting
+# lint + dependencies + coverage (via needs): it is SKIPPED unless you clicked request-release
+# AND all the checks passed. This is how a release is triggered early WITHOUT waiting
 # — click request-release any time; this then runs automatically once the checks
 # go green, or is skipped/cancelled if they fail. It never auto-releases: no
 # request-release click means this is skipped.
@@ -90,6 +90,7 @@ create-release:
   needs:
     - job: request-release
     - job: lint
+    - job: dependencies
     - job: coverage
       parallel:
         matrix:
@@ -136,7 +137,7 @@ create-release:
       fi
   rules:
     # No `when:` -> on_success. The manual gate is request-release (a need above);
-    # this runs automatically once request-release + lint + coverage all succeed,
+    # this runs automatically once request-release + lint + dependencies + coverage all succeed,
     # and is skipped otherwise — so it never releases without a request-release click.
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
@@ -371,6 +372,37 @@ lint:
     - cargo clippy --locked --all-targets --all-features -- -D warnings
     - cargo nextest run --locked --workspace
     - cargo test --locked --workspace --doc   # nextest can't run doctests
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      interruptible: true
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-rc\.\d+)?$/'
+
+# The supply chain, without a build: the same three checks as the `dependencies` job in
+# .github/workflows/ci.yml. cargo-deny checks the crates the workspace builds against the RustSec
+# advisory database and deny.toml's license, ban and source rules; cargo-machete looks for declared
+# but unused dependencies; check-workspace-deps.py for a dependency a crate declares itself instead
+# of taking the workspace's. A job of its own, not part of `lint`, so an advisory published today
+# turns the pipeline red without hiding the lint result; create-release needs it, so a release
+# never tags past one. Each check runs whatever the one before found, so an advisory never hides
+# the rest.
+dependencies:
+  stage: test
+  image: $CI_REGISTRY_IMAGE/ci:rust-1.99.1   # cargo-deny + cargo-machete baked in (ci/Dockerfile)
+  needs:
+    # When ci/Dockerfile changed, wait for the image that carries the tools; ignored on runs
+    # where ci-image is skipped.
+    - job: ci-image
+      optional: true
+  variables:
+    CARGO_TERM_COLOR: always
+  script:
+    - |
+      rc=0
+      cargo deny --locked check || rc=1
+      cargo machete apps crates || rc=1   # vendor/ holds upstream code as published
+      scripts/check-workspace-deps.py || rc=1
+      exit $rc
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       interruptible: true
