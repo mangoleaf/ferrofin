@@ -210,7 +210,7 @@ wat = "1.263.0"            # dev-only in practice: inline-WAT test fixtures (no 
 uuid = { version = "1.29.1", features = ["v4", "serde"] }
 url = "2.5.8"
 chrono = { version = "0.4", features = ["serde"] }
-unicode-normalization = "0.1.25"
+unicode-normalization = "0.1.26"
 rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`), password salts (ferrofin-common)
 # Legacy text encodings (subtitles, playlist files) — C# `UtfUnknown`.
 encoding_rs = "0.8.35"
