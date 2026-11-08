@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
@@ -102,7 +102,7 @@ async fn get_suggestions(
 async fn get_suggestions_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    axum::extract::Path(user_id): axum::extract::Path<Uuid>,
+    axum::extract::Path(DotnetGuid(user_id)): axum::extract::Path<DotnetGuid>,
     Query(mut query): Query<SuggestionsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     query.user_id = Some(user_id);

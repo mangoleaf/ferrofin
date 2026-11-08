@@ -95,7 +95,7 @@ httpdate = "1.0.3"
 flate2 = "1.1.11"
 zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-api, which adds `time`)
 tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
-sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
+sevenz-rust2 = { version = "0.25.0", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
 brotli = "9.1.1"
 tokio = { version = "1", features = ["full"] }
 socket2 = "0.6"
@@ -216,7 +216,7 @@ unicode-normalization = "0.1.26"
 rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`), password salts (ferrofin-common)
 # Legacy text encodings (subtitles, playlist files) — C# `UtfUnknown`.
 encoding_rs = "0.8.44"
-chardetng = "0.1.17"
+chardetng = "1.0.0"
 shlex = "2"              # ffmpeg command strings → argv (ferrofin-mediaencoding `split_args`)
 async-trait = "0.1.92"
 libc = "0.2"
@@ -270,7 +270,7 @@ quick-xml = { version = "0.42.0", features = ["serialize"] }   # NFO/XBMC metada
 lofty = "0.25.5"
 
 # ── dev / test ─────────────────────────────────────────────────────
-rstest = "0.27.0"         # [Theory]/[InlineData] → #[case] transliteration
+rstest = "0.28.0"         # [Theory]/[InlineData] → #[case] transliteration
 tempfile = "3"          # temp SQLite files for ferrofin-db tests
 
 # ── build profiles ─────────────────────────────────────────────────

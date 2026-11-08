@@ -46,7 +46,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::{ApiError, ProblemStatus};
-use crate::extract::{JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::parse_csv_uuids;
 use crate::state::AppState;
@@ -158,7 +158,7 @@ async fn create_playlist(
 async fn get_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(playlist_id): Path<Uuid>,
+    Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
 ) -> Result<Json<PlaylistDto>, ApiError> {
     let user_id = auth.user_id();
     let access = state
@@ -199,7 +199,7 @@ async fn get_playlist(
 async fn update_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(playlist_id): Path<Uuid>,
+    Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
     JsonBody(body): JsonBody<UpdatePlaylistDto>,
 ) -> Result<StatusCode, ApiError> {
     let calling_user_id = auth.user_id();
@@ -274,7 +274,7 @@ struct GetPlaylistItemsQuery {
 async fn get_playlist_items(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(playlist_id): Path<Uuid>,
+    Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
     Query(query): Query<GetPlaylistItemsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     // `RequestHelpers.GetUserId(User, userId)`: another user's id only for an
@@ -398,7 +398,7 @@ struct AddItemsQuery {
 async fn add_item_to_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(playlist_id): Path<Uuid>,
+    Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
     Query(query): Query<AddItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
     // C# `userId = RequestHelpers.GetUserId(User, userId)` — the share check
@@ -447,7 +447,7 @@ struct RemoveItemsQuery {
 async fn remove_item_from_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(playlist_id): Path<Uuid>,
+    Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
     Query(query): Query<RemoveItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
     let calling_user_id = auth.user_id();
@@ -519,7 +519,8 @@ async fn move_item(
         .parse()
         .map_err(|_| ApiError::BadRequest(format!("invalid index {new_index:?}")))?;
     let calling_user_id = auth.user_id();
-    let playlist_uuid = Uuid::parse_str(playlist_id)
+    // `Guid.Parse(playlistId)` here, and `new Guid(playlistId)` in `MoveItemAsync`.
+    let playlist_uuid = DotnetGuid::parse(playlist_id)
         .map_err(|_| ApiError::BadRequest(format!("invalid id {playlist_id:?}")))?;
     require_edit(
         state
@@ -529,7 +530,12 @@ async fn move_item(
     )?;
     state
         .playlists
-        .move_item(playlist_id, item_id, new_index, calling_user_id)
+        .move_item(
+            &playlist_uuid.to_string(),
+            item_id,
+            new_index,
+            calling_user_id,
+        )
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -553,7 +559,7 @@ async fn move_item(
 async fn get_playlist_users(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(playlist_id): Path<Uuid>,
+    Path(DotnetGuid(playlist_id)): Path<DotnetGuid>,
 ) -> Result<Json<Vec<PlaylistUserPermissions>>, ApiError> {
     let access = state
         .playlists
@@ -593,7 +599,7 @@ async fn get_playlist_users(
 async fn get_playlist_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((playlist_id, user_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(playlist_id), DotnetGuid(user_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<Json<PlaylistUserPermissions>, ApiError> {
     let calling_user_id = auth.user_id();
     let access = state
@@ -644,7 +650,7 @@ async fn get_playlist_user(
 async fn update_playlist_user(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((playlist_id, user_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(playlist_id), DotnetGuid(user_id))): Path<(DotnetGuid, DotnetGuid)>,
     body: Option<JsonBody<UpdatePlaylistUserDto>>,
 ) -> Result<StatusCode, ApiError> {
     let body = body.map(|JsonBody(b)| b).unwrap_or_default();
@@ -689,7 +695,7 @@ async fn update_playlist_user(
 async fn remove_user_from_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((playlist_id, user_id)): Path<(Uuid, Uuid)>,
+    Path((DotnetGuid(playlist_id), DotnetGuid(user_id))): Path<(DotnetGuid, DotnetGuid)>,
 ) -> Result<StatusCode, ApiError> {
     let calling_user_id = auth.user_id();
     require_edit(

@@ -885,9 +885,10 @@ fn zip_cover(file: std::fs::File) -> Option<(String, Vec<u8>)> {
 
 /// The cover of a 7z comic ([`pick_cover`]). Entries are decoded in archive
 /// order, as a solid archive requires, so each one before the cover is read
-/// through and discarded: the decoder does not skip what is left unread.
-/// That costs CPU, never memory, for whatever comes before the cover, as
-/// SharpCompress's decoding does.
+/// through and discarded (`Continue` drains and checks it). That costs CPU,
+/// never memory, for whatever comes before the cover, as SharpCompress's
+/// decoding does. Iteration stops at the cover: nothing after it is decoded,
+/// so a damaged later block cannot discard a cover already read.
 fn seven_zip_cover(file: std::fs::File) -> Option<(String, Vec<u8>)> {
     let mut reader =
         sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty()).ok()?;
@@ -900,13 +901,12 @@ fn seven_zip_cover(file: std::fs::File) -> Option<(String, Vec<u8>)> {
     let cover = pick_cover(&names)?;
     let mut bytes = None;
     reader
-        .for_each_entries(|entry, data| {
+        .for_each_entries_with_decision(|entry, data| {
             if entry.name == cover {
                 bytes = read_stream_capped(&entry.name, entry.size, data, MAX_ARCHIVE_ENTRY_BYTES);
-                return Ok(false);
+                return Ok(sevenz_rust2::EntryDecision::Stop);
             }
-            std::io::copy(data, &mut std::io::sink())?;
-            Ok(true)
+            Ok(sevenz_rust2::EntryDecision::Continue)
         })
         .ok()?;
     Some((cover, bytes?))
@@ -2238,6 +2238,41 @@ mod tests {
         let junk = dir.path().join("g.cbz");
         std::fs::write(&junk, b"not an archive").expect("write");
         assert!(read_comic_cover(&junk.to_string_lossy()).is_none());
+    }
+
+    /// A damaged block after the cover's own does not cost the cover: nothing
+    /// after it is decoded. sevenz-rust2 0.25 checks every block it decodes, so
+    /// reading on would turn the damage into an error that discards the cover.
+    #[test]
+    fn a_damaged_block_after_the_cover_does_not_lose_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("non-solid.cb7");
+        let tail = b"later page stored uncompressed for the test".as_slice();
+        let mut writer =
+            sevenz_rust2::ArchiveWriter::new(std::fs::File::create(&path).expect("create 7z"))
+                .expect("7z writer");
+        // Stored, one block per entry, so the later page's bytes sit in the file as is.
+        writer.set_content_methods(vec![sevenz_rust2::EncoderMethod::COPY.into()]);
+        for (name, bytes) in [
+            ("cover.png", b"the cover".as_slice()),
+            ("page002.jpg", tail),
+        ] {
+            writer
+                .push_archive_entry(sevenz_rust2::ArchiveEntry::new_file(name), Some(bytes))
+                .expect("push entry");
+        }
+        writer.finish().expect("finish 7z");
+        let mut archive = std::fs::read(&path).expect("read 7z");
+        let at = archive
+            .windows(tail.len())
+            .position(|window| window == tail)
+            .expect("the later page is stored as is");
+        archive[at] ^= 0xFF;
+        std::fs::write(&path, &archive).expect("damage the later block");
+        assert_eq!(
+            read_comic_cover(&path.to_string_lossy()),
+            Some(("cover.png".to_owned(), b"the cover".to_vec()))
+        );
     }
 
     /// A solid 7z decodes its entries in one stream, so the ones before the

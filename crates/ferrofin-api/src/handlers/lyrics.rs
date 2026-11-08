@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAuth, RequireLyricManagement};
 use crate::error::ApiError;
-use crate::extract::{Query, RequiredRouteString, RouteParameter, upload_body_limit};
+use crate::extract::{DotnetGuid, Query, RequiredRouteString, RouteParameter, upload_body_limit};
 use crate::handlers::{queue_high_priority_refresh, run_item_refresh};
 use crate::state::AppState;
 
@@ -87,7 +87,7 @@ async fn require_item(
 async fn get_lyrics(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
 ) -> Result<Json<LyricDto>, ApiError> {
     require_item(&state, item_id, &auth).await?;
     match state.lyrics.get_lyrics(item_id).await? {
@@ -131,7 +131,7 @@ struct UploadLyricsQuery {
 async fn upload_lyrics(
     State(state): State<AppState>,
     RequireLyricManagement(auth): RequireLyricManagement,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
     Query(query): Query<UploadLyricsQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
@@ -204,7 +204,7 @@ fn upload_format(file_name: &str) -> &str {
 async fn delete_lyrics(
     State(state): State<AppState>,
     RequireLyricManagement(auth): RequireLyricManagement,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
 ) -> Result<StatusCode, ApiError> {
     require_item(&state, item_id, &auth).await?;
     state.lyrics.delete_lyrics(item_id).await?;
@@ -229,7 +229,7 @@ async fn delete_lyrics(
 async fn search_remote_lyrics(
     State(state): State<AppState>,
     RequireLyricManagement(auth): RequireLyricManagement,
-    Path(item_id): Path<Uuid>,
+    Path(DotnetGuid(item_id)): Path<DotnetGuid>,
 ) -> Result<Json<Vec<RemoteLyricInfoDto>>, ApiError> {
     require_item(&state, item_id, &auth).await?;
     let results = state.lyrics.search_lyrics(item_id).await?;
@@ -258,7 +258,7 @@ async fn search_remote_lyrics(
 async fn download_remote_lyrics(
     State(state): State<AppState>,
     RequireLyricManagement(auth): RequireLyricManagement,
-    Path((item_id, _)): Path<(Uuid, String)>,
+    Path((DotnetGuid(item_id), _)): Path<(DotnetGuid, String)>,
     RequiredRouteString(lyric_id, _): RequiredRouteString<LyricId>,
 ) -> Result<Json<LyricDto>, ApiError> {
     require_item(&state, item_id, &auth).await?;

@@ -52,7 +52,7 @@ use ferrofin_traits::stubs::{LiveTvChannelQuery, RecordingVisibility};
 
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{DotnetGuid, JsonBody, Query};
 use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::{
     de_comma_delimited, de_comma_delimited_guids, de_pipe_delimited, parse_csv_enums_lenient,
@@ -225,7 +225,7 @@ async fn get_channels(
 async fn get_channel(
     State(state): State<AppState>,
     RequireLiveTvAccess(auth): RequireLiveTvAccess,
-    Path(channel_id): Path<Uuid>,
+    Path(DotnetGuid(channel_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let Some(m) = state.live_tv.as_ref() else {
@@ -747,7 +747,7 @@ async fn get_recommended_programs(
 async fn get_program(
     State(state): State<AppState>,
     RequireLiveTvAccess(auth): RequireLiveTvAccess,
-    Path(program_id): Path<Uuid>,
+    Path(DotnetGuid(program_id)): Path<DotnetGuid>,
     Query(query): Query<UserIdQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let Some(m) = state.live_tv.as_ref() else {
@@ -1194,7 +1194,7 @@ struct LiveTvUserQuery {
 async fn get_recording(
     State(state): State<AppState>,
     RequireLiveTvAccess(auth): RequireLiveTvAccess,
-    Path(recording_id): Path<Uuid>,
+    Path(DotnetGuid(recording_id)): Path<DotnetGuid>,
     Query(query): Query<LiveTvUserQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
@@ -1320,7 +1320,7 @@ async fn libraries_allow(
 async fn delete_recording(
     State(state): State<AppState>,
     RequireLiveTvManagement(auth): RequireLiveTvManagement,
-    Path(recording_id): Path<Uuid>,
+    Path(DotnetGuid(recording_id)): Path<DotnetGuid>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     require_visible_recording(&state, recording_id, auth.user.as_deref()).await?;
     live_tv(&state)?.delete_recording(recording_id).await?;
@@ -1409,7 +1409,7 @@ async fn get_recording_groups(
 /// this always reports `404` — the faithful outcome.
 async fn get_recording_group(
     RequireLiveTvAccess(_auth): RequireLiveTvAccess,
-    Path(_group_id): Path<Uuid>,
+    Path(DotnetGuid(_group_id)): Path<DotnetGuid>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
     Err(ApiError::NotFound("recording group".into()))
 }
@@ -2432,7 +2432,7 @@ mod tests {
         let err = get_channel(
             State(state),
             auth(),
-            Path(Uuid::nil()),
+            Path(DotnetGuid(Uuid::nil())),
             Query(UserIdQuery::default()),
         )
         .await
@@ -2658,7 +2658,7 @@ mod tests {
 
     #[tokio::test]
     async fn recording_group_and_an_unopened_live_stream_file_are_404() {
-        let group = get_recording_group(auth(), Path(Uuid::nil()))
+        let group = get_recording_group(auth(), Path(DotnetGuid(Uuid::nil())))
             .await
             .unwrap_err();
         assert_eq!(group.status(), axum::http::StatusCode::NOT_FOUND);

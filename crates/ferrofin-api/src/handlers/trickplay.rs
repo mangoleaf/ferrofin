@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::hls::parse_segment_index;
 use crate::handlers::streaming::serve_static_file_without_ranges;
 use crate::state::AppState;
@@ -63,7 +63,7 @@ struct TrickplayQuery {
 async fn get_trickplay_hls_playlist(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((item_id, width)): Path<(Uuid, i32)>,
+    Path((DotnetGuid(item_id), width)): Path<(DotnetGuid, i32)>,
     Query(query): Query<TrickplayQuery>,
 ) -> Result<Response, ApiError> {
     let source_id = query.media_source_id.unwrap_or(item_id);
@@ -124,7 +124,7 @@ async fn get_trickplay_hls_playlist(
 async fn get_trickplay_tile_image(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path((item_id, width, index)): Path<(Uuid, i32, String)>,
+    Path((DotnetGuid(item_id), width, index)): Path<(DotnetGuid, i32, String)>,
     Query(query): Query<TrickplayQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {

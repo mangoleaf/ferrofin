@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{DotnetGuid, Query};
 use crate::handlers::items::{resolve_user, user_uuid};
 use crate::state::AppState;
 
@@ -208,7 +208,7 @@ async fn get_grouping_options(
 async fn get_user_views_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    axum::extract::Path(user_id): axum::extract::Path<Uuid>,
+    axum::extract::Path(DotnetGuid(user_id)): axum::extract::Path<DotnetGuid>,
     Query(mut query): Query<UserViewsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     query.user_id = Some(user_id);
@@ -220,7 +220,7 @@ async fn get_user_views_for_user(
 async fn get_grouping_options_for_user(
     state: State<AppState>,
     auth: RequireAuth,
-    axum::extract::Path(user_id): axum::extract::Path<Uuid>,
+    axum::extract::Path(DotnetGuid(user_id)): axum::extract::Path<DotnetGuid>,
 ) -> Result<Json<Vec<SpecialViewOptionDto>>, ApiError> {
     let query = UserViewsQuery {
         user_id: Some(user_id),

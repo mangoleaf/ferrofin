@@ -273,9 +273,25 @@ pub fn elevated_state_with(
     library: Arc<dyn LibraryManager>,
     system: Arc<dyn SystemManager>,
 ) -> AppState {
+    elevated_state_over(library, Arc::new(FakeUsers), system)
+}
+
+/// [`elevated_fake_state`] over the given user manager, for a handler whose
+/// answer depends on the user an id names ([`FakeAdminUsers`] resolves every
+/// id).
+#[must_use]
+pub fn elevated_state_with_users(users: Arc<dyn UserManager>) -> AppState {
+    elevated_state_over(Arc::new(FakeLibrary), users, Arc::new(FakeSystem))
+}
+
+fn elevated_state_over(
+    library: Arc<dyn LibraryManager>,
+    users: Arc<dyn UserManager>,
+    system: Arc<dyn SystemManager>,
+) -> AppState {
     AppState::new(
         library,
-        Arc::new(FakeUsers),
+        users,
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),

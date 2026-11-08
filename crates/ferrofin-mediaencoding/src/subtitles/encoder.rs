@@ -1165,9 +1165,11 @@ fn detect_charset(bytes: &[u8]) -> DetectedCharset {
         return DetectedCharset::Utf8OrAscii;
     }
 
-    let mut detector = chardetng::EncodingDetector::new();
+    // `Allow` keeps chardetng's pre-1.0 candidate set. It is inert today: 7-bit
+    // ISO-2022-JP is valid UTF-8, so the check above already served it.
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
     detector.feed(bytes, true);
-    let encoding = detector.guess(None, true);
+    let encoding = detector.guess(None, chardetng::Utf8Detection::Allow);
     if encoding == encoding_rs::UTF_8 {
         DetectedCharset::Utf8OrAscii
     } else {
