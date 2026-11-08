@@ -1,4 +1,4 @@
-//! Portable search collation payloads generated from the official ICU 78.1rc export.
+//! Portable search collation payloads generated from the official ICU 79.1rc export.
 //! SPDX-License-Identifier: Unicode-3.0
 use std::cmp::Ordering;
 use std::sync::OnceLock;
@@ -91,7 +91,8 @@ fn find_entry(
             if req.id.marker_attributes.as_str().starts_with("search")
                 && req.id.marker_attributes.as_str().len() > 6 =>
         {
-            // ICU 78 CollationLoader::loadFromCollations retries search before default/standard.
+            // ICU's CollationLoader::loadFromCollations (as read in ICU 78) retries search before
+            // default/standard.
             let attribute = DataMarkerAttributes::from_str_or_panic("search");
             let fallback_req = DataRequest {
                 id: DataIdentifierBorrowed::for_marker_attributes_and_locale(
