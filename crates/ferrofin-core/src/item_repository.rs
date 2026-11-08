@@ -5629,15 +5629,13 @@ mod tests {
                     has_parental_rating: Some(true),
                     ..query.clone()
                 };
+                let selected = repository.get_items(&selector).await.unwrap();
                 assert_eq!(
-                    repository
-                        .get_items(&selector)
-                        .await
-                        .unwrap()
-                        .total_record_count,
-                    2,
-                    "TranslateQuery's explicit HasParentalRating selector skips BlockUnratedItems"
+                    selected.total_record_count, 1,
+                    "hasParentalRating=true keeps the user's BlockUnratedItems, where \
+                     TranslateQuery's selector arm skips it"
                 );
+                assert_eq!(selected.items[0].id, guid_to_db(rated));
             }
             assert!(
                 result.items.iter().any(|item| item.id == guid_to_db(rated)),
