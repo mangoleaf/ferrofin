@@ -631,7 +631,8 @@ fn _assert_object_safe_generated_image_provider(_: &dyn GeneratedImageProvider) 
 /// (`CustomRatingForComparison`, `OfficialRatingForComparison`), scored
 /// against its `GetPreferredMetadataCountryCode()`. The library scan and a
 /// metadata edit call the implementation directly; this is the seam the
-/// provider manager, below it in the crate graph, reaches it through.
+/// provider manager and the Live TV guide refresh, below it in the crate
+/// graph, reach it through.
 #[async_trait]
 pub trait ParentalRatingScorer: Send + Sync {
     /// Sets each row's `InheritedParentalRatingValue` and

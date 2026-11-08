@@ -754,6 +754,38 @@ pub trait ItemRepository: Send + Sync {
 
 fn _assert_object_safe_item_repository(_: &dyn ItemRepository) {}
 
+/// A user's parental restrictions as SQL over `BaseItems`, for a statement the
+/// item repository does not build: the Live TV guide reads its own cache, where
+/// upstream's `LiveTvManager.GetPrograms` queries the programme items with
+/// `new InternalItemsQuery(user)`. The predicate is the repository's own, so
+/// the guide and `GET /Items` hide the same rows.
+#[async_trait]
+pub trait ParentalRestrictions: Send + Sync {
+    /// `query` with the restrictions `SetUser` reads from its user's
+    /// preferences (blocked unrated kinds, blocked and allowed tags) loaded,
+    /// or `None` when it has no user or nothing restricts what that user sees.
+    ///
+    /// # Errors
+    ///
+    /// A failed read of the user's preferences.
+    async fn resolve(
+        &self,
+        query: &InternalItemsQuery,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError>;
+
+    /// Pushes the ` AND …` clauses that keep the `BaseItems` rows under
+    /// `alias` a query from [`resolve`](Self::resolve) may list: its maximum
+    /// rating, blocked unrated kinds and inherited tags.
+    fn push_restrictions(
+        &self,
+        qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+        query: &InternalItemsQuery,
+        alias: &str,
+    );
+}
+
+fn _assert_object_safe_parental_restrictions(_: &dyn ParentalRestrictions) {}
+
 /// Writes item rows and their derived data.
 ///
 /// Port of `IItemPersistenceService`. The C# `BaseItem` arguments become
