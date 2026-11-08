@@ -1,0 +1,2877 @@
+{
+ "ab": {
+  "blocking": [],
+  "cells": [
+   {
+    "a_median": 1.800605,
+    "b_median": 1.5222755000000001,
+    "cell": "loaded/endpoints/detail:item",
+    "kind": "endpoints",
+    "pct": -15.457554544167094,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 4.1262175,
+    "b_median": 4.0175339999999995,
+    "cell": "loaded/endpoints/detail:similar",
+    "kind": "endpoints",
+    "pct": -2.6339740937069025,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 4.461594,
+    "b_median": 4.4778685,
+    "cell": "loaded/endpoints/home:latest-movies",
+    "kind": "endpoints",
+    "pct": 0.3647687351202227,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 2.7294385,
+    "b_median": 2.731968,
+    "cell": "loaded/endpoints/home:latest-music",
+    "kind": "endpoints",
+    "pct": 0.09267473877869288,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 8.898503,
+    "b_median": 8.802742,
+    "cell": "loaded/endpoints/home:latest-shows",
+    "kind": "endpoints",
+    "pct": -1.0761473025294204,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 9.527004999999999,
+    "b_median": 9.202598,
+    "cell": "loaded/endpoints/home:nextup",
+    "kind": "endpoints",
+    "pct": -3.405130993423421,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 5.284031000000001,
+    "b_median": 5.279357,
+    "cell": "loaded/endpoints/home:resume-audio",
+    "kind": "endpoints",
+    "pct": -0.08845519642107533,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.165519,
+    "b_median": 1.1918440000000001,
+    "cell": "loaded/endpoints/home:resume-book",
+    "kind": "endpoints",
+    "pct": 2.258650438131009,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 6.643411,
+    "b_median": 6.6900205,
+    "cell": "loaded/endpoints/home:resume-video",
+    "kind": "endpoints",
+    "pct": 0.7015898910966031,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.982081,
+    "b_median": 1.805606,
+    "cell": "loaded/endpoints/home:views",
+    "kind": "endpoints",
+    "pct": -8.903521097270996,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 11.269563999999999,
+    "b_median": 10.911824,
+    "cell": "loaded/endpoints/movies:items",
+    "kind": "endpoints",
+    "pct": -3.1743907750113474,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.372709,
+    "b_median": 1.3550840000000002,
+    "cell": "loaded/endpoints/playback:intros",
+    "kind": "endpoints",
+    "pct": -1.283957488440724,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.68747,
+    "b_median": 1.1094140000000001,
+    "cell": "loaded/endpoints/playback:playbackinfo",
+    "kind": "endpoints",
+    "pct": -34.255779362003466,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "improved"
+   },
+   {
+    "a_median": 2.492508,
+    "b_median": 1.6255055,
+    "cell": "loaded/endpoints/playback:playing",
+    "kind": "endpoints",
+    "pct": -34.78434171525227,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "improved"
+   },
+   {
+    "a_median": 1.7316955,
+    "b_median": 1.714675,
+    "cell": "loaded/endpoints/playback:segments",
+    "kind": "endpoints",
+    "pct": -0.9828806507841653,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 0.751212,
+    "b_median": 1.173269,
+    "cell": "loaded/endpoints/playback:stopped",
+    "kind": "endpoints",
+    "pct": 56.18347417240405,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.338339,
+    "b_median": 1.220774,
+    "cell": "loaded/endpoints/search:artists",
+    "kind": "endpoints",
+    "pct": -8.784396180638831,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 18.159241,
+    "b_median": 17.0271095,
+    "cell": "loaded/endpoints/search:items",
+    "kind": "endpoints",
+    "pct": -6.234464865574502,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 2.0673415,
+    "b_median": 2.072617,
+    "cell": "loaded/endpoints/search:persons",
+    "kind": "endpoints",
+    "pct": 0.2551828036151846,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 5.223476,
+    "b_median": 5.242444,
+    "cell": "loaded/endpoints/search:videos",
+    "kind": "endpoints",
+    "pct": 0.36312983921051994,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.1894529999999999,
+    "b_median": 0.944338,
+    "cell": "loaded/endpoints/series:episodes",
+    "kind": "endpoints",
+    "pct": -20.607371623763182,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 2.0433814999999997,
+    "b_median": 1.5442805000000002,
+    "cell": "loaded/endpoints/series:item",
+    "kind": "endpoints",
+    "pct": -24.425248050841198,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.3896645,
+    "b_median": 1.233305,
+    "cell": "loaded/endpoints/series:seasons",
+    "kind": "endpoints",
+    "pct": -11.251600656129588,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 3.1258995,
+    "b_median": 2.9045505,
+    "cell": "loaded/endpoints/series:similar",
+    "kind": "endpoints",
+    "pct": -7.081129767607693,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 6,
+    "b_median": 6,
+    "cell": "loaded/screens/detail",
+    "kind": "screens",
+    "pct": 0.0,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 12,
+    "b_median": 12,
+    "cell": "loaded/screens/home",
+    "kind": "screens",
+    "pct": 0.0,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 13,
+    "b_median": 13,
+    "cell": "loaded/screens/movies",
+    "kind": "screens",
+    "pct": 0.0,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 7,
+    "b_median": 6,
+    "cell": "loaded/screens/playback",
+    "kind": "screens",
+    "pct": -14.285714285714285,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 22,
+    "b_median": 21,
+    "cell": "loaded/screens/search",
+    "kind": "screens",
+    "pct": -4.545454545454546,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 5,
+    "b_median": 5,
+    "cell": "loaded/screens/series",
+    "kind": "screens",
+    "pct": 0.0,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 218.7109375,
+    "b_median": 243.94921875,
+    "cell": "memory/peak under load",
+    "kind": "memory",
+    "pct": 11.539560635827826,
+    "reason": null,
+    "unit": "MiB",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 170.69140625,
+    "b_median": 188.1796875,
+    "cell": "memory/steady idle",
+    "kind": "memory",
+    "pct": 10.245554614733276,
+    "reason": null,
+    "unit": "MiB",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 2.0116614999999998,
+    "b_median": 1.67314,
+    "cell": "unloaded/endpoints/detail:item",
+    "kind": "endpoints",
+    "pct": -16.827955399056936,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 4.3624985,
+    "b_median": 4.188349,
+    "cell": "unloaded/endpoints/detail:similar",
+    "kind": "endpoints",
+    "pct": -3.9919669886419538,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.012478,
+    "b_median": 0.963283,
+    "cell": "unloaded/endpoints/detail:special-features",
+    "kind": "endpoints",
+    "pct": -4.858871007567571,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 4.681714,
+    "b_median": 4.686565,
+    "cell": "unloaded/endpoints/home:latest-movies",
+    "kind": "endpoints",
+    "pct": 0.10361589793822293,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 2.762704,
+    "b_median": 2.755489,
+    "cell": "unloaded/endpoints/home:latest-music",
+    "kind": "endpoints",
+    "pct": -0.2611571851345628,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 8.864976,
+    "b_median": 8.834117,
+    "cell": "unloaded/endpoints/home:latest-shows",
+    "kind": "endpoints",
+    "pct": -0.34810020918273804,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 9.6163505,
+    "b_median": 9.324129,
+    "cell": "unloaded/endpoints/home:nextup",
+    "kind": "endpoints",
+    "pct": -3.0387983466284862,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 5.457611999999999,
+    "b_median": 5.372117,
+    "cell": "unloaded/endpoints/home:resume-audio",
+    "kind": "endpoints",
+    "pct": -1.5665276314988863,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.320594,
+    "b_median": 1.275934,
+    "cell": "unloaded/endpoints/home:resume-book",
+    "kind": "endpoints",
+    "pct": -3.381811518150177,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 6.756171,
+    "b_median": 6.643095,
+    "cell": "unloaded/endpoints/home:resume-video",
+    "kind": "endpoints",
+    "pct": -1.6736698937904384,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 2.065172,
+    "b_median": 1.873906,
+    "cell": "unloaded/endpoints/home:views",
+    "kind": "endpoints",
+    "pct": -9.261504610753967,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 11.618129,
+    "b_median": 11.1642825,
+    "cell": "unloaded/endpoints/movies:items",
+    "kind": "endpoints",
+    "pct": -3.9063647855863812,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.3513195,
+    "b_median": 1.3918195,
+    "cell": "unloaded/endpoints/playback:intros",
+    "kind": "endpoints",
+    "pct": 2.997070640955006,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.7621605,
+    "b_median": 1.44388,
+    "cell": "unloaded/endpoints/playback:playbackinfo",
+    "kind": "endpoints",
+    "pct": -18.06194725168337,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 2.4606424999999996,
+    "b_median": 1.588305,
+    "cell": "unloaded/endpoints/playback:playing",
+    "kind": "endpoints",
+    "pct": -35.45161477134528,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "improved"
+   },
+   {
+    "a_median": 1.746971,
+    "b_median": 1.714475,
+    "cell": "unloaded/endpoints/playback:segments",
+    "kind": "endpoints",
+    "pct": -1.8601339117821691,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 0.7529725,
+    "b_median": 1.184575,
+    "cell": "unloaded/endpoints/playback:stopped",
+    "kind": "endpoints",
+    "pct": 57.31982243707437,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.485534,
+    "b_median": 1.290579,
+    "cell": "unloaded/endpoints/search:artists",
+    "kind": "endpoints",
+    "pct": -13.123563647819573,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 18.0356065,
+    "b_median": 16.835127,
+    "cell": "unloaded/endpoints/search:items",
+    "kind": "endpoints",
+    "pct": -6.656163739212209,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 2.1032915,
+    "b_median": 2.0596829999999997,
+    "cell": "unloaded/endpoints/search:persons",
+    "kind": "endpoints",
+    "pct": -2.073345515826046,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.093184,
+    "b_median": 0.962988,
+    "cell": "unloaded/endpoints/search:programs",
+    "kind": "endpoints",
+    "pct": -11.90979743574732,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 5.341086,
+    "b_median": 5.25079,
+    "cell": "unloaded/endpoints/search:videos",
+    "kind": "endpoints",
+    "pct": -1.690592512459067,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.1868485,
+    "b_median": 0.9749384999999999,
+    "cell": "unloaded/endpoints/series:episodes",
+    "kind": "endpoints",
+    "pct": -17.854848365229433,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 2.2816919999999996,
+    "b_median": 1.6517605,
+    "cell": "unloaded/endpoints/series:item",
+    "kind": "endpoints",
+    "pct": -27.608086455139418,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "improved"
+   },
+   {
+    "a_median": 1.59471,
+    "b_median": 1.4123595,
+    "cell": "unloaded/endpoints/series:seasons",
+    "kind": "endpoints",
+    "pct": -11.43471226743421,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 3.33446,
+    "b_median": 3.0834764999999997,
+    "cell": "unloaded/endpoints/series:similar",
+    "kind": "endpoints",
+    "pct": -7.5269608872201275,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 6,
+    "b_median": 6,
+    "cell": "unloaded/screens/detail",
+    "kind": "screens",
+    "pct": 0.0,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 13,
+    "b_median": 13,
+    "cell": "unloaded/screens/home",
+    "kind": "screens",
+    "pct": 0.0,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 14,
+    "b_median": 13,
+    "cell": "unloaded/screens/movies",
+    "kind": "screens",
+    "pct": -7.142857142857142,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 7,
+    "b_median": 7,
+    "cell": "unloaded/screens/playback",
+    "kind": "screens",
+    "pct": 0.0,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 22.5,
+    "b_median": 21,
+    "cell": "unloaded/screens/search",
+    "kind": "screens",
+    "pct": -6.666666666666667,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 6,
+    "b_median": 5,
+    "cell": "unloaded/screens/series",
+    "kind": "screens",
+    "pct": -16.666666666666664,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   }
+  ],
+  "source": {
+   "candidate": "ferrofin:v1.4.1-956-961c0b412",
+   "commit": "961c0b412",
+   "date": "2026-11-07",
+   "pairs": 3,
+   "previous": "ghcr.io/mangoleaf/ferrofin:v1.4.1",
+   "session": "bench"
+  },
+  "verdict": "passed"
+ },
+ "adoption": {
+  "rows": [
+   {
+    "expected": "10.11.8",
+    "fixture": "jellyfin-10.11.8",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "10.11.8",
+    "fixture": "jellyfin-10.11.9",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "10.11.11",
+    "fixture": "jellyfin-10.11.10",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "10.11.11",
+    "fixture": "jellyfin-10.11.11",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.0.0",
+    "fixture": "jellyfin-12.0",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.1.0",
+    "fixture": "jellyfin-12.1-from-10",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.1.0",
+    "fixture": "jellyfin-12.1-from-12",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.2-from-10",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.2-from-12",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.2-from-121",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.2-fresh",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.3-from-122",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.3-from-10",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.3-fresh",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.4-from-123",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.4-from-10",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.4-fresh",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.4-debian",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "10.11.11",
+    "fixture": "jellyfin-10.11.11-messy",
+    "kind": "messy",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.4-messy",
+    "kind": "messy",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "10.11.11",
+    "fixture": "jellyfin-10.11.11-scale",
+    "kind": "scale",
+    "reason": "",
+    "verdict": "PASS"
+   }
+  ],
+  "source": {
+   "commit": "961c0b412329d6c5f9ddd45ddba73ef10c7d0c5e",
+   "date": "2026-11-08",
+   "image_digest": "sha256:7310f81fde719b74429f65e9a4b1ca8973b7ded6791da3bf0aa6804b38216afd",
+   "oracle": "12.4",
+   "session": "detached-961c0b412329-20261107-2316"
+  },
+  "verdict": "passed"
+ },
+ "bench": {
+  "cpu_per_screen": [
+   {
+    "ferrofin": {
+     "max": 24.0649,
+     "median": 23.9825,
+     "min": 23.7674
+    },
+    "jellyfin": {
+     "max": 125.5883,
+     "median": 125.1137,
+     "min": 125.0461
+    },
+    "name": "unloaded",
+    "ratio": null,
+    "unit": "ms",
+    "withheld": "Ferrofin: search:image: request picks differ"
+   },
+   {
+    "ferrofin": {
+     "max": 23.1364,
+     "median": 23.0699,
+     "min": 22.984
+    },
+    "jellyfin": {
+     "max": 111.3293,
+     "median": 110.0201,
+     "min": 109.6722
+    },
+    "name": "loaded",
+    "ratio": null,
+    "unit": "ms",
+    "withheld": "Ferrofin: search:image: request picks differ"
+   },
+   {
+    "ferrofin": {
+     "max": 21.7471,
+     "median": 21.6918,
+     "min": 21.6606
+    },
+    "jellyfin": {
+     "max": 107.9887,
+     "median": 107.8718,
+     "min": 107.3559
+    },
+    "name": "stress",
+    "ratio": null,
+    "unit": "ms",
+    "withheld": "Ferrofin: search:image: request picks differ"
+   }
+  ],
+  "levels": {
+   "loaded": {
+    "endpoints": [
+     {
+      "ferrofin": {
+       "max": 0.4235,
+       "median": 0.4112,
+       "min": 0.4098
+      },
+      "jellyfin": {
+       "max": 4.7058,
+       "median": 4.6622,
+       "min": 4.6469
+      },
+      "name": "home:image",
+      "ratio": 11.3659,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4.4983,
+       "median": 4.4919,
+       "min": 4.4293
+      },
+      "jellyfin": {
+       "max": 11.3465,
+       "median": 11.0588,
+       "min": 10.8131
+      },
+      "name": "home:latest-movies",
+      "ratio": 2.4722,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 2.8226,
+       "median": 2.747,
+       "min": 2.7178
+      },
+      "jellyfin": {
+       "max": 7.0788,
+       "median": 6.9584,
+       "min": 6.9465
+      },
+      "name": "home:latest-music",
+      "ratio": 2.5309,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 8.8554,
+       "median": 8.7871,
+       "min": 8.7706
+      },
+      "jellyfin": {
+       "max": 21.6882,
+       "median": 21.3507,
+       "min": 21.2837
+      },
+      "name": "home:latest-shows",
+      "ratio": 2.4346,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 9.203,
+       "median": 9.1942,
+       "min": 9.1771
+      },
+      "jellyfin": {
+       "max": 25.2464,
+       "median": 24.5894,
+       "min": 24.4577
+      },
+      "name": "home:nextup",
+      "ratio": 2.6768,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 5.3166,
+       "median": 5.2783,
+       "min": 5.2712
+      },
+      "jellyfin": {
+       "max": 19.0214,
+       "median": 18.5588,
+       "min": 18.4212
+      },
+      "name": "home:resume-audio",
+      "ratio": 3.5227,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.1596,
+       "median": 1.1475,
+       "min": 1.1324
+      },
+      "jellyfin": {
+       "max": 19.2125,
+       "median": 18.6163,
+       "min": 18.5566
+      },
+      "name": "home:resume-book",
+      "ratio": 16.1739,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 6.6841,
+       "median": 6.6583,
+       "min": 6.6353
+      },
+      "jellyfin": {
+       "max": 20.8344,
+       "median": 20.5334,
+       "min": 20.374
+      },
+      "name": "home:resume-video",
+      "ratio": 3.0781,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.7901,
+       "median": 1.7756,
+       "min": 1.737
+      },
+      "jellyfin": {
+       "max": 20.064,
+       "median": 19.5,
+       "min": 19.3577
+      },
+      "name": "home:views",
+      "ratio": 10.9551,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.4505,
+       "median": 0.4504,
+       "min": 0.4409
+      },
+      "jellyfin": {
+       "max": 4.7569,
+       "median": 4.7143,
+       "min": 4.6471
+      },
+      "name": "movies:image",
+      "ratio": 10.4667,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 10.8862,
+       "median": 10.8758,
+       "min": 10.7599
+      },
+      "jellyfin": {
+       "max": 24.0453,
+       "median": 23.6366,
+       "min": 23.2144
+      },
+      "name": "movies:items",
+      "ratio": 2.1651,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.3694,
+       "median": 0.3693,
+       "min": 0.3658
+      },
+      "jellyfin": {
+       "max": 4.5546,
+       "median": 4.4909,
+       "min": 4.408
+      },
+      "name": "detail:image",
+      "ratio": 12.1351,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.5164,
+       "median": 1.5035,
+       "min": 1.4629
+      },
+      "jellyfin": {
+       "max": 10.9225,
+       "median": 10.8653,
+       "min": 10.7958
+      },
+      "name": "detail:item",
+      "ratio": 7.2667,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.7871,
+       "median": 0.7468,
+       "min": 0.7424
+      },
+      "jellyfin": {
+       "max": 7.1428,
+       "median": 7.039,
+       "min": 6.9432
+      },
+      "name": "detail:local-trailers",
+      "ratio": 9.3867,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 3.9511,
+       "median": 3.8685,
+       "min": 3.8186
+      },
+      "jellyfin": {
+       "max": 21.1257,
+       "median": 20.4429,
+       "min": 20.4375
+      },
+      "name": "detail:similar",
+      "ratio": 5.2713,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.8039,
+       "median": 0.7626,
+       "min": 0.757
+      },
+      "jellyfin": {
+       "max": 7.2034,
+       "median": 7.06,
+       "min": 6.9212
+      },
+      "name": "detail:special-features",
+      "ratio": 9.2895,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.9579,
+       "median": 0.9508,
+       "min": 0.9476
+      },
+      "jellyfin": {
+       "max": 5.895,
+       "median": 5.8806,
+       "min": 5.8095
+      },
+      "name": "series:episodes",
+      "ratio": 6.1895,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.3546,
+       "median": 0.3528,
+       "min": 0.3445
+      },
+      "jellyfin": {
+       "max": 3.6121,
+       "median": 3.504,
+       "min": 3.4743
+      },
+      "name": "series:image",
+      "ratio": 10.0,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.5714,
+       "median": 1.5555,
+       "min": 1.5195
+      },
+      "jellyfin": {
+       "max": 10.4877,
+       "median": 10.3666,
+       "min": 10.1419
+      },
+      "name": "series:item",
+      "ratio": 6.6667,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.3509,
+       "median": 1.2529,
+       "min": 1.2302
+      },
+      "jellyfin": {
+       "max": 7.7404,
+       "median": 7.6708,
+       "min": 7.3844
+      },
+      "name": "series:seasons",
+      "ratio": 6.136,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 2.9761,
+       "median": 2.9555,
+       "min": 2.8646
+      },
+      "jellyfin": {
+       "max": 13.6407,
+       "median": 13.6223,
+       "min": 13.245
+      },
+      "name": "series:similar",
+      "ratio": 4.5946,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.3108,
+       "median": 1.2624,
+       "min": 1.2069
+      },
+      "jellyfin": {
+       "max": 10.7677,
+       "median": 10.5923,
+       "min": 10.5769
+      },
+      "name": "search:artists",
+      "ratio": 8.4127,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.5016,
+       "median": 0.4881,
+       "min": 0.4705
+      },
+      "jellyfin": {
+       "max": 4.9151,
+       "median": 4.8526,
+       "min": 4.8228
+      },
+      "name": "search:image",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:image: request picks differ"
+     },
+     {
+      "ferrofin": {
+       "max": 17.1774,
+       "median": 17.1133,
+       "min": 17.0884
+      },
+      "jellyfin": {
+       "max": 42.2558,
+       "median": 41.9734,
+       "min": 41.5084
+      },
+      "name": "search:items",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:items: ids differs for a request pick"
+     },
+     {
+      "ferrofin": {
+       "max": 2.1638,
+       "median": 2.1399,
+       "min": 2.0903
+      },
+      "jellyfin": {
+       "max": 16.9832,
+       "median": 16.8411,
+       "min": 16.685
+      },
+      "name": "search:persons",
+      "ratio": 7.8505,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.9408,
+       "median": 0.9281,
+       "min": 0.8398
+      },
+      "jellyfin": {
+       "max": 14.5767,
+       "median": 14.3435,
+       "min": 14.315
+      },
+      "name": "search:programs",
+      "ratio": 15.3763,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 5.2987,
+       "median": 5.2156,
+       "min": 5.1833
+      },
+      "jellyfin": {
+       "max": 32.436,
+       "median": 31.93,
+       "min": 31.9264
+      },
+      "name": "search:videos",
+      "ratio": 6.1111,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.5648,
+       "median": 1.4682,
+       "min": 1.4447
+      },
+      "jellyfin": {
+       "max": 4.8215,
+       "median": 4.8095,
+       "min": 4.7741
+      },
+      "name": "playback:intros",
+      "ratio": 3.2721,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.1941,
+       "median": 1.1688,
+       "min": 1.082
+      },
+      "jellyfin": {
+       "max": 7.6853,
+       "median": 7.4733,
+       "min": 7.4355
+      },
+      "name": "playback:playbackinfo",
+      "ratio": 6.3846,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.7992,
+       "median": 1.6742,
+       "min": 1.6679
+      },
+      "jellyfin": {
+       "max": 8.5452,
+       "median": 8.4655,
+       "min": 8.4608
+      },
+      "name": "playback:playing",
+      "ratio": 5.0719,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.9822,
+       "median": 1.822,
+       "min": 1.803
+      },
+      "jellyfin": {
+       "max": 4.8873,
+       "median": 4.8462,
+       "min": 4.8359
+      },
+      "name": "playback:segments",
+      "ratio": 2.6648,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.3223,
+       "median": 1.2392,
+       "min": 1.2354
+      },
+      "jellyfin": {
+       "max": 6.647,
+       "median": 6.6056,
+       "min": 6.5076
+      },
+      "name": "playback:stopped",
+      "ratio": 5.3306,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.4006,
+       "median": 0.3959,
+       "min": 0.3936
+      },
+      "jellyfin": {
+       "max": 4.6667,
+       "median": 4.626,
+       "min": 4.564
+      },
+      "name": "image",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: image: request picks differ"
+     }
+    ],
+    "rate": 5,
+    "screens": [
+     {
+      "ferrofin": {
+       "max": 12,
+       "median": 12,
+       "min": 12
+      },
+      "jellyfin": {
+       "max": 45,
+       "median": 44,
+       "min": 44
+      },
+      "name": "home",
+      "ratio": 3.6667,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 13,
+       "median": 13,
+       "min": 13
+      },
+      "jellyfin": {
+       "max": 35,
+       "median": 34,
+       "min": 34
+      },
+      "name": "movies",
+      "ratio": 2.6154,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 6,
+       "median": 6,
+       "min": 5
+      },
+      "jellyfin": {
+       "max": 32,
+       "median": 31,
+       "min": 31
+      },
+      "name": "detail",
+      "ratio": 5.1667,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 5,
+       "median": 5,
+       "min": 5
+      },
+      "jellyfin": {
+       "max": 24,
+       "median": 24,
+       "min": 24
+      },
+      "name": "series",
+      "ratio": 4.8,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 21,
+       "median": 21,
+       "min": 21
+      },
+      "jellyfin": {
+       "max": 55,
+       "median": 55,
+       "min": 55
+      },
+      "name": "search",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:image: request picks differ"
+     },
+     {
+      "ferrofin": {
+       "max": 7,
+       "median": 6,
+       "min": 6
+      },
+      "jellyfin": {
+       "max": 29,
+       "median": 28,
+       "min": 28
+      },
+      "name": "playback",
+      "ratio": 4.6667,
+      "unit": "ms",
+      "withheld": null
+     }
+    ]
+   },
+   "stress": {
+    "endpoints": [
+     {
+      "ferrofin": {
+       "max": 0.3889,
+       "median": 0.3853,
+       "min": 0.3837
+      },
+      "jellyfin": {
+       "max": 4.788,
+       "median": 4.7618,
+       "min": 4.7266
+      },
+      "name": "home:image",
+      "ratio": 12.2051,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4.1594,
+       "median": 4.1395,
+       "min": 4.1238
+      },
+      "jellyfin": {
+       "max": 10.1812,
+       "median": 10.1157,
+       "min": 10.0921
+      },
+      "name": "home:latest-movies",
+      "ratio": 2.4396,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 2.7404,
+       "median": 2.6625,
+       "min": 2.6518
+      },
+      "jellyfin": {
+       "max": 7.1588,
+       "median": 7.1051,
+       "min": 7.0882
+      },
+      "name": "home:latest-music",
+      "ratio": 2.6729,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 8.797,
+       "median": 8.753,
+       "min": 8.7465
+      },
+      "jellyfin": {
+       "max": 21.6984,
+       "median": 21.5914,
+       "min": 21.5223
+      },
+      "name": "home:latest-shows",
+      "ratio": 2.4686,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 9.0362,
+       "median": 9.0361,
+       "min": 9.009
+      },
+      "jellyfin": {
+       "max": 24.1287,
+       "median": 24.066,
+       "min": 23.9386
+      },
+      "name": "home:nextup",
+      "ratio": 2.6659,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 5.0965,
+       "median": 5.0957,
+       "min": 5.0954
+      },
+      "jellyfin": {
+       "max": 17.8077,
+       "median": 17.6864,
+       "min": 17.5487
+      },
+      "name": "home:resume-audio",
+      "ratio": 3.4706,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.9781,
+       "median": 0.9749,
+       "min": 0.9682
+      },
+      "jellyfin": {
+       "max": 17.8081,
+       "median": 17.7365,
+       "min": 17.5593
+      },
+      "name": "home:resume-book",
+      "ratio": 18.2474,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 6.3799,
+       "median": 6.3753,
+       "min": 6.3617
+      },
+      "jellyfin": {
+       "max": 19.7385,
+       "median": 19.6069,
+       "min": 19.4288
+      },
+      "name": "home:resume-video",
+      "ratio": 3.0721,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.7231,
+       "median": 1.6897,
+       "min": 1.675
+      },
+      "jellyfin": {
+       "max": 18.7266,
+       "median": 18.6577,
+       "min": 18.5093
+      },
+      "name": "home:views",
+      "ratio": 11.0651,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.381,
+       "median": 0.3797,
+       "min": 0.3738
+      },
+      "jellyfin": {
+       "max": 4.6256,
+       "median": 4.5972,
+       "min": 4.5937
+      },
+      "name": "movies:image",
+      "ratio": 12.1053,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 9.9075,
+       "median": 9.8846,
+       "min": 9.8011
+      },
+      "jellyfin": {
+       "max": 24.2801,
+       "median": 24.1431,
+       "min": 24.0287
+      },
+      "name": "movies:items",
+      "ratio": 2.4393,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.3241,
+       "median": 0.3237,
+       "min": 0.3224
+      },
+      "jellyfin": {
+       "max": 4.5599,
+       "median": 4.559,
+       "min": 4.5318
+      },
+      "name": "detail:image",
+      "ratio": 14.25,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.222,
+       "median": 1.2209,
+       "min": 1.2171
+      },
+      "jellyfin": {
+       "max": 10.1036,
+       "median": 10.0678,
+       "min": 10.0005
+      },
+      "name": "detail:item",
+      "ratio": 8.2787,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.5576,
+       "median": 0.5566,
+       "min": 0.5537
+      },
+      "jellyfin": {
+       "max": 6.1605,
+       "median": 6.1377,
+       "min": 6.1226
+      },
+      "name": "detail:local-trailers",
+      "ratio": 10.9643,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 3.2659,
+       "median": 3.2425,
+       "min": 3.2308
+      },
+      "jellyfin": {
+       "max": 20.3344,
+       "median": 20.2056,
+       "min": 20.1338
+      },
+      "name": "detail:similar",
+      "ratio": 6.2346,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.5683,
+       "median": 0.5658,
+       "min": 0.5615
+      },
+      "jellyfin": {
+       "max": 6.1385,
+       "median": 6.1159,
+       "min": 6.1058
+      },
+      "name": "detail:special-features",
+      "ratio": 10.7368,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.8936,
+       "median": 0.886,
+       "min": 0.88
+      },
+      "jellyfin": {
+       "max": 5.9753,
+       "median": 5.9235,
+       "min": 5.8983
+      },
+      "name": "series:episodes",
+      "ratio": 6.6517,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.3006,
+       "median": 0.3003,
+       "min": 0.2974
+      },
+      "jellyfin": {
+       "max": 3.512,
+       "median": 3.4802,
+       "min": 3.4734
+      },
+      "name": "series:image",
+      "ratio": 11.6,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.2634,
+       "median": 1.2607,
+       "min": 1.2567
+      },
+      "jellyfin": {
+       "max": 10.989,
+       "median": 10.8601,
+       "min": 10.8438
+      },
+      "name": "series:item",
+      "ratio": 8.6508,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.9571,
+       "median": 0.9414,
+       "min": 0.9387
+      },
+      "jellyfin": {
+       "max": 8.1497,
+       "median": 8.0367,
+       "min": 7.9346
+      },
+      "name": "series:seasons",
+      "ratio": 8.5532,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 2.521,
+       "median": 2.5108,
+       "min": 2.4531
+      },
+      "jellyfin": {
+       "max": 14.5608,
+       "median": 14.4626,
+       "min": 14.2192
+      },
+      "name": "series:similar",
+      "ratio": 5.7769,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.9997,
+       "median": 0.9989,
+       "min": 0.9962
+      },
+      "jellyfin": {
+       "max": 9.7639,
+       "median": 9.7519,
+       "min": 9.6612
+      },
+      "name": "search:artists",
+      "ratio": 9.75,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.4576,
+       "median": 0.455,
+       "min": 0.4493
+      },
+      "jellyfin": {
+       "max": 5.0949,
+       "median": 5.0733,
+       "min": 5.0523
+      },
+      "name": "search:image",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:image: request picks differ"
+     },
+     {
+      "ferrofin": {
+       "max": 16.7153,
+       "median": 16.5809,
+       "min": 16.5556
+      },
+      "jellyfin": {
+       "max": 41.6779,
+       "median": 41.5105,
+       "min": 41.316
+      },
+      "name": "search:items",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:items: ids differs for a request pick"
+     },
+     {
+      "ferrofin": {
+       "max": 1.9319,
+       "median": 1.9137,
+       "min": 1.9123
+      },
+      "jellyfin": {
+       "max": 16.3562,
+       "median": 16.3085,
+       "min": 16.2949
+      },
+      "name": "search:persons",
+      "ratio": 8.534,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.6579,
+       "median": 0.6493,
+       "min": 0.6488
+      },
+      "jellyfin": {
+       "max": 13.8055,
+       "median": 13.7962,
+       "min": 13.6678
+      },
+      "name": "search:programs",
+      "ratio": 21.2308,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4.7733,
+       "median": 4.7637,
+       "min": 4.7571
+      },
+      "jellyfin": {
+       "max": 31.8649,
+       "median": 31.4894,
+       "min": 31.4151
+      },
+      "name": "search:videos",
+      "ratio": 6.6176,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.4861,
+       "median": 1.47,
+       "min": 1.3872
+      },
+      "jellyfin": {
+       "max": 6.085,
+       "median": 5.892,
+       "min": 5.8216
+      },
+      "name": "playback:intros",
+      "ratio": 4.0068,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.8454,
+       "median": 0.8437,
+       "min": 0.841
+      },
+      "jellyfin": {
+       "max": 8.4373,
+       "median": 8.2864,
+       "min": 8.1451
+      },
+      "name": "playback:playbackinfo",
+      "ratio": 9.869,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.7781,
+       "median": 1.7481,
+       "min": 1.6662
+      },
+      "jellyfin": {
+       "max": 8.6981,
+       "median": 8.6582,
+       "min": 8.5473
+      },
+      "name": "playback:playing",
+      "ratio": 4.9486,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.8921,
+       "median": 1.8879,
+       "min": 1.7583
+      },
+      "jellyfin": {
+       "max": 6.0692,
+       "median": 5.9009,
+       "min": 5.879
+      },
+      "name": "playback:segments",
+      "ratio": 3.1217,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.2946,
+       "median": 1.2808,
+       "min": 1.2305
+      },
+      "jellyfin": {
+       "max": 6.6513,
+       "median": 6.6347,
+       "min": 6.63
+      },
+      "name": "playback:stopped",
+      "ratio": 5.1797,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.3532,
+       "median": 0.3525,
+       "min": 0.3516
+      },
+      "jellyfin": {
+       "max": 4.7149,
+       "median": 4.7102,
+       "min": 4.6771
+      },
+      "name": "image",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: image: request picks differ"
+     }
+    ],
+    "rate": 25,
+    "screens": [
+     {
+      "ferrofin": {
+       "max": 12,
+       "median": 12,
+       "min": 12
+      },
+      "jellyfin": {
+       "max": 44,
+       "median": 44,
+       "min": 43
+      },
+      "name": "home",
+      "ratio": 3.6667,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 12,
+       "median": 12,
+       "min": 12
+      },
+      "jellyfin": {
+       "max": 35,
+       "median": 35,
+       "min": 35
+      },
+      "name": "movies",
+      "ratio": 2.9167,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 5,
+       "median": 5,
+       "min": 5
+      },
+      "jellyfin": {
+       "max": 31,
+       "median": 31,
+       "min": 31
+      },
+      "name": "detail",
+      "ratio": 6.2,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4,
+       "median": 4,
+       "min": 4
+      },
+      "jellyfin": {
+       "max": 25,
+       "median": 25,
+       "min": 24
+      },
+      "name": "series",
+      "ratio": 6.25,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 20,
+       "median": 20,
+       "min": 20
+      },
+      "jellyfin": {
+       "max": 56,
+       "median": 55,
+       "min": 55
+      },
+      "name": "search",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:image: request picks differ"
+     },
+     {
+      "ferrofin": {
+       "max": 6,
+       "median": 6,
+       "min": 6
+      },
+      "jellyfin": {
+       "max": 31,
+       "median": 31,
+       "min": 31
+      },
+      "name": "playback",
+      "ratio": 5.1667,
+      "unit": "ms",
+      "withheld": null
+     }
+    ]
+   }
+  },
+  "memory": [
+   {
+    "ferrofin": {
+     "max": 254.4531,
+     "median": 244.793,
+     "min": 238.2305
+    },
+    "jellyfin": {
+     "max": 609.1445,
+     "median": 597.8555,
+     "min": 575.8711
+    },
+    "name": "peak under load",
+    "ratio": 2.4408,
+    "unit": "MiB",
+    "withheld": null
+   },
+   {
+    "ferrofin": {
+     "max": 199.6758,
+     "median": 197.0039,
+     "min": 194.1875
+    },
+    "jellyfin": {
+     "max": 414.5078,
+     "median": 404.4961,
+     "min": 383.3086
+    },
+    "name": "steady idle",
+    "ratio": 2.0508,
+    "unit": "MiB",
+    "withheld": null
+   }
+  ],
+  "source": {
+   "commit": "961c0b412",
+   "date": "2026-11-08",
+   "fixture": "4b217db66afc05ac4533e38b6b347018151493f64e4979e549355a9f586d4e04",
+   "host_class": {
+    "cores": 32,
+    "memory_gib": 125
+   },
+   "image_digest": "sha256:7310f81fde719b74429f65e9a4b1ca8973b7ded6791da3bf0aa6804b38216afd",
+   "library": {
+    "episodes": 7490,
+    "hdr": 50,
+    "movies": 3001,
+    "series": 250
+   },
+   "oracle": "Jellyfin 12.4.0",
+   "oracle_image": "jellyfin/jellyfin@sha256:fea863d0cd9ec445985d9c75fc6ed64e38a1d2766cf0c250a33d553f4fc1b771",
+   "run_count": 3,
+   "runs": [
+    "detached-961c0b412329-20261107-2316/bench",
+    "detached-961c0b412329-20261108-0011/bench",
+    "detached-961c0b412329-20261108-0038/bench"
+   ]
+  },
+  "ttfs": [
+   {
+    "ferrofin": {
+     "max": 253.952,
+     "median": 250.052,
+     "min": 242.4853
+    },
+    "jellyfin": {
+     "max": 3260.4077,
+     "median": 3257.1743,
+     "min": 3249.3193
+    },
+    "name": "cold start (restart → authenticated views; host caches retained)",
+    "ratio": 13.028,
+    "unit": "ms",
+    "withheld": null
+   },
+   {
+    "ferrofin": {
+     "max": 168.6043,
+     "median": 167.8436,
+     "min": 165.1414
+    },
+    "jellyfin": {
+     "max": 330.7688,
+     "median": 329.4289,
+     "min": 328.3335
+    },
+    "name": "HLS first segment (forced transcode)",
+    "ratio": 1.9583,
+    "unit": "ms",
+    "withheld": null
+   },
+   {
+    "ferrofin": {
+     "max": 0.7278,
+     "median": 0.7053,
+     "min": 0.6893
+    },
+    "jellyfin": {
+     "max": 4.0778,
+     "median": 3.914,
+     "min": 3.7715
+    },
+    "name": "direct-play TTFB (1 MiB range)",
+    "ratio": 5.507,
+    "unit": "ms",
+    "withheld": null
+   }
+  ]
+ },
+ "parity": {
+  "areas": [
+   {
+    "accepted": 20,
+    "area": "/Items",
+    "filed": 0,
+    "identical": 465,
+    "new": 0,
+    "oracle_failed": 5,
+    "order": 0,
+    "requests": 490
+   },
+   {
+    "accepted": 1,
+    "area": "/Artists",
+    "filed": 0,
+    "identical": 407,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 408
+   },
+   {
+    "accepted": 0,
+    "area": "/Shows",
+    "filed": 0,
+    "identical": 325,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 325
+   },
+   {
+    "accepted": 2,
+    "area": "/Genres",
+    "filed": 0,
+    "identical": 185,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 187
+   },
+   {
+    "accepted": 2,
+    "area": "/MusicGenres",
+    "filed": 0,
+    "identical": 185,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 187
+   },
+   {
+    "accepted": 5,
+    "area": "/UserItems",
+    "filed": 0,
+    "identical": 150,
+    "new": 1,
+    "oracle_failed": 0,
+    "order": 1,
+    "requests": 157
+   },
+   {
+    "accepted": 4,
+    "area": "/Studios",
+    "filed": 0,
+    "identical": 151,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 155
+   },
+   {
+    "accepted": 4,
+    "area": "/Persons",
+    "filed": 0,
+    "identical": 81,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 85
+   },
+   {
+    "accepted": 16,
+    "area": "/LiveTv",
+    "filed": 0,
+    "identical": 19,
+    "new": 0,
+    "oracle_failed": 6,
+    "order": 0,
+    "requests": 41
+   },
+   {
+    "accepted": 2,
+    "area": "/Users",
+    "filed": 0,
+    "identical": 30,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 32
+   },
+   {
+    "accepted": 0,
+    "area": "/Sessions",
+    "filed": 0,
+    "identical": 31,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 31
+   },
+   {
+    "accepted": 6,
+    "area": "/Videos",
+    "filed": 0,
+    "identical": 13,
+    "new": 0,
+    "oracle_failed": 4,
+    "order": 0,
+    "requests": 23
+   },
+   {
+    "accepted": 1,
+    "area": "/SyncPlay",
+    "filed": 0,
+    "identical": 21,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 22
+   },
+   {
+    "accepted": 0,
+    "area": "/Playlists",
+    "filed": 0,
+    "identical": 19,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 19
+   },
+   {
+    "accepted": 4,
+    "area": "/Audio",
+    "filed": 0,
+    "identical": 10,
+    "new": 0,
+    "oracle_failed": 3,
+    "order": 0,
+    "requests": 17
+   },
+   {
+    "accepted": 0,
+    "area": "/Library",
+    "filed": 0,
+    "identical": 17,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 17
+   },
+   {
+    "accepted": 5,
+    "area": "/System",
+    "filed": 0,
+    "identical": 12,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 17
+   },
+   {
+    "accepted": 9,
+    "area": "/Plugins",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 9
+   },
+   {
+    "accepted": 0,
+    "area": "/Intros",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 8,
+    "order": 0,
+    "requests": 8
+   },
+   {
+    "accepted": 0,
+    "area": "/Auth",
+    "filed": 0,
+    "identical": 7,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 7
+   },
+   {
+    "accepted": 1,
+    "area": "/Startup",
+    "filed": 0,
+    "identical": 6,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 7
+   },
+   {
+    "accepted": 1,
+    "area": "/Branding",
+    "filed": 0,
+    "identical": 5,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 6
+   },
+   {
+    "accepted": 0,
+    "area": "/Collections",
+    "filed": 0,
+    "identical": 6,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 6
+   },
+   {
+    "accepted": 0,
+    "area": "/Environment",
+    "filed": 0,
+    "identical": 5,
+    "new": 0,
+    "oracle_failed": 1,
+    "order": 0,
+    "requests": 6
+   },
+   {
+    "accepted": 1,
+    "area": "/ScheduledTasks",
+    "filed": 0,
+    "identical": 4,
+    "new": 0,
+    "oracle_failed": 1,
+    "order": 0,
+    "requests": 6
+   },
+   {
+    "accepted": 2,
+    "area": "/Channels",
+    "filed": 0,
+    "identical": 3,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 5
+   },
+   {
+    "accepted": 1,
+    "area": "/Devices",
+    "filed": 0,
+    "identical": 4,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 5
+   },
+   {
+    "accepted": 3,
+    "area": "/Backup",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 4
+   },
+   {
+    "accepted": 0,
+    "area": "/Localization",
+    "filed": 0,
+    "identical": 4,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 4
+   },
+   {
+    "accepted": 0,
+    "area": "/MergeVersions",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 4,
+    "order": 0,
+    "requests": 4
+   },
+   {
+    "accepted": 3,
+    "area": "/Packages",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 4
+   },
+   {
+    "accepted": 2,
+    "area": "/QuickConnect",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 4
+   },
+   {
+    "accepted": 2,
+    "area": "/UserImage",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 4
+   },
+   {
+    "accepted": 0,
+    "area": "/Episode",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 3,
+    "order": 0,
+    "requests": 3
+   },
+   {
+    "accepted": 0,
+    "area": "/MediaSegmentsApi",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 3,
+    "order": 0,
+    "requests": 3
+   },
+   {
+    "accepted": 0,
+    "area": "/PlayingItems",
+    "filed": 0,
+    "identical": 3,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 3
+   },
+   {
+    "accepted": 0,
+    "area": "/UserViews",
+    "filed": 0,
+    "identical": 3,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 3
+   },
+   {
+    "accepted": 0,
+    "area": "/Albums",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/DisplayPreferences",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/FallbackFont",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/IntroSkipper",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 2,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 1,
+    "area": "/LiveStreams",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/MediaSegments",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 1,
+    "area": "/Movies",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 1,
+    "area": "/Providers",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 1,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/Repositories",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/SkipButtonCss",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 2,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 1,
+    "area": "/Trailers",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 1,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/UserFavoriteItems",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/UserPlayedItems",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 2,
+    "area": "/Years",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 2,
+    "area": "/web",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/ClientLog",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 0,
+    "area": "/FileTransformation",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 1,
+    "order": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 0,
+    "area": "/GetUtcTime",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 0,
+    "area": "/Jellyfin.Plugin.OpenSubtitles",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 1,
+    "order": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 1,
+    "area": "/Libraries",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 1,
+    "area": "/Playback",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 0,
+    "area": "/Search",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 0,
+    "area": "/Songs",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 0,
+    "area": "/Tmdb",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "order": 0,
+    "requests": 1
+   }
+  ],
+  "counts": {
+   "accepted": 107,
+   "filed": 0,
+   "identical": 2198,
+   "new": 1,
+   "oracle_failed": 46,
+   "order": 1
+  },
+  "filed_issues": [],
+  "new_differences": 18,
+  "planned": 2353,
+  "sent": 2353,
+  "source": {
+   "commit": "961c0b412",
+   "date": "2026-11-08",
+   "oracle": "Jellyfin 12.4.0",
+   "session": "detached-961c0b412329-20261107-2316"
+  },
+  "verdict": "new differences"
+ },
+ "schema": 1,
+ "tag": {
+  "commit": "961c0b412329d6c5f9ddd45ddba73ef10c7d0c5e"
+ },
+ "version": "v1.5.0"
+}
