@@ -392,10 +392,10 @@ pub fn build_media_encoding(
         handle.spawn(TranscodeManagerImpl::run_transcode_controls(
             Arc::downgrade(&manager),
         ));
-        handle.spawn(
-            Arc::clone(&manager)
-                .run_idle_reaper(std::time::Duration::from_secs(IDLE_REAPER_SWEEP_SECS)),
-        );
+        handle.spawn(TranscodeManagerImpl::run_idle_reaper(
+            Arc::downgrade(&manager),
+            std::time::Duration::from_secs(IDLE_REAPER_SWEEP_SECS),
+        ));
     }
     let mut hls_impl = HlsStreamManagerImpl::new(
         planner,

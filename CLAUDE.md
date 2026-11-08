@@ -175,7 +175,8 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
 
 - **Dependencies live in the root `Cargo.toml`** `[workspace.dependencies]`; crates reference
   them as `dep.workspace = true`. **Never** inline a version in a crate's `Cargo.toml`. Check
-  crates.io for the latest version before adding a new dependency.
+  crates.io for the latest version before adding a new dependency. A new crate or version
+  also needs a cargo-vet audit or exemption (CONTRIBUTING.md, "Dependencies").
 - **Lints are workspace-wide** (`[workspace.lints]`): `missing_docs` and `clippy::pedantic`
   are warnings, and CI treats warnings as errors. So **every `pub` item needs a `///` doc**,
   and pedantic clippy must pass.
@@ -239,6 +240,7 @@ cargo deny --locked check              # advisories, licenses, bans, sources (de
 cargo deny --manifest-path examples/wasm-hello/Cargo.toml --locked check   # the same for the WASM guest
 cargo machete apps crates              # declared but unused dependencies
 scripts/check-workspace-deps.py        # every dependency through [workspace.dependencies]
+cargo vet --locked                     # every crate audited or exempted (supply-chain/; CONTRIBUTING.md "Dependencies")
 ```
 
 **Coverage gate — ≥80% line coverage, enforced per-crate:**

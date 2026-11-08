@@ -218,23 +218,49 @@ jobs:
       - if: ${{ !cancelled() }}
         run: scripts/check-workspace-deps.py
 
+  # cargo-vet: every crate in Cargo.lock needs an audit (supply-chain/audits.toml, or one imported
+  # from the organisations supply-chain/config.toml names) or an exemption there, so a PR that adds
+  # an unaudited crate, or moves one to an unaudited version, fails here naming it (CONTRIBUTING.md,
+  # "Dependencies"). Its result changes only with the branch, never with the date (--locked reads
+  # the committed supply-chain/imports.lock instead of fetching the imports), so unlike
+  # `dependencies` it is part of `lint` and blocks merging.
+  vet:
+    if: *not-release-pr
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      # cargo-vet reads the crate graph through `cargo metadata`. Same master-commit pin
+      # as clippy (see the note there).
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: 1.99.1 # = rust-toolchain.toml
+      # Built from crates.io, as ci/Dockerfile does for GitLab: the install-action release pinned
+      # above predates cargo-vet 0.10.3, and its fallback would fetch a binary it holds no hash for.
+      - run: cargo install --locked cargo-vet@0.10.3
+      - run: cargo vet --locked
+
   lint:
     # Renamed as well as skipped in the release PR's run (see benchmark-report): a skipped
     # check named `lint` on the commit could pass for the push run's failed one.
     name: ${{ (github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release/') && github.base_ref == 'main') && 'lint (release PR, checked by its push run)' || 'lint' }}
-    needs: [clippy, lint-tests]
+    needs: [clippy, lint-tests, vet]
     # always(): a failed or cancelled job must fail this check, not leave it skipped
     if: ${{ always() && !(github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release/') && github.base_ref == 'main') }}
     runs-on: ubuntu-latest
     permissions: {}
     steps:
-      - name: clippy and every test partition passed
+      - name: clippy, every test partition and cargo vet passed
         env:
           CLIPPY: ${{ needs.clippy.result }}
           TESTS: ${{ needs.lint-tests.result }}
+          VET: ${{ needs.vet.result }}
         run: |
-          echo "clippy: $CLIPPY, lint-tests: $TESTS"
-          [ "$CLIPPY" = success ] && [ "$TESTS" = success ]
+          echo "clippy: $CLIPPY, lint-tests: $TESTS, vet: $VET"
+          [ "$CLIPPY" = success ] && [ "$TESTS" = success ] && [ "$VET" = success ]
 
   shell-tests:
     if: *not-release-pr

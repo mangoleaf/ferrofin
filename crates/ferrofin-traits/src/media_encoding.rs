@@ -1042,6 +1042,14 @@ pub trait HlsStreamManager: Send + Sync {
         &self,
         play_session_id: &str,
     ) -> Result<Option<TranscodingJobHandle>, ServiceError>;
+
+    /// Kills every transcode job as the host tears down, so no ffmpeg
+    /// outlives the server lifetime that started it (gl-141), and returns once
+    /// they are gone.
+    ///
+    /// A manager with no transcode runtime runs no job, so the default has
+    /// nothing to stop.
+    async fn shutdown(&self) {}
 }
 
 /// Compile-time assertion that [`HlsStreamManager`] is object-safe.
