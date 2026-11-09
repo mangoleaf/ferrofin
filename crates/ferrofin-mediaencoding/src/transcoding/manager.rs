@@ -1458,6 +1458,10 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
 
     /// Stops a job already out of the registry: its process, its rolling
     /// deletion and, when `delete_files` is set, its partial output.
+    ///
+    /// A panic while stopping the process is logged and the file and session
+    /// steps still run, as upstream's `KillTranscodingJob` goes on past a
+    /// failed `Stop`: no later sweep or kill would reach this job again.
     async fn tear_down(
         &self,
         handle: &TranscodingJobHandle,
@@ -1477,22 +1481,33 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             );
             // Stop the timer under the same lock as control writes, resuming
             // before kill so ffmpeg cannot remain in its paused command loop.
-            let mut controller = running.controller.lock().await;
-            controller.stopped = true;
-            if controller.paused
-                && let Some(keys) = controller.keys
-            {
-                match running.child.write_stdin(keys.resume()).await {
-                    Ok(()) => controller.paused = false,
-                    Err(error) => {
-                        tracing::error!(path = %handle.path, %error, "resuming transcode before teardown failed");
+            let stop = async {
+                let mut controller = running.controller.lock().await;
+                controller.stopped = true;
+                if controller.paused
+                    && let Some(keys) = controller.keys
+                {
+                    match running.child.write_stdin(keys.resume()).await {
+                        Ok(()) => controller.paused = false,
+                        Err(error) => {
+                            tracing::error!(path = %handle.path, %error, "resuming transcode before teardown failed");
+                        }
                     }
                 }
+                if let Err(error) = running.child.kill().await {
+                    tracing::error!(path = %handle.path, %error, "killing ffmpeg at teardown failed; it may still be running");
+                }
+            };
+            if let Err(payload) =
+                futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(stop)).await
+            {
+                tracing::error!(
+                    path = %handle.path,
+                    play_session_id = handle.play_session_id.as_deref().unwrap_or(""),
+                    panic = ferrofin_util::panic::message(payload.as_ref()),
+                    "stopping ffmpeg at teardown panicked; it may still be running"
+                );
             }
-            if let Err(error) = running.child.kill().await {
-                tracing::error!(path = %handle.path, %error, "killing ffmpeg at teardown failed; it may still be running");
-            }
-            drop(controller);
             if delete_files {
                 let stem = running
                     .playlist_path
@@ -1568,7 +1583,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// A sweep that panics is logged and ends alone (`survive_panic`): the
     /// jobs it had not reached are still registered, so the next sweep reaps
     /// them. The job it was tearing down is already out of the registry and
-    /// is not retried.
+    /// is not retried; a panic while stopping its process does not reach the
+    /// sweep, since `tear_down` contains it and still tells the session layer.
     pub async fn run_idle_reaper(manager: std::sync::Weak<Self>, interval: Duration) {
         let mut failing = false;
         loop {
@@ -3626,6 +3642,8 @@ pub(super) mod throttle_tests {
         events: Mutex<Vec<Vec<u8>>>,
         fail_write: AtomicBool,
         fail_kill: AtomicBool,
+        /// Whether `kill` panics.
+        panic_kill: AtomicBool,
         exited: AtomicBool,
         /// How many more progress reads panic.
         panics: AtomicUsize,
@@ -3645,6 +3663,10 @@ pub(super) mod throttle_tests {
         }
         async fn kill(&self) -> Result<(), String> {
             self.0.events.lock().unwrap().push(b"kill".to_vec());
+            assert!(
+                !self.0.panic_kill.load(Ordering::SeqCst),
+                "killing ffmpeg panicked"
+            );
             if self.0.fail_kill.load(Ordering::SeqCst) {
                 return Err("fixture kill failure".to_owned());
             }
@@ -3739,12 +3761,12 @@ pub(super) mod throttle_tests {
         fixture_job(manager, true).await
     }
     /// As [`fixture_of`], for a video (throttle-eligible) or audio-only job.
-    async fn fixture_job(
-        manager: TranscodeManagerImpl<NoopSessionReporter>,
+    async fn fixture_job<S: SessionReporter>(
+        manager: TranscodeManagerImpl<S>,
         is_input_video: bool,
     ) -> (
         tempfile::TempDir,
-        Arc<TranscodeManagerImpl<NoopSessionReporter>>,
+        Arc<TranscodeManagerImpl<S>>,
         Arc<ChildState>,
         TranscodingJobHandle,
     ) {
@@ -3990,6 +4012,40 @@ pub(super) mod throttle_tests {
             "{errors:#?}"
         );
         assert_eq!(manager.active_job_count(), 0);
+    }
+
+    /// gl-1411: a teardown whose ffmpeg kill panics still deletes the job's
+    /// partial files and tells the session layer, which releases its live
+    /// stream: the job is already out of the registry, so nothing would retry
+    /// them. The panic is logged with the job.
+    #[tokio::test]
+    async fn a_teardown_whose_kill_panics_still_cleans_up_and_tells_the_session() {
+        use super::tests::RecordingReporter;
+        use crate::configuration::reader::tests::CapturedLogs;
+        let reporter = Arc::new(RecordingReporter::default());
+        let (_directory, manager, child, handle) =
+            fixture_job(TranscodeManagerImpl::new(Arc::clone(&reporter)), true).await;
+        child.panic_kill.store(true, Ordering::SeqCst);
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        manager.kill_and_remove(&handle, true, true).await;
+        drop(guard);
+
+        assert_eq!(
+            *reporter.killed.lock().unwrap(),
+            [(handle.path.clone(), true, true)]
+        );
+        assert!(!Path::new(&handle.path).exists(), "partial files kept");
+        assert_eq!(manager.active_job_count(), 0);
+        let errors = logs.lines_at("ERROR");
+        assert!(
+            errors.len() == 1
+                && errors[0].contains("killing ffmpeg panicked")
+                && errors[0].contains(&handle.path)
+                && errors[0].contains("throttle-session"),
+            "{errors:#?}"
+        );
     }
 
     #[tokio::test]
