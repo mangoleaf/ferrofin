@@ -793,25 +793,8 @@ async fn download_images(
     item_id: &str,
     images: Vec<RemoteImage>,
 ) -> Vec<ItemImageInfo> {
-    fetch_image_files(tmdb, item_dir, item_id, images, false).await
-}
-
-/// The download loop of [`download_images`]; `replace` re-downloads a type
-/// whose file is already on disk (keeping it when the download fails).
-async fn fetch_image_files(
-    tmdb: &TmdbClient,
-    item_dir: &Path,
-    item_id: &str,
-    images: Vec<RemoteImage>,
-    replace: bool,
-) -> Vec<ItemImageInfo> {
     let mut infos: Vec<ItemImageInfo> = Vec::new();
     let mut satisfied = std::collections::HashSet::new();
-    // The stems this pass has written. Several types share one stem (every
-    // type `image_type_file_stem` does not name lands on `primary`), and a
-    // replace must not overwrite the file an earlier type of this same pass
-    // just wrote — the poster would end up holding the disc art.
-    let mut written: Vec<&str> = Vec::new();
     for image in images {
         if satisfied.contains(&image.image_type) {
             continue;
@@ -819,48 +802,23 @@ async fn fetch_image_files(
         let stem = image_type_file_stem(image.image_type);
         // Reuse any on-disk file of this stem regardless of extension — it is
         // either this download from an earlier scan or a user upload (which
-        // must win over a re-download) — unless replacing.
-        let existing = existing_art_file(item_dir, stem);
-        let reuse = !replace || written.contains(&stem);
-        let dest = match existing {
-            Some(existing) if reuse => existing,
-            existing => {
-                let dest = item_dir.join(format!("{stem}.jpg"));
-                let Some(bytes) = tmdb.download(&image.url).await else {
-                    // A failed replacement keeps the image the item had.
-                    if let Some(existing) = existing
-                        && !infos.iter().any(|i| i.image_type == image.image_type)
-                    {
-                        infos.push(ItemImageInfo {
-                            date_modified: file_date_modified(&existing),
-                            path: existing.to_string_lossy().into_owned(),
-                            image_type: image.image_type,
-                            width: 0,
-                            height: 0,
-                            blur_hash: None,
-                        });
-                    }
-                    continue;
-                };
-                // A replaced file of another extension would leave two
-                // files of one type in the folder.
-                if let Some(old) = existing.filter(|old| *old != dest)
-                    && let Err(err) = std::fs::remove_file(&old)
-                {
-                    tracing::warn!(%err, item = %item_id, "failed to remove replaced artwork");
-                }
-                if let Err(err) =
-                    std::fs::create_dir_all(item_dir).and_then(|()| std::fs::write(&dest, &bytes))
-                {
-                    tracing::warn!(%err, item = %item_id, "failed to write downloaded artwork");
-                    continue;
-                }
-                written.push(stem);
-                dest
+        // must win over a re-download).
+        let dest = if let Some(existing) = existing_art_file(item_dir, stem) {
+            existing
+        } else {
+            let dest = item_dir.join(format!("{stem}.jpg"));
+            let Some(bytes) = tmdb.download(&image.url).await else {
+                continue;
+            };
+            if let Err(err) =
+                off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes))
+            {
+                tracing::warn!(%err, item = %item_id, "failed to write downloaded artwork");
+                continue;
             }
+            dest
         };
         satisfied.insert(image.image_type);
-        infos.retain(|i| i.image_type != image.image_type);
         infos.push(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type: image.image_type,
@@ -1334,7 +1292,7 @@ async fn studio_thumb(
         };
     };
     let dest = dir.join(format!("{stem}.jpg"));
-    match std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&dest, &bytes)) {
+    match off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes)) {
         Ok(()) => StudioThumb::Found(dest),
         Err(err) => StudioThumb::Failed(Some(ServiceError::backend(format!(
             "write studio thumb: {err}"
@@ -14067,7 +14025,7 @@ impl LibraryScanner {
                 let previous = existing_art_file(&item_dir, stem);
                 let dest = item_dir.join(format!("{stem}.{ext}"));
                 if let Err(err) =
-                    std::fs::create_dir_all(&item_dir).and_then(|()| std::fs::write(&dest, &bytes))
+                    off_runtime(|| ferrofin_util::file_helper::atomic_write_media(&dest, &bytes))
                 {
                     tracing::warn!(%err, item = %entity.id, "failed to write plugin artwork");
                     continue;
@@ -23844,7 +23802,7 @@ fn ordered_remote_images(
 }
 
 /// Keeps the first image of each type (the preferred provider's, then others'
-/// best per type after its sort) — the choice `fetch_image_files` makes when
+/// best per type after its sort) — the choice `artwork::acquire_images` makes when
 /// every download succeeds, which the ranking tests read.
 #[cfg(test)]
 fn dedup_images_by_type(images: Vec<RemoteImage>) -> Vec<RemoteImage> {
@@ -36903,6 +36861,57 @@ mod tests {
         assert_eq!(images.len(), usize::try_from(limit).unwrap());
     }
 
+    /// A full image replacement swaps plugin artwork in whole: a reader that
+    /// opened the old file still reads the old bytes, so the old file was
+    /// never truncated and rewritten in place, and a failed write cannot
+    /// leave half an image (gl-254).
+    #[tokio::test]
+    async fn replaced_plugin_artwork_never_rewrites_the_old_file_in_place() {
+        use std::io::Read as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, _) = artwork_fixture("http://127.0.0.1:1", tmp.path(), &[], false).await;
+        let scanner = scanner.with_dynamic_providers(vec![Arc::new(OrderingArtwork)]);
+        let row = BaseItemEntity {
+            id: SERIES.to_owned(),
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+            ..Default::default()
+        };
+        let options = LibraryOptions {
+            type_options: vec![ferrofin_model::configuration::TypeOptions {
+                type_: Some("Movie".to_owned()),
+                image_fetchers: vec!["ArtworkPlugin".to_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let fetch = |replace_images| super::FetcherPolicy {
+            options: Some(&options),
+            replace_images,
+            ..Default::default()
+        };
+        let mut images = Vec::new();
+        scanner
+            .apply_dynamic_images(&row, &mut images, fetch(false))
+            .await;
+        let [image] = images.as_slice() else {
+            panic!("{images:?}");
+        };
+        let path = std::path::PathBuf::from(&image.path);
+        std::fs::write(&path, b"old artwork").unwrap();
+        let mut reader = std::fs::File::open(&path).unwrap();
+
+        let mut replaced = Vec::new();
+        scanner
+            .apply_dynamic_images(&row, &mut replaced, fetch(true))
+            .await;
+
+        assert_eq!(replaced.len(), 1, "{replaced:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"\x89PNG\r\n\x1a\nplugin");
+        let mut seen = Vec::new();
+        reader.read_to_end(&mut seen).unwrap();
+        assert_eq!(seen, b"old artwork");
+    }
+
     #[rstest::rstest]
     #[case::embedded_first(["Image Extractor", "ArtworkPlugin"], false)]
     #[case::plugin_first(["ArtworkPlugin", "Image Extractor"], true)]
@@ -37325,7 +37334,7 @@ mod tests {
 
     /// A TheTVDB still ranked first that fails to download gives way to
     /// TheMovieDb's, as a failed preferred download does for series artwork
-    /// (`fetch_image_files`).
+    /// (`artwork::acquire_images`).
     #[tokio::test]
     async fn a_failed_episode_still_download_falls_back_to_the_next_provider() {
         use ferrofin_providers::library_options::fetcher_names::{TMDB, TVDB};
