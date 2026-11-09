@@ -68,7 +68,7 @@ FERROFIN_TOKEN=… gates/verify/scan-behaviour.sh BASE_URL LIBRARY_ID SCRATCH_DI
   (the file server's clock) with its own. Raise it when the two clocks differ, as they
   can with NFS or a server in a remote pod.
 
-It needs `curl` and `jq`, and it refuses to run (exit 2) unless:
+It needs `curl`, `jq`, `setsid` and `flock`, and it refuses to run (exit 2) unless:
 
 - the server has `/metrics` on (`FERROFIN_ENABLE_METRICS=true`, or `EnableMetrics` in
   `system.json`, then a restart);

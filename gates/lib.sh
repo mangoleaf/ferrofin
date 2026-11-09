@@ -99,11 +99,12 @@ gates_dir() {
 # A signal goes on at once, from the trap itself, to the worker's process group as a TERM (an
 # asynchronous worker ignores INT and QUIT); then, a second later and every second after, to the worker
 # alone, until its teardown has run gates_ack or it has ended: the worker keeps its own traps and
-# teardown, and a TERM it dropped is simply sent again. This shell exits with 128 + the signal it got, or
-# with the worker's status. In the worker it returns at once.
+# teardown, and a TERM it dropped is simply sent again (gates_resend). This shell exits with 128 + the
+# signal it got, or with the worker's status. In the worker it returns at once.
 gates_supervise() {
   if [ -n "${GATES_WORKER:-}" ]; then unset GATES_WORKER; return 0; fi
-  command -v setsid >/dev/null || { echo "$2: setsid (util-linux) is required" >&2; exit 2; }
+  { command -v setsid && command -v flock; } >/dev/null ||
+    { echo "$2: setsid and flock (util-linux) are required" >&2; exit 2; }
   local w='' status=0 sig=0 waited own=''
   if [ -z "${GATES_ACK_DIR:-}" ]; then   # one per outermost gate; a gate it starts uses the same
     GATES_ACK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gates-ack.XXXXXX") || exit 2
@@ -123,9 +124,7 @@ gates_supervise() {
     if [ "$sig" = 0 ] || [ -e "$GATES_ACK_DIR/$w" ]; then status=0; wait "$w" || status=$?; waited=1
     else
       waited=0; sleep 1 || true
-      # bash 5.2 may have dropped it. The ack is looked for just before: a teardown that acks in the
-      # microseconds between and gives TERM its default action back is the one case left.
-      [ -e "$GATES_ACK_DIR/$w" ] || kill -TERM "$w" 2>/dev/null || true
+      gates_resend "$w"   # bash 5.2 may have dropped it
     fi
     kill -0 "$w" 2>/dev/null || break
   done
@@ -137,19 +136,32 @@ gates_supervise() {
 }
 
 # gates_ack: the first thing a gate's teardown does, once its signal handler has run: the TERM that
-# started it is not sent again. Harmless on an ordinary exit.
-gates_ack() { [ -z "${GATES_ACK_DIR:-}" ] || { : > "$GATES_ACK_DIR/$BASHPID"; } 2>/dev/null || true; }
+# started it is not sent again. Under a supervisor it leaves TERM ignored: a re-send that found no ack yet
+# holds the ack's lock until its kill has landed, so it is dropped, and none comes after (gl-1131). A
+# teardown that takes a second signal sets its TERM trap after this. Harmless on an ordinary exit.
+gates_ack() {
+  [ -n "${GATES_ACK_DIR:-}" ] || return 0
+  trap '' TERM   # before the lock: a TERM that lands while flock waits is discarded, not left pending
+  { flock 8 && : > "$GATES_ACK_DIR/$BASHPID"; } 2>/dev/null 8> "$GATES_ACK_DIR/lock" || true
+}
+
+# gates_resend <pid>: TERM to <pid> again unless its teardown has run gates_ack; the check and the kill hold
+# the ack's lock, so a teardown that acks meanwhile has TERM ignored when the kill lands. Without the ack's
+# directory nothing is sent: no teardown could ack, and a blind TERM every second would cut it short.
+gates_resend() {
+  { flock 8 && { [ -e "$GATES_ACK_DIR/$1" ] || kill -TERM "$1"; }; } 2>/dev/null 8> "$GATES_ACK_DIR/lock" || true
+}
 
 # gates_stop <pid>: wait for a background child shell of the worker that keeps its own traps. It had
 # the TERM gates_supervise sent the whole worker group; if it dropped it (under set -e bash 5.2 exits it
 # with status 2 instead), it is sent again every second until its teardown has run gates_ack or it has
-# ended. Never at once, and never once it has acked: its teardown may have given TERM back its default
-# action, and a TERM then would cut it short.
+# ended. Never at once, and never once it has acked (gates_resend): its teardown may have given TERM back
+# its default action, and a TERM then would cut it short.
 gates_stop() {
   local ack=${GATES_ACK_DIR:-}/$1
   while [ -n "${GATES_ACK_DIR:-}" ] && kill -0 "$1" 2>/dev/null; do
     sleep 1 || true
-    [ -e "$ack" ] || kill -TERM "$1" 2>/dev/null || true
+    gates_resend "$1"
   done
   wait "$1" 2>/dev/null || true
   [ -z "${GATES_ACK_DIR:-}" ] || rm -f -- "$ack"
