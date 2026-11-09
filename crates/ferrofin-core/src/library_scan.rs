@@ -11060,10 +11060,9 @@ impl LibraryScanner {
         }
     }
 
-    /// The scan's backfill heuristics (owner decision D2 of
-    /// `PLAN_SCAN_CHANGE_DETECTION`, recorded in
-    /// `brain/concerns/CONCERN_SCAN_BACKFILL_HEURISTICS.md`) as a trigger for
-    /// the remote metadata providers, evaluated on the STORED row: the
+    /// The scan's backfill heuristics (D2: kept by an owner decision of
+    /// 2026-09-24 until the side effects of removing them are understood) as
+    /// a trigger for the remote metadata providers, evaluated on the STORED row: the
     /// fetcher that would answer first is asked again only when its own
     /// "already enriched" gate is not met.
     ///

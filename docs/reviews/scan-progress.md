@@ -18,7 +18,7 @@ completion. Reporter shutdown is explicit after the scan worker stops.
 
 ## Independent review
 
-Applied `.claude/skills/review-loop/SKILL.md` after implementation, as requested.
+An independent review loop ran after implementation, as requested.
 Round 1 identified reporter lifetime, terminal delivery on last-owner drop, and
 per-folder snapshot consistency issues. All were corrected and covered by tests.
 Round 2 accepted those fixes and identified a test lock-scope lint issue. Round 3
@@ -102,8 +102,8 @@ Reproduce with `node gates/verify/scan-progress.mjs BINARY 100 --measure`.
 The inspected stock Jellyfin Web handlers hide incoming library-card progress at
 exactly 0% and 100%, independently of RefreshStatus. This server fix sends accurate
 values and lifecycle state. Full card visibility at zero or during finalization
-requires a client change; no fabricated positive percentage is sent. The open
-client decision remains in `brain/plans/PLAN_SCAN_PROGRESS.md`.
+requires a client change; no fabricated positive percentage is sent. Whether to
+make that client change is still an open decision.
 
 ## Web 12.0 follow-up (#15)
 
@@ -142,7 +142,7 @@ authenticated and whether it starts/stops streaming. `dashboard scan task snapsh
 records the running/cancelling RefreshLibrary task state and percentage inside the
 socket's session span. This means a snapshot was prepared, not that the browser
 received it. These diagnostics are marked temporary for #15; remove or lower them
-after homelab confirmation. Tokens and raw socket URLs are never logged.
+after confirmation on a test deployment. Tokens and raw socket URLs are never logged.
 
 Web 12.0's main dashboard and Libraries page render the `RefreshLibrary` task when
 `State` is `Running`; the individual library cards do not render `RefreshProgress`.
@@ -186,13 +186,13 @@ scans measure lifecycle logging, not sustained tick-log overhead. The held 12-it
 live fixture separately verified every one-second sample and its diagnostic line.
 Raw results are `/tmp/ferrofin-scan-progress/web12-measure-{before,after}-{1,2,3}.json`.
 
-All follow-up changes remain on `fix/scan-progress`; homelab deployment confirmation
+All follow-up changes remain on `fix/scan-progress`; confirmation on a test deployment
 is still needed. The logging is intentionally temporary.
 
 
 ## Diagnostic logging cleanup
 
-After homelab confirmation of full scans on the dashboard and individual scans on
+After a test deployment confirmed full scans on the dashboard and individual scans on
 Home -> My Media, retained the three detailed progress/subscription diagnostics at
 DEBUG instead of INFO. Existing scan lifecycle and every-100-item INFO messages,
 WebSocket connection logs, and progress-publication warnings keep their levels.
