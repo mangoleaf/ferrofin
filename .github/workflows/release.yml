@@ -410,8 +410,8 @@ jobs:
   # ── every archive and package the Release attaches, through `cargo audit bin` ──
   # The files as published (the .deb's binary included), each of which must carry its
   # cargo-auditable record. A vulnerable experimental binary blocks the release too: none
-  # is published with a known vulnerability. A job of its own, so the tool it installs
-  # never runs beside github-release's contents: write.
+  # is published with a known vulnerability deny.toml has not accepted. A job of its own,
+  # so the tool it installs never runs beside github-release's contents: write.
   audit-binaries:
     if: github.event_name == 'push' && startsWith(github.ref_name, 'v')
     needs: binaries
